@@ -8,6 +8,10 @@ agent sessions inside OWUI's chat interface.
 > No separate proxy, no Node.js middleware, no Python subprocess. Just a single
 > Python file you paste into OWUI's admin panel.
 
+<p align="center">
+  <img src="./owui-screenshot.svg" alt="OpenClaw Gateway Pipe in action — streaming text, tool call rendering, and model selection inside Open WebUI" width="90%">
+</p>
+
 ---
 
 ## ✨ Features
