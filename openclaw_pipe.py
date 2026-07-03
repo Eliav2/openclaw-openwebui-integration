@@ -49,6 +49,7 @@ import threading
 import sys
 import hashlib
 import re
+import mimetypes
 from pathlib import Path
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 
@@ -134,10 +135,37 @@ def _parse_device_identity(raw):
 
 
 # ---------------------------------------------------------------------------
+MEDIA_DIR = "/tmp/openclaw-pipe-media"
+MEDIA_BASE_URL = "http://your-owui-host:18791"  # default; can be overridden via valve
+
 # Simple HTTP file server for media served back to OWUI
 # ---------------------------------------------------------------------------
 
 _file_server_started = False
+
+
+def _resolve_media(text, base_url=None):
+    """Convert MEDIA:filename directives to markdown image URLs.
+    Uses the file server URL for fast delivery (no base64 streaming).
+    Returns (resolved_text, handled) tuple."""
+    if base_url is None:
+        base_url = MEDIA_BASE_URL
+    prefix = "MEDIA:"
+    if prefix not in text:
+        return text, False
+    # Extract filename
+    idx = text.index(prefix)
+    after_prefix = text[idx + len(prefix):].strip()
+    fname = after_prefix.split()[0] if after_prefix else ""
+    if not fname:
+        return text, False
+    # Build URL-based markdown image
+    url = f"{base_url.rstrip('/')}/{fname}"
+    rest = after_prefix[len(fname):].strip()
+    result = f"![{fname}]({url})"
+    if rest:
+        result += "\n" + rest
+    return result, True
 
 
 def _start_file_server(port=18791):
@@ -242,6 +270,10 @@ class Pipe:
         ENABLE_FILE_SERVER: bool = Field(
             default=True,
             description="Start a minimal HTTP server for media files"
+        )
+        FILE_SERVER_BASE_URL: str = Field(
+            default="http://your-owui-host:18791",
+            description="Public URL for the file server (for MEDIA: resolution)"
         )
 
     def __init__(self):
@@ -408,6 +440,16 @@ class Pipe:
                             if delta.startswith("Sender (untrusted metadata)"):
                                 pipe_log("  filtered metadata block")
                                 continue
+                            # Convert MEDIA: directives to base64 images
+                            if "MEDIA:" in delta:
+                                resolved, handled = _resolve_media(
+                                    delta,
+                                    base_url=self.valves.FILE_SERVER_BASE_URL
+                                )
+                                if handled:
+                                    pipe_log("  resolved MEDIA: directive")
+                                    yield resolved
+                                    continue
                             yield delta
 
                     # --- Tool call events ---
