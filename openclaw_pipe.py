@@ -159,6 +159,36 @@ def _start_file_server(port=18791):
             self.send_header("Cache-Control", "no-cache")
             super().end_headers()
 
+        def _handle_upload(self):
+            """Handle PUT/POST file upload."""
+            length = int(self.headers.get("Content-Length", 0))
+            if length == 0:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b"empty")
+                return
+            body = self.rfile.read(length)
+            # Sanitize path: only allow single filename, no ".."
+            path = self.path.strip("/").split("?")[0]
+            if not path or ".." in path or "/" in path:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b"bad path")
+                return
+            dest = os.path.join(directory, os.path.basename(path))
+            with open(dest, "wb") as f:
+                f.write(body)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(f"ok:{path}".encode())
+
+        def do_PUT(self):
+            self._handle_upload()
+
+        def do_POST(self):
+            self._handle_upload()
+
     try:
         server = HTTPServer(("0.0.0.0", port), _Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -374,6 +404,10 @@ class Pipe:
                         delta = data.get("delta") or data.get("text") or ""
                         if delta:
                             text_yielded = True
+                            # Strip inbound metadata blocks that OpenClaw injects
+                            if delta.startswith("Sender (untrusted metadata)"):
+                                pipe_log("  filtered metadata block")
+                                continue
                             yield delta
 
                     # --- Tool call events ---
