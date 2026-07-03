@@ -45,39 +45,75 @@ agent sessions inside OWUI's chat interface.
 
 ---
 
-## 🚀 Installation
+## 🚀 Installation (automated)
 
-### 1. Add the Pipe in OWUI
+### Prerequisites
 
-1. Open **Admin Panel** → **Functions**
-2. Click **"+"** → **"Create a function"**
-3. Set:
-   - **ID:** `openclaw_gateway`
-   - **Name:** `OpenClaw Gateway`
-   - **Type:** `pipe`
-4. Paste the entire contents of [`openclaw_pipe.py`](./openclaw_pipe.py) into
-   the code editor
-5. Click **Save**
+- Python 3.8+ with `cryptography` package on the **machine running this script**
+  (`pip install cryptography`)
+- Admin credentials for your Open WebUI instance
+- Your OpenClaw Gateway API token
 
-### 2. Configure Valves
+### Run the installer
 
-After saving, open the **Valves** section and set:
+```bash
+# Install cryptography if you don't have it
+pip install cryptography
 
-| Valve | Description | Default |
-|-------|-------------|---------|
-| `GATEWAY_URL` | OpenClaw Gateway address | `localhost:18789` |
-| `GATEWAY_TOKEN` | Your gateway API token | *(required)* |
-| `AGENT_ID` | Which agent to route to | `main` |
-| `DEVICE_IDENTITY` | (Advanced) paste from first-run logs to persist identity | `""` |
-| `ENABLE_FILE_SERVER` | Start HTTP server for media files | `True` |
+# Set your environment variables
+export OWUI_URL=http://your-owui-host:8080
+export OWUI_EMAIL=admin@example.com
+export OWUI_PASSWORD=your-password
+export GATEWAY_URL=your-owui-host:18789
+export GATEWAY_TOKEN=your-gateway-token
+export AGENT_ID=main
 
-### 3. Enable & Use
+# Run the installer
+python3 install.py
+```
 
-1. Toggle the pipe **Active** → **ON**
-2. (Optional) Toggle **Global** → **ON** to make it available to all users
-3. Go to any chat, open the model selector dropdown, and choose
-   **"OpenClaw Gateway"**
-4. Start chatting! 🤖
+The script will:
+1. Log in to Open WebUI
+2. Delete any existing pipe with the same ID
+3. Create the pipe function
+4. Enable it (active + global)
+5. Generate a **permanent device identity** (Ed25519 key pair)
+6. Set all valves (including `DEVICE_IDENTITY`)
+7. Print the device ID and guide you through Gateway approval
+
+### Approve the device in the Gateway
+
+When using the pipe for the first time, your OpenClaw Gateway will prompt
+for device approval. On the Gateway host, run:
+
+```bash
+openclaw devices list      # find the pending request
+openclaw devices approve <request-id>
+```
+
+**The identity is permanent.** Even if the pipe function is deleted and
+recreated, the installer re-uses the same key pair (`./.pipe_device_identity.json`),
+so approval is a **one-time** step.
+
+### Manual installation (alternative)
+
+If you can't run the script, install manually:
+
+1. Open **Admin Panel** → **Functions** in OWUI
+2. Click **"+"** → **"Create a function"** with ID `openclaw_gateway`, type `pipe`
+3. Paste the contents of [`openclaw_pipe.py`](./openclaw_pipe.py)
+4. Save, then toggle **Active** → **ON** and **Global** → **ON**
+5. Set the valves:
+
+   | Valve | Description |
+   |-------|-------------|
+   | `GATEWAY_URL` | OpenClaw Gateway address |
+   | `GATEWAY_TOKEN` | Your gateway API token |
+   | `AGENT_ID` | Which agent to route to (default: `main`) |
+   | `DEVICE_IDENTITY` | Paste from `./.pipe_device_identity.json` after running the script once, or leave empty |
+   | `ENABLE_FILE_SERVER` | `True` (media support) |
+
+6. Choose "OpenClaw Gateway" as your model and start chatting
 
 ---
 
@@ -135,9 +171,15 @@ Check OWUI's backend logs for `[openclaw-pipe]` prefixed messages.
 ```
 openclaw-openwebui-pipe/
 ├── openclaw_pipe.py    # The pipe — paste this into OWUI
+├── install.py          # Automated installer script
 ├── README.md           # This file
-└── LICENSE             # MIT
+├── LICENSE             # MIT
+└── .gitignore          # Ignores .pipe_device_identity.json
 ```
+
+> `.pipe_device_identity.json` is created by `install.py` to persist the
+> device identity across re-installs. It contains a private key — **do not**
+> commit or share it.
 
 ---
 
