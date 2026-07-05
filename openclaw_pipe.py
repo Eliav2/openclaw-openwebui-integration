@@ -104,7 +104,7 @@ def _generate_device_identity():
 def _sign_challenge(ident, nonce, ts, token_str=""):
     """Sign the WebSocket challenge using the device identity."""
     parts = [
-        "v2", ident["id"], "test", "cli", "operator",
+        "v2", ident["id"], "webchat", "cli", "operator",
         "operator.read,operator.write", str(ts), token_str, nonce
     ]
     pk = serialization.load_pem_private_key(
@@ -398,7 +398,7 @@ class _GatewayConnection:
         await ws.send(json.dumps(dict(
             type="req", id="1", method="connect", params=dict(
                 minProtocol=4, maxProtocol=4,
-                client=dict(id="test", version="1",
+                client=dict(id="webchat", version="1",
                             platform="linux", mode="cli"),
                 role="operator",
                 scopes=["operator.read", "operator.write"],
