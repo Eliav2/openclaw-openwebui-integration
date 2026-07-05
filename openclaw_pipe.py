@@ -3,16 +3,22 @@ OpenClaw Gateway Pipe for Open WebUI
 =====================================
 
 A self-contained Open WebUI Pipe that connects to an OpenClaw Gateway via its
-WebSocket protocol. Supports streaming responses, real-time tool call rendering,
-and persistent sessions tied to OWUI conversations.
+native WebSocket protocol — with a **persistent** singleton connection shared
+by all conversations. No reconnect per message, no global lock, and no 60s
+idle suicide.
 
 How it works
 ------------
-1. User selects "OpenClaw Gateway" as the model in OWUI
-2. Each message is sent to OpenClaw Gateway via WebSocket
-3. Assistant responses are streamed back token-by-token (OWUI streaming)
-4. Tool calls are rendered as collapsible <details type="tool_calls"> elements
-5. Each OWUI chat gets a stable session key on the OpenClaw side
+1. On the first ``pipe()`` call, a ``_GatewayConnection`` singleton is created:
+   one WebSocket connection to the Gateway, kept alive with tick keepalives.
+2. Each ``pipe()`` call sends ``chat.send`` over the shared connection and
+   receives events via an ``asyncio.Queue`` keyed by session + run.
+3. The background event loop dispatches incoming Gateway events to the correct
+   queue; unmatched events (other sessions, heartbeats, Sender metadata) are
+   filtered out efficiently.
+4. On WS disconnect, the connection manager auto-reconnects with exponential
+   backoff (1s → 2s → 4s → … → 30s max); all consumers survive reconnect.
+5. Tool calls render as native OWUI ``<details type="tool_calls">`` blocks.
 
 Requirements
 ------------
@@ -52,6 +58,7 @@ import re
 import mimetypes
 from pathlib import Path
 from http.server import HTTPServer, SimpleHTTPRequestHandler
+from dataclasses import dataclass, field
 
 import websockets
 from cryptography.hazmat.primitives.asymmetric import ed25519
@@ -121,7 +128,6 @@ def _parse_device_identity(raw):
         return json.loads(raw)
     except json.JSONDecodeError:
         pass
-    # Some deployments mangle the PEM newlines — try to recover
     try:
         def _fix_pem(m):
             return m.group(1) + m.group(2).replace("\n", "").replace("\r", "") + m.group(3)
@@ -135,34 +141,28 @@ def _parse_device_identity(raw):
 
 
 # ---------------------------------------------------------------------------
-MEDIA_DIR = "/tmp/openclaw-pipe-media"
-MEDIA_BASE_URL = "http://your-owui-host:18791"  # default; can be overridden via valve
-
-# Simple HTTP file server for media served back to OWUI
+# File Server (media delivery)
 # ---------------------------------------------------------------------------
+
+MEDIA_DIR = "/tmp/openclaw-pipe-media"
+MEDIA_BASE_URL = "http://your-owui-host:18791"
 
 _file_server_started = False
 
 
 def _resolve_media(text, base_url=None):
-    """Convert MEDIA:filename directives to embedded data-URI images.
-    Reads the file from the local media directory and returns a base64
-    data URI so OWUI can render it inline (OWUI strips external img tags).
-    Falls back to URL-based markdown if the file is not found.
-    Returns (resolved_text, handled) tuple."""
+    """Convert MEDIA:filename directives to embedded media."""
     if base_url is None:
         base_url = MEDIA_BASE_URL
     prefix = "MEDIA:"
     if prefix not in text:
         return text, False
-    # Extract filename
     idx = text.index(prefix)
     after_prefix = text[idx + len(prefix):].strip()
     fname = after_prefix.split()[0] if after_prefix else ""
     if not fname:
         return text, False
-    # Try to read from local media directory first
-    media_dir = MEDIA_DIR  # /tmp/openclaw-pipe-media
+    media_dir = MEDIA_DIR
     fpath = os.path.join(media_dir, fname)
     if os.path.isfile(fpath):
         try:
@@ -175,23 +175,19 @@ def _resolve_media(text, base_url=None):
             result = f"![{fname}]({data_uri})"
             if rest:
                 result += "\n" + rest
-            pipe_log(f"  resolved MEDIA: via base64 data URI ({len(raw)} bytes)")
             return result, True
         except Exception as ex:
             pipe_log(f"  base64 fallback failed: {ex}")
-    # Fallback: URL-based markdown image
     url = f"{base_url.rstrip('/')}/{fname}"
     rest = after_prefix[len(fname):].strip()
     result = f"![{fname}]({url})"
     if rest:
         result += "\n" + rest
-    pipe_log(f"  resolved MEDIA: via URL (file not found locally)")
     return result, True
 
 
 def _start_file_server(port=18791):
-    """Start a minimal HTTP server to serve media files back to OWUI.
-    Only starts once per process lifetime."""
+    """Start a minimal HTTP server for media files. Starts once per process."""
     global _file_server_started
     if _file_server_started:
         return
@@ -209,7 +205,6 @@ def _start_file_server(port=18791):
             super().end_headers()
 
         def _handle_upload(self):
-            """Handle PUT/POST file upload."""
             length = int(self.headers.get("Content-Length", 0))
             if length == 0:
                 self.send_response(400)
@@ -217,7 +212,6 @@ def _start_file_server(port=18791):
                 self.wfile.write(b"empty")
                 return
             body = self.rfile.read(length)
-            # Sanitize path: only allow single filename, no ".."
             path = self.path.strip("/").split("?")[0]
             if not path or ".." in path or "/" in path:
                 self.send_response(400)
@@ -256,23 +250,297 @@ class GatewayError(Exception):
 
 
 # ---------------------------------------------------------------------------
+# Persistent Gateway Connection (singleton)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _Consumer:
+    """An active run consumer — its ``asyncio.Queue`` receives events."""
+    session_key: str
+    run_id: str
+    queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=500))
+
+
+class _GatewayConnection:
+    """Singleton persistent WebSocket connection to the Gateway.
+
+    Maintains one WS connection, dispatches events to per-run queues, and
+    auto-reconnects on disconnect with exponential backoff.
+    """
+
+    def __init__(self, valves_ref):
+        # Weak reference to Pipe valves (re-read on each call)
+        self._valves = valves_ref
+        self._ws: websockets.WebSocketClientProtocol | None = None
+        self._event_loop_task: asyncio.Task | None = None
+        self._init_lock = asyncio.Lock()
+
+        # Identity
+        self._ident: dict | None = None
+        self._device_token: str | None = None
+
+        # Request-response futures (keyed by request id)
+        self._pending_reqs: dict[str, asyncio.Future] = {}
+
+        # Run consumers (keyed by f"{session_key}:{run_id}")
+        self._consumers: dict[str, _Consumer] = {}
+
+        # Reconnect state
+        self._reconnect_attempt = 0
+        self._max_backoff = 30  # seconds
+        self._stopped = False
+
+        # Next request id
+        self._next_req_id = 1
+
+        # Counter for the event loop
+        self._event_count = 0
+
+    # ── Public API ──────────────────────────────────────────────────
+
+    async def ensure_connected(self):
+        """Ensure the WS connection is up; connect/reconnect if needed."""
+        if self._ws and self._event_loop_task and not self._event_loop_task.done():
+            return
+        async with self._init_lock:
+            if self._ws and self._event_loop_task and not self._event_loop_task.done():
+                return
+            self._stopped = False
+            await self._connect_and_start()
+
+    async def send_request(self, method: str, params: dict, timeout: float = 10) -> dict:
+        """Send a request and wait for the response."""
+        req_id = str(self._next_req_id)
+        self._next_req_id += 1
+        fut = asyncio.get_running_loop().create_future()
+        self._pending_reqs[req_id] = fut
+
+        try:
+            await self._ws.send(json.dumps(dict(
+                type="req", id=req_id, method=method, params=params
+            )))
+            return await asyncio.wait_for(fut, timeout=timeout)
+        finally:
+            self._pending_reqs.pop(req_id, None)
+
+    def register_consumer(self, session_key: str, run_id: str) -> asyncio.Queue:
+        """Register an event consumer queue for a (session, run) pair."""
+        key = f"{session_key}:{run_id}"
+        if key not in self._consumers:
+            self._consumers[key] = _Consumer(session_key=session_key, run_id=run_id)
+            pipe_log(f"  registered consumer: {key[:60]}...")
+        return self._consumers[key].queue
+
+    def unregister_consumer(self, session_key: str, run_id: str):
+        """Remove a consumer queue."""
+        key = f"{session_key}:{run_id}"
+        self._consumers.pop(key, None)
+        pipe_log(f"  unregistered consumer: {key[:60]}...")
+
+    async def abort(self, session_key: str, run_id: str):
+        """Send chat.abort for an active run."""
+        try:
+            await self._ws.send(json.dumps(dict(
+                type="req", id="abort", method="chat.abort", params=dict(
+                    sessionKey=session_key,
+                    runId=run_id,
+                )
+            )))
+            pipe_log(f"  sent chat.abort for run {run_id[:20]}...")
+        except Exception as e:
+            pipe_log(f"  abort send failed: {e}")
+
+    async def disconnect(self):
+        """Gracefully close the connection."""
+        self._stopped = True
+        if self._event_loop_task:
+            self._event_loop_task.cancel()
+            try:
+                await self._event_loop_task
+            except asyncio.CancelledError:
+                pass
+            self._event_loop_task = None
+        if self._ws:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+
+    # ── Internal ────────────────────────────────────────────────────
+
+    async def _connect_and_start(self):
+        """Connect, handshake, and start the event loop task."""
+        valves = self._valves()
+        parts = valves.GATEWAY_URL.rsplit(":", 1)
+        host = parts[0]
+        port = int(parts[1]) if len(parts) > 1 else 18789
+        token = valves.GATEWAY_TOKEN
+
+        if not token:
+            raise GatewayError("No GATEWAY_TOKEN configured")
+
+        # Device identity
+        self._ensure_identity(valves)
+
+        # Connect
+        pipe_log(f"Connecting to ws://{host}:{port}")
+        ws = await websockets.connect(f"ws://{host}:{port}", ping_interval=None)
+
+        # Handshake: receive challenge
+        challenge = json.loads(await asyncio.wait_for(ws.recv(), 10))
+        if challenge.get("event") != "connect.challenge":
+            raise GatewayError("Bad handshake — expected connect.challenge")
+
+        c = challenge["payload"]
+        signed = _sign_challenge(self._ident, c["nonce"], c["ts"], token_str=token)
+
+        await ws.send(json.dumps(dict(
+            type="req", id="1", method="connect", params=dict(
+                minProtocol=4, maxProtocol=4,
+                client=dict(id="test", version="1",
+                            platform="linux", mode="cli"),
+                role="operator",
+                scopes=["operator.read", "operator.write"],
+                auth=dict(token=token),
+                device=signed,
+                locale="en-US",
+                userAgent="openclaw-owui-pipe/1.0",
+                caps=["agent-events", "tool-events"]
+            )
+        )))
+
+        resp = json.loads(await asyncio.wait_for(ws.recv(), 10))
+        if not resp.get("ok"):
+            raise GatewayError(
+                str(resp.get("error", {}).get("message", "connect failed"))
+            )
+
+        # Capture device token for future reconnects
+        hello_ok = resp.get("payload", {})
+        if hello_ok.get("auth", {}).get("deviceToken"):
+            self._device_token = hello_ok["auth"]["deviceToken"]
+            pipe_log(f"Device token captured: {self._device_token[:20]}...")
+
+        self._ws = ws
+        self._reconnect_attempt = 0
+        pipe_log("Connected to Gateway (persistent)")
+
+        # Start the background event loop
+        self._event_loop_task = asyncio.create_task(self._event_loop())
+
+    def _ensure_identity(self, valves):
+        """Load or generate device identity."""
+        if self._ident:
+            return
+        if valves.DEVICE_IDENTITY:
+            self._ident = _parse_device_identity(valves.DEVICE_IDENTITY)
+            if self._ident:
+                pipe_log("Using persisted device identity")
+                return
+            pipe_log("Failed to parse DEVICE_IDENTITY, generating new one")
+        self._ident = _generate_device_identity()
+        print(
+            f"DEVICE_IDENTITY={json.dumps(self._ident, separators=(',',':'))}",
+            flush=True
+        )
+
+    async def _event_loop(self):
+        """Background task: reads WS messages and dispatches them."""
+        while not self._stopped:
+            try:
+                msg = json.loads(await asyncio.wait_for(self._ws.recv(), timeout=90))
+
+                # ── Request-response matching ──
+                if msg.get("type") == "res":
+                    req_id = msg.get("id")
+                    fut = self._pending_reqs.get(req_id)
+                    if fut and not fut.done():
+                        fut.set_result(msg.get("payload", {}))
+                    continue
+
+                # ── Tick keepalive (silently consume) ──
+                if msg.get("event") == "tick" or msg.get("payload", {}).get("isHeartbeat"):
+                    continue
+
+                # ── Event dispatch ──
+                if msg.get("type") != "event" or \
+                   msg.get("event") not in ("agent", "chat"):
+                    continue
+
+                payload = msg.get("payload", {})
+                evt_session = payload.get("sessionKey", "")
+                evt_run_id = payload.get("runId", "")
+
+                # Find the matching consumer
+                if evt_session and evt_run_id:
+                    key = f"{evt_session}:{evt_run_id}"
+                    consumer = self._consumers.get(key)
+                    if consumer:
+                        self._event_count += 1
+                        await consumer.queue.put(msg)
+                        continue
+
+                # If session matches but run_id doesn't (e.g. lifecycle/end
+                # for a completed run that was already unregistered), drop it.
+                # If nothing matches at all — drop it.
+                # This efficiently filters cross-session bleed (P16).
+
+            except asyncio.TimeoutError:
+                # No events for 90s but connection is still alive
+                continue
+            except websockets.exceptions.ConnectionClosed:
+                pipe_log("WS disconnected — reconnecting...")
+                await self._reconnect()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                pipe_log(f"Event loop error: {e}")
+                await self._reconnect()
+
+    async def _reconnect(self):
+        """Reconnect with exponential backoff."""
+        self._reconnect_attempt += 1
+        delay = min(2 ** (self._reconnect_attempt - 1), self._max_backoff)
+        pipe_log(f"  reconnect in {delay}s (attempt {self._reconnect_attempt})")
+        await asyncio.sleep(delay)
+        self._ws = None
+        try:
+            await self._connect_and_start()
+        except Exception as e:
+            pipe_log(f"  reconnect failed: {e}")
+            # Try again with the event loop
+
+
+# Module-level singleton
+_gateway_connection: _GatewayConnection | None = None
+_gateway_init_lock = asyncio.Lock()
+
+
+async def _get_gateway_connection(valves_getter) -> _GatewayConnection:
+    """Get or create the singleton Gateway connection."""
+    global _gateway_connection
+    if _gateway_connection is not None:
+        await _gateway_connection.ensure_connected()
+        return _gateway_connection
+    async with _gateway_init_lock:
+        if _gateway_connection is not None:
+            await _gateway_connection.ensure_connected()
+            return _gateway_connection
+        conn = _GatewayConnection(valves_getter)
+        await conn.ensure_connected()
+        _gateway_connection = conn
+        return conn
+
+
+# ---------------------------------------------------------------------------
 # Pipe class (Open WebUI entry point)
 # ---------------------------------------------------------------------------
 
-_pipe_lock = None
-
-
-def _get_pipe_lock():
-    """Module-level asyncio lock to prevent concurrent pipe() calls."""
-    global _pipe_lock
-    if _pipe_lock is None:
-        _pipe_lock = asyncio.Lock()
-    return _pipe_lock
-
-
 class Pipe:
     """
-    Open WebUI Pipe that routes messages through OpenClaw Gateway via WebSocket.
+    Open WebUI Pipe that routes messages through OpenClaw Gateway via
+    a persistent WebSocket connection.
 
     Valves (configured in OWUI admin panel):
     - GATEWAY_URL: OpenClaw Gateway address (default "localhost:18789")
@@ -310,27 +578,24 @@ class Pipe:
 
     def __init__(self):
         self.valves = self.Valves()
-        # Cache tool call arguments between start/result events
-        self._active_tool_args = {}
+        self._active_tool_args: dict[str, str] = {}
+        # Will be set per pipe() call
+        self._current_session_key: str | None = None
+        self._current_run_id: str | None = None
+        self._connection: _GatewayConnection | None = None
 
     async def pipe(self, body, __event_emitter__,
                    __user__=None, __metadata__=None, __request__=None,
                    __task__=None, __task_body__=None):
         """Main pipe entry point — called by Open WebUI for each user message.
 
-        This is an async generator: each ``yield`` emits a chunk that OWUI
-        streams to the frontend in real time.
-
-        Accepts optional __task__ and __task_body__ for OWUI background
-        task detection (title, tags, emoji, follow-up generation).
+        Uses a shared persistent WS connection; no per-message reconnect,
+        no global lock, and no 60s timeout.
         """
         if self.valves.ENABLE_FILE_SERVER:
             _start_file_server()
 
-        # --- Short-circuit OWUI background task requests (P15) ---
-        # OWUI auto-generates titles, tags, emoji, follow-ups, and autocomplete
-        # as background pipe calls. These must NOT reach the OpenClaw session
-        # (they pollute the conversation and compete with the user's real message).
+        # --- P15: Short-circuit OWUI background tasks ---
         if __task__ and __task__ in (
             "title_generation",
             "tags_generation",
@@ -340,7 +605,7 @@ class Pipe:
             "query_generation",
         ):
             pipe_log(f"Skipping OWUI background task: {__task__}")
-            return  # Yield nothing — OWUI handles task results server-side
+            return
 
         # --- Extract user message ---
         messages = body.get("messages", [])
@@ -352,289 +617,179 @@ class Pipe:
         pipe_log(f"Messages: {len(messages)}, last role: "
                  f"{messages[-1]['role'] if messages else 'NONE'}")
 
-        # --- Prevent concurrent calls (queued messages = broken session) ---
-        lock = _get_pipe_lock()
-        if lock.locked():
-            yield "Please wait for the previous message to finish..."
-            return
-
-        # --- Parse gateway connection parameters ---
-        parts = self.valves.GATEWAY_URL.rsplit(":", 1)
-        host = parts[0]
-        port = int(parts[1]) if len(parts) > 1 else 18789
-        token = self.valves.GATEWAY_TOKEN
-        if not token:
-            yield "No GATEWAY_TOKEN configured"
-            return
-
-        # Acquire lock after all early-exit checks
-        await lock.acquire()
-
-        # --- Device identity (Ed25519) ---
-        ident = None
-        if self.valves.DEVICE_IDENTITY:
-            ident = _parse_device_identity(self.valves.DEVICE_IDENTITY)
-            if ident:
-                pipe_log("Using persisted device identity")
-            else:
-                pipe_log("Failed to parse DEVICE_IDENTITY, generating new one")
-
-        if not ident:
-            ident = _generate_device_identity()
-            print(
-                f"DEVICE_IDENTITY={json.dumps(ident, separators=(',',':'))}",
-                flush=True
-            )
-            pipe_log("New device identity generated — copy it from logs into "
-                     "the DEVICE_IDENTITY valve to persist across restarts")
-
-        # --- Connect via WebSocket ---
+        # --- Get the persistent connection ---
         try:
-            pipe_log(f"Connecting to ws://{host}:{port}")
-            ws = await websockets.connect(f"ws://{host}:{port}",
-                                          ping_interval=None)
+            conn = await _get_gateway_connection(lambda: self.valves)
+        except GatewayError as e:
+            yield f"**Gateway connection error:** {e}"
+            return
 
-            # Handshake: receive challenge
-            challenge = json.loads(await asyncio.wait_for(ws.recv(), 10))
-            if challenge.get("event") != "connect.challenge":
-                raise GatewayError("Bad handshake — expected connect.challenge")
+        self._connection = conn
 
-            c = challenge["payload"]
-            signed = _sign_challenge(ident, c["nonce"], c["ts"],
-                                     token_str=token)
-
-            # Send connect request — use real OWUI user identity
-            user_name = (__user__ or {}).get("name", "Open WebUI User")
-            user_email = (__user__ or {}).get("email", "")
-            user_id = (__user__ or {}).get("id", "openwebui")
-            # client.id must be a plain identifier (no email format).
-            # Use the OWUI user_id (UUID) for identity tracking.
-            # client.id must be a simple operator identifier accepted by the
-            # gateway schema. "test" is the dev/default allowed value;
-            # real user identity is conveyed through userAgent and sessionKey.
-            client_id = "test"
-            await ws.send(json.dumps(dict(
-                type="req", id="1", method="connect", params=dict(
-                    minProtocol=4, maxProtocol=4,
-                    client=dict(id=client_id, version="1",
-                                platform="linux", mode="cli"),
-                    role="operator",
-                    scopes=["operator.read", "operator.write"],
-                    auth=dict(token=token),
-                    device=signed,
-                    locale="en-US",
-                    userAgent=f"owui-pipe/1.0 ({user_name})",
-                    caps=["agent-events", "tool-events"]
-                )
-            )))
-
-            resp = json.loads(await asyncio.wait_for(ws.recv(), 10))
-            if not resp.get("ok"):
-                raise GatewayError(
-                    str(resp.get("error", {}).get("message", "connect failed"))
-                )
-            pipe_log("Connected to Gateway")
-
-            # --- Derive stable session key ---
-            # Tie the OpenClaw session to the OWUI chat_id + user_id so that
-            # continuing the same OWUI conversation reuses the same session.
-            if __metadata__:
-                chat_id = (
-                    __metadata__.get("chat_id")
-                    or __metadata__.get("session_id")
-                    or __metadata__.get("conversation_id")
-                )
-                user_id = __metadata__.get("user_id", "unknown")
-            else:
-                chat_id = None
-                user_id = "unknown"
-
-            if not chat_id:
-                chat_id = f"owui-{uuid.uuid4().hex[:12]}"
-                pipe_log("WARNING: no chat_id in metadata, generated random:",
-                         chat_id)
-
-            session_key = (
-                f"agent:{self.valves.AGENT_ID}:openwebui-{user_id}-{chat_id}"
+        # --- Derive stable session key ---
+        if __metadata__:
+            chat_id = (
+                __metadata__.get("chat_id")
+                or __metadata__.get("session_id")
+                or __metadata__.get("conversation_id")
             )
-            pipe_log(f"Session key: {session_key}")
+            user_id = __metadata__.get("user_id", "unknown")
+        else:
+            chat_id = None
+            user_id = "unknown"
 
-            # --- Send the user message ---
-            idempotency_key = f"msg-{chat_id}-{time.time()}"
-            await ws.send(json.dumps(dict(
-                type="req", id="2", method="chat.send", params=dict(
-                    sessionKey=session_key,
-                    message=text,
-                    idempotencyKey=idempotency_key
-                )
-            )))
-            pipe_log("Message sent, waiting for response...")
+        if not chat_id:
+            chat_id = f"owui-{uuid.uuid4().hex[:12]}"
+            pipe_log("WARNING: no chat_id in metadata, generated random:", chat_id)
 
-            # --- Consume events ---
-            done = False
-            event_count = 0
-            text_yielded = False
-            our_run_id = None
+        session_key = f"agent:{self.valves.AGENT_ID}:openwebui-{user_id}-{chat_id}"
+        pipe_log(f"Session key: {session_key}")
+        self._current_session_key = session_key
 
+        # --- Send message and get runId ---
+        idempotency_key = f"msg-{chat_id}-{time.time()}"
+        try:
+            send_resp = await conn.send_request(
+                "chat.send",
+                dict(sessionKey=session_key, message=text,
+                     idempotencyKey=idempotency_key),
+                timeout=30
+            )
+        except asyncio.TimeoutError:
+            yield "**Timeout:** Gateway did not respond to chat.send"
+            return
+        except Exception as e:
+            yield f"**Error sending message:** {e}"
+            return
+
+        our_run_id = send_resp.get("runId", "unknown")
+        self._current_run_id = our_run_id
+        pipe_log(f"Captured runId: {our_run_id}")
+
+        # --- Register consumer ---
+        queue = conn.register_consumer(session_key, our_run_id)
+
+        # --- Consume events ---
+        done = False
+        event_count = 0
+        text_yielded = False
+        aborted = False
+
+        try:
             while not done and event_count < 500:
                 try:
-                    msg = json.loads(
-                        await asyncio.wait_for(ws.recv(), timeout=60)
-                    )
-                    event_count += 1
-
-                    # Capture runId from chat.send response
-                    if msg.get("type") == "res":
-                        if msg.get("id") == "2" and not our_run_id:
-                            our_run_id = (
-                                msg.get("payload", {})
-                                   .get("runId")
-                            )
-                            pipe_log(f"Captured runId: {our_run_id}")
-                        continue
-
-                    # Only process agent/chat events
-                    if msg.get("type") != "event" or \
-                       msg.get("event") not in ("agent", "chat"):
-                        continue
-
-                    payload = msg.get("payload", {})
-                    stream = payload.get("stream")
-                    data = payload.get("data", {})
-                    name = data.get("name", "")
-                    phase = data.get("phase", "")
-
-                    # --- P16: Filter events that don't belong to our session/run ---
-                    # Skip events from other sessions (broadcast to all operator connections)
-                    evt_session = payload.get("sessionKey", "")
-                    if evt_session and evt_session != session_key:
-                        pipe_log(f"  filtered event from other session: "
-                                 f"{evt_session[:60]}...")
-                        continue
-
-                    # Skip events from other runs within our session
-                    evt_run_id = payload.get("runId", "")
-                    if evt_run_id and our_run_id and evt_run_id != our_run_id:
-                        pipe_log(f"  filtered event from other run: {evt_run_id[:20]}...")
-                        continue
-
-                    # Skip heartbeat events
-                    if payload.get("isHeartbeat"):
-                        pipe_log("  filtered heartbeat event")
-                        continue
-
-                    pipe_log(f"Event #{event_count}: stream={stream} "
-                             f"phase={phase} name={name}")
-
-                    # --- Assistant text stream ---
-                    if stream == "assistant":
-                        delta = data.get("delta") or data.get("text") or ""
-                        if delta:
-                            text_yielded = True
-                            # Strip inbound metadata blocks that OpenClaw injects
-                            # (may arrive as a single chunk or multiple deltas)
-                            if "Sender (untrusted metadata)" in delta:
-                                pipe_log("  filtered metadata block")
-                                continue
-                            # Convert MEDIA: directives to base64 images
-                            if "MEDIA:" in delta:
-                                resolved, handled = _resolve_media(
-                                    delta,
-                                    base_url=self.valves.FILE_SERVER_BASE_URL
-                                )
-                                if handled:
-                                    pipe_log("  resolved MEDIA: directive")
-                                    yield resolved
-                                    continue
-                            yield delta
-
-                    # --- Tool call events ---
-                    if stream == "tool":
-                        if phase == "start":
-                            tool_call_id = data.get("toolCallId", "")
-                            args = json.dumps(data.get("args", {}))
-                            if tool_call_id:
-                                self._active_tool_args[tool_call_id] = args
-                            pipe_log(f"  Tool start: {name}")
-
-                            if __event_emitter__:
-                                await __event_emitter__(
-                                    {"type": "status", "data": {
-                                        "description": f"🔧 Running {name}...",
-                                        "done": False
-                                    }}
-                                )
-
-                        elif phase == "result":
-                            result = data.get("result", {})
-                            result_str = json.dumps(result) if not isinstance(
-                                result, str) else result
-                            tool_call_id = data.get("toolCallId", "")
-                            stored_args = self._active_tool_args.pop(
-                                tool_call_id, None
-                            )
-                            args_str = stored_args if stored_args else json.dumps(
-                                data.get("args", {})
-                            )
-                            pipe_log(f"  Tool result: {name} "
-                                     f"({len(result_str)} chars)")
-
-                            # Build OWUI <details type="tool_calls"> element
-                            yield (
-                                '\n<details type="tool_calls" done="true" '
-                                f'id="{html.escape(tool_call_id)}" '
-                                f'name="{html.escape(name)}" '
-                                f'arguments="{html.escape(args_str[:3000])}" '
-                                f'result="{html.escape(result_str[:8000])}" '
-                                f'meta="{html.escape(str(data.get("meta",""))[:500])}" '
-                                'files="[]" embeds="[]">'
-                                f'\n<summary>{html.escape(name)}</summary>'
-                                '\n</details>\n'
-                            )
-
-                            if __event_emitter__:
-                                await __event_emitter__(
-                                    {"type": "status", "data": {
-                                        "description": f"✅ {name} done",
-                                        "done": True
-                                    }}
-                                )
-
-                    # --- Item events (progress) ---
-                    if stream == "item":
-                        pipe_log(f"  Item: kind={data.get('kind','')} "
-                                 f"status={data.get('status','')} "
-                                 f"title={str(data.get('title',''))[:50]}")
-
-                    # --- Lifecycle events ---
-                    if stream == "lifecycle":
-                        pipe_log(f"  Lifecycle: phase={phase}")
-                        if phase == "end":
-                            done = True
-                        elif phase == "error":
-                            error_text = str(data.get("error", "unknown"))
-                            yield f"\n\n**Error:** {error_text}"
-                            done = True
-
+                    msg = await asyncio.wait_for(queue.get(), timeout=90)
                 except asyncio.TimeoutError:
-                    pipe_log("TIMEOUT — no events from Gateway for 60s")
+                    pipe_log("TIMEOUT — no events on queue for 90s")
                     break
 
-            await ws.close()
-            pipe_log(f"DONE — {event_count} events processed, "
-                     f"text yielded: {text_yielded}")
+                event_count += 1
+                payload = msg.get("payload", {})
+                stream = payload.get("stream")
+                data = payload.get("data", {})
+                name = data.get("name", "")
+                phase = data.get("phase", "")
 
-            if not text_yielded:
-                yield "(no response)"
+                # --- P16: Double-check session/run match ---
+                evt_session = payload.get("sessionKey", "")
+                evt_run_id = payload.get("runId", "")
+                if evt_session and evt_session != session_key:
+                    pipe_log(f"  queue delivered wrong session: {evt_session[:40]}...")
+                    continue
+                if evt_run_id and evt_run_id != our_run_id:
+                    pipe_log(f"  queue delivered wrong run: {evt_run_id[:20]}...")
+                    continue
 
-        except Exception as e:
-            pipe_log("EXCEPTION:", str(e))
-            import traceback
-            pipe_log(traceback.format_exc()[:500])
-            yield f"**Connection error:** {e}"
+                # --- Assistant text stream ---
+                if stream == "assistant":
+                    delta = data.get("delta") or data.get("text") or ""
+                    if delta:
+                        # Filter Sender metadata
+                        if "Sender (untrusted metadata)" in delta:
+                            pipe_log("  filtered metadata block")
+                            continue
+                        text_yielded = True
+                        # MEDIA: resolution
+                        if "MEDIA:" in delta:
+                            resolved, handled = _resolve_media(
+                                delta,
+                                base_url=self.valves.FILE_SERVER_BASE_URL
+                            )
+                            if handled:
+                                pipe_log("  resolved MEDIA: directive")
+                                yield resolved
+                                continue
+                        yield delta
+
+                # --- Tool call events ---
+                if stream == "tool":
+                    if phase == "start":
+                        tool_call_id = data.get("toolCallId", "")
+                        args = json.dumps(data.get("args", {}))
+                        if tool_call_id:
+                            self._active_tool_args[tool_call_id] = args
+                        pipe_log(f"  Tool start: {name}")
+                        if __event_emitter__:
+                            await __event_emitter__(
+                                {"type": "status", "data": {
+                                    "description": f"🔧 Running {name}...",
+                                    "done": False
+                                }}
+                            )
+
+                    elif phase == "result":
+                        result = data.get("result", {})
+                        result_str = json.dumps(result) if not isinstance(result, str) else result
+                        tool_call_id = data.get("toolCallId", "")
+                        stored_args = self._active_tool_args.pop(tool_call_id, None)
+                        args_str = stored_args or json.dumps(data.get("args", {}))
+                        pipe_log(f"  Tool result: {name} ({len(result_str)} chars)")
+                        yield (
+                            '\n<details type="tool_calls" done="true" '
+                            f'id="{html.escape(tool_call_id)}" '
+                            f'name="{html.escape(name)}" '
+                            f'arguments="{html.escape(args_str[:3000])}" '
+                            f'result="{html.escape(result_str[:8000])}" '
+                            f'meta="{html.escape(str(data.get("meta",""))[:500])}" '
+                            'files="[]" embeds="[]">'
+                            f'\n<summary>{html.escape(name)}</summary>\n</details>\n'
+                        )
+                        if __event_emitter__:
+                            await __event_emitter__(
+                                {"type": "status", "data": {
+                                    "description": f"✅ {name} done", "done": True
+                                }}
+                            )
+
+                # --- Item events (progress) ---
+                if stream == "item":
+                    pipe_log(f"  Item: kind={data.get('kind','')} "
+                             f"status={data.get('status','')} "
+                             f"title={str(data.get('title',''))[:50]}")
+
+                # --- Lifecycle events ---
+                if stream == "lifecycle":
+                    pipe_log(f"  Lifecycle: phase={phase}")
+                    if phase == "end":
+                        done = True
+                    elif phase == "error":
+                        yield f"\n\n**Error:** {data.get('error', 'unknown')}"
+                        done = True
+
+        except asyncio.CancelledError:
+            # OWUI stop button → abort the gateway run
+            aborted = True
+            pipe_log("Generator cancelled — sending chat.abort")
+            await conn.abort(session_key, our_run_id)
+            raise  # Re-raise to signal proper cancellation
 
         finally:
-            # Release the concurrent call lock
-            if lock.locked():
-                lock.release()
+            conn.unregister_consumer(session_key, our_run_id)
+            self._current_session_key = None
+            self._current_run_id = None
 
+        pipe_log(f"DONE — {event_count} events processed, "
+                 f"text yielded: {text_yielded}")
+
+        if not aborted and not text_yielded:
+            yield "(no response)"
