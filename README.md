@@ -37,11 +37,13 @@ This version works well for basic chat but has known issues being tracked for v1
 
 | Issue | Description | Status |
 |-------|-------------|--------|
-| **Concurrent messages** | Sending a message while the agent is still responding blocks with "Please wait...". Actual use-case: steering mid-run. | Tracked — Phase 1 persistent client + steering |
-| **No stop button** | Pressing stop in OWUI kills the stream but the agent keeps burning tokens on the Gateway side. | Tracked — needs `chat.abort` |
-| **Session bleed** | Events from other chats/surfaces (heartbeats, other OWUI chats) can appear mid-response. | ✅ Fixed — event filter by sessionKey/runId |
+| **Concurrent messages** | Sending a message while the agent is still responding now steers into the active run (no lock, no blocking, no garbling). | ✅ Fixed — persistent WS + steering |
+| **No stop button** | Pressing stop in OWUI now sends `chat.abort` to the Gateway. | ✅ Fixed — CancelledError triggers abort |
+| **60s idle timeout** | Long agent runs no longer cut off — tick keepalive keeps the shared connection alive. | ✅ Fixed — persistent connection + tick handler |
+| **Per-message reconnect** | WS handshake + crypto every message is gone. | ✅ Fixed — singleton connection |
+| **Session bleed** | Events from other chats/surfaces can appear mid-response. | ✅ Fixed — event dispatcher demuxes by sessionKey/runId |
 | **Title/tag pollution** | OWUI background tasks (auto-title, tags, follow-up suggestions) pollute the OpenClaw session. | ✅ Fixed — task short-circuit (Phase 0) |
-| **60s idle timeout** | Long agent runs (big tool calls, subagents) get cut off at 60 seconds. | Tracked — persistent connection + tick keepalive |
+| **Sender metadata** | "Sender (untrusted metadata)" block visible on every message; sender is hardcoded `id:"test"`. | Pending — Gateway schema limits client.id enum; needs further investigation |
 | **Image serving** | Images use base64 data-URI or a separate file server URL. Mixed-content blocked on HTTPS OWUI. | Tracked — OWUI Files API (Phase 2) |
 | **Restart context loss** | Restarting the pipe mid-turn loses the in-flight state (OpenClaw limitation). | Workaround — avoid restarting mid-run |
 
