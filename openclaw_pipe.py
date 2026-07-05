@@ -407,7 +407,12 @@ class Pipe:
             user_name = (__user__ or {}).get("name", "Open WebUI User")
             user_email = (__user__ or {}).get("email", "")
             user_id = (__user__ or {}).get("id", "openwebui")
-            client_id = user_email or user_id
+            # client.id must be a plain identifier (no email format).
+            # Use the OWUI user_id (UUID) for identity tracking.
+            # client.id must be a simple operator identifier accepted by the
+            # gateway schema. Use a static descriptive id; user identity is
+            # conveyed through the userAgent string and the session key.
+            client_id = "owui-pipe"
             await ws.send(json.dumps(dict(
                 type="req", id="1", method="connect", params=dict(
                     minProtocol=4, maxProtocol=4,
