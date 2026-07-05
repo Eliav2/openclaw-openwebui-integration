@@ -24,6 +24,8 @@ interface.
 - **💬 Persistent sessions** — each OWUI conversation gets a stable OpenClaw
   session key (`agent:main:openwebui-{user_id}-{chat_id}`), so the agent
   remembers context across messages
+- **🧭 Model selector entries** — one pipe exposes both `OpenClaw · Default`
+  and `ChatGPT · GPT-5.5` in OWUI's model selector
 - **🔐 Ed25519 device auth** — full WebSocket handshake with challenge/response
 - **🖼️ Native OWUI media support** — `MEDIA:` files are uploaded to the
   Open WebUI Files API and attached to the assistant message; the old file
@@ -89,6 +91,7 @@ export GATEWAY_URL=your-owui-host:18789
 export GATEWAY_TOKEN=your-gateway-token
 export AGENT_ID=main
 export OWUI_API_BASE_URL=http://your-owui-host:8080
+export CHATGPT_MODEL=openai/gpt-5.5
 
 # Install or update the pipe in place, then run a smoke test
 python3 install.py install
@@ -133,6 +136,23 @@ The Gateway device token is saved to `STATE_DIR/device-token.json` after a
 successful connection. This keeps OWUI restarts and pipe reloads from creating
 new devices or requiring repeated approvals.
 
+### OWUI model selector
+
+The pipe is a manifold function, so one OWUI function ID exposes two models:
+
+| OWUI model ID | Display name | OpenClaw behavior |
+|---------------|--------------|-------------------|
+| `openclaw_gateway.default` | `OpenClaw · Default` | Uses the agent's configured default model |
+| `openclaw_gateway.chatgpt` | `ChatGPT · GPT-5.5` | Patches that OWUI conversation's OpenClaw session to `CHATGPT_MODEL` |
+
+The default ChatGPT override is `openai/gpt-5.5`. Change it with either the
+`CHATGPT_MODEL` environment variable during install/repair, the
+`--chatgpt-model` installer flag, or the `CHATGPT_MODEL` valve in OWUI.
+
+Each selector entry gets a separate OpenClaw session suffix, so switching
+between default and ChatGPT in the same OWUI chat does not mix the two model
+contexts.
+
 ### Native OWUI media delivery
 
 When the agent emits a `MEDIA:<filename>` directive and the file exists in the
@@ -155,6 +175,7 @@ Relevant valves:
 | `OWUI_BASE_URL` | Base URL used by the pipe to call the OWUI Files API |
 | `OWUI_API_KEY` | Optional API key for uploads; the current request bearer token is preferred |
 | `FILE_SERVER_BASE_URL` | Legacy fallback URL for the pipe file server |
+| `CHATGPT_MODEL` | OpenClaw model used by the `ChatGPT · GPT-5.5` selector entry |
 
 ### Approve the device in the Gateway
 
@@ -190,8 +211,10 @@ If you can't run the script, install manually:
    | `ENABLE_FILE_SERVER` | `True` (media support) |
    | `USE_OWUI_FILES` | `True` (native OWUI Files API media support) |
    | `OWUI_BASE_URL` | Open WebUI base URL reachable from the OWUI backend |
+   | `CHATGPT_MODEL` | OpenClaw model for the ChatGPT selector entry |
 
-6. Choose "OpenClaw Gateway" as your model and start chatting
+6. Choose `OpenClaw · Default` or `ChatGPT · GPT-5.5` as your model and start
+   chatting
 
 ---
 
@@ -282,7 +305,7 @@ curl -s -X POST http://localhost:8080/api/chat/completions \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "openclaw_gateway",
+    "model": "openclaw_gateway.default",
     "messages": [{"role": "user", "content": "Hello!"}],
     "stream": false
   }'

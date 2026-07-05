@@ -25,6 +25,8 @@ from pathlib import Path
 
 
 FUNCTION_ID = "openclaw_gateway"
+DEFAULT_MODEL_ID = f"{FUNCTION_ID}.default"
+CHATGPT_MODEL_ID = f"{FUNCTION_ID}.chatgpt"
 ROOT = Path(__file__).resolve().parent
 PIPE_FILE = ROOT / "openclaw_pipe.py"
 LOCAL_IDENTITY_FILE = ROOT / ".pipe_device_identity.json"
@@ -45,6 +47,7 @@ DEFAULTS = {
     "state_dir": env("OPENCLAW_BRIDGE_STATE_DIR", "/data/openclaw-bridge"),
     "owui_api_base_url": env("OWUI_API_BASE_URL", env("OWUI_URL", "http://localhost:8080")).rstrip("/"),
     "owui_api_key": env("OWUI_API_KEY", ""),
+    "chatgpt_model": env("CHATGPT_MODEL", "openai/gpt-5.5"),
     "file_server_base_url": env("FILE_SERVER_BASE_URL", ""),
 }
 
@@ -236,7 +239,8 @@ def model_exists(client: OwuiClient) -> bool:
     status, payload = client.request("GET", "/api/v1/models")
     if status != 200 or not isinstance(payload, dict):
         return False
-    return any(m.get("id") == FUNCTION_ID for m in payload.get("data", []))
+    ids = {m.get("id") for m in payload.get("data", [])}
+    return DEFAULT_MODEL_ID in ids and CHATGPT_MODEL_ID in ids
 
 
 def backup_function(fn: dict, valves: dict | None = None) -> None:
@@ -346,6 +350,7 @@ def update_valves(
         "STATE_DIR": args.state_dir,
         "USE_OWUI_FILES": True,
         "OWUI_BASE_URL": args.owui_api_base_url,
+        "CHATGPT_MODEL": args.chatgpt_model,
     }
     if args.owui_api_key:
         required["OWUI_API_KEY"] = args.owui_api_key
@@ -433,7 +438,7 @@ def smoke_test(client: OwuiClient, *, repair_pairing: bool = False,
         "POST",
         "/api/chat/completions",
         {
-            "model": FUNCTION_ID,
+            "model": DEFAULT_MODEL_ID,
             "messages": [
                 {
                     "role": "user",
@@ -504,9 +509,12 @@ def install_or_repair(client: OwuiClient, args: argparse.Namespace) -> dict:
 
     section("Model discovery")
     if model_exists(client):
-        info(f"Model {FUNCTION_ID} is visible")
+        info(f"Models {DEFAULT_MODEL_ID} and {CHATGPT_MODEL_ID} are visible")
     else:
-        raise SystemExit(f"Model {FUNCTION_ID} is not visible after enabling")
+        raise SystemExit(
+            f"Models {DEFAULT_MODEL_ID} and {CHATGPT_MODEL_ID} "
+            "are not both visible after enabling"
+        )
     return valves
 
 
@@ -557,6 +565,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-dir", default=DEFAULTS["state_dir"])
     parser.add_argument("--owui-api-base-url", default=DEFAULTS["owui_api_base_url"])
     parser.add_argument("--owui-api-key", default=DEFAULTS["owui_api_key"])
+    parser.add_argument("--chatgpt-model", default=DEFAULTS["chatgpt_model"])
     parser.add_argument("--file-server-base-url", default=DEFAULTS["file_server_base_url"])
     parser.add_argument(
         "--auto-approve",

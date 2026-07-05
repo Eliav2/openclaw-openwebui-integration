@@ -17,6 +17,8 @@ import urllib.error
 import urllib.request
 
 BASE = os.environ.get("OWUI_URL", "http://localhost:8080").rstrip("/") + "/api"
+DEFAULT_MODEL_ID = "openclaw_gateway.default"
+CHATGPT_MODEL_ID = "openclaw_gateway.chatgpt"
 
 # Will be set after login
 AUTH_TOKEN = None
@@ -101,7 +103,7 @@ def send(payload: dict) -> dict:
 def test_basic_chat():
     """Simple non-streaming chat — verify pipe responds correctly."""
     r = send({
-        "model": "openclaw_gateway",
+        "model": DEFAULT_MODEL_ID,
         "messages": [{"role": "user", "content": "Respond with exactly: PIPE_TEST_OK"}],
         "stream": False,
     })
@@ -117,7 +119,7 @@ def test_basic_chat():
 def test_chat_saves_to_history():
     """Verify chat appears in user's chat list."""
     r = send({
-        "model": "openclaw_gateway",
+        "model": DEFAULT_MODEL_ID,
         "messages": [{"role": "user", "content": "Say hi. No emoji."}],
         "stream": False,
     })
@@ -144,7 +146,7 @@ def test_streaming():
     headers = {"Content-Type": "application/json",
                "Authorization": f"Bearer {AUTH_TOKEN}"}
     payload = json.dumps({
-        "model": "openclaw_gateway",
+        "model": DEFAULT_MODEL_ID,
         "messages": [{"role": "user",
                        "content": "Count from 1 to 3, one per line."}],
         "stream": True,
@@ -166,7 +168,7 @@ def test_streaming():
 def test_metadata_passthrough():
     """Verify __user__ identity is passed through."""
     r = send({
-        "model": "openclaw_gateway",
+        "model": DEFAULT_MODEL_ID,
         "messages": [{"role": "user",
                        "content": "What is my user name? Just answer with the name."}],
         "stream": False,
@@ -180,7 +182,7 @@ def test_metadata_passthrough():
 def test_empty_message():
     """Empty user message."""
     r = send({
-        "model": "openclaw_gateway",
+        "model": DEFAULT_MODEL_ID,
         "messages": [{"role": "user", "content": ""}],
         "stream": False,
     })
@@ -193,7 +195,7 @@ def test_empty_message():
 def test_special_characters():
     """Hebrew and special characters."""
     r = send({
-        "model": "openclaw_gateway",
+        "model": DEFAULT_MODEL_ID,
         "messages": [{"role": "user",
                        "content": "Say hello in exactly 3 Hebrew words: \u05e9\u05dc\u05d5\u05dd \u05e2\u05d5\u05dc\u05dd!"}],
         "stream": False,
@@ -235,12 +237,13 @@ if __name__ == "__main__":
     if "error" in models:
         fail("Cannot list models", json.dumps(models["error"]))
     else:
+        ids = {m.get("id") for m in models.get("data", [])}
         pipe_models = [m for m in models.get("data", [])
-                       if m.get("id") == "openclaw_gateway"]
-        if pipe_models:
-            ok(f"Pipe model 'openclaw_gateway' found ({pipe_models[0].get('owned_by', '?')})")
+                       if m.get("id") in (DEFAULT_MODEL_ID, CHATGPT_MODEL_ID)]
+        if DEFAULT_MODEL_ID in ids and CHATGPT_MODEL_ID in ids:
+            ok("Pipe models found: default + ChatGPT")
         else:
-            fail("Pipe model NOT found in models list")
+            fail("Pipe manifold models NOT found in models list")
             sys.exit(1)
 
     # Run tests

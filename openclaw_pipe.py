@@ -41,7 +41,9 @@ Installation
    - DEVICE_IDENTITY: (advanced) fallback/import device identity JSON
    - STATE_DIR: persistent bridge state dir (default: /data/openclaw-bridge)
    - AGENT_ID: OpenClaw agent to route to (default: "main")
-7. The pipe will appear as a model in your OWUI model selector
+7. The pipe appears in OWUI as two selectable models:
+   - OpenClaw · Default: uses the agent's configured default model
+   - ChatGPT · GPT-5.5: patches the session model to CHATGPT_MODEL
 """
 
 import asyncio
@@ -778,6 +780,10 @@ class Pipe:
             default="http://your-owui-host:18791",
             description="Public URL for the file server (for MEDIA: resolution)"
         )
+        CHATGPT_MODEL: str = Field(
+            default="openai/gpt-5.5",
+            description="OpenClaw model override used by the ChatGPT manifold model"
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -786,6 +792,25 @@ class Pipe:
         self._current_session_key: str | None = None
         self._current_run_id: str | None = None
         self._connection: _GatewayConnection | None = None
+
+    def pipes(self):
+        """Expose multiple OWUI model-selector entries from one pipe."""
+        return [
+            {"id": "default", "name": "OpenClaw · Default"},
+            {"id": "chatgpt", "name": "ChatGPT · GPT-5.5"},
+        ]
+
+    def _selected_preset(self, body):
+        model = str(body.get("model", ""))
+        suffix = model.rsplit(".", 1)[-1].rsplit("/", 1)[-1]
+        if suffix == "chatgpt":
+            return "chatgpt"
+        return "default"
+
+    def _model_override_for_preset(self, preset):
+        if preset == "chatgpt":
+            return self.valves.CHATGPT_MODEL.strip() or None
+        return None
 
     async def pipe(self, body, __event_emitter__,
                    __user__=None, __metadata__=None, __request__=None,
@@ -797,6 +822,8 @@ class Pipe:
         """
         if self.valves.ENABLE_FILE_SERVER:
             _start_file_server()
+        preset = self._selected_preset(body)
+        model_override = self._model_override_for_preset(preset)
 
         # --- P15: Short-circuit OWUI background tasks ---
         if __task__ and __task__ in (
@@ -845,9 +872,25 @@ class Pipe:
             chat_id = f"owui-{uuid.uuid4().hex[:12]}"
             pipe_log("WARNING: no chat_id in metadata, generated random:", chat_id)
 
-        session_key = f"agent:{self.valves.AGENT_ID}:openwebui-{user_id}-{chat_id}"
+        preset_suffix = "" if body.get("model") == "openclaw_gateway" else f"-{preset}"
+        session_key = (
+            f"agent:{self.valves.AGENT_ID}:"
+            f"openwebui-{user_id}-{chat_id}{preset_suffix}"
+        )
         pipe_log(f"Session key: {session_key}")
         self._current_session_key = session_key
+
+        if model_override:
+            try:
+                await conn.send_request(
+                    "sessions.patch",
+                    dict(key=session_key, model=model_override),
+                    timeout=10
+                )
+                pipe_log(f"Applied model override: {model_override}")
+            except Exception as e:
+                yield f"**Model selection error:** could not apply `{model_override}`: {e}"
+                return
 
         # --- Send message and get runId ---
         idempotency_key = f"msg-{chat_id}-{time.time()}"
