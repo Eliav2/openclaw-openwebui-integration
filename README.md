@@ -1,9 +1,10 @@
-# OpenClaw Gateway Pipe for Open WebUI 🔌
+# OpenClaw ↔ Open WebUI Integration 🔌
 
-A self-contained [Open WebUI](https://openwebui.com/) **Pipe** that connects to
-[OpenClaw Gateway](https://github.com/openclaw/openclaw) via its native WebSocket
-protocol — giving you real-time streaming, tool call rendering, and persistent
-agent sessions inside OWUI's chat interface.
+Bidirectional integration between [OpenClaw Gateway](https://github.com/openclaw/openclaw)
+and [Open WebUI](https://openwebui.com/). The primary component is a **Pipe** function
+that connects via OpenClaw's native WebSocket protocol — giving you real-time
+streaming, tool call rendering, and persistent agent sessions inside OWUI's chat
+interface.
 
 > No separate proxy, no Node.js middleware, no Python subprocess. Just a single
 > Python file you paste into OWUI's admin panel.
@@ -38,8 +39,8 @@ This version works well for basic chat but has known issues being tracked for v1
 |-------|-------------|--------|
 | **Concurrent messages** | Sending a message while the agent is still responding blocks with "Please wait...". Actual use-case: steering mid-run. | Tracked — Phase 1 persistent client + steering |
 | **No stop button** | Pressing stop in OWUI kills the stream but the agent keeps burning tokens on the Gateway side. | Tracked — needs `chat.abort` |
-| **Session bleed** | Events from other chats/surfaces (heartbeats, other OWUI chats) can appear mid-response. | Tracked — needs event filter (Phase 0) |
-| **Title/tag pollution** | OWUI background tasks (auto-title, tags, follow-up suggestions) pollute the OpenClaw session. | Tracked — needs task detection (Phase 0) |
+| **Session bleed** | Events from other chats/surfaces (heartbeats, other OWUI chats) can appear mid-response. | ✅ Fixed — event filter by sessionKey/runId |
+| **Title/tag pollution** | OWUI background tasks (auto-title, tags, follow-up suggestions) pollute the OpenClaw session. | ✅ Fixed — task short-circuit (Phase 0) |
 | **60s idle timeout** | Long agent runs (big tool calls, subagents) get cut off at 60 seconds. | Tracked — persistent connection + tick keepalive |
 | **Image serving** | Images use base64 data-URI or a separate file server URL. Mixed-content blocked on HTTPS OWUI. | Tracked — OWUI Files API (Phase 2) |
 | **Restart context loss** | Restarting the pipe mid-turn loses the in-flight state (OpenClaw limitation). | Workaround — avoid restarting mid-run |
@@ -191,7 +192,7 @@ Check OWUI's backend logs for `[openclaw-pipe]` prefixed messages.
 ## 📁 File Layout
 
 ```
-openclaw-openwebui-pipe/
+openclaw-openwebui-integration/
 ├── openclaw_pipe.py    # The pipe — paste this into OWUI
 ├── install.py          # Automated installer script
 ├── README.md           # This file
@@ -202,6 +203,34 @@ openclaw-openwebui-pipe/
 > `.pipe_device_identity.json` is created by `install.py` to persist the
 > device identity across re-installs. It contains a private key — **do not**
 > commit or share it.
+
+---
+
+## 🧪 Testing the pipe via API
+
+You can send messages through the pipe as if using the OWUI frontend by calling
+the internal `/api/chat/completions` endpoint:
+
+```bash
+# 1. Sign in to get a token
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auths/signin \
+  -H "Content-Type: application/json" \
+  -d '{"email":"admin@example.com","password":"***"}' \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])")
+
+# 2. Send a message through the pipe
+curl -s -X POST http://localhost:8080/api/chat/completions \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "openclaw_gateway",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": false
+  }'
+```
+
+This triggers the full pipeline — pipe function → Gateway → agent → response —
+and the conversation is saved to OWUI chat history automatically.
 
 ---
 
