@@ -403,18 +403,22 @@ class Pipe:
             signed = _sign_challenge(ident, c["nonce"], c["ts"],
                                      token_str=token)
 
-            # Send connect request
+            # Send connect request — use real OWUI user identity
+            user_name = (__user__ or {}).get("name", "Open WebUI User")
+            user_email = (__user__ or {}).get("email", "")
+            user_id = (__user__ or {}).get("id", "openwebui")
+            client_id = user_email or user_id
             await ws.send(json.dumps(dict(
                 type="req", id="1", method="connect", params=dict(
                     minProtocol=4, maxProtocol=4,
-                    client=dict(id="test", version="1",
+                    client=dict(id=client_id, version="1",
                                 platform="linux", mode="cli"),
                     role="operator",
                     scopes=["operator.read", "operator.write"],
                     auth=dict(token=token),
                     device=signed,
                     locale="en-US",
-                    userAgent="owui-pipe/1.0",
+                    userAgent=f"owui-pipe/1.0 ({user_name})",
                     caps=["agent-events", "tool-events"]
                 )
             )))
