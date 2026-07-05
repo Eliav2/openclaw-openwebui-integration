@@ -410,9 +410,9 @@ class Pipe:
             # client.id must be a plain identifier (no email format).
             # Use the OWUI user_id (UUID) for identity tracking.
             # client.id must be a simple operator identifier accepted by the
-            # gateway schema. Use a static descriptive id; user identity is
-            # conveyed through the userAgent string and the session key.
-            client_id = "owui-pipe"
+            # gateway schema. "test" is the dev/default allowed value;
+            # real user identity is conveyed through userAgent and sessionKey.
+            client_id = "test"
             await ws.send(json.dumps(dict(
                 type="req", id="1", method="connect", params=dict(
                     minProtocol=4, maxProtocol=4,
@@ -532,7 +532,8 @@ class Pipe:
                         if delta:
                             text_yielded = True
                             # Strip inbound metadata blocks that OpenClaw injects
-                            if delta.startswith("Sender (untrusted metadata)"):
+                            # (may arrive as a single chunk or multiple deltas)
+                            if "Sender (untrusted metadata)" in delta:
                                 pipe_log("  filtered metadata block")
                                 continue
                             # Convert MEDIA: directives to base64 images
