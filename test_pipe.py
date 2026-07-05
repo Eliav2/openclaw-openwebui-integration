@@ -2,24 +2,33 @@
 """
 Comprehensive pipe test suite — runs against the live OWUI instance.
 Tests the pipe's core functionality independently of the frontend.
+
+Usage:
+  OWUI_EMAIL="admin@example.com" OWUI_PASSWORD="secret" python3 test_pipe.py
+  # or via SSH to the HA host:
+  scp test_pipe.py root@your-owui-host:/tmp/
+  ssh root@your-owui-host "OWUI_PASSWORD='secret' python3 /tmp/test_pipe.py"
 """
 
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
-from typing import Any
 
 BASE = "http://localhost:8080/api"
-TOKEN = None
+
+# Will be set after login
+AUTH_TOKEN = None
+
 
 # ── helpers ──────────────────────────────────────────────────────────
 
 def api(method: str, path: str, data: dict | None = None) -> dict:
     url = f"{BASE}/{path.lstrip('/')}"
     headers = {"Content-Type": "application/json"}
-    if TOKEN:
-        headers["Authorization"] = f"Bearer {TOKEN}"
+    if AUTH_TOKEN:
+        headers["Authorization"] = f"Bearer {AUTH_TOKEN}"
     body = json.dumps(data).encode() if data else None
     req = urllib.request.Request(url, data=body, headers=headers,
                                  method=method)
@@ -68,19 +77,19 @@ def check(result: dict, expected_keys: list[str] | None = None,
 
 # ── tests ────────────────────────────────────────────────────────────
 
-passed = 0
-failed = 0
+PASSED = 0
+FAILED = 0
 
 
 def test(name: str, fn):
-    global passed, failed
+    global PASSED, FAILED
     print(f"\n── {name} ──")
     try:
         fn()
-        passed += 1
+        PASSED += 1
     except Exception as e:
         fail("Exception", str(e))
-        failed += 1
+        FAILED += 1
 
 
 def send(payload: dict) -> dict:
@@ -133,7 +142,7 @@ def test_streaming():
     """Streaming response — verify SSE chunks."""
     url = f"{BASE}/chat/completions"
     headers = {"Content-Type": "application/json",
-               "Authorization": f"Bearer {TOKEN}"}
+               "Authorization": f"Bearer {AUTH_TOKEN}"}
     payload = json.dumps({
         "model": "openclaw_gateway",
         "messages": [{"role": "user",
@@ -149,7 +158,7 @@ def test_streaming():
             if len(chunks) >= 3:
                 ok(f"Streamed {len(chunks)} SSE chunks — streaming works")
             else:
-                fail(f"Only {len(chunks)} chunks, expected ≥3")
+                fail(f"Only {len(chunks)} chunks, expected >=3")
     except Exception as e:
         fail(f"Streaming error: {e}")
 
@@ -186,7 +195,7 @@ def test_special_characters():
     r = send({
         "model": "openclaw_gateway",
         "messages": [{"role": "user",
-                       "content": "Say hello in exactly 3 Hebrew words: שלום עולם!"}],
+                       "content": "Say hello in exactly 3 Hebrew words: \u05e9\u05dc\u05d5\u05dd \u05e2\u05d5\u05dc\u05dd!"}],
         "stream": False,
     })
     if not check(r, ["choices"]):
@@ -204,12 +213,20 @@ if __name__ == "__main__":
 
     # Login
     print("\n── Authenticating ──")
-    password = "***REMOVED***"
+    email = os.environ.get("OWUI_EMAIL", "admin@example.com")
+    password = os.environ.get("OWUI_PASSWORD")
+    if not password:
+        print("ERROR: OWUI_PASSWORD env var not set")
+        print("  Usage: OWUI_PASSWORD=secret python3 test_pipe.py")
+        sys.exit(1)
+
     login = api("POST", "v1/auths/signin",
-                {"email": "admin@example.com", "password": password})
-    TOKEN = login.get("token")
-    if not TOKEN:
-        print("❌ Login failed — abort")
+                {"email": email, "password": password})
+    global AUTH_TOKEN
+    AUTH_TOKEN = login.get("token")
+    if not AUTH_TOKEN:
+        print("ERROR: Login failed")
+        print(json.dumps(login.get("error", login), indent=2)[:300])
         sys.exit(1)
     ok(f"Logged in as {login.get('name')} ({login.get('role')})")
 
@@ -238,10 +255,9 @@ if __name__ == "__main__":
 
     # Summary
     print("\n" + "=" * 60)
-    total = passed + failed
-    print(f"Results: {passed}/{total} passed", end="")
-    if failed:
-        print(f", {failed} failed ❌")
-    else:
-        print(" ✅")
+    total = PASSED + FAILED
+    print(f"Results: {total}/{total} passed" if not FAILED else
+          f"Results: {PASSED}/{total} passed, {FAILED} failed")
+    if not FAILED:
+        print("All tests passed! ✅")
     print("=" * 60)
