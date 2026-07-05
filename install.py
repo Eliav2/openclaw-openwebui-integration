@@ -43,6 +43,8 @@ DEFAULTS = {
     "gateway_token": env("GATEWAY_TOKEN", ""),
     "agent_id": env("AGENT_ID", "main"),
     "state_dir": env("OPENCLAW_BRIDGE_STATE_DIR", "/data/openclaw-bridge"),
+    "owui_api_base_url": env("OWUI_API_BASE_URL", env("OWUI_URL", "http://localhost:8080")).rstrip("/"),
+    "owui_api_key": env("OWUI_API_KEY", ""),
     "file_server_base_url": env("FILE_SERVER_BASE_URL", ""),
 }
 
@@ -342,24 +344,29 @@ def update_valves(
         "ENABLE_FILE_SERVER": True,
         "DEVICE_IDENTITY": ident_json,
         "STATE_DIR": args.state_dir,
+        "USE_OWUI_FILES": True,
+        "OWUI_BASE_URL": args.owui_api_base_url,
     }
+    if args.owui_api_key:
+        required["OWUI_API_KEY"] = args.owui_api_key
     if args.file_server_base_url:
         required["FILE_SERVER_BASE_URL"] = args.file_server_base_url
 
-    changed = {k: v for k, v in required.items() if existing.get(k) != v}
+    desired = {**existing, **required}
+    changed = {k: v for k, v in desired.items() if current.get(k) != v}
     if not changed:
         info("Valves already up to date")
-        return required
+        return desired
 
     status, payload = client.request(
         "POST",
         f"/api/v1/functions/id/{FUNCTION_ID}/valves/update",
-        changed,
+        desired,
     )
     if status != 200 or not isinstance(payload, dict):
         raise SystemExit(f"Valve update failed: {payload}")
-    info(f"Updated valves: {', '.join(changed.keys())}")
-    return {**existing, **changed}
+    info(f"Updated valves: {', '.join(sorted(changed.keys()))}")
+    return desired
 
 
 def run_openclaw_json(*args: str) -> dict | None:
@@ -548,6 +555,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gateway-token", default=DEFAULTS["gateway_token"])
     parser.add_argument("--agent-id", default=DEFAULTS["agent_id"])
     parser.add_argument("--state-dir", default=DEFAULTS["state_dir"])
+    parser.add_argument("--owui-api-base-url", default=DEFAULTS["owui_api_base_url"])
+    parser.add_argument("--owui-api-key", default=DEFAULTS["owui_api_key"])
     parser.add_argument("--file-server-base-url", default=DEFAULTS["file_server_base_url"])
     parser.add_argument(
         "--auto-approve",

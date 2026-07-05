@@ -25,8 +25,9 @@ interface.
   session key (`agent:main:openwebui-{user_id}-{chat_id}`), so the agent
   remembers context across messages
 - **🔐 Ed25519 device auth** — full WebSocket handshake with challenge/response
-- **🖼️ Media support** — built-in HTTP file server for serving images/media back
-  to OWUI
+- **🖼️ Native OWUI media support** — `MEDIA:` files are uploaded to the
+  Open WebUI Files API and attached to the assistant message; the old file
+  server remains as a fallback
 - **⚙️ Configurable** — settings live in OWUI valves; device identity/token
   also persist in a state directory so restarts do not force re-pairing
 
@@ -45,7 +46,7 @@ This version works well for basic chat but has known issues being tracked for v1
 | **Session bleed** | Events from other chats/surfaces can appear mid-response. | ✅ Fixed — event dispatcher demuxes by sessionKey/runId |
 | **Title/tag pollution** | OWUI background tasks (auto-title, tags, follow-up suggestions) pollute the OpenClaw session. | ✅ Fixed — task short-circuit (Phase 0) |
 | **Sender metadata** | "Sender (untrusted metadata)" block visible on every message; sender is hardcoded `id:"test"`. | Pending — Gateway schema limits client.id enum; needs further investigation |
-| **Image serving** | Images use base64 data-URI or a separate file server URL. Mixed-content blocked on HTTPS OWUI. | Tracked — OWUI Files API (Phase 2) |
+| **Image serving** | Images use base64 data-URI or a separate file server URL. Mixed-content blocked on HTTPS OWUI. | ✅ Fixed — OWUI Files API upload + file-server fallback |
 | **Restart context loss** | Restarting the pipe mid-turn loses the in-flight state (OpenClaw limitation). | Workaround — avoid restarting mid-run |
 
 ---
@@ -87,6 +88,7 @@ export OWUI_PASSWORD=your-password
 export GATEWAY_URL=your-owui-host:18789
 export GATEWAY_TOKEN=your-gateway-token
 export AGENT_ID=main
+export OWUI_API_BASE_URL=http://your-owui-host:8080
 
 # Install or update the pipe in place, then run a smoke test
 python3 install.py install
@@ -131,6 +133,29 @@ The Gateway device token is saved to `STATE_DIR/device-token.json` after a
 successful connection. This keeps OWUI restarts and pipe reloads from creating
 new devices or requiring repeated approvals.
 
+### Native OWUI media delivery
+
+When the agent emits a `MEDIA:<filename>` directive and the file exists in the
+pipe media directory, the pipe now tries this path first:
+
+1. Upload the file to `POST /api/v1/files/?process=false`
+2. Emit a `files` event so Open WebUI attaches the file to the assistant message
+3. Yield same-origin markdown such as
+   `![image.png](/api/v1/files/<id>/content)`
+
+This avoids mixed-content blocking when OWUI is opened over HTTPS. If upload
+auth is unavailable or the Files API fails, the pipe falls back to the legacy
+`FILE_SERVER_BASE_URL` behavior.
+
+Relevant valves:
+
+| Valve | Description |
+|-------|-------------|
+| `USE_OWUI_FILES` | Enable OWUI Files API upload for `MEDIA:` directives (default: `True`) |
+| `OWUI_BASE_URL` | Base URL used by the pipe to call the OWUI Files API |
+| `OWUI_API_KEY` | Optional API key for uploads; the current request bearer token is preferred |
+| `FILE_SERVER_BASE_URL` | Legacy fallback URL for the pipe file server |
+
 ### Approve the device in the Gateway
 
 When using the pipe for the first time, your OpenClaw Gateway will prompt
@@ -163,6 +188,8 @@ If you can't run the script, install manually:
    | `AGENT_ID` | Which agent to route to (default: `main`) |
    | `DEVICE_IDENTITY` | Paste from `./.pipe_device_identity.json` after running the script once, or leave empty |
    | `ENABLE_FILE_SERVER` | `True` (media support) |
+   | `USE_OWUI_FILES` | `True` (native OWUI Files API media support) |
+   | `OWUI_BASE_URL` | Open WebUI base URL reachable from the OWUI backend |
 
 6. Choose "OpenClaw Gateway" as your model and start chatting
 
@@ -211,6 +238,7 @@ OWUI streams each chunk to the frontend in real time.
 | "Connection error" in chat | OWUI can't reach `GATEWAY_URL` — check network connectivity |
 | Model missing from selector | Run `python3 install.py repair`; it ensures the function is active/global and visible in `/api/v1/models` |
 | "pairing required" | Run `python3 install.py repair` or approve the matching request with `openclaw devices approve <request-id>` |
+| Image still uses `:18791` | OWUI file upload failed and the pipe fell back; check `OWUI_BASE_URL`, request auth/API key, and OWUI logs |
 | Tool calls not showing | The `__event_emitter__` calls fail silently; check OWUI backend logs |
 | Device identity not persisting | Check `STATE_DIR` and the `DEVICE_IDENTITY` valve; run `python3 install.py healthcheck` |
 | Stream stops mid-response | WS timeout (60s default); check agent response time |

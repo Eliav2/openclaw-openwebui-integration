@@ -57,6 +57,8 @@ import sys
 import hashlib
 import re
 import mimetypes
+import urllib.error
+import urllib.request
 from pathlib import Path
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from dataclasses import dataclass, field
@@ -222,6 +224,105 @@ def _resolve_media(text, base_url=None):
     if rest:
         result += "\n" + rest
     return result, True
+
+
+def _extract_request_bearer(__request__):
+    """Return a Bearer token from the current OWUI request, when available."""
+    if not __request__:
+        return None
+    headers = getattr(__request__, "headers", None)
+    if not headers:
+        return None
+    auth = headers.get("authorization") or headers.get("Authorization")
+    if auth and auth.lower().startswith("bearer "):
+        return auth.split(" ", 1)[1].strip()
+    return None
+
+
+def _multipart_body(field_name, file_path, filename, mime):
+    boundary = "----openclawowui" + uuid.uuid4().hex
+    with open(file_path, "rb") as f:
+        raw = f.read()
+    head = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="{field_name}"; '
+        f'filename="{filename}"\r\n'
+        f"Content-Type: {mime}\r\n\r\n"
+    ).encode()
+    tail = f"\r\n--{boundary}--\r\n".encode()
+    return boundary, head + raw + tail
+
+
+def _upload_owui_file(file_path, base_url, token):
+    """Upload one file to OWUI Files API and return the file object."""
+    if not token:
+        raise RuntimeError("missing OWUI bearer token")
+    filename = os.path.basename(file_path)
+    mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    boundary, body = _multipart_body("file", file_path, filename, mime)
+    req = urllib.request.Request(
+        f"{base_url.rstrip('/')}/api/v1/files/?process=false",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:300]
+        raise RuntimeError(f"OWUI file upload failed: {exc.code} {detail}") from exc
+
+
+async def _resolve_media_via_owui(
+    text,
+    *,
+    base_url,
+    token,
+    __event_emitter__,
+):
+    """Upload a MEDIA: file to OWUI and attach it to the current message."""
+    prefix = "MEDIA:"
+    if prefix not in text:
+        return text, False
+    idx = text.index(prefix)
+    before = text[:idx]
+    after_prefix = text[idx + len(prefix):].strip()
+    fname = after_prefix.split()[0] if after_prefix else ""
+    if not fname:
+        return text, False
+    if ".." in fname or "/" in fname:
+        return text, False
+    fpath = os.path.join(MEDIA_DIR, fname)
+    if not os.path.isfile(fpath):
+        return text, False
+
+    file_obj = _upload_owui_file(fpath, base_url, token)
+    if __event_emitter__:
+        await __event_emitter__(
+            {
+                "type": "files",
+                "data": {"files": [file_obj]},
+            }
+        )
+
+    file_id = file_obj.get("id")
+    rest = after_prefix[len(fname):].strip()
+    mime = file_obj.get("meta", {}).get("content_type") or mimetypes.guess_type(fname)[0] or ""
+    content_url = f"/api/v1/files/{file_id}/content" if file_id else ""
+    if content_url and mime.startswith("image/"):
+        replacement = f"![{fname}]({content_url})"
+    elif content_url:
+        replacement = f"[{fname}]({content_url})"
+    else:
+        replacement = f"`{fname}`"
+    if rest:
+        replacement += "\n" + rest
+    return before + replacement, True
 
 
 def _start_file_server(port=18791):
@@ -633,6 +734,7 @@ class Pipe:
     - DEVICE_IDENTITY: (optional) persisted device identity JSON
     - AGENT_ID: target agent (default "main")
     - ENABLE_FILE_SERVER: start media file server (default True)
+    - USE_OWUI_FILES: upload MEDIA files into OWUI Files API (default True)
     """
 
     class Valves(BaseModel):
@@ -659,6 +761,18 @@ class Pipe:
         ENABLE_FILE_SERVER: bool = Field(
             default=True,
             description="Start a minimal HTTP server for media files"
+        )
+        USE_OWUI_FILES: bool = Field(
+            default=True,
+            description="Upload MEDIA files to OWUI Files API before falling back to file server"
+        )
+        OWUI_BASE_URL: str = Field(
+            default="http://127.0.0.1:8080",
+            description="Open WebUI base URL for Files API uploads"
+        )
+        OWUI_API_KEY: str = Field(
+            default="",
+            description="Optional OWUI API key for file uploads; request bearer token is preferred"
         )
         FILE_SERVER_BASE_URL: str = Field(
             default="http://your-owui-host:18791",
@@ -800,10 +914,26 @@ class Pipe:
                         text_yielded = True
                         # MEDIA: resolution
                         if "MEDIA:" in delta:
-                            resolved, handled = _resolve_media(
-                                delta,
-                                base_url=self.valves.FILE_SERVER_BASE_URL
-                            )
+                            handled = False
+                            if self.valves.USE_OWUI_FILES:
+                                token = (
+                                    _extract_request_bearer(__request__)
+                                    or self.valves.OWUI_API_KEY
+                                )
+                                try:
+                                    resolved, handled = await _resolve_media_via_owui(
+                                        delta,
+                                        base_url=self.valves.OWUI_BASE_URL,
+                                        token=token,
+                                        __event_emitter__=__event_emitter__,
+                                    )
+                                except Exception as ex:
+                                    pipe_log(f"  OWUI file upload failed; falling back: {ex}")
+                            if not handled:
+                                resolved, handled = _resolve_media(
+                                    delta,
+                                    base_url=self.valves.FILE_SERVER_BASE_URL
+                                )
                             if handled:
                                 pipe_log("  resolved MEDIA: directive")
                                 yield resolved
