@@ -459,22 +459,29 @@ class Pipe:
                     idempotencyKey=idempotency_key
                 )
             )))
-            pipe_log("Message sent, waiting for events...")
+            pipe_log("Message sent, waiting for response...")
 
             # --- Consume events ---
             done = False
             event_count = 0
             text_yielded = False
+            our_run_id = None
 
-            while not done:
+            while not done and event_count < 500:
                 try:
                     msg = json.loads(
                         await asyncio.wait_for(ws.recv(), timeout=60)
                     )
                     event_count += 1
 
-                    # Skip responses to our requests
+                    # Capture runId from chat.send response
                     if msg.get("type") == "res":
+                        if msg.get("id") == "2" and not our_run_id:
+                            our_run_id = (
+                                msg.get("payload", {})
+                                   .get("runId")
+                            )
+                            pipe_log(f"Captured runId: {our_run_id}")
                         continue
 
                     # Only process agent/chat events
@@ -487,6 +494,25 @@ class Pipe:
                     data = payload.get("data", {})
                     name = data.get("name", "")
                     phase = data.get("phase", "")
+
+                    # --- P16: Filter events that don't belong to our session/run ---
+                    # Skip events from other sessions (broadcast to all operator connections)
+                    evt_session = payload.get("sessionKey", "")
+                    if evt_session and evt_session != session_key:
+                        pipe_log(f"  filtered event from other session: "
+                                 f"{evt_session[:60]}...")
+                        continue
+
+                    # Skip events from other runs within our session
+                    evt_run_id = payload.get("runId", "")
+                    if evt_run_id and our_run_id and evt_run_id != our_run_id:
+                        pipe_log(f"  filtered event from other run: {evt_run_id[:20]}...")
+                        continue
+
+                    # Skip heartbeat events
+                    if payload.get("isHeartbeat"):
+                        pipe_log("  filtered heartbeat event")
+                        continue
 
                     pipe_log(f"Event #{event_count}: stream={stream} "
                              f"phase={phase} name={name}")
