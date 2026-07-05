@@ -314,14 +314,33 @@ class Pipe:
         self._active_tool_args = {}
 
     async def pipe(self, body, __event_emitter__,
-                   __user__=None, __metadata__=None, __request__=None):
+                   __user__=None, __metadata__=None, __request__=None,
+                   __task__=None, __task_body__=None):
         """Main pipe entry point — called by Open WebUI for each user message.
 
         This is an async generator: each ``yield`` emits a chunk that OWUI
         streams to the frontend in real time.
+
+        Accepts optional __task__ and __task_body__ for OWUI background
+        task detection (title, tags, emoji, follow-up generation).
         """
         if self.valves.ENABLE_FILE_SERVER:
             _start_file_server()
+
+        # --- Short-circuit OWUI background task requests (P15) ---
+        # OWUI auto-generates titles, tags, emoji, follow-ups, and autocomplete
+        # as background pipe calls. These must NOT reach the OpenClaw session
+        # (they pollute the conversation and compete with the user's real message).
+        if __task__ and __task__ in (
+            "title_generation",
+            "tags_generation",
+            "follow_up_generation",
+            "emoji_generation",
+            "autocomplete_generation",
+            "query_generation",
+        ):
+            pipe_log(f"Skipping OWUI background task: {__task__}")
+            return  # Yield nothing — OWUI handles task results server-side
 
         # --- Extract user message ---
         messages = body.get("messages", [])
