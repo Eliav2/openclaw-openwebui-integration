@@ -16,7 +16,7 @@ import sys
 import urllib.error
 import urllib.request
 
-BASE = "http://localhost:8080/api"
+BASE = os.environ.get("OWUI_URL", "http://localhost:8080").rstrip("/") + "/api"
 
 # Will be set after login
 AUTH_TOKEN = None
@@ -222,7 +222,6 @@ if __name__ == "__main__":
 
     login = api("POST", "v1/auths/signin",
                 {"email": email, "password": password})
-    global AUTH_TOKEN
     AUTH_TOKEN = login.get("token")
     if not AUTH_TOKEN:
         print("ERROR: Login failed")

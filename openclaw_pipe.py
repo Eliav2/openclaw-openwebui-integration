@@ -38,7 +38,8 @@ Installation
 6. Configure the valves:
    - GATEWAY_URL: your OpenClaw Gateway host:port (default: localhost:18789)
    - GATEWAY_TOKEN: your gateway API token
-   - DEVICE_IDENTITY: (advanced) persist device identity to avoid re-registration
+   - DEVICE_IDENTITY: (advanced) fallback/import device identity JSON
+   - STATE_DIR: persistent bridge state dir (default: /data/openclaw-bridge)
    - AGENT_ID: OpenClaw agent to route to (default: "main")
 7. The pipe will appear as a model in your OWUI model selector
 """
@@ -138,6 +139,43 @@ def _parse_device_identity(raw):
         return json.loads(fixed)
     except Exception:
         return None
+
+
+def _state_dir(path=None):
+    """Return the persistent bridge state directory, creating it if possible."""
+    root = path or os.environ.get("OPENCLAW_BRIDGE_STATE_DIR") or "/data/openclaw-bridge"
+    try:
+        os.makedirs(root, mode=0o700, exist_ok=True)
+        return root
+    except Exception as ex:
+        fallback = "/tmp/openclaw-bridge"
+        os.makedirs(fallback, mode=0o700, exist_ok=True)
+        pipe_log(f"STATE_DIR unavailable ({root}: {ex}); using {fallback}")
+        return fallback
+
+
+def _read_json_file(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception as ex:
+        pipe_log(f"Failed reading {path}: {ex}")
+        return None
+
+
+def _write_json_file(path, data):
+    try:
+        tmp = f"{path}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, separators=(",", ":"))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+        return True
+    except Exception as ex:
+        pipe_log(f"Failed writing {path}: {ex}")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +433,10 @@ class _GatewayConnection:
         c = challenge["payload"]
         signed = _sign_challenge(self._ident, c["nonce"], c["ts"], token_str=token)
 
+        auth = dict(token=token)
+        if self._device_token:
+            auth["deviceToken"] = self._device_token
+
         await ws.send(json.dumps(dict(
             type="req", id="1", method="connect", params=dict(
                 minProtocol=4, maxProtocol=4,
@@ -402,7 +444,7 @@ class _GatewayConnection:
                             platform="linux", mode="cli"),
                 role="operator",
                 scopes=["operator.read", "operator.write"],
-                auth=dict(token=token),
+                auth=auth,
                 device=signed,
                 locale="en-US",
                 userAgent="openclaw-owui-pipe/1.0",
@@ -420,6 +462,7 @@ class _GatewayConnection:
         hello_ok = resp.get("payload", {})
         if hello_ok.get("auth", {}).get("deviceToken"):
             self._device_token = hello_ok["auth"]["deviceToken"]
+            self._save_device_token(valves)
             pipe_log(f"Device token captured: {self._device_token[:20]}...")
 
         self._ws = ws
@@ -429,17 +472,59 @@ class _GatewayConnection:
         # Start the background event loop
         self._event_loop_task = asyncio.create_task(self._event_loop())
 
+    def _identity_path(self, valves):
+        return os.path.join(_state_dir(getattr(valves, "STATE_DIR", "")), "identity.json")
+
+    def _device_token_path(self, valves):
+        return os.path.join(_state_dir(getattr(valves, "STATE_DIR", "")), "device-token.json")
+
+    def _load_device_token(self, valves):
+        if self._device_token:
+            return
+        data = _read_json_file(self._device_token_path(valves))
+        if isinstance(data, dict) and data.get("deviceToken"):
+            self._device_token = data["deviceToken"]
+            pipe_log("Using persisted device token")
+
+    def _save_device_token(self, valves):
+        if not self._device_token:
+            return
+        _write_json_file(
+            self._device_token_path(valves),
+            {"deviceToken": self._device_token, "deviceId": self._ident.get("id")},
+        )
+
     def _ensure_identity(self, valves):
-        """Load or generate device identity."""
+        """Load or generate device identity from stable storage.
+
+        Order matters for restart safety:
+        1. state-dir identity file
+        2. DEVICE_IDENTITY valve
+        3. generate once and persist
+        """
         if self._ident:
             return
+        identity_path = self._identity_path(valves)
+        ident = _read_json_file(identity_path)
+        if ident and ident.get("id") and ident.get("privateKey"):
+            self._ident = ident
+            pipe_log(f"Using device identity from {identity_path}")
+            self._load_device_token(valves)
+            return
+
         if valves.DEVICE_IDENTITY:
-            self._ident = _parse_device_identity(valves.DEVICE_IDENTITY)
-            if self._ident:
-                pipe_log("Using persisted device identity")
+            ident = _parse_device_identity(valves.DEVICE_IDENTITY)
+            if ident and ident.get("id") and ident.get("privateKey"):
+                self._ident = ident
+                _write_json_file(identity_path, ident)
+                pipe_log("Using device identity from valve and persisted it to state dir")
+                self._load_device_token(valves)
                 return
-            pipe_log("Failed to parse DEVICE_IDENTITY, generating new one")
+            pipe_log("Failed to parse DEVICE_IDENTITY valve; generating new identity")
+
         self._ident = _generate_device_identity()
+        _write_json_file(identity_path, self._ident)
+        pipe_log(f"Generated new device identity and saved it to {identity_path}")
         print(
             f"DEVICE_IDENTITY={json.dumps(self._ident, separators=(',',':'))}",
             flush=True
@@ -561,7 +646,11 @@ class Pipe:
         )
         DEVICE_IDENTITY: str = Field(
             default="",
-            description="(Advanced) Persisted device identity JSON from first run"
+            description="(Advanced) Fallback/import device identity JSON"
+        )
+        STATE_DIR: str = Field(
+            default="/data/openclaw-bridge",
+            description="Persistent state directory for identity and device token"
         )
         AGENT_ID: str = Field(
             default="main",

@@ -27,7 +27,8 @@ interface.
 - **🔐 Ed25519 device auth** — full WebSocket handshake with challenge/response
 - **🖼️ Media support** — built-in HTTP file server for serving images/media back
   to OWUI
-- **⚙️ Configurable** — all settings live in OWUI valves (no config files)
+- **⚙️ Configurable** — settings live in OWUI valves; device identity/token
+  also persist in a state directory so restarts do not force re-pairing
 
 ---
 
@@ -87,8 +88,17 @@ export GATEWAY_URL=your-owui-host:18789
 export GATEWAY_TOKEN=your-gateway-token
 export AGENT_ID=main
 
-# Run the installer
-python3 install.py
+# Install or update the pipe in place, then run a smoke test
+python3 install.py install
+
+# Repair a broken install without deleting the function or valves
+python3 install.py repair
+
+# Inspect current state without changing anything
+python3 install.py status
+
+# Run status checks plus an end-to-end smoke test
+python3 install.py healthcheck
 ```
 
 The script will:
@@ -96,15 +106,30 @@ The script will:
 2. Check if the pipe function already exists
 3. **If exists:** update the code in-place (preserving all valves including `DEVICE_IDENTITY`)
 4. **If new:** create the pipe function
-5. Enable it (active + global)
-6. Generate or reuse a **permanent device identity** (Ed25519 key pair)
-7. Only update valves that have changed (preserves existing settings)
-8. Print the device ID and guide you through Gateway approval
+5. Back up the existing function and valves to `backups/`
+6. Ensure it is active + global without blindly toggling it off
+7. Generate or reuse a **permanent device identity** (Ed25519 key pair)
+8. Restore valves if Open WebUI drops them during a function update
+9. Run an end-to-end smoke test through `/api/chat/completions`
+10. If a matching pairing request is pending, approve it automatically when the
+    local `openclaw` CLI is available
 
 > **v2+ no longer deletes and recreates the function**, which means your
 > valve settings (especially `DEVICE_IDENTITY`) survive re-installation.
 > The old `delete+create` cycle that wiped `DEVICE_IDENTITY` and forced
 > re-approval is gone.
+
+### Restart-safe state
+
+The pipe loads identity in this order:
+
+1. `STATE_DIR/identity.json` (default: `/data/openclaw-bridge/identity.json`)
+2. `DEVICE_IDENTITY` valve, then persists it into `STATE_DIR`
+3. Generate a new identity only if neither exists
+
+The Gateway device token is saved to `STATE_DIR/device-token.json` after a
+successful connection. This keeps OWUI restarts and pipe reloads from creating
+new devices or requiring repeated approvals.
 
 ### Approve the device in the Gateway
 
@@ -116,9 +141,10 @@ openclaw devices list      # find the pending request
 openclaw devices approve <request-id>
 ```
 
-**The identity is permanent.** The installer persists the key pair in
-`./.pipe_device_identity.json` and only generates a new one if that file
-is missing. Valve updates are in-place, so approval lasts across reinstalls.
+**The identity is permanent.** The installer prefers the existing
+`DEVICE_IDENTITY` valve, mirrors it into `./.pipe_device_identity.json`, and the
+pipe persists it inside `STATE_DIR` on first run. Valve updates are in-place, so
+approval lasts across reinstalls and restarts.
 
 ### Manual installation (alternative)
 
@@ -183,8 +209,10 @@ OWUI streams each chunk to the frontend in real time.
 | Text appears all at once | Pipe uses `return` instead of `yield` (check your code) |
 | "No GATEWAY_TOKEN configured" | Valve not set — go to Admin → Functions → edit valves |
 | "Connection error" in chat | OWUI can't reach `GATEWAY_URL` — check network connectivity |
+| Model missing from selector | Run `python3 install.py repair`; it ensures the function is active/global and visible in `/api/v1/models` |
+| "pairing required" | Run `python3 install.py repair` or approve the matching request with `openclaw devices approve <request-id>` |
 | Tool calls not showing | The `__event_emitter__` calls fail silently; check OWUI backend logs |
-| Device identity not persisting | Copy the printed `DEVICE_IDENTITY` from logs into the valve |
+| Device identity not persisting | Check `STATE_DIR` and the `DEVICE_IDENTITY` valve; run `python3 install.py healthcheck` |
 | Stream stops mid-response | WS timeout (60s default); check agent response time |
 
 Check OWUI's backend logs for `[openclaw-pipe]` prefixed messages.
@@ -197,6 +225,7 @@ Check OWUI's backend logs for `[openclaw-pipe]` prefixed messages.
 openclaw-openwebui-integration/
 ├── openclaw_pipe.py    # The pipe — paste this into OWUI
 ├── install.py          # Automated installer script
+├── backups/            # Local install backups (ignored by git)
 ├── README.md           # This file
 ├── LICENSE             # MIT
 └── .gitignore          # Ignores .pipe_device_identity.json
