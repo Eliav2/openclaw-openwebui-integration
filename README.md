@@ -30,6 +30,22 @@ agent sessions inside OWUI's chat interface.
 
 ---
 
+## ⚠️ Known Limitations (v0.5)
+
+This version works well for basic chat but has known issues being tracked for v1:
+
+| Issue | Description | Status |
+|-------|-------------|--------|
+| **Concurrent messages** | Sending a message while the agent is still responding blocks with "Please wait...". Actual use-case: steering mid-run. | Tracked — Phase 1 persistent client + steering |
+| **No stop button** | Pressing stop in OWUI kills the stream but the agent keeps burning tokens on the Gateway side. | Tracked — needs `chat.abort` |
+| **Session bleed** | Events from other chats/surfaces (heartbeats, other OWUI chats) can appear mid-response. | Tracked — needs event filter (Phase 0) |
+| **Title/tag pollution** | OWUI background tasks (auto-title, tags, follow-up suggestions) pollute the OpenClaw session. | Tracked — needs task detection (Phase 0) |
+| **60s idle timeout** | Long agent runs (big tool calls, subagents) get cut off at 60 seconds. | Tracked — persistent connection + tick keepalive |
+| **Image serving** | Images use base64 data-URI or a separate file server URL. Mixed-content blocked on HTTPS OWUI. | Tracked — OWUI Files API (Phase 2) |
+| **Restart context loss** | Restarting the pipe mid-turn loses the in-flight state (OpenClaw limitation). | Workaround — avoid restarting mid-run |
+
+---
+
 ## 📋 Requirements
 
 | Component | Version |
@@ -74,12 +90,18 @@ python3 install.py
 
 The script will:
 1. Log in to Open WebUI
-2. Delete any existing pipe with the same ID
-3. Create the pipe function
-4. Enable it (active + global)
-5. Generate a **permanent device identity** (Ed25519 key pair)
-6. Set all valves (including `DEVICE_IDENTITY`)
-7. Print the device ID and guide you through Gateway approval
+2. Check if the pipe function already exists
+3. **If exists:** update the code in-place (preserving all valves including `DEVICE_IDENTITY`)
+4. **If new:** create the pipe function
+5. Enable it (active + global)
+6. Generate or reuse a **permanent device identity** (Ed25519 key pair)
+7. Only update valves that have changed (preserves existing settings)
+8. Print the device ID and guide you through Gateway approval
+
+> **v2+ no longer deletes and recreates the function**, which means your
+> valve settings (especially `DEVICE_IDENTITY`) survive re-installation.
+> The old `delete+create` cycle that wiped `DEVICE_IDENTITY` and forced
+> re-approval is gone.
 
 ### Approve the device in the Gateway
 
@@ -91,9 +113,9 @@ openclaw devices list      # find the pending request
 openclaw devices approve <request-id>
 ```
 
-**The identity is permanent.** Even if the pipe function is deleted and
-recreated, the installer re-uses the same key pair (`./.pipe_device_identity.json`),
-so approval is a **one-time** step.
+**The identity is permanent.** The installer persists the key pair in
+`./.pipe_device_identity.json` and only generates a new one if that file
+is missing. Valve updates are in-place, so approval lasts across reinstalls.
 
 ### Manual installation (alternative)
 
