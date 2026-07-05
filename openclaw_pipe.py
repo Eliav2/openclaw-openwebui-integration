@@ -145,8 +145,10 @@ _file_server_started = False
 
 
 def _resolve_media(text, base_url=None):
-    """Convert MEDIA:filename directives to markdown image URLs.
-    Uses the file server URL for fast delivery (no base64 streaming).
+    """Convert MEDIA:filename directives to embedded data-URI images.
+    Reads the file from the local media directory and returns a base64
+    data URI so OWUI can render it inline (OWUI strips external img tags).
+    Falls back to URL-based markdown if the file is not found.
     Returns (resolved_text, handled) tuple."""
     if base_url is None:
         base_url = MEDIA_BASE_URL
@@ -159,12 +161,31 @@ def _resolve_media(text, base_url=None):
     fname = after_prefix.split()[0] if after_prefix else ""
     if not fname:
         return text, False
-    # Build URL-based markdown image
+    # Try to read from local media directory first
+    media_dir = MEDIA_DIR  # /tmp/openclaw-pipe-media
+    fpath = os.path.join(media_dir, fname)
+    if os.path.isfile(fpath):
+        try:
+            with open(fpath, "rb") as f:
+                raw = f.read()
+            b64 = base64.b64encode(raw).decode()
+            mime = mimetypes.guess_type(fname)[0] or "image/png"
+            data_uri = f"data:{mime};base64,{b64}"
+            rest = after_prefix[len(fname):].strip()
+            result = f"![{fname}]({data_uri})"
+            if rest:
+                result += "\n" + rest
+            pipe_log(f"  resolved MEDIA: via base64 data URI ({len(raw)} bytes)")
+            return result, True
+        except Exception as ex:
+            pipe_log(f"  base64 fallback failed: {ex}")
+    # Fallback: URL-based markdown image
     url = f"{base_url.rstrip('/')}/{fname}"
     rest = after_prefix[len(fname):].strip()
     result = f"![{fname}]({url})"
     if rest:
         result += "\n" + rest
+    pipe_log(f"  resolved MEDIA: via URL (file not found locally)")
     return result, True
 
 
@@ -238,6 +259,17 @@ class GatewayError(Exception):
 # Pipe class (Open WebUI entry point)
 # ---------------------------------------------------------------------------
 
+_pipe_lock = None
+
+
+def _get_pipe_lock():
+    """Module-level asyncio lock to prevent concurrent pipe() calls."""
+    global _pipe_lock
+    if _pipe_lock is None:
+        _pipe_lock = asyncio.Lock()
+    return _pipe_lock
+
+
 class Pipe:
     """
     Open WebUI Pipe that routes messages through OpenClaw Gateway via WebSocket.
@@ -301,6 +333,12 @@ class Pipe:
         pipe_log(f"Messages: {len(messages)}, last role: "
                  f"{messages[-1]['role'] if messages else 'NONE'}")
 
+        # --- Prevent concurrent calls (queued messages = broken session) ---
+        lock = _get_pipe_lock()
+        if lock.locked():
+            yield "Please wait for the previous message to finish..."
+            return
+
         # --- Parse gateway connection parameters ---
         parts = self.valves.GATEWAY_URL.rsplit(":", 1)
         host = parts[0]
@@ -309,6 +347,9 @@ class Pipe:
         if not token:
             yield "No GATEWAY_TOKEN configured"
             return
+
+        # Acquire lock after all early-exit checks
+        await lock.acquire()
 
         # --- Device identity (Ed25519) ---
         ident = None
@@ -536,3 +577,9 @@ class Pipe:
             import traceback
             pipe_log(traceback.format_exc()[:500])
             yield f"**Connection error:** {e}"
+
+        finally:
+            # Release the concurrent call lock
+            if lock.locked():
+                lock.release()
+
