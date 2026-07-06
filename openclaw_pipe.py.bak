@@ -473,7 +473,7 @@ class _Consumer:
     """An active run consumer — its ``asyncio.Queue`` receives events."""
     session_key: str
     run_id: str
-    queues: list[asyncio.Queue] = field(default_factory=list)
+    queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=500))
 
 
 class _GatewayConnection:
@@ -539,38 +539,17 @@ class _GatewayConnection:
             self._pending_reqs.pop(req_id, None)
 
     def register_consumer(self, session_key: str, run_id: str) -> asyncio.Queue:
-        """Register an event consumer queue for a (session, run) pair.
-
-        Returns a new queue attached to the consumer. Multiple queues per
-        consumer are supported for broadcast (used by steering).
-        """
+        """Register an event consumer queue for a (session, run) pair."""
         key = f"{session_key}:{run_id}"
-        consumer = self._consumers.get(key)
-        if consumer is None:
-            consumer = _Consumer(session_key=session_key, run_id=run_id)
-            self._consumers[key] = consumer
+        if key not in self._consumers:
+            self._consumers[key] = _Consumer(session_key=session_key, run_id=run_id)
             pipe_log(f"  registered consumer: {key[:60]}...")
-        q = asyncio.Queue(maxsize=500)
-        consumer.queues.append(q)
-        return q
+        return self._consumers[key].queue
 
-    def unregister_consumer(self, session_key: str, run_id: str, queue: asyncio.Queue | None = None):
-        """Remove a consumer queue.
-
-        If queue is given, only that queue is removed (broadcast mode).
-        If queue is None, the entire consumer (all queues) is removed.
-        """
+    def unregister_consumer(self, session_key: str, run_id: str):
+        """Remove a consumer queue."""
         key = f"{session_key}:{run_id}"
-        consumer = self._consumers.get(key)
-        if consumer is None:
-            return
-        if queue:
-            try:
-                consumer.queues.remove(queue)
-            except ValueError:
-                pass
-        if not consumer.queues or queue is None:
-            del self._consumers[key]
+        self._consumers.pop(key, None)
         pipe_log(f"  unregistered consumer: {key[:60]}...")
 
     def active_run_id_for_session(self, session_key: str) -> str | None:
@@ -801,8 +780,7 @@ class _GatewayConnection:
                     self._event_count += 1
                     if not payload.get("runId"):
                         pipe_log("  dispatched session-only event to sole consumer")
-                    for q in consumers[0].queues:
-                        await q.put(msg)
+                    await consumers[0].queue.put(msg)
                     continue
                 if payload.get("sessionKey") and not payload.get("runId"):
                     pipe_log("  dropped ambiguous or unmatched session-only event")
@@ -1041,65 +1019,49 @@ class Pipe:
                 yield f"**Model selection error:** could not apply `{model_override}`: {e}"
                 return
 
-        # --- Actual steering: inject message into active run, don't wait ---
+        # --- Wait for active run to finish (steering support) ---
         active_run_id = conn.active_run_id_for_session(session_key)
         if active_run_id:
-            pipe_log(f"Active run exists ({active_run_id[:20]}...); steering message into it")
+            pipe_log(
+                f"Active run exists ({active_run_id}); "
+                "waiting for it to finish before sending this message"
+            )
+            wait_start = time.time()
+            wait_timeout = 300  # max 5 minutes
+            while active_run_id:
+                if time.time() - wait_start > wait_timeout:
+                    yield (
+                        "_The previous response is taking too long. "
+                        "Wait for it to finish and try again._"
+                    )
+                    return
+                await asyncio.sleep(1)
+                active_run_id = conn.active_run_id_for_session(session_key)
+            pipe_log(f"Active run finished after {time.time()-wait_start:.0f}s; proceeding")
 
-            # Send the steering message immediately — the gateway will inject it
-            # at the next model boundary (steer mode is the gateway's default).
-            try:
-                send_resp = await conn.send_request(
-                    "chat.send",
-                    dict(sessionKey=session_key, message=text,
-                         idempotencyKey=f"msg-{chat_id}-{time.time()}"),
-                    timeout=30
-                )
-            except asyncio.TimeoutError:
-                yield "**Timeout:** Gateway did not respond to chat.send"
-                return
-            except Exception as e:
-                yield f"**Error sending message:** {e}"
-                return
+        # --- Send message and get runId ---
+        idempotency_key = f"msg-{chat_id}-{time.time()}"
 
-            steer_run_id = send_resp.get("runId", "unknown")
-            self._current_run_id = steer_run_id
-            pipe_log(f"Steer response runId: {steer_run_id[:20] if steer_run_id != 'unknown' else 'unknown'}")
+        try:
+            send_resp = await conn.send_request(
+                "chat.send",
+                dict(sessionKey=session_key, message=text,
+                     idempotencyKey=idempotency_key),
+                timeout=30
+            )
+        except asyncio.TimeoutError:
+            yield "**Timeout:** Gateway did not respond to chat.send"
+            return
+        except Exception as e:
+            yield f"**Error sending message:** {e}"
+            return
 
-            # Register a broadcast consumer on the SAME run so this bubble
-            # gets a copy of all subsequent events (the original bubble's
-            # consumer keeps running with its own queue).
-            if steer_run_id != "unknown":
-                queue = conn.register_consumer(session_key, steer_run_id)
-            else:
-                yield f"**Steer accepted but no runId returned.**"
-                return
+        our_run_id = send_resp.get("runId", "unknown")
+        self._current_run_id = our_run_id
+        pipe_log(f"Captured runId: {our_run_id}")
 
-            # Emit a steering acknowledgment compactly
-            yield "⤷ _Steered into the ongoing response_\n\n"
-
-            # Enter the event consumption loop with this bubble's queue
-            our_run_id = steer_run_id
-        else:
-            # --- Normal path: no active run, send fresh ---
-            idempotency_key = f"msg-{chat_id}-{time.time()}"
-            try:
-                send_resp = await conn.send_request(
-                    "chat.send",
-                    dict(sessionKey=session_key, message=text,
-                         idempotencyKey=idempotency_key),
-                    timeout=30
-                )
-            except asyncio.TimeoutError:
-                yield "**Timeout:** Gateway did not respond to chat.send"
-                return
-            except Exception as e:
-                yield f"**Error sending message:** {e}"
-                return
-            our_run_id = send_resp.get("runId", "unknown")
-            self._current_run_id = our_run_id
-            pipe_log(f"Captured runId: {our_run_id}")
-            queue = conn.register_consumer(session_key, our_run_id)
+        # --- Register consumer ---
+        queue = conn.register_consumer(session_key, our_run_id)
 
         # --- Consume events ---
         done = False
@@ -1385,7 +1347,7 @@ class Pipe:
             raise  # Re-raise to signal proper cancellation
 
         finally:
-            conn.unregister_consumer(session_key, our_run_id, queue=queue)
+            conn.unregister_consumer(session_key, our_run_id)
             self._current_session_key = None
             self._current_run_id = None
 
