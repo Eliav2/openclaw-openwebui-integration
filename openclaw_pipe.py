@@ -451,6 +451,26 @@ def _item_assistant_text(data: dict) -> str:
     return ""
 
 
+def _item_delta_text(item_text: str, last_item_text: str, assistant_stream_text: str) -> str:
+    """Compute the new text (if any) an `item` event adds beyond what's
+    already been shown, either by a prior `item` event or by the regular
+    `assistant` delta stream.
+
+    Some item events of kind "message"/"output" echo the *complete* final
+    assistant text (not just a genuine tool-preamble) — without this check
+    that full text gets yielded a second time on top of what the assistant
+    stream already delivered, duplicating the whole final message.
+    """
+    baseline = last_item_text or assistant_stream_text
+    if not baseline:
+        return item_text
+    if item_text == baseline:
+        return ""
+    if item_text.startswith(baseline):
+        return item_text[len(baseline):]
+    return item_text
+
+
 # ---------------------------------------------------------------------------
 # Persistent Gateway Connection (singleton)
 # ---------------------------------------------------------------------------
@@ -1113,6 +1133,7 @@ class Pipe:
         aborted = False
         first_event_arrived = False
         last_item_text = ""
+        assistant_stream_text = ""
         wait_started_time = time.time()
         last_activity_time = time.time()
         idle_probe_s = 30
@@ -1285,6 +1306,7 @@ class Pipe:
                                 yield resolved
                                 last_activity_time = time.time()
                                 continue
+                        assistant_stream_text += delta
                         yield delta
                         last_activity_time = time.time()
 
@@ -1292,12 +1314,9 @@ class Pipe:
                 if stream == "item":
                     item_text = _item_assistant_text(data)
                     if item_text:
-                        if last_item_text and item_text.startswith(last_item_text):
-                            item_delta = item_text[len(last_item_text):]
-                        elif item_text == last_item_text:
-                            item_delta = ""
-                        else:
-                            item_delta = item_text
+                        item_delta = _item_delta_text(
+                            item_text, last_item_text, assistant_stream_text
+                        )
                         last_item_text = item_text
                         if item_delta:
                             text_yielded = True

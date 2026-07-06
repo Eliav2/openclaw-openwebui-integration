@@ -63,6 +63,7 @@ from openclaw_pipe import (
     _GatewayConnection,
     _coerce_text,
     _item_assistant_text,
+    _item_delta_text,
     _preview_recovery_text,
 )
 
@@ -163,6 +164,51 @@ class ItemTextExtractionTests(unittest.TestCase):
         self.assertEqual(
             _item_assistant_text({"kind": "tool", "text": "internal"}),
             "",
+        )
+
+
+class ItemDeltaDedupTests(unittest.TestCase):
+    """Regression tests for the whole-message duplication bug (2026-07-06):
+    an `item` event of kind message/output can echo the complete final
+    assistant text, which must not be re-yielded on top of what the
+    `assistant` delta stream already produced."""
+
+    def test_genuine_preamble_before_any_assistant_text(self):
+        # No assistant-stream text yet -> a real preamble should pass through.
+        self.assertEqual(
+            _item_delta_text("Let me check that.", "", ""),
+            "Let me check that.",
+        )
+
+    def test_duplicate_full_message_after_assistant_stream_is_suppressed(self):
+        # This is the bug: item event echoes the exact text already streamed.
+        self.assertEqual(
+            _item_delta_text("Hello world", "", "Hello world"),
+            "",
+        )
+
+    def test_item_event_extends_beyond_assistant_stream(self):
+        # Item text repeats what was streamed and adds something new.
+        self.assertEqual(
+            _item_delta_text("Hello world, more.", "", "Hello world"),
+            ", more.",
+        )
+
+    def test_sequential_item_only_events_still_dedup_against_each_other(self):
+        # Original behavior preserved when there's no assistant-stream text.
+        self.assertEqual(
+            _item_delta_text("Hello wor", "Hello", ""),
+            " wor",
+        )
+        self.assertEqual(
+            _item_delta_text("Hello", "Hello", ""),
+            "",
+        )
+
+    def test_unrelated_item_text_passes_through(self):
+        self.assertEqual(
+            _item_delta_text("Something else entirely", "Hello", ""),
+            "Something else entirely",
         )
 
 
