@@ -920,21 +920,28 @@ class Pipe:
         event_count = 0
         text_yielded = False
         aborted = False
+        first_event_arrived = False
+        last_activity_time = time.time()
+        grace_after_last_event_s = 8
 
         try:
             while not done and event_count < 500:
                 try:
-                    msg = await asyncio.wait_for(queue.get(), timeout=90)
+                    recv_timeout = 15 if first_event_arrived else 60
+                    msg = await asyncio.wait_for(queue.get(), timeout=recv_timeout)
                 except asyncio.TimeoutError:
-                    pipe_log("TIMEOUT — no events on queue for 90s")
+                    timeout_desc = "15s" if first_event_arrived else "60s"
+                    pipe_log(f"TIMEOUT — no events on queue for {timeout_desc}")
                     break
 
                 event_count += 1
+                first_event_arrived = True
                 payload = msg.get("payload", {})
                 stream = payload.get("stream")
                 data = payload.get("data", {})
                 name = data.get("name", "")
                 phase = data.get("phase", "")
+                state = payload.get("state", "")
 
                 # --- P16: Double-check session/run match ---
                 evt_session = payload.get("sessionKey", "")
@@ -946,12 +953,32 @@ class Pipe:
                     pipe_log(f"  queue delivered wrong run: {evt_run_id[:20]}...")
                     continue
 
+                # --- Completion signals (multiple sources) ---
+                if stream == "lifecycle" and phase == "end":
+                    done = True
+                    pipe_log("  lifecycle end -> done")
+                elif stream == "lifecycle" and phase == "error":
+                    yield f"\n\n**Error:** {data.get('error', 'unknown')}"
+                    done = True
+                    pipe_log("  lifecycle error -> done")
+
+                if state in ("final", "cancelled", "error"):
+                    done = True
+                    pipe_log(f"  payload state='{state}' -> done")
+
+                if data.get("aborted") is True:
+                    done = True
+                    pipe_log("  data.aborted -> done")
+
                 # --- Assistant text stream ---
                 if stream == "assistant":
                     delta = data.get("delta") or data.get("text") or ""
                     if delta:
                         # Filter Sender metadata
-                        if "Sender (untrusted metadata)" in delta:
+                        if (
+                            "Sender (untrusted metadata)" in delta
+                            or "UnTrustedMetadata" in delta
+                        ):
                             pipe_log("  filtered metadata block")
                             continue
                         text_yielded = True
@@ -980,8 +1007,10 @@ class Pipe:
                             if handled:
                                 pipe_log("  resolved MEDIA: directive")
                                 yield resolved
+                                last_activity_time = time.time()
                                 continue
                         yield delta
+                        last_activity_time = time.time()
 
                 # --- Tool call events ---
                 if stream == "tool":
@@ -998,6 +1027,7 @@ class Pipe:
                                     "done": False
                                 }}
                             )
+                        last_activity_time = time.time()
 
                     elif phase == "result":
                         result = data.get("result", {})
@@ -1022,21 +1052,25 @@ class Pipe:
                                     "description": f"✅ {name} done", "done": True
                                 }}
                             )
+                        last_activity_time = time.time()
 
                 # --- Item events (progress) ---
                 if stream == "item":
                     pipe_log(f"  Item: kind={data.get('kind','')} "
                              f"status={data.get('status','')} "
                              f"title={str(data.get('title',''))[:50]}")
+                    last_activity_time = time.time()
 
-                # --- Lifecycle events ---
-                if stream == "lifecycle":
-                    pipe_log(f"  Lifecycle: phase={phase}")
-                    if phase == "end":
-                        done = True
-                    elif phase == "error":
-                        yield f"\n\n**Error:** {data.get('error', 'unknown')}"
-                        done = True
+                if (
+                    not done
+                    and first_event_arrived
+                    and time.time() - last_activity_time > grace_after_last_event_s
+                ):
+                    pipe_log(
+                        "  grace timer: no activity for "
+                        f"{grace_after_last_event_s}s, self-closing"
+                    )
+                    done = True
 
         except asyncio.CancelledError:
             # OWUI stop button → abort the gateway run
