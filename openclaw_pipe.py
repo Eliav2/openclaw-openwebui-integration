@@ -324,6 +324,15 @@ async def _resolve_media_via_owui(
     return before + replacement, True
 
 
+async def _emit_status(__event_emitter__, description, *, done=False):
+    """Send an OWUI status event when the current pipe call supports events."""
+    if not __event_emitter__:
+        return
+    await __event_emitter__(
+        {"type": "status", "data": {"description": description, "done": done}}
+    )
+
+
 def _start_file_server(port=18791):
     """Start a minimal HTTP server for media files. Starts once per process."""
     global _file_server_started
@@ -1038,6 +1047,7 @@ class Pipe:
             yield "No message"
             return
 
+        await _emit_status(__event_emitter__, "Thinking...", done=False)
         pipe_log(f"Messages: {len(messages)}, last role: "
                  f"{messages[-1]['role'] if messages else 'NONE'}")
 
@@ -1045,6 +1055,7 @@ class Pipe:
         try:
             conn = await _get_gateway_connection(lambda: self.valves)
         except GatewayError as e:
+            await _emit_status(__event_emitter__, "", done=True)
             yield f"**Gateway connection error:** {e}"
             return
 
@@ -1096,6 +1107,7 @@ class Pipe:
                     )
                 pipe_log(f"Applied model override: {model_override}")
             except Exception as e:
+                await _emit_status(__event_emitter__, "", done=True)
                 yield f"**Model selection error:** could not apply `{model_override}`: {e}"
                 return
 
@@ -1103,6 +1115,11 @@ class Pipe:
         active_run_id = conn.active_run_id_for_session(session_key)
         if active_run_id:
             pipe_log(f"Active run exists ({active_run_id[:20]}...); steering message into it")
+            await _emit_status(
+                __event_emitter__,
+                "Steering into current response...",
+                done=False,
+            )
 
             # Send the steering message immediately — the gateway will inject it
             # at the next model boundary (steer mode is the gateway's default).
@@ -1114,9 +1131,11 @@ class Pipe:
                     timeout=30
                 )
             except asyncio.TimeoutError:
+                await _emit_status(__event_emitter__, "", done=True)
                 yield "**Timeout:** Gateway did not respond to chat.send"
                 return
             except Exception as e:
+                await _emit_status(__event_emitter__, "", done=True)
                 yield f"**Error sending message:** {e}"
                 return
 
@@ -1130,6 +1149,7 @@ class Pipe:
             if steer_run_id != "unknown":
                 queue = conn.register_consumer(session_key, steer_run_id)
             else:
+                await _emit_status(__event_emitter__, "", done=True)
                 yield f"**Steer accepted but no runId returned.**"
                 return
 
@@ -1149,9 +1169,11 @@ class Pipe:
                     timeout=30
                 )
             except asyncio.TimeoutError:
+                await _emit_status(__event_emitter__, "", done=True)
                 yield "**Timeout:** Gateway did not respond to chat.send"
                 return
             except Exception as e:
+                await _emit_status(__event_emitter__, "", done=True)
                 yield f"**Error sending message:** {e}"
                 return
             our_run_id = send_resp.get("runId", "unknown")
@@ -1222,25 +1244,21 @@ class Pipe:
                                 "  idle but no assistant text yet; "
                                 "continuing to wait for terminal event"
                             )
-                            if __event_emitter__:
-                                await __event_emitter__(
-                                    {"type": "status", "data": {
-                                        "description": "Waiting for final answer...",
-                                        "done": False
-                                    }}
-                                )
+                            await _emit_status(
+                                __event_emitter__,
+                                "Waiting for final answer...",
+                                done=False,
+                            )
                     else:
                         pipe_log(
                             f"  idle for {idle_elapsed:.0f}s after streaming text; "
                             "verifying the run is actually done before closing"
                         )
-                        if __event_emitter__:
-                            await __event_emitter__(
-                                {"type": "status", "data": {
-                                    "description": "Still working...",
-                                    "done": False
-                                }}
-                            )
+                        await _emit_status(
+                            __event_emitter__,
+                            "Still working...",
+                            done=False,
+                        )
 
                     # Periodically check if the Gateway still has an active run
                     if time.time() - last_describe_check >= describe_check_interval:
@@ -1387,13 +1405,11 @@ class Pipe:
                         if tool_call_id:
                             self._active_tool_args[tool_call_id] = args
                         pipe_log(f"  Tool start: {name}")
-                        if __event_emitter__:
-                            await __event_emitter__(
-                                {"type": "status", "data": {
-                                    "description": f"🔧 Running {name}...",
-                                    "done": False
-                                }}
-                            )
+                        await _emit_status(
+                            __event_emitter__,
+                            f"Running {name}...",
+                            done=False,
+                        )
                         last_activity_time = time.time()
 
                     elif phase == "result":
@@ -1413,12 +1429,11 @@ class Pipe:
                             'files="[]" embeds="[]">'
                             f'\n<summary>{html.escape(name)}</summary>\n</details>\n'
                         )
-                        if __event_emitter__:
-                            await __event_emitter__(
-                                {"type": "status", "data": {
-                                    "description": f"✅ {name} done", "done": True
-                                }}
-                            )
+                        await _emit_status(
+                            __event_emitter__,
+                            f"{name} done",
+                            done=True,
+                        )
                         last_activity_time = time.time()
 
                 # --- Item events (progress) ---
@@ -1460,6 +1475,7 @@ class Pipe:
             # OWUI stop button → abort the gateway run
             aborted = True
             pipe_log("Generator cancelled — sending chat.abort")
+            await _emit_status(__event_emitter__, "Stopped", done=True)
             await conn.abort(session_key, our_run_id)
             if self.valves.SEND_STOP_ON_CANCEL:
                 pipe_log("Generator cancelled — sending /stop fallback")
@@ -1467,6 +1483,7 @@ class Pipe:
             raise  # Re-raise to signal proper cancellation
 
         finally:
+            await _emit_status(__event_emitter__, "", done=True)
             conn.unregister_consumer(session_key, our_run_id, queue=queue)
             self._current_session_key = None
             self._current_run_id = None

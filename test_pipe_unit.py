@@ -62,6 +62,7 @@ if "pydantic" not in sys.modules:
 from openclaw_pipe import (
     _GatewayConnection,
     _coerce_text,
+    _emit_status,
     _item_assistant_text,
     _item_delta_text,
     _preview_recovery_text,
@@ -239,6 +240,27 @@ class ResolveMediaTests(unittest.TestCase):
         )
         self.assertTrue(handled)
         self.assertEqual(result, "![pic.png](https://example.com/pic.png)")
+
+
+class StatusEmitterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_emits_owui_status_event(self):
+        events = []
+
+        async def emitter(event):
+            events.append(event)
+
+        await _emit_status(emitter, "Thinking...", done=False)
+
+        self.assertEqual(
+            events,
+            [{
+                "type": "status",
+                "data": {"description": "Thinking...", "done": False},
+            }],
+        )
+
+    async def test_missing_emitter_is_noop(self):
+        await _emit_status(None, "Thinking...", done=False)
 
 
 if __name__ == "__main__":
