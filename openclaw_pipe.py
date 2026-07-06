@@ -1175,6 +1175,13 @@ class Pipe:
                         done = True
                         break
 
+                    # A quiet queue for idle_probe_s does NOT mean the run is
+                    # done — a long tool call or a stretch of agent reasoning
+                    # with no intermediate events looks identical from here.
+                    # Only `sessions.describe` (the Gateway's own run status)
+                    # is authoritative; never close on silence alone, whether
+                    # or not text has already streamed.
+                    idle_elapsed = time.time() - last_activity_time
                     if not text_yielded:
                         elapsed = time.time() - wait_started_time
                         if elapsed < no_text_deadman_s:
@@ -1189,47 +1196,62 @@ class Pipe:
                                         "done": False
                                     }}
                                 )
-                        # Periodically check if the Gateway still has an active run
-                        if time.time() - last_describe_check >= describe_check_interval:
-                            last_describe_check = time.time()
-                            try:
-                                desc = await conn.send_request(
-                                    "sessions.describe",
-                                    dict(key=session_key),
-                                    timeout=8
-                                )
-                                session_row = desc.get("session")
-                                if session_row is None:
-                                    pipe_log("  sessions.describe: session not found")
-                                elif session_row.get("status") in ("done", "failed", "cancelled"):
-                                    pipe_log("  sessions.describe: session is done/failed/cancelled, checking preview")
-                                    recovered2 = await recover_from_preview()
-                                    if recovered2 and not text_yielded:
-                                        pipe_log("  recovered assistant text after describe probe")
-                                        text_yielded = True
-                                        yield recovered2
-                                        done = True
-                                        break
-                                    elif not text_yielded:
-                                        pipe_log("  session done but no assistant text to recover; closing")
-                                        done = True
-                                        break
-                                else:
-                                    pipe_log(f"  sessions.describe: status={session_row.get('status','unknown')}")
-                            except Exception as ex:
-                                pipe_log(f"  sessions.describe probe failed: {ex}")
-                        continue
-                        yield (
-                            "\n\n**Timeout:** The run produced progress events "
-                            "but no assistant text or terminal event. "
-                            "Please retry; the Gateway may have lost the final event."
+                    else:
+                        pipe_log(
+                            f"  idle for {idle_elapsed:.0f}s after streaming text; "
+                            "verifying the run is actually done before closing"
                         )
-                        text_yielded = True
-                        done = True
-                        break
+                        if __event_emitter__:
+                            await __event_emitter__(
+                                {"type": "status", "data": {
+                                    "description": "Still working...",
+                                    "done": False
+                                }}
+                            )
 
-                    pipe_log("  assistant text already streamed; closing after idle probe")
-                    break
+                    # Periodically check if the Gateway still has an active run
+                    if time.time() - last_describe_check >= describe_check_interval:
+                        last_describe_check = time.time()
+                        try:
+                            desc = await conn.send_request(
+                                "sessions.describe",
+                                dict(key=session_key),
+                                timeout=8
+                            )
+                            session_row = desc.get("session")
+                            if session_row is None:
+                                pipe_log("  sessions.describe: session not found")
+                                if text_yielded:
+                                    done = True
+                                    break
+                            elif session_row.get("status") in ("done", "failed", "cancelled"):
+                                pipe_log("  sessions.describe: session is done/failed/cancelled, checking preview")
+                                recovered2 = await recover_from_preview()
+                                if recovered2 and not text_yielded:
+                                    pipe_log("  recovered assistant text after describe probe")
+                                    text_yielded = True
+                                    yield recovered2
+                                done = True
+                                break
+                            else:
+                                pipe_log(
+                                    f"  sessions.describe: status="
+                                    f"{session_row.get('status','unknown')} — "
+                                    "still active, keep waiting"
+                                )
+                        except Exception as ex:
+                            pipe_log(f"  sessions.describe probe failed: {ex}")
+                            # Belt-and-suspenders: if we can't even confirm
+                            # status and have been idle far longer than the
+                            # normal deadman budget, give up rather than hang
+                            # forever (should be rare — WS reconnect handles
+                            # true connection loss separately).
+                            if text_yielded and idle_elapsed > no_text_deadman_s:
+                                pipe_log("  describe probe unreachable and idle too long; closing")
+                                done = True
+                                break
+
+                    continue
 
                 event_count += 1
                 first_event_arrived = True
