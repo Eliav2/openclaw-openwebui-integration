@@ -187,7 +187,7 @@ def _write_json_file(path, data):
 # ---------------------------------------------------------------------------
 
 MEDIA_DIR = "/tmp/openclaw-pipe-media"
-MEDIA_BASE_URL = "http://your-owui-host:18791"
+MEDIA_BASE_URL = "https://localhost:18791"
 GATEWAY_SCOPES = ["operator.admin", "operator.read", "operator.write"]
 
 _file_server_started = False
@@ -205,22 +205,7 @@ def _resolve_media(text, base_url=None):
     fname = after_prefix.split()[0] if after_prefix else ""
     if not fname:
         return text, False
-    media_dir = MEDIA_DIR
-    fpath = os.path.join(media_dir, fname)
-    if os.path.isfile(fpath):
-        try:
-            with open(fpath, "rb") as f:
-                raw = f.read()
-            b64 = base64.b64encode(raw).decode()
-            mime = mimetypes.guess_type(fname)[0] or "image/png"
-            data_uri = f"data:{mime};base64,{b64}"
-            rest = after_prefix[len(fname):].strip()
-            result = f"![{fname}]({data_uri})"
-            if rest:
-                result += "\n" + rest
-            return result, True
-        except Exception as ex:
-            pipe_log(f"  base64 fallback failed: {ex}")
+    # Prefer HTTPS URL over base64 data URI (base64 breaks OWUI streaming parser).
     url = f"{base_url.rstrip('/')}/{fname}"
     rest = after_prefix[len(fname):].strip()
     result = f"![{fname}]({url})"
@@ -913,7 +898,7 @@ class Pipe:
             description="Optional OWUI API key for file uploads; request bearer token is preferred"
         )
         FILE_SERVER_BASE_URL: str = Field(
-            default="http://your-owui-host:18791",
+            default="https://localhost:18791",
             description="Public URL for the file server (for MEDIA: resolution)"
         )
         CHATGPT_MODEL: str = Field(
