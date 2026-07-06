@@ -636,6 +636,25 @@ class _GatewayConnection:
         except Exception as e:
             pipe_log(f"  abort send failed: {e}")
 
+    async def send_stop(self, session_key: str):
+        """Send the stronger /stop command for runtimes where chat.abort is incomplete."""
+        try:
+            resp = await self.send_request(
+                "chat.send",
+                dict(
+                    sessionKey=session_key,
+                    message="/stop",
+                    deliver=False,
+                    idempotencyKey=f"stop-{uuid.uuid4()}",
+                ),
+                timeout=10,
+            )
+            pipe_log(f"  sent /stop fallback: {resp}")
+        except asyncio.TimeoutError:
+            pipe_log("  /stop fallback timed out")
+        except Exception as e:
+            pipe_log(f"  /stop fallback failed: {e}")
+
     async def disconnect(self):
         """Gracefully close the connection."""
         self._stopped = True
@@ -889,6 +908,7 @@ class Pipe:
     - AGENT_ID: target agent (default "main")
     - ENABLE_FILE_SERVER: start media file server (default True)
     - USE_OWUI_FILES: upload MEDIA files into OWUI Files API (default True)
+    - SEND_STOP_ON_CANCEL: send /stop after chat.abort when OWUI cancels
     """
 
     class Valves(BaseModel):
@@ -919,6 +939,10 @@ class Pipe:
         USE_OWUI_FILES: bool = Field(
             default=True,
             description="Upload MEDIA files to OWUI Files API before falling back to file server"
+        )
+        SEND_STOP_ON_CANCEL: bool = Field(
+            default=True,
+            description="After OWUI cancels a stream, send /stop because chat.abort may not stop active tool subprocesses"
         )
         OWUI_BASE_URL: str = Field(
             default="http://127.0.0.1:8080",
@@ -1437,6 +1461,9 @@ class Pipe:
             aborted = True
             pipe_log("Generator cancelled — sending chat.abort")
             await conn.abort(session_key, our_run_id)
+            if self.valves.SEND_STOP_ON_CANCEL:
+                pipe_log("Generator cancelled — sending /stop fallback")
+                await conn.send_stop(session_key)
             raise  # Re-raise to signal proper cancellation
 
         finally:

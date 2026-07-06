@@ -42,7 +42,7 @@ This version works well for basic chat but has known issues being tracked for v1
 | Issue | Description | Status |
 |-------|-------------|--------|
 | **Concurrent messages** | Sending a message while the agent is still responding now steers into the active run (no lock, no blocking, no garbling). | ✅ Fixed — persistent WS + steering |
-| **No stop button** | Pressing stop in OWUI now sends `chat.abort` to the Gateway. | ✅ Fixed — CancelledError triggers abort |
+| **No stop button** | Pressing stop in OWUI now sends `chat.abort`, then `/stop` as a fallback for Gateway runtimes where `chat.abort` does not stop active tool subprocesses. | ✅ Fixed — CancelledError triggers abort + `/stop` fallback |
 | **60s idle timeout** | Long agent runs no longer treat silence as completion before assistant text arrives. Session-only terminal events are dispatched when unambiguous, and quiet periods probe `sessions.preview` before recovering or continuing. | ✅ Fixed — terminal/recovery flow + deadman only |
 | **Per-message reconnect** | WS handshake + crypto every message is gone. | ✅ Fixed — singleton connection |
 | **Session bleed** | Events from other chats/surfaces can appear mid-response. | ✅ Fixed — event dispatcher demuxes by sessionKey/runId |
@@ -175,6 +175,7 @@ Relevant valves:
 | `OWUI_BASE_URL` | Base URL used by the pipe to call the OWUI Files API |
 | `OWUI_API_KEY` | Optional API key for uploads; the current request bearer token is preferred |
 | `FILE_SERVER_BASE_URL` | Legacy fallback URL for the pipe file server |
+| `SEND_STOP_ON_CANCEL` | Send `/stop` after `chat.abort` when OWUI cancels a stream (default: `True`) |
 | `CHATGPT_MODEL` | OpenClaw model used by the `ChatGPT · GPT-5.5` selector entry |
 
 ### Approve the device in the Gateway
@@ -211,6 +212,7 @@ If you can't run the script, install manually:
    | `ENABLE_FILE_SERVER` | `True` (media support) |
    | `USE_OWUI_FILES` | `True` (native OWUI Files API media support) |
    | `OWUI_BASE_URL` | Open WebUI base URL reachable from the OWUI backend |
+   | `SEND_STOP_ON_CANCEL` | `True` (workaround for `chat.abort` not stopping active tool subprocesses) |
    | `CHATGPT_MODEL` | OpenClaw model for the ChatGPT selector entry |
 
 6. Choose `OpenClaw · Default` or `ChatGPT · GPT-5.5` as your model and start

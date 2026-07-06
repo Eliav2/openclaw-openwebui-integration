@@ -349,6 +349,7 @@ def update_valves(
         "DEVICE_IDENTITY": ident_json,
         "STATE_DIR": args.state_dir,
         "USE_OWUI_FILES": True,
+        "SEND_STOP_ON_CANCEL": True,
         "OWUI_BASE_URL": args.owui_api_base_url,
         "CHATGPT_MODEL": args.chatgpt_model,
     }
