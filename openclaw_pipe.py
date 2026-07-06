@@ -203,6 +203,7 @@ def _resolve_media(text, base_url=None):
     if prefix not in text:
         return text, False
     idx = text.index(prefix)
+    before = text[:idx]
     after_prefix = text[idx + len(prefix):].strip()
     fname = after_prefix.split()[0] if after_prefix else ""
     if not fname:
@@ -210,7 +211,7 @@ def _resolve_media(text, base_url=None):
     # Prefer HTTPS URL over base64 data URI (base64 breaks OWUI streaming parser).
     url = f"{base_url.rstrip('/')}/{fname}"
     rest = after_prefix[len(fname):].strip()
-    result = f"![{fname}]({url})"
+    result = before + f"![{fname}]({url})"
     if rest:
         result += "\n" + rest
     return result, True
@@ -291,7 +292,15 @@ async def _resolve_media_via_owui(
     if not os.path.isfile(fpath):
         return text, False
 
-    file_obj = _upload_owui_file(fpath, base_url, token)
+    # _upload_owui_file uses blocking urllib — must run off the event loop.
+    # This call goes to OWUI's own API (often 127.0.0.1:8080, i.e. OWUI
+    # calling itself) from *inside* the async handler for the very request
+    # that's driving this pipe run. Calling it directly would block the
+    # single asyncio event loop thread, and OWUI can't service its own
+    # incoming HTTP request while its own loop is blocked waiting on it —
+    # a guaranteed self-deadlock that only resolves via timeout. Running it
+    # in a thread lets the event loop keep serving requests concurrently.
+    file_obj = await asyncio.to_thread(_upload_owui_file, fpath, base_url, token)
     if __event_emitter__:
         await __event_emitter__(
             {

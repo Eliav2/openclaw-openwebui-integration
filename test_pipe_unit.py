@@ -65,6 +65,7 @@ from openclaw_pipe import (
     _item_assistant_text,
     _item_delta_text,
     _preview_recovery_text,
+    _resolve_media,
 )
 
 
@@ -210,6 +211,34 @@ class ItemDeltaDedupTests(unittest.TestCase):
             _item_delta_text("Something else entirely", "Hello", ""),
             "Something else entirely",
         )
+
+
+class ResolveMediaTests(unittest.TestCase):
+    """Regression tests for P2 (2026-07-06): _resolve_media used to drop
+    any text preceding the MEDIA: prefix within the same chunk."""
+
+    def test_preserves_text_before_media_directive(self):
+        result, handled = _resolve_media(
+            "CHECKING MEDIA:p2-test.png DONE", base_url="https://example.com"
+        )
+        self.assertTrue(handled)
+        self.assertEqual(
+            result,
+            "CHECKING ![p2-test.png](https://example.com/p2-test.png)\nDONE",
+        )
+
+    def test_no_directive_passes_through_unchanged(self):
+        self.assertEqual(
+            _resolve_media("plain text", base_url="https://example.com"),
+            ("plain text", False),
+        )
+
+    def test_directive_at_start_of_chunk(self):
+        result, handled = _resolve_media(
+            "MEDIA:pic.png", base_url="https://example.com"
+        )
+        self.assertTrue(handled)
+        self.assertEqual(result, "![pic.png](https://example.com/pic.png)")
 
 
 if __name__ == "__main__":
