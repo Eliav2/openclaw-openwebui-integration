@@ -475,6 +475,46 @@ def smoke_test(client: OwuiClient, *, repair_pairing: bool = False,
     return False
 
 
+def chatgpt_route_smoke_test(client: OwuiClient) -> bool:
+    status, payload = client.request(
+        "POST",
+        "/api/chat/completions",
+        {
+            "model": CHATGPT_MODEL_ID,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "Use session_status for current session, then answer "
+                        "with only the exact model line."
+                    ),
+                }
+            ],
+            "stream": False,
+            "metadata": {
+                "chat_id": f"install-chatgpt-smoke-{int(time.time())}",
+                "user_id": "install-chatgpt-smoke",
+            },
+        },
+        timeout=120,
+    )
+    if status != 200 or not isinstance(payload, dict):
+        fail(f"ChatGPT route smoke HTTP failed: {payload}")
+        return False
+
+    content = (
+        payload.get("choices", [{}])[0]
+        .get("message", {})
+        .get("content", "")
+    )
+    if "Model: openai/gpt-5.5" in content:
+        info("ChatGPT route smoke test passed")
+        return True
+
+    fail(f"ChatGPT route smoke failed: {content[:500]}")
+    return False
+
+
 def print_status(client: OwuiClient) -> bool:
     summary = get_function_summary(client)
     valves = get_valves(client) if summary else {}
@@ -535,7 +575,9 @@ def run(args: argparse.Namespace) -> None:
         valves = install_or_repair(client, args)
         section("Smoke test")
         ok = smoke_test(client, repair_pairing=args.auto_approve, valves=valves)
-        raise SystemExit(0 if ok else 1)
+        section("ChatGPT route smoke test")
+        chatgpt_ok = chatgpt_route_smoke_test(client)
+        raise SystemExit(0 if ok and chatgpt_ok else 1)
 
     if args.command == "healthcheck":
         section("Status")
@@ -543,7 +585,9 @@ def run(args: argparse.Namespace) -> None:
         section("Smoke test")
         valves = get_valves(client)
         smoke_ok = smoke_test(client, repair_pairing=args.auto_approve, valves=valves)
-        raise SystemExit(0 if status_ok and smoke_ok else 1)
+        section("ChatGPT route smoke test")
+        chatgpt_ok = chatgpt_route_smoke_test(client)
+        raise SystemExit(0 if status_ok and smoke_ok and chatgpt_ok else 1)
 
 
 def build_parser() -> argparse.ArgumentParser:

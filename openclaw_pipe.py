@@ -110,7 +110,7 @@ def _sign_challenge(ident, nonce, ts, token_str=""):
     """Sign the WebSocket challenge using the device identity."""
     parts = [
         "v2", ident["id"], "webchat", "cli", "operator",
-        "operator.read,operator.write", str(ts), token_str, nonce
+        ",".join(GATEWAY_SCOPES), str(ts), token_str, nonce
     ]
     pk = serialization.load_pem_private_key(
         ident["privateKey"].encode(), password=None, backend=default_backend()
@@ -188,6 +188,7 @@ def _write_json_file(path, data):
 
 MEDIA_DIR = "/tmp/openclaw-pipe-media"
 MEDIA_BASE_URL = "http://your-owui-host:18791"
+GATEWAY_SCOPES = ["operator.admin", "operator.read", "operator.write"]
 
 _file_server_started = False
 
@@ -546,7 +547,7 @@ class _GatewayConnection:
                 client=dict(id="webchat", version="1",
                             platform="linux", mode="cli"),
                 role="operator",
-                scopes=["operator.read", "operator.write"],
+                scopes=GATEWAY_SCOPES,
                 auth=auth,
                 device=signed,
                 locale="en-US",
@@ -644,7 +645,17 @@ class _GatewayConnection:
                     req_id = msg.get("id")
                     fut = self._pending_reqs.get(req_id)
                     if fut and not fut.done():
-                        fut.set_result(msg.get("payload", {}))
+                        if msg.get("ok") is False:
+                            err = msg.get("error", {})
+                            fut.set_exception(
+                                GatewayError(
+                                    err.get("message")
+                                    or err.get("code")
+                                    or "request failed"
+                                )
+                            )
+                        else:
+                            fut.set_result(msg.get("payload", {}))
                     continue
 
                 # ── Tick keepalive (silently consume) ──
@@ -882,11 +893,24 @@ class Pipe:
 
         if model_override:
             try:
-                await conn.send_request(
+                patch_resp = await conn.send_request(
                     "sessions.patch",
                     dict(key=session_key, model=model_override),
                     timeout=10
                 )
+                resolved = patch_resp.get("resolved", {})
+                resolved_model = "/".join(
+                    part for part in (
+                        resolved.get("modelProvider"),
+                        resolved.get("model"),
+                    )
+                    if part
+                )
+                if resolved_model != model_override:
+                    raise GatewayError(
+                        "model override did not apply "
+                        f"(wanted {model_override}, got {resolved_model or 'unknown'})"
+                    )
                 pipe_log(f"Applied model override: {model_override}")
             except Exception as e:
                 yield f"**Model selection error:** could not apply `{model_override}`: {e}"
@@ -922,15 +946,19 @@ class Pipe:
         aborted = False
         first_event_arrived = False
         last_activity_time = time.time()
-        grace_after_last_event_s = 8
+        grace_after_last_event_s = 45
 
         try:
             while not done and event_count < 500:
                 try:
-                    recv_timeout = 15 if first_event_arrived else 60
+                    recv_timeout = grace_after_last_event_s if first_event_arrived else 60
                     msg = await asyncio.wait_for(queue.get(), timeout=recv_timeout)
                 except asyncio.TimeoutError:
-                    timeout_desc = "15s" if first_event_arrived else "60s"
+                    timeout_desc = (
+                        f"{grace_after_last_event_s}s"
+                        if first_event_arrived
+                        else "60s"
+                    )
                     pipe_log(f"TIMEOUT — no events on queue for {timeout_desc}")
                     break
 

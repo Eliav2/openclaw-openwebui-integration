@@ -179,6 +179,28 @@ def test_metadata_passthrough():
     ok(f"Response received: {content[:80]}")
 
 
+def test_chatgpt_model_override():
+    """Verify ChatGPT manifold entry really patches the OpenClaw model."""
+    r = send({
+        "model": CHATGPT_MODEL_ID,
+        "messages": [{
+            "role": "user",
+            "content": (
+                "Use session_status for current session, then answer with "
+                "only the exact model line."
+            ),
+        }],
+        "stream": False,
+    })
+    if not check(r, ["choices"]):
+        return
+    content = r["choices"][0]["message"]["content"]
+    if "Model: openai/gpt-5.5" in content:
+        ok("ChatGPT route uses openai/gpt-5.5")
+    else:
+        fail("ChatGPT route did not report openai/gpt-5.5", content[:500])
+
+
 def test_empty_message():
     """Empty user message."""
     r = send({
@@ -252,6 +274,7 @@ if __name__ == "__main__":
     test("Invalid model rejection", test_model_not_found)
     test("Streaming response", test_streaming)
     test("Metadata/user identity passthrough", test_metadata_passthrough)
+    test("ChatGPT model override", test_chatgpt_model_override)
     test("Empty message handling", test_empty_message)
     test("Hebrew / special characters", test_special_characters)
 
