@@ -436,6 +436,34 @@ def _preview_recovery_text(preview: dict, session_key: str, user_text: str) -> s
     return None
 
 
+def _coerce_text(value) -> str:
+    """Extract text from common stream payload shapes."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("delta", "text", "content", "message"):
+            text = _coerce_text(value.get(key))
+            if text:
+                return text
+        return ""
+    if isinstance(value, list):
+        parts = [_coerce_text(item) for item in value]
+        return "".join(part for part in parts if part)
+    return ""
+
+
+def _item_assistant_text(data: dict) -> str:
+    """Return visible assistant text carried by item/preamble events."""
+    kind = str(data.get("kind", "")).strip().lower()
+    if kind not in ("assistant", "message", "output", "preamble"):
+        return ""
+    for key in ("delta", "text", "content", "message"):
+        text = _coerce_text(data.get(key)).strip()
+        if text:
+            return text
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Persistent Gateway Connection (singleton)
 # ---------------------------------------------------------------------------
@@ -1010,13 +1038,23 @@ class Pipe:
         text_yielded = False
         aborted = False
         first_event_arrived = False
+        last_item_text = ""
         wait_started_time = time.time()
         last_activity_time = time.time()
         idle_probe_s = 45
         no_text_deadman_s = 600
+        max_events_without_text = 5000
+
+        async def recover_from_preview() -> str | None:
+            try:
+                preview = await conn.session_preview(session_key)
+                return _preview_recovery_text(preview, session_key, text)
+            except Exception as ex:
+                pipe_log(f"  preview recovery failed: {ex}")
+                return None
 
         try:
-            while not done and event_count < 500:
+            while not done:
                 try:
                     recv_timeout = idle_probe_s if first_event_arrived else 60
                     msg = await asyncio.wait_for(queue.get(), timeout=recv_timeout)
@@ -1032,13 +1070,7 @@ class Pipe:
                         text_yielded = True
                         break
 
-                    try:
-                        preview = await conn.session_preview(session_key)
-                        recovered = _preview_recovery_text(preview, session_key, text)
-                    except Exception as ex:
-                        recovered = None
-                        pipe_log(f"  preview recovery failed: {ex}")
-
+                    recovered = await recover_from_preview()
                     if recovered and not text_yielded:
                         pipe_log("  recovered assistant text from sessions.preview")
                         text_yielded = True
@@ -1151,6 +1183,23 @@ class Pipe:
                         yield delta
                         last_activity_time = time.time()
 
+                # --- Assistant text carried by item/preamble events ---
+                if stream == "item":
+                    item_text = _item_assistant_text(data)
+                    if item_text:
+                        if last_item_text and item_text.startswith(last_item_text):
+                            item_delta = item_text[len(last_item_text):]
+                        elif item_text == last_item_text:
+                            item_delta = ""
+                        else:
+                            item_delta = item_text
+                        last_item_text = item_text
+                        if item_delta:
+                            text_yielded = True
+                            pipe_log("  yielded text from item event")
+                            yield item_delta
+                            last_activity_time = time.time()
+
                 # --- Tool call events ---
                 if stream == "tool":
                     if phase == "start":
@@ -1200,6 +1249,22 @@ class Pipe:
                              f"title={str(data.get('title',''))[:50]}")
                     last_activity_time = time.time()
 
+                if not text_yielded and event_count >= max_events_without_text:
+                    recovered = await recover_from_preview()
+                    if recovered:
+                        pipe_log("  recovered assistant text after event cap")
+                        text_yielded = True
+                        yield recovered
+                    else:
+                        yield (
+                            "\n\n**Timeout:** The run emitted too many progress "
+                            "events without assistant text. The pipe kept the "
+                            "run from ending as `(no response)`, but the Gateway "
+                            "did not provide visible output."
+                        )
+                        text_yielded = True
+                    done = True
+
                 if (
                     not done
                     and first_event_arrived
@@ -1228,4 +1293,12 @@ class Pipe:
                  f"text yielded: {text_yielded}")
 
         if not aborted and not text_yielded:
-            yield "(no response)"
+            recovered = await recover_from_preview()
+            if recovered:
+                pipe_log("  recovered assistant text at final fallback")
+                yield recovered
+            else:
+                yield (
+                    "\n\n**No visible response:** The run ended without assistant "
+                    "text. Check OpenClaw logs for the missing final output event."
+                )

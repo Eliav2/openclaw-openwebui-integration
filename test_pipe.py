@@ -19,6 +19,7 @@ import urllib.request
 BASE = os.environ.get("OWUI_URL", "http://localhost:8080").rstrip("/") + "/api"
 DEFAULT_MODEL_ID = "openclaw_gateway.default"
 CHATGPT_MODEL_ID = "openclaw_gateway.chatgpt"
+API_TIMEOUT = int(os.environ.get("OWUI_API_TIMEOUT", "180"))
 
 # Will be set after login
 AUTH_TOKEN = None
@@ -35,7 +36,7 @@ def api(method: str, path: str, data: dict | None = None) -> dict:
     req = urllib.request.Request(url, data=body, headers=headers,
                                  method=method)
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=API_TIMEOUT) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         detail = e.read().decode()[:1000]
@@ -57,6 +58,7 @@ def fail(msg: str, detail: str = ""):
     if detail:
         for line in detail.strip().split("\n"):
             print(f"     {line}")
+    raise AssertionError(msg)
 
 
 def check(result: dict, expected_keys: list[str] | None = None,
@@ -90,8 +92,11 @@ def test(name: str, fn):
         fn()
         PASSED += 1
     except Exception as e:
-        fail("Exception", str(e))
         FAILED += 1
+        print("  ❌ Exception")
+        for line in str(e).strip().split("\n"):
+            if line:
+                print(f"     {line}")
 
 
 def send(payload: dict) -> dict:

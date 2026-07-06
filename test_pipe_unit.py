@@ -59,7 +59,12 @@ if "pydantic" not in sys.modules:
     pydantic.Field = _field
     sys.modules["pydantic"] = pydantic
 
-from openclaw_pipe import _GatewayConnection, _preview_recovery_text
+from openclaw_pipe import (
+    _GatewayConnection,
+    _coerce_text,
+    _item_assistant_text,
+    _preview_recovery_text,
+)
 
 
 class PreviewRecoveryTests(unittest.TestCase):
@@ -123,6 +128,29 @@ class EventConsumerMatchingTests(unittest.TestCase):
         consumers = conn.consumers_for_event({"sessionKey": "session-a"})
 
         self.assertEqual(consumers, [])
+
+
+class ItemTextExtractionTests(unittest.TestCase):
+    def test_coerces_text_from_content_blocks(self):
+        self.assertEqual(
+            _coerce_text([
+                {"type": "text", "text": "hello "},
+                {"type": "text", "text": "world"},
+            ]),
+            "hello world",
+        )
+
+    def test_extracts_preamble_text(self):
+        self.assertEqual(
+            _item_assistant_text({"kind": "preamble", "text": "visible"}),
+            "visible",
+        )
+
+    def test_ignores_non_assistant_item_kinds(self):
+        self.assertEqual(
+            _item_assistant_text({"kind": "tool", "text": "internal"}),
+            "",
+        )
 
 
 if __name__ == "__main__":
