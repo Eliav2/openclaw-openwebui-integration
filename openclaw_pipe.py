@@ -44,6 +44,8 @@ Installation
 7. The pipe appears in OWUI as two selectable models:
    - OpenClaw · Default: uses the agent's configured default model
    - ChatGPT · GPT-5.5: patches the session model to CHATGPT_MODEL
+  - Claude · Opus 4.8: patches the session model to OPUS_MODEL
+  - Claude · Sonnet 5: patches the session model to SONNET_MODEL
 """
 
 import asyncio
@@ -905,6 +907,14 @@ class Pipe:
             default="openai/gpt-5.5",
             description="OpenClaw model override used by the ChatGPT manifold model"
         )
+        OPUS_MODEL: str = Field(
+            default="anthropic/claude-opus-4.8",
+            description="OpenClaw model override used by the Opus 4.8 manifold model"
+        )
+        SONNET_MODEL: str = Field(
+            default="anthropic/claude-sonnet-5",
+            description="OpenClaw model override used by the Sonnet 5 manifold model"
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -919,6 +929,8 @@ class Pipe:
         return [
             {"id": "default", "name": "OpenClaw · Default"},
             {"id": "chatgpt", "name": "ChatGPT · GPT-5.5"},
+            {"id": "opus", "name": "Claude · Opus 4.8"},
+            {"id": "sonnet", "name": "Claude · Sonnet 5"},
         ]
 
     def _selected_preset(self, body):
@@ -926,11 +938,19 @@ class Pipe:
         suffix = model.rsplit(".", 1)[-1].rsplit("/", 1)[-1]
         if suffix == "chatgpt":
             return "chatgpt"
+        if suffix == "opus":
+            return "opus"
+        if suffix == "sonnet":
+            return "sonnet"
         return "default"
 
     def _model_override_for_preset(self, preset):
         if preset == "chatgpt":
             return self.valves.CHATGPT_MODEL.strip() or None
+        if preset == "opus":
+            return self.valves.OPUS_MODEL.strip() or None
+        if preset == "sonnet":
+            return self.valves.SONNET_MODEL.strip() or None
         return None
 
     async def pipe(self, body, __event_emitter__,
