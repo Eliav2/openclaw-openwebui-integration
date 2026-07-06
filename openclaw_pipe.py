@@ -552,6 +552,16 @@ class _GatewayConnection:
         self._consumers.pop(key, None)
         pipe_log(f"  unregistered consumer: {key[:60]}...")
 
+    def active_run_id_for_session(self, session_key: str) -> str | None:
+        """Return the sole active run id for a session, if one is registered."""
+        matches = [
+            consumer.run_id for consumer in self._consumers.values()
+            if consumer.session_key == session_key
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
     def consumers_for_event(self, payload: dict) -> list[_Consumer]:
         """Return consumers that should receive a Gateway event payload."""
         evt_session = payload.get("sessionKey", "")
@@ -1010,7 +1020,21 @@ class Pipe:
                 return
 
         # --- Send message and get runId ---
+        active_run_id = conn.active_run_id_for_session(session_key)
         idempotency_key = f"msg-{chat_id}-{time.time()}"
+
+        if active_run_id:
+            pipe_log(
+                "Active OpenClaw run already has an OWUI stream; "
+                f"rejecting overlapping request (active={active_run_id})"
+            )
+            yield (
+                "_OpenClaw is already working on this chat. I kept the active "
+                "stream stable; send the next message after the current answer "
+                "finishes._"
+            )
+            return
+
         try:
             send_resp = await conn.send_request(
                 "chat.send",

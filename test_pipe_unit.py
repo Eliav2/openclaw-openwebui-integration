@@ -129,6 +129,19 @@ class EventConsumerMatchingTests(unittest.TestCase):
 
         self.assertEqual(consumers, [])
 
+    def test_reports_sole_active_run_for_session(self):
+        conn = _GatewayConnection(lambda: None)
+        conn.register_consumer("session-a", "run-1")
+
+        self.assertEqual(conn.active_run_id_for_session("session-a"), "run-1")
+
+    def test_does_not_report_ambiguous_active_run(self):
+        conn = _GatewayConnection(lambda: None)
+        conn.register_consumer("session-a", "run-1")
+        conn.register_consumer("session-a", "run-2")
+
+        self.assertIsNone(conn.active_run_id_for_session("session-a"))
+
 
 class ItemTextExtractionTests(unittest.TestCase):
     def test_coerces_text_from_content_blocks(self):
