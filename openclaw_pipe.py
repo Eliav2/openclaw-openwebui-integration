@@ -1065,8 +1065,10 @@ class Pipe:
         last_item_text = ""
         wait_started_time = time.time()
         last_activity_time = time.time()
-        idle_probe_s = 45
-        no_text_deadman_s = 600
+        idle_probe_s = 30
+        no_text_deadman_s = 180
+        last_describe_check = 0.0
+        describe_check_interval = 45
         max_events_without_text = 5000
 
         async def recover_from_preview() -> str | None:
@@ -1116,7 +1118,36 @@ class Pipe:
                                         "done": False
                                     }}
                                 )
-                            continue
+                        # Periodically check if the Gateway still has an active run
+                        if time.time() - last_describe_check >= describe_check_interval:
+                            last_describe_check = time.time()
+                            try:
+                                desc = await conn.send_request(
+                                    "sessions.describe",
+                                    dict(key=session_key),
+                                    timeout=8
+                                )
+                                session_row = desc.get("session")
+                                if session_row is None:
+                                    pipe_log("  sessions.describe: session not found")
+                                elif session_row.get("status") in ("done", "failed", "cancelled"):
+                                    pipe_log("  sessions.describe: session is done/failed/cancelled, checking preview")
+                                    recovered2 = await recover_from_preview()
+                                    if recovered2 and not text_yielded:
+                                        pipe_log("  recovered assistant text after describe probe")
+                                        text_yielded = True
+                                        yield recovered2
+                                        done = True
+                                        break
+                                    elif not text_yielded:
+                                        pipe_log("  session done but no assistant text to recover; closing")
+                                        done = True
+                                        break
+                                else:
+                                    pipe_log(f"  sessions.describe: status={session_row.get('status','unknown')}")
+                            except Exception as ex:
+                                pipe_log(f"  sessions.describe probe failed: {ex}")
+                        continue
                         yield (
                             "\n\n**Timeout:** The run produced progress events "
                             "but no assistant text or terminal event. "
