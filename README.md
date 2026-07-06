@@ -43,7 +43,7 @@ This version works well for basic chat but has known issues being tracked for v1
 |-------|-------------|--------|
 | **Concurrent messages** | Sending a message while the agent is still responding now steers into the active run (no lock, no blocking, no garbling). | ✅ Fixed — persistent WS + steering |
 | **No stop button** | Pressing stop in OWUI now sends `chat.abort` to the Gateway. | ✅ Fixed — CancelledError triggers abort |
-| **60s idle timeout** | Long agent runs no longer cut off — tick keepalive keeps the shared connection alive. | ✅ Fixed — persistent connection + tick handler |
+| **60s idle timeout** | Long agent runs no longer treat silence as completion before assistant text arrives. Session-only terminal events are dispatched when unambiguous, and quiet periods probe `sessions.preview` before recovering or continuing. | ✅ Fixed — terminal/recovery flow + deadman only |
 | **Per-message reconnect** | WS handshake + crypto every message is gone. | ✅ Fixed — singleton connection |
 | **Session bleed** | Events from other chats/surfaces can appear mid-response. | ✅ Fixed — event dispatcher demuxes by sessionKey/runId |
 | **Title/tag pollution** | OWUI background tasks (auto-title, tags, follow-up suggestions) pollute the OpenClaw session. | ✅ Fixed — task short-circuit (Phase 0) |

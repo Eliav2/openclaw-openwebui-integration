@@ -391,6 +391,51 @@ class GatewayError(Exception):
     pass
 
 
+def _preview_recovery_text(preview: dict, session_key: str, user_text: str) -> str | None:
+    """Return assistant text saved after this user message, if preview has it."""
+    previews = preview.get("previews")
+    if not isinstance(previews, list):
+        return None
+
+    entry = None
+    for candidate in previews:
+        if isinstance(candidate, dict) and candidate.get("key") == session_key:
+            entry = candidate
+            break
+    if not entry:
+        return None
+
+    items = entry.get("items")
+    if not isinstance(items, list):
+        return None
+
+    normalized_user_text = (user_text or "").strip()
+    if not normalized_user_text:
+        return None
+
+    last_matching_user_index = None
+    for idx, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        if item.get("role") != "user":
+            continue
+        if str(item.get("text", "")).strip() == normalized_user_text:
+            last_matching_user_index = idx
+
+    if last_matching_user_index is None:
+        return None
+
+    for item in items[last_matching_user_index + 1:]:
+        if not isinstance(item, dict):
+            continue
+        if item.get("role") != "assistant":
+            continue
+        text = str(item.get("text", "")).strip()
+        if text:
+            return text
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Persistent Gateway Connection (singleton)
 # ---------------------------------------------------------------------------
@@ -478,6 +523,30 @@ class _GatewayConnection:
         key = f"{session_key}:{run_id}"
         self._consumers.pop(key, None)
         pipe_log(f"  unregistered consumer: {key[:60]}...")
+
+    def consumers_for_event(self, payload: dict) -> list[_Consumer]:
+        """Return consumers that should receive a Gateway event payload."""
+        evt_session = payload.get("sessionKey", "")
+        evt_run_id = payload.get("runId", "")
+        if evt_session and evt_run_id:
+            consumer = self._consumers.get(f"{evt_session}:{evt_run_id}")
+            return [consumer] if consumer else []
+        if evt_session and not evt_run_id:
+            matches = [
+                consumer for consumer in self._consumers.values()
+                if consumer.session_key == evt_session
+            ]
+            return matches if len(matches) == 1 else []
+        return []
+
+    async def session_preview(self, session_key: str, limit: int = 8,
+                              max_chars: int = 4000) -> dict:
+        """Fetch a bounded transcript preview for timeout recovery."""
+        return await self.send_request(
+            "sessions.preview",
+            dict(keys=[session_key], limit=limit, maxChars=max_chars),
+            timeout=10
+        )
 
     async def abort(self, session_key: str, run_id: str):
         """Send chat.abort for an active run."""
@@ -668,21 +737,17 @@ class _GatewayConnection:
                     continue
 
                 payload = msg.get("payload", {})
-                evt_session = payload.get("sessionKey", "")
-                evt_run_id = payload.get("runId", "")
+                consumers = self.consumers_for_event(payload)
+                if consumers:
+                    self._event_count += 1
+                    if not payload.get("runId"):
+                        pipe_log("  dispatched session-only event to sole consumer")
+                    await consumers[0].queue.put(msg)
+                    continue
+                if payload.get("sessionKey") and not payload.get("runId"):
+                    pipe_log("  dropped ambiguous or unmatched session-only event")
 
-                # Find the matching consumer
-                if evt_session and evt_run_id:
-                    key = f"{evt_session}:{evt_run_id}"
-                    consumer = self._consumers.get(key)
-                    if consumer:
-                        self._event_count += 1
-                        await consumer.queue.put(msg)
-                        continue
-
-                # If session matches but run_id doesn't (e.g. lifecycle/end
-                # for a completed run that was already unregistered), drop it.
-                # If nothing matches at all — drop it.
+                # If nothing matches at all, drop it.
                 # This efficiently filters cross-session bleed (P16).
 
             except asyncio.TimeoutError:
@@ -945,21 +1010,67 @@ class Pipe:
         text_yielded = False
         aborted = False
         first_event_arrived = False
+        wait_started_time = time.time()
         last_activity_time = time.time()
-        grace_after_last_event_s = 45
+        idle_probe_s = 45
+        no_text_deadman_s = 600
 
         try:
             while not done and event_count < 500:
                 try:
-                    recv_timeout = grace_after_last_event_s if first_event_arrived else 60
+                    recv_timeout = idle_probe_s if first_event_arrived else 60
                     msg = await asyncio.wait_for(queue.get(), timeout=recv_timeout)
                 except asyncio.TimeoutError:
                     timeout_desc = (
-                        f"{grace_after_last_event_s}s"
+                        f"{idle_probe_s}s"
                         if first_event_arrived
                         else "60s"
                     )
                     pipe_log(f"TIMEOUT — no events on queue for {timeout_desc}")
+                    if not first_event_arrived:
+                        yield "**Timeout:** Gateway accepted the message but emitted no run events."
+                        text_yielded = True
+                        break
+
+                    try:
+                        preview = await conn.session_preview(session_key)
+                        recovered = _preview_recovery_text(preview, session_key, text)
+                    except Exception as ex:
+                        recovered = None
+                        pipe_log(f"  preview recovery failed: {ex}")
+
+                    if recovered and not text_yielded:
+                        pipe_log("  recovered assistant text from sessions.preview")
+                        text_yielded = True
+                        yield recovered
+                        done = True
+                        break
+
+                    if not text_yielded:
+                        elapsed = time.time() - wait_started_time
+                        if elapsed < no_text_deadman_s:
+                            pipe_log(
+                                "  idle but no assistant text yet; "
+                                "continuing to wait for terminal event"
+                            )
+                            if __event_emitter__:
+                                await __event_emitter__(
+                                    {"type": "status", "data": {
+                                        "description": "Waiting for final answer...",
+                                        "done": False
+                                    }}
+                                )
+                            continue
+                        yield (
+                            "\n\n**Timeout:** The run produced progress events "
+                            "but no assistant text or terminal event. "
+                            "Please retry; the Gateway may have lost the final event."
+                        )
+                        text_yielded = True
+                        done = True
+                        break
+
+                    pipe_log("  assistant text already streamed; closing after idle probe")
                     break
 
                 event_count += 1
@@ -1092,11 +1203,12 @@ class Pipe:
                 if (
                     not done
                     and first_event_arrived
-                    and time.time() - last_activity_time > grace_after_last_event_s
+                    and text_yielded
+                    and time.time() - last_activity_time > idle_probe_s
                 ):
                     pipe_log(
-                        "  grace timer: no activity for "
-                        f"{grace_after_last_event_s}s, self-closing"
+                        "  idle probe: text already streamed and no activity for "
+                        f"{idle_probe_s}s, self-closing"
                     )
                     done = True
 

@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""Focused unit tests for pipe stream recovery behavior."""
+
+import unittest
+import sys
+import types
+
+if "websockets" not in sys.modules:
+    websockets_stub = types.SimpleNamespace(
+        WebSocketClientProtocol=object,
+        exceptions=types.SimpleNamespace(ConnectionClosed=Exception),
+    )
+    sys.modules["websockets"] = websockets_stub
+
+if "cryptography" not in sys.modules:
+    crypto = types.ModuleType("cryptography")
+    hazmat = types.ModuleType("cryptography.hazmat")
+    primitives = types.ModuleType("cryptography.hazmat.primitives")
+    asymmetric = types.ModuleType("cryptography.hazmat.primitives.asymmetric")
+    ed25519 = types.ModuleType("cryptography.hazmat.primitives.asymmetric.ed25519")
+    serialization = types.ModuleType("cryptography.hazmat.primitives.serialization")
+    backends = types.ModuleType("cryptography.hazmat.backends")
+
+    class _DummyPrivateKey:
+        @staticmethod
+        def generate():
+            raise RuntimeError("cryptography stub cannot generate keys")
+
+    ed25519.Ed25519PrivateKey = _DummyPrivateKey
+    serialization.Encoding = types.SimpleNamespace(Raw="Raw", PEM="PEM")
+    serialization.PublicFormat = types.SimpleNamespace(Raw="Raw")
+    serialization.PrivateFormat = types.SimpleNamespace(PKCS8="PKCS8")
+    serialization.NoEncryption = lambda: None
+    serialization.load_pem_private_key = lambda *args, **kwargs: None
+    backends.default_backend = lambda: None
+
+    sys.modules["cryptography"] = crypto
+    sys.modules["cryptography.hazmat"] = hazmat
+    sys.modules["cryptography.hazmat.primitives"] = primitives
+    sys.modules["cryptography.hazmat.primitives.asymmetric"] = asymmetric
+    sys.modules["cryptography.hazmat.primitives.asymmetric.ed25519"] = ed25519
+    sys.modules["cryptography.hazmat.primitives.serialization"] = serialization
+    sys.modules["cryptography.hazmat.backends"] = backends
+
+if "pydantic" not in sys.modules:
+    pydantic = types.ModuleType("pydantic")
+
+    class _BaseModel:
+        def __init__(self, **kwargs):
+            for name, value in self.__class__.__dict__.items():
+                if name.startswith("_") or callable(value):
+                    continue
+                setattr(self, name, kwargs.get(name, value))
+
+    def _field(*, default=None, **kwargs):
+        return default
+
+    pydantic.BaseModel = _BaseModel
+    pydantic.Field = _field
+    sys.modules["pydantic"] = pydantic
+
+from openclaw_pipe import _GatewayConnection, _preview_recovery_text
+
+
+class PreviewRecoveryTests(unittest.TestCase):
+    def test_recovers_assistant_after_matching_user_message(self):
+        preview = {
+            "previews": [{
+                "key": "agent:main:test",
+                "items": [
+                    {"role": "user", "text": "old"},
+                    {"role": "assistant", "text": "old answer"},
+                    {"role": "user", "text": "current question"},
+                    {"role": "assistant", "text": "current answer"},
+                ],
+            }]
+        }
+        self.assertEqual(
+            _preview_recovery_text(preview, "agent:main:test", "current question"),
+            "current answer",
+        )
+
+    def test_does_not_recover_without_matching_user_message(self):
+        preview = {
+            "previews": [{
+                "key": "agent:main:test",
+                "items": [{"role": "assistant", "text": "answer"}],
+            }]
+        }
+        self.assertIsNone(
+            _preview_recovery_text(preview, "agent:main:test", "current question")
+        )
+
+
+class EventConsumerMatchingTests(unittest.TestCase):
+    def test_matches_exact_session_and_run(self):
+        conn = _GatewayConnection(lambda: None)
+        conn.register_consumer("session-a", "run-1")
+        conn.register_consumer("session-a", "run-2")
+
+        consumers = conn.consumers_for_event({
+            "sessionKey": "session-a",
+            "runId": "run-2",
+        })
+
+        self.assertEqual(len(consumers), 1)
+        self.assertEqual(consumers[0].run_id, "run-2")
+
+    def test_matches_session_only_event_when_unambiguous(self):
+        conn = _GatewayConnection(lambda: None)
+        conn.register_consumer("session-a", "run-1")
+
+        consumers = conn.consumers_for_event({"sessionKey": "session-a"})
+
+        self.assertEqual(len(consumers), 1)
+        self.assertEqual(consumers[0].run_id, "run-1")
+
+    def test_drops_session_only_event_when_ambiguous(self):
+        conn = _GatewayConnection(lambda: None)
+        conn.register_consumer("session-a", "run-1")
+        conn.register_consumer("session-a", "run-2")
+
+        consumers = conn.consumers_for_event({"sessionKey": "session-a"})
+
+        self.assertEqual(consumers, [])
+
+
+if __name__ == "__main__":
+    unittest.main()
