@@ -349,59 +349,16 @@ async def _emit_message_snapshot(__event_emitter__, content):
 
 
 def _is_user_input_prompt(text: str) -> bool:
-    """Return True for OpenClaw/Codex blocking user-input prompts or [[ASK_USER:...]] blocks."""
+    """Return True for OpenClaw/Codex blocking user-input prompts."""
     normalized = (text or "").lstrip()
     return (
         normalized.startswith("Codex needs input:")
         or normalized.startswith("OpenClaw needs input:")
-        or normalized.startswith("[[ASK_USER:")
     )
 
 
-def _parse_ask_user_block(text: str) -> dict | None:
-    """Parse [[ASK_USER:{"question":"...","choices":[...],"secret":false}]] into a dict."""
-    import re
-    match = re.search(r'\[\[ASK_USER:(.*?)\]\]', text, re.DOTALL)
-    if not match:
-        return None
-    try:
-        return json.loads(match.group(1))
-    except (json.JSONDecodeError, Exception):
-        return None
-
-
 def _modal_payload_from_user_input_prompt(prompt_text: str) -> dict:
-    """Build an OWUI modal payload from [[ASK_USER:...]] or legacy "needs input:" prompt text."""
-    normalized = (prompt_text or "").lstrip()
-
-    # Structured [[ASK_USER:...]] format
-    if normalized.startswith("[[ASK_USER:"):
-        parsed = _parse_ask_user_block(normalized)
-        if parsed:
-            question = parsed.get("question", "")
-            choices = parsed.get("choices", [])
-            secret = parsed.get("secret", False)
-            if choices and len(choices) <= 5:
-                return {
-                    "type": "confirm",
-                    "data": {
-                        "title": "Agent needs input",
-                        "message": question,
-                        "options": choices,
-                        "confirm_text": "Send",
-                    },
-                }
-            return {
-                "type": "input",
-                "data": {
-                    "title": "Agent needs input",
-                    "message": question,
-                    "placeholder": "Type your answer...",
-                    "input_type": "password" if secret else "text",
-                },
-            }
-
-    # Legacy "Codex/OpenClaw needs input:" format
+    """Build an OWUI modal payload from OpenClaw's "needs input:" prompt text."""
     lines = [line.strip() for line in (prompt_text or "").splitlines()]
     lines = [line for line in lines if line]
     if lines and lines[0].endswith("needs input:"):
@@ -1422,10 +1379,6 @@ class Pipe:
             last_snapshot_text = visible_message_text
             last_snapshot_time = now
 
-        # Track accumulated assistant text for [[ASK_USER:...]] detection
-        # across streaming chunks.
-        assistant_stream_text = ""
-
         async def maybe_answer_user_input(prompt_text: str) -> bool:
             if not _is_user_input_prompt(prompt_text):
                 return False
@@ -1456,23 +1409,6 @@ class Pipe:
                 pipe_log(f"  sending answer back failed: {ex}")
             await _emit_status(__event_emitter__, "Answer sent; continuing...", done=False)
             return True
-
-        def extract_ask_user_block(text: str) -> tuple[str | None, str | None]:
-            """Find [[ASK_USER:{...}]] in accumulated text.
-            Returns (full_block, extracted_text) or (None, None) if not found.
-            """
-            idx = text.find("[[ASK_USER:")
-            if idx == -1:
-                return None, None
-            end = text.find("]]", idx)
-            if end == -1:
-                return None, None
-            full_block = text[idx:end+2]
-            return full_block, full_block
-
-        def accumulated_has_ask_user() -> tuple[str | None, str | None]:
-            """Check accumulated assistant_stream_text for a complete [[ASK_USER:...]] block."""
-            return extract_ask_user_block(assistant_stream_text)
 
         try:
             while not done:
@@ -1640,31 +1576,6 @@ class Pipe:
                         ):
                             pipe_log("  filtered metadata block")
                             continue
-                        # Accumulate first, then check for complete [[ASK_USER:...]] block
-                        # (the block may span multiple streaming chunks).
-                        assistant_stream_text += delta
-                        ask_block, _ = accumulated_has_ask_user()
-                        if ask_block:
-                            pipe_log(f"  found [[ASK_USER:...]] block in accumulated text")
-                            stripped_text = assistant_stream_text.replace(ask_block, "", 1)
-                            answered = await maybe_answer_user_input(ask_block)
-                            if answered:
-                                # Modal succeeded — strip the ask block from visible text
-                                assistant_stream_text = stripped_text
-                                if stripped_text:
-                                    text_yielded = True
-                                    record_visible_chunk(stripped_text)
-                                    yield stripped_text
-                                last_activity_time = time.time()
-                            else:
-                                # Modal failed — yield the accumulated text as plain question
-                                pipe_log("  ask-user modal failed; yielding question as plain text")
-                                text_yielded = True
-                                record_visible_chunk(assistant_stream_text)
-                                yield assistant_stream_text
-                            last_activity_time = time.time()
-                            continue
-                        # Original legacy single-chunk check ("Codex needs input:" etc.)
                         if await maybe_answer_user_input(delta):
                             last_activity_time = time.time()
                             continue
