@@ -349,16 +349,59 @@ async def _emit_message_snapshot(__event_emitter__, content):
 
 
 def _is_user_input_prompt(text: str) -> bool:
-    """Return True for OpenClaw/Codex blocking user-input prompts."""
+    """Return True for OpenClaw/Codex blocking user-input prompts or [[ASK_USER:...]] blocks."""
     normalized = (text or "").lstrip()
     return (
         normalized.startswith("Codex needs input:")
         or normalized.startswith("OpenClaw needs input:")
+        or normalized.startswith("[[ASK_USER:")
     )
 
 
+def _parse_ask_user_block(text: str) -> dict | None:
+    """Parse [[ASK_USER:{"question":"...","choices":[...],"secret":false}]] into a dict."""
+    import re
+    match = re.search(r'\[\[ASK_USER:(.*?)\]\]', text, re.DOTALL)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(1))
+    except (json.JSONDecodeError, Exception):
+        return None
+
+
 def _modal_payload_from_user_input_prompt(prompt_text: str) -> dict:
-    """Build a simple OWUI input modal payload from OpenClaw's prompt text."""
+    """Build an OWUI modal payload from [[ASK_USER:...]] or legacy "needs input:" prompt text."""
+    normalized = (prompt_text or "").lstrip()
+
+    # Structured [[ASK_USER:...]] format
+    if normalized.startswith("[[ASK_USER:"):
+        parsed = _parse_ask_user_block(normalized)
+        if parsed:
+            question = parsed.get("question", "")
+            choices = parsed.get("choices", [])
+            secret = parsed.get("secret", False)
+            if choices and len(choices) <= 5:
+                return {
+                    "type": "confirm",
+                    "data": {
+                        "title": "Agent needs input",
+                        "message": question,
+                        "options": choices,
+                        "confirm_text": "Send",
+                    },
+                }
+            return {
+                "type": "input",
+                "data": {
+                    "title": "Agent needs input",
+                    "message": question,
+                    "placeholder": "Type your answer...",
+                    "input_type": "password" if secret else "text",
+                },
+            }
+
+    # Legacy "Codex/OpenClaw needs input:" format
     lines = [line.strip() for line in (prompt_text or "").splitlines()]
     lines = [line for line in lines if line]
     if lines and lines[0].endswith("needs input:"):
@@ -395,6 +438,10 @@ def _normalize_event_call_response(response) -> str:
             value = response.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
+        # Confirm type with options
+        value = response.get("option")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
         if response.get("confirmed") is True:
             return "yes"
         if response.get("confirmed") is False:
