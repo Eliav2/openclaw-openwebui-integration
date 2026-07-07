@@ -62,6 +62,7 @@ if "pydantic" not in sys.modules:
 from openclaw_pipe import (
     _GatewayConnection,
     _coerce_text,
+    _emit_message_snapshot,
     _emit_status,
     _item_assistant_text,
     _item_delta_text,
@@ -261,6 +262,35 @@ class StatusEmitterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_emitter_is_noop(self):
         await _emit_status(None, "Thinking...", done=False)
+
+
+class MessageSnapshotEmitterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_emits_persisted_replace_event(self):
+        events = []
+
+        async def emitter(event):
+            events.append(event)
+
+        await _emit_message_snapshot(emitter, "partial answer")
+
+        self.assertEqual(
+            events,
+            [{
+                "type": "replace",
+                "data": {"content": "partial answer"},
+            }],
+        )
+
+    async def test_missing_emitter_or_empty_content_is_noop(self):
+        events = []
+
+        async def emitter(event):
+            events.append(event)
+
+        await _emit_message_snapshot(None, "partial answer")
+        await _emit_message_snapshot(emitter, "")
+
+        self.assertEqual(events, [])
 
 
 if __name__ == "__main__":

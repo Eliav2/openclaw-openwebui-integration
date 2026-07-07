@@ -333,6 +333,21 @@ async def _emit_status(__event_emitter__, description, *, done=False):
     )
 
 
+async def _emit_message_snapshot(__event_emitter__, content):
+    """Persist the in-flight assistant message content for OWUI reloads.
+
+    Pipe yielded content is still the final source of truth, but OWUI only saves
+    that content when the pipe completes. A short-name `replace` event updates
+    the message content in the DB while the run is still active, so navigating
+    away and back can rehydrate the partial response.
+    """
+    if not __event_emitter__ or not content:
+        return
+    await __event_emitter__(
+        {"type": "replace", "data": {"content": content}}
+    )
+
+
 def _start_file_server(port=18791):
     """Start a minimal HTTP server for media files. Starts once per process."""
     global _file_server_started
@@ -1189,6 +1204,11 @@ class Pipe:
         first_event_arrived = False
         last_item_text = ""
         assistant_stream_text = ""
+        visible_message_text = ""
+        last_snapshot_text = ""
+        last_snapshot_time = 0.0
+        snapshot_interval_s = 1.0
+        snapshot_min_delta_chars = 250
         wait_started_time = time.time()
         last_activity_time = time.time()
         idle_probe_s = 30
@@ -1204,6 +1224,27 @@ class Pipe:
             except Exception as ex:
                 pipe_log(f"  preview recovery failed: {ex}")
                 return None
+
+        def record_visible_chunk(chunk: str):
+            nonlocal visible_message_text
+            if chunk:
+                visible_message_text += chunk
+
+        async def maybe_emit_snapshot(*, force: bool = False):
+            nonlocal last_snapshot_text, last_snapshot_time
+            if not visible_message_text or visible_message_text == last_snapshot_text:
+                return
+            now = time.time()
+            if (
+                not force
+                and last_snapshot_text
+                and now - last_snapshot_time < snapshot_interval_s
+                and len(visible_message_text) - len(last_snapshot_text) < snapshot_min_delta_chars
+            ):
+                return
+            await _emit_message_snapshot(__event_emitter__, visible_message_text)
+            last_snapshot_text = visible_message_text
+            last_snapshot_time = now
 
         try:
             while not done:
@@ -1226,7 +1267,9 @@ class Pipe:
                     if recovered and not text_yielded:
                         pipe_log("  recovered assistant text from sessions.preview")
                         text_yielded = True
+                        record_visible_chunk(recovered)
                         yield recovered
+                        await maybe_emit_snapshot(force=True)
                         done = True
                         break
 
@@ -1281,7 +1324,9 @@ class Pipe:
                                 if recovered2 and not text_yielded:
                                     pipe_log("  recovered assistant text after describe probe")
                                     text_yielded = True
+                                    record_visible_chunk(recovered2)
                                     yield recovered2
+                                    await maybe_emit_snapshot(force=True)
                                 done = True
                                 break
                             else:
@@ -1376,11 +1421,15 @@ class Pipe:
                                 )
                             if handled:
                                 pipe_log("  resolved MEDIA: directive")
+                                record_visible_chunk(resolved)
                                 yield resolved
+                                await maybe_emit_snapshot()
                                 last_activity_time = time.time()
                                 continue
                         assistant_stream_text += delta
+                        record_visible_chunk(delta)
                         yield delta
+                        await maybe_emit_snapshot()
                         last_activity_time = time.time()
 
                 # --- Assistant text carried by item/preamble events ---
@@ -1394,7 +1443,9 @@ class Pipe:
                         if item_delta:
                             text_yielded = True
                             pipe_log("  yielded text from item event")
+                            record_visible_chunk(item_delta)
                             yield item_delta
+                            await maybe_emit_snapshot()
                             last_activity_time = time.time()
 
                 # --- Tool call events ---
@@ -1419,7 +1470,7 @@ class Pipe:
                         stored_args = self._active_tool_args.pop(tool_call_id, None)
                         args_str = stored_args or json.dumps(data.get("args", {}))
                         pipe_log(f"  Tool result: {name} ({len(result_str)} chars)")
-                        yield (
+                        tool_block = (
                             '\n<details type="tool_calls" done="true" '
                             f'id="{html.escape(tool_call_id)}" '
                             f'name="{html.escape(name)}" '
@@ -1429,6 +1480,9 @@ class Pipe:
                             'files="[]" embeds="[]">'
                             f'\n<summary>{html.escape(name)}</summary>\n</details>\n'
                         )
+                        record_visible_chunk(tool_block)
+                        yield tool_block
+                        await maybe_emit_snapshot(force=True)
                         await _emit_status(
                             __event_emitter__,
                             f"{name} done",
@@ -1448,14 +1502,19 @@ class Pipe:
                     if recovered:
                         pipe_log("  recovered assistant text after event cap")
                         text_yielded = True
+                        record_visible_chunk(recovered)
                         yield recovered
+                        await maybe_emit_snapshot(force=True)
                     else:
-                        yield (
+                        timeout_text = (
                             "\n\n**Timeout:** The run emitted too many progress "
                             "events without assistant text. The pipe kept the "
                             "run from ending as `(no response)`, but the Gateway "
                             "did not provide visible output."
                         )
+                        record_visible_chunk(timeout_text)
+                        yield timeout_text
+                        await maybe_emit_snapshot(force=True)
                         text_yielded = True
                     done = True
 
@@ -1475,6 +1534,7 @@ class Pipe:
             # OWUI stop button → abort the gateway run
             aborted = True
             pipe_log("Generator cancelled — sending chat.abort")
+            await maybe_emit_snapshot(force=True)
             await _emit_status(__event_emitter__, "Stopped", done=True)
             await conn.abort(session_key, our_run_id)
             if self.valves.SEND_STOP_ON_CANCEL:
@@ -1483,6 +1543,7 @@ class Pipe:
             raise  # Re-raise to signal proper cancellation
 
         finally:
+            await maybe_emit_snapshot(force=True)
             await _emit_status(__event_emitter__, "", done=True)
             conn.unregister_consumer(session_key, our_run_id, queue=queue)
             self._current_session_key = None
@@ -1495,9 +1556,14 @@ class Pipe:
             recovered = await recover_from_preview()
             if recovered:
                 pipe_log("  recovered assistant text at final fallback")
+                record_visible_chunk(recovered)
                 yield recovered
+                await maybe_emit_snapshot(force=True)
             else:
-                yield (
+                no_response_text = (
                     "\n\n**No visible response:** The run ended without assistant "
                     "text. Check OpenClaw logs for the missing final output event."
                 )
+                record_visible_chunk(no_response_text)
+                yield no_response_text
+                await maybe_emit_snapshot(force=True)
