@@ -428,12 +428,17 @@ def _modal_payload_from_user_input_prompt(prompt_text: str) -> dict:
 
 
 def _normalize_event_call_response(response) -> str:
-    """Extract text from common OWUI __event_call__ return shapes."""
+    """Extract text from common OWUI __event_call__ return shapes.
+    Returns empty string for errors, None, or unrecognized shapes.
+    """
     if response is None:
         return ""
     if isinstance(response, str):
         return response.strip()
     if isinstance(response, dict):
+        # Error responses
+        if "error" in response:
+            return ""
         for key in ("value", "text", "content", "message", "response"):
             value = response.get(key)
             if isinstance(value, str) and value.strip():
@@ -446,7 +451,7 @@ def _normalize_event_call_response(response) -> str:
             return "yes"
         if response.get("confirmed") is False:
             return "no"
-    return str(response).strip()
+    return ""
 
 
 async def _ask_user_input_modal(
@@ -1417,6 +1422,10 @@ class Pipe:
             last_snapshot_text = visible_message_text
             last_snapshot_time = now
 
+        # Track accumulated assistant text for [[ASK_USER:...]] detection
+        # across streaming chunks.
+        assistant_stream_text = ""
+
         async def maybe_answer_user_input(prompt_text: str) -> bool:
             if not _is_user_input_prompt(prompt_text):
                 return False
@@ -1426,23 +1435,44 @@ class Pipe:
                 pipe_log(f"  user input modal failed; falling back to chat prompt: {ex}")
                 return False
             if not answer:
+                pipe_log("  user input modal returned empty answer or error")
                 return False
             pipe_log("  user input answered via OWUI modal")
             await _emit_status(__event_emitter__, "Sending answer...", done=False)
             idempotency_key = f"user-input-{chat_id}-{time.time()}"
-            await conn.send_request(
-                "chat.send",
-                _owui_chat_send_params(
-                    session_key=session_key,
-                    message=answer,
-                    idempotency_key=idempotency_key,
-                    owui_chat_id=owui_origin_chat_id,
-                    owui_user_id=owui_origin_user_id,
-                ),
-                timeout=30,
-            )
+            try:
+                await conn.send_request(
+                    "chat.send",
+                    _owui_chat_send_params(
+                        session_key=session_key,
+                        message=answer,
+                        idempotency_key=idempotency_key,
+                        owui_chat_id=owui_origin_chat_id,
+                        owui_user_id=owui_origin_user_id,
+                    ),
+                    timeout=30,
+                )
+            except Exception as ex:
+                pipe_log(f"  sending answer back failed: {ex}")
             await _emit_status(__event_emitter__, "Answer sent; continuing...", done=False)
             return True
+
+        def extract_ask_user_block(text: str) -> tuple[str | None, str | None]:
+            """Find [[ASK_USER:{...}]] in accumulated text.
+            Returns (full_block, extracted_text) or (None, None) if not found.
+            """
+            idx = text.find("[[ASK_USER:")
+            if idx == -1:
+                return None, None
+            end = text.find("]]", idx)
+            if end == -1:
+                return None, None
+            full_block = text[idx:end+2]
+            return full_block, full_block
+
+        def accumulated_has_ask_user() -> tuple[str | None, str | None]:
+            """Check accumulated assistant_stream_text for a complete [[ASK_USER:...]] block."""
+            return extract_ask_user_block(assistant_stream_text)
 
         try:
             while not done:
@@ -1610,6 +1640,23 @@ class Pipe:
                         ):
                             pipe_log("  filtered metadata block")
                             continue
+                        # Accumulate first, then check for complete [[ASK_USER:...]] block
+                        # (the block may span multiple streaming chunks).
+                        assistant_stream_text += delta
+                        ask_block, _ = accumulated_has_ask_user()
+                        if ask_block:
+                            pipe_log(f"  found [[ASK_USER:...]] block in accumulated text")
+                            # Strip the ask block from what we yield
+                            stripped_text = assistant_stream_text.replace(ask_block, "", 1)
+                            assistant_stream_text = stripped_text
+                            if stripped_text:
+                                text_yielded = True
+                                record_visible_chunk(stripped_text)
+                                yield stripped_text
+                            await maybe_answer_user_input(ask_block)
+                            last_activity_time = time.time()
+                            continue
+                        # Original legacy single-chunk check ("Codex needs input:" etc.)
                         if await maybe_answer_user_input(delta):
                             last_activity_time = time.time()
                             continue
