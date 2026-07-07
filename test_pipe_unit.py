@@ -66,6 +66,8 @@ from openclaw_pipe import (
     _emit_status,
     _item_assistant_text,
     _item_delta_text,
+    _model_patch_matches,
+    _owui_session_key,
     _preview_recovery_text,
     _resolve_media,
 )
@@ -145,6 +147,24 @@ class EventConsumerMatchingTests(unittest.TestCase):
         conn.register_consumer("session-a", "run-2")
 
         self.assertIsNone(conn.active_run_id_for_session("session-a"))
+
+
+class OwuiSessionModelTests(unittest.TestCase):
+    def test_session_key_is_stable_across_model_presets(self):
+        expected = "agent:main:openwebui-user-123-chat-456"
+
+        self.assertEqual(_owui_session_key("main", "user-123", "chat-456"), expected)
+
+    def test_model_patch_matches_explicit_override(self):
+        patch_resp = {"resolved": {"modelProvider": "openai", "model": "gpt-5.5"}}
+
+        self.assertTrue(_model_patch_matches("openai/gpt-5.5", patch_resp))
+        self.assertFalse(_model_patch_matches("anthropic/claude-sonnet-5", patch_resp))
+
+    def test_model_patch_reset_accepts_resolved_agent_default(self):
+        patch_resp = {"resolved": {"modelProvider": "openai", "model": "gpt-5-mini"}}
+
+        self.assertTrue(_model_patch_matches(None, patch_resp))
 
 
 class ItemTextExtractionTests(unittest.TestCase):

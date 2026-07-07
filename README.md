@@ -138,20 +138,22 @@ new devices or requiring repeated approvals.
 
 ### OWUI model selector
 
-The pipe is a manifold function, so one OWUI function ID exposes two models:
+The pipe is a manifold function, so one OWUI function ID exposes multiple models:
 
 | OWUI model ID | Display name | OpenClaw behavior |
 |---------------|--------------|-------------------|
 | `openclaw_gateway.default` | `OpenClaw · Default` | Uses the agent's configured default model |
 | `openclaw_gateway.chatgpt` | `ChatGPT · GPT-5.5` | Patches that OWUI conversation's OpenClaw session to `CHATGPT_MODEL` |
+| `openclaw_gateway.opus` | `Claude · Opus 4.8` | Patches that OWUI conversation's OpenClaw session to `OPUS_MODEL` |
+| `openclaw_gateway.sonnet` | `Claude · Sonnet 5` | Patches that OWUI conversation's OpenClaw session to `SONNET_MODEL` |
 
-The default ChatGPT override is `openai/gpt-5.5`. Change it with either the
-`CHATGPT_MODEL` environment variable during install/repair, the
-`--chatgpt-model` installer flag, or the `CHATGPT_MODEL` valve in OWUI.
+The default ChatGPT override is `openai/gpt-5.5`. Change model overrides with
+the `CHATGPT_MODEL`, `OPUS_MODEL`, and `SONNET_MODEL` valves in OWUI.
 
-Each selector entry gets a separate OpenClaw session suffix, so switching
-between default and ChatGPT in the same OWUI chat does not mix the two model
-contexts.
+One OWUI conversation maps to one OpenClaw session regardless of the selected
+model. Switching selector entries patches that same session before sending the
+next message; switching back to `OpenClaw · Default` clears the session model
+override and returns to the agent's configured default model.
 
 ### Native OWUI media delivery
 

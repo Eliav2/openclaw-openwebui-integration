@@ -456,6 +456,25 @@ def _preview_recovery_text(preview: dict, session_key: str, user_text: str) -> s
     return None
 
 
+def _owui_session_key(agent_id: str, user_id: str, chat_id: str) -> str:
+    return f"agent:{agent_id}:openwebui-{user_id}-{chat_id}"
+
+
+def _resolved_model_key(patch_resp: dict) -> str | None:
+    resolved = patch_resp.get("resolved", {})
+    provider = resolved.get("modelProvider")
+    model = resolved.get("model")
+    if provider and model:
+        return f"{provider}/{model}"
+    return None
+
+
+def _model_patch_matches(model_override: str | None, patch_resp: dict) -> bool:
+    if model_override is None:
+        return True
+    return _resolved_model_key(patch_resp) == model_override
+
+
 def _coerce_text(value) -> str:
     """Extract text from common stream payload shapes."""
     if isinstance(value, str):
@@ -1092,39 +1111,31 @@ class Pipe:
             chat_id = f"owui-{uuid.uuid4().hex[:12]}"
             pipe_log("WARNING: no chat_id in metadata, generated random:", chat_id)
 
-        preset_suffix = "" if body.get("model") == "openclaw_gateway" else f"-{preset}"
-        session_key = (
-            f"agent:{self.valves.AGENT_ID}:"
-            f"openwebui-{user_id}-{chat_id}{preset_suffix}"
-        )
+        session_key = _owui_session_key(self.valves.AGENT_ID, user_id, chat_id)
         pipe_log(f"Session key: {session_key}")
         self._current_session_key = session_key
 
-        if model_override:
-            try:
-                patch_resp = await conn.send_request(
-                    "sessions.patch",
-                    dict(key=session_key, model=model_override),
-                    timeout=10
+        try:
+            patch_resp = await conn.send_request(
+                "sessions.patch",
+                dict(key=session_key, model=model_override),
+                timeout=10
+            )
+            if not _model_patch_matches(model_override, patch_resp):
+                resolved_model = _resolved_model_key(patch_resp)
+                raise GatewayError(
+                    "model override did not apply "
+                    f"(wanted {model_override or 'agent default'}, "
+                    f"got {resolved_model or 'agent default'})"
                 )
-                resolved = patch_resp.get("resolved", {})
-                resolved_model = "/".join(
-                    part for part in (
-                        resolved.get("modelProvider"),
-                        resolved.get("model"),
-                    )
-                    if part
-                )
-                if resolved_model != model_override:
-                    raise GatewayError(
-                        "model override did not apply "
-                        f"(wanted {model_override}, got {resolved_model or 'unknown'})"
-                    )
+            if model_override:
                 pipe_log(f"Applied model override: {model_override}")
-            except Exception as e:
-                await _emit_status(__event_emitter__, "", done=True)
-                yield f"**Model selection error:** could not apply `{model_override}`: {e}"
-                return
+            else:
+                pipe_log("Cleared model override; using agent default")
+        except Exception as e:
+            await _emit_status(__event_emitter__, "", done=True)
+            yield f"**Model selection error:** could not apply `{model_override or 'agent default'}`: {e}"
+            return
 
         # --- Actual steering: inject message into active run, don't wait ---
         active_run_id = conn.active_run_id_for_session(session_key)
