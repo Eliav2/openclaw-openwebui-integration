@@ -1646,14 +1646,22 @@ class Pipe:
                         ask_block, _ = accumulated_has_ask_user()
                         if ask_block:
                             pipe_log(f"  found [[ASK_USER:...]] block in accumulated text")
-                            # Strip the ask block from what we yield
                             stripped_text = assistant_stream_text.replace(ask_block, "", 1)
-                            assistant_stream_text = stripped_text
-                            if stripped_text:
+                            answered = await maybe_answer_user_input(ask_block)
+                            if answered:
+                                # Modal succeeded — strip the ask block from visible text
+                                assistant_stream_text = stripped_text
+                                if stripped_text:
+                                    text_yielded = True
+                                    record_visible_chunk(stripped_text)
+                                    yield stripped_text
+                                last_activity_time = time.time()
+                            else:
+                                # Modal failed — yield the accumulated text as plain question
+                                pipe_log("  ask-user modal failed; yielding question as plain text")
                                 text_yielded = True
-                                record_visible_chunk(stripped_text)
-                                yield stripped_text
-                            await maybe_answer_user_input(ask_block)
+                                record_visible_chunk(assistant_stream_text)
+                                yield assistant_stream_text
                             last_activity_time = time.time()
                             continue
                         # Original legacy single-chunk check ("Codex needs input:" etc.)
