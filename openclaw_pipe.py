@@ -402,11 +402,19 @@ def _normalize_event_call_response(response) -> str:
     return str(response).strip()
 
 
-async def _ask_user_input_modal(__event_call__, prompt_text: str) -> str | None:
+async def _ask_user_input_modal(
+    __event_call__,
+    prompt_text: str,
+    *,
+    timeout_s: float = 60,
+) -> str | None:
     """Ask the user through OWUI's modal input API when available."""
     if not __event_call__ or not _is_user_input_prompt(prompt_text):
         return None
-    response = await __event_call__(_modal_payload_from_user_input_prompt(prompt_text))
+    response = await asyncio.wait_for(
+        __event_call__(_modal_payload_from_user_input_prompt(prompt_text)),
+        timeout=timeout_s,
+    )
     answer = _normalize_event_call_response(response)
     return answer or None
 

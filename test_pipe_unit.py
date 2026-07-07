@@ -4,6 +4,7 @@
 import unittest
 import sys
 import types
+import asyncio
 
 if "websockets" not in sys.modules:
     websockets_stub = types.SimpleNamespace(
@@ -400,6 +401,18 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIsNone(answer)
+
+    async def test_ask_user_input_modal_times_out(self):
+        async def event_call(event):
+            await asyncio.sleep(0.05)
+            return {"value": "late"}
+
+        with self.assertRaises(TimeoutError):
+            await _ask_user_input_modal(
+                event_call,
+                "Codex needs input:\n\nPackage\nChoose",
+                timeout_s=0.01,
+            )
 
 
 if __name__ == "__main__":
