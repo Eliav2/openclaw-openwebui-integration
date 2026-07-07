@@ -72,18 +72,31 @@ This version works well for basic chat but has known issues being tracked for v1
 
 ### Prerequisites
 
-- Python 3.8+ with `cryptography` package on the **machine running this script**
-  (`pip install cryptography`)
 - Admin credentials for your Open WebUI instance
 - Your OpenClaw Gateway API token
+- [`uv`](https://docs.astral.sh/uv/) on the **machine running the installer**
+  (not inside OWUI). If you don't have it:
+
+  ```bash
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  ```
+
+  No `uv`? Plain `pip install cryptography click rich` + `python3 install.py`
+  works identically — `uv` just removes that manual step.
 
 ### Run the installer
 
-```bash
-# Install cryptography if you don't have it
-pip install cryptography
+**First time, no env vars handy?** Run the interactive wizard — it prompts for
+everything it needs and explains where to find each value:
 
-# Set your environment variables
+```bash
+uv run install.py install --wizard
+```
+
+**Scripted / repeat installs** — set env vars once, then run non-interactively
+(handy for CI, config management, or reinstalling after an OWUI upgrade):
+
+```bash
 export OWUI_URL=http://your-owui-host:8080
 export OWUI_EMAIL=admin@example.com
 export OWUI_PASSWORD=your-password
@@ -94,16 +107,24 @@ export OWUI_API_BASE_URL=http://your-owui-host:8080
 export CHATGPT_MODEL=openai/gpt-5.5
 
 # Install or update the pipe in place, then run a smoke test
-python3 install.py install
+uv run install.py install
 
 # Repair a broken install without deleting the function or valves
-python3 install.py repair
+uv run install.py repair
 
 # Inspect current state without changing anything
-python3 install.py status
+uv run install.py status
 
 # Run status checks plus an end-to-end smoke test
-python3 install.py healthcheck
+uv run install.py healthcheck
+```
+
+`uv run install.py` resolves `cryptography`, `click`, and `rich` into an
+ephemeral environment automatically — no venv or `pip install` step needed.
+You can also run it straight from GitHub without cloning first:
+
+```bash
+uv run https://raw.githubusercontent.com/Eliav2/openclaw-openwebui-integration/main/install.py install --wizard
 ```
 
 The script will:
@@ -263,11 +284,11 @@ OWUI streams each chunk to the frontend in real time.
 | Text appears all at once | Pipe uses `return` instead of `yield` (check your code) |
 | "No GATEWAY_TOKEN configured" | Valve not set — go to Admin → Functions → edit valves |
 | "Connection error" in chat | OWUI can't reach `GATEWAY_URL` — check network connectivity |
-| Model missing from selector | Run `python3 install.py repair`; it ensures the function is active/global and visible in `/api/v1/models` |
-| "pairing required" | Run `python3 install.py repair` or approve the matching request with `openclaw devices approve <request-id>` |
+| Model missing from selector | Run `uv run install.py repair`; it ensures the function is active/global and visible in `/api/v1/models` |
+| "pairing required" | Run `uv run install.py repair` or approve the matching request with `openclaw devices approve <request-id>` |
 | Image still uses `:18791` | OWUI file upload failed and the pipe fell back; check `OWUI_BASE_URL`, request auth/API key, and OWUI logs |
 | Tool calls not showing | The `__event_emitter__` calls fail silently; check OWUI backend logs |
-| Device identity not persisting | Check `STATE_DIR` and the `DEVICE_IDENTITY` valve; run `python3 install.py healthcheck` |
+| Device identity not persisting | Check `STATE_DIR` and the `DEVICE_IDENTITY` valve; run `uv run install.py healthcheck` |
 | Stream stops mid-response | WS timeout (60s default); check agent response time |
 
 Check OWUI's backend logs for `[openclaw-pipe]` prefixed messages.

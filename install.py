@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "cryptography>=41",
+#     "click>=8.1",
+#     "rich>=13",
+# ]
+# ///
 """
 Install, repair, and health-check the OpenClaw Gateway Pipe in Open WebUI.
 
@@ -8,11 +16,20 @@ The installer is intentionally restart-safe:
 - enable the function only when it is inactive; no blind toggles
 - run an end-to-end smoke test before claiming success
 - optionally approve the matching OpenClaw pairing request automatically
+
+Zero-setup usage (uv resolves cryptography/click/rich automatically):
+
+    uv run https://raw.githubusercontent.com/Eliav2/openclaw-openwebui-integration/main/install.py install --wizard
+
+From a local clone:
+
+    uv run install.py install
+    # or, with deps installed manually: python3 install.py install
 """
 
 from __future__ import annotations
 
-import argparse
+import functools
 import json
 import os
 import shutil
@@ -21,7 +38,13 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass, fields
 from pathlib import Path
+
+import click
+from rich.console import Console
+from rich.panel import Panel
+from rich.prompt import Prompt
 
 
 FUNCTION_ID = "openclaw_gateway"
@@ -32,41 +55,91 @@ PIPE_FILE = ROOT / "openclaw_pipe.py"
 LOCAL_IDENTITY_FILE = ROOT / ".pipe_device_identity.json"
 BACKUP_DIR = ROOT / "backups"
 
-
-def env(name: str, default: str = "") -> str:
-    return os.environ.get(name, default)
-
-
-DEFAULTS = {
-    "owui_url": env("OWUI_URL", "http://localhost:8080").rstrip("/"),
-    "owui_email": env("OWUI_EMAIL", ""),
-    "owui_password": env("OWUI_PASSWORD", ""),
-    "gateway_url": env("GATEWAY_URL", "localhost:18789"),
-    "gateway_token": env("GATEWAY_TOKEN", ""),
-    "agent_id": env("AGENT_ID", "main"),
-    "state_dir": env("OPENCLAW_BRIDGE_STATE_DIR", "/data/openclaw-bridge"),
-    "owui_api_base_url": env("OWUI_API_BASE_URL", env("OWUI_URL", "http://localhost:8080")).rstrip("/"),
-    "owui_api_key": env("OWUI_API_KEY", ""),
-    "chatgpt_model": env("CHATGPT_MODEL", "openai/gpt-5.5"),
-    "file_server_base_url": env("FILE_SERVER_BASE_URL", ""),
-}
+console = Console()
 
 
 def info(msg: str) -> None:
-    print(f"  [ok] {msg}")
+    console.print(f"  [green]✓[/green] {msg}")
 
 
 def warn(msg: str) -> None:
-    print(f"  [warn] {msg}")
+    console.print(f"  [yellow]![/yellow] {msg}")
 
 
 def fail(msg: str) -> None:
-    print(f"  [fail] {msg}")
+    console.print(f"  [red]✗[/red] {msg}")
 
 
 def section(msg: str) -> None:
-    print(f"\n== {msg} ==")
+    console.rule(f"[bold]{msg}[/bold]")
 
+
+# --------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------
+
+@dataclass
+class Config:
+    owui_url: str
+    owui_email: str
+    owui_password: str
+    gateway_url: str
+    gateway_token: str
+    agent_id: str
+    state_dir: str
+    owui_api_base_url: str
+    owui_api_key: str
+    chatgpt_model: str
+    file_server_base_url: str
+    auto_approve: bool = True
+
+
+def require_config(cfg: Config, *, need_gateway: bool) -> None:
+    missing = []
+    if not cfg.owui_email:
+        missing.append("OWUI_EMAIL")
+    if not cfg.owui_password:
+        missing.append("OWUI_PASSWORD")
+    if need_gateway and not cfg.gateway_token:
+        missing.append("GATEWAY_TOKEN")
+    if missing:
+        raise SystemExit(
+            "Missing required env/args: " + ", ".join(missing) + "\n"
+            "Set OWUI_URL, OWUI_EMAIL, OWUI_PASSWORD, GATEWAY_URL, "
+            "GATEWAY_TOKEN, AGENT_ID, or re-run with --wizard."
+        )
+
+
+def run_wizard(cfg: Config, *, need_gateway: bool) -> Config:
+    console.print(
+        Panel(
+            "OpenClaw ↔ Open WebUI bridge — setup wizard\n"
+            "Press Enter to accept a default shown in brackets.",
+            style="bold cyan",
+        )
+    )
+    cfg.owui_url = Prompt.ask("Open WebUI base URL", default=cfg.owui_url)
+    if not cfg.owui_email:
+        cfg.owui_email = Prompt.ask("Open WebUI admin email")
+    if not cfg.owui_password:
+        cfg.owui_password = Prompt.ask("Open WebUI admin password", password=True)
+    if need_gateway:
+        cfg.gateway_url = Prompt.ask(
+            "OpenClaw gateway address (host:port)", default=cfg.gateway_url
+        )
+        if not cfg.gateway_token:
+            console.print(
+                "  [dim]Find this under gateway.auth.token in your OpenClaw "
+                "config, or ask your OpenClaw admin.[/dim]"
+            )
+            cfg.gateway_token = Prompt.ask("OpenClaw gateway token", password=True)
+    cfg.agent_id = Prompt.ask("OpenClaw agent id", default=cfg.agent_id)
+    return cfg
+
+
+# --------------------------------------------------------------------------
+# OWUI API client
+# --------------------------------------------------------------------------
 
 class OwuiClient:
     def __init__(self, base_url: str, email: str, password: str):
@@ -117,21 +190,9 @@ class OwuiClient:
         info(f"Logged into OWUI as {payload.get('name') or self.email}")
 
 
-def require_config(args: argparse.Namespace, *, need_gateway: bool) -> None:
-    missing = []
-    if not args.owui_email:
-        missing.append("OWUI_EMAIL")
-    if not args.owui_password:
-        missing.append("OWUI_PASSWORD")
-    if need_gateway and not args.gateway_token:
-        missing.append("GATEWAY_TOKEN")
-    if missing:
-        raise SystemExit(
-            "Missing required env/args: " + ", ".join(missing) + "\n"
-            "Set OWUI_URL, OWUI_EMAIL, OWUI_PASSWORD, GATEWAY_URL, "
-            "GATEWAY_TOKEN, AGENT_ID."
-        )
-
+# --------------------------------------------------------------------------
+# Device identity
+# --------------------------------------------------------------------------
 
 def generate_device_identity() -> dict:
     from cryptography.hazmat.primitives.asymmetric import ed25519
@@ -206,6 +267,10 @@ def choose_identity(existing_valves: dict) -> dict:
     warn("This new identity must be approved once by OpenClaw.")
     return ident
 
+
+# --------------------------------------------------------------------------
+# Function / valve management
+# --------------------------------------------------------------------------
 
 def get_function(client: OwuiClient) -> dict | None:
     status, payload = client.request("GET", f"/api/v1/functions/id/{FUNCTION_ID}")
@@ -327,11 +392,7 @@ def ensure_active_global(client: OwuiClient) -> None:
         info("Pipe function already global")
 
 
-def update_valves(
-    client: OwuiClient,
-    args: argparse.Namespace,
-    preserved_valves: dict | None = None,
-) -> dict:
+def update_valves(client: OwuiClient, cfg: Config, preserved_valves: dict | None = None) -> dict:
     current = get_valves(client)
     preserved_valves = preserved_valves or {}
     existing = {**preserved_valves, **current}
@@ -342,21 +403,21 @@ def update_valves(
     ident_json = json.dumps(ident, separators=(",", ":"))
 
     required = {
-        "GATEWAY_URL": args.gateway_url,
-        "GATEWAY_TOKEN": args.gateway_token,
-        "AGENT_ID": args.agent_id,
+        "GATEWAY_URL": cfg.gateway_url,
+        "GATEWAY_TOKEN": cfg.gateway_token,
+        "AGENT_ID": cfg.agent_id,
         "ENABLE_FILE_SERVER": True,
         "DEVICE_IDENTITY": ident_json,
-        "STATE_DIR": args.state_dir,
+        "STATE_DIR": cfg.state_dir,
         "USE_OWUI_FILES": True,
         "SEND_STOP_ON_CANCEL": True,
-        "OWUI_BASE_URL": args.owui_api_base_url,
-        "CHATGPT_MODEL": args.chatgpt_model,
+        "OWUI_BASE_URL": cfg.owui_api_base_url,
+        "CHATGPT_MODEL": cfg.chatgpt_model,
     }
-    if args.owui_api_key:
-        required["OWUI_API_KEY"] = args.owui_api_key
-    if args.file_server_base_url:
-        required["FILE_SERVER_BASE_URL"] = args.file_server_base_url
+    if cfg.owui_api_key:
+        required["OWUI_API_KEY"] = cfg.owui_api_key
+    if cfg.file_server_base_url:
+        required["FILE_SERVER_BASE_URL"] = cfg.file_server_base_url
 
     desired = {**existing, **required}
     changed = {k: v for k, v in desired.items() if current.get(k) != v}
@@ -374,6 +435,10 @@ def update_valves(
     info(f"Updated valves: {', '.join(sorted(changed.keys()))}")
     return desired
 
+
+# --------------------------------------------------------------------------
+# OpenClaw device pairing helpers
+# --------------------------------------------------------------------------
 
 def run_openclaw_json(*args: str) -> dict | None:
     if not shutil.which("openclaw"):
@@ -432,6 +497,10 @@ def is_device_paired(device_id: str) -> bool:
         return False
     return any(dev.get("deviceId") == device_id for dev in devices.get("paired", []))
 
+
+# --------------------------------------------------------------------------
+# Smoke tests
+# --------------------------------------------------------------------------
 
 def smoke_test(client: OwuiClient, *, repair_pairing: bool = False,
                valves: dict | None = None) -> bool:
@@ -526,7 +595,7 @@ def print_status(client: OwuiClient) -> bool:
     ident = parse_identity(valves.get("DEVICE_IDENTITY"))
     paired = bool(ident and is_device_paired(ident["id"]))
 
-    print(json.dumps({
+    console.print_json(json.dumps({
         "function_exists": exists,
         "is_active": active,
         "is_global": global_,
@@ -536,17 +605,17 @@ def print_status(client: OwuiClient) -> bool:
         "has_device_identity": bool(ident),
         "device_id": ident.get("id") if ident else None,
         "device_paired": paired,
-    }, indent=2))
+    }))
     return all([exists, active, global_, model, ident, paired])
 
 
-def install_or_repair(client: OwuiClient, args: argparse.Namespace) -> dict:
+def install_or_repair(client: OwuiClient, cfg: Config) -> dict:
     section("Function")
     preserved_valves = update_or_create_function(client)
     ensure_active_global(client)
 
     section("Valves")
-    valves = update_valves(client, args, preserved_valves=preserved_valves)
+    valves = update_valves(client, cfg, preserved_valves=preserved_valves)
 
     section("Model discovery")
     if model_exists(client):
@@ -559,67 +628,125 @@ def install_or_repair(client: OwuiClient, args: argparse.Namespace) -> dict:
     return valves
 
 
-def run(args: argparse.Namespace) -> None:
-    need_gateway = args.command in {"install", "repair", "healthcheck"}
-    require_config(args, need_gateway=need_gateway)
-    client = OwuiClient(args.owui_url, args.owui_email, args.owui_password)
+# --------------------------------------------------------------------------
+# Command orchestration
+# --------------------------------------------------------------------------
+
+def execute(command: str, cfg: Config) -> None:
+    need_gateway = command in {"install", "repair", "healthcheck"}
+    require_config(cfg, need_gateway=need_gateway)
+    client = OwuiClient(cfg.owui_url, cfg.owui_email, cfg.owui_password)
 
     section("Login")
     client.login()
 
-    if args.command == "status":
+    if command == "status":
         section("Status")
         ok = print_status(client)
         raise SystemExit(0 if ok else 1)
 
-    if args.command in {"install", "repair"}:
-        valves = install_or_repair(client, args)
+    if command in {"install", "repair"}:
+        valves = install_or_repair(client, cfg)
         section("Smoke test")
-        ok = smoke_test(client, repair_pairing=args.auto_approve, valves=valves)
+        ok = smoke_test(client, repair_pairing=cfg.auto_approve, valves=valves)
         section("ChatGPT route smoke test")
         chatgpt_ok = chatgpt_route_smoke_test(client)
         raise SystemExit(0 if ok and chatgpt_ok else 1)
 
-    if args.command == "healthcheck":
+    if command == "healthcheck":
         section("Status")
         status_ok = print_status(client)
         section("Smoke test")
         valves = get_valves(client)
-        smoke_ok = smoke_test(client, repair_pairing=args.auto_approve, valves=valves)
+        smoke_ok = smoke_test(client, repair_pairing=cfg.auto_approve, valves=valves)
         section("ChatGPT route smoke test")
         chatgpt_ok = chatgpt_route_smoke_test(client)
         raise SystemExit(0 if status_ok and smoke_ok and chatgpt_ok else 1)
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Install, repair, and health-check the OpenClaw OWUI pipe."
-    )
-    parser.add_argument(
-        "command",
-        nargs="?",
-        default="install",
-        choices=["install", "repair", "status", "healthcheck"],
-    )
-    parser.add_argument("--owui-url", default=DEFAULTS["owui_url"])
-    parser.add_argument("--owui-email", default=DEFAULTS["owui_email"])
-    parser.add_argument("--owui-password", default=DEFAULTS["owui_password"])
-    parser.add_argument("--gateway-url", default=DEFAULTS["gateway_url"])
-    parser.add_argument("--gateway-token", default=DEFAULTS["gateway_token"])
-    parser.add_argument("--agent-id", default=DEFAULTS["agent_id"])
-    parser.add_argument("--state-dir", default=DEFAULTS["state_dir"])
-    parser.add_argument("--owui-api-base-url", default=DEFAULTS["owui_api_base_url"])
-    parser.add_argument("--owui-api-key", default=DEFAULTS["owui_api_key"])
-    parser.add_argument("--chatgpt-model", default=DEFAULTS["chatgpt_model"])
-    parser.add_argument("--file-server-base-url", default=DEFAULTS["file_server_base_url"])
-    parser.add_argument(
-        "--auto-approve",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Approve a matching pending OpenClaw device when smoke test needs pairing.",
-    )
-    return parser
+# --------------------------------------------------------------------------
+# CLI (click)
+# --------------------------------------------------------------------------
+
+def common_options(f):
+    options = [
+        click.option("--owui-url", envvar="OWUI_URL", default="http://localhost:8080",
+                     show_default=True, help="Open WebUI base URL"),
+        click.option("--owui-email", envvar="OWUI_EMAIL", default="",
+                     help="Open WebUI admin email"),
+        click.option("--owui-password", envvar="OWUI_PASSWORD", default="",
+                     help="Open WebUI admin password"),
+        click.option("--gateway-url", envvar="GATEWAY_URL", default="localhost:18789",
+                     show_default=True, help="OpenClaw gateway address (host:port)"),
+        click.option("--gateway-token", envvar="GATEWAY_TOKEN", default="",
+                     help="OpenClaw gateway API token"),
+        click.option("--agent-id", envvar="AGENT_ID", default="main",
+                     show_default=True, help="OpenClaw agent id to route to"),
+        click.option("--state-dir", envvar="OPENCLAW_BRIDGE_STATE_DIR",
+                     default="/data/openclaw-bridge", show_default=True,
+                     help="Pipe state directory inside the OWUI container"),
+        click.option("--owui-api-base-url", envvar="OWUI_API_BASE_URL", default="",
+                     help="Base URL the pipe uses to call OWUI's own API "
+                          "(defaults to --owui-url)"),
+        click.option("--owui-api-key", envvar="OWUI_API_KEY", default="",
+                     help="Optional OWUI API key for native media uploads"),
+        click.option("--chatgpt-model", envvar="CHATGPT_MODEL", default="openai/gpt-5.5",
+                     show_default=True, help="OpenClaw model for the ChatGPT selector entry"),
+        click.option("--file-server-base-url", envvar="FILE_SERVER_BASE_URL", default="",
+                     help="Legacy media fallback base URL"),
+        click.option("--auto-approve/--no-auto-approve", default=True,
+                     help="Approve a matching pending OpenClaw device when a "
+                          "smoke test reports 'pairing required'"),
+        click.option("--wizard", "-w", is_flag=True, default=False,
+                     help="Prompt interactively for any missing required values"),
+    ]
+    for option in reversed(options):
+        f = option(f)
+    return f
+
+
+def _dispatch(command: str, **kwargs) -> None:
+    wizard = kwargs.pop("wizard")
+    cfg = Config(**kwargs)
+    if wizard:
+        cfg = run_wizard(cfg, need_gateway=command in {"install", "repair", "healthcheck"})
+    cfg.owui_url = cfg.owui_url.rstrip("/")
+    cfg.owui_api_base_url = (cfg.owui_api_base_url or cfg.owui_url).rstrip("/")
+    execute(command, cfg)
+
+
+@click.group()
+def cli() -> None:
+    """Install, repair, and health-check the OpenClaw Gateway Pipe in Open WebUI."""
+
+
+@cli.command()
+@common_options
+def install(**kwargs) -> None:
+    """Create or update the pipe function, valves, and run a smoke test."""
+    _dispatch("install", **kwargs)
+
+
+@cli.command()
+@common_options
+def repair(**kwargs) -> None:
+    """Same as install; use after a broken/partial setup."""
+    _dispatch("repair", **kwargs)
+
+
+@cli.command()
+@common_options
+def status(**kwargs) -> None:
+    """Print current state without changing anything."""
+    _dispatch("status", **kwargs)
+
+
+@cli.command()
+@common_options
+def healthcheck(**kwargs) -> None:
+    """Status checks plus an end-to-end smoke test."""
+    _dispatch("healthcheck", **kwargs)
 
 
 if __name__ == "__main__":
-    run(build_parser().parse_args())
+    cli()
