@@ -348,6 +348,69 @@ async def _emit_message_snapshot(__event_emitter__, content):
     )
 
 
+def _is_user_input_prompt(text: str) -> bool:
+    """Return True for OpenClaw/Codex blocking user-input prompts."""
+    normalized = (text or "").lstrip()
+    return (
+        normalized.startswith("Codex needs input:")
+        or normalized.startswith("OpenClaw needs input:")
+    )
+
+
+def _modal_payload_from_user_input_prompt(prompt_text: str) -> dict:
+    """Build a simple OWUI input modal payload from OpenClaw's prompt text."""
+    lines = [line.strip() for line in (prompt_text or "").splitlines()]
+    lines = [line for line in lines if line]
+    if lines and lines[0].endswith("needs input:"):
+        lines = lines[1:]
+
+    title = "OpenClaw needs input"
+    if lines and len(lines[0]) <= 80 and not re.match(r"^\d+\.", lines[0]):
+        title = lines[0]
+        lines = lines[1:]
+
+    message = "\n".join(lines).strip() or "Please answer so the run can continue."
+    is_secret = any(
+        marker in (prompt_text or "").lower()
+        for marker in ("secret", "password", "may show your reply")
+    )
+    data = {
+        "title": title,
+        "message": message,
+        "placeholder": "Reply with a number or your answer",
+    }
+    if is_secret:
+        data["type"] = "password"
+    return {"type": "input", "data": data}
+
+
+def _normalize_event_call_response(response) -> str:
+    """Extract text from common OWUI __event_call__ return shapes."""
+    if response is None:
+        return ""
+    if isinstance(response, str):
+        return response.strip()
+    if isinstance(response, dict):
+        for key in ("value", "text", "content", "message", "response"):
+            value = response.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        if response.get("confirmed") is True:
+            return "yes"
+        if response.get("confirmed") is False:
+            return "no"
+    return str(response).strip()
+
+
+async def _ask_user_input_modal(__event_call__, prompt_text: str) -> str | None:
+    """Ask the user through OWUI's modal input API when available."""
+    if not __event_call__ or not _is_user_input_prompt(prompt_text):
+        return None
+    response = await __event_call__(_modal_payload_from_user_input_prompt(prompt_text))
+    answer = _normalize_event_call_response(response)
+    return answer or None
+
+
 def _start_file_server(port=18791):
     """Start a minimal HTTP server for media files. Starts once per process."""
     global _file_server_started
@@ -1077,7 +1140,7 @@ class Pipe:
             return self.valves.SONNET_MODEL.strip() or None
         return None
 
-    async def pipe(self, body, __event_emitter__,
+    async def pipe(self, body, __event_emitter__, __event_call__=None,
                    __user__=None, __metadata__=None, __request__=None,
                    __task__=None, __task_body__=None):
         """Main pipe entry point — called by Open WebUI for each user message.
@@ -1299,6 +1362,33 @@ class Pipe:
             last_snapshot_text = visible_message_text
             last_snapshot_time = now
 
+        async def maybe_answer_user_input(prompt_text: str) -> bool:
+            if not _is_user_input_prompt(prompt_text):
+                return False
+            try:
+                answer = await _ask_user_input_modal(__event_call__, prompt_text)
+            except Exception as ex:
+                pipe_log(f"  user input modal failed; falling back to chat prompt: {ex}")
+                return False
+            if not answer:
+                return False
+            pipe_log("  user input answered via OWUI modal")
+            await _emit_status(__event_emitter__, "Sending answer...", done=False)
+            idempotency_key = f"user-input-{chat_id}-{time.time()}"
+            await conn.send_request(
+                "chat.send",
+                _owui_chat_send_params(
+                    session_key=session_key,
+                    message=answer,
+                    idempotency_key=idempotency_key,
+                    owui_chat_id=owui_origin_chat_id,
+                    owui_user_id=owui_origin_user_id,
+                ),
+                timeout=30,
+            )
+            await _emit_status(__event_emitter__, "Answer sent; continuing...", done=False)
+            return True
+
         try:
             while not done:
                 try:
@@ -1449,6 +1539,9 @@ class Pipe:
                         ):
                             pipe_log("  filtered metadata block")
                             continue
+                        if await maybe_answer_user_input(delta):
+                            last_activity_time = time.time()
+                            continue
                         text_yielded = True
                         # MEDIA: resolution
                         if "MEDIA:" in delta:
@@ -1489,6 +1582,10 @@ class Pipe:
                 if stream == "item":
                     item_text = _item_assistant_text(data)
                     if item_text:
+                        if await maybe_answer_user_input(item_text):
+                            last_item_text = item_text
+                            last_activity_time = time.time()
+                            continue
                         item_delta = _item_delta_text(
                             item_text, last_item_text, assistant_stream_text
                         )

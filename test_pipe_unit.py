@@ -61,12 +61,16 @@ if "pydantic" not in sys.modules:
 
 from openclaw_pipe import (
     _GatewayConnection,
+    _ask_user_input_modal,
     _coerce_text,
     _emit_message_snapshot,
     _emit_status,
+    _is_user_input_prompt,
     _item_assistant_text,
     _item_delta_text,
+    _modal_payload_from_user_input_prompt,
     _model_patch_matches,
+    _normalize_event_call_response,
     _owui_chat_send_params,
     _owui_session_key,
     _preview_recovery_text,
@@ -340,6 +344,62 @@ class MessageSnapshotEmitterTests(unittest.IsolatedAsyncioTestCase):
         await _emit_message_snapshot(emitter, "")
 
         self.assertEqual(events, [])
+
+
+class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
+    def test_detects_codex_user_input_prompt(self):
+        self.assertTrue(_is_user_input_prompt("Codex needs input:\n\nPackage\nPick one"))
+        self.assertFalse(_is_user_input_prompt("I need input for this function"))
+
+    def test_builds_owui_input_modal_payload(self):
+        payload = _modal_payload_from_user_input_prompt(
+            "Codex needs input:\n\nPackage\nChoose a package style\n1. curl\n2. pipx"
+        )
+
+        self.assertEqual(payload["type"], "input")
+        self.assertEqual(payload["data"]["title"], "Package")
+        self.assertIn("Choose a package style", payload["data"]["message"])
+        self.assertIn("1. curl", payload["data"]["message"])
+        self.assertEqual(
+            payload["data"]["placeholder"],
+            "Reply with a number or your answer",
+        )
+
+    def test_marks_secret_prompts_as_password_inputs(self):
+        payload = _modal_payload_from_user_input_prompt(
+            "Codex needs input:\n\nToken\nThis channel may show your reply to other participants."
+        )
+
+        self.assertEqual(payload["data"]["type"], "password")
+
+    def test_normalizes_event_call_response_shapes(self):
+        self.assertEqual(_normalize_event_call_response("  answer  "), "answer")
+        self.assertEqual(_normalize_event_call_response({"value": "1"}), "1")
+        self.assertEqual(_normalize_event_call_response({"confirmed": True}), "yes")
+        self.assertEqual(_normalize_event_call_response({"confirmed": False}), "no")
+
+    async def test_ask_user_input_modal_returns_answer(self):
+        calls = []
+
+        async def event_call(event):
+            calls.append(event)
+            return {"value": "2"}
+
+        answer = await _ask_user_input_modal(
+            event_call,
+            "Codex needs input:\n\nPackage\nChoose\n1. curl\n2. pipx",
+        )
+
+        self.assertEqual(answer, "2")
+        self.assertEqual(calls[0]["type"], "input")
+
+    async def test_ask_user_input_modal_noops_without_event_call(self):
+        answer = await _ask_user_input_modal(
+            None,
+            "Codex needs input:\n\nPackage\nChoose",
+        )
+
+        self.assertIsNone(answer)
 
 
 if __name__ == "__main__":
