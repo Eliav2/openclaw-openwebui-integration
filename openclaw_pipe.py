@@ -1004,7 +1004,7 @@ class Pipe:
             description="OpenClaw model override used by the ChatGPT manifold model"
         )
         OPUS_MODEL: str = Field(
-            default="anthropic/claude-opus-4.8",
+            default="anthropic/claude-opus-4-8",
             description="OpenClaw model override used by the Opus 4.8 manifold model"
         )
         SONNET_MODEL: str = Field(
