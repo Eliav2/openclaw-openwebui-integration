@@ -67,6 +67,7 @@ from openclaw_pipe import (
     _item_assistant_text,
     _item_delta_text,
     _model_patch_matches,
+    _owui_chat_send_params,
     _owui_session_key,
     _preview_recovery_text,
     _resolve_media,
@@ -154,6 +155,34 @@ class OwuiSessionModelTests(unittest.TestCase):
         expected = "agent:main:openwebui-user-123-chat-456"
 
         self.assertEqual(_owui_session_key("main", "user-123", "chat-456"), expected)
+
+    def test_chat_send_params_include_owui_origin_metadata(self):
+        params = _owui_chat_send_params(
+            session_key="agent:main:openwebui-user-123-chat-456",
+            message="hello",
+            idempotency_key="msg-1",
+            owui_chat_id="chat-456",
+            owui_user_id="user-123",
+        )
+
+        receipt = params["systemProvenanceReceipt"]
+        self.assertIn("Conversation info (untrusted metadata):", receipt)
+        self.assertIn('"chat_id": "chat-456"', receipt)
+        self.assertIn('"source": "openwebui"', receipt)
+        self.assertIn('"user_id": "user-123"', receipt)
+        self.assertNotIn("originatingChannel", params)
+        self.assertNotIn("originatingTo", params)
+
+    def test_chat_send_params_do_not_invent_originating_to(self):
+        params = _owui_chat_send_params(
+            session_key="agent:main:openwebui-unknown-owui-generated",
+            message="hello",
+            idempotency_key="msg-1",
+            owui_chat_id=None,
+            owui_user_id="unknown",
+        )
+
+        self.assertNotIn("systemProvenanceReceipt", params)
 
     def test_model_patch_matches_explicit_override(self):
         patch_resp = {"resolved": {"modelProvider": "openai", "model": "gpt-5.5"}}

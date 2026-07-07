@@ -460,6 +460,34 @@ def _owui_session_key(agent_id: str, user_id: str, chat_id: str) -> str:
     return f"agent:{agent_id}:openwebui-{user_id}-{chat_id}"
 
 
+def _owui_chat_send_params(
+    session_key: str,
+    message: str,
+    idempotency_key: str,
+    owui_chat_id: str | None,
+    owui_user_id: str | None,
+) -> dict:
+    params = dict(
+        sessionKey=session_key,
+        message=message,
+        idempotencyKey=idempotency_key,
+    )
+    if owui_chat_id:
+        metadata = {
+            "chat_id": owui_chat_id,
+            "source": "openwebui",
+        }
+        if owui_user_id and owui_user_id != "unknown":
+            metadata["user_id"] = owui_user_id
+        params["systemProvenanceReceipt"] = "\n".join([
+            "Conversation info (untrusted metadata):",
+            "```json",
+            json.dumps(metadata, ensure_ascii=False, indent=2),
+            "```",
+        ])
+    return params
+
+
 def _resolved_model_key(patch_resp: dict) -> str | None:
     resolved = patch_resp.get("resolved", {})
     provider = resolved.get("modelProvider")
@@ -1107,6 +1135,9 @@ class Pipe:
             chat_id = None
             user_id = "unknown"
 
+        owui_origin_chat_id = chat_id
+        owui_origin_user_id = user_id
+
         if not chat_id:
             chat_id = f"owui-{uuid.uuid4().hex[:12]}"
             pipe_log("WARNING: no chat_id in metadata, generated random:", chat_id)
@@ -1150,10 +1181,16 @@ class Pipe:
             # Send the steering message immediately — the gateway will inject it
             # at the next model boundary (steer mode is the gateway's default).
             try:
+                idempotency_key = f"msg-{chat_id}-{time.time()}"
                 send_resp = await conn.send_request(
                     "chat.send",
-                    dict(sessionKey=session_key, message=text,
-                         idempotencyKey=f"msg-{chat_id}-{time.time()}"),
+                    _owui_chat_send_params(
+                        session_key=session_key,
+                        message=text,
+                        idempotency_key=idempotency_key,
+                        owui_chat_id=owui_origin_chat_id,
+                        owui_user_id=owui_origin_user_id,
+                    ),
                     timeout=30
                 )
             except asyncio.TimeoutError:
@@ -1190,8 +1227,13 @@ class Pipe:
             try:
                 send_resp = await conn.send_request(
                     "chat.send",
-                    dict(sessionKey=session_key, message=text,
-                         idempotencyKey=idempotency_key),
+                    _owui_chat_send_params(
+                        session_key=session_key,
+                        message=text,
+                        idempotency_key=idempotency_key,
+                        owui_chat_id=owui_origin_chat_id,
+                        owui_user_id=owui_origin_user_id,
+                    ),
                     timeout=30
                 )
             except asyncio.TimeoutError:
