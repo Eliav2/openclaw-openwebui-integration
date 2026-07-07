@@ -1119,6 +1119,10 @@ class Pipe:
             default="anthropic/claude-sonnet-5",
             description="OpenClaw model override used by the Sonnet 5 manifold model"
         )
+        GLM_MODEL: str = Field(
+            default="openrouter/z-ai/glm-5.2",
+            description="OpenClaw model override used by the GLM 5.2 manifold model"
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -1135,6 +1139,7 @@ class Pipe:
             {"id": "chatgpt", "name": "ChatGPT · GPT-5.5"},
             {"id": "opus", "name": "Claude · Opus 4.8"},
             {"id": "sonnet", "name": "Claude · Sonnet 5"},
+            {"id": "glm", "name": "GLM 5.2 · OpenRouter"},
         ]
 
     def _selected_preset(self, body):
@@ -1146,6 +1151,8 @@ class Pipe:
             return "opus"
         if suffix == "sonnet":
             return "sonnet"
+        if suffix == "glm":
+            return "glm"
         return "default"
 
     def _model_override_for_preset(self, preset):
@@ -1155,6 +1162,8 @@ class Pipe:
             return self.valves.OPUS_MODEL.strip() or None
         if preset == "sonnet":
             return self.valves.SONNET_MODEL.strip() or None
+        if preset == "glm":
+            return self.valves.GLM_MODEL.strip() or None
         return None
 
     async def pipe(self, body, __event_emitter__, __event_call__=None,
