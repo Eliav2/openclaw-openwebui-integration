@@ -1580,17 +1580,26 @@ class Pipe:
                             last_activity_time = time.time()
                             continue
                         text_yielded = True
-                        # Skip snapshot for pure-text messages (no tool calls).
-                        # A `replace` event with the full text, followed by
-                        # the generator's final yield (the streamed source of
-                        # truth), causes OWUI to double-save the same content
-                        # — the `replace` sets the message content and the
-                        # final yield appends the same text on top. Tool-call
-                        # messages are fine because the `replace` there fires
-                        # with only the tool block (partial content), and
-                        # subsequent yields append fresh text on top.
-                        # See P24 / ELI-9 for full trace.
-                        has_tool_blocks = '<details' in visible_message_text
+                        # No snapshot here, regardless of whether tool blocks
+                        # exist earlier in the message. A `replace` event sets
+                        # the full message content; if it lands on (or near)
+                        # the complete final text right before the generator
+                        # naturally finishes, OWUI double-saves — the
+                        # `replace` writes it once, then the generator's own
+                        # accumulated streamed yields write the same content
+                        # again on top. This isn't only a risk for the literal
+                        # last chunk: since these snapshots are throttled by
+                        # time/char thresholds rather than tied to "a tool
+                        # block was just added", they keep firing throughout
+                        # any plain-text tail after a tool call and will
+                        # eventually land close enough to the end to trigger
+                        # the same duplicate. The one snapshot that's actually
+                        # safe is the forced one taken right when a tool
+                        # block itself is yielded (still partial content by
+                        # definition, since the block was just added) — see
+                        # the `stream == "tool"` / phase == "result" handler.
+                        # See P17 / P19 / P23 / P24 / ELI-9 for the history of
+                        # this recurring bug.
                         # MEDIA: resolution
                         if "MEDIA:" in delta:
                             handled = False
@@ -1623,8 +1632,6 @@ class Pipe:
                         assistant_stream_text += delta
                         record_visible_chunk(delta)
                         yield delta
-                        if has_tool_blocks:
-                            await maybe_emit_snapshot()
                         last_activity_time = time.time()
 
                 # --- Assistant text carried by item/preamble events ---
@@ -1644,9 +1651,6 @@ class Pipe:
                             pipe_log("  yielded text from item event")
                             record_visible_chunk(item_delta)
                             yield item_delta
-                            # Only snapshot if tool blocks exist (see P24/ELI-9)
-                            if '<details' in visible_message_text:
-                                await maybe_emit_snapshot()
                             last_activity_time = time.time()
 
                 # --- Tool call events ---
