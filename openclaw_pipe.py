@@ -1693,7 +1693,15 @@ class Pipe:
             raise  # Re-raise to signal proper cancellation
 
         finally:
-            await maybe_emit_snapshot(force=True)
+            # No forced snapshot here: by the time this runs on a normal
+            # completion, OWUI has already built the final message from the
+            # streamed yields (the documented source of truth). A forced
+            # `replace` snapshot at this exact moment double-writes the same
+            # content, producing an exact duplicate with no separator. The
+            # throttled snapshots inside the loop above cover reload-recovery
+            # during an active run; the CancelledError branch above still
+            # forces one for the abort case, which is legitimate since the
+            # stream is cut short there.
             await _emit_status(__event_emitter__, "", done=True)
             conn.unregister_consumer(session_key, our_run_id, queue=queue)
             self._current_session_key = None
