@@ -1538,7 +1538,23 @@ class Pipe:
 
                 # --- Assistant text stream ---
                 if stream == "assistant":
-                    delta = data.get("delta") or data.get("text") or ""
+                    raw_delta = data.get("delta")
+                    if raw_delta:
+                        delta = raw_delta
+                    else:
+                        # Some providers (observed with claude-cli-backed
+                        # Opus/Sonnet overrides) send a final catch-all event
+                        # with no `delta` but a `text` field holding the full
+                        # cumulative reply rather than a fresh chunk. Treating
+                        # it as always-new re-sent the whole message a second
+                        # time. Diff it against what's already been streamed,
+                        # same as the item-event dedup below.
+                        raw_text = data.get("text") or ""
+                        delta = (
+                            _item_delta_text(raw_text, "", assistant_stream_text)
+                            if raw_text
+                            else ""
+                        )
                     if delta:
                         # Filter Sender metadata
                         if (
@@ -1551,6 +1567,17 @@ class Pipe:
                             last_activity_time = time.time()
                             continue
                         text_yielded = True
+                        # Skip snapshot for pure-text messages (no tool calls).
+                        # A `replace` event with the full text, followed by
+                        # the generator's final yield (the streamed source of
+                        # truth), causes OWUI to double-save the same content
+                        # — the `replace` sets the message content and the
+                        # final yield appends the same text on top. Tool-call
+                        # messages are fine because the `replace` there fires
+                        # with only the tool block (partial content), and
+                        # subsequent yields append fresh text on top.
+                        # See P24 / ELI-9 for full trace.
+                        has_tool_blocks = '<details' in visible_message_text
                         # MEDIA: resolution
                         if "MEDIA:" in delta:
                             handled = False
@@ -1583,7 +1610,8 @@ class Pipe:
                         assistant_stream_text += delta
                         record_visible_chunk(delta)
                         yield delta
-                        await maybe_emit_snapshot()
+                        if has_tool_blocks:
+                            await maybe_emit_snapshot()
                         last_activity_time = time.time()
 
                 # --- Assistant text carried by item/preamble events ---
@@ -1603,7 +1631,9 @@ class Pipe:
                             pipe_log("  yielded text from item event")
                             record_visible_chunk(item_delta)
                             yield item_delta
-                            await maybe_emit_snapshot()
+                            # Only snapshot if tool blocks exist (see P24/ELI-9)
+                            if '<details' in visible_message_text:
+                                await maybe_emit_snapshot()
                             last_activity_time = time.time()
 
                 # --- Tool call events ---
