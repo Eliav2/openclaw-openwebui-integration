@@ -348,12 +348,32 @@ async def _emit_message_snapshot(__event_emitter__, content):
     )
 
 
+_USER_INPUT_TRIGGER_PREFIXES = ("Codex needs input:", "OpenClaw needs input:")
+
+
 def _is_user_input_prompt(text: str) -> bool:
     """Return True for OpenClaw/Codex blocking user-input prompts."""
     normalized = (text or "").lstrip()
-    return (
-        normalized.startswith("Codex needs input:")
-        or normalized.startswith("OpenClaw needs input:")
+    return any(normalized.startswith(p) for p in _USER_INPUT_TRIGGER_PREFIXES)
+
+
+def _could_be_user_input_prefix(normalized_text: str) -> bool:
+    """Return True while `normalized_text` (already left-stripped) is still
+    ambiguous: either a strict prefix of one of the trigger phrases (so more
+    streamed text could still complete it), or already a full match.
+
+    Used to decide whether to keep withholding assistant-delta text instead
+    of yielding it immediately — real token-by-token streaming (e.g. Claude)
+    delivers the trigger phrase a few characters at a time, so checking each
+    raw delta in isolation (as `_is_user_input_prompt` does) never matches.
+    Only once the buffered text diverges from every trigger prefix do we know
+    for sure this message isn't a needs-input prompt.
+    """
+    if not normalized_text:
+        return True
+    return any(
+        normalized_text.startswith(p) or p.startswith(normalized_text)
+        for p in _USER_INPUT_TRIGGER_PREFIXES
     )
 
 
@@ -1519,6 +1539,8 @@ class Pipe:
         assistant_stream_text = ""
         visible_message_text = ""
         had_tool_block = False
+        pending_prompt_text = ""
+        still_checking_input_prompt = True
         last_snapshot_text = ""
         last_snapshot_time = 0.0
         snapshot_interval_s = 1.0
@@ -1757,9 +1779,26 @@ class Pipe:
                         ):
                             pipe_log("  filtered metadata block")
                             continue
-                        if await maybe_answer_user_input(delta):
-                            last_activity_time = time.time()
-                            continue
+                        if still_checking_input_prompt:
+                            # Hold back text while it's still ambiguous
+                            # whether this message opens with a needs-input
+                            # trigger phrase. Real token-by-token streaming
+                            # delivers that phrase a few characters at a
+                            # time, so a per-delta check (as used to happen
+                            # here) essentially never matches — only the
+                            # buffered, accumulated text can be checked
+                            # reliably. Resolved once the run ends (see the
+                            # `else:` clause below) or as soon as the
+                            # buffered text diverges from every trigger.
+                            pending_prompt_text += delta
+                            if _could_be_user_input_prefix(
+                                pending_prompt_text.lstrip()
+                            ):
+                                last_activity_time = time.time()
+                                continue
+                            still_checking_input_prompt = False
+                            delta = pending_prompt_text
+                            pending_prompt_text = ""
                         text_yielded = True
                         # No snapshot here, regardless of whether tool blocks
                         # exist earlier in the message. A `replace` event sets
@@ -1930,11 +1969,30 @@ class Pipe:
             raise  # Re-raise to signal proper cancellation
 
         else:
-            # Normal completion (no cancellation). For pure-text turns, do
-            # NOT force a snapshot here: OWUI's own accumulation of the
-            # streamed yields already lands the full text in `content`, and
-            # an extra forced `replace` at this point double-writes it
-            # (P23/P25 — exact duplicate, no separator).
+            # Normal completion (no cancellation).
+            if pending_prompt_text:
+                # The buffered plain-text tail either fully resolved into a
+                # needs-input trigger (see `_could_be_user_input_prefix`
+                # above — buffering only continues past the ambiguous
+                # prefix stage while it keeps matching) or the run ended
+                # mid-buffer without ever diverging. Either way, resolve it
+                # now that the full text is available. `maybe_answer_user_input`
+                # re-checks the trigger itself and returns False for a
+                # partial/non-match, in which case fall back to showing it
+                # as plain text so nothing is silently dropped.
+                if await maybe_answer_user_input(pending_prompt_text):
+                    text_yielded = True
+                else:
+                    record_visible_chunk(pending_prompt_text)
+                    yield pending_prompt_text
+                    text_yielded = True
+                pending_prompt_text = ""
+
+            # For pure-text turns, do NOT force a snapshot here: OWUI's own
+            # accumulation of the streamed yields already lands the full
+            # text in `content`, and an extra forced `replace` at this
+            # point double-writes it (P23/P25 — exact duplicate, no
+            # separator).
             #
             # Turns that included a tool-call block are different (P27,
             # 2026-07-08): once a `<details type="tool_calls">` block has

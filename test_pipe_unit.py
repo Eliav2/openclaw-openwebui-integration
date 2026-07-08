@@ -65,6 +65,7 @@ from openclaw_pipe import (
     _FALLBACK_MODELS,
     _ask_user_input_modal,
     _coerce_text,
+    _could_be_user_input_prefix,
     _discover_models,
     _emit_message_snapshot,
     _emit_status,
@@ -358,6 +359,34 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
     def test_detects_codex_user_input_prompt(self):
         self.assertTrue(_is_user_input_prompt("Codex needs input:\n\nPackage\nPick one"))
         self.assertFalse(_is_user_input_prompt("I need input for this function"))
+
+    def test_partial_prefix_stays_ambiguous(self):
+        # Real token-by-token streaming (e.g. Claude) delivers the trigger a
+        # few characters at a time — each partial prefix should still read
+        # as "could be a match" so the pipe keeps buffering instead of
+        # yielding it as plain text.
+        for partial in ("", "Open", "OpenClaw needs", "OpenClaw needs input:", "Codex"):
+            self.assertTrue(
+                _could_be_user_input_prefix(partial),
+                f"expected {partial!r} to still be ambiguous",
+            )
+
+    def test_diverged_text_is_not_ambiguous(self):
+        for text in ("Hello there", "Once closed, ", "Codexx needs input:"):
+            self.assertFalse(
+                _could_be_user_input_prefix(text),
+                f"expected {text!r} to have diverged",
+            )
+
+    def test_full_prefix_plus_question_stays_matched(self):
+        # Once the prefix is fully confirmed, appending the rest of the
+        # question (arbitrary length) must keep matching so buffering
+        # continues right up to the end of the run.
+        self.assertTrue(
+            _could_be_user_input_prefix(
+                "OpenClaw needs input: what's your favorite color?"
+            )
+        )
 
     def test_builds_owui_input_modal_payload(self):
         payload = _modal_payload_from_user_input_prompt(
