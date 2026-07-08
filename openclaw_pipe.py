@@ -1356,6 +1356,11 @@ class Pipe:
             description="[Legacy] OpenClaw model override used by the GLM 5.2 manifold model. "
                 "Still honored for backward compatibility."
         )
+        AUTO_TITLE: bool = Field(
+            default=True,
+            description="Auto-generate a chat title after the first exchange (like native OWUI). "
+                "Uses a fast model; best-effort, non-blocking."
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -1447,6 +1452,128 @@ class Pipe:
                 return legacy_val.strip()
             return self._LEGACY_PRESET_MAP[preset]
         return preset
+
+    # ── Auto-title helpers ──────────────────────────────────────────
+
+    async def _auto_title(self, body, conn, visible_message_text,
+                          owui_origin_chat_id, bearer_token):
+        """Generate a chat title and set it via OWUI's REST API.
+
+        Fires after the first successful exchange in a new chat.
+        Best-effort, non-blocking — failures are logged but never surfaced.
+        """
+        if not self.valves.AUTO_TITLE:
+            return
+
+        messages = body.get("messages", [])
+        if not messages or not owui_origin_chat_id or not visible_message_text:
+            return
+
+        # Only fire for the first user message in a new chat
+        user_msgs = [m for m in messages if m.get("role") == "user"]
+        assistant_msgs = [m for m in messages if m.get("role") == "assistant"]
+        if len(user_msgs) != 1 or len(assistant_msgs) != 0:
+            return
+
+        user_text = user_msgs[0].get("content", "")[:400]
+        assistant_preview = visible_message_text[:400]
+
+        pipe_log(f"Auto-title: generating title for chat {owui_origin_chat_id}")
+
+        try:
+            title = await self._generate_title_text(conn, user_text, assistant_preview)
+            if not title:
+                return
+            await self._set_owui_chat_title(owui_origin_chat_id, title, bearer_token)
+            pipe_log(f"Auto-title: set to '{title}'")
+        except Exception as e:
+            pipe_log(f"Auto-title: failed (non-fatal): {e}")
+
+    async def _generate_title_text(self, conn, user_msg: str,
+                                    assistant_msg: str) -> str | None:
+        """Use a lightweight model call to generate a 3-5 word title + emoji."""
+        prompt = (
+            "Create a concise title (3-5 words) with a relevant emoji "
+            "for this conversation. Output ONLY the title, nothing else "
+            "— no quotes, no explanation.\n\n"
+            f"User message: {user_msg}\n\n"
+            f"Assistant response: {assistant_msg}"
+        )
+
+        title_session = f"title-gen-{uuid.uuid4().hex[:12]}"
+
+        try:
+            resp = await conn.send_request(
+                "chat.send",
+                dict(
+                    sessionKey=title_session,
+                    message=prompt,
+                    idempotencyKey=f"title-{title_session}",
+                    deliver=False,
+                ),
+                timeout=15,
+            )
+        except Exception as e:
+            pipe_log(f"Auto-title: chat.send failed: {e}")
+            return None
+
+        run_id = resp.get("runId")
+        if not run_id:
+            return None
+
+        queue = conn.register_consumer(title_session, run_id)
+        title_parts = []
+
+        try:
+            while True:
+                try:
+                    msg = await asyncio.wait_for(queue.get(), timeout=20)
+                except asyncio.TimeoutError:
+                    break
+
+                payload = msg.get("payload", {})
+                stream = payload.get("stream")
+                data = payload.get("data", {})
+
+                if stream == "assistant":
+                    delta = data.get("delta", "")
+                    if delta:
+                        title_parts.append(delta)
+
+                if stream == "lifecycle" and data.get("phase") in ("end", "error"):
+                    break
+                if payload.get("state") in ("final", "cancelled", "error"):
+                    break
+        finally:
+            conn.unregister_consumer(title_session, run_id, queue=queue)
+
+        title = "".join(title_parts).strip()
+        # Cleanup: strip quotes and limit length
+        title = title.strip('\"\' \n\r')
+        if len(title) > 80:
+            title = title[:77] + "..."
+
+        return title if title else None
+
+    async def _set_owui_chat_title(self, chat_id: str, title: str,
+                                    bearer_token: str | None):
+        """Set the chat title via OWUI's REST API (POST /api/v1/chats/{id})."""
+        token = bearer_token or self.valves.OWUI_API_KEY
+        if not token:
+            pipe_log("Auto-title: no OWUI auth token available")
+            return
+
+        data = json.dumps({"title": title}).encode()
+        req = urllib.request.Request(
+            f"{self.valves.OWUI_BASE_URL.rstrip('/')}/api/v1/chats/{chat_id}",
+            data=data,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        await asyncio.to_thread(urllib.request.urlopen, req, timeout=10)
 
     async def pipe(self, body, __event_emitter__, __event_call__=None,
                    __user__=None, __metadata__=None, __request__=None,
@@ -2158,6 +2285,16 @@ class Pipe:
 
         pipe_log(f"DONE — {event_count} events processed, "
                  f"text yielded: {text_yielded}")
+
+        # Auto-title: generate title after first exchange (best-effort, non-blocking)
+        if not aborted and text_yielded:
+            bearer_token = _extract_request_bearer(__request__)
+            asyncio.create_task(
+                self._auto_title(
+                    body, conn, visible_message_text,
+                    owui_origin_chat_id, bearer_token,
+                )
+            )
 
         if not aborted and not text_yielded:
             recovered = await recover_from_preview()
