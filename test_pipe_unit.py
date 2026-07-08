@@ -427,7 +427,7 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pending, "")
 
     def test_builds_owui_input_modal_payload(self):
-        payload = _modal_payload_from_user_input_prompt(
+        payload, is_confirmation = _modal_payload_from_user_input_prompt(
             "Codex needs input:\n\nPackage\nChoose a package style\n1. curl\n2. pipx"
         )
 
@@ -439,19 +439,64 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
             payload["data"]["placeholder"],
             "Reply with a number or your answer",
         )
+        self.assertFalse(is_confirmation)
 
     def test_marks_secret_prompts_as_password_inputs(self):
-        payload = _modal_payload_from_user_input_prompt(
+        payload, is_confirmation = _modal_payload_from_user_input_prompt(
             "Codex needs input:\n\nToken\nThis channel may show your reply to other participants."
         )
 
         self.assertEqual(payload["data"]["type"], "password")
+        self.assertFalse(is_confirmation)
 
     def test_normalizes_event_call_response_shapes(self):
         self.assertEqual(_normalize_event_call_response("  answer  "), "answer")
         self.assertEqual(_normalize_event_call_response({"value": "1"}), "1")
         self.assertEqual(_normalize_event_call_response({"confirmed": True}), "yes")
         self.assertEqual(_normalize_event_call_response({"confirmed": False}), "no")
+
+    def test_normalizes_bare_boolean_confirmation_response(self):
+        # OWUI confirmation modals resolve to a bare bool, not a dict.
+        self.assertEqual(_normalize_event_call_response(True), "yes")
+        self.assertEqual(_normalize_event_call_response(False), "no")
+
+    def test_confirmation_modal_for_explicit_yes_no(self):
+        payload, is_confirmation = _modal_payload_from_user_input_prompt(
+            "OpenClaw needs input:\n\nProceed?\nRun the deploy now? (y/n)"
+        )
+        self.assertTrue(is_confirmation)
+        self.assertEqual(payload["type"], "confirmation")
+
+    def test_confirmation_modal_for_confirm_verb_question(self):
+        payload, is_confirmation = _modal_payload_from_user_input_prompt(
+            "OpenClaw needs input:\n\nDelete file?\nDelete config.json?"
+        )
+        self.assertTrue(is_confirmation)
+        self.assertEqual(payload["type"], "confirmation")
+
+    def test_choice_question_is_not_confirmation(self):
+        # A short "?" title that is really a free-text choice must NOT become
+        # a yes/no dialog (would silently strip the real answer).
+        payload, is_confirmation = _modal_payload_from_user_input_prompt(
+            "OpenClaw needs input:\n\nWhich model?\nWhich model should I use?"
+        )
+        self.assertFalse(is_confirmation)
+        self.assertEqual(payload["type"], "input")
+
+    def test_numbered_options_never_confirmation(self):
+        # An enumerated option list is a choice even if a confirm verb appears.
+        payload, is_confirmation = _modal_payload_from_user_input_prompt(
+            "OpenClaw needs input:\n\nProceed how?\nProceed?\n1. rebase\n2. merge"
+        )
+        self.assertFalse(is_confirmation)
+        self.assertEqual(payload["type"], "input")
+
+    def test_secret_marker_does_not_match_innocent_key_substring(self):
+        # "monkey" contains "key" — must not be flagged as a secret.
+        payload, _ = _modal_payload_from_user_input_prompt(
+            "OpenClaw needs input:\n\nName the monkey\nWhat should we call the monkey?"
+        )
+        self.assertNotEqual(payload["data"].get("type"), "password")
 
     async def test_ask_user_input_modal_returns_answer(self):
         calls = []

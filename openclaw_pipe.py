@@ -406,8 +406,12 @@ def _advance_input_prompt_buffer(pending: str, delta: str) -> tuple[str, str]:
     return before + after, ""
 
 
-def _modal_payload_from_user_input_prompt(prompt_text: str) -> dict:
-    """Build an OWUI modal payload from OpenClaw's "needs input:" prompt text."""
+def _modal_payload_from_user_input_prompt(prompt_text: str) -> tuple[dict, bool]:
+    """Build an OWUI modal payload from OpenClaw's "needs input:" prompt text.
+
+    Returns (payload_dict, is_confirmation) where is_confirmation is True
+    if a yes/no confirmation modal was chosen instead of a free-text input.
+    """
     lines = [line.strip() for line in (prompt_text or "").splitlines()]
     lines = [line for line in lines if line]
     if lines and lines[0].endswith("needs input:"):
@@ -419,10 +423,47 @@ def _modal_payload_from_user_input_prompt(prompt_text: str) -> dict:
         lines = lines[1:]
 
     message = "\n".join(lines).strip() or "Please answer so the run can continue."
+
+    text_lower = (prompt_text or "").lower()
+
+    # Detect password / secret input. Kept specific on purpose: a bare "key"
+    # substring matches innocent words ("monkey", "which key order?"), so we
+    # only trigger on unambiguous secret markers.
     is_secret = any(
-        marker in (prompt_text or "").lower()
-        for marker in ("secret", "password", "may show your reply")
+        marker in text_lower
+        for marker in ("secret", "password", "may show your reply", "api key", "token")
     )
+
+    # Detect confirmation (yes/no) questions — conservatively. Misclassifying a
+    # free-text choice as a binary yes/no silently strips the real answer, so we
+    # only pick confirmation when the prompt clearly reads as binary:
+    #   * an explicit yes/no marker is present, OR
+    #   * a strong confirm verb appears AND the prompt ends with "?".
+    # An enumerated option list ("1. ... 2. ...") is a CHOICE, never yes/no.
+    has_options = bool(re.search(r"(?m)^\s*\d+[.)]\s", prompt_text or ""))
+    yn_markers = ("(y/n)", "[y/n]", "y/n?", "yes/no", "(yes/no)")
+    confirm_verbs = (
+        "confirm", "proceed", "overwrite", "are you sure", "do you want",
+        "delete", "remove", "בטוח", "האם", "هل تريد",
+    )
+    has_yn_marker = any(m in text_lower for m in yn_markers)
+    has_confirm_verb = any(w in text_lower for w in confirm_verbs)
+    ends_question = message.rstrip().endswith("?") or title.rstrip().endswith("?")
+    is_confirmation = (
+        not is_secret
+        and not has_options
+        and (has_yn_marker or (has_confirm_verb and ends_question))
+    )
+
+    if is_confirmation:
+        # Use yes/no confirmation dialog for quick binary choices
+        data = {
+            "title": title,
+            "message": message,
+        }
+        return {"type": "confirmation", "data": data}, True
+
+    # Default: free-text input
     data = {
         "title": title,
         "message": message,
@@ -430,7 +471,23 @@ def _modal_payload_from_user_input_prompt(prompt_text: str) -> dict:
     }
     if is_secret:
         data["type"] = "password"
-    return {"type": "input", "data": data}
+    return {"type": "input", "data": data}, False
+
+
+@dataclass
+class UserInputResult:
+    """Outcome of trying to answer a needs-input prompt via an OWUI modal.
+
+    handled=False  -> not a prompt, user cancelled, or delivery failed;
+                      the caller should show the text as a fallback.
+    handled=True, new_run_id=None -> answer delivered, the run resumed in
+                      place (steer); keep consuming the current run.
+    handled=True, new_run_id="..." -> answer spawned a new run; the caller
+                      should switch its consumer to that run.
+    """
+
+    handled: bool
+    new_run_id: str | None = None
 
 
 def _normalize_event_call_response(response) -> str:
@@ -439,6 +496,10 @@ def _normalize_event_call_response(response) -> str:
     """
     if response is None:
         return ""
+    # Confirmation modals resolve to a bare boolean: True=confirm, False=cancel.
+    # (bool is a subclass of int, so this must be handled before dict/str.)
+    if isinstance(response, bool):
+        return "yes" if response else "no"
     if isinstance(response, str):
         return response.strip()
     if isinstance(response, dict):
@@ -469,8 +530,9 @@ async def _ask_user_input_modal(
     """Ask the user through OWUI's modal input API when available."""
     if not __event_call__ or not _is_user_input_prompt(prompt_text):
         return None
+    payload, _ = _modal_payload_from_user_input_prompt(prompt_text)
     response = await asyncio.wait_for(
-        __event_call__(_modal_payload_from_user_input_prompt(prompt_text)),
+        __event_call__(payload),
         timeout=timeout_s,
     )
     answer = _normalize_event_call_response(response)
@@ -1610,22 +1672,29 @@ class Pipe:
             last_snapshot_text = visible_message_text
             last_snapshot_time = now
 
-        async def maybe_answer_user_input(prompt_text: str) -> bool:
+        async def maybe_answer_user_input(prompt_text: str) -> UserInputResult:
+            """Ask the user via an OWUI modal and deliver their answer.
+
+            See UserInputResult for the meaning of the return value. Crucially,
+            a delivered answer that steers the *same* run (no new runId) still
+            returns handled=True, so the caller suppresses the raw prompt text
+            instead of leaking it into the chat.
+            """
             if not _is_user_input_prompt(prompt_text):
-                return False
+                return UserInputResult(False, None)
             try:
                 answer = await _ask_user_input_modal(__event_call__, prompt_text)
             except Exception as ex:
                 pipe_log(f"  user input modal failed; falling back to chat prompt: {ex}")
-                return False
-            if not answer:
-                pipe_log("  user input modal returned empty answer or error")
-                return False
+                answer = None
+            if answer is None:
+                pipe_log("  user input modal cancelled or empty answer")
+                return UserInputResult(False, None)
             pipe_log("  user input answered via OWUI modal")
             await _emit_status(__event_emitter__, "Sending answer...", done=False)
             idempotency_key = f"user-input-{chat_id}-{time.time()}"
             try:
-                await conn.send_request(
+                send_resp = await conn.send_request(
                     "chat.send",
                     _owui_chat_send_params(
                         session_key=session_key,
@@ -1637,407 +1706,449 @@ class Pipe:
                     timeout=30,
                 )
             except Exception as ex:
+                # Delivery failed: report not-handled so the caller falls back
+                # to showing the prompt text (better than a silent stall).
                 pipe_log(f"  sending answer back failed: {ex}")
+                return UserInputResult(False, None)
+            new_run_id = send_resp.get("runId") or None
             await _emit_status(__event_emitter__, "Answer sent; continuing...", done=False)
-            return True
+            if new_run_id:
+                pipe_log(f"  answer sent, new runId: {new_run_id[:20]}...")
+            else:
+                pipe_log("  answer sent, steering into active run (no new runId)")
+            return UserInputResult(True, new_run_id)
 
+        adopt_new_run = True
         try:
-            while not done:
+            while adopt_new_run:
+                adopt_new_run = False
                 try:
-                    recv_timeout = idle_probe_s if first_event_arrived else 60
-                    msg = await asyncio.wait_for(queue.get(), timeout=recv_timeout)
-                except asyncio.TimeoutError:
-                    timeout_desc = (
-                        f"{idle_probe_s}s"
-                        if first_event_arrived
-                        else "60s"
-                    )
-                    pipe_log(f"TIMEOUT — no events on queue for {timeout_desc}")
-                    if not first_event_arrived:
-                        yield "**Timeout:** Gateway accepted the message but emitted no run events."
-                        text_yielded = True
-                        break
-
-                    recovered = await recover_from_preview()
-                    if recovered and not text_yielded:
-                        pipe_log("  recovered assistant text from sessions.preview")
-                        text_yielded = True
-                        record_visible_chunk(recovered)
-                        yield recovered
-                        await maybe_emit_snapshot(force=True)
-                        done = True
-                        break
-
-                    # A quiet queue for idle_probe_s does NOT mean the run is
-                    # done — a long tool call or a stretch of agent reasoning
-                    # with no intermediate events looks identical from here.
-                    # Only `sessions.describe` (the Gateway's own run status)
-                    # is authoritative; never close on silence alone, whether
-                    # or not text has already streamed.
-                    idle_elapsed = time.time() - last_activity_time
-                    if not text_yielded:
-                        elapsed = time.time() - wait_started_time
-                        if elapsed < no_text_deadman_s:
-                            pipe_log(
-                                "  idle but no assistant text yet; "
-                                "continuing to wait for terminal event"
-                            )
-                            await _emit_status(
-                                __event_emitter__,
-                                "Waiting for final answer...",
-                                done=False,
-                            )
-                    else:
-                        pipe_log(
-                            f"  idle for {idle_elapsed:.0f}s after streaming text; "
-                            "verifying the run is actually done before closing"
-                        )
-                        await _emit_status(
-                            __event_emitter__,
-                            "Still working...",
-                            done=False,
-                        )
-
-                    # Periodically check if the Gateway still has an active run
-                    if time.time() - last_describe_check >= describe_check_interval:
-                        last_describe_check = time.time()
+                    while not done:
                         try:
-                            desc = await conn.send_request(
-                                "sessions.describe",
-                                dict(key=session_key),
-                                timeout=8
+                            recv_timeout = idle_probe_s if first_event_arrived else 60
+                            msg = await asyncio.wait_for(queue.get(), timeout=recv_timeout)
+                        except asyncio.TimeoutError:
+                            timeout_desc = (
+                                f"{idle_probe_s}s"
+                                if first_event_arrived
+                                else "60s"
                             )
-                            session_row = desc.get("session")
-                            if session_row is None:
-                                pipe_log("  sessions.describe: session not found")
-                                if text_yielded:
-                                    done = True
-                                    break
-                            elif session_row.get("status") in ("done", "failed", "cancelled"):
-                                pipe_log("  sessions.describe: session is done/failed/cancelled, checking preview")
-                                recovered2 = await recover_from_preview()
-                                if recovered2 and not text_yielded:
-                                    pipe_log("  recovered assistant text after describe probe")
-                                    text_yielded = True
-                                    record_visible_chunk(recovered2)
-                                    yield recovered2
-                                    await maybe_emit_snapshot(force=True)
+                            pipe_log(f"TIMEOUT — no events on queue for {timeout_desc}")
+                            if not first_event_arrived:
+                                yield "**Timeout:** Gateway accepted the message but emitted no run events."
+                                text_yielded = True
+                                break
+
+                            recovered = await recover_from_preview()
+                            if recovered and not text_yielded:
+                                pipe_log("  recovered assistant text from sessions.preview")
+                                text_yielded = True
+                                record_visible_chunk(recovered)
+                                yield recovered
+                                await maybe_emit_snapshot(force=True)
                                 done = True
                                 break
+
+                            # A quiet queue for idle_probe_s does NOT mean the run is
+                            # done — a long tool call or a stretch of agent reasoning
+                            # with no intermediate events looks identical from here.
+                            # Only `sessions.describe` (the Gateway's own run status)
+                            # is authoritative; never close on silence alone, whether
+                            # or not text has already streamed.
+                            idle_elapsed = time.time() - last_activity_time
+                            if not text_yielded:
+                                elapsed = time.time() - wait_started_time
+                                if elapsed < no_text_deadman_s:
+                                    pipe_log(
+                                        "  idle but no assistant text yet; "
+                                        "continuing to wait for terminal event"
+                                    )
+                                    await _emit_status(
+                                        __event_emitter__,
+                                        "Waiting for final answer...",
+                                        done=False,
+                                    )
                             else:
                                 pipe_log(
-                                    f"  sessions.describe: status="
-                                    f"{session_row.get('status','unknown')} — "
-                                    "still active, keep waiting"
+                                    f"  idle for {idle_elapsed:.0f}s after streaming text; "
+                                    "verifying the run is actually done before closing"
                                 )
-                        except Exception as ex:
-                            pipe_log(f"  sessions.describe probe failed: {ex}")
-                            # Belt-and-suspenders: if we can't even confirm
-                            # status and have been idle far longer than the
-                            # normal deadman budget, give up rather than hang
-                            # forever (should be rare — WS reconnect handles
-                            # true connection loss separately).
-                            if text_yielded and idle_elapsed > no_text_deadman_s:
-                                pipe_log("  describe probe unreachable and idle too long; closing")
-                                done = True
-                                break
-
-                    continue
-
-                event_count += 1
-                first_event_arrived = True
-                payload = msg.get("payload", {})
-                stream = payload.get("stream")
-                data = payload.get("data", {})
-                name = data.get("name", "")
-                phase = data.get("phase", "")
-                state = payload.get("state", "")
-
-                # --- P16: Double-check session/run match ---
-                evt_session = payload.get("sessionKey", "")
-                evt_run_id = payload.get("runId", "")
-                if evt_session and evt_session != session_key:
-                    pipe_log(f"  queue delivered wrong session: {evt_session[:40]}...")
-                    continue
-                if evt_run_id and evt_run_id != our_run_id:
-                    pipe_log(f"  queue delivered wrong run: {evt_run_id[:20]}...")
-                    continue
-
-                # --- Completion signals (multiple sources) ---
-                if stream == "lifecycle" and phase == "end":
-                    done = True
-                    pipe_log("  lifecycle end -> done")
-                elif stream == "lifecycle" and phase == "error":
-                    yield f"\n\n**Error:** {data.get('error', 'unknown')}"
-                    done = True
-                    pipe_log("  lifecycle error -> done")
-
-                if state in ("final", "cancelled", "error"):
-                    done = True
-                    pipe_log(f"  payload state='{state}' -> done")
-
-                if data.get("aborted") is True:
-                    done = True
-                    pipe_log("  data.aborted -> done")
-
-                # --- Assistant text stream ---
-                if stream == "assistant":
-                    raw_delta = data.get("delta")
-                    if raw_delta:
-                        delta = raw_delta
-                    else:
-                        # Some providers (observed with claude-cli-backed
-                        # Opus/Sonnet overrides) send a final catch-all event
-                        # with no `delta` but a `text` field holding the full
-                        # cumulative reply rather than a fresh chunk. Treating
-                        # it as always-new re-sent the whole message a second
-                        # time. Diff it against what's already been streamed,
-                        # same as the item-event dedup below.
-                        raw_text = data.get("text") or ""
-                        delta = (
-                            _item_delta_text(raw_text, "", assistant_stream_text)
-                            if raw_text
-                            else ""
-                        )
-                    if delta:
-                        # Filter Sender metadata
-                        if (
-                            "Sender (untrusted metadata)" in delta
-                            or "UnTrustedMetadata" in delta
-                        ):
-                            pipe_log("  filtered metadata block")
-                            continue
-                        # Hold back text while it (or a fresh line within
-                        # it) is still ambiguous whether it opens with a
-                        # needs-input trigger phrase. Real token-by-token
-                        # streaming delivers that phrase a few characters at
-                        # a time, so checking each raw delta in isolation
-                        # (as used to happen here) essentially never
-                        # matches — only the buffered, accumulated text can
-                        # be checked reliably. Resolved once the run ends
-                        # (see the `else:` clause below) or as soon as the
-                        # buffered text diverges from every trigger.
-                        flush_text, pending_prompt_text = (
-                            _advance_input_prompt_buffer(pending_prompt_text, delta)
-                        )
-                        if not flush_text:
-                            last_activity_time = time.time()
-                            continue
-                        delta = flush_text
-                        text_yielded = True
-                        # No snapshot here, regardless of whether tool blocks
-                        # exist earlier in the message. A `replace` event sets
-                        # the full message content; if it lands on (or near)
-                        # the complete final text right before the generator
-                        # naturally finishes, OWUI double-saves — the
-                        # `replace` writes it once, then the generator's own
-                        # accumulated streamed yields write the same content
-                        # again on top. This isn't only a risk for the literal
-                        # last chunk: since these snapshots are throttled by
-                        # time/char thresholds rather than tied to "a tool
-                        # block was just added", they keep firing throughout
-                        # any plain-text tail after a tool call and will
-                        # eventually land close enough to the end to trigger
-                        # the same duplicate. The one snapshot that's actually
-                        # safe is the forced one taken right when a tool
-                        # block itself is yielded (still partial content by
-                        # definition, since the block was just added) — see
-                        # the `stream == "tool"` / phase == "result" handler.
-                        # See P17 / P19 / P23 / P24 / ELI-9 for the history of
-                        # this recurring bug.
-                        # MEDIA: resolution
-                        if "MEDIA:" in delta:
-                            handled = False
-                            if self.valves.USE_OWUI_FILES:
-                                token = (
-                                    _extract_request_bearer(__request__)
-                                    or self.valves.OWUI_API_KEY
+                                await _emit_status(
+                                    __event_emitter__,
+                                    "Still working...",
+                                    done=False,
                                 )
+
+                            # Periodically check if the Gateway still has an active run
+                            if time.time() - last_describe_check >= describe_check_interval:
+                                last_describe_check = time.time()
                                 try:
-                                    resolved, handled = await _resolve_media_via_owui(
-                                        delta,
-                                        base_url=self.valves.OWUI_BASE_URL,
-                                        token=token,
-                                        __event_emitter__=__event_emitter__,
+                                    desc = await conn.send_request(
+                                        "sessions.describe",
+                                        dict(key=session_key),
+                                        timeout=8
                                     )
+                                    session_row = desc.get("session")
+                                    if session_row is None:
+                                        pipe_log("  sessions.describe: session not found")
+                                        if text_yielded:
+                                            done = True
+                                            break
+                                    elif session_row.get("status") in ("done", "failed", "cancelled"):
+                                        pipe_log("  sessions.describe: session is done/failed/cancelled, checking preview")
+                                        recovered2 = await recover_from_preview()
+                                        if recovered2 and not text_yielded:
+                                            pipe_log("  recovered assistant text after describe probe")
+                                            text_yielded = True
+                                            record_visible_chunk(recovered2)
+                                            yield recovered2
+                                            await maybe_emit_snapshot(force=True)
+                                        done = True
+                                        break
+                                    else:
+                                        pipe_log(
+                                            f"  sessions.describe: status="
+                                            f"{session_row.get('status','unknown')} — "
+                                            "still active, keep waiting"
+                                        )
                                 except Exception as ex:
-                                    pipe_log(f"  OWUI file upload failed; falling back: {ex}")
-                            if not handled:
-                                resolved, handled = _resolve_media(
-                                    delta,
-                                    base_url=self.valves.FILE_SERVER_BASE_URL
-                                )
-                            if handled:
-                                pipe_log("  resolved MEDIA: directive")
-                                record_visible_chunk(resolved)
-                                yield resolved
-                                await maybe_emit_snapshot()
-                                last_activity_time = time.time()
-                                continue
-                        assistant_stream_text += delta
-                        record_visible_chunk(delta)
-                        yield delta
-                        last_activity_time = time.time()
+                                    pipe_log(f"  sessions.describe probe failed: {ex}")
+                                    # Belt-and-suspenders: if we can't even confirm
+                                    # status and have been idle far longer than the
+                                    # normal deadman budget, give up rather than hang
+                                    # forever (should be rare — WS reconnect handles
+                                    # true connection loss separately).
+                                    if text_yielded and idle_elapsed > no_text_deadman_s:
+                                        pipe_log("  describe probe unreachable and idle too long; closing")
+                                        done = True
+                                        break
 
-                # --- Assistant text carried by item/preamble events ---
-                if stream == "item":
-                    item_text = _item_assistant_text(data)
-                    if item_text:
-                        if await maybe_answer_user_input(item_text):
-                            last_item_text = item_text
-                            last_activity_time = time.time()
                             continue
-                        item_delta = _item_delta_text(
-                            item_text, last_item_text, assistant_stream_text
-                        )
-                        last_item_text = item_text
-                        if item_delta:
-                            text_yielded = True
-                            pipe_log("  yielded text from item event")
-                            record_visible_chunk(item_delta)
-                            yield item_delta
+
+                        event_count += 1
+                        first_event_arrived = True
+                        payload = msg.get("payload", {})
+                        stream = payload.get("stream")
+                        data = payload.get("data", {})
+                        name = data.get("name", "")
+                        phase = data.get("phase", "")
+                        state = payload.get("state", "")
+
+                        # --- P16: Double-check session/run match ---
+                        evt_session = payload.get("sessionKey", "")
+                        evt_run_id = payload.get("runId", "")
+                        if evt_session and evt_session != session_key:
+                            pipe_log(f"  queue delivered wrong session: {evt_session[:40]}...")
+                            continue
+                        if evt_run_id and evt_run_id != our_run_id:
+                            pipe_log(f"  queue delivered wrong run: {evt_run_id[:20]}...")
+                            continue
+
+                        # --- Completion signals (multiple sources) ---
+                        if stream == "lifecycle" and phase == "end":
+                            done = True
+                            pipe_log("  lifecycle end -> done")
+                        elif stream == "lifecycle" and phase == "error":
+                            yield f"\n\n**Error:** {data.get('error', 'unknown')}"
+                            done = True
+                            pipe_log("  lifecycle error -> done")
+
+                        if state in ("final", "cancelled", "error"):
+                            done = True
+                            pipe_log(f"  payload state='{state}' -> done")
+
+                        if data.get("aborted") is True:
+                            done = True
+                            pipe_log("  data.aborted -> done")
+
+                        # --- Assistant text stream ---
+                        if stream == "assistant":
+                            raw_delta = data.get("delta")
+                            if raw_delta:
+                                delta = raw_delta
+                            else:
+                                # Some providers (observed with claude-cli-backed
+                                # Opus/Sonnet overrides) send a final catch-all event
+                                # with no `delta` but a `text` field holding the full
+                                # cumulative reply rather than a fresh chunk. Treating
+                                # it as always-new re-sent the whole message a second
+                                # time. Diff it against what's already been streamed,
+                                # same as the item-event dedup below.
+                                raw_text = data.get("text") or ""
+                                delta = (
+                                    _item_delta_text(raw_text, "", assistant_stream_text)
+                                    if raw_text
+                                    else ""
+                                )
+                            if delta:
+                                # Filter Sender metadata
+                                if (
+                                    "Sender (untrusted metadata)" in delta
+                                    or "UnTrustedMetadata" in delta
+                                ):
+                                    pipe_log("  filtered metadata block")
+                                    continue
+                                # Hold back text while it (or a fresh line within
+                                # it) is still ambiguous whether it opens with a
+                                # needs-input trigger phrase. Real token-by-token
+                                # streaming delivers that phrase a few characters at
+                                # a time, so checking each raw delta in isolation
+                                # (as used to happen here) essentially never
+                                # matches — only the buffered, accumulated text can
+                                # be checked reliably. Resolved once the run ends
+                                # (see the `else:` clause below) or as soon as the
+                                # buffered text diverges from every trigger.
+                                flush_text, pending_prompt_text = (
+                                    _advance_input_prompt_buffer(pending_prompt_text, delta)
+                                )
+                                if not flush_text:
+                                    last_activity_time = time.time()
+                                    continue
+                                delta = flush_text
+                                text_yielded = True
+                                # No snapshot here, regardless of whether tool blocks
+                                # exist earlier in the message. A `replace` event sets
+                                # the full message content; if it lands on (or near)
+                                # the complete final text right before the generator
+                                # naturally finishes, OWUI double-saves — the
+                                # `replace` writes it once, then the generator's own
+                                # accumulated streamed yields write the same content
+                                # again on top. This isn't only a risk for the literal
+                                # last chunk: since these snapshots are throttled by
+                                # time/char thresholds rather than tied to "a tool
+                                # block was just added", they keep firing throughout
+                                # any plain-text tail after a tool call and will
+                                # eventually land close enough to the end to trigger
+                                # the same duplicate. The one snapshot that's actually
+                                # safe is the forced one taken right when a tool
+                                # block itself is yielded (still partial content by
+                                # definition, since the block was just added) — see
+                                # the `stream == "tool"` / phase == "result" handler.
+                                # See P17 / P19 / P23 / P24 / ELI-9 for the history of
+                                # this recurring bug.
+                                # MEDIA: resolution
+                                if "MEDIA:" in delta:
+                                    handled = False
+                                    if self.valves.USE_OWUI_FILES:
+                                        token = (
+                                            _extract_request_bearer(__request__)
+                                            or self.valves.OWUI_API_KEY
+                                        )
+                                        try:
+                                            resolved, handled = await _resolve_media_via_owui(
+                                                delta,
+                                                base_url=self.valves.OWUI_BASE_URL,
+                                                token=token,
+                                                __event_emitter__=__event_emitter__,
+                                            )
+                                        except Exception as ex:
+                                            pipe_log(f"  OWUI file upload failed; falling back: {ex}")
+                                    if not handled:
+                                        resolved, handled = _resolve_media(
+                                            delta,
+                                            base_url=self.valves.FILE_SERVER_BASE_URL
+                                        )
+                                    if handled:
+                                        pipe_log("  resolved MEDIA: directive")
+                                        record_visible_chunk(resolved)
+                                        yield resolved
+                                        await maybe_emit_snapshot()
+                                        last_activity_time = time.time()
+                                        continue
+                                assistant_stream_text += delta
+                                record_visible_chunk(delta)
+                                yield delta
+                                last_activity_time = time.time()
+
+                        # --- Assistant text carried by item/preamble events ---
+                        if stream == "item":
+                            item_text = _item_assistant_text(data)
+                            if item_text:
+                                answer_res = await maybe_answer_user_input(item_text)
+                                if answer_res.handled:
+                                    if answer_res.new_run_id and answer_res.new_run_id != our_run_id:
+                                        pipe_log(f"  needs-input handled, switching to run {answer_res.new_run_id[:20]}...")
+                                        conn.unregister_consumer(session_key, our_run_id, queue=queue)
+                                        queue = conn.register_consumer(session_key, answer_res.new_run_id)
+                                        our_run_id = answer_res.new_run_id
+                                    done = False
+                                    last_item_text = item_text
+                                    last_activity_time = time.time()
+                                    continue
+                                item_delta = _item_delta_text(
+                                    item_text, last_item_text, assistant_stream_text
+                                )
+                                last_item_text = item_text
+                                if item_delta:
+                                    text_yielded = True
+                                    pipe_log("  yielded text from item event")
+                                    record_visible_chunk(item_delta)
+                                    yield item_delta
+                                    last_activity_time = time.time()
+
+                        # --- Tool call events ---
+                        if stream == "tool":
+                            if phase == "start":
+                                tool_call_id = data.get("toolCallId", "")
+                                args = json.dumps(data.get("args", {}))
+                                if tool_call_id:
+                                    self._active_tool_args[tool_call_id] = args
+                                pipe_log(f"  Tool start: {name}")
+                                await _emit_status(
+                                    __event_emitter__,
+                                    f"Running {name}...",
+                                    done=False,
+                                )
+                                last_activity_time = time.time()
+
+                            elif phase == "result":
+                                result = data.get("result", {})
+                                result_str = json.dumps(result) if not isinstance(result, str) else result
+                                tool_call_id = data.get("toolCallId", "")
+                                stored_args = self._active_tool_args.pop(tool_call_id, None)
+                                args_str = stored_args or json.dumps(data.get("args", {}))
+                                pipe_log(f"  Tool result: {name} ({len(result_str)} chars)")
+                                tool_block = (
+                                    '\n<details type="tool_calls" done="true" '
+                                    f'id="{html.escape(tool_call_id)}" '
+                                    f'name="{html.escape(name)}" '
+                                    f'arguments="{html.escape(args_str[:3000])}" '
+                                    f'result="{html.escape(result_str[:8000])}" '
+                                    f'meta="{html.escape(str(data.get("meta",""))[:500])}" '
+                                    'files="[]" embeds="[]">'
+                                    f'\n<summary>{html.escape(name)}</summary>\n</details>\n'
+                                )
+                                had_tool_block = True
+                                record_visible_chunk(tool_block)
+                                yield tool_block
+                                await maybe_emit_snapshot(force=True)
+                                await _emit_status(
+                                    __event_emitter__,
+                                    f"{name} done",
+                                    done=True,
+                                )
+                                last_activity_time = time.time()
+
+                        # --- Item events (progress) ---
+                        if stream == "item":
+                            pipe_log(f"  Item: kind={data.get('kind','')} "
+                                     f"status={data.get('status','')} "
+                                     f"title={str(data.get('title',''))[:50]}")
                             last_activity_time = time.time()
 
-                # --- Tool call events ---
-                if stream == "tool":
-                    if phase == "start":
-                        tool_call_id = data.get("toolCallId", "")
-                        args = json.dumps(data.get("args", {}))
-                        if tool_call_id:
-                            self._active_tool_args[tool_call_id] = args
-                        pipe_log(f"  Tool start: {name}")
-                        await _emit_status(
-                            __event_emitter__,
-                            f"Running {name}...",
-                            done=False,
-                        )
-                        last_activity_time = time.time()
+                        if not text_yielded and event_count >= max_events_without_text:
+                            recovered = await recover_from_preview()
+                            if recovered:
+                                pipe_log("  recovered assistant text after event cap")
+                                text_yielded = True
+                                record_visible_chunk(recovered)
+                                yield recovered
+                                await maybe_emit_snapshot(force=True)
+                            else:
+                                timeout_text = (
+                                    "\n\n**Timeout:** The run emitted too many progress "
+                                    "events without assistant text. The pipe kept the "
+                                    "run from ending as `(no response)`, but the Gateway "
+                                    "did not provide visible output."
+                                )
+                                record_visible_chunk(timeout_text)
+                                yield timeout_text
+                                await maybe_emit_snapshot(force=True)
+                                text_yielded = True
+                            done = True
 
-                    elif phase == "result":
-                        result = data.get("result", {})
-                        result_str = json.dumps(result) if not isinstance(result, str) else result
-                        tool_call_id = data.get("toolCallId", "")
-                        stored_args = self._active_tool_args.pop(tool_call_id, None)
-                        args_str = stored_args or json.dumps(data.get("args", {}))
-                        pipe_log(f"  Tool result: {name} ({len(result_str)} chars)")
-                        tool_block = (
-                            '\n<details type="tool_calls" done="true" '
-                            f'id="{html.escape(tool_call_id)}" '
-                            f'name="{html.escape(name)}" '
-                            f'arguments="{html.escape(args_str[:3000])}" '
-                            f'result="{html.escape(result_str[:8000])}" '
-                            f'meta="{html.escape(str(data.get("meta",""))[:500])}" '
-                            'files="[]" embeds="[]">'
-                            f'\n<summary>{html.escape(name)}</summary>\n</details>\n'
-                        )
-                        had_tool_block = True
-                        record_visible_chunk(tool_block)
-                        yield tool_block
-                        await maybe_emit_snapshot(force=True)
-                        await _emit_status(
-                            __event_emitter__,
-                            f"{name} done",
-                            done=True,
-                        )
-                        last_activity_time = time.time()
+                        if (
+                            not done
+                            and first_event_arrived
+                            and text_yielded
+                            and time.time() - last_activity_time > idle_probe_s
+                        ):
+                            pipe_log(
+                                "  idle probe: text already streamed and no activity for "
+                                f"{idle_probe_s}s, self-closing"
+                            )
+                            done = True
 
-                # --- Item events (progress) ---
-                if stream == "item":
-                    pipe_log(f"  Item: kind={data.get('kind','')} "
-                             f"status={data.get('status','')} "
-                             f"title={str(data.get('title',''))[:50]}")
-                    last_activity_time = time.time()
+                except asyncio.CancelledError:
+                    # OWUI stop button → abort the gateway run
+                    aborted = True
+                    pipe_log("Generator cancelled — sending chat.abort")
+                    await maybe_emit_snapshot(force=True)
+                    await _emit_status(__event_emitter__, "Stopped", done=True)
+                    await conn.abort(session_key, our_run_id)
+                    if self.valves.SEND_STOP_ON_CANCEL:
+                        pipe_log("Generator cancelled — sending /stop fallback")
+                        await conn.send_stop(session_key)
+                    raise  # Re-raise to signal proper cancellation
 
-                if not text_yielded and event_count >= max_events_without_text:
-                    recovered = await recover_from_preview()
-                    if recovered:
-                        pipe_log("  recovered assistant text after event cap")
-                        text_yielded = True
-                        record_visible_chunk(recovered)
-                        yield recovered
-                        await maybe_emit_snapshot(force=True)
-                    else:
-                        timeout_text = (
-                            "\n\n**Timeout:** The run emitted too many progress "
-                            "events without assistant text. The pipe kept the "
-                            "run from ending as `(no response)`, but the Gateway "
-                            "did not provide visible output."
-                        )
-                        record_visible_chunk(timeout_text)
-                        yield timeout_text
-                        await maybe_emit_snapshot(force=True)
-                        text_yielded = True
-                    done = True
-
-                if (
-                    not done
-                    and first_event_arrived
-                    and text_yielded
-                    and time.time() - last_activity_time > idle_probe_s
-                ):
-                    pipe_log(
-                        "  idle probe: text already streamed and no activity for "
-                        f"{idle_probe_s}s, self-closing"
-                    )
-                    done = True
-
-        except asyncio.CancelledError:
-            # OWUI stop button → abort the gateway run
-            aborted = True
-            pipe_log("Generator cancelled — sending chat.abort")
-            await maybe_emit_snapshot(force=True)
-            await _emit_status(__event_emitter__, "Stopped", done=True)
-            await conn.abort(session_key, our_run_id)
-            if self.valves.SEND_STOP_ON_CANCEL:
-                pipe_log("Generator cancelled — sending /stop fallback")
-                await conn.send_stop(session_key)
-            raise  # Re-raise to signal proper cancellation
-
-        else:
-            # Normal completion (no cancellation).
-            if pending_prompt_text:
-                # The buffered plain-text tail either fully resolved into a
-                # needs-input trigger (see `_could_be_user_input_prefix`
-                # above — buffering only continues past the ambiguous
-                # prefix stage while it keeps matching) or the run ended
-                # mid-buffer without ever diverging. Either way, resolve it
-                # now that the full text is available. `maybe_answer_user_input`
-                # re-checks the trigger itself and returns False for a
-                # partial/non-match, in which case fall back to showing it
-                # as plain text so nothing is silently dropped.
-                if await maybe_answer_user_input(pending_prompt_text):
-                    text_yielded = True
                 else:
-                    record_visible_chunk(pending_prompt_text)
-                    yield pending_prompt_text
-                    text_yielded = True
-                pending_prompt_text = ""
+                    # Normal completion (no cancellation).
+                    if pending_prompt_text:
+                        # The buffered plain-text tail either fully resolved into a
+                        # needs-input trigger (see `_could_be_user_input_prefix`
+                        # above — buffering only continues past the ambiguous
+                        # prefix stage while it keeps matching) or the run ended
+                        # mid-buffer without ever diverging. Either way, resolve it
+                        # now that the full text is available. `maybe_answer_user_input`
+                        # re-checks the trigger itself and returns False for a
+                        # partial/non-match, in which case fall back to showing it
+                        # as plain text so nothing is silently dropped.
+                        answer_res = await maybe_answer_user_input(pending_prompt_text)
+                        if answer_res.handled:
+                            # Answer delivered. Re-enter the main loop (via the outer
+                            # `while adopt_new_run`) to consume the follow-up — whether
+                            # the run resumed in place (steer) or a new run was spawned
+                            # — so the continuation reuses the same needs-input
+                            # re-detection, dedup and snapshot handling as any other
+                            # run instead of a separate, drift-prone copy of the loop.
+                            text_yielded = True
+                            pending_prompt_text = ""
+                            if answer_res.new_run_id and answer_res.new_run_id != our_run_id:
+                                pipe_log(f"  continuing into new run: {answer_res.new_run_id[:20]}...")
+                                conn.unregister_consumer(session_key, our_run_id, queue=queue)
+                                queue = conn.register_consumer(session_key, answer_res.new_run_id)
+                                our_run_id = answer_res.new_run_id
+                            else:
+                                pipe_log("  continuing in the same run after modal answer")
+                            done = False
+                            adopt_new_run = True
+                            # Fresh activity clock so the idle-probe self-close does not
+                            # fire immediately against a stale pre-answer timestamp.
+                            last_activity_time = time.time()
+                        else:
+                            record_visible_chunk(pending_prompt_text)
+                            yield pending_prompt_text
+                            text_yielded = True
+                            pending_prompt_text = ""
 
-            # For pure-text turns, do NOT force a snapshot here: OWUI's own
-            # accumulation of the streamed yields already lands the full
-            # text in `content`, and an extra forced `replace` at this
-            # point double-writes it (P23/P25 — exact duplicate, no
-            # separator).
-            #
-            # Turns that included a tool-call block are different (P27,
-            # 2026-07-08): once a `<details type="tool_calls">` block has
-            # been yielded, OWUI's own end-of-stream save no longer reliably
-            # lands the plain-text tail in `content` at all — it only shows
-            # up in `output` instead. So for tool-block turns only, force
-            # one last `content` snapshot here.
-            #
-            # This was briefly reverted the same day after what looked like
-            # a live duplicate regression, but that turned out to be a false
-            # alarm caused by redeploying the pipe mid-message in the same
-            # live chat used to test it (a self-inflicted artifact of the
-            # testing method, not this code) — confirmed by reproducing the
-            # duplicate-free "output has it once, content misses it"
-            # signature again on an unrelated turn where nothing was
-            # redeployed mid-stream. Restored. Lesson for future sessions:
-            # never redeploy this pipe function while a message in the same
-            # live chat being used to verify it is still streaming.
-            if had_tool_block:
-                await maybe_emit_snapshot(force=True)
+                    # For pure-text turns, do NOT force a snapshot here: OWUI's own
+                    # accumulation of the streamed yields already lands the full
+                    # text in `content`, and an extra forced `replace` at this
+                    # point double-writes it (P23/P25 — exact duplicate, no
+                    # separator).
+                    #
+                    # Turns that included a tool-call block are different (P27,
+                    # 2026-07-08): once a `<details type="tool_calls">` block has
+                    # been yielded, OWUI's own end-of-stream save no longer reliably
+                    # lands the plain-text tail in `content` at all — it only shows
+                    # up in `output` instead. So for tool-block turns only, force
+                    # one last `content` snapshot here.
+                    #
+                    # This was briefly reverted the same day after what looked like
+                    # a live duplicate regression, but that turned out to be a false
+                    # alarm caused by redeploying the pipe mid-message in the same
+                    # live chat used to test it (a self-inflicted artifact of the
+                    # testing method, not this code) — confirmed by reproducing the
+                    # duplicate-free "output has it once, content misses it"
+                    # signature again on an unrelated turn where nothing was
+                    # redeployed mid-stream. Restored. Lesson for future sessions:
+                    # never redeploy this pipe function while a message in the same
+                    # live chat being used to verify it is still streaming.
+                    #
+                    # Skip while re-entering for a modal follow-up: the snapshot must
+                    # only land once the run is truly finished, not between turns.
+                    if not adopt_new_run and had_tool_block:
+                        await maybe_emit_snapshot(force=True)
 
         finally:
             await _emit_status(__event_emitter__, "", done=True)
