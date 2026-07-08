@@ -1459,7 +1459,8 @@ class Pipe:
                           owui_origin_chat_id, bearer_token):
         """Generate a chat title and set it via OWUI's REST API.
 
-        Fires after the first successful exchange in a new chat.
+        Fires after the SECOND successful exchange (first message + response),
+        when OWUI's chat_id is stable. The first request uses a temporary ID.
         Best-effort, non-blocking — failures are logged but never surfaced.
         """
         if not self.valves.AUTO_TITLE:
@@ -1469,14 +1470,16 @@ class Pipe:
         if not messages or not owui_origin_chat_id or not visible_message_text:
             return
 
-        # Only fire for the first user message in a new chat
+        # Fire on the SECOND user message: one full exchange is now in history,
+        # and the chat_id is stable (OWUI replaces the temp ID after exchange 1).
         user_msgs = [m for m in messages if m.get("role") == "user"]
         assistant_msgs = [m for m in messages if m.get("role") == "assistant"]
-        if len(user_msgs) != 1 or len(assistant_msgs) != 0:
+        if len(user_msgs) != 2 or len(assistant_msgs) != 1:
             return
 
+        # Build title from the FIRST exchange, not the current message
         user_text = user_msgs[0].get("content", "")[:400]
-        assistant_preview = visible_message_text[:400]
+        assistant_preview = assistant_msgs[0].get("content", "")[:400]
 
         pipe_log(f"Auto-title: generating title for chat {owui_origin_chat_id}")
 
