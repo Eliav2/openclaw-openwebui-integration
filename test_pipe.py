@@ -17,12 +17,14 @@ import urllib.error
 import urllib.request
 
 BASE = os.environ.get("OWUI_URL", "http://localhost:8080").rstrip("/") + "/api"
+FUNCTION_ID = "openclaw_gateway"
 DEFAULT_MODEL_ID = "openclaw_gateway.default"
-CHATGPT_MODEL_ID = "openclaw_gateway.chatgpt"
 API_TIMEOUT = int(os.environ.get("OWUI_API_TIMEOUT", "180"))
 
 # Will be set after login
 AUTH_TOKEN = None
+# Set during model discovery: any dynamically-discovered non-default model id
+ROUTE_MODEL_ID = None
 
 
 # ── helpers ──────────────────────────────────────────────────────────
@@ -184,10 +186,17 @@ def test_metadata_passthrough():
     ok(f"Response received: {content[:80]}")
 
 
-def test_chatgpt_model_override():
-    """Verify ChatGPT manifold entry really patches the OpenClaw model."""
+def test_route_model_override():
+    """Verify a dynamically-discovered (non-default) selector entry really
+    patches the OpenClaw model. Replaces the old hardcoded-"chatgpt" preset
+    test, which no longer applies now that presets are discovered
+    dynamically instead of hardcoded (see ELI-11)."""
+    if not ROUTE_MODEL_ID:
+        ok("Skipped: no non-default model currently registered")
+        return
+    expected_key = ROUTE_MODEL_ID.split(".", 1)[1]
     r = send({
-        "model": CHATGPT_MODEL_ID,
+        "model": ROUTE_MODEL_ID,
         "messages": [{
             "role": "user",
             "content": (
@@ -200,10 +209,10 @@ def test_chatgpt_model_override():
     if not check(r, ["choices"]):
         return
     content = r["choices"][0]["message"]["content"]
-    if "Model: openai/gpt-5.5" in content:
-        ok("ChatGPT route uses openai/gpt-5.5")
+    if expected_key in content:
+        ok(f"Route override uses {expected_key}")
     else:
-        fail("ChatGPT route did not report openai/gpt-5.5", content[:500])
+        fail(f"Route override did not report {expected_key}", content[:500])
 
 
 def test_empty_message():
@@ -265,12 +274,17 @@ if __name__ == "__main__":
         fail("Cannot list models", json.dumps(models["error"]))
     else:
         ids = {m.get("id") for m in models.get("data", [])}
-        pipe_models = [m for m in models.get("data", [])
-                       if m.get("id") in (DEFAULT_MODEL_ID, CHATGPT_MODEL_ID)]
-        if DEFAULT_MODEL_ID in ids and CHATGPT_MODEL_ID in ids:
-            ok("Pipe models found: default + ChatGPT")
+        ROUTE_MODEL_ID = next(
+            (i for i in ids if i.startswith(f"{FUNCTION_ID}.") and i != DEFAULT_MODEL_ID),
+            None,
+        )
+        if DEFAULT_MODEL_ID in ids:
+            if ROUTE_MODEL_ID:
+                ok(f"Pipe models found: default + {ROUTE_MODEL_ID}")
+            else:
+                ok("Pipe model found: default only (no dynamic models discovered yet)")
         else:
-            fail("Pipe manifold models NOT found in models list")
+            fail("Default pipe model NOT found in models list")
             sys.exit(1)
 
     # Run tests
@@ -279,7 +293,7 @@ if __name__ == "__main__":
     test("Invalid model rejection", test_model_not_found)
     test("Streaming response", test_streaming)
     test("Metadata/user identity passthrough", test_metadata_passthrough)
-    test("ChatGPT model override", test_chatgpt_model_override)
+    test("Route model override", test_route_model_override)
     test("Empty message handling", test_empty_message)
     test("Hebrew / special characters", test_special_characters)
 

@@ -1047,6 +1047,100 @@ async def _get_gateway_connection(valves_getter) -> _GatewayConnection:
 # Pipe class (Open WebUI entry point)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Dynamic model discovery helpers
+# ---------------------------------------------------------------------------
+
+_FALLBACK_MODELS = [
+    {"key": "deepseek/deepseek-v4-flash", "name": "DeepSeek V4 Flash", "tags": ["configured", "alias:DeepSeek"]},
+    {"key": "openai/gpt-5.5", "name": "gpt-5.5", "tags": ["configured"]},
+    {"key": "anthropic/claude-opus-4-8", "name": "claude-opus-4-8", "tags": ["configured", "alias:opus"]},
+    {"key": "anthropic/claude-sonnet-5", "name": "Claude Sonnet 5", "tags": ["configured", "alias:sonnet-5"]},
+    {"key": "openrouter/z-ai/glm-5.2", "name": "GLM 5.2", "tags": ["configured", "alias:openrouter-glm-5.2"]},
+]
+
+
+def _friendly_name(model_entry: dict) -> str:
+    """Return a human-friendly name for a model entry.
+    
+    Priority: alias tag → model name field → last segment of key.
+    """
+    tags = model_entry.get("tags", [])
+    alias = next((t for t in tags if t.startswith("alias:")), None)
+    if alias:
+        name = alias.split(":", 1)[1]
+        return name[0].upper() + name[1:] if name else name
+    name = model_entry.get("name", "")
+    if name:
+        return name
+    return model_entry["key"].rsplit("/", 1)[-1]
+
+
+def _provider_from_key(key: str) -> str:
+    """Extract the provider/vendor from a model key like 'anthropic/claude-opus-4-8'."""
+    return key.split("/", 1)[0] if "/" in key else ""
+
+
+def _normalize_model_entry(raw: dict) -> dict:
+    """Normalize a raw gateway `models.list` entry into the {key, name, tags}
+    shape used elsewhere in this module (matches _FALLBACK_MODELS).
+
+    The gateway's actual response shape is {id, name, provider, alias, ...} —
+    there is no combined "key" or "tags" field, so this bridges the two.
+    """
+    provider = raw.get("provider", "")
+    model_id = raw.get("id", "")
+    key = f"{provider}/{model_id}" if provider and model_id else (model_id or provider)
+    tags = ["configured"] if raw.get("available", True) else []
+    alias = raw.get("alias")
+    if alias:
+        tags.append(f"alias:{alias}")
+    return {"key": key, "name": raw.get("name", model_id), "tags": tags}
+
+
+def _parse_whitelist(text: str) -> set[str]:
+    """Parse comma-separated model whitelist into a set."""
+    if not text or not text.strip():
+        return set()
+    return {x.strip() for x in text.split(",") if x.strip()}
+
+
+async def _discover_models(valves) -> list[dict]:
+    """Discover available models from the gateway, cache, or hardcoded fallback.
+    
+    Tries in order:
+    1. Live gateway request (only if connection already up)
+    2. Cache file from STATE_DIR
+    3. Hardcoded fallback list
+    """
+    # 1. Try live gateway (fast path only if already connected)
+    global _gateway_connection
+    conn = _gateway_connection
+    if conn and conn._ws and conn._event_loop_task and not conn._event_loop_task.done():
+        try:
+            resp = await conn.send_request("models.list", {}, timeout=5)
+            raw_models = resp.get("models", [])
+            if raw_models:
+                models = [_normalize_model_entry(m) for m in raw_models]
+                _write_json_file(
+                    os.path.join(_state_dir(getattr(valves, "STATE_DIR", "")), "models-cache.json"),
+                    {"models": models, "cachedAt": time.time()}
+                )
+                return models
+        except Exception as e:
+            pipe_log(f"Live model discovery failed: {e}")
+    
+    # 2. Cache fallback
+    cache = _read_json_file(os.path.join(_state_dir(getattr(valves, "STATE_DIR", "")), "models-cache.json"))
+    if cache and cache.get("models"):
+        pipe_log("Using cached model list")
+        return cache["models"]
+    
+    # 3. Hardcoded fallback
+    pipe_log("Using hardcoded fallback model list")
+    return _FALLBACK_MODELS
+
+
 class Pipe:
     """
     Open WebUI Pipe that routes messages through OpenClaw Gateway via
@@ -1103,25 +1197,53 @@ class Pipe:
             default="",
             description="Optional OWUI API key for file uploads; request bearer token is preferred"
         )
+        OWUI_API_KEY: str = Field(
+            default="",
+            description="Optional OWUI API key for file uploads; request bearer token is preferred"
+        )
         FILE_SERVER_BASE_URL: str = Field(
             default="https://localhost:18791",
             description="Public URL for the file server (for MEDIA: resolution)"
         )
+        CONFIGURED_MODELS: str = Field(
+            default="",
+            description="Comma-separated list of model keys to show in the selector. "
+                "Leave empty to show all discovered models. "
+                "See the Default Model valve for a reference list of available keys."
+        )
+        DEFAULT_MODEL: str = Field(
+            default="",
+            description="Override the agent's default model when 'Default' preset is selected. "
+                "Also serves as a reference list of all available model keys.",
+            json_schema_extra={
+                "input": {"type": "select", "options": "get_model_options"}
+            }
+        )
+        MAX_MODELS: int = Field(
+            default=30,
+            description="Maximum number of models to show in the selector when whitelist is empty.",
+            ge=1,
+            le=100
+        )
         CHATGPT_MODEL: str = Field(
             default="openai/gpt-5.5",
-            description="OpenClaw model override used by the ChatGPT manifold model"
+            description="[Legacy] OpenClaw model override used by the ChatGPT manifold model. "
+                "Still honored for backward compatibility."
         )
         OPUS_MODEL: str = Field(
             default="anthropic/claude-opus-4-8",
-            description="OpenClaw model override used by the Opus 4.8 manifold model"
+            description="[Legacy] OpenClaw model override used by the Opus 4.8 manifold model. "
+                "Still honored for backward compatibility."
         )
         SONNET_MODEL: str = Field(
             default="anthropic/claude-sonnet-5",
-            description="OpenClaw model override used by the Sonnet 5 manifold model"
+            description="[Legacy] OpenClaw model override used by the Sonnet 5 manifold model. "
+                "Still honored for backward compatibility."
         )
         GLM_MODEL: str = Field(
             default="openrouter/z-ai/glm-5.2",
-            description="OpenClaw model override used by the GLM 5.2 manifold model"
+            description="[Legacy] OpenClaw model override used by the GLM 5.2 manifold model. "
+                "Still honored for backward compatibility."
         )
 
     def __init__(self):
@@ -1132,39 +1254,88 @@ class Pipe:
         self._current_run_id: str | None = None
         self._connection: _GatewayConnection | None = None
 
-    def pipes(self):
-        """Expose multiple OWUI model-selector entries from one pipe."""
-        return [
-            {"id": "default", "name": "OpenClaw · Default"},
-            {"id": "chatgpt", "name": "ChatGPT · GPT-5.5"},
-            {"id": "opus", "name": "Claude · Opus 4.8"},
-            {"id": "sonnet", "name": "Claude · Sonnet 5"},
-            {"id": "glm", "name": "GLM 5.2 · OpenRouter"},
-        ]
+    _LEGACY_PRESET_MAP = {
+        "chatgpt": "openai/gpt-5.5",
+        "opus": "anthropic/claude-opus-4-8",
+        "sonnet": "anthropic/claude-sonnet-5",
+        "glm": "openrouter/z-ai/glm-5.2",
+    }
+
+    async def pipes(self):
+        """Expose multiple OWUI model-selector entries from one pipe.
+        
+        Dynamically discovers models from the OpenClaw Gateway (or cache)
+        and returns one entry per model plus a 'Default' entry.
+        """
+        models = await _discover_models(self.valves)
+        
+        # Apply whitelist filter
+        whitelist = _parse_whitelist(self.valves.CONFIGURED_MODELS)
+        if whitelist:
+            models = [m for m in models if m["key"] in whitelist]
+        
+        # Apply safety cap
+        if len(models) > self.valves.MAX_MODELS:
+            models = models[:self.valves.MAX_MODELS]
+        
+        entries = []
+        for m in models:
+            friendly = _friendly_name(m)
+            provider = _provider_from_key(m["key"])
+            name = f"{friendly} ({provider}) · OpenClaw"
+            entries.append({"id": m["key"], "name": name})
+        
+        # Always prepend Default at top
+        return [{"id": "default", "name": "OpenClaw · Default"}] + entries
+
+    @classmethod
+    def get_model_options(cls):
+        """Return model options for the DEFAULT_MODEL valve dropdown.
+        
+        Reads synchronously from the model cache or fallback list.
+        """
+        cache = _read_json_file(os.path.join(_state_dir(), "models-cache.json"))
+        models = cache.get("models", _FALLBACK_MODELS) if cache else _FALLBACK_MODELS
+        return [{"value": m["key"], "label": f"{_friendly_name(m)} ({_provider_from_key(m['key'])})"} for m in models]
 
     def _selected_preset(self, body):
+        """Extract the model key or legacy preset name from the OWUI model string."""
         model = str(body.get("model", ""))
-        suffix = model.rsplit(".", 1)[-1].rsplit("/", 1)[-1]
-        if suffix == "chatgpt":
-            return "chatgpt"
-        if suffix == "opus":
-            return "opus"
-        if suffix == "sonnet":
-            return "sonnet"
-        if suffix == "glm":
-            return "glm"
-        return "default"
+        # Split on the FIRST dot only: the function id (e.g. "openclaw_gateway")
+        # never contains a dot, but model keys can (e.g. "gemini-3.1-pro-preview").
+        # rsplit would wrongly cut inside the version number.
+        suffix = model.split(".", 1)[-1]
+        if suffix == "default":
+            return "default"
+        if suffix in self._LEGACY_PRESET_MAP:
+            return suffix  # legacy name like "chatgpt" — mapping handled downstream
+        return suffix  # raw model key
 
     def _model_override_for_preset(self, preset):
-        if preset == "chatgpt":
-            return self.valves.CHATGPT_MODEL.strip() or None
-        if preset == "opus":
-            return self.valves.OPUS_MODEL.strip() or None
-        if preset == "sonnet":
-            return self.valves.SONNET_MODEL.strip() or None
-        if preset == "glm":
-            return self.valves.GLM_MODEL.strip() or None
-        return None
+        """Return the model string to pass to sessions.patch.
+        
+        For legacy presets, respects user-customized legacy valve values
+        (backward compatibility) before falling back to the hardcoded mapping.
+        """
+        if preset == "default":
+            return self.valves.DEFAULT_MODEL.strip() or None
+        if preset in self._LEGACY_PRESET_MAP:
+            legacy_defaults = {
+                "chatgpt": "openai/gpt-5.5",
+                "opus": "anthropic/claude-opus-4-8",
+                "sonnet": "anthropic/claude-sonnet-5",
+                "glm": "openrouter/z-ai/glm-5.2",
+            }
+            legacy_val = {
+                "chatgpt": self.valves.CHATGPT_MODEL,
+                "opus": self.valves.OPUS_MODEL,
+                "sonnet": self.valves.SONNET_MODEL,
+                "glm": self.valves.GLM_MODEL,
+            }.get(preset, "")
+            if legacy_val and legacy_val.strip() and legacy_val.strip() != legacy_defaults.get(preset, ""):
+                return legacy_val.strip()
+            return self._LEGACY_PRESET_MAP[preset]
+        return preset
 
     async def pipe(self, body, __event_emitter__, __event_call__=None,
                    __user__=None, __metadata__=None, __request__=None,

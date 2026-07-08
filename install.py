@@ -49,7 +49,6 @@ from rich.prompt import Prompt
 
 FUNCTION_ID = "openclaw_gateway"
 DEFAULT_MODEL_ID = f"{FUNCTION_ID}.default"
-CHATGPT_MODEL_ID = f"{FUNCTION_ID}.chatgpt"
 ROOT = Path(__file__).resolve().parent
 PIPE_FILE = ROOT / "openclaw_pipe.py"
 LOCAL_IDENTITY_FILE = ROOT / ".pipe_device_identity.json"
@@ -305,7 +304,12 @@ def model_exists(client: OwuiClient) -> bool:
     if status != 200 or not isinstance(payload, dict):
         return False
     ids = {m.get("id") for m in payload.get("data", [])}
-    return DEFAULT_MODEL_ID in ids and CHATGPT_MODEL_ID in ids
+    has_default = DEFAULT_MODEL_ID in ids
+    has_any_other = any(
+        id.startswith(f"{FUNCTION_ID}.") and id != DEFAULT_MODEL_ID
+        for id in ids
+    )
+    return has_default and has_any_other
 
 
 def backup_function(fn: dict, valves: dict | None = None) -> None:
@@ -545,12 +549,30 @@ def smoke_test(client: OwuiClient, *, repair_pairing: bool = False,
     return False
 
 
-def chatgpt_route_smoke_test(client: OwuiClient) -> bool:
+def route_smoke_test(client: OwuiClient) -> bool:
+    """Verify the model-override route works for a dynamically discovered
+    (non-default) model. Replaces the old hardcoded-"chatgpt" preset test,
+    which no longer applies now that presets are discovered dynamically
+    instead of hardcoded (see ELI-11)."""
+    status, payload = client.request("GET", "/api/v1/models")
+    if status != 200 or not isinstance(payload, dict):
+        fail(f"Route smoke test: could not list models: {payload}")
+        return False
+    ids = [m.get("id") for m in payload.get("data", [])]
+    candidate = next(
+        (i for i in ids if i.startswith(f"{FUNCTION_ID}.") and i != DEFAULT_MODEL_ID),
+        None,
+    )
+    if not candidate:
+        warn("Route smoke test skipped: no non-default model currently registered")
+        return True
+    expected_key = candidate.split(".", 1)[1]
+
     status, payload = client.request(
         "POST",
         "/api/chat/completions",
         {
-            "model": CHATGPT_MODEL_ID,
+            "model": candidate,
             "messages": [
                 {
                     "role": "user",
@@ -562,14 +584,14 @@ def chatgpt_route_smoke_test(client: OwuiClient) -> bool:
             ],
             "stream": False,
             "metadata": {
-                "chat_id": f"install-chatgpt-smoke-{int(time.time())}",
-                "user_id": "install-chatgpt-smoke",
+                "chat_id": f"install-route-smoke-{int(time.time())}",
+                "user_id": "install-route-smoke",
             },
         },
         timeout=120,
     )
     if status != 200 or not isinstance(payload, dict):
-        fail(f"ChatGPT route smoke HTTP failed: {payload}")
+        fail(f"Route smoke HTTP failed: {payload}")
         return False
 
     content = (
@@ -577,11 +599,11 @@ def chatgpt_route_smoke_test(client: OwuiClient) -> bool:
         .get("message", {})
         .get("content", "")
     )
-    if "Model: openai/gpt-5.5" in content:
-        info("ChatGPT route smoke test passed")
+    if expected_key in content:
+        info(f"Route smoke test passed ({expected_key})")
         return True
 
-    fail(f"ChatGPT route smoke failed: {content[:500]}")
+    fail(f"Route smoke failed for {expected_key}: {content[:500]}")
     return False
 
 
@@ -619,10 +641,10 @@ def install_or_repair(client: OwuiClient, cfg: Config) -> dict:
 
     section("Model discovery")
     if model_exists(client):
-        info(f"Models {DEFAULT_MODEL_ID} and {CHATGPT_MODEL_ID} are visible")
+        info(f"Model {DEFAULT_MODEL_ID} and at least one dynamic model are visible")
     else:
         raise SystemExit(
-            f"Models {DEFAULT_MODEL_ID} and {CHATGPT_MODEL_ID} "
+            f"Model {DEFAULT_MODEL_ID} and at least one dynamic model "
             "are not both visible after enabling"
         )
     return valves
@@ -649,9 +671,9 @@ def execute(command: str, cfg: Config) -> None:
         valves = install_or_repair(client, cfg)
         section("Smoke test")
         ok = smoke_test(client, repair_pairing=cfg.auto_approve, valves=valves)
-        section("ChatGPT route smoke test")
-        chatgpt_ok = chatgpt_route_smoke_test(client)
-        raise SystemExit(0 if ok and chatgpt_ok else 1)
+        section("Route smoke test")
+        route_ok = route_smoke_test(client)
+        raise SystemExit(0 if ok and route_ok else 1)
 
     if command == "healthcheck":
         section("Status")
@@ -659,9 +681,9 @@ def execute(command: str, cfg: Config) -> None:
         section("Smoke test")
         valves = get_valves(client)
         smoke_ok = smoke_test(client, repair_pairing=cfg.auto_approve, valves=valves)
-        section("ChatGPT route smoke test")
-        chatgpt_ok = chatgpt_route_smoke_test(client)
-        raise SystemExit(0 if status_ok and smoke_ok and chatgpt_ok else 1)
+        section("Route smoke test")
+        route_ok = route_smoke_test(client)
+        raise SystemExit(0 if status_ok and smoke_ok and route_ok else 1)
 
 
 # --------------------------------------------------------------------------

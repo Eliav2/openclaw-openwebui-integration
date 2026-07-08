@@ -62,20 +62,27 @@ if "pydantic" not in sys.modules:
 
 from openclaw_pipe import (
     _GatewayConnection,
+    _FALLBACK_MODELS,
     _ask_user_input_modal,
     _coerce_text,
+    _discover_models,
     _emit_message_snapshot,
     _emit_status,
+    _friendly_name,
     _is_user_input_prompt,
     _item_assistant_text,
     _item_delta_text,
     _modal_payload_from_user_input_prompt,
     _model_patch_matches,
     _normalize_event_call_response,
+    _normalize_model_entry,
     _owui_chat_send_params,
     _owui_session_key,
+    _parse_whitelist,
     _preview_recovery_text,
+    _provider_from_key,
     _resolve_media,
+    Pipe,
 )
 
 
@@ -413,6 +420,181 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
                 "Codex needs input:\n\nPackage\nChoose",
                 timeout_s=0.01,
             )
+
+
+class DynamicModelSelectorTests(unittest.TestCase):
+    """Tests for ELI-11: dynamic model discovery, whitelist, and legacy compat."""
+
+    def test_friendly_name_alias(self):
+        self.assertEqual(_friendly_name({"key": "a/b", "name": "x", "tags": ["alias:opus"]}), "Opus")
+        self.assertEqual(_friendly_name({"key": "a/b", "name": "x", "tags": ["alias:sonnet-5"]}), "Sonnet-5")
+
+    def test_friendly_name_no_alias_uses_name_field(self):
+        self.assertEqual(_friendly_name({"key": "a/b", "name": "gpt-5.5", "tags": ["configured"]}), "gpt-5.5")
+
+    def test_friendly_name_key_fallback(self):
+        self.assertEqual(_friendly_name({"key": "openai/o3-mini", "tags": []}), "o3-mini")
+
+    def test_provider_from_key(self):
+        self.assertEqual(_provider_from_key("anthropic/claude-opus-4-8"), "anthropic")
+        self.assertEqual(_provider_from_key("deepseek/deepseek-v4-flash"), "deepseek")
+        self.assertEqual(_provider_from_key("o3-mini"), "")
+
+    def test_parse_whitelist_empty(self):
+        self.assertEqual(_parse_whitelist(""), set())
+        self.assertEqual(_parse_whitelist("   "), set())
+
+    def test_parse_whitelist_commas(self):
+        self.assertEqual(_parse_whitelist(" a , b, c "), {"a", "b", "c"})
+
+    def test_pipe_selected_preset_default(self):
+        pipe = Pipe()
+        self.assertEqual(pipe._selected_preset({"model": "openclaw_gateway.default"}), "default")
+
+    def test_pipe_selected_preset_key(self):
+        pipe = Pipe()
+        self.assertEqual(
+            pipe._selected_preset({"model": "openclaw_gateway.deepseek/deepseek-v4-flash"}),
+            "deepseek/deepseek-v4-flash",
+        )
+
+    def test_pipe_selected_preset_key_with_dot_in_version(self):
+        # Model keys can contain dots (e.g. version numbers like "3.1");
+        # only the function-id prefix's dot should be stripped.
+        pipe = Pipe()
+        self.assertEqual(
+            pipe._selected_preset({"model": "openclaw_gateway.google/gemini-3.1-pro-preview"}),
+            "google/gemini-3.1-pro-preview",
+        )
+
+    def test_pipe_selected_preset_legacy_chatgpt(self):
+        pipe = Pipe()
+        self.assertEqual(
+            pipe._selected_preset({"model": "openclaw_gateway.chatgpt"}),
+            "chatgpt",
+        )
+
+    def test_pipe_model_override_default_empty(self):
+        pipe = Pipe()
+        self.assertIsNone(pipe._model_override_for_preset("default"))
+
+    def test_pipe_model_override_default_set(self):
+        pipe = Pipe()
+        pipe.valves.DEFAULT_MODEL = "openai/gpt-5.5"
+        self.assertEqual(pipe._model_override_for_preset("default"), "openai/gpt-5.5")
+
+    def test_pipe_model_override_legacy_custom(self):
+        pipe = Pipe()
+        pipe.valves.CHATGPT_MODEL = "openai/gpt-5.5-pro"
+        self.assertEqual(
+            pipe._model_override_for_preset("chatgpt"),
+            "openai/gpt-5.5-pro",
+        )
+
+    def test_pipe_model_override_legacy_default(self):
+        pipe = Pipe()
+        self.assertEqual(
+            pipe._model_override_for_preset("openai/gpt-5.5"),
+            "openai/gpt-5.5",
+        )
+
+    def test_normalize_model_entry_matches_real_gateway_shape(self):
+        # Real gateway `models.list` entries use id/name/provider/alias —
+        # not the key/tags shape the rest of this module expects.
+        raw = {
+            "id": "claude-opus-4-8",
+            "name": "Claude Opus 4.8",
+            "provider": "anthropic",
+            "alias": "opus",
+            "available": True,
+        }
+        normalized = _normalize_model_entry(raw)
+        self.assertEqual(normalized["key"], "anthropic/claude-opus-4-8")
+        self.assertEqual(normalized["name"], "Claude Opus 4.8")
+        self.assertIn("configured", normalized["tags"])
+        self.assertIn("alias:opus", normalized["tags"])
+
+    def test_normalize_model_entry_no_alias(self):
+        raw = {"id": "claude-opus-4-6", "name": "Claude Opus 4.6", "provider": "anthropic", "available": True}
+        normalized = _normalize_model_entry(raw)
+        self.assertEqual(normalized["key"], "anthropic/claude-opus-4-6")
+        self.assertNotIn("alias:", str(normalized["tags"]))
+
+    def test_normalize_model_entry_unavailable_not_configured(self):
+        raw = {"id": "x", "name": "X", "provider": "p", "available": False}
+        normalized = _normalize_model_entry(raw)
+        self.assertNotIn("configured", normalized["tags"])
+
+
+class DiscoverModelsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_discover_models_returns_fallback_when_everything_cold(self):
+        """When no gateway connection and no cache, returns hardcoded fallback."""
+        import openclaw_pipe as ocp
+        orig_conn = ocp._gateway_connection
+        try:
+            ocp._gateway_connection = None
+            # Use a minimal valves-like object with STATE_DIR
+            class FakeValves:
+                STATE_DIR = "/tmp/openclaw-test-discover"
+            models = await _discover_models(FakeValves())
+            self.assertEqual(len(models), 5)
+            keys = {m["key"] for m in models}
+            self.assertIn("deepseek/deepseek-v4-flash", keys)
+            self.assertIn("anthropic/claude-opus-4-8", keys)
+        finally:
+            ocp._gateway_connection = orig_conn
+
+    async def test_discover_models_normalizes_live_gateway_response(self):
+        """Live gateway responses use id/name/provider/alias, not key/tags —
+        _discover_models must normalize them before returning/caching."""
+        import openclaw_pipe as ocp
+
+        class FakeConn:
+            _ws = object()
+
+            class _event_loop_task:
+                @staticmethod
+                def done():
+                    return False
+
+            async def send_request(self, method, params, timeout=5):
+                return {
+                    "models": [
+                        {
+                            "id": "claude-opus-4-8",
+                            "name": "Claude Opus 4.8",
+                            "provider": "anthropic",
+                            "alias": "opus",
+                            "available": True,
+                        }
+                    ]
+                }
+
+        class FakeValves:
+            STATE_DIR = "/tmp/openclaw-test-discover-live"
+
+        orig_conn = ocp._gateway_connection
+        try:
+            ocp._gateway_connection = FakeConn()
+            models = await _discover_models(FakeValves())
+        finally:
+            ocp._gateway_connection = orig_conn
+
+        self.assertEqual(len(models), 1)
+        self.assertEqual(models[0]["key"], "anthropic/claude-opus-4-8")
+        self.assertIn("alias:opus", models[0]["tags"])
+
+
+class GetModelOptionsTests(unittest.TestCase):
+    def test_returns_fallback_when_no_cache(self):
+        options = Pipe.get_model_options()
+        self.assertEqual(len(options), 5)
+        values = {opt["value"] for opt in options}
+        self.assertIn("deepseek/deepseek-v4-flash", values)
+        # label should contain provider
+        for opt in options:
+            self.assertIn("(", opt["label"])
+            self.assertIn(")", opt["label"])
 
 
 if __name__ == "__main__":
