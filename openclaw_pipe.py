@@ -1567,7 +1567,6 @@ class Pipe:
         last_item_text = ""
         assistant_stream_text = ""
         visible_message_text = ""
-        had_tool_block = False
         pending_prompt_text = ""
         last_snapshot_text = ""
         last_snapshot_time = 0.0
@@ -1930,7 +1929,6 @@ class Pipe:
                             'files="[]" embeds="[]">'
                             f'\n<summary>{html.escape(name)}</summary>\n</details>\n'
                         )
-                        had_tool_block = True
                         record_visible_chunk(tool_block)
                         yield tool_block
                         await maybe_emit_snapshot(force=True)
@@ -2013,26 +2011,24 @@ class Pipe:
                     text_yielded = True
                 pending_prompt_text = ""
 
-            # For pure-text turns, do NOT force a snapshot here: OWUI's own
-            # accumulation of the streamed yields already lands the full
-            # text in `content`, and an extra forced `replace` at this
-            # point double-writes it (P23/P25 — exact duplicate, no
-            # separator).
+            # No forced snapshot here, ever, regardless of tool blocks.
             #
-            # Turns that included a tool-call block are different (P27,
-            # 2026-07-08): once a `<details type="tool_calls">` block has
-            # been yielded, OWUI's own end-of-stream save no longer reliably
-            # lands the plain-text tail in `content` at all — confirmed live
-            # via the chats API (`content` cut off right at the last tool
-            # block; the tail text existed only in `output`, and duplicated
-            # there instead). So for tool-block turns only, force one last
-            # `content` snapshot here to make sure the tail text is actually
-            # saved where OWUI renders it. This is safe from the P23/P25
-            # duplicate risk because OWUI's own save isn't writing to
-            # `content` for this case in the first place — there's nothing
-            # to double up against.
-            if had_tool_block:
-                await maybe_emit_snapshot(force=True)
+            # P27 (2026-07-08) forced one for tool-block turns, reasoning
+            # that OWUI's own end-of-stream save wasn't reliably landing
+            # the plain-text tail in `content` for that case, so there was
+            # "nothing to double up against". That held for the one
+            # incident it was based on, but broke immediately in
+            # combination with the P22 ask-user buffering fix added the
+            # same day: once that buffering holds text back and yields it
+            # late, right here in this `else:` clause near the generator's
+            # true end, OWUI's own natural save DOES end up capturing it —
+            # and the forced replace on top produced an exact whole-message
+            # duplicate, no separator, same signature as P23/P25 (caught
+            # live by Eliav within minutes of deploying it). Reverted;
+            # P27's original "missing tail text" symptom is the safer
+            # failure mode of the two (recoverable via the read API,
+            # doesn't visibly duplicate a wall of text) until this is
+            # understood well enough to force safely.
 
         finally:
             await _emit_status(__event_emitter__, "", done=True)
