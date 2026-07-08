@@ -1494,7 +1494,12 @@ class Pipe:
 
     async def _generate_title_text(self, conn, user_msg: str,
                                     assistant_msg: str) -> str | None:
-        """Use a lightweight model call to generate a 3-5 word title + emoji."""
+        """Use a lightweight model call to generate a 3-5 word title + emoji.
+
+        Sends a chat.send to a temp session, then polls sessions.preview
+        until the model's response is available. Avoids the complexity of
+        registering consumers and consuming raw gateway events.
+        """
         prompt = (
             "Create a concise title (3-5 words) with a relevant emoji "
             "for this conversation. Output ONLY the title, nothing else "
@@ -1505,14 +1510,14 @@ class Pipe:
 
         title_session = f"title-gen-{uuid.uuid4().hex[:12]}"
 
+        # 1. Send the title-gen prompt to a new session
         try:
-            resp = await conn.send_request(
+            await conn.send_request(
                 "chat.send",
                 dict(
                     sessionKey=title_session,
                     message=prompt,
                     idempotencyKey=f"title-{title_session}",
-                    deliver=False,
                 ),
                 timeout=15,
             )
@@ -1520,42 +1525,42 @@ class Pipe:
             pipe_log(f"Auto-title: chat.send failed: {e}")
             return None
 
-        run_id = resp.get("runId")
-        if not run_id:
-            return None
+        # 2. Poll sessions.preview until the model responds (up to ~20s)
+        for attempt in range(7):
+            await asyncio.sleep(3)
+            try:
+                preview = await conn.send_request(
+                    "sessions.preview",
+                    dict(keys=[title_session], limit=3, maxChars=600),
+                    timeout=8,
+                )
+            except Exception:
+                continue
 
-        queue = conn.register_consumer(title_session, run_id)
-        title_parts = []
+            # Extract the last assistant message from the preview
+            previews = preview.get("previews", [])
+            if not previews:
+                continue
+            items = previews[0].get("items", [])
+            for item in reversed(items):
+                if isinstance(item, dict) and item.get("role") == "assistant":
+                    title = str(item.get("text", "")).strip()
+                    if title:
+                        pipe_log(f"Auto-title: got title from preview (attempt {attempt+1})")
+                        return self._clean_title_text(title)
 
-        try:
-            while True:
-                try:
-                    msg = await asyncio.wait_for(queue.get(), timeout=20)
-                except asyncio.TimeoutError:
-                    break
+        pipe_log("Auto-title: no assistant response in preview after polling")
+        return None
 
-                payload = msg.get("payload", {})
-                stream = payload.get("stream")
-                data = payload.get("data", {})
-
-                if stream == "assistant":
-                    delta = data.get("delta", "")
-                    if delta:
-                        title_parts.append(delta)
-
-                if stream == "lifecycle" and data.get("phase") in ("end", "error"):
-                    break
-                if payload.get("state") in ("final", "cancelled", "error"):
-                    break
-        finally:
-            conn.unregister_consumer(title_session, run_id, queue=queue)
-
-        title = "".join(title_parts).strip()
-        # Cleanup: strip quotes and limit length
-        title = title.strip('\"\' \n\r')
+    @staticmethod
+    def _clean_title_text(raw: str) -> str | None:
+        """Clean up raw model output into a valid title."""
+        title = raw.strip('\"\' \n\r')
+        # Some models wrap in quotes or add explanatory text
+        if "\n" in title:
+            title = title.split("\n")[0].strip()
         if len(title) > 80:
             title = title[:77] + "..."
-
         return title if title else None
 
     async def _set_owui_chat_title(self, chat_id: str, title: str,
@@ -1566,7 +1571,7 @@ class Pipe:
             pipe_log("Auto-title: no OWUI auth token available")
             return
 
-        data = json.dumps({"title": title}).encode()
+        data = json.dumps({"chat": {"title": title}}).encode()
         req = urllib.request.Request(
             f"{self.valves.OWUI_BASE_URL.rstrip('/')}/api/v1/chats/{chat_id}",
             data=data,
