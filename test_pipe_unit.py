@@ -63,6 +63,7 @@ if "pydantic" not in sys.modules:
 from openclaw_pipe import (
     _GatewayConnection,
     _FALLBACK_MODELS,
+    _advance_input_prompt_buffer,
     _ask_user_input_modal,
     _coerce_text,
     _could_be_user_input_prefix,
@@ -387,6 +388,43 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
                 "OpenClaw needs input: what's your favorite color?"
             )
         )
+
+    def test_advance_buffer_holds_ambiguous_prefix(self):
+        flush, pending = _advance_input_prompt_buffer("", "Open")
+        self.assertEqual(flush, "")
+        self.assertEqual(pending, "Open")
+
+    def test_advance_buffer_flushes_diverged_text_with_no_newline(self):
+        flush, pending = _advance_input_prompt_buffer("", "Hello there")
+        self.assertEqual(flush, "Hello there")
+        self.assertEqual(pending, "")
+
+    def test_advance_buffer_accumulates_across_deltas_until_resolved(self):
+        pending = ""
+        flush, pending = _advance_input_prompt_buffer(pending, "Open")
+        self.assertEqual(flush, "")
+        flush, pending = _advance_input_prompt_buffer(pending, "Claw needs input: color?")
+        self.assertEqual(flush, "")
+        self.assertEqual(pending, "OpenClaw needs input: color?")
+
+    def test_advance_buffer_catches_trigger_after_midchunk_newline(self):
+        # The exact bug caught live 2026-07-08: a single delta can contain
+        # the tail of normal prose, the paragraph-break newline, AND the
+        # start of the next paragraph all at once — the newline doesn't
+        # land at the delta's edge, so a naive endswith("\n") check misses
+        # it. The text after the LAST newline must still be buffered.
+        flush, pending = _advance_input_prompt_buffer(
+            "", "fixed:\n\nOpenClaw needs input: what's your favorite color?"
+        )
+        self.assertEqual(flush, "fixed:\n\n")
+        self.assertEqual(pending, "OpenClaw needs input: what's your favorite color?")
+
+    def test_advance_buffer_flushes_everything_when_no_fresh_line_matches(self):
+        flush, pending = _advance_input_prompt_buffer(
+            "", "line one\nline two\nline three"
+        )
+        self.assertEqual(flush, "line one\nline two\nline three")
+        self.assertEqual(pending, "")
 
     def test_builds_owui_input_modal_payload(self):
         payload = _modal_payload_from_user_input_prompt(

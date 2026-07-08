@@ -377,6 +377,35 @@ def _could_be_user_input_prefix(normalized_text: str) -> bool:
     )
 
 
+def _advance_input_prompt_buffer(pending: str, delta: str) -> tuple[str, str]:
+    """Feed a new assistant-delta chunk into the needs-input buffering state.
+
+    Returns `(text_to_yield_now, new_pending)`. `pending` is text already
+    withheld because it might still become a needs-input trigger.
+
+    A trigger is only meaningful as the start of a line, so once the
+    combined text (`pending + delta`) diverges from every trigger prefix,
+    only the text after the LAST newline is worth re-examining as a fresh
+    candidate — a real streaming delta doesn't necessarily break exactly at
+    a line boundary (e.g. a single chunk can contain the tail of one
+    paragraph, the blank-line separator, *and* the start of the next one),
+    so checking `delta.endswith("\\n")` at the yield site isn't enough on
+    its own (P22 follow-up, 2026-07-08 — caught live: a reply that talked
+    normally first and only asked its question in the next paragraph never
+    got buffered, because the newline landed mid-delta, not at its edge).
+    """
+    candidate = pending + delta
+    if _could_be_user_input_prefix(candidate.lstrip()):
+        return "", candidate
+    idx = candidate.rfind("\n")
+    if idx == -1:
+        return candidate, ""
+    before, after = candidate[: idx + 1], candidate[idx + 1 :]
+    if after and _could_be_user_input_prefix(after.lstrip()):
+        return before, after
+    return before + after, ""
+
+
 def _modal_payload_from_user_input_prompt(prompt_text: str) -> dict:
     """Build an OWUI modal payload from OpenClaw's "needs input:" prompt text."""
     lines = [line.strip() for line in (prompt_text or "").splitlines()]
@@ -1540,7 +1569,6 @@ class Pipe:
         visible_message_text = ""
         had_tool_block = False
         pending_prompt_text = ""
-        still_checking_input_prompt = True
         last_snapshot_text = ""
         last_snapshot_time = 0.0
         snapshot_interval_s = 1.0
@@ -1779,26 +1807,23 @@ class Pipe:
                         ):
                             pipe_log("  filtered metadata block")
                             continue
-                        if still_checking_input_prompt:
-                            # Hold back text while it's still ambiguous
-                            # whether this message opens with a needs-input
-                            # trigger phrase. Real token-by-token streaming
-                            # delivers that phrase a few characters at a
-                            # time, so a per-delta check (as used to happen
-                            # here) essentially never matches — only the
-                            # buffered, accumulated text can be checked
-                            # reliably. Resolved once the run ends (see the
-                            # `else:` clause below) or as soon as the
-                            # buffered text diverges from every trigger.
-                            pending_prompt_text += delta
-                            if _could_be_user_input_prefix(
-                                pending_prompt_text.lstrip()
-                            ):
-                                last_activity_time = time.time()
-                                continue
-                            still_checking_input_prompt = False
-                            delta = pending_prompt_text
-                            pending_prompt_text = ""
+                        # Hold back text while it (or a fresh line within
+                        # it) is still ambiguous whether it opens with a
+                        # needs-input trigger phrase. Real token-by-token
+                        # streaming delivers that phrase a few characters at
+                        # a time, so checking each raw delta in isolation
+                        # (as used to happen here) essentially never
+                        # matches — only the buffered, accumulated text can
+                        # be checked reliably. Resolved once the run ends
+                        # (see the `else:` clause below) or as soon as the
+                        # buffered text diverges from every trigger.
+                        flush_text, pending_prompt_text = (
+                            _advance_input_prompt_buffer(pending_prompt_text, delta)
+                        )
+                        if not flush_text:
+                            last_activity_time = time.time()
+                            continue
+                        delta = flush_text
                         text_yielded = True
                         # No snapshot here, regardless of whether tool blocks
                         # exist earlier in the message. A `replace` event sets
@@ -1853,16 +1878,6 @@ class Pipe:
                         record_visible_chunk(delta)
                         yield delta
                         last_activity_time = time.time()
-                        if delta.endswith("\n"):
-                            # Re-arm the needs-input prefix check at the
-                            # start of each new line/paragraph, not just the
-                            # very start of the turn (P22 follow-up,
-                            # 2026-07-08: a reply that talks normally first
-                            # and only asks a question in a later paragraph
-                            # was falling through to plain text for the rest
-                            # of the run, since divergence used to disable
-                            # the check permanently).
-                            still_checking_input_prompt = True
 
                 # --- Assistant text carried by item/preamble events ---
                 if stream == "item":
