@@ -1853,6 +1853,16 @@ class Pipe:
                         record_visible_chunk(delta)
                         yield delta
                         last_activity_time = time.time()
+                        if delta.endswith("\n"):
+                            # Re-arm the needs-input prefix check at the
+                            # start of each new line/paragraph, not just the
+                            # very start of the turn (P22 follow-up,
+                            # 2026-07-08: a reply that talks normally first
+                            # and only asks a question in a later paragraph
+                            # was falling through to plain text for the rest
+                            # of the run, since divergence used to disable
+                            # the check permanently).
+                            still_checking_input_prompt = True
 
                 # --- Assistant text carried by item/preamble events ---
                 if stream == "item":
