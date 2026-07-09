@@ -74,6 +74,7 @@ from openclaw_pipe import (
     _is_user_input_prompt,
     _item_assistant_text,
     _item_delta_text,
+    _live_session_id_for_user,
     _modal_payload_from_user_input_prompt,
     _model_patch_matches,
     _normalize_event_call_response,
@@ -532,6 +533,86 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
                 "Codex needs input:\n\nPackage\nChoose",
                 timeout_s=0.01,
             )
+
+    def test_live_session_id_for_user_finds_match(self):
+        pool = {"sid-a": {"id": "u1"}, "sid-b": {"id": "u2"}}
+        self.assertEqual(_live_session_id_for_user("u2", pool), "sid-b")
+        self.assertIsNone(_live_session_id_for_user("u3", pool))
+        self.assertIsNone(_live_session_id_for_user("u1", {}))
+
+    def _install_fake_owui_socket_module(self, fake_sio, session_pool):
+        fake_module = types.ModuleType("open_webui.socket.main")
+        fake_module.sio = fake_sio
+        fake_module.SESSION_POOL = session_pool
+        sys.modules.setdefault("open_webui", types.ModuleType("open_webui"))
+        sys.modules.setdefault("open_webui.socket", types.ModuleType("open_webui.socket"))
+        sys.modules["open_webui.socket.main"] = fake_module
+
+    async def test_ask_user_input_modal_retries_after_reconnect(self):
+        session_pool = {}
+
+        class _FakeSio:
+            def __init__(self):
+                self.calls = []
+
+            async def call(self, event, data, to=None, timeout=None):
+                self.calls.append((event, data, to, timeout))
+                return {"value": "42"}
+
+        fake_sio = _FakeSio()
+        self._install_fake_owui_socket_module(fake_sio, session_pool)
+        self.addCleanup(sys.modules.pop, "open_webui.socket.main", None)
+
+        async def event_call(payload):
+            raise asyncio.TimeoutError()
+
+        async def populate_session_soon():
+            await asyncio.sleep(0.02)
+            session_pool["sid-123"] = {"id": "user-1"}
+
+        populate_task = asyncio.ensure_future(populate_session_soon())
+        try:
+            answer = await _ask_user_input_modal(
+                event_call,
+                "OpenClaw needs input:\n\nQ\nAnswer?\n1. a\n2. b",
+                timeout_s=0.01,
+                owui_user_id="user-1",
+                owui_chat_id="chat-1",
+                owui_message_id="msg-1",
+                max_wait_s=1,
+                poll_interval_s=0.01,
+            )
+        finally:
+            await populate_task
+
+        self.assertEqual(answer, "42")
+        self.assertEqual(fake_sio.calls[0][2], "sid-123")
+        self.assertEqual(fake_sio.calls[0][1]["chat_id"], "chat-1")
+        self.assertEqual(fake_sio.calls[0][1]["message_id"], "msg-1")
+
+    async def test_ask_user_input_modal_gives_up_if_never_reconnects(self):
+        session_pool = {}
+
+        class _FakeSio:
+            async def call(self, *args, **kwargs):
+                raise AssertionError("should never be called if user never reconnects")
+
+        self._install_fake_owui_socket_module(_FakeSio(), session_pool)
+        self.addCleanup(sys.modules.pop, "open_webui.socket.main", None)
+
+        async def event_call(payload):
+            raise asyncio.TimeoutError()
+
+        answer = await _ask_user_input_modal(
+            event_call,
+            "OpenClaw needs input:\n\nQ\nAnswer?\n1. a\n2. b",
+            timeout_s=0.01,
+            owui_user_id="user-1",
+            max_wait_s=0.05,
+            poll_interval_s=0.01,
+        )
+
+        self.assertIsNone(answer)
 
 
 class DynamicModelSelectorTests(unittest.TestCase):

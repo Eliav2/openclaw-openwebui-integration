@@ -521,22 +521,140 @@ def _normalize_event_call_response(response) -> str:
     return ""
 
 
+def _live_session_id_for_user(user_id: str, session_pool) -> str | None:
+    """Find a currently-connected OWUI session_id belonging to user_id.
+
+    session_pool is OWUI's own SESSION_POOL dict (sid -> user dict with an
+    'id' field), imported live from the running process — see
+    _retry_modal_on_reconnect for why this only works inside OWUI itself.
+    """
+    for sid, session in list(session_pool.items()):
+        if session and session.get("id") == user_id:
+            return sid
+    return None
+
+
+async def _retry_modal_on_reconnect(
+    owui_user_id: str,
+    owui_chat_id: str | None,
+    owui_message_id: str | None,
+    payload: dict,
+    *,
+    max_wait_s: float,
+    poll_interval_s: float,
+) -> str | None:
+    """Wait for owui_user_id to reconnect, then re-fire the modal directly.
+
+    OWUI's own __event_call__ closure is bound to the session_id that was
+    live when the original request started; once that session disconnects
+    there is no way to retarget it. But OWUI imposes no execution timeout on
+    a running pipe (confirmed in docs.openwebui.com's Events page,
+    "Persistence & Browser Disconnection" section: the background task
+    keeps running after tab close, only killed by returning/raising, manual
+    /api/tasks/stop, or a server restart) — and our pipe module runs inside
+    the very same process as the OWUI backend, so we can import its live
+    `sio` AsyncServer and SESSION_POOL dict directly and poll for a new
+    session_id to appear for this user, then call sio.call() against it
+    ourselves, bypassing the stale closure entirely.
+    """
+    try:
+        from open_webui.socket.main import sio, SESSION_POOL
+    except Exception as ex:
+        pipe_log(f"  reconnect retry unavailable (not running inside OWUI process?): {ex}")
+        return None
+
+    deadline = time.monotonic() + max_wait_s
+    seen_sids: set[str] = set()
+    while time.monotonic() < deadline:
+        await asyncio.sleep(poll_interval_s)
+        sid = _live_session_id_for_user(owui_user_id, SESSION_POOL)
+        if not sid or sid in seen_sids:
+            continue
+        seen_sids.add(sid)
+        pipe_log(f"  {owui_user_id[:8]}... reconnected (sid {sid[:8]}...); retrying modal")
+        try:
+            response = await asyncio.wait_for(
+                sio.call(
+                    "events",
+                    {
+                        "chat_id": owui_chat_id,
+                        "message_id": owui_message_id,
+                        "data": payload,
+                    },
+                    to=sid,
+                    timeout=30,
+                ),
+                timeout=35,
+            )
+        except Exception as ex:
+            pipe_log(f"  retry event_call failed for sid {sid[:8]}...: {ex}")
+            continue
+        answer = _normalize_event_call_response(response)
+        if answer:
+            return answer
+        # Reconnected but cancelled/empty this time; keep watching in case
+        # they reconnect again (e.g. an accidental tab close).
+    pipe_log(f"  gave up waiting for {owui_user_id[:8]}... to reconnect after {int(max_wait_s)}s")
+    return None
+
+
 async def _ask_user_input_modal(
     __event_call__,
     prompt_text: str,
     *,
     timeout_s: float = 60,
+    owui_user_id: str | None = None,
+    owui_chat_id: str | None = None,
+    owui_message_id: str | None = None,
+    max_wait_s: float = 3600,
+    poll_interval_s: float = 5,
+    __event_emitter__=None,
 ) -> str | None:
-    """Ask the user through OWUI's modal input API when available."""
+    """Ask the user through OWUI's modal input API when available.
+
+    If the live call fails (user not connected right now) and owui_user_id
+    is given, keep the pipe's own background task alive and poll for the
+    user to reconnect (up to max_wait_s total), retrying the modal against
+    their fresh session — see _retry_modal_on_reconnect. Without
+    owui_user_id, behaves exactly as before: a single attempt, exceptions
+    (including TimeoutError) propagate to the caller.
+    """
     if not __event_call__ or not _is_user_input_prompt(prompt_text):
         return None
     payload, _ = _modal_payload_from_user_input_prompt(prompt_text)
-    response = await asyncio.wait_for(
-        __event_call__(payload),
-        timeout=timeout_s,
+
+    try:
+        response = await asyncio.wait_for(
+            __event_call__(payload),
+            timeout=timeout_s,
+        )
+        answer = _normalize_event_call_response(response)
+        if answer:
+            return answer
+    except asyncio.TimeoutError:
+        if not owui_user_id:
+            raise
+
+    if not owui_user_id:
+        return None
+
+    pipe_log(
+        f"  modal not answered live; polling for {owui_user_id[:8]}... "
+        f"to reconnect (up to {int(max_wait_s)}s)"
     )
-    answer = _normalize_event_call_response(response)
-    return answer or None
+    await _emit_status(
+        __event_emitter__,
+        "Waiting for your reply — question is pending, reconnect anytime",
+        done=False,
+    )
+    return await _retry_modal_on_reconnect(
+        owui_user_id,
+        owui_chat_id,
+        owui_message_id,
+        payload,
+        max_wait_s=max_wait_s,
+        poll_interval_s=poll_interval_s,
+    )
 
 
 def _start_file_server(port=18791):
@@ -1817,8 +1935,20 @@ class Pipe:
             """
             if not _is_user_input_prompt(prompt_text):
                 return UserInputResult(False, None)
+            reconnect_user_id = (
+                owui_origin_user_id
+                if owui_origin_user_id and owui_origin_user_id != "unknown"
+                else None
+            )
             try:
-                answer = await _ask_user_input_modal(__event_call__, prompt_text)
+                answer = await _ask_user_input_modal(
+                    __event_call__,
+                    prompt_text,
+                    owui_user_id=reconnect_user_id,
+                    owui_chat_id=owui_origin_chat_id,
+                    owui_message_id=(__metadata__ or {}).get("message_id"),
+                    __event_emitter__=__event_emitter__,
+                )
             except Exception as ex:
                 pipe_log(f"  user input modal failed; falling back to chat prompt: {ex}")
                 answer = None
