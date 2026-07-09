@@ -64,6 +64,7 @@ from openclaw_pipe import (
     _GatewayConnection,
     _FALLBACK_MODELS,
     _advance_input_prompt_buffer,
+    _ask_user_detail_block,
     _ask_user_input_modal,
     _coerce_text,
     _could_be_user_input_prefix,
@@ -533,6 +534,18 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
                 "Codex needs input:\n\nPackage\nChoose",
                 timeout_s=0.01,
             )
+
+    def test_ask_user_detail_block_renders_as_tool_call(self):
+        block = _ask_user_detail_block(
+            "OpenClaw needs input:\n\nPick one\nWhich?\n1. a\n2. b",
+            "2",
+        )
+        self.assertIn('<details type="tool_calls"', block)
+        self.assertIn('name="Ask User"', block)
+        self.assertIn("Ask User", block)
+        self.assertIn("Pick one", block)
+        self.assertIn("Which?", block)
+        self.assertIn('result="2"', block)
 
     def test_live_session_id_for_user_finds_match(self):
         pool = {"sid-a": {"id": "u1"}, "sid-b": {"id": "u2"}}

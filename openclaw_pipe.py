@@ -474,6 +474,36 @@ def _modal_payload_from_user_input_prompt(prompt_text: str) -> tuple[dict, bool]
     return {"type": "input", "data": data}, False
 
 
+def _ask_user_detail_block(prompt_text: str, answer: str) -> str:
+    """Render an answered ask-user prompt as a native OWUI tool-call block.
+
+    OWUI's frontend only special-cases a handful of `<details type="...">`
+    values with a nice icon + collapsible UI (confirmed by grepping the
+    compiled frontend bundle): "tool_calls", "reasoning", "code_interpreter".
+    There's no dedicated type for Q&A, so we reuse "tool_calls" (labelled as
+    an "Ask User" call) to get the same familiar rendering Eliav already
+    likes for real tool calls, inserted inline at the point the question
+    was asked/answered — instead of showing nothing (previous behavior:
+    the raw prompt text was fully suppressed once answered).
+    """
+    payload, _ = _modal_payload_from_user_input_prompt(prompt_text)
+    data = payload.get("data", {})
+    title = data.get("title", "Question")
+    message = data.get("message", "")
+    question_display = f"{title}\n{message}".strip() if message else title
+    args_str = json.dumps({"question": question_display})
+    call_id = f"ask-user-{uuid.uuid4().hex[:12]}"
+    return (
+        '\n<details type="tool_calls" done="true" '
+        f'id="{html.escape(call_id)}" '
+        'name="Ask User" '
+        f'arguments="{html.escape(args_str[:3000])}" '
+        f'result="{html.escape(answer[:8000])}" '
+        'meta="" files="[]" embeds="[]">'
+        '\n<summary>❓ Ask User</summary>\n</details>\n'
+    )
+
+
 @dataclass
 class UserInputResult:
     """Outcome of trying to answer a needs-input prompt via an OWUI modal.
@@ -488,6 +518,8 @@ class UserInputResult:
 
     handled: bool
     new_run_id: str | None = None
+    prompt_text: str | None = None
+    answer: str | None = None
 
 
 def _normalize_event_call_response(response) -> str:
@@ -1981,7 +2013,7 @@ class Pipe:
                 pipe_log(f"  answer sent, new runId: {new_run_id[:20]}...")
             else:
                 pipe_log("  answer sent, steering into active run (no new runId)")
-            return UserInputResult(True, new_run_id)
+            return UserInputResult(True, new_run_id, prompt_text=prompt_text, answer=answer)
 
         adopt_new_run = True
         try:
@@ -2231,6 +2263,13 @@ class Pipe:
                             if item_text:
                                 answer_res = await maybe_answer_user_input(item_text)
                                 if answer_res.handled:
+                                    if answer_res.answer:
+                                        detail_block = _ask_user_detail_block(
+                                            answer_res.prompt_text or item_text, answer_res.answer
+                                        )
+                                        record_visible_chunk(detail_block)
+                                        yield detail_block
+                                        await maybe_emit_snapshot(force=True)
                                     if answer_res.new_run_id and answer_res.new_run_id != our_run_id:
                                         pipe_log(f"  needs-input handled, switching to run {answer_res.new_run_id[:20]}...")
                                         conn.unregister_consumer(session_key, our_run_id, queue=queue)
@@ -2367,6 +2406,13 @@ class Pipe:
                             # re-detection, dedup and snapshot handling as any other
                             # run instead of a separate, drift-prone copy of the loop.
                             text_yielded = True
+                            if answer_res.answer:
+                                detail_block = _ask_user_detail_block(
+                                    answer_res.prompt_text or pending_prompt_text, answer_res.answer
+                                )
+                                record_visible_chunk(detail_block)
+                                yield detail_block
+                                await maybe_emit_snapshot(force=True)
                             pending_prompt_text = ""
                             if answer_res.new_run_id and answer_res.new_run_id != our_run_id:
                                 pipe_log(f"  continuing into new run: {answer_res.new_run_id[:20]}...")
