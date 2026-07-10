@@ -228,6 +228,11 @@ class _GatewayConnection:
         # Counter for the event loop
         self._event_count = 0
 
+        # Dedup guard for proactive OWUI delivery (P33/ELI-17), keyed by
+        # "session_key:run_id" so a retried/duplicated final event never
+        # writes the same message into chat history twice.
+        self._delivered_proactive: dict[str, bool] = {}
+
     # ── Public API ──────────────────────────────────────────────────
 
     async def ensure_connected(self):
@@ -301,6 +306,25 @@ class _GatewayConnection:
         if len(matches) == 1:
             return matches[0]
         return None
+
+    def parse_owui_session_key(self, session_key: str) -> tuple[str, str] | None:
+        """Reverse `_owui_session_key`: extract (user_id, chat_id) from a
+        session key this pipe built, e.g.
+        "agent:main:openwebui-<user_id>-<chat_id>". Both ids are fixed-width
+        36-char UUIDs, so a positional split resolves the ambiguity of a
+        plain "-".split() (UUIDs themselves contain dashes). Returns None for
+        session keys not owned by this pipe/agent (e.g. cross-channel bleed).
+        """
+        agent_id = getattr(self._valves(), "AGENT_ID", None)
+        if not agent_id:
+            return None
+        prefix = f"agent:{agent_id}:openwebui-"
+        if not session_key.startswith(prefix):
+            return None
+        after = session_key[len(prefix):]
+        if len(after) < 73 or after[36] != "-":
+            return None
+        return after[0:36], after[37:73]
 
     def consumers_for_event(self, payload: dict) -> list[_Consumer]:
         """Return consumers that should receive a Gateway event payload."""
@@ -556,6 +580,26 @@ class _GatewayConnection:
                     for q in consumers[0].queues:
                         await q.put(msg)
                     continue
+
+                # ── Proactive delivery for idle OWUI sessions (P33/ELI-17) ──
+                # Nobody is live-consuming this event — no browser tab is
+                # mid-request for this exact session+run. If it's the final
+                # event of a completed turn on one of this pipe's own OWUI
+                # sessions (cron wake, heartbeat, or a bare `sessions_send`
+                # with no active pipe() call), persist it into OWUI chat
+                # history instead of silently dropping it. See
+                # _deliver_proactive_owui_message for why this only works
+                # running in-process inside OWUI.
+                evt_session = payload.get("sessionKey", "")
+                if evt_session and payload.get("state") == "final":
+                    if self.parse_owui_session_key(evt_session):
+                        asyncio.create_task(
+                            _deliver_proactive_owui_message(
+                                self, evt_session, payload.get("runId", "")
+                            )
+                        )
+                        continue
+
                 if payload.get("sessionKey") and not payload.get("runId"):
                     pipe_log("  dropped ambiguous or unmatched session-only event")
 
@@ -596,6 +640,118 @@ class _GatewayConnection:
                 pipe_log(f"  reconnect failed: {e}")
                 self._ws = None
                 # loop and try again
+
+
+def _last_assistant_text_from_preview(preview: dict, session_key: str) -> str | None:
+    """Return the last assistant message text for session_key in a
+    `sessions.preview` response (same shape `_preview_recovery_text` reads),
+    without requiring a preceding user-text match — a proactive delivery
+    (cron/heartbeat/sessions_send) has no live "user turn" in this pipe to
+    anchor against, we just want whatever the run finished saying.
+    """
+    previews = preview.get("previews")
+    if not isinstance(previews, list):
+        return None
+    entry = next(
+        (p for p in previews if isinstance(p, dict) and p.get("key") == session_key),
+        None,
+    )
+    if not entry:
+        return None
+    items = entry.get("items")
+    if not isinstance(items, list):
+        return None
+    for item in reversed(items):
+        if isinstance(item, dict) and item.get("role") == "assistant":
+            text = str(item.get("text", "")).strip()
+            if text:
+                return text
+    return None
+
+
+async def _deliver_proactive_owui_message(
+    conn: "_GatewayConnection", session_key: str, run_id: str
+) -> None:
+    """Persist a finished OpenClaw turn into OWUI chat history when nobody's
+    tab is live-consuming it (P33/ELI-17: cron wake, heartbeat, or a bare
+    `sessions_send` with no active `pipe()` call for this session+run).
+
+    This only works because the pipe module is loaded as an OWUI function
+    and runs inside OWUI's own backend process — the exact same in-process
+    privilege `_retry_modal_on_reconnect` already relies on to import
+    `open_webui.socket.main`. An external caller (e.g. a real OpenClaw
+    channel plugin running in OpenClaw's own gateway process) has no
+    equivalent access; OWUI does not expose a public API to both write a
+    chat message and live-refresh an open tab for it, so v0 scope is
+    persistence only — the message appears next time the chat is opened or
+    refreshed, not instantly in an already-open tab.
+    """
+    parsed = conn.parse_owui_session_key(session_key)
+    if not parsed:
+        return
+    user_id, chat_id = parsed
+
+    dedup_key = f"{session_key}:{run_id}"
+    if dedup_key in conn._delivered_proactive:
+        return
+    conn._delivered_proactive[dedup_key] = True
+    if len(conn._delivered_proactive) > 200:
+        for stale_key in list(conn._delivered_proactive)[:100]:
+            conn._delivered_proactive.pop(stale_key, None)
+
+    try:
+        preview = await conn.session_preview(session_key, limit=1, max_chars=8000)
+    except Exception as ex:
+        pipe_log(f"  proactive delivery: session_preview failed: {ex}")
+        return
+
+    text = _last_assistant_text_from_preview(preview, session_key)
+    if not text:
+        pipe_log("  proactive delivery: no assistant text in preview, skipping")
+        return
+
+    try:
+        from open_webui.models.chats import Chats
+    except Exception as ex:
+        pipe_log(f"  proactive delivery unavailable (not running inside OWUI process?): {ex}")
+        return
+
+    try:
+        chat = await Chats.get_chat_by_id(chat_id)
+        if chat is None:
+            pipe_log(f"  proactive delivery: chat {chat_id[:8]}... not found")
+            return
+        history = chat.chat.get("history", {}) or {}
+        old_leaf_id = history.get("currentId")
+        new_message_id = str(uuid.uuid4())
+
+        await Chats.upsert_message_to_chat_by_id_and_message_id(
+            chat_id,
+            new_message_id,
+            {
+                "role": "assistant",
+                "content": text,
+                "parentId": old_leaf_id,
+                "childrenIds": [],
+                "timestamp": int(time.time()),
+            },
+        )
+
+        if old_leaf_id:
+            old_leaf = (history.get("messages") or {}).get(old_leaf_id, {})
+            children = list(old_leaf.get("childrenIds", []))
+            if new_message_id not in children:
+                children.append(new_message_id)
+                await Chats.upsert_message_to_chat_by_id_and_message_id(
+                    chat_id, old_leaf_id, {"childrenIds": children},
+                )
+
+        pipe_log(
+            f"  proactive delivery: persisted message into chat {chat_id[:8]}... "
+            f"for user {user_id[:8]}... ({len(text)} chars)"
+        )
+    except Exception as ex:
+        pipe_log(f"  proactive delivery failed: {ex}")
 
 
 # Module-level singleton

@@ -72,6 +72,7 @@ from openclaw_pipe import (
     _ask_user_input_modal,
     _coerce_text,
     _could_be_user_input_prefix,
+    _deliver_proactive_owui_message,
     _discover_models,
     _emit_message_snapshot,
     _emit_status,
@@ -79,6 +80,7 @@ from openclaw_pipe import (
     _is_user_input_prompt,
     _item_assistant_text,
     _item_delta_text,
+    _last_assistant_text_from_preview,
     _live_session_id_for_user,
     _modal_payload_from_user_input_prompt,
     _model_patch_matches,
@@ -124,6 +126,85 @@ class PreviewRecoveryTests(unittest.TestCase):
         self.assertIsNone(
             _preview_recovery_text(preview, "agent:main:test", "current question")
         )
+
+
+class ProactiveDeliveryTests(unittest.TestCase):
+    """P33/ELI-17: persisting a proactive (idle-session) turn into OWUI."""
+
+    def _conn(self, agent_id="main"):
+        return _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID=agent_id))
+
+    def test_parses_own_session_key(self):
+        conn = self._conn()
+        session_key = _owui_session_key(
+            "main", "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        )
+        self.assertEqual(
+            conn.parse_owui_session_key(session_key),
+            (
+                "11111111-1111-1111-1111-111111111111",
+                "22222222-2222-2222-2222-222222222222",
+            ),
+        )
+
+    def test_rejects_session_key_for_a_different_agent(self):
+        conn = self._conn(agent_id="main")
+        session_key = _owui_session_key(
+            "other-agent", "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        )
+        self.assertIsNone(conn.parse_owui_session_key(session_key))
+
+    def test_rejects_non_owui_session_key(self):
+        conn = self._conn()
+        self.assertIsNone(conn.parse_owui_session_key("agent:main:some-other-channel-key"))
+
+    def test_last_assistant_text_from_preview_takes_latest_assistant_turn(self):
+        preview = {
+            "previews": [{
+                "key": "agent:main:test",
+                "items": [
+                    {"role": "assistant", "text": "older"},
+                    {"role": "user", "text": "(no live turn, cron-triggered)"},
+                    {"role": "assistant", "text": "the background check finished: all green"},
+                ],
+            }]
+        }
+        self.assertEqual(
+            _last_assistant_text_from_preview(preview, "agent:main:test"),
+            "the background check finished: all green",
+        )
+
+    def test_last_assistant_text_from_preview_none_when_no_assistant_turn(self):
+        preview = {"previews": [{"key": "agent:main:test", "items": [{"role": "user", "text": "hi"}]}]}
+        self.assertIsNone(_last_assistant_text_from_preview(preview, "agent:main:test"))
+
+    def test_deliver_skips_non_owui_session_without_touching_gateway(self):
+        conn = self._conn()
+        conn.session_preview = mock.AsyncMock(side_effect=AssertionError("should not be called"))
+        asyncio.run(_deliver_proactive_owui_message(conn, "agent:main:slack-some-channel", "run-1"))
+        conn.session_preview.assert_not_called()
+
+    def test_deliver_dedups_same_session_and_run(self):
+        conn = self._conn()
+        session_key = _owui_session_key(
+            "main", "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        )
+        conn.session_preview = mock.AsyncMock(
+            return_value={"previews": [{"key": session_key, "items": [
+                {"role": "assistant", "text": "hello from cron"},
+            ]}]}
+        )
+        # `open_webui` isn't installed in this test environment (it only exists
+        # inside a running OWUI process), so the internal Chats import fails
+        # and delivery no-ops after the preview fetch — that's fine, this test
+        # only asserts the dedup guard, not the OWUI-internals write path.
+        asyncio.run(_deliver_proactive_owui_message(conn, session_key, "run-1"))
+        asyncio.run(_deliver_proactive_owui_message(conn, session_key, "run-1"))
+        # session_preview only called once — the second call short-circuits on dedup.
+        self.assertEqual(conn.session_preview.await_count, 1)
 
 
 class EventConsumerMatchingTests(unittest.TestCase):
