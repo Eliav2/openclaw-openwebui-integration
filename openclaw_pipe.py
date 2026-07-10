@@ -2078,6 +2078,29 @@ class Pipe:
                 pipe_log(f"  preview recovery failed: {ex}")
                 return None
 
+        async def session_still_active() -> bool:
+            """Check the Gateway's own run status (P26).
+
+            A quiet queue before the first event ever arrives does not mean
+            the message was lost — it may simply be queued behind another
+            active run in the same session (e.g. a long-running agent task).
+            Only `sessions.describe` is authoritative; ask it before treating
+            60s of silence as a dead run.
+            """
+            try:
+                desc = await conn.send_request(
+                    "sessions.describe",
+                    dict(key=session_key),
+                    timeout=8,
+                )
+            except Exception as ex:
+                pipe_log(f"  initial describe probe failed: {ex}")
+                return False
+            session_row = desc.get("session")
+            if session_row is None:
+                return False
+            return session_row.get("status") not in ("done", "failed", "cancelled")
+
         def record_visible_chunk(chunk: str):
             nonlocal visible_message_text
             if chunk:
@@ -2174,6 +2197,19 @@ class Pipe:
                             )
                             pipe_log(f"TIMEOUT — no events on queue for {timeout_desc}")
                             if not first_event_arrived:
+                                elapsed = time.time() - wait_started_time
+                                if elapsed < no_text_deadman_s and await session_still_active():
+                                    pipe_log(
+                                        "  no run events yet but session still active "
+                                        "(queued behind other work); continuing to wait"
+                                    )
+                                    await _emit_status(
+                                        __event_emitter__,
+                                        "Waiting — your message is queued behind an "
+                                        "active response...",
+                                        done=False,
+                                    )
+                                    continue
                                 yield "**Timeout:** Gateway accepted the message but emitted no run events."
                                 text_yielded = True
                                 break
