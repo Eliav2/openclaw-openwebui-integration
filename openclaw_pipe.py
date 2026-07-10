@@ -1007,6 +1007,32 @@ def _item_delta_text(item_text: str, last_item_text: str, assistant_stream_text:
     return item_text
 
 
+def _suppress_already_shown(delta: str, visible_message_text: str) -> str:
+    """Final safety net against re-yielding text that's already been shown.
+
+    `_item_delta_text`'s dedup baseline (`assistant_stream_text` or
+    `last_item_text`) is a separate accumulator from `visible_message_text`
+    and can drift from it — e.g. a provider's final catch-all event races
+    an idle-timeout recovery cycle, or arrives after other text (tool
+    blocks, recovered previews) has been recorded into
+    `visible_message_text` without also updating `assistant_stream_text`.
+    When that happens, `_item_delta_text`'s prefix check fails to match and
+    it falls through to returning the *entire* cumulative text unchanged,
+    which then gets appended a second time with no separator (P27,
+    reproduced live 2026-07-10).
+
+    `visible_message_text` is the true, complete record of everything
+    already recorded for this turn, so checking whether `delta` is already
+    its tail catches this regardless of which upstream baseline caused the
+    false negative — without touching the primary dedup logic (so a
+    genuine partial catch-up, which is never already at the tail, still
+    yields normally).
+    """
+    if delta and visible_message_text.endswith(delta):
+        return ""
+    return delta
+
+
 # ---------------------------------------------------------------------------
 # Persistent Gateway Connection (singleton)
 # ---------------------------------------------------------------------------
@@ -2355,6 +2381,19 @@ class Pipe:
                                     if raw_text
                                     else ""
                                 )
+                                # Safety net (P27, reproduced live 2026-07-10):
+                                # `assistant_stream_text` can drift from
+                                # `visible_message_text` and defeat the prefix
+                                # check above, which then falls through to
+                                # re-yielding the entire cumulative text. See
+                                # `_suppress_already_shown`'s docstring.
+                                suppressed = _suppress_already_shown(delta, visible_message_text)
+                                if delta and not suppressed:
+                                    pipe_log(
+                                        "  suppressed duplicate catch-all assistant "
+                                        f"text ({len(delta)} chars already shown)"
+                                    )
+                                delta = suppressed
                             if delta:
                                 # Filter Sender metadata
                                 if (

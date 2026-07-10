@@ -91,6 +91,7 @@ from openclaw_pipe import (
     _provider_from_key,
     _resolve_media,
     _resolve_media_via_owui,
+    _suppress_already_shown,
     Pipe,
 )
 
@@ -370,6 +371,55 @@ class ItemDeltaDedupTests(unittest.TestCase):
         self.assertEqual(
             _item_delta_text("Something else entirely", "Hello", ""),
             "Something else entirely",
+        )
+
+
+class SuppressAlreadyShownTests(unittest.TestCase):
+    """Regression tests for P27 (reproduced live 2026-07-10): a provider's
+    final catch-all `assistant` event can carry the full cumulative reply
+    while `assistant_stream_text` (the primary dedup baseline) has drifted
+    from what was actually recorded into `visible_message_text` — e.g.
+    across an idle-timeout recovery cycle. When that happens
+    `_item_delta_text`'s prefix check fails and it falls through to
+    returning the whole text unchanged, duplicating the entire message with
+    no separator. `_suppress_already_shown` is the final safety net,
+    checked against `visible_message_text` directly (the true record of
+    what's already been shown) regardless of which baseline produced the
+    false negative."""
+
+    def test_suppresses_text_already_at_the_tail(self):
+        self.assertEqual(
+            _suppress_already_shown("world", "hello world"),
+            "",
+        )
+
+    def test_suppresses_exact_full_duplicate(self):
+        # The exact live-reproduced shape: assistant_stream_text drifted,
+        # so _item_delta_text's `return item_text` branch handed back the
+        # entire message verbatim.
+        full_text = "Status update: all six repro attempts came back clean.\n\nWhat next?"
+        self.assertEqual(
+            _suppress_already_shown(full_text, full_text),
+            "",
+        )
+
+    def test_genuine_new_text_passes_through(self):
+        # Not yet shown anywhere in visible_message_text -> must not be dropped.
+        self.assertEqual(
+            _suppress_already_shown(" more", "hello world"),
+            " more",
+        )
+
+    def test_empty_delta_is_noop(self):
+        self.assertEqual(_suppress_already_shown("", "hello world"), "")
+
+    def test_substring_in_the_middle_is_not_suppressed(self):
+        # Only a match at the very tail counts as "already shown" — a
+        # coincidental substring earlier in the text is not evidence of
+        # duplication and must pass through untouched.
+        self.assertEqual(
+            _suppress_already_shown("world", "world peace hello"),
+            "world",
         )
 
 
