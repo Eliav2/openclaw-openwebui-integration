@@ -206,6 +206,77 @@ class ProactiveDeliveryTests(unittest.TestCase):
         # session_preview only called once — the second call short-circuits on dedup.
         self.assertEqual(conn.session_preview.await_count, 1)
 
+    def test_deliver_leaves_new_message_as_the_active_leaf(self):
+        """Regression for the 2026-07-11 bug: the message was written to
+        `history.messages` and pipe_log even reported success, but nothing
+        ever showed up in OWUI. Root cause: OWUI's real
+        `upsert_message_to_chat_by_id_and_message_id` sets
+        `history['currentId'] = message_id` as a side effect of *every*
+        call — including the second call this function used to make (to
+        patch the *old* leaf's `childrenIds`), which silently reverted
+        `currentId` back to the old leaf right after the new message was
+        set as current. The new message became an orphan branch: present
+        in `history.messages`, but unreachable from `currentId`, so neither
+        OWUI's frontend nor any API-based reconstruction ever showed it.
+        This test replicates that real side effect via a fake `Chats` model
+        and asserts `currentId` ends up on the new message, not the old one.
+        """
+        conn = self._conn()
+        session_key = _owui_session_key(
+            "main", "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        )
+        conn.session_preview = mock.AsyncMock(
+            return_value={"previews": [{"key": session_key, "items": [
+                {"role": "assistant", "text": "hello from cron"},
+            ]}]}
+        )
+
+        old_leaf_id = "old-leaf"
+        chat_state = {
+            "history": {
+                "currentId": old_leaf_id,
+                "messages": {old_leaf_id: {"role": "user", "childrenIds": []}},
+            }
+        }
+
+        class FakeChat:
+            def __init__(self, chat):
+                self.chat = chat
+
+        class FakeChats:
+            @staticmethod
+            async def get_chat_by_id(chat_id):
+                return FakeChat(chat_state)
+
+            @staticmethod
+            async def upsert_message_to_chat_by_id_and_message_id(chat_id, message_id, message):
+                # Mirrors the real OWUI method: merge fields into the
+                # message dict, then unconditionally repoint currentId at
+                # whatever message_id was just touched.
+                history = chat_state["history"]
+                messages = history.setdefault("messages", {})
+                messages[message_id] = {**messages.get(message_id, {}), **message}
+                history["currentId"] = message_id
+                return FakeChat(chat_state)
+
+        fake_chats_module = types.ModuleType("open_webui.models.chats")
+        fake_chats_module.Chats = FakeChats
+        fake_models_module = types.ModuleType("open_webui.models")
+        fake_owui_module = types.ModuleType("open_webui")
+        with mock.patch.dict(sys.modules, {
+            "open_webui": fake_owui_module,
+            "open_webui.models": fake_models_module,
+            "open_webui.models.chats": fake_chats_module,
+        }):
+            asyncio.run(_deliver_proactive_owui_message(conn, session_key, "run-1"))
+
+        history = chat_state["history"]
+        new_id = history["currentId"]
+        self.assertNotEqual(new_id, old_leaf_id, "currentId was clobbered back to the old leaf")
+        self.assertEqual(history["messages"][new_id]["content"], "hello from cron")
+        self.assertIn(new_id, history["messages"][old_leaf_id]["childrenIds"])
+
 
 class EventConsumerMatchingTests(unittest.TestCase):
     def test_matches_exact_session_and_run(self):

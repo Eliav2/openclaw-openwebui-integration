@@ -725,6 +725,24 @@ async def _deliver_proactive_owui_message(
         old_leaf_id = history.get("currentId")
         new_message_id = str(uuid.uuid4())
 
+        # `upsert_message_to_chat_by_id_and_message_id` unconditionally sets
+        # `history.currentId = message_id` as a side effect of *every* call
+        # (it's OWUI's own generic upsert, not something we control). So the
+        # childrenIds patch on the *old* leaf must happen first — otherwise
+        # it clobbers currentId back to old_leaf_id right after we set it,
+        # and the new message becomes an invisible orphan branch (P33 bug,
+        # found 2026-07-11: pipe_log showed successful "persisted" calls but
+        # nothing ever appeared in OWUI, because currentId never actually
+        # ended up pointing at the new message).
+        if old_leaf_id:
+            old_leaf = (history.get("messages") or {}).get(old_leaf_id, {})
+            children = list(old_leaf.get("childrenIds", []))
+            if new_message_id not in children:
+                children.append(new_message_id)
+                await Chats.upsert_message_to_chat_by_id_and_message_id(
+                    chat_id, old_leaf_id, {"childrenIds": children},
+                )
+
         await Chats.upsert_message_to_chat_by_id_and_message_id(
             chat_id,
             new_message_id,
@@ -736,15 +754,6 @@ async def _deliver_proactive_owui_message(
                 "timestamp": int(time.time()),
             },
         )
-
-        if old_leaf_id:
-            old_leaf = (history.get("messages") or {}).get(old_leaf_id, {})
-            children = list(old_leaf.get("childrenIds", []))
-            if new_message_id not in children:
-                children.append(new_message_id)
-                await Chats.upsert_message_to_chat_by_id_and_message_id(
-                    chat_id, old_leaf_id, {"childrenIds": children},
-                )
 
         pipe_log(
             f"  proactive delivery: persisted message into chat {chat_id[:8]}... "
