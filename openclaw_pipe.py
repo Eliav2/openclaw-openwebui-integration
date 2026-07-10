@@ -1678,6 +1678,12 @@ class Pipe:
             description="Auto-generate a chat title after the first exchange (like native OWUI). "
                 "Uses a fast model; best-effort, non-blocking."
         )
+        TITLE_GEN_AGENT_ID: str = Field(
+            default="title-gen",
+            description="Agent id used for the background title-generation session. Deliberately "
+                "separate from AGENT_ID: title-gen gets its own CLI process/lane, so it no longer "
+                "queues behind the main conversation's active work (2026-07-10 regression, P36-adjacent)."
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -1816,6 +1822,15 @@ class Pipe:
         Sends a chat.send to a temp session, then polls sessions.preview
         until the model's response is available. Avoids the complexity of
         registering consumers and consuming raw gateway events.
+
+        Runs under TITLE_GEN_AGENT_ID (a separate configured agent from
+        AGENT_ID), not the main conversation's agent. A bare/unprefixed
+        sessionKey previously defaulted onto the SAME agent as the live
+        conversation, so this background call shared its CLI process/queue
+        lane — when the main conversation was busy (any heavy tool-call
+        turn), title-gen queued behind it and routinely missed this
+        function's ~21s polling window, silently dropping the title
+        (2026-07-10 regression). A distinct agent id gets its own lane.
         """
         prompt = (
             "Create a concise title (3-5 words) with a relevant emoji "
@@ -1825,7 +1840,8 @@ class Pipe:
             f"Assistant response: {assistant_msg}"
         )
 
-        title_session = f"title-gen-{uuid.uuid4().hex[:12]}"
+        agent_id = self.valves.TITLE_GEN_AGENT_ID.strip() or "title-gen"
+        title_session = f"agent:{agent_id}:title-gen-{uuid.uuid4().hex[:12]}"
 
         # 1. Send the title-gen prompt to a new session
         try:
@@ -2499,6 +2515,14 @@ class Pipe:
                                     item_text, last_item_text, assistant_stream_text
                                 )
                                 last_item_text = item_text
+                                # Same safety net as the assistant-stream catch-all
+                                # above, and for the same reason: `last_item_text`/
+                                # `assistant_stream_text` can drift from
+                                # `visible_message_text`, and this call site has the
+                                # exact same `_item_delta_text` fallback that
+                                # re-yields the entire text when the prefix check
+                                # fails (P27).
+                                item_delta = _suppress_already_shown(item_delta, visible_message_text)
                                 if item_delta:
                                     text_yielded = True
                                     pipe_log("  yielded text from item event")
