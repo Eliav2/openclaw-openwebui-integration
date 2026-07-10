@@ -1063,6 +1063,16 @@ def _suppress_already_shown(delta: str, visible_message_text: str) -> str:
 # Persistent Gateway Connection (singleton)
 # ---------------------------------------------------------------------------
 
+# Hard kill switch for P33/ELI-17/ELI-19 proactive delivery. Disabled
+# 2026-07-11: even the session-wide idleness gate (has_any_consumer_for_session)
+# has a live race at steering-leg boundaries — a run_id can finish and
+# unregister while the user is still actively chatting, and each leg's
+# distinct run_id defeats the dedup cache. This produced duplicate assistant
+# messages in an unrelated, currently-active chat (see PLAN.md P33). Do not
+# re-enable without a fix for that race and a live verification that does not
+# touch real conversations.
+PROACTIVE_DELIVERY_ENABLED = False
+
 @dataclass
 class _Consumer:
     """An active run consumer — its ``asyncio.Queue`` receives events."""
@@ -1492,7 +1502,7 @@ class _GatewayConnection:
                 # for this run. Only then treat it as a true out-of-band wake
                 # (cron, heartbeat, or a bare sessions_send).
                 evt_session = payload.get("sessionKey", "")
-                if evt_session and payload.get("state") == "final":
+                if PROACTIVE_DELIVERY_ENABLED and evt_session and payload.get("state") == "final":
                     if (
                         self.parse_owui_session_key(evt_session)
                         and not self.has_any_consumer_for_session(evt_session)
