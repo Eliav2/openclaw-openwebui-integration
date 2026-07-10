@@ -5,6 +5,7 @@ import unittest
 import sys
 import types
 import asyncio
+from unittest import mock
 
 if "websockets" not in sys.modules:
     websockets_stub = types.SimpleNamespace(
@@ -64,6 +65,7 @@ from openclaw_pipe import (
     _GatewayConnection,
     _FALLBACK_MODELS,
     _advance_input_prompt_buffer,
+    _advance_media_buffer,
     _ask_user_detail_block,
     _ask_user_input_modal,
     _coerce_text,
@@ -86,6 +88,7 @@ from openclaw_pipe import (
     _preview_recovery_text,
     _provider_from_key,
     _resolve_media,
+    _resolve_media_via_owui,
     Pipe,
 )
 
@@ -306,6 +309,160 @@ class ResolveMediaTests(unittest.TestCase):
         )
         self.assertTrue(handled)
         self.assertEqual(result, "![pic.png](https://example.com/pic.png)")
+
+    def test_resolves_multiple_directives_in_one_chunk(self):
+        # Regression: sending several images in one reply (confirmed live
+        # 2026-07-10) used to only resolve the first MEDIA: occurrence,
+        # leaving the rest as literal "MEDIA:filename" text.
+        text = "one\nMEDIA:a.png\n\ntwo\nMEDIA:b.png\n\nMEDIA:c.png\nend"
+        result, handled = _resolve_media(text, base_url="https://example.com")
+        self.assertTrue(handled)
+        self.assertEqual(
+            result,
+            "one\n![a.png](https://example.com/a.png)\n"
+            "two\n![b.png](https://example.com/b.png)\n"
+            "![c.png](https://example.com/c.png)\nend",
+        )
+
+    def test_multiple_directives_back_to_back_no_text_between(self):
+        result, handled = _resolve_media(
+            "MEDIA:a.png\nMEDIA:b.png", base_url="https://example.com"
+        )
+        self.assertTrue(handled)
+        self.assertEqual(
+            result,
+            "![a.png](https://example.com/a.png)\n![b.png](https://example.com/b.png)",
+        )
+
+    def test_prose_use_of_media_term_is_not_mangled(self):
+        # Regression: writing "the MEDIA: fix" as a documentation term (not
+        # an actual directive) got misparsed live 2026-07-10 — "fix" (no
+        # extension) was treated as a filename and turned into a broken
+        # image link, corrupting the assistant's own explanatory text.
+        text = "not something my MEDIA: fix touched, see the MEDIA: multi-image work"
+        result, handled = _resolve_media(text, base_url="https://example.com")
+        self.assertFalse(handled)
+        self.assertEqual(result, text)
+
+    def test_prose_use_does_not_block_a_real_directive_later_on(self):
+        text = "the MEDIA: fix now handles MEDIA:real-file.png correctly"
+        result, handled = _resolve_media(text, base_url="https://example.com")
+        self.assertTrue(handled)
+        self.assertEqual(
+            result,
+            "the MEDIA: fix now handles ![real-file.png](https://example.com/real-file.png)\ncorrectly",
+        )
+
+
+class ResolveMediaViaOwuiTests(unittest.IsolatedAsyncioTestCase):
+    """Async tests for the native-OWUI-upload MEDIA: resolution path,
+    covering the same multi-directive regression as ResolveMediaTests."""
+
+    async def test_resolves_multiple_directives_in_one_chunk(self):
+        uploads = []
+
+        def fake_upload(fpath, base_url, token):
+            uploads.append(fpath)
+            name = fpath.rsplit("/", 1)[-1]
+            return {"id": f"id-{name}", "meta": {"content_type": "image/png"}}
+
+        with mock.patch("openclaw_pipe._upload_owui_file", side_effect=fake_upload), \
+             mock.patch("os.path.isfile", return_value=True):
+            result, handled = await _resolve_media_via_owui(
+                "caption\nMEDIA:a.png\n\nMEDIA:b.png\nend",
+                base_url="https://owui.example.com",
+                token="tok",
+                __event_emitter__=None,
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(len(uploads), 2)
+        self.assertEqual(
+            result,
+            "caption\n![a.png](/api/v1/files/id-a.png/content)\n"
+            "![b.png](/api/v1/files/id-b.png/content)\nend",
+        )
+
+    async def test_missing_file_bails_out_entirely_for_caller_fallback(self):
+        # If any single directive can't be resolved (file missing locally),
+        # the whole attempt must bail with handled=False so the caller falls
+        # back to _resolve_media for ALL directives uniformly, instead of
+        # leaving a mix of native-uploaded and unresolved directives.
+        with mock.patch("os.path.isfile", return_value=False):
+            result, handled = await _resolve_media_via_owui(
+                "MEDIA:missing.png",
+                base_url="https://owui.example.com",
+                token="tok",
+                __event_emitter__=None,
+            )
+        self.assertFalse(handled)
+        self.assertEqual(result, "MEDIA:missing.png")
+
+    async def test_prose_use_of_media_term_is_not_mangled(self):
+        # Same regression as _resolve_media's prose test, but for the
+        # native-OWUI-upload path: no upload should even be attempted for
+        # "MEDIA: fix" since "fix" isn't a plausible filename.
+        with mock.patch("openclaw_pipe._upload_owui_file") as upload_mock, \
+             mock.patch("os.path.isfile", return_value=True):
+            text = "not something my MEDIA: fix touched"
+            result, handled = await _resolve_media_via_owui(
+                text,
+                base_url="https://owui.example.com",
+                token="tok",
+                __event_emitter__=None,
+            )
+        upload_mock.assert_not_called()
+        self.assertFalse(handled)
+        self.assertEqual(result, text)
+
+
+class MediaBufferTests(unittest.TestCase):
+    """Regression tests for the 2026-07-10 finding: a real streaming
+    provider can split "MEDIA:filename.png" across multiple deltas at any
+    point, and resolving eagerly against a single truncated delta either
+    drops the directive (if "MEDIA:" itself is split) or corrupts the
+    filename (if the split lands mid-filename). _advance_media_buffer
+    holds back until a trailing whitespace confirms the filename is whole."""
+
+    def test_filename_split_across_deltas_stays_intact(self):
+        pending = ""
+        flush, pending = _advance_media_buffer(pending, "caption\nMEDIA:repro2-")
+        self.assertEqual(flush, "caption\n")
+        self.assertEqual(pending, "MEDIA:repro2-")
+
+        flush, pending = _advance_media_buffer(pending, "orphaned.png\n\nmore text")
+        self.assertEqual(flush, "MEDIA:repro2-orphaned.png\n\nmore text")
+        self.assertEqual(pending, "")
+
+    def test_prefix_itself_split_across_deltas(self):
+        pending = ""
+        flush, pending = _advance_media_buffer(pending, "some text MED")
+        self.assertEqual(flush, "some text ")
+        self.assertEqual(pending, "MED")
+
+        flush, pending = _advance_media_buffer(pending, "IA:repro3-revealed.png")
+        self.assertEqual(flush, "")
+        self.assertEqual(pending, "MEDIA:repro3-revealed.png")
+
+        flush, pending = _advance_media_buffer(pending, "\nmore")
+        self.assertEqual(flush, "MEDIA:repro3-revealed.png\nmore")
+        self.assertEqual(pending, "")
+
+    def test_plain_text_passes_through_unbuffered(self):
+        flush, pending = _advance_media_buffer("", "just normal text, no media here")
+        self.assertEqual(flush, "just normal text, no media here")
+        self.assertEqual(pending, "")
+
+    def test_directive_fully_formed_in_one_chunk_releases_immediately(self):
+        flush, pending = _advance_media_buffer("", "caption\nMEDIA:file.png\n\nmore")
+        self.assertEqual(flush, "caption\nMEDIA:file.png\n\nmore")
+        self.assertEqual(pending, "")
+
+    def test_partial_prefix_at_chunk_end_not_mistaken_for_unrelated_text(self):
+        # A single "M" at the end of a chunk could still become "MEDIA:".
+        flush, pending = _advance_media_buffer("", "word ending in M")
+        self.assertEqual(flush, "word ending in ")
+        self.assertEqual(pending, "M")
 
 
 class StatusEmitterTests(unittest.IsolatedAsyncioTestCase):

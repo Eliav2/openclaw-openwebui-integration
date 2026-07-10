@@ -194,27 +194,89 @@ GATEWAY_SCOPES = ["operator.admin", "operator.read", "operator.write"]
 
 _file_server_started = False
 
+_MEDIA_TRIGGER = "MEDIA:"
+_MEDIA_FNAME_RE = re.compile(r"\.[A-Za-z0-9]{1,8}$")
+
+
+def _looks_like_media_filename(fname: str) -> bool:
+    """Return True only if fname plausibly names a real file (has an
+    extension). Without this, ordinary prose that happens to use "MEDIA:"
+    as a documentation term (e.g. "the MEDIA: fix is proven") gets its next
+    word treated as a filename and mangled into a broken image link —
+    confirmed live 2026-07-10 when explaining this very feature corrupted
+    "the MEDIA: fix" into `![fix](.../fix)`.
+    """
+    return bool(_MEDIA_FNAME_RE.search(fname))
+
+
+def _advance_media_buffer(pending: str, delta: str) -> tuple[str, str]:
+    """Feed a new assistant-delta chunk into the MEDIA: buffering state.
+
+    Returns (text_to_yield_now, new_pending), mirroring
+    `_advance_input_prompt_buffer`. A real streaming provider can deliver
+    "MEDIA:filename.png" split across multiple deltas at any point,
+    including mid-filename or mid-prefix — resolving `_resolve_media`
+    eagerly against a single truncated delta either drops the directive
+    entirely (if "MEDIA:" itself is split, so neither chunk contains the
+    full prefix) or resolves it against a truncated filename (confirmed
+    live 2026-07-10: sending several images in one turn hit both failure
+    modes in the same message). Hold back from the first "MEDIA:" (or a
+    prefix of it that could still complete) until a whitespace char
+    confirms the filename is done.
+    """
+    candidate = pending + delta
+    idx = candidate.find(_MEDIA_TRIGGER)
+    if idx == -1:
+        for i in range(min(len(_MEDIA_TRIGGER) - 1, len(candidate)), 0, -1):
+            if candidate.endswith(_MEDIA_TRIGGER[:i]):
+                return candidate[:-i], candidate[-i:]
+        return candidate, ""
+    after = candidate[idx + len(_MEDIA_TRIGGER):]
+    if not re.search(r"\s", after):
+        return candidate[:idx], candidate[idx:]
+    return candidate, ""
+
 
 def _resolve_media(text, base_url=None):
-    """Convert MEDIA:filename directives to embedded media."""
+    """Convert every MEDIA:filename directive in text to embedded media.
+
+    A single reply can legitimately carry several images (confirmed live
+    2026-07-10 sending a 4-screenshot bug repro) — this must loop over every
+    occurrence, not just the first, or later directives in the same chunk
+    silently pass through as literal "MEDIA:filename" text.
+    """
     if base_url is None:
         base_url = MEDIA_BASE_URL
     prefix = "MEDIA:"
     if prefix not in text:
         return text, False
-    idx = text.index(prefix)
-    before = text[:idx]
-    after_prefix = text[idx + len(prefix):].strip()
-    fname = after_prefix.split()[0] if after_prefix else ""
-    if not fname:
-        return text, False
-    # Prefer HTTPS URL over base64 data URI (base64 breaks OWUI streaming parser).
-    url = f"{base_url.rstrip('/')}/{fname}"
-    rest = after_prefix[len(fname):].strip()
-    result = before + f"![{fname}]({url})"
-    if rest:
-        result += "\n" + rest
-    return result, True
+    handled = False
+    out = ""
+    remaining = text
+    while prefix in remaining:
+        idx = remaining.index(prefix)
+        before = remaining[:idx]
+        after_prefix = remaining[idx + len(prefix):].strip()
+        fname = after_prefix.split()[0] if after_prefix else ""
+        if not fname:
+            break
+        if not _looks_like_media_filename(fname):
+            # Not a real directive — e.g. prose using "MEDIA:" as a term,
+            # not a file reference. Leave this occurrence as literal text
+            # and keep scanning past it for any genuine directive later on.
+            out += before + prefix
+            remaining = remaining[idx + len(prefix):]
+            continue
+        # Prefer HTTPS URL over base64 data URI (base64 breaks OWUI streaming parser).
+        url = f"{base_url.rstrip('/')}/{fname}"
+        rest = after_prefix[len(fname):].strip()
+        out += before + f"![{fname}]({url})"
+        handled = True
+        if rest:
+            out += "\n"
+        remaining = rest
+    out += remaining
+    return (out, True) if handled else (text, False)
 
 
 def _extract_request_bearer(__request__):
@@ -276,52 +338,105 @@ async def _resolve_media_via_owui(
     token,
     __event_emitter__,
 ):
-    """Upload a MEDIA: file to OWUI and attach it to the current message."""
+    """Upload every MEDIA: file in text to OWUI, in order, and attach each to
+    the current message.
+
+    A single reply can legitimately carry several images (confirmed live
+    2026-07-10 sending a 4-screenshot bug repro) — this must loop over every
+    occurrence, not just the first, or later directives in the same chunk
+    silently pass through as literal "MEDIA:filename" text. If any single
+    directive can't be resolved this way (file missing locally, bad name),
+    bail out entirely with handled=False so the caller's fallback
+    (`_resolve_media`) handles ALL directives uniformly via the external
+    URL instead of leaving a mix of native-upload and unresolved directives
+    in one message.
+    """
     prefix = "MEDIA:"
     if prefix not in text:
         return text, False
-    idx = text.index(prefix)
-    before = text[:idx]
-    after_prefix = text[idx + len(prefix):].strip()
-    fname = after_prefix.split()[0] if after_prefix else ""
-    if not fname:
-        return text, False
-    if ".." in fname or "/" in fname:
-        return text, False
-    fpath = os.path.join(MEDIA_DIR, fname)
-    if not os.path.isfile(fpath):
-        return text, False
 
-    # _upload_owui_file uses blocking urllib — must run off the event loop.
-    # This call goes to OWUI's own API (often 127.0.0.1:8080, i.e. OWUI
-    # calling itself) from *inside* the async handler for the very request
-    # that's driving this pipe run. Calling it directly would block the
-    # single asyncio event loop thread, and OWUI can't service its own
-    # incoming HTTP request while its own loop is blocked waiting on it —
-    # a guaranteed self-deadlock that only resolves via timeout. Running it
-    # in a thread lets the event loop keep serving requests concurrently.
-    file_obj = await asyncio.to_thread(_upload_owui_file, fpath, base_url, token)
-    if __event_emitter__:
-        await __event_emitter__(
-            {
-                "type": "files",
-                "data": {"files": [file_obj]},
-            }
-        )
+    out = ""
+    remaining = text
+    uploaded_any = False
+    while prefix in remaining:
+        idx = remaining.index(prefix)
+        before = remaining[:idx]
+        after_prefix = remaining[idx + len(prefix):].strip()
+        fname = after_prefix.split()[0] if after_prefix else ""
+        if not fname or not _looks_like_media_filename(fname):
+            # Not a real directive — e.g. prose using "MEDIA:" as a term,
+            # not a file reference. Leave this occurrence as literal text
+            # and keep scanning past it for any genuine directive later on.
+            out += before + prefix
+            remaining = remaining[idx + len(prefix):]
+            continue
+        if ".." in fname or "/" in fname:
+            return text, False
+        fpath = os.path.join(MEDIA_DIR, fname)
+        if not os.path.isfile(fpath):
+            return text, False
 
-    file_id = file_obj.get("id")
-    rest = after_prefix[len(fname):].strip()
-    mime = file_obj.get("meta", {}).get("content_type") or mimetypes.guess_type(fname)[0] or ""
-    content_url = f"/api/v1/files/{file_id}/content" if file_id else ""
-    if content_url and mime.startswith("image/"):
-        replacement = f"![{fname}]({content_url})"
-    elif content_url:
-        replacement = f"[{fname}]({content_url})"
-    else:
-        replacement = f"`{fname}`"
-    if rest:
-        replacement += "\n" + rest
-    return before + replacement, True
+        # _upload_owui_file uses blocking urllib — must run off the event loop.
+        # This call goes to OWUI's own API (often 127.0.0.1:8080, i.e. OWUI
+        # calling itself) from *inside* the async handler for the very request
+        # that's driving this pipe run. Calling it directly would block the
+        # single asyncio event loop thread, and OWUI can't service its own
+        # incoming HTTP request while its own loop is blocked waiting on it —
+        # a guaranteed self-deadlock that only resolves via timeout. Running it
+        # in a thread lets the event loop keep serving requests concurrently.
+        file_obj = await asyncio.to_thread(_upload_owui_file, fpath, base_url, token)
+        if __event_emitter__:
+            await __event_emitter__(
+                {
+                    "type": "files",
+                    "data": {"files": [file_obj]},
+                }
+            )
+
+        file_id = file_obj.get("id")
+        mime = file_obj.get("meta", {}).get("content_type") or mimetypes.guess_type(fname)[0] or ""
+        content_url = f"/api/v1/files/{file_id}/content" if file_id else ""
+        if content_url and mime.startswith("image/"):
+            replacement = f"![{fname}]({content_url})"
+        elif content_url:
+            replacement = f"[{fname}]({content_url})"
+        else:
+            replacement = f"`{fname}`"
+
+        rest = after_prefix[len(fname):].strip()
+        out += before + replacement
+        uploaded_any = True
+        if rest:
+            out += "\n"
+        remaining = rest
+
+    out += remaining
+    return (out, True) if uploaded_any else (text, False)
+
+
+async def _resolve_media_text(text, *, valves, __request__=None, __event_emitter__=None):
+    """Resolve a MEDIA: directive, preferring the native OWUI Files API upload
+    and falling back to the external file-server URL. Shared by the main
+    per-delta resolution site and the end-of-stream final-flush site so both
+    stay in sync (see `_advance_media_buffer` for why callers must only pass
+    in text whose MEDIA:filename is already known-complete).
+    """
+    handled = False
+    resolved = text
+    if valves.USE_OWUI_FILES:
+        token = _extract_request_bearer(__request__) or valves.OWUI_API_KEY
+        try:
+            resolved, handled = await _resolve_media_via_owui(
+                text,
+                base_url=valves.OWUI_BASE_URL,
+                token=token,
+                __event_emitter__=__event_emitter__,
+            )
+        except Exception as ex:
+            pipe_log(f"  OWUI file upload failed; falling back: {ex}")
+    if not handled:
+        resolved, handled = _resolve_media(text, base_url=valves.FILE_SERVER_BASE_URL)
+    return resolved, handled
 
 
 async def _emit_status(__event_emitter__, description, *, done=False):
@@ -1916,6 +2031,7 @@ class Pipe:
         visible_message_text = ""
         had_tool_block = False
         pending_prompt_text = ""
+        pending_media_text = ""
         last_snapshot_text = ""
         last_snapshot_time = 0.0
         snapshot_interval_s = 1.0
@@ -2202,6 +2318,19 @@ class Pipe:
                                     last_activity_time = time.time()
                                     continue
                                 delta = flush_text
+
+                                # Hold back a MEDIA: directive until its filename is
+                                # confirmed complete (terminated by whitespace) — a
+                                # real streaming provider can split "MEDIA:filename.png"
+                                # across multiple deltas at any point, including
+                                # mid-filename or mid-prefix. See _advance_media_buffer.
+                                delta, pending_media_text = _advance_media_buffer(
+                                    pending_media_text, delta
+                                )
+                                if not delta:
+                                    last_activity_time = time.time()
+                                    continue
+
                                 text_yielded = True
                                 # No snapshot here, regardless of whether tool blocks
                                 # exist earlier in the message. A `replace` event sets
@@ -2225,26 +2354,12 @@ class Pipe:
                                 # this recurring bug.
                                 # MEDIA: resolution
                                 if "MEDIA:" in delta:
-                                    handled = False
-                                    if self.valves.USE_OWUI_FILES:
-                                        token = (
-                                            _extract_request_bearer(__request__)
-                                            or self.valves.OWUI_API_KEY
-                                        )
-                                        try:
-                                            resolved, handled = await _resolve_media_via_owui(
-                                                delta,
-                                                base_url=self.valves.OWUI_BASE_URL,
-                                                token=token,
-                                                __event_emitter__=__event_emitter__,
-                                            )
-                                        except Exception as ex:
-                                            pipe_log(f"  OWUI file upload failed; falling back: {ex}")
-                                    if not handled:
-                                        resolved, handled = _resolve_media(
-                                            delta,
-                                            base_url=self.valves.FILE_SERVER_BASE_URL
-                                        )
+                                    resolved, handled = await _resolve_media_text(
+                                        delta,
+                                        valves=self.valves,
+                                        __request__=__request__,
+                                        __event_emitter__=__event_emitter__,
+                                    )
                                     if handled:
                                         pipe_log("  resolved MEDIA: directive")
                                         record_visible_chunk(resolved)
@@ -2431,6 +2546,25 @@ class Pipe:
                             yield pending_prompt_text
                             text_yielded = True
                             pending_prompt_text = ""
+
+                    if pending_media_text:
+                        # The run ended with a MEDIA: directive still buffered —
+                        # either its filename never got a trailing whitespace
+                        # before the stream closed, or "MEDIA:" itself was still
+                        # incomplete. Nothing more is coming, so it's safe to
+                        # resolve now; `_resolve_media_text` still falls back to
+                        # showing it as plain text if resolution fails, so
+                        # nothing is silently dropped.
+                        resolved, handled = await _resolve_media_text(
+                            pending_media_text,
+                            valves=self.valves,
+                            __request__=__request__,
+                            __event_emitter__=__event_emitter__,
+                        )
+                        record_visible_chunk(resolved)
+                        yield resolved
+                        text_yielded = True
+                        pending_media_text = ""
 
                     # For pure-text turns, do NOT force a snapshot here: OWUI's own
                     # accumulation of the streamed yields already lands the full
