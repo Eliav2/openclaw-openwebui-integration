@@ -1460,16 +1460,23 @@ class _GatewayConnection:
                     continue
 
                 # ── Proactive delivery for idle OWUI sessions (P33/ELI-17) ──
-                # Nobody is live-consuming this event — no browser tab is
-                # mid-request for this exact session+run. If it's the final
-                # event of a completed turn on one of this pipe's own OWUI
-                # sessions (cron wake, heartbeat, or a bare `sessions_send`
-                # with no active pipe() call), persist it into OWUI chat
-                # history instead of silently dropping it. See
-                # _deliver_proactive_owui_message for why this only works
-                # running in-process inside OWUI.
+                # DISABLED 2026-07-11: once the currentId-clobber bug was
+                # fixed (making delivered messages actually visible instead
+                # of silent orphan branches), it surfaced that "no live
+                # consumer for this exact session+run" is not a reliable
+                # signal for "this is a genuine idle cron/heartbeat wake."
+                # It also fires on ordinary momentary gaps inside a session
+                # the user is actively, live chatting in right now (observed
+                # live: spurious duplicate assistant bubbles injected into
+                # an unrelated, actively-in-use chat while its own real
+                # reply was streaming normally). Re-enable only after this
+                # branch can distinguish a true out-of-band wake (cron/
+                # heartbeat/sessions_send with zero active pipe() calls for
+                # the whole session, not just this run) from a transient gap
+                # in an otherwise-live conversation.
+                PROACTIVE_DELIVERY_ENABLED = False
                 evt_session = payload.get("sessionKey", "")
-                if evt_session and payload.get("state") == "final":
+                if PROACTIVE_DELIVERY_ENABLED and evt_session and payload.get("state") == "final":
                     if self.parse_owui_session_key(evt_session):
                         asyncio.create_task(
                             _deliver_proactive_owui_message(
