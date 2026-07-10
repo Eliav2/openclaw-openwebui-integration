@@ -307,6 +307,25 @@ class _GatewayConnection:
             return matches[0]
         return None
 
+    def has_any_consumer_for_session(self, session_key: str) -> bool:
+        """True if *any* run (not just a specific run_id) currently has a
+        live pipe() call registered for this session.
+
+        Used to gate proactive delivery (P33/ELI-17/ELI-19): an event can
+        fail to match `consumers_for_event` (e.g. its run_id belongs to a
+        just-superseded steering leg, or it's a bare session-only event with
+        zero or multiple session matches) while the session is still
+        genuinely being serviced by an open browser tab under a *different*
+        run_id. Proactive delivery must only fire when the session has no
+        active consumer at all — otherwise it risks injecting a duplicate
+        message into a conversation that's live right now (see 2026-07-11
+        incident in PLAN.md P33).
+        """
+        return any(
+            consumer.session_key == session_key
+            for consumer in self._consumers.values()
+        )
+
     def parse_owui_session_key(self, session_key: str) -> tuple[str, str] | None:
         """Reverse `_owui_session_key`: extract (user_id, chat_id) from a
         session key this pipe built, e.g.
@@ -581,25 +600,25 @@ class _GatewayConnection:
                         await q.put(msg)
                     continue
 
-                # ── Proactive delivery for idle OWUI sessions (P33/ELI-17) ──
-                # DISABLED 2026-07-11: once the currentId-clobber bug was
-                # fixed (making delivered messages actually visible instead
-                # of silent orphan branches), it surfaced that "no live
-                # consumer for this exact session+run" is not a reliable
-                # signal for "this is a genuine idle cron/heartbeat wake."
-                # It also fires on ordinary momentary gaps inside a session
-                # the user is actively, live chatting in right now (observed
-                # live: spurious duplicate assistant bubbles injected into
-                # an unrelated, actively-in-use chat while its own real
-                # reply was streaming normally). Re-enable only after this
-                # branch can distinguish a true out-of-band wake (cron/
-                # heartbeat/sessions_send with zero active pipe() calls for
-                # the whole session, not just this run) from a transient gap
-                # in an otherwise-live conversation.
-                PROACTIVE_DELIVERY_ENABLED = False
+                # ── Proactive delivery for idle OWUI sessions (P33/ELI-17/ELI-19) ──
+                # Nobody is live-consuming this *exact* event — no browser tab
+                # is mid-request for this precise session+run. That alone is
+                # NOT enough to prove the session is idle: this event's run_id
+                # can simply not match a *different*, still-active run on the
+                # same session (steering handoff, or a bare session-only event
+                # with zero/multiple matches) — proactively delivering in that
+                # case injects a duplicate into a live conversation (real
+                # incident, 2026-07-11, see PLAN.md P33). So this branch also
+                # requires `not has_any_consumer_for_session(...)`: genuinely
+                # zero active pipe() calls anywhere on this session, not just
+                # for this run. Only then treat it as a true out-of-band wake
+                # (cron, heartbeat, or a bare sessions_send).
                 evt_session = payload.get("sessionKey", "")
-                if PROACTIVE_DELIVERY_ENABLED and evt_session and payload.get("state") == "final":
-                    if self.parse_owui_session_key(evt_session):
+                if evt_session and payload.get("state") == "final":
+                    if (
+                        self.parse_owui_session_key(evt_session)
+                        and not self.has_any_consumer_for_session(evt_session)
+                    ):
                         asyncio.create_task(
                             _deliver_proactive_owui_message(
                                 self, evt_session, payload.get("runId", "")

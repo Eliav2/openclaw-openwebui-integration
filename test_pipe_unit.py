@@ -323,6 +323,23 @@ class EventConsumerMatchingTests(unittest.TestCase):
 
         self.assertIsNone(conn.active_run_id_for_session("session-a"))
 
+    def test_has_any_consumer_false_for_genuinely_idle_session(self):
+        conn = _GatewayConnection(lambda: None)
+        conn.register_consumer("session-a", "run-1")
+        self.assertFalse(conn.has_any_consumer_for_session("session-b"))
+
+    def test_has_any_consumer_true_even_for_a_different_run_id(self):
+        """Regression for the 2026-07-11 live incident (P33/ELI-17/ELI-19):
+        an event for run-1 fails to match `consumers_for_event` (e.g. a
+        steering handoff already re-registered the session under run-2), but
+        the session is still genuinely live — proactive delivery must not
+        treat this as an idle wake just because *this specific run_id*
+        has no consumer.
+        """
+        conn = _GatewayConnection(lambda: None)
+        conn.register_consumer("session-a", "run-2")
+        self.assertTrue(conn.has_any_consumer_for_session("session-a"))
+
 
 class GatewayReconnectStormTests(unittest.IsolatedAsyncioTestCase):
     """Regression tests for the 2026-07-10 reconnect-storm incident (P36):
