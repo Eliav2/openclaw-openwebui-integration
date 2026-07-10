@@ -14,6 +14,8 @@ if "websockets" not in sys.modules:
     )
     sys.modules["websockets"] = websockets_stub
 
+import websockets  # noqa: E402  (must come after the stub is installed above)
+
 if "cryptography" not in sys.modules:
     crypto = types.ModuleType("cryptography")
     hazmat = types.ModuleType("cryptography.hazmat")
@@ -167,6 +169,94 @@ class EventConsumerMatchingTests(unittest.TestCase):
         conn.register_consumer("session-a", "run-2")
 
         self.assertIsNone(conn.active_run_id_for_session("session-a"))
+
+
+class GatewayReconnectStormTests(unittest.IsolatedAsyncioTestCase):
+    """Regression tests for the 2026-07-10 reconnect-storm incident (P36):
+    `_reconnect()` used to call `_connect_and_start()`, which spawned a
+    *second* `_event_loop` task on success — but the original coroutine
+    kept looping too, so both raced on `self._ws.recv()`. Each collision
+    raised its own exception, which triggered another `_reconnect()`, which
+    spawned yet another task: exponential task growth, a reconnect storm
+    hammering the Gateway with connection attempts (observed as HTTP 503
+    rejections), and elevated Gateway memory pressure."""
+
+    async def test_reconnect_never_spawns_a_task(self):
+        conn = _GatewayConnection(lambda: None)
+        conn._max_backoff = 0
+
+        connect_calls = {"n": 0}
+
+        async def fake_connect_and_start():
+            connect_calls["n"] += 1
+            conn._ws = mock.MagicMock()
+
+        conn._connect_and_start = fake_connect_and_start
+
+        with mock.patch("asyncio.create_task") as mock_create_task:
+            await conn._reconnect()
+            await conn._reconnect()
+            await conn._reconnect()
+
+        self.assertEqual(connect_calls["n"], 3)
+        mock_create_task.assert_not_called()
+
+    async def test_event_loop_survives_disconnect_with_a_single_task(self):
+        conn = _GatewayConnection(lambda: None)
+        conn._max_backoff = 0
+
+        recv_calls = {"n": 0}
+
+        class FakeWS:
+            async def recv(self):
+                recv_calls["n"] += 1
+                if recv_calls["n"] == 2:
+                    conn._stopped = True
+                raise websockets.exceptions.ConnectionClosed("closed")
+
+        connect_calls = {"n": 0}
+
+        async def fake_connect_and_start():
+            connect_calls["n"] += 1
+            conn._ws = FakeWS()
+
+        conn._connect_and_start = fake_connect_and_start
+        conn._ws = FakeWS()
+
+        with mock.patch("asyncio.create_task") as mock_create_task:
+            await conn._event_loop()
+
+        # One disconnect -> exactly one reconnect (no duplicate tasks) ->
+        # one more disconnect that stops the loop.
+        self.assertEqual(recv_calls["n"], 2)
+        self.assertEqual(connect_calls["n"], 1)
+        mock_create_task.assert_not_called()
+
+    async def test_ensure_connected_starts_exactly_one_task(self):
+        conn = _GatewayConnection(lambda: None)
+
+        async def fake_connect_and_start():
+            conn._ws = mock.MagicMock()
+
+        conn._connect_and_start = fake_connect_and_start
+
+        async def fake_event_loop():
+            await asyncio.sleep(3600)
+
+        conn._event_loop = fake_event_loop
+
+        await conn.ensure_connected()
+        first_task = conn._event_loop_task
+        self.assertIsNotNone(first_task)
+
+        # Calling ensure_connected again while already connected must not
+        # spawn a second task.
+        await conn.ensure_connected()
+        self.assertIs(conn._event_loop_task, first_task)
+
+        first_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await first_task
 
 
 class OwuiSessionModelTests(unittest.TestCase):

@@ -1065,6 +1065,8 @@ class _GatewayConnection:
                 return
             self._stopped = False
             await self._connect_and_start()
+            if not self._event_loop_task or self._event_loop_task.done():
+                self._event_loop_task = asyncio.create_task(self._event_loop())
 
     async def send_request(self, method: str, params: dict, timeout: float = 10) -> dict:
         """Send a request and wait for the response."""
@@ -1262,9 +1264,10 @@ class _GatewayConnection:
         self._ws = ws
         self._reconnect_attempt = 0
         pipe_log("Connected to Gateway (persistent)")
-
-        # Start the background event loop
-        self._event_loop_task = asyncio.create_task(self._event_loop())
+        # NOTE: does not start/spawn the event-loop task — that happens
+        # exactly once, in `ensure_connected`. This method is also called
+        # from inside `_reconnect`, which runs from within the event-loop
+        # task itself; spawning another task here would duplicate it.
 
     def _identity_path(self, valves):
         return os.path.join(_state_dir(getattr(valves, "STATE_DIR", "")), "identity.json")
@@ -1325,9 +1328,22 @@ class _GatewayConnection:
         )
 
     async def _event_loop(self):
-        """Background task: reads WS messages and dispatches them."""
+        """Background task: reads WS messages and dispatches them.
+
+        This is the ONLY task that ever calls `self._ws.recv()`. Reconnects
+        happen in place (`self._ws = None`, then `_reconnect()` blocks until
+        a new socket is ready) rather than by spawning a second event-loop
+        task — spawning a second task here previously caused a runaway
+        reconnect storm: the old coroutine kept looping after `_reconnect()`
+        returned, so two tasks raced on `self._ws.recv()`, each collision
+        raised its own exception, and each of *those* spawned yet another
+        task (2026-07-10 incident, see PLAN.md P36).
+        """
         while not self._stopped:
             try:
+                if self._ws is None:
+                    await self._reconnect()
+                    continue
                 msg = json.loads(await asyncio.wait_for(self._ws.recv(), timeout=90))
 
                 # ── Request-response matching ──
@@ -1377,25 +1393,35 @@ class _GatewayConnection:
                 continue
             except websockets.exceptions.ConnectionClosed:
                 pipe_log("WS disconnected — reconnecting...")
-                await self._reconnect()
+                self._ws = None
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 pipe_log(f"Event loop error: {e}")
-                await self._reconnect()
+                self._ws = None
 
     async def _reconnect(self):
-        """Reconnect with exponential backoff."""
-        self._reconnect_attempt += 1
-        delay = min(2 ** (self._reconnect_attempt - 1), self._max_backoff)
-        pipe_log(f"  reconnect in {delay}s (attempt {self._reconnect_attempt})")
-        await asyncio.sleep(delay)
-        self._ws = None
-        try:
-            await self._connect_and_start()
-        except Exception as e:
-            pipe_log(f"  reconnect failed: {e}")
-            # Try again with the event loop
+        """Reconnect with exponential backoff.
+
+        Blocks (looping in place, in the single `_event_loop` task) until a
+        new connection is established or the connection is stopped. Must
+        NEVER spawn a new `_event_loop` task — see the docstring on
+        `_event_loop` for why that caused a runaway task/connection storm.
+        """
+        while not self._stopped:
+            self._reconnect_attempt += 1
+            delay = min(2 ** (self._reconnect_attempt - 1), self._max_backoff)
+            pipe_log(f"  reconnect in {delay}s (attempt {self._reconnect_attempt})")
+            await asyncio.sleep(delay)
+            if self._stopped:
+                return
+            try:
+                await self._connect_and_start()
+                return
+            except Exception as e:
+                pipe_log(f"  reconnect failed: {e}")
+                self._ws = None
+                # loop and try again
 
 
 # Module-level singleton
