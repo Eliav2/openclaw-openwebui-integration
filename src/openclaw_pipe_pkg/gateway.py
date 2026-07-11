@@ -185,15 +185,17 @@ def _suppress_already_shown(delta: str, visible_message_text: str) -> str:
 # Persistent Gateway Connection (singleton)
 # ---------------------------------------------------------------------------
 
-# Hard kill switch for P33/ELI-17/ELI-19 proactive delivery. Disabled
-# 2026-07-11: even the session-wide idleness gate (has_any_consumer_for_session)
-# has a live race at steering-leg boundaries — a run_id can finish and
-# unregister while the user is still actively chatting, and each leg's
-# distinct run_id defeats the dedup cache. This produced duplicate assistant
-# messages in an unrelated, currently-active chat (see PLAN.md P33). Do not
-# re-enable without a fix for that race and a live verification that does not
-# touch real conversations.
-PROACTIVE_DELIVERY_ENABLED = False
+# Kill switch for P33/ELI-17/ELI-19 proactive delivery. Re-enabled
+# 2026-07-11 after fixing the steering-leg race: `has_any_consumer_for_session`
+# alone was a point-in-time read that could be momentarily False in the gap
+# between one leg's HTTP request ending and the next leg's request landing a
+# few seconds later, causing duplicate assistant messages in a live chat.
+# Delivery now goes through `session_idle_for` + `_maybe_deliver_proactive_after_debounce`,
+# which require a sustained quiet period (no registered consumer for
+# min_idle_s, default 120s) before trusting a session is genuinely
+# abandoned. See PLAN.md P33 for the live verification performed before
+# re-enabling (isolated throwaway chat, checked for zero cross-chat bleed).
+PROACTIVE_DELIVERY_ENABLED = True
 
 @dataclass
 class _Consumer:
@@ -242,6 +244,18 @@ class _GatewayConnection:
         # "session_key:run_id" so a retried/duplicated final event never
         # writes the same message into chat history twice.
         self._delivered_proactive: dict[str, bool] = {}
+
+        # Records, by "session_key:run_id", every *final* event that was
+        # actually dispatched to a live consumer queue (i.e. genuinely shown
+        # to an open browser tab, which persists it itself via OWUI's normal
+        # client-side flow). If the Gateway later re-emits a duplicate/retried
+        # final event for that same run_id after the tab's request has
+        # closed, this identity check catches it precisely — unlike a
+        # content-equality check, it can't false-positive just because two
+        # unrelated turns happen to end with the same short text (e.g. "OK.",
+        # "Done."), and unlike the debounce timer alone, it doesn't depend on
+        # how long the session stays quiet afterward.
+        self._delivered_live: dict[str, float] = {}
 
         # Last time *any* consumer for a session was registered or
         # unregistered (P33/ELI-19 second incident, 2026-07-11). A bare
@@ -340,6 +354,22 @@ class _GatewayConnection:
             oldest_first = sorted(self._session_last_activity.items(), key=lambda kv: kv[1])
             for stale_key, _ in oldest_first[:250]:
                 self._session_last_activity.pop(stale_key, None)
+
+    def mark_delivered_live(self, session_key: str, run_id: str):
+        """Record that this run's final event was just dispatched to a live
+        consumer queue — i.e. genuinely shown to an open browser tab, which
+        persists it itself via OWUI's own client-side flow. See
+        `_delivered_live`'s docstring for why this is the precise signal to
+        gate proactive delivery on."""
+        key = f"{session_key}:{run_id}"
+        self._delivered_live[key] = time.time()
+        if len(self._delivered_live) > 500:
+            oldest_first = sorted(self._delivered_live.items(), key=lambda kv: kv[1])
+            for stale_key, _ in oldest_first[:250]:
+                self._delivered_live.pop(stale_key, None)
+
+    def was_delivered_live(self, session_key: str, run_id: str) -> bool:
+        return f"{session_key}:{run_id}" in self._delivered_live
 
     def active_run_id_for_session(self, session_key: str) -> str | None:
         """Return the sole active run id for a session, if one is registered."""
@@ -667,6 +697,12 @@ class _GatewayConnection:
                     self._event_count += 1
                     if not payload.get("runId"):
                         pipe_log("  dispatched session-only event to sole consumer")
+                    if payload.get("state") == "final" and payload.get("sessionKey") and payload.get("runId"):
+                        # Genuinely shown to a live tab, which persists it via
+                        # OWUI's own client-side flow — remember this so a
+                        # later duplicate/retried final event for the same
+                        # run_id is never proactively re-delivered (P33).
+                        self.mark_delivered_live(payload["sessionKey"], payload["runId"])
                     for q in consumers[0].queues:
                         await q.put(msg)
                     continue
@@ -687,18 +723,26 @@ class _GatewayConnection:
                 # incident). So this branch hands off to a debounce watcher
                 # (`_maybe_deliver_proactive_after_debounce`) that only
                 # delivers once the session has been genuinely consumer-free
-                # for a sustained quiet period, not just at this instant.
+                # for a sustained quiet period, not just at this instant. On
+                # top of that, `was_delivered_live` gates out a *duplicate or
+                # retried* final event for a run that was already genuinely
+                # shown to a live tab — that scenario doesn't depend on
+                # timing at all (the tab may have gone quiet for well over
+                # the debounce window by the time the retry arrives), so it
+                # needs its own identity-based check, not a longer timer.
                 evt_session = payload.get("sessionKey", "")
+                evt_run_id = payload.get("runId", "")
                 if PROACTIVE_DELIVERY_ENABLED and evt_session and payload.get("state") == "final":
                     if (
                         self.parse_owui_session_key(evt_session)
                         and not self.has_any_consumer_for_session(evt_session)
+                        and not self.was_delivered_live(evt_session, evt_run_id)
                         and evt_session not in self._pending_proactive_debounce
                     ):
                         self._pending_proactive_debounce.add(evt_session)
                         asyncio.create_task(
                             _maybe_deliver_proactive_after_debounce(
-                                self, evt_session, payload.get("runId", "")
+                                self, evt_session, evt_run_id
                             )
                         )
                         continue
@@ -805,6 +849,14 @@ async def _maybe_deliver_proactive_after_debounce(
                 return
             await asyncio.sleep(poll_interval_s)
             waited += poll_interval_s
+        if conn.was_delivered_live(session_key, run_id):
+            # The run got shown to a (re)connected live tab while we were
+            # waiting out the debounce window — that tab already persists
+            # it via OWUI's own client-side flow, so proactively delivering
+            # now would be a pure duplicate.
+            pipe_log(f"  proactive delivery: {session_key[:40]}... run "
+                      f"{run_id[:20]}... was delivered live during debounce wait, skipping")
+            return
         await _deliver_proactive_owui_message(conn, session_key, run_id)
     finally:
         conn._pending_proactive_debounce.discard(session_key)

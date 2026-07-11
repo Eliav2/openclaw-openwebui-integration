@@ -344,6 +344,25 @@ class EventConsumerMatchingTests(unittest.TestCase):
         conn.register_consumer("session-a", "run-2")
         self.assertTrue(conn.has_any_consumer_for_session("session-a"))
 
+    def test_was_delivered_live_false_before_any_mark(self):
+        conn = _GatewayConnection(lambda: None)
+        self.assertFalse(conn.was_delivered_live("session-a", "run-1"))
+
+    def test_was_delivered_live_true_after_mark(self):
+        conn = _GatewayConnection(lambda: None)
+        conn.mark_delivered_live("session-a", "run-1")
+        self.assertTrue(conn.was_delivered_live("session-a", "run-1"))
+
+    def test_was_delivered_live_is_scoped_to_exact_session_and_run(self):
+        """A mark for one run_id must not blind the guard for a different
+        run_id on the same session, or the same run_id on a different
+        session — only the exact (session, run) pair that was actually
+        shown live is exempt from proactive delivery."""
+        conn = _GatewayConnection(lambda: None)
+        conn.mark_delivered_live("session-a", "run-1")
+        self.assertFalse(conn.was_delivered_live("session-a", "run-2"))
+        self.assertFalse(conn.was_delivered_live("session-b", "run-1"))
+
     def test_session_idle_for_false_while_consumer_active(self):
         conn = _GatewayConnection(lambda: None)
         conn.register_consumer("session-a", "run-1")
@@ -455,6 +474,34 @@ class ProactiveDebounceWatcherTests(unittest.IsolatedAsyncioTestCase):
             await _maybe_deliver_proactive_after_debounce(
                 conn, session_key, "run-1",
                 min_idle_s=120, poll_interval_s=0.02, max_wait_s=5,
+            )
+
+        self.assertNotIn(session_key, conn._pending_proactive_debounce)
+
+    async def test_skips_delivery_if_marked_delivered_live_during_wait(self):
+        """A duplicate/retried final event for a run that gets shown to a
+        (re)connected live tab *while* the debounce watcher is waiting must
+        not still be proactively delivered once the wait ends — the tab
+        already persists it itself. This is the identity-based guard
+        (`was_delivered_live`), not the content-matching approach, so it
+        can't false-positive on coincidentally-identical text and doesn't
+        depend on debounce timing."""
+        conn = self._conn()
+        session_key = _owui_session_key(
+            "main", "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        )
+        # Session is idle from the start (min_idle_s=0), so the watcher's
+        # only loop iteration is the post-loop was_delivered_live check.
+        conn.mark_delivered_live(session_key, "run-1")
+
+        with mock.patch("openclaw_pipe.PROACTIVE_DELIVERY_ENABLED", True), mock.patch(
+            "openclaw_pipe._deliver_proactive_owui_message",
+            side_effect=AssertionError("must not deliver a run already shown live"),
+        ):
+            await _maybe_deliver_proactive_after_debounce(
+                conn, session_key, "run-1",
+                min_idle_s=0, poll_interval_s=0.02, max_wait_s=2,
             )
 
         self.assertNotIn(session_key, conn._pending_proactive_debounce)
