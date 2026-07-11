@@ -1681,6 +1681,40 @@ async def _deliver_proactive_owui_message(
 _gateway_connection: _GatewayConnection | None = None
 _gateway_init_lock = asyncio.Lock()
 
+# Anchor for finding a connection left behind by a *previous* deploy of this
+# same function (P33/P36: OWUI's function loader (open_webui/utils/plugin.py)
+# execs each redeploy into a brand-new module object with no teardown hook on
+# the old one — a module-level singleton alone resets every deploy and orphans
+# the old module's WS/event-loop task forever). Stashing it as an attribute on
+# `open_webui.socket.main` — OWUI's own stable module, never reloaded by our
+# function — lets the next deploy find and `disconnect()` the previous one
+# before opening a new connection, so redeploys self-heal without a container
+# restart. Falls back to a no-op when not running inside OWUI (e.g. unit tests).
+_STALE_CONN_ATTR = "_openclaw_gateway_connection_v1"
+
+
+async def _reap_stale_gateway_connection() -> None:
+    try:
+        import open_webui.socket.main as _owui_socket_main
+    except Exception:
+        return
+    stale = getattr(_owui_socket_main, _STALE_CONN_ATTR, None)
+    if stale is None or stale is _gateway_connection:
+        return
+    try:
+        await asyncio.wait_for(stale.disconnect(), timeout=5)
+        pipe_log("  reaped stale gateway connection from a previous deploy")
+    except Exception as ex:
+        pipe_log(f"  failed to reap stale gateway connection (non-fatal): {ex}")
+
+
+def _remember_gateway_connection(conn: _GatewayConnection) -> None:
+    try:
+        import open_webui.socket.main as _owui_socket_main
+    except Exception:
+        return
+    setattr(_owui_socket_main, _STALE_CONN_ATTR, conn)
+
 
 async def _get_gateway_connection(valves_getter) -> _GatewayConnection:
     """Get or create the singleton Gateway connection."""
@@ -1692,9 +1726,11 @@ async def _get_gateway_connection(valves_getter) -> _GatewayConnection:
         if _gateway_connection is not None:
             await _gateway_connection.ensure_connected()
             return _gateway_connection
+        await _reap_stale_gateway_connection()
         conn = _GatewayConnection(valves_getter)
         await conn.ensure_connected()
         _gateway_connection = conn
+        _remember_gateway_connection(conn)
         return conn
 
 

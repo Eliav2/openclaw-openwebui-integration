@@ -91,6 +91,8 @@ from openclaw_pipe import (
     _parse_whitelist,
     _preview_recovery_text,
     _provider_from_key,
+    _reap_stale_gateway_connection,
+    _remember_gateway_connection,
     _resolve_media,
     _resolve_media_via_owui,
     _suppress_already_shown,
@@ -427,6 +429,96 @@ class GatewayReconnectStormTests(unittest.IsolatedAsyncioTestCase):
         first_task.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await first_task
+
+
+class GatewayReloadReapTests(unittest.IsolatedAsyncioTestCase):
+    """Regression tests for the 2026-07-11 zombie-connection incident
+    (P33/P36 sibling bug): OWUI's function loader execs every redeploy into a
+    brand-new module with no teardown hook on the old one, so a
+    module-level-only singleton reset every deploy and orphaned the previous
+    deploy's WS/event-loop task forever (7 live connections observed after a
+    string of same-evening redeploys). `_reap_stale_gateway_connection` /
+    `_remember_gateway_connection` anchor the singleton on OWUI's own stable
+    `open_webui.socket.main` module (never reloaded by our function) so the
+    next deploy can tear down the previous one's connection before opening
+    its own — self-healing without a container restart."""
+
+    def _install_fake_owui_socket_module(self):
+        fake_module = types.ModuleType("open_webui.socket.main")
+        sys.modules.setdefault("open_webui", types.ModuleType("open_webui"))
+        sys.modules.setdefault("open_webui.socket", types.ModuleType("open_webui.socket"))
+        sys.modules["open_webui.socket.main"] = fake_module
+        self.addCleanup(sys.modules.pop, "open_webui.socket.main", None)
+        return fake_module
+
+    async def test_reaps_and_disconnects_a_stale_connection_from_a_prior_deploy(self):
+        fake_socket_module = self._install_fake_owui_socket_module()
+
+        disconnect_calls = {"n": 0}
+
+        class _FakeStaleConn:
+            async def disconnect(self):
+                disconnect_calls["n"] += 1
+
+        stale = _FakeStaleConn()
+        fake_socket_module._openclaw_gateway_connection_v1 = stale
+
+        with mock.patch("openclaw_pipe._gateway_connection", None):
+            await _reap_stale_gateway_connection()
+
+        self.assertEqual(disconnect_calls["n"], 1)
+
+    async def test_does_not_reap_when_stale_is_the_current_connection(self):
+        fake_socket_module = self._install_fake_owui_socket_module()
+        conn = _GatewayConnection(lambda: None)
+
+        disconnect_calls = {"n": 0}
+        conn.disconnect = mock.AsyncMock(side_effect=lambda: disconnect_calls.__setitem__("n", disconnect_calls["n"] + 1))
+        fake_socket_module._openclaw_gateway_connection_v1 = conn
+
+        with mock.patch("openclaw_pipe._gateway_connection", conn):
+            await _reap_stale_gateway_connection()
+
+        self.assertEqual(disconnect_calls["n"], 0)
+
+    async def test_reap_is_a_noop_when_no_anchor_present(self):
+        self._install_fake_owui_socket_module()
+        with mock.patch("openclaw_pipe._gateway_connection", None):
+            await _reap_stale_gateway_connection()  # must not raise
+
+    async def test_reap_is_a_noop_outside_owui(self):
+        sys.modules.pop("open_webui.socket.main", None)
+        sys.modules.pop("open_webui.socket", None)
+        sys.modules.pop("open_webui", None)
+        with mock.patch("openclaw_pipe._gateway_connection", None):
+            await _reap_stale_gateway_connection()  # must not raise
+
+    async def test_disconnect_failure_is_swallowed_not_fatal(self):
+        fake_socket_module = self._install_fake_owui_socket_module()
+
+        class _FakeStaleConn:
+            async def disconnect(self):
+                raise RuntimeError("socket already dead")
+
+        fake_socket_module._openclaw_gateway_connection_v1 = _FakeStaleConn()
+
+        with mock.patch("openclaw_pipe._gateway_connection", None):
+            await _reap_stale_gateway_connection()  # must not raise
+
+    def test_remember_stores_connection_on_owui_socket_module(self):
+        fake_socket_module = self._install_fake_owui_socket_module()
+        conn = _GatewayConnection(lambda: None)
+
+        _remember_gateway_connection(conn)
+
+        self.assertIs(fake_socket_module._openclaw_gateway_connection_v1, conn)
+
+    def test_remember_is_a_noop_outside_owui(self):
+        sys.modules.pop("open_webui.socket.main", None)
+        sys.modules.pop("open_webui.socket", None)
+        sys.modules.pop("open_webui", None)
+        conn = _GatewayConnection(lambda: None)
+        _remember_gateway_connection(conn)  # must not raise
 
 
 class OwuiSessionModelTests(unittest.TestCase):
