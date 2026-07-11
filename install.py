@@ -95,6 +95,7 @@ class Config:
     file_server_base_url: str
     auto_approve: bool = True
     dev_bundle: bool = False
+    confirm_downgrade_from_dev_bundle: bool = False
 
 
 def require_config(cfg: Config, *, need_gateway: bool) -> None:
@@ -360,7 +361,40 @@ def _rebuild_pipe_file(pipe_file: Path, *, dev: bool) -> None:
         info(f"Rebuilt {pipe_file.name} from src/openclaw_pipe_pkg/")
 
 
+def _assert_not_silently_downgrading_from_dev_bundle(cfg: Config) -> None:
+    """Refuse to deploy the plain artifact over a live pipe that's currently
+    running the dev bundle, unless explicitly confirmed.
+
+    Forgetting --dev-bundle is an easy mistake (it defaults to False), and
+    the consequence isn't cosmetic: it silently replaces the coordinated
+    dev pipe with the plain stripped one, deleting the ELI-24 deploy-
+    coordination mechanism from the live instance and restoring the
+    original ELI-23 hazard (a mid-turn deploy kills that turn's own
+    generator) with zero warning. A live pipe only responds on
+    /__devcoord__/status if it's currently running the dev bundle, so that
+    response is a reliable signal this deploy would be a downgrade.
+    """
+    if cfg.dev_bundle or cfg.confirm_downgrade_from_dev_bundle:
+        return
+    base = _devcoord_base_url(cfg)
+    try:
+        _devcoord_request(f"{base}/__devcoord__/status", timeout=3.0)
+    except Exception:
+        return  # live pipe isn't running the dev bundle -- nothing to downgrade
+    raise SystemExit(
+        "Refusing to deploy: the live pipe is currently running the dev bundle "
+        "(cross-agent deploy coordination, ELI-24), but this deploy would "
+        "overwrite it with the plain public artifact -- silently deleting that "
+        "coordination and bringing back the ELI-23 hazard (a mid-turn deploy "
+        "kills that turn's own generator) with no warning.\n"
+        "If you meant to deploy the dev bundle, add --dev-bundle.\n"
+        "If you really want to downgrade to the plain artifact on purpose, "
+        "re-run with --confirm-downgrade-from-dev-bundle."
+    )
+
+
 def update_or_create_function(client: OwuiClient, cfg: Config) -> dict:
+    _assert_not_silently_downgrading_from_dev_bundle(cfg)
     pipe_file = _resolve_pipe_file(cfg)
     _rebuild_pipe_file(pipe_file, dev=cfg.dev_bundle)
     if not pipe_file.exists():
@@ -866,6 +900,12 @@ def common_options(f):
                      help="Internal-only (ELI-24): deploy openclaw_pipe.dev.py "
                           "(includes cross-agent deploy coordination) instead of "
                           "the public openclaw_pipe.py. Never use for a real install."),
+        click.option("--confirm-downgrade-from-dev-bundle", is_flag=True, default=False,
+                     help="Required to deploy the plain artifact (i.e. without "
+                          "--dev-bundle) over a live pipe that's currently running "
+                          "the dev bundle -- without this, that deploy is refused "
+                          "since it would silently delete the ELI-24 deploy-"
+                          "coordination mechanism from the live instance."),
         click.option("--wizard", "-w", is_flag=True, default=False,
                      help="Prompt interactively for any missing required values"),
     ]
