@@ -75,157 +75,60 @@ async def _get_action_connection(valves_getter):
 
 
 # ---------------------------------------------------------------------------
-# Milestone 2: a real dialog instead of a toast, rendered via the "execute"
-# event (runs unsandboxed in the actual OWUI page, not a sandboxed Rich UI
-# iframe) so it can use OWUI's own live Tailwind classes and CSS custom
-# properties directly -- exact design-system match for free, no hand-tuned
-# color palette, no guessing which of OWUI's several themes is active. The
-# trade-off (unsandboxed JS) is acceptable here because the code is 100%
+# Milestone 2 (+ later, per-section independent loading): a real dialog
+# instead of a toast, rendered via the "execute" event (runs unsandboxed in
+# the actual OWUI page, not a sandboxed Rich UI iframe) so it can use
+# OWUI's own live Tailwind classes and CSS custom properties directly --
+# exact design-system match for free, no hand-tuned color palette, no
+# guessing which of OWUI's several themes is active. The trade-off
+# (unsandboxed JS) is acceptable here because the code is 100%
 # admin-authored, not influenced by any untrusted input; the only dynamic
-# values are our own gateway's numbers, passed in as a single JSON blob
-# (never string-interpolated) so nothing can break out of the data payload.
+# values are our own gateway's numbers, passed in as a single JSON blob per
+# section (never string-interpolated) so nothing can break out of the data
+# payload.
 #
-# Split into two separate `execute` emits rather than one, for latency: a
-# click should get instant visual feedback (the overlay + a loading
-# skeleton), not nothing happening for however long the gateway round trip
-# takes. `_MODAL_OPEN_JS` (static, no data, fired immediately) builds the
-# overlay/panel/header/close-button and a placeholder body with a loading
-# skeleton; `_render_modal_fill_js(data)` (fired once the RPCs resolve)
-# finds that same body by id and replaces its contents in place -- no
-# flicker, no second overlay animation. If the user already dismissed the
-# dialog before the data arrived, the body element is gone and the fill
-# call is a safe no-op (checked explicitly below).
+# Each of Context, Rate Limits, and Subagents loads and fills independently
+# (Eliav's explicit ask): three separate skeleton placeholders open
+# immediately, and each is replaced by its own `execute` fill event as soon
+# as ITS OWN gateway call resolves, rather than one combined
+# fetch-everything-then-render-once step where a slow call holds up
+# everything else. Subagents is fully independent (tasks.list only, no
+# dependency on the other two). Rate Limits genuinely needs the active
+# provider's name, which only comes from sessions.describe -- rather than
+# faking independence there, its fill waits on Context's own resolution of
+# that RPC (shared Task, not a second request) before adding usage.status
+# on top; it still has its own skeleton and fills in on its own schedule,
+# separate from Context's.
+#
+# Shared JS helpers (bar rendering, color thresholds, section headers, the
+# Compact button's click handler) are defined once in _MODAL_OPEN_JS_TEMPLATE and
+# stashed on `window.__openclawStatus` rather than duplicated in each
+# section's fill template -- each fill is its own separate `execute` call
+# (a fresh top-level script, no shared scope with the others), so without
+# this every section would need its own copy of ~30 lines of identical
+# helper code.
 # ---------------------------------------------------------------------------
 
-_MODAL_OPEN_JS = r"""
+_MODAL_OPEN_JS_TEMPLATE = r"""
 (function() {
+  const IDENTITY = __OPENCLAW_IDENTITY__;
   const existing = document.getElementById('openclaw-status-modal-root');
   if (existing) existing.remove();
 
-  const root = document.createElement('div');
-  root.id = 'openclaw-status-modal-root';
-  root.className = 'fixed inset-0 z-[9999] flex items-center justify-center';
-  root.style.background = 'rgba(0,0,0,0.4)';
-
-  const panel = document.createElement('div');
-  panel.className = 'bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 '
-    + 'rounded-2xl shadow-2xl border border-gray-100 dark:border-gray-800 '
-    + 'p-5 w-[380px] max-w-[90vw]';
-  panel.addEventListener('click', function(e) { e.stopPropagation(); });
-
-  const header = document.createElement('div');
-  header.className = 'flex items-center justify-between mb-3';
-  const title = document.createElement('div');
-  title.className = 'text-sm font-semibold';
-  title.textContent = 'OpenClaw Status';
-  header.appendChild(title);
-  const closeBtn = document.createElement('button');
-  closeBtn.type = 'button';
-  closeBtn.textContent = '×';
-  closeBtn.className = 'text-xl leading-none text-gray-400 hover:text-gray-700 '
-    + 'dark:hover:text-gray-200 px-1';
-  closeBtn.onclick = function() { root.remove(); };
-  header.appendChild(closeBtn);
-  panel.appendChild(header);
-
-  const body = document.createElement('div');
-  body.id = 'openclaw-status-modal-body';
-  body.innerHTML = '<div class="animate-pulse space-y-2">'
-    + '<div class="h-3 w-2/3 bg-gray-200 dark:bg-gray-700 rounded"></div>'
-    + '<div class="h-3 w-full bg-gray-200 dark:bg-gray-700 rounded"></div>'
-    + '<div class="h-3 w-1/2 bg-gray-200 dark:bg-gray-700 rounded"></div>'
-    + '</div>';
-  panel.appendChild(body);
-
-  root.appendChild(panel);
-  root.addEventListener('click', function() { root.remove(); });
-  const onKey = function(e) {
-    if (e.key === 'Escape') {
-      root.remove();
-      document.removeEventListener('keydown', onKey);
-    }
-  };
-  document.addEventListener('keydown', onKey);
-
-  document.body.appendChild(root);
-})();
-"""
-
-# Static (no data), fired the moment a compact is triggered -- see
-# Action._run_compact. Deliberately a distinct, prominent "Compacting..."
-# state rather than reusing the generic loading skeleton: compaction is an
-# LLM call that can take a while, so the dialog should look like it's
-# doing something specific and ongoing, not like a normal fetch that's
-# about to finish in a second.
-_MODAL_COMPACTING_JS = r"""
-(function() {
-  const body = document.getElementById('openclaw-status-modal-body');
-  if (!body) return;
-  body.innerHTML = '';
-
   const isDark = document.documentElement.classList.contains('dark');
-
-  const wrap = document.createElement('div');
-  wrap.className = 'flex flex-col items-center justify-center py-6 text-center';
-
-  const spinner = document.createElement('div');
-  spinner.className = 'animate-spin rounded-full h-6 w-6 border-2 mb-3';
-  spinner.style.borderColor = isDark ? '#4b5563' : '#d1d5db';
-  spinner.style.borderTopColor = 'transparent';
-  wrap.appendChild(spinner);
-
-  const title = document.createElement('div');
-  title.className = 'text-sm font-medium text-gray-700 dark:text-gray-200';
-  title.textContent = 'Compacting…';
-  wrap.appendChild(title);
-
-  const sub = document.createElement('div');
-  sub.className = 'text-xs text-gray-400 dark:text-gray-500 mt-1';
-  sub.textContent = 'This can take a moment for long conversations.';
-  wrap.appendChild(sub);
-
-  body.appendChild(wrap);
-})();
-"""
-
-_MODAL_FILL_JS_TEMPLATE = r"""
-(function() {
-  const DATA = __OPENCLAW_STATUS_DATA__;
-  const body = document.getElementById('openclaw-status-modal-body');
-  if (!body) return;
-  body.innerHTML = '';
-
-  const isDark = document.documentElement.classList.contains('dark');
-
-  if (DATA.error) {
-    const err = document.createElement('div');
-    err.className = 'text-sm';
-    err.style.color = isDark ? '#fb7185' : '#e11d48';
-    err.textContent = DATA.error;
-    body.appendChild(err);
-    return;
-  }
 
   // Used-percent -> color: green while healthy, amber approaching the
-  // limit, red once it's mostly consumed. Same thresholds for every bar
-  // (context and each rate-limit window) so the color language is
-  // consistent across sections.
+  // limit, red once it's mostly consumed. Same thresholds for every bar.
   //
   // Inline hex, not Tailwind utility classes: Tailwind only ships the
   // utility classes it finds referenced somewhere in ITS OWN build's
   // source, so a class this injected code invents (rather than one OWUI's
   // own frontend already uses) can silently have zero CSS behind it --
-  // exactly what happened here. 'bg-rose-500' is never referenced
-  // anywhere in open-webui/open-webui's own source (verified against the
-  // real repo), so that utility class was never generated in OWUI's
-  // compiled stylesheet at all; the fill div picked up the class but no
-  // styling, rendering as an invisible 0-color bar even at 86% width.
-  // 'bg-emerald-500' happened to render fine only because OWUI's own UI
-  // elsewhere happens to use emerald -- relying on that coincidence for
-  // every color is fragile (a future OWUI redesign could drop it too).
-  // Inline styles have no dependency on the host page's Tailwind content
-  // scan at all, so this can't recur regardless of what OWUI's frontend
-  // does or doesn't use.
+  // confirmed live: 'bg-rose-500' is never referenced anywhere in
+  // open-webui/open-webui's own source, so that utility class was never
+  // generated in OWUI's compiled stylesheet, and a bar using it rendered
+  // as an invisible 0-color fill even at 86% width. Inline styles have no
+  // dependency on the host page's Tailwind content scan at all.
   function barColor(usedPercent) {
     if (usedPercent >= 85) return '#f43f5e';
     if (usedPercent >= 60) return '#f59e0b';
@@ -253,17 +156,42 @@ _MODAL_FILL_JS_TEMPLATE = r"""
     return h;
   }
 
+  function errorEl(message) {
+    const err = document.createElement('div');
+    err.className = 'text-sm';
+    err.style.color = isDark ? '#fb7185' : '#e11d48';
+    err.textContent = message;
+    return err;
+  }
+
+  function skeletonSection(id) {
+    const el = document.createElement('div');
+    el.id = id;
+    el.className = 'mb-4';
+    el.innerHTML = '<div class="animate-pulse space-y-2">'
+      + '<div class="h-3 w-2/3 bg-gray-200 dark:bg-gray-700 rounded"></div>'
+      + '<div class="h-3 w-full bg-gray-200 dark:bg-gray-700 rounded"></div>'
+      + '</div>';
+    return el;
+  }
+
+  function touchFooter(fetchedAt, source) {
+    const f = document.getElementById('openclaw-status-footer');
+    if (f) f.textContent = 'Updated ' + fetchedAt + ' · via ' + source;
+  }
+
   // Fetches back to this same Action (same-origin, unsandboxed execute
   // context -- no iframe/postMessage plumbing needed) with a synthetic
   // mode="compact" marker. Reads OWUI's own stored auth token directly
   // (confirmed against OWUI's frontend source: it keeps its bearer token
   // at localStorage['token']) rather than assuming cookie auth. The
-  // chat/message/session identity is the *original* click's, threaded
-  // through in DATA, so the Python side's __event_emitter__ calls for
-  // this follow-up route back to this same open tab. The fetch response
-  // itself is ignored -- all UI updates arrive as separate execute events
-  // pushed from the Python side as the compact operation progresses,
-  // exactly like the initial open/fill sequence.
+  // chat/message/session identity is the *original* click's (captured at
+  // open time, in IDENTITY -- these never change over the dialog's
+  // lifetime and never need an RPC, unlike everything else here), so the
+  // Python side's __event_emitter__ calls for this follow-up route back
+  // to this same open tab. The fetch response itself is ignored -- all UI
+  // updates arrive as separate execute events pushed from the Python side
+  // as the compact operation progresses.
   function triggerCompact() {
     const token = localStorage.getItem('token');
     fetch('/api/chat/actions/openclaw_status_action', {
@@ -273,147 +201,347 @@ _MODAL_FILL_JS_TEMPLATE = r"""
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: DATA.owuiModel,
-        chat_id: DATA.chatId,
-        id: DATA.messageId,
-        session_id: DATA.sessionId,
+        model: IDENTITY.owuiModel,
+        chat_id: IDENTITY.chatId,
+        id: IDENTITY.messageId,
+        session_id: IDENTITY.sessionId,
         mode: 'compact',
       }),
     }).catch(function(err) {
-      const target = document.getElementById('openclaw-status-modal-body');
-      if (!target) return;
-      target.innerHTML = '';
-      const errEl = document.createElement('div');
-      errEl.className = 'text-sm';
-      errEl.style.color = isDark ? '#fb7185' : '#e11d48';
-      errEl.textContent = 'Could not start compact: ' + err;
-      target.appendChild(errEl);
+      const wrap = document.getElementById('openclaw-status-sections');
+      if (!wrap) return;
+      wrap.innerHTML = '';
+      wrap.appendChild(errorEl('Could not start compact: ' + err));
     });
+  }
+
+  window.__openclawStatus = {
+    identity: IDENTITY, isDark: isDark, barColor: barColor, makeBar: makeBar,
+    sectionHeader: sectionHeader, errorEl: errorEl,
+    skeletonSection: skeletonSection, touchFooter: touchFooter,
+    triggerCompact: triggerCompact,
+  };
+
+  const root = document.createElement('div');
+  root.id = 'openclaw-status-modal-root';
+  root.className = 'fixed inset-0 z-[9999] flex items-center justify-center';
+  root.style.background = 'rgba(0,0,0,0.4)';
+
+  const panel = document.createElement('div');
+  panel.className = 'bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 '
+    + 'rounded-2xl shadow-2xl border border-gray-100 dark:border-gray-800 '
+    + 'p-5 w-[380px] max-w-[90vw]';
+  panel.addEventListener('click', function(e) { e.stopPropagation(); });
+
+  const header = document.createElement('div');
+  header.className = 'flex items-center justify-between mb-3';
+  const title = document.createElement('div');
+  title.className = 'text-sm font-semibold';
+  title.textContent = 'OpenClaw Status';
+  header.appendChild(title);
+  const closeBtn = document.createElement('button');
+  closeBtn.type = 'button';
+  closeBtn.textContent = '×';
+  closeBtn.className = 'text-xl leading-none text-gray-400 hover:text-gray-700 '
+    + 'dark:hover:text-gray-200 px-1';
+  closeBtn.onclick = function() { root.remove(); };
+  header.appendChild(closeBtn);
+  panel.appendChild(header);
+
+  const sections = document.createElement('div');
+  sections.id = 'openclaw-status-sections';
+  sections.appendChild(skeletonSection('openclaw-status-section-context'));
+  sections.appendChild(skeletonSection('openclaw-status-section-limits'));
+  sections.appendChild(skeletonSection('openclaw-status-section-subagents'));
+  panel.appendChild(sections);
+
+  const footer = document.createElement('div');
+  footer.id = 'openclaw-status-footer';
+  footer.className = 'text-[11px] text-gray-400 dark:text-gray-600 pt-3 '
+    + 'border-t border-gray-100 dark:border-gray-800';
+  footer.textContent = ' ';
+  panel.appendChild(footer);
+
+  root.appendChild(panel);
+  root.addEventListener('click', function() { root.remove(); });
+  const onKey = function(e) {
+    if (e.key === 'Escape') {
+      root.remove();
+      document.removeEventListener('keydown', onKey);
+    }
+  };
+  document.addEventListener('keydown', onKey);
+
+  document.body.appendChild(root);
+})();
+"""
+
+# Fired only on a post-compact refresh (_run_status(show_loading=False)),
+# never on the initial open. _MODAL_COMPACTING_JS (below) replaces
+# #openclaw-status-sections' entire contents with its spinner, which
+# destroys the three individual section ids each fill function targets --
+# this recreates fresh skeletons in their place before the refreshed RPCs
+# are fired, without touching the overlay/header/window.__openclawStatus
+# (already correctly set up from the original open).
+_RESET_SECTIONS_JS = r"""
+(function() {
+  const wrap = document.getElementById('openclaw-status-sections');
+  const S = window.__openclawStatus;
+  if (!wrap || !S) return;
+  wrap.innerHTML = '';
+  wrap.appendChild(S.skeletonSection('openclaw-status-section-context'));
+  wrap.appendChild(S.skeletonSection('openclaw-status-section-limits'));
+  wrap.appendChild(S.skeletonSection('openclaw-status-section-subagents'));
+})();
+"""
+
+# Static (no data), fired the moment a compact is triggered -- see
+# Action._run_compact. Deliberately a distinct, prominent "Compacting..."
+# state rather than reusing the generic loading skeleton: compaction is an
+# LLM call that can take a while, so the dialog should look like it's
+# doing something specific and ongoing, not like a normal fetch that's
+# about to finish in a second. Replaces the whole sections wrapper (not a
+# specific section) since this is a dialog-wide state, not a per-query one.
+_MODAL_COMPACTING_JS = r"""
+(function() {
+  const wrap = document.getElementById('openclaw-status-sections');
+  if (!wrap) return;
+  wrap.innerHTML = '';
+
+  const isDark = document.documentElement.classList.contains('dark');
+
+  const box = document.createElement('div');
+  box.className = 'flex flex-col items-center justify-center py-6 text-center';
+
+  const spinner = document.createElement('div');
+  spinner.className = 'animate-spin rounded-full h-6 w-6 border-2 mb-3';
+  spinner.style.borderColor = isDark ? '#4b5563' : '#d1d5db';
+  spinner.style.borderTopColor = 'transparent';
+  box.appendChild(spinner);
+
+  const title = document.createElement('div');
+  title.className = 'text-sm font-medium text-gray-700 dark:text-gray-200';
+  title.textContent = 'Compacting…';
+  box.appendChild(title);
+
+  const sub = document.createElement('div');
+  sub.className = 'text-xs text-gray-400 dark:text-gray-500 mt-1';
+  sub.textContent = 'This can take a moment for long conversations.';
+  box.appendChild(sub);
+
+  wrap.appendChild(box);
+})();
+"""
+
+# Dialog-wide error (connection failures, "busy" guard, compact timeout) --
+# also replaces the whole sections wrapper rather than one section, same
+# reasoning as _MODAL_COMPACTING_JS.
+_SECTIONS_ERROR_JS_TEMPLATE = r"""
+(function() {
+  const MESSAGE = __OPENCLAW_ERROR_MESSAGE__;
+  const wrap = document.getElementById('openclaw-status-sections');
+  if (!wrap) return;
+  wrap.innerHTML = '';
+  const S = window.__openclawStatus;
+  if (S) {
+    wrap.appendChild(S.errorEl(MESSAGE));
+  } else {
+    wrap.textContent = MESSAGE;
+  }
+})();
+"""
+
+_CONTEXT_FILL_JS_TEMPLATE = r"""
+(function() {
+  const DATA = __OPENCLAW_STATUS_DATA__;
+  const section = document.getElementById('openclaw-status-section-context');
+  const S = window.__openclawStatus;
+  if (!section || !S) return;
+  section.innerHTML = '';
+  section.className = 'mb-4';
+
+  if (DATA.error) {
+    section.appendChild(S.errorEl(DATA.error));
+    return;
   }
 
   const sub = document.createElement('div');
-  sub.className = 'text-xs text-gray-500 dark:text-gray-400 mb-4';
+  sub.className = 'text-xs text-gray-500 dark:text-gray-400 mb-3';
   sub.textContent = DATA.provider + (DATA.model ? (' · ' + DATA.model) : '');
-  body.appendChild(sub);
+  section.appendChild(sub);
 
-  let sectionCount = 0;
-
-  if (DATA.context) {
-    sectionCount++;
-    const section = document.createElement('div');
-    section.className = 'mb-4';
-
-    const headerRow = document.createElement('div');
-    headerRow.className = 'flex items-center justify-between mb-1.5';
-    const headerLabel = document.createElement('div');
-    headerLabel.className = 'text-[10px] font-semibold tracking-wide uppercase '
-      + 'text-gray-400 dark:text-gray-500';
-    headerLabel.textContent = 'Context';
-    headerRow.appendChild(headerLabel);
-    if (DATA.chatId && DATA.messageId && DATA.sessionId) {
-      const compactBtn = document.createElement('button');
-      compactBtn.type = 'button';
-      compactBtn.textContent = 'Compact';
-      compactBtn.className = 'text-[10px] font-medium px-2 py-0.5 rounded-full '
-        + 'border border-gray-200 dark:border-gray-700 text-gray-500 dark:text-gray-400 '
-        + 'hover:text-gray-800 dark:hover:text-gray-100 hover:border-gray-300 dark:hover:border-gray-600';
-      compactBtn.onclick = triggerCompact;
-      headerRow.appendChild(compactBtn);
-    }
-    section.appendChild(headerRow);
-
-    section.appendChild(makeBar(DATA.context.pct));
-    const label = document.createElement('div');
-    label.className = 'text-xs text-gray-500 dark:text-gray-400 mt-1.5';
-    label.textContent = DATA.context.usedTokens + ' / ' + DATA.context.totalTokens
-      + ' tokens · ' + DATA.context.pct + '%';
-    section.appendChild(label);
-    body.appendChild(section);
+  if (!DATA.context) {
+    const empty = document.createElement('div');
+    empty.className = 'text-gray-400 dark:text-gray-500 text-xs';
+    empty.textContent = 'No context data available for this session yet.';
+    section.appendChild(empty);
+    return;
   }
 
-  if (DATA.windows.length > 0) {
-    sectionCount++;
-    const section = document.createElement('div');
-    section.className = 'mb-4';
-    section.appendChild(sectionHeader('Rate Limits'));
-    DATA.windows.forEach(function(w, i) {
-      const row = document.createElement('div');
-      row.className = i > 0 ? 'mt-3' : '';
-      const top = document.createElement('div');
-      top.className = 'flex items-center justify-between text-xs '
-        + 'text-gray-600 dark:text-gray-300 mb-1';
-      const labelEl = document.createElement('span');
-      labelEl.textContent = w.label;
-      const pctEl = document.createElement('span');
-      pctEl.textContent = Math.round(100 - w.usedPercent) + '% left';
-      top.appendChild(labelEl);
-      top.appendChild(pctEl);
-      row.appendChild(top);
-      row.appendChild(makeBar(w.usedPercent));
-      if (w.resetIn) {
-        const reset = document.createElement('div');
-        reset.className = 'text-[11px] text-gray-400 dark:text-gray-500 mt-1';
-        let text = 'resets in ' + w.resetIn;
-        if (w.resetAtMs) {
-          // Formatted in the browser's own local timezone, not computed
-          // server-side -- the gateway/OWUI container's system timezone
-          // and the person actually looking at this dialog aren't
-          // guaranteed to be the same, so doing this client-side is the
-          // only way to get it right regardless of where either runs.
-          const abs = new Date(w.resetAtMs).toLocaleTimeString([], {
-            hour: '2-digit', minute: '2-digit'
-          });
-          text += ' · ' + abs;
-        }
-        reset.textContent = text;
-        row.appendChild(reset);
-      }
-      section.appendChild(row);
-    });
-    body.appendChild(section);
+  const headerRow = document.createElement('div');
+  headerRow.className = 'flex items-center justify-between mb-1.5';
+  const headerLabel = document.createElement('div');
+  headerLabel.className = 'text-[10px] font-semibold tracking-wide uppercase '
+    + 'text-gray-400 dark:text-gray-500';
+  headerLabel.textContent = 'Context';
+  headerRow.appendChild(headerLabel);
+  if (S.identity.chatId && S.identity.messageId && S.identity.sessionId) {
+    const compactBtn = document.createElement('button');
+    compactBtn.type = 'button';
+    compactBtn.textContent = 'Compact';
+    compactBtn.className = 'text-[10px] font-medium px-2 py-0.5 rounded-full '
+      + 'border border-gray-200 dark:border-gray-700 text-gray-500 dark:text-gray-400 '
+      + 'hover:text-gray-800 dark:hover:text-gray-100 hover:border-gray-300 dark:hover:border-gray-600';
+    compactBtn.onclick = S.triggerCompact;
+    headerRow.appendChild(compactBtn);
   }
+  section.appendChild(headerRow);
+
+  section.appendChild(S.makeBar(DATA.context.pct));
+  const label = document.createElement('div');
+  label.className = 'text-xs text-gray-500 dark:text-gray-400 mt-1.5';
+  label.textContent = DATA.context.usedTokens + ' / ' + DATA.context.totalTokens
+    + ' tokens · ' + DATA.context.pct + '%';
+  section.appendChild(label);
 
   if (DATA.goal) {
-    sectionCount++;
-    const section = document.createElement('div');
-    section.className = 'mb-4';
-    section.appendChild(sectionHeader('Goal'));
+    const goalWrap = document.createElement('div');
+    goalWrap.className = 'mt-3 pt-3 border-t border-gray-100 dark:border-gray-800';
+    goalWrap.appendChild(S.sectionHeader('Goal'));
     const line = document.createElement('div');
     line.className = 'text-sm text-gray-700 dark:text-gray-200';
     line.textContent = DATA.goal.line;
-    section.appendChild(line);
+    goalWrap.appendChild(line);
     if (DATA.goal.pct !== null) {
       const barWrap = document.createElement('div');
       barWrap.className = 'mt-1.5';
-      barWrap.appendChild(makeBar(DATA.goal.pct));
-      section.appendChild(barWrap);
+      barWrap.appendChild(S.makeBar(DATA.goal.pct));
+      goalWrap.appendChild(barWrap);
     }
-    body.appendChild(section);
+    section.appendChild(goalWrap);
   }
 
-  if (sectionCount === 0) {
-    const empty = document.createElement('div');
-    empty.className = 'text-gray-400 dark:text-gray-500 text-xs mb-4';
-    empty.textContent = 'No usage data available for this session yet.';
-    body.appendChild(empty);
+  S.touchFooter(DATA.fetchedAt, DATA.source);
+})();
+"""
+
+# Always gets its own section when we have a real provider to report on --
+# not gated on windows.length > 0. The gateway's usage.status can
+# transiently report zero windows for the active provider while a run is
+# in flight (its rate-limit cache is most likely refreshed from that run's
+# own API response headers, so there's a real gap while one is active) --
+# silently omitting the section in that case looked exactly like a missing
+# feature rather than a temporary data gap (what Eliav asked about,
+# 2026-07-11). Showing an explicit note instead turns that into an
+# understood, expected state.
+_LIMITS_FILL_JS_TEMPLATE = r"""
+(function() {
+  const DATA = __OPENCLAW_STATUS_DATA__;
+  const section = document.getElementById('openclaw-status-section-limits');
+  const S = window.__openclawStatus;
+  if (!section || !S) return;
+  section.innerHTML = '';
+
+  if (DATA.error) {
+    section.className = 'mb-4';
+    section.appendChild(S.errorEl(DATA.error));
+    return;
   }
 
-  const footer = document.createElement('div');
-  footer.className = 'text-[11px] text-gray-400 dark:text-gray-600 pt-3 '
-    + 'border-t border-gray-100 dark:border-gray-800';
-  footer.textContent = 'Fetched ' + DATA.fetchedAt + ' · via ' + DATA.source;
-  body.appendChild(footer);
+  if (!DATA.provider || DATA.provider === '?') {
+    section.className = '';
+    return;
+  }
+
+  section.className = 'mb-4';
+  section.appendChild(S.sectionHeader('Rate Limits'));
+  if (DATA.windows.length === 0) {
+    const note = document.createElement('div');
+    note.className = 'text-xs text-gray-400 dark:text-gray-500';
+    note.textContent = 'No rate-limit data available right now'
+      + (DATA.sessionActive ? ' (a response is in progress).' : '.');
+    section.appendChild(note);
+  }
+  DATA.windows.forEach(function(w, i) {
+    const row = document.createElement('div');
+    row.className = i > 0 ? 'mt-3' : '';
+    const top = document.createElement('div');
+    top.className = 'flex items-center justify-between text-xs '
+      + 'text-gray-600 dark:text-gray-300 mb-1';
+    const labelEl = document.createElement('span');
+    labelEl.textContent = w.label;
+    const pctEl = document.createElement('span');
+    pctEl.textContent = Math.round(100 - w.usedPercent) + '% left';
+    top.appendChild(labelEl);
+    top.appendChild(pctEl);
+    row.appendChild(top);
+    row.appendChild(S.makeBar(w.usedPercent));
+    if (w.resetIn) {
+      const reset = document.createElement('div');
+      reset.className = 'text-[11px] text-gray-400 dark:text-gray-500 mt-1';
+      let text = 'resets in ' + w.resetIn;
+      if (w.resetAtMs) {
+        // Formatted in the browser's own local timezone, not computed
+        // server-side -- the gateway/OWUI container's system timezone and
+        // the person actually looking at this dialog aren't guaranteed to
+        // be the same, so doing this client-side is the only way to get
+        // it right regardless of where either runs.
+        const abs = new Date(w.resetAtMs).toLocaleTimeString([], {
+          hour: '2-digit', minute: '2-digit'
+        });
+        text += ' · ' + abs;
+      }
+      reset.textContent = text;
+      row.appendChild(reset);
+    }
+    section.appendChild(row);
+  });
+
+  S.touchFooter(DATA.fetchedAt, DATA.source);
+})();
+"""
+
+# Deliberately hidden entirely (not even a header) when count is 0 --
+# "general tracking, no detail" (Eliav's ask): a permanently-visible
+# "0 running" line for the common idle case would be more clutter than
+# signal. Only appears when there's actually something to report.
+_SUBAGENTS_FILL_JS_TEMPLATE = r"""
+(function() {
+  const DATA = __OPENCLAW_STATUS_DATA__;
+  const section = document.getElementById('openclaw-status-section-subagents');
+  const S = window.__openclawStatus;
+  if (!section || !S) return;
+  section.innerHTML = '';
+
+  if (DATA.error) {
+    section.className = 'mb-4';
+    section.appendChild(S.errorEl(DATA.error));
+    return;
+  }
+
+  if (!DATA.count) {
+    section.className = '';
+    return;
+  }
+
+  section.className = 'mb-4';
+  section.appendChild(S.sectionHeader('Subagents'));
+  const line = document.createElement('div');
+  line.className = 'text-sm text-gray-700 dark:text-gray-200';
+  line.textContent = '🤖 ' + DATA.count + ' running';
+  section.appendChild(line);
+
+  S.touchFooter(DATA.fetchedAt, DATA.source);
 })();
 """
 
 
-def _render_modal_fill_js(data: dict) -> str:
-    """Fill the modal template with a single JSON blob -- never string-
-    interpolate individual fields directly into the JS source. json.dumps
-    always produces a syntactically valid JS object-literal expression, so
-    this is the one substitution point that needs to be safe against
-    whatever the gateway's numbers/text happen to contain (e.g. a goal
-    description with quotes or backslashes).
+def _json_for_js(data) -> str:
+    """Never string-interpolate individual fields directly into JS source.
+    json.dumps always produces a syntactically valid JS expression, so this
+    is the one substitution point that needs to be safe against whatever
+    the gateway's numbers/text happen to contain (e.g. a goal description
+    with quotes or backslashes).
 
     json.dumps does NOT escape "<" by default, so a value containing a
     literal "</script>" would terminate an enclosing <script> tag early if
@@ -421,8 +549,27 @@ def _render_modal_fill_js(data: dict) -> str:
     a JS execution call -- escaping "<" to the equivalent \\u003c unicode
     escape is a no-op for JSON.parse but closes that off regardless of how
     the execute event happens to deliver this string."""
-    payload = json.dumps(data).replace("<", "\\u003c")
-    return _MODAL_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", payload)
+    return json.dumps(data).replace("<", "\\u003c")
+
+
+def _render_modal_open_js(identity: dict) -> str:
+    return _MODAL_OPEN_JS_TEMPLATE.replace("__OPENCLAW_IDENTITY__", _json_for_js(identity))
+
+
+def _render_sections_error_js(message: str) -> str:
+    return _SECTIONS_ERROR_JS_TEMPLATE.replace("__OPENCLAW_ERROR_MESSAGE__", _json_for_js(message))
+
+
+def _render_context_fill_js(data: dict) -> str:
+    return _CONTEXT_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
+
+
+def _render_limits_fill_js(data: dict) -> str:
+    return _LIMITS_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
+
+
+def _render_subagents_fill_js(data: dict) -> str:
+    return _SUBAGENTS_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
 
 
 class Action:
@@ -463,14 +610,26 @@ class Action:
         this is what OWUI sends for the actual message-toolbar click) opens
         the dialog and shows live usage; "compact" is never sent by OWUI
         itself -- it's a synthetic marker the dialog's own in-page Compact
-        button fetches back with (see the Compact button's onclick in
-        _MODAL_FILL_JS_TEMPLATE), reusing this same endpoint rather than
+        button fetches back with (see triggerCompact() in
+        _MODAL_OPEN_JS_TEMPLATE), reusing this same endpoint rather than
         registering a second Action."""
         if body.get("mode") == "compact":
             return await self._run_compact(body, __user__, __event_emitter__)
         return await self._run_status(body, __user__, __event_emitter__)
 
     async def _run_status(self, body: dict, __user__, __event_emitter__, *, show_loading=True):
+        """Fetches and renders the dialog's three sections -- Context, Rate
+        Limits, Subagents -- each independently: its own skeleton at open,
+        its own fill event as soon as its own data is ready, not one
+        combined fetch-everything-then-render-once step (Eliav's explicit
+        ask, 2026-07-11). Subagents (tasks.list) has no dependency on the
+        other two at all. Rate Limits genuinely needs the active provider's
+        name, which only comes from sessions.describe -- rather than fake
+        independence there, its fill awaits Context's own resolution of
+        that RPC (the same Task object, not a second request) before adding
+        usage.status on top; it still has its own skeleton and fills in on
+        its own schedule, separate from Context's.
+        """
         chat_id = body.get("chat_id")
         user_id = (__user__ or {}).get("id") or "unknown"
 
@@ -481,123 +640,175 @@ class Action:
             })
             return {"status": "error", "detail": "missing chat_id"}
 
-        # Open the dialog immediately -- before touching the network -- so
-        # the click gets instant feedback (overlay + loading skeleton)
-        # instead of nothing visibly happening for however long the
-        # gateway round trip takes. Skipped when refreshing after a compact
-        # completes (_run_compact already has the dialog open on its own
-        # "Compacting..." state) -- re-showing the generic skeleton there
-        # would be an unnecessary extra flash between two loading states.
+        # chat_id/message_id/session_id/model never depend on any RPC --
+        # they're already in `body` -- so they're embedded once at open
+        # time (IDENTITY in _MODAL_OPEN_JS_TEMPLATE) rather than threaded
+        # through every section's own fill payload.
         if show_loading:
-            await __event_emitter__({"type": "execute", "data": {"code": _MODAL_OPEN_JS}})
+            identity = {
+                "chatId": chat_id,
+                "messageId": body.get("id"),
+                "sessionId": body.get("session_id"),
+                "owuiModel": body.get("model"),
+            }
+            await __event_emitter__({"type": "execute", "data": {"code": _render_modal_open_js(identity)}})
+        else:
+            # Post-compact refresh: the dialog is already open, but
+            # _MODAL_COMPACTING_JS replaced the sections wrapper with its
+            # spinner, destroying the three section ids -- recreate fresh
+            # skeletons in their place before firing the refreshed RPCs.
+            await __event_emitter__({"type": "execute", "data": {"code": _RESET_SECTIONS_JS}})
 
         session_key = _owui_session_key(self.valves.AGENT_ID, user_id, chat_id)
 
         try:
             conn, source = await _get_action_connection(lambda: self.valves)
-            # Raw sessions.describe/usage.status rather than emit.py's
-            # _build_usage_status_lines: that helper joins context+primary
-            # window into one thin combined line to fit the status UI's
-            # single-line clamp (see its docstring), which is exactly the
-            # constraint the dialog doesn't have -- Context and Rate Limits
-            # get their own sections with individual progress bars here.
-            # Still reuses emit.py's small formatting primitives
-            # (_fmt_tokens, _relative_time, _format_goal_line) so text like
-            # "resets in 2h05m" matches the status line's wording exactly.
-            desc_task = asyncio.ensure_future(
-                conn.send_request("sessions.describe", dict(key=session_key), timeout=5)
-            )
-            usage_task = asyncio.ensure_future(
-                conn.send_request("usage.status", {}, timeout=5)
-            )
-            desc = await desc_task
-            usage = await usage_task
         except Exception as ex:
-            pipe_log(f"[status-action] fetch failed: {ex}")
+            pipe_log(f"[status-action] connect failed: {ex}")
             await __event_emitter__({
                 "type": "execute",
-                "data": {"code": _render_modal_fill_js(
-                    {"error": f"Could not fetch status: {ex}"}
-                )},
+                "data": {"code": _render_sections_error_js(f"Could not connect: {ex}")},
             })
             return {"status": "error", "detail": str(ex)}
 
-        session_row = (desc or {}).get("session") or {}
-        provider = session_row.get("modelProvider") or "?"
+        # Fired concurrently; each section's own coroutine below awaits
+        # only what it actually needs and emits its own fill the moment
+        # that's ready.
+        desc_task = asyncio.ensure_future(
+            conn.send_request("sessions.describe", dict(key=session_key), timeout=5)
+        )
+        usage_task = asyncio.ensure_future(conn.send_request("usage.status", {}, timeout=5))
+        tasks_task = asyncio.ensure_future(conn.send_request(
+            "tasks.list", dict(sessionKey=session_key, status=["running", "queued"], limit=50), timeout=5,
+        ))
 
-        context_tokens = session_row.get("contextTokens")
-        total_tokens = session_row.get("totalTokens")
-        context_data = None
-        if context_tokens and total_tokens is not None:
-            context_data = {
-                "usedTokens": _fmt_tokens(total_tokens),
-                "totalTokens": _fmt_tokens(context_tokens),
-                "pct": round(total_tokens / context_tokens * 100, 1),
-            }
+        async def fill_context():
+            """Also resolves provider/session_row for fill_limits to reuse
+            (returned, not re-fetched) -- still reuses emit.py's small
+            formatting primitives (_fmt_tokens, _format_goal_line) so
+            wording matches the status line exactly."""
+            try:
+                desc = await desc_task
+            except Exception as ex:
+                pipe_log(f"[status-action] sessions.describe failed: {ex}")
+                await __event_emitter__({"type": "execute", "data": {
+                    "code": _render_context_fill_js({"error": f"Could not fetch context: {ex}"})
+                }})
+                return None, {}
 
-        windows_data = []
-        for p in (usage or {}).get("providers", []):
-            if p.get("provider") != provider:
-                continue
-            for w in p.get("windows") or []:
-                used = w.get("usedPercent")
-                if used is None:
+            session_row = (desc or {}).get("session") or {}
+            provider = session_row.get("modelProvider") or "?"
+
+            context_tokens = session_row.get("contextTokens")
+            total_tokens = session_row.get("totalTokens")
+            context_data = None
+            if context_tokens and total_tokens is not None:
+                context_data = {
+                    "usedTokens": _fmt_tokens(total_tokens),
+                    "totalTokens": _fmt_tokens(context_tokens),
+                    "pct": round(total_tokens / context_tokens * 100, 1),
+                }
+
+            goal_data = None
+            goal = session_row.get("goal")
+            if goal:
+                goal_line = _format_goal_line(goal)
+                if goal_line:
+                    tokens_used = goal.get("tokensUsed")
+                    budget = goal.get("tokenBudget")
+                    goal_pct = (
+                        round(tokens_used / budget * 100, 1)
+                        if (tokens_used is not None and budget) else None
+                    )
+                    goal_data = {"line": goal_line, "pct": goal_pct}
+
+            await __event_emitter__({"type": "execute", "data": {"code": _render_context_fill_js({
+                "provider": provider,
+                "model": session_row.get("model") or "",
+                "context": context_data,
+                "goal": goal_data,
+                "source": source,
+                "fetchedAt": time.strftime("%H:%M:%S"),
+                "error": None,
+            })}})
+            return provider, session_row
+
+        async def fill_limits():
+            provider, session_row = await context_ready
+            if provider is None:
+                return  # fill_context already reported the fetch error
+            try:
+                usage = await usage_task
+            except Exception as ex:
+                pipe_log(f"[status-action] usage.status failed: {ex}")
+                await __event_emitter__({"type": "execute", "data": {
+                    "code": _render_limits_fill_js({"error": f"Could not fetch rate limits: {ex}"})
+                }})
+                return
+
+            windows_data = []
+            for p in (usage or {}).get("providers", []):
+                if p.get("provider") != provider:
                     continue
-                windows_data.append({
-                    "label": w.get("label"),
-                    "usedPercent": used,
-                    "resetIn": _relative_time(w.get("resetAt")),
-                    # Raw ms timestamp, not a server-formatted clock time --
-                    # the absolute time is rendered client-side (see
-                    # _MODAL_FILL_JS_TEMPLATE) so it shows in the browser's
-                    # own local timezone rather than whatever timezone this
-                    # container happens to be running in.
-                    "resetAtMs": w.get("resetAt"),
-                })
-            break
+                for w in p.get("windows") or []:
+                    used = w.get("usedPercent")
+                    if used is None:
+                        continue
+                    windows_data.append({
+                        "label": w.get("label"),
+                        "usedPercent": used,
+                        "resetIn": _relative_time(w.get("resetAt")),
+                        # Raw ms timestamp, not a server-formatted clock
+                        # time -- the absolute time is rendered client-side
+                        # so it shows in the browser's own local timezone
+                        # rather than whatever timezone this container is in.
+                        "resetAtMs": w.get("resetAt"),
+                    })
+                break
 
-        goal_data = None
-        goal = session_row.get("goal")
-        if goal:
-            goal_line = _format_goal_line(goal)
-            if goal_line:
-                tokens_used = goal.get("tokensUsed")
-                budget = goal.get("tokenBudget")
-                goal_pct = (
-                    round(tokens_used / budget * 100, 1)
-                    if (tokens_used is not None and budget) else None
-                )
-                goal_data = {"line": goal_line, "pct": goal_pct}
+            await __event_emitter__({"type": "execute", "data": {"code": _render_limits_fill_js({
+                "provider": provider,
+                "windows": windows_data,
+                # Only used to word the empty-windows note -- a live run is
+                # the one confirmed case (2026-07-11 live debugging) where
+                # usage.status can transiently report zero windows for the
+                # active provider, most likely because its rate-limit cache
+                # refreshes from that run's own API response headers.
+                "sessionActive": session_row.get("status") == "running",
+                "source": source,
+                "fetchedAt": time.strftime("%H:%M:%S"),
+                "error": None,
+            })}})
 
-        modal_data = {
-            "provider": provider,
-            "model": session_row.get("model") or "",
-            "context": context_data,
-            "windows": windows_data,
-            "goal": goal_data,
-            "source": source,
-            "fetchedAt": time.strftime("%H:%M:%S"),
-            "error": None,
-            # Threaded through so the dialog's own Compact button can POST
-            # back to this same Action (mode="compact") with the exact same
-            # chat/message/session identity -- required so the follow-up
-            # call's __event_emitter__ routes to this same open browser tab.
-            # __user__ is NOT included here: OWUI resolves that itself from
-            # the fetch call's own Authorization header, same as the
-            # original click, so there's nothing for the client to send.
-            "chatId": chat_id,
-            "messageId": body.get("id"),
-            "sessionId": body.get("session_id"),
-            "owuiModel": body.get("model"),
-        }
-        pipe_log(f"[status-action] opened modal ({source}): "
-                 f"context={context_data} windows={len(windows_data)} goal={bool(goal_data)}")
+        async def fill_subagents():
+            """No dependency on sessions.describe/usage.status at all --
+            session_key is already known synchronously, so this is the
+            most genuinely independent of the three sections."""
+            try:
+                tasks_resp = await tasks_task
+            except Exception as ex:
+                pipe_log(f"[status-action] tasks.list failed: {ex}")
+                await __event_emitter__({"type": "execute", "data": {
+                    "code": _render_subagents_fill_js({"error": f"Could not fetch subagents: {ex}"})
+                }})
+                return
+            count = sum(
+                1 for t in (tasks_resp or {}).get("tasks", []) if t.get("kind") == "subagent"
+            )
+            await __event_emitter__({"type": "execute", "data": {"code": _render_subagents_fill_js({
+                "count": count, "source": source, "fetchedAt": time.strftime("%H:%M:%S"), "error": None,
+            })}})
 
-        await __event_emitter__({
-            "type": "execute",
-            "data": {"code": _render_modal_fill_js(modal_data)},
-        })
-        return {"status": "ok", "context": context_data, "windows": windows_data}
+        context_ready = asyncio.ensure_future(fill_context())
+        limits_ready = asyncio.ensure_future(fill_limits())
+        subagents_ready = asyncio.ensure_future(fill_subagents())
+
+        provider, _session_row = await context_ready
+        await limits_ready
+        await subagents_ready
+
+        pipe_log(f"[status-action] status dialog filled ({source}) provider={provider}")
+        return {"status": "ok"}
 
     async def _run_compact(self, body: dict, __user__, __event_emitter__):
         """Triggers /compact on the same session and waits for it to
@@ -630,7 +841,7 @@ class Action:
         if not chat_id:
             await __event_emitter__({
                 "type": "execute",
-                "data": {"code": _render_modal_fill_js({"error": "Missing chat_id"})},
+                "data": {"code": _render_sections_error_js("Missing chat_id")},
             })
             return {"status": "error", "detail": "missing chat_id"}
 
@@ -641,17 +852,17 @@ class Action:
         except Exception as ex:
             await __event_emitter__({
                 "type": "execute",
-                "data": {"code": _render_modal_fill_js({"error": f"Could not connect: {ex}"})},
+                "data": {"code": _render_sections_error_js(f"Could not connect: {ex}")},
             })
             return {"status": "error", "detail": str(ex)}
 
         if conn.active_run_id_for_session(session_key):
             await __event_emitter__({
                 "type": "execute",
-                "data": {"code": _render_modal_fill_js({
-                    "error": "A response is currently in progress — wait for "
-                             "it to finish before compacting."
-                })},
+                "data": {"code": _render_sections_error_js(
+                    "A response is currently in progress — wait for it to "
+                    "finish before compacting."
+                )},
             })
             return {"status": "error", "detail": "session busy"}
 
@@ -680,7 +891,7 @@ class Action:
             pipe_log(f"[status-action] compact chat.send failed: {ex}")
             await __event_emitter__({
                 "type": "execute",
-                "data": {"code": _render_modal_fill_js({"error": f"Could not start compact: {ex}"})},
+                "data": {"code": _render_sections_error_js(f"Could not start compact: {ex}")},
             })
             return {"status": "error", "detail": str(ex)}
 
@@ -702,8 +913,8 @@ class Action:
         if status not in ("done", "failed", "cancelled"):
             await __event_emitter__({
                 "type": "execute",
-                "data": {"code": _render_modal_fill_js(
-                    {"error": "Compact timed out — it may still finish in the background."}
+                "data": {"code": _render_sections_error_js(
+                    "Compact timed out — it may still finish in the background."
                 )},
             })
             return {"status": "error", "detail": "timeout"}
@@ -711,7 +922,7 @@ class Action:
         if status != "done":
             await __event_emitter__({
                 "type": "execute",
-                "data": {"code": _render_modal_fill_js({"error": f"Compact {status}."})},
+                "data": {"code": _render_sections_error_js(f"Compact {status}.")},
             })
             return {"status": "error", "detail": status}
 

@@ -70,44 +70,58 @@ from openclaw_status_action import (  # noqa: E402
     Action,
     _get_action_connection,
     _owui_session_key,
-    _render_modal_fill_js,
+    _render_context_fill_js,
+    _render_limits_fill_js,
+    _render_modal_open_js,
+    _render_sections_error_js,
+    _render_subagents_fill_js,
 )
 
 
-class RenderModalJsTests(unittest.TestCase):
-    """The JSON-blob substitution is the one place untrusted-ish gateway
-    text (e.g. a goal description) flows into JS source -- these guard the
-    safety property described in action.py's module comment."""
+def _emitted_codes(emitted, event_type="execute"):
+    return [e["data"]["code"] for e in emitted if e["type"] == event_type]
 
-    def test_placeholder_fully_replaced(self):
-        js = _render_modal_fill_js({"provider": "x", "model": "", "context": None, "windows": [], "goal": None, "source": "pipe", "fetchedAt": "12:00:00"})
-        self.assertNotIn("__OPENCLAW_STATUS_DATA__", js)
+
+class RenderJsTests(unittest.TestCase):
+    """The JSON-blob substitution (_json_for_js, used by every _render_*_js
+    function here) is the one place untrusted-ish gateway text (e.g. a goal
+    description) flows into JS source -- these guard the safety property
+    described in action.py's module comment, exercised through each of the
+    four render entry points that use it."""
+
+    def test_open_js_embeds_identity_and_no_placeholder_left(self):
+        js = _render_modal_open_js({"chatId": "c1", "messageId": "m1", "sessionId": "s1", "owuiModel": "x.y"})
+        self.assertNotIn("__OPENCLAW_IDENTITY__", js)
+        self.assertIn('"chatId": "c1"', js)
+        self.assertTrue(js.strip().startswith("(function()"))
+        self.assertTrue(js.strip().endswith("})();"))
+
+    def test_open_js_creates_three_independent_section_skeletons(self):
+        """Eliav's explicit ask (2026-07-11): each query gets its own
+        loading state. Structural guard that the three sections exist as
+        distinct, independently-targetable containers from the start."""
+        js = _render_modal_open_js({"chatId": None, "messageId": None, "sessionId": None, "owuiModel": None})
+        for section_id in (
+            "openclaw-status-section-context",
+            "openclaw-status-section-limits",
+            "openclaw-status-section-subagents",
+        ):
+            self.assertIn(section_id, js)
 
     def test_adversarial_strings_stay_inside_the_json_blob(self):
         """Quotes, backslashes, and a fake </script> tag must not be able to
         terminate the JS string/close the <script> the execute event runs
-        inside -- json.dumps is what guarantees this, this test guards
-        against someone "simplifying" _render_modal_fill_js into raw %-formatting
-        or str concatenation later."""
+        inside -- json.dumps is what guarantees this."""
         nasty = 'a"b\\c</script><img src=x onerror=alert(1)>\nline2'
-        js = _render_modal_fill_js({
-            "provider": nasty, "model": "", "context": None,
-            "windows": [{"label": nasty, "usedPercent": 50, "resetIn": None}],
-            "goal": None, "source": "pipe", "fetchedAt": "12:00:00",
+        js = _render_context_fill_js({
+            "provider": nasty, "model": "", "context": None, "goal": None,
+            "source": "pipe", "fetchedAt": "12:00:00", "error": None,
         })
-        # The DATA assignment line must be valid JSON on its own.
         line = next(l for l in js.splitlines() if l.strip().startswith("const DATA ="))
         raw_json = line.strip()[len("const DATA = "):].rstrip(";")
         parsed = json.loads(raw_json)
         self.assertEqual(parsed["provider"], nasty)
-        self.assertEqual(parsed["windows"][0]["label"], nasty)
-        # And the literal raw '</script>' must never appear unescaped.
         self.assertNotIn("</script>", js.replace("<\\/script>", ""))
-
-    def test_output_is_self_contained_iife(self):
-        js = _render_modal_fill_js({"provider": "x", "model": "", "context": None, "windows": [], "goal": None, "source": "pipe", "fetchedAt": "12:00:00"})
-        self.assertTrue(js.strip().startswith("(function()"))
-        self.assertTrue(js.strip().endswith("})();"))
 
     def test_bar_and_error_colors_are_inline_not_tailwind_classes(self):
         """Regression guard: 'bg-rose-500' (and friends) rendered as an
@@ -115,13 +129,9 @@ class RenderModalJsTests(unittest.TestCase):
         classes it finds referenced in ITS OWN build's source -- OWUI's
         frontend never uses "rose" anywhere, so that class had zero CSS
         behind it despite looking like a normal Tailwind color utility.
-        Every dynamic traffic-light color must be an inline style, which
-        has no dependency on what OWUI's own frontend does or doesn't use,
-        so this can't silently regress again."""
-        js = _render_modal_fill_js({"provider": "x", "model": "", "context": None, "windows": [], "goal": None, "source": "pipe", "fetchedAt": "12:00:00"})
+        Every dynamic traffic-light color must be an inline style."""
+        js = _render_modal_open_js({"chatId": None, "messageId": None, "sessionId": None, "owuiModel": None})
         for leftover in ("bg-rose", "bg-amber", "bg-emerald", "text-rose"):
-            # Only the explanatory comment may mention these strings; the
-            # executable JS itself must not.
             executable = "\n".join(l for l in js.splitlines() if not l.strip().startswith("//"))
             self.assertNotIn(leftover, executable)
         self.assertIn("style.backgroundColor = barColor", js)
@@ -129,37 +139,91 @@ class RenderModalJsTests(unittest.TestCase):
         self.assertIn("#f59e0b", js)  # amber-500 equivalent
         self.assertIn("#10b981", js)  # emerald-500 equivalent
 
-    def test_compact_button_only_wired_when_identity_fields_present(self):
-        """The Compact button's click handler needs DATA.chatId/messageId/
-        sessionId to build a working callback request -- the render must
-        gate the button on all three being present rather than rendering
-        a button that silently no-ops (or crashes) on click for a status
-        response that came from somewhere those weren't threaded through."""
-        with_ids = _render_modal_fill_js({
-            "provider": "x", "model": "", "context": {"usedTokens": "1k", "totalTokens": "10k", "pct": 10.0},
-            "windows": [], "goal": None, "source": "pipe", "fetchedAt": "12:00:00",
-            "chatId": "c1", "messageId": "m1", "sessionId": "s1", "owuiModel": "x.y",
+    def test_limits_shows_explicit_note_when_windows_empty(self):
+        """Regression guard for the confusion Eliav reported: 'why does it
+        sometimes show only Context and no Rate Limits?'. Root cause was a
+        real gateway-side gap (usage.status can transiently report zero
+        windows for the active provider while a run is in flight), not a
+        bug here -- the section must always show its header (given a real
+        provider) with either the data or an explicit note, never nothing."""
+        js = _render_limits_fill_js({
+            "provider": "anthropic", "windows": [], "sessionActive": True,
+            "source": "pipe", "fetchedAt": "12:00:00", "error": None,
         })
-        self.assertIn("compactBtn", with_ids)
-        self.assertIn("triggerCompact", with_ids)
+        self.assertIn("Rate Limits", js)
+        self.assertIn("No rate-limit data available", js)
+        self.assertIn("a response is in progress", js)
 
-        without_ids = _render_modal_fill_js({
-            "provider": "x", "model": "", "context": {"usedTokens": "1k", "totalTokens": "10k", "pct": 10.0},
-            "windows": [], "goal": None, "source": "pipe", "fetchedAt": "12:00:00",
-            "chatId": None, "messageId": None, "sessionId": None, "owuiModel": None,
+    def test_limits_note_is_gated_on_empty_windows_not_always_shown(self):
+        """_render_limits_fill_js returns JS *source*, not a rendered
+        result -- both the note branch and the per-window render loop are
+        always present as code regardless of data, so the only thing
+        checkable from Python is that the note is correctly gated behind
+        `DATA.windows.length === 0` rather than unconditional."""
+        js = _render_limits_fill_js({
+            "provider": "anthropic",
+            "windows": [{"label": "5h", "usedPercent": 50, "resetIn": None, "resetAtMs": None}],
+            "sessionActive": False, "source": "pipe", "fetchedAt": "12:00:00", "error": None,
         })
-        # triggerCompact is always defined (harmless), but the button
-        # creation must be gated -- check the guard condition is present.
-        self.assertIn("DATA.chatId && DATA.messageId && DATA.sessionId", without_ids)
+        gate_idx = js.index("if (DATA.windows.length === 0)")
+        note_idx = js.index("No rate-limit data available")
+        loop_idx = js.index("DATA.windows.forEach")
+        self.assertTrue(gate_idx < note_idx < loop_idx)
+
+    def test_limits_reset_shows_both_relative_and_absolute(self):
+        """Relative countdown from the server, absolute clock time computed
+        client-side (browser's own timezone, not the gateway container's)."""
+        js = _render_limits_fill_js({
+            "provider": "anthropic",
+            "windows": [{"label": "5h", "usedPercent": 50, "resetIn": "1h21m", "resetAtMs": 1783790000000}],
+            "sessionActive": False, "source": "pipe", "fetchedAt": "12:00:00", "error": None,
+        })
+        self.assertIn("resetAtMs", js)
+        self.assertIn("toLocaleTimeString", js)
+        self.assertIn("'resets in ' + w.resetIn", js)
+
+    def test_compact_button_gated_on_identity_fields_present(self):
+        """The Compact button's click handler needs chatId/messageId/
+        sessionId (embedded in IDENTITY at open time, read via
+        S.identity.*) to build a working callback -- the context fill must
+        gate the button's creation on all three being present."""
+        js = _render_context_fill_js({
+            "provider": "x", "model": "", "context": {"usedTokens": "1k", "totalTokens": "10k", "pct": 10.0},
+            "goal": None, "source": "pipe", "fetchedAt": "12:00:00", "error": None,
+        })
+        self.assertIn("S.identity.chatId && S.identity.messageId && S.identity.sessionId", js)
+        self.assertIn("compactBtn", js)
+        self.assertIn("S.triggerCompact", js)
 
     def test_compact_fetch_targets_this_same_action_with_mode_marker(self):
-        js = _render_modal_fill_js({
-            "provider": "x", "model": "", "context": None, "windows": [], "goal": None,
-            "source": "pipe", "fetchedAt": "12:00:00",
-        })
+        js = _render_modal_open_js({"chatId": "c1", "messageId": "m1", "sessionId": "s1", "owuiModel": "x.y"})
         self.assertIn("/api/chat/actions/openclaw_status_action", js)
         self.assertIn("mode: 'compact'", js)
         self.assertIn("localStorage.getItem('token')", js)
+
+    def test_subagents_hidden_entirely_when_count_zero(self):
+        """'General tracking, no detail' (Eliav's ask): a permanently
+        visible '0 running' line for the common idle case would be more
+        clutter than signal -- gated in source, not just data-dependent
+        text, so it truly renders nothing (not an empty header)."""
+        js = _render_subagents_fill_js({"count": 0, "source": "pipe", "fetchedAt": "12:00:00", "error": None})
+        gate_idx = js.index("if (!DATA.count)")
+        header_idx = js.index("sectionHeader('Subagents')")
+        self.assertLess(gate_idx, header_idx)
+
+    def test_subagents_shows_count_when_nonzero(self):
+        # _render_subagents_fill_js returns JS *source*: DATA.count is a
+        # runtime value substituted into a string concatenation, not
+        # literal text, so check the JSON payload plus the concatenation
+        # expression rather than a rendered "3 running" string.
+        js = _render_subagents_fill_js({"count": 3, "source": "pipe", "fetchedAt": "12:00:00", "error": None})
+        self.assertIn('"count": 3', js)
+        self.assertIn("DATA.count + ' running'", js)
+
+    def test_sections_error_js_uses_shared_error_helper(self):
+        js = _render_sections_error_js("boom")
+        self.assertIn("openclaw-status-sections", js)
+        self.assertIn('"boom"', js)
 
 
 class GetActionConnectionTests(unittest.IsolatedAsyncioTestCase):
@@ -219,13 +283,11 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(emitted[0]["type"], "notification")
         self.assertEqual(emitted[0]["data"]["type"], "error")
 
-    async def test_success_path_opens_immediately_then_fills(self):
-        """Two execute emits: the loading-skeleton open happens before any
-        network call, the data fill happens after -- this is the whole
-        point of the open/fill split (instant feedback on click, no
-        waiting for the gateway round trip before anything visible
-        happens). Also exercises all three sections (context, rate limits,
-        goal) end to end."""
+    async def test_success_fills_all_three_sections_independently(self):
+        """Open happens before any network call; each of Context, Rate
+        Limits, Subagents then emits its own separate execute fill as its
+        own RPC resolves -- not one combined event. Exercises context+goal,
+        rate-limit windows, and a nonzero subagent count all end to end."""
         action = Action()
         emitted = []
 
@@ -245,59 +307,50 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 return {"providers": [{"provider": "anthropic", "windows": [
                     {"label": "5h", "usedPercent": 72, "resetAt": 1783790000000},
                 ]}]}
+            if method == "tasks.list":
+                self.assertEqual(params["status"], ["running", "queued"])
+                return {"tasks": [
+                    {"kind": "subagent", "status": "running"},
+                    {"kind": "subagent", "status": "queued"},
+                    {"kind": "cron", "status": "running"},  # must be excluded from the count
+                ]}
             raise AssertionError(f"unexpected RPC: {method}")
 
         fake_conn = mock.AsyncMock()
         fake_conn.send_request = mock.AsyncMock(side_effect=fake_send_request)
 
         async def fake_get_connection(_valves_getter):
-            # By the time the connection is fetched, the loading modal must
-            # already have been emitted -- this is what actually proves the
-            # open happens before the network call, not just before the
-            # function returns.
+            # By the time the connection is fetched, the open (loading
+            # skeletons) must already have been emitted -- proves open
+            # happens before any network call, not just before return.
             self.assertEqual(len(emitted), 1)
             self.assertEqual(emitted[0]["type"], "execute")
-            self.assertIn("openclaw-status-modal-body", emitted[0]["data"]["code"])
+            self.assertIn("openclaw-status-section-context", emitted[0]["data"]["code"])
             self.assertIn("animate-pulse", emitted[0]["data"]["code"])
             return fake_conn, "pipe"
 
         with mock.patch("openclaw_status_action._get_action_connection", new=fake_get_connection):
             result = await action.action(
-                {"chat_id": "chat-1"}, __user__={"id": "user-1"}, __event_emitter__=emitter,
+                {"chat_id": "chat-1", "id": "msg-1", "session_id": "sess-1", "model": "x.y"},
+                __user__={"id": "user-1"}, __event_emitter__=emitter,
             )
 
         self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["context"]["pct"], 20.0)
-        self.assertEqual(len(result["windows"]), 1)
-        self.assertEqual(len(emitted), 2)
-        fill_code = emitted[1]["data"]["code"]
-        payload = json.loads(fill_code.split("const DATA = ", 1)[1].split(";\n", 1)[0])
-        self.assertEqual(payload["provider"], "anthropic")
-        self.assertEqual(payload["context"]["pct"], 20.0)
-        self.assertEqual(payload["windows"][0]["label"], "5h")
-        self.assertEqual(payload["windows"][0]["resetAtMs"], 1783790000000)
-        self.assertIn("Pursuing goal", payload["goal"]["line"])
-        self.assertEqual(payload["goal"]["pct"], 25.0)
+        codes = _emitted_codes(emitted)
+        self.assertEqual(len(codes), 4)  # open + 3 independent fills
 
-    async def test_reset_time_shows_both_relative_and_absolute(self):
-        """The reset line must carry both the server-computed relative
-        countdown and the raw timestamp for the browser to format as a
-        local-timezone absolute clock time -- computed client-side, not
-        server-side, since the gateway container and whoever is looking at
-        the dialog aren't guaranteed to share a timezone."""
-        js = _render_modal_fill_js({
-            "provider": "x", "model": "", "context": None,
-            "windows": [{"label": "5h", "usedPercent": 50, "resetIn": "1h21m", "resetAtMs": 1783790000000}],
-            "goal": None, "source": "pipe", "fetchedAt": "12:00:00",
-        })
-        self.assertIn("resetAtMs", js)
-        self.assertIn("toLocaleTimeString", js)
-        self.assertIn("'resets in ' + w.resetIn", js)
+        context_code = next(c for c in codes if "getElementById('openclaw-status-section-context')" in c)
+        self.assertIn("anthropic", context_code)
+        self.assertIn("Pursuing goal", context_code)
 
-    async def test_fetch_error_fills_modal_with_error_not_a_bare_notification(self):
-        """A failure after the loading modal is already open must update
-        that same modal to an error state, not leave it spinning forever
-        while a separate toast fires instead."""
+        limits_code = next(c for c in codes if "getElementById('openclaw-status-section-limits')" in c)
+        self.assertIn("5h", limits_code)
+        self.assertIn("1783790000000", limits_code)
+
+        subagents_code = next(c for c in codes if "getElementById('openclaw-status-section-subagents')" in c)
+        self.assertIn('"count": 2', subagents_code)  # cron task excluded
+
+    async def test_connect_failure_shows_dialog_wide_error(self):
         action = Action()
         emitted = []
 
@@ -311,16 +364,51 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result["status"], "error")
-        self.assertEqual(len(emitted), 2)
-        self.assertEqual(emitted[0]["type"], "execute")  # the loading open
-        self.assertEqual(emitted[1]["type"], "execute")  # the error fill
-        self.assertIn("gateway unreachable", emitted[1]["data"]["code"])
+        codes = _emitted_codes(emitted)
+        self.assertEqual(len(codes), 2)  # open, then one dialog-wide error fill
+        self.assertIn("openclaw-status-sections", codes[1])
+        self.assertIn("gateway unreachable", codes[1])
+
+    async def test_per_section_rpc_failure_only_errors_that_section(self):
+        """A failure fetching one section's data (here: tasks.list) must
+        not prevent the other two, independently-loading sections from
+        rendering their own real data."""
+        action = Action()
+        emitted = []
+
+        async def emitter(evt):
+            emitted.append(evt)
+
+        async def fake_send_request(method, params, timeout=5):
+            if method == "sessions.describe":
+                return {"session": {"modelProvider": "anthropic", "model": "claude-sonnet-5"}}
+            if method == "usage.status":
+                return {"providers": []}
+            if method == "tasks.list":
+                raise RuntimeError("tasks unavailable")
+            raise AssertionError(f"unexpected RPC: {method}")
+
+        fake_conn = mock.AsyncMock()
+        fake_conn.send_request = mock.AsyncMock(side_effect=fake_send_request)
+
+        with mock.patch("openclaw_status_action._get_action_connection",
+                         new=mock.AsyncMock(return_value=(fake_conn, "pipe"))):
+            result = await action.action(
+                {"chat_id": "chat-1"}, __user__={"id": "user-1"}, __event_emitter__=emitter,
+            )
+
+        self.assertEqual(result["status"], "ok")
+        codes = _emitted_codes(emitted)
+        context_code = next(c for c in codes if "getElementById('openclaw-status-section-context')" in c)
+        self.assertIn('"error": null', context_code)
+        subagents_code = next(c for c in codes if "getElementById('openclaw-status-section-subagents')" in c)
+        self.assertIn("tasks unavailable", subagents_code)
 
 
 class CompactTests(unittest.IsolatedAsyncioTestCase):
     """The dialog's Compact button fetches back to this same Action with a
     synthetic mode="compact" marker (see triggerCompact() in
-    _MODAL_FILL_JS_TEMPLATE) -- these cover the Python-side dispatch and
+    _MODAL_OPEN_JS_TEMPLATE) -- these cover the Python-side dispatch and
     the poll-for-completion flow (chat.send + sessions.describe polling,
     not the Pipe's full event-consumer loop -- see action.py's
     _run_compact docstring for why)."""
@@ -363,7 +451,7 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(emitted), 1)
         self.assertIn("currently in progress", emitted[0]["data"]["code"])
 
-    async def test_success_shows_compacting_then_refreshes_status(self):
+    async def test_success_shows_compacting_then_refreshes_all_sections(self):
         action = Action()
         emitted = []
 
@@ -381,15 +469,15 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
                 describe_calls["n"] += 1
                 # Still running on the first poll, done on the second --
                 # exercises the loop actually looping, not just the
-                # single-iteration happy path. Any call after that (the
-                # _run_status refresh triggers its own sessions.describe
-                # too) also reports done/finished data.
+                # single-iteration happy path. Calls after that (the
+                # _run_status refresh's own sessions.describe) report done.
                 status = "running" if describe_calls["n"] == 1 else "done"
                 return {"session": {"status": status, "modelProvider": "anthropic",
                                      "model": "claude-sonnet-5"}}
             if method == "usage.status":
-                # Hit during the post-compact _run_status refresh.
                 return {"providers": []}
+            if method == "tasks.list":
+                return {"tasks": []}
             raise AssertionError(f"unexpected RPC: {method}")
 
         fake_conn = mock.Mock()
@@ -403,11 +491,15 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["status"], "ok")
         self.assertGreaterEqual(describe_calls["n"], 2)
-        self.assertEqual(emitted[0]["type"], "execute")
-        self.assertIn("Compacting", emitted[0]["data"]["code"])
-        # Final emit is the normal status fill (refresh), not another
-        # "Compacting..." state or a bare notification.
-        self.assertIn("anthropic", emitted[-1]["data"]["code"])
+        codes = _emitted_codes(emitted)
+        self.assertIn("Compacting", codes[0])
+        self.assertIn("openclaw-status-sections", codes[1])  # skeleton reset, not full re-open
+        # The refresh must reach all three sections again, not just Context.
+        self.assertTrue(any("getElementById('openclaw-status-section-context')" in c for c in codes))
+        self.assertTrue(any("getElementById('openclaw-status-section-limits')" in c for c in codes))
+        self.assertTrue(any("getElementById('openclaw-status-section-subagents')" in c for c in codes))
+        context_code = next(c for c in codes if "getElementById('openclaw-status-section-context')" in c)
+        self.assertIn("anthropic", context_code)
 
     async def test_timeout_shows_clear_message_not_infinite_spin(self):
         action = Action()
@@ -445,7 +537,9 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["status"], "error")
         self.assertEqual(result["detail"], "timeout")
-        self.assertIn("timed out", emitted[-1]["data"]["code"])
+        codes = _emitted_codes(emitted)
+        self.assertIn("timed out", codes[-1])
+        self.assertIn("openclaw-status-sections", codes[-1])
 
 
 if __name__ == "__main__":
