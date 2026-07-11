@@ -361,7 +361,13 @@ class Pipe:
         (ELI-24) can bracket every turn without re-indenting the whole body.
         """
         # DEV-ONLY-START
-        await _devcoord_wait_if_deploy_pending()
+        async def _devcoord_report_wait(waited_s):
+            await _emit_status(
+                __event_emitter__,
+                f"⏳ Deploy in progress, waiting to start ({int(waited_s)}s)...",
+                done=False,
+            )
+        await _devcoord_wait_if_deploy_pending(on_wait=_devcoord_report_wait)
         _devcoord_marker = _devcoord_turn_begin()
         # DEV-ONLY-END
         try:

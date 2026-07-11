@@ -94,18 +94,31 @@ def _devcoord_turn_end(marker):
         pipe_log(f"devcoord: failed to clear inflight marker: {ex}")
 
 
-async def _devcoord_wait_if_deploy_pending(max_wait_s=5.0, poll_interval_s=0.25):
-    """Give a pending deploy a short head start before admitting a new turn.
+async def _devcoord_wait_if_deploy_pending(*, poll_interval_s=0.25, on_wait=None,
+                                           status_interval_s=3.0):
+    """Wait, with no upper bound, for a pending-deploy flag to clear before
+    admitting a new turn.
 
-    Best-effort only: never blocks a real user turn indefinitely, since the
-    pending flag is written by dev tooling and could in principle go stale.
+    Mirrors install.py's own devcoord_deploy_guard policy (ELI-24): no forced
+    timeout, because admitting a turn anyway after some arbitrary cutoff is
+    exactly how a deploy's quiet window keeps getting missed -- every newly
+    admitted turn joins the in-flight count and pushes the window further
+    out. Waiting here instead means in-flight turns can actually drain to
+    zero once no new ones are joining.
+
+    `on_wait(waited_s)`, if given, is called roughly every status_interval_s
+    while waiting, so the caller (pipe.py) can surface this to the user
+    instead of it looking like the turn is simply not starting.
     """
     if not _read_json_file(_devcoord_pending_path()):
         return
-    deadline = time.time() + max_wait_s
-    while time.time() < deadline:
-        if not _read_json_file(_devcoord_pending_path()):
-            return
+    start = time.time()
+    next_status = start + status_interval_s
+    while _read_json_file(_devcoord_pending_path()):
+        now = time.time()
+        if on_wait and now >= next_status:
+            await on_wait(now - start)
+            next_status = now + status_interval_s
         await asyncio.sleep(poll_interval_s)
 
 # DEV-ONLY-END

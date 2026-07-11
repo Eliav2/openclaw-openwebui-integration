@@ -171,7 +171,7 @@ class DevCoordWaitIfDeployPendingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_no_pending_flag_returns_immediately(self):
         start = devcoord.time.time()
-        await devcoord._devcoord_wait_if_deploy_pending(max_wait_s=5.0, poll_interval_s=0.1)
+        await devcoord._devcoord_wait_if_deploy_pending(poll_interval_s=0.1)
         self.assertLess(devcoord.time.time() - start, 1.0)
 
     async def test_pending_flag_cleared_mid_wait_returns_early(self):
@@ -184,21 +184,52 @@ class DevCoordWaitIfDeployPendingTests(unittest.IsolatedAsyncioTestCase):
 
         start = devcoord.time.time()
         await asyncio.gather(
-            devcoord._devcoord_wait_if_deploy_pending(max_wait_s=5.0, poll_interval_s=0.05),
+            devcoord._devcoord_wait_if_deploy_pending(poll_interval_s=0.05),
             clear_after_delay(),
         )
         elapsed = devcoord.time.time() - start
         self.assertGreaterEqual(elapsed, 0.2)
         self.assertLess(elapsed, 1.0)
 
-    async def test_pending_flag_never_clears_hits_timeout(self):
+    async def test_pending_flag_never_clears_keeps_waiting_and_reports(self):
+        """No forced timeout (ELI-24 follow-up): a still-pending flag must
+        never cause the wait to give up on its own -- it should keep waiting
+        and periodically report via on_wait, only returning once something
+        else (a real deploy completing) clears the flag."""
         pending_path = devcoord._devcoord_pending_path()
         devcoord._write_json_file(pending_path, {"requested_by": "test"})
+        reports = []
+
+        async def on_wait(waited_s):
+            reports.append(waited_s)
+
+        async def clear_after_delay():
+            await asyncio.sleep(0.35)
+            os.remove(pending_path)
+
         start = devcoord.time.time()
-        await devcoord._devcoord_wait_if_deploy_pending(max_wait_s=0.3, poll_interval_s=0.05)
+        await asyncio.gather(
+            devcoord._devcoord_wait_if_deploy_pending(
+                poll_interval_s=0.05, on_wait=on_wait, status_interval_s=0.1,
+            ),
+            clear_after_delay(),
+        )
         elapsed = devcoord.time.time() - start
-        self.assertGreaterEqual(elapsed, 0.3)
-        self.assertLess(elapsed, 1.0)
+        self.assertGreaterEqual(elapsed, 0.35)
+        self.assertGreaterEqual(len(reports), 2, "on_wait should fire more than once while waiting")
+
+    async def test_no_on_wait_callback_is_fine(self):
+        pending_path = devcoord._devcoord_pending_path()
+        devcoord._write_json_file(pending_path, {"requested_by": "test"})
+
+        async def clear_after_delay():
+            await asyncio.sleep(0.1)
+            os.remove(pending_path)
+
+        await asyncio.gather(
+            devcoord._devcoord_wait_if_deploy_pending(poll_interval_s=0.05),
+            clear_after_delay(),
+        )  # must not raise even with no on_wait passed
 
 
 class StaleFileServerReapTests(unittest.TestCase):
