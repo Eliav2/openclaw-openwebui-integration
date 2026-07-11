@@ -1,0 +1,44 @@
+"""
+OpenClaw Status Action for Open WebUI
+=======================================
+
+A companion Action Function (separate from the OpenClaw Gateway Pipe) that
+adds a button to the message toolbar. Clicking it fetches live session
+context/usage data from the OpenClaw Gateway on demand -- not cached from
+the last turn -- so it stays accurate even minutes after the last message.
+
+Milestone 1 scope: proves the connection path works. Shows the result as a
+toast notification. A richer dialog comes in a later milestone; this file
+does not touch the Pipe or its existing status-line behavior at all.
+
+How it works
+------------
+1. Reuses the Pipe's already-connected WebSocket connection when one exists
+   (found via a stable OWUI module both Functions can read), so clicking
+   this button opens zero new connections in the common case.
+2. Falls back to its own connection only if the Pipe hasn't connected yet
+   in this process. Still reuses the same on-disk device identity/token the
+   Pipe already has (via STATE_DIR), so this never triggers a second
+   device-pairing approval.
+3. Calls the same read-only Gateway RPCs the status line uses
+   (sessions.describe, usage.status), fresh on every click.
+
+Requirements
+------------
+- Open WebUI v0.9+ (tested on v0.10.x)
+- The OpenClaw Gateway Pipe (openclaw_pipe.py) installed in the same OWUI
+  instance -- this Action is a companion to it, not a replacement
+- Python modules: websockets, cryptography, pydantic (same as the Pipe)
+
+Installation
+------------
+1. In Open WebUI, go to Admin Panel > Functions
+2. Click "+" and choose "Create a function"
+3. Set id to "openclaw_status_action" (type is auto-detected as "action")
+4. Paste the entire contents of this file
+5. Save and enable the function, then turn on the "Global" toggle so the
+   button appears on every model's messages
+6. Configure the valves (only needed for the fallback connection path --
+   set them to the exact same values as the Pipe's valves):
+   - GATEWAY_URL, GATEWAY_TOKEN, DEVICE_IDENTITY, STATE_DIR, AGENT_ID
+"""

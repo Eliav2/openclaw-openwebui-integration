@@ -73,6 +73,7 @@ from openclaw_pipe import (
     _ask_user_input_modal,
     _build_usage_status_lines,
     _coerce_text,
+    _content_has_image,
     _could_be_user_input_prefix,
     _deliver_proactive_owui_message,
     _discover_models,
@@ -100,6 +101,8 @@ from openclaw_pipe import (
     _remember_gateway_connection,
     _resolve_media,
     _resolve_media_via_owui,
+    _shared_gateway_state,
+    _SHARED_STATE_ATTR,
     _suppress_already_shown,
     Pipe,
 )
@@ -319,7 +322,8 @@ class ProactiveDeliveryTests(unittest.TestCase):
         history = chat_state["history"]
         new_id = history["currentId"]
         self.assertNotEqual(new_id, old_leaf_id, "currentId was clobbered back to the old leaf")
-        self.assertEqual(history["messages"][new_id]["content"], "hello from cron")
+        self.assertIn("hello from cron", history["messages"][new_id]["content"])
+        self.assertIn("Proactive message", history["messages"][new_id]["content"])
         self.assertIn(new_id, history["messages"][old_leaf_id]["childrenIds"])
 
     def test_deliver_never_persists_announce_skip_sentinel(self):
@@ -827,6 +831,45 @@ class ItemTextExtractionTests(unittest.TestCase):
             _item_assistant_text({"kind": "tool", "text": "internal"}),
             "",
         )
+
+
+class MultimodalUserMessageTests(unittest.TestCase):
+    """P39: OWUI sends `content` as a list of content blocks (not a plain
+    string) whenever the user attaches an image. Before this, `pipe.py`
+    sent that raw Python list straight through as the RPC's `message`
+    field with no normalization at all."""
+
+    def test_content_has_image_false_for_plain_text(self):
+        self.assertFalse(_content_has_image("just plain text"))
+
+    def test_content_has_image_false_for_text_only_blocks(self):
+        self.assertFalse(_content_has_image([
+            {"type": "text", "text": "hello"},
+        ]))
+
+    def test_content_has_image_true_when_image_url_block_present(self):
+        self.assertTrue(_content_has_image([
+            {"type": "text", "text": "what is this?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,xyz"}},
+        ]))
+
+    def test_content_has_image_true_for_image_only_message(self):
+        self.assertTrue(_content_has_image([
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,xyz"}},
+        ]))
+
+    def test_coerce_text_extracts_text_and_skips_image_block(self):
+        """_coerce_text on a mixed text+image content list must yield only
+        the text -- the image_url block has no "text"/"delta"/"content"/
+        "message" key for _coerce_text to recurse into, so it resolves to
+        an empty string and is dropped from the join, not raising and not
+        leaking the raw data: URL into the text sent to the agent."""
+        text = _coerce_text([
+            {"type": "text", "text": "what is this?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,xyz"}},
+        ])
+        self.assertEqual(text, "what is this?")
+        self.assertNotIn("data:image", text)
 
 
 class ItemDeltaDedupTests(unittest.TestCase):
@@ -1854,6 +1897,91 @@ class GetModelOptionsTests(unittest.TestCase):
         for opt in options:
             self.assertIn("(", opt["label"])
             self.assertIn(")", opt["label"])
+
+
+class SharedProactiveStateAcrossConnectionsTests(unittest.TestCase):
+    """Regression tests for the 2/2 duplicate-branch / bogus '*↳ Proactive
+    message*' bug (P33, root-caused 2026-07-11).
+
+    Root cause: OWUI's function loader execs each redeploy into a new module
+    with no teardown of the old one, so a connection left running by a
+    previous deploy (a "zombie") keeps its own event loop and its own private
+    proactive-delivery bookkeeping. The zombie still receives the Gateway's
+    broadcast `final` events; with private bookkeeping it can't tell the live
+    connection already showed the turn to the open tab, so it re-writes the
+    turn into chat history as a spurious proactive message — creating a second
+    assistant branch (the 1/2 <-> 2/2 navigation) on every turn.
+
+    Fix: when running inside OWUI the liveness bookkeeping is anchored on
+    `open_webui.socket.main` and shared by *every* connection in the process,
+    so a turn shown live by any connection is seen as delivered by all of them.
+    These tests simulate that by installing a fake `open_webui.socket.main`
+    module and asserting two independent connections share the same state.
+    """
+
+    def setUp(self):
+        self._fake_owui = types.ModuleType("open_webui.socket.main")
+        self._saved = {
+            k: sys.modules.get(k)
+            for k in ("open_webui", "open_webui.socket", "open_webui.socket.main")
+        }
+        sys.modules["open_webui"] = types.ModuleType("open_webui")
+        sys.modules["open_webui.socket"] = types.ModuleType("open_webui.socket")
+        sys.modules["open_webui.socket.main"] = self._fake_owui
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+    def _conn(self):
+        return _GatewayConnection(lambda: None)
+
+    def test_shared_state_helper_returns_same_object(self):
+        a = _shared_gateway_state()
+        b = _shared_gateway_state()
+        self.assertIsNotNone(a)
+        self.assertIs(a, b)
+        self.assertIs(getattr(self._fake_owui, _SHARED_STATE_ATTR), a)
+
+    def test_two_connections_share_bookkeeping_objects(self):
+        live, zombie = self._conn(), self._conn()
+        self.assertIs(live._delivered_live, zombie._delivered_live)
+        self.assertIs(live._delivered_proactive, zombie._delivered_proactive)
+        self.assertIs(live._session_last_activity, zombie._session_last_activity)
+        self.assertIs(
+            live._pending_proactive_debounce, zombie._pending_proactive_debounce
+        )
+
+    def test_zombie_sees_live_delivery_and_wont_redeliver(self):
+        live, zombie = self._conn(), self._conn()
+        # Live connection dispatches the final event to its open tab.
+        live.mark_delivered_live("session-x", "run-1")
+        # The zombie, receiving the same broadcast, must recognise it was
+        # already shown live and skip proactive delivery.
+        self.assertTrue(zombie.was_delivered_live("session-x", "run-1"))
+
+    def test_zombie_sees_live_consumer_activity_as_non_idle(self):
+        live, zombie = self._conn(), self._conn()
+        q = live.register_consumer("session-x", "run-1")
+        # Live connection is actively servicing the session, so from the
+        # zombie's perspective it is NOT idle and proactive must not fire.
+        self.assertFalse(zombie.session_idle_for("session-x", min_idle_s=120))
+        live.unregister_consumer("session-x", "run-1", q)
+        # Immediately after unregister the shared activity timestamp is fresh,
+        # so the session is still within its quiet-period guard.
+        self.assertFalse(zombie.session_idle_for("session-x", min_idle_s=120))
+
+    def test_isolated_when_not_inside_owui(self):
+        # Without OWUI's module present, each connection keeps private state so
+        # unrelated processes/tests can't leak into each other.
+        for k in ("open_webui.socket.main", "open_webui.socket", "open_webui"):
+            sys.modules.pop(k, None)
+        self.assertIsNone(_shared_gateway_state())
+        a, b = self._conn(), self._conn()
+        self.assertIsNot(a._delivered_live, b._delivered_live)
 
 
 if __name__ == "__main__":

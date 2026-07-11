@@ -14,6 +14,7 @@ import build as build_mod
 ROOT = Path(__file__).resolve().parent
 BUILT = ROOT / "openclaw_pipe.py"
 DEV_BUILT = ROOT / "openclaw_pipe.dev.py"
+ACTION_BUILT = ROOT / "openclaw_status_action.py"
 PKG = ROOT / "src" / "openclaw_pipe_pkg"
 
 
@@ -127,6 +128,78 @@ class DevBundleTests(unittest.TestCase):
             capture_output=True, text=True, cwd=str(ROOT),
         )
         self.assertEqual(r.returncode, 0, f"{r.stdout}\n{r.stderr}")
+
+
+class StatusActionBuildTests(unittest.TestCase):
+    """openclaw_status_action.py -- the companion Action Function. Same
+    guards as BuildTests, adapted to the Action's own OWUI constraints
+    (top-level `Action` class rather than `Pipe`)."""
+
+    def test_no_drift(self):
+        r = subprocess.run(
+            [sys.executable, str(ROOT / "build.py"), "--check-action"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(r.returncode, 0, f"drift detected:\n{r.stdout}\n{r.stderr}")
+
+    def test_frontmatter_is_first(self):
+        tree = ast.parse(ACTION_BUILT.read_text())
+        self.assertTrue(tree.body, "empty module")
+        first = tree.body[0]
+        self.assertIsInstance(first, ast.Expr)
+        self.assertIsInstance(first.value, ast.Constant)
+        self.assertIn("OpenClaw Status Action", first.value.value)
+
+    def test_action_class_is_top_level(self):
+        tree = ast.parse(ACTION_BUILT.read_text())
+        names = {n.name for n in tree.body if isinstance(n, ast.ClassDef)}
+        self.assertIn("Action", names)
+
+    def test_built_file_compiles(self):
+        compile(ACTION_BUILT.read_text(), str(ACTION_BUILT), "exec")
+
+    def test_no_dev_only_markers_leak(self):
+        built = ACTION_BUILT.read_text()
+        self.assertNotIn(build_mod.DEV_ONLY_START, built)
+        self.assertNotIn(build_mod.DEV_ONLY_END, built)
+        self.assertNotIn("DEV-ONLY", built)
+
+    def test_proactive_delivery_disabled_for_fallback_connection(self):
+        """The Action's own fallback connection must never run the Pipe's
+        proactive-message-delivery logic (see action.py's module-level
+        override and its docstring for why) -- the override must be the
+        LAST assignment of this name in the built file, since gateway.py's
+        own `= True` is defined earlier and Python module execution is
+        top-to-bottom."""
+        built = ACTION_BUILT.read_text()
+        true_idx = built.rindex("PROACTIVE_DELIVERY_ENABLED = True")
+        false_idx = built.rindex("PROACTIVE_DELIVERY_ENABLED = False")
+        self.assertGreater(
+            false_idx, true_idx,
+            "override must appear after gateway.py's default to win",
+        )
+
+    def test_does_not_reuse_pipe_stale_conn_write_path(self):
+        """The Action fragment must never call _remember_gateway_connection
+        or assign the module-level `_gateway_connection` singleton itself
+        -- both are the Pipe's own redeploy-reaping bookkeeping, and the
+        Action must only ever READ _STALE_CONN_ATTR, never write it (see
+        action.py's module docstring for the collision this avoids)."""
+        action_src = (PKG / "action.py").read_text()
+        self.assertNotIn("_remember_gateway_connection(", action_src)
+        self.assertNotIn("_get_gateway_connection(", action_src)
+
+    def test_shares_gateway_fragment_verbatim_with_pipe(self):
+        """The Action and Pipe artifacts must bundle byte-identical
+        gateway.py content -- this is what "reuse, don't duplicate" means
+        here: one fragment file, two build targets."""
+        gateway_src = (PKG / "gateway.py").read_text()
+        # Both artifacts strip the fragment banner before inlining; compare
+        # the post-strip body so this test is agnostic to how build.py
+        # formats the surrounding per-fragment header.
+        body = build_mod._strip_fragment_banner(gateway_src)
+        self.assertIn(body.rstrip("\n"), BUILT.read_text())
+        self.assertIn(body.rstrip("\n"), ACTION_BUILT.read_text())
 
 
 if __name__ == "__main__":

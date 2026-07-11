@@ -20,22 +20,68 @@ Usage:
                               # gitignored, never distributed, rebuild before every
                               # dev deploy.
   python3 build.py --check-dev  # same drift guard, for the dev bundle
+  python3 build.py --action        # build -> openclaw_status_action.py, the
+                              # companion Action Function (see ARTIFACTS below)
+  python3 build.py --check-action  # same drift guard, for the action artifact
 """
 from __future__ import annotations
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 ROOT = Path(__file__).resolve().parent
 PKG = ROOT / "src" / "openclaw_pipe_pkg"
-FRONTMATTER = ROOT / "src" / "frontmatter.txt"
-OUT = ROOT / "openclaw_pipe.py"
-DEV_OUT = ROOT / "openclaw_pipe.dev.py"
+
+
+class Artifact(NamedTuple):
+    """One buildable output: a frontmatter file + an ordered subset of
+    fragments from PKG, concatenated into a single flat .py file. Multiple
+    artifacts can (and do) share the same fragment files -- see ACTION's
+    reuse of _prelude/identity/state/gateway, which is the whole point of
+    keeping those as separate fragments rather than inlining them into
+    pipe.py.
+
+    NamedTuple, not @dataclass: install.py's own _rebuild_pipe_file (and
+    this repo's install_action.py) load this module dynamically via
+    importlib.util.module_from_spec + exec_module, which does NOT register
+    the module in sys.modules the way a normal `import` does. @dataclass's
+    class-processing internally does sys.modules.get(cls.__module__) to
+    resolve forward-referenced annotations (this file uses `from __future__
+    import annotations`), which raises AttributeError on None under that
+    loading pattern -- confirmed live, this broke install.py's existing
+    _rebuild_pipe_file the moment this class was added as a dataclass, even
+    though install.py itself was never touched. NamedTuple has no such
+    dependency and sidesteps the whole issue."""
+    frontmatter: Path
+    out: Path
+    dev_out: "Path | None"
+    module_order: tuple[str, ...]
+
 
 # Fixed dependency order. Module-load statements (constants, asyncio.Lock(),
 # logging.basicConfig) have no cross-module load-time references, so this order
 # only needs to satisfy human readability, not import semantics.
-MODULE_ORDER = ["_prelude", "identity", "state", "media", "emit",
-                "askuser", "gateway", "models", "pipe"]
+PIPE = Artifact(
+    frontmatter=ROOT / "src" / "frontmatter.txt",
+    out=ROOT / "openclaw_pipe.py",
+    dev_out=ROOT / "openclaw_pipe.dev.py",
+    module_order=("_prelude", "identity", "state", "media", "emit",
+                  "askuser", "gateway", "models", "pipe"),
+)
+
+# The status Action reuses the Pipe's connection/identity/formatting
+# fragments verbatim (same files, not copies) and adds only its own
+# "action" fragment. "emit" is included so the modal's numbers come from
+# the exact same _build_usage_status_lines/_fmt_tokens logic the status
+# line itself uses -- one source of truth, no risk of the two drifting
+# apart. No dev/internal-tooling variant yet -- add a dev_out here if this
+# artifact ever grows a devcoord-style need for one.
+ACTION = Artifact(
+    frontmatter=ROOT / "src" / "frontmatter-action.txt",
+    out=ROOT / "openclaw_status_action.py",
+    dev_out=None,
+    module_order=("_prelude", "identity", "state", "gateway", "emit", "action"),
+)
 
 BANNER = (
     "# ==========================================================================\n"
@@ -94,12 +140,16 @@ def _strip_dev_only(text: str) -> str:
     return "".join(out_lines)
 
 
-def build(strip_dev_only: bool = True) -> str:
-    frontmatter = FRONTMATTER.read_text()
+def build(strip_dev_only: bool = True, artifact: Artifact = PIPE) -> str:
+    """Assemble one artifact's frontmatter + fragments into a flat .py file.
+
+    Defaults to PIPE so existing callers (install.py's
+    ``mod.build(strip_dev_only=not dev)``) keep working unchanged."""
+    frontmatter = artifact.frontmatter.read_text()
     if not frontmatter.endswith("\n"):
         frontmatter += "\n"
     parts = [frontmatter, "\n", BANNER]
-    for mod in MODULE_ORDER:
+    for mod in artifact.module_order:
         body = _strip_fragment_banner((PKG / f"{mod}.py").read_text())
         if strip_dev_only:
             body = _strip_dev_only(body)
@@ -122,12 +172,24 @@ def _check(out_path: Path, built: str, label: str) -> None:
 
 
 def main():
+    action = "--action" in sys.argv or "--check-action" in sys.argv
     dev = "--dev" in sys.argv or "--check-dev" in sys.argv
-    out_path = DEV_OUT if dev else OUT
-    built = build(strip_dev_only=not dev)
+    checking = any(a in sys.argv for a in ("--check", "--check-dev", "--check-action"))
 
-    if "--check" in sys.argv or "--check-dev" in sys.argv:
-        _check(out_path, built, "--check-dev" if dev else "--check")
+    if action:
+        if dev:
+            print("ACTION has no --dev variant yet", file=sys.stderr)
+            sys.exit(2)
+        artifact, out_path, label = ACTION, ACTION.out, "--check-action"
+    else:
+        artifact = PIPE
+        out_path = PIPE.dev_out if dev else PIPE.out
+        label = "--check-dev" if dev else "--check"
+
+    built = build(strip_dev_only=not dev, artifact=artifact)
+
+    if checking:
+        _check(out_path, built, label)
         return
 
     out_path.write_text(built)

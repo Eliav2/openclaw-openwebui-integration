@@ -1196,6 +1196,20 @@ def _coerce_text(value) -> str:
     return ""
 
 
+def _content_has_image(raw_content) -> bool:
+    """True if an OWUI message's `content` is a multimodal block list
+    (P39) that includes at least one image_url block. `content` is a
+    plain string for ordinary text-only messages -- only the list shape
+    (sent when a user attaches an image) can carry one, so this returns
+    False immediately for the common string case."""
+    if not isinstance(raw_content, list):
+        return False
+    return any(
+        isinstance(block, dict) and block.get("type") == "image_url"
+        for block in raw_content
+    )
+
+
 def _item_assistant_text(data: dict) -> str:
     """Return visible assistant text carried by item/preamble events."""
     kind = str(data.get("kind", "")).strip().lower()
@@ -1274,6 +1288,47 @@ def _suppress_already_shown(delta: str, visible_message_text: str) -> str:
 # incident.
 PROACTIVE_DELIVERY_ENABLED = True
 
+
+# Anchor for state that must be shared by *every* `_GatewayConnection` alive in
+# this Python process — not just the current module's singleton. OWUI's function
+# loader execs each redeploy into a brand-new module object with no teardown hook
+# on the old one, so a connection left running by a previous deploy (a "zombie")
+# keeps its own event loop and its own *private* bookkeeping dicts. That zombie
+# still receives the Gateway's broadcast `final` events; with private bookkeeping
+# it sees an empty `delivered_live`/`session_last_activity` for the session,
+# wrongly concludes "nobody consumed this, the session is idle", and proactively
+# re-writes the turn into chat history — even though the *live* connection just
+# showed it to the open tab. That is the "*↳ Proactive message* on a live turn"
+# / duplicate-branch (2/2) bug (P33, root-caused 2026-07-11). Stashing the
+# liveness bookkeeping on `open_webui.socket.main` (OWUI's own stable module,
+# never reloaded by our function) makes all connections — current and zombie —
+# read and write the *same* dicts, so a turn shown live by any connection is seen
+# as delivered by all of them, and proactive delivery only fires for turns no
+# connection ever showed live (genuine cron/heartbeat/sessions_send wakes).
+_SHARED_STATE_ATTR = "_openclaw_gateway_shared_state_v1"
+
+
+def _shared_gateway_state() -> dict | None:
+    """Return the process-global bookkeeping dicts shared across all
+    `_GatewayConnection` instances, or None when not running inside OWUI
+    (e.g. unit tests), in which case callers keep instance-local state so
+    each test connection stays isolated."""
+    try:
+        import open_webui.socket.main as _owui_socket_main
+    except Exception:
+        return None
+    state = getattr(_owui_socket_main, _SHARED_STATE_ATTR, None)
+    if state is None:
+        state = {
+            "delivered_live": {},
+            "delivered_proactive": {},
+            "session_last_activity": {},
+            "pending_proactive_debounce": set(),
+        }
+        setattr(_owui_socket_main, _SHARED_STATE_ATTR, state)
+    return state
+
+
 @dataclass
 class _Consumer:
     """An active run consumer — its ``asyncio.Queue`` receives events."""
@@ -1317,10 +1372,22 @@ class _GatewayConnection:
         # Counter for the event loop
         self._event_count = 0
 
+        # Proactive-delivery bookkeeping. When running inside OWUI these four
+        # dicts/sets are the *same objects* for every `_GatewayConnection` in
+        # the process (see `_shared_gateway_state`), so a turn shown live by
+        # one connection is seen as delivered by all of them and a zombie
+        # connection left by a previous deploy can no longer re-deliver a live
+        # turn as a bogus "*↳ Proactive message*" (P33, 2026-07-11). Outside
+        # OWUI (unit tests) each connection gets its own isolated dicts.
+        _shared = _shared_gateway_state()
+
         # Dedup guard for proactive OWUI delivery (P33/ELI-17), keyed by
-        # "session_key:run_id" so a retried/duplicated final event never
+        # "session_key:run_id" so a retried/duplicated final event — or a
+        # second (zombie) connection racing the same idle session — never
         # writes the same message into chat history twice.
-        self._delivered_proactive: dict[str, bool] = {}
+        self._delivered_proactive: dict[str, bool] = (
+            _shared["delivered_proactive"] if _shared is not None else {}
+        )
 
         # Records, by "session_key:run_id", every *final* event that was
         # actually dispatched to a live consumer queue (i.e. genuinely shown
@@ -1332,7 +1399,9 @@ class _GatewayConnection:
         # unrelated turns happen to end with the same short text (e.g. "OK.",
         # "Done."), and unlike the debounce timer alone, it doesn't depend on
         # how long the session stays quiet afterward.
-        self._delivered_live: dict[str, float] = {}
+        self._delivered_live: dict[str, float] = (
+            _shared["delivered_live"] if _shared is not None else {}
+        )
 
         # Last time *any* consumer for a session was registered or
         # unregistered (P33/ELI-19 second incident, 2026-07-11). A bare
@@ -1347,8 +1416,13 @@ class _GatewayConnection:
         # still actively looking at. Recording the timestamp on every
         # register/unregister lets `session_idle_for` require a minimum
         # quiet period with zero consumers before trusting the session is
-        # genuinely idle, which a few-second leg gap cannot satisfy.
-        self._session_last_activity: dict[str, float] = {}
+        # genuinely idle, which a few-second leg gap cannot satisfy. Shared
+        # across connections so a zombie sees the live connection's consumer
+        # register/unregister activity and treats the session as busy, not
+        # idle.
+        self._session_last_activity: dict[str, float] = (
+            _shared["session_last_activity"] if _shared is not None else {}
+        )
 
         # Sessions currently being watched by a debounce task waiting for
         # `session_idle_for` to clear (see `_maybe_deliver_proactive_after_debounce`).
@@ -1356,8 +1430,12 @@ class _GatewayConnection:
         # when multiple unmatched "final" events arrive close together —
         # which would otherwise let both watchers independently observe
         # idleness later and each call `_deliver_proactive_owui_message`
-        # with a *different* run_id, defeating the per-run dedup guard.
-        self._pending_proactive_debounce: set[str] = set()
+        # with a *different* run_id, defeating the per-run dedup guard. Shared
+        # across connections so two connections (e.g. current + a zombie) never
+        # each spawn their own watcher for the same session.
+        self._pending_proactive_debounce: set[str] = (
+            _shared["pending_proactive_debounce"] if _shared is not None else set()
+        )
 
     # ── Public API ──────────────────────────────────────────────────
 
@@ -2596,11 +2674,46 @@ class Pipe:
             return
 
         # --- Extract user message ---
+        # OWUI sends `content` as a plain string for text-only messages, but
+        # as a list of content blocks (`{"type": "text", ...}` /
+        # `{"type": "image_url", ...}`) whenever the user attaches an image.
+        # Coercing through _coerce_text (already used elsewhere for gateway
+        # event payloads with the same block shape) extracts and joins any
+        # text blocks and safely no-ops on plain strings, so this line no
+        # longer sends a raw Python list as the RPC's `message` field when
+        # an image is attached (P39: previously reached the gateway as an
+        # unserializable-as-text value with no clear error surfaced to the
+        # user). It does not add actual image support -- there is no
+        # multimodal path into the agent's chat.send protocol -- so an
+        # image-only message (no accompanying text) is still not something
+        # this bridge can act on; the guard below now says so explicitly
+        # instead of the previous generic "No message".
         messages = body.get("messages", [])
-        text = messages[-1]["content"] if messages else ""
+        raw_content = messages[-1]["content"] if messages else ""
+        text = _coerce_text(raw_content)
+        has_image = _content_has_image(raw_content)
         if not text:
-            yield "No message"
+            if has_image:
+                yield (
+                    "**Images aren't relayed yet** — this bridge only sends text "
+                    "to the agent. Please describe what's in the image in words "
+                    "and send that instead."
+                )
+            else:
+                yield "No message"
             return
+
+        if has_image:
+            # Text was present alongside the image (the empty-text case
+            # above already handled image-only), so the turn proceeds
+            # normally on the text -- but silently dropping the image with
+            # no acknowledgment at all would be its own confusing failure
+            # mode, so say so up front rather than letting the reply look
+            # like it fully addressed a message that included a picture.
+            yield (
+                "_(Note: image attachments aren't relayed to the agent yet — "
+                "only the text below was sent.)_\n\n"
+            )
 
         await _emit_status(__event_emitter__, "Thinking...", done=False)
         pipe_log(f"Messages: {len(messages)}, last role: "
