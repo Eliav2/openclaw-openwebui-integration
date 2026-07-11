@@ -1063,17 +1063,21 @@ def _suppress_already_shown(delta: str, visible_message_text: str) -> str:
 # Persistent Gateway Connection (singleton)
 # ---------------------------------------------------------------------------
 
-# Kill switch for P33/ELI-17/ELI-19 proactive delivery. Re-enabled
-# 2026-07-11 after fixing the steering-leg race: `has_any_consumer_for_session`
-# alone was a point-in-time read that could be momentarily False in the gap
-# between one leg's HTTP request ending and the next leg's request landing a
-# few seconds later, causing duplicate assistant messages in a live chat.
-# Delivery now goes through `session_idle_for` + `_maybe_deliver_proactive_after_debounce`,
-# which require a sustained quiet period (no registered consumer for
-# min_idle_s, default 120s) before trusting a session is genuinely
-# abandoned. See PLAN.md P33 for the live verification performed before
-# re-enabling (isolated throwaway chat, checked for zero cross-chat bleed).
-PROACTIVE_DELIVERY_ENABLED = True
+# Hard-disabled again 2026-07-11, ~09:12 UTC: live re-verification testing
+# turned up an internal protocol marker ("ANNOUNCE_SKIP", from the
+# sessions_send announce-delivery mechanism) being proactively delivered
+# into a chat as if it were real assistant text — `_last_assistant_text_from_preview`
+# doesn't distinguish user-facing text from internal markers that happen to
+# flow through the same event stream. Separately (and now fixed, see
+# `session_idle_for`/`was_delivered_live` below), a live turn in an
+# *actively-used* real chat got proactively re-delivered as a duplicate ~4
+# minutes after its own genuine completion, during the same testing window
+# — confirmed via timestamps to have happened only in the ~08:54-09:10 UTC
+# window before `was_delivered_live` was deployed, not after. Do not
+# re-enable until the ANNOUNCE_SKIP-class content-legitimacy issue is
+# understood and fixed; the duplicate-identity issue is believed fixed but
+# unverified against a fresh live test after this one.
+PROACTIVE_DELIVERY_ENABLED = False
 
 @dataclass
 class _Consumer:
