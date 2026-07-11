@@ -184,6 +184,44 @@ class ProactiveDeliveryTests(unittest.TestCase):
         preview = {"previews": [{"key": "agent:main:test", "items": [{"role": "user", "text": "hi"}]}]}
         self.assertIsNone(_last_assistant_text_from_preview(preview, "agent:main:test"))
 
+    def test_last_assistant_text_from_preview_filters_announce_skip_sentinel(self):
+        preview = {
+            "previews": [{
+                "key": "agent:main:test",
+                "items": [{"role": "assistant", "text": "ANNOUNCE_SKIP"}],
+            }]
+        }
+        self.assertIsNone(_last_assistant_text_from_preview(preview, "agent:main:test"))
+
+    def test_last_assistant_text_from_preview_filters_no_reply_sentinels(self):
+        for sentinel in ("NO_REPLY", "no_reply"):
+            preview = {
+                "previews": [{
+                    "key": "agent:main:test",
+                    "items": [{"role": "assistant", "text": sentinel}],
+                }]
+            }
+            self.assertIsNone(
+                _last_assistant_text_from_preview(preview, "agent:main:test"),
+                f"sentinel {sentinel!r} should be filtered",
+            )
+
+    def test_last_assistant_text_from_preview_sentinel_does_not_fall_back_to_older_turn(self):
+        # A sentinel-only final leg means "nothing to show for THIS run" — it
+        # must not fall through to an older, already-delivered assistant
+        # message from an earlier leg.
+        preview = {
+            "previews": [{
+                "key": "agent:main:test",
+                "items": [
+                    {"role": "assistant", "text": "an earlier real reply"},
+                    {"role": "user", "text": "(no live turn, cron-triggered)"},
+                    {"role": "assistant", "text": "ANNOUNCE_SKIP"},
+                ],
+            }]
+        }
+        self.assertIsNone(_last_assistant_text_from_preview(preview, "agent:main:test"))
+
     def test_deliver_skips_non_owui_session_without_touching_gateway(self):
         conn = self._conn()
         conn.session_preview = mock.AsyncMock(side_effect=AssertionError("should not be called"))
@@ -280,6 +318,40 @@ class ProactiveDeliveryTests(unittest.TestCase):
         self.assertNotEqual(new_id, old_leaf_id, "currentId was clobbered back to the old leaf")
         self.assertEqual(history["messages"][new_id]["content"], "hello from cron")
         self.assertIn(new_id, history["messages"][old_leaf_id]["childrenIds"])
+
+    def test_deliver_never_persists_announce_skip_sentinel(self):
+        """End-to-end regression for the 2026-07-11 incident: a preview
+        whose last assistant text is the literal protocol sentinel
+        `ANNOUNCE_SKIP` must never reach OWUI's chat-write path at all —
+        not just return non-matching text. Asserts the fake `Chats.get_chat_by_id`
+        is never called, i.e. delivery bails out before touching chat history.
+        """
+        conn = self._conn()
+        session_key = _owui_session_key(
+            "main", "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        )
+        conn.session_preview = mock.AsyncMock(
+            return_value={"previews": [{"key": session_key, "items": [
+                {"role": "assistant", "text": "ANNOUNCE_SKIP"},
+            ]}]}
+        )
+
+        class FakeChats:
+            @staticmethod
+            async def get_chat_by_id(chat_id):
+                raise AssertionError("should never touch chat history for a sentinel-only reply")
+
+        fake_chats_module = types.ModuleType("open_webui.models.chats")
+        fake_chats_module.Chats = FakeChats
+        fake_models_module = types.ModuleType("open_webui.models")
+        fake_owui_module = types.ModuleType("open_webui")
+        with mock.patch.dict(sys.modules, {
+            "open_webui": fake_owui_module,
+            "open_webui.models": fake_models_module,
+            "open_webui.models.chats": fake_chats_module,
+        }):
+            asyncio.run(_deliver_proactive_owui_message(conn, session_key, "run-1"))
 
 
 class EventConsumerMatchingTests(unittest.TestCase):

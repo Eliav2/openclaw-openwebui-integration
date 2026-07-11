@@ -1063,21 +1063,21 @@ def _suppress_already_shown(delta: str, visible_message_text: str) -> str:
 # Persistent Gateway Connection (singleton)
 # ---------------------------------------------------------------------------
 
-# Hard-disabled again 2026-07-11, ~09:12 UTC: live re-verification testing
-# turned up an internal protocol marker ("ANNOUNCE_SKIP", from the
-# sessions_send announce-delivery mechanism) being proactively delivered
-# into a chat as if it were real assistant text — `_last_assistant_text_from_preview`
-# doesn't distinguish user-facing text from internal markers that happen to
-# flow through the same event stream. Separately (and now fixed, see
-# `session_idle_for`/`was_delivered_live` below), a live turn in an
-# *actively-used* real chat got proactively re-delivered as a duplicate ~4
-# minutes after its own genuine completion, during the same testing window
-# — confirmed via timestamps to have happened only in the ~08:54-09:10 UTC
-# window before `was_delivered_live` was deployed, not after. Do not
-# re-enable until the ANNOUNCE_SKIP-class content-legitimacy issue is
-# understood and fixed; the duplicate-identity issue is believed fixed but
-# unverified against a fresh live test after this one.
-PROACTIVE_DELIVERY_ENABLED = False
+# Re-enabled 2026-07-11 after fixing the ANNOUNCE_SKIP-class bug: an
+# internal protocol marker ("ANNOUNCE_SKIP", from the sessions_send
+# announce-delivery mechanism) was being proactively delivered into a chat
+# as if it were real assistant text, because `_last_assistant_text_from_preview`
+# didn't distinguish user-facing text from internal markers that happen to
+# flow through the same event stream. Fixed by filtering the documented
+# silent sentinels (`_SILENT_SENTINELS`: ANNOUNCE_SKIP, NO_REPLY, no_reply)
+# before treating preview text as deliverable — see that constant's
+# docstring. The separate duplicate-identity issue (a live turn in an
+# actively-used real chat getting proactively re-delivered) was already
+# fixed by `was_delivered_live` and confirmed via timestamps to only have
+# happened in the window *before* that fix was deployed, not after. Do not
+# re-disable without updating this comment and PLAN.md P33 with the new
+# incident.
+PROACTIVE_DELIVERY_ENABLED = True
 
 @dataclass
 class _Consumer:
@@ -1671,6 +1671,15 @@ class _GatewayConnection:
                 # loop and try again
 
 
+# Protocol sentinels (docs/tools/subagents.md:470-431) that mean "no
+# user-visible content was produced" — never real assistant text to show a
+# human. An announce-follow-up run can legitimately finish with exactly one
+# of these as its only "assistant text", and naively persisting it as a
+# proactive OWUI message leaks internal plumbing into the chat (P33,
+# 2026-07-11: `ANNOUNCE_SKIP` landed as literal message text).
+_SILENT_SENTINELS = {"ANNOUNCE_SKIP", "NO_REPLY", "no_reply"}
+
+
 def _last_assistant_text_from_preview(preview: dict, session_key: str) -> str | None:
     """Return the last assistant message text for session_key in a
     `sessions.preview` response (same shape `_preview_recovery_text` reads),
@@ -1693,8 +1702,10 @@ def _last_assistant_text_from_preview(preview: dict, session_key: str) -> str | 
     for item in reversed(items):
         if isinstance(item, dict) and item.get("role") == "assistant":
             text = str(item.get("text", "")).strip()
-            if text:
+            if text and text not in _SILENT_SENTINELS:
                 return text
+            if text in _SILENT_SENTINELS:
+                return None
     return None
 
 
