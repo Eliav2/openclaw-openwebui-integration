@@ -79,6 +79,7 @@ from openclaw_pipe import (
     _discover_models,
     _emit_message_snapshot,
     _emit_status,
+    _extract_image_attachments,
     _fmt_tokens,
     _friendly_name,
     _is_user_input_prompt,
@@ -870,6 +871,56 @@ class MultimodalUserMessageTests(unittest.TestCase):
         ])
         self.assertEqual(text, "what is this?")
         self.assertNotIn("data:image", text)
+
+
+class ExtractImageAttachmentsTests(unittest.TestCase):
+    """P39 follow-up: OWUI image_url blocks are decoded into the gateway's
+    `chat.send` attachments shape so images are actually relayed to the
+    agent, not just silently dropped with a note."""
+
+    def test_returns_empty_list_for_plain_text(self):
+        self.assertEqual(_extract_image_attachments("just plain text"), [])
+
+    def test_returns_empty_list_for_text_only_blocks(self):
+        self.assertEqual(_extract_image_attachments([
+            {"type": "text", "text": "hello"},
+        ]), [])
+
+    def test_decodes_single_base64_image(self):
+        attachments = _extract_image_attachments([
+            {"type": "text", "text": "what is this?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}},
+        ])
+        self.assertEqual(len(attachments), 1)
+        att = attachments[0]
+        self.assertEqual(att["mimeType"], "image/png")
+        self.assertEqual(att["content"], "QUJD")
+        self.assertEqual(att["type"], "image")
+        self.assertTrue(att["fileName"].endswith(".png"))
+
+    def test_decodes_multiple_images_in_order(self):
+        attachments = _extract_image_attachments([
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA="}},
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,BBB="}},
+        ])
+        self.assertEqual([a["content"] for a in attachments], ["AAA=", "BBB="])
+        self.assertEqual(attachments[1]["mimeType"], "image/jpeg")
+
+    def test_skips_non_data_url_image_refs(self):
+        self.assertEqual(_extract_image_attachments([
+            {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+        ]), [])
+
+    def test_skips_non_base64_data_urls(self):
+        self.assertEqual(_extract_image_attachments([
+            {"type": "image_url", "image_url": {"url": "data:image/svg+xml,<svg/>"}},
+        ]), [])
+
+    def test_defaults_mime_when_missing(self):
+        attachments = _extract_image_attachments([
+            {"type": "image_url", "image_url": {"url": "data:;base64,QUJD"}},
+        ])
+        self.assertEqual(attachments[0]["mimeType"], "image/png")
 
 
 class ItemDeltaDedupTests(unittest.TestCase):

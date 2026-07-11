@@ -412,39 +412,29 @@ class Pipe:
         # `{"type": "image_url", ...}`) whenever the user attaches an image.
         # Coercing through _coerce_text (already used elsewhere for gateway
         # event payloads with the same block shape) extracts and joins any
-        # text blocks and safely no-ops on plain strings, so this line no
-        # longer sends a raw Python list as the RPC's `message` field when
-        # an image is attached (P39: previously reached the gateway as an
-        # unserializable-as-text value with no clear error surfaced to the
-        # user). It does not add actual image support -- there is no
-        # multimodal path into the agent's chat.send protocol -- so an
-        # image-only message (no accompanying text) is still not something
-        # this bridge can act on; the guard below now says so explicitly
-        # instead of the previous generic "No message".
+        # text blocks and safely no-ops on plain strings.
         messages = body.get("messages", [])
         raw_content = messages[-1]["content"] if messages else ""
         text = _coerce_text(raw_content)
         has_image = _content_has_image(raw_content)
-        if not text:
+        image_attachments = _extract_image_attachments(raw_content) if has_image else []
+        if not text and not image_attachments:
             if has_image:
                 yield (
-                    "**Images aren't relayed yet** — this bridge only sends text "
-                    "to the agent. Please describe what's in the image in words "
-                    "and send that instead."
+                    "**Couldn't read that image** — only base64-embedded "
+                    "images are supported right now. Please describe what's "
+                    "in the image in words and send that instead."
                 )
             else:
                 yield "No message"
             return
 
-        if has_image:
-            # Text was present alongside the image (the empty-text case
-            # above already handled image-only), so the turn proceeds
-            # normally on the text -- but silently dropping the image with
-            # no acknowledgment at all would be its own confusing failure
-            # mode, so say so up front rather than letting the reply look
-            # like it fully addressed a message that included a picture.
+        if has_image and not image_attachments:
+            # An image block was present but couldn't be turned into an
+            # attachment (e.g. not a base64 data URL) -- text still goes
+            # through, but say so rather than silently dropping the image.
             yield (
-                "_(Note: image attachments aren't relayed to the agent yet — "
+                "_(Note: that image couldn't be relayed to the agent — "
                 "only the text below was sent.)_\n\n"
             )
 
@@ -529,6 +519,7 @@ class Pipe:
                         idempotency_key=idempotency_key,
                         owui_chat_id=owui_origin_chat_id,
                         owui_user_id=owui_origin_user_id,
+                        attachments=image_attachments,
                     ),
                     timeout=30
                 )
@@ -572,6 +563,7 @@ class Pipe:
                         idempotency_key=idempotency_key,
                         owui_chat_id=owui_origin_chat_id,
                         owui_user_id=owui_origin_user_id,
+                        attachments=image_attachments,
                     ),
                     timeout=30
                 )

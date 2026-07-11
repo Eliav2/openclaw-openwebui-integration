@@ -70,12 +70,15 @@ def _owui_chat_send_params(
     idempotency_key: str,
     owui_chat_id: str | None,
     owui_user_id: str | None,
+    attachments: list | None = None,
 ) -> dict:
     params = dict(
         sessionKey=session_key,
         message=message,
         idempotencyKey=idempotency_key,
     )
+    if attachments:
+        params["attachments"] = attachments
     if owui_chat_id:
         metadata = {
             "chat_id": owui_chat_id,
@@ -135,6 +138,44 @@ def _content_has_image(raw_content) -> bool:
         isinstance(block, dict) and block.get("type") == "image_url"
         for block in raw_content
     )
+
+
+_DATA_URL_RE = re.compile(r"^data:([^;,]*)(?:;[^,]*)?,(.*)$", re.DOTALL)
+
+
+def _extract_image_attachments(raw_content) -> list:
+    """Pull inline images out of an OWUI multimodal `content` block list
+    (P39) and shape them for the gateway's `chat.send` `attachments` param:
+    `{type, mimeType, fileName, content}` with `content` as base64.
+
+    OWUI sends attached/pasted images as `image_url` blocks whose `url` is
+    a `data:<mime>;base64,<data>` URI (confirmed via OWUI's own request
+    shape, not just this bridge's tests) -- there is no plain-HTTP(S)
+    `image_url` case to support here, so anything else is skipped rather
+    than guessed at.
+    """
+    if not isinstance(raw_content, list):
+        return []
+    attachments = []
+    for idx, block in enumerate(raw_content):
+        if not (isinstance(block, dict) and block.get("type") == "image_url"):
+            continue
+        image_url = block.get("image_url")
+        url = image_url.get("url") if isinstance(image_url, dict) else None
+        if not isinstance(url, str):
+            continue
+        match = _DATA_URL_RE.match(url.strip())
+        if not match or ";base64" not in url.split(",", 1)[0]:
+            continue
+        mime = match.group(1) or "image/png"
+        ext = mimetypes.guess_extension(mime) or ".png"
+        attachments.append({
+            "type": "image",
+            "mimeType": mime,
+            "fileName": f"image-{idx + 1}{ext}",
+            "content": match.group(2),
+        })
+    return attachments
 
 
 def _item_assistant_text(data: dict) -> str:
