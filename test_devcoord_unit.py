@@ -358,6 +358,22 @@ class DevCoordHttpRouteTests(unittest.TestCase):
         devcoord._devcoord_turn_end(m1)
         devcoord._devcoord_turn_end(m2)
 
+    def test_status_route_reaps_stale_marker_and_excludes_it(self):
+        """A marker left behind by a turn whose process died mid-flight
+        (crash, kill, container restart) must not block deploys forever --
+        see the real 2026-07-11 incident where a 14:55 marker was still
+        being counted almost two hours later with nothing left alive to
+        ever clear it."""
+        fresh = devcoord._devcoord_turn_begin()
+        stale_path = os.path.join(str(devcoord._devcoord_dir()), "stale-turn.json")
+        devcoord._write_json_file(
+            stale_path, {"started": time.time() - devcoord._DEVCOORD_STALE_MARKER_S - 60}
+        )
+        status, body = self._request("GET", "/__devcoord__/status")
+        self.assertEqual(json.loads(body), {"inflight": 1})
+        self.assertFalse(os.path.exists(stale_path), "stale marker should have been reaped")
+        devcoord._devcoord_turn_end(fresh)
+
     def test_post_deploy_pending_sets_flag_readable_by_pipe(self):
         status, _ = self._request("POST", "/__devcoord__/deploy-pending")
         self.assertEqual(status, 200)

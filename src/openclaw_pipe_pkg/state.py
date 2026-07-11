@@ -94,6 +94,38 @@ def _devcoord_turn_end(marker):
         pipe_log(f"devcoord: failed to clear inflight marker: {ex}")
 
 
+_DEVCOORD_STALE_MARKER_S = 1200  # 20 minutes
+
+
+def _devcoord_inflight_count():
+    """Count in-flight turns, reaping any marker older than
+    _DEVCOORD_STALE_MARKER_S first.
+
+    A turn's `finally` normally removes its own marker, but a process that
+    dies mid-turn (killed, crashed, container restarted) can leave one
+    behind permanently -- and since install.py's own deploy_guard waits
+    for this count to hit zero with no forced timeout of its own (ELI-24
+    follow-up), a single leaked marker would otherwise block every future
+    deploy forever. 20 minutes is well above any turn seen in practice, so a
+    marker that old is far more likely leaked than a genuinely long turn.
+    """
+    now = time.time()
+    count = 0
+    for name in os.listdir(_devcoord_dir()):
+        path = os.path.join(_devcoord_dir(), name)
+        data = _read_json_file(path)
+        started = (data or {}).get("started")
+        if started is not None and now - started > _DEVCOORD_STALE_MARKER_S:
+            pipe_log(f"devcoord: reaping stale inflight marker {name} (age {int(now - started)}s)")
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            continue
+        count += 1
+    return count
+
+
 async def _devcoord_wait_if_deploy_pending(*, poll_interval_s=0.25, on_wait=None,
                                            status_interval_s=3.0):
     """Wait, with no upper bound, for a pending-deploy flag to clear before

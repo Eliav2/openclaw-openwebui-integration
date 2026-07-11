@@ -360,7 +360,7 @@ def _start_file_server(port=18791):
         def do_GET(self):
             if self.path.rstrip("/") == "/__devcoord__/status":
                 try:
-                    inflight = len(os.listdir(_devcoord_dir()))
+                    inflight = _devcoord_inflight_count()
                 except Exception:
                     inflight = 0
                 body = json.dumps({"inflight": inflight}).encode()
