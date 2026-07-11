@@ -71,12 +71,14 @@ from openclaw_pipe import (
     _advance_media_buffer,
     _ask_user_detail_block,
     _ask_user_input_modal,
+    _build_usage_status_lines,
     _coerce_text,
     _could_be_user_input_prefix,
     _deliver_proactive_owui_message,
     _discover_models,
     _emit_message_snapshot,
     _emit_status,
+    _fmt_tokens,
     _friendly_name,
     _is_user_input_prompt,
     _item_assistant_text,
@@ -94,6 +96,7 @@ from openclaw_pipe import (
     _preview_recovery_text,
     _provider_from_key,
     _reap_stale_gateway_connection,
+    _relative_time,
     _remember_gateway_connection,
     _resolve_media,
     _resolve_media_via_owui,
@@ -1121,6 +1124,262 @@ class StatusEmitterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_emitter_is_noop(self):
         await _emit_status(None, "Thinking...", done=False)
+
+
+class FormatTokensTests(unittest.TestCase):
+    def test_formats_thousands_and_millions(self):
+        self.assertEqual(_fmt_tokens(115212), "115k")
+        self.assertEqual(_fmt_tokens(1_000_000), "1.0m")
+        self.assertEqual(_fmt_tokens(42), "42")
+        self.assertEqual(_fmt_tokens(None), "?")
+
+
+class RelativeTimeTests(unittest.TestCase):
+    # +2s buffer on every delta below: test execution time between computing
+    # `now_ms` and `_relative_time()` reading the real clock can itself eat a
+    # few ms, which is enough to floor a value sitting exactly on a minute
+    # boundary down by one unit. The buffer keeps these deterministic
+    # without weakening what's actually being checked (whole-unit rounding).
+    def test_minutes_only(self):
+        now_ms = time.time() * 1000
+        self.assertEqual(_relative_time(now_ms + 22 * 60_000 + 2000), "22m")
+
+    def test_hours_and_minutes(self):
+        now_ms = time.time() * 1000
+        self.assertEqual(_relative_time(now_ms + (4 * 3600 + 7 * 60) * 1000 + 2000), "4h07m")
+
+    def test_days_and_hours(self):
+        now_ms = time.time() * 1000
+        self.assertEqual(_relative_time(now_ms + (3 * 86400 + 7 * 3600) * 1000 + 2000), "3d07h")
+
+    def test_missing_or_past_returns_none(self):
+        self.assertIsNone(_relative_time(None))
+        self.assertIsNone(_relative_time(0))
+        self.assertIsNone(_relative_time(time.time() * 1000 - 1000))
+
+
+class UsageStatusLineTests(unittest.IsolatedAsyncioTestCase):
+    def _conn(self, describe_result, usage_result=None, usage_exc=None):
+        conn = mock.Mock()
+
+        async def send_request(method, params, timeout=5):
+            if method == "sessions.describe":
+                return describe_result
+            if method == "usage.status":
+                if usage_exc:
+                    raise usage_exc
+                return usage_result
+            raise AssertionError(f"unexpected method {method}")
+
+        conn.send_request = send_request
+        return conn
+
+    async def test_context_combines_with_primary_window_thin(self):
+        conn = self._conn(
+            describe_result={
+                "session": {
+                    "contextTokens": 1_000_000,
+                    "totalTokens": 115212,
+                    "modelProvider": "anthropic",
+                }
+            },
+            usage_result={
+                "providers": [
+                    {
+                        "provider": "anthropic",
+                        # No resetAt on either window here -> no detail
+                        # lines, just the thin combined line.
+                        "windows": [
+                            {"label": "5h", "usedPercent": 24},
+                            {"label": "Week", "usedPercent": 14},
+                        ],
+                    }
+                ]
+            },
+        )
+        lines = await _build_usage_status_lines(conn, "agent:main:x")
+        self.assertEqual(lines, ["🧠 115k/1.0m (11.5%) · ⏱ 5h 76% left"])
+
+    async def test_windows_with_reset_time_get_their_own_detail_line(self):
+        now_ms = time.time() * 1000
+        conn = self._conn(
+            describe_result={
+                "session": {
+                    "contextTokens": 1_000_000,
+                    "totalTokens": 115212,
+                    "modelProvider": "anthropic",
+                }
+            },
+            usage_result={
+                "providers": [
+                    {
+                        "provider": "anthropic",
+                        "windows": [
+                            {
+                                "label": "5h",
+                                "usedPercent": 24,
+                                "resetAt": now_ms + 22 * 60_000 + 2000,
+                            },
+                            {
+                                "label": "Week",
+                                "usedPercent": 14,
+                                "resetAt": now_ms + (6 * 86400 + 3 * 3600) * 1000 + 2000,
+                            },
+                        ],
+                    }
+                ]
+            },
+        )
+        lines = await _build_usage_status_lines(conn, "agent:main:x")
+        # Thin combined line stays exactly as before (no reset time on it);
+        # each window that has a reset time gets its own extra detail line,
+        # in addition to (not instead of) the thin one.
+        self.assertEqual(
+            lines,
+            [
+                "⏱ 5h 76% left (resets in 22m)",
+                "⏱ Week 86% left (resets in 6d03h)",
+                "🧠 115k/1.0m (11.5%) · ⏱ 5h 76% left",
+            ],
+        )
+
+    async def test_single_window_has_no_secondary_line(self):
+        conn = self._conn(
+            describe_result={
+                "session": {
+                    "contextTokens": 1_000_000,
+                    "totalTokens": 500,
+                    "modelProvider": "google-gemini-cli",
+                }
+            },
+            usage_result={
+                "providers": [
+                    {"provider": "google-gemini-cli", "windows": [{"label": "Pro", "usedPercent": 5}]}
+                ]
+            },
+        )
+        lines = await _build_usage_status_lines(conn, "agent:main:x")
+        self.assertEqual(lines, ["🧠 500/1.0m (0.1%) · ⏱ Pro 95% left"])
+
+    async def test_falls_back_to_summary_when_no_windows(self):
+        conn = self._conn(
+            describe_result={
+                "session": {
+                    "contextTokens": 1_000_000,
+                    "totalTokens": 1000,
+                    "modelProvider": "deepseek",
+                }
+            },
+            usage_result={
+                "providers": [
+                    {"provider": "deepseek", "windows": [], "summary": "Balance $4.58"}
+                ]
+            },
+        )
+        lines = await _build_usage_status_lines(conn, "agent:main:x")
+        self.assertEqual(lines, ["🧠 1k/1.0m (0.1%) · ⏱ Balance $4.58"])
+
+    async def test_describe_failure_yields_no_lines(self):
+        conn = mock.Mock()
+
+        async def send_request(method, params, timeout=5):
+            raise TimeoutError("gateway unreachable")
+
+        conn.send_request = send_request
+        lines = await _build_usage_status_lines(conn, "agent:main:x")
+        self.assertEqual(lines, [])
+
+    async def test_usage_status_failure_still_returns_context(self):
+        conn = self._conn(
+            describe_result={
+                "session": {
+                    "contextTokens": 1_000_000,
+                    "totalTokens": 115212,
+                    "modelProvider": "anthropic",
+                }
+            },
+            usage_exc=TimeoutError("no usage"),
+        )
+        lines = await _build_usage_status_lines(conn, "agent:main:x")
+        self.assertEqual(lines, ["🧠 115k/1.0m (11.5%)"])
+
+    async def test_no_matching_provider_yields_context_only(self):
+        conn = self._conn(
+            describe_result={
+                "session": {
+                    "contextTokens": 1_000_000,
+                    "totalTokens": 500,
+                    "modelProvider": "openai",
+                }
+            },
+            usage_result={"providers": [{"provider": "anthropic", "windows": []}]},
+        )
+        lines = await _build_usage_status_lines(conn, "agent:main:x")
+        self.assertEqual(lines, ["🧠 500/1.0m (0.1%)"])
+
+    async def test_active_goal_with_budget(self):
+        conn = self._conn(
+            describe_result={
+                "session": {
+                    "contextTokens": 1_000_000,
+                    "totalTokens": 500,
+                    "modelProvider": "anthropic",
+                    "goal": {
+                        "status": "active",
+                        "objective": "get CI green",
+                        "tokensUsed": 12000,
+                        "tokenBudget": 50000,
+                    },
+                }
+            },
+            usage_result={"providers": []},
+        )
+        lines = await _build_usage_status_lines(conn, "agent:main:x")
+        self.assertEqual(lines, ["🎯 Pursuing goal (12k/50k)", "🧠 500/1.0m (0.1%)"])
+
+    async def test_active_goal_without_budget_shows_objective(self):
+        conn = self._conn(
+            describe_result={
+                "session": {
+                    "contextTokens": 1_000_000,
+                    "totalTokens": 500,
+                    "modelProvider": "anthropic",
+                    "goal": {"status": "active", "objective": "ship the fix", "tokensUsed": 0},
+                }
+            },
+            usage_result={"providers": []},
+        )
+        lines = await _build_usage_status_lines(conn, "agent:main:x")
+        self.assertEqual(lines, ["🎯 Pursuing goal: ship the fix", "🧠 500/1.0m (0.1%)"])
+
+    async def test_paused_goal(self):
+        conn = self._conn(
+            describe_result={
+                "session": {
+                    "contextTokens": 1_000_000,
+                    "totalTokens": 500,
+                    "modelProvider": "anthropic",
+                    "goal": {"status": "paused"},
+                }
+            },
+            usage_result={"providers": []},
+        )
+        lines = await _build_usage_status_lines(conn, "agent:main:x")
+        self.assertIn("🎯 Goal paused (/goal resume)", lines)
+
+    async def test_no_goal_omits_goal_line(self):
+        conn = self._conn(
+            describe_result={
+                "session": {
+                    "contextTokens": 1_000_000,
+                    "totalTokens": 500,
+                    "modelProvider": "anthropic",
+                }
+            },
+            usage_result={"providers": []},
+        )
+        lines = await _build_usage_status_lines(conn, "agent:main:x")
+        self.assertTrue(all("🎯" not in line for line in lines))
 
 
 class MessageSnapshotEmitterTests(unittest.IsolatedAsyncioTestCase):

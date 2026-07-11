@@ -1157,7 +1157,23 @@ class Pipe:
                         await maybe_emit_snapshot(force=True)
 
         finally:
-            await _emit_status(__event_emitter__, "", done=True)
+            status_lines = []
+            if not aborted and text_yielded:
+                status_lines = await _build_usage_status_lines(conn, session_key)
+            if status_lines:
+                # One `status` event per fact (context / rate-limit / goal) so
+                # each row stays inside OWUI's per-line clamp instead of one
+                # long combined line getting cut off. All of them already
+                # reflect final data by the time we get here (both RPCs in
+                # `_build_usage_status_lines` already completed) — none of
+                # this is genuinely still "in progress", so every line is
+                # `done=True`. Marking earlier ones `done=False` made them
+                # shimmer for an instant before getting replaced by the last
+                # line, a visible flash for no reason.
+                for line in status_lines:
+                    await _emit_status(__event_emitter__, line, done=True)
+            else:
+                await _emit_status(__event_emitter__, "", done=True)
             conn.unregister_consumer(session_key, our_run_id, queue=queue)
             self._current_session_key = None
             self._current_run_id = None
