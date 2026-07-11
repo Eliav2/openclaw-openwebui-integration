@@ -3,6 +3,7 @@
 
 import unittest
 import sys
+import time
 import types
 import asyncio
 from unittest import mock
@@ -82,6 +83,7 @@ from openclaw_pipe import (
     _item_delta_text,
     _last_assistant_text_from_preview,
     _live_session_id_for_user,
+    _maybe_deliver_proactive_after_debounce,
     _modal_payload_from_user_input_prompt,
     _model_patch_matches,
     _normalize_event_call_response,
@@ -341,6 +343,121 @@ class EventConsumerMatchingTests(unittest.TestCase):
         conn = _GatewayConnection(lambda: None)
         conn.register_consumer("session-a", "run-2")
         self.assertTrue(conn.has_any_consumer_for_session("session-a"))
+
+    def test_session_idle_for_false_while_consumer_active(self):
+        conn = _GatewayConnection(lambda: None)
+        conn.register_consumer("session-a", "run-1")
+        self.assertFalse(conn.session_idle_for("session-a", min_idle_s=120))
+
+    def test_session_idle_for_true_immediately_for_never_seen_session(self):
+        conn = _GatewayConnection(lambda: None)
+        self.assertTrue(conn.session_idle_for("session-never-seen", min_idle_s=120))
+
+    def test_session_idle_for_false_right_after_unregister(self):
+        """Regression for the second 2026-07-11 incident: unregistering a
+        consumer must NOT immediately count as idle — the next leg's HTTP
+        request (e.g. answering an ask-user modal) can still land a few
+        seconds later under a brand-new run_id."""
+        conn = _GatewayConnection(lambda: None)
+        conn.register_consumer("session-a", "run-1")
+        conn.unregister_consumer("session-a", "run-1")
+        self.assertFalse(conn.session_idle_for("session-a", min_idle_s=120))
+
+    def test_session_idle_for_true_after_min_idle_s_elapses(self):
+        conn = _GatewayConnection(lambda: None)
+        conn.register_consumer("session-a", "run-1")
+        conn.unregister_consumer("session-a", "run-1")
+        conn._session_last_activity["session-a"] = time.time() - 200
+        self.assertTrue(conn.session_idle_for("session-a", min_idle_s=120))
+
+    def test_session_idle_for_false_again_if_a_new_leg_reregisters(self):
+        """Even after the quiet period has elapsed once, a fresh
+        register_consumer call must reset the clock — the session isn't
+        idle again until the *new* leg also finishes and settles."""
+        conn = _GatewayConnection(lambda: None)
+        conn.register_consumer("session-a", "run-1")
+        conn.unregister_consumer("session-a", "run-1")
+        conn._session_last_activity["session-a"] = time.time() - 200
+        conn.register_consumer("session-a", "run-2")
+        self.assertFalse(conn.session_idle_for("session-a", min_idle_s=120))
+
+
+class ProactiveDebounceWatcherTests(unittest.IsolatedAsyncioTestCase):
+    """P33/ELI-19 (second incident, 2026-07-11): a debounce watcher must
+    delay proactive delivery until the session has been genuinely idle for
+    a sustained period, and must never deliver if the session stays busy."""
+
+    def _conn(self, agent_id="main"):
+        return _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID=agent_id))
+
+    async def test_delivers_once_session_settles_idle(self):
+        conn = self._conn()
+        session_key = _owui_session_key(
+            "main", "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        )
+        # Simulate: a leg just unregistered (not idle yet at min_idle_s=0.05s).
+        conn.register_consumer(session_key, "run-1")
+        conn.unregister_consumer(session_key, "run-1")
+
+        delivered = []
+
+        async def fake_deliver(c, sk, rid):
+            delivered.append((sk, rid))
+
+        with mock.patch("openclaw_pipe.PROACTIVE_DELIVERY_ENABLED", True), mock.patch(
+            "openclaw_pipe._deliver_proactive_owui_message", side_effect=fake_deliver
+        ):
+            await _maybe_deliver_proactive_after_debounce(
+                conn, session_key, "run-1",
+                min_idle_s=0.05, poll_interval_s=0.02, max_wait_s=2,
+            )
+
+        self.assertEqual(delivered, [(session_key, "run-1")])
+        # Watcher must clear itself from the pending-set on completion.
+        self.assertNotIn(session_key, conn._pending_proactive_debounce)
+
+    async def test_never_delivers_if_session_stays_busy_until_timeout(self):
+        conn = self._conn()
+        session_key = _owui_session_key(
+            "main", "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        )
+        # A consumer is (and remains) registered the whole time — session is
+        # never idle, simulating an ongoing live conversation.
+        conn.register_consumer(session_key, "run-2")
+        conn._pending_proactive_debounce.add(session_key)
+
+        with mock.patch("openclaw_pipe.PROACTIVE_DELIVERY_ENABLED", True), mock.patch(
+            "openclaw_pipe._deliver_proactive_owui_message",
+            side_effect=AssertionError("must not deliver into a busy session"),
+        ):
+            await _maybe_deliver_proactive_after_debounce(
+                conn, session_key, "run-1",
+                min_idle_s=120, poll_interval_s=0.02, max_wait_s=0.1,
+            )
+
+        self.assertNotIn(session_key, conn._pending_proactive_debounce)
+
+    async def test_bails_immediately_if_kill_switch_flipped_off_mid_wait(self):
+        conn = self._conn()
+        session_key = _owui_session_key(
+            "main", "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        )
+        conn.register_consumer(session_key, "run-1")  # never idle on its own
+        conn._pending_proactive_debounce.add(session_key)
+
+        with mock.patch("openclaw_pipe.PROACTIVE_DELIVERY_ENABLED", False), mock.patch(
+            "openclaw_pipe._deliver_proactive_owui_message",
+            side_effect=AssertionError("must not deliver once disabled"),
+        ):
+            await _maybe_deliver_proactive_after_debounce(
+                conn, session_key, "run-1",
+                min_idle_s=120, poll_interval_s=0.02, max_wait_s=5,
+            )
+
+        self.assertNotIn(session_key, conn._pending_proactive_debounce)
 
 
 class GatewayReconnectStormTests(unittest.IsolatedAsyncioTestCase):

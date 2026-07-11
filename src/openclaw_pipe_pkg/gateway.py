@@ -243,6 +243,31 @@ class _GatewayConnection:
         # writes the same message into chat history twice.
         self._delivered_proactive: dict[str, bool] = {}
 
+        # Last time *any* consumer for a session was registered or
+        # unregistered (P33/ELI-19 second incident, 2026-07-11). A bare
+        # `has_any_consumer_for_session() is False` check is racy at
+        # steering-leg / OWUI-request boundaries: a leg can unregister its
+        # consumer the instant its HTTP request ends, and the browser tab
+        # sends the *next* leg's request (e.g. answering an ask-user modal)
+        # a few seconds later under a brand-new run_id. During that gap the
+        # session has zero registered consumers yet is not actually
+        # abandoned — a "final" event landing in that window used to get
+        # proactively delivered as a duplicate into a chat the user was
+        # still actively looking at. Recording the timestamp on every
+        # register/unregister lets `session_idle_for` require a minimum
+        # quiet period with zero consumers before trusting the session is
+        # genuinely idle, which a few-second leg gap cannot satisfy.
+        self._session_last_activity: dict[str, float] = {}
+
+        # Sessions currently being watched by a debounce task waiting for
+        # `session_idle_for` to clear (see `_maybe_deliver_proactive_after_debounce`).
+        # Prevents spawning a second concurrent watcher for the same session
+        # when multiple unmatched "final" events arrive close together —
+        # which would otherwise let both watchers independently observe
+        # idleness later and each call `_deliver_proactive_owui_message`
+        # with a *different* run_id, defeating the per-run dedup guard.
+        self._pending_proactive_debounce: set[str] = set()
+
     # ── Public API ──────────────────────────────────────────────────
 
     async def ensure_connected(self):
@@ -286,6 +311,7 @@ class _GatewayConnection:
             pipe_log(f"  registered consumer: {key[:60]}...")
         q = asyncio.Queue(maxsize=500)
         consumer.queues.append(q)
+        self._touch_session_activity(session_key)
         return q
 
     def unregister_consumer(self, session_key: str, run_id: str, queue: asyncio.Queue | None = None):
@@ -305,7 +331,15 @@ class _GatewayConnection:
                 pass
         if not consumer.queues or queue is None:
             del self._consumers[key]
+        self._touch_session_activity(session_key)
         pipe_log(f"  unregistered consumer: {key[:60]}...")
+
+    def _touch_session_activity(self, session_key: str):
+        self._session_last_activity[session_key] = time.time()
+        if len(self._session_last_activity) > 500:
+            oldest_first = sorted(self._session_last_activity.items(), key=lambda kv: kv[1])
+            for stale_key, _ in oldest_first[:250]:
+                self._session_last_activity.pop(stale_key, None)
 
     def active_run_id_for_session(self, session_key: str) -> str | None:
         """Return the sole active run id for a session, if one is registered."""
@@ -335,6 +369,33 @@ class _GatewayConnection:
             consumer.session_key == session_key
             for consumer in self._consumers.values()
         )
+
+    def session_idle_for(self, session_key: str, min_idle_s: float = 120) -> bool:
+        """True only if the session has had *zero* registered consumers for
+        at least `min_idle_s` seconds (P33/ELI-19, second incident,
+        2026-07-11).
+
+        `has_any_consumer_for_session` alone is racy: it can momentarily
+        read False in the gap between one leg's HTTP request ending
+        (unregister) and the browser's next request for the same logical
+        turn arriving (register) — a few seconds, not the minutes a
+        genuinely abandoned session sits idle for. Requiring a sustained
+        quiet period turns a race into a simple timing margin: a real
+        steering/modal round trip resolves in low single-digit seconds,
+        while a proactive wake (cron, heartbeat, bare sessions_send) has no
+        pending browser request at all, so it always clears the bar.
+
+        A session_key never seen by this connection (no register/unregister
+        recorded — e.g. this is a fresh process, or the previous owner of
+        this session was a now-reaped zombie connection) has no activity to
+        race against, so it's treated as idle immediately.
+        """
+        if self.has_any_consumer_for_session(session_key):
+            return False
+        last_activity = self._session_last_activity.get(session_key)
+        if last_activity is None:
+            return True
+        return (time.time() - last_activity) >= min_idle_s
 
     def parse_owui_session_key(self, session_key: str) -> tuple[str, str] | None:
         """Reverse `_owui_session_key`: extract (user_id, chat_id) from a
@@ -618,19 +679,25 @@ class _GatewayConnection:
                 # same session (steering handoff, or a bare session-only event
                 # with zero/multiple matches) — proactively delivering in that
                 # case injects a duplicate into a live conversation (real
-                # incident, 2026-07-11, see PLAN.md P33). So this branch also
-                # requires `not has_any_consumer_for_session(...)`: genuinely
-                # zero active pipe() calls anywhere on this session, not just
-                # for this run. Only then treat it as a true out-of-band wake
-                # (cron, heartbeat, or a bare sessions_send).
+                # incident, 2026-07-11, see PLAN.md P33). Even
+                # `has_any_consumer_for_session` alone isn't enough: it's a
+                # point-in-time read that can be momentarily False in the gap
+                # between one leg's HTTP request ending and the next leg's
+                # request arriving a few seconds later (second 2026-07-11
+                # incident). So this branch hands off to a debounce watcher
+                # (`_maybe_deliver_proactive_after_debounce`) that only
+                # delivers once the session has been genuinely consumer-free
+                # for a sustained quiet period, not just at this instant.
                 evt_session = payload.get("sessionKey", "")
                 if PROACTIVE_DELIVERY_ENABLED and evt_session and payload.get("state") == "final":
                     if (
                         self.parse_owui_session_key(evt_session)
                         and not self.has_any_consumer_for_session(evt_session)
+                        and evt_session not in self._pending_proactive_debounce
                     ):
+                        self._pending_proactive_debounce.add(evt_session)
                         asyncio.create_task(
-                            _deliver_proactive_owui_message(
+                            _maybe_deliver_proactive_after_debounce(
                                 self, evt_session, payload.get("runId", "")
                             )
                         )
@@ -703,6 +770,44 @@ def _last_assistant_text_from_preview(preview: dict, session_key: str) -> str | 
             if text:
                 return text
     return None
+
+
+async def _maybe_deliver_proactive_after_debounce(
+    conn: "_GatewayConnection",
+    session_key: str,
+    run_id: str,
+    min_idle_s: float = 120,
+    poll_interval_s: float = 5,
+    max_wait_s: float = 600,
+) -> None:
+    """Wait out `session_idle_for`'s quiet-period requirement before handing
+    off to `_deliver_proactive_owui_message` (P33/ELI-19, second incident).
+
+    Re-polls rather than sleeping once for `min_idle_s`, because the
+    session's idle clock can restart at any point (a new leg registers a
+    consumer, runs, then unregisters again) — a single fixed sleep would
+    miss that and could still deliver during a live steering round trip. If
+    the session never settles within `max_wait_s`, gives up rather than
+    delivering into a session whose liveness can't be confirmed; also bails
+    immediately if the kill switch is flipped back off mid-wait.
+    """
+    try:
+        waited = 0.0
+        while not conn.session_idle_for(session_key, min_idle_s=min_idle_s):
+            if not PROACTIVE_DELIVERY_ENABLED:
+                pipe_log("  proactive delivery: disabled mid-debounce, abandoning wait")
+                return
+            if waited >= max_wait_s:
+                pipe_log(
+                    f"  proactive delivery: session {session_key[:40]}... never "
+                    f"settled idle within {max_wait_s:.0f}s, giving up"
+                )
+                return
+            await asyncio.sleep(poll_interval_s)
+            waited += poll_interval_s
+        await _deliver_proactive_owui_message(conn, session_key, run_id)
+    finally:
+        conn._pending_proactive_debounce.discard(session_key)
 
 
 async def _deliver_proactive_owui_message(
