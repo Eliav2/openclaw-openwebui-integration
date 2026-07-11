@@ -259,11 +259,50 @@ async def _resolve_media_text(text, *, valves, __request__=None, __event_emitter
     return resolved, handled
 
 
+# Anchor for finding a file server left behind by a *previous* deploy of this
+# same function (same class of issue as P33/P36/gateway._reap_stale_gateway_
+# connection: OWUI's function loader execs each redeploy into a brand-new
+# module object with no teardown hook on the old one, so a module-level
+# _file_server_started flag alone just resets and a second HTTPServer tries
+# to bind the same port -- silently failing since the old one is still
+# listening, per _start_file_server's `except OSError: pass`). Stashing the
+# server object on `open_webui.socket.main` -- OWUI's own stable module,
+# never reloaded by our function -- lets the next deploy find and shut down
+# the previous one first, so redeploys self-heal without a container
+# restart. Falls back to a no-op when not running inside OWUI (unit tests).
+_STALE_FILE_SERVER_ATTR = "_openclaw_file_server_v1"
+
+
+def _reap_stale_file_server() -> None:
+    try:
+        import open_webui.socket.main as _owui_socket_main
+    except Exception:
+        return
+    stale = getattr(_owui_socket_main, _STALE_FILE_SERVER_ATTR, None)
+    if stale is None:
+        return
+    try:
+        stale.shutdown()
+        stale.server_close()
+        pipe_log("  reaped stale file server from a previous deploy")
+    except Exception as ex:
+        pipe_log(f"  failed to reap stale file server (non-fatal): {ex}")
+
+
+def _remember_file_server(server) -> None:
+    try:
+        import open_webui.socket.main as _owui_socket_main
+    except Exception:
+        return
+    setattr(_owui_socket_main, _STALE_FILE_SERVER_ATTR, server)
+
+
 def _start_file_server(port=18791):
     """Start a minimal HTTP server for media files. Starts once per process."""
     global _file_server_started
     if _file_server_started:
         return
+    _reap_stale_file_server()
     directory = "/tmp/openclaw-pipe-media"
     os.makedirs(directory, exist_ok=True)
     Path(directory, "health").write_text("ok")
@@ -303,10 +342,52 @@ def _start_file_server(port=18791):
             self._handle_upload()
 
         def do_POST(self):
+            # DEV-ONLY-START
+            # Cross-agent deploy coordination (ELI-24): install.py has no
+            # filesystem access to this container's STATE_DIR, so it signals
+            # a pending deploy over this same unauthenticated port instead.
+            # Dev/internal-tooling only -- stripped from openclaw_pipe.py by
+            # build.py, never present in the artifact end users install.
+            if self.path.rstrip("/") == "/__devcoord__/deploy-pending":
+                _write_json_file(_devcoord_pending_path(), {"requested": time.time()})
+                self.send_response(200)
+                self.end_headers()
+                return
+            # DEV-ONLY-END
             self._handle_upload()
+
+        # DEV-ONLY-START
+        def do_GET(self):
+            if self.path.rstrip("/") == "/__devcoord__/status":
+                try:
+                    inflight = len(os.listdir(_devcoord_dir()))
+                except Exception:
+                    inflight = 0
+                body = json.dumps({"inflight": inflight}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            super().do_GET()
+
+        def do_DELETE(self):
+            if self.path.rstrip("/") == "/__devcoord__/deploy-pending":
+                try:
+                    os.remove(_devcoord_pending_path())
+                except FileNotFoundError:
+                    pass
+                self.send_response(200)
+                self.end_headers()
+                return
+            self.send_response(404)
+            self.end_headers()
+        # DEV-ONLY-END
 
     try:
         server = HTTPServer(("0.0.0.0", port), _Handler)
+        _remember_file_server(server)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         _file_server_started = True
     except OSError:

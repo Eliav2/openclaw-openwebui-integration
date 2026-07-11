@@ -455,11 +455,50 @@ async def _resolve_media_text(text, *, valves, __request__=None, __event_emitter
     return resolved, handled
 
 
+# Anchor for finding a file server left behind by a *previous* deploy of this
+# same function (same class of issue as P33/P36/gateway._reap_stale_gateway_
+# connection: OWUI's function loader execs each redeploy into a brand-new
+# module object with no teardown hook on the old one, so a module-level
+# _file_server_started flag alone just resets and a second HTTPServer tries
+# to bind the same port -- silently failing since the old one is still
+# listening, per _start_file_server's `except OSError: pass`). Stashing the
+# server object on `open_webui.socket.main` -- OWUI's own stable module,
+# never reloaded by our function -- lets the next deploy find and shut down
+# the previous one first, so redeploys self-heal without a container
+# restart. Falls back to a no-op when not running inside OWUI (unit tests).
+_STALE_FILE_SERVER_ATTR = "_openclaw_file_server_v1"
+
+
+def _reap_stale_file_server() -> None:
+    try:
+        import open_webui.socket.main as _owui_socket_main
+    except Exception:
+        return
+    stale = getattr(_owui_socket_main, _STALE_FILE_SERVER_ATTR, None)
+    if stale is None:
+        return
+    try:
+        stale.shutdown()
+        stale.server_close()
+        pipe_log("  reaped stale file server from a previous deploy")
+    except Exception as ex:
+        pipe_log(f"  failed to reap stale file server (non-fatal): {ex}")
+
+
+def _remember_file_server(server) -> None:
+    try:
+        import open_webui.socket.main as _owui_socket_main
+    except Exception:
+        return
+    setattr(_owui_socket_main, _STALE_FILE_SERVER_ATTR, server)
+
+
 def _start_file_server(port=18791):
     """Start a minimal HTTP server for media files. Starts once per process."""
     global _file_server_started
     if _file_server_started:
         return
+    _reap_stale_file_server()
     directory = "/tmp/openclaw-pipe-media"
     os.makedirs(directory, exist_ok=True)
     Path(directory, "health").write_text("ok")
@@ -501,8 +540,10 @@ def _start_file_server(port=18791):
         def do_POST(self):
             self._handle_upload()
 
+
     try:
         server = HTTPServer(("0.0.0.0", port), _Handler)
+        _remember_file_server(server)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         _file_server_started = True
     except OSError:
@@ -519,6 +560,160 @@ async def _emit_status(__event_emitter__, description, *, done=False):
     await __event_emitter__(
         {"type": "status", "data": {"description": description, "done": done}}
     )
+
+
+def _fmt_tokens(n) -> str:
+    """Compact token count: 115212 -> '115k', 1000000 -> '1.0m'."""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return "?"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}m"
+    if n >= 1_000:
+        return f"{n // 1_000}k"
+    return str(n)
+
+
+def _format_goal_line(goal: dict) -> str:
+    """Mirror the TUI footer's goal phrasing (see docs/tools/goal.md)."""
+    status = goal.get("status")
+    tokens_used = goal.get("tokensUsed")
+    budget = goal.get("tokenBudget")
+    used_fmt = _fmt_tokens(tokens_used) if tokens_used is not None else "?"
+    if status == "active":
+        if budget:
+            return f"🎯 Pursuing goal ({used_fmt}/{_fmt_tokens(budget)})"
+        objective = (goal.get("objective") or "").strip()
+        if len(objective) > 40:
+            objective = objective[:39] + "…"
+        return f"🎯 Pursuing goal: {objective}" if objective else "🎯 Pursuing goal"
+    if status == "paused":
+        return "🎯 Goal paused (/goal resume)"
+    if status == "blocked":
+        return "🎯 Goal blocked (/goal resume)"
+    if status == "usage_limited":
+        return "🎯 Goal hit usage limits (/goal resume)"
+    if status == "budget_limited":
+        return f"🎯 Goal unmet ({used_fmt}/{_fmt_tokens(budget)})"
+    if status == "complete":
+        return f"🎯 Goal achieved ({used_fmt})"
+    return ""
+
+
+def _window_bit(w: dict) -> str | None:
+    used = w.get("usedPercent")
+    if used is None:
+        return None
+    return f"{w.get('label')} {round(100 - used)}% left"
+
+
+def _relative_time(reset_at_ms) -> str | None:
+    """Compact relative countdown: '22m', '4h07m', '3d07h'. None if unknown/past."""
+    if not reset_at_ms:
+        return None
+    delta_s = int((reset_at_ms - time.time() * 1000) / 1000)
+    if delta_s <= 0:
+        return None
+    days, rem = divmod(delta_s, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    if days:
+        return f"{days}d{hours:02d}h"
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    return f"{minutes}m"
+
+
+def _window_reset_line(w: dict) -> str | None:
+    """Full detail line for one rate-limit window, only when it has a known
+    reset time — e.g. '⏱ 5h 18% left (resets in 22m)'. Skipped for windows
+    without a `resetAt` (e.g. Gemini's Pro/Flash aren't time-windows), since
+    there'd be nothing new to say beyond what the thin combined line already
+    shows.
+    """
+    bit = _window_bit(w)
+    rel = _relative_time(w.get("resetAt"))
+    if not bit or not rel:
+        return None
+    return f"⏱ {bit} (resets in {rel})"
+
+
+async def _build_usage_status_lines(conn, session_key, timeout: float = 5) -> list[str]:
+    """Best-effort final status lines: context window fill (combined with the
+    provider's primary/nearest-term rate-limit window on the same line, kept
+    deliberately thin — no reset time), one full detail line per rate-limit
+    window that has a known reset time (e.g. both '5h' and 'Week' for
+    Anthropic/OpenAI), and the active session goal (if any) on its own line.
+    Returned as separate short lines (rather than one combined line) because
+    OWUI's status UI hard-clamps every line to a single row (`line-clamp-1`,
+    no way to disable per-event) — one line per fact keeps each row inside
+    that clamp instead of getting cut off mid-number.
+
+    OWUI shows only the *last* emitted status line by default (the rest
+    only appear once the user expands that message's status history), so
+    the thin context+primary-window line is placed last on purpose. Goal and
+    the per-window reset-time detail lines still show up immediately on
+    expand.
+
+    Both RPCs are read-only and already used elsewhere by the pipe
+    (`sessions.describe`) or are simple/cheap (`usage.status`); any failure
+    here must not affect the actual reply, so every error is swallowed and
+    just omits that line. They're fetched concurrently (not one after the
+    other) so this adds at most one round trip's worth of latency, not two,
+    to the moment the status line settles after the reply text is done.
+    """
+    describe_task = asyncio.ensure_future(
+        conn.send_request("sessions.describe", dict(key=session_key), timeout=timeout)
+    )
+    usage_task = asyncio.ensure_future(conn.send_request("usage.status", {}, timeout=timeout))
+
+    context_bit = None
+    goal_line = None
+    provider = None
+    try:
+        desc = await describe_task
+        session_row = (desc or {}).get("session") or {}
+        provider = session_row.get("modelProvider")
+        context_tokens = session_row.get("contextTokens")
+        total_tokens = session_row.get("totalTokens")
+        if context_tokens and total_tokens is not None:
+            pct = round(total_tokens / context_tokens * 100, 1)
+            context_bit = f"🧠 {_fmt_tokens(total_tokens)}/{_fmt_tokens(context_tokens)} ({pct:g}%)"
+        goal = session_row.get("goal")
+        if goal:
+            goal_line = _format_goal_line(goal) or None
+    except Exception:
+        pass
+
+    primary_bit = None
+    reset_lines = []
+    try:
+        usage = await usage_task
+        if provider:
+            for p in (usage or {}).get("providers", []):
+                if p.get("provider") != provider:
+                    continue
+                windows = p.get("windows") or []
+                bits = [b for b in (_window_bit(w) for w in windows) if b]
+                if bits:
+                    primary_bit = f"⏱ {bits[0]}"
+                elif p.get("summary"):
+                    primary_bit = f"⏱ {p['summary']}"
+                # A full "(resets in ...)" line per window that actually has
+                # a known reset time — including the same window already
+                # folded into `primary_bit`, since that one stays thin (no
+                # reset time) on purpose.
+                reset_lines = [
+                    line for line in (_window_reset_line(w) for w in windows) if line
+                ]
+                break
+    except Exception:
+        pass
+
+    context_and_primary = " · ".join(bit for bit in (context_bit, primary_bit) if bit) or None
+
+    return [line for line in (goal_line, *reset_lines, context_and_primary) if line]
 
 
 async def _emit_message_snapshot(__event_emitter__, content):
@@ -1796,6 +1991,8 @@ async def _deliver_proactive_owui_message(
         pipe_log("  proactive delivery: no assistant text in preview, skipping")
         return
 
+    text = f"*↳ Proactive message*\n\n{text}"
+
     try:
         from open_webui.models.chats import Chats
     except Exception as ex:
@@ -2362,7 +2559,23 @@ class Pipe:
                    __task__=None, __task_body__=None):
         """Main pipe entry point — called by Open WebUI for each user message.
 
-        Uses a shared persistent WS connection; no per-message reconnect,
+        Thin wrapper around _pipe_impl so dev-only deploy-coordination hooks
+        (ELI-24) can bracket every turn without re-indenting the whole body.
+        """
+        try:
+            async for item in self._pipe_impl(
+                body, __event_emitter__, __event_call__=__event_call__,
+                __user__=__user__, __metadata__=__metadata__, __request__=__request__,
+                __task__=__task__, __task_body__=__task_body__,
+            ):
+                yield item
+        finally:
+            pass
+
+    async def _pipe_impl(self, body, __event_emitter__, __event_call__=None,
+                   __user__=None, __metadata__=None, __request__=None,
+                   __task__=None, __task_body__=None):
+        """Uses a shared persistent WS connection; no per-message reconnect,
         no global lock, and no 60s timeout.
         """
         if self.valves.ENABLE_FILE_SERVER:
@@ -2561,14 +2774,17 @@ class Pipe:
                 pipe_log(f"  preview recovery failed: {ex}")
                 return None
 
-        async def session_still_active() -> bool:
+        async def gateway_run_status() -> str | None:
             """Check the Gateway's own run status (P26).
 
             A quiet queue before the first event ever arrives does not mean
             the message was lost — it may simply be queued behind another
             active run in the same session (e.g. a long-running agent task).
             Only `sessions.describe` is authoritative; ask it before treating
-            60s of silence as a dead run.
+            60s of silence as a dead run. Returns the raw status string
+            (e.g. "active", "done", "failed", "cancelled") so callers can
+            tell a user-initiated stop apart from a genuinely dead run;
+            None means the probe itself failed or the session is unknown.
             """
             try:
                 desc = await conn.send_request(
@@ -2578,11 +2794,11 @@ class Pipe:
                 )
             except Exception as ex:
                 pipe_log(f"  initial describe probe failed: {ex}")
-                return False
+                return None
             session_row = desc.get("session")
             if session_row is None:
-                return False
-            return session_row.get("status") not in ("done", "failed", "cancelled")
+                return None
+            return session_row.get("status")
 
         def record_visible_chunk(chunk: str):
             nonlocal visible_message_text
@@ -2681,7 +2897,11 @@ class Pipe:
                             pipe_log(f"TIMEOUT — no events on queue for {timeout_desc}")
                             if not first_event_arrived:
                                 elapsed = time.time() - wait_started_time
-                                if elapsed < no_text_deadman_s and await session_still_active():
+                                status = await gateway_run_status()
+                                still_active = status is not None and status not in (
+                                    "done", "failed", "cancelled",
+                                )
+                                if elapsed < no_text_deadman_s and still_active:
                                     pipe_log(
                                         "  no run events yet but session still active "
                                         "(queued behind other work); continuing to wait"
@@ -2693,7 +2913,17 @@ class Pipe:
                                         done=False,
                                     )
                                     continue
-                                yield "**Timeout:** Gateway accepted the message but emitted no run events."
+                                # `status` distinguishes a user-initiated stop (Gateway
+                                # reports "cancelled") from a run that genuinely never
+                                # produced output — the two used to show the same
+                                # generic "Timeout" wording, which was misleading when
+                                # the run was simply aborted, not stuck (2026-07-11).
+                                if status == "cancelled":
+                                    yield "**Stopped.**"
+                                elif status == "failed":
+                                    yield "**Failed:** the run did not complete."
+                                else:
+                                    yield "**Timeout:** Gateway accepted the message but emitted no run events."
                                 text_yielded = True
                                 break
 
@@ -3162,7 +3392,23 @@ class Pipe:
                         await maybe_emit_snapshot(force=True)
 
         finally:
-            await _emit_status(__event_emitter__, "", done=True)
+            status_lines = []
+            if not aborted and text_yielded:
+                status_lines = await _build_usage_status_lines(conn, session_key)
+            if status_lines:
+                # One `status` event per fact (context / rate-limit / goal) so
+                # each row stays inside OWUI's per-line clamp instead of one
+                # long combined line getting cut off. All of them already
+                # reflect final data by the time we get here (both RPCs in
+                # `_build_usage_status_lines` already completed) — none of
+                # this is genuinely still "in progress", so every line is
+                # `done=True`. Marking earlier ones `done=False` made them
+                # shimmer for an instant before getting replaced by the last
+                # line, a visible flash for no reason.
+                for line in status_lines:
+                    await _emit_status(__event_emitter__, line, done=True)
+            else:
+                await _emit_status(__event_emitter__, "", done=True)
             conn.unregister_consumer(session_key, our_run_id, queue=queue)
             self._current_session_key = None
             self._current_run_id = None

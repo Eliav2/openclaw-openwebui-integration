@@ -11,9 +11,15 @@ pydantic) are provided by the OWUI runtime and stay as normal imports — so the
 "bundle" is a deterministic ordered concatenation.
 
 Usage:
-  python3 build.py            # build -> openclaw_pipe.py
+  python3 build.py            # build -> openclaw_pipe.py (DEV-ONLY blocks stripped;
+                              # this is the artifact real users install)
   python3 build.py --check    # build in memory, diff vs committed openclaw_pipe.py,
                               # exit 1 if they differ (drift guard for CI/deploy)
+  python3 build.py --dev        # build -> openclaw_pipe.dev.py, DEV-ONLY blocks kept.
+                              # Internal-only (ELI-24 cross-agent deploy coordination);
+                              # gitignored, never distributed, rebuild before every
+                              # dev deploy.
+  python3 build.py --check-dev  # same drift guard, for the dev bundle
 """
 from __future__ import annotations
 import sys
@@ -23,6 +29,7 @@ ROOT = Path(__file__).resolve().parent
 PKG = ROOT / "src" / "openclaw_pipe_pkg"
 FRONTMATTER = ROOT / "src" / "frontmatter.txt"
 OUT = ROOT / "openclaw_pipe.py"
+DEV_OUT = ROOT / "openclaw_pipe.dev.py"
 
 # Fixed dependency order. Module-load statements (constants, asyncio.Lock(),
 # logging.basicConfig) have no cross-module load-time references, so this order
@@ -38,6 +45,9 @@ BANNER = (
 )
 
 FRAGMENT_HEADER_PREFIX = "# ---"  # strip the per-fragment BUILD FRAGMENT banner
+
+DEV_ONLY_START = "# DEV-ONLY-START"
+DEV_ONLY_END = "# DEV-ONLY-END"
 
 
 def _strip_fragment_banner(text: str) -> str:
@@ -55,13 +65,44 @@ def _strip_fragment_banner(text: str) -> str:
     return "".join(out_lines)
 
 
-def build() -> str:
+def _strip_dev_only(text: str) -> str:
+    """Drop every '# DEV-ONLY-START' .. '# DEV-ONLY-END' block.
+
+    Dev/internal-tooling-only code (e.g. cross-agent deploy coordination,
+    ELI-24) lives in src/ so it's testable and reviewable in context, but
+    must never reach the artifact real users install -- hence stripped here
+    rather than gated at runtime.
+    """
+    out_lines = []
+    skipping = False
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped == DEV_ONLY_START:
+            if skipping:
+                raise ValueError(f"nested {DEV_ONLY_START} marker")
+            skipping = True
+            continue
+        if stripped == DEV_ONLY_END:
+            if not skipping:
+                raise ValueError(f"{DEV_ONLY_END} without matching {DEV_ONLY_START}")
+            skipping = False
+            continue
+        if not skipping:
+            out_lines.append(line)
+    if skipping:
+        raise ValueError(f"unterminated {DEV_ONLY_START} marker")
+    return "".join(out_lines)
+
+
+def build(strip_dev_only: bool = True) -> str:
     frontmatter = FRONTMATTER.read_text()
     if not frontmatter.endswith("\n"):
         frontmatter += "\n"
     parts = [frontmatter, "\n", BANNER]
     for mod in MODULE_ORDER:
         body = _strip_fragment_banner((PKG / f"{mod}.py").read_text())
+        if strip_dev_only:
+            body = _strip_dev_only(body)
         parts.append("\n\n")
         parts.append(f"# --- {mod} " + "-" * (70 - len(mod)) + "\n")
         parts.append(body.rstrip("\n") + "\n")
@@ -71,18 +112,26 @@ def build() -> str:
     return result
 
 
+def _check(out_path: Path, built: str, label: str) -> None:
+    current = out_path.read_text() if out_path.exists() else ""
+    if built != current:
+        print(f"DRIFT: {out_path.name} is out of date vs src/. Run: python3 build.py {label}",
+              file=sys.stderr)
+        sys.exit(1)
+    print(f"{out_path.name} is in sync with src/ (no drift)")
+
+
 def main():
-    built = build()
-    if "--check" in sys.argv:
-        current = OUT.read_text() if OUT.exists() else ""
-        if built != current:
-            print("DRIFT: openclaw_pipe.py is out of date vs src/. Run: python3 build.py",
-                  file=sys.stderr)
-            sys.exit(1)
-        print("openclaw_pipe.py is in sync with src/ (no drift)")
+    dev = "--dev" in sys.argv or "--check-dev" in sys.argv
+    out_path = DEV_OUT if dev else OUT
+    built = build(strip_dev_only=not dev)
+
+    if "--check" in sys.argv or "--check-dev" in sys.argv:
+        _check(out_path, built, "--check-dev" if dev else "--check")
         return
-    OUT.write_text(built)
-    print(f"built {OUT}  ({len(built.splitlines())} lines)")
+
+    out_path.write_text(built)
+    print(f"built {out_path}  ({len(built.splitlines())} lines)")
 
 
 if __name__ == "__main__":

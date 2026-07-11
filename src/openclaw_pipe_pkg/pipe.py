@@ -357,7 +357,30 @@ class Pipe:
                    __task__=None, __task_body__=None):
         """Main pipe entry point — called by Open WebUI for each user message.
 
-        Uses a shared persistent WS connection; no per-message reconnect,
+        Thin wrapper around _pipe_impl so dev-only deploy-coordination hooks
+        (ELI-24) can bracket every turn without re-indenting the whole body.
+        """
+        # DEV-ONLY-START
+        await _devcoord_wait_if_deploy_pending()
+        _devcoord_marker = _devcoord_turn_begin()
+        # DEV-ONLY-END
+        try:
+            async for item in self._pipe_impl(
+                body, __event_emitter__, __event_call__=__event_call__,
+                __user__=__user__, __metadata__=__metadata__, __request__=__request__,
+                __task__=__task__, __task_body__=__task_body__,
+            ):
+                yield item
+        finally:
+            # DEV-ONLY-START
+            _devcoord_turn_end(_devcoord_marker)
+            # DEV-ONLY-END
+            pass
+
+    async def _pipe_impl(self, body, __event_emitter__, __event_call__=None,
+                   __user__=None, __metadata__=None, __request__=None,
+                   __task__=None, __task_body__=None):
+        """Uses a shared persistent WS connection; no per-message reconnect,
         no global lock, and no 60s timeout.
         """
         if self.valves.ENABLE_FILE_SERVER:
@@ -556,14 +579,17 @@ class Pipe:
                 pipe_log(f"  preview recovery failed: {ex}")
                 return None
 
-        async def session_still_active() -> bool:
+        async def gateway_run_status() -> str | None:
             """Check the Gateway's own run status (P26).
 
             A quiet queue before the first event ever arrives does not mean
             the message was lost — it may simply be queued behind another
             active run in the same session (e.g. a long-running agent task).
             Only `sessions.describe` is authoritative; ask it before treating
-            60s of silence as a dead run.
+            60s of silence as a dead run. Returns the raw status string
+            (e.g. "active", "done", "failed", "cancelled") so callers can
+            tell a user-initiated stop apart from a genuinely dead run;
+            None means the probe itself failed or the session is unknown.
             """
             try:
                 desc = await conn.send_request(
@@ -573,11 +599,11 @@ class Pipe:
                 )
             except Exception as ex:
                 pipe_log(f"  initial describe probe failed: {ex}")
-                return False
+                return None
             session_row = desc.get("session")
             if session_row is None:
-                return False
-            return session_row.get("status") not in ("done", "failed", "cancelled")
+                return None
+            return session_row.get("status")
 
         def record_visible_chunk(chunk: str):
             nonlocal visible_message_text
@@ -676,7 +702,11 @@ class Pipe:
                             pipe_log(f"TIMEOUT — no events on queue for {timeout_desc}")
                             if not first_event_arrived:
                                 elapsed = time.time() - wait_started_time
-                                if elapsed < no_text_deadman_s and await session_still_active():
+                                status = await gateway_run_status()
+                                still_active = status is not None and status not in (
+                                    "done", "failed", "cancelled",
+                                )
+                                if elapsed < no_text_deadman_s and still_active:
                                     pipe_log(
                                         "  no run events yet but session still active "
                                         "(queued behind other work); continuing to wait"
@@ -688,7 +718,17 @@ class Pipe:
                                         done=False,
                                     )
                                     continue
-                                yield "**Timeout:** Gateway accepted the message but emitted no run events."
+                                # `status` distinguishes a user-initiated stop (Gateway
+                                # reports "cancelled") from a run that genuinely never
+                                # produced output — the two used to show the same
+                                # generic "Timeout" wording, which was misleading when
+                                # the run was simply aborted, not stuck (2026-07-11).
+                                if status == "cancelled":
+                                    yield "**Stopped.**"
+                                elif status == "failed":
+                                    yield "**Failed:** the run did not complete."
+                                else:
+                                    yield "**Timeout:** Gateway accepted the message but emitted no run events."
                                 text_yielded = True
                                 break
 

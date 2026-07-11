@@ -2,3 +2,10 @@
 __pycache__/
 .pipe_device_identity.json
 backups/
+
+# Internal-only dev bundle (ELI-24 cross-agent deploy coordination) --
+# rebuild with `python3 build.py --dev` before every dev deploy, never
+# distributed or committed. openclaw_pipe.py (no suffix) is NOT ignored:
+# that one is the real distributed artifact install.py reads directly.
+openclaw_pipe.dev.py
+.deploy.lock
