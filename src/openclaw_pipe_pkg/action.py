@@ -215,11 +215,66 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     });
   }
 
+  // TaskSummary timestamps can arrive as either an ISO string or an epoch-ms
+  // integer (schema allows both) -- normalize once here rather than in every
+  // caller. Elapsed time is computed client-side from raw ms (not a
+  // server-formatted duration) for the same reason resetAtMs already is:
+  // avoids clock-skew between whenever the RPC resolved and whenever the
+  // user actually reads the row.
+  function toMs(v) {
+    if (v == null) return null;
+    if (typeof v === 'number') return v;
+    const parsed = new Date(v).getTime();
+    return isNaN(parsed) ? null : parsed;
+  }
+
+  function elapsedTime(startedAt, endedAt) {
+    const startMs = toMs(startedAt);
+    if (startMs == null) return '';
+    const endMs = toMs(endedAt) || Date.now();
+    const deltaS = Math.max(0, Math.floor((endMs - startMs) / 1000));
+    const days = Math.floor(deltaS / 86400);
+    const hours = Math.floor((deltaS % 86400) / 3600);
+    const minutes = Math.floor((deltaS % 3600) / 60);
+    if (days) return days + 'd' + String(hours).padStart(2, '0') + 'h';
+    if (hours) return hours + 'h' + String(minutes).padStart(2, '0') + 'm';
+    if (minutes) return minutes + 'm';
+    return deltaS + 's';
+  }
+
+  // Same same-origin/synthetic-mode trick as triggerCompact() above, just a
+  // different mode + extra taskId/title/status payload so the drawer
+  // (_DRAWER_OPEN_JS_TEMPLATE) can paint its header instantly from data the
+  // row already had, before Action._run_subagent_detail's own RPCs resolve.
+  function openSubagentDrawer(task) {
+    const token = localStorage.getItem('token');
+    fetch('/api/chat/actions/openclaw_status_action', {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + token,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: IDENTITY.owuiModel,
+        chat_id: IDENTITY.chatId,
+        id: IDENTITY.messageId,
+        session_id: IDENTITY.sessionId,
+        mode: 'subagent-detail',
+        taskId: task.id,
+        taskTitle: task.title,
+        taskStatus: task.status,
+      }),
+    }).catch(function(err) {
+      console.error('[openclaw-status] could not open subagent drawer', err);
+    });
+  }
+
   window.__openclawStatus = {
     identity: IDENTITY, isDark: isDark, barColor: barColor, makeBar: makeBar,
     sectionHeader: sectionHeader, errorEl: errorEl,
     skeletonSection: skeletonSection, touchFooter: touchFooter,
-    triggerCompact: triggerCompact,
+    triggerCompact: triggerCompact, elapsedTime: elapsedTime,
+    openSubagentDrawer: openSubagentDrawer,
   };
 
   const root = document.createElement('div');
@@ -229,8 +284,13 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
 
   const panel = document.createElement('div');
   panel.className = 'bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 '
-    + 'rounded-2xl shadow-2xl border border-gray-100 dark:border-gray-800 '
-    + 'p-5 w-[380px] max-w-[90vw]';
+    + 'rounded-2xl shadow-2xl border border-gray-100 dark:border-gray-800 p-5';
+  // Inline, not a `w-[380px] max-w-[90vw]` utility class: same reasoning as
+  // barColor() below -- an arbitrary-value class OWUI's own Tailwind build
+  // never scanned out of its own source can silently carry zero CSS.
+  // min() keeps this mobile-first: a narrow viewport wins the 88vw side (a
+  // visible margin, not edge-to-edge), a wide one wins the 380px cap.
+  panel.style.width = 'min(380px, 88vw)';
   panel.addEventListener('click', function(e) { e.stopPropagation(); });
 
   const header = document.createElement('div');
@@ -471,7 +531,7 @@ _LIMITS_FILL_JS_TEMPLATE = r"""
     const labelEl = document.createElement('span');
     labelEl.textContent = w.label;
     const pctEl = document.createElement('span');
-    pctEl.textContent = Math.round(100 - w.usedPercent) + '% left';
+    pctEl.textContent = Math.round(w.usedPercent) + '% used';
     top.appendChild(labelEl);
     top.appendChild(pctEl);
     row.appendChild(top);
@@ -501,10 +561,13 @@ _LIMITS_FILL_JS_TEMPLATE = r"""
 })();
 """
 
-# Deliberately hidden entirely (not even a header) when count is 0 --
-# "general tracking, no detail" (Eliav's ask): a permanently-visible
-# "0 running" line for the common idle case would be more clutter than
-# signal. Only appears when there's actually something to report.
+# Deliberately hidden entirely (not even a header) when there are no tasks --
+# "general tracking, no detail" (Eliav's original ask): a permanently-visible
+# empty line for the common idle case would be more clutter than signal. Only
+# appears when there's actually something to report. Each row is clickable --
+# opens the per-subagent drawer (see _DRAWER_OPEN_JS_TEMPLATE) via
+# S.openSubagentDrawer, passing the already-known TaskSummary fields along so
+# the drawer can paint its header instantly, before any RPC resolves.
 _SUBAGENTS_FILL_JS_TEMPLATE = r"""
 (function() {
   const DATA = __OPENCLAW_STATUS_DATA__;
@@ -519,19 +582,410 @@ _SUBAGENTS_FILL_JS_TEMPLATE = r"""
     return;
   }
 
-  if (!DATA.count) {
+  if (!DATA.tasks || !DATA.tasks.length) {
     section.className = '';
     return;
   }
 
   section.className = 'mb-4';
-  section.appendChild(S.sectionHeader('Subagents'));
-  const line = document.createElement('div');
-  line.className = 'text-sm text-gray-700 dark:text-gray-200';
-  line.textContent = '🤖 ' + DATA.count + ' running';
-  section.appendChild(line);
+  section.appendChild(S.sectionHeader('Subagents (' + DATA.tasks.length + ')'));
+
+  const STATUS_COLOR = {
+    queued: '#9ca3af', running: '#3b82f6', completed: '#10b981',
+    failed: '#f43f5e', cancelled: '#f59e0b', timed_out: '#f59e0b',
+  };
+
+  DATA.tasks.forEach(function(t) {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'w-full flex items-start gap-2 text-left py-1.5 px-1.5 -mx-1.5 '
+      + 'rounded-lg hover:bg-gray-50 dark:hover:bg-gray-800/60';
+    row.onclick = function() { S.openSubagentDrawer(t); };
+
+    const dot = document.createElement('span');
+    dot.className = 'mt-1.5 h-1.5 w-1.5 rounded-full shrink-0'
+      + (t.status === 'running' ? ' animate-pulse' : '');
+    dot.style.backgroundColor = STATUS_COLOR[t.status] || '#9ca3af';
+    row.appendChild(dot);
+
+    const body = document.createElement('div');
+    body.className = 'min-w-0 flex-1';
+    const titleLine = document.createElement('div');
+    titleLine.className = 'text-sm text-gray-700 dark:text-gray-200 break-words';
+    titleLine.textContent = t.title || t.id;
+    body.appendChild(titleLine);
+
+    const sub = t.status === 'running' ? t.progressSummary : (t.terminalSummary || t.error);
+    if (sub) {
+      const subLine = document.createElement('div');
+      subLine.className = 'text-xs text-gray-400 dark:text-gray-500 break-words';
+      subLine.textContent = sub;
+      body.appendChild(subLine);
+    }
+    row.appendChild(body);
+
+    const elapsed = document.createElement('span');
+    elapsed.className = 'text-[10px] text-gray-400 dark:text-gray-500 shrink-0 mt-1.5';
+    elapsed.textContent = S.elapsedTime(t.startedAt, t.endedAt);
+    row.appendChild(elapsed);
+
+    section.appendChild(row);
+  });
 
   S.touchFooter(DATA.fetchedAt, DATA.source);
+})();
+"""
+
+
+# Right-side slide-in panel, sibling to _MODAL_OPEN_JS_TEMPLATE -- deliberately
+# does NOT close/replace the parent status modal (different root id,
+# positioned to the side rather than centered) so the full subagent list
+# stays visible and glanceable behind it. Opened by S.openSubagentDrawer()
+# (defined in _MODAL_OPEN_JS_TEMPLATE) via a synthetic mode="subagent-detail"
+# call -- same self-call convention triggerCompact() already uses. All three
+# tab panes are created up front with skeletons; Action._run_subagent_detail
+# fills all three on every poll tick regardless of which tab is visible
+# (cheap: it's just a DOM update), so switching tabs is a pure visibility
+# toggle with no extra fetch involved.
+_DRAWER_OPEN_JS_TEMPLATE = r"""
+(function() {
+  const TASK = __OPENCLAW_TASK__;
+  const existing = document.getElementById('openclaw-drawer-root');
+  if (existing) existing.remove();
+
+  const S = window.__openclawStatus;
+  if (!S) return;
+
+  const root = document.createElement('div');
+  root.id = 'openclaw-drawer-root';
+  root.className = 'fixed inset-0 z-[10000]';
+
+  const backdrop = document.createElement('div');
+  backdrop.className = 'absolute inset-0';
+  backdrop.style.background = 'rgba(0,0,0,0.25)';
+  backdrop.onclick = function() { root.remove(); };
+  root.appendChild(backdrop);
+
+  const panel = document.createElement('div');
+  panel.className = 'absolute right-0 top-0 bottom-0 '
+    + 'bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 '
+    + 'shadow-2xl border-l border-gray-100 dark:border-gray-800 flex flex-col';
+  // Inline, not a `w-[420px] max-w-[92vw]` utility class -- same reasoning
+  // as the status modal's panel above. min() keeps this mobile-first: a
+  // narrow viewport wins the 88vw side (leaves a visible margin so the
+  // subagent list behind it stays glanceable, not edge-to-edge), a wide one
+  // wins the 420px cap.
+  panel.style.width = 'min(420px, 88vw)';
+  panel.addEventListener('click', function(e) { e.stopPropagation(); });
+  root.appendChild(panel);
+
+  const header = document.createElement('div');
+  header.className = 'flex items-start justify-between gap-2 p-4 border-b '
+    + 'border-gray-100 dark:border-gray-800';
+  const headerText = document.createElement('div');
+  headerText.className = 'min-w-0';
+  const titleEl = document.createElement('div');
+  titleEl.className = 'text-sm font-semibold break-words';
+  titleEl.textContent = TASK.title || TASK.id;
+  headerText.appendChild(titleEl);
+  const statusEl = document.createElement('div');
+  statusEl.id = 'openclaw-drawer-status';
+  statusEl.className = 'text-xs text-gray-400 dark:text-gray-500 mt-0.5';
+  statusEl.textContent = TASK.status || '';
+  headerText.appendChild(statusEl);
+  header.appendChild(headerText);
+  const closeBtn = document.createElement('button');
+  closeBtn.type = 'button';
+  closeBtn.textContent = '×';
+  closeBtn.className = 'text-xl leading-none text-gray-400 hover:text-gray-700 '
+    + 'dark:hover:text-gray-200 px-1 shrink-0';
+  closeBtn.onclick = function() { root.remove(); };
+  header.appendChild(closeBtn);
+  panel.appendChild(header);
+
+  const TABS = ['Overview', 'Transcript', 'Tools'];
+  const tabBar = document.createElement('div');
+  tabBar.className = 'flex gap-1 px-3 pt-2 border-b border-gray-100 dark:border-gray-800';
+  const panes = {};
+  function tabClass(active) {
+    return 'text-xs font-medium px-2.5 py-1.5 rounded-t-lg border-b-2 '
+      + (active ? 'border-blue-500 text-blue-600 dark:text-blue-400'
+                : 'border-transparent text-gray-400 dark:text-gray-500 '
+                  + 'hover:text-gray-600 dark:hover:text-gray-300');
+  }
+  TABS.forEach(function(name, i) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = name;
+    btn.dataset.tab = name;
+    btn.className = tabClass(i === 0);
+    btn.onclick = function() {
+      TABS.forEach(function(n) {
+        const b = tabBar.querySelector('[data-tab="' + n + '"]');
+        const active = n === name;
+        b.className = tabClass(active);
+        panes[n].style.display = active ? 'block' : 'none';
+      });
+    };
+    tabBar.appendChild(btn);
+  });
+  panel.appendChild(tabBar);
+
+  const content = document.createElement('div');
+  content.className = 'flex-1 overflow-y-auto p-4';
+  TABS.forEach(function(name, i) {
+    const pane = document.createElement('div');
+    pane.id = 'openclaw-drawer-pane-' + name.toLowerCase();
+    pane.style.display = i === 0 ? 'block' : 'none';
+    pane.appendChild(S.skeletonSection('openclaw-drawer-section-' + name.toLowerCase()));
+    panes[name] = pane;
+    content.appendChild(pane);
+  });
+  panel.appendChild(content);
+
+  const footer = document.createElement('div');
+  footer.id = 'openclaw-drawer-footer';
+  footer.className = 'text-[11px] text-gray-400 dark:text-gray-600 px-4 py-2 '
+    + 'border-t border-gray-100 dark:border-gray-800';
+  footer.textContent = ' ';
+  panel.appendChild(footer);
+
+  const onKey = function(e) {
+    if (e.key === 'Escape') {
+      root.remove();
+      document.removeEventListener('keydown', onKey);
+    }
+  };
+  document.addEventListener('keydown', onKey);
+
+  document.body.appendChild(root);
+})();
+"""
+
+# Whole-drawer error (task not found, connect failure) -- replaces the
+# content of all three panes at once, same reasoning as
+# _SECTIONS_ERROR_JS_TEMPLATE for the outer modal.
+_DRAWER_ERROR_JS_TEMPLATE = r"""
+(function() {
+  const MESSAGE = __OPENCLAW_ERROR_MESSAGE__;
+  const S = window.__openclawStatus;
+  ['overview', 'transcript', 'tools'].forEach(function(name) {
+    const pane = document.getElementById('openclaw-drawer-pane-' + name);
+    if (!pane) return;
+    pane.innerHTML = '';
+    pane.appendChild(S ? S.errorEl(MESSAGE) : document.createTextNode(MESSAGE));
+  });
+})();
+"""
+
+_DRAWER_OVERVIEW_FILL_JS_TEMPLATE = r"""
+(function() {
+  const DATA = __OPENCLAW_STATUS_DATA__;
+  const section = document.getElementById('openclaw-drawer-section-overview');
+  const S = window.__openclawStatus;
+  if (!section || !S) return;
+
+  const statusEl = document.getElementById('openclaw-drawer-status');
+  if (statusEl && DATA.task) {
+    statusEl.textContent = DATA.task.status
+      + (DATA.task.terminalSummary ? ' · ' + DATA.task.terminalSummary : '')
+      + (DATA.task.error ? ' · ' + DATA.task.error : '');
+  }
+
+  section.innerHTML = '';
+  if (DATA.error) {
+    section.appendChild(S.errorEl(DATA.error));
+    return;
+  }
+  if (!DATA.task) {
+    const empty = document.createElement('div');
+    empty.className = 'text-gray-400 dark:text-gray-500 text-xs';
+    empty.textContent = 'No task data.';
+    section.appendChild(empty);
+    return;
+  }
+
+  const meta = document.createElement('div');
+  meta.className = 'text-xs text-gray-500 dark:text-gray-400 mb-3';
+  meta.textContent = 'Started ' + (S.elapsedTime(DATA.task.startedAt, null) || '?') + ' ago'
+    + (DATA.task.endedAt ? ' · ran ' + S.elapsedTime(DATA.task.startedAt, DATA.task.endedAt) : '');
+  section.appendChild(meta);
+
+  if (!DATA.childSessionKey) {
+    const notStarted = document.createElement('div');
+    notStarted.className = 'text-gray-400 dark:text-gray-500 text-xs';
+    notStarted.textContent = 'Not started yet.';
+    section.appendChild(notStarted);
+    return;
+  }
+
+  const sub = document.createElement('div');
+  sub.className = 'text-xs text-gray-500 dark:text-gray-400 mb-3';
+  sub.textContent = (DATA.provider || '?') + (DATA.model ? (' · ' + DATA.model) : '');
+  section.appendChild(sub);
+
+  if (DATA.context) {
+    section.appendChild(S.sectionHeader('Context'));
+    section.appendChild(S.makeBar(DATA.context.pct));
+    const label = document.createElement('div');
+    label.className = 'text-xs text-gray-500 dark:text-gray-400 mt-1.5 mb-3';
+    label.textContent = DATA.context.usedTokens + ' / ' + DATA.context.totalTokens
+      + ' tokens · ' + DATA.context.pct + '%';
+    section.appendChild(label);
+  }
+
+  if (DATA.goal) {
+    section.appendChild(S.sectionHeader('Goal'));
+    const line = document.createElement('div');
+    line.className = 'text-xs text-gray-700 dark:text-gray-200';
+    line.textContent = DATA.goal.line;
+    section.appendChild(line);
+  }
+
+  const df = document.getElementById('openclaw-drawer-footer');
+  if (df) df.textContent = 'Updated ' + DATA.fetchedAt + ' · via ' + DATA.source;
+})();
+"""
+
+# Message shape assumed here ({role, content: [{type: "text"|"toolcall"|
+# "tool_result"|"thinking", ...}]}) confirmed live against a real session via
+# sessions_history (chat.history is a display-normalized projection of the
+# same underlying transcript, not a separate schema, so expected to match --
+# see _extract_transcript_and_tools). Only renders rows that actually have
+# text after stripping tool-call/tool-result/thinking parts, so the
+# scrollback doesn't show empty gaps for pure tool-call turns (those live in
+# the Tools tab instead).
+_DRAWER_TRANSCRIPT_FILL_JS_TEMPLATE = r"""
+(function() {
+  const DATA = __OPENCLAW_STATUS_DATA__;
+  const section = document.getElementById('openclaw-drawer-section-transcript');
+  const pane = document.getElementById('openclaw-drawer-pane-transcript');
+  const S = window.__openclawStatus;
+  if (!section || !pane || !S) return;
+
+  if (DATA.error) {
+    section.innerHTML = '';
+    section.appendChild(S.errorEl(DATA.error));
+    return;
+  }
+
+  if (!DATA.childSessionKey) {
+    section.innerHTML = '';
+    const notStarted = document.createElement('div');
+    notStarted.className = 'text-gray-400 dark:text-gray-500 text-xs';
+    notStarted.textContent = 'Not started yet.';
+    section.appendChild(notStarted);
+    return;
+  }
+
+  // Preserve "was already scrolled to bottom" before rebuilding, so a live
+  // poll tick doesn't yank the view away from wherever the user scrolled to
+  // read older messages.
+  const wasAtBottom = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 40;
+
+  section.innerHTML = '';
+  const ROLE_STYLE = {
+    user: 'text-gray-900 dark:text-gray-100',
+    assistant: 'text-gray-700 dark:text-gray-300',
+  };
+
+  const rows = DATA.messages || [];
+  if (!rows.length) {
+    const empty = document.createElement('div');
+    empty.className = 'text-gray-400 dark:text-gray-500 text-xs';
+    empty.textContent = 'No transcript yet.';
+    section.appendChild(empty);
+    return;
+  }
+
+  rows.forEach(function(m) {
+    if (!m.text) return;
+    const row = document.createElement('div');
+    row.className = 'text-xs mb-2.5 ' + (ROLE_STYLE[m.role] || ROLE_STYLE.assistant);
+    const roleLabel = document.createElement('div');
+    roleLabel.className = 'text-[10px] uppercase tracking-wide text-gray-400 dark:text-gray-500 mb-0.5';
+    roleLabel.textContent = m.role;
+    row.appendChild(roleLabel);
+    const text = document.createElement('div');
+    text.className = 'whitespace-pre-wrap break-words';
+    text.textContent = m.text;
+    row.appendChild(text);
+    section.appendChild(row);
+  });
+
+  if (wasAtBottom) pane.scrollTop = pane.scrollHeight;
+})();
+"""
+
+# Uses real <details>/<summary> (natively collapsible with zero JS) rather
+# than OWUI's own "<details type=\"tool_calls\">" markup convention: that
+# convention only renders as a card because OWUI's own markdown-message
+# component parses it out of a message's markdown source -- it does nothing
+# special for DOM nodes built directly via execute(), which is how this
+# whole drawer (like the rest of the status dialog) is delivered. A plain
+# native <details> gets the same "collapsible card" behavior for free
+# without depending on that unrelated rendering path.
+_DRAWER_TOOLS_FILL_JS_TEMPLATE = r"""
+(function() {
+  const DATA = __OPENCLAW_STATUS_DATA__;
+  const section = document.getElementById('openclaw-drawer-section-tools');
+  const S = window.__openclawStatus;
+  if (!section || !S) return;
+
+  if (DATA.error) {
+    section.innerHTML = '';
+    section.appendChild(S.errorEl(DATA.error));
+    return;
+  }
+
+  if (!DATA.childSessionKey) {
+    section.innerHTML = '';
+    const notStarted = document.createElement('div');
+    notStarted.className = 'text-gray-400 dark:text-gray-500 text-xs';
+    notStarted.textContent = 'Not started yet.';
+    section.appendChild(notStarted);
+    return;
+  }
+
+  section.innerHTML = '';
+  const calls = DATA.toolCalls || [];
+  if (!calls.length) {
+    const empty = document.createElement('div');
+    empty.className = 'text-gray-400 dark:text-gray-500 text-xs';
+    empty.textContent = 'No tool calls yet.';
+    section.appendChild(empty);
+    return;
+  }
+
+  calls.forEach(function(c) {
+    const details = document.createElement('details');
+    details.className = 'mb-2 rounded-lg border border-gray-100 dark:border-gray-800 px-2.5 py-1.5';
+    const summary = document.createElement('summary');
+    summary.className = 'text-xs font-medium cursor-pointer text-gray-700 dark:text-gray-200';
+    summary.textContent = '🔧 ' + c.name;
+    details.appendChild(summary);
+
+    const argsEl = document.createElement('pre');
+    argsEl.className = 'text-[11px] mt-1.5 whitespace-pre-wrap break-words '
+      + 'text-gray-500 dark:text-gray-400';
+    argsEl.textContent = c.arguments;
+    details.appendChild(argsEl);
+
+    if (c.result) {
+      const resultLabel = document.createElement('div');
+      resultLabel.className = 'text-[10px] uppercase tracking-wide text-gray-400 '
+        + 'dark:text-gray-500 mt-1.5';
+      resultLabel.textContent = 'Result';
+      details.appendChild(resultLabel);
+      const resultEl = document.createElement('pre');
+      resultEl.className = 'text-[11px] whitespace-pre-wrap break-words '
+        + 'text-gray-500 dark:text-gray-400';
+      resultEl.textContent = c.result;
+      details.appendChild(resultEl);
+    }
+
+    section.appendChild(details);
+  });
 })();
 """
 
@@ -572,6 +1026,90 @@ def _render_subagents_fill_js(data: dict) -> str:
     return _SUBAGENTS_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
 
 
+def _render_drawer_open_js(task: dict) -> str:
+    return _DRAWER_OPEN_JS_TEMPLATE.replace("__OPENCLAW_TASK__", _json_for_js(task))
+
+
+def _render_drawer_error_js(message: str) -> str:
+    return _DRAWER_ERROR_JS_TEMPLATE.replace("__OPENCLAW_ERROR_MESSAGE__", _json_for_js(message))
+
+
+def _render_drawer_overview_fill_js(data: dict) -> str:
+    return _DRAWER_OVERVIEW_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
+
+
+def _render_drawer_transcript_fill_js(data: dict) -> str:
+    return _DRAWER_TRANSCRIPT_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
+
+
+def _render_drawer_tools_fill_js(data: dict) -> str:
+    return _DRAWER_TOOLS_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
+
+
+# Bounds for Action._run_subagent_detail's hold-open poll loop -- same
+# "hold the request, sleep, poll, keep emitting" shape _run_compact already
+# proves works (there, bounded to 180s). A subagent can legitimately run much
+# longer than a compact call, so this gets its own, longer ceiling; it exists
+# purely so a forgotten-open drawer (or a subagent stuck non-terminal) can't
+# pin the coroutine/connection open forever, not because 15 minutes is a
+# meaningful product limit.
+_SUBAGENT_POLL_MAX_S = 900
+_SUBAGENT_POLL_INTERVAL_S = 2.5
+
+
+def _extract_transcript_and_tools(messages: list) -> tuple[list, list]:
+    """Splits chat.history's message rows into plain-text transcript rows and
+    tool-call cards for the drawer's Transcript/Tools tabs.
+
+    Assumes the same {role, content: [...]} shape confirmed live via
+    sessions_history (content items typed "text" / "toolcall" /
+    "tool_result" / "thinking") -- chat.history is a display-normalized
+    projection of the same underlying transcript store, not a separate
+    schema, so this is expected to match; a plain string `content` (some
+    transports may still use that) is treated as a single text row so this
+    degrades instead of silently dropping messages if the shape differs.
+    """
+    text_rows: list = []
+    tool_calls: list = []
+    pending_by_id: dict = {}
+    for m in messages or []:
+        role = m.get("role")
+        content = m.get("content")
+        if isinstance(content, str):
+            if content.strip():
+                text_rows.append({"role": role, "text": content})
+            continue
+        if not isinstance(content, list):
+            continue
+        text_parts = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type == "text" and item.get("text"):
+                text_parts.append(item["text"])
+            elif item_type == "toolcall":
+                call = {
+                    "id": item.get("id"),
+                    "name": item.get("name") or "tool",
+                    "arguments": (
+                        json.dumps(item.get("arguments"), indent=2)
+                        if item.get("arguments") is not None else ""
+                    ),
+                    "result": None,
+                }
+                pending_by_id[call["id"]] = call
+                tool_calls.append(call)
+            elif item_type == "tool_result":
+                call = pending_by_id.get(item.get("tool_use_id"))
+                if call is not None:
+                    result = item.get("content")
+                    call["result"] = result if isinstance(result, str) else json.dumps(result)
+        if text_parts:
+            text_rows.append({"role": role, "text": "\n".join(text_parts)})
+    return text_rows, tool_calls
+
+
 class Action:
     class Valves(BaseModel):
         GATEWAY_URL: str = Field(
@@ -608,13 +1146,33 @@ class Action:
     async def action(self, body: dict, __user__=None, __event_emitter__=None):
         """Dispatches on body["mode"]: the default ("status", or absent --
         this is what OWUI sends for the actual message-toolbar click) opens
-        the dialog and shows live usage; "compact" is never sent by OWUI
-        itself -- it's a synthetic marker the dialog's own in-page Compact
-        button fetches back with (see triggerCompact() in
-        _MODAL_OPEN_JS_TEMPLATE), reusing this same endpoint rather than
-        registering a second Action."""
-        if body.get("mode") == "compact":
+        the dialog and shows live usage; "compact" and "subagent-detail" are
+        never sent by OWUI itself -- both are synthetic markers the dialog's
+        own in-page buttons fetch back with (see triggerCompact() and
+        openSubagentDrawer() in _MODAL_OPEN_JS_TEMPLATE), reusing this same
+        endpoint rather than registering a second Action.
+
+        A real toolbar click on a proactively-delivered sub-agent-finished
+        message is also mode-less (OWUI itself never sends a "mode"), but
+        carries a hidden `<!-- openclaw:taskId=... -->` marker in
+        `body["content"]` (see `_deliver_subagent_proactive_owui_message` in
+        gateway.py) -- there's deliberately no separate Action/button for
+        this (Eliav's call, 2026-07-13: a second OWUI Function + flipping
+        the existing one off "global" was more infra/config-risk than the
+        payoff of a visually distinct icon). Detected here and redirected
+        straight into the same subagent-detail drawer instead of the
+        general status dialog, keyed off content rather than mode."""
+        mode = body.get("mode")
+        if mode == "compact":
             return await self._run_compact(body, __user__, __event_emitter__)
+        if mode == "subagent-detail":
+            return await self._run_subagent_detail(body, __user__, __event_emitter__)
+        if mode is None:
+            marker = _SUBAGENT_TASK_ID_MARKER_RE.search(body.get("content") or "")
+            if marker:
+                return await self._run_subagent_detail(
+                    {**body, "taskId": marker.group(1)}, __user__, __event_emitter__,
+                )
         return await self._run_status(body, __user__, __event_emitter__)
 
     async def _run_status(self, body: dict, __user__, __event_emitter__, *, show_loading=True):
@@ -783,7 +1341,14 @@ class Action:
         async def fill_subagents():
             """No dependency on sessions.describe/usage.status at all --
             session_key is already known synchronously, so this is the
-            most genuinely independent of the three sections."""
+            most genuinely independent of the three sections.
+
+            Passes the raw TaskSummary fields through (not just a count) so
+            the fill template can render one clickable row per subagent --
+            each row's own click handler carries these same fields into the
+            detail drawer's opening request (see S.openSubagentDrawer /
+            Action._run_subagent_detail), so the drawer can paint its header
+            instantly before its own RPCs resolve."""
             try:
                 tasks_resp = await tasks_task
             except Exception as ex:
@@ -792,11 +1357,22 @@ class Action:
                     "code": _render_subagents_fill_js({"error": f"Could not fetch subagents: {ex}"})
                 }})
                 return
-            count = sum(
-                1 for t in (tasks_resp or {}).get("tasks", []) if t.get("kind") == "subagent"
-            )
+            subagent_tasks = [
+                {
+                    "id": t.get("id"),
+                    "title": t.get("title"),
+                    "status": t.get("status"),
+                    "progressSummary": t.get("progressSummary"),
+                    "terminalSummary": t.get("terminalSummary"),
+                    "error": t.get("error"),
+                    "childSessionKey": t.get("childSessionKey"),
+                    "startedAt": t.get("startedAt"),
+                    "endedAt": t.get("endedAt"),
+                }
+                for t in (tasks_resp or {}).get("tasks", []) if t.get("kind") == "subagent"
+            ]
             await __event_emitter__({"type": "execute", "data": {"code": _render_subagents_fill_js({
-                "count": count, "source": source, "fetchedAt": time.strftime("%H:%M:%S"), "error": None,
+                "tasks": subagent_tasks, "source": source, "fetchedAt": time.strftime("%H:%M:%S"), "error": None,
             })}})
 
         context_ready = asyncio.ensure_future(fill_context())
@@ -928,3 +1504,121 @@ class Action:
 
         pipe_log("[status-action] compact done, refreshing status")
         return await self._run_status(body, __user__, __event_emitter__, show_loading=False)
+
+    async def _run_subagent_detail(self, body: dict, __user__, __event_emitter__):
+        """Opens the per-subagent drawer and holds this same request open for
+        the life of the subagent's run, polling and pushing fresh execute
+        fills roughly every _SUBAGENT_POLL_INTERVAL_S seconds -- the same
+        "hold the request open, sleep-poll, keep emitting" shape
+        _run_compact already uses and has proven works (there, bounded to
+        180s). Bounded here to _SUBAGENT_POLL_MAX_S so a forgotten-open
+        drawer, or a subagent that never reaches a terminal status, can't
+        pin this coroutine/connection open forever.
+
+        Deliberately has no "close" round-trip to cancel the loop early: if
+        the user closes the drawer (or reopens it for a different task,
+        which removes and recreates '#openclaw-drawer-root'), every fill
+        template's own `if (!section) return;` guard makes further
+        execute() pushes targeting the now-missing ids silent no-ops. Same
+        trade-off _run_compact already accepts (no cancel path there either)
+        -- wasted polling until the next terminal status or the deadline,
+        never a visible glitch.
+        """
+        task_id = body.get("taskId")
+        if not task_id:
+            await __event_emitter__({"type": "execute", "data": {
+                "code": _render_drawer_error_js("Missing taskId")
+            }})
+            return {"status": "error", "detail": "missing taskId"}
+
+        await __event_emitter__({"type": "execute", "data": {"code": _render_drawer_open_js({
+            "id": task_id, "title": body.get("taskTitle"), "status": body.get("taskStatus"),
+        })}})
+
+        try:
+            conn, source = await _get_action_connection(lambda: self.valves)
+        except Exception as ex:
+            pipe_log(f"[status-action] subagent-detail connect failed: {ex}")
+            await __event_emitter__({"type": "execute", "data": {
+                "code": _render_drawer_error_js(f"Could not connect: {ex}")
+            }})
+            return {"status": "error", "detail": str(ex)}
+
+        deadline = time.time() + _SUBAGENT_POLL_MAX_S
+        while True:
+            try:
+                task_resp = await conn.send_request("tasks.get", dict(taskId=task_id), timeout=8)
+                task = (task_resp or {}).get("task") or {}
+            except Exception as ex:
+                pipe_log(f"[status-action] subagent tasks.get failed: {ex}")
+                await __event_emitter__({"type": "execute", "data": {
+                    "code": _render_drawer_error_js(f"Could not fetch task: {ex}")
+                }})
+                return {"status": "error", "detail": str(ex)}
+
+            if not task:
+                await __event_emitter__({"type": "execute", "data": {
+                    "code": _render_drawer_error_js("Task not found.")
+                }})
+                return {"status": "error", "detail": "task not found"}
+
+            child_key = task.get("childSessionKey")
+            provider = model = None
+            context_data = goal_data = None
+            text_rows: list = []
+            tool_calls: list = []
+
+            if child_key:
+                try:
+                    desc_resp, history_resp = await asyncio.gather(
+                        conn.send_request("sessions.describe", dict(key=child_key), timeout=8),
+                        conn.send_request(
+                            "chat.history", dict(sessionKey=child_key, limit=50, maxChars=4000), timeout=8,
+                        ),
+                    )
+                except Exception as ex:
+                    pipe_log(f"[status-action] subagent detail fetch failed: {ex}")
+                    desc_resp, history_resp = None, None
+
+                session_row = (desc_resp or {}).get("session") or {}
+                provider = session_row.get("modelProvider")
+                model = session_row.get("model")
+                context_tokens = session_row.get("contextTokens")
+                total_tokens = session_row.get("totalTokens")
+                if context_tokens and total_tokens is not None:
+                    context_data = {
+                        "usedTokens": _fmt_tokens(total_tokens),
+                        "totalTokens": _fmt_tokens(context_tokens),
+                        "pct": round(total_tokens / context_tokens * 100, 1),
+                    }
+                goal = session_row.get("goal")
+                if goal:
+                    goal_line = _format_goal_line(goal)
+                    if goal_line:
+                        goal_data = {"line": goal_line}
+
+                text_rows, tool_calls = _extract_transcript_and_tools(
+                    (history_resp or {}).get("messages") or []
+                )
+
+            fetched_at = time.strftime("%H:%M:%S")
+            await __event_emitter__({"type": "execute", "data": {"code": _render_drawer_overview_fill_js({
+                "task": task, "childSessionKey": child_key, "provider": provider, "model": model,
+                "context": context_data, "goal": goal_data, "source": source,
+                "fetchedAt": fetched_at, "error": None,
+            })}})
+            await __event_emitter__({"type": "execute", "data": {"code": _render_drawer_transcript_fill_js({
+                "childSessionKey": child_key, "messages": text_rows, "error": None,
+            })}})
+            await __event_emitter__({"type": "execute", "data": {"code": _render_drawer_tools_fill_js({
+                "childSessionKey": child_key, "toolCalls": tool_calls, "error": None,
+            })}})
+
+            if task.get("status") not in ("queued", "running"):
+                break
+            if time.time() >= deadline:
+                break
+            await asyncio.sleep(_SUBAGENT_POLL_INTERVAL_S)
+
+        pipe_log(f"[status-action] subagent-detail loop ended taskId={task_id}")
+        return {"status": "ok"}

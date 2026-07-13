@@ -68,9 +68,14 @@ if "pydantic" not in sys.modules:
 
 from openclaw_status_action import (  # noqa: E402
     Action,
+    _extract_transcript_and_tools,
     _get_action_connection,
     _owui_session_key,
     _render_context_fill_js,
+    _render_drawer_open_js,
+    _render_drawer_overview_fill_js,
+    _render_drawer_tools_fill_js,
+    _render_drawer_transcript_fill_js,
     _render_limits_fill_js,
     _render_modal_open_js,
     _render_sections_error_js,
@@ -201,24 +206,30 @@ class RenderJsTests(unittest.TestCase):
         self.assertIn("mode: 'compact'", js)
         self.assertIn("localStorage.getItem('token')", js)
 
-    def test_subagents_hidden_entirely_when_count_zero(self):
+    def test_subagents_hidden_entirely_when_tasks_empty(self):
         """'General tracking, no detail' (Eliav's ask): a permanently
-        visible '0 running' line for the common idle case would be more
+        visible empty section for the common idle case would be more
         clutter than signal -- gated in source, not just data-dependent
         text, so it truly renders nothing (not an empty header)."""
-        js = _render_subagents_fill_js({"count": 0, "source": "pipe", "fetchedAt": "12:00:00", "error": None})
-        gate_idx = js.index("if (!DATA.count)")
-        header_idx = js.index("sectionHeader('Subagents')")
+        js = _render_subagents_fill_js({"tasks": [], "source": "pipe", "fetchedAt": "12:00:00", "error": None})
+        gate_idx = js.index("if (!DATA.tasks || !DATA.tasks.length)")
+        header_idx = js.index("sectionHeader('Subagents")
         self.assertLess(gate_idx, header_idx)
 
-    def test_subagents_shows_count_when_nonzero(self):
-        # _render_subagents_fill_js returns JS *source*: DATA.count is a
-        # runtime value substituted into a string concatenation, not
-        # literal text, so check the JSON payload plus the concatenation
-        # expression rather than a rendered "3 running" string.
-        js = _render_subagents_fill_js({"count": 3, "source": "pipe", "fetchedAt": "12:00:00", "error": None})
-        self.assertIn('"count": 3', js)
-        self.assertIn("DATA.count + ' running'", js)
+    def test_subagents_shows_clickable_rows_when_nonempty(self):
+        # _render_subagents_fill_js returns JS *source*: task fields are
+        # runtime values substituted into the DOM-building code, not
+        # literal rendered text, so check the JSON payload plus the
+        # row-building/click-handler expressions rather than rendered text.
+        tasks = [
+            {"id": "t1", "title": "Research X", "status": "running", "progressSummary": "reading docs",
+             "terminalSummary": None, "error": None, "childSessionKey": "sess-1",
+             "startedAt": 1783790000000, "endedAt": None},
+        ]
+        js = _render_subagents_fill_js({"tasks": tasks, "source": "pipe", "fetchedAt": "12:00:00", "error": None})
+        self.assertIn('"title": "Research X"', js)
+        self.assertIn("S.openSubagentDrawer(t)", js)
+        self.assertIn("S.elapsedTime(t.startedAt, t.endedAt)", js)
 
     def test_sections_error_js_uses_shared_error_helper(self):
         js = _render_sections_error_js("boom")
@@ -348,7 +359,9 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1783790000000", limits_code)
 
         subagents_code = next(c for c in codes if "getElementById('openclaw-status-section-subagents')" in c)
-        self.assertIn('"count": 2', subagents_code)  # cron task excluded
+        # cron task excluded -- exactly the two "subagent"-kind rows come through
+        self.assertEqual(subagents_code.count('"status": "running"') + subagents_code.count('"status": "queued"'), 2)
+        self.assertNotIn('"kind": "cron"', subagents_code)
 
     async def test_connect_failure_shows_dialog_wide_error(self):
         action = Action()
@@ -540,6 +553,214 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
         codes = _emitted_codes(emitted)
         self.assertIn("timed out", codes[-1])
         self.assertIn("openclaw-status-sections", codes[-1])
+
+
+class ExtractTranscriptAndToolsTests(unittest.TestCase):
+    """Message shape here mirrors what sessions_history returns for a real
+    session (confirmed live, 2026-07-12): content is a list of typed parts
+    ("text" / "toolcall" / "tool_result" / "thinking"), with a toolcall and
+    its matching tool_result sometimes sharing one message's content array.
+    chat.history is a display-normalized projection of the same underlying
+    transcript, not a separate schema, so this is the expected shape there
+    too."""
+
+    def test_splits_text_from_tool_calls_and_pairs_results(self):
+        messages = [
+            {"role": "assistant", "content": [
+                {"type": "toolcall", "id": "t1", "name": "ToolSearch", "arguments": {"query": "foo"}},
+                {"type": "tool_result", "tool_use_id": "t1", "content": "found it", "name": "ToolSearch"},
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "internal reasoning, never shown"},
+                {"type": "text", "text": "Here is the answer."},
+            ]},
+            {"role": "user", "content": "What about this?"},
+        ]
+        text_rows, tool_calls = _extract_transcript_and_tools(messages)
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "ToolSearch")
+        self.assertIn("foo", tool_calls[0]["arguments"])
+        self.assertEqual(tool_calls[0]["result"], "found it")
+
+        # The tool-call-only message contributes no text row (goes in Tools
+        # tab instead); thinking is never shown in either tab.
+        self.assertEqual(len(text_rows), 2)
+        self.assertEqual(text_rows[0]["text"], "Here is the answer.")
+        self.assertNotIn("internal reasoning", text_rows[0]["text"])
+        self.assertEqual(text_rows[1], {"role": "user", "text": "What about this?"})
+
+    def test_empty_and_missing_content_do_not_crash(self):
+        text_rows, tool_calls = _extract_transcript_and_tools([{"role": "user", "content": []}, {"role": "user"}])
+        self.assertEqual(text_rows, [])
+        self.assertEqual(tool_calls, [])
+
+
+class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
+    """The Subagents section's rows fetch back to this same Action with a
+    synthetic mode="subagent-detail" marker (see openSubagentDrawer() in
+    _MODAL_OPEN_JS_TEMPLATE) -- these cover the Python-side dispatch and the
+    hold-the-request-open poll loop (same shape as CompactTests exercises
+    for _run_compact, just polling tasks.get instead of sessions.describe)."""
+
+    DETAIL_BODY = {"mode": "subagent-detail", "chat_id": "chat-1", "id": "msg-1", "session_id": "sess-1",
+                   "model": "x.y", "taskId": "task-1", "taskTitle": "Research X", "taskStatus": "running"}
+
+    async def test_mode_dispatch_routes_to_subagent_detail(self):
+        action = Action()
+        with mock.patch.object(action, "_run_subagent_detail",
+                                new=mock.AsyncMock(return_value={"status": "ok"})) as m:
+            result = await action.action(self.DETAIL_BODY, __user__={"id": "u1"}, __event_emitter__=mock.AsyncMock())
+        m.assert_awaited_once()
+        self.assertEqual(result["status"], "ok")
+
+    async def test_missing_task_id_returns_error(self):
+        action = Action()
+        emitted = []
+
+        async def emitter(evt):
+            emitted.append(evt)
+
+        result = await action._run_subagent_detail({"mode": "subagent-detail"}, {"id": "u1"}, emitter)
+        self.assertEqual(result["status"], "error")
+        self.assertIn("taskId", _emitted_codes(emitted)[0])
+
+    async def test_polls_until_terminal_status_then_stops(self):
+        action = Action()
+        emitted = []
+
+        async def emitter(evt):
+            emitted.append(evt)
+
+        get_calls = {"n": 0}
+
+        async def fake_send_request(method, params, timeout=5):
+            if method == "tasks.get":
+                get_calls["n"] += 1
+                self.assertEqual(params["taskId"], "task-1")
+                status = "running" if get_calls["n"] == 1 else "completed"
+                return {"task": {"id": "task-1", "title": "Research X", "status": status,
+                                 "childSessionKey": "child-sess-1", "startedAt": 1783790000000,
+                                 "endedAt": None if status == "running" else 1783790005000}}
+            if method == "sessions.describe":
+                return {"session": {"modelProvider": "anthropic", "model": "claude-sonnet-5",
+                                     "contextTokens": 1000000, "totalTokens": 5000}}
+            if method == "chat.history":
+                self.assertEqual(params["sessionKey"], "child-sess-1")
+                return {"messages": [{"role": "assistant", "content": [{"type": "text", "text": "working on it"}]}]}
+            raise AssertionError(f"unexpected RPC: {method}")
+
+        fake_conn = mock.Mock()
+        fake_conn.send_request = mock.AsyncMock(side_effect=fake_send_request)
+
+        with mock.patch("openclaw_status_action._get_action_connection",
+                         new=mock.AsyncMock(return_value=(fake_conn, "pipe"))), \
+             mock.patch("openclaw_status_action.asyncio.sleep", new=mock.AsyncMock()):
+            result = await action._run_subagent_detail(self.DETAIL_BODY, {"id": "u1"}, emitter)
+
+        self.assertEqual(result["status"], "ok")
+        # Looped (running -> completed), not a single-iteration happy path.
+        self.assertEqual(get_calls["n"], 2)
+        codes = _emitted_codes(emitted)
+        self.assertIn("openclaw-drawer-root", codes[0])  # initial open
+        self.assertTrue(any("openclaw-drawer-section-overview" in c for c in codes))
+        self.assertTrue(any("openclaw-drawer-section-transcript" in c and "working on it" in c for c in codes))
+        self.assertTrue(any("openclaw-drawer-section-tools" in c for c in codes))
+
+    async def test_deadline_bounds_the_loop(self):
+        action = Action()
+        emitted = []
+
+        async def emitter(evt):
+            emitted.append(evt)
+
+        async def fake_send_request(method, params, timeout=5):
+            if method == "tasks.get":
+                return {"task": {"id": "task-1", "status": "running", "childSessionKey": None}}
+            raise AssertionError(f"unexpected RPC: {method}")
+
+        fake_conn = mock.Mock()
+        fake_conn.send_request = mock.AsyncMock(side_effect=fake_send_request)
+
+        # Simulate the poll deadline elapsing without a real wait: each
+        # asyncio.sleep call jumps the fake clock forward past it immediately.
+        clock = {"t": 0.0}
+
+        def fake_time():
+            return clock["t"]
+
+        async def fake_sleep(_seconds):
+            clock["t"] += 10_000
+
+        with mock.patch("openclaw_status_action._get_action_connection",
+                         new=mock.AsyncMock(return_value=(fake_conn, "pipe"))), \
+             mock.patch("openclaw_status_action.time.time", side_effect=fake_time), \
+             mock.patch("openclaw_status_action.asyncio.sleep", new=fake_sleep):
+            result = await action._run_subagent_detail(self.DETAIL_BODY, {"id": "u1"}, emitter)
+
+        # Never reaches a terminal status, but the loop still returns
+        # instead of hanging forever -- the whole point of the deadline.
+        self.assertEqual(result["status"], "ok")
+
+
+class SubagentProactiveMessageClickTests(unittest.IsolatedAsyncioTestCase):
+    """A real OWUI toolbar click on a proactively-delivered sub-agent-finished
+    message is mode-less (OWUI itself never sends "mode") but carries a
+    hidden `<!-- openclaw:taskId=... -->` marker in body["content"] (see
+    `_deliver_subagent_proactive_owui_message` in gateway.py). Deliberately
+    no separate Action/button for this (Eliav's call, 2026-07-13) -- the
+    existing default click handler detects the marker and redirects into
+    the same subagent-detail drawer instead of the general status dialog."""
+
+    async def test_marker_in_content_routes_to_subagent_detail(self):
+        action = Action()
+        body = {
+            "chat_id": "chat-1", "id": "msg-1", "session_id": "sess-1",
+            "model": "openclaw_gateway.default",
+            "content": "*↳ Sub-agent finished: Fix bug*\n\nAll done.\n\n"
+                       "<!-- openclaw:taskId=task-77 -->",
+        }
+        with mock.patch.object(action, "_run_subagent_detail",
+                                new=mock.AsyncMock(return_value={"status": "ok"})) as m:
+            result = await action.action(body, __user__={"id": "u1"}, __event_emitter__=mock.AsyncMock())
+        m.assert_awaited_once()
+        routed_body = m.await_args.args[0]
+        self.assertEqual(routed_body["taskId"], "task-77")
+        self.assertEqual(result["status"], "ok")
+
+    async def test_no_marker_routes_to_normal_status(self):
+        action = Action()
+        body = {"chat_id": "chat-1", "id": "msg-1", "session_id": "sess-1",
+                "model": "openclaw_gateway.default", "content": "just a normal reply"}
+        with mock.patch.object(action, "_run_subagent_detail", new=mock.AsyncMock()) as detail_m, \
+             mock.patch.object(action, "_run_status",
+                                new=mock.AsyncMock(return_value={"status": "ok"})) as status_m:
+            result = await action.action(body, __user__={"id": "u1"}, __event_emitter__=mock.AsyncMock())
+        detail_m.assert_not_awaited()
+        status_m.assert_awaited_once()
+        self.assertEqual(result["status"], "ok")
+
+    async def test_missing_content_routes_to_normal_status(self):
+        action = Action()
+        body = {"chat_id": "chat-1", "id": "msg-1", "session_id": "sess-1", "model": "openclaw_gateway.default"}
+        with mock.patch.object(action, "_run_subagent_detail", new=mock.AsyncMock()) as detail_m, \
+             mock.patch.object(action, "_run_status",
+                                new=mock.AsyncMock(return_value={"status": "ok"})):
+            await action.action(body, __user__={"id": "u1"}, __event_emitter__=mock.AsyncMock())
+        detail_m.assert_not_awaited()
+
+    async def test_explicit_mode_still_takes_priority_over_marker_sniffing(self):
+        """A synthetic mode="compact"/"subagent-detail" click (the dialog's
+        own in-page buttons) must never be reinterpreted by content
+        sniffing, even if its body coincidentally carries old marker text."""
+        action = Action()
+        body = {"mode": "compact", "chat_id": "chat-1",
+                "content": "<!-- openclaw:taskId=task-1 -->"}
+        with mock.patch.object(action, "_run_compact", new=mock.AsyncMock(return_value={"status": "ok"})) as compact_m, \
+             mock.patch.object(action, "_run_subagent_detail", new=mock.AsyncMock()) as detail_m:
+            await action.action(body, __user__={"id": "u1"}, __event_emitter__=mock.AsyncMock())
+        compact_m.assert_awaited_once()
+        detail_m.assert_not_awaited()
 
 
 if __name__ == "__main__":

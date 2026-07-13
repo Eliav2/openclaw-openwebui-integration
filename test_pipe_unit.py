@@ -75,7 +75,9 @@ from openclaw_pipe import (
     _coerce_text,
     _content_has_image,
     _could_be_user_input_prefix,
+    _deepest_leaf_id,
     _deliver_proactive_owui_message,
+    _deliver_subagent_proactive_owui_message,
     _discover_models,
     _emit_message_snapshot,
     _emit_status,
@@ -88,6 +90,7 @@ from openclaw_pipe import (
     _last_assistant_text_from_preview,
     _live_session_id_for_user,
     _maybe_deliver_proactive_after_debounce,
+    _maybe_deliver_subagent_proactive,
     _modal_payload_from_user_input_prompt,
     _model_patch_matches,
     _normalize_event_call_response,
@@ -104,6 +107,7 @@ from openclaw_pipe import (
     _resolve_media_via_owui,
     _shared_gateway_state,
     _SHARED_STATE_ATTR,
+    _SUBAGENT_TASK_ID_MARKER_RE,
     _suppress_already_shown,
     Pipe,
 )
@@ -326,6 +330,90 @@ class ProactiveDeliveryTests(unittest.TestCase):
         self.assertIn("hello from cron", history["messages"][new_id]["content"])
         self.assertIn("Proactive message", history["messages"][new_id]["content"])
         self.assertIn(new_id, history["messages"][old_leaf_id]["childrenIds"])
+
+    def test_deepest_leaf_walks_past_currentid_with_existing_child(self):
+        """Pure-function guard for the 2026-07-13 sibling bug: OWUI's
+        `currentId` can point at an ancestor that already has a child (e.g.
+        the frontend reset it right after a proactive message was appended).
+        Anchoring there again forks a 1/2·2/2 variant; the leaf walk must skip
+        down to the real childless tail. Also cycle- and multi-branch-safe."""
+        messages = {
+            "a": {"childrenIds": ["b"]},
+            "b": {"childrenIds": ["c1", "c2"]},   # branched: follow newest
+            "c1": {"childrenIds": []},
+            "c2": {"childrenIds": ["d"]},
+            "d": {"childrenIds": []},
+        }
+        self.assertEqual(_deepest_leaf_id(messages, "a"), "d")
+        self.assertEqual(_deepest_leaf_id(messages, "d"), "d")
+        self.assertIsNone(_deepest_leaf_id(messages, None))
+        # Malformed self-cycle must terminate, not spin.
+        self.assertEqual(_deepest_leaf_id({"x": {"childrenIds": ["x"]}}, "x"), "x")
+
+    def test_deliver_chains_off_leaf_not_stale_currentid(self):
+        """Integration regression for the observed variant-group bug: a prior
+        proactive message (`existing`) is already a child of `anchor`, but
+        `currentId` was reset back to `anchor`. The next proactive delivery
+        must chain *below* `existing` (linear), not append a second child of
+        `anchor` (which OWUI renders as swipeable 1/2·2/2 variants)."""
+        conn = self._conn()
+        session_key = _owui_session_key(
+            "main", "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        )
+        conn.session_preview = mock.AsyncMock(
+            return_value={"previews": [{"key": session_key, "items": [
+                {"role": "assistant", "text": "second proactive"},
+            ]}]}
+        )
+
+        chat_state = {
+            "history": {
+                # currentId reset to an ancestor that already has a child.
+                "currentId": "anchor",
+                "messages": {
+                    "anchor": {"role": "assistant", "childrenIds": ["existing"]},
+                    "existing": {"role": "assistant", "childrenIds": [],
+                                 "content": "*↳ Sub-agent finished: x*"},
+                },
+            }
+        }
+
+        class FakeChat:
+            def __init__(self, chat):
+                self.chat = chat
+
+        class FakeChats:
+            @staticmethod
+            async def get_chat_by_id(chat_id):
+                return FakeChat(chat_state)
+
+            @staticmethod
+            async def upsert_message_to_chat_by_id_and_message_id(chat_id, message_id, message):
+                history = chat_state["history"]
+                messages = history.setdefault("messages", {})
+                messages[message_id] = {**messages.get(message_id, {}), **message}
+                history["currentId"] = message_id
+                return FakeChat(chat_state)
+
+        fake_chats_module = types.ModuleType("open_webui.models.chats")
+        fake_chats_module.Chats = FakeChats
+        fake_models_module = types.ModuleType("open_webui.models")
+        fake_owui_module = types.ModuleType("open_webui")
+        with mock.patch.dict(sys.modules, {
+            "open_webui": fake_owui_module,
+            "open_webui.models": fake_models_module,
+            "open_webui.models.chats": fake_chats_module,
+        }):
+            asyncio.run(_deliver_proactive_owui_message(conn, session_key, "run-2"))
+
+        history = chat_state["history"]
+        new_id = history["currentId"]
+        # New message chains below `existing`, NOT as a second child of anchor.
+        self.assertEqual(history["messages"]["existing"]["childrenIds"], [new_id])
+        self.assertEqual(history["messages"][new_id]["parentId"], "existing")
+        self.assertEqual(history["messages"]["anchor"]["childrenIds"], ["existing"])
+        self.assertIn("second proactive", history["messages"][new_id]["content"])
 
     def test_deliver_stamps_model_from_immediately_preceding_message(self):
         """Regression for the 2026-07-13 bug: proactively-delivered messages
@@ -710,6 +798,373 @@ class ProactiveDebounceWatcherTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertNotIn(session_key, conn._pending_proactive_debounce)
+
+
+class SubagentSessionKeyTests(unittest.TestCase):
+    """A sub-agent's own session key (`agent:*:subagent:*`) is never an OWUI
+    session, so it must never be mistaken for one -- and vice versa."""
+
+    def _conn(self, agent_id="main"):
+        return _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID=agent_id))
+
+    def test_recognizes_subagent_session_key(self):
+        conn = self._conn()
+        self.assertTrue(
+            conn.is_subagent_session_key("agent:main:subagent:11111111-1111-1111-1111-111111111111")
+        )
+
+    def test_rejects_owui_session_key(self):
+        conn = self._conn()
+        session_key = _owui_session_key(
+            "main", "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        )
+        self.assertFalse(conn.is_subagent_session_key(session_key))
+
+
+class ResolveSubagentParentTaskTests(unittest.IsolatedAsyncioTestCase):
+    """`resolve_subagent_parent_task`: `tasks.list` matches params.sessionKey
+    against a task's requesterSessionKey, childSessionKey, *or* ownerKey, so
+    passing the *child's own* session key still returns the task record --
+    whose `sessionKey` field is the parent's, not the child's."""
+
+    def _conn(self, agent_id="main"):
+        return _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID=agent_id))
+
+    async def test_finds_task_by_child_session_key(self):
+        conn = self._conn()
+        child_key = "agent:main:subagent:11111111-1111-1111-1111-111111111111"
+        parent_key = _owui_session_key(
+            "main", "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        )
+
+        async def fake_send_request(method, params, timeout=None):
+            self.assertEqual(method, "tasks.list")
+            self.assertEqual(params.get("sessionKey"), child_key)
+            return {"tasks": [
+                {"id": "task-1", "childSessionKey": "some-other-child", "sessionKey": "irrelevant"},
+                {"id": "task-2", "childSessionKey": child_key, "sessionKey": parent_key, "title": "Do the thing"},
+            ]}
+
+        conn.send_request = mock.AsyncMock(side_effect=fake_send_request)
+        task = await conn.resolve_subagent_parent_task(child_key)
+        self.assertEqual(task, {
+            "id": "task-2", "childSessionKey": child_key, "sessionKey": parent_key, "title": "Do the thing",
+        })
+
+    async def test_returns_none_when_no_task_matches(self):
+        conn = self._conn()
+        conn.send_request = mock.AsyncMock(return_value={"tasks": []})
+        self.assertIsNone(await conn.resolve_subagent_parent_task("agent:main:subagent:x"))
+
+    async def test_returns_none_on_rpc_failure(self):
+        conn = self._conn()
+        conn.send_request = mock.AsyncMock(side_effect=RuntimeError("gateway unreachable"))
+        self.assertIsNone(await conn.resolve_subagent_parent_task("agent:main:subagent:x"))
+
+    async def test_skips_self_referential_cli_task_and_returns_owui_parent(self):
+        """Production reality: one sub-agent run yields TWO records whose
+        childSessionKey is this child -- a self-referential runtime="cli"
+        execution record (its mapped sessionKey is the child's OWN key) that
+        tasks.list returns *first* because it's created a few ms later
+        (newest-first), and the real spawn record whose sessionKey is the
+        OWUI parent. Returning the first childSessionKey match hands back the
+        self-referential one and delivery aborts. The resolver must skip any
+        record whose sessionKey isn't a real OWUI session and return the
+        OWUI-parent record instead."""
+        conn = self._conn()
+        child_key = "agent:main:subagent:d4baed2f-044c-45d6-b0a6-ba4343947ada"
+        parent_key = _owui_session_key(
+            "main", "2d206eab-acac-4945-bd2f-7e8b6365de8c",
+            "c201663d-211a-4054-9be9-718eef3eb308",
+        )
+
+        async def fake_send_request(method, params, timeout=None):
+            self.assertEqual(method, "tasks.list")
+            return {"tasks": [
+                # self-referential CLI execution record — newest, returned first
+                {"id": "task-cli", "childSessionKey": child_key,
+                 "sessionKey": child_key, "runtime": "cli"},
+                # real spawn record linking back to the OWUI parent
+                {"id": "task-spawn", "childSessionKey": child_key,
+                 "sessionKey": parent_key, "runtime": "subagent",
+                 "title": "e2e-subagent-proof"},
+            ]}
+
+        conn.send_request = mock.AsyncMock(side_effect=fake_send_request)
+        task = await conn.resolve_subagent_parent_task(child_key)
+        self.assertIsNotNone(task)
+        self.assertEqual(task["id"], "task-spawn")
+        self.assertEqual(task["sessionKey"], parent_key)
+
+    async def test_returns_none_when_only_self_referential_record_exists(self):
+        """If the *only* childSessionKey match is self-referential (no OWUI
+        parent link recorded at all -- e.g. a nested sub-agent), give up
+        rather than returning a record that can't resolve to a chat."""
+        conn = self._conn()
+        child_key = "agent:main:subagent:99999999-9999-9999-9999-999999999999"
+
+        async def fake_send_request(method, params, timeout=None):
+            return {"tasks": [
+                {"id": "task-cli", "childSessionKey": child_key,
+                 "sessionKey": child_key, "runtime": "cli"},
+            ]}
+
+        conn.send_request = mock.AsyncMock(side_effect=fake_send_request)
+        self.assertIsNone(await conn.resolve_subagent_parent_task(child_key))
+
+
+class SubagentProactiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    """Sub-agent finish -> proactive delivery into the *parent's* OWUI chat:
+    content comes from the child's own transcript, the message is tagged
+    distinctly, and carries a hidden taskId marker the Action endpoint can
+    parse back out to open the drawer directly (see action.py)."""
+
+    def _conn(self, agent_id="main"):
+        return _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID=agent_id))
+
+    def _fake_chats(self, chat_state):
+        class FakeChat:
+            def __init__(self, chat):
+                self.chat = chat
+
+        class FakeChats:
+            @staticmethod
+            async def get_chat_by_id(chat_id):
+                return FakeChat(chat_state)
+
+            @staticmethod
+            async def upsert_message_to_chat_by_id_and_message_id(chat_id, message_id, message):
+                history = chat_state["history"]
+                messages = history.setdefault("messages", {})
+                messages[message_id] = {**messages.get(message_id, {}), **message}
+                history["currentId"] = message_id
+                return FakeChat(chat_state)
+
+        fake_chats_module = types.ModuleType("open_webui.models.chats")
+        fake_chats_module.Chats = FakeChats
+        fake_models_module = types.ModuleType("open_webui.models")
+        fake_owui_module = types.ModuleType("open_webui")
+        return mock.patch.dict(sys.modules, {
+            "open_webui": fake_owui_module,
+            "open_webui.models": fake_models_module,
+            "open_webui.models.chats": fake_chats_module,
+        })
+
+    async def test_delivers_child_text_into_parent_chat_with_marker_and_label(self):
+        conn = self._conn()
+        child_key = "agent:main:subagent:11111111-1111-1111-1111-111111111111"
+        parent_key = _owui_session_key(
+            "main", "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        )
+        conn.session_preview = mock.AsyncMock(
+            return_value={"previews": [{"key": child_key, "items": [
+                {"role": "assistant", "text": "done: found 3 bugs"},
+            ]}]}
+        )
+        old_leaf_id = "old-leaf"
+        chat_state = {
+            "models": ["openclaw_gateway.default"],
+            "history": {
+                "currentId": old_leaf_id,
+                "messages": {old_leaf_id: {
+                    "role": "assistant", "childrenIds": [],
+                    "model": "openclaw_gateway.default", "modelName": "OpenClaw · Default",
+                }},
+            },
+        }
+
+        with self._fake_chats(chat_state):
+            await _deliver_subagent_proactive_owui_message(
+                conn, child_key, "run-1", parent_key, "task-42", "Fix the bug",
+            )
+
+        history = chat_state["history"]
+        new_msg = history["messages"][history["currentId"]]
+        self.assertIn("Sub-agent finished: Fix the bug", new_msg["content"])
+        self.assertIn("done: found 3 bugs", new_msg["content"])
+        self.assertIn("<!-- openclaw:taskId=task-42 -->", new_msg["content"])
+        self.assertEqual(new_msg["model"], "openclaw_gateway.default")
+
+    async def test_dedups_same_child_session_and_run(self):
+        conn = self._conn()
+        child_key = "agent:main:subagent:11111111-1111-1111-1111-111111111111"
+        parent_key = _owui_session_key(
+            "main", "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        )
+        conn._delivered_proactive[f"{child_key}:run-1"] = True
+        conn.session_preview = mock.AsyncMock(side_effect=AssertionError("should not be called"))
+        await _deliver_subagent_proactive_owui_message(
+            conn, child_key, "run-1", parent_key, "task-1", None,
+        )
+        conn.session_preview.assert_not_called()
+
+    async def test_skips_when_parent_is_not_an_owui_session(self):
+        conn = self._conn()
+        child_key = "agent:main:subagent:11111111-1111-1111-1111-111111111111"
+        conn.session_preview = mock.AsyncMock(side_effect=AssertionError("should not be called"))
+        await _deliver_subagent_proactive_owui_message(
+            conn, child_key, "run-1", "agent:main:some-nested-subagent-parent", "task-1", None,
+        )
+        conn.session_preview.assert_not_called()
+
+    async def test_falls_back_to_generic_label_without_title(self):
+        conn = self._conn()
+        child_key = "agent:main:subagent:11111111-1111-1111-1111-111111111111"
+        parent_key = _owui_session_key(
+            "main", "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        )
+        conn.session_preview = mock.AsyncMock(
+            return_value={"previews": [{"key": child_key, "items": [
+                {"role": "assistant", "text": "done"},
+            ]}]}
+        )
+        chat_state = {"models": ["openclaw_gateway.default"], "history": {"currentId": None, "messages": {}}}
+
+        with self._fake_chats(chat_state):
+            await _deliver_subagent_proactive_owui_message(
+                conn, child_key, "run-1", parent_key, "task-1", None,
+            )
+
+        new_msg = next(iter(chat_state["history"]["messages"].values()))
+        self.assertIn("Sub-agent finished*", new_msg["content"])
+        self.assertNotIn("Sub-agent finished:", new_msg["content"])
+
+
+class MaybeDeliverSubagentProactiveTests(unittest.IsolatedAsyncioTestCase):
+    """The debounce/lookup wrapper: must resolve the parent via
+    `resolve_subagent_parent_task`, wait out the *parent's* idle-debounce
+    (never the child's -- no tab ever talks to a sub-agent session directly,
+    so checking the child's own idleness would always read True and skip
+    the debounce entirely), and always clear the pending-set on exit."""
+
+    def _conn(self, agent_id="main"):
+        return _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID=agent_id))
+
+    async def test_delivers_once_parent_settles_idle(self):
+        conn = self._conn()
+        child_key = "agent:main:subagent:11111111-1111-1111-1111-111111111111"
+        parent_key = _owui_session_key(
+            "main", "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        )
+        conn._pending_proactive_debounce.add(child_key)
+        conn.resolve_subagent_parent_task = mock.AsyncMock(
+            return_value={"id": "task-1", "sessionKey": parent_key, "title": "Do it"}
+        )
+        # Parent has a registered consumer initially (not idle), then clears.
+        conn.register_consumer(parent_key, "parent-run")
+        conn.unregister_consumer(parent_key, "parent-run")
+
+        delivered = []
+
+        async def fake_deliver(c, child, run_id, parent, task_id, title):
+            delivered.append((child, run_id, parent, task_id, title))
+
+        with mock.patch("openclaw_pipe.PROACTIVE_DELIVERY_ENABLED", True), mock.patch(
+            "openclaw_pipe._deliver_subagent_proactive_owui_message", side_effect=fake_deliver
+        ):
+            await _maybe_deliver_subagent_proactive(
+                conn, child_key, "run-1",
+                min_idle_s=0.05, poll_interval_s=0.02, max_wait_s=2,
+            )
+
+        self.assertEqual(delivered, [(child_key, "run-1", parent_key, "task-1", "Do it")])
+        self.assertNotIn(child_key, conn._pending_proactive_debounce)
+
+    async def test_gives_up_quietly_when_no_task_found(self):
+        conn = self._conn()
+        child_key = "agent:main:subagent:11111111-1111-1111-1111-111111111111"
+        conn._pending_proactive_debounce.add(child_key)
+        conn.resolve_subagent_parent_task = mock.AsyncMock(return_value=None)
+
+        with mock.patch(
+            "openclaw_pipe._deliver_subagent_proactive_owui_message",
+            side_effect=AssertionError("must not deliver without a resolved task"),
+        ):
+            await _maybe_deliver_subagent_proactive(conn, child_key, "run-1")
+
+        self.assertNotIn(child_key, conn._pending_proactive_debounce)
+
+    async def test_gives_up_quietly_when_parent_is_not_an_owui_session(self):
+        conn = self._conn()
+        child_key = "agent:main:subagent:11111111-1111-1111-1111-111111111111"
+        conn._pending_proactive_debounce.add(child_key)
+        # Nested sub-agent: the "parent" is itself another sub-agent session.
+        conn.resolve_subagent_parent_task = mock.AsyncMock(
+            return_value={"id": "task-1", "sessionKey": "agent:main:subagent:nested-parent"}
+        )
+
+        with mock.patch(
+            "openclaw_pipe._deliver_subagent_proactive_owui_message",
+            side_effect=AssertionError("must not deliver to a non-OWUI parent"),
+        ):
+            await _maybe_deliver_subagent_proactive(conn, child_key, "run-1")
+
+        self.assertNotIn(child_key, conn._pending_proactive_debounce)
+
+    async def test_never_delivers_if_parent_stays_busy_until_timeout(self):
+        conn = self._conn()
+        child_key = "agent:main:subagent:11111111-1111-1111-1111-111111111111"
+        parent_key = _owui_session_key(
+            "main", "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        )
+        conn._pending_proactive_debounce.add(child_key)
+        conn.resolve_subagent_parent_task = mock.AsyncMock(
+            return_value={"id": "task-1", "sessionKey": parent_key}
+        )
+        conn.register_consumer(parent_key, "parent-run")  # never idle
+
+        with mock.patch("openclaw_pipe.PROACTIVE_DELIVERY_ENABLED", True), mock.patch(
+            "openclaw_pipe._deliver_subagent_proactive_owui_message",
+            side_effect=AssertionError("must not deliver into a busy parent"),
+        ):
+            await _maybe_deliver_subagent_proactive(
+                conn, child_key, "run-1",
+                min_idle_s=120, poll_interval_s=0.02, max_wait_s=0.1,
+            )
+
+        self.assertNotIn(child_key, conn._pending_proactive_debounce)
+
+    async def test_bails_immediately_if_kill_switch_flipped_off_mid_wait(self):
+        conn = self._conn()
+        child_key = "agent:main:subagent:11111111-1111-1111-1111-111111111111"
+        parent_key = _owui_session_key(
+            "main", "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        )
+        conn._pending_proactive_debounce.add(child_key)
+        conn.resolve_subagent_parent_task = mock.AsyncMock(
+            return_value={"id": "task-1", "sessionKey": parent_key}
+        )
+        conn.register_consumer(parent_key, "parent-run")  # never idle on its own
+
+        with mock.patch("openclaw_pipe.PROACTIVE_DELIVERY_ENABLED", False), mock.patch(
+            "openclaw_pipe._deliver_subagent_proactive_owui_message",
+            side_effect=AssertionError("must not deliver once disabled"),
+        ):
+            await _maybe_deliver_subagent_proactive(
+                conn, child_key, "run-1",
+                min_idle_s=120, poll_interval_s=0.02, max_wait_s=5,
+            )
+
+        self.assertNotIn(child_key, conn._pending_proactive_debounce)
+
+
+class SubagentTaskIdMarkerRegexTests(unittest.TestCase):
+    def test_extracts_task_id_from_marker(self):
+        text = "*↳ Sub-agent finished: Fix bug*\n\nAll done.\n\n<!-- openclaw:taskId=task-42 -->"
+        match = _SUBAGENT_TASK_ID_MARKER_RE.search(text)
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group(1), "task-42")
+
+    def test_no_match_without_marker(self):
+        self.assertIsNone(_SUBAGENT_TASK_ID_MARKER_RE.search("just a normal message"))
 
 
 class GatewayReconnectStormTests(unittest.IsolatedAsyncioTestCase):
@@ -2121,6 +2576,24 @@ class SharedProactiveStateAcrossConnectionsTests(unittest.TestCase):
         self.assertIsNotNone(a)
         self.assertIs(a, b)
         self.assertIs(getattr(self._fake_owui, _SHARED_STATE_ATTR), a)
+
+    def test_shared_state_backfills_new_keys_into_existing_dict(self):
+        """Redeploy migration guard (2026-07-13): the shared-state dict
+        persists across function redeploys, so a key added in a newer version
+        must be backfilled into the *already-existing* dict via setdefault —
+        otherwise `__init__`'s `_shared['chat_write_locks']` KeyErrors on the
+        first request after redeploy (this broke a live deploy). Simulate an
+        old dict missing the new key and assert it gets added without dropping
+        the pre-existing entries."""
+        old_state = {"delivered_live": {"keep": 1.0}}
+        setattr(self._fake_owui, _SHARED_STATE_ATTR, old_state)
+        state = _shared_gateway_state()
+        self.assertIs(state, old_state)  # same object, mutated in place
+        self.assertEqual(state["delivered_live"], {"keep": 1.0})  # not clobbered
+        self.assertIn("chat_write_locks", state)
+        # A connection built against it must not raise.
+        conn = self._conn()
+        self.assertIs(conn._chat_write_locks, state["chat_write_locks"])
 
     def test_two_connections_share_bookkeeping_objects(self):
         live, zombie = self._conn(), self._conn()

@@ -478,13 +478,20 @@ def _shared_gateway_state() -> dict | None:
         return None
     state = getattr(_owui_socket_main, _SHARED_STATE_ATTR, None)
     if state is None:
-        state = {
-            "delivered_live": {},
-            "delivered_proactive": {},
-            "session_last_activity": {},
-            "pending_proactive_debounce": set(),
-        }
+        state = {}
         setattr(_owui_socket_main, _SHARED_STATE_ATTR, state)
+    # `setdefault` per key (not a one-shot dict literal on the `is None`
+    # branch): this same dict persists across redeploys of the function
+    # (stashed on OWUI's stable socket module), so a *new* key added in a
+    # later version must be backfilled into the already-existing dict —
+    # otherwise `__init__` does `_shared["new_key"]` and KeyErrors on the
+    # first request after redeploy (chat_write_locks hit exactly this,
+    # 2026-07-13).
+    state.setdefault("delivered_live", {})
+    state.setdefault("delivered_proactive", {})
+    state.setdefault("session_last_activity", {})
+    state.setdefault("pending_proactive_debounce", set())
+    state.setdefault("chat_write_locks", {})
     return state
 
 
@@ -595,6 +602,28 @@ class _GatewayConnection:
         self._pending_proactive_debounce: set[str] = (
             _shared["pending_proactive_debounce"] if _shared is not None else set()
         )
+
+        # Per-chat write locks serializing the two proactive-delivery paths
+        # (`_deliver_proactive_owui_message` and
+        # `_deliver_subagent_proactive_owui_message`) against each other for a
+        # given chat. Both read the chat's current leaf, then append a new
+        # child; without a lock two deliveries landing close together each
+        # read the same leaf and append as *siblings*, which OWUI renders as a
+        # 1/2·2/2 variant group instead of a linear sequence (2026-07-13).
+        # Shared across connections so a zombie connection can't race the live
+        # one on the same chat. Keyed by chat_id.
+        self._chat_write_locks: dict[str, asyncio.Lock] = (
+            _shared["chat_write_locks"] if _shared is not None else {}
+        )
+
+    def _chat_write_lock(self, chat_id: str) -> asyncio.Lock:
+        """Return the process-wide `asyncio.Lock` for serializing proactive
+        writes into `chat_id`, creating it on first use."""
+        lock = self._chat_write_locks.get(chat_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._chat_write_locks[chat_id] = lock
+        return lock
 
     # ── Public API ──────────────────────────────────────────────────
 
@@ -759,6 +788,58 @@ class _GatewayConnection:
         if len(after) < 73 or after[36] != "-":
             return None
         return after[0:36], after[37:73]
+
+    def is_subagent_session_key(self, session_key: str) -> bool:
+        """True for a sub-agent's own session key, e.g.
+        "agent:<agentId>:subagent:<uuid>" (`sessions_spawn`/Task tool
+        format, docs/tools/subagents.md). These never have an OWUI tab
+        talking to them directly -- only their *requester* (parent) session
+        can be an OWUI chat -- so they're never matched by
+        `parse_owui_session_key` and need `resolve_subagent_parent_task` to
+        find who to deliver to.
+        """
+        return ":subagent:" in session_key
+
+    async def resolve_subagent_parent_task(self, session_key: str) -> dict | None:
+        """Look up the task record for a sub-agent's own session key via
+        `tasks.list`.
+
+        The Gateway's tasks.list handler matches `params.sessionKey` against
+        a task's requesterSessionKey, childSessionKey, *or* ownerKey (any of
+        the three) -- so passing the *child's* session key here still finds
+        the task, and the returned record's `sessionKey` field is the
+        *parent's* (requester's) session key, not the child's. That's the
+        one piece of information `parse_owui_session_key` alone can't get to,
+        since a sub-agent session key has no positional relationship to the
+        OWUI session that spawned it.
+
+        Crucially, a single sub-agent run produces *two* task records whose
+        `childSessionKey` is this session: the spawn/announce task, whose
+        `sessionKey` (requesterSessionKey) is the real OWUI parent, AND a
+        second `runtime="cli"` execution task that is self-referential --
+        its requesterSessionKey is the sub-agent's *own* key. The latter is
+        created a few ms later, so tasks.list (newest-first) returns it
+        first. Returning the first `childSessionKey` match therefore hands
+        back the self-referential record, whose `sessionKey` is the child
+        itself -> `parse_owui_session_key` fails and delivery silently
+        aborts. So we must skip past any record whose `sessionKey` doesn't
+        actually resolve to an OWUI chat and keep looking for the one that
+        does. `limit` is generous enough to include both records.
+        """
+        try:
+            resp = await self.send_request(
+                "tasks.list", dict(sessionKey=session_key, limit=25), timeout=8,
+            )
+        except Exception as ex:
+            pipe_log(f"  subagent parent lookup failed: {ex}")
+            return None
+        for task in (resp or {}).get("tasks", []):
+            if task.get("childSessionKey") != session_key:
+                continue
+            parent = task.get("sessionKey")
+            if parent and self.parse_owui_session_key(parent):
+                return task
+        return None
 
     def consumers_for_event(self, payload: dict) -> list[_Consumer]:
         """Return consumers that should receive a Gateway event payload."""
@@ -1061,6 +1142,34 @@ class _GatewayConnection:
                         )
                         continue
 
+                # ── Proactive delivery for finished sub-agent tasks ──
+                # A sub-agent's own session key (`agent:*:subagent:*`) never
+                # matches `parse_owui_session_key` -- it's not an OWUI
+                # session at all, so the branch above never fires for it and
+                # it always reaches here. Resolving *which* OWUI chat (if
+                # any) should hear about it requires an RPC
+                # (`resolve_subagent_parent_task`), so this can't reuse the
+                # sync gate above -- it hands off immediately to a task that
+                # does the lookup first, then the same idle-debounce dance,
+                # but checked against the *parent's* liveness, not the
+                # sub-agent's own (which has no meaning -- no tab ever talks
+                # to a sub-agent session directly, so it would always read
+                # "idle" and defeat the point of debouncing at all).
+                if (
+                    PROACTIVE_DELIVERY_ENABLED
+                    and evt_session
+                    and payload.get("state") == "final"
+                    and self.is_subagent_session_key(evt_session)
+                    and evt_session not in self._pending_proactive_debounce
+                ):
+                    self._pending_proactive_debounce.add(evt_session)
+                    asyncio.create_task(
+                        _maybe_deliver_subagent_proactive(
+                            self, evt_session, evt_run_id
+                        )
+                    )
+                    continue
+
                 if payload.get("sessionKey") and not payload.get("runId"):
                     pipe_log("  dropped ambiguous or unmatched session-only event")
 
@@ -1187,6 +1296,34 @@ async def _maybe_deliver_proactive_after_debounce(
         conn._pending_proactive_debounce.discard(session_key)
 
 
+def _deepest_leaf_id(messages: dict, start_id: str | None) -> str | None:
+    """Walk down `childrenIds` from `start_id` to the deepest childless node.
+
+    OWUI's `history.currentId` is only a *view* pointer: the frontend (or an
+    interleaved live turn) can reset it back to an ancestor that already has
+    children — e.g. right after a proactive message was appended. Anchoring a
+    new proactive message directly on `currentId` in that state appends it as
+    a *sibling* of the existing child, which OWUI renders as a 1/2·2/2 variant
+    group instead of a linear message (observed 2026-07-13: a `Sub-agent
+    finished` message and the next proactive message both parented to the same
+    node). Walking to the true leaf (following the most-recently-appended
+    child at each branch) makes every proactive write chain off the real tail.
+    Cycle-guarded and depth-capped for safety against malformed history.
+    """
+    node_id = start_id
+    seen: set[str] = set()
+    for _ in range(10_000):
+        if not node_id or node_id in seen:
+            break
+        seen.add(node_id)
+        node = messages.get(node_id) or {}
+        children = node.get("childrenIds") or []
+        if not children:
+            break
+        node_id = children[-1]
+    return node_id
+
+
 async def _deliver_proactive_owui_message(
     conn: "_GatewayConnection", session_key: str, run_id: str
 ) -> None:
@@ -1237,43 +1374,67 @@ async def _deliver_proactive_owui_message(
         return
 
     try:
-        chat = await Chats.get_chat_by_id(chat_id)
-        if chat is None:
-            pipe_log(f"  proactive delivery: chat {chat_id[:8]}... not found")
-            return
-        history = chat.chat.get("history", {}) or {}
-        old_leaf_id = history.get("currentId")
-        new_message_id = str(uuid.uuid4())
+        # Serialize with the sub-agent proactive path (and any zombie
+        # connection) so two deliveries into the same chat can't each read the
+        # leaf before the other commits and end up appending as siblings.
+        async with conn._chat_write_lock(chat_id):
+            chat = await Chats.get_chat_by_id(chat_id)
+            if chat is None:
+                pipe_log(f"  proactive delivery: chat {chat_id[:8]}... not found")
+                return
+            history = chat.chat.get("history", {}) or {}
+            # Anchor on the true childless leaf, not the bare `currentId`
+            # (which can point at an ancestor that already has children — see
+            # `_deepest_leaf_id`), otherwise the new message forks a sibling
+            # variant instead of extending the conversation linearly.
+            old_leaf_id = _deepest_leaf_id(history.get("messages") or {}, history.get("currentId"))
+            new_message_id = str(uuid.uuid4())
 
-        # `upsert_message_to_chat_by_id_and_message_id` unconditionally sets
-        # `history.currentId = message_id` as a side effect of *every* call
-        # (it's OWUI's own generic upsert, not something we control). So the
-        # childrenIds patch on the *old* leaf must happen first — otherwise
-        # it clobbers currentId back to old_leaf_id right after we set it,
-        # and the new message becomes an invisible orphan branch (P33 bug,
-        # found 2026-07-11: pipe_log showed successful "persisted" calls but
-        # nothing ever appeared in OWUI, because currentId never actually
-        # ended up pointing at the new message).
-        if old_leaf_id:
-            old_leaf = (history.get("messages") or {}).get(old_leaf_id, {})
-            children = list(old_leaf.get("childrenIds", []))
-            if new_message_id not in children:
-                children.append(new_message_id)
-                await Chats.upsert_message_to_chat_by_id_and_message_id(
-                    chat_id, old_leaf_id, {"childrenIds": children},
-                )
+            # Without a `model` field, OWUI's frontend can't resolve
+            # `$models.find((m) => m.id === message.model)` for this message,
+            # so it has zero associated actions -- the Status button (and any
+            # future proactive-specific action) silently never renders on
+            # proactively-delivered messages (confirmed against
+            # ResponseMessage.svelte, 2026-07-13). Prefer the immediately
+            # preceding message's own `model` (most locally accurate -- it's
+            # what actually produced this branch of the conversation) over the
+            # chat's globally-selected `models` list, which only reflects
+            # whatever's picked in the model dropdown right now and can drift
+            # from what a given branch was actually generated with.
+            old_leaf = (history.get("messages") or {}).get(old_leaf_id, {}) if old_leaf_id else {}
+            model_id = old_leaf.get("model") or next(iter(chat.chat.get("models") or []), None)
 
-        await Chats.upsert_message_to_chat_by_id_and_message_id(
-            chat_id,
-            new_message_id,
-            {
+            # `upsert_message_to_chat_by_id_and_message_id` unconditionally
+            # sets `history.currentId = message_id` as a side effect of
+            # *every* call (it's OWUI's own generic upsert, not something we
+            # control). So the childrenIds patch on the *old* leaf must happen
+            # first — otherwise it clobbers currentId back to old_leaf_id right
+            # after we set it, and the new message becomes an invisible orphan
+            # branch (P33 bug, found 2026-07-11: pipe_log showed successful
+            # "persisted" calls but nothing ever appeared in OWUI, because
+            # currentId never actually ended up pointing at the new message).
+            if old_leaf_id:
+                children = list(old_leaf.get("childrenIds", []))
+                if new_message_id not in children:
+                    children.append(new_message_id)
+                    await Chats.upsert_message_to_chat_by_id_and_message_id(
+                        chat_id, old_leaf_id, {"childrenIds": children},
+                    )
+
+            message_fields = {
                 "role": "assistant",
                 "content": text,
                 "parentId": old_leaf_id,
                 "childrenIds": [],
                 "timestamp": int(time.time()),
-            },
-        )
+            }
+            if model_id:
+                message_fields["model"] = model_id
+                message_fields["modelName"] = old_leaf.get("modelName") or model_id
+
+            await Chats.upsert_message_to_chat_by_id_and_message_id(
+                chat_id, new_message_id, message_fields,
+            )
 
         pipe_log(
             f"  proactive delivery: persisted message into chat {chat_id[:8]}... "
@@ -1281,6 +1442,171 @@ async def _deliver_proactive_owui_message(
         )
     except Exception as ex:
         pipe_log(f"  proactive delivery failed: {ex}")
+
+
+# Embedded in the proactively-delivered message text for a finished
+# sub-agent task, invisible in rendered markdown (an HTML comment) but still
+# present in the raw `content` OWUI hands the Action endpoint on click — the
+# one piece of information a toolbar button click doesn't otherwise carry
+# (OWUI sends chat_id/message_id/model/content, never a custom taskId).
+# `_run_subagent_detail`-style consumers parse it back out with
+# `_SUBAGENT_TASK_ID_MARKER_RE` to open straight into that task's drawer
+# instead of the general status dialog.
+_SUBAGENT_TASK_ID_MARKER_RE = re.compile(r"<!--\s*openclaw:taskId=([^\s>]+?)\s*-->")
+
+
+async def _maybe_deliver_subagent_proactive(
+    conn: "_GatewayConnection",
+    child_session_key: str,
+    run_id: str,
+    min_idle_s: float = 120,
+    poll_interval_s: float = 5,
+    max_wait_s: float = 600,
+) -> None:
+    """Resolve a finished sub-agent's parent OWUI chat, wait out the same
+    idle-debounce contract `_maybe_deliver_proactive_after_debounce` uses
+    (checked against the *parent's* liveness, not the sub-agent's own — see
+    the event-loop call site's comment for why), then deliver.
+
+    A nested sub-agent (spawned by another sub-agent, not by an OWUI
+    session directly) resolves to a parent that also fails
+    `parse_owui_session_key` — there is no OWUI chat to deliver to at all in
+    that case, so this quietly gives up rather than trying to walk further
+    up the chain.
+    """
+    try:
+        task = await conn.resolve_subagent_parent_task(child_session_key)
+        if not task:
+            pipe_log(f"  subagent proactive: no task found for {child_session_key[:40]}...")
+            return
+        parent_session_key = task.get("sessionKey")
+        task_id = task.get("id")
+        if not task_id or not parent_session_key or not conn.parse_owui_session_key(parent_session_key):
+            return
+
+        waited = 0.0
+        while not conn.session_idle_for(parent_session_key, min_idle_s=min_idle_s):
+            if not PROACTIVE_DELIVERY_ENABLED:
+                pipe_log("  subagent proactive delivery: disabled mid-debounce, abandoning wait")
+                return
+            if waited >= max_wait_s:
+                pipe_log(
+                    f"  subagent proactive delivery: parent {parent_session_key[:40]}... "
+                    f"never settled idle within {max_wait_s:.0f}s, giving up"
+                )
+                return
+            await asyncio.sleep(poll_interval_s)
+            waited += poll_interval_s
+
+        await _deliver_subagent_proactive_owui_message(
+            conn, child_session_key, run_id, parent_session_key, task_id,
+            task.get("title"),
+        )
+    finally:
+        conn._pending_proactive_debounce.discard(child_session_key)
+
+
+async def _deliver_subagent_proactive_owui_message(
+    conn: "_GatewayConnection",
+    child_session_key: str,
+    run_id: str,
+    parent_session_key: str,
+    task_id: str,
+    task_title: str | None,
+) -> None:
+    """Same persistence mechanism as `_deliver_proactive_owui_message`
+    (direct write via `Chats.upsert_message_to_chat_by_id_and_message_id`,
+    same must-run-inside-OWUI-process constraint), but the *content* source
+    and the *delivery target* are different sessions: the sub-agent's own
+    transcript for what it said, the parent's chat for where it's shown.
+    """
+    parsed = conn.parse_owui_session_key(parent_session_key)
+    if not parsed:
+        return
+    user_id, chat_id = parsed
+
+    dedup_key = f"{child_session_key}:{run_id}"
+    if dedup_key in conn._delivered_proactive:
+        return
+    conn._delivered_proactive[dedup_key] = True
+    if len(conn._delivered_proactive) > 200:
+        for stale_key in list(conn._delivered_proactive)[:100]:
+            conn._delivered_proactive.pop(stale_key, None)
+
+    try:
+        preview = await conn.session_preview(child_session_key, limit=1, max_chars=8000)
+    except Exception as ex:
+        pipe_log(f"  subagent proactive delivery: session_preview failed: {ex}")
+        return
+
+    text = _last_assistant_text_from_preview(preview, child_session_key)
+    if not text:
+        pipe_log("  subagent proactive delivery: no assistant text in preview, skipping")
+        return
+
+    label = f"Sub-agent finished: {task_title}" if task_title else "Sub-agent finished"
+    text = f"*↳ {label}*\n\n{text}\n\n<!-- openclaw:taskId={task_id} -->"
+
+    try:
+        from open_webui.models.chats import Chats
+    except Exception as ex:
+        pipe_log(f"  subagent proactive delivery unavailable (not running inside OWUI process?): {ex}")
+        return
+
+    try:
+        # Serialize with the regular proactive path (see that function) so a
+        # sub-agent-finished message and a regular proactive message can't each
+        # read the same leaf and land as sibling 1/2·2/2 variants.
+        async with conn._chat_write_lock(chat_id):
+            chat = await Chats.get_chat_by_id(chat_id)
+            if chat is None:
+                pipe_log(f"  subagent proactive delivery: chat {chat_id[:8]}... not found")
+                return
+            history = chat.chat.get("history", {}) or {}
+            # Anchor on the true childless leaf, not the bare `currentId`
+            # (see `_deepest_leaf_id`) — otherwise this forks a sibling variant.
+            old_leaf_id = _deepest_leaf_id(history.get("messages") or {}, history.get("currentId"))
+            new_message_id = str(uuid.uuid4())
+
+            # Same reasoning as the regular proactive path: inherit the
+            # branch's own model so OWUI's frontend still resolves an `actions`
+            # list for this message (ResponseMessage.svelte) and the existing
+            # Status button renders on it — its default click handler is what
+            # detects the taskId marker and redirects into the drawer (see
+            # action.py), so this message needs the SAME model, not a
+            # different one.
+            old_leaf = (history.get("messages") or {}).get(old_leaf_id, {}) if old_leaf_id else {}
+            model_id = old_leaf.get("model") or next(iter(chat.chat.get("models") or []), None)
+
+            if old_leaf_id:
+                children = list(old_leaf.get("childrenIds", []))
+                if new_message_id not in children:
+                    children.append(new_message_id)
+                    await Chats.upsert_message_to_chat_by_id_and_message_id(
+                        chat_id, old_leaf_id, {"childrenIds": children},
+                    )
+
+            message_fields = {
+                "role": "assistant",
+                "content": text,
+                "parentId": old_leaf_id,
+                "childrenIds": [],
+                "timestamp": int(time.time()),
+            }
+            if model_id:
+                message_fields["model"] = model_id
+                message_fields["modelName"] = old_leaf.get("modelName") or model_id
+
+            await Chats.upsert_message_to_chat_by_id_and_message_id(
+                chat_id, new_message_id, message_fields,
+            )
+
+        pipe_log(
+            f"  subagent proactive delivery: persisted message into chat {chat_id[:8]}... "
+            f"for user {user_id[:8]}... task {task_id[:8]}... ({len(text)} chars)"
+        )
+    except Exception as ex:
+        pipe_log(f"  subagent proactive delivery failed: {ex}")
 
 
 # Module-level singleton
@@ -1734,11 +2060,66 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     });
   }
 
+  // TaskSummary timestamps can arrive as either an ISO string or an epoch-ms
+  // integer (schema allows both) -- normalize once here rather than in every
+  // caller. Elapsed time is computed client-side from raw ms (not a
+  // server-formatted duration) for the same reason resetAtMs already is:
+  // avoids clock-skew between whenever the RPC resolved and whenever the
+  // user actually reads the row.
+  function toMs(v) {
+    if (v == null) return null;
+    if (typeof v === 'number') return v;
+    const parsed = new Date(v).getTime();
+    return isNaN(parsed) ? null : parsed;
+  }
+
+  function elapsedTime(startedAt, endedAt) {
+    const startMs = toMs(startedAt);
+    if (startMs == null) return '';
+    const endMs = toMs(endedAt) || Date.now();
+    const deltaS = Math.max(0, Math.floor((endMs - startMs) / 1000));
+    const days = Math.floor(deltaS / 86400);
+    const hours = Math.floor((deltaS % 86400) / 3600);
+    const minutes = Math.floor((deltaS % 3600) / 60);
+    if (days) return days + 'd' + String(hours).padStart(2, '0') + 'h';
+    if (hours) return hours + 'h' + String(minutes).padStart(2, '0') + 'm';
+    if (minutes) return minutes + 'm';
+    return deltaS + 's';
+  }
+
+  // Same same-origin/synthetic-mode trick as triggerCompact() above, just a
+  // different mode + extra taskId/title/status payload so the drawer
+  // (_DRAWER_OPEN_JS_TEMPLATE) can paint its header instantly from data the
+  // row already had, before Action._run_subagent_detail's own RPCs resolve.
+  function openSubagentDrawer(task) {
+    const token = localStorage.getItem('token');
+    fetch('/api/chat/actions/openclaw_status_action', {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + token,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: IDENTITY.owuiModel,
+        chat_id: IDENTITY.chatId,
+        id: IDENTITY.messageId,
+        session_id: IDENTITY.sessionId,
+        mode: 'subagent-detail',
+        taskId: task.id,
+        taskTitle: task.title,
+        taskStatus: task.status,
+      }),
+    }).catch(function(err) {
+      console.error('[openclaw-status] could not open subagent drawer', err);
+    });
+  }
+
   window.__openclawStatus = {
     identity: IDENTITY, isDark: isDark, barColor: barColor, makeBar: makeBar,
     sectionHeader: sectionHeader, errorEl: errorEl,
     skeletonSection: skeletonSection, touchFooter: touchFooter,
-    triggerCompact: triggerCompact,
+    triggerCompact: triggerCompact, elapsedTime: elapsedTime,
+    openSubagentDrawer: openSubagentDrawer,
   };
 
   const root = document.createElement('div');
@@ -1748,8 +2129,13 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
 
   const panel = document.createElement('div');
   panel.className = 'bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 '
-    + 'rounded-2xl shadow-2xl border border-gray-100 dark:border-gray-800 '
-    + 'p-5 w-[380px] max-w-[90vw]';
+    + 'rounded-2xl shadow-2xl border border-gray-100 dark:border-gray-800 p-5';
+  // Inline, not a `w-[380px] max-w-[90vw]` utility class: same reasoning as
+  // barColor() below -- an arbitrary-value class OWUI's own Tailwind build
+  // never scanned out of its own source can silently carry zero CSS.
+  // min() keeps this mobile-first: a narrow viewport wins the 88vw side (a
+  // visible margin, not edge-to-edge), a wide one wins the 380px cap.
+  panel.style.width = 'min(380px, 88vw)';
   panel.addEventListener('click', function(e) { e.stopPropagation(); });
 
   const header = document.createElement('div');
@@ -1990,7 +2376,7 @@ _LIMITS_FILL_JS_TEMPLATE = r"""
     const labelEl = document.createElement('span');
     labelEl.textContent = w.label;
     const pctEl = document.createElement('span');
-    pctEl.textContent = Math.round(100 - w.usedPercent) + '% left';
+    pctEl.textContent = Math.round(w.usedPercent) + '% used';
     top.appendChild(labelEl);
     top.appendChild(pctEl);
     row.appendChild(top);
@@ -2020,10 +2406,13 @@ _LIMITS_FILL_JS_TEMPLATE = r"""
 })();
 """
 
-# Deliberately hidden entirely (not even a header) when count is 0 --
-# "general tracking, no detail" (Eliav's ask): a permanently-visible
-# "0 running" line for the common idle case would be more clutter than
-# signal. Only appears when there's actually something to report.
+# Deliberately hidden entirely (not even a header) when there are no tasks --
+# "general tracking, no detail" (Eliav's original ask): a permanently-visible
+# empty line for the common idle case would be more clutter than signal. Only
+# appears when there's actually something to report. Each row is clickable --
+# opens the per-subagent drawer (see _DRAWER_OPEN_JS_TEMPLATE) via
+# S.openSubagentDrawer, passing the already-known TaskSummary fields along so
+# the drawer can paint its header instantly, before any RPC resolves.
 _SUBAGENTS_FILL_JS_TEMPLATE = r"""
 (function() {
   const DATA = __OPENCLAW_STATUS_DATA__;
@@ -2038,19 +2427,410 @@ _SUBAGENTS_FILL_JS_TEMPLATE = r"""
     return;
   }
 
-  if (!DATA.count) {
+  if (!DATA.tasks || !DATA.tasks.length) {
     section.className = '';
     return;
   }
 
   section.className = 'mb-4';
-  section.appendChild(S.sectionHeader('Subagents'));
-  const line = document.createElement('div');
-  line.className = 'text-sm text-gray-700 dark:text-gray-200';
-  line.textContent = '🤖 ' + DATA.count + ' running';
-  section.appendChild(line);
+  section.appendChild(S.sectionHeader('Subagents (' + DATA.tasks.length + ')'));
+
+  const STATUS_COLOR = {
+    queued: '#9ca3af', running: '#3b82f6', completed: '#10b981',
+    failed: '#f43f5e', cancelled: '#f59e0b', timed_out: '#f59e0b',
+  };
+
+  DATA.tasks.forEach(function(t) {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'w-full flex items-start gap-2 text-left py-1.5 px-1.5 -mx-1.5 '
+      + 'rounded-lg hover:bg-gray-50 dark:hover:bg-gray-800/60';
+    row.onclick = function() { S.openSubagentDrawer(t); };
+
+    const dot = document.createElement('span');
+    dot.className = 'mt-1.5 h-1.5 w-1.5 rounded-full shrink-0'
+      + (t.status === 'running' ? ' animate-pulse' : '');
+    dot.style.backgroundColor = STATUS_COLOR[t.status] || '#9ca3af';
+    row.appendChild(dot);
+
+    const body = document.createElement('div');
+    body.className = 'min-w-0 flex-1';
+    const titleLine = document.createElement('div');
+    titleLine.className = 'text-sm text-gray-700 dark:text-gray-200 break-words';
+    titleLine.textContent = t.title || t.id;
+    body.appendChild(titleLine);
+
+    const sub = t.status === 'running' ? t.progressSummary : (t.terminalSummary || t.error);
+    if (sub) {
+      const subLine = document.createElement('div');
+      subLine.className = 'text-xs text-gray-400 dark:text-gray-500 break-words';
+      subLine.textContent = sub;
+      body.appendChild(subLine);
+    }
+    row.appendChild(body);
+
+    const elapsed = document.createElement('span');
+    elapsed.className = 'text-[10px] text-gray-400 dark:text-gray-500 shrink-0 mt-1.5';
+    elapsed.textContent = S.elapsedTime(t.startedAt, t.endedAt);
+    row.appendChild(elapsed);
+
+    section.appendChild(row);
+  });
 
   S.touchFooter(DATA.fetchedAt, DATA.source);
+})();
+"""
+
+
+# Right-side slide-in panel, sibling to _MODAL_OPEN_JS_TEMPLATE -- deliberately
+# does NOT close/replace the parent status modal (different root id,
+# positioned to the side rather than centered) so the full subagent list
+# stays visible and glanceable behind it. Opened by S.openSubagentDrawer()
+# (defined in _MODAL_OPEN_JS_TEMPLATE) via a synthetic mode="subagent-detail"
+# call -- same self-call convention triggerCompact() already uses. All three
+# tab panes are created up front with skeletons; Action._run_subagent_detail
+# fills all three on every poll tick regardless of which tab is visible
+# (cheap: it's just a DOM update), so switching tabs is a pure visibility
+# toggle with no extra fetch involved.
+_DRAWER_OPEN_JS_TEMPLATE = r"""
+(function() {
+  const TASK = __OPENCLAW_TASK__;
+  const existing = document.getElementById('openclaw-drawer-root');
+  if (existing) existing.remove();
+
+  const S = window.__openclawStatus;
+  if (!S) return;
+
+  const root = document.createElement('div');
+  root.id = 'openclaw-drawer-root';
+  root.className = 'fixed inset-0 z-[10000]';
+
+  const backdrop = document.createElement('div');
+  backdrop.className = 'absolute inset-0';
+  backdrop.style.background = 'rgba(0,0,0,0.25)';
+  backdrop.onclick = function() { root.remove(); };
+  root.appendChild(backdrop);
+
+  const panel = document.createElement('div');
+  panel.className = 'absolute right-0 top-0 bottom-0 '
+    + 'bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 '
+    + 'shadow-2xl border-l border-gray-100 dark:border-gray-800 flex flex-col';
+  // Inline, not a `w-[420px] max-w-[92vw]` utility class -- same reasoning
+  // as the status modal's panel above. min() keeps this mobile-first: a
+  // narrow viewport wins the 88vw side (leaves a visible margin so the
+  // subagent list behind it stays glanceable, not edge-to-edge), a wide one
+  // wins the 420px cap.
+  panel.style.width = 'min(420px, 88vw)';
+  panel.addEventListener('click', function(e) { e.stopPropagation(); });
+  root.appendChild(panel);
+
+  const header = document.createElement('div');
+  header.className = 'flex items-start justify-between gap-2 p-4 border-b '
+    + 'border-gray-100 dark:border-gray-800';
+  const headerText = document.createElement('div');
+  headerText.className = 'min-w-0';
+  const titleEl = document.createElement('div');
+  titleEl.className = 'text-sm font-semibold break-words';
+  titleEl.textContent = TASK.title || TASK.id;
+  headerText.appendChild(titleEl);
+  const statusEl = document.createElement('div');
+  statusEl.id = 'openclaw-drawer-status';
+  statusEl.className = 'text-xs text-gray-400 dark:text-gray-500 mt-0.5';
+  statusEl.textContent = TASK.status || '';
+  headerText.appendChild(statusEl);
+  header.appendChild(headerText);
+  const closeBtn = document.createElement('button');
+  closeBtn.type = 'button';
+  closeBtn.textContent = '×';
+  closeBtn.className = 'text-xl leading-none text-gray-400 hover:text-gray-700 '
+    + 'dark:hover:text-gray-200 px-1 shrink-0';
+  closeBtn.onclick = function() { root.remove(); };
+  header.appendChild(closeBtn);
+  panel.appendChild(header);
+
+  const TABS = ['Overview', 'Transcript', 'Tools'];
+  const tabBar = document.createElement('div');
+  tabBar.className = 'flex gap-1 px-3 pt-2 border-b border-gray-100 dark:border-gray-800';
+  const panes = {};
+  function tabClass(active) {
+    return 'text-xs font-medium px-2.5 py-1.5 rounded-t-lg border-b-2 '
+      + (active ? 'border-blue-500 text-blue-600 dark:text-blue-400'
+                : 'border-transparent text-gray-400 dark:text-gray-500 '
+                  + 'hover:text-gray-600 dark:hover:text-gray-300');
+  }
+  TABS.forEach(function(name, i) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = name;
+    btn.dataset.tab = name;
+    btn.className = tabClass(i === 0);
+    btn.onclick = function() {
+      TABS.forEach(function(n) {
+        const b = tabBar.querySelector('[data-tab="' + n + '"]');
+        const active = n === name;
+        b.className = tabClass(active);
+        panes[n].style.display = active ? 'block' : 'none';
+      });
+    };
+    tabBar.appendChild(btn);
+  });
+  panel.appendChild(tabBar);
+
+  const content = document.createElement('div');
+  content.className = 'flex-1 overflow-y-auto p-4';
+  TABS.forEach(function(name, i) {
+    const pane = document.createElement('div');
+    pane.id = 'openclaw-drawer-pane-' + name.toLowerCase();
+    pane.style.display = i === 0 ? 'block' : 'none';
+    pane.appendChild(S.skeletonSection('openclaw-drawer-section-' + name.toLowerCase()));
+    panes[name] = pane;
+    content.appendChild(pane);
+  });
+  panel.appendChild(content);
+
+  const footer = document.createElement('div');
+  footer.id = 'openclaw-drawer-footer';
+  footer.className = 'text-[11px] text-gray-400 dark:text-gray-600 px-4 py-2 '
+    + 'border-t border-gray-100 dark:border-gray-800';
+  footer.textContent = ' ';
+  panel.appendChild(footer);
+
+  const onKey = function(e) {
+    if (e.key === 'Escape') {
+      root.remove();
+      document.removeEventListener('keydown', onKey);
+    }
+  };
+  document.addEventListener('keydown', onKey);
+
+  document.body.appendChild(root);
+})();
+"""
+
+# Whole-drawer error (task not found, connect failure) -- replaces the
+# content of all three panes at once, same reasoning as
+# _SECTIONS_ERROR_JS_TEMPLATE for the outer modal.
+_DRAWER_ERROR_JS_TEMPLATE = r"""
+(function() {
+  const MESSAGE = __OPENCLAW_ERROR_MESSAGE__;
+  const S = window.__openclawStatus;
+  ['overview', 'transcript', 'tools'].forEach(function(name) {
+    const pane = document.getElementById('openclaw-drawer-pane-' + name);
+    if (!pane) return;
+    pane.innerHTML = '';
+    pane.appendChild(S ? S.errorEl(MESSAGE) : document.createTextNode(MESSAGE));
+  });
+})();
+"""
+
+_DRAWER_OVERVIEW_FILL_JS_TEMPLATE = r"""
+(function() {
+  const DATA = __OPENCLAW_STATUS_DATA__;
+  const section = document.getElementById('openclaw-drawer-section-overview');
+  const S = window.__openclawStatus;
+  if (!section || !S) return;
+
+  const statusEl = document.getElementById('openclaw-drawer-status');
+  if (statusEl && DATA.task) {
+    statusEl.textContent = DATA.task.status
+      + (DATA.task.terminalSummary ? ' · ' + DATA.task.terminalSummary : '')
+      + (DATA.task.error ? ' · ' + DATA.task.error : '');
+  }
+
+  section.innerHTML = '';
+  if (DATA.error) {
+    section.appendChild(S.errorEl(DATA.error));
+    return;
+  }
+  if (!DATA.task) {
+    const empty = document.createElement('div');
+    empty.className = 'text-gray-400 dark:text-gray-500 text-xs';
+    empty.textContent = 'No task data.';
+    section.appendChild(empty);
+    return;
+  }
+
+  const meta = document.createElement('div');
+  meta.className = 'text-xs text-gray-500 dark:text-gray-400 mb-3';
+  meta.textContent = 'Started ' + (S.elapsedTime(DATA.task.startedAt, null) || '?') + ' ago'
+    + (DATA.task.endedAt ? ' · ran ' + S.elapsedTime(DATA.task.startedAt, DATA.task.endedAt) : '');
+  section.appendChild(meta);
+
+  if (!DATA.childSessionKey) {
+    const notStarted = document.createElement('div');
+    notStarted.className = 'text-gray-400 dark:text-gray-500 text-xs';
+    notStarted.textContent = 'Not started yet.';
+    section.appendChild(notStarted);
+    return;
+  }
+
+  const sub = document.createElement('div');
+  sub.className = 'text-xs text-gray-500 dark:text-gray-400 mb-3';
+  sub.textContent = (DATA.provider || '?') + (DATA.model ? (' · ' + DATA.model) : '');
+  section.appendChild(sub);
+
+  if (DATA.context) {
+    section.appendChild(S.sectionHeader('Context'));
+    section.appendChild(S.makeBar(DATA.context.pct));
+    const label = document.createElement('div');
+    label.className = 'text-xs text-gray-500 dark:text-gray-400 mt-1.5 mb-3';
+    label.textContent = DATA.context.usedTokens + ' / ' + DATA.context.totalTokens
+      + ' tokens · ' + DATA.context.pct + '%';
+    section.appendChild(label);
+  }
+
+  if (DATA.goal) {
+    section.appendChild(S.sectionHeader('Goal'));
+    const line = document.createElement('div');
+    line.className = 'text-xs text-gray-700 dark:text-gray-200';
+    line.textContent = DATA.goal.line;
+    section.appendChild(line);
+  }
+
+  const df = document.getElementById('openclaw-drawer-footer');
+  if (df) df.textContent = 'Updated ' + DATA.fetchedAt + ' · via ' + DATA.source;
+})();
+"""
+
+# Message shape assumed here ({role, content: [{type: "text"|"toolcall"|
+# "tool_result"|"thinking", ...}]}) confirmed live against a real session via
+# sessions_history (chat.history is a display-normalized projection of the
+# same underlying transcript, not a separate schema, so expected to match --
+# see _extract_transcript_and_tools). Only renders rows that actually have
+# text after stripping tool-call/tool-result/thinking parts, so the
+# scrollback doesn't show empty gaps for pure tool-call turns (those live in
+# the Tools tab instead).
+_DRAWER_TRANSCRIPT_FILL_JS_TEMPLATE = r"""
+(function() {
+  const DATA = __OPENCLAW_STATUS_DATA__;
+  const section = document.getElementById('openclaw-drawer-section-transcript');
+  const pane = document.getElementById('openclaw-drawer-pane-transcript');
+  const S = window.__openclawStatus;
+  if (!section || !pane || !S) return;
+
+  if (DATA.error) {
+    section.innerHTML = '';
+    section.appendChild(S.errorEl(DATA.error));
+    return;
+  }
+
+  if (!DATA.childSessionKey) {
+    section.innerHTML = '';
+    const notStarted = document.createElement('div');
+    notStarted.className = 'text-gray-400 dark:text-gray-500 text-xs';
+    notStarted.textContent = 'Not started yet.';
+    section.appendChild(notStarted);
+    return;
+  }
+
+  // Preserve "was already scrolled to bottom" before rebuilding, so a live
+  // poll tick doesn't yank the view away from wherever the user scrolled to
+  // read older messages.
+  const wasAtBottom = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 40;
+
+  section.innerHTML = '';
+  const ROLE_STYLE = {
+    user: 'text-gray-900 dark:text-gray-100',
+    assistant: 'text-gray-700 dark:text-gray-300',
+  };
+
+  const rows = DATA.messages || [];
+  if (!rows.length) {
+    const empty = document.createElement('div');
+    empty.className = 'text-gray-400 dark:text-gray-500 text-xs';
+    empty.textContent = 'No transcript yet.';
+    section.appendChild(empty);
+    return;
+  }
+
+  rows.forEach(function(m) {
+    if (!m.text) return;
+    const row = document.createElement('div');
+    row.className = 'text-xs mb-2.5 ' + (ROLE_STYLE[m.role] || ROLE_STYLE.assistant);
+    const roleLabel = document.createElement('div');
+    roleLabel.className = 'text-[10px] uppercase tracking-wide text-gray-400 dark:text-gray-500 mb-0.5';
+    roleLabel.textContent = m.role;
+    row.appendChild(roleLabel);
+    const text = document.createElement('div');
+    text.className = 'whitespace-pre-wrap break-words';
+    text.textContent = m.text;
+    row.appendChild(text);
+    section.appendChild(row);
+  });
+
+  if (wasAtBottom) pane.scrollTop = pane.scrollHeight;
+})();
+"""
+
+# Uses real <details>/<summary> (natively collapsible with zero JS) rather
+# than OWUI's own "<details type=\"tool_calls\">" markup convention: that
+# convention only renders as a card because OWUI's own markdown-message
+# component parses it out of a message's markdown source -- it does nothing
+# special for DOM nodes built directly via execute(), which is how this
+# whole drawer (like the rest of the status dialog) is delivered. A plain
+# native <details> gets the same "collapsible card" behavior for free
+# without depending on that unrelated rendering path.
+_DRAWER_TOOLS_FILL_JS_TEMPLATE = r"""
+(function() {
+  const DATA = __OPENCLAW_STATUS_DATA__;
+  const section = document.getElementById('openclaw-drawer-section-tools');
+  const S = window.__openclawStatus;
+  if (!section || !S) return;
+
+  if (DATA.error) {
+    section.innerHTML = '';
+    section.appendChild(S.errorEl(DATA.error));
+    return;
+  }
+
+  if (!DATA.childSessionKey) {
+    section.innerHTML = '';
+    const notStarted = document.createElement('div');
+    notStarted.className = 'text-gray-400 dark:text-gray-500 text-xs';
+    notStarted.textContent = 'Not started yet.';
+    section.appendChild(notStarted);
+    return;
+  }
+
+  section.innerHTML = '';
+  const calls = DATA.toolCalls || [];
+  if (!calls.length) {
+    const empty = document.createElement('div');
+    empty.className = 'text-gray-400 dark:text-gray-500 text-xs';
+    empty.textContent = 'No tool calls yet.';
+    section.appendChild(empty);
+    return;
+  }
+
+  calls.forEach(function(c) {
+    const details = document.createElement('details');
+    details.className = 'mb-2 rounded-lg border border-gray-100 dark:border-gray-800 px-2.5 py-1.5';
+    const summary = document.createElement('summary');
+    summary.className = 'text-xs font-medium cursor-pointer text-gray-700 dark:text-gray-200';
+    summary.textContent = '🔧 ' + c.name;
+    details.appendChild(summary);
+
+    const argsEl = document.createElement('pre');
+    argsEl.className = 'text-[11px] mt-1.5 whitespace-pre-wrap break-words '
+      + 'text-gray-500 dark:text-gray-400';
+    argsEl.textContent = c.arguments;
+    details.appendChild(argsEl);
+
+    if (c.result) {
+      const resultLabel = document.createElement('div');
+      resultLabel.className = 'text-[10px] uppercase tracking-wide text-gray-400 '
+        + 'dark:text-gray-500 mt-1.5';
+      resultLabel.textContent = 'Result';
+      details.appendChild(resultLabel);
+      const resultEl = document.createElement('pre');
+      resultEl.className = 'text-[11px] whitespace-pre-wrap break-words '
+        + 'text-gray-500 dark:text-gray-400';
+      resultEl.textContent = c.result;
+      details.appendChild(resultEl);
+    }
+
+    section.appendChild(details);
+  });
 })();
 """
 
@@ -2091,6 +2871,90 @@ def _render_subagents_fill_js(data: dict) -> str:
     return _SUBAGENTS_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
 
 
+def _render_drawer_open_js(task: dict) -> str:
+    return _DRAWER_OPEN_JS_TEMPLATE.replace("__OPENCLAW_TASK__", _json_for_js(task))
+
+
+def _render_drawer_error_js(message: str) -> str:
+    return _DRAWER_ERROR_JS_TEMPLATE.replace("__OPENCLAW_ERROR_MESSAGE__", _json_for_js(message))
+
+
+def _render_drawer_overview_fill_js(data: dict) -> str:
+    return _DRAWER_OVERVIEW_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
+
+
+def _render_drawer_transcript_fill_js(data: dict) -> str:
+    return _DRAWER_TRANSCRIPT_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
+
+
+def _render_drawer_tools_fill_js(data: dict) -> str:
+    return _DRAWER_TOOLS_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
+
+
+# Bounds for Action._run_subagent_detail's hold-open poll loop -- same
+# "hold the request, sleep, poll, keep emitting" shape _run_compact already
+# proves works (there, bounded to 180s). A subagent can legitimately run much
+# longer than a compact call, so this gets its own, longer ceiling; it exists
+# purely so a forgotten-open drawer (or a subagent stuck non-terminal) can't
+# pin the coroutine/connection open forever, not because 15 minutes is a
+# meaningful product limit.
+_SUBAGENT_POLL_MAX_S = 900
+_SUBAGENT_POLL_INTERVAL_S = 2.5
+
+
+def _extract_transcript_and_tools(messages: list) -> tuple[list, list]:
+    """Splits chat.history's message rows into plain-text transcript rows and
+    tool-call cards for the drawer's Transcript/Tools tabs.
+
+    Assumes the same {role, content: [...]} shape confirmed live via
+    sessions_history (content items typed "text" / "toolcall" /
+    "tool_result" / "thinking") -- chat.history is a display-normalized
+    projection of the same underlying transcript store, not a separate
+    schema, so this is expected to match; a plain string `content` (some
+    transports may still use that) is treated as a single text row so this
+    degrades instead of silently dropping messages if the shape differs.
+    """
+    text_rows: list = []
+    tool_calls: list = []
+    pending_by_id: dict = {}
+    for m in messages or []:
+        role = m.get("role")
+        content = m.get("content")
+        if isinstance(content, str):
+            if content.strip():
+                text_rows.append({"role": role, "text": content})
+            continue
+        if not isinstance(content, list):
+            continue
+        text_parts = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type == "text" and item.get("text"):
+                text_parts.append(item["text"])
+            elif item_type == "toolcall":
+                call = {
+                    "id": item.get("id"),
+                    "name": item.get("name") or "tool",
+                    "arguments": (
+                        json.dumps(item.get("arguments"), indent=2)
+                        if item.get("arguments") is not None else ""
+                    ),
+                    "result": None,
+                }
+                pending_by_id[call["id"]] = call
+                tool_calls.append(call)
+            elif item_type == "tool_result":
+                call = pending_by_id.get(item.get("tool_use_id"))
+                if call is not None:
+                    result = item.get("content")
+                    call["result"] = result if isinstance(result, str) else json.dumps(result)
+        if text_parts:
+            text_rows.append({"role": role, "text": "\n".join(text_parts)})
+    return text_rows, tool_calls
+
+
 class Action:
     class Valves(BaseModel):
         GATEWAY_URL: str = Field(
@@ -2127,13 +2991,33 @@ class Action:
     async def action(self, body: dict, __user__=None, __event_emitter__=None):
         """Dispatches on body["mode"]: the default ("status", or absent --
         this is what OWUI sends for the actual message-toolbar click) opens
-        the dialog and shows live usage; "compact" is never sent by OWUI
-        itself -- it's a synthetic marker the dialog's own in-page Compact
-        button fetches back with (see triggerCompact() in
-        _MODAL_OPEN_JS_TEMPLATE), reusing this same endpoint rather than
-        registering a second Action."""
-        if body.get("mode") == "compact":
+        the dialog and shows live usage; "compact" and "subagent-detail" are
+        never sent by OWUI itself -- both are synthetic markers the dialog's
+        own in-page buttons fetch back with (see triggerCompact() and
+        openSubagentDrawer() in _MODAL_OPEN_JS_TEMPLATE), reusing this same
+        endpoint rather than registering a second Action.
+
+        A real toolbar click on a proactively-delivered sub-agent-finished
+        message is also mode-less (OWUI itself never sends a "mode"), but
+        carries a hidden `<!-- openclaw:taskId=... -->` marker in
+        `body["content"]` (see `_deliver_subagent_proactive_owui_message` in
+        gateway.py) -- there's deliberately no separate Action/button for
+        this (Eliav's call, 2026-07-13: a second OWUI Function + flipping
+        the existing one off "global" was more infra/config-risk than the
+        payoff of a visually distinct icon). Detected here and redirected
+        straight into the same subagent-detail drawer instead of the
+        general status dialog, keyed off content rather than mode."""
+        mode = body.get("mode")
+        if mode == "compact":
             return await self._run_compact(body, __user__, __event_emitter__)
+        if mode == "subagent-detail":
+            return await self._run_subagent_detail(body, __user__, __event_emitter__)
+        if mode is None:
+            marker = _SUBAGENT_TASK_ID_MARKER_RE.search(body.get("content") or "")
+            if marker:
+                return await self._run_subagent_detail(
+                    {**body, "taskId": marker.group(1)}, __user__, __event_emitter__,
+                )
         return await self._run_status(body, __user__, __event_emitter__)
 
     async def _run_status(self, body: dict, __user__, __event_emitter__, *, show_loading=True):
@@ -2302,7 +3186,14 @@ class Action:
         async def fill_subagents():
             """No dependency on sessions.describe/usage.status at all --
             session_key is already known synchronously, so this is the
-            most genuinely independent of the three sections."""
+            most genuinely independent of the three sections.
+
+            Passes the raw TaskSummary fields through (not just a count) so
+            the fill template can render one clickable row per subagent --
+            each row's own click handler carries these same fields into the
+            detail drawer's opening request (see S.openSubagentDrawer /
+            Action._run_subagent_detail), so the drawer can paint its header
+            instantly before its own RPCs resolve."""
             try:
                 tasks_resp = await tasks_task
             except Exception as ex:
@@ -2311,11 +3202,22 @@ class Action:
                     "code": _render_subagents_fill_js({"error": f"Could not fetch subagents: {ex}"})
                 }})
                 return
-            count = sum(
-                1 for t in (tasks_resp or {}).get("tasks", []) if t.get("kind") == "subagent"
-            )
+            subagent_tasks = [
+                {
+                    "id": t.get("id"),
+                    "title": t.get("title"),
+                    "status": t.get("status"),
+                    "progressSummary": t.get("progressSummary"),
+                    "terminalSummary": t.get("terminalSummary"),
+                    "error": t.get("error"),
+                    "childSessionKey": t.get("childSessionKey"),
+                    "startedAt": t.get("startedAt"),
+                    "endedAt": t.get("endedAt"),
+                }
+                for t in (tasks_resp or {}).get("tasks", []) if t.get("kind") == "subagent"
+            ]
             await __event_emitter__({"type": "execute", "data": {"code": _render_subagents_fill_js({
-                "count": count, "source": source, "fetchedAt": time.strftime("%H:%M:%S"), "error": None,
+                "tasks": subagent_tasks, "source": source, "fetchedAt": time.strftime("%H:%M:%S"), "error": None,
             })}})
 
         context_ready = asyncio.ensure_future(fill_context())
@@ -2447,3 +3349,121 @@ class Action:
 
         pipe_log("[status-action] compact done, refreshing status")
         return await self._run_status(body, __user__, __event_emitter__, show_loading=False)
+
+    async def _run_subagent_detail(self, body: dict, __user__, __event_emitter__):
+        """Opens the per-subagent drawer and holds this same request open for
+        the life of the subagent's run, polling and pushing fresh execute
+        fills roughly every _SUBAGENT_POLL_INTERVAL_S seconds -- the same
+        "hold the request open, sleep-poll, keep emitting" shape
+        _run_compact already uses and has proven works (there, bounded to
+        180s). Bounded here to _SUBAGENT_POLL_MAX_S so a forgotten-open
+        drawer, or a subagent that never reaches a terminal status, can't
+        pin this coroutine/connection open forever.
+
+        Deliberately has no "close" round-trip to cancel the loop early: if
+        the user closes the drawer (or reopens it for a different task,
+        which removes and recreates '#openclaw-drawer-root'), every fill
+        template's own `if (!section) return;` guard makes further
+        execute() pushes targeting the now-missing ids silent no-ops. Same
+        trade-off _run_compact already accepts (no cancel path there either)
+        -- wasted polling until the next terminal status or the deadline,
+        never a visible glitch.
+        """
+        task_id = body.get("taskId")
+        if not task_id:
+            await __event_emitter__({"type": "execute", "data": {
+                "code": _render_drawer_error_js("Missing taskId")
+            }})
+            return {"status": "error", "detail": "missing taskId"}
+
+        await __event_emitter__({"type": "execute", "data": {"code": _render_drawer_open_js({
+            "id": task_id, "title": body.get("taskTitle"), "status": body.get("taskStatus"),
+        })}})
+
+        try:
+            conn, source = await _get_action_connection(lambda: self.valves)
+        except Exception as ex:
+            pipe_log(f"[status-action] subagent-detail connect failed: {ex}")
+            await __event_emitter__({"type": "execute", "data": {
+                "code": _render_drawer_error_js(f"Could not connect: {ex}")
+            }})
+            return {"status": "error", "detail": str(ex)}
+
+        deadline = time.time() + _SUBAGENT_POLL_MAX_S
+        while True:
+            try:
+                task_resp = await conn.send_request("tasks.get", dict(taskId=task_id), timeout=8)
+                task = (task_resp or {}).get("task") or {}
+            except Exception as ex:
+                pipe_log(f"[status-action] subagent tasks.get failed: {ex}")
+                await __event_emitter__({"type": "execute", "data": {
+                    "code": _render_drawer_error_js(f"Could not fetch task: {ex}")
+                }})
+                return {"status": "error", "detail": str(ex)}
+
+            if not task:
+                await __event_emitter__({"type": "execute", "data": {
+                    "code": _render_drawer_error_js("Task not found.")
+                }})
+                return {"status": "error", "detail": "task not found"}
+
+            child_key = task.get("childSessionKey")
+            provider = model = None
+            context_data = goal_data = None
+            text_rows: list = []
+            tool_calls: list = []
+
+            if child_key:
+                try:
+                    desc_resp, history_resp = await asyncio.gather(
+                        conn.send_request("sessions.describe", dict(key=child_key), timeout=8),
+                        conn.send_request(
+                            "chat.history", dict(sessionKey=child_key, limit=50, maxChars=4000), timeout=8,
+                        ),
+                    )
+                except Exception as ex:
+                    pipe_log(f"[status-action] subagent detail fetch failed: {ex}")
+                    desc_resp, history_resp = None, None
+
+                session_row = (desc_resp or {}).get("session") or {}
+                provider = session_row.get("modelProvider")
+                model = session_row.get("model")
+                context_tokens = session_row.get("contextTokens")
+                total_tokens = session_row.get("totalTokens")
+                if context_tokens and total_tokens is not None:
+                    context_data = {
+                        "usedTokens": _fmt_tokens(total_tokens),
+                        "totalTokens": _fmt_tokens(context_tokens),
+                        "pct": round(total_tokens / context_tokens * 100, 1),
+                    }
+                goal = session_row.get("goal")
+                if goal:
+                    goal_line = _format_goal_line(goal)
+                    if goal_line:
+                        goal_data = {"line": goal_line}
+
+                text_rows, tool_calls = _extract_transcript_and_tools(
+                    (history_resp or {}).get("messages") or []
+                )
+
+            fetched_at = time.strftime("%H:%M:%S")
+            await __event_emitter__({"type": "execute", "data": {"code": _render_drawer_overview_fill_js({
+                "task": task, "childSessionKey": child_key, "provider": provider, "model": model,
+                "context": context_data, "goal": goal_data, "source": source,
+                "fetchedAt": fetched_at, "error": None,
+            })}})
+            await __event_emitter__({"type": "execute", "data": {"code": _render_drawer_transcript_fill_js({
+                "childSessionKey": child_key, "messages": text_rows, "error": None,
+            })}})
+            await __event_emitter__({"type": "execute", "data": {"code": _render_drawer_tools_fill_js({
+                "childSessionKey": child_key, "toolCalls": tool_calls, "error": None,
+            })}})
+
+            if task.get("status") not in ("queued", "running"):
+                break
+            if time.time() >= deadline:
+                break
+            await asyncio.sleep(_SUBAGENT_POLL_INTERVAL_S)
+
+        pipe_log(f"[status-action] subagent-detail loop ended taskId={task_id}")
+        return {"status": "ok"}
