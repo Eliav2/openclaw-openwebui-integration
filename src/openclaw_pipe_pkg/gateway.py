@@ -1054,6 +1054,20 @@ async def _deliver_proactive_owui_message(
         old_leaf_id = history.get("currentId")
         new_message_id = str(uuid.uuid4())
 
+        # Without a `model` field, OWUI's frontend can't resolve
+        # `$models.find((m) => m.id === message.model)` for this message, so
+        # it has zero associated actions -- the Status button (and any
+        # future proactive-specific action) silently never renders on
+        # proactively-delivered messages (confirmed against
+        # ResponseMessage.svelte, 2026-07-13). Prefer the immediately
+        # preceding message's own `model` (most locally accurate -- it's
+        # what actually produced this branch of the conversation) over the
+        # chat's globally-selected `models` list, which only reflects
+        # whatever's picked in the model dropdown right now and can drift
+        # from what a given branch was actually generated with.
+        old_leaf = (history.get("messages") or {}).get(old_leaf_id, {}) if old_leaf_id else {}
+        model_id = old_leaf.get("model") or next(iter(chat.chat.get("models") or []), None)
+
         # `upsert_message_to_chat_by_id_and_message_id` unconditionally sets
         # `history.currentId = message_id` as a side effect of *every* call
         # (it's OWUI's own generic upsert, not something we control). So the
@@ -1064,7 +1078,6 @@ async def _deliver_proactive_owui_message(
         # nothing ever appeared in OWUI, because currentId never actually
         # ended up pointing at the new message).
         if old_leaf_id:
-            old_leaf = (history.get("messages") or {}).get(old_leaf_id, {})
             children = list(old_leaf.get("childrenIds", []))
             if new_message_id not in children:
                 children.append(new_message_id)
@@ -1072,16 +1085,19 @@ async def _deliver_proactive_owui_message(
                     chat_id, old_leaf_id, {"childrenIds": children},
                 )
 
+        message_fields = {
+            "role": "assistant",
+            "content": text,
+            "parentId": old_leaf_id,
+            "childrenIds": [],
+            "timestamp": int(time.time()),
+        }
+        if model_id:
+            message_fields["model"] = model_id
+            message_fields["modelName"] = old_leaf.get("modelName") or model_id
+
         await Chats.upsert_message_to_chat_by_id_and_message_id(
-            chat_id,
-            new_message_id,
-            {
-                "role": "assistant",
-                "content": text,
-                "parentId": old_leaf_id,
-                "childrenIds": [],
-                "timestamp": int(time.time()),
-            },
+            chat_id, new_message_id, message_fields,
         )
 
         pipe_log(

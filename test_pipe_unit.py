@@ -327,6 +327,131 @@ class ProactiveDeliveryTests(unittest.TestCase):
         self.assertIn("Proactive message", history["messages"][new_id]["content"])
         self.assertIn(new_id, history["messages"][old_leaf_id]["childrenIds"])
 
+    def test_deliver_stamps_model_from_immediately_preceding_message(self):
+        """Regression for the 2026-07-13 bug: proactively-delivered messages
+        had no `model` field, so OWUI's frontend
+        (`$models.find((m) => m.id === message.model)`) could never resolve
+        any actions for them -- the Status button (and any future
+        proactive-specific action) silently never rendered. The old leaf's
+        own `model`/`modelName` (the branch this proactive message actually
+        continues) is the most locally-accurate source, preferred over the
+        chat's globally-selected `models` list.
+        """
+        conn = self._conn()
+        session_key = _owui_session_key(
+            "main", "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        )
+        conn.session_preview = mock.AsyncMock(
+            return_value={"previews": [{"key": session_key, "items": [
+                {"role": "assistant", "text": "hello from cron"},
+            ]}]}
+        )
+
+        old_leaf_id = "old-leaf"
+        chat_state = {
+            "models": ["openclaw_gateway.other"],
+            "history": {
+                "currentId": old_leaf_id,
+                "messages": {old_leaf_id: {
+                    "role": "assistant",
+                    "childrenIds": [],
+                    "model": "openclaw_gateway.default",
+                    "modelName": "OpenClaw · Default",
+                }},
+            },
+        }
+
+        class FakeChat:
+            def __init__(self, chat):
+                self.chat = chat
+
+        class FakeChats:
+            @staticmethod
+            async def get_chat_by_id(chat_id):
+                return FakeChat(chat_state)
+
+            @staticmethod
+            async def upsert_message_to_chat_by_id_and_message_id(chat_id, message_id, message):
+                history = chat_state["history"]
+                messages = history.setdefault("messages", {})
+                messages[message_id] = {**messages.get(message_id, {}), **message}
+                history["currentId"] = message_id
+                return FakeChat(chat_state)
+
+        fake_chats_module = types.ModuleType("open_webui.models.chats")
+        fake_chats_module.Chats = FakeChats
+        fake_models_module = types.ModuleType("open_webui.models")
+        fake_owui_module = types.ModuleType("open_webui")
+        with mock.patch.dict(sys.modules, {
+            "open_webui": fake_owui_module,
+            "open_webui.models": fake_models_module,
+            "open_webui.models.chats": fake_chats_module,
+        }):
+            asyncio.run(_deliver_proactive_owui_message(conn, session_key, "run-1"))
+
+        history = chat_state["history"]
+        new_msg = history["messages"][history["currentId"]]
+        self.assertEqual(new_msg["model"], "openclaw_gateway.default")
+        self.assertEqual(new_msg["modelName"], "OpenClaw · Default")
+
+    def test_deliver_falls_back_to_chat_selected_models_when_prior_leaf_has_none(self):
+        """A user message (or a fresh chat with no prior assistant turn) has
+        no `model` field of its own -- falls back to the chat's
+        globally-selected `models` list so the button still appears rather
+        than silently omitting `model` again."""
+        conn = self._conn()
+        session_key = _owui_session_key(
+            "main", "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        )
+        conn.session_preview = mock.AsyncMock(
+            return_value={"previews": [{"key": session_key, "items": [
+                {"role": "assistant", "text": "hello from cron"},
+            ]}]}
+        )
+
+        old_leaf_id = "old-leaf"
+        chat_state = {
+            "models": ["openclaw_gateway.default"],
+            "history": {
+                "currentId": old_leaf_id,
+                "messages": {old_leaf_id: {"role": "user", "childrenIds": []}},
+            },
+        }
+
+        class FakeChat:
+            def __init__(self, chat):
+                self.chat = chat
+
+        class FakeChats:
+            @staticmethod
+            async def get_chat_by_id(chat_id):
+                return FakeChat(chat_state)
+
+            @staticmethod
+            async def upsert_message_to_chat_by_id_and_message_id(chat_id, message_id, message):
+                history = chat_state["history"]
+                messages = history.setdefault("messages", {})
+                messages[message_id] = {**messages.get(message_id, {}), **message}
+                history["currentId"] = message_id
+                return FakeChat(chat_state)
+
+        fake_chats_module = types.ModuleType("open_webui.models.chats")
+        fake_chats_module.Chats = FakeChats
+        fake_models_module = types.ModuleType("open_webui.models")
+        fake_owui_module = types.ModuleType("open_webui")
+        with mock.patch.dict(sys.modules, {
+            "open_webui": fake_owui_module,
+            "open_webui.models": fake_models_module,
+            "open_webui.models.chats": fake_chats_module,
+        }):
+            asyncio.run(_deliver_proactive_owui_message(conn, session_key, "run-1"))
+
+        history = chat_state["history"]
+        new_msg = history["messages"][history["currentId"]]
+        self.assertEqual(new_msg["model"], "openclaw_gateway.default")
+
     def test_deliver_never_persists_announce_skip_sentinel(self):
         """End-to-end regression for the 2026-07-11 incident: a preview
         whose last assistant text is the literal protocol sentinel
