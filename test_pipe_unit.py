@@ -71,7 +71,9 @@ from openclaw_pipe import (
     _advance_media_buffer,
     _ask_user_detail_block,
     _ask_user_input_modal,
+    _build_choice_modal_js,
     _build_usage_status_lines,
+    _extract_numbered_options,
     _coerce_text,
     _content_has_image,
     _could_be_user_input_prefix,
@@ -2156,19 +2158,52 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pending, "")
 
     def test_builds_owui_input_modal_payload(self):
+        # A free-text prompt with no numbered options stays a text input.
         payload, is_confirmation = _modal_payload_from_user_input_prompt(
-            "Codex needs input:\n\nPackage\nChoose a package style\n1. curl\n2. pipx"
+            "Codex needs input:\n\nPackage\nName the package you want"
         )
 
         self.assertEqual(payload["type"], "input")
         self.assertEqual(payload["data"]["title"], "Package")
-        self.assertIn("Choose a package style", payload["data"]["message"])
-        self.assertIn("1. curl", payload["data"]["message"])
+        self.assertIn("Name the package", payload["data"]["message"])
         self.assertEqual(
             payload["data"]["placeholder"],
             "Reply with a number or your answer",
         )
         self.assertFalse(is_confirmation)
+
+    def test_numbered_options_build_choice_payload(self):
+        # An enumerated option list becomes a clickable "choice" payload.
+        payload, is_confirmation = _modal_payload_from_user_input_prompt(
+            "OpenClaw needs input:\n\nFavorite color?\nPick one\n1. Red\n2. Green\n3. Blue"
+        )
+        self.assertFalse(is_confirmation)
+        self.assertEqual(payload["type"], "choice")
+        self.assertEqual(payload["data"]["title"], "Favorite color?")
+        self.assertEqual(payload["data"]["options"], ["Red", "Green", "Blue"])
+
+    def test_extract_numbered_options_parses_dot_and_paren(self):
+        opts = _extract_numbered_options("intro\n1. alpha\n2) beta\n  3. gamma\nfooter")
+        self.assertEqual(opts, [("1", "alpha"), ("2", "beta"), ("3", "gamma")])
+
+    def test_extract_numbered_options_none(self):
+        self.assertEqual(_extract_numbered_options("no options here"), [])
+
+    def test_build_choice_modal_js_returns_execute_promise(self):
+        payload = _build_choice_modal_js("Title", "Message", ["Red", "Green"])
+        self.assertEqual(payload["type"], "execute")
+        code = payload["data"]["code"]
+        # Must resolve INSIDE a Promise -- a bare top-level resolve() silently
+        # ReferenceErrors under OWUI's execute wrapper (learned live).
+        self.assertIn("new Promise", code)
+        self.assertIn("resolve(", code)
+        # Option labels round-trip into the embedded JSON config.
+        self.assertIn("Red", code)
+        self.assertIn("Green", code)
+
+    def test_choice_modal_answer_normalizes_to_label(self):
+        # Button clicks resolve to {value: <label>}.
+        self.assertEqual(_normalize_event_call_response({"value": "Green"}), "Green")
 
     def test_marks_secret_prompts_as_password_inputs(self):
         payload, is_confirmation = _modal_payload_from_user_input_prompt(
@@ -2218,7 +2253,8 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
             "OpenClaw needs input:\n\nProceed how?\nProceed?\n1. rebase\n2. merge"
         )
         self.assertFalse(is_confirmation)
-        self.assertEqual(payload["type"], "input")
+        self.assertEqual(payload["type"], "choice")
+        self.assertEqual(payload["data"]["options"], ["rebase", "merge"])
 
     def test_secret_marker_does_not_match_innocent_key_substring(self):
         # "monkey" contains "key" — must not be flagged as a secret.
@@ -2232,15 +2268,18 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
 
         async def event_call(event):
             calls.append(event)
-            return {"value": "2"}
+            return {"value": "pipx"}
 
         answer = await _ask_user_input_modal(
             event_call,
             "Codex needs input:\n\nPackage\nChoose\n1. curl\n2. pipx",
         )
 
-        self.assertEqual(answer, "2")
-        self.assertEqual(calls[0]["type"], "input")
+        self.assertEqual(answer, "pipx")
+        # A numbered-option prompt is delivered as a clickable-button overlay
+        # (an "execute" event), not a free-text input.
+        self.assertEqual(calls[0]["type"], "execute")
+        self.assertIn("resolve(", calls[0]["data"]["code"])
 
     async def test_ask_user_input_modal_noops_without_event_call(self):
         answer = await _ask_user_input_modal(

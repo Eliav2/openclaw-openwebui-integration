@@ -63,11 +63,83 @@ def _advance_input_prompt_buffer(pending: str, delta: str) -> tuple[str, str]:
     return before + after, ""
 
 
+def _extract_numbered_options(prompt_text: str) -> list[tuple[str, str]]:
+    """Return [(index_str, label), ...] for a numbered option list, in prompt
+    order, or [] if there are none. Matches lines like "1. foo" / "2) bar"."""
+    pattern = re.compile(r"(?m)^\s*(\d+)[.)]\s+(.+)$")
+    return [(m.group(1), m.group(2).strip()) for m in pattern.finditer(prompt_text or "")]
+
+
+def _build_choice_modal_js(title: str, message: str, options: list[str]) -> dict:
+    """Turn a numbered-option prompt into a real {"type": "execute"} OWUI event
+    payload: a clickable-button overlay that resolves to the chosen label.
+
+    OWUI has no native "pick one of N buttons" widget (only free-text "input",
+    yes/no "confirmation", and a "select" dropdown). The "execute" event type
+    runs raw JS: OWUI does `new Function('return (async () => {'+code+'})()')()`
+    and forwards whatever that async fn *returns* as the __event_call__ result.
+    There is no resolve/reject in scope, so the code must end with
+    `return await new Promise(...)` whose executor's `resolve` is what button
+    clicks call -- a bare top-level resolve() is a silent ReferenceError
+    swallowed by OWUI's try/catch (the modal then just hangs; confirmed live
+    2026-07-10). Buttons resolve to {value: label}; Escape / backdrop resolve
+    to null (cancel) so the pipe falls back / keeps waiting like the other
+    modals. Themed with OWUI's own --color-gray-* CSS vars so it matches
+    light/dark, with a plain-color fallback if they're absent.
+    """
+    cfg_json = json.dumps({"title": title, "message": message, "options": options})
+    code = (
+        "return await new Promise(function(resolve){\n"
+        "  var cfg = JSON.parse(" + json.dumps(cfg_json) + ");\n"
+        "  var done = false;\n"
+        "  function finish(v){ if(done) return; done = true;"
+        " try{ document.body.removeChild(ov); }catch(e){}"
+        " document.removeEventListener('keydown', onKey); resolve(v); }\n"
+        "  var ov = document.createElement('div');\n"
+        "  ov.setAttribute('data-openclaw-choice','1');\n"
+        "  ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);"
+        "z-index:2147483647;display:flex;align-items:center;justify-content:center;padding:1rem;';\n"
+        "  var box = document.createElement('div');\n"
+        "  box.style.cssText = 'background:var(--color-gray-850,#1b1b1b);"
+        "color:var(--color-gray-100,#ececec);border:1px solid var(--color-gray-700,#333);"
+        "padding:1.25rem;border-radius:.75rem;max-width:min(28rem,92vw);width:100%;"
+        "box-shadow:0 10px 40px rgba(0,0,0,.5);font-family:inherit;';\n"
+        "  if(cfg.title){ var h=document.createElement('div'); h.textContent=cfg.title;"
+        " h.style.cssText='font-weight:600;font-size:1rem;margin-bottom:.35rem;'; box.appendChild(h); }\n"
+        "  if(cfg.message){ var m=document.createElement('div'); m.textContent=cfg.message;"
+        " m.style.cssText='opacity:.8;font-size:.9rem;margin-bottom:.9rem;white-space:pre-wrap;';"
+        " box.appendChild(m); }\n"
+        "  cfg.options.forEach(function(label){\n"
+        "    var b=document.createElement('button');\n"
+        "    b.textContent=label;\n"
+        "    b.style.cssText='display:block;width:100%;text-align:left;margin:.35rem 0;"
+        "padding:.6rem .75rem;border-radius:.5rem;border:1px solid var(--color-gray-700,#3a3a3a);"
+        "background:var(--color-gray-800,#2a2a2a);color:inherit;font-size:.9rem;cursor:pointer;"
+        "transition:background .12s;';\n"
+        "    b.onmouseenter=function(){ b.style.background='var(--color-gray-700,#3a3a3a)'; };\n"
+        "    b.onmouseleave=function(){ b.style.background='var(--color-gray-800,#2a2a2a)'; };\n"
+        "    b.onclick=function(){ finish({value: label}); };\n"
+        "    box.appendChild(b);\n"
+        "  });\n"
+        "  var onKey=function(e){ if(e.key==='Escape'){ finish(null); } };\n"
+        "  document.addEventListener('keydown', onKey);\n"
+        "  ov.onclick=function(e){ if(e.target===ov){ finish(null); } };\n"
+        "  ov.appendChild(box);\n"
+        "  document.body.appendChild(ov);\n"
+        "});\n"
+    )
+    return {"type": "execute", "data": {"code": code}}
+
+
 def _modal_payload_from_user_input_prompt(prompt_text: str) -> tuple[dict, bool]:
     """Build an OWUI modal payload from OpenClaw's "needs input:" prompt text.
 
     Returns (payload_dict, is_confirmation) where is_confirmation is True
     if a yes/no confirmation modal was chosen instead of a free-text input.
+
+    A non-secret prompt carrying >=2 numbered options becomes a "choice"
+    payload (clickable buttons -- see _build_choice_modal_js), which the
+    caller converts to an "execute" event just before firing it.
     """
     lines = [line.strip() for line in (prompt_text or "").splitlines()]
     lines = [line for line in lines if line]
@@ -119,6 +191,17 @@ def _modal_payload_from_user_input_prompt(prompt_text: str) -> tuple[dict, bool]
             "message": message,
         }
         return {"type": "confirmation", "data": data}, True
+
+    # Real clickable options ("American style" multiple choice): a numbered
+    # list that isn't a secret prompt and didn't get claimed by confirmation.
+    options = _extract_numbered_options(prompt_text)
+    if not is_secret and len(options) >= 2:
+        data = {
+            "title": title,
+            "message": message,
+            "options": [label for _, label in options],
+        }
+        return {"type": "choice", "data": data}, False
 
     # Default: free-text input
     data = {
@@ -311,6 +394,12 @@ async def _ask_user_input_modal(
     if not __event_call__ or not _is_user_input_prompt(prompt_text):
         return None
     payload, _ = _modal_payload_from_user_input_prompt(prompt_text)
+    # A clickable-choice prompt is delivered as an "execute" event that renders
+    # its own button overlay; convert here so both the live call and the
+    # reconnect-retry path fire the same ready-to-run payload.
+    if payload.get("type") == "choice":
+        d = payload["data"]
+        payload = _build_choice_modal_js(d["title"], d["message"], d["options"])
 
     try:
         response = await asyncio.wait_for(
