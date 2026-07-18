@@ -3824,13 +3824,16 @@ class Pipe:
                                 assistant_stream_text += delta
                                 record_visible_chunk(delta)
                                 yield delta
-                                # Back-sync: persist the growing text to the OWUI
-                                # DB via a throttled `replace` so a dropped WS /
-                                # reload rehydrates it (previously only tool turns
-                                # got this; pure-text turns left the DB empty and
-                                # were unrecoverable). Throttled by maybe_emit_
-                                # snapshot (1s / 250 chars).
-                                await maybe_emit_snapshot()
+                                # NOTE: do NOT emit a `replace` snapshot per text
+                                # delta here. A mid-stream `replace` carrying the
+                                # full accumulated text makes OWUI's own
+                                # `_suppress_already_shown` treat the *continuing*
+                                # delta stream as already-shown and suppress it —
+                                # the visible stream freezes mid-message (regression
+                                # 2026-07-18, exactly the P23/P25 hazard). Text-turn
+                                # DB back-sync must be done a different way (e.g. a
+                                # single terminal snapshot, or replace-only streaming
+                                # that never also yields), not per-delta.
                                 last_activity_time = time.time()
 
                         # --- Assistant text carried by item/preamble events ---
