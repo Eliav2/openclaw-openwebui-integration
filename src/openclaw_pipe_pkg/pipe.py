@@ -540,6 +540,7 @@ class Pipe:
                 pipe_log(f"  active-check describe failed: {ex}")
                 return conn.active_run_id_for_session(session_key) is not None
 
+        queue_directive = ""
         if await _session_run_active():
             pipe_log("Session has an active run (gateway-authoritative); queueing behind it")
             await _emit_status(
@@ -547,6 +548,15 @@ class Pipe:
                 "⏳ Queued behind the current response…",
                 done=False,
             )
+            # Belt-and-suspenders against the steer race: ask the gateway to
+            # QUEUE this as a followup (its own run + terminal) rather than
+            # steer-merge it into the active run. The gateway strips this
+            # `/queue` directive from the delivered message. This makes the
+            # send safe even if a run is still active at send time (the wait
+            # below only narrows, not eliminates, that window) — followup
+            # avoids the phantom 'final' (no text) + 2/2-variant proactive
+            # leak that steer-merging produces.
+            queue_directive = "/queue followup "
             queue_wait_started = time.time()
             queue_wait_cap_s = 1800  # safety ceiling; socket keepalive holds the request
             while time.time() - queue_wait_started < queue_wait_cap_s:
@@ -562,7 +572,7 @@ class Pipe:
                 "chat.send",
                 _owui_chat_send_params(
                     session_key=session_key,
-                    message=text,
+                    message=queue_directive + text,
                     idempotency_key=idempotency_key,
                     owui_chat_id=owui_origin_chat_id,
                     owui_user_id=owui_origin_user_id,
