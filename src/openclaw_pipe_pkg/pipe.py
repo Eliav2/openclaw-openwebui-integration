@@ -508,36 +508,51 @@ class Pipe:
         # runId + terminal. This matches OWUI's default "queue" UX and can never
         # strand the bubble. (This is a deterministic wait on the gateway's own
         # run status, not a heuristic timer.)
-        active_run_id = conn.active_run_id_for_session(session_key)
-        if active_run_id:
-            pipe_log(f"Active run exists ({active_run_id[:20]}...); queueing behind it")
+        # Whether the session already has an in-progress run must be decided
+        # AUTHORITATIVELY by the gateway (sessions.describe), NOT by the
+        # per-worker `active_run_id_for_session` registry: OWUI runs multiple
+        # worker processes, so a run started while another worker handled the
+        # previous turn is invisible to this worker's registry. That blind spot
+        # let a concurrent message fall through to a fresh chat.send while the
+        # gateway still had an active run — the gateway steer-merged it and
+        # returned a runId that instantly emits a single 'final' with no text,
+        # so the bubble rendered nothing and the real answer leaked out via
+        # proactive delivery. (Verified from live pipe logs 2026-07-18.)
+        # Whitelist the states that mean "a run is genuinely in progress".
+        # Blacklisting terminal states is unsafe: an idle session reports
+        # status "idle" (there is also "done"), so a `not in (done, failed,
+        # cancelled)` test would treat every idle session as active and hang
+        # every message. Only these states gate the queue.
+        _ACTIVE_RUN_STATES = ("active", "running", "streaming", "queued")
+
+        async def _session_run_active() -> bool:
+            try:
+                desc = await conn.send_request(
+                    "sessions.describe", dict(key=session_key), timeout=8
+                )
+                row = desc.get("session") or {}
+                if row.get("activeRunId"):
+                    return True
+                return row.get("status") in _ACTIVE_RUN_STATES
+            except Exception as ex:
+                # Only on a describe failure do we consult the (per-worker,
+                # possibly-blind) local registry as a weak secondary signal.
+                pipe_log(f"  active-check describe failed: {ex}")
+                return conn.active_run_id_for_session(session_key) is not None
+
+        if await _session_run_active():
+            pipe_log("Session has an active run (gateway-authoritative); queueing behind it")
             await _emit_status(
                 __event_emitter__,
                 "⏳ Queued behind the current response…",
                 done=False,
             )
             queue_wait_started = time.time()
-            queue_wait_cap_s = 1800  # socket keepalive holds the request open
+            queue_wait_cap_s = 1800  # safety ceiling; socket keepalive holds the request
             while time.time() - queue_wait_started < queue_wait_cap_s:
-                # Authoritative signal: the gateway no longer reports the
-                # session as an active run. Confirm with a describe probe and
-                # also require this process to hold no live consumer for it.
-                try:
-                    desc = await conn.send_request(
-                        "sessions.describe", dict(key=session_key), timeout=8
-                    )
-                    row = desc.get("session")
-                    status = row.get("status") if row else None
-                    gw_active = status is not None and status not in (
-                        "done", "failed", "cancelled",
-                    )
-                except Exception as ex:
-                    pipe_log(f"  queue-wait describe failed ({ex}); proceeding to send")
-                    gw_active = False
-                local_active = conn.active_run_id_for_session(session_key) is not None
-                if not gw_active and not local_active:
+                if not await _session_run_active():
                     break
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(1.5)
             pipe_log("  active run ended; sending queued message as its own run")
 
         # --- Send this message as its own fresh run ---
@@ -984,6 +999,13 @@ class Pipe:
                                 assistant_stream_text += delta
                                 record_visible_chunk(delta)
                                 yield delta
+                                # Back-sync: persist the growing text to the OWUI
+                                # DB via a throttled `replace` so a dropped WS /
+                                # reload rehydrates it (previously only tool turns
+                                # got this; pure-text turns left the DB empty and
+                                # were unrecoverable). Throttled by maybe_emit_
+                                # snapshot (1s / 250 chars).
+                                await maybe_emit_snapshot()
                                 last_activity_time = time.time()
 
                         # --- Assistant text carried by item/preamble events ---
