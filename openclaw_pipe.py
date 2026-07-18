@@ -3310,88 +3310,76 @@ class Pipe:
             yield f"**Model selection error:** could not apply `{model_override or 'agent default'}`: {e}"
             return
 
-        # --- Actual steering: inject message into active run, don't wait ---
+        # --- Concurrency: queue behind an active run, never steer-merge ---
+        # A message that arrives while a run is active must become its OWN run,
+        # not a steer-merge into the active run. Steer-merging (the gateway's
+        # default when a run is active) returns a *phantom* runId that never
+        # runs independently and emits no terminal — the injected message just
+        # merges into the active run — so a bubble bound to it renders nothing
+        # ("No visible response"). Instead we wait for the active run to reach a
+        # definite terminal, then send this message as a fresh run with its own
+        # runId + terminal. This matches OWUI's default "queue" UX and can never
+        # strand the bubble. (This is a deterministic wait on the gateway's own
+        # run status, not a heuristic timer.)
         active_run_id = conn.active_run_id_for_session(session_key)
         if active_run_id:
-            pipe_log(f"Active run exists ({active_run_id[:20]}...); steering message into it")
+            pipe_log(f"Active run exists ({active_run_id[:20]}...); queueing behind it")
             await _emit_status(
                 __event_emitter__,
-                "Steering into current response...",
+                "⏳ Queued behind the current response…",
                 done=False,
             )
+            queue_wait_started = time.time()
+            queue_wait_cap_s = 1800  # socket keepalive holds the request open
+            while time.time() - queue_wait_started < queue_wait_cap_s:
+                # Authoritative signal: the gateway no longer reports the
+                # session as an active run. Confirm with a describe probe and
+                # also require this process to hold no live consumer for it.
+                try:
+                    desc = await conn.send_request(
+                        "sessions.describe", dict(key=session_key), timeout=8
+                    )
+                    row = desc.get("session")
+                    status = row.get("status") if row else None
+                    gw_active = status is not None and status not in (
+                        "done", "failed", "cancelled",
+                    )
+                except Exception as ex:
+                    pipe_log(f"  queue-wait describe failed ({ex}); proceeding to send")
+                    gw_active = False
+                local_active = conn.active_run_id_for_session(session_key) is not None
+                if not gw_active and not local_active:
+                    break
+                await asyncio.sleep(1.0)
+            pipe_log("  active run ended; sending queued message as its own run")
 
-            # Send the steering message immediately — the gateway will inject it
-            # at the next model boundary (steer mode is the gateway's default).
-            try:
-                idempotency_key = f"msg-{chat_id}-{time.time()}"
-                send_resp = await conn.send_request(
-                    "chat.send",
-                    _owui_chat_send_params(
-                        session_key=session_key,
-                        message=text,
-                        idempotency_key=idempotency_key,
-                        owui_chat_id=owui_origin_chat_id,
-                        owui_user_id=owui_origin_user_id,
-                        attachments=image_attachments,
-                    ),
-                    timeout=30
-                )
-            except asyncio.TimeoutError:
-                await _emit_status(__event_emitter__, "", done=True)
-                yield "**Timeout:** Gateway did not respond to chat.send"
-                return
-            except Exception as e:
-                await _emit_status(__event_emitter__, "", done=True)
-                yield f"**Error sending message:** {e}"
-                return
-
-            steer_run_id = send_resp.get("runId", "unknown")
-            self._current_run_id = steer_run_id
-            pipe_log(f"Steer response runId: {steer_run_id[:20] if steer_run_id != 'unknown' else 'unknown'}")
-
-            # Register a broadcast consumer on the SAME run so this bubble
-            # gets a copy of all subsequent events (the original bubble's
-            # consumer keeps running with its own queue).
-            if steer_run_id != "unknown":
-                queue = conn.register_consumer(session_key, steer_run_id)
-            else:
-                await _emit_status(__event_emitter__, "", done=True)
-                yield f"**Steer accepted but no runId returned.**"
-                return
-
-            # Emit a steering acknowledgment compactly
-            yield "⤷ _Steered into the ongoing response_\n\n"
-
-            # Enter the event consumption loop with this bubble's queue
-            our_run_id = steer_run_id
-        else:
-            # --- Normal path: no active run, send fresh ---
-            idempotency_key = f"msg-{chat_id}-{time.time()}"
-            try:
-                send_resp = await conn.send_request(
-                    "chat.send",
-                    _owui_chat_send_params(
-                        session_key=session_key,
-                        message=text,
-                        idempotency_key=idempotency_key,
-                        owui_chat_id=owui_origin_chat_id,
-                        owui_user_id=owui_origin_user_id,
-                        attachments=image_attachments,
-                    ),
-                    timeout=30
-                )
-            except asyncio.TimeoutError:
-                await _emit_status(__event_emitter__, "", done=True)
-                yield "**Timeout:** Gateway did not respond to chat.send"
-                return
-            except Exception as e:
-                await _emit_status(__event_emitter__, "", done=True)
-                yield f"**Error sending message:** {e}"
-                return
-            our_run_id = send_resp.get("runId", "unknown")
-            self._current_run_id = our_run_id
-            pipe_log(f"Captured runId: {our_run_id}")
-            queue = conn.register_consumer(session_key, our_run_id)
+        # --- Send this message as its own fresh run ---
+        idempotency_key = f"msg-{chat_id}-{time.time()}"
+        try:
+            send_resp = await conn.send_request(
+                "chat.send",
+                _owui_chat_send_params(
+                    session_key=session_key,
+                    message=text,
+                    idempotency_key=idempotency_key,
+                    owui_chat_id=owui_origin_chat_id,
+                    owui_user_id=owui_origin_user_id,
+                    attachments=image_attachments,
+                ),
+                timeout=30
+            )
+        except asyncio.TimeoutError:
+            await _emit_status(__event_emitter__, "", done=True)
+            yield "**Timeout:** Gateway did not respond to chat.send"
+            return
+        except Exception as e:
+            await _emit_status(__event_emitter__, "", done=True)
+            yield f"**Error sending message:** {e}"
+            return
+        our_run_id = send_resp.get("runId", "unknown")
+        self._current_run_id = our_run_id
+        pipe_log(f"Captured runId: {our_run_id}")
+        queue = conn.register_consumer(session_key, our_run_id)
 
         # --- Consume events ---
         done = False
@@ -4085,9 +4073,23 @@ class Pipe:
                 yield recovered
                 await maybe_emit_snapshot(force=True)
             else:
-                no_response_text = (
-                    "\n\n**No visible response:** The run ended without assistant "
-                    "text. Check OpenClaw logs for the missing final output event."
+                # No assistant text and preview recovery came up empty. Surface
+                # the run's REAL terminal state (from the gateway) instead of a
+                # scary generic "missing output event" placeholder.
+                reason = None
+                try:
+                    desc = await conn.send_request(
+                        "sessions.describe", dict(key=session_key), timeout=8)
+                    row = desc.get("session") or {}
+                    status = row.get("status")
+                    if status == "failed":
+                        reason = "**The response failed.** Please try again."
+                    elif status == "cancelled":
+                        reason = "**Stopped.**"
+                except Exception as ex:
+                    pipe_log(f"  terminal-reason describe failed: {ex}")
+                no_response_text = "\n\n" + (
+                    reason or "_(This turn produced no reply text.)_"
                 )
                 record_visible_chunk(no_response_text)
                 yield no_response_text
