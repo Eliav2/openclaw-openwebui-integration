@@ -475,6 +475,21 @@ class Pipe:
         pipe_log(f"Session key: {session_key}")
         self._current_session_key = session_key
 
+        # DIAG (2026-07-18, ELI-56): log the OWUI message_id + a short content
+        # hash of the user text so a *re-fired / duplicate* completion for the
+        # same message — the suspected cause of the phantom "1-event, no-text"
+        # turns (e.g. on a socket reconnect over the tailscale proxy) — becomes
+        # visible: two pipe() invocations with the SAME owui_msg_id / text_sha
+        # close together is a smoking gun. Pure logging, no behavior change.
+        _diag_md = __metadata__ or {}
+        _diag_sha = hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()[:8]
+        self._diag_text_sha = _diag_sha
+        pipe_log(
+            f"  [diag] owui_msg_id={_diag_md.get('message_id')} "
+            f"session_id={str(_diag_md.get('session_id'))[:12]} "
+            f"text_sha={_diag_sha} text_preview={text[:48]!r}"
+        )
+
         try:
             patch_resp = await conn.send_request(
                 "sessions.patch",
@@ -1271,6 +1286,16 @@ class Pipe:
 
         pipe_log(f"DONE — {event_count} events processed, "
                  f"text yielded: {text_yielded}")
+        if not text_yielded:
+            # DIAG (ELI-56): a no-text turn is the phantom. Emit the correlation
+            # keys so it can be matched to a duplicate/re-fired completion above
+            # (same text_sha / owui_msg_id) and to the run that actually carried
+            # the answer (which then leaks out via proactive delivery).
+            pipe_log(
+                f"  [diag] PHANTOM (no text): our_run_id={str(our_run_id)[:40]} "
+                f"text_sha={getattr(self, '_diag_text_sha', None)} "
+                f"first_event_arrived={first_event_arrived} aborted={aborted}"
+            )
 
         # Auto-title: generate title after first exchange (best-effort, non-blocking)
         if not aborted and text_yielded:
