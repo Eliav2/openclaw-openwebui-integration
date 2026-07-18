@@ -799,9 +799,11 @@ def _extract_numbered_options(prompt_text: str) -> list[tuple[str, str]]:
     return [(m.group(1), m.group(2).strip()) for m in pattern.finditer(prompt_text or "")]
 
 
-def _build_choice_modal_js(title: str, message: str, options: list[str]) -> dict:
+def _build_choice_modal_js(
+    title: str, message: str, options: list[str], multi: bool = False
+) -> dict:
     """Turn a numbered-option prompt into a real {"type": "execute"} OWUI event
-    payload: a clickable-button overlay that resolves to the chosen label.
+    payload: a clickable-button overlay that resolves to the chosen label(s).
 
     OWUI has no native "pick one of N buttons" widget (only free-text "input",
     yes/no "confirmation", and a "select" dropdown). The "execute" event type
@@ -811,19 +813,31 @@ def _build_choice_modal_js(title: str, message: str, options: list[str]) -> dict
     `return await new Promise(...)` whose executor's `resolve` is what button
     clicks call -- a bare top-level resolve() is a silent ReferenceError
     swallowed by OWUI's try/catch (the modal then just hangs; confirmed live
-    2026-07-10). Buttons resolve to {value: label}; Escape / backdrop resolve
-    to null (cancel) so the pipe falls back / keeps waiting like the other
-    modals. Themed with OWUI's own --color-gray-* CSS vars so it matches
-    light/dark, with a plain-color fallback if they're absent.
+    2026-07-10).
+
+    Single-select (multi=False): clicking a button resolves immediately to
+    {value: label}. Multi-select (multi=True): each option toggles a checkbox;
+    a "Submit" button (disabled until >=1 is picked) resolves to
+    {value: "label1, label2"} (click order), which _normalize_event_call_response
+    passes through verbatim so the agent receives a comma-joined list. In both
+    modes Escape / backdrop resolve to null (cancel) so the pipe falls back /
+    keeps waiting like the other modals. Themed with OWUI's own --color-gray-*
+    CSS vars so it matches light/dark, with a plain-color fallback if absent.
     """
-    cfg_json = json.dumps({"title": title, "message": message, "options": options})
+    cfg_json = json.dumps(
+        {"title": title, "message": message, "options": options, "multi": bool(multi)}
+    )
     code = (
         "return await new Promise(function(resolve){\n"
         "  var cfg = JSON.parse(" + json.dumps(cfg_json) + ");\n"
         "  var done = false;\n"
+        "  var selected = [];\n"
         "  function finish(v){ if(done) return; done = true;"
         " try{ document.body.removeChild(ov); }catch(e){}"
         " document.removeEventListener('keydown', onKey); resolve(v); }\n"
+        "  var stale = document.querySelectorAll('[data-openclaw-choice]');\n"
+        "  for(var si=0; si<stale.length; si++){"
+        " try{ stale[si].parentNode.removeChild(stale[si]); }catch(e){} }\n"
         "  var ov = document.createElement('div');\n"
         "  ov.setAttribute('data-openclaw-choice','1');\n"
         "  ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);"
@@ -838,18 +852,47 @@ def _build_choice_modal_js(title: str, message: str, options: list[str]) -> dict
         "  if(cfg.message){ var m=document.createElement('div'); m.textContent=cfg.message;"
         " m.style.cssText='opacity:.8;font-size:.9rem;margin-bottom:.9rem;white-space:pre-wrap;';"
         " box.appendChild(m); }\n"
+        "  var sub;\n"
         "  cfg.options.forEach(function(label){\n"
         "    var b=document.createElement('button');\n"
-        "    b.textContent=label;\n"
         "    b.style.cssText='display:block;width:100%;text-align:left;margin:.35rem 0;"
         "padding:.6rem .75rem;border-radius:.5rem;border:1px solid var(--color-gray-700,#3a3a3a);"
         "background:var(--color-gray-800,#2a2a2a);color:inherit;font-size:.9rem;cursor:pointer;"
         "transition:background .12s;';\n"
-        "    b.onmouseenter=function(){ b.style.background='var(--color-gray-700,#3a3a3a)'; };\n"
-        "    b.onmouseleave=function(){ b.style.background='var(--color-gray-800,#2a2a2a)'; };\n"
-        "    b.onclick=function(){ finish({value: label}); };\n"
+        "    if(cfg.multi){\n"
+        "      var mark=document.createElement('span');"
+        " mark.textContent='\\u2610 '; mark.style.cssText='opacity:.85;';\n"
+        "      var lab=document.createElement('span'); lab.textContent=label;\n"
+        "      b.appendChild(mark); b.appendChild(lab);\n"
+        "      b.onclick=function(){\n"
+        "        var i=selected.indexOf(label);\n"
+        "        if(i>=0){ selected.splice(i,1); mark.textContent='\\u2610 ';"
+        " b.style.background='var(--color-gray-800,#2a2a2a)'; }\n"
+        "        else { selected.push(label); mark.textContent='\\u2611 ';"
+        " b.style.background='var(--color-gray-600,#4a4a4a)'; }\n"
+        "        if(sub){ sub.disabled=selected.length===0;"
+        " sub.style.opacity=selected.length?'1':'.5';"
+        " sub.style.cursor=selected.length?'pointer':'not-allowed'; }\n"
+        "      };\n"
+        "    } else {\n"
+        "      b.textContent=label;\n"
+        "      b.onmouseenter=function(){ b.style.background='var(--color-gray-700,#3a3a3a)'; };\n"
+        "      b.onmouseleave=function(){ b.style.background='var(--color-gray-800,#2a2a2a)'; };\n"
+        "      b.onclick=function(){ finish({value: label}); };\n"
+        "    }\n"
         "    box.appendChild(b);\n"
         "  });\n"
+        "  if(cfg.multi){\n"
+        "    sub=document.createElement('button'); sub.textContent='Submit';\n"
+        "    sub.style.cssText='display:block;width:100%;margin:.75rem 0 0;"
+        "padding:.6rem .75rem;border-radius:.5rem;border:none;"
+        "background:var(--color-gray-100,#ececec);color:var(--color-gray-900,#111);"
+        "font-weight:600;font-size:.9rem;cursor:not-allowed;opacity:.5;';\n"
+        "    sub.disabled=true;\n"
+        "    sub.onclick=function(){ if(!selected.length) return;"
+        " finish({value: selected.join(', ')}); };\n"
+        "    box.appendChild(sub);\n"
+        "  }\n"
         "  var onKey=function(e){ if(e.key==='Escape'){ finish(null); } };\n"
         "  document.addEventListener('keydown', onKey);\n"
         "  ov.onclick=function(e){ if(e.target===ov){ finish(null); } };\n"
@@ -883,6 +926,23 @@ def _modal_payload_from_user_input_prompt(prompt_text: str) -> tuple[dict, bool]
     message = "\n".join(lines).strip() or "Please answer so the run can continue."
 
     text_lower = (prompt_text or "").lower()
+
+    # Multi-select ("check all that apply"): a numbered-option prompt carrying
+    # one of these markers renders checkboxes + a Submit button instead of
+    # one-click-and-done buttons. The marker itself is stripped from the
+    # displayed title/message so the user never sees the raw directive.
+    multi_markers = (
+        "(multiselect)", "(multi-select)", "(multi)", "[multiselect]", "[multi]",
+        "select all that apply", "choose all that apply", "check all that apply",
+        "בחר כמה", "בחירה מרובה", "אפשר לבחור כמה", "בחר את כל",
+    )
+    has_multi_marker = any(m in text_lower for m in multi_markers)
+    if has_multi_marker:
+        for mk in multi_markers:
+            title = re.sub(re.escape(mk), "", title, flags=re.IGNORECASE).strip()
+            message = re.sub(re.escape(mk), "", message, flags=re.IGNORECASE).strip()
+        title = title or "OpenClaw needs input"
+        message = message or "Please answer so the run can continue."
 
     # Detect password / secret input. Kept specific on purpose: a bare "key"
     # substring matches innocent words ("monkey", "which key order?"), so we
@@ -929,6 +989,7 @@ def _modal_payload_from_user_input_prompt(prompt_text: str) -> tuple[dict, bool]
             "title": title,
             "message": message,
             "options": [label for _, label in options],
+            "multi": has_multi_marker,
         }
         return {"type": "choice", "data": data}, False
 
@@ -1043,6 +1104,7 @@ async def _retry_modal_on_reconnect(
     *,
     max_wait_s: float,
     poll_interval_s: float,
+    event_timeout_s: float = 300,
 ) -> str | None:
     """Wait for owui_user_id to reconnect, then re-fire the modal directly.
 
@@ -1057,6 +1119,19 @@ async def _retry_modal_on_reconnect(
     `sio` AsyncServer and SESSION_POOL dict directly and poll for a new
     session_id to appear for this user, then call sio.call() against it
     ourselves, bypassing the stale closure entirely.
+
+    A re-fired modal is an `execute`/`input`/`confirmation` event whose
+    `sio.call` only resolves once the user actually interacts with it, so the
+    call must be given a real human-interaction budget: OWUI's own live caller
+    uses WEBSOCKET_EVENT_CALLER_TIMEOUT (default 300s), and using a short 30s
+    here was the bug that made a reconnect modal pop but then silently vanish
+    if it wasn't clicked within 30s (and `seen_sids` then blocked it from ever
+    re-firing). We now (a) give each fire `event_timeout_s`, and (b) re-fire
+    when the user reconnects on a *fresh* session, or when a previous fire
+    timed out with no interaction (they were away) — so the question keeps
+    coming back until it's answered. An explicit dismiss (Escape/backdrop,
+    which resolves without an error) is respected: we stop re-popping that
+    same live session and wait for a genuinely new reconnect.
     """
     try:
         from open_webui.socket.main import sio, SESSION_POOL
@@ -1065,13 +1140,19 @@ async def _retry_modal_on_reconnect(
         return None
 
     deadline = time.monotonic() + max_wait_s
-    seen_sids: set[str] = set()
+    # sid we've already delivered to and that dismissed (or is still showing)
+    # the modal without answering — don't spam it; wait for a fresh reconnect.
+    dismissed_sid: str | None = None
     while time.monotonic() < deadline:
         await asyncio.sleep(poll_interval_s)
         sid = _live_session_id_for_user(owui_user_id, SESSION_POOL)
-        if not sid or sid in seen_sids:
+        if not sid:
+            # Fully disconnected again; a later reconnect (even reusing this
+            # sid) should re-fire.
+            dismissed_sid = None
             continue
-        seen_sids.add(sid)
+        if sid == dismissed_sid:
+            continue
         pipe_log(f"  {owui_user_id[:8]}... reconnected (sid {sid[:8]}...); retrying modal")
         try:
             response = await asyncio.wait_for(
@@ -1083,18 +1164,25 @@ async def _retry_modal_on_reconnect(
                         "data": payload,
                     },
                     to=sid,
-                    timeout=30,
+                    timeout=event_timeout_s,
                 ),
-                timeout=35,
+                timeout=event_timeout_s + 5,
             )
         except Exception as ex:
-            pipe_log(f"  retry event_call failed for sid {sid[:8]}...: {ex}")
+            # Timed out with no interaction (tab open but idle, or the message
+            # is no longer rendered so the client never acked). They were away;
+            # loop and re-fire to this same session on the next poll.
+            pipe_log(f"  retry event_call timed out/failed for sid {sid[:8]}...: {ex!r}")
+            dismissed_sid = None
             continue
         answer = _normalize_event_call_response(response)
         if answer:
             return answer
-        # Reconnected but cancelled/empty this time; keep watching in case
-        # they reconnect again (e.g. an accidental tab close).
+        # Reconnected and the modal was shown but explicitly dismissed
+        # (Escape/backdrop) or came back empty. Respect it: stop re-popping
+        # this live session; only a fresh reconnect re-asks.
+        pipe_log(f"  reconnect modal dismissed without an answer (sid {sid[:8]}...); waiting for a new reconnect")
+        dismissed_sid = sid
     pipe_log(f"  gave up waiting for {owui_user_id[:8]}... to reconnect after {int(max_wait_s)}s")
     return None
 
@@ -1128,7 +1216,9 @@ async def _ask_user_input_modal(
     # reconnect-retry path fire the same ready-to-run payload.
     if payload.get("type") == "choice":
         d = payload["data"]
-        payload = _build_choice_modal_js(d["title"], d["message"], d["options"])
+        payload = _build_choice_modal_js(
+            d["title"], d["message"], d["options"], d.get("multi", False)
+        )
 
     try:
         response = await asyncio.wait_for(

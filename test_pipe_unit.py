@@ -2205,6 +2205,66 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
         # Button clicks resolve to {value: <label>}.
         self.assertEqual(_normalize_event_call_response({"value": "Green"}), "Green")
 
+    def test_multiselect_marker_sets_multi_flag(self):
+        # A numbered-option prompt with a multiselect marker is still a choice,
+        # but flagged multi=True and the marker stripped from the display text.
+        payload, is_confirmation = _modal_payload_from_user_input_prompt(
+            "OpenClaw needs input:\n\nToppings (multiselect)\n"
+            "Pick any\n1. Cheese\n2. Olives\n3. Mushrooms"
+        )
+        self.assertFalse(is_confirmation)
+        self.assertEqual(payload["type"], "choice")
+        self.assertTrue(payload["data"]["multi"])
+        self.assertEqual(
+            payload["data"]["options"], ["Cheese", "Olives", "Mushrooms"]
+        )
+        # The raw "(multiselect)" directive must not leak into the shown title.
+        self.assertNotIn("multiselect", payload["data"]["title"].lower())
+        self.assertEqual(payload["data"]["title"], "Toppings")
+
+    def test_multiselect_hebrew_marker(self):
+        payload, _ = _modal_payload_from_user_input_prompt(
+            "OpenClaw needs input:\n\nמה בא לך? בחר כמה\n1. פיצה\n2. סושי"
+        )
+        self.assertEqual(payload["type"], "choice")
+        self.assertTrue(payload["data"]["multi"])
+
+    def test_single_select_default_not_multi(self):
+        # No marker => single-select (multi False), unchanged behavior.
+        payload, _ = _modal_payload_from_user_input_prompt(
+            "OpenClaw needs input:\n\nColor?\nPick\n1. Red\n2. Green"
+        )
+        self.assertEqual(payload["type"], "choice")
+        self.assertFalse(payload["data"]["multi"])
+
+    def test_build_choice_modal_js_multi_has_submit_and_join(self):
+        payload = _build_choice_modal_js(
+            "Title", "Message", ["Red", "Green"], multi=True
+        )
+        code = payload["data"]["code"]
+        # Multi mode accumulates a selection and resolves a joined string on
+        # an explicit Submit, rather than one-click-and-done. The shared JS
+        # body branches on the embedded cfg.multi flag at runtime.
+        self.assertIn("selected.join(', ')", code)
+        self.assertIn("Submit", code)
+        self.assertIn("new Promise", code)
+        self.assertIn(r'multi\": true', code)
+
+    def test_build_choice_modal_js_single_flags_multi_false(self):
+        # Single-select (default) keeps one-click-and-done: cfg.multi is false,
+        # so the shared JS never enters the checkbox/Submit branch at runtime.
+        payload = _build_choice_modal_js("Title", "Message", ["Red", "Green"])
+        code = payload["data"]["code"]
+        self.assertIn(r'multi\": false', code)
+        self.assertIn("finish({value: label})", code)
+
+    def test_multiselect_answer_normalizes_to_joined_labels(self):
+        # Submit resolves {value: "a, b"}; passes through verbatim.
+        self.assertEqual(
+            _normalize_event_call_response({"value": "Cheese, Olives"}),
+            "Cheese, Olives",
+        )
+
     def test_marks_secret_prompts_as_password_inputs(self):
         payload, is_confirmation = _modal_payload_from_user_input_prompt(
             "Codex needs input:\n\nToken\nThis channel may show your reply to other participants."
@@ -2368,6 +2428,73 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_sio.calls[0][2], "sid-123")
         self.assertEqual(fake_sio.calls[0][1]["chat_id"], "chat-1")
         self.assertEqual(fake_sio.calls[0][1]["message_id"], "msg-1")
+
+    async def test_reconnect_refires_to_same_session_after_a_timeout(self):
+        # Regression (2026-07-18): a reconnect modal that popped but wasn't
+        # clicked in time used to time out and then NEVER re-fire (seen_sids
+        # blocked the same session forever). Now a timed-out fire must be
+        # retried to the same live session on a later poll.
+        session_pool = {"sid-123": {"id": "user-1"}}
+
+        class _FakeSio:
+            def __init__(self):
+                self.calls = 0
+
+            async def call(self, event, data, to=None, timeout=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise asyncio.TimeoutError()  # away / didn't click in time
+                return {"value": "clicked"}
+
+        fake_sio = _FakeSio()
+        self._install_fake_owui_socket_module(fake_sio, session_pool)
+        self.addCleanup(sys.modules.pop, "open_webui.socket.main", None)
+
+        async def event_call(payload):
+            raise asyncio.TimeoutError()
+
+        answer = await _ask_user_input_modal(
+            event_call,
+            "OpenClaw needs input:\n\nQ\nAnswer?\n1. a\n2. b",
+            timeout_s=0.01,
+            owui_user_id="user-1",
+            owui_chat_id="chat-1",
+            owui_message_id="msg-1",
+            max_wait_s=1,
+            poll_interval_s=0.01,
+        )
+
+        self.assertEqual(answer, "clicked")
+        self.assertGreaterEqual(fake_sio.calls, 2)  # re-fired after the timeout
+
+    async def test_reconnect_gives_modal_a_human_interaction_timeout(self):
+        # The re-fired sio.call must wait a real human-interaction budget for a
+        # click (OWUI's WEBSOCKET_EVENT_CALLER_TIMEOUT, default 300s), not the
+        # old 30s that made modals vanish before they could be answered.
+        session_pool = {"sid-123": {"id": "user-1"}}
+        captured = {}
+
+        class _FakeSio:
+            async def call(self, event, data, to=None, timeout=None):
+                captured["timeout"] = timeout
+                return {"value": "ok"}
+
+        self._install_fake_owui_socket_module(_FakeSio(), session_pool)
+        self.addCleanup(sys.modules.pop, "open_webui.socket.main", None)
+
+        async def event_call(payload):
+            raise asyncio.TimeoutError()
+
+        await _ask_user_input_modal(
+            event_call,
+            "OpenClaw needs input:\n\nQ\nAnswer?\n1. a\n2. b",
+            timeout_s=0.01,
+            owui_user_id="user-1",
+            max_wait_s=1,
+            poll_interval_s=0.01,
+        )
+
+        self.assertGreaterEqual(captured.get("timeout", 0), 300)
 
     async def test_ask_user_input_modal_gives_up_if_never_reconnects(self):
         session_pool = {}
