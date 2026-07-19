@@ -482,6 +482,11 @@ class Pipe:
             f"text_sha={_diag_sha} text_preview={text[:48]!r}"
         )
 
+        # Heal any 1/2·2/2 variant group a previous turn's proactive delivery
+        # left behind, so the proactive message shows in the normal linear flow
+        # rather than behind a swipe arrow (see _relinearize_proactive_variants).
+        await _heal_proactive_variants(conn, owui_origin_chat_id)
+
         try:
             patch_resp = await conn.send_request(
                 "sessions.patch",

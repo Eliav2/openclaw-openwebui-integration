@@ -1510,6 +1510,104 @@ def _deepest_leaf_id(messages: dict, start_id: str | None) -> str | None:
     return node_id
 
 
+def _is_proactive_message(msg: dict) -> bool:
+    """A message this bridge delivered out-of-band (proactive / sub-agent
+    finished), recognizable by the `*↳` prefix its content always carries."""
+    if not isinstance(msg, dict) or msg.get("role") != "assistant":
+        return False
+    head = (msg.get("content") or "")[:48]
+    return "*↳ Proactive message*" in head or "*↳ Sub-agent" in head
+
+
+def _relinearize_proactive_variants(history: dict) -> bool:
+    """Heal 1/2·2/2 variant groups an out-of-band proactive delivery created,
+    so the proactive message sits in the normal linear flow instead of behind
+    a swipe arrow.
+
+    Cause: OWUI can't live-append a new message to an already-open tab, so a
+    proactive message is written to the DB while the tab's `currentId` is
+    stale. When the user then sends their next message, the frontend parents it
+    to the PRE-proactive leaf — making the proactive message and the new
+    message siblings of one node, which OWUI renders as a swipeable 1/2·2/2
+    variant group (observed live 2026-07-19: 7 such groups, each an assistant
+    node with a proactive child + a user child).
+
+    This re-chains any such group into one linear path: for a node whose
+    children are one-or-more (leaf) proactive messages plus AT MOST ONE
+    non-proactive continuation, rewire them parent → proactive(oldest→newest) →
+    continuation. Genuine user-regeneration variants (2+ non-proactive
+    children) are left untouched; a group where a proactive node already has
+    children is skipped (already chained), which also makes this idempotent.
+    Returns True if anything changed.
+    """
+    messages = history.get("messages")
+    if not isinstance(messages, dict):
+        return False
+    changed = False
+    for parent_id, parent in list(messages.items()):
+        if not isinstance(parent, dict):
+            continue
+        kids = list(parent.get("childrenIds") or [])
+        if len(kids) < 2:
+            continue
+        proactive = [k for k in kids if _is_proactive_message(messages.get(k) or {})]
+        others = [k for k in kids if k not in proactive]
+        if not proactive or len(others) > 1:
+            continue
+        # Only a clean leaf group: every proactive sibling must be childless
+        # (a fresh bubble), never one that already anchors a chain.
+        if any((messages.get(k) or {}).get("childrenIds") for k in proactive):
+            continue
+        proactive.sort(key=lambda k: (messages.get(k) or {}).get("timestamp") or 0)
+        chain = proactive + others  # `others` is [] or exactly [one]
+        parent["childrenIds"] = [chain[0]]
+        for i, node_id in enumerate(chain):
+            node = messages.get(node_id)
+            if not isinstance(node, dict):
+                continue
+            node["parentId"] = parent_id if i == 0 else chain[i - 1]
+            if i + 1 < len(chain):
+                node["childrenIds"] = [chain[i + 1]]
+            # the last node keeps its own children (the continuation's reply)
+        # Point the view at the true tail so the whole linear flow — including
+        # the now-inlined proactive message — is what shows.
+        history["currentId"] = _deepest_leaf_id(messages, chain[-1])
+        changed = True
+    return changed
+
+
+async def _heal_proactive_variants(conn: "_GatewayConnection", chat_id: str) -> None:
+    """Best-effort: read a chat, re-linearize any proactive-created variant
+    group (`_relinearize_proactive_variants`), and persist if changed. Runs at
+    the start of each turn so a previous turn's stray variant is healed before
+    the user (or a reload) ever has to swipe to find the proactive message.
+    Silent no-op outside OWUI or on any failure."""
+    if not chat_id:
+        return
+    try:
+        from open_webui.models.chats import Chats
+    except Exception:
+        return
+    try:
+        async with conn._chat_write_lock(chat_id):
+            chat = await Chats.get_chat_by_id(chat_id)
+            if chat is None:
+                return
+            blob = chat.chat
+            history = blob.get("history") if isinstance(blob, dict) else None
+            if not isinstance(history, dict):
+                return
+            if _relinearize_proactive_variants(history):
+                # update_chat_by_id resets the title to "New Chat" when the
+                # passed blob has no 'title' key — preserve it explicitly.
+                if "title" not in blob:
+                    blob["title"] = getattr(chat, "title", None) or "New Chat"
+                await Chats.update_chat_by_id(chat_id, blob)
+                pipe_log(f"  healed proactive variant group(s) in chat {chat_id[:8]}...")
+    except Exception as ex:
+        pipe_log(f"  proactive variant heal failed (non-fatal): {ex}")
+
+
 async def _append_proactive_message_to_chat(
     conn: "_GatewayConnection", chat_id: str, text: str, *, log_prefix: str
 ) -> bool:

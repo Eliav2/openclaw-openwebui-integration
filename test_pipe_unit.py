@@ -70,6 +70,7 @@ from openclaw_pipe import (
     _TurnRenderer,
     _render_tool_result_block,
     _finalize_inline_message,
+    _relinearize_proactive_variants,
     _FALLBACK_MODELS,
     _advance_input_prompt_buffer,
     _advance_media_buffer,
@@ -1319,6 +1320,76 @@ class ParityFinalizeTests(unittest.TestCase):
         # untouched — a live tab already persisted it
         self.assertEqual(
             chat_state["history"]["messages"]["asst-3"]["content"], "partial")
+
+
+class RelinearizeProactiveVariantsTests(unittest.TestCase):
+    """A proactive message must sit in the normal linear flow, not behind a
+    1/2·2/2 swipe arrow (2026-07-19)."""
+
+    def _variant_history(self):
+        # assistant X has TWO children: a proactive bubble AND the user's next
+        # message — exactly the observed variant group.
+        return {
+            "currentId": "user2",
+            "messages": {
+                "user1": {"role": "user", "content": "hi", "parentId": None,
+                          "childrenIds": ["asstX"]},
+                "asstX": {"role": "assistant", "content": "answer", "parentId": "user1",
+                          "childrenIds": ["proac", "user2"], "timestamp": 100},
+                "proac": {"role": "assistant", "content": "*↳ Proactive message*\n\nheads up",
+                          "parentId": "asstX", "childrenIds": [], "timestamp": 110},
+                "user2": {"role": "user", "content": "next", "parentId": "asstX",
+                          "childrenIds": ["asstY"], "timestamp": 120},
+                "asstY": {"role": "assistant", "content": "reply2", "parentId": "user2",
+                          "childrenIds": []},
+            },
+        }
+
+    def test_linearizes_proactive_then_user(self):
+        h = self._variant_history()
+        self.assertTrue(_relinearize_proactive_variants(h))
+        m = h["messages"]
+        # asstX now has exactly one child: the proactive message
+        self.assertEqual(m["asstX"]["childrenIds"], ["proac"])
+        # proactive chains to the user message
+        self.assertEqual(m["proac"]["childrenIds"], ["user2"])
+        self.assertEqual(m["user2"]["parentId"], "proac")
+        # user message keeps its own reply
+        self.assertEqual(m["user2"]["childrenIds"], ["asstY"])
+        # no node has >1 child anymore (no variant)
+        self.assertTrue(all(len(msg.get("childrenIds") or []) <= 1 for msg in m.values()))
+        # view points at the true tail
+        self.assertEqual(h["currentId"], "asstY")
+
+    def test_idempotent(self):
+        h = self._variant_history()
+        self.assertTrue(_relinearize_proactive_variants(h))
+        self.assertFalse(_relinearize_proactive_variants(h))  # already linear
+
+    def test_leaves_genuine_regeneration_variants_untouched(self):
+        # two non-proactive assistant children = a real regeneration variant
+        h = {"currentId": "b", "messages": {
+            "u": {"role": "user", "childrenIds": ["a", "b"]},
+            "a": {"role": "assistant", "content": "v1", "childrenIds": []},
+            "b": {"role": "assistant", "content": "v2", "childrenIds": []},
+        }}
+        self.assertFalse(_relinearize_proactive_variants(h))
+        self.assertEqual(sorted(h["messages"]["u"]["childrenIds"]), ["a", "b"])
+
+    def test_orders_multiple_proactive_by_timestamp(self):
+        h = {"currentId": "u2", "messages": {
+            "x": {"role": "assistant", "childrenIds": ["p2", "p1", "u2"]},
+            "p1": {"role": "assistant", "content": "*↳ Proactive message*\n\na",
+                   "childrenIds": [], "timestamp": 10},
+            "p2": {"role": "assistant", "content": "*↳ Proactive message*\n\nb",
+                   "childrenIds": [], "timestamp": 20},
+            "u2": {"role": "user", "content": "hey", "childrenIds": []},
+        }}
+        self.assertTrue(_relinearize_proactive_variants(h))
+        m = h["messages"]
+        self.assertEqual(m["x"]["childrenIds"], ["p1"])   # oldest proactive first
+        self.assertEqual(m["p1"]["childrenIds"], ["p2"])
+        self.assertEqual(m["p2"]["childrenIds"], ["u2"])
 
 
 class GatewayReconnectStormTests(unittest.IsolatedAsyncioTestCase):
