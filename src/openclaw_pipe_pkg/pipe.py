@@ -61,10 +61,6 @@ class Pipe:
             default="",
             description="Optional OWUI API key for file uploads; request bearer token is preferred"
         )
-        OWUI_API_KEY: str = Field(
-            default="",
-            description="Optional OWUI API key for file uploads; request bearer token is preferred"
-        )
         FILE_SERVER_BASE_URL: str = Field(
             default="https://localhost:18791",
             description="Public URL for the file server (for MEDIA: resolution)"
@@ -195,19 +191,15 @@ class Pipe:
         if preset == "default":
             return self.valves.DEFAULT_MODEL.strip() or None
         if preset in self._LEGACY_PRESET_MAP:
-            legacy_defaults = {
-                "chatgpt": "openai/gpt-5.5",
-                "opus": "anthropic/claude-opus-4-8",
-                "sonnet": "anthropic/claude-sonnet-5",
-                "glm": "openrouter/z-ai/glm-5.2",
-            }
+            # `_LEGACY_PRESET_MAP` is the single source of truth for each
+            # preset's default model — don't re-hardcode it here.
             legacy_val = {
                 "chatgpt": self.valves.CHATGPT_MODEL,
                 "opus": self.valves.OPUS_MODEL,
                 "sonnet": self.valves.SONNET_MODEL,
                 "glm": self.valves.GLM_MODEL,
             }.get(preset, "")
-            if legacy_val and legacy_val.strip() and legacy_val.strip() != legacy_defaults.get(preset, ""):
+            if legacy_val and legacy_val.strip() and legacy_val.strip() != self._LEGACY_PRESET_MAP[preset]:
                 return legacy_val.strip()
             return self._LEGACY_PRESET_MAP[preset]
         return preset

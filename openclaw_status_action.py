@@ -641,6 +641,14 @@ class _GatewayConnection:
 
     async def send_request(self, method: str, params: dict, timeout: float = 10) -> dict:
         """Send a request and wait for the response."""
+        # `self._ws` is briefly None while the event loop is reconnecting
+        # (see `_event_loop`/`_reconnect`). Without this guard the `.send`
+        # below raises a bare `AttributeError: 'NoneType' object has no
+        # attribute 'send'`, which surfaces to the user as a cryptic
+        # "**Error sending message:** 'NoneType'...". A GatewayError with a
+        # clear reason is caught by the same callers and reads sanely.
+        if self._ws is None:
+            raise GatewayError("gateway connection not ready (reconnecting)")
         req_id = str(self._next_req_id)
         self._next_req_id += 1
         fut = asyncio.get_running_loop().create_future()
@@ -1324,6 +1332,76 @@ def _deepest_leaf_id(messages: dict, start_id: str | None) -> str | None:
     return node_id
 
 
+async def _append_proactive_message_to_chat(
+    conn: "_GatewayConnection", chat_id: str, text: str, *, log_prefix: str
+) -> bool:
+    """Persist one assistant message onto the tail of an OWUI chat.
+
+    Shared write path for both proactive-delivery functions
+    (`_deliver_proactive_owui_message` and its sub-agent sibling), which did
+    this identically apart from log wording (~45 duplicated lines each). The
+    load-bearing details are all P33-history (2026-07-11/13) and MUST stay
+    identical for both callers:
+      * anchor on the true childless leaf (`_deepest_leaf_id`), not the bare
+        `currentId`, or the message forks a 1/2·2/2 sibling variant;
+      * patch the old leaf's `childrenIds` BEFORE upserting the new message —
+        `upsert_message_to_chat_by_id_and_message_id` resets `currentId` on
+        every call, so doing it after would orphan the new message;
+      * inherit the branch's own `model` so OWUI's frontend still resolves an
+        `actions` list (the Status button) for the message;
+      * hold the per-chat write lock so the two proactive paths (and any
+        zombie connection) can't each read the same leaf and append siblings.
+
+    Returns True on a successful persist. Callers own the success log line
+    (its detail — user_id, task_id — differs); this owns the
+    unavailable/not-found/failed logs, tagged with `log_prefix`.
+    """
+    try:
+        from open_webui.models.chats import Chats
+    except Exception as ex:
+        pipe_log(f"  {log_prefix} unavailable (not running inside OWUI process?): {ex}")
+        return False
+
+    try:
+        async with conn._chat_write_lock(chat_id):
+            chat = await Chats.get_chat_by_id(chat_id)
+            if chat is None:
+                pipe_log(f"  {log_prefix}: chat {chat_id[:8]}... not found")
+                return False
+            history = chat.chat.get("history", {}) or {}
+            old_leaf_id = _deepest_leaf_id(history.get("messages") or {}, history.get("currentId"))
+            new_message_id = str(uuid.uuid4())
+            old_leaf = (history.get("messages") or {}).get(old_leaf_id, {}) if old_leaf_id else {}
+            model_id = old_leaf.get("model") or next(iter(chat.chat.get("models") or []), None)
+
+            if old_leaf_id:
+                children = list(old_leaf.get("childrenIds", []))
+                if new_message_id not in children:
+                    children.append(new_message_id)
+                    await Chats.upsert_message_to_chat_by_id_and_message_id(
+                        chat_id, old_leaf_id, {"childrenIds": children},
+                    )
+
+            message_fields = {
+                "role": "assistant",
+                "content": text,
+                "parentId": old_leaf_id,
+                "childrenIds": [],
+                "timestamp": int(time.time()),
+            }
+            if model_id:
+                message_fields["model"] = model_id
+                message_fields["modelName"] = old_leaf.get("modelName") or model_id
+
+            await Chats.upsert_message_to_chat_by_id_and_message_id(
+                chat_id, new_message_id, message_fields,
+            )
+        return True
+    except Exception as ex:
+        pipe_log(f"  {log_prefix} failed: {ex}")
+        return False
+
+
 async def _deliver_proactive_owui_message(
     conn: "_GatewayConnection", session_key: str, run_id: str
 ) -> None:
@@ -1367,81 +1445,13 @@ async def _deliver_proactive_owui_message(
 
     text = f"*↳ Proactive message*\n\n{text}"
 
-    try:
-        from open_webui.models.chats import Chats
-    except Exception as ex:
-        pipe_log(f"  proactive delivery unavailable (not running inside OWUI process?): {ex}")
-        return
-
-    try:
-        # Serialize with the sub-agent proactive path (and any zombie
-        # connection) so two deliveries into the same chat can't each read the
-        # leaf before the other commits and end up appending as siblings.
-        async with conn._chat_write_lock(chat_id):
-            chat = await Chats.get_chat_by_id(chat_id)
-            if chat is None:
-                pipe_log(f"  proactive delivery: chat {chat_id[:8]}... not found")
-                return
-            history = chat.chat.get("history", {}) or {}
-            # Anchor on the true childless leaf, not the bare `currentId`
-            # (which can point at an ancestor that already has children — see
-            # `_deepest_leaf_id`), otherwise the new message forks a sibling
-            # variant instead of extending the conversation linearly.
-            old_leaf_id = _deepest_leaf_id(history.get("messages") or {}, history.get("currentId"))
-            new_message_id = str(uuid.uuid4())
-
-            # Without a `model` field, OWUI's frontend can't resolve
-            # `$models.find((m) => m.id === message.model)` for this message,
-            # so it has zero associated actions -- the Status button (and any
-            # future proactive-specific action) silently never renders on
-            # proactively-delivered messages (confirmed against
-            # ResponseMessage.svelte, 2026-07-13). Prefer the immediately
-            # preceding message's own `model` (most locally accurate -- it's
-            # what actually produced this branch of the conversation) over the
-            # chat's globally-selected `models` list, which only reflects
-            # whatever's picked in the model dropdown right now and can drift
-            # from what a given branch was actually generated with.
-            old_leaf = (history.get("messages") or {}).get(old_leaf_id, {}) if old_leaf_id else {}
-            model_id = old_leaf.get("model") or next(iter(chat.chat.get("models") or []), None)
-
-            # `upsert_message_to_chat_by_id_and_message_id` unconditionally
-            # sets `history.currentId = message_id` as a side effect of
-            # *every* call (it's OWUI's own generic upsert, not something we
-            # control). So the childrenIds patch on the *old* leaf must happen
-            # first — otherwise it clobbers currentId back to old_leaf_id right
-            # after we set it, and the new message becomes an invisible orphan
-            # branch (P33 bug, found 2026-07-11: pipe_log showed successful
-            # "persisted" calls but nothing ever appeared in OWUI, because
-            # currentId never actually ended up pointing at the new message).
-            if old_leaf_id:
-                children = list(old_leaf.get("childrenIds", []))
-                if new_message_id not in children:
-                    children.append(new_message_id)
-                    await Chats.upsert_message_to_chat_by_id_and_message_id(
-                        chat_id, old_leaf_id, {"childrenIds": children},
-                    )
-
-            message_fields = {
-                "role": "assistant",
-                "content": text,
-                "parentId": old_leaf_id,
-                "childrenIds": [],
-                "timestamp": int(time.time()),
-            }
-            if model_id:
-                message_fields["model"] = model_id
-                message_fields["modelName"] = old_leaf.get("modelName") or model_id
-
-            await Chats.upsert_message_to_chat_by_id_and_message_id(
-                chat_id, new_message_id, message_fields,
-            )
-
+    if await _append_proactive_message_to_chat(
+        conn, chat_id, text, log_prefix="proactive delivery"
+    ):
         pipe_log(
             f"  proactive delivery: persisted message into chat {chat_id[:8]}... "
             f"for user {user_id[:8]}... ({len(text)} chars)"
         )
-    except Exception as ex:
-        pipe_log(f"  proactive delivery failed: {ex}")
 
 
 # Embedded in the proactively-delivered message text for a finished
@@ -1547,66 +1557,13 @@ async def _deliver_subagent_proactive_owui_message(
     label = f"Sub-agent finished: {task_title}" if task_title else "Sub-agent finished"
     text = f"*↳ {label}*\n\n{text}\n\n<!-- openclaw:taskId={task_id} -->"
 
-    try:
-        from open_webui.models.chats import Chats
-    except Exception as ex:
-        pipe_log(f"  subagent proactive delivery unavailable (not running inside OWUI process?): {ex}")
-        return
-
-    try:
-        # Serialize with the regular proactive path (see that function) so a
-        # sub-agent-finished message and a regular proactive message can't each
-        # read the same leaf and land as sibling 1/2·2/2 variants.
-        async with conn._chat_write_lock(chat_id):
-            chat = await Chats.get_chat_by_id(chat_id)
-            if chat is None:
-                pipe_log(f"  subagent proactive delivery: chat {chat_id[:8]}... not found")
-                return
-            history = chat.chat.get("history", {}) or {}
-            # Anchor on the true childless leaf, not the bare `currentId`
-            # (see `_deepest_leaf_id`) — otherwise this forks a sibling variant.
-            old_leaf_id = _deepest_leaf_id(history.get("messages") or {}, history.get("currentId"))
-            new_message_id = str(uuid.uuid4())
-
-            # Same reasoning as the regular proactive path: inherit the
-            # branch's own model so OWUI's frontend still resolves an `actions`
-            # list for this message (ResponseMessage.svelte) and the existing
-            # Status button renders on it — its default click handler is what
-            # detects the taskId marker and redirects into the drawer (see
-            # action.py), so this message needs the SAME model, not a
-            # different one.
-            old_leaf = (history.get("messages") or {}).get(old_leaf_id, {}) if old_leaf_id else {}
-            model_id = old_leaf.get("model") or next(iter(chat.chat.get("models") or []), None)
-
-            if old_leaf_id:
-                children = list(old_leaf.get("childrenIds", []))
-                if new_message_id not in children:
-                    children.append(new_message_id)
-                    await Chats.upsert_message_to_chat_by_id_and_message_id(
-                        chat_id, old_leaf_id, {"childrenIds": children},
-                    )
-
-            message_fields = {
-                "role": "assistant",
-                "content": text,
-                "parentId": old_leaf_id,
-                "childrenIds": [],
-                "timestamp": int(time.time()),
-            }
-            if model_id:
-                message_fields["model"] = model_id
-                message_fields["modelName"] = old_leaf.get("modelName") or model_id
-
-            await Chats.upsert_message_to_chat_by_id_and_message_id(
-                chat_id, new_message_id, message_fields,
-            )
-
+    if await _append_proactive_message_to_chat(
+        conn, chat_id, text, log_prefix="subagent proactive delivery"
+    ):
         pipe_log(
             f"  subagent proactive delivery: persisted message into chat {chat_id[:8]}... "
             f"for user {user_id[:8]}... task {task_id[:8]}... ({len(text)} chars)"
         )
-    except Exception as ex:
-        pipe_log(f"  subagent proactive delivery failed: {ex}")
 
 
 # Module-level singleton

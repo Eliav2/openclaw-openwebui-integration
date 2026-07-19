@@ -66,6 +66,7 @@ if "pydantic" not in sys.modules:
 
 from openclaw_pipe import (
     _GatewayConnection,
+    GatewayError,
     _FALLBACK_MODELS,
     _advance_input_prompt_buffer,
     _advance_media_buffer,
@@ -1255,6 +1256,16 @@ class GatewayReconnectStormTests(unittest.IsolatedAsyncioTestCase):
         first_task.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await first_task
+
+    async def test_send_request_raises_clean_error_while_reconnecting(self):
+        """During the brief window where the event loop has dropped the
+        socket and is reconnecting, `self._ws` is None. `send_request` must
+        surface a clear GatewayError, not a bare AttributeError('NoneType'...)
+        that reaches the user as a cryptic '**Error sending message:**'."""
+        conn = _GatewayConnection(lambda: None)
+        conn._ws = None
+        with self.assertRaises(GatewayError):
+            await conn.send_request("sessions.describe", {"key": "k"}, timeout=1)
 
 
 class GatewayReloadReapTests(unittest.IsolatedAsyncioTestCase):
