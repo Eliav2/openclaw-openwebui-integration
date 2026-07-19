@@ -1151,11 +1151,35 @@ class Pipe:
                             and text_yielded
                             and time.time() - last_activity_time > idle_probe_s
                         ):
-                            pipe_log(
-                                "  idle probe: text already streamed and no activity for "
-                                f"{idle_probe_s}s, self-closing"
-                            )
-                            done = True
+                            # Do NOT hard-close on a 30s silent gap: a long tool
+                            # call or a stretch of silent model reasoning looks
+                            # identical to a finished run from here, and closing
+                            # on it strands the rest of the turn as a detached
+                            # proactive bubble (root cause of the 2026-07-19
+                            # "my reply came at the end as a separate bubble"
+                            # reports). Confirm with the gateway first; only
+                            # close if the run is genuinely terminal, otherwise
+                            # stay alive so the inline message keeps streaming to
+                            # completion (no proactive/finalize needed at all).
+                            status = await gateway_run_status()
+                            if status in ("done", "failed", "cancelled"):
+                                pipe_log(
+                                    f"  idle {idle_probe_s}s + gateway status="
+                                    f"{status}: closing"
+                                )
+                                done = True
+                            else:
+                                pipe_log(
+                                    f"  idle {idle_probe_s}s but gateway status="
+                                    f"{status or 'unknown'} — run still active, "
+                                    "staying alive"
+                                )
+                                await _emit_status(
+                                    __event_emitter__, "Still working...", done=False
+                                )
+                                # Reset the idle clock so we re-probe roughly
+                                # once per idle_probe_s, not on every dead event.
+                                last_activity_time = time.time()
 
                 except asyncio.CancelledError:
                     # OWUI stop button → abort the gateway run
