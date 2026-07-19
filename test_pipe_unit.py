@@ -1376,6 +1376,28 @@ class RelinearizeProactiveVariantsTests(unittest.TestCase):
         self.assertFalse(_relinearize_proactive_variants(h))
         self.assertEqual(sorted(h["messages"]["u"]["childrenIds"]), ["a", "b"])
 
+    def test_chains_continuation_below_proactive_that_already_has_a_subtree(self):
+        """Real 2026-07-19 case: the proactive sibling isn't a leaf — a later
+        message already chained under it. The user continuation must attach at
+        the proactive's deepest leaf, not get skipped."""
+        h = {"currentId": "u2", "messages": {
+            "x": {"role": "assistant", "childrenIds": ["proac", "u2"]},
+            "proac": {"role": "assistant", "content": "*↳ Proactive message*\n\nyo",
+                      "childrenIds": ["c1"], "timestamp": 10},
+            "c1": {"role": "user", "content": "under proactive", "childrenIds": []},
+            "u2": {"role": "user", "content": "sibling", "childrenIds": ["a2"]},
+            "a2": {"role": "assistant", "content": "reply", "childrenIds": []},
+        }}
+        self.assertTrue(_relinearize_proactive_variants(h))
+        m = h["messages"]
+        self.assertEqual(m["x"]["childrenIds"], ["proac"])
+        self.assertEqual(m["proac"]["childrenIds"], ["c1"])
+        self.assertEqual(m["c1"]["childrenIds"], ["u2"])   # continuation below proactive's leaf
+        self.assertEqual(m["u2"]["parentId"], "c1")
+        self.assertEqual(m["u2"]["childrenIds"], ["a2"])   # keeps its own reply
+        self.assertTrue(all(len(v.get("childrenIds") or []) <= 1 for v in m.values()))
+        self.assertEqual(h["currentId"], "a2")
+
     def test_orders_multiple_proactive_by_timestamp(self):
         h = {"currentId": "u2", "messages": {
             "x": {"role": "assistant", "childrenIds": ["p2", "p1", "u2"]},

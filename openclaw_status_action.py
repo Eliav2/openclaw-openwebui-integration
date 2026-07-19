@@ -1554,24 +1554,30 @@ def _relinearize_proactive_variants(history: dict) -> bool:
         others = [k for k in kids if k not in proactive]
         if not proactive or len(others) > 1:
             continue
-        # Only a clean leaf group: every proactive sibling must be childless
-        # (a fresh bubble), never one that already anchors a chain.
-        if any((messages.get(k) or {}).get("childrenIds") for k in proactive):
-            continue
         proactive.sort(key=lambda k: (messages.get(k) or {}).get("timestamp") or 0)
         chain = proactive + others  # `others` is [] or exactly [one]
+        # Keep only the first node under the parent; chain the rest under the
+        # deepest leaf of the previous node's existing subtree (a proactive
+        # message may already anchor its own tail — e.g. a later proactive
+        # chained under it — so we must extend, not overwrite, its children).
         parent["childrenIds"] = [chain[0]]
-        for i, node_id in enumerate(chain):
-            node = messages.get(node_id)
-            if not isinstance(node, dict):
-                continue
-            node["parentId"] = parent_id if i == 0 else chain[i - 1]
-            if i + 1 < len(chain):
-                node["childrenIds"] = [chain[i + 1]]
-            # the last node keeps its own children (the continuation's reply)
+        first = messages.get(chain[0])
+        if isinstance(first, dict):
+            first["parentId"] = parent_id
+        for i in range(len(chain) - 1):
+            cur_leaf = _deepest_leaf_id(messages, chain[i])
+            nxt = chain[i + 1]
+            leaf_node = messages.get(cur_leaf)
+            if isinstance(leaf_node, dict):
+                leaf_node.setdefault("childrenIds", [])
+                if nxt not in leaf_node["childrenIds"]:
+                    leaf_node["childrenIds"].append(nxt)
+            nxt_node = messages.get(nxt)
+            if isinstance(nxt_node, dict):
+                nxt_node["parentId"] = cur_leaf
         # Point the view at the true tail so the whole linear flow — including
         # the now-inlined proactive message — is what shows.
-        history["currentId"] = _deepest_leaf_id(messages, chain[-1])
+        history["currentId"] = _deepest_leaf_id(messages, chain[0])
         changed = True
     return changed
 
