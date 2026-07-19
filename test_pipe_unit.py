@@ -67,6 +67,9 @@ if "pydantic" not in sys.modules:
 from openclaw_pipe import (
     _GatewayConnection,
     GatewayError,
+    _TurnRenderer,
+    _render_tool_result_block,
+    _finalize_inline_message,
     _FALLBACK_MODELS,
     _advance_input_prompt_buffer,
     _advance_media_buffer,
@@ -1168,6 +1171,154 @@ class SubagentTaskIdMarkerRegexTests(unittest.TestCase):
 
     def test_no_match_without_marker(self):
         self.assertIsNone(_SUBAGENT_TASK_ID_MARKER_RE.search("just a normal message"))
+
+
+class TurnRendererTests(unittest.TestCase):
+    """Parity (2026-07-19): the shadow renderer reconstructs a run's full
+    visible content (text + tool blocks) from its gateway event stream, so an
+    interrupted inline turn's OWUI message can be finalized to the complete
+    content."""
+
+    def test_accumulates_text_and_tool_block_in_order(self):
+        r = _TurnRenderer()
+        r.feed({"stream": "assistant", "data": {"delta": "Working"}})
+        r.feed({"stream": "assistant", "data": {"delta": " on it. "}})
+        r.feed({"stream": "tool", "data": {"phase": "start", "name": "Bash",
+                                           "toolCallId": "t1", "args": {"cmd": "echo hi"}}})
+        r.feed({"stream": "tool", "data": {"phase": "result", "name": "Bash",
+                                           "toolCallId": "t1", "result": "hi"}})
+        r.feed({"stream": "assistant", "data": {"delta": "Done."}})
+        self.assertTrue(r.visible_text.startswith("Working on it. "))
+        self.assertIn('<details type="tool_calls"', r.visible_text)
+        self.assertIn("Bash", r.visible_text)
+        self.assertTrue(r.visible_text.rstrip().endswith("Done."))
+
+    def test_tool_block_matches_shared_renderer(self):
+        r = _TurnRenderer()
+        r.feed({"stream": "tool", "data": {"phase": "result", "name": "Read",
+                                           "toolCallId": "t9", "result": "contents"}})
+        expected = _render_tool_result_block("Read", "t9", "{}", "contents", "")
+        self.assertIn(expected.strip(), r.visible_text)
+
+    def test_catch_all_text_is_not_duplicated(self):
+        """A provider's final catch-all `text` (full cumulative reply, no
+        `delta`) must not re-append what was already streamed."""
+        r = _TurnRenderer()
+        r.feed({"stream": "assistant", "data": {"delta": "Hello world"}})
+        r.feed({"stream": "assistant", "data": {"text": "Hello world"}})
+        self.assertEqual(r.visible_text, "Hello world")
+
+    def test_filters_sender_metadata(self):
+        r = _TurnRenderer()
+        r.feed({"stream": "assistant", "data": {"delta": "Sender (untrusted metadata) ..."}})
+        self.assertEqual(r.visible_text, "")
+
+
+class ParityFinalizeTests(unittest.TestCase):
+    """Parity finalize: when the inline turn ends before the run does, the
+    ORIGINAL assistant message is completed in place with the full content —
+    never a user message, and never when a live tab already has it."""
+
+    def _conn(self, agent_id="main"):
+        return _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID=agent_id))
+
+    def _session(self):
+        return _owui_session_key(
+            "main", "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        )
+
+    def _run_with_fake_chats(self, conn, session_key, run_id, chat_state):
+        class FakeChat:
+            def __init__(self, chat):
+                self.chat = chat
+
+        class FakeChats:
+            @staticmethod
+            async def get_chat_by_id(chat_id):
+                return FakeChat(chat_state)
+
+            @staticmethod
+            async def upsert_message_to_chat_by_id_and_message_id(chat_id, message_id, message):
+                history = chat_state["history"]
+                messages = history.setdefault("messages", {})
+                messages[message_id] = {**messages.get(message_id, {}), **message}
+                history["currentId"] = message_id
+                return FakeChat(chat_state)
+
+        fake_chats_module = types.ModuleType("open_webui.models.chats")
+        fake_chats_module.Chats = FakeChats
+        with mock.patch.dict(sys.modules, {
+            "open_webui": types.ModuleType("open_webui"),
+            "open_webui.models": types.ModuleType("open_webui.models"),
+            "open_webui.models.chats": fake_chats_module,
+        }):
+            asyncio.run(_finalize_inline_message(conn, session_key, run_id))
+
+    def test_completes_assistant_message_in_place(self):
+        conn = self._conn()
+        sk = self._session()
+        conn.register_run_target(sk, "run-1", "chat-1", "asst-1")
+        r = conn._run_renderers[f"{sk}:run-1"]
+        r.feed({"stream": "assistant", "data": {"delta": "Full answer text."}})
+        r.feed({"stream": "tool", "data": {"phase": "result", "name": "Bash",
+                                           "toolCallId": "t1", "result": "ok"}})
+
+        chat_state = {"history": {"currentId": "asst-1", "messages": {
+            "user-1": {"role": "user", "content": "hi", "childrenIds": ["asst-1"]},
+            "asst-1": {"role": "assistant", "content": "Full ans", "done": True,
+                       "parentId": "user-1", "childrenIds": []},
+        }}}
+        self._run_with_fake_chats(conn, sk, "run-1", chat_state)
+
+        msg = chat_state["history"]["messages"]["asst-1"]
+        self.assertIn("Full answer text.", msg["content"])
+        self.assertIn('<details type="tool_calls"', msg["content"])
+        self.assertTrue(msg["done"])
+        # target cleaned up
+        self.assertNotIn(f"{sk}:run-1", conn._run_targets)
+
+    def test_never_overwrites_a_user_message(self):
+        """Critical safety: if the target id resolves to a user message (should
+        never happen, but must never corrupt one), finalize appends a new tail
+        instead of overwriting it in place."""
+        conn = self._conn()
+        sk = self._session()
+        conn.register_run_target(sk, "run-2", "chat-1", "user-1")  # wrong id -> user
+        conn._run_renderers[f"{sk}:run-2"].feed(
+            {"stream": "assistant", "data": {"delta": "assistant tail content"}})
+
+        chat_state = {"history": {"currentId": "user-1", "messages": {
+            "user-1": {"role": "user", "content": "original user text",
+                       "childrenIds": []},
+        }}}
+        self._run_with_fake_chats(conn, sk, "run-2", chat_state)
+
+        # the user message must be untouched
+        self.assertEqual(
+            chat_state["history"]["messages"]["user-1"]["content"], "original user text")
+        # and the content landed as a NEW assistant message, not lost
+        assts = [m for m in chat_state["history"]["messages"].values()
+                 if m.get("role") == "assistant"]
+        self.assertTrue(any("assistant tail content" in (m.get("content") or "") for m in assts))
+
+    def test_noop_when_delivered_live(self):
+        conn = self._conn()
+        sk = self._session()
+        conn.register_run_target(sk, "run-3", "chat-1", "asst-3")
+        conn._run_renderers[f"{sk}:run-3"].feed(
+            {"stream": "assistant", "data": {"delta": "tail"}})
+        conn.mark_delivered_live(sk, "run-3")
+
+        chat_state = {"history": {"currentId": "asst-3", "messages": {
+            "asst-3": {"role": "assistant", "content": "partial", "done": True,
+                       "childrenIds": []},
+        }}}
+        self._run_with_fake_chats(conn, sk, "run-3", chat_state)
+
+        # untouched — a live tab already persisted it
+        self.assertEqual(
+            chat_state["history"]["messages"]["asst-3"]["content"], "partial")
 
 
 class GatewayReconnectStormTests(unittest.IsolatedAsyncioTestCase):

@@ -594,6 +594,15 @@ class Pipe:
         self._current_run_id = our_run_id
         pipe_log(f"Captured runId: {our_run_id}")
         queue = conn.register_consumer(session_key, our_run_id)
+        # Parity (2026-07-19): tell the persistent connection which OWUI message
+        # this run streams into, so a shadow renderer can finalize that message
+        # to the complete content if this inline turn ends before the run does
+        # (idle self-close / cancel / torn-down request). No-op without a stable
+        # message id. See _finalize_inline_message / _TurnRenderer in gateway.py.
+        conn.register_run_target(
+            session_key, our_run_id, owui_origin_chat_id,
+            (__metadata__ or {}).get("message_id"),
+        )
 
         # --- Consume events ---
         done = False
@@ -1086,15 +1095,11 @@ class Pipe:
                                 stored_args = self._active_tool_args.pop(tool_call_id, None)
                                 args_str = stored_args or json.dumps(data.get("args", {}))
                                 pipe_log(f"  Tool result: {name} ({len(result_str)} chars)")
-                                tool_block = (
-                                    '\n<details type="tool_calls" done="true" '
-                                    f'id="{html.escape(tool_call_id)}" '
-                                    f'name="{html.escape(name)}" '
-                                    f'arguments="{html.escape(args_str[:3000])}" '
-                                    f'result="{html.escape(result_str[:8000])}" '
-                                    f'meta="{html.escape(str(data.get("meta",""))[:500])}" '
-                                    'files="[]" embeds="[]">'
-                                    f'\n<summary>{html.escape(name)}</summary>\n</details>\n'
+                                # Shared with the parity shadow renderer so both
+                                # produce byte-identical tool cards (gateway.py).
+                                tool_block = _render_tool_result_block(
+                                    name, tool_call_id, args_str, result_str,
+                                    data.get("meta", ""),
                                 )
                                 had_tool_block = True
                                 record_visible_chunk(tool_block)
