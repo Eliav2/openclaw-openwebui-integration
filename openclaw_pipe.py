@@ -1718,6 +1718,15 @@ class _GatewayConnection:
         # Run consumers (keyed by f"{session_key}:{run_id}")
         self._consumers: dict[str, _Consumer] = {}
 
+        # Per-session locks serializing the queue-release -> chat.send -> run
+        # registration critical section. Two concurrent messages that release
+        # from the queue at the same instant would otherwise both send into the
+        # same idle window; the gateway steer-merges the second into the first,
+        # which then renders nothing ("no reply text"). Serializing the send so
+        # the next waiter observes the just-started run (via sessions.list
+        # hasActiveRun) closes that thundering-herd race. ELI-56.
+        self._session_send_locks: dict[str, asyncio.Lock] = {}
+
         # Reconnect state
         self._reconnect_attempt = 0
         self._max_backoff = 30  # seconds
@@ -1887,6 +1896,17 @@ class _GatewayConnection:
             return await asyncio.wait_for(fut, timeout=timeout)
         finally:
             self._pending_reqs.pop(req_id, None)
+
+    def session_send_lock(self, session_key: str) -> asyncio.Lock:
+        """Per-session lock serializing the queue-release -> chat.send -> run
+        registration critical section (see `_session_send_locks`). Created
+        lazily; asyncio.Lock is created on the running loop the first time it
+        is awaited."""
+        lock = self._session_send_locks.get(session_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_send_locks[session_key] = lock
+        return lock
 
     def register_consumer(self, session_key: str, run_id: str) -> asyncio.Queue:
         """Register an event consumer queue for a (session, run) pair.
@@ -3772,6 +3792,7 @@ class Pipe:
                 return active
             return conn.active_run_id_for_session(session_key) is not None
 
+        # Immediate feedback (outside the lock) if the session is busy right now.
         if await _session_run_active():
             pipe_log("Session has an active run (gateway-authoritative); queueing behind it")
             await _emit_status(
@@ -3779,57 +3800,70 @@ class Pipe:
                 "⏳ Queued behind the current response…",
                 done=False,
             )
-            # NOTE: do NOT prepend a `/queue followup` directive here. On the
-            # 2026.7.1 gateway that directive is NOT stripped from a device
-            # chat.send — it leaked verbatim into the delivered message (seen
-            # in the OpenClaw transcript as "/queue followup <user text>"),
-            # polluting the message without achieving native followup queueing.
+
+        # Serialize the queue-release -> chat.send -> run-registration critical
+        # section per session. Two messages released from the queue at the same
+        # instant would otherwise both send into the same idle window; the
+        # gateway steer-merges the second into the first, which then renders
+        # nothing ("no reply text"). Holding this lock only across the wait+send
+        # (NOT the event loop below) means the next waiter re-checks AFTER our
+        # run is registered and observes it active (sessions.list hasActiveRun),
+        # so it waits its turn instead of racing us. Confirmed thundering-herd
+        # phantom: two Captured runIds 10ms apart under a burst release (ELI-56).
+        # NOTE: do NOT prepend a `/queue followup` directive here. On the
+        # 2026.7.1 gateway that directive is NOT stripped from a device
+        # chat.send — it leaked verbatim into the delivered message.
+        async with conn.session_send_lock(session_key):
             queue_wait_started = time.time()
             queue_wait_cap_s = 1800  # safety ceiling; socket keepalive holds the request
             queue_settle_s = 2.0     # re-confirm not-active before releasing
+            ever_active = False
             while time.time() - queue_wait_started < queue_wait_cap_s:
-                if not await _session_run_active():
-                    # Settle-confirm before releasing the queue. When a
-                    # subagent finishes, the parent turn resumes as a NEW run;
-                    # there is a brief window between the child ending and the
-                    # parent's resume run registering where hasActiveRun can
-                    # read false. Sending in that window races the resume and
-                    # phantoms again (ELI-56). Wait a beat and re-check; only
-                    # release if the session is still idle.
-                    await asyncio.sleep(queue_settle_s)
-                    if not await _session_run_active():
-                        break
+                if await _session_run_active():
+                    ever_active = True
+                    await asyncio.sleep(1.5)
                     continue
-                await asyncio.sleep(1.5)
-            pipe_log("  active run ended; sending queued message as its own run")
+                # Not active now. If we were ever queued, settle-confirm before
+                # releasing: when a subagent finishes the parent resumes as a
+                # NEW run, and there is a brief window between the child ending
+                # and that resume registering where hasActiveRun reads false;
+                # sending in it races the resume and phantoms again (ELI-56).
+                if ever_active:
+                    await asyncio.sleep(queue_settle_s)
+                    if await _session_run_active():
+                        continue
+                break
+            if ever_active:
+                pipe_log("  active run ended; sending queued message as its own run")
 
-        # --- Send this message as its own fresh run ---
-        idempotency_key = f"msg-{chat_id}-{time.time()}"
-        try:
-            send_resp = await conn.send_request(
-                "chat.send",
-                _owui_chat_send_params(
-                    session_key=session_key,
-                    message=text,
-                    idempotency_key=idempotency_key,
-                    owui_chat_id=owui_origin_chat_id,
-                    owui_user_id=owui_origin_user_id,
-                    attachments=image_attachments,
-                ),
-                timeout=30
-            )
-        except asyncio.TimeoutError:
-            await _emit_status(__event_emitter__, "", done=True)
-            yield "**Timeout:** Gateway did not respond to chat.send"
-            return
-        except Exception as e:
-            await _emit_status(__event_emitter__, "", done=True)
-            yield f"**Error sending message:** {e}"
-            return
-        our_run_id = send_resp.get("runId", "unknown")
-        self._current_run_id = our_run_id
-        pipe_log(f"Captured runId: {our_run_id}")
-        queue = conn.register_consumer(session_key, our_run_id)
+            # --- Send this message as its own fresh run (still holding the lock
+            #     so the next waiter observes our run before deciding to send) ---
+            idempotency_key = f"msg-{chat_id}-{time.time()}"
+            try:
+                send_resp = await conn.send_request(
+                    "chat.send",
+                    _owui_chat_send_params(
+                        session_key=session_key,
+                        message=text,
+                        idempotency_key=idempotency_key,
+                        owui_chat_id=owui_origin_chat_id,
+                        owui_user_id=owui_origin_user_id,
+                        attachments=image_attachments,
+                    ),
+                    timeout=30
+                )
+            except asyncio.TimeoutError:
+                await _emit_status(__event_emitter__, "", done=True)
+                yield "**Timeout:** Gateway did not respond to chat.send"
+                return
+            except Exception as e:
+                await _emit_status(__event_emitter__, "", done=True)
+                yield f"**Error sending message:** {e}"
+                return
+            our_run_id = send_resp.get("runId", "unknown")
+            self._current_run_id = our_run_id
+            pipe_log(f"Captured runId: {our_run_id}")
+            queue = conn.register_consumer(session_key, our_run_id)
         # Parity (2026-07-19): tell the persistent connection which OWUI message
         # this run streams into, so a shadow renderer can finalize that message
         # to the complete content if this inline turn ends before the run does

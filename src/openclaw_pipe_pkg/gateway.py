@@ -439,6 +439,15 @@ class _GatewayConnection:
         # Run consumers (keyed by f"{session_key}:{run_id}")
         self._consumers: dict[str, _Consumer] = {}
 
+        # Per-session locks serializing the queue-release -> chat.send -> run
+        # registration critical section. Two concurrent messages that release
+        # from the queue at the same instant would otherwise both send into the
+        # same idle window; the gateway steer-merges the second into the first,
+        # which then renders nothing ("no reply text"). Serializing the send so
+        # the next waiter observes the just-started run (via sessions.list
+        # hasActiveRun) closes that thundering-herd race. ELI-56.
+        self._session_send_locks: dict[str, asyncio.Lock] = {}
+
         # Reconnect state
         self._reconnect_attempt = 0
         self._max_backoff = 30  # seconds
@@ -608,6 +617,17 @@ class _GatewayConnection:
             return await asyncio.wait_for(fut, timeout=timeout)
         finally:
             self._pending_reqs.pop(req_id, None)
+
+    def session_send_lock(self, session_key: str) -> asyncio.Lock:
+        """Per-session lock serializing the queue-release -> chat.send -> run
+        registration critical section (see `_session_send_locks`). Created
+        lazily; asyncio.Lock is created on the running loop the first time it
+        is awaited."""
+        lock = self._session_send_locks.get(session_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_send_locks[session_key] = lock
+        return lock
 
     def register_consumer(self, session_key: str, run_id: str) -> asyncio.Queue:
         """Register an event consumer queue for a (session, run) pair.
