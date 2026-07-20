@@ -4,6 +4,31 @@
 # ------------------------------------------------------------------
 
 
+# Session states that `sessions.describe` reports for a genuinely in-progress
+# run. Blacklisting terminal states is unsafe: an idle session reports "idle"
+# (and "done"), so a `not in (done, failed, cancelled)` test would treat every
+# resting session as active and hang every message. Only these gate the queue.
+_ACTIVE_RUN_STATES = ("active", "running", "streaming", "queued")
+
+
+def _session_active_from_signals(describe_status, list_has_active_run) -> bool:
+    """Decide whether a session has an in-progress run from the two gateway
+    signals the pipe can observe over RPC (ELI-56).
+
+    `sessions.describe` only exposes a persisted `status`, which flips to
+    'done' the instant a turn calls `sessions_yield` to await a subagent — even
+    though the run is merely suspended and WILL resume, and the gateway still
+    steer-merges any message sent into that window (→ a phantom "no reply
+    text" bubble). `sessions.list` additionally exposes `hasActiveRun`, the
+    authoritative live signal derived from the gateway's chatAbortControllers
+    map + isEmbeddedAgentRunActive(sessionId); it stays true across the whole
+    yield gap. So a session is "active" if EITHER describe says a run state OR
+    list says a run is live.
+    """
+    if describe_status in _ACTIVE_RUN_STATES:
+        return True
+    return bool(list_has_active_run)
+
 
 class Pipe:
     """
@@ -530,27 +555,49 @@ class Pipe:
         # returned a runId that instantly emits a single 'final' with no text,
         # so the bubble rendered nothing and the real answer leaked out via
         # proactive delivery. (Verified from live pipe logs 2026-07-18.)
-        # Whitelist the states that mean "a run is genuinely in progress".
-        # Blacklisting terminal states is unsafe: an idle session reports
-        # status "idle" (there is also "done"), so a `not in (done, failed,
-        # cancelled)` test would treat every idle session as active and hang
-        # every message. Only these states gate the queue.
-        _ACTIVE_RUN_STATES = ("active", "running", "streaming", "queued")
+        async def _list_has_active_run() -> bool | None:
+            """Authoritative live run signal from sessions.list (hasActiveRun).
+            Returns None if the probe fails or our session isn't in the list."""
+            try:
+                lst = await conn.send_request("sessions.list", dict(), timeout=8)
+            except Exception as ex:
+                pipe_log(f"  active-check sessions.list failed: {ex}")
+                return None
+            for s in (lst.get("sessions") or []):
+                if s.get("key") == session_key:
+                    return bool(s.get("hasActiveRun"))
+            return None
 
         async def _session_run_active() -> bool:
+            # Fast path: describe exposes a persisted `status`. When it names a
+            # live run state we're done. But describe.status flips to 'done'
+            # during a subagent-yield gap (the run is only suspended and will
+            # resume — ELI-56), so a non-active status is NOT conclusive:
+            # confirm against sessions.list's authoritative hasActiveRun before
+            # treating the session as free to send into.
             try:
                 desc = await conn.send_request(
                     "sessions.describe", dict(key=session_key), timeout=8
                 )
                 row = desc.get("session") or {}
-                if row.get("activeRunId"):
+                status = row.get("status")
+                if row.get("activeRunId") or status in _ACTIVE_RUN_STATES:
                     return True
-                return row.get("status") in _ACTIVE_RUN_STATES
             except Exception as ex:
-                # Only on a describe failure do we consult the (per-worker,
-                # possibly-blind) local registry as a weak secondary signal.
+                # Describe failed: fall back to the list probe below, and if
+                # that also fails, to the (per-worker, possibly-blind) registry.
                 pipe_log(f"  active-check describe failed: {ex}")
-                return conn.active_run_id_for_session(session_key) is not None
+                status = None
+            list_active = await _list_has_active_run()
+            if list_active is not None:
+                active = _session_active_from_signals(status, list_active)
+                if active and status not in _ACTIVE_RUN_STATES:
+                    pipe_log(
+                        f"  active-check: describe.status={status!r} but "
+                        "list.hasActiveRun=True (subagent-yield gap; queueing)"
+                    )
+                return active
+            return conn.active_run_id_for_session(session_key) is not None
 
         if await _session_run_active():
             pipe_log("Session has an active run (gateway-authoritative); queueing behind it")
@@ -566,9 +613,20 @@ class Pipe:
             # polluting the message without achieving native followup queueing.
             queue_wait_started = time.time()
             queue_wait_cap_s = 1800  # safety ceiling; socket keepalive holds the request
+            queue_settle_s = 2.0     # re-confirm not-active before releasing
             while time.time() - queue_wait_started < queue_wait_cap_s:
                 if not await _session_run_active():
-                    break
+                    # Settle-confirm before releasing the queue. When a
+                    # subagent finishes, the parent turn resumes as a NEW run;
+                    # there is a brief window between the child ending and the
+                    # parent's resume run registering where hasActiveRun can
+                    # read false. Sending in that window races the resume and
+                    # phantoms again (ELI-56). Wait a beat and re-check; only
+                    # release if the session is still idle.
+                    await asyncio.sleep(queue_settle_s)
+                    if not await _session_run_active():
+                        break
+                    continue
                 await asyncio.sleep(1.5)
             pipe_log("  active run ended; sending queued message as its own run")
 

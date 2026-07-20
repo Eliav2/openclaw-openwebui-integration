@@ -112,6 +112,7 @@ from openclaw_pipe import (
     _remember_gateway_connection,
     _resolve_media,
     _resolve_media_via_owui,
+    _session_active_from_signals,
     _shared_gateway_state,
     _SHARED_STATE_ATTR,
     _SUBAGENT_TASK_ID_MARKER_RE,
@@ -805,6 +806,32 @@ class ProactiveDebounceWatcherTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertNotIn(session_key, conn._pending_proactive_debounce)
+
+
+class SessionActiveSignalsTests(unittest.TestCase):
+    """ELI-56: a concurrent message must queue behind a run that only LOOKS
+    done. When a turn calls sessions_yield to await a subagent, describe.status
+    flips to 'done' while the run is merely suspended; sessions.list's
+    hasActiveRun stays true. The decision must treat that gap as active."""
+
+    def test_running_status_is_active_regardless_of_list(self):
+        self.assertTrue(_session_active_from_signals("running", False))
+        self.assertTrue(_session_active_from_signals("streaming", None))
+        self.assertTrue(_session_active_from_signals("queued", False))
+
+    def test_yield_gap_done_status_but_list_active_is_active(self):
+        # The exact ELI-56 signature: describe says 'done', list says a run
+        # is live (isEmbeddedAgentRunActive true during the yield gap).
+        self.assertTrue(_session_active_from_signals("done", True))
+
+    def test_truly_idle_is_not_active(self):
+        self.assertFalse(_session_active_from_signals("done", False))
+        self.assertFalse(_session_active_from_signals("idle", False))
+        self.assertFalse(_session_active_from_signals("failed", False))
+
+    def test_unknown_status_defers_to_list_signal(self):
+        self.assertFalse(_session_active_from_signals(None, False))
+        self.assertTrue(_session_active_from_signals(None, True))
 
 
 class SubagentSessionKeyTests(unittest.TestCase):
