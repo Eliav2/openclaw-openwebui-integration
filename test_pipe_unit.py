@@ -113,6 +113,7 @@ from openclaw_pipe import (
     _resolve_media,
     _resolve_media_via_owui,
     _session_active_from_signals,
+    _strip_input_marker_line,
     _shared_gateway_state,
     _SHARED_STATE_ATTR,
     _SUBAGENT_TASK_ID_MARKER_RE,
@@ -806,6 +807,38 @@ class ProactiveDebounceWatcherTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertNotIn(session_key, conn._pending_proactive_debounce)
+
+
+class StripInputMarkerLineTests(unittest.TestCase):
+    """A needs-input prompt must never leak its raw "OpenClaw needs input:"
+    directive line as visible chat text (fallback paths where no modal fired)."""
+
+    def test_strips_marker_line_keeps_question(self):
+        text = "OpenClaw needs input:\n\nPick a color\n1. Red\n2. Blue"
+        out = _strip_input_marker_line(text)
+        self.assertNotIn("needs input:", out)
+        self.assertIn("Pick a color", out)
+        self.assertIn("1. Red", out)
+
+    def test_strips_codex_marker(self):
+        self.assertEqual(
+            _strip_input_marker_line("Codex needs input:\nProceed?"), "Proceed?"
+        )
+
+    def test_strips_marker_with_leading_whitespace(self):
+        out = _strip_input_marker_line("  \nOpenClaw needs input:\nQ?")
+        self.assertNotIn("needs input:", out)
+        self.assertIn("Q?", out)
+
+    def test_leaves_normal_text_untouched(self):
+        text = "Here is a normal answer with no marker."
+        self.assertEqual(_strip_input_marker_line(text), text)
+
+    def test_marker_only_becomes_empty(self):
+        self.assertEqual(_strip_input_marker_line("OpenClaw needs input:"), "")
+
+    def test_empty_input(self):
+        self.assertEqual(_strip_input_marker_line(""), "")
 
 
 class SessionActiveSignalsTests(unittest.TestCase):

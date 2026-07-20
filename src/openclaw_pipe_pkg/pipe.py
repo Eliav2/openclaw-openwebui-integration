@@ -1129,6 +1129,14 @@ class Pipe:
                                 # re-yields the entire text when the prefix check
                                 # fails (P27).
                                 item_delta = _suppress_already_shown(item_delta, visible_message_text)
+                                # Unlike the assistant-stream path, item events
+                                # carry no `_advance_input_prompt_buffer` guard,
+                                # so a needs-input prompt that arrives here (and
+                                # wasn't handled into a modal above) would leak
+                                # its raw "OpenClaw needs input:" marker line.
+                                # Strip it defensively.
+                                if _is_user_input_prompt(item_delta):
+                                    item_delta = _strip_input_marker_line(item_delta)
                                 if item_delta:
                                     text_yielded = True
                                     pipe_log("  yielded text from item event")
@@ -1293,9 +1301,15 @@ class Pipe:
                             # fire immediately against a stale pre-answer timestamp.
                             last_activity_time = time.time()
                         else:
-                            record_visible_chunk(pending_prompt_text)
-                            yield pending_prompt_text
-                            text_yielded = True
+                            # Modal not handled (cancelled / dismissed / gave up
+                            # on reconnect). Show the prompt as a fallback, but
+                            # never leak the literal "OpenClaw needs input:"
+                            # directive line as visible text.
+                            fallback = _strip_input_marker_line(pending_prompt_text)
+                            if fallback:
+                                record_visible_chunk(fallback)
+                                yield fallback
+                                text_yielded = True
                             pending_prompt_text = ""
 
                     if pending_media_text:

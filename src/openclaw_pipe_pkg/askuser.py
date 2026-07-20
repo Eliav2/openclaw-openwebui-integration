@@ -63,6 +63,31 @@ def _advance_input_prompt_buffer(pending: str, delta: str) -> tuple[str, str]:
     return before + after, ""
 
 
+def _strip_input_marker_line(text: str) -> str:
+    """Remove a leading needs-input trigger line ("OpenClaw needs input:" /
+    "Codex needs input:") from text about to be shown as visible content.
+
+    A needs-input prompt is normally intercepted into a modal and never
+    rendered raw. But the fallback paths — a cancelled/dismissed modal, a run
+    that ended before the modal could fire, or the item-event path which lacks
+    the streaming buffer guard — can still reach a raw ``yield`` with the marker
+    intact, leaking the literal directive line into the chat. The marker is only
+    ever meaningful as the FIRST line, so drop exactly that line and keep the
+    rest (the actual question) as a readable fallback.
+    """
+    if not text:
+        return text
+    stripped = text.lstrip()
+    lead_ws = text[: len(text) - len(stripped)]
+    for prefix in _USER_INPUT_TRIGGER_PREFIXES:
+        if stripped.startswith(prefix):
+            rest = stripped[len(prefix):]
+            nl = rest.find("\n")
+            rest = rest[nl + 1:] if nl != -1 else ""
+            return lead_ws + rest.lstrip("\n")
+    return text
+
+
 def _extract_numbered_options(prompt_text: str) -> list[tuple[str, str]]:
     """Return [(index_str, label), ...] for a numbered option list, in prompt
     order, or [] if there are none. Matches lines like "1. foo" / "2) bar"."""
