@@ -512,26 +512,44 @@ class Pipe:
         # rather than behind a swipe arrow (see _relinearize_proactive_variants).
         await _heal_proactive_variants(conn, owui_origin_chat_id)
 
-        try:
-            patch_resp = await conn.send_request(
-                "sessions.patch",
-                dict(key=session_key, model=model_override),
-                timeout=10
-            )
-            if not _model_patch_matches(model_override, patch_resp):
-                resolved_model = _resolved_model_key(patch_resp)
-                raise GatewayError(
-                    "model override did not apply "
-                    f"(wanted {model_override or 'agent default'}, "
-                    f"got {resolved_model or 'agent default'})"
+        # Apply the model with one retry. sessions.patch is idempotent (set the
+        # session's model to a fixed value), and under a burst of near-
+        # simultaneous messages the RPC can transiently time out or return a
+        # racing/stale row (observed once at ~8 messages in 3s). A single retry
+        # absorbs that blip instead of surfacing a scary "Model selection error"
+        # to the user; a genuine misconfig still fails on the second attempt.
+        patch_err = None
+        for _patch_attempt in range(2):
+            try:
+                patch_resp = await conn.send_request(
+                    "sessions.patch",
+                    dict(key=session_key, model=model_override),
+                    timeout=10
                 )
-            if model_override:
-                pipe_log(f"Applied model override: {model_override}")
-            else:
-                pipe_log("Cleared model override; using agent default")
-        except Exception as e:
+                if not _model_patch_matches(model_override, patch_resp):
+                    resolved_model = _resolved_model_key(patch_resp)
+                    raise GatewayError(
+                        "model override did not apply "
+                        f"(wanted {model_override or 'agent default'}, "
+                        f"got {resolved_model or 'agent default'})"
+                    )
+                if model_override:
+                    pipe_log(f"Applied model override: {model_override}")
+                else:
+                    pipe_log("Cleared model override; using agent default")
+                patch_err = None
+                break
+            except Exception as e:
+                patch_err = e
+                pipe_log(
+                    f"  [diag] model patch attempt {_patch_attempt + 1} failed: "
+                    f"{type(e).__name__}: {e!r}"
+                )
+                if _patch_attempt == 0:
+                    await asyncio.sleep(0.5)
+        if patch_err is not None:
             await _emit_status(__event_emitter__, "", done=True)
-            yield f"**Model selection error:** could not apply `{model_override or 'agent default'}`: {e}"
+            yield f"**Model selection error:** could not apply `{model_override or 'agent default'}`: {patch_err}"
             return
 
         # --- Concurrency: queue behind an active run, never steer-merge ---
