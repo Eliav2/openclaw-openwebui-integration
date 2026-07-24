@@ -1427,6 +1427,21 @@ class Pipe:
                 f"first_event_arrived={first_event_arrived} aborted={aborted}"
             )
 
+        # Terminal back-sync (ELI-57): persist the completed turn's visible text
+        # to the OWUI DB with one final `replace` snapshot. OWUI only saves
+        # yielded content when the BROWSER writes it back after completion — if
+        # the tab/socket died mid-stream, the SSE yields land nowhere, raise
+        # nothing, and the message stays empty in the DB forever (reload shows
+        # nothing). Tool turns already snapshot along the way; pure-text turns
+        # snapshot nowhere since the per-delta back-sync was reverted (ffd2fdd —
+        # a mid-stream `replace` makes the frontend suppress the CONTINUING
+        # delta stream, P23/P25). At terminal there are no continuing deltas,
+        # so a single force snapshot is freeze-safe, and OWUI's `replace`
+        # handler writes the DB unconditionally (sio.emit to an empty room is a
+        # no-op, not an error), so it persists even with everything dead.
+        if not aborted and text_yielded:
+            await maybe_emit_snapshot(force=True)
+
         # Auto-title: generate title after first exchange (best-effort, non-blocking)
         if not aborted and text_yielded:
             bearer_token = _extract_request_bearer(__request__)
