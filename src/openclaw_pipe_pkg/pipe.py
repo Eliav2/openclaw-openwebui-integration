@@ -518,35 +518,50 @@ class Pipe:
         # racing/stale row (observed once at ~8 messages in 3s). A single retry
         # absorbs that blip instead of surfacing a scary "Model selection error"
         # to the user; a genuine misconfig still fails on the second attempt.
+        # ELI-59 (fuller fix): the burst's patches are all redundant — same
+        # session, same model — so (a) a per-session lock collapses them to one
+        # in-flight RPC, and (b) a TTL cache of the last applied model lets the
+        # waiters (and the next ~60s of same-model messages) skip the RPC
+        # entirely. Failure invalidates the cache so nothing sticks.
         patch_err = None
-        for _patch_attempt in range(2):
-            try:
-                patch_resp = await conn.send_request(
-                    "sessions.patch",
-                    dict(key=session_key, model=model_override),
-                    timeout=10
-                )
-                if not _model_patch_matches(model_override, patch_resp):
-                    resolved_model = _resolved_model_key(patch_resp)
-                    raise GatewayError(
-                        "model override did not apply "
-                        f"(wanted {model_override or 'agent default'}, "
-                        f"got {resolved_model or 'agent default'})"
-                    )
-                if model_override:
-                    pipe_log(f"Applied model override: {model_override}")
-                else:
-                    pipe_log("Cleared model override; using agent default")
-                patch_err = None
-                break
-            except Exception as e:
-                patch_err = e
+        async with conn.model_patch_lock(session_key):
+            if conn.model_patch_cached(session_key, model_override):
                 pipe_log(
-                    f"  [diag] model patch attempt {_patch_attempt + 1} failed: "
-                    f"{type(e).__name__}: {e!r}"
+                    f"  model patch skipped (cached: "
+                    f"{model_override or 'agent default'})"
                 )
-                if _patch_attempt == 0:
-                    await asyncio.sleep(0.5)
+            else:
+                for _patch_attempt in range(2):
+                    try:
+                        patch_resp = await conn.send_request(
+                            "sessions.patch",
+                            dict(key=session_key, model=model_override),
+                            timeout=10
+                        )
+                        if not _model_patch_matches(model_override, patch_resp):
+                            resolved_model = _resolved_model_key(patch_resp)
+                            raise GatewayError(
+                                "model override did not apply "
+                                f"(wanted {model_override or 'agent default'}, "
+                                f"got {resolved_model or 'agent default'})"
+                            )
+                        if model_override:
+                            pipe_log(f"Applied model override: {model_override}")
+                        else:
+                            pipe_log("Cleared model override; using agent default")
+                        conn.record_model_patched(session_key, model_override)
+                        patch_err = None
+                        break
+                    except Exception as e:
+                        patch_err = e
+                        pipe_log(
+                            f"  [diag] model patch attempt {_patch_attempt + 1} failed: "
+                            f"{type(e).__name__}: {e!r}"
+                        )
+                        if _patch_attempt == 0:
+                            await asyncio.sleep(0.5)
+                if patch_err is not None:
+                    conn.invalidate_model_patch(session_key)
         if patch_err is not None:
             await _emit_status(__event_emitter__, "", done=True)
             yield f"**Model selection error:** could not apply `{model_override or 'agent default'}`: {patch_err}"

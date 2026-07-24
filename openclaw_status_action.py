@@ -639,6 +639,19 @@ class _GatewayConnection:
         # hasActiveRun) closes that thundering-herd race. ELI-56.
         self._session_send_locks: dict[str, asyncio.Lock] = {}
 
+        # ELI-59: last model applied per session, {session_key: (model, ts)}.
+        # A burst of near-simultaneous messages on one session all issue the
+        # SAME idempotent sessions.patch; under that contention the RPC can
+        # transiently time out and that message's answer is replaced by a
+        # "Model selection error". Caching the last applied value (with a
+        # short TTL — the session model can drift externally, e.g. /model in
+        # the Control UI) lets same-model calls skip the RPC entirely, and the
+        # per-session patch lock collapses a burst to ONE in-flight patch.
+        # OWUI caveat: multiple worker processes each keep their own cache —
+        # imperfect, but strictly fewer redundant patches than before.
+        self._model_patch_cache: dict[str, tuple[str | None, float]] = {}
+        self._model_patch_locks: dict[str, asyncio.Lock] = {}
+
         # Reconnect state
         self._reconnect_attempt = 0
         self._max_backoff = 30  # seconds
@@ -819,6 +832,38 @@ class _GatewayConnection:
             lock = asyncio.Lock()
             self._session_send_locks[session_key] = lock
         return lock
+
+    MODEL_PATCH_CACHE_TTL_S = 60.0
+
+    def model_patch_lock(self, session_key: str) -> asyncio.Lock:
+        """Per-session lock so a burst of same-session messages issues one
+        sessions.patch, not N concurrent ones (ELI-59). Lazily created, same
+        pattern as session_send_lock."""
+        lock = self._model_patch_locks.get(session_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._model_patch_locks[session_key] = lock
+        return lock
+
+    def model_patch_cached(self, session_key: str, model: str | None) -> bool:
+        """True if `model` was successfully applied to this session within the
+        cache TTL, so the idempotent sessions.patch can be skipped (ELI-59).
+        The TTL bounds the wrong-model window if the session's model is changed
+        externally (e.g. /model in the Control UI) between OWUI messages."""
+        entry = self._model_patch_cache.get(session_key)
+        if entry is None:
+            return False
+        cached_model, ts = entry
+        return cached_model == model and (time.time() - ts) < self.MODEL_PATCH_CACHE_TTL_S
+
+    def record_model_patched(self, session_key: str, model: str | None) -> None:
+        """Record a successful sessions.patch for the cache (ELI-59)."""
+        self._model_patch_cache[session_key] = (model, time.time())
+
+    def invalidate_model_patch(self, session_key: str) -> None:
+        """Drop the cached model for a session (ELI-59) — called on patch
+        failure so the next message retries the RPC from scratch."""
+        self._model_patch_cache.pop(session_key, None)
 
     def register_consumer(self, session_key: str, run_id: str) -> asyncio.Queue:
         """Register an event consumer queue for a (session, run) pair.

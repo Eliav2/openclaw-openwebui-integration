@@ -3116,3 +3116,51 @@ class SharedProactiveStateAcrossConnectionsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ModelPatchCacheTests(unittest.TestCase):
+    """ELI-59: per-session model-patch cache + lock (skip redundant
+    sessions.patch RPCs under a same-model burst)."""
+
+    def test_cache_miss_initially(self):
+        conn = _GatewayConnection(lambda: None)
+        self.assertFalse(conn.model_patch_cached("s1", "m1"))
+
+    def test_cache_hit_after_record(self):
+        conn = _GatewayConnection(lambda: None)
+        conn.record_model_patched("s1", "m1")
+        self.assertTrue(conn.model_patch_cached("s1", "m1"))
+
+    def test_cache_none_model_is_a_distinct_value(self):
+        conn = _GatewayConnection(lambda: None)
+        conn.record_model_patched("s1", None)
+        self.assertTrue(conn.model_patch_cached("s1", None))
+        self.assertFalse(conn.model_patch_cached("s1", "m1"))
+
+    def test_cache_miss_for_different_model_or_session(self):
+        conn = _GatewayConnection(lambda: None)
+        conn.record_model_patched("s1", "m1")
+        self.assertFalse(conn.model_patch_cached("s1", "m2"))
+        self.assertFalse(conn.model_patch_cached("s2", "m1"))
+
+    def test_cache_expires_after_ttl(self):
+        conn = _GatewayConnection(lambda: None)
+        conn.record_model_patched("s1", "m1")
+        model, ts = conn._model_patch_cache["s1"]
+        conn._model_patch_cache["s1"] = (model, ts - conn.MODEL_PATCH_CACHE_TTL_S - 1)
+        self.assertFalse(conn.model_patch_cached("s1", "m1"))
+
+    def test_invalidate_drops_entry(self):
+        conn = _GatewayConnection(lambda: None)
+        conn.record_model_patched("s1", "m1")
+        conn.invalidate_model_patch("s1")
+        self.assertFalse(conn.model_patch_cached("s1", "m1"))
+        conn.invalidate_model_patch("s1")  # idempotent on missing key
+
+    def test_lock_is_per_session_and_stable(self):
+        conn = _GatewayConnection(lambda: None)
+        a1 = conn.model_patch_lock("s1")
+        a2 = conn.model_patch_lock("s1")
+        b = conn.model_patch_lock("s2")
+        self.assertIs(a1, a2)
+        self.assertIsNot(a1, b)

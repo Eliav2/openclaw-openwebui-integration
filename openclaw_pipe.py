@@ -1727,6 +1727,19 @@ class _GatewayConnection:
         # hasActiveRun) closes that thundering-herd race. ELI-56.
         self._session_send_locks: dict[str, asyncio.Lock] = {}
 
+        # ELI-59: last model applied per session, {session_key: (model, ts)}.
+        # A burst of near-simultaneous messages on one session all issue the
+        # SAME idempotent sessions.patch; under that contention the RPC can
+        # transiently time out and that message's answer is replaced by a
+        # "Model selection error". Caching the last applied value (with a
+        # short TTL — the session model can drift externally, e.g. /model in
+        # the Control UI) lets same-model calls skip the RPC entirely, and the
+        # per-session patch lock collapses a burst to ONE in-flight patch.
+        # OWUI caveat: multiple worker processes each keep their own cache —
+        # imperfect, but strictly fewer redundant patches than before.
+        self._model_patch_cache: dict[str, tuple[str | None, float]] = {}
+        self._model_patch_locks: dict[str, asyncio.Lock] = {}
+
         # Reconnect state
         self._reconnect_attempt = 0
         self._max_backoff = 30  # seconds
@@ -1907,6 +1920,38 @@ class _GatewayConnection:
             lock = asyncio.Lock()
             self._session_send_locks[session_key] = lock
         return lock
+
+    MODEL_PATCH_CACHE_TTL_S = 60.0
+
+    def model_patch_lock(self, session_key: str) -> asyncio.Lock:
+        """Per-session lock so a burst of same-session messages issues one
+        sessions.patch, not N concurrent ones (ELI-59). Lazily created, same
+        pattern as session_send_lock."""
+        lock = self._model_patch_locks.get(session_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._model_patch_locks[session_key] = lock
+        return lock
+
+    def model_patch_cached(self, session_key: str, model: str | None) -> bool:
+        """True if `model` was successfully applied to this session within the
+        cache TTL, so the idempotent sessions.patch can be skipped (ELI-59).
+        The TTL bounds the wrong-model window if the session's model is changed
+        externally (e.g. /model in the Control UI) between OWUI messages."""
+        entry = self._model_patch_cache.get(session_key)
+        if entry is None:
+            return False
+        cached_model, ts = entry
+        return cached_model == model and (time.time() - ts) < self.MODEL_PATCH_CACHE_TTL_S
+
+    def record_model_patched(self, session_key: str, model: str | None) -> None:
+        """Record a successful sessions.patch for the cache (ELI-59)."""
+        self._model_patch_cache[session_key] = (model, time.time())
+
+    def invalidate_model_patch(self, session_key: str) -> None:
+        """Drop the cached model for a session (ELI-59) — called on patch
+        failure so the next message retries the RPC from scratch."""
+        self._model_patch_cache.pop(session_key, None)
 
     def register_consumer(self, session_key: str, run_id: str) -> asyncio.Queue:
         """Register an event consumer queue for a (session, run) pair.
@@ -3693,35 +3738,50 @@ class Pipe:
         # racing/stale row (observed once at ~8 messages in 3s). A single retry
         # absorbs that blip instead of surfacing a scary "Model selection error"
         # to the user; a genuine misconfig still fails on the second attempt.
+        # ELI-59 (fuller fix): the burst's patches are all redundant — same
+        # session, same model — so (a) a per-session lock collapses them to one
+        # in-flight RPC, and (b) a TTL cache of the last applied model lets the
+        # waiters (and the next ~60s of same-model messages) skip the RPC
+        # entirely. Failure invalidates the cache so nothing sticks.
         patch_err = None
-        for _patch_attempt in range(2):
-            try:
-                patch_resp = await conn.send_request(
-                    "sessions.patch",
-                    dict(key=session_key, model=model_override),
-                    timeout=10
-                )
-                if not _model_patch_matches(model_override, patch_resp):
-                    resolved_model = _resolved_model_key(patch_resp)
-                    raise GatewayError(
-                        "model override did not apply "
-                        f"(wanted {model_override or 'agent default'}, "
-                        f"got {resolved_model or 'agent default'})"
-                    )
-                if model_override:
-                    pipe_log(f"Applied model override: {model_override}")
-                else:
-                    pipe_log("Cleared model override; using agent default")
-                patch_err = None
-                break
-            except Exception as e:
-                patch_err = e
+        async with conn.model_patch_lock(session_key):
+            if conn.model_patch_cached(session_key, model_override):
                 pipe_log(
-                    f"  [diag] model patch attempt {_patch_attempt + 1} failed: "
-                    f"{type(e).__name__}: {e!r}"
+                    f"  model patch skipped (cached: "
+                    f"{model_override or 'agent default'})"
                 )
-                if _patch_attempt == 0:
-                    await asyncio.sleep(0.5)
+            else:
+                for _patch_attempt in range(2):
+                    try:
+                        patch_resp = await conn.send_request(
+                            "sessions.patch",
+                            dict(key=session_key, model=model_override),
+                            timeout=10
+                        )
+                        if not _model_patch_matches(model_override, patch_resp):
+                            resolved_model = _resolved_model_key(patch_resp)
+                            raise GatewayError(
+                                "model override did not apply "
+                                f"(wanted {model_override or 'agent default'}, "
+                                f"got {resolved_model or 'agent default'})"
+                            )
+                        if model_override:
+                            pipe_log(f"Applied model override: {model_override}")
+                        else:
+                            pipe_log("Cleared model override; using agent default")
+                        conn.record_model_patched(session_key, model_override)
+                        patch_err = None
+                        break
+                    except Exception as e:
+                        patch_err = e
+                        pipe_log(
+                            f"  [diag] model patch attempt {_patch_attempt + 1} failed: "
+                            f"{type(e).__name__}: {e!r}"
+                        )
+                        if _patch_attempt == 0:
+                            await asyncio.sleep(0.5)
+                if patch_err is not None:
+                    conn.invalidate_model_patch(session_key)
         if patch_err is not None:
             await _emit_status(__event_emitter__, "", done=True)
             yield f"**Model selection error:** could not apply `{model_override or 'agent default'}`: {patch_err}"
