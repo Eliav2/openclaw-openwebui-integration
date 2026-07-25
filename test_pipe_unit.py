@@ -71,6 +71,9 @@ from openclaw_pipe import (
     GatewayError,
     _TurnRenderer,
     _render_tool_result_block,
+    _append_proactive_message_to_chat,
+    _emit_live_bootstrap_reload,
+    LIVE_STREAM_BOOTSTRAP_ENABLED,
     _finalize_inline_message,
     _relinearize_proactive_variants,
     _FALLBACK_MODELS,
@@ -584,6 +587,128 @@ class ProactiveDeliveryTests(unittest.TestCase):
             "open_webui.models.chats": fake_chats_module,
         }):
             asyncio.run(_deliver_proactive_owui_message(conn, session_key, "run-1"))
+
+
+class LiveBootstrapReloadTests(unittest.TestCase):
+    """ELI-62 PoC: `_emit_live_bootstrap_reload` and its wiring into the two
+    proactive-delivery call sites. Kill switch (`LIVE_STREAM_BOOTSTRAP_ENABLED`)
+    defaults to False in production; these tests patch it True to exercise
+    the emit path without needing it flipped on for real."""
+
+    def _conn(self, agent_id="main"):
+        return _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID=agent_id))
+
+    def _fake_socket_main(self):
+        """A minimal `open_webui.socket.main` stub with a mock `sio`,
+        matching the shape `_emit_live_bootstrap_reload` imports from."""
+        fake_socket_main = types.ModuleType("open_webui.socket.main")
+        fake_socket_main.sio = mock.AsyncMock()
+        fake_socket_module = types.ModuleType("open_webui.socket")
+        fake_socket_module.main = fake_socket_main
+        fake_owui_module = types.ModuleType("open_webui")
+        return fake_socket_main, {
+            "open_webui": fake_owui_module,
+            "open_webui.socket": fake_socket_module,
+            "open_webui.socket.main": fake_socket_main,
+        }
+
+    def test_noop_when_target_message_id_is_none(self):
+        fake_socket_main, modules = self._fake_socket_main()
+        with mock.patch.dict(sys.modules, modules):
+            asyncio.run(_emit_live_bootstrap_reload("user-1", "chat-1", None))
+        fake_socket_main.sio.emit.assert_not_called()
+
+    def test_emits_execute_event_targeting_given_message_id(self):
+        fake_socket_main, modules = self._fake_socket_main()
+        with mock.patch.dict(sys.modules, modules):
+            asyncio.run(_emit_live_bootstrap_reload("user-1", "chat-1", "old-leaf"))
+        fake_socket_main.sio.emit.assert_awaited_once()
+        args, kwargs = fake_socket_main.sio.emit.await_args
+        self.assertEqual(args[0], "events")
+        payload = args[1]
+        self.assertEqual(payload["chat_id"], "chat-1")
+        # Must target a message id ALREADY known to the frontend (the old
+        # leaf), never the brand-new proactive message id — OWUI's
+        # chatEventHandler silently drops events for unknown message ids.
+        self.assertEqual(payload["message_id"], "old-leaf")
+        self.assertEqual(payload["data"]["type"], "execute")
+        self.assertIn("location.reload()", payload["data"]["data"]["code"])
+        self.assertEqual(kwargs["room"], "user:user-1")
+
+    def test_survives_missing_open_webui_socket_module(self):
+        # No stub installed at all -- simulates running outside OWUI's
+        # process (e.g. a stray import in a non-OWUI context). Must not raise.
+        with mock.patch.dict(sys.modules, {}, clear=False):
+            sys.modules.pop("open_webui.socket.main", None)
+            asyncio.run(_emit_live_bootstrap_reload("user-1", "chat-1", "old-leaf"))
+
+    def _deliver_with_fakes(self, *, enabled: bool):
+        conn = self._conn()
+        session_key = _owui_session_key(
+            "main", "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        )
+        conn.session_preview = mock.AsyncMock(
+            return_value={"previews": [{"key": session_key, "items": [
+                {"role": "assistant", "text": "hello from cron"},
+            ]}]}
+        )
+
+        old_leaf_id = "old-leaf"
+        chat_state = {
+            "history": {
+                "currentId": old_leaf_id,
+                "messages": {old_leaf_id: {"role": "user", "childrenIds": []}},
+            }
+        }
+
+        class FakeChat:
+            def __init__(self, chat):
+                self.chat = chat
+
+        class FakeChats:
+            @staticmethod
+            async def get_chat_by_id(chat_id):
+                return FakeChat(chat_state)
+
+            @staticmethod
+            async def upsert_message_to_chat_by_id_and_message_id(chat_id, message_id, message):
+                history = chat_state["history"]
+                messages = history.setdefault("messages", {})
+                messages[message_id] = {**messages.get(message_id, {}), **message}
+                history["currentId"] = message_id
+                return FakeChat(chat_state)
+
+        fake_chats_module = types.ModuleType("open_webui.models.chats")
+        fake_chats_module.Chats = FakeChats
+        fake_models_module = types.ModuleType("open_webui.models")
+        fake_owui_module = types.ModuleType("open_webui")
+        fake_socket_main, socket_modules = self._fake_socket_main()
+
+        modules = {
+            "open_webui": fake_owui_module,
+            "open_webui.models": fake_models_module,
+            "open_webui.models.chats": fake_chats_module,
+            **socket_modules,
+        }
+        with mock.patch.dict(sys.modules, modules), \
+             mock.patch("openclaw_pipe.LIVE_STREAM_BOOTSTRAP_ENABLED", enabled):
+            asyncio.run(_deliver_proactive_owui_message(conn, session_key, "run-1"))
+        return fake_socket_main, old_leaf_id, chat_state
+
+    def test_bootstrap_disabled_by_default_never_touches_sio(self):
+        fake_socket_main, _old_leaf_id, _chat_state = self._deliver_with_fakes(enabled=False)
+        fake_socket_main.sio.emit.assert_not_called()
+
+    def test_bootstrap_enabled_targets_the_old_leaf_after_persisting(self):
+        fake_socket_main, old_leaf_id, chat_state = self._deliver_with_fakes(enabled=True)
+        fake_socket_main.sio.emit.assert_awaited_once()
+        _args, kwargs = fake_socket_main.sio.emit.await_args
+        payload = _args[1]
+        # The new message became currentId; the emit must target the OLD
+        # leaf (already known to any open tab), not the new message.
+        self.assertNotEqual(payload["message_id"], chat_state["history"]["currentId"])
+        self.assertEqual(payload["message_id"], old_leaf_id)
 
 
 class EventConsumerMatchingTests(unittest.TestCase):

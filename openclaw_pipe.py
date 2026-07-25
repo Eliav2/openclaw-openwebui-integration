@@ -2794,7 +2794,8 @@ async def _heal_proactive_variants(conn: "_GatewayConnection", chat_id: str) -> 
 
 
 async def _append_proactive_message_to_chat(
-    conn: "_GatewayConnection", chat_id: str, text: str, *, log_prefix: str
+    conn: "_GatewayConnection", chat_id: str, text: str, *, log_prefix: str,
+    out: dict | None = None,
 ) -> bool:
     """Persist one assistant message onto the tail of an OWUI chat.
 
@@ -2816,6 +2817,12 @@ async def _append_proactive_message_to_chat(
     Returns True on a successful persist. Callers own the success log line
     (its detail — user_id, task_id — differs); this owns the
     unavailable/not-found/failed logs, tagged with `log_prefix`.
+
+    `out`, if given, is filled with `old_leaf_id`/`new_message_id` on success
+    (ELI-62: the live-bootstrap step needs the OLD leaf id — a message id
+    already known to any open tab — as its `execute` event target). Optional
+    and additive so the three pre-existing callers that don't pass it keep
+    their plain bool return untouched.
     """
     try:
         from open_webui.models.chats import Chats
@@ -2857,10 +2864,76 @@ async def _append_proactive_message_to_chat(
             await Chats.upsert_message_to_chat_by_id_and_message_id(
                 chat_id, new_message_id, message_fields,
             )
+        if out is not None:
+            out["old_leaf_id"] = old_leaf_id
+            out["new_message_id"] = new_message_id
         return True
     except Exception as ex:
         pipe_log(f"  {log_prefix} failed: {ex}")
         return False
+
+
+# ELI-62 PoC kill switch — default OFF. Flips on the "introduce + bootstrap"
+# slice of the live-streaming design only (steps 2-3: persist the message,
+# then nudge any open tab to reload so it appears without a manual refresh).
+# Token-by-token relay of an in-flight run (step 4) is a separate, larger
+# follow-up and is NOT gated by this flag because it doesn't exist yet.
+# Do not flip on without re-reading the Linear ELI-62 description's safety
+# rails and the docstring on `_emit_live_bootstrap_reload` below.
+LIVE_STREAM_BOOTSTRAP_ENABLED = False
+
+
+async def _emit_live_bootstrap_reload(user_id: str, chat_id: str, target_message_id: str | None) -> None:
+    """Fire-and-forget nudge: ask any open tab showing `chat_id` to reload so
+    a message this bridge just persisted out-of-band (which OWUI's own
+    live-refresh logic never picks up — see `_deliver_proactive_owui_message`'s
+    docstring) shows up immediately instead of waiting for the user to
+    reopen/refresh the chat by hand.
+
+    Wire protocol confirmed against the actual deployed OWUI backend
+    (0.10.2, `open_webui/socket/main.py::get_event_emitter`, checked
+    2026-07-25): `sio.emit('events', {chat_id, message_id, data}, room=f
+    'user:{user_id}')`. The frontend's `chatEventHandler` (`Chat.svelte`,
+    same version, confirmed live) drops the WHOLE event — before even
+    looking at `data.type` — unless `history.messages[message_id]` already
+    exists in that tab's in-memory history. That's why this targets
+    `target_message_id` = the OLD leaf (a message id already known to any
+    open tab), never the brand-new proactive message id itself, and why a
+    missing/None target is a silent no-op rather than an error: an empty
+    chat with no prior messages has nothing for an open tab to key off of
+    anyway. `chat_id` in the payload also matters — the handler only acts
+    when `event.chat_id === $chatId`, so other chats/tabs/users are
+    unaffected even though the emit targets the whole `user:{user_id}` room
+    (every tab that user has open, matching OWUI's own room-wide behavior).
+
+    PoC scope (Eliav-approved, ELI-62): the injected code is the constant
+    `location.reload()` — a full reload, not a targeted DOM patch. Jarring
+    but simple and safe; a nicer alternative is explicitly left as a later
+    exploration in the design doc, not attempted here.
+
+    `sio.emit` (fire-and-forget), not `sio.call` — there is no answer to
+    wait for, unlike the ask-user modal's `sio.call` in askuser.py.
+    """
+    if not target_message_id:
+        return
+    try:
+        from open_webui.socket.main import sio
+    except Exception as ex:
+        pipe_log(f"  live bootstrap unavailable (not inside OWUI process?): {ex}")
+        return
+    try:
+        await sio.emit(
+            "events",
+            {
+                "chat_id": chat_id,
+                "message_id": target_message_id,
+                "data": {"type": "execute", "data": {"code": "location.reload();"}},
+            },
+            room=f"user:{user_id}",
+        )
+        pipe_log(f"  live bootstrap: fired reload nudge for chat {chat_id[:8]}...")
+    except Exception as ex:
+        pipe_log(f"  live bootstrap emit failed: {ex}")
 
 
 async def _finalize_inline_message(
@@ -2982,13 +3055,16 @@ async def _deliver_proactive_owui_message(
 
     text = f"*↳ Proactive message*\n\n{text}"
 
+    append_out: dict = {}
     if await _append_proactive_message_to_chat(
-        conn, chat_id, text, log_prefix="proactive delivery"
+        conn, chat_id, text, log_prefix="proactive delivery", out=append_out
     ):
         pipe_log(
             f"  proactive delivery: persisted message into chat {chat_id[:8]}... "
             f"for user {user_id[:8]}... ({len(text)} chars)"
         )
+        if LIVE_STREAM_BOOTSTRAP_ENABLED:
+            await _emit_live_bootstrap_reload(user_id, chat_id, append_out.get("old_leaf_id"))
 
 
 # Embedded in the proactively-delivered message text for a finished
@@ -3094,13 +3170,16 @@ async def _deliver_subagent_proactive_owui_message(
     label = f"Sub-agent finished: {task_title}" if task_title else "Sub-agent finished"
     text = f"*↳ {label}*\n\n{text}\n\n<!-- openclaw:taskId={task_id} -->"
 
+    append_out: dict = {}
     if await _append_proactive_message_to_chat(
-        conn, chat_id, text, log_prefix="subagent proactive delivery"
+        conn, chat_id, text, log_prefix="subagent proactive delivery", out=append_out
     ):
         pipe_log(
             f"  subagent proactive delivery: persisted message into chat {chat_id[:8]}... "
             f"for user {user_id[:8]}... task {task_id[:8]}... ({len(text)} chars)"
         )
+        if LIVE_STREAM_BOOTSTRAP_ENABLED:
+            await _emit_live_bootstrap_reload(user_id, chat_id, append_out.get("old_leaf_id"))
 
 
 # Module-level singleton
