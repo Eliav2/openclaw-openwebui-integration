@@ -780,6 +780,15 @@ class _GatewayConnection:
         self._run_targets: dict[str, dict] = {}
         self._run_renderers: dict[str, "_TurnRenderer"] = {}
 
+        # ELI-62 live-relay bookkeeping (slice 2). Keyed by "session_key:run_id",
+        # holds a `_RelayState` for every PROACTIVE run currently being streamed
+        # out-of-band into an open OWUI tab (see LIVE_STREAM_RELAY_ENABLED). Only
+        # populated when the kill switch is on; instance-local because only the
+        # singleton connection drives relay emits, and cross-connection dedup is
+        # already handled via the shared `_delivered_proactive` claim at
+        # introduce time (a zombie sees the claim and never double-introduces).
+        self._relay_sessions: dict[str, "_RelayState"] = {}
+
     def register_run_target(self, session_key: str, run_id: str,
                             chat_id: str | None, message_id: str | None) -> None:
         """Remember that this run streams into OWUI message `message_id` in
@@ -1341,6 +1350,43 @@ class _GatewayConnection:
                             pipe_log(f"  shadow renderer feed failed: {ex}")
 
                 consumers = self.consumers_for_event(payload)
+
+                # ── ELI-62 live relay (step 4, slice 2) ──
+                # When enabled (kill switch default OFF — see
+                # LIVE_STREAM_RELAY_ENABLED), relay a PROACTIVE run's deltas
+                # straight into an already-open OWUI tab as they stream,
+                # instead of only persisting the finished text post-hoc. Only
+                # engages for a run with NO live consumer on a genuinely-idle
+                # OWUI session; a run a live pipe() call is already servicing
+                # keeps the normal inline path untouched. Fully inert when the
+                # switch is off, so default behavior is byte-for-byte identical.
+                _relay_key = (
+                    f"{_evt_sess}:{_evt_run}" if (_evt_sess and _evt_run) else None
+                )
+                if LIVE_STREAM_RELAY_ENABLED and _relay_key in self._relay_sessions:
+                    if consumers:
+                        # A live consumer appeared for a run we were relaying —
+                        # hand the run back to the inline path (finalize our
+                        # out-of-band bubble so it isn't left pending) and let
+                        # the normal dispatch below take over.
+                        await _relay_abort(self, _relay_key)
+                    else:
+                        await _relay_feed_event(self, _evt_sess, _evt_run, payload)
+                        continue
+                elif (
+                    LIVE_STREAM_RELAY_ENABLED
+                    and _relay_key is not None
+                    and not consumers
+                    and payload.get("state") != "final"
+                    and self.parse_owui_session_key(_evt_sess)
+                    and not self.has_any_consumer_for_session(_evt_sess)
+                    and self.session_idle_for(_evt_sess, min_idle_s=_RELAY_MIN_IDLE_S)
+                    and not self.was_delivered_live(_evt_sess, _evt_run)
+                    and _relay_key not in self._delivered_proactive
+                ):
+                    await _relay_begin(self, _evt_sess, _evt_run, payload)
+                    continue
+
                 if consumers:
                     self._event_count += 1
                     if not payload.get("runId"):
@@ -1846,6 +1892,318 @@ async def _emit_live_bootstrap_reload(user_id: str, chat_id: str, target_message
         pipe_log(f"  live bootstrap: fired reload nudge for chat {chat_id[:8]}...")
     except Exception as ex:
         pipe_log(f"  live bootstrap emit failed: {ex}")
+
+
+# ── ELI-62 live relay (step 4, slice 2) ────────────────────────────────────
+# Kill switch — default OFF. When on, a PROACTIVE run (cron/wake/sessions_send
+# into an idle OWUI session with no live tab consuming it) is streamed straight
+# into any already-open tab showing that chat, token by token, instead of only
+# being persisted as finished text after the run ends (slice 1). Supersedes the
+# slice-1 post-hoc reload-nudge for the same run: when relay owns a run it
+# claims the run's `_delivered_proactive` identity at introduce time, so the
+# post-hoc `_deliver_proactive_owui_message` path skips it.
+#
+# Design + verified OWUI 0.10.2 wire protocol: Linear ELI-62 (`message` = append
+# at Chat.svelte:650, `replace` = set at :652, both applied for any KNOWN
+# message id regardless of initiator; `chat:active:false` drives loadChat
+# reconciliation once a pending assistant leaf exists). We emit these directly
+# via `sio.emit("events", …)` (same envelope as `_emit_live_bootstrap_reload`),
+# which reaches open tabs but does NOT go through OWUI's `get_event_emitter`, so
+# it does NOT auto-persist — this path owns DB writes explicitly (introduce =
+# done:false, snapshots + finalize = done:true), exactly like the slice-1 /
+# parity paths already do.
+#
+# NOT flipped on here — leave False. Before enabling, the terminal
+# `chat:active` event envelope still needs a live-browser confirmation
+# (see `_relay_finalize`); DB persistence guarantees reload-correctness
+# regardless, so an imperfect terminal event only costs a spinner nicety.
+LIVE_STREAM_RELAY_ENABLED = False
+
+# A proactive run is only eligible for relay once its session has had zero
+# consumers for at least this long — the same sustained-idle contract the
+# post-hoc debounce path uses (`session_idle_for`), so a live steering/modal
+# round trip (low single-digit seconds) can never be mistaken for a genuine
+# idle wake and we never race a message the user is mid-way through sending.
+_RELAY_MIN_IDLE_S = 120
+
+# Minimum seconds between successive full `replace` snapshot emits (which also
+# re-persist the in-flight content to the DB for reload parity). `message`
+# append deltas still flow every event for smooth streaming; the throttled
+# snapshot is the correctness anchor that self-heals any append lost while a
+# tab was mid-`location.reload()` from the bootstrap step.
+_RELAY_SNAPSHOT_MIN_INTERVAL_S = 1.0
+
+
+@dataclass
+class _RelayState:
+    """Per-run state machine for one live-relayed proactive run (ELI-62)."""
+    session_key: str
+    run_id: str
+    user_id: str
+    chat_id: str
+    renderer: "_TurnRenderer"
+    message_id: str | None = None      # None until `introduced`
+    old_leaf_id: str | None = None     # bootstrap `execute` target
+    introduced: bool = False
+    emitted_len: int = 0               # chars of content already sent to the tab
+    last_snapshot_content: str = ""
+    last_snapshot_ts: float = 0.0
+
+
+def _relay_content_is_showable(text: str) -> bool:
+    """True once the accumulated visible content is safe to surface as a real
+    bubble: non-empty, not a silent sentinel, and not still a prefix that could
+    grow into a sentinel-only run. Delaying introduce until this holds means a
+    sentinel-only wake (`NO_REPLY`/`ANNOUNCE_SKIP`) never flashes an empty
+    bubble — the same suppression the post-hoc path gets from
+    `_last_assistant_text_from_preview`, applied to a stream we watch grow.
+    """
+    t = text.strip()
+    if not t or t in _SILENT_SENTINELS:
+        return False
+    if any(s.startswith(t) for s in _SILENT_SENTINELS):
+        return False
+    return True
+
+
+async def _relay_emit_event(user_id: str, chat_id: str, message_id: str | None,
+                            data: dict) -> bool:
+    """Fire one OWUI socket `events` envelope to the user room (same transport
+    as `_emit_live_bootstrap_reload`). Returns False on any failure so callers
+    can log context; a failed emit never raises into the event loop."""
+    if not message_id:
+        return False
+    try:
+        from open_webui.socket.main import sio
+    except Exception as ex:
+        pipe_log(f"  live relay unavailable (not inside OWUI process?): {ex}")
+        return False
+    try:
+        await sio.emit(
+            "events",
+            {"chat_id": chat_id, "message_id": message_id, "data": data},
+            room=f"user:{user_id}",
+        )
+        return True
+    except Exception as ex:
+        pipe_log(f"  live relay emit failed: {ex}")
+        return False
+
+
+async def _relay_persist_content(conn: "_GatewayConnection", chat_id: str,
+                                 message_id: str | None, content: str, *,
+                                 done: bool) -> None:
+    """Write the in-flight/final content into the DB message, under the same
+    per-chat write lock the proactive paths use. Keeps reload parity mid-stream
+    (a tab reopened while a run streams shows the last snapshot) and is the
+    authoritative done:true record at run end — the terminal socket event is
+    only a live-tab nicety on top of this."""
+    if not message_id:
+        return
+    try:
+        from open_webui.models.chats import Chats
+    except Exception as ex:
+        pipe_log(f"  live relay persist unavailable (not inside OWUI process?): {ex}")
+        return
+    try:
+        async with conn._chat_write_lock(chat_id):
+            await Chats.upsert_message_to_chat_by_id_and_message_id(
+                chat_id, message_id, {"content": content, "done": done},
+            )
+    except Exception as ex:
+        pipe_log(f"  live relay persist failed: {ex}")
+
+
+async def _relay_begin(conn: "_GatewayConnection", session_key: str, run_id: str,
+                       payload: dict) -> None:
+    """Start tracking a proactive run for live relay and feed it its first
+    event. Creates the `_RelayState` (with its own `_TurnRenderer`); the actual
+    introduce+bootstrap is deferred to `_relay_feed_event` until the content is
+    showable, so a sentinel-only run never introduces a bubble at all."""
+    parsed = conn.parse_owui_session_key(session_key)
+    if not parsed:
+        return
+    user_id, chat_id = parsed
+    key = f"{session_key}:{run_id}"
+    conn._relay_sessions[key] = _RelayState(
+        session_key=session_key, run_id=run_id, user_id=user_id,
+        chat_id=chat_id, renderer=_TurnRenderer(),
+    )
+    # Bound memory: a run that somehow never emits a terminal would otherwise
+    # leak its state forever. Far above any real concurrency.
+    if len(conn._relay_sessions) > 100:
+        for stale in list(conn._relay_sessions)[:50]:
+            conn._relay_sessions.pop(stale, None)
+    pipe_log(
+        f"  live relay: begin for chat {chat_id[:8]}... run {run_id[:20]}..."
+    )
+    await _relay_feed_event(conn, session_key, run_id, payload)
+
+
+async def _relay_introduce(conn: "_GatewayConnection", state: "_RelayState") -> bool:
+    """Persist the assistant message (done:false) at the true chat leaf and
+    nudge any open tab to reload onto it. Claims the run's proactive-dedup
+    identity FIRST so the post-hoc path (and any zombie connection) never also
+    delivers the same run. Returns True once the bubble exists."""
+    key = f"{state.session_key}:{state.run_id}"
+    if key in conn._delivered_proactive:
+        # Another path (post-hoc / a zombie connection) already claimed this
+        # run — abandon relay rather than risk a duplicate bubble.
+        conn._relay_sessions.pop(key, None)
+        return False
+    conn._delivered_proactive[key] = True
+    if len(conn._delivered_proactive) > 200:
+        for stale_key in list(conn._delivered_proactive)[:100]:
+            if stale_key != key:
+                conn._delivered_proactive.pop(stale_key, None)
+
+    content = state.renderer.visible_text
+    out: dict = {}
+    if not await _append_proactive_message_to_chat(
+        conn, state.chat_id, content, log_prefix="live relay introduce", out=out
+    ):
+        # Persist failed — release the claim so the post-hoc path can still try.
+        conn._delivered_proactive.pop(key, None)
+        conn._relay_sessions.pop(key, None)
+        return False
+    state.message_id = out.get("new_message_id")
+    state.old_leaf_id = out.get("old_leaf_id")
+    state.introduced = True
+    state.emitted_len = len(content)
+    state.last_snapshot_content = content
+    state.last_snapshot_ts = time.time()
+    # Mark the freshly-appended message as still-generating (the append helper
+    # doesn't set `done`); a reload before the first snapshot shows a pending
+    # bubble, not a spuriously-complete one.
+    await _relay_persist_content(
+        conn, state.chat_id, state.message_id, content, done=False
+    )
+    # Bootstrap: make any open tab reload and pick up the pending message so
+    # subsequent `message`/`replace` events (which the frontend only applies to
+    # KNOWN message ids) actually land. Targets the OLD leaf — a message id the
+    # tab already knows — exactly like slice 1.
+    await _emit_live_bootstrap_reload(state.user_id, state.chat_id, state.old_leaf_id)
+    pipe_log(
+        f"  live relay: introduced message {str(state.message_id)[:8]}... "
+        f"in chat {state.chat_id[:8]}..."
+    )
+    return True
+
+
+async def _relay_feed_event(conn: "_GatewayConnection", session_key: str,
+                            run_id: str, payload: dict) -> None:
+    """Feed one gateway event into a run's relay: grow the shadow renderer,
+    introduce the bubble on first showable content, stream the new delta as a
+    `message` append (plus a throttled full `replace` snapshot), and finalize
+    on the run's terminal event."""
+    key = f"{session_key}:{run_id}"
+    state = conn._relay_sessions.get(key)
+    if state is None:
+        return
+    is_final = payload.get("state") == "final"
+    try:
+        state.renderer.feed(payload)
+    except Exception as ex:
+        pipe_log(f"  live relay renderer feed failed: {ex}")
+
+    content = state.renderer.visible_text or ""
+
+    if not state.introduced:
+        if _relay_content_is_showable(content):
+            if not await _relay_introduce(conn, state):
+                return
+        elif is_final:
+            # Run ended before any showable content (empty / sentinel-only wake)
+            # — never introduced a bubble, so just drop the state silently.
+            conn._relay_sessions.pop(key, None)
+            return
+        else:
+            return  # nothing to show yet; keep accumulating
+
+    # Stream the newly-appended text as an append delta (renderer content only
+    # ever grows, so a plain suffix slice is the delta).
+    if len(content) > state.emitted_len:
+        delta = content[state.emitted_len:]
+        if await _relay_emit_event(
+            state.user_id, state.chat_id, state.message_id,
+            {"type": "message", "data": {"content": delta}},
+        ):
+            state.emitted_len = len(content)
+
+    if is_final:
+        await _relay_finalize(conn, state, content)
+        return
+
+    # Throttled full-content re-anchor: idempotent `replace` that self-heals any
+    # append lost during the bootstrap reload, and keeps the DB current so a
+    # mid-stream reopen rehydrates the partial reply.
+    now = time.time()
+    if (
+        content != state.last_snapshot_content
+        and (now - state.last_snapshot_ts) >= _RELAY_SNAPSHOT_MIN_INTERVAL_S
+    ):
+        state.last_snapshot_content = content
+        state.last_snapshot_ts = now
+        state.emitted_len = len(content)
+        await _relay_emit_event(
+            state.user_id, state.chat_id, state.message_id,
+            {"type": "replace", "data": {"content": content}},
+        )
+        await _relay_persist_content(
+            conn, state.chat_id, state.message_id, content, done=False
+        )
+
+
+async def _relay_finalize(conn: "_GatewayConnection", state: "_RelayState",
+                          content: str) -> None:
+    """Complete a relayed run: authoritative done:true DB write, a final full
+    `replace` so the live tab shows the complete content, then a
+    `chat:active:false` event to settle the frontend's generating state. Always
+    drops the run's relay state on the way out."""
+    key = f"{state.session_key}:{state.run_id}"
+    try:
+        if not state.introduced or not state.message_id:
+            return
+        final_content = (content or "").strip() or state.last_snapshot_content
+        await _relay_persist_content(
+            conn, state.chat_id, state.message_id, final_content, done=True
+        )
+        await _relay_emit_event(
+            state.user_id, state.chat_id, state.message_id,
+            {"type": "replace", "data": {"content": final_content}},
+        )
+        # Terminal signal: once a pending assistant leaf exists (it does — we
+        # introduced it), OWUI's chatEventHandler treats chat:active:false as a
+        # reconciliation trigger (ELI-62 groundwork). Envelope still wants a
+        # live-browser confirmation before the kill switch is flipped on; the
+        # done:true DB write above already guarantees reload-correctness.
+        await _relay_emit_event(
+            state.user_id, state.chat_id, state.message_id,
+            {"type": "chat:active", "data": {"active": False}},
+        )
+        pipe_log(
+            f"  live relay: finalized message {str(state.message_id)[:8]}... "
+            f"in chat {state.chat_id[:8]}... ({len(final_content)} chars)"
+        )
+    except Exception as ex:
+        pipe_log(f"  live relay finalize failed: {ex}")
+    finally:
+        conn._relay_sessions.pop(key, None)
+
+
+async def _relay_abort(conn: "_GatewayConnection", key: str) -> None:
+    """A live consumer appeared for a run we were relaying — stop relaying and
+    finalize whatever we have so the out-of-band bubble isn't left pending. The
+    inline path then renders the run into its own message; a brief duplicate is
+    possible in this rare race (relay only starts after sustained idle), which
+    is acceptable for a kill-switched-OFF PoC and documented in ELI-62."""
+    state = conn._relay_sessions.get(key)
+    if state is None:
+        return
+    if state.introduced and state.message_id:
+        await _relay_finalize(conn, state, state.renderer.visible_text or "")
+    else:
+        conn._relay_sessions.pop(key, None)
 
 
 async def _finalize_inline_message(

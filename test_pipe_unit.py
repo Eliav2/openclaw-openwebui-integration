@@ -74,6 +74,12 @@ from openclaw_pipe import (
     _append_proactive_message_to_chat,
     _emit_live_bootstrap_reload,
     LIVE_STREAM_BOOTSTRAP_ENABLED,
+    LIVE_STREAM_RELAY_ENABLED,
+    _RelayState,
+    _relay_content_is_showable,
+    _relay_begin,
+    _relay_feed_event,
+    _relay_finalize,
     _finalize_inline_message,
     _relinearize_proactive_variants,
     _FALLBACK_MODELS,
@@ -709,6 +715,191 @@ class LiveBootstrapReloadTests(unittest.TestCase):
         # leaf (already known to any open tab), not the new message.
         self.assertNotEqual(payload["message_id"], chat_state["history"]["currentId"])
         self.assertEqual(payload["message_id"], old_leaf_id)
+
+
+class LiveRelayTests(unittest.TestCase):
+    """ELI-62 PoC slice 2: true live token relay of a proactive run
+    (`_relay_begin`/`_relay_feed_event`/`_relay_finalize`). Kill switch
+    (`LIVE_STREAM_RELAY_ENABLED`) defaults False in production; these tests
+    drive the helpers directly (which don't gate on the flag — the event loop
+    does), with fake OWUI Chats + sio, to exercise introduce/stream/finalize."""
+
+    USER = "11111111-1111-1111-1111-111111111111"
+    CHAT = "22222222-2222-2222-2222-222222222222"
+
+    def _conn(self, agent_id="main"):
+        return _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID=agent_id))
+
+    def _session_key(self):
+        return _owui_session_key("main", self.USER, self.CHAT)
+
+    def _fakes(self):
+        """Fake `open_webui.models.chats.Chats` (records appends + upserts) and
+        `open_webui.socket.main.sio` (records emits). Returns (modules, chat_state,
+        fake_sio)."""
+        old_leaf_id = "old-leaf"
+        chat_state = {
+            "history": {
+                "currentId": old_leaf_id,
+                "messages": {old_leaf_id: {"role": "user", "childrenIds": []}},
+            }
+        }
+
+        class FakeChat:
+            def __init__(self, chat):
+                self.chat = chat
+
+        class FakeChats:
+            @staticmethod
+            async def get_chat_by_id(chat_id):
+                return FakeChat(chat_state)
+
+            @staticmethod
+            async def upsert_message_to_chat_by_id_and_message_id(chat_id, message_id, message):
+                messages = chat_state["history"].setdefault("messages", {})
+                messages[message_id] = {**messages.get(message_id, {}), **message}
+                chat_state["history"]["currentId"] = message_id
+                return FakeChat(chat_state)
+
+        fake_chats_module = types.ModuleType("open_webui.models.chats")
+        fake_chats_module.Chats = FakeChats
+        fake_models_module = types.ModuleType("open_webui.models")
+        fake_owui_module = types.ModuleType("open_webui")
+        fake_socket_main = types.ModuleType("open_webui.socket.main")
+        fake_sio = mock.AsyncMock()
+        fake_socket_main.sio = fake_sio
+        fake_socket_module = types.ModuleType("open_webui.socket")
+        fake_socket_module.main = fake_socket_main
+        modules = {
+            "open_webui": fake_owui_module,
+            "open_webui.models": fake_models_module,
+            "open_webui.models.chats": fake_chats_module,
+            "open_webui.socket": fake_socket_module,
+            "open_webui.socket.main": fake_socket_main,
+        }
+        return modules, chat_state, fake_sio, old_leaf_id
+
+    @staticmethod
+    def _evt(session_key, run_id, delta=None, *, final=False):
+        payload = {"sessionKey": session_key, "runId": run_id}
+        if final:
+            payload["state"] = "final"
+        if delta is not None:
+            payload["stream"] = "assistant"
+            payload["data"] = {"delta": delta}
+        return payload
+
+    @staticmethod
+    def _emitted(fake_sio, ev_type):
+        """All `events` emits of a given data.type, as their payload dicts."""
+        out = []
+        for call in fake_sio.emit.await_args_list:
+            args, _kwargs = call
+            if args and args[0] == "events" and args[1].get("data", {}).get("type") == ev_type:
+                out.append(args[1])
+        return out
+
+    # ── static invariants ───────────────────────────────────────────────
+
+    def test_kill_switch_defaults_off(self):
+        self.assertFalse(LIVE_STREAM_RELAY_ENABLED)
+
+    def test_content_is_showable_filters_sentinels_and_prefixes(self):
+        self.assertFalse(_relay_content_is_showable(""))
+        self.assertFalse(_relay_content_is_showable("   "))
+        self.assertFalse(_relay_content_is_showable("NO_REPLY"))
+        self.assertFalse(_relay_content_is_showable("ANNOUNCE_SKIP"))
+        # "N" is a prefix of NO_REPLY — could still resolve to a sentinel-only
+        # run, so not yet showable.
+        self.assertFalse(_relay_content_is_showable("N"))
+        # A real reply diverges from every sentinel prefix immediately.
+        self.assertTrue(_relay_content_is_showable("Nope, here's the answer"))
+        self.assertTrue(_relay_content_is_showable("Hello"))
+
+    # ── introduce + stream + finalize ───────────────────────────────────
+
+    def test_full_run_introduces_streams_and_finalizes(self):
+        conn = self._conn()
+        sk = self._session_key()
+        modules, chat_state, fake_sio, old_leaf_id = self._fakes()
+        with mock.patch.dict(sys.modules, modules):
+            asyncio.run(self._drive(conn, sk, "run-1", fake_sio,
+                                    ["Hello", " world"], finalize=True))
+
+        # Exactly one assistant bubble appended, done:true, full content.
+        assistants = [
+            m for m in chat_state["history"]["messages"].values()
+            if m.get("role") == "assistant"
+        ]
+        self.assertEqual(len(assistants), 1)
+        self.assertEqual(assistants[0]["content"], "Hello world")
+        self.assertTrue(assistants[0]["done"])
+
+        # Bootstrap reload nudge targeted the OLD leaf (known to the tab).
+        execs = self._emitted(fake_sio, "execute")
+        self.assertEqual(len(execs), 1)
+        self.assertEqual(execs[0]["message_id"], old_leaf_id)
+        self.assertIn("location.reload()", execs[0]["data"]["data"]["code"])
+
+        # Streamed live: post-introduce text goes out as append deltas (the
+        # introduce-time prefix rides the DB message the reloaded tab loads,
+        # not a duplicate append), a final full `replace` re-anchors the tab to
+        # the complete content, then a terminal chat:active false settles it.
+        appends = self._emitted(fake_sio, "message")
+        self.assertTrue(appends, "expected at least one append `message` event")
+        streamed = "".join(a["data"]["data"]["content"] for a in appends)
+        self.assertTrue(streamed, "append deltas should carry the post-introduce text")
+        self.assertTrue("Hello world".endswith(streamed))
+        replaces = self._emitted(fake_sio, "replace")
+        self.assertTrue(replaces, "expected a final `replace` snapshot")
+        self.assertEqual(replaces[-1]["data"]["data"]["content"], "Hello world")
+        self.assertEqual(len(self._emitted(fake_sio, "chat:active")), 1)
+
+        # Relay state cleaned up; run's proactive-dedup identity claimed so the
+        # post-hoc path won't ALSO deliver it.
+        self.assertEqual(conn._relay_sessions, {})
+        self.assertIn(f"{sk}:run-1", conn._delivered_proactive)
+
+    def test_sentinel_only_run_never_introduces_a_bubble(self):
+        conn = self._conn()
+        sk = self._session_key()
+        modules, chat_state, fake_sio, _old = self._fakes()
+        with mock.patch.dict(sys.modules, modules):
+            asyncio.run(self._drive(conn, sk, "run-2", fake_sio,
+                                    ["NO_REPLY"], finalize=True))
+        # No assistant message, no socket emits at all, state cleaned up, and
+        # the run was NOT claimed (post-hoc path stays free to no-op on it).
+        assistants = [
+            m for m in chat_state["history"]["messages"].values()
+            if m.get("role") == "assistant"
+        ]
+        self.assertEqual(assistants, [])
+        fake_sio.emit.assert_not_called()
+        self.assertEqual(conn._relay_sessions, {})
+        self.assertNotIn(f"{sk}:run-2", conn._delivered_proactive)
+
+    def test_introduce_deferred_until_showable_content(self):
+        conn = self._conn()
+        sk = self._session_key()
+        modules, chat_state, fake_sio, _old = self._fakes()
+        with mock.patch.dict(sys.modules, modules):
+            # First event carries a bare sentinel-prefix; must not introduce.
+            asyncio.run(_relay_begin(conn, sk, "run-3", self._evt(sk, "run-3", "N")))
+            self.assertFalse(fake_sio.emit.await_args_list)
+            state = conn._relay_sessions[f"{sk}:run-3"]
+            self.assertFalse(state.introduced)
+            # Diverging into real text introduces the bubble.
+            asyncio.run(_relay_feed_event(conn, sk, "run-3",
+                                          self._evt(sk, "run-3", "ope!")))
+            self.assertTrue(conn._relay_sessions[f"{sk}:run-3"].introduced)
+            self.assertEqual(len(self._emitted(fake_sio, "execute")), 1)
+
+    async def _drive(self, conn, sk, run_id, fake_sio, deltas, *, finalize):
+        await _relay_begin(conn, sk, run_id, self._evt(sk, run_id, deltas[0]))
+        for d in deltas[1:]:
+            await _relay_feed_event(conn, sk, run_id, self._evt(sk, run_id, d))
+        if finalize:
+            await _relay_feed_event(conn, sk, run_id, self._evt(sk, run_id, final=True))
 
 
 class EventConsumerMatchingTests(unittest.TestCase):
