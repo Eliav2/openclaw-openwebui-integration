@@ -2048,6 +2048,24 @@ class OwuiSessionModelTests(unittest.TestCase):
 
         self.assertTrue(_model_patch_matches(None, patch_resp))
 
+    def test_model_patch_runtime_namespace_matches_canonical_vendor(self):
+        # A model keyed by its serving runtime (claude-cli/claude-opus-5)
+        # resolves to the model's canonical vendor (anthropic/claude-opus-5).
+        # Same model id + runtime provider namespace → treated as applied.
+        patch_resp = {"resolved": {"modelProvider": "anthropic", "model": "claude-opus-5"}}
+        self.assertTrue(_model_patch_matches("claude-cli/claude-opus-5", patch_resp))
+
+    def test_model_patch_runtime_namespace_rejects_different_model(self):
+        # Runtime namespace does NOT excuse a genuinely different model id.
+        patch_resp = {"resolved": {"modelProvider": "anthropic", "model": "claude-sonnet-5"}}
+        self.assertFalse(_model_patch_matches("claude-cli/claude-opus-5", patch_resp))
+
+    def test_model_patch_non_runtime_provider_still_strict(self):
+        # A normal vendor-keyed override must still match provider + model
+        # exactly; the relaxation is scoped to runtime namespaces only.
+        patch_resp = {"resolved": {"modelProvider": "anthropic", "model": "claude-opus-5"}}
+        self.assertFalse(_model_patch_matches("openrouter/claude-opus-5", patch_resp))
+
 
 class ItemTextExtractionTests(unittest.TestCase):
     def test_coerces_text_from_content_blocks(self):

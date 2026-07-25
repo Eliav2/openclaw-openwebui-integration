@@ -1383,10 +1383,31 @@ def _resolved_model_key(patch_resp: dict) -> str | None:
     return None
 
 
+# Provider namespaces that name a *serving runtime* rather than the model's
+# canonical API vendor. A model keyed under one of these (e.g.
+# "claude-cli/claude-opus-5") resolves, on sessions.patch, to the model's
+# canonical provider ("anthropic/claude-opus-5") — the gateway always reports
+# the vendor, not the runtime. Without treating these as equal, any model
+# keyed by its runtime can never pass the post-patch equality check and the
+# pipe wrongly aborts with "model override did not apply" (opus-5 was the only
+# such model; the claude-cli/ key was chosen deliberately to avoid a separate
+# compaction bug, so the fix belongs here, not in gateway config).
+_RUNTIME_PROVIDER_NAMESPACES = {"claude-cli", "google-gemini-cli", "codex-cli"}
+
+
 def _model_patch_matches(model_override: str | None, patch_resp: dict) -> bool:
     if model_override is None:
         return True
-    return _resolved_model_key(patch_resp) == model_override
+    if _resolved_model_key(patch_resp) == model_override:
+        return True
+    # Runtime-namespaced key (claude-cli/<id>) vs canonical vendor readback
+    # (anthropic/<id>): same model, different provider label — treat as applied.
+    if "/" in model_override:
+        want_provider, want_model = model_override.split("/", 1)
+        got_model = patch_resp.get("resolved", {}).get("model")
+        if want_provider in _RUNTIME_PROVIDER_NAMESPACES and want_model == got_model:
+            return True
+    return False
 
 
 def _coerce_text(value) -> str:
