@@ -3198,9 +3198,23 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
 class DynamicModelSelectorTests(unittest.TestCase):
     """Tests for ELI-11: dynamic model discovery, whitelist, and legacy compat."""
 
-    def test_friendly_name_alias(self):
-        self.assertEqual(_friendly_name({"key": "a/b", "name": "x", "tags": ["alias:opus"]}), "Opus")
-        self.assertEqual(_friendly_name({"key": "a/b", "name": "x", "tags": ["alias:sonnet-5"]}), "Sonnet-5")
+    def test_friendly_name_prefers_versioned_catalog_name_over_alias(self):
+        # The alias ("opus") hides the version; the catalog name carries it.
+        # Two versions must not both render as a bare "Opus" in the selector.
+        self.assertEqual(
+            _friendly_name({"key": "anthropic/claude-opus-4-8",
+                            "name": "Claude Opus 4.8", "tags": ["alias:opus"]}),
+            "Claude Opus 4.8",
+        )
+        self.assertEqual(
+            _friendly_name({"key": "claude-cli/claude-opus-5",
+                            "name": "Claude Opus 5", "tags": ["alias:opus-5"]}),
+            "Claude Opus 5",
+        )
+
+    def test_friendly_name_falls_back_to_alias_when_unnamed(self):
+        self.assertEqual(_friendly_name({"key": "a/b", "tags": ["alias:opus"]}), "Opus")
+        self.assertEqual(_friendly_name({"key": "a/b", "name": "", "tags": ["alias:sonnet-5"]}), "Sonnet-5")
 
     def test_friendly_name_no_alias_uses_name_field(self):
         self.assertEqual(_friendly_name({"key": "a/b", "name": "gpt-5.5", "tags": ["configured"]}), "gpt-5.5")

@@ -3640,17 +3640,24 @@ _FALLBACK_MODELS = [
 
 def _friendly_name(model_entry: dict) -> str:
     """Return a human-friendly name for a model entry.
-    
-    Priority: alias tag → model name field → last segment of key.
+
+    Priority: model name field → alias tag → last segment of key.
+
+    The catalog `name` is preferred because it carries the *version*
+    ("Claude Opus 4.8"), while the alias is a deliberately short handle
+    ("opus") that hides which version you're actually talking to — the
+    selector then shows two indistinguishable "Opus"/"Sonnet" entries as
+    new versions land. Same complaint as upstream openclaw#111884.
+    Alias remains the fallback for models the gateway returns unnamed.
     """
-    tags = model_entry.get("tags", [])
-    alias = next((t for t in tags if t.startswith("alias:")), None)
-    if alias:
-        name = alias.split(":", 1)[1]
-        return name[0].upper() + name[1:] if name else name
     name = model_entry.get("name", "")
     if name:
         return name
+    tags = model_entry.get("tags", [])
+    alias = next((t for t in tags if t.startswith("alias:")), None)
+    if alias:
+        alias_name = alias.split(":", 1)[1]
+        return alias_name[0].upper() + alias_name[1:] if alias_name else alias_name
     return model_entry["key"].rsplit("/", 1)[-1]
 
 
