@@ -2,6 +2,8 @@
 """Focused unit tests for pipe stream recovery behavior."""
 
 import unittest
+import html
+import re
 import sys
 import time
 import types
@@ -1260,6 +1262,29 @@ class TurnRendererTests(unittest.TestCase):
                                            "toolCallId": "t9", "result": "contents"}})
         expected = _render_tool_result_block("Read", "t9", "{}", "contents", "")
         self.assertIn(expected.strip(), r.visible_text)
+
+    def test_multiline_result_survives_owui_attribute_regex(self):
+        """A multi-line tool result must still be readable by OWUI's frontend.
+
+        OWUI parses these attributes with a non-dotAll `/(\\w+)="(.*?)"/g`, so a
+        literal newline anywhere in a value silently drops that attribute and
+        the card renders INPUT-only (2026-07-25 regression report). Assert both
+        that the opening tag is single-line and that an equivalent regex still
+        recovers the full result.
+        """
+        result = "hello from bash\nFri Jul 24 23:45:02 Asia 2026\n up 18 days"
+        block = _render_tool_result_block("Bash", "t1", '{"a": 1}', result, "")
+
+        open_tag = block.strip().split(">")[0] + ">"
+        self.assertNotIn("\n", open_tag)
+
+        # Mirror of OWUI's parser: `.` must not need to match a newline.
+        attrs = dict(re.findall(r'(\w+)="(.*?)"', open_tag))
+        self.assertIn("result", attrs)
+        self.assertEqual(
+            html.unescape(attrs["result"]).replace("\r\n", "\n"), result
+        )
+        self.assertEqual(html.unescape(attrs["arguments"]), '{"a": 1}')
 
     def test_catch_all_text_is_not_duplicated(self):
         """A provider's final catch-all `text` (full cumulative reply, no

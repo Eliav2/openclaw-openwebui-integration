@@ -236,6 +236,32 @@ def _suppress_already_shown(delta: str, visible_message_text: str) -> str:
     return delta
 
 
+def _attr(value: str) -> str:
+    """Escape a string for use as an HTML attribute value in a tool card.
+
+    `html.escape` alone is NOT enough here. OWUI's frontend parses these
+    `<details>` attributes with a non-dotAll regex (`/(\\w+)="(.*?)"/g`, chunk
+    `_UcCb4Vt.js`), so `.` never matches a newline: any attribute value
+    containing a literal newline fails to match and is silently DROPPED — the
+    tool card then renders with INPUT and no OUTPUT at all, with no error.
+
+    That was invisible for `arguments` (always `json.dumps`-ed, so its newlines
+    are already the two-char `\\n` escape) but hit almost every multi-line tool
+    `result`, which is passed through raw (2026-07-25).
+
+    Encoding the newline as the numeric character reference `&#10;` keeps the
+    attribute on one physical line for that regex while still decoding back to
+    a real newline when the browser parses the attribute — the same path that
+    already turns `&quot;` into `"` in the rendered card.
+    """
+    return (
+        html.escape(value)
+        .replace("\r\n", "&#10;")
+        .replace("\n", "&#10;")
+        .replace("\r", "&#10;")
+    )
+
+
 def _render_tool_result_block(name: str, tool_call_id: str, args_str: str,
                               result_str: str, meta) -> str:
     """Render a finished tool call as OWUI's collapsible `tool_calls` card.
@@ -247,11 +273,11 @@ def _render_tool_result_block(name: str, tool_call_id: str, args_str: str,
     """
     return (
         '\n<details type="tool_calls" done="true" '
-        f'id="{html.escape(tool_call_id)}" '
-        f'name="{html.escape(name)}" '
-        f'arguments="{html.escape(args_str[:3000])}" '
-        f'result="{html.escape(result_str[:8000])}" '
-        f'meta="{html.escape(str(meta)[:500])}" '
+        f'id="{_attr(tool_call_id)}" '
+        f'name="{_attr(name)}" '
+        f'arguments="{_attr(args_str[:3000])}" '
+        f'result="{_attr(result_str[:8000])}" '
+        f'meta="{_attr(str(meta)[:500])}" '
         'files="[]" embeds="[]">'
         f'\n<summary>{html.escape(name)}</summary>\n</details>\n'
     )
