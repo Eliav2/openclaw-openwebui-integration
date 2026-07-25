@@ -2947,7 +2947,7 @@ async def _append_proactive_message_to_chat(
 # follow-up and is NOT gated by this flag because it doesn't exist yet.
 # Do not flip on without re-reading the Linear ELI-62 description's safety
 # rails and the docstring on `_emit_live_bootstrap_reload` below.
-LIVE_STREAM_BOOTSTRAP_ENABLED = False
+LIVE_STREAM_BOOTSTRAP_ENABLED = True
 
 
 async def _emit_live_bootstrap_reload(user_id: str, chat_id: str, target_message_id: str | None) -> None:
@@ -3026,7 +3026,7 @@ async def _emit_live_bootstrap_reload(user_id: str, chat_id: str, target_message
 # `chat:active` event envelope still needs a live-browser confirmation
 # (see `_relay_finalize`); DB persistence guarantees reload-correctness
 # regardless, so an imperfect terminal event only costs a spinner nicety.
-LIVE_STREAM_RELAY_ENABLED = False
+LIVE_STREAM_RELAY_ENABLED = True
 
 # A proactive run is only eligible for relay once its session has had zero
 # consumers for at least this long — the same sustained-idle contract the

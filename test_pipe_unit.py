@@ -801,8 +801,10 @@ class LiveRelayTests(unittest.TestCase):
 
     # ── static invariants ───────────────────────────────────────────────
 
-    def test_kill_switch_defaults_off(self):
-        self.assertFalse(LIVE_STREAM_RELAY_ENABLED)
+    def test_kill_switch_is_on(self):
+        # Flipped ON 2026-07-25 at Eliav's request after the PoC phase; if you
+        # need to disable the relay, flip the constant in src/ and update this.
+        self.assertTrue(LIVE_STREAM_RELAY_ENABLED)
 
     def test_content_is_showable_filters_sentinels_and_prefixes(self):
         self.assertFalse(_relay_content_is_showable(""))
