@@ -3,6 +3,7 @@
 
 import unittest
 import html
+import json
 import re
 import sys
 import time
@@ -71,6 +72,8 @@ from openclaw_pipe import (
     GatewayError,
     _TurnRenderer,
     _render_tool_result_block,
+    _tool_call_started_event,
+    _tool_call_result_event,
     _append_proactive_message_to_chat,
     _emit_live_bootstrap_reload,
     LIVE_STREAM_BOOTSTRAP_ENABLED,
@@ -1618,64 +1621,65 @@ class TurnRendererTests(unittest.TestCase):
         self.assertEqual(r.visible_text, "")
 
 
-class RunningToolCardTests(unittest.TestCase):
-    """Two-phase tool cards: spinner at start, checkmark + output at the end.
+class NativeToolItemTests(unittest.TestCase):
+    """Tool calls streamed as Responses-API output items.
 
-    OWUI's `ToolCallDisplay` keys all three of its states off `done` alone, and
-    hides the Output section unless `done="true"` — so the running card is the
-    finished card minus the result.
+    Yielded markdown is append-only for the rest of the turn, so a card baked
+    into the text can never stop spinning. These dicts are folded into OWUI's
+    own output list instead, where the spinner→checkmark transition is OWUI's
+    to make.
     """
 
-    def test_default_stays_done_true(self):
-        """The shadow `_TurnRenderer` and every pre-existing call site pass no
-        `done`, and must keep emitting finished cards."""
+    def test_start_event_is_a_pending_function_call(self):
+        ev = _tool_call_started_event("Bash", "call-1", '{"command": "sleep 8"}')
+        self.assertEqual(ev["type"], "response.output_item.added")
+        item = ev["item"]
+        self.assertEqual(item["type"], "function_call")
+        self.assertEqual(item["call_id"], "call-1")
+        self.assertEqual(item["name"], "Bash")
+        self.assertEqual(item["arguments"], '{"command": "sleep 8"}')
+        # in_progress + no matching output item is what renders as a spinner.
+        self.assertEqual(item["status"], "in_progress")
+        self.assertNotIn("output", item)
+
+    def test_result_event_matches_the_start_event_by_call_id(self):
+        """The shared call_id is the entire flip mechanism — if these diverge
+        the card spins forever."""
+        start = _tool_call_started_event("Bash", "call-1", "{}")
+        result = _tool_call_result_event("call-1", "total 4\ndrwxr-xr-x")
+        self.assertEqual(start["item"]["call_id"], result["item"]["call_id"])
+        self.assertEqual(result["item"]["type"], "function_call_output")
+        self.assertEqual(result["item"]["status"], "completed")
+        self.assertEqual(
+            result["item"]["output"], [{"type": "output_text", "text": "total 4\ndrwxr-xr-x"}]
+        )
+
+    def test_item_ids_are_distinct_between_call_and_output(self):
+        """Both items land in one output list; colliding ids would make the
+        backend treat them as the same item."""
+        start = _tool_call_started_event("Bash", "call-1", "{}")
+        result = _tool_call_result_event("call-1", "x")
+        self.assertNotEqual(start["item"]["id"], result["item"]["id"])
+
+    def test_payloads_are_json_serializable(self):
+        """OWUI serializes a yielded dict with `json.dumps` — a non-serializable
+        value would break the SSE line rather than the card."""
+        json.dumps(_tool_call_started_event("Bash", "c", '{"a": 1}'))
+        json.dumps(_tool_call_result_event("c", "out"))
+
+    def test_result_text_is_capped(self):
+        ev = _tool_call_result_event("c", "x" * 20000)
+        self.assertEqual(len(ev["item"]["output"][0]["text"]), 8000)
+
+    def test_markdown_card_path_is_unchanged(self):
+        """Valve off (and the shadow renderer, which has no live stream) must
+        still produce the finished-only markdown card."""
         block = _render_tool_result_block("Bash", "t1", "{}", "out", "")
         self.assertIn('done="true"', block)
-
-    def test_running_card_is_not_done_and_carries_no_result(self):
-        block = _render_tool_result_block(
-            "Bash", "t1", '{"command": "sleep 8"}', "", "", done=False,
-        )
-        self.assertIn('done="false"', block)
-        self.assertNotIn('done="true"', block)
-        # Arguments are visible while running (that's the point); the result
-        # attribute exists but is empty, so nothing partial can leak.
-        self.assertIn('result=""', block)
-        attrs = dict(re.findall(r'(\w+)="(.*?)"', block.strip().split(">")[0] + ">"))
-        self.assertEqual(html.unescape(attrs["arguments"]), '{"command": "sleep 8"}')
-        self.assertEqual(attrs["name"], "Bash")
-
-    def test_result_swap_leaves_exactly_one_card(self):
-        """The result phase replaces the running card in `visible_message_text`
-        rather than appending — otherwise the turn shows the same tool twice,
-        once spinning forever."""
-        running = _render_tool_result_block(
-            "Bash", "t1", '{"command": "ls"}', "", "", done=False,
-        )
-        finished = _render_tool_result_block(
-            "Bash", "t1", '{"command": "ls"}', "total 4", "m", done=True,
-        )
-        visible = "Let me check.\n" + running + "\nDone."
-
-        self.assertTrue(running in visible)
-        swapped = visible.replace(running, finished, 1)
-
-        self.assertEqual(swapped.count('<details type="tool_calls"'), 1)
-        self.assertNotIn('done="false"', swapped)
-        self.assertIn('result="total 4"', swapped)
-        # Surrounding assistant text is untouched by the swap.
-        self.assertTrue(swapped.startswith("Let me check.\n"))
-        self.assertTrue(swapped.endswith("\nDone."))
-
-    def test_running_card_of_one_call_does_not_match_another(self):
-        """Two concurrent tools must not swap each other's cards."""
-        a = _render_tool_result_block("Bash", "call-a", "{}", "", "", done=False)
-        b = _render_tool_result_block("Bash", "call-b", "{}", "", "", done=False)
-        self.assertNotEqual(a, b)
-        self.assertNotIn(a, b)
+        self.assertIn('result="out"', block)
 
     def test_valve_defaults_off(self):
-        self.assertFalse(Pipe.Valves().SHOW_RUNNING_TOOL_CARDS)
+        self.assertFalse(Pipe.Valves().NATIVE_TOOL_ITEMS)
 
 
 class ParityFinalizeTests(unittest.TestCase):

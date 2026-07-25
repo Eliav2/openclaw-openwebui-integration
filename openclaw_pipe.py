@@ -1562,26 +1562,70 @@ def _attr(value: str) -> str:
     )
 
 
+def _tool_call_started_event(name: str, tool_call_id: str, args_str: str) -> dict:
+    """Announce a tool call as a Responses-API output item (live spinner).
+
+    Yielding a *dict* from the pipe is a supported protocol switch: OWUI
+    serializes it verbatim as an SSE `data:` line (`functions.py::process_line`)
+    instead of wrapping it in a chat chunk, and any event whose `type` starts
+    with `response.` is folded into the backend's OWN output list by
+    `handle_responses_streaming_event` (`middleware.py`).
+
+    That matters because the backend's output list is what feeds the live
+    `chat:completion` emissions, the final done event AND the DB write — so a
+    tool call announced this way is mutable, unlike yielded markdown, which is
+    append-only for the rest of the turn (see the two-phase `<details>` attempt
+    that this replaced). The frontend renders a `function_call` with no matching
+    `function_call_output` as a spinner (`structuredOutput.ts::buildToolCallToken`).
+
+    Ordering is by arrival, and `response.output_item.added` simply appends, so
+    these interleave correctly with ordinary streamed text — no output_index
+    bookkeeping needed on our side.
+    """
+    return {
+        "type": "response.output_item.added",
+        "item": {
+            "type": "function_call",
+            "id": f"fc_{tool_call_id}",
+            "call_id": tool_call_id,
+            "name": name,
+            "arguments": args_str[:3000],
+            "status": "in_progress",
+        },
+    }
+
+
+def _tool_call_result_event(tool_call_id: str, result_str: str) -> dict:
+    """Complete a tool call announced by `_tool_call_started_event`.
+
+    A `function_call_output` sharing the same `call_id` is what flips the card
+    to done and reveals the Output section. If we never send one (run cancelled,
+    pipe torn down), the backend still marks every leftover `in_progress` item
+    completed before the final event, so a card can't be left spinning forever.
+    """
+    return {
+        "type": "response.output_item.added",
+        "item": {
+            "type": "function_call_output",
+            "id": f"fco_{tool_call_id}",
+            "call_id": tool_call_id,
+            "output": [{"type": "output_text", "text": result_str[:8000]}],
+            "status": "completed",
+        },
+    }
+
+
 def _render_tool_result_block(name: str, tool_call_id: str, args_str: str,
-                              result_str: str, meta, *, done: bool = True) -> str:
-    """Render a tool call as OWUI's collapsible `tool_calls` card.
+                              result_str: str, meta) -> str:
+    """Render a finished tool call as OWUI's collapsible `tool_calls` card.
 
-    Extracted from the inline pipe loop so the shadow `_TurnRenderer` (which
-    completes a run's OWUI message when the inline turn ended early) produces
-    byte-identical tool blocks — same escaping, same field caps — instead of a
-    second, drift-prone copy of this markup.
-
-    `done` drives OWUI's own three-state rendering of this card
-    (`ToolCallDisplay.svelte`, verified against the deployed v0.10.2 bundle):
-    `done="true"` gives the green checkmark plus a rendered Output section,
-    anything else gives a spinner, a shimmering "Executing <name>..." label,
-    and NO Output section at all (`{#if isDone && result}`). So a card emitted
-    at tool-start with `done=False` needs no result and cannot leak a partial
-    one — pass the args only, then re-render the same card with `done=True`
-    once the result arrives.
+    The markdown path, used when native tool items are off and by the shadow
+    `_TurnRenderer` (which completes a run's OWUI message when the inline turn
+    ended early, outside any live stream — so it has no protocol channel and
+    must bake the card into text).
     """
     return (
-        f'\n<details type="tool_calls" done="{"true" if done else "false"}" '
+        '\n<details type="tool_calls" done="true" '
         f'id="{_attr(tool_call_id)}" '
         f'name="{_attr(name)}" '
         f'arguments="{_attr(args_str[:3000])}" '
@@ -3874,12 +3918,13 @@ class Pipe:
                 "separate from AGENT_ID: title-gen gets its own CLI process/lane, so it no longer "
                 "queues behind the main conversation's active work (2026-07-10 regression, P36-adjacent)."
         )
-        SHOW_RUNNING_TOOL_CARDS: bool = Field(
+        NATIVE_TOOL_ITEMS: bool = Field(
             default=False,
-            description="Show a tool card as soon as the tool STARTS (spinner + 'Executing <name>...', "
-                "arguments visible, no output yet), then rewrite it in place with the result and a "
-                "checkmark when it finishes. Off = the pre-existing behavior, where the card only "
-                "appears once the tool has already completed."
+            description="Stream tool calls as native Responses-API output items instead of baking a "
+                "markdown card into the message text. Gives a live spinner while the tool runs "
+                "(arguments visible, no output yet) that flips to a checkmark with the output when it "
+                "finishes — OWUI owns that transition. Off = the pre-existing behavior, where a "
+                "finished-only card appears once the tool has already completed."
         )
 
     def __init__(self):
@@ -4451,11 +4496,6 @@ class Pipe:
         assistant_stream_text = ""
         visible_message_text = ""
         had_tool_block = False
-        # toolCallId -> the exact running-card markup recorded into
-        # `visible_message_text`, so the result phase can swap that same string
-        # out. Per-turn (not on self) so an abandoned card from an earlier turn
-        # can never be matched against this turn's text.
-        running_tool_cards: dict[str, str] = {}
         pending_prompt_text = ""
         pending_media_text = ""
         last_snapshot_text = ""
@@ -4508,24 +4548,6 @@ class Pipe:
             nonlocal visible_message_text
             if chunk:
                 visible_message_text += chunk
-
-        def replace_visible_chunk(old: str, new: str) -> bool:
-            """Swap an already-recorded chunk for a new one, in place.
-
-            Used to turn a running tool card into its finished form. The stream
-            itself is append-only, so the swap is only visible to the user once
-            a snapshot goes out — every caller must follow this with
-            `maybe_emit_snapshot(force=True)`.
-
-            Returns False (and changes nothing) when `old` isn't present, so
-            callers can fall back to appending instead of silently dropping the
-            finished card.
-            """
-            nonlocal visible_message_text
-            if not old or old not in visible_message_text:
-                return False
-            visible_message_text = visible_message_text.replace(old, new, 1)
-            return True
 
         async def maybe_emit_snapshot(*, force: bool = False):
             nonlocal last_snapshot_text, last_snapshot_time
@@ -4949,18 +4971,15 @@ class Pipe:
                                 if tool_call_id:
                                     self._active_tool_args[tool_call_id] = args
                                 pipe_log(f"  Tool start: {name}")
-                                if self.valves.SHOW_RUNNING_TOOL_CARDS and tool_call_id:
-                                    # Same card the result phase will render, minus
-                                    # the result — OWUI hides the Output section
-                                    # entirely while done="false", so there is
-                                    # nothing to leak here.
-                                    running_block = _render_tool_result_block(
-                                        name, tool_call_id, args, "", "", done=False,
-                                    )
-                                    running_tool_cards[tool_call_id] = running_block
-                                    had_tool_block = True
-                                    record_visible_chunk(running_block)
-                                    yield running_block
+                                if self.valves.NATIVE_TOOL_ITEMS and tool_call_id:
+                                    # Protocol switch, not text: this dict becomes a
+                                    # `function_call` item in OWUI's own output list,
+                                    # which renders as a live spinner until its
+                                    # matching result item arrives. Deliberately NOT
+                                    # recorded into `visible_message_text` — it is
+                                    # not part of the message text, and the snapshot
+                                    # path must not duplicate it as markdown.
+                                    yield _tool_call_started_event(name, tool_call_id, args)
                                 await _emit_status(
                                     __event_emitter__,
                                     f"Running {name}...",
@@ -4975,27 +4994,24 @@ class Pipe:
                                 stored_args = self._active_tool_args.pop(tool_call_id, None)
                                 args_str = stored_args or json.dumps(data.get("args", {}))
                                 pipe_log(f"  Tool result: {name} ({len(result_str)} chars)")
-                                # Shared with the parity shadow renderer so both
-                                # produce byte-identical tool cards (gateway.py).
-                                tool_block = _render_tool_result_block(
-                                    name, tool_call_id, args_str, result_str,
-                                    data.get("meta", ""),
-                                )
-                                had_tool_block = True
-                                # If a running card for this call is already on
-                                # screen, rewrite THAT card rather than appending
-                                # a second one. The swap only reaches the browser
-                                # via the forced snapshot below (the stream can
-                                # only append), which this path already emitted
-                                # after every tool result long before running
-                                # cards existed — so no new `replace` traffic is
-                                # introduced into the P23/P25/P27 machinery here,
-                                # only different content in an existing snapshot.
-                                running_block = running_tool_cards.pop(tool_call_id, None)
-                                if not replace_visible_chunk(running_block or "", tool_block):
+                                if self.valves.NATIVE_TOOL_ITEMS and tool_call_id:
+                                    # Completes the item yielded at start: same
+                                    # call_id is what flips that card to done and
+                                    # reveals its Output. No snapshot needed — the
+                                    # backend folds this into the output list it
+                                    # already persists and re-emits.
+                                    yield _tool_call_result_event(tool_call_id, result_str)
+                                else:
+                                    # Shared with the parity shadow renderer so both
+                                    # produce byte-identical tool cards (gateway.py).
+                                    tool_block = _render_tool_result_block(
+                                        name, tool_call_id, args_str, result_str,
+                                        data.get("meta", ""),
+                                    )
+                                    had_tool_block = True
                                     record_visible_chunk(tool_block)
                                     yield tool_block
-                                await maybe_emit_snapshot(force=True)
+                                    await maybe_emit_snapshot(force=True)
                                 await _emit_status(
                                     __event_emitter__,
                                     f"{name} done",

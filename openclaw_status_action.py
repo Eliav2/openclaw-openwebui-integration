@@ -474,26 +474,70 @@ def _attr(value: str) -> str:
     )
 
 
+def _tool_call_started_event(name: str, tool_call_id: str, args_str: str) -> dict:
+    """Announce a tool call as a Responses-API output item (live spinner).
+
+    Yielding a *dict* from the pipe is a supported protocol switch: OWUI
+    serializes it verbatim as an SSE `data:` line (`functions.py::process_line`)
+    instead of wrapping it in a chat chunk, and any event whose `type` starts
+    with `response.` is folded into the backend's OWN output list by
+    `handle_responses_streaming_event` (`middleware.py`).
+
+    That matters because the backend's output list is what feeds the live
+    `chat:completion` emissions, the final done event AND the DB write — so a
+    tool call announced this way is mutable, unlike yielded markdown, which is
+    append-only for the rest of the turn (see the two-phase `<details>` attempt
+    that this replaced). The frontend renders a `function_call` with no matching
+    `function_call_output` as a spinner (`structuredOutput.ts::buildToolCallToken`).
+
+    Ordering is by arrival, and `response.output_item.added` simply appends, so
+    these interleave correctly with ordinary streamed text — no output_index
+    bookkeeping needed on our side.
+    """
+    return {
+        "type": "response.output_item.added",
+        "item": {
+            "type": "function_call",
+            "id": f"fc_{tool_call_id}",
+            "call_id": tool_call_id,
+            "name": name,
+            "arguments": args_str[:3000],
+            "status": "in_progress",
+        },
+    }
+
+
+def _tool_call_result_event(tool_call_id: str, result_str: str) -> dict:
+    """Complete a tool call announced by `_tool_call_started_event`.
+
+    A `function_call_output` sharing the same `call_id` is what flips the card
+    to done and reveals the Output section. If we never send one (run cancelled,
+    pipe torn down), the backend still marks every leftover `in_progress` item
+    completed before the final event, so a card can't be left spinning forever.
+    """
+    return {
+        "type": "response.output_item.added",
+        "item": {
+            "type": "function_call_output",
+            "id": f"fco_{tool_call_id}",
+            "call_id": tool_call_id,
+            "output": [{"type": "output_text", "text": result_str[:8000]}],
+            "status": "completed",
+        },
+    }
+
+
 def _render_tool_result_block(name: str, tool_call_id: str, args_str: str,
-                              result_str: str, meta, *, done: bool = True) -> str:
-    """Render a tool call as OWUI's collapsible `tool_calls` card.
+                              result_str: str, meta) -> str:
+    """Render a finished tool call as OWUI's collapsible `tool_calls` card.
 
-    Extracted from the inline pipe loop so the shadow `_TurnRenderer` (which
-    completes a run's OWUI message when the inline turn ended early) produces
-    byte-identical tool blocks — same escaping, same field caps — instead of a
-    second, drift-prone copy of this markup.
-
-    `done` drives OWUI's own three-state rendering of this card
-    (`ToolCallDisplay.svelte`, verified against the deployed v0.10.2 bundle):
-    `done="true"` gives the green checkmark plus a rendered Output section,
-    anything else gives a spinner, a shimmering "Executing <name>..." label,
-    and NO Output section at all (`{#if isDone && result}`). So a card emitted
-    at tool-start with `done=False` needs no result and cannot leak a partial
-    one — pass the args only, then re-render the same card with `done=True`
-    once the result arrives.
+    The markdown path, used when native tool items are off and by the shadow
+    `_TurnRenderer` (which completes a run's OWUI message when the inline turn
+    ended early, outside any live stream — so it has no protocol channel and
+    must bake the card into text).
     """
     return (
-        f'\n<details type="tool_calls" done="{"true" if done else "false"}" '
+        '\n<details type="tool_calls" done="true" '
         f'id="{_attr(tool_call_id)}" '
         f'name="{_attr(name)}" '
         f'arguments="{_attr(args_str[:3000])}" '
