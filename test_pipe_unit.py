@@ -1618,6 +1618,66 @@ class TurnRendererTests(unittest.TestCase):
         self.assertEqual(r.visible_text, "")
 
 
+class RunningToolCardTests(unittest.TestCase):
+    """Two-phase tool cards: spinner at start, checkmark + output at the end.
+
+    OWUI's `ToolCallDisplay` keys all three of its states off `done` alone, and
+    hides the Output section unless `done="true"` — so the running card is the
+    finished card minus the result.
+    """
+
+    def test_default_stays_done_true(self):
+        """The shadow `_TurnRenderer` and every pre-existing call site pass no
+        `done`, and must keep emitting finished cards."""
+        block = _render_tool_result_block("Bash", "t1", "{}", "out", "")
+        self.assertIn('done="true"', block)
+
+    def test_running_card_is_not_done_and_carries_no_result(self):
+        block = _render_tool_result_block(
+            "Bash", "t1", '{"command": "sleep 8"}', "", "", done=False,
+        )
+        self.assertIn('done="false"', block)
+        self.assertNotIn('done="true"', block)
+        # Arguments are visible while running (that's the point); the result
+        # attribute exists but is empty, so nothing partial can leak.
+        self.assertIn('result=""', block)
+        attrs = dict(re.findall(r'(\w+)="(.*?)"', block.strip().split(">")[0] + ">"))
+        self.assertEqual(html.unescape(attrs["arguments"]), '{"command": "sleep 8"}')
+        self.assertEqual(attrs["name"], "Bash")
+
+    def test_result_swap_leaves_exactly_one_card(self):
+        """The result phase replaces the running card in `visible_message_text`
+        rather than appending — otherwise the turn shows the same tool twice,
+        once spinning forever."""
+        running = _render_tool_result_block(
+            "Bash", "t1", '{"command": "ls"}', "", "", done=False,
+        )
+        finished = _render_tool_result_block(
+            "Bash", "t1", '{"command": "ls"}', "total 4", "m", done=True,
+        )
+        visible = "Let me check.\n" + running + "\nDone."
+
+        self.assertTrue(running in visible)
+        swapped = visible.replace(running, finished, 1)
+
+        self.assertEqual(swapped.count('<details type="tool_calls"'), 1)
+        self.assertNotIn('done="false"', swapped)
+        self.assertIn('result="total 4"', swapped)
+        # Surrounding assistant text is untouched by the swap.
+        self.assertTrue(swapped.startswith("Let me check.\n"))
+        self.assertTrue(swapped.endswith("\nDone."))
+
+    def test_running_card_of_one_call_does_not_match_another(self):
+        """Two concurrent tools must not swap each other's cards."""
+        a = _render_tool_result_block("Bash", "call-a", "{}", "", "", done=False)
+        b = _render_tool_result_block("Bash", "call-b", "{}", "", "", done=False)
+        self.assertNotEqual(a, b)
+        self.assertNotIn(a, b)
+
+    def test_valve_defaults_off(self):
+        self.assertFalse(Pipe.Valves().SHOW_RUNNING_TOOL_CARDS)
+
+
 class ParityFinalizeTests(unittest.TestCase):
     """Parity finalize: when the inline turn ends before the run does, the
     ORIGINAL assistant message is completed in place with the full content —

@@ -475,16 +475,25 @@ def _attr(value: str) -> str:
 
 
 def _render_tool_result_block(name: str, tool_call_id: str, args_str: str,
-                              result_str: str, meta) -> str:
-    """Render a finished tool call as OWUI's collapsible `tool_calls` card.
+                              result_str: str, meta, *, done: bool = True) -> str:
+    """Render a tool call as OWUI's collapsible `tool_calls` card.
 
     Extracted from the inline pipe loop so the shadow `_TurnRenderer` (which
     completes a run's OWUI message when the inline turn ended early) produces
     byte-identical tool blocks — same escaping, same field caps — instead of a
     second, drift-prone copy of this markup.
+
+    `done` drives OWUI's own three-state rendering of this card
+    (`ToolCallDisplay.svelte`, verified against the deployed v0.10.2 bundle):
+    `done="true"` gives the green checkmark plus a rendered Output section,
+    anything else gives a spinner, a shimmering "Executing <name>..." label,
+    and NO Output section at all (`{#if isDone && result}`). So a card emitted
+    at tool-start with `done=False` needs no result and cannot leak a partial
+    one — pass the args only, then re-render the same card with `done=True`
+    once the result arrives.
     """
     return (
-        '\n<details type="tool_calls" done="true" '
+        f'\n<details type="tool_calls" done="{"true" if done else "false"}" '
         f'id="{_attr(tool_call_id)}" '
         f'name="{_attr(name)}" '
         f'arguments="{_attr(args_str[:3000])}" '
