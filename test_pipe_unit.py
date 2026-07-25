@@ -1678,8 +1678,22 @@ class NativeToolItemTests(unittest.TestCase):
         self.assertIn('done="true"', block)
         self.assertIn('result="out"', block)
 
-    def test_valve_defaults_off(self):
-        self.assertFalse(Pipe.Valves().NATIVE_TOOL_ITEMS)
+    def test_orphan_close_reuses_the_result_event(self):
+        """A call announced but never resolved must still be completed, or its
+        card spins forever. OWUI's own end-of-stream sweep does not reliably
+        reach this path (observed 2026-07-25: a delivered call stayed
+        `in_progress` and only rendered done because its result item existed)."""
+        ev = _tool_call_result_event("call-1", "(no result — the run ended first)")
+        self.assertEqual(ev["item"]["type"], "function_call_output")
+        self.assertEqual(ev["item"]["call_id"], "call-1")
+        self.assertEqual(ev["item"]["status"], "completed")
+
+    def test_no_valve_gates_native_items(self):
+        """Native items are unconditional now — a leftover toggle would be a
+        second, untested code path."""
+        valves = Pipe.Valves()
+        self.assertFalse(hasattr(valves, "NATIVE_TOOL_ITEMS"))
+        self.assertFalse(hasattr(valves, "SHOW_RUNNING_TOOL_CARDS"))
 
 
 class ParityFinalizeTests(unittest.TestCase):

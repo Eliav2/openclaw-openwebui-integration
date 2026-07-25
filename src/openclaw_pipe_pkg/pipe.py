@@ -141,14 +141,6 @@ class Pipe:
                 "separate from AGENT_ID: title-gen gets its own CLI process/lane, so it no longer "
                 "queues behind the main conversation's active work (2026-07-10 regression, P36-adjacent)."
         )
-        NATIVE_TOOL_ITEMS: bool = Field(
-            default=False,
-            description="Stream tool calls as native Responses-API output items instead of baking a "
-                "markdown card into the message text. Gives a live spinner while the tool runs "
-                "(arguments visible, no output yet) that flips to a checkmark with the output when it "
-                "finishes — OWUI owns that transition. Off = the pre-existing behavior, where a "
-                "finished-only card appears once the tool has already completed."
-        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -732,6 +724,10 @@ class Pipe:
         assistant_stream_text = ""
         visible_message_text = ""
         had_tool_block = False
+        # toolCallIds announced to OWUI as `function_call` items that have
+        # not been completed by a matching result item yet. Anything left
+        # here when the run ends would render as a spinner forever.
+        pending_tool_calls: set[str] = set()
         pending_prompt_text = ""
         pending_media_text = ""
         last_snapshot_text = ""
@@ -1207,7 +1203,7 @@ class Pipe:
                                 if tool_call_id:
                                     self._active_tool_args[tool_call_id] = args
                                 pipe_log(f"  Tool start: {name}")
-                                if self.valves.NATIVE_TOOL_ITEMS and tool_call_id:
+                                if tool_call_id:
                                     # Protocol switch, not text: this dict becomes a
                                     # `function_call` item in OWUI's own output list,
                                     # which renders as a live spinner until its
@@ -1215,6 +1211,7 @@ class Pipe:
                                     # recorded into `visible_message_text` — it is
                                     # not part of the message text, and the snapshot
                                     # path must not duplicate it as markdown.
+                                    pending_tool_calls.add(tool_call_id)
                                     yield _tool_call_started_event(name, tool_call_id, args)
                                 await _emit_status(
                                     __event_emitter__,
@@ -1230,16 +1227,18 @@ class Pipe:
                                 stored_args = self._active_tool_args.pop(tool_call_id, None)
                                 args_str = stored_args or json.dumps(data.get("args", {}))
                                 pipe_log(f"  Tool result: {name} ({len(result_str)} chars)")
-                                if self.valves.NATIVE_TOOL_ITEMS and tool_call_id:
-                                    # Completes the item yielded at start: same
+                                if tool_call_id:
+                                    # Completes the item yielded at start: the shared
                                     # call_id is what flips that card to done and
                                     # reveals its Output. No snapshot needed — the
                                     # backend folds this into the output list it
                                     # already persists and re-emits.
+                                    pending_tool_calls.discard(tool_call_id)
                                     yield _tool_call_result_event(tool_call_id, result_str)
                                 else:
-                                    # Shared with the parity shadow renderer so both
-                                    # produce byte-identical tool cards (gateway.py).
+                                    # No toolCallId means there is nothing to pair a
+                                    # result item to, so fall back to the markdown
+                                    # card — the same one the shadow renderer emits.
                                     tool_block = _render_tool_result_block(
                                         name, tool_call_id, args_str, result_str,
                                         data.get("meta", ""),
@@ -1431,6 +1430,23 @@ class Pipe:
                     # only land once the run is truly finished, not between turns.
                     if not adopt_new_run and had_tool_block:
                         await maybe_emit_snapshot(force=True)
+
+                    # Resolve any tool call that was announced but never got a
+                    # result (run cancelled, gateway dropped it, tool crashed).
+                    # Its card is a spinner until something completes it, and
+                    # OWUI's own "mark leftover in_progress items completed"
+                    # sweep does NOT reliably reach this path — observed
+                    # 2026-07-25, where a delivered call stayed `in_progress`
+                    # in the persisted item and only rendered as done because
+                    # its result item happened to exist. So close them here
+                    # rather than relying on that.
+                    if not adopt_new_run and pending_tool_calls:
+                        for orphan_id in list(pending_tool_calls):
+                            pipe_log(f"  closing orphaned tool call {orphan_id}")
+                            yield _tool_call_result_event(
+                                orphan_id, "(no result — the run ended first)"
+                            )
+                        pending_tool_calls.clear()
 
         finally:
             status_lines = []
