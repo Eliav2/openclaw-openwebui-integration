@@ -1,0 +1,11 @@
+# Build artifacts: generated from src/openclaw_pipe_pkg/ by build.py.
+#
+# They ARE tracked on purpose — install.py falls back to deploying whatever is
+# already committed when there is no src/ tree (remote `uv run install.py`), and
+# an OWUI Function is installed by pasting one flat .py file. A `git rm` would
+# break both. The drift guard (`build.py --check`, test_build) keeps them honest.
+#
+# Marking them generated collapses them by default in PR diffs and excludes them
+# from language stats, so reviewers see only the source change.
+openclaw_pipe.py linguist-generated=true
+openclaw_status_action.py linguist-generated=true
