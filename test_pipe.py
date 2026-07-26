@@ -5,9 +5,9 @@ Tests the pipe's core functionality independently of the frontend.
 
 Usage:
   OWUI_EMAIL="admin@example.com" OWUI_PASSWORD="secret" python3 test_pipe.py
-  # or via SSH to the HA host:
-  scp test_pipe.py root@your-owui-host:/tmp/
-  ssh root@your-owui-host "OWUI_PASSWORD='secret' python3 /tmp/test_pipe.py"
+  # or via SSH to the OWUI host:
+  scp test_pipe.py user@your-owui-host:/tmp/
+  ssh user@your-owui-host "OWUI_PASSWORD='secret' python3 /tmp/test_pipe.py"
 """
 
 import json

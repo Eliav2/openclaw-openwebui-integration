@@ -3,6 +3,11 @@ __pycache__/
 .pipe_device_identity.json
 backups/
 
+# Local-only credentials for running scripts/owui_api.py, test_pipe.py, and
+# install.py against a real instance without retyping env vars every time.
+# Never commit real OWUI_EMAIL/OWUI_PASSWORD/GATEWAY_TOKEN values.
+.env.local
+
 # Internal-only dev bundle (ELI-24 cross-agent deploy coordination) --
 # rebuild with `python3 build.py --dev` before every dev deploy, never
 # distributed or committed. openclaw_pipe.py (no suffix) is NOT ignored:

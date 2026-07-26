@@ -5,13 +5,14 @@ Import or run standalone for login/chat/title/files operations.
 
 Usage as module:
     from owui_api import OwuiClient
-    c = OwuiClient("http://your-owui-host:8080", "admin@example.com", "***REMOVED***")
+    c = OwuiClient("http://localhost:8080", "admin@example.com", "your-password")
     c.login()
     chats = c.list_chats()
     c.set_chat_title(chat_id, "My Title")
 
-Usage as CLI:
-    python3 owui_api.py login
+Usage as CLI (reads OWUI_URL / OWUI_EMAIL / OWUI_PASSWORD from the environment):
+    OWUI_URL=http://localhost:8080 OWUI_EMAIL=admin@example.com OWUI_PASSWORD=secret \
+        python3 owui_api.py login
     python3 owui_api.py list-chats
     python3 owui_api.py set-title <chat_id> "Title"
 """
@@ -57,9 +58,9 @@ class OwuiClient:
     def from_env() -> "OwuiClient":
         """Create from OWUI_URL, OWUI_EMAIL, OWUI_PASSWORD env vars."""
         return OwuiClient(
-            os.environ.get("OWUI_URL", "http://your-owui-host:8080"),
-            os.environ.get("OWUI_EMAIL", "admin@example.com"),
-            os.environ.get("OWUI_PASSWORD", "***REMOVED***"),
+            os.environ.get("OWUI_URL", "http://localhost:8080"),
+            os.environ.get("OWUI_EMAIL", ""),
+            os.environ.get("OWUI_PASSWORD", ""),
         )
 
     # ── Low-level ────────────────────────────────────────────────────

@@ -3,11 +3,12 @@
 Bidirectional integration between [OpenClaw Gateway](https://github.com/openclaw/openclaw)
 and [Open WebUI](https://openwebui.com/). The primary component is a **Pipe** function
 that connects via OpenClaw's native WebSocket protocol — giving you real-time
-streaming, tool call rendering, and persistent agent sessions inside OWUI's chat
-interface.
+streaming, native tool-call rendering, and persistent agent sessions inside OWUI's chat
+interface. A companion **Action** function adds a live session/usage lookup button
+to the message toolbar.
 
-> No separate proxy, no Node.js middleware, no Python subprocess. Just a single
-> Python file you paste into OWUI's admin panel.
+> No separate proxy, no Node.js middleware, no Python subprocess. Just two
+> Python files you paste into OWUI's admin panel.
 
 <p align="center">
   <img src="./owui-screenshot.svg" alt="OpenClaw Gateway Pipe in action — streaming text, tool call rendering, and model selection inside Open WebUI" width="90%">
@@ -19,37 +20,44 @@ interface.
 
 - **🔴 Real-time streaming** — assistant responses appear token-by-token, not
   all at once at the end
-- **🛠️ Tool call rendering** — tools show up as native collapsible
-  `<details type="tool_calls">` blocks in the chat
+- **🛠️ Native tool-call rendering** — tool calls are yielded as Responses-API
+  output items, so OWUI renders them as native two-phase tool cards (spinner
+  while running, result on finish) instead of ad-hoc HTML
 - **💬 Persistent sessions** — each OWUI conversation gets a stable OpenClaw
   session key (`agent:main:openwebui-{user_id}-{chat_id}`), so the agent
   remembers context across messages
-- **🧭 Model selector entries** — one pipe exposes both `OpenClaw · Default`
-  and `ChatGPT · GPT-5.5` in OWUI's model selector
-- **🔐 Ed25519 device auth** — full WebSocket handshake with challenge/response
+- **🧭 Dynamic model selector** — the pipe discovers every model the Gateway
+  knows about (`models.list`) and lists one entry per model, with an optional
+  whitelist and a size cap; legacy fixed presets (ChatGPT/Opus/Sonnet/GLM) are
+  kept only for backward compatibility
+- **❓ Ask-user modal** — agents can call a `request_user_input` tool to pop a
+  real OWUI input/choice dialog mid-run instead of guessing at free text (see
+  [`docs/ask-user-modal.md`](./docs/ask-user-modal.md))
+- **📊 Status Action button** — a companion Action function adds a toolbar
+  button that fetches live session/usage data from the Gateway on demand,
+  reusing the Pipe's connection when one is already open
+- **🏷️ Auto-title** — generates a chat title after the first exchange on a
+  separate agent lane (`title-gen`), so it never queues behind the main
+  conversation
+- **🔐 Ed25519 device auth** — full WebSocket handshake with challenge/response,
+  with a permanent device identity that survives restarts and reinstalls
 - **🖼️ Native OWUI media support** — `MEDIA:` files are uploaded to the
-  Open WebUI Files API and attached to the assistant message; the old file
+  Open WebUI Files API and attached to the assistant message; a plain file
   server remains as a fallback
 - **⚙️ Configurable** — settings live in OWUI valves; device identity/token
   also persist in a state directory so restarts do not force re-pairing
 
 ---
 
-## ⚠️ Known Limitations (v0.5)
+## 📦 Two Functions
 
-This version works well for basic chat but has known issues being tracked for v1:
+| File | OWUI type | Purpose |
+|------|-----------|---------|
+| [`openclaw_pipe.py`](./openclaw_pipe.py) | Pipe (manifold) | The chat integration — everything above |
+| [`openclaw_status_action.py`](./openclaw_status_action.py) | Action | Message-toolbar button for on-demand session/usage lookups; reuses the Pipe's live connection and device identity, no second pairing |
 
-| Issue | Description | Status |
-|-------|-------------|--------|
-| **Concurrent messages** | Sending a message while the agent is still responding now steers into the active run (no lock, no blocking, no garbling). | ✅ Fixed — persistent WS + steering |
-| **No stop button** | Pressing stop in OWUI now sends `chat.abort`, then `/stop` as a fallback for Gateway runtimes where `chat.abort` does not stop active tool subprocesses. | ✅ Fixed — CancelledError triggers abort + `/stop` fallback |
-| **60s idle timeout** | Long agent runs no longer treat silence as completion before assistant text arrives. Session-only terminal events are dispatched when unambiguous, and quiet periods probe `sessions.preview` before recovering or continuing. | ✅ Fixed — terminal/recovery flow + deadman only |
-| **Per-message reconnect** | WS handshake + crypto every message is gone. | ✅ Fixed — singleton connection |
-| **Session bleed** | Events from other chats/surfaces can appear mid-response. | ✅ Fixed — event dispatcher demuxes by sessionKey/runId |
-| **Title/tag pollution** | OWUI background tasks (auto-title, tags, follow-up suggestions) pollute the OpenClaw session. | ✅ Fixed — task short-circuit (Phase 0) |
-| **Sender metadata** | "Sender (untrusted metadata)" block visible on every message; sender is hardcoded `id:"test"`. | Pending — Gateway schema limits client.id enum; needs further investigation |
-| **Image serving** | Images use base64 data-URI or a separate file server URL. Mixed-content blocked on HTTPS OWUI. | ✅ Fixed — OWUI Files API upload + file-server fallback |
-| **Restart context loss** | Restarting the pipe mid-turn loses the in-flight state (OpenClaw limitation). | Workaround — avoid restarting mid-run |
+Both are generated from the same `src/openclaw_pipe_pkg/` source fragments —
+see [Development](#-development) if you're contributing.
 
 ---
 
@@ -104,7 +112,6 @@ export GATEWAY_URL=your-owui-host:18789
 export GATEWAY_TOKEN=your-gateway-token
 export AGENT_ID=main
 export OWUI_API_BASE_URL=http://your-owui-host:8080
-export CHATGPT_MODEL=openai/gpt-5.5
 
 # Install or update the pipe in place, then run a smoke test
 uv run install.py install
@@ -145,6 +152,12 @@ The script will:
 > The old `delete+create` cycle that wiped `DEVICE_IDENTITY` and forced
 > re-approval is gone.
 
+The installer currently manages `openclaw_pipe.py` only. To install the
+companion Status Action, use the manual steps below with
+[`openclaw_status_action.py`](./openclaw_status_action.py); it must point at
+the same `STATE_DIR` and `AGENT_ID` as the Pipe so it can reuse the existing
+device identity and connection.
+
 ### Restart-safe state
 
 The pipe loads identity in this order:
@@ -159,22 +172,33 @@ new devices or requiring repeated approvals.
 
 ### OWUI model selector
 
-The pipe is a manifold function, so one OWUI function ID exposes multiple models:
+The pipe is a manifold function: `pipes()` calls the Gateway's `models.list`
+RPC (falling back to a cached list, then a small hardcoded list, if the
+Gateway is unreachable) and returns one selector entry per discovered model,
+plus an always-present `OpenClaw · Default` entry. Selecting a model patches
+that OWUI conversation's OpenClaw session to that model; switching back to
+`Default` clears the override and returns to the agent's configured default.
 
-| OWUI model ID | Display name | OpenClaw behavior |
-|---------------|--------------|-------------------|
-| `openclaw_gateway.default` | `OpenClaw · Default` | Uses the agent's configured default model |
-| `openclaw_gateway.chatgpt` | `ChatGPT · GPT-5.5` | Patches that OWUI conversation's OpenClaw session to `CHATGPT_MODEL` |
-| `openclaw_gateway.opus` | `Claude · Opus 4.8` | Patches that OWUI conversation's OpenClaw session to `OPUS_MODEL` |
-| `openclaw_gateway.sonnet` | `Claude · Sonnet 5` | Patches that OWUI conversation's OpenClaw session to `SONNET_MODEL` |
+Relevant valves:
 
-The default ChatGPT override is `openai/gpt-5.5`. Change model overrides with
-the `CHATGPT_MODEL`, `OPUS_MODEL`, and `SONNET_MODEL` valves in OWUI.
+| Valve | Description |
+|-------|-------------|
+| `CONFIGURED_MODELS` | Comma-separated whitelist of model keys to show. Empty = show all discovered models. |
+| `DEFAULT_MODEL` | Model used when `OpenClaw · Default` is selected. Also doubles as a reference dropdown of known model keys. |
+| `MAX_MODELS` | Safety cap on how many models the selector lists when there's no whitelist (default `30`). |
 
-One OWUI conversation maps to one OpenClaw session regardless of the selected
-model. Switching selector entries patches that same session before sending the
-next message; switching back to `OpenClaw · Default` clears the session model
-override and returns to the agent's configured default model.
+**Legacy fixed presets** (`ChatGPT · GPT-5.5`, `Claude · Opus 4.8`,
+`Claude · Sonnet 5`, `GLM 5.2`) still work via the `CHATGPT_MODEL`,
+`OPUS_MODEL`, `SONNET_MODEL`, and `GLM_MODEL` valves, kept only for backward
+compatibility with conversations that already picked one of them. New
+installs should rely on dynamic discovery instead of these valves.
+
+### Auto-generated chat titles
+
+When `AUTO_TITLE` is enabled (default), the pipe generates a chat title after
+the first exchange, similar to native OWUI behavior. Title generation runs on
+a separate agent lane (`TITLE_GEN_AGENT_ID`, default `title-gen`) so it never
+queues behind — or pollutes — the main conversation's session.
 
 ### Native OWUI media delivery
 
@@ -199,7 +223,6 @@ Relevant valves:
 | `OWUI_API_KEY` | Optional API key for uploads; the current request bearer token is preferred |
 | `FILE_SERVER_BASE_URL` | Legacy fallback URL for the pipe file server |
 | `SEND_STOP_ON_CANCEL` | Send `/stop` after `chat.abort` when OWUI cancels a stream (default: `True`) |
-| `CHATGPT_MODEL` | OpenClaw model used by the `ChatGPT · GPT-5.5` selector entry |
 
 ### Approve the device in the Gateway
 
@@ -236,10 +259,13 @@ If you can't run the script, install manually:
    | `USE_OWUI_FILES` | `True` (native OWUI Files API media support) |
    | `OWUI_BASE_URL` | Open WebUI base URL reachable from the OWUI backend |
    | `SEND_STOP_ON_CANCEL` | `True` (workaround for `chat.abort` not stopping active tool subprocesses) |
-   | `CHATGPT_MODEL` | OpenClaw model for the ChatGPT selector entry |
 
-6. Choose `OpenClaw · Default` or `ChatGPT · GPT-5.5` as your model and start
-   chatting
+6. Choose `OpenClaw · Default` (or any discovered model) and start chatting
+
+Optionally repeat the same steps for the Status Action, creating an
+**Action** function (not a Pipe) with the contents of
+[`openclaw_status_action.py`](./openclaw_status_action.py), and matching
+`STATE_DIR`/`AGENT_ID` valves.
 
 ---
 
@@ -311,7 +337,7 @@ will be documented here.
 │                      │                      │                  │
 │  OWUI renders:       │                      └──────────────────┘
 │   • Text streaming   │
-│   • Tool call cards  │
+│   • Native tool cards│
 │   • Status updates   │
 │   • Media links      │
 └──────────────────────┘
@@ -319,16 +345,23 @@ will be documented here.
 
 The pipe:
 1. Receives the user's message from OWUI
-2. Opens a WebSocket connection to the Gateway
-3. Performs the Ed25519 challenge/response handshake
+2. Opens (or reuses) a persistent, singleton WebSocket connection to the
+   Gateway, shared across all conversations
+3. Performs the Ed25519 challenge/response handshake once, on first use
 4. Sends the message with a stable session key
 5. **Yields** each event chunk back to OWUI:
    - `stream="assistant"` → text delta → **yielded** for streaming
-   - `stream="tool"` → tool result → **yielded** as `<details>` HTML
+   - `stream="tool"` → tool call → **yielded** as a native Responses-API
+     output item, so OWUI renders a two-phase tool card (spinner while
+     running, result on finish) instead of hand-built HTML
    - `stream="lifecycle"` → end signal → **done**
 
 Because the pipe is an **async generator** (uses `yield` instead of `return`),
-OWUI streams each chunk to the frontend in real time.
+OWUI streams each chunk to the frontend in real time. Once content is yielded
+it's frozen on screen for the rest of the run — the pipe can still update
+what's saved to the OWUI database afterward, but not what's already rendered
+— so anything meant to change later (like a tool result replacing a spinner)
+has to be sent as a fresh item, not a patch to an old one.
 
 ---
 
@@ -339,12 +372,13 @@ OWUI streams each chunk to the frontend in real time.
 | Text appears all at once | Pipe uses `return` instead of `yield` (check your code) |
 | "No GATEWAY_TOKEN configured" | Valve not set — go to Admin → Functions → edit valves |
 | "Connection error" in chat | OWUI can't reach `GATEWAY_URL` — check network connectivity |
-| Model missing from selector | Run `uv run install.py repair`; it ensures the function is active/global and visible in `/api/v1/models` |
+| Model missing from selector | Run `uv run install.py repair`; it ensures the function is active/global and visible in `/api/v1/models`. Also check `CONFIGURED_MODELS` isn't filtering it out. |
 | "pairing required" | Run `uv run install.py repair` or approve the matching request with `openclaw devices approve <request-id>` |
-| Image still uses `:18791` | OWUI file upload failed and the pipe fell back; check `OWUI_BASE_URL`, request auth/API key, and OWUI logs |
+| Image still uses the legacy file server | OWUI file upload failed and the pipe fell back; check `OWUI_BASE_URL`, request auth/API key, and OWUI logs |
 | Tool calls not showing | The `__event_emitter__` calls fail silently; check OWUI backend logs |
 | Device identity not persisting | Check `STATE_DIR` and the `DEVICE_IDENTITY` valve; run `uv run install.py healthcheck` |
 | Stream stops mid-response | WS timeout (60s default); check agent response time |
+| Restarting mid-turn loses context | Known OpenClaw limitation — avoid restarting the Gateway while a run is in flight |
 
 Check OWUI's backend logs for `[openclaw-pipe]` prefixed messages.
 
@@ -354,17 +388,67 @@ Check OWUI's backend logs for `[openclaw-pipe]` prefixed messages.
 
 ```
 openclaw-openwebui-integration/
-├── openclaw_pipe.py    # The pipe — paste this into OWUI
-├── install.py          # Automated installer script
-├── backups/            # Local install backups (ignored by git)
-├── README.md           # This file
-├── LICENSE             # MIT
-└── .gitignore          # Ignores .pipe_device_identity.json
+├── openclaw_pipe.py           # Built artifact — paste this into OWUI (Pipe)
+├── openclaw_status_action.py  # Built artifact — paste this into OWUI (Action)
+├── src/openclaw_pipe_pkg/     # Source of truth — edit these, not the artifacts above
+│   ├── pipe.py                 # Pipe class: valves, model selector, pipe() entry point
+│   ├── gateway.py               # WebSocket connection, handshake, event dispatch/demux
+│   ├── action.py                 # Status Action class
+│   ├── askuser.py                 # request_user_input tool + modal plumbing
+│   ├── emit.py                     # Event emission / tool-card formatting helpers
+│   ├── media.py                     # MEDIA: directive handling, OWUI Files API upload
+│   ├── models.py                     # Dynamic model discovery, whitelist, fallback list
+│   ├── identity.py                    # Ed25519 device identity load/generate/persist
+│   └── state.py                        # STATE_DIR read/write helpers
+├── build.py                    # Concatenates src/ fragments into the artifacts above
+├── install.py                  # Automated installer/updater/healthcheck script
+├── install_action.py           # Same, for the Status Action
+├── test_*.py                   # Unit + integration test suites (see Development)
+├── scripts/                    # Auxiliary scripts (OWUI API client, auto-title test)
+├── docs/                       # Design docs (e.g. ask-user-modal.md)
+├── backups/                    # Local install backups (gitignored)
+├── README.md                   # This file
+├── LICENSE                     # MIT
+└── .gitignore
 ```
 
 > `.pipe_device_identity.json` is created by `install.py` to persist the
 > device identity across re-installs. It contains a private key — **do not**
 > commit or share it.
+
+---
+
+## 🧑‍💻 Development
+
+`openclaw_pipe.py` and `openclaw_status_action.py` are **built artifacts** —
+don't hand-edit them. Edit the fragments under `src/openclaw_pipe_pkg/`, then
+rebuild:
+
+```bash
+python3 build.py            # rebuild both artifacts (DEV-ONLY blocks stripped)
+python3 build.py --check    # verify committed artifacts match src/ (CI drift guard)
+```
+
+Why a hand-written concatenation instead of a bundler: OWUI reads a function
+as a single flat `.py` file, using the frontmatter docstring for metadata and
+introspecting a top-level `Pipe`/`Action` class directly — most bundlers
+break one or both of those.
+
+### Running the tests
+
+```bash
+uv run --with pytest --with pydantic --with websockets --with cryptography \
+  --with click --with rich pytest -q
+```
+
+Most of the suite (`test_pipe_unit.py`, `test_status_action_unit.py`,
+`test_build.py`, `test_devcoord_unit.py`, `test_install_unit.py`) is pure
+unit tests with no external dependencies. `test_pipe.py` and
+`scripts/test_auto_title.py` are **integration tests** that need a real,
+reachable OWUI instance with valid admin credentials (see env vars in
+[Installation](#-installation-automated)) — they will fail with `401
+Not authenticated` or timeouts if pointed at nothing, which is expected in a
+sandbox with no live OWUI to talk to.
 
 ---
 
