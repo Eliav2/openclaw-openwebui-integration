@@ -74,6 +74,8 @@ from openclaw_pipe import (
     _render_tool_result_block,
     _tool_call_started_event,
     _tool_call_result_event,
+    _tool_call_error_relabel_event,
+    _tool_error_banner,
     _append_proactive_message_to_chat,
     _emit_live_bootstrap_reload,
     LIVE_STREAM_BOOTSTRAP_ENABLED,
@@ -1694,6 +1696,68 @@ class NativeToolItemTests(unittest.TestCase):
         valves = Pipe.Valves()
         self.assertFalse(hasattr(valves, "NATIVE_TOOL_ITEMS"))
         self.assertFalse(hasattr(valves, "SHOW_RUNNING_TOOL_CARDS"))
+
+
+class ToolErrorIndicationTests(unittest.TestCase):
+    """A failed tool call must LOOK failed.
+
+    OWUI's card picks its status icon from `isDone` alone — spinner, green
+    check, or wrench, with no failure branch (`ToolCallDisplay.svelte:136`) —
+    so the only outcome-carrying field we control is the name shown in the
+    collapsed row, plus the Output text behind it.
+    """
+
+    def test_relabel_replaces_the_item_in_place(self):
+        """`added` would append a second card; only `done` replaces."""
+        ev = _tool_call_error_relabel_event("Bash", "call-1", '{"command": "ls /nope"}')
+        self.assertEqual(ev["type"], "response.output_item.done")
+        self.assertEqual(ev["item"]["type"], "function_call")
+
+    def test_relabel_targets_the_started_item(self):
+        """Same id AND call_id as the start event: the id is what makes this a
+        replacement rather than a new item, and the call_id is what keeps it
+        paired with its result."""
+        start = _tool_call_started_event("Bash", "call-1", "{}")
+        relabel = _tool_call_error_relabel_event("Bash", "call-1", "{}")
+        self.assertEqual(relabel["item"]["id"], start["item"]["id"])
+        self.assertEqual(relabel["item"]["call_id"], start["item"]["call_id"])
+
+    def test_relabel_marks_the_name(self):
+        ev = _tool_call_error_relabel_event("Bash", "call-1", "{}")
+        self.assertEqual(ev["item"]["name"], "Bash ❌")
+
+    def test_relabel_sends_no_output_index(self):
+        """Deliberate: OWUI defaults to the last item, and the caller only
+        relabels when the started item IS last. A wrong explicit index would
+        overwrite a text item and eat visible message content."""
+        ev = _tool_call_error_relabel_event("Bash", "call-1", "{}")
+        self.assertNotIn("output_index", ev)
+
+    def test_relabel_keeps_arguments(self):
+        """It replaces the item wholesale — dropping arguments would blank the
+        card's Input section."""
+        ev = _tool_call_error_relabel_event("Bash", "call-1", '{"command": "ls /nope"}')
+        self.assertEqual(ev["item"]["arguments"], '{"command": "ls /nope"}')
+
+    def test_relabel_status_still_counts_as_done(self):
+        """`isDoneStatus` accepts 'failed' (`structuredOutput.ts:102`), so the
+        card must not fall back to a spinner."""
+        ev = _tool_call_error_relabel_event("Bash", "call-1", "{}")
+        self.assertIn(ev["item"]["status"], ("completed", "failed", "incomplete"))
+
+    def test_relabel_arguments_are_capped(self):
+        ev = _tool_call_error_relabel_event("Bash", "call-1", "x" * 20000)
+        self.assertEqual(len(ev["item"]["arguments"]), 3000)
+
+    def test_relabel_is_json_serializable(self):
+        json.dumps(_tool_call_error_relabel_event("Bash", "call-1", '{"a": 1}'))
+
+    def test_banner_precedes_the_original_output(self):
+        """The banner is the fallback when the card can't be relabeled, so it
+        must never cost the actual error text."""
+        banner = _tool_error_banner("ls: cannot access '/nope'")
+        self.assertTrue(banner.startswith("❌"))
+        self.assertIn("ls: cannot access '/nope'", banner)
 
 
 class ParityFinalizeTests(unittest.TestCase):

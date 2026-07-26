@@ -336,6 +336,52 @@ def _tool_call_result_event(tool_call_id: str, result_str: str) -> dict:
     }
 
 
+TOOL_ERROR_MARK = "❌"
+
+
+def _tool_call_error_relabel_event(name: str, tool_call_id: str,
+                                   args_str: str) -> dict:
+    """Re-emit a failed call's `function_call` item with ❌ in its name.
+
+    The card's collapsed row shows `attributes.name` and nothing else about
+    outcome: its status icon is chosen by `isDone` alone, with no failure
+    branch (`ToolCallDisplay.svelte:136`), so a red icon is unreachable
+    without patching OWUI. The name is the only outcome-carrying field we
+    control, and it renders through `Markdown`, so an emoji survives.
+
+    `response.output_item.done` REPLACES `output[output_index]`, defaulting to
+    the last item (`middleware.py:708`). We deliberately send no
+    `output_index`: the caller only uses this when the started item is still
+    last, which is exactly when the default is correct. Tracking real indices
+    would mean mirroring OWUI's list, and guessing wrong here overwrites a
+    text item — silently eating visible message content.
+
+    Every field from the start event is repeated because this replaces the
+    item wholesale; dropping `arguments` would blank the card's Input section.
+    """
+    return {
+        "type": "response.output_item.done",
+        "item": {
+            "type": "function_call",
+            "id": f"fc_{tool_call_id}",
+            "call_id": tool_call_id,
+            "name": f"{name} {TOOL_ERROR_MARK}",
+            "arguments": args_str[:3000],
+            "status": "failed",
+        },
+    }
+
+
+def _tool_error_banner(result_str: str) -> str:
+    """Prefix a failed tool's Output with an explicit failure line.
+
+    Used both as the fallback when the card label can't be safely relabeled
+    (parallel calls) and alongside a relabel, so the reason is visible once
+    the card is expanded rather than only implied by the ❌.
+    """
+    return f"{TOOL_ERROR_MARK} tool call failed\n\n{result_str}"
+
+
 def _render_tool_result_block(name: str, tool_call_id: str, args_str: str,
                               result_str: str, meta) -> str:
     """Render a finished tool call as OWUI's collapsible `tool_calls` card.

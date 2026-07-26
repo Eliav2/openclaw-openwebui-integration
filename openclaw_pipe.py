@@ -1615,6 +1615,52 @@ def _tool_call_result_event(tool_call_id: str, result_str: str) -> dict:
     }
 
 
+TOOL_ERROR_MARK = "❌"
+
+
+def _tool_call_error_relabel_event(name: str, tool_call_id: str,
+                                   args_str: str) -> dict:
+    """Re-emit a failed call's `function_call` item with ❌ in its name.
+
+    The card's collapsed row shows `attributes.name` and nothing else about
+    outcome: its status icon is chosen by `isDone` alone, with no failure
+    branch (`ToolCallDisplay.svelte:136`), so a red icon is unreachable
+    without patching OWUI. The name is the only outcome-carrying field we
+    control, and it renders through `Markdown`, so an emoji survives.
+
+    `response.output_item.done` REPLACES `output[output_index]`, defaulting to
+    the last item (`middleware.py:708`). We deliberately send no
+    `output_index`: the caller only uses this when the started item is still
+    last, which is exactly when the default is correct. Tracking real indices
+    would mean mirroring OWUI's list, and guessing wrong here overwrites a
+    text item — silently eating visible message content.
+
+    Every field from the start event is repeated because this replaces the
+    item wholesale; dropping `arguments` would blank the card's Input section.
+    """
+    return {
+        "type": "response.output_item.done",
+        "item": {
+            "type": "function_call",
+            "id": f"fc_{tool_call_id}",
+            "call_id": tool_call_id,
+            "name": f"{name} {TOOL_ERROR_MARK}",
+            "arguments": args_str[:3000],
+            "status": "failed",
+        },
+    }
+
+
+def _tool_error_banner(result_str: str) -> str:
+    """Prefix a failed tool's Output with an explicit failure line.
+
+    Used both as the fallback when the card label can't be safely relabeled
+    (parallel calls) and alongside a relabel, so the reason is visible once
+    the card is expanded rather than only implied by the ❌.
+    """
+    return f"{TOOL_ERROR_MARK} tool call failed\n\n{result_str}"
+
+
 def _render_tool_result_block(name: str, tool_call_id: str, args_str: str,
                               result_str: str, meta) -> str:
     """Render a finished tool call as OWUI's collapsible `tool_calls` card.
@@ -4492,6 +4538,12 @@ class Pipe:
         # not been completed by a matching result item yet. Anything left
         # here when the run ends would render as a spinner forever.
         pending_tool_calls: set[str] = set()
+        # toolCallId of the `function_call` item yielded most recently, held
+        # only while it is still the LAST item in OWUI's output list; anything
+        # else we yield clears it. A failed call can only be relabeled (❌ in
+        # the card name) while it is last, because the relabel event replaces
+        # by index and we send none — see `_tool_call_error_relabel_event`.
+        relabelable_tool_call: str | None = None
         pending_prompt_text = ""
         pending_media_text = ""
         last_snapshot_text = ""
@@ -4541,9 +4593,14 @@ class Pipe:
             return session_row.get("status")
 
         def record_visible_chunk(chunk: str):
-            nonlocal visible_message_text
+            nonlocal visible_message_text, relabelable_tool_call
             if chunk:
                 visible_message_text += chunk
+                # Text either extends OWUI's last output item or appends a new
+                # `message` one (`middleware.py:4452`); either way the
+                # `function_call` we were holding is no longer last, so an
+                # index-less relabel would now overwrite this text instead.
+                relabelable_tool_call = None
 
         async def maybe_emit_snapshot(*, force: bool = False):
             nonlocal last_snapshot_text, last_snapshot_time
@@ -4977,6 +5034,12 @@ class Pipe:
                                     # path must not duplicate it as markdown.
                                     pending_tool_calls.add(tool_call_id)
                                     yield _tool_call_started_event(name, tool_call_id, args)
+                                    # Now the last item in OWUI's output list,
+                                    # so a relabel on failure can target it
+                                    # without an output_index. A second start
+                                    # (parallel calls) displaces the first,
+                                    # which then falls back to the banner.
+                                    relabelable_tool_call = tool_call_id
                                 await _emit_status(
                                     __event_emitter__,
                                     f"Running {name}...",
@@ -4988,9 +5051,28 @@ class Pipe:
                                 result = data.get("result", {})
                                 result_str = json.dumps(result) if not isinstance(result, str) else result
                                 tool_call_id = data.get("toolCallId", "")
+                                # The Gateway already tells us the outcome
+                                # (`execute.runtime`'s emitCliToolResult); the
+                                # card just never showed it.
+                                is_error = data.get("isError") is True
                                 stored_args = self._active_tool_args.pop(tool_call_id, None)
                                 args_str = stored_args or json.dumps(data.get("args", {}))
-                                pipe_log(f"  Tool result: {name} ({len(result_str)} chars)")
+                                pipe_log(
+                                    f"  Tool result: {name} ({len(result_str)} chars)"
+                                    f"{' [error]' if is_error else ''}"
+                                )
+                                if is_error:
+                                    if tool_call_id and relabelable_tool_call == tool_call_id:
+                                        # Replaces the started item in place:
+                                        # the collapsed row becomes
+                                        # "View Result from **<name> ❌**",
+                                        # and OWUI persists it, so the mark
+                                        # survives a reload.
+                                        yield _tool_call_error_relabel_event(
+                                            name, tool_call_id, args_str,
+                                        )
+                                    result_str = _tool_error_banner(result_str)
+                                relabelable_tool_call = None
                                 if tool_call_id:
                                     # Completes the item yielded at start: the shared
                                     # call_id is what flips that card to done and
