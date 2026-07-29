@@ -718,6 +718,98 @@ class _GatewayConnection:
         # introduce time (a zombie sees the claim and never double-introduces).
         self._relay_sessions: dict[str, "_RelayState"] = {}
 
+        # Subagents-drawer live tool watches (ELI-26), keyed by session key:
+        # {"refs": int, "calls": {toolCallId: card}}. Populated from
+        # `session.tool` events for keys an open drawer has subscribed to.
+        # Instance-local, like the renderers above: only the singleton
+        # connection reads the socket, and a zombie never holds a watch.
+        self._tool_watches: dict[str, dict] = {}
+
+    # ── Live tool watches (subagents drawer) ────────────────────────
+
+    async def watch_session_tools(self, session_key: str) -> None:
+        """Start buffering `session_key`'s live tool calls, subscribing to its
+        message events on first watcher.
+
+        Ref-counted: two drawers open on the same subagent share one
+        subscription, and the last one to leave unsubscribes.
+        """
+        if not session_key:
+            return
+        watch = self._tool_watches.get(session_key)
+        if watch is not None:
+            watch["refs"] += 1
+            return
+        self._tool_watches[session_key] = {"refs": 1, "calls": {}}
+        try:
+            await self.send_request(
+                "sessions.messages.subscribe", dict(key=session_key), timeout=8,
+            )
+        except Exception as ex:
+            # Keep the (empty) watch registered rather than raising: the drawer
+            # still works off chat.history, it just won't gain live rows.
+            pipe_log(f"[tool-watch] subscribe failed for {session_key}: {ex}")
+
+    async def unwatch_session_tools(self, session_key: str) -> None:
+        """Drop one watcher; unsubscribe and free the buffer when the last
+        watcher leaves."""
+        watch = self._tool_watches.get(session_key)
+        if watch is None:
+            return
+        watch["refs"] -= 1
+        if watch["refs"] > 0:
+            return
+        self._tool_watches.pop(session_key, None)
+        try:
+            await self.send_request(
+                "sessions.messages.unsubscribe", dict(key=session_key), timeout=8,
+            )
+        except Exception as ex:
+            pipe_log(f"[tool-watch] unsubscribe failed for {session_key}: {ex}")
+
+    def _feed_tool_watch(self, payload: dict) -> None:
+        """Fold one `session.tool` event into its session's live buffer.
+
+        Event shape (captured live 2026-07-30):
+          phase="start"  -> name, toolCallId, args
+          phase="result" -> name, toolCallId, isError, result
+        Only keys with an open watch are buffered, so an unrelated subscription
+        can't grow memory here.
+        """
+        watch = self._tool_watches.get(payload.get("sessionKey", ""))
+        if watch is None:
+            return
+        data = payload.get("data", {}) or {}
+        tcid = data.get("toolCallId")
+        if not tcid:
+            return
+        calls = watch["calls"]
+        card = calls.get(tcid)
+        if card is None:
+            # Bound memory per watch; a drawer only ever renders the tail.
+            if len(calls) >= 500:
+                for stale in list(calls)[:250]:
+                    calls.pop(stale, None)
+            card = {"id": tcid, "name": data.get("name") or "tool",
+                    "arguments": "", "result": None, "isError": False}
+            calls[tcid] = card
+        if data.get("name"):
+            card["name"] = data["name"]
+        if data.get("phase") == "start":
+            args = data.get("args")
+            if args is not None:
+                card["arguments"] = json.dumps(args, indent=2)
+        elif data.get("phase") == "result":
+            result = data.get("result")
+            card["result"] = result if isinstance(result, str) else json.dumps(result)
+            card["isError"] = bool(data.get("isError"))
+
+    def live_tool_calls(self, session_key: str) -> list:
+        """Buffered live tool calls for `session_key`, oldest first (dict
+        insertion order == event arrival order). Empty when not watched."""
+        watch = self._tool_watches.get(session_key)
+        return list(watch["calls"].values()) if watch else []
+
     def register_run_target(self, session_key: str, run_id: str,
                             chat_id: str | None, message_id: str | None) -> None:
         """Remember that this run streams into OWUI message `message_id` in
@@ -1254,6 +1346,20 @@ class _GatewayConnection:
 
                 # ── Tick keepalive (silently consume) ──
                 if msg.get("event") == "tick" or msg.get("payload", {}).get("isHeartbeat"):
+                    continue
+
+                # ── Subagent-drawer live tool watch (ELI-26) ──
+                # `session.tool` is a THIRD event family, delivered only to a
+                # connection that called sessions.messages.subscribe for that
+                # session key. It is the only source of a RUNNING session's
+                # tool calls: chat.history can't show them, because an
+                # in-flight turn isn't written to the session store until it
+                # completes (verified 2026-07-30 — a subagent mid-run returns
+                # only its seed user messages, then every tool call lands at
+                # once on completion). Handled before the agent/chat filter
+                # below, which would otherwise drop it.
+                if msg.get("event") == "session.tool":
+                    self._feed_tool_watch(msg.get("payload", {}) or {})
                     continue
 
                 # ── Event dispatch ──

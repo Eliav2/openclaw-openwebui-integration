@@ -909,6 +909,129 @@ class LiveRelayTests(unittest.TestCase):
             await _relay_feed_event(conn, sk, run_id, self._evt(sk, run_id, final=True))
 
 
+class LiveToolWatchTests(unittest.IsolatedAsyncioTestCase):
+    """Buffers `session.tool` events for a session an open subagents drawer is
+    watching. Event shape captured off the live wire 2026-07-30:
+      phase="start"  -> {name, toolCallId, args}
+      phase="result" -> {name, toolCallId, isError, result}
+    This is the ONLY source of a running agent's tool calls -- chat.history
+    cannot see an in-flight turn, because it isn't written to the session
+    store until the turn completes (ELI-26).
+    """
+
+    SK = "agent:main:subagent:abc"
+
+    def _conn(self):
+        conn = _GatewayConnection(lambda: None)
+        conn.send_request = mock.AsyncMock(return_value={"subscribed": True})
+        return conn
+
+    @staticmethod
+    def _evt(session_key, phase, tcid, **data):
+        return {"sessionKey": session_key, "stream": "tool",
+                "data": {"phase": phase, "toolCallId": tcid, **data}}
+
+    async def test_start_then_result_builds_one_card(self):
+        conn = self._conn()
+        await conn.watch_session_tools(self.SK)
+        conn._feed_tool_watch(self._evt(self.SK, "start", "t1", name="Bash",
+                                        args={"command": "date"}))
+        conn._feed_tool_watch(self._evt(self.SK, "result", "t1", name="Bash",
+                                        result="Wed", isError=False))
+
+        calls = conn.live_tool_calls(self.SK)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["name"], "Bash")
+        self.assertIn("date", calls[0]["arguments"])
+        self.assertEqual(calls[0]["result"], "Wed")
+        self.assertFalse(calls[0]["isError"])
+
+    async def test_started_but_unfinished_call_has_no_result(self):
+        conn = self._conn()
+        await conn.watch_session_tools(self.SK)
+        conn._feed_tool_watch(self._evt(self.SK, "start", "t1", name="Grep", args={}))
+        self.assertIsNone(conn.live_tool_calls(self.SK)[0]["result"])
+
+    async def test_error_result_is_flagged(self):
+        conn = self._conn()
+        await conn.watch_session_tools(self.SK)
+        conn._feed_tool_watch(self._evt(self.SK, "result", "t1", name="Read",
+                                        result="boom", isError=True))
+        self.assertTrue(conn.live_tool_calls(self.SK)[0]["isError"])
+
+    async def test_events_for_unwatched_sessions_are_ignored(self):
+        conn = self._conn()
+        await conn.watch_session_tools(self.SK)
+        conn._feed_tool_watch(self._evt("some-other-session", "start", "x1", name="Bash"))
+        self.assertEqual(conn.live_tool_calls(self.SK), [])
+        self.assertEqual(conn.live_tool_calls("some-other-session"), [])
+
+    async def test_watch_is_ref_counted_and_subscribes_once(self):
+        conn = self._conn()
+        await conn.watch_session_tools(self.SK)
+        await conn.watch_session_tools(self.SK)
+        subscribes = [c for c in conn.send_request.await_args_list
+                      if c.args[0] == "sessions.messages.subscribe"]
+        self.assertEqual(len(subscribes), 1)
+
+        # First release keeps the buffer alive for the other drawer...
+        conn._feed_tool_watch(self._evt(self.SK, "start", "t1", name="Bash"))
+        await conn.unwatch_session_tools(self.SK)
+        self.assertEqual(len(conn.live_tool_calls(self.SK)), 1)
+
+        # ...the last one tears it down and unsubscribes.
+        await conn.unwatch_session_tools(self.SK)
+        self.assertEqual(conn.live_tool_calls(self.SK), [])
+        unsubs = [c for c in conn.send_request.await_args_list
+                  if c.args[0] == "sessions.messages.unsubscribe"]
+        self.assertEqual(len(unsubs), 1)
+
+    async def test_reader_loop_routes_session_tool_events(self):
+        """Regression guard for the actual dispatch bug: the reader loop's
+        event filter only accepted ("agent", "chat"), so `session.tool` was
+        silently dropped and the buffer never filled no matter what the
+        drawer subscribed to.
+        """
+        conn = _GatewayConnection(lambda: None)
+        conn.send_request = mock.AsyncMock(return_value={"subscribed": True})
+        await conn.watch_session_tools(self.SK)
+
+        frames = [
+            json.dumps({"type": "event", "event": "session.tool", "payload": self._evt(
+                self.SK, "start", "t1", name="Bash", args={"command": "date"})}),
+            json.dumps({"type": "event", "event": "session.tool", "payload": self._evt(
+                self.SK, "result", "t1", name="Bash", result="Wed", isError=False)}),
+        ]
+
+        class FakeWS:
+            async def recv(self):
+                if frames:
+                    return frames.pop(0)
+                conn._stopped = True
+                raise websockets.exceptions.ConnectionClosed("closed")
+
+        conn._ws = FakeWS()
+        conn._max_backoff = 0
+        conn._connect_and_start = mock.AsyncMock()
+
+        await conn._event_loop()
+
+        calls = conn.live_tool_calls(self.SK)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["name"], "Bash")
+        self.assertEqual(calls[0]["result"], "Wed")
+
+    async def test_failed_subscribe_still_leaves_a_usable_watch(self):
+        """A failed subscribe must degrade the drawer to history-only, not
+        raise -- the tab is still useful for a finished subagent."""
+        conn = self._conn()
+        conn.send_request = mock.AsyncMock(side_effect=GatewayError("nope"))
+        await conn.watch_session_tools(self.SK)
+        self.assertEqual(conn.live_tool_calls(self.SK), [])
+        conn._feed_tool_watch(self._evt(self.SK, "start", "t1", name="Bash"))
+        self.assertEqual(len(conn.live_tool_calls(self.SK)), 1)
+
+
 class EventConsumerMatchingTests(unittest.TestCase):
     def test_matches_exact_session_and_run(self):
         conn = _GatewayConnection(lambda: None)

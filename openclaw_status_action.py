@@ -527,6 +527,52 @@ def _tool_call_result_event(tool_call_id: str, result_str: str) -> dict:
     }
 
 
+TOOL_ERROR_MARK = "❌"
+
+
+def _tool_call_error_relabel_event(name: str, tool_call_id: str,
+                                   args_str: str) -> dict:
+    """Re-emit a failed call's `function_call` item with ❌ in its name.
+
+    The card's collapsed row shows `attributes.name` and nothing else about
+    outcome: its status icon is chosen by `isDone` alone, with no failure
+    branch (`ToolCallDisplay.svelte:136`), so a red icon is unreachable
+    without patching OWUI. The name is the only outcome-carrying field we
+    control, and it renders through `Markdown`, so an emoji survives.
+
+    `response.output_item.done` REPLACES `output[output_index]`, defaulting to
+    the last item (`middleware.py:708`). We deliberately send no
+    `output_index`: the caller only uses this when the started item is still
+    last, which is exactly when the default is correct. Tracking real indices
+    would mean mirroring OWUI's list, and guessing wrong here overwrites a
+    text item — silently eating visible message content.
+
+    Every field from the start event is repeated because this replaces the
+    item wholesale; dropping `arguments` would blank the card's Input section.
+    """
+    return {
+        "type": "response.output_item.done",
+        "item": {
+            "type": "function_call",
+            "id": f"fc_{tool_call_id}",
+            "call_id": tool_call_id,
+            "name": f"{name} {TOOL_ERROR_MARK}",
+            "arguments": args_str[:3000],
+            "status": "failed",
+        },
+    }
+
+
+def _tool_error_banner(result_str: str) -> str:
+    """Prefix a failed tool's Output with an explicit failure line.
+
+    Used both as the fallback when the card label can't be safely relabeled
+    (parallel calls) and alongside a relabel, so the reason is visible once
+    the card is expanded rather than only implied by the ❌.
+    """
+    return f"{TOOL_ERROR_MARK} tool call failed\n\n{result_str}"
+
+
 def _render_tool_result_block(name: str, tool_call_id: str, args_str: str,
                               result_str: str, meta) -> str:
     """Render a finished tool call as OWUI's collapsible `tool_calls` card.
@@ -862,6 +908,98 @@ class _GatewayConnection:
         # already handled via the shared `_delivered_proactive` claim at
         # introduce time (a zombie sees the claim and never double-introduces).
         self._relay_sessions: dict[str, "_RelayState"] = {}
+
+        # Subagents-drawer live tool watches (ELI-26), keyed by session key:
+        # {"refs": int, "calls": {toolCallId: card}}. Populated from
+        # `session.tool` events for keys an open drawer has subscribed to.
+        # Instance-local, like the renderers above: only the singleton
+        # connection reads the socket, and a zombie never holds a watch.
+        self._tool_watches: dict[str, dict] = {}
+
+    # ── Live tool watches (subagents drawer) ────────────────────────
+
+    async def watch_session_tools(self, session_key: str) -> None:
+        """Start buffering `session_key`'s live tool calls, subscribing to its
+        message events on first watcher.
+
+        Ref-counted: two drawers open on the same subagent share one
+        subscription, and the last one to leave unsubscribes.
+        """
+        if not session_key:
+            return
+        watch = self._tool_watches.get(session_key)
+        if watch is not None:
+            watch["refs"] += 1
+            return
+        self._tool_watches[session_key] = {"refs": 1, "calls": {}}
+        try:
+            await self.send_request(
+                "sessions.messages.subscribe", dict(key=session_key), timeout=8,
+            )
+        except Exception as ex:
+            # Keep the (empty) watch registered rather than raising: the drawer
+            # still works off chat.history, it just won't gain live rows.
+            pipe_log(f"[tool-watch] subscribe failed for {session_key}: {ex}")
+
+    async def unwatch_session_tools(self, session_key: str) -> None:
+        """Drop one watcher; unsubscribe and free the buffer when the last
+        watcher leaves."""
+        watch = self._tool_watches.get(session_key)
+        if watch is None:
+            return
+        watch["refs"] -= 1
+        if watch["refs"] > 0:
+            return
+        self._tool_watches.pop(session_key, None)
+        try:
+            await self.send_request(
+                "sessions.messages.unsubscribe", dict(key=session_key), timeout=8,
+            )
+        except Exception as ex:
+            pipe_log(f"[tool-watch] unsubscribe failed for {session_key}: {ex}")
+
+    def _feed_tool_watch(self, payload: dict) -> None:
+        """Fold one `session.tool` event into its session's live buffer.
+
+        Event shape (captured live 2026-07-30):
+          phase="start"  -> name, toolCallId, args
+          phase="result" -> name, toolCallId, isError, result
+        Only keys with an open watch are buffered, so an unrelated subscription
+        can't grow memory here.
+        """
+        watch = self._tool_watches.get(payload.get("sessionKey", ""))
+        if watch is None:
+            return
+        data = payload.get("data", {}) or {}
+        tcid = data.get("toolCallId")
+        if not tcid:
+            return
+        calls = watch["calls"]
+        card = calls.get(tcid)
+        if card is None:
+            # Bound memory per watch; a drawer only ever renders the tail.
+            if len(calls) >= 500:
+                for stale in list(calls)[:250]:
+                    calls.pop(stale, None)
+            card = {"id": tcid, "name": data.get("name") or "tool",
+                    "arguments": "", "result": None, "isError": False}
+            calls[tcid] = card
+        if data.get("name"):
+            card["name"] = data["name"]
+        if data.get("phase") == "start":
+            args = data.get("args")
+            if args is not None:
+                card["arguments"] = json.dumps(args, indent=2)
+        elif data.get("phase") == "result":
+            result = data.get("result")
+            card["result"] = result if isinstance(result, str) else json.dumps(result)
+            card["isError"] = bool(data.get("isError"))
+
+    def live_tool_calls(self, session_key: str) -> list:
+        """Buffered live tool calls for `session_key`, oldest first (dict
+        insertion order == event arrival order). Empty when not watched."""
+        watch = self._tool_watches.get(session_key)
+        return list(watch["calls"].values()) if watch else []
 
     def register_run_target(self, session_key: str, run_id: str,
                             chat_id: str | None, message_id: str | None) -> None:
@@ -1399,6 +1537,20 @@ class _GatewayConnection:
 
                 # ── Tick keepalive (silently consume) ──
                 if msg.get("event") == "tick" or msg.get("payload", {}).get("isHeartbeat"):
+                    continue
+
+                # ── Subagent-drawer live tool watch (ELI-26) ──
+                # `session.tool` is a THIRD event family, delivered only to a
+                # connection that called sessions.messages.subscribe for that
+                # session key. It is the only source of a RUNNING session's
+                # tool calls: chat.history can't show them, because an
+                # in-flight turn isn't written to the session store until it
+                # completes (verified 2026-07-30 — a subagent mid-run returns
+                # only its seed user messages, then every tool call lands at
+                # once on completion). Handled before the agent/chat filter
+                # below, which would otherwise drop it.
+                if msg.get("event") == "session.tool":
+                    self._feed_tool_watch(msg.get("payload", {}) or {})
                     continue
 
                 # ── Event dispatch ──
@@ -3724,7 +3876,12 @@ _DRAWER_TOOLS_FILL_JS_TEMPLATE = r"""
     details.className = 'mb-2 rounded-lg border border-gray-100 dark:border-gray-800 px-2.5 py-1.5';
     const summary = document.createElement('summary');
     summary.className = 'text-xs font-medium cursor-pointer text-gray-700 dark:text-gray-200';
-    summary.textContent = '🔧 ' + c.name;
+    // A card with no result yet is a call the subagent is running RIGHT NOW
+    // (only reachable via the live event buffer -- chat.history never shows a
+    // half-finished call), so it gets its own marker rather than looking
+    // indistinguishable from one that returned nothing.
+    const mark = c.isError ? '❌' : (c.result === null || c.result === undefined ? '⏳' : '🔧');
+    summary.textContent = mark + ' ' + c.name;
     details.appendChild(summary);
 
     const argsEl = document.createElement('pre');
@@ -3859,6 +4016,7 @@ def _extract_transcript_and_tools(messages: list) -> tuple[list, list]:
                         if item.get("arguments") is not None else ""
                     ),
                     "result": None,
+                    "isError": False,
                 }
                 pending_by_id[call["id"]] = call
                 tool_calls.append(call)
@@ -3867,9 +4025,38 @@ def _extract_transcript_and_tools(messages: list) -> tuple[list, list]:
                 if call is not None:
                     result = item.get("content")
                     call["result"] = result if isinstance(result, str) else json.dumps(result)
+                    # Real tool_result rows carry is_error; surfacing it here
+                    # lets the card mark a failure the same way the inline
+                    # chat tool cards already do.
+                    call["isError"] = bool(item.get("is_error"))
         if text_parts:
             text_rows.append({"role": role, "text": "\n".join(text_parts)})
     return text_rows, tool_calls
+
+
+def _merge_live_tool_calls(history_calls: list, live_calls: list) -> list:
+    """Overlays a session's live `session.tool` buffer onto the tool calls read
+    from chat.history, de-duplicated by tool-call id.
+
+    Why this exists: chat.history alone shows NOTHING for a running agent --
+    an in-flight turn isn't written to the session store until it completes,
+    so the drawer's whole reason for existing (watching a subagent work) was
+    the one case it could not show. The live buffer fills exactly that gap.
+
+    History wins on conflict: once a turn flushes, its persisted row carries
+    the full result, whereas a live card may have been captured mid-flight (or
+    missed its `start` phase if the drawer opened part-way through a call).
+    Live-only cards append after the persisted ones, which is also their
+    chronological place -- anything still only in the buffer is by definition
+    newer than anything already flushed.
+    """
+    seen = {c.get("id") for c in history_calls if c.get("id")}
+    merged = list(history_calls)
+    for call in live_calls:
+        if call.get("id") in seen:
+            continue
+        merged.append(call)
+    return merged
 
 
 class Action:
@@ -4306,6 +4493,30 @@ class Action:
             }})
             return {"status": "error", "detail": str(ex)}
 
+        # `_subagent_detail_poll_loop` holds a live tool watch on the child
+        # session; releasing it here (rather than inside the loop) covers every
+        # exit path at once -- terminal status, deadline, or an error return.
+        watch_state: dict = {"key": None}
+        try:
+            return await self._subagent_detail_poll_loop(
+                conn, source, task_id, watch_state, __event_emitter__,
+            )
+        finally:
+            if watch_state["key"]:
+                try:
+                    await conn.unwatch_session_tools(watch_state["key"])
+                except Exception as ex:
+                    pipe_log(f"[status-action] unwatch failed: {ex}")
+
+    async def _subagent_detail_poll_loop(self, conn, source, task_id,
+                                         watch_state, __event_emitter__):
+        """The drawer's poll body: refresh task/session/history + live tools
+        every _SUBAGENT_POLL_INTERVAL_S until the subagent reaches a terminal
+        status or _SUBAGENT_POLL_MAX_S elapses.
+
+        Records the watched child session key into `watch_state` so the caller
+        can release the subscription on any exit path.
+        """
         deadline = time.time() + _SUBAGENT_POLL_MAX_S
         while True:
             try:
@@ -4331,6 +4542,13 @@ class Action:
             tool_calls: list = []
 
             if child_key:
+                # Start the live tool watch before the first history read, so
+                # tool calls the subagent makes during this very poll cycle are
+                # already being buffered. Idempotent + ref-counted, so calling
+                # it on every tick costs nothing after the first.
+                if watch_state["key"] != child_key:
+                    await conn.watch_session_tools(child_key)
+                    watch_state["key"] = child_key
                 try:
                     desc_resp, history_resp = await asyncio.gather(
                         conn.send_request("sessions.describe", dict(key=child_key), timeout=8),
@@ -4361,6 +4579,11 @@ class Action:
 
                 text_rows, tool_calls = _extract_transcript_and_tools(
                     (history_resp or {}).get("messages") or []
+                )
+                # chat.history is blind to the in-flight turn; the live buffer
+                # is the only thing that shows a working subagent's tool calls.
+                tool_calls = _merge_live_tool_calls(
+                    tool_calls, conn.live_tool_calls(child_key)
                 )
 
             fetched_at = time.strftime("%H:%M:%S")

@@ -70,6 +70,7 @@ from openclaw_status_action import (  # noqa: E402
     Action,
     _extract_transcript_and_tools,
     _get_action_connection,
+    _merge_live_tool_calls,
     _owui_session_key,
     _render_context_fill_js,
     _render_drawer_open_js,
@@ -595,6 +596,88 @@ class ExtractTranscriptAndToolsTests(unittest.TestCase):
         self.assertEqual(text_rows, [])
         self.assertEqual(tool_calls, [])
 
+    def test_marks_failed_tool_result_as_error(self):
+        text_rows, tool_calls = _extract_transcript_and_tools([
+            {"role": "assistant", "content": [
+                {"type": "toolcall", "id": "t1", "name": "Bash", "arguments": {"command": "nope"}},
+                {"type": "tool_result", "tool_use_id": "t1", "content": "boom",
+                 "is_error": True, "name": "Bash"},
+            ]},
+        ])
+        self.assertTrue(tool_calls[0]["isError"])
+
+    def test_running_session_history_yields_no_tool_calls(self):
+        """The regression this whole live-buffer path exists for.
+
+        Measured against the real gateway (2026-07-30): while a subagent is
+        RUNNING, chat.history returns only its seed user message(s) -- an
+        in-flight turn isn't written to the session store until it completes,
+        at which point every tool call appears at once. So history alone can
+        never populate the Tools tab for a working subagent, which is exactly
+        the case the drawer was built to watch.
+        """
+        running_history = [
+            {"role": "user", "content": "[Subagent Context] You are running as a subagent"},
+            {"role": "user", "content": "[Inter-session message] status?"},
+        ]
+        text_rows, tool_calls = _extract_transcript_and_tools(running_history)
+        self.assertEqual(tool_calls, [])
+        self.assertEqual(len(text_rows), 2)
+
+
+class MergeLiveToolCallsTests(unittest.TestCase):
+    """Live cards come from `session.tool` gateway events, whose shape was
+    captured off the wire 2026-07-30:
+      phase="start"  -> {name, toolCallId, args}
+      phase="result" -> {name, toolCallId, isError, result}
+    Their toolCallId is the SAME id chat.history reports as a toolcall's `id`
+    (verified: ids matched across both sources for one live session), which is
+    what makes de-duplication by id sound.
+    """
+
+    @staticmethod
+    def _card(cid, name="Bash", result=None, is_error=False):
+        return {"id": cid, "name": name, "arguments": "{}",
+                "result": result, "isError": is_error}
+
+    def test_live_calls_fill_an_empty_history(self):
+        merged = _merge_live_tool_calls([], [self._card("t1"), self._card("t2")])
+        self.assertEqual([c["id"] for c in merged], ["t1", "t2"])
+
+    def test_history_wins_over_live_for_the_same_call(self):
+        history = [self._card("t1", result="full persisted result")]
+        live = [self._card("t1", result="truncated mid-flight")]
+        merged = _merge_live_tool_calls(history, live)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["result"], "full persisted result")
+
+    def test_live_only_calls_append_after_persisted_ones(self):
+        merged = _merge_live_tool_calls(
+            [self._card("t1", result="done")],
+            [self._card("t1", result="done"), self._card("t2"), self._card("t3")],
+        )
+        self.assertEqual([c["id"] for c in merged], ["t1", "t2", "t3"])
+
+    def test_pending_live_call_has_no_result(self):
+        """A started-but-unfinished call is what the ⏳ marker renders from."""
+        merged = _merge_live_tool_calls([], [self._card("t9")])
+        self.assertIsNone(merged[0]["result"])
+
+
+def _drawer_conn(send_request, live_tool_calls=()):
+    """Fake gateway connection with the drawer's live-tool-watch surface.
+
+    `watch_session_tools`/`unwatch_session_tools` are awaited by the poll
+    loop, and `live_tool_calls` returns whatever the `session.tool` event
+    buffer would hold for the watched child session.
+    """
+    conn = mock.Mock()
+    conn.send_request = mock.AsyncMock(side_effect=send_request)
+    conn.watch_session_tools = mock.AsyncMock()
+    conn.unwatch_session_tools = mock.AsyncMock()
+    conn.live_tool_calls = mock.Mock(return_value=list(live_tool_calls))
+    return conn
+
 
 class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
     """The Subagents section's rows fetch back to this same Action with a
@@ -650,8 +733,7 @@ class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
                 return {"messages": [{"role": "assistant", "content": [{"type": "text", "text": "working on it"}]}]}
             raise AssertionError(f"unexpected RPC: {method}")
 
-        fake_conn = mock.Mock()
-        fake_conn.send_request = mock.AsyncMock(side_effect=fake_send_request)
+        fake_conn = _drawer_conn(fake_send_request)
 
         with mock.patch("openclaw_status_action._get_action_connection",
                          new=mock.AsyncMock(return_value=(fake_conn, "pipe"))), \
@@ -661,11 +743,66 @@ class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "ok")
         # Looped (running -> completed), not a single-iteration happy path.
         self.assertEqual(get_calls["n"], 2)
+        # Watch opened once for the child session and released on exit.
+        fake_conn.watch_session_tools.assert_awaited_once_with("child-sess-1")
+        fake_conn.unwatch_session_tools.assert_awaited_once_with("child-sess-1")
         codes = _emitted_codes(emitted)
         self.assertIn("openclaw-drawer-root", codes[0])  # initial open
         self.assertTrue(any("openclaw-drawer-section-overview" in c for c in codes))
         self.assertTrue(any("openclaw-drawer-section-transcript" in c and "working on it" in c for c in codes))
         self.assertTrue(any("openclaw-drawer-section-tools" in c for c in codes))
+
+    async def test_running_subagent_renders_live_tool_calls(self):
+        """End-to-end guard for the bug this path fixes.
+
+        chat.history returns what a RUNNING subagent really returns -- seed
+        user messages only, zero tool calls (measured against the live gateway
+        2026-07-30). Everything the Tools tab shows here therefore comes from
+        the `session.tool` live buffer. Before the buffer existed this tab
+        rendered "No tool calls yet." for the entire run, which is precisely
+        what Eliav hit when he inspected a running agent.
+        """
+        action = Action()
+        emitted = []
+
+        async def emitter(evt):
+            emitted.append(evt)
+
+        async def fake_send_request(method, params, timeout=5):
+            if method == "tasks.get":
+                return {"task": {"id": "task-1", "title": "Research X", "status": "completed",
+                                 "childSessionKey": "child-sess-1", "startedAt": 1783790000000}}
+            if method == "sessions.describe":
+                return {"session": {"modelProvider": "anthropic", "model": "claude-sonnet-5"}}
+            if method == "chat.history":
+                return {"messages": [
+                    {"role": "user", "content": "[Subagent Context] running as a subagent"},
+                ]}
+            raise AssertionError(f"unexpected RPC: {method}")
+
+        live = [
+            {"id": "toolu_a", "name": "Bash", "arguments": '{\n  "command": "date"\n}',
+             "result": "Wed Jul 29", "isError": False},
+            {"id": "toolu_b", "name": "Grep", "arguments": "{}", "result": None, "isError": False},
+            {"id": "toolu_c", "name": "Read", "arguments": "{}", "result": "boom", "isError": True},
+        ]
+        fake_conn = _drawer_conn(fake_send_request, live_tool_calls=live)
+
+        with mock.patch("openclaw_status_action._get_action_connection",
+                         new=mock.AsyncMock(return_value=(fake_conn, "pipe"))), \
+             mock.patch("openclaw_status_action.asyncio.sleep", new=mock.AsyncMock()):
+            result = await action._run_subagent_detail(self.DETAIL_BODY, {"id": "u1"}, emitter)
+
+        self.assertEqual(result["status"], "ok")
+        tools_code = [c for c in _emitted_codes(emitted)
+                      if "openclaw-drawer-section-tools" in c]
+        self.assertTrue(tools_code, "no Tools tab fill was emitted")
+        payload = tools_code[-1]
+        # All three live calls reached the tab, and it is NOT the empty state.
+        for name in ("Bash", "Grep", "Read"):
+            self.assertIn(name, payload)
+        self.assertIn("toolu_a", payload)
+        self.assertIn('"isError": true', payload.replace("'", '"'))
 
     async def test_deadline_bounds_the_loop(self):
         action = Action()
@@ -679,8 +816,7 @@ class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
                 return {"task": {"id": "task-1", "status": "running", "childSessionKey": None}}
             raise AssertionError(f"unexpected RPC: {method}")
 
-        fake_conn = mock.Mock()
-        fake_conn.send_request = mock.AsyncMock(side_effect=fake_send_request)
+        fake_conn = _drawer_conn(fake_send_request)
 
         # Simulate the poll deadline elapsing without a real wait: each
         # asyncio.sleep call jumps the fake clock forward past it immediately.
