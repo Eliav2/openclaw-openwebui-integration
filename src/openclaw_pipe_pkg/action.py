@@ -962,12 +962,9 @@ _DRAWER_TOOLS_FILL_JS_TEMPLATE = r"""
     details.className = 'mb-2 rounded-lg border border-gray-100 dark:border-gray-800 px-2.5 py-1.5';
     const summary = document.createElement('summary');
     summary.className = 'text-xs font-medium cursor-pointer text-gray-700 dark:text-gray-200';
-    // A card with no result yet is a call the subagent is running RIGHT NOW
-    // (only reachable via the live event buffer -- chat.history never shows a
-    // half-finished call), so it gets its own marker rather than looking
-    // indistinguishable from one that returned nothing.
-    const mark = c.isError ? '❌' : (c.result === null || c.result === undefined ? '⏳' : '🔧');
-    summary.textContent = mark + ' ' + c.name;
+    // Only ❌ vs 🔧 here: every card comes from chat.history, which only ever
+    // holds finished calls, so there is no in-flight state to distinguish.
+    summary.textContent = (c.isError ? '❌' : '🔧') + ' ' + c.name;
     details.appendChild(summary);
 
     const argsEl = document.createElement('pre');
@@ -1118,31 +1115,6 @@ def _extract_transcript_and_tools(messages: list) -> tuple[list, list]:
         if text_parts:
             text_rows.append({"role": role, "text": "\n".join(text_parts)})
     return text_rows, tool_calls
-
-
-def _merge_live_tool_calls(history_calls: list, live_calls: list) -> list:
-    """Overlays a session's live `session.tool` buffer onto the tool calls read
-    from chat.history, de-duplicated by tool-call id.
-
-    Why this exists: chat.history alone shows NOTHING for a running agent --
-    an in-flight turn isn't written to the session store until it completes,
-    so the drawer's whole reason for existing (watching a subagent work) was
-    the one case it could not show. The live buffer fills exactly that gap.
-
-    History wins on conflict: once a turn flushes, its persisted row carries
-    the full result, whereas a live card may have been captured mid-flight (or
-    missed its `start` phase if the drawer opened part-way through a call).
-    Live-only cards append after the persisted ones, which is also their
-    chronological place -- anything still only in the buffer is by definition
-    newer than anything already flushed.
-    """
-    seen = {c.get("id") for c in history_calls if c.get("id")}
-    merged = list(history_calls)
-    for call in live_calls:
-        if call.get("id") in seen:
-            continue
-        merged.append(call)
-    return merged
 
 
 class Action:
@@ -1579,29 +1551,15 @@ class Action:
             }})
             return {"status": "error", "detail": str(ex)}
 
-        # `_subagent_detail_poll_loop` holds a live tool watch on the child
-        # session; releasing it here (rather than inside the loop) covers every
-        # exit path at once -- terminal status, deadline, or an error return.
-        watch_state: dict = {"key": None}
-        try:
-            return await self._subagent_detail_poll_loop(
-                conn, source, task_id, watch_state, __event_emitter__,
-            )
-        finally:
-            if watch_state["key"]:
-                try:
-                    await conn.unwatch_session_tools(watch_state["key"])
-                except Exception as ex:
-                    pipe_log(f"[status-action] unwatch failed: {ex}")
+        return await self._subagent_detail_poll_loop(
+            conn, source, task_id, __event_emitter__,
+        )
 
     async def _subagent_detail_poll_loop(self, conn, source, task_id,
-                                         watch_state, __event_emitter__):
-        """The drawer's poll body: refresh task/session/history + live tools
-        every _SUBAGENT_POLL_INTERVAL_S until the subagent reaches a terminal
-        status or _SUBAGENT_POLL_MAX_S elapses.
-
-        Records the watched child session key into `watch_state` so the caller
-        can release the subscription on any exit path.
+                                         __event_emitter__):
+        """The drawer's poll body: refresh task/session/history every
+        _SUBAGENT_POLL_INTERVAL_S until the subagent reaches a terminal status
+        or _SUBAGENT_POLL_MAX_S elapses.
         """
         deadline = time.time() + _SUBAGENT_POLL_MAX_S
         while True:
@@ -1628,13 +1586,6 @@ class Action:
             tool_calls: list = []
 
             if child_key:
-                # Start the live tool watch before the first history read, so
-                # tool calls the subagent makes during this very poll cycle are
-                # already being buffered. Idempotent + ref-counted, so calling
-                # it on every tick costs nothing after the first.
-                if watch_state["key"] != child_key:
-                    await conn.watch_session_tools(child_key)
-                    watch_state["key"] = child_key
                 try:
                     desc_resp, history_resp = await asyncio.gather(
                         conn.send_request("sessions.describe", dict(key=child_key), timeout=8),
@@ -1663,13 +1614,14 @@ class Action:
                     if goal_line:
                         goal_data = {"line": goal_line}
 
+                # KNOWN GAP (ELI-26): chat.history is blind to the in-flight
+                # turn, so while the subagent is running this yields nothing and
+                # every tool call appears at once when the turn flushes. There
+                # is no pipe-side fix -- a running session's tool events reach
+                # only the connection that started the run. See the note in
+                # gateway.py's reader loop for the measurement.
                 text_rows, tool_calls = _extract_transcript_and_tools(
                     (history_resp or {}).get("messages") or []
-                )
-                # chat.history is blind to the in-flight turn; the live buffer
-                # is the only thing that shows a working subagent's tool calls.
-                tool_calls = _merge_live_tool_calls(
-                    tool_calls, conn.live_tool_calls(child_key)
                 )
 
             fetched_at = time.strftime("%H:%M:%S")
