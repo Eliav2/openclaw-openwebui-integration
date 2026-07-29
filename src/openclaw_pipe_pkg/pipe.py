@@ -1252,6 +1252,20 @@ class Pipe:
                                     f"{' [error]' if is_error else ''}"
                                 )
                                 if is_error:
+                                    # Log the gate decision, always. Without it a
+                                    # skipped relabel is invisible, which is
+                                    # indistinguishable from the error branch never
+                                    # running at all. That ambiguity is exactly why
+                                    # ELI-75 read as a missing feature for months
+                                    # while the branch was in fact running and only
+                                    # the relabel was being skipped.
+                                    pipe_log(
+                                        f"  relabel gate: call={tool_call_id!r} "
+                                        f"held={relabelable_tool_call!r} "
+                                        + ("FIRE" if tool_call_id
+                                           and relabelable_tool_call == tool_call_id
+                                           else "SKIP")
+                                    )
                                     if tool_call_id and relabelable_tool_call == tool_call_id:
                                         # Replaces the started item in place:
                                         # the collapsed row becomes
