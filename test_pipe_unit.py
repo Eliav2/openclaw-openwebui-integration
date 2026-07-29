@@ -1742,52 +1742,34 @@ class ToolErrorIndicationTests(unittest.TestCase):
     check, or wrench, with no failure branch (`ToolCallDisplay.svelte:136`) —
     so the only outcome-carrying field we control is the name shown in the
     collapsed row, plus the Output text behind it.
+
+    ELI-75: the previous shape here (`response.output_item.done`) looked
+    correct by inspection but was dead code in OWUI's own event handler — see
+    `RealHandlerReplayTests` below, which replays these events through an
+    extraction of that handler instead of asserting our belief about it.
     """
 
-    def test_relabel_replaces_the_item_in_place(self):
-        """`added` would append a second card; only `done` replaces."""
-        ev = _tool_call_error_relabel_event("Bash", "call-1", '{"command": "ls /nope"}')
-        self.assertEqual(ev["type"], "response.output_item.done")
-        self.assertEqual(ev["item"]["type"], "function_call")
-
-    def test_relabel_targets_the_started_item(self):
-        """Same id AND call_id as the start event: the id is what makes this a
-        replacement rather than a new item, and the call_id is what keeps it
-        paired with its result."""
-        start = _tool_call_started_event("Bash", "call-1", "{}")
-        relabel = _tool_call_error_relabel_event("Bash", "call-1", "{}")
-        self.assertEqual(relabel["item"]["id"], start["item"]["id"])
-        self.assertEqual(relabel["item"]["call_id"], start["item"]["call_id"])
+    def test_relabel_uses_the_generic_field_done_shape(self):
+        """`response.output_item.done` is unreachable in OWUI's handler (a
+        broader `.done` branch matches first and explicitly skips it); the
+        generic `<field>.done` arm of that same broader branch is the one
+        that actually runs and broadcasts."""
+        ev = _tool_call_error_relabel_event("Bash")
+        self.assertEqual(ev["type"], "response.name.done")
 
     def test_relabel_marks_the_name(self):
-        ev = _tool_call_error_relabel_event("Bash", "call-1", "{}")
-        self.assertEqual(ev["item"]["name"], "Bash ❌")
+        ev = _tool_call_error_relabel_event("Bash")
+        self.assertEqual(ev["name"], "Bash ❌")
 
     def test_relabel_sends_no_output_index(self):
         """Deliberate: OWUI defaults to the last item, and the caller only
         relabels when the started item IS last. A wrong explicit index would
         overwrite a text item and eat visible message content."""
-        ev = _tool_call_error_relabel_event("Bash", "call-1", "{}")
+        ev = _tool_call_error_relabel_event("Bash")
         self.assertNotIn("output_index", ev)
 
-    def test_relabel_keeps_arguments(self):
-        """It replaces the item wholesale — dropping arguments would blank the
-        card's Input section."""
-        ev = _tool_call_error_relabel_event("Bash", "call-1", '{"command": "ls /nope"}')
-        self.assertEqual(ev["item"]["arguments"], '{"command": "ls /nope"}')
-
-    def test_relabel_status_still_counts_as_done(self):
-        """`isDoneStatus` accepts 'failed' (`structuredOutput.ts:102`), so the
-        card must not fall back to a spinner."""
-        ev = _tool_call_error_relabel_event("Bash", "call-1", "{}")
-        self.assertIn(ev["item"]["status"], ("completed", "failed", "incomplete"))
-
-    def test_relabel_arguments_are_capped(self):
-        ev = _tool_call_error_relabel_event("Bash", "call-1", "x" * 20000)
-        self.assertEqual(len(ev["item"]["arguments"]), 3000)
-
     def test_relabel_is_json_serializable(self):
-        json.dumps(_tool_call_error_relabel_event("Bash", "call-1", '{"a": 1}'))
+        json.dumps(_tool_call_error_relabel_event("Bash"))
 
     def test_banner_precedes_the_original_output(self):
         """The banner is the fallback when the card can't be relabeled, so it
@@ -1795,6 +1777,95 @@ class ToolErrorIndicationTests(unittest.TestCase):
         banner = _tool_error_banner("ls: cannot access '/nope'")
         self.assertTrue(banner.startswith("❌"))
         self.assertIn("ls: cannot access '/nope'", banner)
+
+
+class RealHandlerReplayTests(unittest.TestCase):
+    """Replay our emitted events through an extraction of OWUI's actual
+    `handle_responses_streaming_event` (`test_fixture_owui_streaming_handler.py`)
+    instead of asserting our belief about what it does.
+
+    This is the regression guard for ELI-75: the old relabel event was
+    logically well-formed by every unit test above and still a no-op against
+    the real handler, because the handler treats `response.output_item.done`
+    as dead code. A test that only inspects our own event dicts cannot catch
+    that class of bug; only replaying through the real (extracted) handler
+    can.
+    """
+
+    def _replay(self, events, initial_output=()):
+        from test_fixture_owui_streaming_handler import (
+            handle_responses_streaming_event,
+        )
+
+        output = list(initial_output)
+        metadata_seq = []
+        for ev in events:
+            output, metadata = handle_responses_streaming_event(ev, output)
+            metadata_seq.append(metadata)
+        return output, metadata_seq
+
+    def test_relabel_lands_on_the_real_handler(self):
+        started = _tool_call_started_event("Read", "call-1", "{}")
+        relabel = _tool_call_error_relabel_event("Read")
+        result = _tool_call_result_event("call-1", "BANNER")
+
+        output, metadata_seq = self._replay([started, relabel, result])
+
+        function_call = next(item for item in output if item["type"] == "function_call")
+        self.assertEqual(function_call["name"], "Read ❌")
+        # The relabel step must itself trigger a broadcast (non-None
+        # metadata), not just silently mutate an output list nobody sees.
+        self.assertIsNotNone(metadata_seq[1])
+
+    def test_relabel_lands_with_preceding_text(self):
+        """Same replay, but with a streamed text item ahead of the tool call
+        — the generic field-done arm targets by output_index (default: last
+        item), so a leading item must not shift what gets relabeled."""
+        preceding_text = {
+            "type": "message",
+            "id": "msg_1",
+            "status": "in_progress",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "hi"}],
+        }
+        started = _tool_call_started_event("Read", "call-1", "{}")
+        relabel = _tool_call_error_relabel_event("Read")
+        result = _tool_call_result_event("call-1", "BANNER")
+
+        output, _ = self._replay(
+            [started, relabel, result], initial_output=[preceding_text]
+        )
+
+        function_call = next(item for item in output if item["type"] == "function_call")
+        self.assertEqual(function_call["name"], "Read ❌")
+
+    def test_the_old_shape_is_confirmed_dead_code(self):
+        """Documents WHY the fix was needed: replaying the old
+        `response.output_item.done` shape through the real handler is a
+        no-op. If this ever starts passing, OWUI has fixed the dead-code
+        branch upstream and the relabel could move back to it."""
+        from test_fixture_owui_streaming_handler import (
+            handle_responses_streaming_event,
+        )
+
+        started = _tool_call_started_event("Read", "call-1", "{}")
+        old_shape_relabel = {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "id": "fc_call-1",
+                "call_id": "call-1",
+                "name": "Read ❌",
+                "arguments": "{}",
+                "status": "failed",
+            },
+        }
+
+        output = [started["item"]]
+        output, metadata = handle_responses_streaming_event(old_shape_relabel, output)
+
+        self.assertIsNone(metadata)
+        self.assertEqual(output[0]["name"], "Read")
 
 
 class ParityFinalizeTests(unittest.TestCase):

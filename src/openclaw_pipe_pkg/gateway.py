@@ -339,8 +339,7 @@ def _tool_call_result_event(tool_call_id: str, result_str: str) -> dict:
 TOOL_ERROR_MARK = "❌"
 
 
-def _tool_call_error_relabel_event(name: str, tool_call_id: str,
-                                   args_str: str) -> dict:
+def _tool_call_error_relabel_event(name: str) -> dict:
     """Re-emit a failed call's `function_call` item with ❌ in its name.
 
     The card's collapsed row shows `attributes.name` and nothing else about
@@ -349,26 +348,26 @@ def _tool_call_error_relabel_event(name: str, tool_call_id: str,
     without patching OWUI. The name is the only outcome-carrying field we
     control, and it renders through `Markdown`, so an emoji survives.
 
-    `response.output_item.done` REPLACES `output[output_index]`, defaulting to
-    the last item (`middleware.py:708`). We deliberately send no
-    `output_index`: the caller only uses this when the started item is still
-    last, which is exactly when the default is correct. Tracking real indices
-    would mean mirroring OWUI's list, and guessing wrong here overwrites a
-    text item — silently eating visible message content.
+    `response.output_item.done` looks like the natural event for this, but in
+    OWUI's `handle_responses_streaming_event` it is dead code: the broader
+    `elif event_type.startswith('response.') and event_type.endswith('.done')`
+    branch matches first and explicitly skips `output_item` ("handled
+    specifically below" — it isn't reachable). So we instead use that
+    branch's own "Generic Field Done" arm, which for an unrecognized
+    `response.<field>.done` event does `item[<field>] = data[<field>]` on
+    `output[output_index]` (default: last item) and returns a non-None
+    metadata dict, which is what actually triggers the broadcast. No
+    `output_index` needed: the caller only uses this when the started item is
+    still last, which is exactly when the default is correct.
 
-    Every field from the start event is repeated because this replaces the
-    item wholesale; dropping `arguments` would blank the card's Input section.
+    Unlike the old (dead) `output_item.done` shape, this mutates the existing
+    item in place rather than replacing it wholesale, so `arguments`/`status`
+    don't need to be repeated here — they're already set on the item from the
+    start event and survive untouched.
     """
     return {
-        "type": "response.output_item.done",
-        "item": {
-            "type": "function_call",
-            "id": f"fc_{tool_call_id}",
-            "call_id": tool_call_id,
-            "name": f"{name} {TOOL_ERROR_MARK}",
-            "arguments": args_str[:3000],
-            "status": "failed",
-        },
+        "type": "response.name.done",
+        "name": f"{name} {TOOL_ERROR_MARK}",
     }
 
 

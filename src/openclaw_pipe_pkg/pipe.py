@@ -1267,14 +1267,14 @@ class Pipe:
                                            else "SKIP")
                                     )
                                     if tool_call_id and relabelable_tool_call == tool_call_id:
-                                        # Replaces the started item in place:
-                                        # the collapsed row becomes
-                                        # "View Result from **<name> ❌**",
-                                        # and OWUI persists it, so the mark
-                                        # survives a reload.
-                                        yield _tool_call_error_relabel_event(
-                                            name, tool_call_id, args_str,
-                                        )
+                                        # Mutates the started item's `name`
+                                        # field in place via OWUI's generic
+                                        # "<field>.done" handler: the
+                                        # collapsed row becomes "View Result
+                                        # from **<name> ❌**", and OWUI
+                                        # persists it, so the mark survives a
+                                        # reload.
+                                        yield _tool_call_error_relabel_event(name)
                                     result_str = _tool_error_banner(result_str)
                                 relabelable_tool_call = None
                                 if tool_call_id:
