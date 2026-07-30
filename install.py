@@ -383,10 +383,10 @@ def _assert_not_silently_downgrading_from_dev_bundle(cfg: Config) -> None:
         return  # live pipe isn't running the dev bundle -- nothing to downgrade
     raise SystemExit(
         "Refusing to deploy: the live pipe is currently running the dev bundle "
-        "(cross-agent deploy coordination, ELI-24), but this deploy would "
-        "overwrite it with the plain public artifact -- silently deleting that "
-        "coordination and bringing back the ELI-23 hazard (a mid-turn deploy "
-        "kills that turn's own generator) with no warning.\n"
+        "(which adds deploy coordination), but this deploy would overwrite it "
+        "with the plain public artifact -- silently removing that coordination "
+        "and restoring the hazard it exists to prevent: a deploy landing "
+        "mid-turn kills that turn's own generator, with no warning.\n"
         "If you meant to deploy the dev bundle, add --dev-bundle.\n"
         "If you really want to downgrade to the plain artifact on purpose, "
         "re-run with --confirm-downgrade-from-dev-bundle."

@@ -87,8 +87,12 @@ class Pipe:
             description="Optional OWUI API key for file uploads; request bearer token is preferred"
         )
         FILE_SERVER_BASE_URL: str = Field(
-            default="https://localhost:18791",
-            description="Public URL for the file server (for MEDIA: resolution)"
+            default="http://localhost:18791",
+            description="Legacy fallback only: base URL of the built-in media file "
+                "server, used when USE_OWUI_FILES is off or an upload fails. The "
+                "browser resolves this URL, not OWUI, so the default only works when "
+                "you browse OWUI from the same host. Point it at an address your "
+                "browser can reach if you depend on this fallback."
         )
         CONFIGURED_MODELS: str = Field(
             default="",
@@ -495,7 +499,7 @@ class Pipe:
         # DIAG (2026-07-18, ELI-56): log the OWUI message_id + a short content
         # hash of the user text so a *re-fired / duplicate* completion for the
         # same message — the suspected cause of the phantom "1-event, no-text"
-        # turns (e.g. on a socket reconnect over the tailscale proxy) — becomes
+        # turns (e.g. on a socket reconnect behind a reverse proxy) — becomes
         # visible: two pipe() invocations with the SAME owui_msg_id / text_sha
         # close together is a smoking gun. Pure logging, no behavior change.
         _diag_md = __metadata__ or {}

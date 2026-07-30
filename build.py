@@ -11,18 +11,25 @@ pydantic) are provided by the OWUI runtime and stay as normal imports — so the
 "bundle" is a deterministic ordered concatenation.
 
 Usage:
-  python3 build.py            # build -> openclaw_pipe.py (DEV-ONLY blocks stripped;
-                              # this is the artifact real users install)
-  python3 build.py --check    # build in memory, diff vs committed openclaw_pipe.py,
-                              # exit 1 if they differ (drift guard for CI/deploy)
-  python3 build.py --dev        # build -> openclaw_pipe.dev.py, DEV-ONLY blocks kept.
-                              # Internal-only (ELI-24 cross-agent deploy coordination);
-                              # gitignored, never distributed, rebuild before every
-                              # dev deploy.
-  python3 build.py --check-dev  # same drift guard, for the dev bundle
-  python3 build.py --action        # build -> openclaw_status_action.py, the
+  python3 build.py --all      # build BOTH distributed artifacts. Use this after
+                              # touching any fragment -- a fragment can feed both.
+  python3 build.py --check-all  # drift guard for BOTH artifacts. This is what CI
+                              # runs; exits 1 if either is stale.
+
+  python3 build.py            # build -> openclaw_pipe.py only (DEV-ONLY blocks
+                              # stripped; this is the artifact real users install)
+  python3 build.py --check    # drift guard for openclaw_pipe.py only
+  python3 build.py --action        # build -> openclaw_status_action.py only, the
                               # companion Action Function (see ARTIFACTS below)
-  python3 build.py --check-action  # same drift guard, for the action artifact
+  python3 build.py --check-action  # drift guard for openclaw_status_action.py only
+
+  python3 build.py --dev        # build -> openclaw_pipe.dev.py, DEV-ONLY blocks kept.
+                              # Internal-only deploy-coordination bundle; gitignored,
+                              # never distributed, rebuild before every dev deploy.
+  python3 build.py --check-dev  # same drift guard, for the dev bundle
+
+Each single-artifact invocation builds exactly one file. Prefer --all/--check-all
+so an edit to a shared fragment cannot leave the other artifact silently stale.
 """
 from __future__ import annotations
 import sys
@@ -162,38 +169,59 @@ def build(strip_dev_only: bool = True, artifact: Artifact = PIPE) -> str:
     return result
 
 
-def _check(out_path: Path, built: str, label: str) -> None:
+def _check(out_path: Path, built: str, rebuild_flag: str) -> bool:
+    """Compare a freshly built artifact against the committed one.
+
+    Returns True when in sync. `rebuild_flag` is the flag that REBUILDS this
+    artifact, not the flag that checks it -- telling someone to re-run the
+    check they just failed is useless advice.
+    """
     current = out_path.read_text() if out_path.exists() else ""
     if built != current:
-        print(f"DRIFT: {out_path.name} is out of date vs src/. Run: python3 build.py {label}",
+        cmd = f"python3 build.py {rebuild_flag}".rstrip()
+        print(f"DRIFT: {out_path.name} is out of date vs src/. Rebuild with: {cmd}",
               file=sys.stderr)
-        sys.exit(1)
+        return False
     print(f"{out_path.name} is in sync with src/ (no drift)")
+    return True
 
 
 def main():
+    do_all = "--all" in sys.argv or "--check-all" in sys.argv
     action = "--action" in sys.argv or "--check-action" in sys.argv
     dev = "--dev" in sys.argv or "--check-dev" in sys.argv
-    checking = any(a in sys.argv for a in ("--check", "--check-dev", "--check-action"))
+    checking = any(a in sys.argv
+                   for a in ("--check", "--check-dev", "--check-action", "--check-all"))
 
-    if action:
+    if do_all:
+        if dev or action:
+            print("--all/--check-all already covers both distributed artifacts; "
+                  "do not combine it with --action or --dev", file=sys.stderr)
+            sys.exit(2)
+        # Both distributed artifacts. The dev bundle is deliberately excluded:
+        # it is gitignored, so there is no committed copy to drift against.
+        targets = [(PIPE, PIPE.out, ""), (ACTION, ACTION.out, "--action")]
+    elif action:
         if dev:
             print("ACTION has no --dev variant yet", file=sys.stderr)
             sys.exit(2)
-        artifact, out_path, label = ACTION, ACTION.out, "--check-action"
+        targets = [(ACTION, ACTION.out, "--action")]
+    elif dev:
+        targets = [(PIPE, PIPE.dev_out, "--dev")]
     else:
-        artifact = PIPE
-        out_path = PIPE.dev_out if dev else PIPE.out
-        label = "--check-dev" if dev else "--check"
+        targets = [(PIPE, PIPE.out, "")]
 
-    built = build(strip_dev_only=not dev, artifact=artifact)
+    ok = True
+    for artifact, out_path, rebuild_flag in targets:
+        built = build(strip_dev_only=(rebuild_flag != "--dev"), artifact=artifact)
+        if checking:
+            ok = _check(out_path, built, rebuild_flag) and ok
+        else:
+            out_path.write_text(built)
+            print(f"built {out_path}  ({len(built.splitlines())} lines)")
 
-    if checking:
-        _check(out_path, built, label)
-        return
-
-    out_path.write_text(built)
-    print(f"built {out_path}  ({len(built.splitlines())} lines)")
+    if checking and not ok:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

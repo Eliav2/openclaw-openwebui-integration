@@ -12,6 +12,20 @@ import sys, os, time
 sys.path.insert(0, os.path.dirname(__file__))
 from owui_api import OwuiClient
 
+# Integration test: needs a live Open WebUI with the pipe installed. Skip under
+# pytest when that isn't configured, rather than failing -- see the note in
+# test_pipe.py on why an always-failing suite is worse than a skipped one.
+try:
+    import pytest
+except ImportError:  # standalone `python3 test_auto_title.py`
+    pass
+else:
+    pytestmark = pytest.mark.skipif(
+        not (os.environ.get("OWUI_EMAIL") and os.environ.get("OWUI_PASSWORD")),
+        reason="integration test: set OWUI_URL, OWUI_EMAIL and OWUI_PASSWORD "
+               "to run it against a live Open WebUI instance",
+    )
+
 
 def test_auto_title():
     c = OwuiClient.from_env()

@@ -102,8 +102,7 @@ class RenderJsTests(unittest.TestCase):
         self.assertTrue(js.strip().endswith("})();"))
 
     def test_open_js_creates_three_independent_section_skeletons(self):
-        """Eliav's explicit ask (2026-07-11): each query gets its own
-        loading state. Structural guard that the three sections exist as
+        """Each query gets its own loading state. Structural guard that the three sections exist as
         distinct, independently-targetable containers from the start."""
         js = _render_modal_open_js({"chatId": None, "messageId": None, "sessionId": None, "owuiModel": None})
         for section_id in (
@@ -145,8 +144,8 @@ class RenderJsTests(unittest.TestCase):
         self.assertIn("#10b981", js)  # emerald-500 equivalent
 
     def test_limits_shows_explicit_note_when_windows_empty(self):
-        """Regression guard for the confusion Eliav reported: 'why does it
-        sometimes show only Context and no Rate Limits?'. Root cause was a
+        """Regression guard for a reported confusion: "why does it sometimes
+        show only Context and no Rate Limits?". Root cause was a
         real gateway-side gap (usage.status can transiently report zero
         windows for the active provider while a run is in flight), not a
         bug here -- the section must always show its header (given a real
@@ -207,7 +206,7 @@ class RenderJsTests(unittest.TestCase):
         self.assertIn("localStorage.getItem('token')", js)
 
     def test_subagents_hidden_entirely_when_tasks_empty(self):
-        """'General tracking, no detail' (Eliav's ask): a permanently
+        """General tracking, no detail: a permanently
         visible empty section for the common idle case would be more
         clutter than signal -- gated in source, not just data-dependent
         text, so it truly renders nothing (not an empty header)."""
@@ -800,7 +799,7 @@ class SubagentProactiveMessageClickTests(unittest.IsolatedAsyncioTestCase):
     message is mode-less (OWUI itself never sends "mode") but carries a
     hidden `<!-- openclaw:taskId=... -->` marker in body["content"] (see
     `_deliver_subagent_proactive_owui_message` in gateway.py). Deliberately
-    no separate Action/button for this (Eliav's call, 2026-07-13) -- the
+    no separate Action/button for this -- the
     existing default click handler detects the marker and redirects into
     the same subagent-detail drawer instead of the general status dialog."""
 

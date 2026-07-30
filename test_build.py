@@ -4,6 +4,7 @@
 Run: python3 -m unittest test_build -v
 """
 import ast
+import re
 import subprocess
 import sys
 import unittest
@@ -16,6 +17,37 @@ BUILT = ROOT / "openclaw_pipe.py"
 DEV_BUILT = ROOT / "openclaw_pipe.dev.py"
 ACTION_BUILT = ROOT / "openclaw_status_action.py"
 PKG = ROOT / "src" / "openclaw_pipe_pkg"
+
+# Verbatim copy of open_webui.utils.plugin.extract_frontmatter (0.11.0).
+# Reimplemented rather than imported because OWUI is not a test dependency --
+# the artifacts have to satisfy OWUI's parser, not ours.
+_FRONTMATTER_RE = re.compile(r"^\s*([a-z_]+):\s*(.*)\s*$", re.IGNORECASE)
+
+
+def extract_frontmatter(content: str) -> dict:
+    frontmatter = {}
+    lines = content.splitlines()
+    if len(lines) < 1 or lines[0].strip() != '"""':
+        return {}
+    for line in lines[1:]:
+        if '"""' in line:
+            break
+        match = _FRONTMATTER_RE.match(line)
+        if match:
+            key, value = match.groups()
+            frontmatter[key.strip()] = value.strip()
+    return frontmatter
+
+
+# Keys OWUI reads off a distributed function. `requirements` is the load-bearing
+# one: OWUI pip-installs it on first load, so omitting it means every user on a
+# stock image hits ModuleNotFoundError for websockets/cryptography instead of a
+# working function. All of these silently parsed to {} before this was guarded.
+REQUIRED_FRONTMATTER_KEYS = (
+    "title", "author", "version", "license",
+    "requirements", "required_open_webui_version", "description",
+)
+REQUIRED_PY_MODULES = ("websockets", "cryptography")
 
 
 class BuildTests(unittest.TestCase):
@@ -36,6 +68,20 @@ class BuildTests(unittest.TestCase):
         self.assertIsInstance(first, ast.Expr)
         self.assertIsInstance(first.value, ast.Constant)
         self.assertIn("OpenClaw Gateway Pipe", first.value.value)
+
+    def test_owui_parses_frontmatter_metadata(self):
+        """OWUI must extract real metadata from the artifact, not an empty dict.
+
+        Prose alone parses to {}: OWUI's regex only picks up `key: value` lines.
+        Without `requirements`, OWUI never auto-installs websockets/cryptography
+        and a stock deployment fails to load the function at all.
+        """
+        fm = extract_frontmatter(BUILT.read_text())
+        self.assertTrue(fm, "OWUI would parse an empty frontmatter dict")
+        for key in REQUIRED_FRONTMATTER_KEYS:
+            self.assertIn(key, fm, f"frontmatter is missing '{key}'")
+        for mod in REQUIRED_PY_MODULES:
+            self.assertIn(mod, fm["requirements"])
 
     def test_pipe_class_is_top_level(self):
         """OWUI introspects a top-level `Pipe` class; it must not be buried
@@ -149,6 +195,15 @@ class StatusActionBuildTests(unittest.TestCase):
         self.assertIsInstance(first, ast.Expr)
         self.assertIsInstance(first.value, ast.Constant)
         self.assertIn("OpenClaw Status Action", first.value.value)
+
+    def test_owui_parses_frontmatter_metadata(self):
+        """Same contract as the Pipe -- see BuildTests for why this matters."""
+        fm = extract_frontmatter(ACTION_BUILT.read_text())
+        self.assertTrue(fm, "OWUI would parse an empty frontmatter dict")
+        for key in REQUIRED_FRONTMATTER_KEYS:
+            self.assertIn(key, fm, f"frontmatter is missing '{key}'")
+        for mod in REQUIRED_PY_MODULES:
+            self.assertIn(mod, fm["requirements"])
 
     def test_action_class_is_top_level(self):
         tree = ast.parse(ACTION_BUILT.read_text())

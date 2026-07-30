@@ -1,4 +1,14 @@
 """
+title: OpenClaw Status
+author: Eliav
+author_url: https://github.com/Eliav2
+project_url: https://github.com/Eliav2/openclaw-openwebui-integration
+version: 0.7.0
+license: MIT
+requirements: websockets, cryptography
+required_open_webui_version: 0.10.2
+description: Companion Action for the OpenClaw Gateway Pipe. Adds a message-toolbar button that fetches live OpenClaw session context and usage from the Gateway on demand.
+
 OpenClaw Status Action for Open WebUI
 =======================================
 
@@ -7,9 +17,8 @@ adds a button to the message toolbar. Clicking it fetches live session
 context/usage data from the OpenClaw Gateway on demand -- not cached from
 the last turn -- so it stays accurate even minutes after the last message.
 
-Milestone 1 scope: proves the connection path works. Shows the result as a
-toast notification. A richer dialog comes in a later milestone; this file
-does not touch the Pipe or its existing status-line behavior at all.
+The result is shown as a toast notification. This Action is read-only: it does
+not touch the Pipe or its status-line behavior.
 
 How it works
 ------------
@@ -25,21 +34,30 @@ How it works
 
 Requirements
 ------------
-- Open WebUI v0.9+ (tested on v0.10.x)
+- Open WebUI v0.10.2+ (developed and tested against 0.10.2 and 0.11.0)
 - The OpenClaw Gateway Pipe (openclaw_pipe.py) installed in the same OWUI
   instance -- this Action is a companion to it, not a replacement
-- Python modules: websockets, cryptography, pydantic (same as the Pipe)
+- Python modules: websockets, cryptography, pydantic (same as the Pipe).
+  Open WebUI ships pydantic and installs the other two from the
+  ``requirements:`` field above.
 
 Installation
 ------------
+Recommended: run the installer from a clone, which mirrors every shared valve
+from the Pipe so the Action reuses the already-approved device identity:
+
+    uv run install_action.py install
+
+Manual alternative:
 1. In Open WebUI, go to Admin Panel > Functions
 2. Click "+" and choose "Create a function"
 3. Set id to "openclaw_status_action" (type is auto-detected as "action")
 4. Paste the entire contents of this file
 5. Save and enable the function, then turn on the "Global" toggle so the
    button appears on every model's messages
-6. Configure the valves (only needed for the fallback connection path --
-   set them to the exact same values as the Pipe's valves):
+6. Configure the valves. Set all five to the exact same values as the Pipe's
+   valves -- DEVICE_IDENTITY especially, or a fallback connection registers as
+   a new device and asks for a second pairing approval:
    - GATEWAY_URL, GATEWAY_TOKEN, DEVICE_IDENTITY, STATE_DIR, AGENT_ID
 """
 
@@ -1982,8 +2000,9 @@ async def _append_proactive_message_to_chat(
 # then nudge any open tab to reload so it appears without a manual refresh).
 # Token-by-token relay of an in-flight run (step 4) is a separate, larger
 # follow-up and is NOT gated by this flag because it doesn't exist yet.
-# Do not flip on without re-reading the Linear ELI-62 description's safety
-# rails and the docstring on `_emit_live_bootstrap_reload` below.
+# Do not flip on without reading the docstring on `_emit_live_bootstrap_reload`
+# below: it emits straight to open tabs, bypassing OWUI's own event emitter, so
+# a mistake here is visible to every connected client, not just one request.
 LIVE_STREAM_BOOTSTRAP_ENABLED = True
 
 
@@ -2010,7 +2029,7 @@ async def _emit_live_bootstrap_reload(user_id: str, chat_id: str, target_message
     unaffected even though the emit targets the whole `user:{user_id}` room
     (every tab that user has open, matching OWUI's own room-wide behavior).
 
-    PoC scope (Eliav-approved, ELI-62): the injected code is the constant
+    PoC scope: the injected code is the constant
     `location.reload()` — a full reload, not a targeted DOM patch. Jarring
     but simple and safe; a nicer alternative is explicitly left as a later
     exploration in the design doc, not attempted here.
@@ -2049,7 +2068,7 @@ async def _emit_live_bootstrap_reload(user_id: str, chat_id: str, target_message
 # claims the run's `_delivered_proactive` identity at introduce time, so the
 # post-hoc `_deliver_proactive_owui_message` path skips it.
 #
-# Design + verified OWUI 0.10.2 wire protocol: Linear ELI-62 (`message` = append
+# Verified against the OWUI 0.10.2 wire protocol (`message` = append
 # at Chat.svelte:650, `replace` = set at :652, both applied for any KNOWN
 # message id regardless of initiator; `chat:active:false` drives loadChat
 # reconciliation once a pending assistant leaf exists). We emit these directly
@@ -2921,8 +2940,8 @@ async def _get_action_connection(valves_getter):
 # section (never string-interpolated) so nothing can break out of the data
 # payload.
 #
-# Each of Context, Rate Limits, and Subagents loads and fills independently
-# (Eliav's explicit ask): three separate skeleton placeholders open
+# Each of Context, Rate Limits, and Subagents loads and fills independently:
+# three separate skeleton placeholders open
 # immediately, and each is replaced by its own `execute` fill event as soon
 # as ITS OWN gateway call resolves, rather than one combined
 # fetch-everything-then-render-once step where a slow call holds up
@@ -3325,8 +3344,7 @@ _CONTEXT_FILL_JS_TEMPLATE = r"""
 # in flight (its rate-limit cache is most likely refreshed from that run's
 # own API response headers, so there's a real gap while one is active) --
 # silently omitting the section in that case looked exactly like a missing
-# feature rather than a temporary data gap (what Eliav asked about,
-# 2026-07-11). Showing an explicit note instead turns that into an
+# feature rather than a temporary data gap. Showing an explicit note instead turns that into an
 # understood, expected state.
 _LIMITS_FILL_JS_TEMPLATE = r"""
 (function() {
@@ -3396,7 +3414,7 @@ _LIMITS_FILL_JS_TEMPLATE = r"""
 """
 
 # Deliberately hidden entirely (not even a header) when there are no tasks --
-# "general tracking, no detail" (Eliav's original ask): a permanently-visible
+# "general tracking, no detail": a permanently-visible
 # empty line for the common idle case would be more clutter than signal. Only
 # appears when there's actually something to report. Each row is clickable --
 # opens the per-subagent drawer (see _DRAWER_OPEN_JS_TEMPLATE) via
@@ -3998,9 +4016,9 @@ class Action:
         carries a hidden `<!-- openclaw:taskId=... -->` marker in
         `body["content"]` (see `_deliver_subagent_proactive_owui_message` in
         gateway.py) -- there's deliberately no separate Action/button for
-        this (Eliav's call, 2026-07-13: a second OWUI Function + flipping
-        the existing one off "global" was more infra/config-risk than the
-        payoff of a visually distinct icon). Detected here and redirected
+        this: a second OWUI Function, plus flipping the existing one off
+        "global", was more infra and config risk than the payoff of a
+        visually distinct icon. Detected here and redirected
         straight into the same subagent-detail drawer instead of the
         general status dialog, keyed off content rather than mode."""
         mode = body.get("mode")
@@ -4020,8 +4038,7 @@ class Action:
         """Fetches and renders the dialog's three sections -- Context, Rate
         Limits, Subagents -- each independently: its own skeleton at open,
         its own fill event as soon as its own data is ready, not one
-        combined fetch-everything-then-render-once step (Eliav's explicit
-        ask, 2026-07-11). Subagents (tasks.list) has no dependency on the
+        combined fetch-everything-then-render-once step. Subagents (tasks.list) has no dependency on the
         other two at all. Rate Limits genuinely needs the active provider's
         name, which only comes from sessions.describe -- rather than fake
         independence there, its fill awaits Context's own resolution of

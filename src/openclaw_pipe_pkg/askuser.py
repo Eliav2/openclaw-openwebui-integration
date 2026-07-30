@@ -309,8 +309,8 @@ def _ask_user_detail_block(prompt_text: str, answer: str) -> str:
     values with a nice icon + collapsible UI (confirmed by grepping the
     compiled frontend bundle): "tool_calls", "reasoning", "code_interpreter".
     There's no dedicated type for Q&A, so we reuse "tool_calls" (labelled as
-    an "Ask User" call) to get the same familiar rendering Eliav already
-    likes for real tool calls, inserted inline at the point the question
+    an "Ask User" call) to get the same familiar rendering users already
+    know from real tool calls, inserted inline at the point the question
     was asked/answered — instead of showing nothing (previous behavior:
     the raw prompt text was fully suppressed once answered).
     """

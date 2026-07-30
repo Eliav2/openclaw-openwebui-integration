@@ -1,9 +1,19 @@
 """
+title: OpenClaw Gateway
+author: Eliav
+author_url: https://github.com/Eliav2
+project_url: https://github.com/Eliav2/openclaw-openwebui-integration
+version: 0.7.0
+license: MIT
+requirements: websockets, cryptography
+required_open_webui_version: 0.10.2
+description: Chat with an OpenClaw Gateway agent inside Open WebUI over the Gateway's native WebSocket protocol, with real-time streaming, native tool-call cards, and a persistent agent session per conversation.
+
 OpenClaw Gateway Pipe for Open WebUI
 =====================================
 
 A self-contained Open WebUI Pipe that connects to an OpenClaw Gateway via its
-native WebSocket protocol — with a **persistent** singleton connection shared
+native WebSocket protocol -- with a **persistent** singleton connection shared
 by all conversations. No reconnect per message, no global lock, and no 60s
 idle suicide.
 
@@ -17,16 +27,23 @@ How it works
    queue; unmatched events (other sessions, heartbeats, Sender metadata) are
    filtered out efficiently.
 4. On WS disconnect, the connection manager auto-reconnects with exponential
-   backoff (1s → 2s → 4s → … → 30s max); all consumers survive reconnect.
-5. Tool calls render as native OWUI ``<details type="tool_calls">`` blocks.
+   backoff (1s -> 2s -> 4s -> ... -> 30s max); all consumers survive reconnect.
+5. Tool calls are yielded as Responses-API output items, so Open WebUI renders
+   them as native two-phase tool cards: a spinner while the tool runs, the
+   result when it finishes.
 
 Requirements
 ------------
-- Open WebUI v0.9+ (tested on v0.10.x)
-- OpenClaw Gateway running and accessible
+- Open WebUI v0.10.2+ (developed and tested against 0.10.2 and 0.11.0).
+  Native tool-card rendering relies on Open WebUI's Responses-API streaming
+  handler; older releases are untested and the pipe performs no version check.
+- An OpenClaw Gateway, reachable from the Open WebUI backend
 - Python modules: websockets, cryptography, pydantic
-  (Open WebUI ships pydantic; websockets and cryptography may need
-   manual install depending on your OWUI deployment)
+
+  Open WebUI ships pydantic. The ``requirements:`` field above lets Open WebUI
+  install websockets and cryptography itself when the function is first loaded.
+  If your deployment sets ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS=false or
+  runs in offline mode, install those two packages into the image yourself.
 
 Installation
 ------------
@@ -34,18 +51,25 @@ Installation
 2. Click "+" and choose "Create a function"
 3. Set type to "pipe", id to "openclaw_gateway"
 4. Paste the entire contents of this file
-5. Save and enable the function
+5. Save, then turn on both the "Active" and the "Global" toggle
 6. Configure the valves:
    - GATEWAY_URL: your OpenClaw Gateway host:port (default: localhost:18789)
    - GATEWAY_TOKEN: your gateway API token
-   - DEVICE_IDENTITY: (advanced) fallback/import device identity JSON
-   - STATE_DIR: persistent bridge state dir (default: /data/openclaw-bridge)
    - AGENT_ID: OpenClaw agent to route to (default: "main")
-7. The pipe appears in OWUI as two selectable models:
-   - OpenClaw · Default: uses the agent's configured default model
-   - ChatGPT · GPT-5.5: patches the session model to CHATGPT_MODEL
-  - Claude · Opus 4.8: patches the session model to OPUS_MODEL
-  - Claude · Sonnet 5: patches the session model to SONNET_MODEL
+   - DEVICE_IDENTITY: (advanced) fallback/import device identity JSON
+   - STATE_DIR: persistent bridge state dir (default: /data/openclaw-bridge).
+     Must be writable and persistent, or the pipe falls back to /tmp and you
+     will be asked to re-approve the device after every restart.
+7. Approve the device once, on the Gateway host:
+     openclaw devices list
+     openclaw devices approve <request-id>
+8. Pick a model in Open WebUI. The pipe asks the Gateway which models it knows
+   about and lists one selector entry per model, alongside an always-present
+   "OpenClaw . Default" entry that leaves the agent's own configured model
+   alone. CONFIGURED_MODELS restricts that list; MAX_MODELS caps it.
+
+Full valve reference, troubleshooting, and the agent metadata contract:
+https://github.com/Eliav2/openclaw-openwebui-integration
 """
 
 # ==========================================================================
@@ -206,7 +230,7 @@ def _write_json_file(path, data):
 # ---------------------------------------------------------------------------
 
 MEDIA_DIR = "/tmp/openclaw-pipe-media"
-MEDIA_BASE_URL = "https://localhost:18791"
+MEDIA_BASE_URL = "http://localhost:18791"
 
 _file_server_started = False
 
@@ -1038,8 +1062,8 @@ def _ask_user_detail_block(prompt_text: str, answer: str) -> str:
     values with a nice icon + collapsible UI (confirmed by grepping the
     compiled frontend bundle): "tool_calls", "reasoning", "code_interpreter".
     There's no dedicated type for Q&A, so we reuse "tool_calls" (labelled as
-    an "Ask User" call) to get the same familiar rendering Eliav already
-    likes for real tool calls, inserted inline at the point the question
+    an "Ask User" call) to get the same familiar rendering users already
+    know from real tool calls, inserted inline at the point the question
     was asked/answered — instead of showing nothing (previous behavior:
     the raw prompt text was fully suppressed once answered).
     """
@@ -3070,8 +3094,9 @@ async def _append_proactive_message_to_chat(
 # then nudge any open tab to reload so it appears without a manual refresh).
 # Token-by-token relay of an in-flight run (step 4) is a separate, larger
 # follow-up and is NOT gated by this flag because it doesn't exist yet.
-# Do not flip on without re-reading the Linear ELI-62 description's safety
-# rails and the docstring on `_emit_live_bootstrap_reload` below.
+# Do not flip on without reading the docstring on `_emit_live_bootstrap_reload`
+# below: it emits straight to open tabs, bypassing OWUI's own event emitter, so
+# a mistake here is visible to every connected client, not just one request.
 LIVE_STREAM_BOOTSTRAP_ENABLED = True
 
 
@@ -3098,7 +3123,7 @@ async def _emit_live_bootstrap_reload(user_id: str, chat_id: str, target_message
     unaffected even though the emit targets the whole `user:{user_id}` room
     (every tab that user has open, matching OWUI's own room-wide behavior).
 
-    PoC scope (Eliav-approved, ELI-62): the injected code is the constant
+    PoC scope: the injected code is the constant
     `location.reload()` — a full reload, not a targeted DOM patch. Jarring
     but simple and safe; a nicer alternative is explicitly left as a later
     exploration in the design doc, not attempted here.
@@ -3137,7 +3162,7 @@ async def _emit_live_bootstrap_reload(user_id: str, chat_id: str, target_message
 # claims the run's `_delivered_proactive` identity at introduce time, so the
 # post-hoc `_deliver_proactive_owui_message` path skips it.
 #
-# Design + verified OWUI 0.10.2 wire protocol: Linear ELI-62 (`message` = append
+# Verified against the OWUI 0.10.2 wire protocol (`message` = append
 # at Chat.svelte:650, `replace` = set at :652, both applied for any KNOWN
 # message id regardless of initiator; `chat:active:false` drives loadChat
 # reconciliation once a pending assistant leaf exists). We emit these directly
@@ -3936,8 +3961,12 @@ class Pipe:
             description="Optional OWUI API key for file uploads; request bearer token is preferred"
         )
         FILE_SERVER_BASE_URL: str = Field(
-            default="https://localhost:18791",
-            description="Public URL for the file server (for MEDIA: resolution)"
+            default="http://localhost:18791",
+            description="Legacy fallback only: base URL of the built-in media file "
+                "server, used when USE_OWUI_FILES is off or an upload fails. The "
+                "browser resolves this URL, not OWUI, so the default only works when "
+                "you browse OWUI from the same host. Point it at an address your "
+                "browser can reach if you depend on this fallback."
         )
         CONFIGURED_MODELS: str = Field(
             default="",
@@ -4331,7 +4360,7 @@ class Pipe:
         # DIAG (2026-07-18, ELI-56): log the OWUI message_id + a short content
         # hash of the user text so a *re-fired / duplicate* completion for the
         # same message — the suspected cause of the phantom "1-event, no-text"
-        # turns (e.g. on a socket reconnect over the tailscale proxy) — becomes
+        # turns (e.g. on a socket reconnect behind a reverse proxy) — becomes
         # visible: two pipe() invocations with the SAME owui_msg_id / text_sha
         # close together is a smoking gun. Pure logging, no behavior change.
         _diag_md = __metadata__ or {}

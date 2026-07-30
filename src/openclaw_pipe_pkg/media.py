@@ -10,7 +10,7 @@
 # ---------------------------------------------------------------------------
 
 MEDIA_DIR = "/tmp/openclaw-pipe-media"
-MEDIA_BASE_URL = "https://localhost:18791"
+MEDIA_BASE_URL = "http://localhost:18791"
 
 _file_server_started = False
 
