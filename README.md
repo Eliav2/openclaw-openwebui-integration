@@ -460,9 +460,9 @@ openclaw-openwebui-integration/
 ├── install.py                  # Automated installer/updater/healthcheck script
 ├── install_action.py           # Same, for the Status Action
 ├── test_*.py                   # Unit + integration test suites (see Development)
-├── scripts/                    # Auxiliary scripts (OWUI API client, auto-title test)
+├── scripts/                    # Auxiliary scripts (OWUI API client, live verifiers)
 ├── tools/                      # One-off maintenance scripts
-├── docs/                       # Design docs (e.g. ask-user-modal.md)
+├── docs/                       # Design + behavior docs (see Development)
 ├── .github/workflows/ci.yml    # Drift guard + tests + artifact load check
 ├── backups/                    # Local install backups (gitignored, created on first install)
 ├── owui-screenshot.svg         # README screenshot
@@ -508,6 +508,18 @@ Why a hand-written concatenation instead of a bundler: OWUI reads a function
 as a single flat `.py` file, using the frontmatter docstring for metadata and
 introspecting a top-level `Pipe`/`Action` class directly — most bundlers
 break one or both of those.
+
+### Docs
+
+| Doc | What it covers |
+|-----|----------------|
+| [`docs/rehydration-persistence.md`](./docs/rehydration-persistence.md) | How Open WebUI persists an assistant message, why `output` wins over `content`, and why the pipe emits mid-run snapshots so a client reconnecting mid-turn isn't left staring at an empty message. Read this before changing anything about snapshots or streaming. |
+| [`docs/ask-user-modal.md`](./docs/ask-user-modal.md) | Design spec for a tool-call-based ask-user flow. **Not implemented as written** — see the banner at the top; the shipped approach intercepts `OpenClaw needs input:` text. |
+
+`scripts/verify_rehydration.py` is a live verifier for the behavior described in
+the first doc. It needs the pipe deployed and a real streaming turn — it polls a
+chat until the turn is done and reports whether mid-run snapshots landed and
+whether the final message duplicated itself.
 
 ### Running the tests
 
