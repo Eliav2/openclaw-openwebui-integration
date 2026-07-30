@@ -461,7 +461,6 @@ openclaw-openwebui-integration/
 ├── install_action.py           # Same, for the Status Action
 ├── test_*.py                   # Unit + integration test suites (see Development)
 ├── scripts/                    # Auxiliary scripts (OWUI API client, live verifiers)
-├── tools/                      # One-off maintenance scripts
 ├── docs/                       # Design + behavior docs (see Development)
 ├── .github/workflows/ci.yml    # Drift guard + tests + artifact load check
 ├── backups/                    # Local install backups (gitignored, created on first install)
