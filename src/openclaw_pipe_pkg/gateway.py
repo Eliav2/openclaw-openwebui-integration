@@ -1791,8 +1791,9 @@ async def _append_proactive_message_to_chat(
 # then nudge any open tab to reload so it appears without a manual refresh).
 # Token-by-token relay of an in-flight run (step 4) is a separate, larger
 # follow-up and is NOT gated by this flag because it doesn't exist yet.
-# Do not flip on without re-reading the Linear ELI-62 description's safety
-# rails and the docstring on `_emit_live_bootstrap_reload` below.
+# Do not flip on without reading the docstring on `_emit_live_bootstrap_reload`
+# below: it emits straight to open tabs, bypassing OWUI's own event emitter, so
+# a mistake here is visible to every connected client, not just one request.
 LIVE_STREAM_BOOTSTRAP_ENABLED = True
 
 
@@ -1819,7 +1820,7 @@ async def _emit_live_bootstrap_reload(user_id: str, chat_id: str, target_message
     unaffected even though the emit targets the whole `user:{user_id}` room
     (every tab that user has open, matching OWUI's own room-wide behavior).
 
-    PoC scope (Eliav-approved, ELI-62): the injected code is the constant
+    PoC scope: the injected code is the constant
     `location.reload()` — a full reload, not a targeted DOM patch. Jarring
     but simple and safe; a nicer alternative is explicitly left as a later
     exploration in the design doc, not attempted here.
@@ -1858,7 +1859,7 @@ async def _emit_live_bootstrap_reload(user_id: str, chat_id: str, target_message
 # claims the run's `_delivered_proactive` identity at introduce time, so the
 # post-hoc `_deliver_proactive_owui_message` path skips it.
 #
-# Design + verified OWUI 0.10.2 wire protocol: Linear ELI-62 (`message` = append
+# Verified against the OWUI 0.10.2 wire protocol (`message` = append
 # at Chat.svelte:650, `replace` = set at :652, both applied for any KNOWN
 # message id regardless of initiator; `chat:active:false` drives loadChat
 # reconciliation once a pending assistant leaf exists). We emit these directly

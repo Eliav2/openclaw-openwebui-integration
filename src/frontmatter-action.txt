@@ -1,4 +1,14 @@
 """
+title: OpenClaw Status
+author: Eliav
+author_url: https://github.com/Eliav2
+project_url: https://github.com/Eliav2/openclaw-openwebui-integration
+version: 0.7.0
+license: MIT
+requirements: websockets, cryptography
+required_open_webui_version: 0.10.2
+description: Companion Action for the OpenClaw Gateway Pipe. Adds a message-toolbar button that fetches live OpenClaw session context and usage from the Gateway on demand.
+
 OpenClaw Status Action for Open WebUI
 =======================================
 
@@ -7,9 +17,8 @@ adds a button to the message toolbar. Clicking it fetches live session
 context/usage data from the OpenClaw Gateway on demand -- not cached from
 the last turn -- so it stays accurate even minutes after the last message.
 
-Milestone 1 scope: proves the connection path works. Shows the result as a
-toast notification. A richer dialog comes in a later milestone; this file
-does not touch the Pipe or its existing status-line behavior at all.
+The result is shown as a toast notification. This Action is read-only: it does
+not touch the Pipe or its status-line behavior.
 
 How it works
 ------------
@@ -25,20 +34,29 @@ How it works
 
 Requirements
 ------------
-- Open WebUI v0.9+ (tested on v0.10.x)
+- Open WebUI v0.10.2+ (developed and tested against 0.10.2 and 0.11.0)
 - The OpenClaw Gateway Pipe (openclaw_pipe.py) installed in the same OWUI
   instance -- this Action is a companion to it, not a replacement
-- Python modules: websockets, cryptography, pydantic (same as the Pipe)
+- Python modules: websockets, cryptography, pydantic (same as the Pipe).
+  Open WebUI ships pydantic and installs the other two from the
+  ``requirements:`` field above.
 
 Installation
 ------------
+Recommended: run the installer from a clone, which mirrors every shared valve
+from the Pipe so the Action reuses the already-approved device identity:
+
+    uv run install_action.py install
+
+Manual alternative:
 1. In Open WebUI, go to Admin Panel > Functions
 2. Click "+" and choose "Create a function"
 3. Set id to "openclaw_status_action" (type is auto-detected as "action")
 4. Paste the entire contents of this file
 5. Save and enable the function, then turn on the "Global" toggle so the
    button appears on every model's messages
-6. Configure the valves (only needed for the fallback connection path --
-   set them to the exact same values as the Pipe's valves):
+6. Configure the valves. Set all five to the exact same values as the Pipe's
+   valves -- DEVICE_IDENTITY especially, or a fallback connection registers as
+   a new device and asks for a second pairing approval:
    - GATEWAY_URL, GATEWAY_TOKEN, DEVICE_IDENTITY, STATE_DIR, AGENT_ID
 """

@@ -87,8 +87,8 @@ async def _get_action_connection(valves_getter):
 # section (never string-interpolated) so nothing can break out of the data
 # payload.
 #
-# Each of Context, Rate Limits, and Subagents loads and fills independently
-# (Eliav's explicit ask): three separate skeleton placeholders open
+# Each of Context, Rate Limits, and Subagents loads and fills independently:
+# three separate skeleton placeholders open
 # immediately, and each is replaced by its own `execute` fill event as soon
 # as ITS OWN gateway call resolves, rather than one combined
 # fetch-everything-then-render-once step where a slow call holds up
@@ -491,8 +491,7 @@ _CONTEXT_FILL_JS_TEMPLATE = r"""
 # in flight (its rate-limit cache is most likely refreshed from that run's
 # own API response headers, so there's a real gap while one is active) --
 # silently omitting the section in that case looked exactly like a missing
-# feature rather than a temporary data gap (what Eliav asked about,
-# 2026-07-11). Showing an explicit note instead turns that into an
+# feature rather than a temporary data gap. Showing an explicit note instead turns that into an
 # understood, expected state.
 _LIMITS_FILL_JS_TEMPLATE = r"""
 (function() {
@@ -562,7 +561,7 @@ _LIMITS_FILL_JS_TEMPLATE = r"""
 """
 
 # Deliberately hidden entirely (not even a header) when there are no tasks --
-# "general tracking, no detail" (Eliav's original ask): a permanently-visible
+# "general tracking, no detail": a permanently-visible
 # empty line for the common idle case would be more clutter than signal. Only
 # appears when there's actually something to report. Each row is clickable --
 # opens the per-subagent drawer (see _DRAWER_OPEN_JS_TEMPLATE) via
@@ -1164,9 +1163,9 @@ class Action:
         carries a hidden `<!-- openclaw:taskId=... -->` marker in
         `body["content"]` (see `_deliver_subagent_proactive_owui_message` in
         gateway.py) -- there's deliberately no separate Action/button for
-        this (Eliav's call, 2026-07-13: a second OWUI Function + flipping
-        the existing one off "global" was more infra/config-risk than the
-        payoff of a visually distinct icon). Detected here and redirected
+        this: a second OWUI Function, plus flipping the existing one off
+        "global", was more infra and config risk than the payoff of a
+        visually distinct icon. Detected here and redirected
         straight into the same subagent-detail drawer instead of the
         general status dialog, keyed off content rather than mode."""
         mode = body.get("mode")
@@ -1186,8 +1185,7 @@ class Action:
         """Fetches and renders the dialog's three sections -- Context, Rate
         Limits, Subagents -- each independently: its own skeleton at open,
         its own fill event as soon as its own data is ready, not one
-        combined fetch-everything-then-render-once step (Eliav's explicit
-        ask, 2026-07-11). Subagents (tasks.list) has no dependency on the
+        combined fetch-everything-then-render-once step. Subagents (tasks.list) has no dependency on the
         other two at all. Rate Limits genuinely needs the active provider's
         name, which only comes from sessions.describe -- rather than fake
         independence there, its fill awaits Context's own resolution of

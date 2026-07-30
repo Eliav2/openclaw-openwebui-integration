@@ -87,8 +87,12 @@ class Pipe:
             description="Optional OWUI API key for file uploads; request bearer token is preferred"
         )
         FILE_SERVER_BASE_URL: str = Field(
-            default="https://localhost:18791",
-            description="Public URL for the file server (for MEDIA: resolution)"
+            default="http://localhost:18791",
+            description="Legacy fallback only: base URL of the built-in media file "
+                "server, used when USE_OWUI_FILES is off or an upload fails. The "
+                "browser resolves this URL, not OWUI, so the default only works when "
+                "you browse OWUI from the same host. Point it at an address your "
+                "browser can reach if you depend on this fallback."
         )
         CONFIGURED_MODELS: str = Field(
             default="",

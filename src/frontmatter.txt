@@ -1,9 +1,19 @@
 """
+title: OpenClaw Gateway
+author: Eliav
+author_url: https://github.com/Eliav2
+project_url: https://github.com/Eliav2/openclaw-openwebui-integration
+version: 0.7.0
+license: MIT
+requirements: websockets, cryptography
+required_open_webui_version: 0.10.2
+description: Chat with an OpenClaw Gateway agent inside Open WebUI over the Gateway's native WebSocket protocol, with real-time streaming, native tool-call cards, and a persistent agent session per conversation.
+
 OpenClaw Gateway Pipe for Open WebUI
 =====================================
 
 A self-contained Open WebUI Pipe that connects to an OpenClaw Gateway via its
-native WebSocket protocol — with a **persistent** singleton connection shared
+native WebSocket protocol -- with a **persistent** singleton connection shared
 by all conversations. No reconnect per message, no global lock, and no 60s
 idle suicide.
 
@@ -17,16 +27,23 @@ How it works
    queue; unmatched events (other sessions, heartbeats, Sender metadata) are
    filtered out efficiently.
 4. On WS disconnect, the connection manager auto-reconnects with exponential
-   backoff (1s → 2s → 4s → … → 30s max); all consumers survive reconnect.
-5. Tool calls render as native OWUI ``<details type="tool_calls">`` blocks.
+   backoff (1s -> 2s -> 4s -> ... -> 30s max); all consumers survive reconnect.
+5. Tool calls are yielded as Responses-API output items, so Open WebUI renders
+   them as native two-phase tool cards: a spinner while the tool runs, the
+   result when it finishes.
 
 Requirements
 ------------
-- Open WebUI v0.9+ (tested on v0.10.x)
-- OpenClaw Gateway running and accessible
+- Open WebUI v0.10.2+ (developed and tested against 0.10.2 and 0.11.0).
+  Native tool-card rendering relies on Open WebUI's Responses-API streaming
+  handler; older releases are untested and the pipe performs no version check.
+- An OpenClaw Gateway, reachable from the Open WebUI backend
 - Python modules: websockets, cryptography, pydantic
-  (Open WebUI ships pydantic; websockets and cryptography may need
-   manual install depending on your OWUI deployment)
+
+  Open WebUI ships pydantic. The ``requirements:`` field above lets Open WebUI
+  install websockets and cryptography itself when the function is first loaded.
+  If your deployment sets ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS=false or
+  runs in offline mode, install those two packages into the image yourself.
 
 Installation
 ------------
@@ -34,16 +51,23 @@ Installation
 2. Click "+" and choose "Create a function"
 3. Set type to "pipe", id to "openclaw_gateway"
 4. Paste the entire contents of this file
-5. Save and enable the function
+5. Save, then turn on both the "Active" and the "Global" toggle
 6. Configure the valves:
    - GATEWAY_URL: your OpenClaw Gateway host:port (default: localhost:18789)
    - GATEWAY_TOKEN: your gateway API token
-   - DEVICE_IDENTITY: (advanced) fallback/import device identity JSON
-   - STATE_DIR: persistent bridge state dir (default: /data/openclaw-bridge)
    - AGENT_ID: OpenClaw agent to route to (default: "main")
-7. The pipe appears in OWUI as two selectable models:
-   - OpenClaw · Default: uses the agent's configured default model
-   - ChatGPT · GPT-5.5: patches the session model to CHATGPT_MODEL
-  - Claude · Opus 4.8: patches the session model to OPUS_MODEL
-  - Claude · Sonnet 5: patches the session model to SONNET_MODEL
+   - DEVICE_IDENTITY: (advanced) fallback/import device identity JSON
+   - STATE_DIR: persistent bridge state dir (default: /data/openclaw-bridge).
+     Must be writable and persistent, or the pipe falls back to /tmp and you
+     will be asked to re-approve the device after every restart.
+7. Approve the device once, on the Gateway host:
+     openclaw devices list
+     openclaw devices approve <request-id>
+8. Pick a model in Open WebUI. The pipe asks the Gateway which models it knows
+   about and lists one selector entry per model, alongside an always-present
+   "OpenClaw . Default" entry that leaves the agent's own configured model
+   alone. CONFIGURED_MODELS restricts that list; MAX_MODELS caps it.
+
+Full valve reference, troubleshooting, and the agent metadata contract:
+https://github.com/Eliav2/openclaw-openwebui-integration
 """

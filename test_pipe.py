@@ -27,6 +27,64 @@ AUTH_TOKEN = None
 ROUTE_MODEL_ID = None
 
 
+# ── pytest integration ───────────────────────────────────────────────
+#
+# This module is an INTEGRATION suite: every case needs a reachable OWUI with
+# the pipe installed. Two things are needed to make it behave under pytest.
+#
+# 1. Skip, don't fail, when no live instance is configured. A suite that always
+#    fails is indistinguishable from a suite that is correctly reporting a real
+#    regression, so "expected to fail in a sandbox" is not an acceptable resting
+#    state -- it trains everyone to ignore the only signal it has.
+# 2. Log in first. Authentication used to happen only under `__main__`, so under
+#    pytest AUTH_TOKEN stayed None and every case failed 401 no matter how
+#    healthy the instance was. The fixture below gives these tests the
+#    precondition they assert on.
+
+def live_owui_configured() -> bool:
+    return bool(os.environ.get("OWUI_EMAIL") and os.environ.get("OWUI_PASSWORD"))
+
+
+try:
+    import pytest
+except ImportError:  # standalone `python3 test_pipe.py`; pytest is optional
+    pass
+else:
+    pytestmark = pytest.mark.skipif(
+        not live_owui_configured(),
+        reason="integration suite: set OWUI_URL, OWUI_EMAIL and OWUI_PASSWORD "
+               "to run it against a live Open WebUI instance",
+    )
+
+    @pytest.fixture(scope="module", autouse=True)
+    def _live_session():
+        """Authenticate and discover pipe models, as __main__ does."""
+        global AUTH_TOKEN, ROUTE_MODEL_ID
+        login = api("POST", "v1/auths/signin", {
+            "email": os.environ["OWUI_EMAIL"],
+            "password": os.environ["OWUI_PASSWORD"],
+        })
+        token = login.get("token")
+        if not token:
+            pytest.skip(f"OWUI login failed: {login.get('error', login)}")
+        AUTH_TOKEN = token
+
+        models = api("GET", "models")
+        if "error" in models:
+            pytest.skip(f"cannot list OWUI models: {models['error']}")
+        ids = {m.get("id") for m in models.get("data", [])}
+        if DEFAULT_MODEL_ID not in ids:
+            pytest.skip(f"{DEFAULT_MODEL_ID} not registered in OWUI -- "
+                        "install the pipe first (uv run install.py install)")
+        ROUTE_MODEL_ID = next(
+            (i for i in ids
+             if i.startswith(f"{FUNCTION_ID}.") and i != DEFAULT_MODEL_ID),
+            None,
+        )
+        yield
+        AUTH_TOKEN = None
+
+
 # ── helpers ──────────────────────────────────────────────────────────
 
 def api(method: str, path: str, data: dict | None = None) -> dict:
@@ -87,7 +145,12 @@ PASSED = 0
 FAILED = 0
 
 
-def test(name: str, fn):
+def run_case(name: str, fn):
+    """Run one case in standalone mode.
+
+    Deliberately NOT named `test*`: pytest would collect it as a test case and
+    then error out trying to supply `name` and `fn` as fixtures.
+    """
     global PASSED, FAILED
     print(f"\n── {name} ──")
     try:
@@ -288,14 +351,14 @@ if __name__ == "__main__":
             sys.exit(1)
 
     # Run tests
-    test("Basic non-streaming chat", test_basic_chat)
-    test("Chat saves to history", test_chat_saves_to_history)
-    test("Invalid model rejection", test_model_not_found)
-    test("Streaming response", test_streaming)
-    test("Metadata/user identity passthrough", test_metadata_passthrough)
-    test("Route model override", test_route_model_override)
-    test("Empty message handling", test_empty_message)
-    test("Hebrew / special characters", test_special_characters)
+    run_case("Basic non-streaming chat", test_basic_chat)
+    run_case("Chat saves to history", test_chat_saves_to_history)
+    run_case("Invalid model rejection", test_model_not_found)
+    run_case("Streaming response", test_streaming)
+    run_case("Metadata/user identity passthrough", test_metadata_passthrough)
+    run_case("Route model override", test_route_model_override)
+    run_case("Empty message handling", test_empty_message)
+    run_case("Hebrew / special characters", test_special_characters)
 
     # Summary
     print("\n" + "=" * 60)

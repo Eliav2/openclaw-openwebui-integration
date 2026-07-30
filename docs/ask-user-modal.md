@@ -1,5 +1,27 @@
 # Ask-User Modal — Design Spec
 
+> **Status: design spec, not implemented as written.**
+>
+> This document proposes a `request_user_input` function-calling tool. That tool
+> **does not exist** — the shipped implementation in
+> [`src/openclaw_pipe_pkg/askuser.py`](../src/openclaw_pipe_pkg/askuser.py) took
+> the other path: it intercepts assistant text beginning with
+> `OpenClaw needs input:` or `Codex needs input:` and synthesizes the modal from
+> the prompt text. Notable divergences from this spec:
+>
+> - **Trigger:** assistant text deltas, not a typed tool-call event.
+> - **`secret`:** inferred by keyword-scanning the prompt, not a tool parameter.
+> - **N-way choices:** options are scraped from numbered lines (`1. foo`) and
+>   rendered via a hand-built widget, because OWUI has no native
+>   "pick one of N buttons" control. Only genuine yes/no prompts become a
+>   confirmation dialog.
+> - **Timeouts:** 60s for the modal, 300s across a reconnect — not the single
+>   5-minute timeout described below, and no `{"error": "User did not respond"}`
+>   payload.
+>
+> Kept for the design rationale and as the reference for a future typed-event
+> version. Read `askuser.py` for current behavior.
+
 ## Problem
 
 Agents need to ask the user a question during a run. OpenClaw core supports
