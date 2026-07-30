@@ -4360,7 +4360,7 @@ class Pipe:
         # DIAG (2026-07-18, ELI-56): log the OWUI message_id + a short content
         # hash of the user text so a *re-fired / duplicate* completion for the
         # same message — the suspected cause of the phantom "1-event, no-text"
-        # turns (e.g. on a socket reconnect over the tailscale proxy) — becomes
+        # turns (e.g. on a socket reconnect behind a reverse proxy) — becomes
         # visible: two pipe() invocations with the SAME owui_msg_id / text_sha
         # close together is a smoking gun. Pure logging, no behavior change.
         _diag_md = __metadata__ or {}

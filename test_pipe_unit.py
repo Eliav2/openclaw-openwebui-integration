@@ -808,8 +808,8 @@ class LiveRelayTests(unittest.TestCase):
     # ── static invariants ───────────────────────────────────────────────
 
     def test_kill_switch_is_on(self):
-        # Flipped ON 2026-07-25 at Eliav's request after the PoC phase; if you
-        # need to disable the relay, flip the constant in src/ and update this.
+        # Flipped ON after the PoC phase; if you need to disable the relay,
+        # flip the constant in src/ and update this test with it.
         self.assertTrue(LIVE_STREAM_RELAY_ENABLED)
 
     def test_content_is_showable_filters_sentinels_and_prefixes(self):
@@ -3280,7 +3280,12 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.05)
             return {"value": "late"}
 
-        with self.assertRaises(TimeoutError):
+        # asyncio.TimeoutError, not the builtin: the two are the same class only
+        # from 3.11 on. `asyncio.wait_for` raises asyncio's on every version, so
+        # asserting the builtin passes on 3.11+ and fails on 3.10. The runtime
+        # code catches asyncio.TimeoutError throughout and is version-correct;
+        # this assertion was the only version-fragile spot.
+        with self.assertRaises(asyncio.TimeoutError):
             await _ask_user_input_modal(
                 event_call,
                 "Codex needs input:\n\nPackage\nChoose",
