@@ -1385,10 +1385,33 @@ def _parse_gateway_url(raw: str) -> tuple[str, int]:
             )
     # Drop any path/query a pasted URL dragged along ("host:8443/" -> "host:8443").
     value = value.split("/", 1)[0].split("?", 1)[0]
-    host, sep, port_str = value.rpartition(":")
-    if not sep:
-        host, port_str = value, "18789"
-    if not host:
+
+    if value.startswith("["):
+        # Bracketed IPv6, "[::1]:18789". Split on the closing bracket, not the
+        # last colon, and keep the brackets -- websockets needs them in the URL.
+        addr, sep, rest = value.partition("]")
+        if not sep:
+            raise GatewayError(
+                f"GATEWAY_URL {raw!r} is missing a closing ']' on the IPv6 "
+                "address. Expected [address]:port, for example [::1]:18789."
+            )
+        host = addr + "]"
+        port_str = rest[1:] if rest.startswith(":") else (rest or "18789")
+    elif value.count(":") > 1:
+        # A bare IPv6 literal. rpartition(":") would read "::1" as host ":" on
+        # port 1 -- silently wrong on both counts, which is the whole failure
+        # class this function exists to remove. Ask for brackets instead of
+        # guessing which colon separates the port.
+        raise GatewayError(
+            f"GATEWAY_URL {raw!r} looks like an IPv6 address. Wrap it in "
+            "brackets so the port is unambiguous, for example [::1]:18789."
+        )
+    else:
+        host, sep, port_str = value.rpartition(":")
+        if not sep:
+            host, port_str = value, "18789"
+
+    if not host or host == "[]":
         raise GatewayError(
             f"GATEWAY_URL {raw!r} has no host. Expected host:port, "
             "for example localhost:18789."
@@ -1398,7 +1421,13 @@ def _parse_gateway_url(raw: str) -> tuple[str, int]:
             f"GATEWAY_URL {raw!r} has a non-numeric port {port_str!r}. "
             "Expected host:port, for example localhost:18789."
         )
-    return host, int(port_str)
+    port = int(port_str)
+    if not 1 <= port <= 65535:
+        raise GatewayError(
+            f"GATEWAY_URL {raw!r} has port {port}, which is outside 1-65535. "
+            "The OpenClaw Gateway default is 18789."
+        )
+    return host, port
 
 
 def _preview_recovery_text(preview: dict, session_key: str, user_text: str) -> str | None:
@@ -2518,11 +2547,17 @@ class _GatewayConnection:
                 "and that the Open WebUI backend can reach that host (Open WebUI "
                 "resolves it, not your browser)."
             )
-        except OSError as ex:
+        except (OSError, websockets.exceptions.WebSocketException) as ex:
+            # WebSocketException is NOT an OSError subclass, so catching OSError
+            # alone still let InvalidStatus/InvalidHandshake escape -- which is
+            # exactly what happens when something answers but isn't a Gateway
+            # (a reverse proxy returning 502 on the upgrade, an HTTP server on
+            # the port). That is a configuration mistake, and it belongs in the
+            # chat naming the valve, not as an unattributed traceback.
             raise GatewayError(
                 f"Could not connect to the OpenClaw Gateway at {host}:{port} "
-                f"({ex}). Is the Gateway running, and is the GATEWAY_URL valve "
-                "correct?"
+                f"({type(ex).__name__}: {ex}). Is the Gateway running, and is "
+                "the GATEWAY_URL valve pointing at it?"
             )
 
         # Handshake: receive challenge
@@ -3951,13 +3986,91 @@ def _parse_whitelist(text: str) -> set[str]:
     return {x.strip() for x in text.split(",") if x.strip()}
 
 
+# Words in a sessions.patch failure that mean "the agent is the problem", not
+# "the model is". Kept broad on purpose: the cost of a false positive is a
+# message that mentions both AGENT_ID and the model, which is still better than
+# one that confidently blames only the model.
+_AGENT_ERROR_HINTS = ("agent", "session")
+
+
+def _explain_session_patch_failure(err, *, model_override, agent_id) -> str:
+    """Describe a failed sessions.patch without misattributing the cause.
+
+    The session key embeds AGENT_ID and this patch is the turn's first
+    agent-scoped RPC, so a mistyped AGENT_ID surfaces here -- and used to be
+    reported as "Model selection error", sending the user to fix
+    DEFAULT_MODEL/CONFIGURED_MODELS, which were never the problem.
+
+    Classifying by substring is genuinely ambiguous, so the ordering matters and
+    is deliberate:
+
+    * "model" (or the model key) present -> a MODEL error. Checked FIRST and
+      allowed to win outright, because gateway model errors routinely mention
+      the agent too ("model x/y is not configured for this agent"), whereas an
+      agent error rarely mentions a model. An earlier version of this matched
+      "not found" as an agent hint, which misfiled "model 'x/y' not found" --
+      the exact misattribution this function exists to prevent, just pointed
+      the other way.
+    * otherwise, agent/session wording -> an AGENT error.
+    * otherwise -> say we don't know, and name both valves. Guessing wrong is
+      worse than admitting ambiguity: it sends the user to edit a valve that
+      was correct.
+    """
+    detail = str(err)
+    low = detail.lower()
+    wanted = model_override or "agent default"
+
+    looks_like_model = "model" in low or (
+        bool(model_override) and model_override.lower() in low
+    )
+    if looks_like_model:
+        return f"**Model selection error:** could not apply `{wanted}`: {detail}"
+
+    if any(h in low for h in _AGENT_ERROR_HINTS):
+        return (
+            f"**Could not start a session on agent `{agent_id}`:** {detail}\n\n"
+            f"Check the `AGENT_ID` valve — it must name an agent your OpenClaw "
+            f"Gateway actually defines (`main` unless you configured others). "
+            f"This surfaces here because applying the model is the first thing "
+            f"the pipe asks the agent to do; the model (`{wanted}`) may be fine."
+        )
+
+    return (
+        f"**Could not start this conversation's session:** {detail}\n\n"
+        f"The pipe was applying model `{wanted}` on agent `{agent_id}`. Check "
+        f"the `AGENT_ID` valve names an agent your Gateway defines, and that "
+        f"the model is one it offers."
+    )
+
+
+MODELS_SOURCE_LIVE = "live"
+MODELS_SOURCE_CACHE = "cache"
+MODELS_SOURCE_FALLBACK = "fallback"
+
+# Appended to selector entries built from _FALLBACK_MODELS. Display text only --
+# the entry's `id` (the routing key) is untouched, so this cannot affect routing.
+UNVERIFIED_MODEL_SUFFIX = " — example, Gateway not reached"
+
+
 async def _discover_models(valves) -> list[dict]:
-    """Discover available models from the gateway, cache, or hardcoded fallback.
-    
-    Tries in order:
-    1. Live gateway request (only if connection already up)
-    2. Cache file from STATE_DIR
-    3. Hardcoded fallback list
+    """Back-compat wrapper for callers that don't care where the list came from."""
+    models, _source = await _discover_models_with_source(valves)
+    return models
+
+
+async def _discover_models_with_source(valves) -> tuple[list[dict], str]:
+    """Discover models, and report where the list came from.
+
+    Returns (models, source), source being "live", "cache" or "fallback".
+
+    Callers need that distinction because the three are not interchangeable to
+    a user. `pipes()` never initiates a connection -- it only reuses one that a
+    previous chat established -- so on a fresh install the live branch is skipped
+    and no cache exists yet, and the selector filled up with five hardcoded
+    models bearing no relationship to the user's Gateway, rendered identically
+    to genuinely discovered ones. Picking one the Gateway doesn't have then
+    failed with a bare "Model selection error", with nothing to suggest the list
+    itself had been fabricated.
     """
     # 1. Try live gateway (fast path only if already connected)
     global _gateway_connection
@@ -3972,19 +4085,23 @@ async def _discover_models(valves) -> list[dict]:
                     os.path.join(_state_dir(getattr(valves, "STATE_DIR", "")), "models-cache.json"),
                     {"models": models, "cachedAt": time.time()}
                 )
-                return models
+                return models, MODELS_SOURCE_LIVE
         except Exception as e:
             pipe_log(f"Live model discovery failed: {e}")
-    
+
     # 2. Cache fallback
     cache = _read_json_file(os.path.join(_state_dir(getattr(valves, "STATE_DIR", "")), "models-cache.json"))
     if cache and cache.get("models"):
         pipe_log("Using cached model list")
-        return cache["models"]
-    
+        return cache["models"], MODELS_SOURCE_CACHE
+
     # 3. Hardcoded fallback
-    pipe_log("Using hardcoded fallback model list")
-    return _FALLBACK_MODELS
+    pipe_log(
+        "Using hardcoded fallback model list -- the Gateway has not been reached "
+        "yet, so these are examples, not your Gateway's models. They are labelled "
+        "as such in the model selector."
+    )
+    return _FALLBACK_MODELS, MODELS_SOURCE_FALLBACK
 
 
 # --- pipe ------------------------------------------------------------------
@@ -4183,25 +4300,34 @@ class Pipe:
         Dynamically discovers models from the OpenClaw Gateway (or cache)
         and returns one entry per model plus a 'Default' entry.
         """
-        models = await _discover_models(self.valves)
-        
+        models, source = await _discover_models_with_source(self.valves)
+
         # Apply whitelist filter
         whitelist = _parse_whitelist(self.valves.CONFIGURED_MODELS)
         if whitelist:
             models = [m for m in models if m["key"] in whitelist]
-        
+
         # Apply safety cap
         if len(models) > self.valves.MAX_MODELS:
             models = models[:self.valves.MAX_MODELS]
-        
+
+        # A hardcoded list is a guess, not a discovery. Say so in the only place
+        # the user is looking -- the selector itself -- rather than letting five
+        # invented models masquerade as their Gateway's. Suffixing the display
+        # name is deliberate: `id` stays the untouched routing key.
+        unverified = source == MODELS_SOURCE_FALLBACK
         entries = []
         for m in models:
             friendly = _friendly_name(m)
             provider = _provider_from_key(m["key"])
             name = f"{friendly} ({provider}) · OpenClaw"
+            if unverified:
+                name += UNVERIFIED_MODEL_SUFFIX
             entries.append({"id": m["key"], "name": name})
-        
-        # Always prepend Default at top
+
+        # Always prepend Default at top. It is the one entry that always works
+        # in this state: it clears the override and uses the agent's own model,
+        # so it needs no Gateway round trip to be correct.
         return [{"id": "default", "name": "OpenClaw · Default"}] + entries
 
     @classmethod
@@ -4211,8 +4337,19 @@ class Pipe:
         Reads synchronously from the model cache or fallback list.
         """
         cache = _read_json_file(os.path.join(_state_dir(), "models-cache.json"))
-        models = cache.get("models", _FALLBACK_MODELS) if cache else _FALLBACK_MODELS
-        return [{"value": m["key"], "label": f"{_friendly_name(m)} ({_provider_from_key(m['key'])})"} for m in models]
+        cached = cache.get("models") if cache else None
+        models = cached or _FALLBACK_MODELS
+        # Same honesty as pipes(): before the first successful connection this
+        # dropdown is a built-in example list, not a reference of what the
+        # Gateway actually offers.
+        suffix = "" if cached else UNVERIFIED_MODEL_SUFFIX
+        return [
+            {
+                "value": m["key"],
+                "label": f"{_friendly_name(m)} ({_provider_from_key(m['key'])}){suffix}",
+            }
+            for m in models
+        ]
 
     def _selected_preset(self, body):
         """Extract the model key or legacy preset name from the OWUI model string."""
@@ -4571,7 +4708,11 @@ class Pipe:
                     conn.invalidate_model_patch(session_key)
         if patch_err is not None:
             await _emit_status(__event_emitter__, "", done=True)
-            yield f"**Model selection error:** could not apply `{model_override or 'agent default'}`: {patch_err}"
+            yield _explain_session_patch_failure(
+                patch_err,
+                model_override=model_override,
+                agent_id=self.valves.AGENT_ID,
+            )
             return
 
         # --- Concurrency: queue behind an active run, never steer-merge ---

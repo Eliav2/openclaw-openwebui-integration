@@ -74,13 +74,91 @@ def _parse_whitelist(text: str) -> set[str]:
     return {x.strip() for x in text.split(",") if x.strip()}
 
 
+# Words in a sessions.patch failure that mean "the agent is the problem", not
+# "the model is". Kept broad on purpose: the cost of a false positive is a
+# message that mentions both AGENT_ID and the model, which is still better than
+# one that confidently blames only the model.
+_AGENT_ERROR_HINTS = ("agent", "session")
+
+
+def _explain_session_patch_failure(err, *, model_override, agent_id) -> str:
+    """Describe a failed sessions.patch without misattributing the cause.
+
+    The session key embeds AGENT_ID and this patch is the turn's first
+    agent-scoped RPC, so a mistyped AGENT_ID surfaces here -- and used to be
+    reported as "Model selection error", sending the user to fix
+    DEFAULT_MODEL/CONFIGURED_MODELS, which were never the problem.
+
+    Classifying by substring is genuinely ambiguous, so the ordering matters and
+    is deliberate:
+
+    * "model" (or the model key) present -> a MODEL error. Checked FIRST and
+      allowed to win outright, because gateway model errors routinely mention
+      the agent too ("model x/y is not configured for this agent"), whereas an
+      agent error rarely mentions a model. An earlier version of this matched
+      "not found" as an agent hint, which misfiled "model 'x/y' not found" --
+      the exact misattribution this function exists to prevent, just pointed
+      the other way.
+    * otherwise, agent/session wording -> an AGENT error.
+    * otherwise -> say we don't know, and name both valves. Guessing wrong is
+      worse than admitting ambiguity: it sends the user to edit a valve that
+      was correct.
+    """
+    detail = str(err)
+    low = detail.lower()
+    wanted = model_override or "agent default"
+
+    looks_like_model = "model" in low or (
+        bool(model_override) and model_override.lower() in low
+    )
+    if looks_like_model:
+        return f"**Model selection error:** could not apply `{wanted}`: {detail}"
+
+    if any(h in low for h in _AGENT_ERROR_HINTS):
+        return (
+            f"**Could not start a session on agent `{agent_id}`:** {detail}\n\n"
+            f"Check the `AGENT_ID` valve — it must name an agent your OpenClaw "
+            f"Gateway actually defines (`main` unless you configured others). "
+            f"This surfaces here because applying the model is the first thing "
+            f"the pipe asks the agent to do; the model (`{wanted}`) may be fine."
+        )
+
+    return (
+        f"**Could not start this conversation's session:** {detail}\n\n"
+        f"The pipe was applying model `{wanted}` on agent `{agent_id}`. Check "
+        f"the `AGENT_ID` valve names an agent your Gateway defines, and that "
+        f"the model is one it offers."
+    )
+
+
+MODELS_SOURCE_LIVE = "live"
+MODELS_SOURCE_CACHE = "cache"
+MODELS_SOURCE_FALLBACK = "fallback"
+
+# Appended to selector entries built from _FALLBACK_MODELS. Display text only --
+# the entry's `id` (the routing key) is untouched, so this cannot affect routing.
+UNVERIFIED_MODEL_SUFFIX = " — example, Gateway not reached"
+
+
 async def _discover_models(valves) -> list[dict]:
-    """Discover available models from the gateway, cache, or hardcoded fallback.
-    
-    Tries in order:
-    1. Live gateway request (only if connection already up)
-    2. Cache file from STATE_DIR
-    3. Hardcoded fallback list
+    """Back-compat wrapper for callers that don't care where the list came from."""
+    models, _source = await _discover_models_with_source(valves)
+    return models
+
+
+async def _discover_models_with_source(valves) -> tuple[list[dict], str]:
+    """Discover models, and report where the list came from.
+
+    Returns (models, source), source being "live", "cache" or "fallback".
+
+    Callers need that distinction because the three are not interchangeable to
+    a user. `pipes()` never initiates a connection -- it only reuses one that a
+    previous chat established -- so on a fresh install the live branch is skipped
+    and no cache exists yet, and the selector filled up with five hardcoded
+    models bearing no relationship to the user's Gateway, rendered identically
+    to genuinely discovered ones. Picking one the Gateway doesn't have then
+    failed with a bare "Model selection error", with nothing to suggest the list
+    itself had been fabricated.
     """
     # 1. Try live gateway (fast path only if already connected)
     global _gateway_connection
@@ -95,16 +173,20 @@ async def _discover_models(valves) -> list[dict]:
                     os.path.join(_state_dir(getattr(valves, "STATE_DIR", "")), "models-cache.json"),
                     {"models": models, "cachedAt": time.time()}
                 )
-                return models
+                return models, MODELS_SOURCE_LIVE
         except Exception as e:
             pipe_log(f"Live model discovery failed: {e}")
-    
+
     # 2. Cache fallback
     cache = _read_json_file(os.path.join(_state_dir(getattr(valves, "STATE_DIR", "")), "models-cache.json"))
     if cache and cache.get("models"):
         pipe_log("Using cached model list")
-        return cache["models"]
-    
+        return cache["models"], MODELS_SOURCE_CACHE
+
     # 3. Hardcoded fallback
-    pipe_log("Using hardcoded fallback model list")
-    return _FALLBACK_MODELS
+    pipe_log(
+        "Using hardcoded fallback model list -- the Gateway has not been reached "
+        "yet, so these are examples, not your Gateway's models. They are labelled "
+        "as such in the model selector."
+    )
+    return _FALLBACK_MODELS, MODELS_SOURCE_FALLBACK
