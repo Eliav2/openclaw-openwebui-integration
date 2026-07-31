@@ -22,7 +22,7 @@ def _looks_like_media_filename(fname: str) -> bool:
     """Return True only if fname plausibly names a real file (has an
     extension). Without this, ordinary prose that happens to use "MEDIA:"
     as a documentation term (e.g. "the MEDIA: fix is proven") gets its next
-    word treated as a filename and mangled into a broken image link —
+    word treated as a filename and mangled into a broken image link --
     confirmed live 2026-07-10 when explaining this very feature corrupted
     "the MEDIA: fix" into `![fix](.../fix)`.
     """
@@ -35,7 +35,7 @@ def _advance_media_buffer(pending: str, delta: str) -> tuple[str, str]:
     Returns (text_to_yield_now, new_pending), mirroring
     `_advance_input_prompt_buffer`. A real streaming provider can deliver
     "MEDIA:filename.png" split across multiple deltas at any point,
-    including mid-filename or mid-prefix — resolving `_resolve_media`
+    including mid-filename or mid-prefix -- resolving `_resolve_media`
     eagerly against a single truncated delta either drops the directive
     entirely (if "MEDIA:" itself is split, so neither chunk contains the
     full prefix) or resolves it against a truncated filename (confirmed
@@ -61,7 +61,7 @@ def _resolve_media(text, base_url=None):
     """Convert every MEDIA:filename directive in text to embedded media.
 
     A single reply can legitimately carry several images (confirmed live
-    2026-07-10 sending a 4-screenshot bug repro) — this must loop over every
+    2026-07-10 sending a 4-screenshot bug repro) -- this must loop over every
     occurrence, not just the first, or later directives in the same chunk
     silently pass through as literal "MEDIA:filename" text.
     """
@@ -81,7 +81,7 @@ def _resolve_media(text, base_url=None):
         if not fname:
             break
         if not _looks_like_media_filename(fname):
-            # Not a real directive — e.g. prose using "MEDIA:" as a term,
+            # Not a real directive -- e.g. prose using "MEDIA:" as a term,
             # not a file reference. Leave this occurrence as literal text
             # and keep scanning past it for any genuine directive later on.
             out += before + prefix
@@ -162,7 +162,7 @@ async def _resolve_media_via_owui(
     the current message.
 
     A single reply can legitimately carry several images (confirmed live
-    2026-07-10 sending a 4-screenshot bug repro) — this must loop over every
+    2026-07-10 sending a 4-screenshot bug repro) -- this must loop over every
     occurrence, not just the first, or later directives in the same chunk
     silently pass through as literal "MEDIA:filename" text. If any single
     directive can't be resolved this way (file missing locally, bad name),
@@ -184,7 +184,7 @@ async def _resolve_media_via_owui(
         after_prefix = remaining[idx + len(prefix):].strip()
         fname = after_prefix.split()[0] if after_prefix else ""
         if not fname or not _looks_like_media_filename(fname):
-            # Not a real directive — e.g. prose using "MEDIA:" as a term,
+            # Not a real directive -- e.g. prose using "MEDIA:" as a term,
             # not a file reference. Leave this occurrence as literal text
             # and keep scanning past it for any genuine directive later on.
             out += before + prefix
@@ -196,12 +196,12 @@ async def _resolve_media_via_owui(
         if not os.path.isfile(fpath):
             return text, False
 
-        # _upload_owui_file uses blocking urllib — must run off the event loop.
+        # _upload_owui_file uses blocking urllib -- must run off the event loop.
         # This call goes to OWUI's own API (often 127.0.0.1:8080, i.e. OWUI
         # calling itself) from *inside* the async handler for the very request
         # that's driving this pipe run. Calling it directly would block the
         # single asyncio event loop thread, and OWUI can't service its own
-        # incoming HTTP request while its own loop is blocked waiting on it —
+        # incoming HTTP request while its own loop is blocked waiting on it --
         # a guaranteed self-deadlock that only resolves via timeout. Running it
         # in a thread lets the event loop keep serving requests concurrently.
         file_obj = await asyncio.to_thread(_upload_owui_file, fpath, base_url, token)

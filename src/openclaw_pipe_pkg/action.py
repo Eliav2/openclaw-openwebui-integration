@@ -1133,7 +1133,7 @@ class Action:
         )
         DEVICE_IDENTITY: str = Field(
             default="",
-            description="Copy this exactly from the Pipe's valves — do not leave "
+            description="Copy this exactly from the Pipe's valves -- do not leave "
                         "it empty if the Pipe has one. It is what lets a fallback "
                         "connection be recognised as the same already-approved "
                         "device instead of raising a second pairing request."
@@ -1146,7 +1146,7 @@ class Action:
         )
         AGENT_ID: str = Field(
             default="main",
-            description="Copy this exactly from the Pipe's valves — the same "
+            description="Copy this exactly from the Pipe's valves -- the same "
                         "OpenClaw agent the Pipe routes chats to."
         )
 
@@ -1445,7 +1445,7 @@ class Action:
             await __event_emitter__({
                 "type": "execute",
                 "data": {"code": _render_sections_error_js(
-                    "A response is currently in progress — wait for it to "
+                    "A response is currently in progress -- wait for it to "
                     "finish before compacting."
                 )},
             })
@@ -1499,7 +1499,7 @@ class Action:
             await __event_emitter__({
                 "type": "execute",
                 "data": {"code": _render_sections_error_js(
-                    "Compact timed out — it may still finish in the background."
+                    "Compact timed out -- it may still finish in the background."
                 )},
             })
             return {"status": "error", "detail": "timeout"}

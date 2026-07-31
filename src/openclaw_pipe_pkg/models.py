@@ -29,7 +29,7 @@ def _friendly_name(model_entry: dict) -> str:
 
     The catalog `name` is preferred because it carries the *version*
     ("Claude Opus 4.8"), while the alias is a deliberately short handle
-    ("opus") that hides which version you're actually talking to — the
+    ("opus") that hides which version you're actually talking to -- the
     selector then shows two indistinguishable "Opus"/"Sonnet" entries as
     new versions land. Same complaint as upstream openclaw#111884.
     Alias remains the fallback for models the gateway returns unnamed.
@@ -54,7 +54,7 @@ def _normalize_model_entry(raw: dict) -> dict:
     """Normalize a raw gateway `models.list` entry into the {key, name, tags}
     shape used elsewhere in this module (matches _FALLBACK_MODELS).
 
-    The gateway's actual response shape is {id, name, provider, alias, ...} —
+    The gateway's actual response shape is {id, name, provider, alias, ...} --
     there is no combined "key" or "tags" field, so this bridges the two.
     """
     provider = raw.get("provider", "")
@@ -112,7 +112,7 @@ def _explain_session_patch_failure(err, *, model_override, agent_id) -> str:
     if isinstance(err, (asyncio.TimeoutError, ConnectionError)):
         return (
             "**The Gateway did not respond in time while starting this "
-            "conversation.** This is usually transient — send the message "
+            "conversation.** This is usually transient -- send the message "
             "again. If it keeps happening, check that the Gateway is healthy "
             "and reachable from Open WebUI."
         )
@@ -130,7 +130,7 @@ def _explain_session_patch_failure(err, *, model_override, agent_id) -> str:
     if any(h in low for h in _AGENT_ERROR_HINTS):
         return (
             f"**Could not start a session on agent `{agent_id}`:** {detail}\n\n"
-            f"Check the `AGENT_ID` valve — it must name an agent your OpenClaw "
+            f"Check the `AGENT_ID` valve -- it must name an agent your OpenClaw "
             f"Gateway actually defines (`main` unless you configured others). "
             f"This surfaces here because applying the model is the first thing "
             f"the pipe asks the agent to do; the model (`{wanted}`) may be fine."
@@ -150,7 +150,7 @@ MODELS_SOURCE_FALLBACK = "fallback"
 
 # Appended to selector entries built from _FALLBACK_MODELS. Display text only --
 # the entry's `id` (the routing key) is untouched, so this cannot affect routing.
-UNVERIFIED_MODEL_SUFFIX = " — example, Gateway not reached"
+UNVERIFIED_MODEL_SUFFIX = " -- example, Gateway not reached"
 
 
 async def _discover_models(valves) -> list[dict]:
