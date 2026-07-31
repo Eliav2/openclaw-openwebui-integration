@@ -198,25 +198,34 @@ class Pipe:
         Dynamically discovers models from the OpenClaw Gateway (or cache)
         and returns one entry per model plus a 'Default' entry.
         """
-        models = await _discover_models(self.valves)
-        
+        models, source = await _discover_models_with_source(self.valves)
+
         # Apply whitelist filter
         whitelist = _parse_whitelist(self.valves.CONFIGURED_MODELS)
         if whitelist:
             models = [m for m in models if m["key"] in whitelist]
-        
+
         # Apply safety cap
         if len(models) > self.valves.MAX_MODELS:
             models = models[:self.valves.MAX_MODELS]
-        
+
+        # A hardcoded list is a guess, not a discovery. Say so in the only place
+        # the user is looking -- the selector itself -- rather than letting five
+        # invented models masquerade as their Gateway's. Suffixing the display
+        # name is deliberate: `id` stays the untouched routing key.
+        unverified = source == MODELS_SOURCE_FALLBACK
         entries = []
         for m in models:
             friendly = _friendly_name(m)
             provider = _provider_from_key(m["key"])
             name = f"{friendly} ({provider}) · OpenClaw"
+            if unverified:
+                name += UNVERIFIED_MODEL_SUFFIX
             entries.append({"id": m["key"], "name": name})
-        
-        # Always prepend Default at top
+
+        # Always prepend Default at top. It is the one entry that always works
+        # in this state: it clears the override and uses the agent's own model,
+        # so it needs no Gateway round trip to be correct.
         return [{"id": "default", "name": "OpenClaw · Default"}] + entries
 
     @classmethod
@@ -226,8 +235,19 @@ class Pipe:
         Reads synchronously from the model cache or fallback list.
         """
         cache = _read_json_file(os.path.join(_state_dir(), "models-cache.json"))
-        models = cache.get("models", _FALLBACK_MODELS) if cache else _FALLBACK_MODELS
-        return [{"value": m["key"], "label": f"{_friendly_name(m)} ({_provider_from_key(m['key'])})"} for m in models]
+        cached = cache.get("models") if cache else None
+        models = cached or _FALLBACK_MODELS
+        # Same honesty as pipes(): before the first successful connection this
+        # dropdown is a built-in example list, not a reference of what the
+        # Gateway actually offers.
+        suffix = "" if cached else UNVERIFIED_MODEL_SUFFIX
+        return [
+            {
+                "value": m["key"],
+                "label": f"{_friendly_name(m)} ({_provider_from_key(m['key'])}){suffix}",
+            }
+            for m in models
+        ]
 
     def _selected_preset(self, body):
         """Extract the model key or legacy preset name from the OWUI model string."""
@@ -599,7 +619,11 @@ class Pipe:
                     conn.invalidate_model_patch(session_key)
         if patch_err is not None:
             await _emit_status(__event_emitter__, "", done=True)
-            yield f"**Model selection error:** could not apply `{model_override or 'agent default'}`: {patch_err}"
+            yield _explain_session_patch_failure(
+                patch_err,
+                model_override=model_override,
+                agent_id=self.valves.AGENT_ID,
+            )
             return
 
         # --- Concurrency: queue behind an active run, never steer-merge ---
