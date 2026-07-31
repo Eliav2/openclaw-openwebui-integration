@@ -1718,6 +1718,28 @@ def _item_delta_text(item_text: str, last_item_text: str, assistant_stream_text:
     return item_text
 
 
+
+def _catch_all_delta(raw_text: str, received_text: str, visible_text: str) -> str:
+    """New text carried by a cumulative catch-all assistant event.
+
+    Some providers end a turn with an event that has no `delta` but a `text`
+    field holding the WHOLE reply. It has to be diffed against what already
+    arrived, or the entire message is treated as new.
+
+    The diff is against `received_text`, everything the gateway sent us, and
+    not only against what was shown. Those two differ: text held back by the
+    ask-user buffer was received but never yielded. Diffing against shown text
+    alone made the final catch-all look entirely new, so the whole needs-input
+    block was appended to that buffer a second time and the dialog rendered the
+    prompt twice with double the options (ELI-80). The visible-text pass stays
+    as a second net for the drift case it was originally written for (P27).
+    """
+    if not raw_text:
+        return ""
+    delta = _item_delta_text(raw_text, "", received_text)
+    return _suppress_already_shown(delta, visible_text)
+
+
 def _suppress_already_shown(delta: str, visible_message_text: str) -> str:
     """Final safety net against re-yielding text that's already been shown.
 
@@ -4982,6 +5004,11 @@ class Pipe:
         first_event_arrived = False
         last_item_text = ""
         assistant_stream_text = ""
+        # Everything the gateway has sent for this turn, including text the
+        # ask-user buffer withheld. assistant_stream_text only tracks what was
+        # FLUSHED, so it cannot be used to dedup a cumulative catch-all event
+        # while a needs-input block is being held back (ELI-80).
+        assistant_received_text = ""
         visible_message_text = ""
         had_tool_block = False
         # toolCallIds announced to OWUI as `function_call` items that have
@@ -5301,6 +5328,7 @@ class Pipe:
                             raw_delta = data.get("delta")
                             if raw_delta:
                                 delta = raw_delta
+                                assistant_received_text += raw_delta
                             else:
                                 # Some providers (observed with claude-cli-backed
                                 # Opus/Sonnet overrides) send a final catch-all event
@@ -5310,24 +5338,18 @@ class Pipe:
                                 # time. Diff it against what's already been streamed,
                                 # same as the item-event dedup below.
                                 raw_text = data.get("text") or ""
-                                delta = (
-                                    _item_delta_text(raw_text, "", assistant_stream_text)
-                                    if raw_text
-                                    else ""
+                                before = _item_delta_text(
+                                    raw_text, "", assistant_received_text
+                                ) if raw_text else ""
+                                delta = _catch_all_delta(
+                                    raw_text, assistant_received_text, visible_message_text
                                 )
-                                # Safety net (P27, reproduced live 2026-07-10):
-                                # `assistant_stream_text` can drift from
-                                # `visible_message_text` and defeat the prefix
-                                # check above, which then falls through to
-                                # re-yielding the entire cumulative text. See
-                                # `_suppress_already_shown`'s docstring.
-                                suppressed = _suppress_already_shown(delta, visible_message_text)
-                                if delta and not suppressed:
+                                if before and not delta:
                                     pipe_log(
                                         "  suppressed duplicate catch-all assistant "
-                                        f"text ({len(delta)} chars already shown)"
+                                        f"text ({len(before)} chars already received)"
                                     )
-                                delta = suppressed
+                                assistant_received_text += delta
                             if delta:
                                 # Filter Sender metadata
                                 if (
