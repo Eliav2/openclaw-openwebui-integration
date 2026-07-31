@@ -1,9 +1,9 @@
-# Ask-User Modal — Design Spec
+# Ask-User Modal: Design Spec
 
 > **Status: design spec, not implemented as written.**
 >
 > This document proposes a `request_user_input` function-calling tool. That tool
-> **does not exist** — the shipped implementation in
+> **does not exist**: the shipped implementation in
 > [`src/openclaw_pipe_pkg/askuser.py`](../src/openclaw_pipe_pkg/askuser.py) took
 > the other path: it intercepts assistant text beginning with
 > `OpenClaw needs input:` or `Codex needs input:` and synthesizes the modal from
@@ -15,7 +15,7 @@
 >   rendered via a hand-built widget, because OWUI has no native
 >   "pick one of N buttons" control. Only genuine yes/no prompts become a
 >   confirmation dialog.
-> - **Timeouts:** 60s for the modal, 300s across a reconnect — not the single
+> - **Timeouts:** 60s for the modal, 300s across a reconnect, not the single
 >   5-minute timeout described below, and no `{"error": "User did not respond"}`
 >   payload.
 >
@@ -44,7 +44,7 @@ any model can call. The tool:
 
 - Function calling is supported by every mainstream provider
   (OpenAI, Anthropic, DeepSeek, Google, OpenRouter)
-- The pipe defines the tool, not the Gateway — no OpenClaw core change needed
+- The pipe defines the tool, not the Gateway, so no OpenClaw core change is needed
 - The tool only needs `text` + optionally `choices`; no provider-specific types
 
 ## Tool schema
@@ -77,7 +77,7 @@ parameters:
 
 1. The pipe receives the tool call event (`stream="tool"`, `phase="start"`)
 2. If the user is in the same OWUI chat (most common case):
-   - **Choices present (2–5):** render as OWUI `confirmation` event with
+   - **Choices present (2 to 5):** render as OWUI `confirmation` event with
      button-like options
    - **Choices > 5 or free-text only:** render as an OWUI `input` event
    - **`secret=True`:** render as `input` with `type: "password"`
@@ -103,7 +103,7 @@ This means even without modal support, the agent can still ask questions.
 
 ## Implementation plan
 
-### Phase 1 — Tool registration
+### Phase 1: Tool registration
 
 In `Pipe.__init__` or a new method, register `request_user_input` as an
 available function tool. The Gateway must be informed of the tool schema
@@ -114,7 +114,7 @@ so it can offer it to the agent.
 already sends messages via the WS; we need to include tool definitions
 at `__meta__` or in the first message.
 
-### Phase 2 — Tool call handling
+### Phase 2: Tool call handling
 
 In `pipe()`, when the Gateway yields a tool-call start event for
 `request_user_input`:
@@ -126,14 +126,14 @@ In `pipe()`, when the Gateway yields a tool-call start event for
 5. When the next user message arrives for this session, resolve the future
    with the user's answer text
 
-### Phase 3 — Answer routing
+### Phase 3: Answer routing
 
 The pipe already has a mechanism to handle user messages during an active run
 (steering). We extend it: if there is a pending `request_user_input` for this
 session+run, treat the new message as the **answer** to that tool call, not as
 a new steer message.
 
-### Phase 4 — Persistence
+### Phase 4: Persistence
 
 Pending user inputs survive only in memory (pipe instance state). If the pipe
 restarts, pending inputs are lost. This is acceptable for v1; the agent will
@@ -148,7 +148,7 @@ see a timeout error and can re-ask.
 
 2. **Does the pipe need to manage tool call state across yield points?**
    - Since `pipe()` is an async generator, we can hold a `Future` between
-     yields, but the OWUI event loop also runs — we need to ensure the
+     yields, but the OWUI event loop also runs, so we need to ensure the
      answer arrives on the same run context.
 
 3. **What happens if the user types a free-form answer when choices are given?**

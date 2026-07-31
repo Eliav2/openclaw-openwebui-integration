@@ -9,12 +9,12 @@ What it checks
 --------------
 1. REHYDRATION: while the turn is running (message.done == False), the assistant
    message's persisted `content` grows above empty. That is only possible if the
-   pipe's mid-run `replace` snapshots are landing in the DB — i.e. a client that
+   pipe's mid-run `replace` snapshots are landing in the DB -- i.e. a client that
    reconnects mid-turn would see partial text. (Root bug: this used to stay empty
    until done.)
 2. NO DUPLICATION: once done, neither the flat `content` nor the text extracted
    from `output` is a byte-identical whole-message double (ABCABC with no
-   separator) — the 820f6cc signature.
+   separator) -- the 820f6cc signature.
 
 Usage
 -----

@@ -457,7 +457,7 @@ def _resolved_model_key(patch_resp: dict) -> str | None:
 # Provider namespaces that name a *serving runtime* rather than the model's
 # canonical API vendor. A model keyed under one of these (e.g.
 # "claude-cli/claude-opus-5") resolves, on sessions.patch, to the model's
-# canonical provider ("anthropic/claude-opus-5") — the gateway always reports
+# canonical provider ("anthropic/claude-opus-5") -- the gateway always reports
 # the vendor, not the runtime. Without treating these as equal, any model
 # keyed by its runtime can never pass the post-patch equality check and the
 # pipe wrongly aborts with "model override did not apply" (opus-5 was the only
@@ -472,7 +472,7 @@ def _model_patch_matches(model_override: str | None, patch_resp: dict) -> bool:
     if _resolved_model_key(patch_resp) == model_override:
         return True
     # Runtime-namespaced key (claude-cli/<id>) vs canonical vendor readback
-    # (anthropic/<id>): same model, different provider label — treat as applied.
+    # (anthropic/<id>): same model, different provider label -- treat as applied.
     if "/" in model_override:
         want_provider, want_model = model_override.split("/", 1)
         got_model = patch_resp.get("resolved", {}).get("model")
@@ -567,7 +567,7 @@ def _item_delta_text(item_text: str, last_item_text: str, assistant_stream_text:
     `assistant` delta stream.
 
     Some item events of kind "message"/"output" echo the *complete* final
-    assistant text (not just a genuine tool-preamble) — without this check
+    assistant text (not just a genuine tool-preamble) -- without this check
     that full text gets yielded a second time on top of what the assistant
     stream already delivered, duplicating the whole final message.
     """
@@ -586,7 +586,7 @@ def _suppress_already_shown(delta: str, visible_message_text: str) -> str:
 
     `_item_delta_text`'s dedup baseline (`assistant_stream_text` or
     `last_item_text`) is a separate accumulator from `visible_message_text`
-    and can drift from it — e.g. a provider's final catch-all event races
+    and can drift from it -- e.g. a provider's final catch-all event races
     an idle-timeout recovery cycle, or arrives after other text (tool
     blocks, recovered previews) has been recorded into
     `visible_message_text` without also updating `assistant_stream_text`.
@@ -598,7 +598,7 @@ def _suppress_already_shown(delta: str, visible_message_text: str) -> str:
     `visible_message_text` is the true, complete record of everything
     already recorded for this turn, so checking whether `delta` is already
     its tail catches this regardless of which upstream baseline caused the
-    false negative — without touching the primary dedup logic (so a
+    false negative -- without touching the primary dedup logic (so a
     genuine partial catch-up, which is never already at the tail, still
     yields normally).
     """
@@ -613,7 +613,7 @@ def _attr(value: str) -> str:
     `html.escape` alone is NOT enough here. OWUI's frontend parses these
     `<details>` attributes with a non-dotAll regex (`/(\\w+)="(.*?)"/g`, chunk
     `_UcCb4Vt.js`), so `.` never matches a newline: any attribute value
-    containing a literal newline fails to match and is silently DROPPED — the
+    containing a literal newline fails to match and is silently DROPPED -- the
     tool card then renders with INPUT and no OUTPUT at all, with no error.
 
     That was invisible for `arguments` (always `json.dumps`-ed, so its newlines
@@ -622,7 +622,7 @@ def _attr(value: str) -> str:
 
     Encoding the newline as the numeric character reference `&#10;` keeps the
     attribute on one physical line for that regex while still decoding back to
-    a real newline when the browser parses the attribute — the same path that
+    a real newline when the browser parses the attribute -- the same path that
     already turns `&quot;` into `"` in the rendered card.
     """
     return (
@@ -643,14 +643,14 @@ def _tool_call_started_event(name: str, tool_call_id: str, args_str: str) -> dic
     `handle_responses_streaming_event` (`middleware.py`).
 
     That matters because the backend's output list is what feeds the live
-    `chat:completion` emissions, the final done event AND the DB write — so a
+    `chat:completion` emissions, the final done event AND the DB write -- so a
     tool call announced this way is mutable, unlike yielded markdown, which is
     append-only for the rest of the turn (see the two-phase `<details>` attempt
     that this replaced). The frontend renders a `function_call` with no matching
     `function_call_output` as a spinner (`structuredOutput.ts::buildToolCallToken`).
 
     Ordering is by arrival, and `response.output_item.added` simply appends, so
-    these interleave correctly with ordinary streamed text — no output_index
+    these interleave correctly with ordinary streamed text -- no output_index
     bookkeeping needed on our side.
     """
     return {
@@ -702,7 +702,7 @@ def _tool_call_error_relabel_event(name: str) -> dict:
     OWUI's `handle_responses_streaming_event` it is dead code: the broader
     `elif event_type.startswith('response.') and event_type.endswith('.done')`
     branch matches first and explicitly skips `output_item` ("handled
-    specifically below" — it isn't reachable). So we instead use that
+    specifically below" -- it isn't reachable). So we instead use that
     branch's own "Generic Field Done" arm, which for an unrecognized
     `response.<field>.done` event does `item[<field>] = data[<field>]` on
     `output[output_index]` (default: last item) and returns a non-None
@@ -712,7 +712,7 @@ def _tool_call_error_relabel_event(name: str) -> dict:
 
     Unlike the old (dead) `output_item.done` shape, this mutates the existing
     item in place rather than replacing it wholesale, so `arguments`/`status`
-    don't need to be repeated here — they're already set on the item from the
+    don't need to be repeated here -- they're already set on the item from the
     start event and survive untouched.
     """
     return {
@@ -737,7 +737,7 @@ def _render_tool_result_block(name: str, tool_call_id: str, args_str: str,
 
     The markdown path, used when native tool items are off and by the shadow
     `_TurnRenderer` (which completes a run's OWUI message when the inline turn
-    ended early, outside any live stream — so it has no protocol channel and
+    ended early, outside any live stream -- so it has no protocol channel and
     must bake the card into text).
     """
     return (
@@ -765,7 +765,7 @@ class _TurnRenderer:
     dispatches, so the run's ORIGINAL OWUI message can be finalized to exactly
     what a non-interrupted turn would have stored.
 
-    Scope: assistant text deltas, item-carried text, and tool-result blocks —
+    Scope: assistant text deltas, item-carried text, and tool-result blocks --
     the substance of the long autonomous turns this path exists for. MEDIA
     uploads and ask-user modals are intentionally NOT reproduced (they need the
     live browser and don't occur on a self-closed background tail).
@@ -845,7 +845,7 @@ class _TurnRenderer:
 # didn't distinguish user-facing text from internal markers that happen to
 # flow through the same event stream. Fixed by filtering the documented
 # silent sentinels (`_SILENT_SENTINELS`: ANNOUNCE_SKIP, NO_REPLY, no_reply)
-# before treating preview text as deliverable — see that constant's
+# before treating preview text as deliverable -- see that constant's
 # docstring. The separate duplicate-identity issue (a live turn in an
 # actively-used real chat getting proactively re-delivered) was already
 # fixed by `was_delivered_live` and confirmed via timestamps to only have
@@ -856,18 +856,18 @@ PROACTIVE_DELIVERY_ENABLED = True
 
 
 # Anchor for state that must be shared by *every* `_GatewayConnection` alive in
-# this Python process — not just the current module's singleton. OWUI's function
+# this Python process -- not just the current module's singleton. OWUI's function
 # loader execs each redeploy into a brand-new module object with no teardown hook
 # on the old one, so a connection left running by a previous deploy (a "zombie")
 # keeps its own event loop and its own *private* bookkeeping dicts. That zombie
 # still receives the Gateway's broadcast `final` events; with private bookkeeping
 # it sees an empty `delivered_live`/`session_last_activity` for the session,
 # wrongly concludes "nobody consumed this, the session is idle", and proactively
-# re-writes the turn into chat history — even though the *live* connection just
+# re-writes the turn into chat history -- even though the *live* connection just
 # showed it to the open tab. That is the "*↳ Proactive message* on a live turn"
 # / duplicate-branch (2/2) bug (P33, root-caused 2026-07-11). Stashing the
 # liveness bookkeeping on `open_webui.socket.main` (OWUI's own stable module,
-# never reloaded by our function) makes all connections — current and zombie —
+# never reloaded by our function) makes all connections -- current and zombie --
 # read and write the *same* dicts, so a turn shown live by any connection is seen
 # as delivered by all of them, and proactive delivery only fires for turns no
 # connection ever showed live (genuine cron/heartbeat/sessions_send wakes).
@@ -890,7 +890,7 @@ def _shared_gateway_state() -> dict | None:
     # `setdefault` per key (not a one-shot dict literal on the `is None`
     # branch): this same dict persists across redeploys of the function
     # (stashed on OWUI's stable socket module), so a *new* key added in a
-    # later version must be backfilled into the already-existing dict —
+    # later version must be backfilled into the already-existing dict --
     # otherwise `__init__` does `_shared["new_key"]` and KeyErrors on the
     # first request after redeploy (chat_write_locks hit exactly this,
     # 2026-07-13).
@@ -904,7 +904,7 @@ def _shared_gateway_state() -> dict | None:
 
 @dataclass
 class _Consumer:
-    """An active run consumer — its ``asyncio.Queue`` receives events."""
+    """An active run consumer -- its ``asyncio.Queue`` receives events."""
     session_key: str
     run_id: str
     queues: list[asyncio.Queue] = field(default_factory=list)
@@ -948,10 +948,10 @@ class _GatewayConnection:
         # SAME idempotent sessions.patch; under that contention the RPC can
         # transiently time out and that message's answer is replaced by a
         # "Model selection error". Caching the last applied value (with a
-        # short TTL — the session model can drift externally, e.g. /model in
+        # short TTL -- the session model can drift externally, e.g. /model in
         # the Control UI) lets same-model calls skip the RPC entirely, and the
         # per-session patch lock collapses a burst to ONE in-flight patch.
-        # OWUI caveat: multiple worker processes each keep their own cache —
+        # OWUI caveat: multiple worker processes each keep their own cache --
         # imperfect, but strictly fewer redundant patches than before.
         self._model_patch_cache: dict[str, tuple[str | None, float]] = {}
         self._model_patch_locks: dict[str, asyncio.Lock] = {}
@@ -977,8 +977,8 @@ class _GatewayConnection:
         _shared = _shared_gateway_state()
 
         # Dedup guard for proactive OWUI delivery (P33/ELI-17), keyed by
-        # "session_key:run_id" so a retried/duplicated final event — or a
-        # second (zombie) connection racing the same idle session — never
+        # "session_key:run_id" so a retried/duplicated final event -- or a
+        # second (zombie) connection racing the same idle session -- never
         # writes the same message into chat history twice.
         self._delivered_proactive: dict[str, bool] = (
             _shared["delivered_proactive"] if _shared is not None else {}
@@ -989,7 +989,7 @@ class _GatewayConnection:
         # to an open browser tab, which persists it itself via OWUI's normal
         # client-side flow). If the Gateway later re-emits a duplicate/retried
         # final event for that same run_id after the tab's request has
-        # closed, this identity check catches it precisely — unlike a
+        # closed, this identity check catches it precisely -- unlike a
         # content-equality check, it can't false-positive just because two
         # unrelated turns happen to end with the same short text (e.g. "OK.",
         # "Done."), and unlike the debounce timer alone, it doesn't depend on
@@ -1006,7 +1006,7 @@ class _GatewayConnection:
         # sends the *next* leg's request (e.g. answering an ask-user modal)
         # a few seconds later under a brand-new run_id. During that gap the
         # session has zero registered consumers yet is not actually
-        # abandoned — a "final" event landing in that window used to get
+        # abandoned -- a "final" event landing in that window used to get
         # proactively delivered as a duplicate into a chat the user was
         # still actively looking at. Recording the timestamp on every
         # register/unregister lets `session_idle_for` require a minimum
@@ -1022,7 +1022,7 @@ class _GatewayConnection:
         # Sessions currently being watched by a debounce task waiting for
         # `session_idle_for` to clear (see `_maybe_deliver_proactive_after_debounce`).
         # Prevents spawning a second concurrent watcher for the same session
-        # when multiple unmatched "final" events arrive close together —
+        # when multiple unmatched "final" events arrive close together --
         # which would otherwise let both watchers independently observe
         # idleness later and each call `_deliver_proactive_owui_message`
         # with a *different* run_id, defeating the per-run dedup guard. Shared
@@ -1049,7 +1049,7 @@ class _GatewayConnection:
         # rendering into a known OWUI message, `_run_targets[key]` holds that
         # message's (chat_id, message_id) and `_run_renderers[key]` a
         # `_TurnRenderer` accumulating the full content from this run's event
-        # stream — so if the inline turn ends before the run does (idle
+        # stream -- so if the inline turn ends before the run does (idle
         # self-close / cancel / torn-down request), the run's final can finalize
         # the ORIGINAL message to the complete content instead of stranding the
         # tail in a truncated, tool-block-less proactive bubble. Instance-local
@@ -1180,7 +1180,7 @@ class _GatewayConnection:
         self._model_patch_cache[session_key] = (model, time.time())
 
     def invalidate_model_patch(self, session_key: str) -> None:
-        """Drop the cached model for a session (ELI-59) — called on patch
+        """Drop the cached model for a session (ELI-59) -- called on patch
         failure so the next message retries the RPC from scratch."""
         self._model_patch_cache.pop(session_key, None)
 
@@ -1230,7 +1230,7 @@ class _GatewayConnection:
 
     def mark_delivered_live(self, session_key: str, run_id: str):
         """Record that this run's final event was just dispatched to a live
-        consumer queue — i.e. genuinely shown to an open browser tab, which
+        consumer queue -- i.e. genuinely shown to an open browser tab, which
         persists it itself via OWUI's own client-side flow. See
         `_delivered_live`'s docstring for why this is the precise signal to
         gate proactive delivery on."""
@@ -1264,7 +1264,7 @@ class _GatewayConnection:
         zero or multiple session matches) while the session is still
         genuinely being serviced by an open browser tab under a *different*
         run_id. Proactive delivery must only fire when the session has no
-        active consumer at all — otherwise it risks injecting a duplicate
+        active consumer at all -- otherwise it risks injecting a duplicate
         message into a conversation that's live right now (see 2026-07-11
         incident in PLAN.md P33).
         """
@@ -1281,7 +1281,7 @@ class _GatewayConnection:
         `has_any_consumer_for_session` alone is racy: it can momentarily
         read False in the gap between one leg's HTTP request ending
         (unregister) and the browser's next request for the same logical
-        turn arriving (register) — a few seconds, not the minutes a
+        turn arriving (register) -- a few seconds, not the minutes a
         genuinely abandoned session sits idle for. Requiring a sustained
         quiet period turns a race into a simple timing margin: a real
         steering/modal round trip resolves in low single-digit seconds,
@@ -1289,7 +1289,7 @@ class _GatewayConnection:
         pending browser request at all, so it always clears the bar.
 
         A session_key never seen by this connection (no register/unregister
-        recorded — e.g. this is a fresh process, or the previous owner of
+        recorded -- e.g. this is a fresh process, or the previous owner of
         this session was a now-reaped zombie connection) has no activity to
         race against, so it's treated as idle immediately.
         """
@@ -1501,7 +1501,7 @@ class _GatewayConnection:
         # Handshake: receive challenge
         challenge = json.loads(await asyncio.wait_for(ws.recv(), 10))
         if challenge.get("event") != "connect.challenge":
-            raise GatewayError("Bad handshake — expected connect.challenge")
+            raise GatewayError("Bad handshake -- expected connect.challenge")
 
         c = challenge["payload"]
         signed = _sign_challenge(self._ident, c["nonce"], c["ts"], token_str=token)
@@ -1521,7 +1521,7 @@ class _GatewayConnection:
                 device=signed,
                 locale="en-US",
                 userAgent="openclaw-owui-pipe/1.0",
-                caps=["agent-events", "tool-events"]
+                caps=["tool-events"]
             )
         )))
 
@@ -1544,7 +1544,7 @@ class _GatewayConnection:
         self._ws = ws
         self._reconnect_attempt = 0
         pipe_log("Connected to Gateway (persistent)")
-        # NOTE: does not start/spawn the event-loop task — that happens
+        # NOTE: does not start/spawn the event-loop task -- that happens
         # exactly once, in `ensure_connected`. This method is also called
         # from inside `_reconnect`, which runs from within the event-loop
         # task itself; spawning another task here would duplicate it.
@@ -1613,7 +1613,7 @@ class _GatewayConnection:
         This is the ONLY task that ever calls `self._ws.recv()`. Reconnects
         happen in place (`self._ws = None`, then `_reconnect()` blocks until
         a new socket is ready) rather than by spawning a second event-loop
-        task — spawning a second task here previously caused a runaway
+        task -- spawning a second task here previously caused a runaway
         reconnect storm: the old coroutine kept looping after `_reconnect()`
         returned, so two tasks raced on `self._ws.recv()`, each collision
         raised its own exception, and each of *those* spawned yet another
@@ -1694,7 +1694,7 @@ class _GatewayConnection:
                 consumers = self.consumers_for_event(payload)
 
                 # ── ELI-62 live relay (step 4, slice 2) ──
-                # When enabled (kill switch default OFF — see
+                # When enabled (kill switch default OFF -- see
                 # LIVE_STREAM_RELAY_ENABLED), relay a PROACTIVE run's deltas
                 # straight into an already-open OWUI tab as they stream,
                 # instead of only persisting the finished text post-hoc. Only
@@ -1707,7 +1707,7 @@ class _GatewayConnection:
                 )
                 if LIVE_STREAM_RELAY_ENABLED and _relay_key in self._relay_sessions:
                     if consumers:
-                        # A live consumer appeared for a run we were relaying —
+                        # A live consumer appeared for a run we were relaying --
                         # hand the run back to the inline path (finalize our
                         # out-of-band bubble so it isn't left pending) and let
                         # the normal dispatch below take over.
@@ -1735,12 +1735,12 @@ class _GatewayConnection:
                         pipe_log("  dispatched session-only event to sole consumer")
                     if payload.get("state") == "final" and payload.get("sessionKey") and payload.get("runId"):
                         # Genuinely shown to a live tab, which persists it via
-                        # OWUI's own client-side flow — remember this so a
+                        # OWUI's own client-side flow -- remember this so a
                         # later duplicate/retried final event for the same
                         # run_id is never proactively re-delivered (P33).
                         self.mark_delivered_live(payload["sessionKey"], payload["runId"])
                         # The inline turn is alive and took the final itself, so
-                        # the parity shadow isn't needed for this run — drop it.
+                        # the parity shadow isn't needed for this run -- drop it.
                         self.unregister_run_target(payload["sessionKey"], payload["runId"])
                     for q in consumers[0].queues:
                         await q.put(msg)
@@ -1748,7 +1748,7 @@ class _GatewayConnection:
 
                 # ── Parity finalize (2026-07-19) ──
                 # A final arrived with NO live consumer, but we were tracking
-                # this run's OWUI message — i.e. the inline pipe() turn ended
+                # this run's OWUI message -- i.e. the inline pipe() turn ended
                 # before the run did. Complete the ORIGINAL message with the
                 # full shadow-rendered content, in place, instead of letting
                 # the tail fall through to the detached/truncated proactive
@@ -1768,12 +1768,12 @@ class _GatewayConnection:
                     continue
 
                 # ── Proactive delivery for idle OWUI sessions (P33/ELI-17/ELI-19) ──
-                # Nobody is live-consuming this *exact* event — no browser tab
+                # Nobody is live-consuming this *exact* event -- no browser tab
                 # is mid-request for this precise session+run. That alone is
                 # NOT enough to prove the session is idle: this event's run_id
                 # can simply not match a *different*, still-active run on the
                 # same session (steering handoff, or a bare session-only event
-                # with zero/multiple matches) — proactively delivering in that
+                # with zero/multiple matches) -- proactively delivering in that
                 # case injects a duplicate into a live conversation (real
                 # incident, 2026-07-11, see PLAN.md P33). Even
                 # `has_any_consumer_for_session` alone isn't enough: it's a
@@ -1786,7 +1786,7 @@ class _GatewayConnection:
                 # for a sustained quiet period, not just at this instant. On
                 # top of that, `was_delivered_live` gates out a *duplicate or
                 # retried* final event for a run that was already genuinely
-                # shown to a live tab — that scenario doesn't depend on
+                # shown to a live tab -- that scenario doesn't depend on
                 # timing at all (the tab may have gone quiet for well over
                 # the debounce window by the time the retry arrives), so it
                 # needs its own identity-based check, not a longer timer.
@@ -1845,7 +1845,7 @@ class _GatewayConnection:
                 # No events for 90s but connection is still alive
                 continue
             except websockets.exceptions.ConnectionClosed:
-                pipe_log("WS disconnected — reconnecting...")
+                pipe_log("WS disconnected -- reconnecting...")
                 self._ws = None
             except asyncio.CancelledError:
                 break
@@ -1858,7 +1858,7 @@ class _GatewayConnection:
 
         Blocks (looping in place, in the single `_event_loop` task) until a
         new connection is established or the connection is stopped. Must
-        NEVER spawn a new `_event_loop` task — see the docstring on
+        NEVER spawn a new `_event_loop` task -- see the docstring on
         `_event_loop` for why that caused a runaway task/connection storm.
         """
         while not self._stopped:
@@ -1878,7 +1878,7 @@ class _GatewayConnection:
 
 
 # Protocol sentinels (docs/tools/subagents.md:470-431) that mean "no
-# user-visible content was produced" — never real assistant text to show a
+# user-visible content was produced" -- never real assistant text to show a
 # human. An announce-follow-up run can legitimately finish with exactly one
 # of these as its only "assistant text", and naively persisting it as a
 # proactive OWUI message leaks internal plumbing into the chat (P33,
@@ -1889,7 +1889,7 @@ _SILENT_SENTINELS = {"ANNOUNCE_SKIP", "NO_REPLY", "no_reply"}
 def _last_assistant_text_from_preview(preview: dict, session_key: str) -> str | None:
     """Return the last assistant message text for session_key in a
     `sessions.preview` response (same shape `_preview_recovery_text` reads),
-    without requiring a preceding user-text match — a proactive delivery
+    without requiring a preceding user-text match -- a proactive delivery
     (cron/heartbeat/sessions_send) has no live "user turn" in this pipe to
     anchor against, we just want whatever the run finished saying.
     """
@@ -1928,7 +1928,7 @@ async def _maybe_deliver_proactive_after_debounce(
 
     Re-polls rather than sleeping once for `min_idle_s`, because the
     session's idle clock can restart at any point (a new leg registers a
-    consumer, runs, then unregisters again) — a single fixed sleep would
+    consumer, runs, then unregisters again) -- a single fixed sleep would
     miss that and could still deliver during a live steering round trip. If
     the session never settles within `max_wait_s`, gives up rather than
     delivering into a session whose liveness can't be confirmed; also bails
@@ -1950,7 +1950,7 @@ async def _maybe_deliver_proactive_after_debounce(
             waited += poll_interval_s
         if conn.was_delivered_live(session_key, run_id):
             # The run got shown to a (re)connected live tab while we were
-            # waiting out the debounce window — that tab already persists
+            # waiting out the debounce window -- that tab already persists
             # it via OWUI's own client-side flow, so proactively delivering
             # now would be a pure duplicate.
             pipe_log(f"  proactive delivery: {session_key[:40]}... run "
@@ -1966,7 +1966,7 @@ def _deepest_leaf_id(messages: dict, start_id: str | None) -> str | None:
 
     OWUI's `history.currentId` is only a *view* pointer: the frontend (or an
     interleaved live turn) can reset it back to an ancestor that already has
-    children — e.g. right after a proactive message was appended. Anchoring a
+    children -- e.g. right after a proactive message was appended. Anchoring a
     new proactive message directly on `currentId` in that state appends it as
     a *sibling* of the existing child, which OWUI renders as a 1/2·2/2 variant
     group instead of a linear message (observed 2026-07-13: a `Sub-agent
@@ -2006,7 +2006,7 @@ def _relinearize_proactive_variants(history: dict) -> bool:
     Cause: OWUI can't live-append a new message to an already-open tab, so a
     proactive message is written to the DB while the tab's `currentId` is
     stale. When the user then sends their next message, the frontend parents it
-    to the PRE-proactive leaf — making the proactive message and the new
+    to the PRE-proactive leaf -- making the proactive message and the new
     message siblings of one node, which OWUI renders as a swipeable 1/2·2/2
     variant group (observed live 2026-07-19: 7 such groups, each an assistant
     node with a proactive child + a user child).
@@ -2037,8 +2037,8 @@ def _relinearize_proactive_variants(history: dict) -> bool:
         chain = proactive + others  # `others` is [] or exactly [one]
         # Keep only the first node under the parent; chain the rest under the
         # deepest leaf of the previous node's existing subtree (a proactive
-        # message may already anchor its own tail — e.g. a later proactive
-        # chained under it — so we must extend, not overwrite, its children).
+        # message may already anchor its own tail -- e.g. a later proactive
+        # chained under it -- so we must extend, not overwrite, its children).
         parent["childrenIds"] = [chain[0]]
         first = messages.get(chain[0])
         if isinstance(first, dict):
@@ -2054,8 +2054,8 @@ def _relinearize_proactive_variants(history: dict) -> bool:
             nxt_node = messages.get(nxt)
             if isinstance(nxt_node, dict):
                 nxt_node["parentId"] = cur_leaf
-        # Point the view at the true tail so the whole linear flow — including
-        # the now-inlined proactive message — is what shows.
+        # Point the view at the true tail so the whole linear flow -- including
+        # the now-inlined proactive message -- is what shows.
         history["currentId"] = _deepest_leaf_id(messages, chain[0])
         changed = True
     return changed
@@ -2084,7 +2084,7 @@ async def _heal_proactive_variants(conn: "_GatewayConnection", chat_id: str) -> 
                 return
             if _relinearize_proactive_variants(history):
                 # update_chat_by_id resets the title to "New Chat" when the
-                # passed blob has no 'title' key — preserve it explicitly.
+                # passed blob has no 'title' key -- preserve it explicitly.
                 if "title" not in blob:
                     blob["title"] = getattr(chat, "title", None) or "New Chat"
                 await Chats.update_chat_by_id(chat_id, blob)
@@ -2106,7 +2106,7 @@ async def _append_proactive_message_to_chat(
     identical for both callers:
       * anchor on the true childless leaf (`_deepest_leaf_id`), not the bare
         `currentId`, or the message forks a 1/2·2/2 sibling variant;
-      * patch the old leaf's `childrenIds` BEFORE upserting the new message —
+      * patch the old leaf's `childrenIds` BEFORE upserting the new message --
         `upsert_message_to_chat_by_id_and_message_id` resets `currentId` on
         every call, so doing it after would orphan the new message;
       * inherit the branch's own `model` so OWUI's frontend still resolves an
@@ -2115,12 +2115,12 @@ async def _append_proactive_message_to_chat(
         zombie connection) can't each read the same leaf and append siblings.
 
     Returns True on a successful persist. Callers own the success log line
-    (its detail — user_id, task_id — differs); this owns the
+    (its detail -- user_id, task_id -- differs); this owns the
     unavailable/not-found/failed logs, tagged with `log_prefix`.
 
     `out`, if given, is filled with `old_leaf_id`/`new_message_id` on success
-    (ELI-62: the live-bootstrap step needs the OLD leaf id — a message id
-    already known to any open tab — as its `execute` event target). Optional
+    (ELI-62: the live-bootstrap step needs the OLD leaf id -- a message id
+    already known to any open tab -- as its `execute` event target). Optional
     and additive so the three pre-existing callers that don't pass it keep
     their plain bool return untouched.
     """
@@ -2173,7 +2173,7 @@ async def _append_proactive_message_to_chat(
         return False
 
 
-# ELI-62 PoC kill switch — default OFF. Flips on the "introduce + bootstrap"
+# ELI-62 PoC kill switch -- default OFF. Flips on the "introduce + bootstrap"
 # slice of the live-streaming design only (steps 2-3: persist the message,
 # then nudge any open tab to reload so it appears without a manual refresh).
 # Token-by-token relay of an in-flight run (step 4) is a separate, larger
@@ -2187,7 +2187,7 @@ LIVE_STREAM_BOOTSTRAP_ENABLED = True
 async def _emit_live_bootstrap_reload(user_id: str, chat_id: str, target_message_id: str | None) -> None:
     """Fire-and-forget nudge: ask any open tab showing `chat_id` to reload so
     a message this bridge just persisted out-of-band (which OWUI's own
-    live-refresh logic never picks up — see `_deliver_proactive_owui_message`'s
+    live-refresh logic never picks up -- see `_deliver_proactive_owui_message`'s
     docstring) shows up immediately instead of waiting for the user to
     reopen/refresh the chat by hand.
 
@@ -2195,24 +2195,24 @@ async def _emit_live_bootstrap_reload(user_id: str, chat_id: str, target_message
     (0.10.2, `open_webui/socket/main.py::get_event_emitter`, checked
     2026-07-25): `sio.emit('events', {chat_id, message_id, data}, room=f
     'user:{user_id}')`. The frontend's `chatEventHandler` (`Chat.svelte`,
-    same version, confirmed live) drops the WHOLE event — before even
-    looking at `data.type` — unless `history.messages[message_id]` already
+    same version, confirmed live) drops the WHOLE event -- before even
+    looking at `data.type` -- unless `history.messages[message_id]` already
     exists in that tab's in-memory history. That's why this targets
     `target_message_id` = the OLD leaf (a message id already known to any
     open tab), never the brand-new proactive message id itself, and why a
     missing/None target is a silent no-op rather than an error: an empty
     chat with no prior messages has nothing for an open tab to key off of
-    anyway. `chat_id` in the payload also matters — the handler only acts
+    anyway. `chat_id` in the payload also matters -- the handler only acts
     when `event.chat_id === $chatId`, so other chats/tabs/users are
     unaffected even though the emit targets the whole `user:{user_id}` room
     (every tab that user has open, matching OWUI's own room-wide behavior).
 
     PoC scope: the injected code is the constant
-    `location.reload()` — a full reload, not a targeted DOM patch. Jarring
+    `location.reload()` -- a full reload, not a targeted DOM patch. Jarring
     but simple and safe; a nicer alternative is explicitly left as a later
     exploration in the design doc, not attempted here.
 
-    `sio.emit` (fire-and-forget), not `sio.call` — there is no answer to
+    `sio.emit` (fire-and-forget), not `sio.call` -- there is no answer to
     wait for, unlike the ask-user modal's `sio.call` in askuser.py.
     """
     if not target_message_id:
@@ -2238,7 +2238,7 @@ async def _emit_live_bootstrap_reload(user_id: str, chat_id: str, target_message
 
 
 # ── ELI-62 live relay (step 4, slice 2) ────────────────────────────────────
-# Kill switch — default OFF. When on, a PROACTIVE run (cron/wake/sessions_send
+# Kill switch -- default OFF. When on, a PROACTIVE run (cron/wake/sessions_send
 # into an idle OWUI session with no live tab consuming it) is streamed straight
 # into any already-open tab showing that chat, token by token, instead of only
 # being persisted as finished text after the run ends (slice 1). Supersedes the
@@ -2252,18 +2252,18 @@ async def _emit_live_bootstrap_reload(user_id: str, chat_id: str, target_message
 # reconciliation once a pending assistant leaf exists). We emit these directly
 # via `sio.emit("events", …)` (same envelope as `_emit_live_bootstrap_reload`),
 # which reaches open tabs but does NOT go through OWUI's `get_event_emitter`, so
-# it does NOT auto-persist — this path owns DB writes explicitly (introduce =
+# it does NOT auto-persist -- this path owns DB writes explicitly (introduce =
 # done:false, snapshots + finalize = done:true), exactly like the slice-1 /
 # parity paths already do.
 #
-# NOT flipped on here — leave False. Before enabling, the terminal
+# NOT flipped on here -- leave False. Before enabling, the terminal
 # `chat:active` event envelope still needs a live-browser confirmation
 # (see `_relay_finalize`); DB persistence guarantees reload-correctness
 # regardless, so an imperfect terminal event only costs a spinner nicety.
 LIVE_STREAM_RELAY_ENABLED = True
 
 # A proactive run is only eligible for relay once its session has had zero
-# consumers for at least this long — the same sustained-idle contract the
+# consumers for at least this long -- the same sustained-idle contract the
 # post-hoc debounce path uses (`session_idle_for`), so a live steering/modal
 # round trip (low single-digit seconds) can never be mistaken for a genuine
 # idle wake and we never race a message the user is mid-way through sending.
@@ -2298,7 +2298,7 @@ def _relay_content_is_showable(text: str) -> bool:
     bubble: non-empty, not a silent sentinel, and not still a prefix that could
     grow into a sentinel-only run. Delaying introduce until this holds means a
     sentinel-only wake (`NO_REPLY`/`ANNOUNCE_SKIP`) never flashes an empty
-    bubble — the same suppression the post-hoc path gets from
+    bubble -- the same suppression the post-hoc path gets from
     `_last_assistant_text_from_preview`, applied to a stream we watch grow.
     """
     t = text.strip()
@@ -2339,7 +2339,7 @@ async def _relay_persist_content(conn: "_GatewayConnection", chat_id: str,
     """Write the in-flight/final content into the DB message, under the same
     per-chat write lock the proactive paths use. Keeps reload parity mid-stream
     (a tab reopened while a run streams shows the last snapshot) and is the
-    authoritative done:true record at run end — the terminal socket event is
+    authoritative done:true record at run end -- the terminal socket event is
     only a live-tab nicety on top of this."""
     if not message_id:
         return
@@ -2391,7 +2391,7 @@ async def _relay_introduce(conn: "_GatewayConnection", state: "_RelayState") -> 
     key = f"{state.session_key}:{state.run_id}"
     if key in conn._delivered_proactive:
         # Another path (post-hoc / a zombie connection) already claimed this
-        # run — abandon relay rather than risk a duplicate bubble.
+        # run -- abandon relay rather than risk a duplicate bubble.
         conn._relay_sessions.pop(key, None)
         return False
     conn._delivered_proactive[key] = True
@@ -2405,7 +2405,7 @@ async def _relay_introduce(conn: "_GatewayConnection", state: "_RelayState") -> 
     if not await _append_proactive_message_to_chat(
         conn, state.chat_id, content, log_prefix="live relay introduce", out=out
     ):
-        # Persist failed — release the claim so the post-hoc path can still try.
+        # Persist failed -- release the claim so the post-hoc path can still try.
         conn._delivered_proactive.pop(key, None)
         conn._relay_sessions.pop(key, None)
         return False
@@ -2423,8 +2423,8 @@ async def _relay_introduce(conn: "_GatewayConnection", state: "_RelayState") -> 
     )
     # Bootstrap: make any open tab reload and pick up the pending message so
     # subsequent `message`/`replace` events (which the frontend only applies to
-    # KNOWN message ids) actually land. Targets the OLD leaf — a message id the
-    # tab already knows — exactly like slice 1.
+    # KNOWN message ids) actually land. Targets the OLD leaf -- a message id the
+    # tab already knows -- exactly like slice 1.
     await _emit_live_bootstrap_reload(state.user_id, state.chat_id, state.old_leaf_id)
     pipe_log(
         f"  live relay: introduced message {str(state.message_id)[:8]}... "
@@ -2457,7 +2457,7 @@ async def _relay_feed_event(conn: "_GatewayConnection", session_key: str,
                 return
         elif is_final:
             # Run ended before any showable content (empty / sentinel-only wake)
-            # — never introduced a bubble, so just drop the state silently.
+            # -- never introduced a bubble, so just drop the state silently.
             conn._relay_sessions.pop(key, None)
             return
         else:
@@ -2515,7 +2515,7 @@ async def _relay_finalize(conn: "_GatewayConnection", state: "_RelayState",
             state.user_id, state.chat_id, state.message_id,
             {"type": "replace", "data": {"content": final_content}},
         )
-        # Terminal signal: once a pending assistant leaf exists (it does — we
+        # Terminal signal: once a pending assistant leaf exists (it does -- we
         # introduced it), OWUI's chatEventHandler treats chat:active:false as a
         # reconciliation trigger (ELI-62 groundwork). Envelope still wants a
         # live-browser confirmation before the kill switch is flipped on; the
@@ -2535,7 +2535,7 @@ async def _relay_finalize(conn: "_GatewayConnection", state: "_RelayState",
 
 
 async def _relay_abort(conn: "_GatewayConnection", key: str) -> None:
-    """A live consumer appeared for a run we were relaying — stop relaying and
+    """A live consumer appeared for a run we were relaying -- stop relaying and
     finalize whatever we have so the out-of-band bubble isn't left pending. The
     inline path then renders the run into its own message; a brief duplicate is
     possible in this rare race (relay only starts after sustained idle), which
@@ -2556,8 +2556,8 @@ async def _finalize_inline_message(
     the run itself finished, write the COMPLETE shadow-rendered content into
     the ORIGINAL OWUI message the turn was streaming into.
 
-    Result is parity with a turn that was never interrupted — same message,
-    full assistant text + every tool block, marked done — instead of the tail
+    Result is parity with a turn that was never interrupted -- same message,
+    full assistant text + every tool block, marked done -- instead of the tail
     stranding in a truncated, tool-block-less, detached proactive bubble.
 
     Safety: only ever overwrites an *assistant* message in place. If the target
@@ -2599,7 +2599,7 @@ async def _finalize_inline_message(
             if existing and existing.get("role") == "assistant":
                 # Update the existing assistant message in place: OWUI's upsert
                 # merges these fields into it, keeping role/parentId/childrenIds/
-                # model. This is the parity case — same bubble, full content.
+                # model. This is the parity case -- same bubble, full content.
                 async with conn._chat_write_lock(chat_id):
                     await Chats.upsert_message_to_chat_by_id_and_message_id(
                         chat_id, message_id, {"content": content, "done": True},
@@ -2609,7 +2609,7 @@ async def _finalize_inline_message(
                     f"{message_id[:8]}... in place ({len(content)} chars)"
                 )
             else:
-                # Original id missing or not an assistant message — never
+                # Original id missing or not an assistant message -- never
                 # overwrite it. Append the full content as a new tail message
                 # (still complete, with tool blocks) so the turn isn't lost.
                 if await _append_proactive_message_to_chat(
@@ -2633,13 +2633,13 @@ async def _deliver_proactive_owui_message(
     `sessions_send` with no active `pipe()` call for this session+run).
 
     This only works because the pipe module is loaded as an OWUI function
-    and runs inside OWUI's own backend process — the exact same in-process
+    and runs inside OWUI's own backend process -- the exact same in-process
     privilege `_retry_modal_on_reconnect` already relies on to import
     `open_webui.socket.main`. An external caller (e.g. a real OpenClaw
     channel plugin running in OpenClaw's own gateway process) has no
     equivalent access; OWUI does not expose a public API to both write a
     chat message and live-refresh an open tab for it, so v0 scope is
-    persistence only — the message appears next time the chat is opened or
+    persistence only -- the message appears next time the chat is opened or
     refreshed, not instantly in an already-open tab.
     """
     parsed = conn.parse_owui_session_key(session_key)
@@ -2682,7 +2682,7 @@ async def _deliver_proactive_owui_message(
 
 # Embedded in the proactively-delivered message text for a finished
 # sub-agent task, invisible in rendered markdown (an HTML comment) but still
-# present in the raw `content` OWUI hands the Action endpoint on click — the
+# present in the raw `content` OWUI hands the Action endpoint on click -- the
 # one piece of information a toolbar button click doesn't otherwise carry
 # (OWUI sends chat_id/message_id/model/content, never a custom taskId).
 # `_run_subagent_detail`-style consumers parse it back out with
@@ -2701,12 +2701,12 @@ async def _maybe_deliver_subagent_proactive(
 ) -> None:
     """Resolve a finished sub-agent's parent OWUI chat, wait out the same
     idle-debounce contract `_maybe_deliver_proactive_after_debounce` uses
-    (checked against the *parent's* liveness, not the sub-agent's own — see
+    (checked against the *parent's* liveness, not the sub-agent's own -- see
     the event-loop call site's comment for why), then deliver.
 
     A nested sub-agent (spawned by another sub-agent, not by an OWUI
     session directly) resolves to a parent that also fails
-    `parse_owui_session_key` — there is no OWUI chat to deliver to at all in
+    `parse_owui_session_key` -- there is no OWUI chat to deliver to at all in
     that case, so this quietly gives up rather than trying to walk further
     up the chain.
     """
@@ -2802,10 +2802,10 @@ _gateway_init_lock = asyncio.Lock()
 # Anchor for finding a connection left behind by a *previous* deploy of this
 # same function (P33/P36: OWUI's function loader (open_webui/utils/plugin.py)
 # execs each redeploy into a brand-new module object with no teardown hook on
-# the old one — a module-level singleton alone resets every deploy and orphans
+# the old one -- a module-level singleton alone resets every deploy and orphans
 # the old module's WS/event-loop task forever). Stashing it as an attribute on
-# `open_webui.socket.main` — OWUI's own stable module, never reloaded by our
-# function — lets the next deploy find and `disconnect()` the previous one
+# `open_webui.socket.main` -- OWUI's own stable module, never reloaded by our
+# function -- lets the next deploy find and `disconnect()` the previous one
 # before opening a new connection, so redeploys self-heal without a container
 # restart. Falls back to a no-op when not running inside OWUI (e.g. unit tests).
 _STALE_CONN_ATTR = "_openclaw_gateway_connection_v1"
@@ -2929,7 +2929,7 @@ def _relative_time(reset_at_ms) -> str | None:
 
 def _window_reset_line(w: dict) -> str | None:
     """Full detail line for one rate-limit window, only when it has a known
-    reset time — e.g. '⏱ 5h 18% left (resets in 22m)'. Skipped for windows
+    reset time -- e.g. '⏱ 5h 18% left (resets in 22m)'. Skipped for windows
     without a `resetAt` (e.g. Gemini's Pro/Flash aren't time-windows), since
     there'd be nothing new to say beyond what the thin combined line already
     shows.
@@ -2944,12 +2944,12 @@ def _window_reset_line(w: dict) -> str | None:
 async def _build_usage_status_lines(conn, session_key, timeout: float = 5) -> list[str]:
     """Best-effort final status lines: context window fill (combined with the
     provider's primary/nearest-term rate-limit window on the same line, kept
-    deliberately thin — no reset time), one full detail line per rate-limit
+    deliberately thin -- no reset time), one full detail line per rate-limit
     window that has a known reset time (e.g. both '5h' and 'Week' for
     Anthropic/OpenAI), and the active session goal (if any) on its own line.
     Returned as separate short lines (rather than one combined line) because
     OWUI's status UI hard-clamps every line to a single row (`line-clamp-1`,
-    no way to disable per-event) — one line per fact keeps each row inside
+    no way to disable per-event) -- one line per fact keeps each row inside
     that clamp instead of getting cut off mid-number.
 
     OWUI shows only the *last* emitted status line by default (the rest
@@ -3003,7 +3003,7 @@ async def _build_usage_status_lines(conn, session_key, timeout: float = 5) -> li
                 elif p.get("summary"):
                     primary_bit = f"⏱ {p['summary']}"
                 # A full "(resets in ...)" line per window that actually has
-                # a known reset time — including the same window already
+                # a known reset time -- including the same window already
                 # folded into `primary_bit`, since that one stays thin (no
                 # reset time) on purpose.
                 reset_lines = [
@@ -4164,7 +4164,7 @@ class Action:
         )
         DEVICE_IDENTITY: str = Field(
             default="",
-            description="Copy this exactly from the Pipe's valves — do not leave "
+            description="Copy this exactly from the Pipe's valves -- do not leave "
                         "it empty if the Pipe has one. It is what lets a fallback "
                         "connection be recognised as the same already-approved "
                         "device instead of raising a second pairing request."
@@ -4177,7 +4177,7 @@ class Action:
         )
         AGENT_ID: str = Field(
             default="main",
-            description="Copy this exactly from the Pipe's valves — the same "
+            description="Copy this exactly from the Pipe's valves -- the same "
                         "OpenClaw agent the Pipe routes chats to."
         )
 
@@ -4476,7 +4476,7 @@ class Action:
             await __event_emitter__({
                 "type": "execute",
                 "data": {"code": _render_sections_error_js(
-                    "A response is currently in progress — wait for it to "
+                    "A response is currently in progress -- wait for it to "
                     "finish before compacting."
                 )},
             })
@@ -4530,7 +4530,7 @@ class Action:
             await __event_emitter__({
                 "type": "execute",
                 "data": {"code": _render_sections_error_js(
-                    "Compact timed out — it may still finish in the background."
+                    "Compact timed out -- it may still finish in the background."
                 )},
             })
             return {"status": "error", "detail": "timeout"}

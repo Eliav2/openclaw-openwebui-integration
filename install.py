@@ -56,6 +56,7 @@ ROOT = Path(__file__).resolve().parent
 PIPE_FILE = ROOT / "openclaw_pipe.py"
 LOCAL_IDENTITY_FILE = ROOT / ".pipe_device_identity.json"
 BACKUP_DIR = ROOT / "backups"
+SKILLS_DIR = ROOT / "skills"
 
 console = Console()
 
@@ -117,7 +118,7 @@ def require_config(cfg: Config, *, need_gateway: bool) -> None:
 def run_wizard(cfg: Config, *, need_gateway: bool) -> Config:
     console.print(
         Panel(
-            "OpenClaw ↔ Open WebUI bridge — setup wizard\n"
+            "OpenClaw ↔ Open WebUI bridge -- setup wizard\n"
             "Press Enter to accept a default shown in brackets.",
             style="bold cyan",
         )
@@ -140,6 +141,65 @@ def run_wizard(cfg: Config, *, need_gateway: bool) -> Config:
     cfg.agent_id = Prompt.ask("OpenClaw agent id", default=cfg.agent_id)
     return cfg
 
+
+
+# --------------------------------------------------------------------------
+# Agent-side skills
+# --------------------------------------------------------------------------
+
+def install_bundled_skills(force: bool = False) -> bool:
+    """Install (or refresh) the bundled agent-side skills via the openclaw CLI.
+
+    These teach the AGENT the two conventions the pipe listens for: the
+    "OpenClaw needs input:" marker and the MEDIA: directive. Without them the
+    pipe's ask-user and media features are advertised but unreachable, because
+    nothing tells the model they exist.
+
+    Skills must land where the AGENT runs, which is the Gateway host. This
+    installer runs wherever the Open WebUI admin credentials are, and those are
+    not always the same machine. Rather than ask, detect: the openclaw CLI is
+    only present on the Gateway host, and that is already how this script
+    decides whether it can auto-approve a device (see approve_pending_device).
+    """
+    if not SKILLS_DIR.is_dir():
+        warn(f"no skills directory at {SKILLS_DIR}; run this from a clone")
+        return False
+    skills = sorted(d for d in SKILLS_DIR.iterdir() if (d / "SKILL.md").is_file())
+    if not skills:
+        warn(f"no skills found under {SKILLS_DIR}")
+        return False
+    if not shutil.which("openclaw"):
+        warn("openclaw CLI not found here, so the agent-side skills were NOT "
+             "installed.")
+        console.print(
+            "  [dim]That usually means the Gateway runs on another machine. "
+            "Clone this repo there and run:[/dim]"
+        )
+        for d in skills:
+            console.print(f"  [dim]  openclaw skills install ./skills/{d.name}[/dim]")
+        return False
+
+    ok = True
+    for d in skills:
+        # No --force by default. `install --force` is documented as overwriting
+        # an existing workspace skill folder for the same slug, and OpenClaw
+        # keeps NO history for skill installs, so a surprise overwrite of a
+        # user-authored skill is unrecoverable. Learned the hard way: this very
+        # function destroyed a hand-written skill during development.
+        cmd = ["openclaw", "skills", "install", str(d)]
+        if force:
+            cmd.append("--force")
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode == 0:
+            info(f"skill installed: {d.name}")
+        else:
+            ok = False
+            fail(f"skill install failed: {d.name}"
+                 + ("" if force else "  (already present? re-run with --force-skills to overwrite)"))
+            detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            for line in detail[-3:]:
+                console.print(f"    [dim]{line}[/dim]")
+    return ok
 
 # --------------------------------------------------------------------------
 # OWUI API client
@@ -981,12 +1041,17 @@ def common_options(f):
 
 def _dispatch(command: str, **kwargs) -> None:
     wizard = kwargs.pop("wizard")
+    with_skills = kwargs.pop("with_skills", False)
+    force_skills = kwargs.pop("force_skills", False)
     cfg = Config(**kwargs)
     if wizard:
         cfg = run_wizard(cfg, need_gateway=command in {"install", "repair", "healthcheck"})
     cfg.owui_url = cfg.owui_url.rstrip("/")
     cfg.owui_api_base_url = (cfg.owui_api_base_url or cfg.owui_url).rstrip("/")
     execute(command, cfg)
+    if with_skills:
+        section("Agent-side skills")
+        install_bundled_skills(force=force_skills)
 
 
 @click.group()
@@ -996,6 +1061,12 @@ def cli() -> None:
 
 @cli.command()
 @common_options
+@click.option("--with-skills", is_flag=True, default=False,
+              help="Also install the bundled agent-side skills with the local "
+                   "openclaw CLI. Only works on the Gateway host.")
+@click.option("--force-skills", is_flag=True, default=False,
+              help="Overwrite an existing skill of the same name. Off by "
+                   "default: OpenClaw keeps no history, so this is unrecoverable.")
 def install(**kwargs) -> None:
     """Create or update the pipe function, valves, and run a smoke test."""
     _dispatch("install", **kwargs)
@@ -1003,9 +1074,28 @@ def install(**kwargs) -> None:
 
 @cli.command()
 @common_options
+@click.option("--with-skills", is_flag=True, default=False,
+              help="Also install the bundled agent-side skills with the local "
+                   "openclaw CLI. Only works on the Gateway host.")
+@click.option("--force-skills", is_flag=True, default=False,
+              help="Overwrite an existing skill of the same name. Off by "
+                   "default: OpenClaw keeps no history, so this is unrecoverable.")
 def repair(**kwargs) -> None:
     """Same as install; use after a broken/partial setup."""
     _dispatch("repair", **kwargs)
+
+
+@cli.command()
+@click.option("--force", "force", is_flag=True, default=False,
+              help="Overwrite an existing skill of the same name (unrecoverable).")
+def skills(force: bool) -> None:
+    """Install or refresh the agent-side skills (run on the Gateway host).
+
+    Separate from `install` because the skills belong where the AGENT runs,
+    which is not always where Open WebUI runs. Needs no Open WebUI credentials.
+    """
+    section("Agent-side skills")
+    raise SystemExit(0 if install_bundled_skills(force=force) else 1)
 
 
 @cli.command()

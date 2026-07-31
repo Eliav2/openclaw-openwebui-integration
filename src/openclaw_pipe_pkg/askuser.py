@@ -20,7 +20,7 @@ def _could_be_user_input_prefix(normalized_text: str) -> bool:
     streamed text could still complete it), or already a full match.
 
     Used to decide whether to keep withholding assistant-delta text instead
-    of yielding it immediately — real token-by-token streaming (e.g. Claude)
+    of yielding it immediately -- real token-by-token streaming (e.g. Claude)
     delivers the trigger phrase a few characters at a time, so checking each
     raw delta in isolation (as `_is_user_input_prompt` does) never matches.
     Only once the buffered text diverges from every trigger prefix do we know
@@ -43,11 +43,11 @@ def _advance_input_prompt_buffer(pending: str, delta: str) -> tuple[str, str]:
     A trigger is only meaningful as the start of a line, so once the
     combined text (`pending + delta`) diverges from every trigger prefix,
     only the text after the LAST newline is worth re-examining as a fresh
-    candidate — a real streaming delta doesn't necessarily break exactly at
+    candidate -- a real streaming delta doesn't necessarily break exactly at
     a line boundary (e.g. a single chunk can contain the tail of one
     paragraph, the blank-line separator, *and* the start of the next one),
     so checking `delta.endswith("\\n")` at the yield site isn't enough on
-    its own (P22 follow-up, 2026-07-08 — caught live: a reply that talked
+    its own (P22 follow-up, 2026-07-08 -- caught live: a reply that talked
     normally first and only asked its question in the next paragraph never
     got buffered, because the newline landed mid-delta, not at its edge).
     """
@@ -68,9 +68,9 @@ def _strip_input_marker_line(text: str) -> str:
     "Codex needs input:") from text about to be shown as visible content.
 
     A needs-input prompt is normally intercepted into a modal and never
-    rendered raw. But the fallback paths — a cancelled/dismissed modal, a run
+    rendered raw. But the fallback paths -- a cancelled/dismissed modal, a run
     that ended before the modal could fire, or the item-event path which lacks
-    the streaming buffer guard — can still reach a raw ``yield`` with the marker
+    the streaming buffer guard -- can still reach a raw ``yield`` with the marker
     intact, leaking the literal directive line into the chat. The marker is only
     ever meaningful as the FIRST line, so drop exactly that line and keep the
     rest (the actual question) as a readable fallback.
@@ -86,6 +86,48 @@ def _strip_input_marker_line(text: str) -> str:
             rest = rest[nl + 1:] if nl != -1 else ""
             return lead_ws + rest.lstrip("\n")
     return text
+
+
+def _truncate_at_repeated_marker(text: str) -> str:
+    """Keep only the FIRST needs-input block.
+
+    An agent that emits the marker block twice (seen live: the second copy glued
+    straight onto the last option, "3. Park itOpenClaw needs input: ...") turned
+    a 3-option question into a 6-button dialog, one of whose labels was the raw
+    internal directive. The agent misbehaved, but the pipe owns what the user
+    sees, so it should not render that. Everything from a second marker onward
+    is a repeat, not part of the prompt.
+    """
+    if not text:
+        return text
+    first_end = -1
+    for prefix in _USER_INPUT_TRIGGER_PREFIXES:
+        i = text.find(prefix)
+        if i != -1 and (first_end == -1 or i + len(prefix) < first_end):
+            first_end = i + len(prefix)
+    if first_end == -1:
+        return text
+    nxt = -1
+    for prefix in _USER_INPUT_TRIGGER_PREFIXES:
+        i = text.find(prefix, first_end)
+        if i != -1 and (nxt == -1 or i < nxt):
+            nxt = i
+    return text[:nxt].rstrip() if nxt != -1 else text
+
+
+def _dedupe_options(options):
+    """Drop repeated option labels, keeping first-seen order.
+
+    Belt and braces behind _truncate_at_repeated_marker: a dialog that offers
+    the same answer twice is always wrong, whatever produced it.
+    """
+    seen, out = set(), []
+    for opt in options:
+        key = opt.strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(opt)
+    return out
 
 
 def _extract_numbered_options(prompt_text: str) -> list[tuple[str, str]]:
@@ -211,7 +253,8 @@ def _modal_payload_from_user_input_prompt(prompt_text: str) -> tuple[dict, bool]
     payload (clickable buttons -- see _build_choice_modal_js), which the
     caller converts to an "execute" event just before firing it.
     """
-    lines = [line.strip() for line in (prompt_text or "").splitlines()]
+    prompt_text = _truncate_at_repeated_marker(prompt_text or "")
+    lines = [line.strip() for line in prompt_text.splitlines()]
     lines = [line for line in lines if line]
     if lines and lines[0].endswith("needs input:"):
         lines = lines[1:]
@@ -250,7 +293,7 @@ def _modal_payload_from_user_input_prompt(prompt_text: str) -> tuple[dict, bool]
         for marker in ("secret", "password", "may show your reply", "api key", "token")
     )
 
-    # Detect confirmation (yes/no) questions — conservatively. Misclassifying a
+    # Detect confirmation (yes/no) questions -- conservatively. Misclassifying a
     # free-text choice as a binary yes/no silently strips the real answer, so we
     # only pick confirmation when the prompt clearly reads as binary:
     #   * an explicit yes/no marker is present, OR
@@ -286,7 +329,7 @@ def _modal_payload_from_user_input_prompt(prompt_text: str) -> tuple[dict, bool]
         data = {
             "title": title,
             "message": message,
-            "options": [label for _, label in options],
+            "options": _dedupe_options([label for _, label in options]),
             "multi": has_multi_marker,
         }
         return {"type": "choice", "data": data}, False
@@ -311,7 +354,7 @@ def _ask_user_detail_block(prompt_text: str, answer: str) -> str:
     There's no dedicated type for Q&A, so we reuse "tool_calls" (labelled as
     an "Ask User" call) to get the same familiar rendering users already
     know from real tool calls, inserted inline at the point the question
-    was asked/answered — instead of showing nothing (previous behavior:
+    was asked/answered -- instead of showing nothing (previous behavior:
     the raw prompt text was fully suppressed once answered).
     """
     payload, _ = _modal_payload_from_user_input_prompt(prompt_text)
@@ -385,7 +428,7 @@ def _live_session_id_for_user(user_id: str, session_pool) -> str | None:
     """Find a currently-connected OWUI session_id belonging to user_id.
 
     session_pool is OWUI's own SESSION_POOL dict (sid -> user dict with an
-    'id' field), imported live from the running process — see
+    'id' field), imported live from the running process -- see
     _retry_modal_on_reconnect for why this only works inside OWUI itself.
     """
     for sid, session in list(session_pool.items()):
@@ -412,7 +455,7 @@ async def _retry_modal_on_reconnect(
     a running pipe (confirmed in docs.openwebui.com's Events page,
     "Persistence & Browser Disconnection" section: the background task
     keeps running after tab close, only killed by returning/raising, manual
-    /api/tasks/stop, or a server restart) — and our pipe module runs inside
+    /api/tasks/stop, or a server restart) -- and our pipe module runs inside
     the very same process as the OWUI backend, so we can import its live
     `sio` AsyncServer and SESSION_POOL dict directly and poll for a new
     session_id to appear for this user, then call sio.call() against it
@@ -426,7 +469,7 @@ async def _retry_modal_on_reconnect(
     if it wasn't clicked within 30s (and `seen_sids` then blocked it from ever
     re-firing). We now (a) give each fire `event_timeout_s`, and (b) re-fire
     when the user reconnects on a *fresh* session, or when a previous fire
-    timed out with no interaction (they were away) — so the question keeps
+    timed out with no interaction (they were away) -- so the question keeps
     coming back until it's answered. An explicit dismiss (Escape/backdrop,
     which resolves without an error) is respected: we stop re-popping that
     same live session and wait for a genuinely new reconnect.
@@ -439,7 +482,7 @@ async def _retry_modal_on_reconnect(
 
     deadline = time.monotonic() + max_wait_s
     # sid we've already delivered to and that dismissed (or is still showing)
-    # the modal without answering — don't spam it; wait for a fresh reconnect.
+    # the modal without answering -- don't spam it; wait for a fresh reconnect.
     dismissed_sid: str | None = None
     while time.monotonic() < deadline:
         await asyncio.sleep(poll_interval_s)
@@ -502,7 +545,7 @@ async def _ask_user_input_modal(
     If the live call fails (user not connected right now) and owui_user_id
     is given, keep the pipe's own background task alive and poll for the
     user to reconnect (up to max_wait_s total), retrying the modal against
-    their fresh session — see _retry_modal_on_reconnect. Without
+    their fresh session -- see _retry_modal_on_reconnect. Without
     owui_user_id, behaves exactly as before: a single attempt, exceptions
     (including TimeoutError) propagate to the caller.
     """
@@ -539,7 +582,7 @@ async def _ask_user_input_modal(
     )
     await _emit_status(
         __event_emitter__,
-        "Waiting for your reply — question is pending, reconnect anytime",
+        "Waiting for your reply -- question is pending, reconnect anytime",
         done=False,
     )
     return await _retry_modal_on_reconnect(

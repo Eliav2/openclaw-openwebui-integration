@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Comprehensive pipe test suite — runs against the live OWUI instance.
+Comprehensive pipe test suite -- runs against the live OWUI instance.
 Tests the pipe's core functionality independently of the frontend.
 
 Usage:
@@ -171,7 +171,7 @@ def send(payload: dict) -> dict:
 # ─────────────────────────────────────────────────────────────────────
 
 def test_basic_chat():
-    """Simple non-streaming chat — verify pipe responds correctly."""
+    """Simple non-streaming chat -- verify pipe responds correctly."""
     r = send({
         "model": DEFAULT_MODEL_ID,
         "messages": [{"role": "user", "content": "Respond with exactly: PIPE_TEST_OK"}],
@@ -211,7 +211,7 @@ def test_model_not_found():
 
 
 def test_streaming():
-    """Streaming response — verify SSE chunks."""
+    """Streaming response -- verify SSE chunks."""
     url = f"{BASE}/chat/completions"
     headers = {"Content-Type": "application/json",
                "Authorization": f"Bearer {AUTH_TOKEN}"}
@@ -228,7 +228,7 @@ def test_streaming():
             raw = resp.read().decode()
             chunks = [l for l in raw.split("\n") if l.startswith("data: ")]
             if len(chunks) >= 3:
-                ok(f"Streamed {len(chunks)} SSE chunks — streaming works")
+                ok(f"Streamed {len(chunks)} SSE chunks -- streaming works")
             else:
                 fail(f"Only {len(chunks)} chunks, expected >=3")
     except Exception as e:
@@ -309,7 +309,7 @@ def test_special_characters():
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("OpenClaw Gateway Pipe — OWUI Integration Test Suite")
+    print("OpenClaw Gateway Pipe -- OWUI Integration Test Suite")
     print("=" * 60)
 
     # Login
