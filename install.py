@@ -117,7 +117,7 @@ def require_config(cfg: Config, *, need_gateway: bool) -> None:
 def run_wizard(cfg: Config, *, need_gateway: bool) -> Config:
     console.print(
         Panel(
-            "OpenClaw ↔ Open WebUI bridge — setup wizard\n"
+            "OpenClaw ↔ Open WebUI bridge -- setup wizard\n"
             "Press Enter to accept a default shown in brackets.",
             style="bold cyan",
         )

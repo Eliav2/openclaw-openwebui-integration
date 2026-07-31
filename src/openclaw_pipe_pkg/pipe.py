@@ -16,7 +16,7 @@ def _session_active_from_signals(describe_status, list_has_active_run) -> bool:
     signals the pipe can observe over RPC (ELI-56).
 
     `sessions.describe` only exposes a persisted `status`, which flips to
-    'done' the instant a turn calls `sessions_yield` to await a subagent — even
+    'done' the instant a turn calls `sessions_yield` to await a subagent -- even
     though the run is merely suspended and WILL resume, and the gateway still
     steer-merges any message sent into that window (→ a phantom "no reply
     text" bubble). `sessions.list` additionally exposes `hasActiveRun`, the
@@ -48,7 +48,7 @@ class Pipe:
     class Valves(BaseModel):
         GATEWAY_URL: str = Field(
             default="localhost:18789",
-            description="Required. Your OpenClaw Gateway as host:port — no "
+            description="Required. Your OpenClaw Gateway as host:port -- no "
                 "http:// or ws:// prefix. Example: 192.168.1.10:18789. It must "
                 "be reachable from the Open WebUI backend, which is not "
                 "necessarily the same network as your browser."
@@ -61,7 +61,7 @@ class Pipe:
         )
         DEVICE_IDENTITY: str = Field(
             default="",
-            description="(Advanced — normally leave empty.) Ed25519 device "
+            description="(Advanced -- normally leave empty.) Ed25519 device "
                 "identity JSON. The pipe generates one on first connect and "
                 "persists it in STATE_DIR. Set this only to import an "
                 "already-approved identity, or to make the companion Status "
@@ -86,7 +86,7 @@ class Pipe:
             description="Start a small HTTP server on port 18791 to serve "
                 "agent-generated images and files. Only used as a fallback when "
                 "USE_OWUI_FILES is off or an upload fails. Note it is "
-                "unauthenticated — leave off if port 18791 is exposed."
+                "unauthenticated -- leave off if port 18791 is exposed."
         )
         USE_OWUI_FILES: bool = Field(
             default=True,
@@ -97,7 +97,7 @@ class Pipe:
         SEND_STOP_ON_CANCEL: bool = Field(
             default=True,
             description="Recommended. When you press Stop, also send the agent "
-                "a /stop, so a tool it is running is actually killed — aborting "
+                "a /stop, so a tool it is running is actually killed -- aborting "
                 "the stream alone can leave the tool running."
         )
         OWUI_BASE_URL: str = Field(
@@ -110,7 +110,7 @@ class Pipe:
         OWUI_API_KEY: str = Field(
             default="",
             description="(Optional.) Only needed if media uploads fail with an "
-                "auth error — the pipe normally reuses your own login token."
+                "auth error -- the pipe normally reuses your own login token."
         )
         FILE_SERVER_BASE_URL: str = Field(
             default="http://localhost:18791",
@@ -146,22 +146,22 @@ class Pipe:
         )
         CHATGPT_MODEL: str = Field(
             default="openai/gpt-5.5",
-            description="[Legacy — ignore this on a new install.] Model used by the fixed "
+            description="[Legacy -- ignore this on a new install.] Model used by the fixed "
                 "'ChatGPT' selector entry. Kept only for chats that already picked it."
         )
         OPUS_MODEL: str = Field(
             default="anthropic/claude-opus-4-8",
-            description="[Legacy — ignore this on a new install.] Model used by the fixed "
+            description="[Legacy -- ignore this on a new install.] Model used by the fixed "
                 "'Opus' selector entry. Kept only for chats that already picked it."
         )
         SONNET_MODEL: str = Field(
             default="anthropic/claude-sonnet-5",
-            description="[Legacy — ignore this on a new install.] Model used by the fixed "
+            description="[Legacy -- ignore this on a new install.] Model used by the fixed "
                 "'Sonnet' selector entry. Kept only for chats that already picked it."
         )
         GLM_MODEL: str = Field(
             default="openrouter/z-ai/glm-5.2",
-            description="[Legacy — ignore this on a new install.] Model used by the fixed "
+            description="[Legacy -- ignore this on a new install.] Model used by the fixed "
                 "'GLM' selector entry. Kept only for chats that already picked it."
         )
         AUTO_TITLE: bool = Field(
@@ -283,7 +283,7 @@ class Pipe:
         if suffix == "default":
             return "default"
         if suffix in self._LEGACY_PRESET_MAP:
-            return suffix  # legacy name like "chatgpt" — mapping handled downstream
+            return suffix  # legacy name like "chatgpt" -- mapping handled downstream
         return suffix  # raw model key
 
     def _model_override_for_preset(self, preset):
@@ -296,7 +296,7 @@ class Pipe:
             return self.valves.DEFAULT_MODEL.strip() or None
         if preset in self._LEGACY_PRESET_MAP:
             # `_LEGACY_PRESET_MAP` is the single source of truth for each
-            # preset's default model — don't re-hardcode it here.
+            # preset's default model -- don't re-hardcode it here.
             legacy_val = {
                 "chatgpt": self.valves.CHATGPT_MODEL,
                 "opus": self.valves.OPUS_MODEL,
@@ -316,7 +316,7 @@ class Pipe:
 
         Fires after the SECOND successful exchange (first message + response),
         when OWUI's chat_id is stable. The first request uses a temporary ID.
-        Best-effort, non-blocking — failures are logged but never surfaced.
+        Best-effort, non-blocking -- failures are logged but never surfaced.
         """
         if not self.valves.AUTO_TITLE:
             return
@@ -359,7 +359,7 @@ class Pipe:
         AGENT_ID), not the main conversation's agent. A bare/unprefixed
         sessionKey previously defaulted onto the SAME agent as the live
         conversation, so this background call shared its CLI process/queue
-        lane — when the main conversation was busy (any heavy tool-call
+        lane -- when the main conversation was busy (any heavy tool-call
         turn), title-gen queued behind it and routinely missed this
         function's ~21s polling window, silently dropping the title
         (2026-07-10 regression). A distinct agent id gets its own lane.
@@ -367,7 +367,7 @@ class Pipe:
         prompt = (
             "Create a concise title (3-5 words) with a relevant emoji "
             "for this conversation. Output ONLY the title, nothing else "
-            "— no quotes, no explanation.\n\n"
+            "-- no quotes, no explanation.\n\n"
             f"User message: {user_msg}\n\n"
             f"Assistant response: {assistant_msg}"
         )
@@ -451,7 +451,7 @@ class Pipe:
     async def pipe(self, body, __event_emitter__, __event_call__=None,
                    __user__=None, __metadata__=None, __request__=None,
                    __task__=None, __task_body__=None):
-        """Main pipe entry point — called by Open WebUI for each user message.
+        """Main pipe entry point -- called by Open WebUI for each user message.
 
         Thin wrapper around _pipe_impl so dev-only deploy-coordination hooks
         (ELI-24) can bracket every turn without re-indenting the whole body.
@@ -517,7 +517,7 @@ class Pipe:
         if not text and not image_attachments:
             if has_image:
                 yield (
-                    "**Couldn't read that image** — only base64-embedded "
+                    "**Couldn't read that image** -- only base64-embedded "
                     "images are supported right now. Please describe what's "
                     "in the image in words and send that instead."
                 )
@@ -530,7 +530,7 @@ class Pipe:
             # attachment (e.g. not a base64 data URL) -- text still goes
             # through, but say so rather than silently dropping the image.
             yield (
-                "_(Note: that image couldn't be relayed to the agent — "
+                "_(Note: that image couldn't be relayed to the agent -- "
                 "only the text below was sent.)_\n\n"
             )
 
@@ -573,8 +573,8 @@ class Pipe:
 
         # DIAG (2026-07-18, ELI-56): log the OWUI message_id + a short content
         # hash of the user text so a *re-fired / duplicate* completion for the
-        # same message — the suspected cause of the phantom "1-event, no-text"
-        # turns (e.g. on a socket reconnect behind a reverse proxy) — becomes
+        # same message -- the suspected cause of the phantom "1-event, no-text"
+        # turns (e.g. on a socket reconnect behind a reverse proxy) -- becomes
         # visible: two pipe() invocations with the SAME owui_msg_id / text_sha
         # close together is a smoking gun. Pure logging, no behavior change.
         _diag_md = __metadata__ or {}
@@ -597,8 +597,8 @@ class Pipe:
         # racing/stale row (observed once at ~8 messages in 3s). A single retry
         # absorbs that blip instead of surfacing a scary "Model selection error"
         # to the user; a genuine misconfig still fails on the second attempt.
-        # ELI-59 (fuller fix): the burst's patches are all redundant — same
-        # session, same model — so (a) a per-session lock collapses them to one
+        # ELI-59 (fuller fix): the burst's patches are all redundant -- same
+        # session, same model -- so (a) a per-session lock collapses them to one
         # in-flight RPC, and (b) a TTL cache of the last applied model lets the
         # waiters (and the next ~60s of same-model messages) skip the RPC
         # entirely. Failure invalidates the cache so nothing sticks.
@@ -654,8 +654,8 @@ class Pipe:
         # A message that arrives while a run is active must become its OWN run,
         # not a steer-merge into the active run. Steer-merging (the gateway's
         # default when a run is active) returns a *phantom* runId that never
-        # runs independently and emits no terminal — the injected message just
-        # merges into the active run — so a bubble bound to it renders nothing
+        # runs independently and emits no terminal -- the injected message just
+        # merges into the active run -- so a bubble bound to it renders nothing
         # ("No visible response"). Instead we wait for the active run to reach a
         # definite terminal, then send this message as a fresh run with its own
         # runId + terminal. This matches OWUI's default "queue" UX and can never
@@ -667,7 +667,7 @@ class Pipe:
         # worker processes, so a run started while another worker handled the
         # previous turn is invisible to this worker's registry. That blind spot
         # let a concurrent message fall through to a fresh chat.send while the
-        # gateway still had an active run — the gateway steer-merged it and
+        # gateway still had an active run -- the gateway steer-merged it and
         # returned a runId that instantly emits a single 'final' with no text,
         # so the bubble rendered nothing and the real answer leaked out via
         # proactive delivery. (Verified from live pipe logs 2026-07-18.)
@@ -688,7 +688,7 @@ class Pipe:
             # Fast path: describe exposes a persisted `status`. When it names a
             # live run state we're done. But describe.status flips to 'done'
             # during a subagent-yield gap (the run is only suspended and will
-            # resume — ELI-56), so a non-active status is NOT conclusive:
+            # resume -- ELI-56), so a non-active status is NOT conclusive:
             # confirm against sessions.list's authoritative hasActiveRun before
             # treating the session as free to send into.
             try:
@@ -735,7 +735,7 @@ class Pipe:
         # phantom: two Captured runIds 10ms apart under a burst release (ELI-56).
         # NOTE: do NOT prepend a `/queue followup` directive here. On the
         # 2026.7.1 gateway that directive is NOT stripped from a device
-        # chat.send — it leaked verbatim into the delivered message.
+        # chat.send -- it leaked verbatim into the delivered message.
         async with conn.session_send_lock(session_key):
             queue_wait_started = time.time()
             queue_wait_cap_s = 1800  # safety ceiling; socket keepalive holds the request
@@ -815,7 +815,7 @@ class Pipe:
         # only while it is still the LAST item in OWUI's output list; anything
         # else we yield clears it. A failed call can only be relabeled (❌ in
         # the card name) while it is last, because the relabel event replaces
-        # by index and we send none — see `_tool_call_error_relabel_event`.
+        # by index and we send none -- see `_tool_call_error_relabel_event`.
         relabelable_tool_call: str | None = None
         pending_prompt_text = ""
         pending_media_text = ""
@@ -843,7 +843,7 @@ class Pipe:
             """Check the Gateway's own run status (P26).
 
             A quiet queue before the first event ever arrives does not mean
-            the message was lost — it may simply be queued behind another
+            the message was lost -- it may simply be queued behind another
             active run in the same session (e.g. a long-running agent task).
             Only `sessions.describe` is authoritative; ask it before treating
             60s of silence as a dead run. Returns the raw status string
@@ -964,7 +964,7 @@ class Pipe:
                                 if first_event_arrived
                                 else "60s"
                             )
-                            pipe_log(f"TIMEOUT — no events on queue for {timeout_desc}")
+                            pipe_log(f"TIMEOUT -- no events on queue for {timeout_desc}")
                             if not first_event_arrived:
                                 elapsed = time.time() - wait_started_time
                                 status = await gateway_run_status()
@@ -978,14 +978,14 @@ class Pipe:
                                     )
                                     await _emit_status(
                                         __event_emitter__,
-                                        "Waiting — your message is queued behind an "
+                                        "Waiting -- your message is queued behind an "
                                         "active response...",
                                         done=False,
                                     )
                                     continue
                                 # `status` distinguishes a user-initiated stop (Gateway
                                 # reports "cancelled") from a run that genuinely never
-                                # produced output — the two used to show the same
+                                # produced output -- the two used to show the same
                                 # generic "Timeout" wording, which was misleading when
                                 # the run was simply aborted, not stuck (2026-07-11).
                                 if status == "cancelled":
@@ -1008,7 +1008,7 @@ class Pipe:
                                 break
 
                             # A quiet queue for idle_probe_s does NOT mean the run is
-                            # done — a long tool call or a stretch of agent reasoning
+                            # done -- a long tool call or a stretch of agent reasoning
                             # with no intermediate events looks identical from here.
                             # Only `sessions.describe` (the Gateway's own run status)
                             # is authoritative; never close on silence alone, whether
@@ -1066,7 +1066,7 @@ class Pipe:
                                     else:
                                         pipe_log(
                                             f"  sessions.describe: status="
-                                            f"{session_row.get('status','unknown')} — "
+                                            f"{session_row.get('status','unknown')} -- "
                                             "still active, keep waiting"
                                         )
                                 except Exception as ex:
@@ -1074,7 +1074,7 @@ class Pipe:
                                     # Belt-and-suspenders: if we can't even confirm
                                     # status and have been idle far longer than the
                                     # normal deadman budget, give up rather than hang
-                                    # forever (should be rare — WS reconnect handles
+                                    # forever (should be rare -- WS reconnect handles
                                     # true connection loss separately).
                                     if text_yielded and idle_elapsed > no_text_deadman_s:
                                         pipe_log("  describe probe unreachable and idle too long; closing")
@@ -1165,7 +1165,7 @@ class Pipe:
                                 # streaming delivers that phrase a few characters at
                                 # a time, so checking each raw delta in isolation
                                 # (as used to happen here) essentially never
-                                # matches — only the buffered, accumulated text can
+                                # matches -- only the buffered, accumulated text can
                                 # be checked reliably. Resolved once the run ends
                                 # (see the `else:` clause below) or as soon as the
                                 # buffered text diverges from every trigger.
@@ -1178,7 +1178,7 @@ class Pipe:
                                 delta = flush_text
 
                                 # Hold back a MEDIA: directive until its filename is
-                                # confirmed complete (terminated by whitespace) — a
+                                # confirmed complete (terminated by whitespace) -- a
                                 # real streaming provider can split "MEDIA:filename.png"
                                 # across multiple deltas at any point, including
                                 # mid-filename or mid-prefix. See _advance_media_buffer.
@@ -1194,7 +1194,7 @@ class Pipe:
                                 # exist earlier in the message. A `replace` event sets
                                 # the full message content; if it lands on (or near)
                                 # the complete final text right before the generator
-                                # naturally finishes, OWUI double-saves — the
+                                # naturally finishes, OWUI double-saves -- the
                                 # `replace` writes it once, then the generator's own
                                 # accumulated streamed yields write the same content
                                 # again on top. This isn't only a risk for the literal
@@ -1206,7 +1206,7 @@ class Pipe:
                                 # the same duplicate. The one snapshot that's actually
                                 # safe is the forced one taken right when a tool
                                 # block itself is yielded (still partial content by
-                                # definition, since the block was just added) — see
+                                # definition, since the block was just added) -- see
                                 # the `stream == "tool"` / phase == "result" handler.
                                 # See P17 / P19 / P23 / P24 / ELI-9 for the history of
                                 # this recurring bug.
@@ -1232,7 +1232,7 @@ class Pipe:
                                 # delta here. A mid-stream `replace` carrying the
                                 # full accumulated text makes OWUI's own
                                 # `_suppress_already_shown` treat the *continuing*
-                                # delta stream as already-shown and suppress it —
+                                # delta stream as already-shown and suppress it --
                                 # the visible stream freezes mid-message (regression
                                 # 2026-07-18, exactly the P23/P25 hazard). Text-turn
                                 # DB back-sync must be done a different way (e.g. a
@@ -1302,7 +1302,7 @@ class Pipe:
                                     # `function_call` item in OWUI's own output list,
                                     # which renders as a live spinner until its
                                     # matching result item arrives. Deliberately NOT
-                                    # recorded into `visible_message_text` — it is
+                                    # recorded into `visible_message_text` -- it is
                                     # not part of the message text, and the snapshot
                                     # path must not duplicate it as markdown.
                                     pending_tool_calls.add(tool_call_id)
@@ -1363,7 +1363,7 @@ class Pipe:
                                 if tool_call_id:
                                     # Completes the item yielded at start: the shared
                                     # call_id is what flips that card to done and
-                                    # reveals its Output. No snapshot needed — the
+                                    # reveals its Output. No snapshot needed -- the
                                     # backend folds this into the output list it
                                     # already persists and re-emits.
                                     pending_tool_calls.discard(tool_call_id)
@@ -1371,7 +1371,7 @@ class Pipe:
                                 else:
                                     # No toolCallId means there is nothing to pair a
                                     # result item to, so fall back to the markdown
-                                    # card — the same one the shadow renderer emits.
+                                    # card -- the same one the shadow renderer emits.
                                     tool_block = _render_tool_result_block(
                                         name, tool_call_id, args_str, result_str,
                                         data.get("meta", ""),
@@ -1441,7 +1441,7 @@ class Pipe:
                             else:
                                 pipe_log(
                                     f"  idle {idle_probe_s}s but gateway status="
-                                    f"{status or 'unknown'} — run still active, "
+                                    f"{status or 'unknown'} -- run still active, "
                                     "staying alive"
                                 )
                                 await _emit_status(
@@ -1454,12 +1454,12 @@ class Pipe:
                 except asyncio.CancelledError:
                     # OWUI stop button → abort the gateway run
                     aborted = True
-                    pipe_log("Generator cancelled — sending chat.abort")
+                    pipe_log("Generator cancelled -- sending chat.abort")
                     await maybe_emit_snapshot(force=True)
                     await _emit_status(__event_emitter__, "Stopped", done=True)
                     await conn.abort(session_key, our_run_id)
                     if self.valves.SEND_STOP_ON_CANCEL:
-                        pipe_log("Generator cancelled — sending /stop fallback")
+                        pipe_log("Generator cancelled -- sending /stop fallback")
                         await conn.send_stop(session_key)
                     raise  # Re-raise to signal proper cancellation
 
@@ -1468,7 +1468,7 @@ class Pipe:
                     if pending_prompt_text:
                         # The buffered plain-text tail either fully resolved into a
                         # needs-input trigger (see `_could_be_user_input_prefix`
-                        # above — buffering only continues past the ambiguous
+                        # above -- buffering only continues past the ambiguous
                         # prefix stage while it keeps matching) or the run ended
                         # mid-buffer without ever diverging. Either way, resolve it
                         # now that the full text is available. `maybe_answer_user_input`
@@ -1478,9 +1478,9 @@ class Pipe:
                         answer_res = await maybe_answer_user_input(pending_prompt_text)
                         if answer_res.handled:
                             # Answer delivered. Re-enter the main loop (via the outer
-                            # `while adopt_new_run`) to consume the follow-up — whether
+                            # `while adopt_new_run`) to consume the follow-up -- whether
                             # the run resumed in place (steer) or a new run was spawned
-                            # — so the continuation reuses the same needs-input
+                            # -- so the continuation reuses the same needs-input
                             # re-detection, dedup and snapshot handling as any other
                             # run instead of a separate, drift-prone copy of the loop.
                             text_yielded = True
@@ -1517,7 +1517,7 @@ class Pipe:
                             pending_prompt_text = ""
 
                     if pending_media_text:
-                        # The run ended with a MEDIA: directive still buffered —
+                        # The run ended with a MEDIA: directive still buffered --
                         # either its filename never got a trailing whitespace
                         # before the stream closed, or "MEDIA:" itself was still
                         # incomplete. Nothing more is coming, so it's safe to
@@ -1538,13 +1538,13 @@ class Pipe:
                     # For pure-text turns, do NOT force a snapshot here: OWUI's own
                     # accumulation of the streamed yields already lands the full
                     # text in `content`, and an extra forced `replace` at this
-                    # point double-writes it (P23/P25 — exact duplicate, no
+                    # point double-writes it (P23/P25 -- exact duplicate, no
                     # separator).
                     #
                     # Turns that included a tool-call block are different (P27,
                     # 2026-07-08): once a `<details type="tool_calls">` block has
                     # been yielded, OWUI's own end-of-stream save no longer reliably
-                    # lands the plain-text tail in `content` at all — it only shows
+                    # lands the plain-text tail in `content` at all -- it only shows
                     # up in `output` instead. So for tool-block turns only, force
                     # one last `content` snapshot here.
                     #
@@ -1552,7 +1552,7 @@ class Pipe:
                     # a live duplicate regression, but that turned out to be a false
                     # alarm caused by redeploying the pipe mid-message in the same
                     # live chat used to test it (a self-inflicted artifact of the
-                    # testing method, not this code) — confirmed by reproducing the
+                    # testing method, not this code) -- confirmed by reproducing the
                     # duplicate-free "output has it once, content misses it"
                     # signature again on an unrelated turn where nothing was
                     # redeployed mid-stream. Restored. Lesson for future sessions:
@@ -1568,7 +1568,7 @@ class Pipe:
                     # result (run cancelled, gateway dropped it, tool crashed).
                     # Its card is a spinner until something completes it, and
                     # OWUI's own "mark leftover in_progress items completed"
-                    # sweep does NOT reliably reach this path — observed
+                    # sweep does NOT reliably reach this path -- observed
                     # 2026-07-25, where a delivered call stayed `in_progress`
                     # in the persisted item and only rendered as done because
                     # its result item happened to exist. So close them here
@@ -1577,7 +1577,7 @@ class Pipe:
                         for orphan_id in list(pending_tool_calls):
                             pipe_log(f"  closing orphaned tool call {orphan_id}")
                             yield _tool_call_result_event(
-                                orphan_id, "(no result — the run ended first)"
+                                orphan_id, "(no result -- the run ended first)"
                             )
                         pending_tool_calls.clear()
 
@@ -1590,7 +1590,7 @@ class Pipe:
                 # each row stays inside OWUI's per-line clamp instead of one
                 # long combined line getting cut off. All of them already
                 # reflect final data by the time we get here (both RPCs in
-                # `_build_usage_status_lines` already completed) — none of
+                # `_build_usage_status_lines` already completed) -- none of
                 # this is genuinely still "in progress", so every line is
                 # `done=True`. Marking earlier ones `done=False` made them
                 # shimmer for an instant before getting replaced by the last
@@ -1603,7 +1603,7 @@ class Pipe:
             self._current_session_key = None
             self._current_run_id = None
 
-        pipe_log(f"DONE — {event_count} events processed, "
+        pipe_log(f"DONE -- {event_count} events processed, "
                  f"text yielded: {text_yielded}")
         if not text_yielded:
             # DIAG (ELI-56): a no-text turn is the phantom. Emit the correlation
@@ -1618,11 +1618,11 @@ class Pipe:
 
         # Terminal back-sync (ELI-57): persist the completed turn's visible text
         # to the OWUI DB with one final `replace` snapshot. OWUI only saves
-        # yielded content when the BROWSER writes it back after completion — if
+        # yielded content when the BROWSER writes it back after completion -- if
         # the tab/socket died mid-stream, the SSE yields land nowhere, raise
         # nothing, and the message stays empty in the DB forever (reload shows
         # nothing). Tool turns already snapshot along the way; pure-text turns
-        # snapshot nowhere since the per-delta back-sync was reverted (ffd2fdd —
+        # snapshot nowhere since the per-delta back-sync was reverted (ffd2fdd --
         # a mid-stream `replace` makes the frontend suppress the CONTINUING
         # delta stream, P23/P25). At terminal there are no continuing deltas,
         # so a single force snapshot is freeze-safe, and OWUI's `replace`

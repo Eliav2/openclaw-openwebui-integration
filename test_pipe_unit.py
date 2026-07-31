@@ -77,6 +77,9 @@ from openclaw_pipe import (
     _explain_connect_rejection,
     _explain_session_patch_failure,
     _discover_models_with_source,
+    _modal_payload_from_user_input_prompt,
+    _truncate_at_repeated_marker,
+    _dedupe_options,
     Pipe,
     _write_json_file,
     _state_dir,
@@ -256,7 +259,7 @@ class ProactiveDeliveryTests(unittest.TestCase):
             )
 
     def test_last_assistant_text_from_preview_sentinel_does_not_fall_back_to_older_turn(self):
-        # A sentinel-only final leg means "nothing to show for THIS run" — it
+        # A sentinel-only final leg means "nothing to show for THIS run" -- it
         # must not fall through to an older, already-delivered assistant
         # message from an earlier leg.
         preview = {
@@ -290,11 +293,11 @@ class ProactiveDeliveryTests(unittest.TestCase):
         )
         # `open_webui` isn't installed in this test environment (it only exists
         # inside a running OWUI process), so the internal Chats import fails
-        # and delivery no-ops after the preview fetch — that's fine, this test
+        # and delivery no-ops after the preview fetch -- that's fine, this test
         # only asserts the dedup guard, not the OWUI-internals write path.
         asyncio.run(_deliver_proactive_owui_message(conn, session_key, "run-1"))
         asyncio.run(_deliver_proactive_owui_message(conn, session_key, "run-1"))
-        # session_preview only called once — the second call short-circuits on dedup.
+        # session_preview only called once -- the second call short-circuits on dedup.
         self.assertEqual(conn.session_preview.await_count, 1)
 
     def test_deliver_leaves_new_message_as_the_active_leaf(self):
@@ -303,7 +306,7 @@ class ProactiveDeliveryTests(unittest.TestCase):
         ever showed up in OWUI. Root cause: OWUI's real
         `upsert_message_to_chat_by_id_and_message_id` sets
         `history['currentId'] = message_id` as a side effect of *every*
-        call — including the second call this function used to make (to
+        call -- including the second call this function used to make (to
         patch the *old* leaf's `childrenIds`), which silently reverted
         `currentId` back to the old leaf right after the new message was
         set as current. The new message became an orphan branch: present
@@ -581,7 +584,7 @@ class ProactiveDeliveryTests(unittest.TestCase):
     def test_deliver_never_persists_announce_skip_sentinel(self):
         """End-to-end regression for the 2026-07-11 incident: a preview
         whose last assistant text is the literal protocol sentinel
-        `ANNOUNCE_SKIP` must never reach OWUI's chat-write path at all —
+        `ANNOUNCE_SKIP` must never reach OWUI's chat-write path at all --
         not just return non-matching text. Asserts the fake `Chats.get_chat_by_id`
         is never called, i.e. delivery bails out before touching chat history.
         """
@@ -652,7 +655,7 @@ class LiveBootstrapReloadTests(unittest.TestCase):
         payload = args[1]
         self.assertEqual(payload["chat_id"], "chat-1")
         # Must target a message id ALREADY known to the frontend (the old
-        # leaf), never the brand-new proactive message id — OWUI's
+        # leaf), never the brand-new proactive message id -- OWUI's
         # chatEventHandler silently drops events for unknown message ids.
         self.assertEqual(payload["message_id"], "old-leaf")
         self.assertEqual(payload["data"]["type"], "execute")
@@ -739,7 +742,7 @@ class LiveRelayTests(unittest.TestCase):
     """ELI-62 PoC slice 2: true live token relay of a proactive run
     (`_relay_begin`/`_relay_feed_event`/`_relay_finalize`). Kill switch
     (`LIVE_STREAM_RELAY_ENABLED`) defaults False in production; these tests
-    drive the helpers directly (which don't gate on the flag — the event loop
+    drive the helpers directly (which don't gate on the flag -- the event loop
     does), with fake OWUI Chats + sio, to exercise introduce/stream/finalize."""
 
     USER = "11111111-1111-1111-1111-111111111111"
@@ -829,7 +832,7 @@ class LiveRelayTests(unittest.TestCase):
         self.assertFalse(_relay_content_is_showable("   "))
         self.assertFalse(_relay_content_is_showable("NO_REPLY"))
         self.assertFalse(_relay_content_is_showable("ANNOUNCE_SKIP"))
-        # "N" is a prefix of NO_REPLY — could still resolve to a sentinel-only
+        # "N" is a prefix of NO_REPLY -- could still resolve to a sentinel-only
         # run, so not yet showable.
         self.assertFalse(_relay_content_is_showable("N"))
         # A real reply diverges from every sentinel prefix immediately.
@@ -1012,7 +1015,7 @@ class EventConsumerMatchingTests(unittest.TestCase):
         """Regression for the 2026-07-11 live incident (P33/ELI-17/ELI-19):
         an event for run-1 fails to match `consumers_for_event` (e.g. a
         steering handoff already re-registered the session under run-2), but
-        the session is still genuinely live — proactive delivery must not
+        the session is still genuinely live -- proactive delivery must not
         treat this as an idle wake just because *this specific run_id*
         has no consumer.
         """
@@ -1032,7 +1035,7 @@ class EventConsumerMatchingTests(unittest.TestCase):
     def test_was_delivered_live_is_scoped_to_exact_session_and_run(self):
         """A mark for one run_id must not blind the guard for a different
         run_id on the same session, or the same run_id on a different
-        session — only the exact (session, run) pair that was actually
+        session -- only the exact (session, run) pair that was actually
         shown live is exempt from proactive delivery."""
         conn = _GatewayConnection(lambda: None)
         conn.mark_delivered_live("session-a", "run-1")
@@ -1050,7 +1053,7 @@ class EventConsumerMatchingTests(unittest.TestCase):
 
     def test_session_idle_for_false_right_after_unregister(self):
         """Regression for the second 2026-07-11 incident: unregistering a
-        consumer must NOT immediately count as idle — the next leg's HTTP
+        consumer must NOT immediately count as idle -- the next leg's HTTP
         request (e.g. answering an ask-user modal) can still land a few
         seconds later under a brand-new run_id."""
         conn = _GatewayConnection(lambda: None)
@@ -1067,7 +1070,7 @@ class EventConsumerMatchingTests(unittest.TestCase):
 
     def test_session_idle_for_false_again_if_a_new_leg_reregisters(self):
         """Even after the quiet period has elapsed once, a fresh
-        register_consumer call must reset the clock — the session isn't
+        register_consumer call must reset the clock -- the session isn't
         idle again until the *new* leg also finishes and settles."""
         conn = _GatewayConnection(lambda: None)
         conn.register_consumer("session-a", "run-1")
@@ -1118,7 +1121,7 @@ class ProactiveDebounceWatcherTests(unittest.IsolatedAsyncioTestCase):
             "main", "11111111-1111-1111-1111-111111111111",
             "22222222-2222-2222-2222-222222222222",
         )
-        # A consumer is (and remains) registered the whole time — session is
+        # A consumer is (and remains) registered the whole time -- session is
         # never idle, simulating an ongoing live conversation.
         conn.register_consumer(session_key, "run-2")
         conn._pending_proactive_debounce.add(session_key)
@@ -1157,7 +1160,7 @@ class ProactiveDebounceWatcherTests(unittest.IsolatedAsyncioTestCase):
     async def test_skips_delivery_if_marked_delivered_live_during_wait(self):
         """A duplicate/retried final event for a run that gets shown to a
         (re)connected live tab *while* the debounce watcher is waiting must
-        not still be proactively delivered once the wait ends — the tab
+        not still be proactively delivered once the wait ends -- the tab
         already persists it itself. This is the identity-based guard
         (`was_delivered_live`), not the content-matching approach, so it
         can't false-positive on coincidentally-identical text and doesn't
@@ -1324,7 +1327,7 @@ class ResolveSubagentParentTaskTests(unittest.IsolatedAsyncioTestCase):
         async def fake_send_request(method, params, timeout=None):
             self.assertEqual(method, "tasks.list")
             return {"tasks": [
-                # self-referential CLI execution record — newest, returned first
+                # self-referential CLI execution record -- newest, returned first
                 {"id": "task-cli", "childSessionKey": child_key,
                  "sessionKey": child_key, "runtime": "cli"},
                 # real spawn record linking back to the OWUI parent
@@ -1694,7 +1697,7 @@ class NativeToolItemTests(unittest.TestCase):
         self.assertNotIn("output", item)
 
     def test_result_event_matches_the_start_event_by_call_id(self):
-        """The shared call_id is the entire flip mechanism — if these diverge
+        """The shared call_id is the entire flip mechanism -- if these diverge
         the card spins forever."""
         start = _tool_call_started_event("Bash", "call-1", "{}")
         result = _tool_call_result_event("call-1", "total 4\ndrwxr-xr-x")
@@ -1713,7 +1716,7 @@ class NativeToolItemTests(unittest.TestCase):
         self.assertNotEqual(start["item"]["id"], result["item"]["id"])
 
     def test_payloads_are_json_serializable(self):
-        """OWUI serializes a yielded dict with `json.dumps` — a non-serializable
+        """OWUI serializes a yielded dict with `json.dumps` -- a non-serializable
         value would break the SSE line rather than the card."""
         json.dumps(_tool_call_started_event("Bash", "c", '{"a": 1}'))
         json.dumps(_tool_call_result_event("c", "out"))
@@ -1734,13 +1737,13 @@ class NativeToolItemTests(unittest.TestCase):
         card spins forever. OWUI's own end-of-stream sweep does not reliably
         reach this path (observed 2026-07-25: a delivered call stayed
         `in_progress` and only rendered done because its result item existed)."""
-        ev = _tool_call_result_event("call-1", "(no result — the run ended first)")
+        ev = _tool_call_result_event("call-1", "(no result -- the run ended first)")
         self.assertEqual(ev["item"]["type"], "function_call_output")
         self.assertEqual(ev["item"]["call_id"], "call-1")
         self.assertEqual(ev["item"]["status"], "completed")
 
     def test_no_valve_gates_native_items(self):
-        """Native items are unconditional now — a leftover toggle would be a
+        """Native items are unconditional now -- a leftover toggle would be a
         second, untested code path."""
         valves = Pipe.Valves()
         self.assertFalse(hasattr(valves, "NATIVE_TOOL_ITEMS"))
@@ -1750,13 +1753,13 @@ class NativeToolItemTests(unittest.TestCase):
 class ToolErrorIndicationTests(unittest.TestCase):
     """A failed tool call must LOOK failed.
 
-    OWUI's card picks its status icon from `isDone` alone — spinner, green
-    check, or wrench, with no failure branch (`ToolCallDisplay.svelte:136`) —
+    OWUI's card picks its status icon from `isDone` alone -- spinner, green
+    check, or wrench, with no failure branch (`ToolCallDisplay.svelte:136`) --
     so the only outcome-carrying field we control is the name shown in the
     collapsed row, plus the Output text behind it.
 
     ELI-75: the previous shape here (`response.output_item.done`) looked
-    correct by inspection but was dead code in OWUI's own event handler — see
+    correct by inspection but was dead code in OWUI's own event handler -- see
     `RealHandlerReplayTests` below, which replays these events through an
     extraction of that handler instead of asserting our belief about it.
     """
@@ -1831,7 +1834,7 @@ class RealHandlerReplayTests(unittest.TestCase):
 
     def test_relabel_lands_with_preceding_text(self):
         """Same replay, but with a streamed text item ahead of the tool call
-        — the generic field-done arm targets by output_index (default: last
+        -- the generic field-done arm targets by output_index (default: last
         item), so a leading item must not shift what gets relabeled."""
         preceding_text = {
             "type": "message",
@@ -1882,7 +1885,7 @@ class RealHandlerReplayTests(unittest.TestCase):
 
 class ParityFinalizeTests(unittest.TestCase):
     """Parity finalize: when the inline turn ends before the run does, the
-    ORIGINAL assistant message is completed in place with the full content —
+    ORIGINAL assistant message is completed in place with the full content --
     never a user message, and never when a live tab already has it."""
 
     def _conn(self, agent_id="main"):
@@ -1982,7 +1985,7 @@ class ParityFinalizeTests(unittest.TestCase):
         }}}
         self._run_with_fake_chats(conn, sk, "run-3", chat_state)
 
-        # untouched — a live tab already persisted it
+        # untouched -- a live tab already persisted it
         self.assertEqual(
             chat_state["history"]["messages"]["asst-3"]["content"], "partial")
 
@@ -1993,7 +1996,7 @@ class RelinearizeProactiveVariantsTests(unittest.TestCase):
 
     def _variant_history(self):
         # assistant X has TWO children: a proactive bubble AND the user's next
-        # message — exactly the observed variant group.
+        # message -- exactly the observed variant group.
         return {
             "currentId": "user2",
             "messages": {
@@ -2042,7 +2045,7 @@ class RelinearizeProactiveVariantsTests(unittest.TestCase):
         self.assertEqual(sorted(h["messages"]["u"]["childrenIds"]), ["a", "b"])
 
     def test_chains_continuation_below_proactive_that_already_has_a_subtree(self):
-        """Real 2026-07-19 case: the proactive sibling isn't a leaf — a later
+        """Real 2026-07-19 case: the proactive sibling isn't a leaf -- a later
         message already chained under it. The user continuation must attach at
         the proactive's deepest leaf, not get skipped."""
         h = {"currentId": "u2", "messages": {
@@ -2082,7 +2085,7 @@ class RelinearizeProactiveVariantsTests(unittest.TestCase):
 class GatewayReconnectStormTests(unittest.IsolatedAsyncioTestCase):
     """Regression tests for the 2026-07-10 reconnect-storm incident (P36):
     `_reconnect()` used to call `_connect_and_start()`, which spawned a
-    *second* `_event_loop` task on success — but the original coroutine
+    *second* `_event_loop` task on success -- but the original coroutine
     kept looping too, so both raced on `self._ws.recv()`. Each collision
     raised its own exception, which triggered another `_reconnect()`, which
     spawned yet another task: exponential task growth, a reconnect storm
@@ -2187,7 +2190,7 @@ class GatewayReloadReapTests(unittest.IsolatedAsyncioTestCase):
     `_remember_gateway_connection` anchor the singleton on OWUI's own stable
     `open_webui.socket.main` module (never reloaded by our function) so the
     next deploy can tear down the previous one's connection before opening
-    its own — self-healing without a container restart."""
+    its own -- self-healing without a container restart."""
 
     def _install_fake_owui_socket_module(self):
         fake_module = types.ModuleType("open_webui.socket.main")
@@ -2492,7 +2495,7 @@ class SuppressAlreadyShownTests(unittest.TestCase):
     """Regression tests for P27 (reproduced live 2026-07-10): a provider's
     final catch-all `assistant` event can carry the full cumulative reply
     while `assistant_stream_text` (the primary dedup baseline) has drifted
-    from what was actually recorded into `visible_message_text` — e.g.
+    from what was actually recorded into `visible_message_text` -- e.g.
     across an idle-timeout recovery cycle. When that happens
     `_item_delta_text`'s prefix check fails and it falls through to
     returning the whole text unchanged, duplicating the entire message with
@@ -2528,7 +2531,7 @@ class SuppressAlreadyShownTests(unittest.TestCase):
         self.assertEqual(_suppress_already_shown("", "hello world"), "")
 
     def test_substring_in_the_middle_is_not_suppressed(self):
-        # Only a match at the very tail counts as "already shown" — a
+        # Only a match at the very tail counts as "already shown" -- a
         # coincidental substring earlier in the text is not evidence of
         # duplication and must pass through untouched.
         self.assertEqual(
@@ -2590,7 +2593,7 @@ class ResolveMediaTests(unittest.TestCase):
 
     def test_prose_use_of_media_term_is_not_mangled(self):
         # Regression: writing "the MEDIA: fix" as a documentation term (not
-        # an actual directive) got misparsed live 2026-07-10 — "fix" (no
+        # an actual directive) got misparsed live 2026-07-10 -- "fix" (no
         # extension) was treated as a filename and turned into a broken
         # image link, corrupting the assistant's own explanatory text.
         text = "not something my MEDIA: fix touched, see the MEDIA: multi-image work"
@@ -3032,7 +3035,7 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
 
     def test_partial_prefix_stays_ambiguous(self):
         # Real token-by-token streaming (e.g. Claude) delivers the trigger a
-        # few characters at a time — each partial prefix should still read
+        # few characters at a time -- each partial prefix should still read
         # as "could be a match" so the pipe keeps buffering instead of
         # yielding it as plain text.
         for partial in ("", "Open", "OpenClaw needs", "OpenClaw needs input:", "Codex"):
@@ -3079,7 +3082,7 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
     def test_advance_buffer_catches_trigger_after_midchunk_newline(self):
         # The exact bug caught live 2026-07-08: a single delta can contain
         # the tail of normal prose, the paragraph-break newline, AND the
-        # start of the next paragraph all at once — the newline doesn't
+        # start of the next paragraph all at once -- the newline doesn't
         # land at the delta's edge, so a naive endswith("\n") check misses
         # it. The text after the LAST newline must still be buffered.
         flush, pending = _advance_input_prompt_buffer(
@@ -3255,7 +3258,7 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["data"]["options"], ["rebase", "merge"])
 
     def test_secret_marker_does_not_match_innocent_key_substring(self):
-        # "monkey" contains "key" — must not be flagged as a secret.
+        # "monkey" contains "key" -- must not be flagged as a secret.
         payload, _ = _modal_payload_from_user_input_prompt(
             "OpenClaw needs input:\n\nName the monkey\nWhat should we call the monkey?"
         )
@@ -3555,7 +3558,7 @@ class DynamicModelSelectorTests(unittest.TestCase):
         )
 
     def test_normalize_model_entry_matches_real_gateway_shape(self):
-        # Real gateway `models.list` entries use id/name/provider/alias —
+        # Real gateway `models.list` entries use id/name/provider/alias --
         # not the key/tags shape the rest of this module expects.
         raw = {
             "id": "claude-opus-4-8",
@@ -3601,7 +3604,7 @@ class DiscoverModelsTests(unittest.IsolatedAsyncioTestCase):
             ocp._gateway_connection = orig_conn
 
     async def test_discover_models_normalizes_live_gateway_response(self):
-        """Live gateway responses use id/name/provider/alias, not key/tags —
+        """Live gateway responses use id/name/provider/alias, not key/tags --
         _discover_models must normalize them before returning/caching."""
         import openclaw_pipe as ocp
 
@@ -3663,7 +3666,7 @@ class SharedProactiveStateAcrossConnectionsTests(unittest.TestCase):
     proactive-delivery bookkeeping. The zombie still receives the Gateway's
     broadcast `final` events; with private bookkeeping it can't tell the live
     connection already showed the turn to the open tab, so it re-writes the
-    turn into chat history as a spurious proactive message — creating a second
+    turn into chat history as a spurious proactive message -- creating a second
     assistant branch (the 1/2 <-> 2/2 navigation) on every turn.
 
     Fix: when running inside OWUI the liveness bookkeeping is anchored on
@@ -3703,7 +3706,7 @@ class SharedProactiveStateAcrossConnectionsTests(unittest.TestCase):
     def test_shared_state_backfills_new_keys_into_existing_dict(self):
         """Redeploy migration guard (2026-07-13): the shared-state dict
         persists across function redeploys, so a key added in a newer version
-        must be backfilled into the *already-existing* dict via setdefault —
+        must be backfilled into the *already-existing* dict via setdefault --
         otherwise `__init__`'s `_shared['chat_write_locks']` KeyErrors on the
         first request after redeploy (this broke a live deploy). Simulate an
         old dict missing the new key and assert it gets added without dropping
@@ -3944,7 +3947,7 @@ class UnverifiedModelListTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             for e in asyncio.run(self._pipe(tmp).pipes()):
                 self.assertNotIn(UNVERIFIED_MODEL_SUFFIX, e["id"])
-                self.assertNotIn("—", e["id"])
+                self.assertNotIn("--", e["id"])
 
     def test_cached_models_are_not_labelled_as_examples(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4108,3 +4111,56 @@ class ReviewFollowupRegressionTests(unittest.TestCase):
             self.assertEqual(len(entries), 1)
             self.assertIn(UNVERIFIED_MODEL_SUFFIX, entries[0]["name"])
             self.assertEqual(entries[0]["id"], "default")
+
+
+class RepeatedAskUserMarkerTests(unittest.TestCase):
+    """Caught in a real screenshot: an agent emitted the needs-input block twice,
+    the second copy glued onto the last option with no newline. The dialog then
+    offered SIX buttons for a three-option question, and one of them was labelled
+    with the raw internal directive:
+
+        "Park itOpenClaw needs input: Which PoC do we run?"
+
+    The agent misbehaved, but the pipe owns what reaches the screen."""
+
+    REAL = ("OpenClaw needs input:\n"
+            "Which PoC do we run?\n"
+            "1. Dev-tool micro-product\n"
+            "2. Prediction markets, small bankroll\n"
+            "3. Park itOpenClaw needs input: Which PoC do we run?\n"
+            "1. Dev-tool micro-product\n"
+            "2. Prediction markets, small bankroll\n"
+            "3. Park it")
+
+    def test_repeated_block_yields_three_clean_options(self):
+        data = _modal_payload_from_user_input_prompt(self.REAL)[0]["data"]
+        self.assertEqual(data["options"],
+                         ["Dev-tool micro-product",
+                          "Prediction markets, small bankroll",
+                          "Park it"])
+
+    def test_no_option_label_leaks_the_internal_marker(self):
+        data = _modal_payload_from_user_input_prompt(self.REAL)[0]["data"]
+        for label in data["options"]:
+            self.assertNotIn("needs input:", label.lower())
+
+    def test_truncation_keeps_only_the_first_block(self):
+        out = _truncate_at_repeated_marker(self.REAL)
+        self.assertEqual(out.lower().count("needs input:"), 1)
+        self.assertTrue(out.rstrip().endswith("Park it"))
+
+    def test_truncation_is_a_noop_on_a_normal_prompt(self):
+        normal = "OpenClaw needs input:\nPick one\n1. Alpha\n2. Beta"
+        self.assertEqual(_truncate_at_repeated_marker(normal), normal)
+
+    def test_normal_prompt_is_unaffected(self):
+        data = _modal_payload_from_user_input_prompt(
+            "OpenClaw needs input:\nPick one\n1. Alpha\n2. Beta\n3. Gamma")[0]["data"]
+        self.assertEqual(data["title"], "Pick one")
+        self.assertEqual(data["options"], ["Alpha", "Beta", "Gamma"])
+
+    def test_dedupe_preserves_first_seen_order(self):
+        self.assertEqual(_dedupe_options(["b", "a", "B", "a", "c"]), ["b", "a", "c"])
+
+    def test_dedupe_drops_blanks(self):
+        self.assertEqual(_dedupe_options(["a", "  ", "", "a"]), ["a"])
