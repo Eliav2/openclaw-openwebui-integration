@@ -74,10 +74,10 @@ def _parse_whitelist(text: str) -> set[str]:
     return {x.strip() for x in text.split(",") if x.strip()}
 
 
-# Words in a sessions.patch failure that mean "the agent is the problem", not
-# "the model is". Kept broad on purpose: the cost of a false positive is a
-# message that mentions both AGENT_ID and the model, which is still better than
-# one that confidently blames only the model.
+# Wording that points at the agent/session rather than the model. Kept NARROW
+# on purpose -- an earlier version also matched "not found", which misfiled
+# "model 'x/y' not found" as an AGENT_ID problem. Do not re-broaden these; the
+# tests in SessionPatchFailureAttributionTests assert both directions.
 _AGENT_ERROR_HINTS = ("agent", "session")
 
 
@@ -104,7 +104,20 @@ def _explain_session_patch_failure(err, *, model_override, agent_id) -> str:
       worse than admitting ambiguity: it sends the user to edit a valve that
       was correct.
     """
-    detail = str(err)
+    # Transient and transport failures are neither valve's fault, and the retry
+    # comment in pipe() says they are the common ones under load. Classify by
+    # TYPE first: substring matching cannot see them, and str(TimeoutError()) is
+    # "", which rendered as a dangling colon followed by advice to edit two
+    # valves that were both correct.
+    if isinstance(err, (asyncio.TimeoutError, ConnectionError)):
+        return (
+            "**The Gateway did not respond in time while starting this "
+            "conversation.** This is usually transient — send the message "
+            "again. If it keeps happening, check that the Gateway is healthy "
+            "and reachable from Open WebUI."
+        )
+
+    detail = str(err).strip() or repr(err)
     low = detail.lower()
     wanted = model_override or "agent default"
 

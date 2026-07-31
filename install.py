@@ -37,7 +37,6 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -346,7 +345,7 @@ ARTIFACT_URL = os.environ.get(
 )
 
 
-def _fetch_pipe_file(dest_dir: Path) -> Path:
+def _fetch_pipe_file() -> str:
     """Download openclaw_pipe.py for the no-clone install path.
 
     ``uv run https://.../install.py install`` hands us a lone temp copy of this
@@ -376,10 +375,12 @@ def _fetch_pipe_file(dest_dir: Path) -> Path:
             "If you overrode OPENCLAW_PIPE_ARTIFACT_URL, check it points at the "
             "raw openclaw_pipe.py."
         )
-    dest = dest_dir / "openclaw_pipe.py"
-    dest.write_text(body)
     info(f"Fetched openclaw_pipe.py ({len(body.splitlines())} lines)")
-    return dest
+    # Returned as text, not written to disk: the caller only needs the source,
+    # and a write/read round trip would re-encode through the locale encoding
+    # while the download decoded explicitly as UTF-8. The artifact contains
+    # non-ASCII (·, Hebrew, Arabic), so that round trip is a latent corruption.
+    return body
 
 
 def _rebuild_pipe_file(pipe_file: Path, *, dev: bool) -> None:
@@ -441,12 +442,15 @@ def update_or_create_function(client: OwuiClient, cfg: Config) -> dict:
     _assert_not_silently_downgrading_from_dev_bundle(cfg)
     pipe_file = _resolve_pipe_file(cfg)
     _rebuild_pipe_file(pipe_file, dev=cfg.dev_bundle)
-    if not pipe_file.exists() and not cfg.dev_bundle:
-        # No clone: running as `uv run <raw-url> install`. Never do this for
-        # --dev-bundle, which is internal-only and deliberately never published.
-        with tempfile.TemporaryDirectory(prefix="openclaw-pipe-") as tmp:
-            fetched = _fetch_pipe_file(Path(tmp))
-            return _deploy_pipe_code(client, fetched.read_text())
+    running_without_a_clone = not (ROOT / "src").exists() and not (ROOT / ".git").exists()
+    if not pipe_file.exists() and not cfg.dev_bundle and running_without_a_clone:
+        # No clone: running as `uv run <raw-url> install`, where __file__ is a
+        # lone temp copy. Gate on "there is no repo here" rather than merely
+        # "the artifact is missing" -- a partial checkout (sparse, blob-filtered,
+        # or someone who deleted the artifact) would otherwise silently deploy
+        # HEAD-of-main from the internet instead of failing loudly.
+        # Never for --dev-bundle, which is internal-only and never published.
+        return _deploy_pipe_code(client, _fetch_pipe_file())
     if not pipe_file.exists():
         raise SystemExit(
             f"Pipe file not found: {pipe_file}\n"
