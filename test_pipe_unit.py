@@ -71,6 +71,8 @@ if "pydantic" not in sys.modules:
 from openclaw_pipe import (
     _GatewayConnection,
     GatewayError,
+    _parse_gateway_url,
+    _explain_connect_rejection,
     _TurnRenderer,
     _render_tool_result_block,
     _tool_call_started_event,
@@ -3794,3 +3796,82 @@ class ModelPatchCacheTests(unittest.TestCase):
         b = conn.model_patch_lock("s2")
         self.assertIs(a1, a2)
         self.assertIsNot(a1, b)
+
+
+class GatewayUrlParsingTests(unittest.TestCase):
+    """GATEWAY_URL renders as a plain text box that looks like a URL field, so
+    users paste URLs into it. Before this parser, `http://gw:18789` silently
+    dialled a host literally named `http` on port 80, and `http://gw` raised a
+    bare ValueError that escaped pipe()'s `except GatewayError` entirely."""
+
+    def test_plain_host_port(self):
+        self.assertEqual(_parse_gateway_url("localhost:18789"), ("localhost", 18789))
+
+    def test_host_only_uses_default_port(self):
+        self.assertEqual(_parse_gateway_url("gw.local"), ("gw.local", 18789))
+
+    def test_whitespace_is_tolerated(self):
+        self.assertEqual(_parse_gateway_url("  gw.local:18789 "), ("gw.local", 18789))
+
+    def test_schemes_are_stripped_not_rejected(self):
+        for raw in ("http://gw.local:18789", "https://gw.local:18789",
+                    "ws://gw.local:18789", "wss://gw.local:18789"):
+            with self.subTest(raw=raw):
+                self.assertEqual(_parse_gateway_url(raw), ("gw.local", 18789))
+
+    def test_scheme_without_port_falls_back_to_default(self):
+        # Previously: int("//gw.local") -> ValueError, uncaught.
+        self.assertEqual(_parse_gateway_url("http://gw.local"), ("gw.local", 18789))
+
+    def test_trailing_path_and_query_are_dropped(self):
+        # Previously: int("8443/") -> ValueError, uncaught.
+        self.assertEqual(_parse_gateway_url("https://gw.local:8443/"), ("gw.local", 8443))
+        self.assertEqual(_parse_gateway_url("gw.local:8443/api?x=1"), ("gw.local", 8443))
+
+    def test_never_yields_a_scheme_as_the_hostname(self):
+        # The exact old bug: hostname would come back as "http".
+        host, _ = _parse_gateway_url("http://gw.local:18789")
+        self.assertNotIn(host, ("http", "https", "ws", "wss"))
+
+    def test_empty_raises_gateway_error_naming_the_valve(self):
+        for raw in ("", "   ", None):
+            with self.subTest(raw=raw):
+                with self.assertRaises(GatewayError) as cm:
+                    _parse_gateway_url(raw)
+                self.assertIn("GATEWAY_URL", str(cm.exception))
+
+    def test_bad_port_raises_gateway_error_not_valueerror(self):
+        with self.assertRaises(GatewayError) as cm:
+            _parse_gateway_url("gw.local:not-a-port")
+        self.assertIn("GATEWAY_URL", str(cm.exception))
+        self.assertIn("localhost:18789", str(cm.exception))
+
+    def test_unsupported_scheme_is_rejected_clearly(self):
+        with self.assertRaises(GatewayError) as cm:
+            _parse_gateway_url("ftp://gw.local:18789")
+        self.assertIn("ftp://", str(cm.exception))
+
+
+class ConnectRejectionMessageTests(unittest.TestCase):
+    """Device approval happens on every first install; the raw Gateway reply is
+    just 'pairing required', and the fixing command lived only in the README."""
+
+    def test_pairing_message_names_the_command_and_device(self):
+        msg = _explain_connect_rejection("pairing required", device_id="abc123")
+        self.assertIn("openclaw devices approve", msg)
+        self.assertIn("openclaw devices list", msg)
+        self.assertIn("abc123", msg)
+
+    def test_pairing_message_without_device_id_still_helps(self):
+        msg = _explain_connect_rejection("device not approved", device_id=None)
+        self.assertIn("openclaw devices approve", msg)
+
+    def test_auth_failure_points_at_the_token_valve(self):
+        for raw in ("unauthorized", "invalid token", "forbidden"):
+            with self.subTest(raw=raw):
+                msg = _explain_connect_rejection(raw)
+                self.assertIn("GATEWAY_TOKEN", msg)
+
+    def test_unrecognized_errors_pass_through_verbatim(self):
+        self.assertEqual(_explain_connect_rejection("some novel failure"),
+                         "some novel failure")

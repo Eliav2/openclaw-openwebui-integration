@@ -1120,30 +1120,34 @@ class Action:
     class Valves(BaseModel):
         GATEWAY_URL: str = Field(
             default="localhost:18789",
-            description="OpenClaw Gateway address (host:port). Only used if "
-                        "this Action ever has to open its own connection "
-                        "instead of reusing the Pipe's (see module notes)."
+            description="Copy this exactly from the Pipe's valves. Gateway as "
+                        "host:port, no http:// or ws:// prefix, e.g. "
+                        "192.168.1.10:18789. Used only when this Action has to "
+                        "open its own connection instead of reusing the Pipe's."
         )
         GATEWAY_TOKEN: str = Field(
             default="",
-            description="OpenClaw Gateway API token. Same fallback-only caveat as GATEWAY_URL."
+            description="Copy this exactly from the Pipe's valves. The value of "
+                        "`gateway.auth.token` in your OpenClaw config. Used only "
+                        "for the fallback connection."
         )
         DEVICE_IDENTITY: str = Field(
             default="",
-            description="(Advanced) Fallback device identity JSON. Set this "
-                        "to the exact same value as the Pipe's DEVICE_IDENTITY "
-                        "valve so a fallback connection is recognized as the "
-                        "same already-approved device, not a new pairing request."
+            description="Copy this exactly from the Pipe's valves — do not leave "
+                        "it empty if the Pipe has one. It is what lets a fallback "
+                        "connection be recognised as the same already-approved "
+                        "device instead of raising a second pairing request."
         )
         STATE_DIR: str = Field(
             default="/data/openclaw-bridge",
-            description="Must match the Pipe's STATE_DIR valve -- this is how "
-                        "a fallback connection finds the Pipe's persisted "
-                        "device token on disk without re-pairing."
+            description="Copy this exactly from the Pipe's valves. It is how a "
+                        "fallback connection finds the Pipe's persisted device "
+                        "token on disk without re-pairing."
         )
         AGENT_ID: str = Field(
             default="main",
-            description="Target agent identifier -- must match the Pipe's AGENT_ID valve."
+            description="Copy this exactly from the Pipe's valves — the same "
+                        "OpenClaw agent the Pipe routes chats to."
         )
 
     def __init__(self):

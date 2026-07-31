@@ -1318,6 +1318,89 @@ class GatewayError(Exception):
     pass
 
 
+# How long to wait for the Gateway's TCP/WS accept before giving up. Without a
+# bound, an unroutable host blocks for the OS SYN-retry budget (~130s on Linux).
+_GATEWAY_CONNECT_TIMEOUT_S = 10.0
+
+
+def _explain_connect_rejection(message: str, *, device_id: str | None = None) -> str:
+    """Turn the Gateway's terse connect rejection into something actionable.
+
+    Device approval is a mandatory step of every first install, not an
+    exceptional case, yet the raw response is just "pairing required" -- and the
+    command that fixes it appears nowhere in the product, only in the README.
+    The device id the operator has to match is already in hand here.
+    """
+    lowered = message.lower()
+    if "pairing" in lowered or "not approved" in lowered:
+        ident = f"\n\nThis device's id is `{device_id}`." if device_id else ""
+        return (
+            "This Open WebUI instance is not an approved device on the OpenClaw "
+            "Gateway yet.\n\nOn the Gateway host, run:\n\n"
+            "    openclaw devices list\n"
+            "    openclaw devices approve <request-id>\n"
+            f"{ident}\n\nThen send your message again."
+        )
+    if any(k in lowered for k in ("unauthor", "invalid token", "forbidden", "bad token")):
+        return (
+            f"The Gateway rejected the credentials ({message}). Check the "
+            "GATEWAY_TOKEN valve in Open WebUI under Admin Panel > Functions > "
+            "OpenClaw Gateway > valves; it must match `gateway.auth.token` in "
+            "your OpenClaw config."
+        )
+    return message
+
+
+def _parse_gateway_url(raw: str) -> tuple[str, int]:
+    """Parse the GATEWAY_URL valve into (host, port).
+
+    The valve wants a bare ``host:port`` -- but it renders as a text box that
+    looks exactly like a URL field, so pasting ``http://host:18789`` is the
+    single most likely new-user mistake. A naive ``rsplit(":", 1)`` handles that
+    input catastrophically quietly:
+
+      ``http://gw:18789``  -> host ``http://gw``  -> websockets parses the
+                              hostname as literally ``http`` on port 80
+      ``http://gw``        -> ``int("//gw")`` -> a raw ValueError that escapes
+                              pipe()'s ``except GatewayError`` and surfaces as
+                              an unattributed error naming no valve
+
+    So: accept a scheme and strip it (being liberal costs three lines and kills
+    the whole failure class), and raise a GatewayError naming the valve for
+    anything still unparseable, so it lands in the one handler that prints
+    nicely into the chat.
+    """
+    value = (raw or "").strip()
+    if not value:
+        raise GatewayError(
+            "The GATEWAY_URL valve is empty. Set it to your OpenClaw Gateway "
+            "as host:port, for example localhost:18789."
+        )
+    if "://" in value:
+        scheme, _, value = value.partition("://")
+        if scheme.lower() not in ("ws", "wss", "http", "https"):
+            raise GatewayError(
+                f"GATEWAY_URL has an unsupported scheme '{scheme}://'. Use a "
+                "bare host:port, for example localhost:18789."
+            )
+    # Drop any path/query a pasted URL dragged along ("host:8443/" -> "host:8443").
+    value = value.split("/", 1)[0].split("?", 1)[0]
+    host, sep, port_str = value.rpartition(":")
+    if not sep:
+        host, port_str = value, "18789"
+    if not host:
+        raise GatewayError(
+            f"GATEWAY_URL {raw!r} has no host. Expected host:port, "
+            "for example localhost:18789."
+        )
+    if not port_str.isdigit():
+        raise GatewayError(
+            f"GATEWAY_URL {raw!r} has a non-numeric port {port_str!r}. "
+            "Expected host:port, for example localhost:18789."
+        )
+    return host, int(port_str)
+
+
 def _preview_recovery_text(preview: dict, session_key: str, user_text: str) -> str | None:
     """Return assistant text saved after this user message, if preview has it."""
     previews = preview.get("previews")
@@ -2402,20 +2485,45 @@ class _GatewayConnection:
     async def _connect_and_start(self):
         """Connect, handshake, and start the event loop task."""
         valves = self._valves()
-        parts = valves.GATEWAY_URL.rsplit(":", 1)
-        host = parts[0]
-        port = int(parts[1]) if len(parts) > 1 else 18789
+        host, port = _parse_gateway_url(valves.GATEWAY_URL)
         token = valves.GATEWAY_TOKEN
 
         if not token:
-            raise GatewayError("No GATEWAY_TOKEN configured")
+            raise GatewayError(
+                "The GATEWAY_TOKEN valve is empty. Set it in Open WebUI under "
+                "Admin Panel > Functions > OpenClaw Gateway > valves. The value "
+                "is `gateway.auth.token` in your OpenClaw config."
+            )
 
         # Device identity
         self._ensure_identity(valves)
 
         # Connect
         pipe_log(f"Connecting to ws://{host}:{port}")
-        ws = await websockets.connect(f"ws://{host}:{port}", ping_interval=None)
+        # Bounded, and every failure converted to GatewayError: pipe() only has
+        # an `except GatewayError` around this, so a bare OSError escapes the
+        # generator and OWUI renders it as an unattributed error. An unroutable
+        # host (firewall DROP, wrong IP) also blocks for the OS SYN-retry budget
+        # -- ~130s on Linux -- while holding the global init lock, so every other
+        # chat in the instance stalls behind it with only "Thinking..." on screen.
+        try:
+            ws = await asyncio.wait_for(
+                websockets.connect(f"ws://{host}:{port}", ping_interval=None),
+                timeout=_GATEWAY_CONNECT_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            raise GatewayError(
+                f"No response from the OpenClaw Gateway at {host}:{port} within "
+                f"{_GATEWAY_CONNECT_TIMEOUT_S:.0f}s. Check the GATEWAY_URL valve, "
+                "and that the Open WebUI backend can reach that host (Open WebUI "
+                "resolves it, not your browser)."
+            )
+        except OSError as ex:
+            raise GatewayError(
+                f"Could not connect to the OpenClaw Gateway at {host}:{port} "
+                f"({ex}). Is the Gateway running, and is the GATEWAY_URL valve "
+                "correct?"
+            )
 
         # Handshake: receive challenge
         challenge = json.loads(await asyncio.wait_for(ws.recv(), 10))
@@ -2447,7 +2555,10 @@ class _GatewayConnection:
         resp = json.loads(await asyncio.wait_for(ws.recv(), 10))
         if not resp.get("ok"):
             raise GatewayError(
-                str(resp.get("error", {}).get("message", "connect failed"))
+                _explain_connect_rejection(
+                    str(resp.get("error", {}).get("message", "connect failed")),
+                    device_id=(self._ident or {}).get("id"),
+                )
             )
 
         # Capture device token for future reconnects
@@ -3922,43 +4033,69 @@ class Pipe:
     class Valves(BaseModel):
         GATEWAY_URL: str = Field(
             default="localhost:18789",
-            description="OpenClaw Gateway address (host:port)"
+            description="Required. Your OpenClaw Gateway as host:port — no "
+                "http:// or ws:// prefix. Example: 192.168.1.10:18789. It must "
+                "be reachable from the Open WebUI backend, which is not "
+                "necessarily the same network as your browser."
         )
         GATEWAY_TOKEN: str = Field(
             default="",
-            description="OpenClaw Gateway API token"
+            description="Required. The Gateway API token: the value of "
+                "`gateway.auth.token` in your OpenClaw config. Ask whoever runs "
+                "the Gateway if you don't manage it yourself."
         )
         DEVICE_IDENTITY: str = Field(
             default="",
-            description="(Advanced) Fallback/import device identity JSON"
+            description="(Advanced — normally leave empty.) Ed25519 device "
+                "identity JSON. The pipe generates one on first connect and "
+                "persists it in STATE_DIR. Set this only to import an "
+                "already-approved identity, or to make the companion Status "
+                "Action reuse this exact device instead of raising a second "
+                "pairing request."
         )
         STATE_DIR: str = Field(
             default="/data/openclaw-bridge",
-            description="Persistent state directory for identity and device token"
+            description="Directory inside the Open WebUI container where the "
+                "device identity and Gateway token are stored. Must survive "
+                "restarts: if it is not writable the pipe silently falls back "
+                "to /tmp, and you will be asked to approve the device again "
+                "after every restart."
         )
         AGENT_ID: str = Field(
             default="main",
-            description="Target agent identifier"
+            description="Which OpenClaw agent handles these chats. Leave as "
+                "'main' unless your Gateway defines additional named agents."
         )
         ENABLE_FILE_SERVER: bool = Field(
             default=True,
-            description="Start a minimal HTTP server for media files"
+            description="Start a small HTTP server on port 18791 to serve "
+                "agent-generated images and files. Only used as a fallback when "
+                "USE_OWUI_FILES is off or an upload fails. Note it is "
+                "unauthenticated — leave off if port 18791 is exposed."
         )
         USE_OWUI_FILES: bool = Field(
             default=True,
-            description="Upload MEDIA files to OWUI Files API before falling back to file server"
+            description="Recommended. Upload agent-generated images and files "
+                "through Open WebUI's own Files API so they attach natively and "
+                "work over HTTPS. Falls back to the file server if it fails."
         )
         SEND_STOP_ON_CANCEL: bool = Field(
             default=True,
-            description="After OWUI cancels a stream, send /stop because chat.abort may not stop active tool subprocesses"
+            description="Recommended. When you press Stop, also send the agent "
+                "a /stop, so a tool it is running is actually killed — aborting "
+                "the stream alone can leave the tool running."
         )
         OWUI_BASE_URL: str = Field(
             default="http://127.0.0.1:8080",
-            description="Open WebUI base URL for Files API uploads"
+            description="Open WebUI's own base URL, resolved by the Open WebUI "
+                "backend itself and not by your browser. The default is correct "
+                "for a standard single-container install; change it only if "
+                "Open WebUI cannot reach itself at 127.0.0.1:8080."
         )
         OWUI_API_KEY: str = Field(
             default="",
-            description="Optional OWUI API key for file uploads; request bearer token is preferred"
+            description="(Optional.) Only needed if media uploads fail with an "
+                "auth error — the pipe normally reuses your own login token."
         )
         FILE_SERVER_BASE_URL: str = Field(
             default="http://localhost:18791",
@@ -3970,14 +4107,18 @@ class Pipe:
         )
         CONFIGURED_MODELS: str = Field(
             default="",
-            description="Comma-separated list of model keys to show in the selector. "
-                "Leave empty to show all discovered models. "
-                "See the Default Model valve for a reference list of available keys."
+            description="(Optional.) Comma-separated model keys to show in the selector, e.g. "
+                "'anthropic/claude-sonnet-5,openai/gpt-5.5'. Leave empty to show every "
+                "model your Gateway reports. The Default Model dropdown lists the keys "
+                "currently known."
         )
         DEFAULT_MODEL: str = Field(
             default="",
-            description="Override the agent's default model when 'Default' preset is selected. "
-                "Also serves as a reference list of all available model keys.",
+            description="Model used when you pick 'OpenClaw · Default'. Leave empty to "
+                "use the agent's own configured model. The dropdown lists models "
+                "discovered from your Gateway; before the first successful "
+                "connection it shows a built-in example list that may not match "
+                "your Gateway.",
             json_schema_extra={
                 "input": {"type": "select", "options": "get_model_options"}
             }
@@ -3990,23 +4131,23 @@ class Pipe:
         )
         CHATGPT_MODEL: str = Field(
             default="openai/gpt-5.5",
-            description="[Legacy] OpenClaw model override used by the ChatGPT manifold model. "
-                "Still honored for backward compatibility."
+            description="[Legacy — ignore this on a new install.] Model used by the fixed "
+                "'ChatGPT' selector entry. Kept only for chats that already picked it."
         )
         OPUS_MODEL: str = Field(
             default="anthropic/claude-opus-4-8",
-            description="[Legacy] OpenClaw model override used by the Opus 4.8 manifold model. "
-                "Still honored for backward compatibility."
+            description="[Legacy — ignore this on a new install.] Model used by the fixed "
+                "'Opus' selector entry. Kept only for chats that already picked it."
         )
         SONNET_MODEL: str = Field(
             default="anthropic/claude-sonnet-5",
-            description="[Legacy] OpenClaw model override used by the Sonnet 5 manifold model. "
-                "Still honored for backward compatibility."
+            description="[Legacy — ignore this on a new install.] Model used by the fixed "
+                "'Sonnet' selector entry. Kept only for chats that already picked it."
         )
         GLM_MODEL: str = Field(
             default="openrouter/z-ai/glm-5.2",
-            description="[Legacy] OpenClaw model override used by the GLM 5.2 manifold model. "
-                "Still honored for backward compatibility."
+            description="[Legacy — ignore this on a new install.] Model used by the fixed "
+                "'GLM' selector entry. Kept only for chats that already picked it."
         )
         AUTO_TITLE: bool = Field(
             default=True,
@@ -4015,9 +4156,10 @@ class Pipe:
         )
         TITLE_GEN_AGENT_ID: str = Field(
             default="title-gen",
-            description="Agent id used for the background title-generation session. Deliberately "
-                "separate from AGENT_ID: title-gen gets its own CLI process/lane, so it no longer "
-                "queues behind the main conversation's active work (2026-07-10 regression, P36-adjacent)."
+            description="Agent id used for background chat-title generation. It must "
+                "exist on the Gateway (default 'title-gen'); if it does not, titles are "
+                "silently skipped. Kept separate from AGENT_ID so title generation never "
+                "queues behind your conversation."
         )
 
     def __init__(self):

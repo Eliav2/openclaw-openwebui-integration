@@ -48,43 +48,69 @@ class Pipe:
     class Valves(BaseModel):
         GATEWAY_URL: str = Field(
             default="localhost:18789",
-            description="OpenClaw Gateway address (host:port)"
+            description="Required. Your OpenClaw Gateway as host:port — no "
+                "http:// or ws:// prefix. Example: 192.168.1.10:18789. It must "
+                "be reachable from the Open WebUI backend, which is not "
+                "necessarily the same network as your browser."
         )
         GATEWAY_TOKEN: str = Field(
             default="",
-            description="OpenClaw Gateway API token"
+            description="Required. The Gateway API token: the value of "
+                "`gateway.auth.token` in your OpenClaw config. Ask whoever runs "
+                "the Gateway if you don't manage it yourself."
         )
         DEVICE_IDENTITY: str = Field(
             default="",
-            description="(Advanced) Fallback/import device identity JSON"
+            description="(Advanced — normally leave empty.) Ed25519 device "
+                "identity JSON. The pipe generates one on first connect and "
+                "persists it in STATE_DIR. Set this only to import an "
+                "already-approved identity, or to make the companion Status "
+                "Action reuse this exact device instead of raising a second "
+                "pairing request."
         )
         STATE_DIR: str = Field(
             default="/data/openclaw-bridge",
-            description="Persistent state directory for identity and device token"
+            description="Directory inside the Open WebUI container where the "
+                "device identity and Gateway token are stored. Must survive "
+                "restarts: if it is not writable the pipe silently falls back "
+                "to /tmp, and you will be asked to approve the device again "
+                "after every restart."
         )
         AGENT_ID: str = Field(
             default="main",
-            description="Target agent identifier"
+            description="Which OpenClaw agent handles these chats. Leave as "
+                "'main' unless your Gateway defines additional named agents."
         )
         ENABLE_FILE_SERVER: bool = Field(
             default=True,
-            description="Start a minimal HTTP server for media files"
+            description="Start a small HTTP server on port 18791 to serve "
+                "agent-generated images and files. Only used as a fallback when "
+                "USE_OWUI_FILES is off or an upload fails. Note it is "
+                "unauthenticated — leave off if port 18791 is exposed."
         )
         USE_OWUI_FILES: bool = Field(
             default=True,
-            description="Upload MEDIA files to OWUI Files API before falling back to file server"
+            description="Recommended. Upload agent-generated images and files "
+                "through Open WebUI's own Files API so they attach natively and "
+                "work over HTTPS. Falls back to the file server if it fails."
         )
         SEND_STOP_ON_CANCEL: bool = Field(
             default=True,
-            description="After OWUI cancels a stream, send /stop because chat.abort may not stop active tool subprocesses"
+            description="Recommended. When you press Stop, also send the agent "
+                "a /stop, so a tool it is running is actually killed — aborting "
+                "the stream alone can leave the tool running."
         )
         OWUI_BASE_URL: str = Field(
             default="http://127.0.0.1:8080",
-            description="Open WebUI base URL for Files API uploads"
+            description="Open WebUI's own base URL, resolved by the Open WebUI "
+                "backend itself and not by your browser. The default is correct "
+                "for a standard single-container install; change it only if "
+                "Open WebUI cannot reach itself at 127.0.0.1:8080."
         )
         OWUI_API_KEY: str = Field(
             default="",
-            description="Optional OWUI API key for file uploads; request bearer token is preferred"
+            description="(Optional.) Only needed if media uploads fail with an "
+                "auth error — the pipe normally reuses your own login token."
         )
         FILE_SERVER_BASE_URL: str = Field(
             default="http://localhost:18791",
@@ -96,14 +122,18 @@ class Pipe:
         )
         CONFIGURED_MODELS: str = Field(
             default="",
-            description="Comma-separated list of model keys to show in the selector. "
-                "Leave empty to show all discovered models. "
-                "See the Default Model valve for a reference list of available keys."
+            description="(Optional.) Comma-separated model keys to show in the selector, e.g. "
+                "'anthropic/claude-sonnet-5,openai/gpt-5.5'. Leave empty to show every "
+                "model your Gateway reports. The Default Model dropdown lists the keys "
+                "currently known."
         )
         DEFAULT_MODEL: str = Field(
             default="",
-            description="Override the agent's default model when 'Default' preset is selected. "
-                "Also serves as a reference list of all available model keys.",
+            description="Model used when you pick 'OpenClaw · Default'. Leave empty to "
+                "use the agent's own configured model. The dropdown lists models "
+                "discovered from your Gateway; before the first successful "
+                "connection it shows a built-in example list that may not match "
+                "your Gateway.",
             json_schema_extra={
                 "input": {"type": "select", "options": "get_model_options"}
             }
@@ -116,23 +146,23 @@ class Pipe:
         )
         CHATGPT_MODEL: str = Field(
             default="openai/gpt-5.5",
-            description="[Legacy] OpenClaw model override used by the ChatGPT manifold model. "
-                "Still honored for backward compatibility."
+            description="[Legacy — ignore this on a new install.] Model used by the fixed "
+                "'ChatGPT' selector entry. Kept only for chats that already picked it."
         )
         OPUS_MODEL: str = Field(
             default="anthropic/claude-opus-4-8",
-            description="[Legacy] OpenClaw model override used by the Opus 4.8 manifold model. "
-                "Still honored for backward compatibility."
+            description="[Legacy — ignore this on a new install.] Model used by the fixed "
+                "'Opus' selector entry. Kept only for chats that already picked it."
         )
         SONNET_MODEL: str = Field(
             default="anthropic/claude-sonnet-5",
-            description="[Legacy] OpenClaw model override used by the Sonnet 5 manifold model. "
-                "Still honored for backward compatibility."
+            description="[Legacy — ignore this on a new install.] Model used by the fixed "
+                "'Sonnet' selector entry. Kept only for chats that already picked it."
         )
         GLM_MODEL: str = Field(
             default="openrouter/z-ai/glm-5.2",
-            description="[Legacy] OpenClaw model override used by the GLM 5.2 manifold model. "
-                "Still honored for backward compatibility."
+            description="[Legacy — ignore this on a new install.] Model used by the fixed "
+                "'GLM' selector entry. Kept only for chats that already picked it."
         )
         AUTO_TITLE: bool = Field(
             default=True,
@@ -141,9 +171,10 @@ class Pipe:
         )
         TITLE_GEN_AGENT_ID: str = Field(
             default="title-gen",
-            description="Agent id used for the background title-generation session. Deliberately "
-                "separate from AGENT_ID: title-gen gets its own CLI process/lane, so it no longer "
-                "queues behind the main conversation's active work (2026-07-10 regression, P36-adjacent)."
+            description="Agent id used for background chat-title generation. It must "
+                "exist on the Gateway (default 'title-gen'); if it does not, titles are "
+                "silently skipped. Kept separate from AGENT_ID so title generation never "
+                "queues behind your conversation."
         )
 
     def __init__(self):
