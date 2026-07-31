@@ -78,30 +78,57 @@ def _parse_whitelist(text: str) -> set[str]:
 # "the model is". Kept broad on purpose: the cost of a false positive is a
 # message that mentions both AGENT_ID and the model, which is still better than
 # one that confidently blames only the model.
-_AGENT_ERROR_HINTS = ("agent", "no such session", "unknown session", "not found")
+_AGENT_ERROR_HINTS = ("agent", "session")
 
 
 def _explain_session_patch_failure(err, *, model_override, agent_id) -> str:
     """Describe a failed sessions.patch without misattributing the cause.
 
-    The session key embeds AGENT_ID, and this patch is the first agent-scoped
-    RPC of the turn -- so a mistyped AGENT_ID surfaces here, and used to be
-    reported as "Model selection error". That sends the user to fix
-    DEFAULT_MODEL / CONFIGURED_MODELS, which are not the problem, and there is
-    nothing anywhere in the message naming the valve that is.
+    The session key embeds AGENT_ID and this patch is the turn's first
+    agent-scoped RPC, so a mistyped AGENT_ID surfaces here -- and used to be
+    reported as "Model selection error", sending the user to fix
+    DEFAULT_MODEL/CONFIGURED_MODELS, which were never the problem.
+
+    Classifying by substring is genuinely ambiguous, so the ordering matters and
+    is deliberate:
+
+    * "model" (or the model key) present -> a MODEL error. Checked FIRST and
+      allowed to win outright, because gateway model errors routinely mention
+      the agent too ("model x/y is not configured for this agent"), whereas an
+      agent error rarely mentions a model. An earlier version of this matched
+      "not found" as an agent hint, which misfiled "model 'x/y' not found" --
+      the exact misattribution this function exists to prevent, just pointed
+      the other way.
+    * otherwise, agent/session wording -> an AGENT error.
+    * otherwise -> say we don't know, and name both valves. Guessing wrong is
+      worse than admitting ambiguity: it sends the user to edit a valve that
+      was correct.
     """
     detail = str(err)
+    low = detail.lower()
     wanted = model_override or "agent default"
-    if any(h in detail.lower() for h in _AGENT_ERROR_HINTS):
+
+    looks_like_model = "model" in low or (
+        bool(model_override) and model_override.lower() in low
+    )
+    if looks_like_model:
+        return f"**Model selection error:** could not apply `{wanted}`: {detail}"
+
+    if any(h in low for h in _AGENT_ERROR_HINTS):
         return (
             f"**Could not start a session on agent `{agent_id}`:** {detail}\n\n"
             f"Check the `AGENT_ID` valve — it must name an agent your OpenClaw "
             f"Gateway actually defines (`main` unless you configured others). "
-            f"This is reported here because applying the model is the first "
-            f"thing the pipe asks the agent to do; the model (`{wanted}`) may "
-            f"be fine."
+            f"This surfaces here because applying the model is the first thing "
+            f"the pipe asks the agent to do; the model (`{wanted}`) may be fine."
         )
-    return f"**Model selection error:** could not apply `{wanted}`: {detail}"
+
+    return (
+        f"**Could not start this conversation's session:** {detail}\n\n"
+        f"The pipe was applying model `{wanted}` on agent `{agent_id}`. Check "
+        f"the `AGENT_ID` valve names an agent your Gateway defines, and that "
+        f"the model is one it offers."
+    )
 
 
 MODELS_SOURCE_LIVE = "live"

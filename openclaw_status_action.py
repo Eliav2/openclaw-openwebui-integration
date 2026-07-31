@@ -291,10 +291,33 @@ def _parse_gateway_url(raw: str) -> tuple[str, int]:
             )
     # Drop any path/query a pasted URL dragged along ("host:8443/" -> "host:8443").
     value = value.split("/", 1)[0].split("?", 1)[0]
-    host, sep, port_str = value.rpartition(":")
-    if not sep:
-        host, port_str = value, "18789"
-    if not host:
+
+    if value.startswith("["):
+        # Bracketed IPv6, "[::1]:18789". Split on the closing bracket, not the
+        # last colon, and keep the brackets -- websockets needs them in the URL.
+        addr, sep, rest = value.partition("]")
+        if not sep:
+            raise GatewayError(
+                f"GATEWAY_URL {raw!r} is missing a closing ']' on the IPv6 "
+                "address. Expected [address]:port, for example [::1]:18789."
+            )
+        host = addr + "]"
+        port_str = rest[1:] if rest.startswith(":") else (rest or "18789")
+    elif value.count(":") > 1:
+        # A bare IPv6 literal. rpartition(":") would read "::1" as host ":" on
+        # port 1 -- silently wrong on both counts, which is the whole failure
+        # class this function exists to remove. Ask for brackets instead of
+        # guessing which colon separates the port.
+        raise GatewayError(
+            f"GATEWAY_URL {raw!r} looks like an IPv6 address. Wrap it in "
+            "brackets so the port is unambiguous, for example [::1]:18789."
+        )
+    else:
+        host, sep, port_str = value.rpartition(":")
+        if not sep:
+            host, port_str = value, "18789"
+
+    if not host or host == "[]":
         raise GatewayError(
             f"GATEWAY_URL {raw!r} has no host. Expected host:port, "
             "for example localhost:18789."
@@ -304,7 +327,13 @@ def _parse_gateway_url(raw: str) -> tuple[str, int]:
             f"GATEWAY_URL {raw!r} has a non-numeric port {port_str!r}. "
             "Expected host:port, for example localhost:18789."
         )
-    return host, int(port_str)
+    port = int(port_str)
+    if not 1 <= port <= 65535:
+        raise GatewayError(
+            f"GATEWAY_URL {raw!r} has port {port}, which is outside 1-65535. "
+            "The OpenClaw Gateway default is 18789."
+        )
+    return host, port
 
 
 def _preview_recovery_text(preview: dict, session_key: str, user_text: str) -> str | None:
@@ -1424,11 +1453,17 @@ class _GatewayConnection:
                 "and that the Open WebUI backend can reach that host (Open WebUI "
                 "resolves it, not your browser)."
             )
-        except OSError as ex:
+        except (OSError, websockets.exceptions.WebSocketException) as ex:
+            # WebSocketException is NOT an OSError subclass, so catching OSError
+            # alone still let InvalidStatus/InvalidHandshake escape -- which is
+            # exactly what happens when something answers but isn't a Gateway
+            # (a reverse proxy returning 502 on the upgrade, an HTTP server on
+            # the port). That is a configuration mistake, and it belongs in the
+            # chat naming the valve, not as an unattributed traceback.
             raise GatewayError(
                 f"Could not connect to the OpenClaw Gateway at {host}:{port} "
-                f"({ex}). Is the Gateway running, and is the GATEWAY_URL valve "
-                "correct?"
+                f"({type(ex).__name__}: {ex}). Is the Gateway running, and is "
+                "the GATEWAY_URL valve pointing at it?"
             )
 
         # Handshake: receive challenge

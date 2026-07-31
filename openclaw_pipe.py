@@ -1385,10 +1385,33 @@ def _parse_gateway_url(raw: str) -> tuple[str, int]:
             )
     # Drop any path/query a pasted URL dragged along ("host:8443/" -> "host:8443").
     value = value.split("/", 1)[0].split("?", 1)[0]
-    host, sep, port_str = value.rpartition(":")
-    if not sep:
-        host, port_str = value, "18789"
-    if not host:
+
+    if value.startswith("["):
+        # Bracketed IPv6, "[::1]:18789". Split on the closing bracket, not the
+        # last colon, and keep the brackets -- websockets needs them in the URL.
+        addr, sep, rest = value.partition("]")
+        if not sep:
+            raise GatewayError(
+                f"GATEWAY_URL {raw!r} is missing a closing ']' on the IPv6 "
+                "address. Expected [address]:port, for example [::1]:18789."
+            )
+        host = addr + "]"
+        port_str = rest[1:] if rest.startswith(":") else (rest or "18789")
+    elif value.count(":") > 1:
+        # A bare IPv6 literal. rpartition(":") would read "::1" as host ":" on
+        # port 1 -- silently wrong on both counts, which is the whole failure
+        # class this function exists to remove. Ask for brackets instead of
+        # guessing which colon separates the port.
+        raise GatewayError(
+            f"GATEWAY_URL {raw!r} looks like an IPv6 address. Wrap it in "
+            "brackets so the port is unambiguous, for example [::1]:18789."
+        )
+    else:
+        host, sep, port_str = value.rpartition(":")
+        if not sep:
+            host, port_str = value, "18789"
+
+    if not host or host == "[]":
         raise GatewayError(
             f"GATEWAY_URL {raw!r} has no host. Expected host:port, "
             "for example localhost:18789."
@@ -1398,7 +1421,13 @@ def _parse_gateway_url(raw: str) -> tuple[str, int]:
             f"GATEWAY_URL {raw!r} has a non-numeric port {port_str!r}. "
             "Expected host:port, for example localhost:18789."
         )
-    return host, int(port_str)
+    port = int(port_str)
+    if not 1 <= port <= 65535:
+        raise GatewayError(
+            f"GATEWAY_URL {raw!r} has port {port}, which is outside 1-65535. "
+            "The OpenClaw Gateway default is 18789."
+        )
+    return host, port
 
 
 def _preview_recovery_text(preview: dict, session_key: str, user_text: str) -> str | None:
@@ -2518,11 +2547,17 @@ class _GatewayConnection:
                 "and that the Open WebUI backend can reach that host (Open WebUI "
                 "resolves it, not your browser)."
             )
-        except OSError as ex:
+        except (OSError, websockets.exceptions.WebSocketException) as ex:
+            # WebSocketException is NOT an OSError subclass, so catching OSError
+            # alone still let InvalidStatus/InvalidHandshake escape -- which is
+            # exactly what happens when something answers but isn't a Gateway
+            # (a reverse proxy returning 502 on the upgrade, an HTTP server on
+            # the port). That is a configuration mistake, and it belongs in the
+            # chat naming the valve, not as an unattributed traceback.
             raise GatewayError(
                 f"Could not connect to the OpenClaw Gateway at {host}:{port} "
-                f"({ex}). Is the Gateway running, and is the GATEWAY_URL valve "
-                "correct?"
+                f"({type(ex).__name__}: {ex}). Is the Gateway running, and is "
+                "the GATEWAY_URL valve pointing at it?"
             )
 
         # Handshake: receive challenge
@@ -3955,30 +3990,57 @@ def _parse_whitelist(text: str) -> set[str]:
 # "the model is". Kept broad on purpose: the cost of a false positive is a
 # message that mentions both AGENT_ID and the model, which is still better than
 # one that confidently blames only the model.
-_AGENT_ERROR_HINTS = ("agent", "no such session", "unknown session", "not found")
+_AGENT_ERROR_HINTS = ("agent", "session")
 
 
 def _explain_session_patch_failure(err, *, model_override, agent_id) -> str:
     """Describe a failed sessions.patch without misattributing the cause.
 
-    The session key embeds AGENT_ID, and this patch is the first agent-scoped
-    RPC of the turn -- so a mistyped AGENT_ID surfaces here, and used to be
-    reported as "Model selection error". That sends the user to fix
-    DEFAULT_MODEL / CONFIGURED_MODELS, which are not the problem, and there is
-    nothing anywhere in the message naming the valve that is.
+    The session key embeds AGENT_ID and this patch is the turn's first
+    agent-scoped RPC, so a mistyped AGENT_ID surfaces here -- and used to be
+    reported as "Model selection error", sending the user to fix
+    DEFAULT_MODEL/CONFIGURED_MODELS, which were never the problem.
+
+    Classifying by substring is genuinely ambiguous, so the ordering matters and
+    is deliberate:
+
+    * "model" (or the model key) present -> a MODEL error. Checked FIRST and
+      allowed to win outright, because gateway model errors routinely mention
+      the agent too ("model x/y is not configured for this agent"), whereas an
+      agent error rarely mentions a model. An earlier version of this matched
+      "not found" as an agent hint, which misfiled "model 'x/y' not found" --
+      the exact misattribution this function exists to prevent, just pointed
+      the other way.
+    * otherwise, agent/session wording -> an AGENT error.
+    * otherwise -> say we don't know, and name both valves. Guessing wrong is
+      worse than admitting ambiguity: it sends the user to edit a valve that
+      was correct.
     """
     detail = str(err)
+    low = detail.lower()
     wanted = model_override or "agent default"
-    if any(h in detail.lower() for h in _AGENT_ERROR_HINTS):
+
+    looks_like_model = "model" in low or (
+        bool(model_override) and model_override.lower() in low
+    )
+    if looks_like_model:
+        return f"**Model selection error:** could not apply `{wanted}`: {detail}"
+
+    if any(h in low for h in _AGENT_ERROR_HINTS):
         return (
             f"**Could not start a session on agent `{agent_id}`:** {detail}\n\n"
             f"Check the `AGENT_ID` valve — it must name an agent your OpenClaw "
             f"Gateway actually defines (`main` unless you configured others). "
-            f"This is reported here because applying the model is the first "
-            f"thing the pipe asks the agent to do; the model (`{wanted}`) may "
-            f"be fine."
+            f"This surfaces here because applying the model is the first thing "
+            f"the pipe asks the agent to do; the model (`{wanted}`) may be fine."
         )
-    return f"**Model selection error:** could not apply `{wanted}`: {detail}"
+
+    return (
+        f"**Could not start this conversation's session:** {detail}\n\n"
+        f"The pipe was applying model `{wanted}` on agent `{agent_id}`. Check "
+        f"the `AGENT_ID` valve names an agent your Gateway defines, and that "
+        f"the model is one it offers."
+    )
 
 
 MODELS_SOURCE_LIVE = "live"
