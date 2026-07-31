@@ -446,16 +446,16 @@ def update_or_create_function(client: OwuiClient, cfg: Config) -> dict:
         # --dev-bundle, which is internal-only and deliberately never published.
         with tempfile.TemporaryDirectory(prefix="openclaw-pipe-") as tmp:
             fetched = _fetch_pipe_file(Path(tmp))
-            return _deploy_pipe_code(client, cfg, fetched.read_text())
+            return _deploy_pipe_code(client, fetched.read_text())
     if not pipe_file.exists():
         raise SystemExit(
             f"Pipe file not found: {pipe_file}\n"
             "Run `python3 build.py --dev` first, or drop --dev-bundle."
         )
-    return _deploy_pipe_code(client, cfg, pipe_file.read_text())
+    return _deploy_pipe_code(client, pipe_file.read_text())
 
 
-def _deploy_pipe_code(client: OwuiClient, cfg: Config, pipe_code: str) -> dict:
+def _deploy_pipe_code(client: OwuiClient, pipe_code: str) -> dict:
     """Create or update the OWUI function from already-resolved pipe source.
 
     Split out so the no-clone path (fetched artifact, never written into the
