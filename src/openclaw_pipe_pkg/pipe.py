@@ -805,6 +805,11 @@ class Pipe:
         first_event_arrived = False
         last_item_text = ""
         assistant_stream_text = ""
+        # Everything the gateway has sent for this turn, including text the
+        # ask-user buffer withheld. assistant_stream_text only tracks what was
+        # FLUSHED, so it cannot be used to dedup a cumulative catch-all event
+        # while a needs-input block is being held back (ELI-80).
+        assistant_received_text = ""
         visible_message_text = ""
         had_tool_block = False
         # toolCallIds announced to OWUI as `function_call` items that have
@@ -1124,6 +1129,7 @@ class Pipe:
                             raw_delta = data.get("delta")
                             if raw_delta:
                                 delta = raw_delta
+                                assistant_received_text += raw_delta
                             else:
                                 # Some providers (observed with claude-cli-backed
                                 # Opus/Sonnet overrides) send a final catch-all event
@@ -1133,24 +1139,18 @@ class Pipe:
                                 # time. Diff it against what's already been streamed,
                                 # same as the item-event dedup below.
                                 raw_text = data.get("text") or ""
-                                delta = (
-                                    _item_delta_text(raw_text, "", assistant_stream_text)
-                                    if raw_text
-                                    else ""
+                                before = _item_delta_text(
+                                    raw_text, "", assistant_received_text
+                                ) if raw_text else ""
+                                delta = _catch_all_delta(
+                                    raw_text, assistant_received_text, visible_message_text
                                 )
-                                # Safety net (P27, reproduced live 2026-07-10):
-                                # `assistant_stream_text` can drift from
-                                # `visible_message_text` and defeat the prefix
-                                # check above, which then falls through to
-                                # re-yielding the entire cumulative text. See
-                                # `_suppress_already_shown`'s docstring.
-                                suppressed = _suppress_already_shown(delta, visible_message_text)
-                                if delta and not suppressed:
+                                if before and not delta:
                                     pipe_log(
                                         "  suppressed duplicate catch-all assistant "
-                                        f"text ({len(delta)} chars already shown)"
+                                        f"text ({len(before)} chars already received)"
                                     )
-                                delta = suppressed
+                                assistant_received_text += delta
                             if delta:
                                 # Filter Sender metadata
                                 if (
