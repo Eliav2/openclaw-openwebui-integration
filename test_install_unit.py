@@ -172,21 +172,21 @@ class FetchPipeArtifactTests(unittest.TestCase):
     def test_fetches_and_writes_the_artifact(self):
         body = b'"""frontmatter"""\n\n\nclass Pipe:\n    pass\n'
         inst.ARTIFACT_URL = self._serve(body)
-        got = inst._fetch_pipe_file(Path(self.tmp))
-        self.assertTrue(got.exists())
-        self.assertIn("class Pipe", got.read_text())
+        got = inst._fetch_pipe_file()
+        self.assertIsInstance(got, str)
+        self.assertIn("class Pipe", got)
 
     def test_rejects_a_200_that_is_not_the_artifact(self):
         # A raw URL typo on GitHub can return an HTML page with status 200.
         inst.ARTIFACT_URL = self._serve(b"<html>not found</html>")
         with self.assertRaises(SystemExit) as cm:
-            inst._fetch_pipe_file(Path(self.tmp))
+            inst._fetch_pipe_file()
         self.assertIn("did not return the pipe artifact", str(cm.exception))
 
     def test_unreachable_url_explains_the_clone_fallback(self):
         inst.ARTIFACT_URL = "http://127.0.0.1:1/openclaw_pipe.py"
         with self.assertRaises(SystemExit) as cm:
-            inst._fetch_pipe_file(Path(self.tmp))
+            inst._fetch_pipe_file()
         msg = str(cm.exception)
         self.assertIn("Could not download", msg)
         self.assertIn("git clone", msg)
