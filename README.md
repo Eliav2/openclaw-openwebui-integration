@@ -372,6 +372,29 @@ its valves — `GATEWAY_URL`, `GATEWAY_TOKEN`, `DEVICE_IDENTITY`, `STATE_DIR`,
 
 ---
 
+## 🔧 Troubleshooting
+
+| Symptom | Likely cause |
+|---------|-------------|
+| Text appears all at once | Pipe uses `return` instead of `yield` (check your code) |
+| "No GATEWAY_TOKEN configured" | Valve not set — go to Admin → Functions → edit valves |
+| An `**Error:**` line instead of a reply | OWUI can't reach `GATEWAY_URL` — check network connectivity from the OWUI backend |
+| Model missing from selector | Run `uv run install.py repair`; it ensures the function is active/global and visible in `/api/v1/models`. Also check `CONFIGURED_MODELS` isn't filtering it out. |
+| "pairing required" | Run `uv run install.py repair` or approve the matching request with `openclaw devices approve <request-id>` |
+| Image still uses the legacy file server | OWUI file upload failed and the pipe fell back; check `OWUI_BASE_URL`, request auth/API key, and OWUI logs |
+| Tool calls not showing | The `__event_emitter__` calls fail silently; check OWUI backend logs |
+| Device identity not persisting | Check `STATE_DIR` and the `DEVICE_IDENTITY` valve; run `uv run install.py healthcheck` |
+| Stream stops mid-response | The pipe probes the Gateway after 30s of silence and gives up after 180s with no text; check agent response time and the OWUI backend log |
+| Repeated device-pairing prompts | `STATE_DIR` isn't persistent — grep the OWUI backend log for `STATE_DIR unavailable` |
+| `ModuleNotFoundError: websockets` on load | OWUI's frontmatter auto-install is off (`ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS=false`) or it's in offline mode — install `websockets` and `cryptography` into the OWUI image |
+| Models are listed as "— example, Gateway not reached" | The pipe hasn't reached your Gateway yet, so the selector is showing a built-in example list rather than your models. Pick `OpenClaw · Default` (it always works), send one message to establish the connection, then reload — the real list replaces it. If it persists, the Gateway is genuinely unreachable: check `GATEWAY_URL` and `GATEWAY_TOKEN`. |
+| "Could not start a session on agent `<id>`" | `AGENT_ID` names an agent your Gateway doesn't define. Use `main` unless you configured others. |
+| Restarting mid-turn loses context | Known OpenClaw limitation — avoid restarting the Gateway while a run is in flight |
+
+Check OWUI's backend logs for `[openclaw-pipe]` prefixed messages.
+
+---
+
 ## 📋 Metadata Contract
 
 Every user message that reaches the agent through the pipe includes two
@@ -470,27 +493,6 @@ it's frozen on screen for the rest of the run — the pipe can still update
 what's saved to the OWUI database afterward, but not what's already rendered
 — so anything meant to change later (like a tool result replacing a spinner)
 has to be sent as a fresh item, not a patch to an old one.
-
----
-
-## 🔧 Troubleshooting
-
-| Symptom | Likely cause |
-|---------|-------------|
-| Text appears all at once | Pipe uses `return` instead of `yield` (check your code) |
-| "No GATEWAY_TOKEN configured" | Valve not set — go to Admin → Functions → edit valves |
-| An `**Error:**` line instead of a reply | OWUI can't reach `GATEWAY_URL` — check network connectivity from the OWUI backend |
-| Model missing from selector | Run `uv run install.py repair`; it ensures the function is active/global and visible in `/api/v1/models`. Also check `CONFIGURED_MODELS` isn't filtering it out. |
-| "pairing required" | Run `uv run install.py repair` or approve the matching request with `openclaw devices approve <request-id>` |
-| Image still uses the legacy file server | OWUI file upload failed and the pipe fell back; check `OWUI_BASE_URL`, request auth/API key, and OWUI logs |
-| Tool calls not showing | The `__event_emitter__` calls fail silently; check OWUI backend logs |
-| Device identity not persisting | Check `STATE_DIR` and the `DEVICE_IDENTITY` valve; run `uv run install.py healthcheck` |
-| Stream stops mid-response | The pipe probes the Gateway after 30s of silence and gives up after 180s with no text; check agent response time and the OWUI backend log |
-| Repeated device-pairing prompts | `STATE_DIR` isn't persistent — grep the OWUI backend log for `STATE_DIR unavailable` |
-| `ModuleNotFoundError: websockets` on load | OWUI's frontmatter auto-install is off (`ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS=false`) or it's in offline mode — install `websockets` and `cryptography` into the OWUI image |
-| Restarting mid-turn loses context | Known OpenClaw limitation — avoid restarting the Gateway while a run is in flight |
-
-Check OWUI's backend logs for `[openclaw-pipe]` prefixed messages.
 
 ---
 
