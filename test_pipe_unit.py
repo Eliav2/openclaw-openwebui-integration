@@ -77,6 +77,7 @@ from openclaw_pipe import (
     _explain_connect_rejection,
     _explain_session_patch_failure,
     _catch_all_delta,
+    _marker_line_index,
     _discover_models_with_source,
     _modal_payload_from_user_input_prompt,
     _truncate_at_repeated_marker,
@@ -4257,3 +4258,71 @@ class CatchAllDuplicatesAskUserPromptTests(unittest.TestCase):
 
     def test_empty_catch_all_is_noop(self):
         self.assertEqual(_catch_all_delta("", "abc", "abc"), "")
+
+
+class MarkerAfterPreambleTests(unittest.TestCase):
+    """Seen live 2026-08-01: a reply that explained itself first and asked at the
+    end leaked the raw marker into the chat with no dialog.
+
+    The buffer only inspected the text after the LAST newline. That is fine
+    while tokens arrive one at a time (the marker is briefly the final line),
+    but wrong when a provider delivers the whole reply as ONE cumulative chunk:
+    the marker then sits mid-string with its option lines after it, and was
+    never recognised. Token-streamed turns were unaffected, which is exactly why
+    this looked intermittent rather than broken.
+    """
+
+    PREAMBLE = ("Deployed and verified. The live function now contains stuff.\n\n"
+                "Now the real proof. Same shape as the one that failed.\n\n")
+    BLOCK = "OpenClaw needs input:\nPick a theme\n1. Dark\n2. Light\n3. Auto"
+
+    def _feed(self, deltas):
+        pending, shown = "", ""
+        for d in deltas:
+            flush, pending = _advance_input_prompt_buffer(pending, d)
+            shown += flush
+        return pending, shown
+
+    def test_whole_reply_in_one_chunk_still_triggers(self):
+        """The live failure. Was: marker leaked, no dialog."""
+        pending, shown = self._feed([self.PREAMBLE + self.BLOCK])
+        self.assertTrue(_is_user_input_prompt(pending))
+        self.assertNotIn("needs input:", shown)
+        self.assertIn("Deployed and verified", shown)
+
+    def test_token_streamed_reply_still_triggers(self):
+        msg = self.PREAMBLE + self.BLOCK
+        pending, shown = self._feed([msg[i:i + 7] for i in range(0, len(msg), 7)])
+        self.assertTrue(_is_user_input_prompt(pending))
+        self.assertNotIn("needs input:", shown)
+
+    def test_marker_only_reply_still_triggers(self):
+        pending, shown = self._feed([self.BLOCK])
+        self.assertTrue(_is_user_input_prompt(pending))
+        self.assertEqual(shown, "")
+
+    def test_ordinary_reply_is_not_held(self):
+        pending, shown = self._feed(["A normal reply.\nWith two lines.\n"])
+        self.assertFalse(_is_user_input_prompt(pending))
+        self.assertIn("A normal reply.", shown)
+
+    def test_preamble_is_still_shown(self):
+        """The explanation before the question must not be swallowed."""
+        _pending, shown = self._feed([self.PREAMBLE + self.BLOCK])
+        self.assertIn("Now the real proof.", shown)
+
+    def test_marker_line_index_finds_first_line_only(self):
+        self.assertEqual(_marker_line_index("OpenClaw needs input:\nx"), 0)
+        self.assertEqual(_marker_line_index("abc\nOpenClaw needs input:\nx"), 4)
+        self.assertIsNone(_marker_line_index("abc\ndef"))
+
+    def test_marker_must_open_a_line_not_appear_mid_sentence(self):
+        """Prose mentioning the marker must not pop a dialog."""
+        self.assertIsNone(
+            _marker_line_index("I emit OpenClaw needs input: when I want a dialog."))
+
+    def test_dialog_built_from_a_preamble_reply_is_clean(self):
+        pending, _shown = self._feed([self.PREAMBLE + self.BLOCK])
+        data = _modal_payload_from_user_input_prompt(pending)[0]["data"]
+        self.assertEqual(data["title"], "Pick a theme")
+        self.assertEqual(data["options"], ["Dark", "Light", "Auto"])
