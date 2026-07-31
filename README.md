@@ -7,12 +7,42 @@ streaming, native tool-call rendering, and persistent agent sessions inside OWUI
 interface. A companion **Action** function adds a live session/usage lookup button
 to the message toolbar.
 
-> No separate proxy, no Node.js middleware, no Python subprocess. Just two
-> Python files you paste into OWUI's admin panel.
+> No separate proxy, no Node.js middleware, no Python subprocess — the whole
+> integration is two self-contained Python files loaded as Open WebUI functions.
 
 <p align="center">
-  <img src="./owui-screenshot.svg" alt="OpenClaw Gateway Pipe in action — streaming text, tool call rendering, and model selection inside Open WebUI" width="90%">
+  <img src="./owui-screenshot.svg" alt="Illustration of the OpenClaw Gateway Pipe rendering inside Open WebUI — streaming text, tool call cards, and model selection" width="90%">
 </p>
+
+<p align="center"><sub>Illustration of the pipe's rendering in Open WebUI.</sub></p>
+
+> **You need a running OpenClaw Gateway before any of this is useful.**
+> [OpenClaw](https://github.com/openclaw/openclaw) is a self-hosted agent
+> runtime: it runs tool-using agents on your own machine and exposes them over a
+> WebSocket gateway. This repo only bridges an **existing** Gateway into Open
+> WebUI's chat UI — it is not itself an agent. If you don't have a Gateway yet,
+> set that up first.
+
+---
+
+## ⚡ Quickstart
+
+```bash
+git clone https://github.com/Eliav2/openclaw-openwebui-integration
+cd openclaw-openwebui-integration
+uv run install.py install --wizard    # prompts for everything it needs
+```
+
+Then approve the device once on your Gateway host:
+
+```bash
+openclaw devices list
+openclaw devices approve <request-id>
+```
+
+Now pick **`OpenClaw · Default`** in Open WebUI's model dropdown and say hello.
+Full detail in [Installation](#-installation-automated); if something goes
+wrong, jump to [Troubleshooting](#-troubleshooting).
 
 ---
 
@@ -88,8 +118,10 @@ see [Development](#-development) if you're contributing.
 
 ### Prerequisites
 
+- A running OpenClaw Gateway, reachable from the machine Open WebUI runs on
 - Admin credentials for your Open WebUI instance
-- Your OpenClaw Gateway API token
+- Your OpenClaw Gateway API token — the value of `gateway.auth.token` in your
+  OpenClaw config, or ask whoever runs your Gateway
 - [`uv`](https://docs.astral.sh/uv/) on the **machine running the installer**
   (not inside OWUI). If you don't have it:
 
@@ -148,6 +180,11 @@ You can also run it straight from GitHub without cloning first:
 uv run https://raw.githubusercontent.com/Eliav2/openclaw-openwebui-integration/main/install.py install --wizard
 ```
 
+In that no-clone form there is no `openclaw_pipe.py` next to the script, so the
+installer downloads the artifact from this repo before deploying it. Set
+`OPENCLAW_PIPE_ARTIFACT_URL` to point that at a fork, a pinned tag, or an
+internal mirror.
+
 The script will:
 1. Log in to Open WebUI
 2. Check if the pipe function already exists
@@ -165,6 +202,28 @@ The script will:
 > valve settings (especially `DEVICE_IDENTITY`) survive re-installation.
 > The old `delete+create` cycle that wiped `DEVICE_IDENTITY` and forced
 > re-approval is gone.
+
+### Verify it worked
+
+1. `uv run install.py healthcheck` — status checks plus an end-to-end smoke
+   test. It should finish with all ✓ and exit 0.
+2. Reload Open WebUI. `OpenClaw · Default` should appear in the model picker.
+3. Select it and send "hello". Text should stream in token by token.
+
+If the smoke test reports **pairing required**, that's expected on a first
+install — approve the device (below), then re-run it.
+
+### Uninstalling
+
+There's no `uninstall` subcommand; removal is a UI action. In Open WebUI go to
+**Admin Panel → Functions** and delete `openclaw_gateway` (and
+`openclaw_status_action` if you installed it). Every install first writes the
+previous function and its valves to `backups/`, so if you only want to roll back
+a bad upgrade, restore the JSON from there rather than deleting.
+
+Deleting the functions does not touch `STATE_DIR`. Remove that directory too if
+you want the device identity gone, and revoke the device on the Gateway with
+`openclaw devices list` / `openclaw devices remove <id>`.
 
 ### Installing the companion Status Action
 

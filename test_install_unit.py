@@ -11,6 +11,8 @@ Run: python3 -m unittest test_install_unit -v
 """
 import http.server
 import json
+import shutil
+import tempfile
 import sys
 import threading
 import types
@@ -129,6 +131,69 @@ class DowngradeGuardTests(unittest.TestCase):
 
         inst.DEVCOORD_PORT = self.port
         inst._assert_not_silently_downgrading_from_dev_bundle(Cfg())  # must not raise
+
+
+class FetchPipeArtifactTests(unittest.TestCase):
+    """The README advertises a no-clone install:
+
+        uv run https://raw.githubusercontent.com/.../install.py install --wizard
+
+    Under that form `__file__` is a lone temp copy, so openclaw_pipe.py is not
+    beside it and there is no src/ tree to build from. Before the fetch step the
+    deploy died on "Pipe file not found" -- and only AFTER the wizard had already
+    collected the OWUI password and the gateway token.
+    """
+
+    def setUp(self):
+        self._orig_url = inst.ARTIFACT_URL
+        self.tmp = tempfile.mkdtemp(prefix="fetch-test-")
+
+    def tearDown(self):
+        inst.ARTIFACT_URL = self._orig_url
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _serve(self, body: bytes, status: int = 200):
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(status)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        self.addCleanup(srv.server_close)
+        return f"http://127.0.0.1:{srv.server_address[1]}/openclaw_pipe.py"
+
+    def test_fetches_and_writes_the_artifact(self):
+        body = b'"""frontmatter"""\n\n\nclass Pipe:\n    pass\n'
+        inst.ARTIFACT_URL = self._serve(body)
+        got = inst._fetch_pipe_file(Path(self.tmp))
+        self.assertTrue(got.exists())
+        self.assertIn("class Pipe", got.read_text())
+
+    def test_rejects_a_200_that_is_not_the_artifact(self):
+        # A raw URL typo on GitHub can return an HTML page with status 200.
+        inst.ARTIFACT_URL = self._serve(b"<html>not found</html>")
+        with self.assertRaises(SystemExit) as cm:
+            inst._fetch_pipe_file(Path(self.tmp))
+        self.assertIn("did not return the pipe artifact", str(cm.exception))
+
+    def test_unreachable_url_explains_the_clone_fallback(self):
+        inst.ARTIFACT_URL = "http://127.0.0.1:1/openclaw_pipe.py"
+        with self.assertRaises(SystemExit) as cm:
+            inst._fetch_pipe_file(Path(self.tmp))
+        msg = str(cm.exception)
+        self.assertIn("Could not download", msg)
+        self.assertIn("git clone", msg)
+
+    def test_url_is_overridable_by_env(self):
+        # Lets a fork, a pinned tag, or a local mirror drive the no-clone path.
+        self.assertIn("openclaw_pipe.py", inst.ARTIFACT_URL)
 
 
 if __name__ == "__main__":
