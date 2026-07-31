@@ -74,13 +74,64 @@ def _parse_whitelist(text: str) -> set[str]:
     return {x.strip() for x in text.split(",") if x.strip()}
 
 
+# Words in a sessions.patch failure that mean "the agent is the problem", not
+# "the model is". Kept broad on purpose: the cost of a false positive is a
+# message that mentions both AGENT_ID and the model, which is still better than
+# one that confidently blames only the model.
+_AGENT_ERROR_HINTS = ("agent", "no such session", "unknown session", "not found")
+
+
+def _explain_session_patch_failure(err, *, model_override, agent_id) -> str:
+    """Describe a failed sessions.patch without misattributing the cause.
+
+    The session key embeds AGENT_ID, and this patch is the first agent-scoped
+    RPC of the turn -- so a mistyped AGENT_ID surfaces here, and used to be
+    reported as "Model selection error". That sends the user to fix
+    DEFAULT_MODEL / CONFIGURED_MODELS, which are not the problem, and there is
+    nothing anywhere in the message naming the valve that is.
+    """
+    detail = str(err)
+    wanted = model_override or "agent default"
+    if any(h in detail.lower() for h in _AGENT_ERROR_HINTS):
+        return (
+            f"**Could not start a session on agent `{agent_id}`:** {detail}\n\n"
+            f"Check the `AGENT_ID` valve — it must name an agent your OpenClaw "
+            f"Gateway actually defines (`main` unless you configured others). "
+            f"This is reported here because applying the model is the first "
+            f"thing the pipe asks the agent to do; the model (`{wanted}`) may "
+            f"be fine."
+        )
+    return f"**Model selection error:** could not apply `{wanted}`: {detail}"
+
+
+MODELS_SOURCE_LIVE = "live"
+MODELS_SOURCE_CACHE = "cache"
+MODELS_SOURCE_FALLBACK = "fallback"
+
+# Appended to selector entries built from _FALLBACK_MODELS. Display text only --
+# the entry's `id` (the routing key) is untouched, so this cannot affect routing.
+UNVERIFIED_MODEL_SUFFIX = " — example, Gateway not reached"
+
+
 async def _discover_models(valves) -> list[dict]:
-    """Discover available models from the gateway, cache, or hardcoded fallback.
-    
-    Tries in order:
-    1. Live gateway request (only if connection already up)
-    2. Cache file from STATE_DIR
-    3. Hardcoded fallback list
+    """Back-compat wrapper for callers that don't care where the list came from."""
+    models, _source = await _discover_models_with_source(valves)
+    return models
+
+
+async def _discover_models_with_source(valves) -> tuple[list[dict], str]:
+    """Discover models, and report where the list came from.
+
+    Returns (models, source), source being "live", "cache" or "fallback".
+
+    Callers need that distinction because the three are not interchangeable to
+    a user. `pipes()` never initiates a connection -- it only reuses one that a
+    previous chat established -- so on a fresh install the live branch is skipped
+    and no cache exists yet, and the selector filled up with five hardcoded
+    models bearing no relationship to the user's Gateway, rendered identically
+    to genuinely discovered ones. Picking one the Gateway doesn't have then
+    failed with a bare "Model selection error", with nothing to suggest the list
+    itself had been fabricated.
     """
     # 1. Try live gateway (fast path only if already connected)
     global _gateway_connection
@@ -95,16 +146,20 @@ async def _discover_models(valves) -> list[dict]:
                     os.path.join(_state_dir(getattr(valves, "STATE_DIR", "")), "models-cache.json"),
                     {"models": models, "cachedAt": time.time()}
                 )
-                return models
+                return models, MODELS_SOURCE_LIVE
         except Exception as e:
             pipe_log(f"Live model discovery failed: {e}")
-    
+
     # 2. Cache fallback
     cache = _read_json_file(os.path.join(_state_dir(getattr(valves, "STATE_DIR", "")), "models-cache.json"))
     if cache and cache.get("models"):
         pipe_log("Using cached model list")
-        return cache["models"]
-    
+        return cache["models"], MODELS_SOURCE_CACHE
+
     # 3. Hardcoded fallback
-    pipe_log("Using hardcoded fallback model list")
-    return _FALLBACK_MODELS
+    pipe_log(
+        "Using hardcoded fallback model list -- the Gateway has not been reached "
+        "yet, so these are examples, not your Gateway's models. They are labelled "
+        "as such in the model selector."
+    )
+    return _FALLBACK_MODELS, MODELS_SOURCE_FALLBACK
