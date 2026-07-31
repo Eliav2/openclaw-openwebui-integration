@@ -1311,7 +1311,7 @@ class _GatewayConnection:
                 device=signed,
                 locale="en-US",
                 userAgent="openclaw-owui-pipe/1.0",
-                caps=["agent-events", "tool-events"]
+                caps=["tool-events"]
             )
         )))
 
