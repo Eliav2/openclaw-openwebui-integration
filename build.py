@@ -6,8 +6,8 @@ Why a hand-written concat and not stickytape/pinliner: OWUI stores a function as
 one flat .py file and (a) reads the frontmatter docstring from the FIRST bytes and
 (b) introspects a top-level `Pipe` class. Loader-based bundlers prepend boilerplate
 (breaking (a)) and bury classes inside a runtime loader (breaking (b)). We only
-bundle our OWN first-party fragments — third-party deps (websockets, cryptography,
-pydantic) are provided by the OWUI runtime and stay as normal imports — so the
+bundle our OWN first-party fragments -- third-party deps (websockets, cryptography,
+pydantic) are provided by the OWUI runtime and stay as normal imports -- so the
 "bundle" is a deterministic ordered concatenation.
 
 Usage:

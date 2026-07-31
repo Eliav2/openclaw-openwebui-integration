@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-OWUI API helper — reusable module for OWUI REST API operations.
+OWUI API helper -- reusable module for OWUI REST API operations.
 Import or run standalone for login/chat/title/files operations.
 
 Usage as module:
@@ -150,7 +150,7 @@ class OwuiClient:
         """Send a message to a chat and get the model's response.
 
         Note: messages sent via the completions API may not persist to
-        the chat DB — this is for testing pipe behavior, not full chat UX.
+        the chat DB -- this is for testing pipe behavior, not full chat UX.
         """
         if history is None:
             history = []

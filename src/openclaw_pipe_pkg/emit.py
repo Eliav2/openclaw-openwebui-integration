@@ -79,7 +79,7 @@ def _relative_time(reset_at_ms) -> str | None:
 
 def _window_reset_line(w: dict) -> str | None:
     """Full detail line for one rate-limit window, only when it has a known
-    reset time — e.g. '⏱ 5h 18% left (resets in 22m)'. Skipped for windows
+    reset time -- e.g. '⏱ 5h 18% left (resets in 22m)'. Skipped for windows
     without a `resetAt` (e.g. Gemini's Pro/Flash aren't time-windows), since
     there'd be nothing new to say beyond what the thin combined line already
     shows.
@@ -94,12 +94,12 @@ def _window_reset_line(w: dict) -> str | None:
 async def _build_usage_status_lines(conn, session_key, timeout: float = 5) -> list[str]:
     """Best-effort final status lines: context window fill (combined with the
     provider's primary/nearest-term rate-limit window on the same line, kept
-    deliberately thin — no reset time), one full detail line per rate-limit
+    deliberately thin -- no reset time), one full detail line per rate-limit
     window that has a known reset time (e.g. both '5h' and 'Week' for
     Anthropic/OpenAI), and the active session goal (if any) on its own line.
     Returned as separate short lines (rather than one combined line) because
     OWUI's status UI hard-clamps every line to a single row (`line-clamp-1`,
-    no way to disable per-event) — one line per fact keeps each row inside
+    no way to disable per-event) -- one line per fact keeps each row inside
     that clamp instead of getting cut off mid-number.
 
     OWUI shows only the *last* emitted status line by default (the rest
@@ -153,7 +153,7 @@ async def _build_usage_status_lines(conn, session_key, timeout: float = 5) -> li
                 elif p.get("summary"):
                     primary_bit = f"⏱ {p['summary']}"
                 # A full "(resets in ...)" line per window that actually has
-                # a known reset time — including the same window already
+                # a known reset time -- including the same window already
                 # folded into `primary_bit`, since that one stays thin (no
                 # reset time) on purpose.
                 reset_lines = [
