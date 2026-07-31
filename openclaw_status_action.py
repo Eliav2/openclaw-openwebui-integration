@@ -581,6 +581,28 @@ def _item_delta_text(item_text: str, last_item_text: str, assistant_stream_text:
     return item_text
 
 
+
+def _catch_all_delta(raw_text: str, received_text: str, visible_text: str) -> str:
+    """New text carried by a cumulative catch-all assistant event.
+
+    Some providers end a turn with an event that has no `delta` but a `text`
+    field holding the WHOLE reply. It has to be diffed against what already
+    arrived, or the entire message is treated as new.
+
+    The diff is against `received_text`, everything the gateway sent us, and
+    not only against what was shown. Those two differ: text held back by the
+    ask-user buffer was received but never yielded. Diffing against shown text
+    alone made the final catch-all look entirely new, so the whole needs-input
+    block was appended to that buffer a second time and the dialog rendered the
+    prompt twice with double the options (ELI-80). The visible-text pass stays
+    as a second net for the drift case it was originally written for (P27).
+    """
+    if not raw_text:
+        return ""
+    delta = _item_delta_text(raw_text, "", received_text)
+    return _suppress_already_shown(delta, visible_text)
+
+
 def _suppress_already_shown(delta: str, visible_message_text: str) -> str:
     """Final safety net against re-yielding text that's already been shown.
 

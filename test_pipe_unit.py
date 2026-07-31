@@ -76,6 +76,7 @@ from openclaw_pipe import (
     _parse_gateway_url,
     _explain_connect_rejection,
     _explain_session_patch_failure,
+    _catch_all_delta,
     _discover_models_with_source,
     _modal_payload_from_user_input_prompt,
     _truncate_at_repeated_marker,
@@ -4164,3 +4165,95 @@ class RepeatedAskUserMarkerTests(unittest.TestCase):
 
     def test_dedupe_drops_blanks(self):
         self.assertEqual(_dedupe_options(["a", "  ", "", "a"]), ["a"])
+
+
+class CatchAllDuplicatesAskUserPromptTests(unittest.TestCase):
+    """ELI-80. Reproduced live 2026-08-01 with a SINGLE marker emission.
+
+    Sequence that broke it:
+
+      1. The agent streams a needs-input block. Every delta is withheld by
+         _advance_input_prompt_buffer, so nothing is yielded and
+         `visible_message_text` stays empty. `assistant_stream_text` also stays
+         empty, because it is only appended to AFTER the buffer flushes.
+      2. The turn ends with a catch-all event: no `delta`, a `text` field
+         holding the whole reply.
+      3. That was diffed against `assistant_stream_text` (empty) and against
+         `visible_message_text` (empty), so the entire block looked new.
+      4. `candidate = pending + delta` appended it to the buffer a second time,
+         with no separator, producing `3. AutoOpenClaw needs input:` and a
+         dialog with six buttons for a three-option question.
+
+    The fix diffs against everything RECEIVED, not everything shown.
+    """
+
+    BLOCK = ("OpenClaw needs input:\n"
+             "Pick a theme\n"
+             "1. Dark\n"
+             "2. Light\n"
+             "3. Auto")
+
+    def _stream_withheld(self):
+        """Feed the block through the ask-user buffer one delta at a time.
+
+        Returns (pending, received, visible) exactly as pipe() would hold them:
+        everything withheld, nothing shown.
+        """
+        pending, received, visible = "", "", ""
+        for delta in (self.BLOCK[i:i + 7] for i in range(0, len(self.BLOCK), 7)):
+            received += delta
+            flush, pending = _advance_input_prompt_buffer(pending, delta)
+            visible += flush
+        return pending, received, visible
+
+    def test_whole_block_is_withheld_and_nothing_is_shown(self):
+        pending, received, visible = self._stream_withheld()
+        self.assertEqual(pending, self.BLOCK)
+        self.assertEqual(received, self.BLOCK)
+        self.assertEqual(visible, "")
+
+    def test_catch_all_adds_nothing_when_block_was_withheld(self):
+        """The regression itself. Before the fix this returned the whole block."""
+        _pending, received, visible = self._stream_withheld()
+        self.assertEqual(_catch_all_delta(self.BLOCK, received, visible), "")
+
+    def test_prompt_is_not_doubled(self):
+        """End state the user sees: the assembled prompt, once."""
+        pending, received, visible = self._stream_withheld()
+        pending += _catch_all_delta(self.BLOCK, received, visible)
+        self.assertEqual(pending, self.BLOCK)
+        self.assertEqual(pending.lower().count("needs input:"), 1)
+        self.assertNotIn("AutoOpenClaw", pending)
+
+    def test_dialog_offers_three_options_not_six(self):
+        pending, received, visible = self._stream_withheld()
+        pending += _catch_all_delta(self.BLOCK, received, visible)
+        data = _modal_payload_from_user_input_prompt(pending)[0]["data"]
+        self.assertEqual(data["title"], "Pick a theme")
+        self.assertEqual(data["options"], ["Dark", "Light", "Auto"])
+
+    def test_diffing_against_shown_text_alone_is_the_bug(self):
+        """Pins WHY the fix works, so nobody 'simplifies' it back.
+
+        Shown text is empty while a block is withheld, so a shown-only diff
+        reports the entire block as new. That was the defect.
+        """
+        _pending, _received, visible = self._stream_withheld()
+        shown_only = _catch_all_delta(self.BLOCK, visible, visible)
+        self.assertEqual(shown_only, self.BLOCK)
+
+    def test_genuinely_new_trailing_text_still_arrives(self):
+        """The fix must not swallow real content the catch-all adds."""
+        pending, received, visible = self._stream_withheld()
+        full = self.BLOCK + "\nAnything else?"
+        self.assertEqual(_catch_all_delta(full, received, visible), "\nAnything else?")
+
+    def test_catch_all_after_normal_shown_text_is_unchanged(self):
+        """No needs-input involved: prior behaviour preserved."""
+        received = visible = "Hello there."
+        self.assertEqual(_catch_all_delta("Hello there.", received, visible), "")
+        self.assertEqual(
+            _catch_all_delta("Hello there. More.", received, visible), " More.")
+
+    def test_empty_catch_all_is_noop(self):
+        self.assertEqual(_catch_all_delta("", "abc", "abc"), "")
