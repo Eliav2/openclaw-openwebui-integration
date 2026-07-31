@@ -177,6 +177,10 @@ class Pipe:
                 "queues behind your conversation."
         )
 
+    # Set from the live valves so the DEFAULT_MODEL dropdown (a classmethod with
+    # no access to self.valves) reads the same cache pipes() writes.
+    _last_state_dir = ""
+
     def __init__(self):
         self.valves = self.Valves()
         self._active_tool_args: dict[str, str] = {}
@@ -198,6 +202,7 @@ class Pipe:
         Dynamically discovers models from the OpenClaw Gateway (or cache)
         and returns one entry per model plus a 'Default' entry.
         """
+        type(self)._last_state_dir = getattr(self.valves, "STATE_DIR", "") or ""
         models, source = await _discover_models_with_source(self.valves)
 
         # Apply whitelist filter
@@ -226,15 +231,34 @@ class Pipe:
         # Always prepend Default at top. It is the one entry that always works
         # in this state: it clears the override and uses the agent's own model,
         # so it needs no Gateway round trip to be correct.
-        return [{"id": "default", "name": "OpenClaw · Default"}] + entries
+        #
+        # When CONFIGURED_MODELS lists the user's real Gateway keys but the
+        # Gateway hasn't been reached, the whitelist filters the example list to
+        # nothing and the warning disappears with it -- leaving exactly the user
+        # who most needs it (real config, unreachable Gateway) with a bare
+        # single-entry selector and no explanation. Say it on Default instead.
+        default_name = "OpenClaw · Default"
+        if unverified and not entries:
+            default_name += UNVERIFIED_MODEL_SUFFIX
+        return [{"id": "default", "name": default_name}] + entries
 
     @classmethod
     def get_model_options(cls):
         """Return model options for the DEFAULT_MODEL valve dropdown.
-        
+
         Reads synchronously from the model cache or fallback list.
+
+        Uses the state dir the running Pipe last resolved (recorded in
+        _last_state_dir) rather than _state_dir() with no argument. Being a
+        classmethod there is no self.valves here, and the no-argument form
+        resolves to OPENCLAW_BRIDGE_STATE_DIR or /data/openclaw-bridge -- so for
+        anyone who set the STATE_DIR valve it read a path nothing ever writes,
+        never found the cache, and therefore labelled every option
+        "Gateway not reached" permanently, long after successful discovery.
         """
-        cache = _read_json_file(os.path.join(_state_dir(), "models-cache.json"))
+        cache = _read_json_file(
+            os.path.join(_state_dir(cls._last_state_dir), "models-cache.json")
+        )
         cached = cache.get("models") if cache else None
         models = cached or _FALLBACK_MODELS
         # Same honesty as pipes(): before the first successful connection this

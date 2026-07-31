@@ -4032,3 +4032,79 @@ class SessionPatchFailureAttributionTests(unittest.TestCase):
         msg = _explain_session_patch_failure(
             Exception("boom"), model_override=None, agent_id="main")
         self.assertIn("agent default", msg)
+
+
+class ReviewFollowupRegressionTests(unittest.TestCase):
+    """Defects found reviewing the branch that introduced the fixes above.
+    Each of these shipped briefly; none may come back silently."""
+
+    def test_bracketed_hostname_is_rejected_not_crashed(self):
+        """Brackets mean IPv6 to every URL parser, so websockets' urlsplit()
+        raises a bare ValueError for a bracketed hostname -- neither OSError nor
+        WebSocketException, so it escaped both the connect handler and pipe()'s
+        except GatewayError. Reachable by following our own advice: the bare-IPv6
+        branch says "wrap it in brackets", and wrapping a HOSTNAME lands here."""
+        for raw in ("[gateway.local]:18789", "[localhost]:18789", "[192.168.1.10]:18789"):
+            with self.subTest(raw=raw):
+                with self.assertRaises(GatewayError) as cm:
+                    _parse_gateway_url(raw)
+                self.assertIn("brackets", str(cm.exception))
+        # real IPv6 still works
+        self.assertEqual(_parse_gateway_url("[fe80::1]:18789"), ("[fe80::1]", 18789))
+
+    def test_multi_colon_non_ipv6_is_not_called_ipv6(self):
+        with self.assertRaises(GatewayError) as cm:
+            _parse_gateway_url("myhost:80:90")
+        self.assertNotIn("is an IPv6 address", str(cm.exception))
+
+    def test_non_ascii_digit_port_raises_gateway_error_not_valueerror(self):
+        """str.isdigit() is True for superscripts that int() then rejects, and
+        that ValueError was raised before the caller's try, so it escaped."""
+        for raw in ("host:²", "host:¹8789"):
+            with self.subTest(raw=raw):
+                with self.assertRaises(GatewayError):
+                    _parse_gateway_url(raw)
+
+    def test_transient_failures_are_not_blamed_on_a_valve(self):
+        """str(TimeoutError()) is "", which rendered as a dangling colon followed
+        by advice to edit two valves that were both correct."""
+        for err in (asyncio.TimeoutError(), ConnectionResetError(104, "reset")):
+            with self.subTest(err=type(err).__name__):
+                msg = _explain_session_patch_failure(
+                    err, model_override="x/y", agent_id="main")
+                self.assertNotIn("AGENT_ID", msg)
+                self.assertNotIn("Model selection error", msg)
+                self.assertIn("again", msg.lower())
+
+    def test_dropdown_reads_the_cache_the_pipe_actually_writes(self):
+        """get_model_options is a classmethod, so it used _state_dir() with no
+        argument while the writer used the STATE_DIR valve. For anyone with a
+        custom STATE_DIR it read a path nothing writes, never found the cache,
+        and so labelled every option "Gateway not reached" permanently."""
+        with tempfile.TemporaryDirectory() as tmp:
+            custom = os.path.join(tmp, "custom")
+            p = Pipe()
+            p.valves.STATE_DIR = custom
+            p.valves.CONFIGURED_MODELS = ""
+            _write_json_file(
+                os.path.join(_state_dir(custom), "models-cache.json"),
+                {"models": [{"key": "vendor/real", "name": "Real", "tags": []}]},
+            )
+            asyncio.run(p.pipes())
+            labels = [o["label"] for o in Pipe.get_model_options()]
+            self.assertTrue(any("Real" in l for l in labels), labels)
+            for l in labels:
+                self.assertNotIn(UNVERIFIED_MODEL_SUFFIX, l)
+
+    def test_warning_survives_a_whitelist_that_filters_everything(self):
+        """CONFIGURED_MODELS set to real Gateway keys + an unreachable Gateway
+        emptied the example list, taking the warning with it -- leaving exactly
+        the user who most needs it with no explanation."""
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Pipe()
+            p.valves.STATE_DIR = tmp
+            p.valves.CONFIGURED_MODELS = "vendor/only-mine"
+            entries = asyncio.run(p.pipes())
+            self.assertEqual(len(entries), 1)
+            self.assertIn(UNVERIFIED_MODEL_SUFFIX, entries[0]["name"])
+            self.assertEqual(entries[0]["id"], "default")

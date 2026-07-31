@@ -99,6 +99,7 @@ from pathlib import Path
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from dataclasses import dataclass, field
 
+import ipaddress
 import websockets
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.hazmat.primitives import serialization
@@ -1318,8 +1319,9 @@ class GatewayError(Exception):
     pass
 
 
-# How long to wait for the Gateway's TCP/WS accept before giving up. Without a
-# bound, an unroutable host blocks for the OS SYN-retry budget (~130s on Linux).
+# How long to wait for the Gateway's TCP/WS accept before giving up. Mirrors
+# websockets' own open_timeout default; kept explicit so the bound is visible
+# and tunable in one place rather than inherited silently.
 _GATEWAY_CONNECT_TIMEOUT_S = 10.0
 
 
@@ -1395,16 +1397,43 @@ def _parse_gateway_url(raw: str) -> tuple[str, int]:
                 f"GATEWAY_URL {raw!r} is missing a closing ']' on the IPv6 "
                 "address. Expected [address]:port, for example [::1]:18789."
             )
+        inner = addr[1:]
+        # Brackets mean IPv6 to every URL parser. If the contents are not an
+        # IPv6 literal, websockets' urlsplit().hostname raises a bare ValueError
+        # -- which is neither OSError nor WebSocketException, so it escapes the
+        # connect handler AND pipe()'s except GatewayError. Reject it here.
+        # This is reachable by following our own advice: the bare-IPv6 branch
+        # below says "wrap it in brackets", and a user who wraps a *hostname*
+        # lands exactly on this input.
+        try:
+            ipaddress.IPv6Address(inner)
+        except ValueError:
+            raise GatewayError(
+                f"GATEWAY_URL {raw!r} has {inner!r} in brackets, but brackets "
+                "are only for IPv6 literals. Use a plain host:port such as "
+                f"{inner}:18789, or bracket an actual IPv6 address like "
+                "[::1]:18789."
+            )
         host = addr + "]"
         port_str = rest[1:] if rest.startswith(":") else (rest or "18789")
     elif value.count(":") > 1:
+        # More than one colon and no brackets. If it parses as IPv6, say so;
+        # otherwise it is something like "host:80:90" or a pasted URL with
+        # userinfo, and calling that "an IPv6 address" would be wrong.
+        try:
+            ipaddress.IPv6Address(value)
+        except ValueError:
+            raise GatewayError(
+                f"GATEWAY_URL {raw!r} has more than one ':' and is not an IPv6 "
+                "address, so the port is ambiguous. Expected host:port, for "
+                "example localhost:18789."
+            )
         # A bare IPv6 literal. rpartition(":") would read "::1" as host ":" on
         # port 1 -- silently wrong on both counts, which is the whole failure
-        # class this function exists to remove. Ask for brackets instead of
-        # guessing which colon separates the port.
+        # class this function exists to remove.
         raise GatewayError(
-            f"GATEWAY_URL {raw!r} looks like an IPv6 address. Wrap it in "
-            "brackets so the port is unambiguous, for example [::1]:18789."
+            f"GATEWAY_URL {raw!r} is an IPv6 address. Wrap it in brackets so "
+            "the port is unambiguous, for example [::1]:18789."
         )
     else:
         host, sep, port_str = value.rpartition(":")
@@ -1416,7 +1445,7 @@ def _parse_gateway_url(raw: str) -> tuple[str, int]:
             f"GATEWAY_URL {raw!r} has no host. Expected host:port, "
             "for example localhost:18789."
         )
-    if not port_str.isdigit():
+    if not (port_str.isascii() and port_str.isdigit()):
         raise GatewayError(
             f"GATEWAY_URL {raw!r} has a non-numeric port {port_str!r}. "
             "Expected host:port, for example localhost:18789."
@@ -2529,12 +2558,15 @@ class _GatewayConnection:
 
         # Connect
         pipe_log(f"Connecting to ws://{host}:{port}")
-        # Bounded, and every failure converted to GatewayError: pipe() only has
-        # an `except GatewayError` around this, so a bare OSError escapes the
-        # generator and OWUI renders it as an unattributed error. An unroutable
-        # host (firewall DROP, wrong IP) also blocks for the OS SYN-retry budget
-        # -- ~130s on Linux -- while holding the global init lock, so every other
-        # chat in the instance stalls behind it with only "Thinking..." on screen.
+        # Bounded, and every failure converted to GatewayError. The conversion
+        # is the load-bearing part: pipe() only has an `except GatewayError`
+        # around this, so anything else escapes the generator and OWUI renders
+        # it as an unattributed error naming no valve.
+        #
+        # websockets already defaults to open_timeout=10 and that covers the TCP
+        # connect, so this wait_for is a belt-and-braces bound rather than the
+        # only one -- keep _GATEWAY_CONNECT_TIMEOUT_S and that default in step
+        # if you tune either.
         try:
             ws = await asyncio.wait_for(
                 websockets.connect(f"ws://{host}:{port}", ping_interval=None),
@@ -2547,7 +2579,7 @@ class _GatewayConnection:
                 "and that the Open WebUI backend can reach that host (Open WebUI "
                 "resolves it, not your browser)."
             )
-        except (OSError, websockets.exceptions.WebSocketException) as ex:
+        except (OSError, ValueError, websockets.exceptions.WebSocketException) as ex:
             # WebSocketException is NOT an OSError subclass, so catching OSError
             # alone still let InvalidStatus/InvalidHandshake escape -- which is
             # exactly what happens when something answers but isn't a Gateway
@@ -3986,10 +4018,10 @@ def _parse_whitelist(text: str) -> set[str]:
     return {x.strip() for x in text.split(",") if x.strip()}
 
 
-# Words in a sessions.patch failure that mean "the agent is the problem", not
-# "the model is". Kept broad on purpose: the cost of a false positive is a
-# message that mentions both AGENT_ID and the model, which is still better than
-# one that confidently blames only the model.
+# Wording that points at the agent/session rather than the model. Kept NARROW
+# on purpose -- an earlier version also matched "not found", which misfiled
+# "model 'x/y' not found" as an AGENT_ID problem. Do not re-broaden these; the
+# tests in SessionPatchFailureAttributionTests assert both directions.
 _AGENT_ERROR_HINTS = ("agent", "session")
 
 
@@ -4016,7 +4048,20 @@ def _explain_session_patch_failure(err, *, model_override, agent_id) -> str:
       worse than admitting ambiguity: it sends the user to edit a valve that
       was correct.
     """
-    detail = str(err)
+    # Transient and transport failures are neither valve's fault, and the retry
+    # comment in pipe() says they are the common ones under load. Classify by
+    # TYPE first: substring matching cannot see them, and str(TimeoutError()) is
+    # "", which rendered as a dangling colon followed by advice to edit two
+    # valves that were both correct.
+    if isinstance(err, (asyncio.TimeoutError, ConnectionError)):
+        return (
+            "**The Gateway did not respond in time while starting this "
+            "conversation.** This is usually transient — send the message "
+            "again. If it keeps happening, check that the Gateway is healthy "
+            "and reachable from Open WebUI."
+        )
+
+    detail = str(err).strip() or repr(err)
     low = detail.lower()
     wanted = model_override or "agent default"
 
@@ -4279,6 +4324,10 @@ class Pipe:
                 "queues behind your conversation."
         )
 
+    # Set from the live valves so the DEFAULT_MODEL dropdown (a classmethod with
+    # no access to self.valves) reads the same cache pipes() writes.
+    _last_state_dir = ""
+
     def __init__(self):
         self.valves = self.Valves()
         self._active_tool_args: dict[str, str] = {}
@@ -4300,6 +4349,7 @@ class Pipe:
         Dynamically discovers models from the OpenClaw Gateway (or cache)
         and returns one entry per model plus a 'Default' entry.
         """
+        type(self)._last_state_dir = getattr(self.valves, "STATE_DIR", "") or ""
         models, source = await _discover_models_with_source(self.valves)
 
         # Apply whitelist filter
@@ -4328,15 +4378,34 @@ class Pipe:
         # Always prepend Default at top. It is the one entry that always works
         # in this state: it clears the override and uses the agent's own model,
         # so it needs no Gateway round trip to be correct.
-        return [{"id": "default", "name": "OpenClaw · Default"}] + entries
+        #
+        # When CONFIGURED_MODELS lists the user's real Gateway keys but the
+        # Gateway hasn't been reached, the whitelist filters the example list to
+        # nothing and the warning disappears with it -- leaving exactly the user
+        # who most needs it (real config, unreachable Gateway) with a bare
+        # single-entry selector and no explanation. Say it on Default instead.
+        default_name = "OpenClaw · Default"
+        if unverified and not entries:
+            default_name += UNVERIFIED_MODEL_SUFFIX
+        return [{"id": "default", "name": default_name}] + entries
 
     @classmethod
     def get_model_options(cls):
         """Return model options for the DEFAULT_MODEL valve dropdown.
-        
+
         Reads synchronously from the model cache or fallback list.
+
+        Uses the state dir the running Pipe last resolved (recorded in
+        _last_state_dir) rather than _state_dir() with no argument. Being a
+        classmethod there is no self.valves here, and the no-argument form
+        resolves to OPENCLAW_BRIDGE_STATE_DIR or /data/openclaw-bridge -- so for
+        anyone who set the STATE_DIR valve it read a path nothing ever writes,
+        never found the cache, and therefore labelled every option
+        "Gateway not reached" permanently, long after successful discovery.
         """
-        cache = _read_json_file(os.path.join(_state_dir(), "models-cache.json"))
+        cache = _read_json_file(
+            os.path.join(_state_dir(cls._last_state_dir), "models-cache.json")
+        )
         cached = cache.get("models") if cache else None
         models = cached or _FALLBACK_MODELS
         # Same honesty as pipes(): before the first successful connection this

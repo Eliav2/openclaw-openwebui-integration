@@ -23,6 +23,7 @@ from pathlib import Path
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from dataclasses import dataclass, field
 
+import ipaddress
 import websockets
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.hazmat.primitives import serialization
