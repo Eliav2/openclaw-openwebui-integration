@@ -37,6 +37,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -338,6 +339,49 @@ def _resolve_pipe_file(cfg: Config) -> Path:
     return (ROOT / "openclaw_pipe.dev.py") if cfg.dev_bundle else PIPE_FILE
 
 
+ARTIFACT_URL = os.environ.get(
+    "OPENCLAW_PIPE_ARTIFACT_URL",
+    "https://raw.githubusercontent.com/Eliav2/openclaw-openwebui-integration"
+    "/main/openclaw_pipe.py",
+)
+
+
+def _fetch_pipe_file(dest_dir: Path) -> Path:
+    """Download openclaw_pipe.py for the no-clone install path.
+
+    ``uv run https://.../install.py install`` hands us a lone temp copy of this
+    script, so there is no artifact and no src/ tree beside it -- the deploy
+    would otherwise die on "Pipe file not found" only AFTER the wizard has
+    already collected the OWUI password and gateway token. Fetch the artifact
+    from the same repo instead. Override the source with
+    OPENCLAW_PIPE_ARTIFACT_URL (a fork, a pinned tag, or a local file server).
+    """
+    info(f"No local openclaw_pipe.py; fetching it from {ARTIFACT_URL}")
+    try:
+        with urllib.request.urlopen(ARTIFACT_URL, timeout=30) as resp:
+            body = resp.read().decode("utf-8")
+    except Exception as exc:
+        raise SystemExit(
+            f"Could not download the pipe artifact from {ARTIFACT_URL}: {exc}\n"
+            "Run the installer from a clone instead:\n"
+            "  git clone https://github.com/Eliav2/openclaw-openwebui-integration\n"
+            "  cd openclaw-openwebui-integration && uv run install.py install"
+        ) from exc
+    # Cheapest honest check that we got the artifact and not a 404 page or an
+    # HTML error body served with a 200.
+    if "class Pipe" not in body:
+        raise SystemExit(
+            f"{ARTIFACT_URL} did not return the pipe artifact "
+            f"(no top-level `class Pipe` in {len(body)} bytes). "
+            "If you overrode OPENCLAW_PIPE_ARTIFACT_URL, check it points at the "
+            "raw openclaw_pipe.py."
+        )
+    dest = dest_dir / "openclaw_pipe.py"
+    dest.write_text(body)
+    info(f"Fetched openclaw_pipe.py ({len(body.splitlines())} lines)")
+    return dest
+
+
 def _rebuild_pipe_file(pipe_file: Path, *, dev: bool) -> None:
     """Always regenerate the deployed artifact from src/ before deploying, so
     a forgotten ``python3 build.py`` step can never cause a stale deploy.
@@ -397,9 +441,26 @@ def update_or_create_function(client: OwuiClient, cfg: Config) -> dict:
     _assert_not_silently_downgrading_from_dev_bundle(cfg)
     pipe_file = _resolve_pipe_file(cfg)
     _rebuild_pipe_file(pipe_file, dev=cfg.dev_bundle)
+    if not pipe_file.exists() and not cfg.dev_bundle:
+        # No clone: running as `uv run <raw-url> install`. Never do this for
+        # --dev-bundle, which is internal-only and deliberately never published.
+        with tempfile.TemporaryDirectory(prefix="openclaw-pipe-") as tmp:
+            fetched = _fetch_pipe_file(Path(tmp))
+            return _deploy_pipe_code(client, cfg, fetched.read_text())
     if not pipe_file.exists():
-        raise SystemExit(f"Pipe file not found: {pipe_file}")
-    pipe_code = pipe_file.read_text()
+        raise SystemExit(
+            f"Pipe file not found: {pipe_file}\n"
+            "Run `python3 build.py --dev` first, or drop --dev-bundle."
+        )
+    return _deploy_pipe_code(client, cfg, pipe_file.read_text())
+
+
+def _deploy_pipe_code(client: OwuiClient, cfg: Config, pipe_code: str) -> dict:
+    """Create or update the OWUI function from already-resolved pipe source.
+
+    Split out so the no-clone path (fetched artifact, never written into the
+    working directory) and the normal path share one deploy implementation.
+    """
     existing = get_function(client)
     preserved_valves = get_valves(client) if existing else {}
 
