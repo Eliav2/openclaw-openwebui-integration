@@ -256,9 +256,28 @@ class StaleFileServerReapTests(unittest.TestCase):
         devcoord._start_file_server.__globals__["_file_server_started"] = False
 
     def tearDown(self):
+        # Shut the server down and release the port. Without this the daemon
+        # thread outlives the test and keeps PORT bound for the rest of the
+        # process, so the NEXT test to bind it fails -- and because
+        # _start_file_server swallows bind errors, that failure surfaces as the
+        # misleading "server never came up" rather than "port in use". This made
+        # the suite order-dependent: it passed on 3.10-3.12 and failed on 3.13
+        # purely because test ordering/timing differs.
+        self._shutdown_stashed_server()
         for name in ("open_webui.socket.main", "open_webui.socket", "open_webui"):
             sys.modules.pop(name, None)
         devcoord._start_file_server.__globals__["_file_server_started"] = False
+
+    def _shutdown_stashed_server(self):
+        server = getattr(self.stub_owui_socket_main,
+                         devcoord._STALE_FILE_SERVER_ATTR, None)
+        if server is None:
+            return
+        try:
+            server.shutdown()
+            server.server_close()
+        except Exception:
+            pass
 
     def _wait_up(self, port, timeout=2.0):
         deadline = time.time() + timeout
@@ -305,6 +324,9 @@ class DevCoordHttpRouteTests(unittest.TestCase):
         cls.tmpdir = tempfile.mkdtemp(prefix="devcoord-http-test-")
         cls._old_env = os.environ.get("OPENCLAW_BRIDGE_STATE_DIR")
         os.environ["OPENCLAW_BRIDGE_STATE_DIR"] = cls.tmpdir
+        # A previous class may have left this True, which would make
+        # _start_file_server return without binding anything.
+        devcoord._start_file_server.__globals__["_file_server_started"] = False
         devcoord._start_file_server(port=cls.PORT)
         deadline = time.time() + 2.0
         last_err = None
@@ -319,6 +341,18 @@ class DevCoordHttpRouteTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # Release PORT for the rest of the process -- see the note in
+        # StaleFileServerReapTests.tearDown on why a leaked server surfaces as
+        # a confusing "server did not come up" in an unrelated test.
+        for mod in (sys.modules.get("open_webui.socket.main"),):
+            server = getattr(mod, devcoord._STALE_FILE_SERVER_ATTR, None) if mod else None
+            if server is not None:
+                try:
+                    server.shutdown()
+                    server.server_close()
+                except Exception:
+                    pass
+        devcoord._start_file_server.__globals__["_file_server_started"] = False
         if cls._old_env is None:
             os.environ.pop("OPENCLAW_BRIDGE_STATE_DIR", None)
         else:

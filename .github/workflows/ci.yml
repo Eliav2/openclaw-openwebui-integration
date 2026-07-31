@@ -12,8 +12,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.10 is the floor install.py declares; 3.11 is what Open WebUI ships.
-        python-version: ["3.10", "3.11", "3.12"]
+        # 3.10 is the floor install.py declares; 3.11 is what Open WebUI ships
+        # today; 3.13 is what a user running install.py on a current distro
+        # will most likely have.
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
 
     steps:
       - uses: actions/checkout@v4
