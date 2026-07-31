@@ -3856,6 +3856,34 @@ class GatewayUrlParsingTests(unittest.TestCase):
         self.assertIn("GATEWAY_URL", str(cm.exception))
         self.assertIn("localhost:18789", str(cm.exception))
 
+    def test_ipv6_must_be_bracketed_and_is_kept_bracketed(self):
+        """websockets needs the brackets in the URL, so they are preserved."""
+        self.assertEqual(_parse_gateway_url("[::1]:18789"), ("[::1]", 18789))
+        self.assertEqual(_parse_gateway_url("[::1]"), ("[::1]", 18789))
+        self.assertEqual(_parse_gateway_url("[fe80::1]"), ("[fe80::1]", 18789))
+        self.assertEqual(_parse_gateway_url("http://[::1]:18789"), ("[::1]", 18789))
+
+    def test_bare_ipv6_is_rejected_rather_than_silently_misparsed(self):
+        """Regression guard: rpartition(":") reads "::1" as host ":" port 1 --
+        silently wrong on both counts, the exact failure class this exists to
+        remove. Asking for brackets beats guessing which colon is the port."""
+        with self.assertRaises(GatewayError) as cm:
+            _parse_gateway_url("::1")
+        self.assertIn("brackets", str(cm.exception))
+
+    def test_unclosed_bracket_is_reported(self):
+        with self.assertRaises(GatewayError) as cm:
+            _parse_gateway_url("[::1")
+        self.assertIn("]", str(cm.exception))
+
+    def test_port_must_be_in_range(self):
+        for raw in ("host:0", "host:99999", "host:65536"):
+            with self.subTest(raw=raw):
+                with self.assertRaises(GatewayError) as cm:
+                    _parse_gateway_url(raw)
+                self.assertIn("65535", str(cm.exception))
+        self.assertEqual(_parse_gateway_url("host:65535"), ("host", 65535))
+
     def test_unsupported_scheme_is_rejected_clearly(self):
         with self.assertRaises(GatewayError) as cm:
             _parse_gateway_url("ftp://gw.local:18789")
@@ -3967,6 +3995,38 @@ class SessionPatchFailureAttributionTests(unittest.TestCase):
             model_override="x/y", agent_id="main")
         self.assertIn("Model selection error", msg)
         self.assertIn("x/y", msg)
+
+    def test_model_errors_are_never_blamed_on_the_agent(self):
+        """Regression guard. The first version of this matched "not found" as an
+        agent hint, so "model 'x/y' not found" -- a plain model error -- told the
+        user to go fix AGENT_ID. That is the same misattribution this function
+        exists to prevent, merely pointed the other way."""
+        for detail in (
+            "model 'x/y' not found",
+            "model not found: openai/gpt-9",
+            "no such model 'foo/bar'",
+            "unknown model key",
+            "model x/y is not configured for this agent",
+            "model x/y unavailable for this session",
+        ):
+            with self.subTest(detail=detail):
+                msg = _explain_session_patch_failure(
+                    Exception(detail), model_override="x/y", agent_id="main")
+                self.assertIn("Model selection error", msg)
+                self.assertNotIn("AGENT_ID", msg)
+
+    def test_error_naming_the_model_key_is_a_model_error(self):
+        msg = _explain_session_patch_failure(
+            Exception("openrouter/z-ai/glm-5.2 is not available"),
+            model_override="openrouter/z-ai/glm-5.2", agent_id="main")
+        self.assertIn("Model selection error", msg)
+
+    def test_ambiguous_error_names_both_valves_rather_than_guessing(self):
+        msg = _explain_session_patch_failure(
+            Exception("provider not found"), model_override="x/y", agent_id="main")
+        self.assertIn("AGENT_ID", msg)
+        self.assertIn("x/y", msg)
+        self.assertNotIn("Model selection error", msg)
 
     def test_model_failure_mentions_agent_default_when_no_override(self):
         msg = _explain_session_patch_failure(
