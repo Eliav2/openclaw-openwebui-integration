@@ -3,6 +3,8 @@
 
 import unittest
 import html
+import os
+import tempfile
 import inspect
 import json
 import re
@@ -73,6 +75,14 @@ from openclaw_pipe import (
     GatewayError,
     _parse_gateway_url,
     _explain_connect_rejection,
+    _explain_session_patch_failure,
+    _discover_models_with_source,
+    Pipe,
+    _write_json_file,
+    _state_dir,
+    UNVERIFIED_MODEL_SUFFIX,
+    MODELS_SOURCE_FALLBACK,
+    MODELS_SOURCE_CACHE,
     _TurnRenderer,
     _render_tool_result_block,
     _tool_call_started_event,
@@ -3875,3 +3885,90 @@ class ConnectRejectionMessageTests(unittest.TestCase):
     def test_unrecognized_errors_pass_through_verbatim(self):
         self.assertEqual(_explain_connect_rejection("some novel failure"),
                          "some novel failure")
+
+
+class UnverifiedModelListTests(unittest.TestCase):
+    """pipes() never opens a connection -- it only reuses one a previous chat
+    established. So on a fresh install the live branch is skipped and there is
+    no cache, and the selector used to fill with five hardcoded models rendered
+    identically to real ones. Picking one the Gateway lacks then failed with a
+    bare "Model selection error"."""
+
+    def _pipe(self, tmp):
+        p = Pipe()
+        p.valves.STATE_DIR = tmp
+        p.valves.CONFIGURED_MODELS = ""
+        p.valves.MAX_MODELS = 30
+        return p
+
+    def test_fresh_install_labels_every_fabricated_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            entries = asyncio.run(self._pipe(tmp).pipes())
+            self.assertGreater(len(entries), 1)
+            default, models = entries[0], entries[1:]
+            self.assertEqual(default["id"], "default")
+            # Default genuinely works with no Gateway: it clears the override.
+            self.assertNotIn(UNVERIFIED_MODEL_SUFFIX, default["name"])
+            for e in models:
+                self.assertIn(UNVERIFIED_MODEL_SUFFIX, e["name"], e)
+
+    def test_labelling_never_touches_the_routing_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for e in asyncio.run(self._pipe(tmp).pipes()):
+                self.assertNotIn(UNVERIFIED_MODEL_SUFFIX, e["id"])
+                self.assertNotIn("—", e["id"])
+
+    def test_cached_models_are_not_labelled_as_examples(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_json_file(
+                os.path.join(_state_dir(tmp), "models-cache.json"),
+                {"models": [{"key": "vendor/real-model", "name": "Real", "tags": []}]},
+            )
+            entries = asyncio.run(self._pipe(tmp).pipes())
+            self.assertEqual(len(entries), 2)
+            self.assertNotIn(UNVERIFIED_MODEL_SUFFIX, entries[1]["name"])
+            self.assertEqual(entries[1]["id"], "vendor/real-model")
+
+    def test_source_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            v = self._pipe(tmp).valves
+            _, source = asyncio.run(_discover_models_with_source(v))
+            self.assertEqual(source, MODELS_SOURCE_FALLBACK)
+            _write_json_file(
+                os.path.join(_state_dir(tmp), "models-cache.json"),
+                {"models": [{"key": "vendor/m", "name": "M", "tags": []}]},
+            )
+            _, source = asyncio.run(_discover_models_with_source(v))
+            self.assertEqual(source, MODELS_SOURCE_CACHE)
+
+
+class SessionPatchFailureAttributionTests(unittest.TestCase):
+    """The session key embeds AGENT_ID and this patch is the turn's first
+    agent-scoped RPC, so a mistyped AGENT_ID surfaced as "Model selection
+    error" -- sending the user to fix model valves that were never the problem."""
+
+    def test_agent_shaped_error_names_agent_id_not_the_model(self):
+        msg = _explain_session_patch_failure(
+            Exception("unknown agent 'typo'"), model_override=None, agent_id="typo")
+        self.assertIn("AGENT_ID", msg)
+        self.assertIn("typo", msg)
+        self.assertNotIn("Model selection error", msg)
+
+    def test_session_shaped_error_also_points_at_the_agent(self):
+        for detail in ("no such session", "unknown session xyz", "agent not found"):
+            with self.subTest(detail=detail):
+                msg = _explain_session_patch_failure(
+                    Exception(detail), model_override="a/b", agent_id="main")
+                self.assertIn("AGENT_ID", msg)
+
+    def test_genuine_model_failure_still_reads_as_a_model_failure(self):
+        msg = _explain_session_patch_failure(
+            Exception("model 'x/y' is not configured"),
+            model_override="x/y", agent_id="main")
+        self.assertIn("Model selection error", msg)
+        self.assertIn("x/y", msg)
+
+    def test_model_failure_mentions_agent_default_when_no_override(self):
+        msg = _explain_session_patch_failure(
+            Exception("boom"), model_override=None, agent_id="main")
+        self.assertIn("agent default", msg)
