@@ -882,7 +882,25 @@ class Pipe:
 
         async def maybe_emit_snapshot(*, force: bool = False):
             nonlocal last_snapshot_text, last_snapshot_time
+            # ELI-82 instrumentation. A forced snapshot is the pipe's last
+            # chance to persist trailing text, and it used to be completely
+            # silent: on the 2026-08-01 incident the final 3417-char block
+            # vanished and there was no way to tell whether this ever ran, let
+            # alone with what. Only `force` calls are logged, so the mid-stream
+            # cadence stays quiet. Log-only, no behaviour change.
+            if force:
+                pipe_log(
+                    f"  snapshot(force): visible={len(visible_message_text)} "
+                    f"last={len(last_snapshot_text)} "
+                    f"delta={len(visible_message_text) - len(last_snapshot_text)}"
+                )
             if not visible_message_text or visible_message_text == last_snapshot_text:
+                if force:
+                    pipe_log(
+                        "  snapshot(force): SKIPPED "
+                        + ("visible_message_text empty" if not visible_message_text
+                           else "identical to last snapshot")
+                    )
                 return
             now = time.time()
             if (
@@ -895,6 +913,8 @@ class Pipe:
             await _emit_message_snapshot(__event_emitter__, visible_message_text)
             last_snapshot_text = visible_message_text
             last_snapshot_time = now
+            if force:
+                pipe_log(f"  snapshot(force): EMITTED {len(visible_message_text)} chars")
 
         async def maybe_answer_user_input(prompt_text: str) -> UserInputResult:
             """Ask the user via an OWUI modal and deliver their answer.
@@ -1628,6 +1648,15 @@ class Pipe:
         # so a single force snapshot is freeze-safe, and OWUI's `replace`
         # handler writes the DB unconditionally (sio.emit to an empty room is a
         # no-op, not an error), so it persists even with everything dead.
+        # ELI-82 instrumentation: record the terminal decision inputs, not just
+        # its effect. `text_yielded` gating this call means a turn can end with
+        # a populated visible_message_text and still never snapshot, which is
+        # indistinguishable from "snapshotted but OWUI dropped it" unless the
+        # inputs are on the record.
+        pipe_log(
+            f"  terminal: aborted={aborted} text_yielded={text_yielded} "
+            f"visible={len(visible_message_text)} snapshotted={len(last_snapshot_text)}"
+        )
         if not aborted and text_yielded:
             await maybe_emit_snapshot(force=True)
 
