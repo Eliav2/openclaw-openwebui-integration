@@ -788,6 +788,30 @@ def _could_be_user_input_prefix(normalized_text: str) -> bool:
     )
 
 
+def _marker_line_index(text: str):
+    """Index of the first line that opens a needs-input block, else None.
+
+    The marker only counts at the start of a line, but it does NOT have to be
+    the start of the message: a reply usually explains itself first and asks at
+    the end. The buffer used to look only at the text after the LAST newline,
+    which is fine while tokens arrive one at a time, but wrong when a provider
+    delivers the whole reply as ONE cumulative chunk. In that case the marker
+    sat mid-string with its option lines after it, was never recognised, and
+    leaked into the chat as raw text with no dialog (seen live 2026-08-01 on a
+    claude-cli turn; token-streamed turns were unaffected, which is why this
+    looked intermittent).
+    """
+    start = 0
+    while True:
+        nl = text.find("\n", start)
+        line = text[start:] if nl == -1 else text[start:nl]
+        if _is_user_input_prompt(line):
+            return start
+        if nl == -1:
+            return None
+        start = nl + 1
+
+
 def _advance_input_prompt_buffer(pending: str, delta: str) -> tuple[str, str]:
     """Feed a new assistant-delta chunk into the needs-input buffering state.
 
@@ -808,6 +832,11 @@ def _advance_input_prompt_buffer(pending: str, delta: str) -> tuple[str, str]:
     candidate = pending + delta
     if _could_be_user_input_prefix(candidate.lstrip()):
         return "", candidate
+    # A complete marker may sit mid-candidate when the whole reply arrives at
+    # once. Flush what precedes it and hold from the marker onward.
+    marker_at = _marker_line_index(candidate)
+    if marker_at is not None:
+        return candidate[:marker_at], candidate[marker_at:]
     idx = candidate.rfind("\n")
     if idx == -1:
         return candidate, ""
