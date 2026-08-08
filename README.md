@@ -802,7 +802,7 @@ MIT, see [LICENSE](./LICENSE).
 
 ## 🙏 Acknowledgements
 
-- Based on [cfullelove's gist](https://gist.github.com/cfullelove/7c6fa74e16d0a8f355e6d5ddb6d8e5fb)
- , the original proof-of-concept that got this rolling
+- Based on [cfullelove's gist](https://gist.github.com/cfullelove/7c6fa74e16d0a8f355e6d5ddb6d8e5fb),
+  the original proof-of-concept that got this rolling
 - [Open WebUI](https://openwebui.com/) for the excellent pipe/function system
 - [OpenClaw](https://github.com/openclaw/openclaw) for the WS Gateway Protocol
