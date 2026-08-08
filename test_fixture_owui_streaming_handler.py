@@ -4,7 +4,7 @@ used only to pin our event-emitting tests to OWUI's actual behavior instead of
 our belief about it (see ELI-75: a docstring-inferred belief about this exact
 function was wrong for months).
 
-Pure function, zero imports, no I/O — safe to extract with
+Pure function, zero imports, no I/O, safe to extract with
 `sed -n '478,806p' open_webui/utils/middleware.py` and re-paste here if OWUI
 changes this handler. Do not hand-edit the body below; if it drifts from
 upstream, re-extract instead of patching in place.
