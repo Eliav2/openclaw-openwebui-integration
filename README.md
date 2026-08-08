@@ -19,9 +19,9 @@ function adds a live session/usage button to the message toolbar. Two files,
 nothing else to run, nothing added to your OpenClaw install.
 
 <p align="center">
-  <img src="./docs/img/tool-calls-streaming.jpg" alt="Tool calls streaming live in Open WebUI on a phone, with spinners and green checkmarks, including nested subagents" width="42%">
+  <img src="./docs/img/tool-calls-streaming.jpg" alt="Tool calls streaming live in Open WebUI on a phone, with spinners and green checkmarks" width="42%">
 </p>
-<p align="center"><sub>Tool calls stream live as the agent works, including nested subagents. On a phone.</sub></p>
+<p align="center"><sub>Tool calls stream live as the agent works. On a phone.</sub></p>
 
 > **You need a running OpenClaw Gateway before any of this is useful.**
 > [OpenClaw](https://github.com/openclaw/openclaw) is a self-hosted agent
@@ -50,9 +50,9 @@ clients use.
 
 That is the entire reason the rest of this is possible. A text-in, text-out API
 can carry the agent's _answer_; only the native protocol carries the agent's
-_work_: every tool call as it happens, every subagent it spawns, the questions
-it stops to ask you, and the files it emits. The comparison below shows what
-that changes in practice; [Features](#-features) has the full list.
+_work_: every tool call as it happens, the questions it stops to ask you, and
+the files it emits. The comparison below shows what that changes in practice;
+[Features](#-features) has the full list.
 
 One thing worth calling out separately, because it is not about the protocol:
 **your history lives in Open WebUI's database.** It survives Gateway restarts
@@ -72,9 +72,9 @@ loses mid-flight is still there in the chat.
 <p align="center"><sub>Left: what it opens, fetched live from the Gateway. Right: every model your Gateway knows about, discovered automatically.</sub></p>
 
 <p align="center">
-  <img src="./docs/img/subagent-drawer.jpg" alt="Subagent drawer with Overview, Transcript and Tools tabs, showing a running subagent's transcript" width="80%">
+  <img src="./docs/img/subagent-drawer.jpg" alt="Subagent drawer with Overview, Transcript and Tools tabs, showing a subagent's transcript" width="80%">
 </p>
-<p align="center"><sub>Open any subagent and read its transcript while it runs.</sub></p>
+<p align="center"><sub>The status dialog lists the subagents a run spawned; open one to read its transcript. Its tool calls appear once it finishes, see the note in Features.</sub></p>
 
 <p align="center">
   <img src="./docs/img/tool-call-expanded.jpg" alt="An expanded tool call showing its INPUT arguments and OUTPUT result" width="70%">
@@ -99,7 +99,7 @@ The difference is what each one gives you:
 | Streams assistant text                                                      | Yes                    | Yes                                                |
 | Client-declared OpenAI function tools                                       | Yes                    | Not applicable                                     |
 | **The agent's own tool calls,** its shell commands, file edits and searches | Not surfaced           | Rendered live as native tool cards                 |
-| **Subagents**                                                               | Not surfaced           | Listed live, with a transcript drawer per subagent |
+| **Subagents**                                                               | Not surfaced           | Listed with status, transcript drawer per subagent |
 | **Ask-user dialogs** mid-run                                                | No                     | Yes                                                |
 | **Agent-emitted images and files**                                          | No                     | Attached natively                                  |
 | **Context and rate-limit usage**                                            | No                     | On demand, live                                    |
@@ -162,6 +162,13 @@ to know the convention. See [Teaching your agent](#-teaching-your-agent-to-use-t
   reusing the Pipe's connection when one is already open. Ships as
   `openclaw_status_action.py` and installs separately, see
   [Installing the companion Status Action](#installing-the-companion-status-action)
+- **👥 Subagent drawer** _(partial)_: the status dialog lists the subagents a run
+  spawned with their status and elapsed time, and opens a per-subagent drawer
+  with its transcript. **Its tool calls only appear once it finishes.** The
+  Gateway routes tool events to the connection that started a run, and a
+  subagent's run starts inside the Gateway, so no client can watch a running
+  subagent's tool calls. Measured and pinned by a test, see
+  [`src/openclaw_pipe_pkg/gateway.py`](./src/openclaw_pipe_pkg/gateway.py)
 - **🏷️ Auto-title**: generates a chat title after the first exchange on a
   separate agent lane (`title-gen`), so it never queues behind the main
   conversation
