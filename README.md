@@ -8,13 +8,15 @@ Run your [OpenClaw Gateway](https://github.com/openclaw/openclaw) agents inside
 [Open WebUI](https://openwebui.com/), with their tool calls, subagents and
 mid-run questions rendered as real UI instead of flattened into text.
 
-A **Pipe** function speaks the Gateway's native WebSocket protocol, which is
-what buys the real-time streaming, the native tool-call cards, and the
-persistent agent sessions. A companion **Action** function adds a live
-session/usage button to the message toolbar.
-
-> No separate proxy, no Node.js middleware, no Python subprocess. The whole
-> integration is two self-contained Python files loaded as Open WebUI functions.
+A [**Pipe**](https://docs.openwebui.com/features/extensibility/plugin/functions/pipe)
+function connects as an
+[external app](https://docs.openclaw.ai/gateway/external-apps) speaking the
+[Gateway's native v4 WebSocket protocol](https://docs.openclaw.ai/gateway/protocol),
+which is what buys the real-time streaming, the native tool-call cards, and the
+persistent agent sessions. A companion
+[**Action**](https://docs.openwebui.com/features/extensibility/plugin/functions/action)
+function adds a live session/usage button to the message toolbar. Two files,
+nothing else to run, nothing added to your OpenClaw install.
 
 <p align="center">
   <img src="./docs/img/tool-calls-streaming.jpg" alt="Tool calls streaming live in Open WebUI on a phone, with spinners and green checkmarks, including nested subagents" width="42%">
@@ -47,8 +49,8 @@ Gateway's **native v4 WebSocket protocol** instead, the same one OpenClaw's own
 clients use.
 
 That is the entire reason the rest of this is possible. A text-in, text-out API
-can carry the agent's *answer*; only the native protocol carries the agent's
-*work*: every tool call as it happens, every subagent it spawns, the questions
+can carry the agent's _answer_; only the native protocol carries the agent's
+_work_: every tool call as it happens, every subagent it spawns, the questions
 it stops to ask you, and the files it emits. The comparison below shows what
 that changes in practice; [Features](#-features) has the full list.
 
@@ -69,6 +71,11 @@ loses mid-flight is still there in the chat.
 </p>
 <p align="center"><sub>Open any subagent and read its transcript while it runs.</sub></p>
 
+<p align="center">
+  <img src="./docs/img/tool-call-expanded.jpg" alt="An expanded tool call showing its INPUT arguments and OUTPUT result" width="70%">
+</p>
+<p align="center"><sub>Tap any tool call to see its arguments and result.</sub></p>
+
 <details>
 <summary><b>Why not just point Open WebUI at <code>/v1</code>?</b> &mdash; <sub>the official endpoint, and what it does not carry</sub></summary>
 
@@ -81,34 +88,24 @@ pick `openclaw/default`. No install, nothing to maintain. See
 
 The difference is what each one gives you:
 
-| | `/v1` endpoint | This integration |
-|---|---|---|
-| Setup | Change one config flag | Install two functions |
-| Streams assistant text | Yes | Yes |
-| Client-declared OpenAI function tools | Yes | Not applicable |
-| **The agent's own tool calls,** its shell commands, file edits and searches | Not surfaced | Rendered live as native tool cards |
-| **Subagents** | Not surfaced | Listed live, with a transcript drawer per subagent |
-| **Ask-user dialogs** mid-run | No | Yes |
-| **Agent-emitted images and files** | No | Attached natively |
-| **Context and rate-limit usage** | No | On demand, live |
-| Model switching | One model id | Every model your Gateway knows, per conversation |
-| Auth | Shared bearer token | Ed25519 device pairing |
+|                                                                             | `/v1` endpoint         | This integration                                   |
+| --------------------------------------------------------------------------- | ---------------------- | -------------------------------------------------- |
+| Setup                                                                       | Change one config flag | Install two functions                              |
+| Streams assistant text                                                      | Yes                    | Yes                                                |
+| Client-declared OpenAI function tools                                       | Yes                    | Not applicable                                     |
+| **The agent's own tool calls,** its shell commands, file edits and searches | Not surfaced           | Rendered live as native tool cards                 |
+| **Subagents**                                                               | Not surfaced           | Listed live, with a transcript drawer per subagent |
+| **Ask-user dialogs** mid-run                                                | No                     | Yes                                                |
+| **Agent-emitted images and files**                                          | No                     | Attached natively                                  |
+| **Context and rate-limit usage**                                            | No                     | On demand, live                                    |
+| Model switching                                                             | One model id           | Every model your Gateway knows, per conversation   |
+| Auth                                                                        | Shared bearer token    | Ed25519 device pairing                             |
 
 Put simply: **`/v1` gives you the agent as a model. This gives you the agent as
 an agent.** If you want OpenClaw in a model dropdown, use `/v1`. If you want to
 watch it work, use this.
 
 </details>
-
-<p align="center">
-  <img src="./docs/img/tool-call-expanded.jpg" alt="An expanded tool call showing its INPUT arguments and OUTPUT result" width="70%">
-</p>
-<p align="center"><sub>Tap any tool call to see its arguments and result.</sub></p>
-
-Under the hood this is an
-[external app](https://docs.openclaw.ai/gateway/external-apps): a Gateway
-protocol client speaking the v4 WebSocket protocol. It imports nothing from
-OpenClaw's plugin SDK and adds no upstream footprint.
 
 ---
 
@@ -135,6 +132,10 @@ something goes wrong, jump to [Troubleshooting](#-troubleshooting).
 
 ## ✨ Features
 
+Everything here works the moment the Pipe is installed, except the two marked
+**needs agent setup**: the integration provides the mechanism, but your agent has
+to know the convention. See [Teaching your agent](#-teaching-your-agent-to-use-this).
+
 - **🔴 Real-time streaming**: assistant responses appear token-by-token, not
   all at once at the end
 - **🛠️ Native tool-call rendering**: tool calls are yielded as Responses-API
@@ -146,20 +147,22 @@ something goes wrong, jump to [Troubleshooting](#-troubleshooting).
 - **🧭 Dynamic model selector**: the integration discovers every model the Gateway
   knows about (`models.list`) and lists one entry per model, with an optional
   whitelist and a size cap
-- **❓ Ask-user modal**: when an agent emits a line beginning with
+- **❓ Ask-user modal** _(needs agent setup)_: when an agent emits a line beginning with
   `OpenClaw needs input:` (or `Codex needs input:`), the integration intercepts it and
   pops a real OWUI input / choice / confirmation dialog mid-run, instead of
   leaking the raw prompt into the chat as text
   (implementation: [`src/openclaw_pipe_pkg/askuser.py`](./src/openclaw_pipe_pkg/askuser.py))
-- **📊 Status Action button**: a companion Action function adds a toolbar
+- **📊 Status Action button** _(separate function)_: adds a message-toolbar
   button that fetches live session/usage data from the Gateway on demand,
-  reusing the Pipe's connection when one is already open
+  reusing the Pipe's connection when one is already open. Ships as
+  `openclaw_status_action.py` and installs separately, see
+  [Installing the companion Status Action](#installing-the-companion-status-action)
 - **🏷️ Auto-title**: generates a chat title after the first exchange on a
   separate agent lane (`title-gen`), so it never queues behind the main
   conversation
 - **🔐 Ed25519 device auth**: full WebSocket handshake with challenge/response,
   with a permanent device identity that survives restarts and reinstalls
-- **🖼️ Native OWUI media support**: `MEDIA:` files are uploaded to the
+- **🖼️ Native OWUI media support** _(needs agent setup)_: `MEDIA:` files are uploaded to the
   Open WebUI Files API and attached to the assistant message; a plain file
   server remains as a fallback
 - **⚙️ Configurable**: settings live in OWUI valves; device identity/token
@@ -169,10 +172,10 @@ something goes wrong, jump to [Troubleshooting](#-troubleshooting).
 
 ## 📦 Two Functions
 
-| File | OWUI type | Purpose |
-|------|-----------|---------|
-| [`openclaw_pipe.py`](./openclaw_pipe.py) | Pipe (manifold) | The chat integration. Everything above |
-| [`openclaw_status_action.py`](./openclaw_status_action.py) | Action | Message-toolbar button for on-demand session/usage lookups; reuses the Pipe's live connection and device identity, no second pairing |
+| File                                                       | OWUI type                                                                                  | Purpose                                                                                                                              |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
+| [`openclaw_pipe.py`](./openclaw_pipe.py)                   | [Pipe](https://docs.openwebui.com/features/extensibility/plugin/functions/pipe) (manifold) | The chat integration. Everything above                                                                                               |
+| [`openclaw_status_action.py`](./openclaw_status_action.py) | [Action](https://docs.openwebui.com/features/extensibility/plugin/functions/action)        | Message-toolbar button for on-demand session/usage lookups; reuses the Pipe's live connection and device identity, no second pairing |
 
 Both are generated from the same `src/openclaw_pipe_pkg/` source fragments.
 See [`docs/development.md`](./docs/development.md) if you're contributing.
@@ -181,10 +184,10 @@ See [`docs/development.md`](./docs/development.md) if you're contributing.
 
 ## 📋 Requirements
 
-| Component | Requirement |
-|-----------|-------------|
-| Open WebUI | ≥ v0.10.2. Developed and tested against v0.10.2 and v0.11.0 |
-| OpenClaw Gateway | v2025+ (WS protocol v4) |
+| Component                   | Requirement                                                      |
+| --------------------------- | ---------------------------------------------------------------- |
+| Open WebUI                  | ≥ v0.10.2. Developed and tested against v0.10.2 and v0.11.0      |
+| OpenClaw Gateway            | v2025+ (WS protocol v4)                                          |
 | Python packages inside OWUI | `websockets`, `cryptography`. `pydantic` already ships with OWUI |
 
 > **Open WebUI version:** native tool-card rendering depends on OWUI's
@@ -221,7 +224,7 @@ your OWUI admin email and password. The manual path needs neither.
   ```
 
   No `uv`? Plain `pip install cryptography click rich` + `python3 install.py
-  install` works identically. `uv` just removes that manual step. (A bare
+install` works identically. `uv` just removes that manual step. (A bare
   `python3 install.py` with no subcommand only prints help.)
 
 #### Run the installer
@@ -251,21 +254,21 @@ change that.
 
 Only three values are required. Everything else has a working default:
 
-| Required | |
-|---|---|
-| `OWUI_EMAIL` | Open WebUI admin email |
-| `OWUI_PASSWORD` | Open WebUI admin password |
+| Required        |                                                |
+| --------------- | ---------------------------------------------- |
+| `OWUI_EMAIL`    | Open WebUI admin email                         |
+| `OWUI_PASSWORD` | Open WebUI admin password                      |
 | `GATEWAY_TOKEN` | `gateway.auth.token` from your OpenClaw config |
 
-| Optional | Default |
-|---|---|
-| `OWUI_URL` | `http://localhost:8080` |
-| `GATEWAY_URL` | `localhost:18789` |
-| `AGENT_ID` | `main` |
-| `OPENCLAW_BRIDGE_STATE_DIR` | `/data/openclaw-bridge` |
-| `OWUI_API_BASE_URL` | whatever `OWUI_URL` is. Set it only when the pipe must reach OWUI's API at a different address than you do |
-| `OWUI_API_KEY` | empty. Only needed if the request bearer token can't be used for media uploads |
-| `FILE_SERVER_BASE_URL` | empty. Only needed if you rely on the legacy media fallback |
+| Optional                    | Default                                                                                                    |
+| --------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `OWUI_URL`                  | `http://localhost:8080`                                                                                    |
+| `GATEWAY_URL`               | `localhost:18789`                                                                                          |
+| `AGENT_ID`                  | `main`                                                                                                     |
+| `OPENCLAW_BRIDGE_STATE_DIR` | `/data/openclaw-bridge`                                                                                    |
+| `OWUI_API_BASE_URL`         | whatever `OWUI_URL` is. Set it only when the pipe must reach OWUI's API at a different address than you do |
+| `OWUI_API_KEY`              | empty. Only needed if the request bearer token can't be used for media uploads                             |
+| `FILE_SERVER_BASE_URL`      | empty. Only needed if you rely on the legacy media fallback                                                |
 
 Supply them as env vars, or as flags with the same names (`--owui-email`,
 `--gateway-token`, ...). `uv run install.py install --help` lists every flag.
@@ -300,13 +303,13 @@ recreated, so `DEVICE_IDENTITY` survives and you never re-approve the device.
 
 #### Commands
 
-| Command | What it does |
-|---|---|
-| `install` | Create or update the Pipe function and its valves, then smoke test |
-| `repair` | Same as `install`. Use after a broken or partial setup |
-| `status` | Print current state, change nothing |
-| `healthcheck` | Status checks plus an end-to-end smoke test |
-| `skills` | Install the agent-side skills. Run on the **Gateway host**, needs no OWUI credentials (see [Teaching your agent](#-teaching-your-agent-to-use-this)) |
+| Command       | What it does                                                                                                                                         |
+| ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `install`     | Create or update the Pipe function and its valves, then smoke test                                                                                   |
+| `repair`      | Same as `install`. Use after a broken or partial setup                                                                                               |
+| `status`      | Print current state, change nothing                                                                                                                  |
+| `healthcheck` | Status checks plus an end-to-end smoke test                                                                                                          |
+| `skills`      | Install the agent-side skills. Run on the **Gateway host**, needs no OWUI credentials (see [Teaching your agent](#-teaching-your-agent-to-use-this)) |
 
 `install` and `repair` also take `--with-skills` when you happen to be on the
 Gateway host, and `--force-skills` to overwrite an existing skill.
@@ -324,16 +327,16 @@ An OWUI function is one flat `.py` file. Paste it in the admin panel:
 4. Save, then toggle **Active** → **ON** and **Global** → **ON**
 5. Set the valves:
 
-   | Valve | Description |
-   |-------|-------------|
-   | `GATEWAY_URL` | OpenClaw Gateway address, `host:port`, no scheme (default: `localhost:18789`) |
-   | `GATEWAY_TOKEN` | Your gateway API token |
-   | `AGENT_ID` | Which agent to route to (default: `main`) |
-   | `DEVICE_IDENTITY` | Paste from `./.pipe_device_identity.json` after running the script once, or leave empty |
-   | `ENABLE_FILE_SERVER` | `True` (media support) |
-   | `USE_OWUI_FILES` | `True` (native OWUI Files API media support) |
-   | `OWUI_BASE_URL` | Open WebUI base URL reachable from the OWUI backend |
-   | `SEND_STOP_ON_CANCEL` | `True` (workaround for `chat.abort` not stopping active tool subprocesses) |
+   | Valve                 | Description                                                                             |
+   | --------------------- | --------------------------------------------------------------------------------------- |
+   | `GATEWAY_URL`         | OpenClaw Gateway address, `host:port`, no scheme (default: `localhost:18789`)           |
+   | `GATEWAY_TOKEN`       | Your gateway API token                                                                  |
+   | `AGENT_ID`            | Which agent to route to (default: `main`)                                               |
+   | `DEVICE_IDENTITY`     | Paste from `./.pipe_device_identity.json` after running the script once, or leave empty |
+   | `ENABLE_FILE_SERVER`  | `True` (media support)                                                                  |
+   | `USE_OWUI_FILES`      | `True` (native OWUI Files API media support)                                            |
+   | `OWUI_BASE_URL`       | Open WebUI base URL reachable from the OWUI backend                                     |
+   | `SEND_STOP_ON_CANCEL` | `True` (workaround for `chat.abort` not stopping active tool subprocesses)              |
 
 6. Choose `OpenClaw · Default` (or any discovered model) and start chatting
 
@@ -345,7 +348,7 @@ its valves, `GATEWAY_URL`, `GATEWAY_TOKEN`, `DEVICE_IDENTITY`, `STATE_DIR`,
 `AGENT_ID`: to exactly the same values as the Pipe's.
 
 > Do not skip `DEVICE_IDENTITY` here. Without it, a fallback connection from the
-> Action registers as a *new* device and the Gateway raises a second pairing
+> Action registers as a _new_ device and the Gateway raises a second pairing
 > request. `uv run install_action.py install` mirrors all five for you.
 
 </details>
@@ -465,11 +468,11 @@ that OWUI conversation's OpenClaw session to that model; switching back to
 
 Relevant valves:
 
-| Valve | Description |
-|-------|-------------|
-| `CONFIGURED_MODELS` | Comma-separated whitelist of model keys to show. Empty = show all discovered models. |
-| `DEFAULT_MODEL` | Model used when `OpenClaw · Default` is selected. Also doubles as a reference dropdown of known model keys. |
-| `MAX_MODELS` | Safety cap on how many models the selector lists when there's no whitelist (default `30`). |
+| Valve               | Description                                                                                                 |
+| ------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `CONFIGURED_MODELS` | Comma-separated whitelist of model keys to show. Empty = show all discovered models.                        |
+| `DEFAULT_MODEL`     | Model used when `OpenClaw · Default` is selected. Also doubles as a reference dropdown of known model keys. |
+| `MAX_MODELS`        | Safety cap on how many models the selector lists when there's no whitelist (default `30`).                  |
 
 > **Legacy presets.** The `CHATGPT_MODEL`, `OPUS_MODEL`, `SONNET_MODEL`, and
 > `GLM_MODEL` valves still produce fixed selector entries, purely so
@@ -499,34 +502,34 @@ auth is unavailable or the Files API fails, the integration falls back to the le
 
 Relevant valves:
 
-| Valve | Description |
-|-------|-------------|
-| `USE_OWUI_FILES` | Enable OWUI Files API upload for `MEDIA:` directives (default: `True`) |
-| `OWUI_BASE_URL` | Base URL the integration uses to call the OWUI Files API (default: `http://127.0.0.1:8080`). The integration runs inside the OWUI backend, so the loopback default is usually correct. |
-| `OWUI_API_KEY` | Optional API key for uploads; the current request bearer token is preferred (default: empty) |
+| Valve                  | Description                                                                                                                                                                                                                                                                 |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `USE_OWUI_FILES`       | Enable OWUI Files API upload for `MEDIA:` directives (default: `True`)                                                                                                                                                                                                      |
+| `OWUI_BASE_URL`        | Base URL the integration uses to call the OWUI Files API (default: `http://127.0.0.1:8080`). The integration runs inside the OWUI backend, so the loopback default is usually correct.                                                                                      |
+| `OWUI_API_KEY`         | Optional API key for uploads; the current request bearer token is preferred (default: empty)                                                                                                                                                                                |
 | `FILE_SERVER_BASE_URL` | Legacy fallback base URL for the built-in media file server, used only when `USE_OWUI_FILES` is off or an upload fails (default: `http://localhost:18791`). The **browser** resolves this URL, not OWUI, so the default only works when you browse OWUI from the same host. |
-| `SEND_STOP_ON_CANCEL` | Send `/stop` after `chat.abort` when OWUI cancels a stream (default: `True`) |
+| `SEND_STOP_ON_CANCEL`  | Send `/stop` after `chat.abort` when OWUI cancels a stream (default: `True`)                                                                                                                                                                                                |
 
 ---
 
 ## 🔧 Troubleshooting
 
-| Symptom | Likely cause |
-|---------|-------------|
-| Text appears all at once | Pipe uses `return` instead of `yield` (check your code) |
-| "No GATEWAY_TOKEN configured" | Valve not set, go to Admin → Functions → edit valves |
-| An `**Error:**` line instead of a reply | OWUI can't reach `GATEWAY_URL`: check network connectivity from the OWUI backend |
-| Model missing from selector | Run `uv run install.py repair`; it ensures the function is active/global and visible in `/api/v1/models`. Also check `CONFIGURED_MODELS` isn't filtering it out. |
-| "pairing required" | Run `uv run install.py repair` or approve the matching request with `openclaw devices approve <request-id>` |
-| Image still uses the legacy file server | OWUI file upload failed and the integration fell back; check `OWUI_BASE_URL`, request auth/API key, and OWUI logs |
-| Tool calls not showing | The `__event_emitter__` calls fail silently; check OWUI backend logs |
-| Device identity not persisting | Check `STATE_DIR` and the `DEVICE_IDENTITY` valve; run `uv run install.py healthcheck` |
-| Stream stops mid-response | The integration probes the Gateway after 30s of silence and gives up after 180s with no text; check agent response time and the OWUI backend log |
-| Repeated device-pairing prompts | `STATE_DIR` isn't persistent, grep the OWUI backend log for `STATE_DIR unavailable` |
-| `ModuleNotFoundError: websockets` on load | OWUI's frontmatter auto-install is off (`ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS=false`) or it's in offline mode, install `websockets` and `cryptography` into the OWUI image |
+| Symptom                                               | Likely cause                                                                                                                                                                                                                                                                                                                                                   |
+| ----------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Text appears all at once                              | Pipe uses `return` instead of `yield` (check your code)                                                                                                                                                                                                                                                                                                        |
+| "No GATEWAY_TOKEN configured"                         | Valve not set, go to Admin → Functions → edit valves                                                                                                                                                                                                                                                                                                           |
+| An `**Error:**` line instead of a reply               | OWUI can't reach `GATEWAY_URL`: check network connectivity from the OWUI backend                                                                                                                                                                                                                                                                               |
+| Model missing from selector                           | Run `uv run install.py repair`; it ensures the function is active/global and visible in `/api/v1/models`. Also check `CONFIGURED_MODELS` isn't filtering it out.                                                                                                                                                                                               |
+| "pairing required"                                    | Run `uv run install.py repair` or approve the matching request with `openclaw devices approve <request-id>`                                                                                                                                                                                                                                                    |
+| Image still uses the legacy file server               | OWUI file upload failed and the integration fell back; check `OWUI_BASE_URL`, request auth/API key, and OWUI logs                                                                                                                                                                                                                                              |
+| Tool calls not showing                                | The `__event_emitter__` calls fail silently; check OWUI backend logs                                                                                                                                                                                                                                                                                           |
+| Device identity not persisting                        | Check `STATE_DIR` and the `DEVICE_IDENTITY` valve; run `uv run install.py healthcheck`                                                                                                                                                                                                                                                                         |
+| Stream stops mid-response                             | The integration probes the Gateway after 30s of silence and gives up after 180s with no text; check agent response time and the OWUI backend log                                                                                                                                                                                                               |
+| Repeated device-pairing prompts                       | `STATE_DIR` isn't persistent, grep the OWUI backend log for `STATE_DIR unavailable`                                                                                                                                                                                                                                                                            |
+| `ModuleNotFoundError: websockets` on load             | OWUI's frontmatter auto-install is off (`ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS=false`) or it's in offline mode, install `websockets` and `cryptography` into the OWUI image                                                                                                                                                                              |
 | Models are listed as "- example, Gateway not reached" | The integration hasn't reached your Gateway yet, so the selector is showing a built-in example list rather than your models. Pick `OpenClaw · Default` (it always works), send one message to establish the connection, then reload, the real list replaces it. If it persists, the Gateway is genuinely unreachable: check `GATEWAY_URL` and `GATEWAY_TOKEN`. |
-| "Could not start a session on agent `<id>`" | `AGENT_ID` names an agent your Gateway doesn't define. Use `main` unless you configured others. |
-| Restarting mid-turn loses context | Known OpenClaw limitation, avoid restarting the Gateway while a run is in flight |
+| "Could not start a session on agent `<id>`"           | `AGENT_ID` names an agent your Gateway doesn't define. Use `main` unless you configured others.                                                                                                                                                                                                                                                                |
+| Restarting mid-turn loses context                     | Known OpenClaw limitation, avoid restarting the Gateway while a run is in flight                                                                                                                                                                                                                                                                               |
 
 Check OWUI's backend logs for `[openclaw-pipe]` prefixed messages.
 
@@ -538,10 +541,10 @@ Two features need the **agent** to know a convention. The integration provides
 the mechanism, but nothing tells your model it exists, so out of the box the
 agent will never use them:
 
-| Feature | The agent must | Otherwise |
-|---|---|---|
-| Ask-user dialog | Start a line with `OpenClaw needs input:` | It calls its own ask tool, which never reaches you here |
-| Send an image or file | Emit `MEDIA:<bare-filename>` | An absolute path silently drops, with no image and no error |
+| Feature               | The agent must                            | Otherwise                                                   |
+| --------------------- | ----------------------------------------- | ----------------------------------------------------------- |
+| Ask-user dialog       | Start a line with `OpenClaw needs input:` | It calls its own ask tool, which never reaches you here     |
+| Send an image or file | Emit `MEDIA:<bare-filename>`              | An absolute path silently drops, with no image and no error |
 
 Two skills ship with this repo. Install them **on the Gateway host**, which is
 where the agent runs and is not always where Open WebUI runs:
@@ -576,13 +579,13 @@ agent's own instructions. The skills are only a convenient carrier.
 The detail that used to live in this file, moved out so the README stays a
 getting-started document:
 
-| Doc | What it covers |
-|-----|----------------|
-| [`docs/architecture.md`](./docs/architecture.md) | How a message travels OWUI → Gateway → agent → back, why the Pipe is an async generator, and the repo's file layout |
-| [`docs/metadata-contract.md`](./docs/metadata-contract.md) | The Sender and Conversation info blocks every message carries, their stability guarantees, and how an agent should read them |
-| [`docs/development.md`](./docs/development.md) | Editing `src/` fragments, the build and drift guard, running the tests, driving the integration over the OWUI API |
-| [`docs/rehydration-persistence.md`](./docs/rehydration-persistence.md) | How OWUI persists an assistant message and why the integration emits mid-run snapshots. Read before touching snapshots or streaming |
-| [`docs/ask-user-modal.md`](./docs/ask-user-modal.md) | Design spec for a tool-call-based ask-user flow. **Not implemented as written**, the shipped path intercepts `OpenClaw needs input:` text |
+| Doc                                                                    | What it covers                                                                                                                            |
+| ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| [`docs/architecture.md`](./docs/architecture.md)                       | How a message travels OWUI → Gateway → agent → back, why the Pipe is an async generator, and the repo's file layout                       |
+| [`docs/metadata-contract.md`](./docs/metadata-contract.md)             | The Sender and Conversation info blocks every message carries, their stability guarantees, and how an agent should read them              |
+| [`docs/development.md`](./docs/development.md)                         | Editing `src/` fragments, the build and drift guard, running the tests, driving the integration over the OWUI API                         |
+| [`docs/rehydration-persistence.md`](./docs/rehydration-persistence.md) | How OWUI persists an assistant message and why the integration emits mid-run snapshots. Read before touching snapshots or streaming       |
+| [`docs/ask-user-modal.md`](./docs/ask-user-modal.md)                   | Design spec for a tool-call-based ask-user flow. **Not implemented as written**, the shipped path intercepts `OpenClaw needs input:` text |
 
 ---
 

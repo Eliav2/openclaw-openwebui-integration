@@ -3,6 +3,11 @@
 How a message travels from Open WebUI to your agent and back, and where each
 piece of the repo lives.
 
+The integration is an
+[external app](https://docs.openclaw.ai/gateway/external-apps): a plain Gateway
+protocol client. It imports nothing from OpenClaw's plugin SDK and adds no
+upstream footprint, so it can only do what any other v4 client can do.
+
 ## How it works
 
 ```
