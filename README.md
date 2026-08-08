@@ -49,9 +49,8 @@ clients use.
 That is the entire reason the rest of this is possible. A text-in, text-out API
 can carry the agent's *answer*; only the native protocol carries the agent's
 *work*: every tool call as it happens, every subagent it spawns, the questions
-it stops to ask you, and the files it emits. See the
-[comparison below](#why-not-just-point-open-webui-at-v1) for what that changes
-in practice, and [Features](#-features) for the full list.
+it stops to ask you, and the files it emits. The comparison below shows what
+that changes in practice; [Features](#-features) has the full list.
 
 One thing worth calling out separately, because it is not about the protocol:
 **your history lives in Open WebUI's database.** It survives Gateway restarts
@@ -70,7 +69,8 @@ loses mid-flight is still there in the chat.
 </p>
 <p align="center"><sub>Open any subagent and read its transcript while it runs.</sub></p>
 
-### Why not just point Open WebUI at `/v1`?
+<details>
+<summary><b>Why not just point Open WebUI at <code>/v1</code>?</b> &mdash; <sub>the official endpoint, and what it does not carry</sub></summary>
 
 You can, and for many people that is the right answer. OpenClaw ships an
 official OpenAI-compatible endpoint, and Open WebUI is a documented, CI-tested
@@ -97,6 +97,8 @@ The difference is what each one gives you:
 Put simply: **`/v1` gives you the agent as a model. This gives you the agent as
 an agent.** If you want OpenClaw in a model dropdown, use `/v1`. If you want to
 watch it work, use this.
+
+</details>
 
 <p align="center">
   <img src="./docs/img/tool-call-expanded.jpg" alt="An expanded tool call showing its INPUT arguments and OUTPUT result" width="70%">
@@ -126,8 +128,8 @@ openclaw devices approve <request-id>
 ```
 
 Now pick **`OpenClaw · Default`** in Open WebUI's model dropdown and say hello.
-Full detail in [Installation](#-installation-automated); if something goes
-wrong, jump to [Troubleshooting](#-troubleshooting).
+Full detail, including a manual path, in [Installation](#-installation). If
+something goes wrong, jump to [Troubleshooting](#-troubleshooting).
 
 ---
 
@@ -173,7 +175,7 @@ wrong, jump to [Troubleshooting](#-troubleshooting).
 | [`openclaw_status_action.py`](./openclaw_status_action.py) | Action | Message-toolbar button for on-demand session/usage lookups; reuses the Pipe's live connection and device identity, no second pairing |
 
 Both are generated from the same `src/openclaw_pipe_pkg/` source fragments.
-See [Development](#-development) if you're contributing.
+See [`docs/development.md`](./docs/development.md) if you're contributing.
 
 ---
 
@@ -197,9 +199,15 @@ See [Development](#-development) if you're contributing.
 
 ---
 
-## 🚀 Installation (automated)
+## 🚀 Installation
 
-### Prerequisites
+Two paths, same result. `install.py` drives Open WebUI's REST API, so it needs
+your OWUI admin email and password. The manual path needs neither.
+
+<details open>
+<summary><b>🤖 Automated</b> &mdash; <sub>one command, needs your OWUI admin password</sub></summary>
+
+#### Prerequisites
 
 - A running OpenClaw Gateway, reachable from the machine Open WebUI runs on
 - Admin credentials for your Open WebUI instance
@@ -216,97 +224,172 @@ See [Development](#-development) if you're contributing.
   install` works identically. `uv` just removes that manual step. (A bare
   `python3 install.py` with no subcommand only prints help.)
 
-### Run the installer
+#### Run the installer
 
-**First time, no env vars handy?** Run the interactive wizard. It prompts for
-everything it needs and explains where to find each value:
+The wizard prompts for everything it needs and explains where to find each
+value. Start here:
 
 ```bash
 uv run install.py install --wizard
 ```
 
-**Scripted / repeat installs**: set env vars once, then run non-interactively
-(handy for CI, config management, or reinstalling after an OWUI upgrade):
+`uv run` resolves `cryptography`, `click`, and `rich` into an ephemeral
+environment, so there is no venv or `pip install` step.
 
-```bash
-export OWUI_URL=http://your-owui-host:8080
-export OWUI_EMAIL=admin@example.com
-export OWUI_PASSWORD=your-password
-export GATEWAY_URL=your-gateway-host:18789
-export GATEWAY_TOKEN=your-gateway-token
-export AGENT_ID=main
-export OWUI_API_BASE_URL=http://your-owui-host:8080
-
-# Optional
-export OPENCLAW_BRIDGE_STATE_DIR=/data/openclaw-bridge  # note the prefix, not STATE_DIR
-export OWUI_API_KEY=...                                 # only if the request bearer token can't be used for uploads
-export FILE_SERVER_BASE_URL=http://your-owui-host:18791 # only if you rely on the legacy media fallback
-
-# Install or update the integration in place, then run a smoke test
-uv run install.py install
-
-# Repair a broken install without deleting the function or valves
-uv run install.py repair
-
-# Inspect current state without changing anything
-uv run install.py status
-
-# Run status checks plus an end-to-end smoke test
-uv run install.py healthcheck
-```
-
-`uv run install.py` resolves `cryptography`, `click`, and `rich` into an
-ephemeral environment automatically, no venv or `pip install` step needed.
-You can also run it straight from GitHub without cloning first:
+You can also run it without cloning first:
 
 ```bash
 uv run https://raw.githubusercontent.com/Eliav2/openclaw-openwebui-integration/main/install.py install --wizard
 ```
 
-In that no-clone form there is no `openclaw_pipe.py` next to the script, so the
-installer downloads the artifact from this repo before deploying it. Set
-`OPENCLAW_PIPE_ARTIFACT_URL` to point that at a fork, a pinned tag, or an
-internal mirror.
+In that form there is no `openclaw_pipe.py` next to the script, so the installer
+downloads the artifact from this repo before deploying it. Point
+`OPENCLAW_PIPE_ARTIFACT_URL` at a fork, a pinned tag, or an internal mirror to
+change that.
 
-The script will:
+#### Configuration
+
+Only three values are required. Everything else has a working default:
+
+| Required | |
+|---|---|
+| `OWUI_EMAIL` | Open WebUI admin email |
+| `OWUI_PASSWORD` | Open WebUI admin password |
+| `GATEWAY_TOKEN` | `gateway.auth.token` from your OpenClaw config |
+
+| Optional | Default |
+|---|---|
+| `OWUI_URL` | `http://localhost:8080` |
+| `GATEWAY_URL` | `localhost:18789` |
+| `AGENT_ID` | `main` |
+| `OPENCLAW_BRIDGE_STATE_DIR` | `/data/openclaw-bridge` |
+| `OWUI_API_BASE_URL` | whatever `OWUI_URL` is. Set it only when the pipe must reach OWUI's API at a different address than you do |
+| `OWUI_API_KEY` | empty. Only needed if the request bearer token can't be used for media uploads |
+| `FILE_SERVER_BASE_URL` | empty. Only needed if you rely on the legacy media fallback |
+
+Supply them as env vars, or as flags with the same names (`--owui-email`,
+`--gateway-token`, ...). `uv run install.py install --help` lists every flag.
+Skip the wizard once they are set:
+
+```bash
+export OWUI_EMAIL=admin@example.com
+export OWUI_PASSWORD=your-password
+export GATEWAY_TOKEN=your-gateway-token
+
+uv run install.py install
+```
+
+That non-interactive form is what you want for CI, config management, or
+reinstalling after an OWUI upgrade.
+
+#### What `install` does
+
 1. Log in to Open WebUI
-2. Check if the Gateway function already exists
-3. **If exists:** update the code in-place (preserving all valves including `DEVICE_IDENTITY`)
-4. **If new:** create the Gateway function
-5. Back up the existing function and valves to `backups/`
-6. Ensure it is active + global without blindly toggling it off
-7. Generate or reuse a **permanent device identity** (Ed25519 key pair)
-8. Restore valves if Open WebUI drops them during a function update
+2. Check whether the Gateway function already exists
+3. **If it exists:** update the code in place, preserving every valve including `DEVICE_IDENTITY`
+4. **If it's new:** create the function
+5. Back up the previous function and valves to `backups/`
+6. Ensure it is active and global, without blindly toggling it off first
+7. Generate or reuse a permanent device identity (Ed25519 key pair)
+8. Restore valves if Open WebUI drops them during the update
 9. Run an end-to-end smoke test through `/api/chat/completions`
-10. If a matching pairing request is pending, approve it automatically when the
-    local `openclaw` CLI is available
+10. Approve a matching pending pairing request, when the local `openclaw` CLI is available
 
-> **v2+ no longer deletes and recreates the function**, which means your
-> valve settings (especially `DEVICE_IDENTITY`) survive re-installation.
-> The old `delete+create` cycle that wiped `DEVICE_IDENTITY` and forced
-> re-approval is gone.
+Step 3 is why re-running this is safe: the function is never deleted and
+recreated, so `DEVICE_IDENTITY` survives and you never re-approve the device.
+
+#### Commands
+
+| Command | What it does |
+|---|---|
+| `install` | Create or update the Pipe function and its valves, then smoke test |
+| `repair` | Same as `install`. Use after a broken or partial setup |
+| `status` | Print current state, change nothing |
+| `healthcheck` | Status checks plus an end-to-end smoke test |
+| `skills` | Install the agent-side skills. Run on the **Gateway host**, needs no OWUI credentials (see [Teaching your agent](#-teaching-your-agent-to-use-this)) |
+
+`install` and `repair` also take `--with-skills` when you happen to be on the
+Gateway host, and `--force-skills` to overwrite an existing skill.
+
+</details>
+
+<details>
+<summary><b>✋ Manual</b> &mdash; <sub>paste two files in the admin panel, no credentials shared</sub></summary>
+
+An OWUI function is one flat `.py` file. Paste it in the admin panel:
+
+1. Open **Admin Panel** → **Functions** in OWUI
+2. Click **"+"** → **"Create a function"** with ID `openclaw_gateway`, type `pipe`
+3. Paste the contents of [`openclaw_pipe.py`](./openclaw_pipe.py)
+4. Save, then toggle **Active** → **ON** and **Global** → **ON**
+5. Set the valves:
+
+   | Valve | Description |
+   |-------|-------------|
+   | `GATEWAY_URL` | OpenClaw Gateway address, `host:port`, no scheme (default: `localhost:18789`) |
+   | `GATEWAY_TOKEN` | Your gateway API token |
+   | `AGENT_ID` | Which agent to route to (default: `main`) |
+   | `DEVICE_IDENTITY` | Paste from `./.pipe_device_identity.json` after running the script once, or leave empty |
+   | `ENABLE_FILE_SERVER` | `True` (media support) |
+   | `USE_OWUI_FILES` | `True` (native OWUI Files API media support) |
+   | `OWUI_BASE_URL` | Open WebUI base URL reachable from the OWUI backend |
+   | `SEND_STOP_ON_CANCEL` | `True` (workaround for `chat.abort` not stopping active tool subprocesses) |
+
+6. Choose `OpenClaw · Default` (or any discovered model) and start chatting
+
+Optionally repeat the same steps for the Status Action, creating an
+**Action** function (not a Pipe) with id `openclaw_status_action` and the
+contents of [`openclaw_status_action.py`](./openclaw_status_action.py). Turn on
+**Global** so the button appears on every model's messages, then set all five of
+its valves, `GATEWAY_URL`, `GATEWAY_TOKEN`, `DEVICE_IDENTITY`, `STATE_DIR`,
+`AGENT_ID`: to exactly the same values as the Pipe's.
+
+> Do not skip `DEVICE_IDENTITY` here. Without it, a fallback connection from the
+> Action registers as a *new* device and the Gateway raises a second pairing
+> request. `uv run install_action.py install` mirrors all five for you.
+
+</details>
+
+---
+
+### Approve the device in the Gateway
+
+A first install pairs a brand-new device, so the Gateway holds it pending until
+you approve it. Expect the installer to report **pairing required**; that is the
+normal first run, not a failure.
+
+If the installer ran on the Gateway host it approves the request for you. If it
+ran anywhere else, approve it yourself, on the Gateway host:
+
+```bash
+openclaw devices list      # find the pending request
+openclaw devices approve <request-id>
+```
+
+**The identity is permanent.** The installer prefers the existing
+`DEVICE_IDENTITY` valve, mirrors it into `./.pipe_device_identity.json`, and the
+pipe persists it inside `STATE_DIR` on first run. Valve updates are in-place, so
+approval lasts across reinstalls and restarts.
+
+---
 
 ### Verify it worked
 
-1. `uv run install.py healthcheck`: status checks plus an end-to-end smoke
-   test. It should finish with all ✓ and exit 0.
-2. Reload Open WebUI. `OpenClaw · Default` should appear in the model picker.
-3. Select it and send "hello". Text should stream in token by token.
+1. Reload Open WebUI. `OpenClaw · Default` should appear in the model picker.
+2. Select it and send "hello". Text should stream in token by token.
 
-If the smoke test reports **pairing required**, that's expected on a first
-install, approve the device (below), then re-run it.
+Automated path only, covers both checks at once:
 
-### Uninstalling
+```bash
+uv run install.py healthcheck   # status checks plus an end-to-end smoke test
+```
 
-There's no `uninstall` subcommand; removal is a UI action. In Open WebUI go to
-**Admin Panel → Functions** and delete `openclaw_gateway` (and
-`openclaw_status_action` if you installed it). Every install first writes the
-previous function and its valves to `backups/`, so if you only want to roll back
-a bad upgrade, restore the JSON from there rather than deleting.
+All ✓ and exit 0 means done.
 
-Deleting the functions does not touch `STATE_DIR`. Remove that directory too if
-you want the device identity gone, and revoke the device on the Gateway with
-`openclaw devices list` / `openclaw devices remove <id>`.
+If the smoke test reports **pairing required**, the approval above hasn't landed
+yet. Approve the device, then re-run `healthcheck`.
+
+---
 
 ### Installing the companion Status Action
 
@@ -329,6 +412,27 @@ It fails fast if the Pipe isn't installed yet.
 Two differences from `install.py`: it must be run from a clone (it imports from
 `install.py`, so the `uv run <raw-github-url>` form doesn't work), and it has no
 `healthcheck` subcommand.
+
+---
+
+### Uninstalling
+
+There's no `uninstall` subcommand; removal is a UI action. In Open WebUI go to
+**Admin Panel → Functions** and delete `openclaw_gateway` (and
+`openclaw_status_action` if you installed it). Every install first writes the
+previous function and its valves to `backups/`, so if you only want to roll back
+a bad upgrade, restore the JSON from there rather than deleting.
+
+Deleting the functions does not touch `STATE_DIR`. Remove that directory too if
+you want the device identity gone, and revoke the device on the Gateway with
+`openclaw devices list` / `openclaw devices remove <id>`.
+
+---
+
+## ⚙️ Configuration reference
+
+Behaviour you can tune after the integration is running. None of it is
+needed for a first install.
 
 ### Restart-safe state
 
@@ -402,55 +506,6 @@ Relevant valves:
 | `OWUI_API_KEY` | Optional API key for uploads; the current request bearer token is preferred (default: empty) |
 | `FILE_SERVER_BASE_URL` | Legacy fallback base URL for the built-in media file server, used only when `USE_OWUI_FILES` is off or an upload fails (default: `http://localhost:18791`). The **browser** resolves this URL, not OWUI, so the default only works when you browse OWUI from the same host. |
 | `SEND_STOP_ON_CANCEL` | Send `/stop` after `chat.abort` when OWUI cancels a stream (default: `True`) |
-
-### Approve the device in the Gateway
-
-When using the integration for the first time, your OpenClaw Gateway will prompt
-for device approval. On the Gateway host, run:
-
-```bash
-openclaw devices list      # find the pending request
-openclaw devices approve <request-id>
-```
-
-**The identity is permanent.** The installer prefers the existing
-`DEVICE_IDENTITY` valve, mirrors it into `./.pipe_device_identity.json`, and the
-pipe persists it inside `STATE_DIR` on first run. Valve updates are in-place, so
-approval lasts across reinstalls and restarts.
-
-### Manual installation (alternative)
-
-If you can't run the script, install manually:
-
-1. Open **Admin Panel** → **Functions** in OWUI
-2. Click **"+"** → **"Create a function"** with ID `openclaw_gateway`, type `pipe`
-3. Paste the contents of [`openclaw_pipe.py`](./openclaw_pipe.py)
-4. Save, then toggle **Active** → **ON** and **Global** → **ON**
-5. Set the valves:
-
-   | Valve | Description |
-   |-------|-------------|
-   | `GATEWAY_URL` | OpenClaw Gateway address, `host:port`, no scheme (default: `localhost:18789`) |
-   | `GATEWAY_TOKEN` | Your gateway API token |
-   | `AGENT_ID` | Which agent to route to (default: `main`) |
-   | `DEVICE_IDENTITY` | Paste from `./.pipe_device_identity.json` after running the script once, or leave empty |
-   | `ENABLE_FILE_SERVER` | `True` (media support) |
-   | `USE_OWUI_FILES` | `True` (native OWUI Files API media support) |
-   | `OWUI_BASE_URL` | Open WebUI base URL reachable from the OWUI backend |
-   | `SEND_STOP_ON_CANCEL` | `True` (workaround for `chat.abort` not stopping active tool subprocesses) |
-
-6. Choose `OpenClaw · Default` (or any discovered model) and start chatting
-
-Optionally repeat the same steps for the Status Action, creating an
-**Action** function (not a Pipe) with id `openclaw_status_action` and the
-contents of [`openclaw_status_action.py`](./openclaw_status_action.py). Turn on
-**Global** so the button appears on every model's messages, then set all five of
-its valves, `GATEWAY_URL`, `GATEWAY_TOKEN`, `DEVICE_IDENTITY`, `STATE_DIR`,
-`AGENT_ID`: to exactly the same values as the Pipe's.
-
-> Do not skip `DEVICE_IDENTITY` here. Without it, a fallback connection from the
-> Action registers as a *new* device and the Gateway raises a second pairing
-> request. `uv run install_action.py install` mirrors all five for you.
 
 ---
 
