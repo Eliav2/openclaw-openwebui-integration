@@ -1,20 +1,25 @@
-# OpenClaw ↔ Open WebUI Integration 🔌
+# OpenClaw in Open WebUI 🔌
 
-Bidirectional integration between [OpenClaw Gateway](https://github.com/openclaw/openclaw)
-and [Open WebUI](https://openwebui.com/). The primary component is a **Pipe** function
-that connects via OpenClaw's native WebSocket protocol, which gives you real-time
-streaming, native tool-call rendering, and persistent agent sessions inside OWUI's chat
-interface. A companion **Action** function adds a live session/usage lookup button
-to the message toolbar.
+[![CI](https://github.com/Eliav2/openclaw-openwebui-integration/actions/workflows/ci.yml/badge.svg)](https://github.com/Eliav2/openclaw-openwebui-integration/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](./LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+
+Run your [OpenClaw Gateway](https://github.com/openclaw/openclaw) agents inside
+[Open WebUI](https://openwebui.com/), with their tool calls, subagents and
+mid-run questions rendered as real UI instead of flattened into text.
+
+A **Pipe** function speaks the Gateway's native WebSocket protocol, which is
+what buys the real-time streaming, the native tool-call cards, and the
+persistent agent sessions. A companion **Action** function adds a live
+session/usage button to the message toolbar.
 
 > No separate proxy, no Node.js middleware, no Python subprocess. The whole
 > integration is two self-contained Python files loaded as Open WebUI functions.
 
 <p align="center">
-  <img src="./owui-screenshot.svg" alt="Illustration of the OpenClaw Gateway integration rendering inside Open WebUI: streaming text, tool call cards, and model selection" width="90%">
+  <img src="./docs/img/tool-calls-streaming.jpg" alt="Tool calls streaming live in Open WebUI on a phone, with spinners and green checkmarks, including nested subagents" width="42%">
 </p>
-
-<p align="center"><sub>Illustration of the integration's rendering in Open WebUI.</sub></p>
+<p align="center"><sub>Tool calls stream live as the agent works, including nested subagents. On a phone.</sub></p>
 
 > **You need a running OpenClaw Gateway before any of this is useful.**
 > [OpenClaw](https://github.com/openclaw/openclaw) is a self-hosted agent
@@ -35,35 +40,23 @@ It feels like using ChatGPT or Claude, and I wanted that same experience for my
 own agents. So I built this, used it daily for a few months, and I'm now
 sharing it.
 
-<p align="center">
-  <img src="./docs/img/tool-calls-streaming.jpg" alt="Tool calls streaming live in Open WebUI on a phone, with spinners and green checkmarks, including nested subagents" width="46%">
-</p>
-<p align="center"><sub>Tool calls stream live as the agent works, including nested subagents. On a phone.</sub></p>
-
 **The other difference is the connection.** The usual ways to reach OpenClaw
 from outside, such as WhatsApp or Telegram, go through OpenClaw's public API,
 which is deliberately narrow: text in, text out. This integration speaks the
 Gateway's **native v4 WebSocket protocol** instead, the same one OpenClaw's own
-clients use. That is the entire reason the rest of this is possible:
+clients use.
 
-- **Every tool call, streamed as it happens.** Name, arguments and result,
-  rendered as native Open WebUI tool cards rather than a wall of text.
-- **Subagents as first-class citizens.** Watch them spawn and run, then open any
-  one to read its full transcript and tool calls.
-- **Live context and rate-limit usage,** fetched fresh on demand rather than
-  left stale from the last turn.
-- **The agent can stop and ask you a question** mid-run, in a real dialog,
-  instead of guessing.
-- **Images and files** rendered inline, natively.
-- **Every model your Gateway knows about,** discovered automatically and
-  switchable per conversation.
-- **Persistent sessions.** Each chat is a stable agent session that remembers
-  context.
-- **Your history is kept by Open WebUI,** in its own database. It survives
-  Gateway restarts and agent crashes, and stays searchable and exportable. A
-  turn that the Gateway loses mid-flight is still there in the chat.
+That is the entire reason the rest of this is possible. A text-in, text-out API
+can carry the agent's *answer*; only the native protocol carries the agent's
+*work*: every tool call as it happens, every subagent it spawns, the questions
+it stops to ask you, and the files it emits. See the
+[comparison below](#why-not-just-point-open-webui-at-v1) for what that changes
+in practice, and [Features](#-features) for the full list.
 
-None of that fits through a text-in, text-out API.
+One thing worth calling out separately, because it is not about the protocol:
+**your history lives in Open WebUI's database.** It survives Gateway restarts
+and agent crashes, stays searchable and exportable, and a turn the Gateway
+loses mid-flight is still there in the chat.
 
 <p align="center">
   <img src="./docs/img/status-modal.jpg" alt="Status dialog showing context usage, 5h and weekly rate limits, and five running subagents" width="40%">
@@ -150,13 +143,12 @@ wrong, jump to [Troubleshooting](#-troubleshooting).
   remembers context across messages
 - **🧭 Dynamic model selector**: the integration discovers every model the Gateway
   knows about (`models.list`) and lists one entry per model, with an optional
-  whitelist and a size cap; legacy fixed presets (ChatGPT/Opus/Sonnet/GLM) are
-  kept only for backward compatibility
+  whitelist and a size cap
 - **❓ Ask-user modal**: when an agent emits a line beginning with
   `OpenClaw needs input:` (or `Codex needs input:`), the integration intercepts it and
   pops a real OWUI input / choice / confirmation dialog mid-run, instead of
   leaking the raw prompt into the chat as text
-  (see [`docs/ask-user-modal.md`](./docs/ask-user-modal.md))
+  (implementation: [`src/openclaw_pipe_pkg/askuser.py`](./src/openclaw_pipe_pkg/askuser.py))
 - **📊 Status Action button**: a companion Action function adds a toolbar
   button that fetches live session/usage data from the Gateway on demand,
   reusing the Pipe's connection when one is already open
@@ -187,12 +179,11 @@ See [Development](#-development) if you're contributing.
 
 ## 📋 Requirements
 
-| Component | Version |
-|-----------|---------|
+| Component | Requirement |
+|-----------|-------------|
 | Open WebUI | ≥ v0.10.2. Developed and tested against v0.10.2 and v0.11.0 |
 | OpenClaw Gateway | v2025+ (WS protocol v4) |
-| Python (in OWUI) | websockets, cryptography |
-| | (pydantic ships with OWUI) |
+| Python packages inside OWUI | `websockets`, `cryptography`. `pydantic` already ships with OWUI |
 
 > **Open WebUI version:** native tool-card rendering depends on OWUI's
 > Responses-API streaming handler. The integration performs no runtime version check,
@@ -376,11 +367,10 @@ Relevant valves:
 | `DEFAULT_MODEL` | Model used when `OpenClaw · Default` is selected. Also doubles as a reference dropdown of known model keys. |
 | `MAX_MODELS` | Safety cap on how many models the selector lists when there's no whitelist (default `30`). |
 
-**Legacy fixed presets** (`ChatGPT · GPT-5.5`, `Claude · Opus 4.8`,
-`Claude · Sonnet 5`, `GLM 5.2`) still work via the `CHATGPT_MODEL`,
-`OPUS_MODEL`, `SONNET_MODEL`, and `GLM_MODEL` valves, kept only for backward
-compatibility with conversations that already picked one of them. New
-installs should rely on dynamic discovery instead of these valves.
+> **Legacy presets.** The `CHATGPT_MODEL`, `OPUS_MODEL`, `SONNET_MODEL`, and
+> `GLM_MODEL` valves still produce fixed selector entries, purely so
+> conversations that already picked one keep working. Ignore them on a new
+> install; dynamic discovery replaces them.
 
 ### Auto-generated chat titles
 
@@ -620,10 +610,10 @@ The integration:
 
 Because the integration is an **async generator** (uses `yield` instead of `return`),
 OWUI streams each chunk to the frontend in real time. Once content is yielded
-it's frozen on screen for the rest of the run, the integration can still update
-what's saved to the OWUI database afterward, but not what's already rendered
-- so anything meant to change later (like a tool result replacing a spinner)
-has to be sent as a fresh item, not a patch to an old one.
+it's frozen on screen for the rest of the run. The integration can still update
+what's saved to the OWUI database afterward, but not what's already rendered,
+so anything meant to change later (like a tool result replacing a spinner) has
+to be sent as a fresh item, not a patch to an old one.
 
 ---
 
@@ -656,7 +646,6 @@ openclaw-openwebui-integration/
 ├── docs/                       # Design + behavior docs (see Development)
 ├── .github/workflows/ci.yml    # Drift guard + tests + artifact load check
 ├── backups/                    # Local install backups (gitignored, created on first install)
-├── owui-screenshot.svg         # README screenshot
 ├── README.md                   # This file
 ├── LICENSE                     # MIT
 ├── .gitattributes
