@@ -60,11 +60,16 @@ and agent crashes, stays searchable and exportable, and a turn the Gateway
 loses mid-flight is still there in the chat.
 
 <p align="center">
+  <img src="./docs/img/action-button.png" alt="The OpenClaw Status button in Open WebUI's message toolbar, tooltip showing" width="28%">
+</p>
+<p align="center"><sub>The companion Action puts this button on every message.</sub></p>
+
+<p align="center">
   <img src="./docs/img/status-modal.jpg" alt="Status dialog showing context usage, 5h and weekly rate limits, and five running subagents" width="40%">
   &nbsp;&nbsp;
   <img src="./docs/img/model-selector.jpg" alt="Open WebUI model dropdown listing models discovered from the Gateway" width="40%">
 </p>
-<p align="center"><sub>Left: context, rate limits and running subagents, fetched live from the Gateway. Right: every model your Gateway knows about, discovered automatically.</sub></p>
+<p align="center"><sub>Left: what it opens, fetched live from the Gateway. Right: every model your Gateway knows about, discovered automatically.</sub></p>
 
 <p align="center">
   <img src="./docs/img/subagent-drawer.jpg" alt="Subagent drawer with Overview, Transcript and Tools tabs, showing a running subagent's transcript" width="80%">
