@@ -49,9 +49,8 @@ clients use.
 That is the entire reason the rest of this is possible. A text-in, text-out API
 can carry the agent's *answer*; only the native protocol carries the agent's
 *work*: every tool call as it happens, every subagent it spawns, the questions
-it stops to ask you, and the files it emits. See the
-[comparison below](#why-not-just-point-open-webui-at-v1) for what that changes
-in practice, and [Features](#-features) for the full list.
+it stops to ask you, and the files it emits. The comparison below shows what
+that changes in practice; [Features](#-features) has the full list.
 
 One thing worth calling out separately, because it is not about the protocol:
 **your history lives in Open WebUI's database.** It survives Gateway restarts
@@ -70,7 +69,8 @@ loses mid-flight is still there in the chat.
 </p>
 <p align="center"><sub>Open any subagent and read its transcript while it runs.</sub></p>
 
-### Why not just point Open WebUI at `/v1`?
+<details>
+<summary><b>Why not just point Open WebUI at <code>/v1</code>?</b> &mdash; <sub>the official endpoint, and what it does not carry</sub></summary>
 
 You can, and for many people that is the right answer. OpenClaw ships an
 official OpenAI-compatible endpoint, and Open WebUI is a documented, CI-tested
@@ -97,6 +97,8 @@ The difference is what each one gives you:
 Put simply: **`/v1` gives you the agent as a model. This gives you the agent as
 an agent.** If you want OpenClaw in a model dropdown, use `/v1`. If you want to
 watch it work, use this.
+
+</details>
 
 <p align="center">
   <img src="./docs/img/tool-call-expanded.jpg" alt="An expanded tool call showing its INPUT arguments and OUTPUT result" width="70%">
