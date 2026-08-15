@@ -20,6 +20,27 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 ARTIFACT = ROOT / "openclaw_thinking_filter.py"
 
+# Precondition, checked before anything else: this suite exercises the real
+# pydantic surface (create_model, then model_json_schema on what it built), so
+# a stubbed or missing pydantic makes every assertion below meaningless. A
+# sibling suite's stub used to shadow the real library here; conftest.py now
+# imports it first, and this guard says so out loud if that ever stops working.
+# On CI the dependency is installed, so a miss there is a real breakage and has
+# to fail: a suite that quietly skips itself is indistinguishable from one that
+# passes.
+try:
+    from pydantic import create_model as _require_real_pydantic  # noqa: F401
+except ImportError as exc:  # pragma: no cover - environment guard
+    _reason = f"this suite needs the real pydantic, got: {exc}"
+    if os.environ.get("CI"):
+        raise RuntimeError(f"CI installs pydantic, so this is a bug: {_reason}")
+    print(f"\nSKIPPED: {_reason}")
+    try:
+        import pytest
+    except ImportError:
+        sys.exit(0)
+    pytest.skip(_reason, allow_module_level=True)
+
 FAILURES = []
 
 
