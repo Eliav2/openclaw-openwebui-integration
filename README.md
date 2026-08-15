@@ -447,6 +447,28 @@ Two differences from `install.py`: it must be run from a clone (it imports from
 
 ---
 
+### Installing the thinking filter
+
+Optional, and installed by hand rather than by a script. It has no installer
+because it has nothing to configure: unlike the Action it shares no valves with
+the Pipe, needs no device identity, and never talks to the Gateway itself.
+
+1. Open WebUI → **Admin Panel** → **Functions** → **+**
+2. Paste the contents of [`openclaw_thinking_filter.py`](./openclaw_thinking_filter.py)
+3. Save, then toggle it **Active**
+
+Leave it global (the default) so the toggle is available in every chat. It does
+nothing until you switch it on in a given conversation: Open WebUI does not run
+a toggled filter's `inlet` while the toggle is off, so an untouched chat behaves
+exactly as if the filter were not installed.
+
+The Pipe should be installed first. The filter's level dropdown is populated
+from the ladder cache the Pipe writes, so before the Pipe has run once the
+dropdown falls back to the five levels every observed provider supports. See
+[Per-chat thinking control](#f-thinking).
+
+---
+
 ### Uninstalling
 
 There's no `uninstall` subcommand; removal is a UI action. In Open WebUI go to
