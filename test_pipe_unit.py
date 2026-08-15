@@ -4360,19 +4360,37 @@ class ThinkingWiringTests(unittest.TestCase):
         params = _owui_chat_send_params(thinking="off", **self.SEND_KW)
         self.assertEqual(params["thinking"], "off")
 
-    def test_ladder_read_from_thinking_options(self):
-        desc = {"session": {"thinkingOptions": ["off", "low", "high"]}}
-        self.assertEqual(_session_thinking_ladder(desc), ["off", "low", "high"])
-
-    def test_ladder_falls_back_to_the_labelled_form(self):
+    def test_ladder_read_from_thinking_levels(self):
+        # thinkingLevels carries the real {id, label} objects the gateway
+        # resolves (resolveGatewaySessionThinkingProjectionInternal ->
+        # thinkingLevels: metadata.levels) -- this is the authoritative,
+        # canonical-id source clamp_to_ladder/LEVEL_RANKS match against.
         desc = {"session": {"thinkingLevels": [
             {"id": "off", "label": "off"}, {"id": "medium", "label": "medium"}]}}
         self.assertEqual(_session_thinking_ladder(desc), ["off", "medium"])
 
-    def test_thinking_options_wins_when_both_are_present(self):
-        desc = {"session": {"thinkingOptions": ["off"],
+    def test_thinking_levels_wins_when_both_are_present(self):
+        # Regression for ELI-85's live break: the old code checked
+        # thinkingOptions FIRST and returned it as-is. thinkingOptions is
+        # display LABELS (metadata.levels.map(level => level.label)), not
+        # ids -- for a model whose label differs from its id (the realistic
+        # case, e.g. "Off" vs "off"), that ladder can never match a
+        # requested level, clamp_to_ladder falls through to "pass it to the
+        # gateway", and the gateway hard-rejects the turn with its own
+        # "Thinking level ... is not supported" error. thinkingLevels must
+        # win whenever both are present.
+        desc = {"session": {"thinkingOptions": ["Off"],
                             "thinkingLevels": [{"id": "max"}]}}
-        self.assertEqual(_session_thinking_ladder(desc), ["off"])
+        self.assertEqual(_session_thinking_ladder(desc), ["max"])
+
+    def test_ladder_falls_back_to_the_labelled_form_lowercased(self):
+        # thinkingOptions is a last-resort fallback only (some future
+        # gateway build stops emitting thinkingLevels). Lowercased on the
+        # way out so a label that happens to already equal its id in casing
+        # ("off") still matches LEVEL_RANKS instead of silently ranking as
+        # unknown (rank 0) the way a bare capitalized "Off" would.
+        desc = {"session": {"thinkingOptions": ["Off", "High"]}}
+        self.assertEqual(_session_thinking_ladder(desc), ["off", "high"])
 
     def test_no_ladder_is_None_not_empty(self):
         # None means "unknown, pass the request through"; [] would mean "this
@@ -4439,6 +4457,17 @@ class ThinkingWiringTests(unittest.TestCase):
         self.assertEqual(clamp_to_ladder("high", None), ("high", None))
         self.assertEqual(clamp_to_ladder(None, ["off"]), (None, None))
         self.assertEqual(LEVEL_RANKS["off"], 0)
+
+    def test_clamp_does_not_crash_on_an_unranked_ladder_entry(self):
+        # A ladder entry outside LEVEL_RANKS (e.g. a raw display label that
+        # slipped through, or a future gateway level id this build doesn't
+        # know about yet) must degrade gracefully, not KeyError. The
+        # at_or_below filter already tolerates this via .get(lv, 0); the
+        # subsequent max() pick used to index LEVEL_RANKS[lv] directly and
+        # would crash the whole turn on exactly this input.
+        got, note = clamp_to_ladder("high", ["off", "Unranked"])
+        self.assertEqual(got, "off")
+        self.assertIn("high", note)
 
     def test_the_pipe_artifact_exposes_no_Filter_class(self):
         # Open WebUI introspects an uploaded file for Pipe/Filter/Action

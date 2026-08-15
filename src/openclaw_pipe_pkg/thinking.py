@@ -73,7 +73,7 @@ def clamp_to_ladder(level, ladder):
 
     at_or_below = [lv for lv in ladder if LEVEL_RANKS.get(lv, 0) <= want]
     if at_or_below:
-        best = max(at_or_below, key=lambda lv: LEVEL_RANKS[lv])
+        best = max(at_or_below, key=lambda lv: LEVEL_RANKS.get(lv, 0))
     else:
         best = min(ladder, key=lambda lv: LEVEL_RANKS.get(lv, 0))
     return best, (

@@ -213,21 +213,36 @@ def _session_thinking_ladder(desc: dict) -> list | None:
     model's, which is wrong the moment a session overrides the model. Only
     describe reflects what is actually resolved for this session right now.
 
+    `thinkingLevels` is authoritative: the gateway defines it as the raw
+    `{id, label}` objects (`resolveGatewaySessionThinkingProjectionInternal`
+    -> `thinkingLevels: metadata.levels`), keyed by the canonical lowercase
+    ids (`off`, `minimal`, ...) that LEVEL_RANKS and clamp_to_ladder match
+    against. `thinkingOptions` is display-only -- the SAME gateway function
+    derives it as `metadata.levels.map(level => level.label)`, i.e. human
+    labels ("Off", "Extra High", ...), not ids. Matching a requested level
+    against labels silently breaks clamping (nothing in LEVEL_RANKS looks
+    like a label), so `thinkingOptions` must never be used for the ladder --
+    checking it first, as this used to, let an unsupported level fall
+    through the clamp and reach the gateway's own hard validation error
+    (ELI-85 field mixup, caused a live chat to hard-fail on every turn).
+    Kept only as a last-resort fallback in case a future gateway build ever
+    stops emitting `thinkingLevels` -- an imperfect ladder beats none.
+
     Returns None (not []) when the field is absent, because "no ladder known"
     and "this model supports nothing" have to lead to different behaviour: the
     first passes the request through to the gateway, the second would clamp
     every request away.
     """
     row = (desc or {}).get("session") or {}
-    opts = row.get("thinkingOptions")
-    if isinstance(opts, list) and opts:
-        return [str(x) for x in opts]
     levels = row.get("thinkingLevels")
     if isinstance(levels, list) and levels:
         out = [str(lv.get("id")) for lv in levels
                if isinstance(lv, dict) and lv.get("id")]
         if out:
             return out
+    opts = row.get("thinkingOptions")
+    if isinstance(opts, list) and opts:
+        return [str(x).strip().lower() for x in opts]
     return None
 
 
