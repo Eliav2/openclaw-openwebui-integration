@@ -3584,10 +3584,11 @@ async def _emit_live_bootstrap_reload(user_id: str, chat_id: str, target_message
 # done:false, snapshots + finalize = done:true), exactly like the slice-1 /
 # parity paths already do.
 #
-# NOT flipped on here -- leave False. Before enabling, the terminal
-# `chat:active` event envelope still needs a live-browser confirmation
-# (see `_relay_finalize`); DB persistence guarantees reload-correctness
-# regardless, so an imperfect terminal event only costs a spinner nicety.
+# Flipped ON in 2aada56 after the live-browser confirmation this comment used to
+# be waiting for. The terminal `chat:active` envelope (see `_relay_finalize`) is
+# still the least-verified part of the path, but DB persistence guarantees
+# reload-correctness regardless, so an imperfect terminal event only costs a
+# spinner nicety. Set to False to fall back to slice-1 post-hoc delivery.
 LIVE_STREAM_RELAY_ENABLED = True
 
 # A proactive run is only eligible for relay once its session has had zero
