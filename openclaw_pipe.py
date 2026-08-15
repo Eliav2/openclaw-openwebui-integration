@@ -223,6 +223,86 @@ def _write_json_file(path, data):
         return False
 
 
+# --- thinking --------------------------------------------------------------
+# Shared by BOTH the Thinking filter and the Pipe: the filter offers the levels
+# and the pipe enforces them against the live session ladder, so the ranks and
+# the clamping rule have to be one implementation, not two that agree today.
+#
+# Deliberately has no imports, no classes, and no module-level names beyond the
+# five below. It is concatenated into the Pipe artifact, where every name in it
+# lands in the same flat namespace as every other fragment: a helper named like
+# one of the pipe's own (a `_state_dir`, say) would silently shadow it
+# depending on fragment order. Filter-only helpers live in `thinking_filter`
+# for exactly that reason.
+
+# ---------------------------------------------------------------------------
+# Levels
+# ---------------------------------------------------------------------------
+
+# Ranks mirror the gateway's own table (off is genuinely a level, not an
+# absence). Used to order the dropdown and to clamp downward, never upward:
+# asking for less thinking than requested is a safe degradation, asking for
+# more is a surprise on someone's bill.
+LEVEL_RANKS = {
+    "off": 0,
+    "minimal": 10,
+    "low": 20,
+    "medium": 30,
+    "adaptive": 30,
+    "high": 40,
+    "xhigh": 60,
+    "max": 70,
+    "ultra": 80,
+}
+
+# The sentinel meaning "do not send the field at all". Distinct from "off",
+# which is an explicit instruction to not think. "default" leaves the agent's
+# own configured level alone; "off" overrides it.
+UNSET = "default"
+
+# Used until the pipe has run once and written a real ladder cache. Every
+# provider observed supports at least these, so nothing here can be a lie.
+FALLBACK_LEVELS = ["off", "minimal", "low", "medium", "high"]
+
+LADDER_CACHE_NAME = "thinking-ladders.json"
+
+
+def clamp_to_ladder(level, ladder):
+    """Fit a requested level to what a model actually supports.
+
+    Returns (resolved_level, note). `note` is None when the request went
+    through untouched, otherwise a short human sentence explaining what
+    changed, which the caller is expected to show rather than swallow.
+
+    Clamping is always downward to the nearest supported rank. If the model
+    supports nothing at or below the request (a ladder of only higher levels,
+    which no observed provider has, but which costs nothing to handle), the
+    lowest supported level is used.
+    """
+    if not level or level == UNSET:
+        return None, None
+    if not ladder:
+        # No ladder known: pass the request through and let the gateway rule on
+        # it. Silently dropping a level the user explicitly picked is worse.
+        return level, None
+    if level in ladder:
+        return level, None
+
+    want = LEVEL_RANKS.get(level)
+    if want is None:
+        return None, f"Unknown thinking level {level!r}, ignoring it."
+
+    at_or_below = [lv for lv in ladder if LEVEL_RANKS.get(lv, 0) <= want]
+    if at_or_below:
+        best = max(at_or_below, key=lambda lv: LEVEL_RANKS[lv])
+    else:
+        best = min(ladder, key=lambda lv: LEVEL_RANKS.get(lv, 0))
+    return best, (
+        f"This model does not support thinking level {level!r}, "
+        f"using {best!r} instead."
+    )
+
+
 # --- media -----------------------------------------------------------------
 
 
@@ -1580,6 +1660,60 @@ def _owui_session_key(agent_id: str, user_id: str, chat_id: str) -> str:
     return f"agent:{agent_id}:openwebui-{user_id}-{chat_id}"
 
 
+def _session_thinking_ladder(desc: dict) -> list | None:
+    """Pull the thinking levels a session's CURRENT model supports out of a
+    `sessions.describe` response.
+
+    `models.list` cannot answer this: it carries a `reasoning` boolean and
+    nothing else. `agents.list` does carry a ladder, but the agent's PRIMARY
+    model's, which is wrong the moment a session overrides the model. Only
+    describe reflects what is actually resolved for this session right now.
+
+    Returns None (not []) when the field is absent, because "no ladder known"
+    and "this model supports nothing" have to lead to different behaviour: the
+    first passes the request through to the gateway, the second would clamp
+    every request away.
+    """
+    row = (desc or {}).get("session") or {}
+    opts = row.get("thinkingOptions")
+    if isinstance(opts, list) and opts:
+        return [str(x) for x in opts]
+    levels = row.get("thinkingLevels")
+    if isinstance(levels, list) and levels:
+        out = [str(lv.get("id")) for lv in levels
+               if isinstance(lv, dict) and lv.get("id")]
+        if out:
+            return out
+    return None
+
+
+def _record_thinking_ladder(levels) -> None:
+    """Fold a ladder we just saw into the cache the Thinking filter reads.
+
+    The cache is a UNION across every model this bridge has seen, because Open
+    WebUI builds a valve dropdown once from the class and cannot vary it per
+    selected model. The per-model narrowing happens at send time instead, where
+    the live ladder is known. The union means the dropdown can offer a level
+    the currently selected model does not support, which is exactly what the
+    clamping note exists to explain.
+
+    Best-effort by design: a failed write costs a slightly stale dropdown and
+    must never affect the message being sent.
+    """
+    known = [lv for lv in (levels or []) if lv in LEVEL_RANKS]
+    if not known:
+        return
+    path = os.path.join(_state_dir(), LADDER_CACHE_NAME)
+    current = _read_json_file(path) or {}
+    have = current.get("levels")
+    have = [x for x in have if x in LEVEL_RANKS] if isinstance(have, list) else []
+    merged = sorted(set(have) | set(known), key=lambda lv: (LEVEL_RANKS[lv], lv))
+    if merged == have:
+        return
+    if _write_json_file(path, {"levels": merged, "updated": int(time.time())}):
+        pipe_log(f"thinking ladder cache updated: {merged}")
+
+
 def _owui_chat_send_params(
     session_key: str,
     message: str,
@@ -1587,6 +1721,7 @@ def _owui_chat_send_params(
     owui_chat_id: str | None,
     owui_user_id: str | None,
     attachments: list | None = None,
+    thinking: str | None = None,
 ) -> dict:
     params = dict(
         sessionKey=session_key,
@@ -1595,6 +1730,11 @@ def _owui_chat_send_params(
     )
     if attachments:
         params["attachments"] = attachments
+    # Only when actually chosen. chat.send reads an absent `thinking` as "use
+    # whatever the agent is configured for", which is a different instruction
+    # from any value we could send, "off" very much included.
+    if thinking:
+        params["thinking"] = thinking
     if owui_chat_id:
         metadata = {
             "chat_id": owui_chat_id,
@@ -4718,6 +4858,19 @@ class Pipe:
         preset = self._selected_preset(body)
         model_override = self._model_override_for_preset(preset)
 
+        # Per-chat thinking level (ELI-85). `reasoning_effort` is the single
+        # source of truth: Open WebUI's own Advanced Params control writes it,
+        # and so does the companion Thinking filter's toggle. Reading the field
+        # rather than a filter-specific one means either control works, and the
+        # bridge keeps working for anyone who never installs the filter.
+        # Absent means absent: no `thinking` is sent and the agent's configured
+        # level applies. Validation against the model's real ladder happens
+        # below, once describe has told us what this session resolves to.
+        requested_thinking = body.get("reasoning_effort") or None
+        if requested_thinking is not None:
+            requested_thinking = str(requested_thinking).strip().lower() or None
+        session_thinking_ladder = None
+
         # --- P15: Short-circuit OWUI background tasks ---
         if __task__ and __task__ in (
             "title_generation",
@@ -4919,12 +5072,24 @@ class Pipe:
             # resume -- ELI-56), so a non-active status is NOT conclusive:
             # confirm against sessions.list's authoritative hasActiveRun before
             # treating the session as free to send into.
+            nonlocal session_thinking_ladder
             try:
                 desc = await conn.send_request(
                     "sessions.describe", dict(key=session_key), timeout=8
                 )
                 row = desc.get("session") or {}
                 status = row.get("status")
+                # Harvest the thinking ladder from the describe we are already
+                # making. It is the only RPC that reports the CURRENTLY
+                # RESOLVED model's levels, and this probe runs before every
+                # send, so the per-model validation below costs no extra round
+                # trip. Piggybacking rather than adding a describe of its own
+                # also means the ladder can never be fresher or staler than the
+                # run state it was read alongside.
+                ladder = _session_thinking_ladder(desc)
+                if ladder:
+                    session_thinking_ladder = ladder
+                    _record_thinking_ladder(ladder)
                 if row.get("activeRunId") or status in _ACTIVE_RUN_STATES:
                     return True
             except Exception as ex:
@@ -4990,6 +5155,17 @@ class Pipe:
             # --- Send this message as its own fresh run (still holding the lock
             #     so the next waiter observes our run before deciding to send) ---
             idempotency_key = f"msg-{chat_id}-{time.time()}"
+            # Fit the requested level to what this session's model actually
+            # supports. The dropdown is a union across models, so a level that
+            # is real for one model can be unavailable here. Clamping is
+            # downward only and always explained: silently answering at a level
+            # other than the one asked for is worse than a short note, and
+            # silently erroring out is worse still.
+            resolved_thinking, thinking_note = clamp_to_ladder(
+                requested_thinking, session_thinking_ladder)
+            if thinking_note:
+                pipe_log(f"thinking: {thinking_note}")
+                yield f"_{thinking_note}_\n\n"
             try:
                 send_resp = await conn.send_request(
                     "chat.send",
@@ -5000,6 +5176,7 @@ class Pipe:
                         owui_chat_id=owui_origin_chat_id,
                         owui_user_id=owui_origin_user_id,
                         attachments=image_attachments,
+                        thinking=resolved_thinking,
                     ),
                     timeout=30
                 )

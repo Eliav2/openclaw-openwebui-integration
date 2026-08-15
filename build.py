@@ -11,14 +11,17 @@ pydantic) are provided by the OWUI runtime and stay as normal imports -- so the
 "bundle" is a deterministic ordered concatenation.
 
 Usage:
-  python3 build.py --all      # build BOTH distributed artifacts. Use this after
+  python3 build.py --all      # build ALL distributed artifacts. Use this after
                               # touching any fragment -- a fragment can feed both.
-  python3 build.py --check-all  # drift guard for BOTH artifacts. This is what CI
+  python3 build.py --check-all  # drift guard for ALL artifacts. This is what CI
                               # runs; exits 1 if either is stale.
 
   python3 build.py            # build -> openclaw_pipe.py only (DEV-ONLY blocks
                               # stripped; this is the artifact real users install)
   python3 build.py --check    # drift guard for openclaw_pipe.py only
+  python3 build.py --filter        # build -> openclaw_thinking_filter.py only, the
+                              # per-chat thinking control (a Filter, not a Pipe)
+  python3 build.py --check-filter  # drift guard for openclaw_thinking_filter.py only
   python3 build.py --action        # build -> openclaw_status_action.py only, the
                               # companion Action Function (see ARTIFACTS below)
   python3 build.py --check-action  # drift guard for openclaw_status_action.py only
@@ -72,7 +75,7 @@ PIPE = Artifact(
     frontmatter=ROOT / "src" / "frontmatter.txt",
     out=ROOT / "openclaw_pipe.py",
     dev_out=ROOT / "openclaw_pipe.dev.py",
-    module_order=("_prelude", "identity", "state", "media", "emit",
+    module_order=("_prelude", "identity", "state", "thinking", "media", "emit",
                   "askuser", "gateway", "models", "pipe"),
 )
 
@@ -87,7 +90,29 @@ ACTION = Artifact(
     frontmatter=ROOT / "src" / "frontmatter-action.txt",
     out=ROOT / "openclaw_status_action.py",
     dev_out=None,
-    module_order=("_prelude", "identity", "state", "gateway", "emit", "action"),
+    module_order=("_prelude", "identity", "state", "thinking", "gateway",
+                  "emit", "action"),
+)
+# "thinking" is here because ACTION takes "gateway", and gateway's ladder cache
+# helper reads LEVEL_RANKS / LADDER_CACHE_NAME from it. Python resolves those at
+# call time, not import time, so omitting the fragment would not fail the build
+# or the import: it would fail the first time the code ran. Any artifact that
+# takes a fragment must take what that fragment names.
+
+# The Thinking filter shares exactly ONE fragment with the Pipe: "thinking",
+# which holds the level ranks and the clamping rule. The filter offers the
+# levels and the pipe enforces them, so those two have to be one implementation.
+# It deliberately does NOT take "_prelude", which pulls in websockets and
+# cryptography: a filter runs on every message, so an import it does not need is
+# an outage it does not need either. "thinking" is therefore stdlib-only and
+# class-free, and "thinking_filter" carries the pydantic surface the Pipe must
+# not expose (a stray top-level Filter class in the Pipe artifact is one more
+# thing for Open WebUI's introspection to trip over).
+FILTER = Artifact(
+    frontmatter=ROOT / "src" / "frontmatter-filter.txt",
+    out=ROOT / "openclaw_thinking_filter.py",
+    dev_out=None,
+    module_order=("thinking", "thinking_filter"),
 )
 
 BANNER = (
@@ -189,23 +214,31 @@ def _check(out_path: Path, built: str, rebuild_flag: str) -> bool:
 def main():
     do_all = "--all" in sys.argv or "--check-all" in sys.argv
     action = "--action" in sys.argv or "--check-action" in sys.argv
+    filt = "--filter" in sys.argv or "--check-filter" in sys.argv
     dev = "--dev" in sys.argv or "--check-dev" in sys.argv
     checking = any(a in sys.argv
-                   for a in ("--check", "--check-dev", "--check-action", "--check-all"))
+                   for a in ("--check", "--check-dev", "--check-action",
+                             "--check-filter", "--check-all"))
 
     if do_all:
-        if dev or action:
-            print("--all/--check-all already covers both distributed artifacts; "
-                  "do not combine it with --action or --dev", file=sys.stderr)
+        if dev or action or filt:
+            print("--all/--check-all already covers every distributed artifact; "
+                  "do not combine it with --action, --filter or --dev", file=sys.stderr)
             sys.exit(2)
-        # Both distributed artifacts. The dev bundle is deliberately excluded:
+        # Every distributed artifact. The dev bundle is deliberately excluded:
         # it is gitignored, so there is no committed copy to drift against.
-        targets = [(PIPE, PIPE.out, ""), (ACTION, ACTION.out, "--action")]
+        targets = [(PIPE, PIPE.out, ""), (ACTION, ACTION.out, "--action"),
+                   (FILTER, FILTER.out, "--filter")]
     elif action:
         if dev:
             print("ACTION has no --dev variant yet", file=sys.stderr)
             sys.exit(2)
         targets = [(ACTION, ACTION.out, "--action")]
+    elif filt:
+        if dev:
+            print("FILTER has no --dev variant yet", file=sys.stderr)
+            sys.exit(2)
+        targets = [(FILTER, FILTER.out, "--filter")]
     elif dev:
         targets = [(PIPE, PIPE.dev_out, "--dev")]
     else:

@@ -1,0 +1,63 @@
+"""
+title: OpenClaw Thinking
+author: Eliav
+author_url: https://github.com/Eliav2
+project_url: https://github.com/Eliav2/openclaw-openwebui-integration
+version: 0.7.0
+license: MIT
+required_open_webui_version: 0.10.2
+description: Per-chat thinking / reasoning-effort control for the OpenClaw Gateway pipe. Adds a toggle to the message input and a level dropdown, and writes the standard reasoning_effort field the pipe reads.
+
+OpenClaw Thinking Filter for Open WebUI
+=======================================
+
+Sets how hard the agent thinks before answering, per chat, from the message
+input row rather than from a settings page.
+
+Why a filter
+------------
+Open WebUI has no extension point for adding a control to the message input
+box itself. A Filter with ``toggle = True`` is the one thing that renders
+there, so the toggle is the entry point and the level lives in the filter's
+per-user valves.
+
+Single source of truth
+----------------------
+The level is written to ``body["reasoning_effort"]``, which is the same field
+Open WebUI's own Advanced Params "Reasoning Effort" control writes. Setting
+either one moves the same value, and this filter shows whatever Advanced
+Params already set. When the toggle is off, the filter does not touch the
+field at all, so Advanced Params keeps working exactly as before.
+
+Nothing is sent when nothing is chosen. "default" means the pipe omits the
+field entirely and the agent's own configured thinking level applies.
+
+Which levels appear
+-------------------
+The dropdown lists only levels that a model on your gateway actually supports.
+The pipe writes the ladders it sees to ``<STATE_DIR>/thinking-ladders.json``
+and this filter reads that file when Open WebUI loads it. Providers differ:
+an Anthropic model may offer ``off, minimal, low, medium, high`` while a
+DeepSeek model also offers ``xhigh`` and ``max``. Until the pipe has run at
+least once, a conservative built-in list is used.
+
+Because Open WebUI builds a valve dropdown once, from the class, the list is
+the union across models rather than per selected model. The pipe does the
+per-model part: it checks the chosen level against the live session ladder and
+clamps down to the nearest supported one, telling you in the chat when it did.
+
+Installation
+------------
+1. In Open WebUI, go to Admin Panel > Functions
+2. Click "+" and choose "Create a function"
+3. Set type to "filter", id to "openclaw_thinking"
+4. Paste the entire contents of this file
+5. Save and turn on "Active"
+6. Leave "Global" OFF unless every model you use is an OpenClaw pipe model.
+   Attach it to the OpenClaw models instead: Workspace > Models > (model) >
+   Filters. A global filter runs on every chat with every model, and this one
+   writes reasoning_effort, which other pipes may interpret differently.
+
+Then open a chat, click the Thinking toggle under the message box, and pick a
+level in Chat Controls > Valves.
+"""

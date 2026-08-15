@@ -204,6 +204,60 @@ def _owui_session_key(agent_id: str, user_id: str, chat_id: str) -> str:
     return f"agent:{agent_id}:openwebui-{user_id}-{chat_id}"
 
 
+def _session_thinking_ladder(desc: dict) -> list | None:
+    """Pull the thinking levels a session's CURRENT model supports out of a
+    `sessions.describe` response.
+
+    `models.list` cannot answer this: it carries a `reasoning` boolean and
+    nothing else. `agents.list` does carry a ladder, but the agent's PRIMARY
+    model's, which is wrong the moment a session overrides the model. Only
+    describe reflects what is actually resolved for this session right now.
+
+    Returns None (not []) when the field is absent, because "no ladder known"
+    and "this model supports nothing" have to lead to different behaviour: the
+    first passes the request through to the gateway, the second would clamp
+    every request away.
+    """
+    row = (desc or {}).get("session") or {}
+    opts = row.get("thinkingOptions")
+    if isinstance(opts, list) and opts:
+        return [str(x) for x in opts]
+    levels = row.get("thinkingLevels")
+    if isinstance(levels, list) and levels:
+        out = [str(lv.get("id")) for lv in levels
+               if isinstance(lv, dict) and lv.get("id")]
+        if out:
+            return out
+    return None
+
+
+def _record_thinking_ladder(levels) -> None:
+    """Fold a ladder we just saw into the cache the Thinking filter reads.
+
+    The cache is a UNION across every model this bridge has seen, because Open
+    WebUI builds a valve dropdown once from the class and cannot vary it per
+    selected model. The per-model narrowing happens at send time instead, where
+    the live ladder is known. The union means the dropdown can offer a level
+    the currently selected model does not support, which is exactly what the
+    clamping note exists to explain.
+
+    Best-effort by design: a failed write costs a slightly stale dropdown and
+    must never affect the message being sent.
+    """
+    known = [lv for lv in (levels or []) if lv in LEVEL_RANKS]
+    if not known:
+        return
+    path = os.path.join(_state_dir(), LADDER_CACHE_NAME)
+    current = _read_json_file(path) or {}
+    have = current.get("levels")
+    have = [x for x in have if x in LEVEL_RANKS] if isinstance(have, list) else []
+    merged = sorted(set(have) | set(known), key=lambda lv: (LEVEL_RANKS[lv], lv))
+    if merged == have:
+        return
+    if _write_json_file(path, {"levels": merged, "updated": int(time.time())}):
+        pipe_log(f"thinking ladder cache updated: {merged}")
+
+
 def _owui_chat_send_params(
     session_key: str,
     message: str,
@@ -211,6 +265,7 @@ def _owui_chat_send_params(
     owui_chat_id: str | None,
     owui_user_id: str | None,
     attachments: list | None = None,
+    thinking: str | None = None,
 ) -> dict:
     params = dict(
         sessionKey=session_key,
@@ -219,6 +274,11 @@ def _owui_chat_send_params(
     )
     if attachments:
         params["attachments"] = attachments
+    # Only when actually chosen. chat.send reads an absent `thinking` as "use
+    # whatever the agent is configured for", which is a different instruction
+    # from any value we could send, "off" very much included.
+    if thinking:
+        params["thinking"] = thinking
     if owui_chat_id:
         metadata = {
             "chat_id": owui_chat_id,

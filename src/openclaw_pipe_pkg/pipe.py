@@ -490,6 +490,19 @@ class Pipe:
         preset = self._selected_preset(body)
         model_override = self._model_override_for_preset(preset)
 
+        # Per-chat thinking level (ELI-85). `reasoning_effort` is the single
+        # source of truth: Open WebUI's own Advanced Params control writes it,
+        # and so does the companion Thinking filter's toggle. Reading the field
+        # rather than a filter-specific one means either control works, and the
+        # bridge keeps working for anyone who never installs the filter.
+        # Absent means absent: no `thinking` is sent and the agent's configured
+        # level applies. Validation against the model's real ladder happens
+        # below, once describe has told us what this session resolves to.
+        requested_thinking = body.get("reasoning_effort") or None
+        if requested_thinking is not None:
+            requested_thinking = str(requested_thinking).strip().lower() or None
+        session_thinking_ladder = None
+
         # --- P15: Short-circuit OWUI background tasks ---
         if __task__ and __task__ in (
             "title_generation",
@@ -691,12 +704,24 @@ class Pipe:
             # resume -- ELI-56), so a non-active status is NOT conclusive:
             # confirm against sessions.list's authoritative hasActiveRun before
             # treating the session as free to send into.
+            nonlocal session_thinking_ladder
             try:
                 desc = await conn.send_request(
                     "sessions.describe", dict(key=session_key), timeout=8
                 )
                 row = desc.get("session") or {}
                 status = row.get("status")
+                # Harvest the thinking ladder from the describe we are already
+                # making. It is the only RPC that reports the CURRENTLY
+                # RESOLVED model's levels, and this probe runs before every
+                # send, so the per-model validation below costs no extra round
+                # trip. Piggybacking rather than adding a describe of its own
+                # also means the ladder can never be fresher or staler than the
+                # run state it was read alongside.
+                ladder = _session_thinking_ladder(desc)
+                if ladder:
+                    session_thinking_ladder = ladder
+                    _record_thinking_ladder(ladder)
                 if row.get("activeRunId") or status in _ACTIVE_RUN_STATES:
                     return True
             except Exception as ex:
@@ -762,6 +787,17 @@ class Pipe:
             # --- Send this message as its own fresh run (still holding the lock
             #     so the next waiter observes our run before deciding to send) ---
             idempotency_key = f"msg-{chat_id}-{time.time()}"
+            # Fit the requested level to what this session's model actually
+            # supports. The dropdown is a union across models, so a level that
+            # is real for one model can be unavailable here. Clamping is
+            # downward only and always explained: silently answering at a level
+            # other than the one asked for is worse than a short note, and
+            # silently erroring out is worse still.
+            resolved_thinking, thinking_note = clamp_to_ladder(
+                requested_thinking, session_thinking_ladder)
+            if thinking_note:
+                pipe_log(f"thinking: {thinking_note}")
+                yield f"_{thinking_note}_\n\n"
             try:
                 send_resp = await conn.send_request(
                     "chat.send",
@@ -772,6 +808,7 @@ class Pipe:
                         owui_chat_id=owui_origin_chat_id,
                         owui_user_id=owui_origin_user_id,
                         attachments=image_attachments,
+                        thinking=resolved_thinking,
                     ),
                     timeout=30
                 )

@@ -152,6 +152,12 @@ from openclaw_pipe import (
     _SHARED_STATE_ATTR,
     _SUBAGENT_TASK_ID_MARKER_RE,
     _suppress_already_shown,
+    _owui_chat_send_params,
+    _session_thinking_ladder,
+    _record_thinking_ladder,
+    clamp_to_ladder,
+    LEVEL_RANKS,
+    LADDER_CACHE_NAME,
     Pipe,
 )
 
@@ -4326,3 +4332,118 @@ class MarkerAfterPreambleTests(unittest.TestCase):
         data = _modal_payload_from_user_input_prompt(pending)[0]["data"]
         self.assertEqual(data["title"], "Pick a theme")
         self.assertEqual(data["options"], ["Dark", "Light", "Auto"])
+
+
+class ThinkingWiringTests(unittest.TestCase):
+    """Pipe half of the per-chat thinking control (ELI-85).
+
+    The filter offers levels; the pipe decides what is actually sendable and
+    tells the gateway. These tests cover that second half, plus the seam
+    between them: the ladder cache the filter reads is written here.
+    """
+
+    SEND_KW = dict(session_key="agent:main:openwebui-u-c", message="hi",
+                   idempotency_key="k", owui_chat_id=None, owui_user_id=None)
+
+    def test_no_thinking_field_when_nothing_was_chosen(self):
+        # Absent is a real instruction: it means "use the agent's configured
+        # level". Sending any value, including "off", would override it.
+        for value in (None, "", False):
+            params = _owui_chat_send_params(thinking=value, **self.SEND_KW)
+            self.assertNotIn("thinking", params, f"thinking={value!r}")
+
+    def test_a_chosen_level_reaches_chat_send(self):
+        params = _owui_chat_send_params(thinking="high", **self.SEND_KW)
+        self.assertEqual(params["thinking"], "high")
+
+    def test_off_is_sent_because_it_is_an_instruction_not_an_absence(self):
+        params = _owui_chat_send_params(thinking="off", **self.SEND_KW)
+        self.assertEqual(params["thinking"], "off")
+
+    def test_ladder_read_from_thinking_options(self):
+        desc = {"session": {"thinkingOptions": ["off", "low", "high"]}}
+        self.assertEqual(_session_thinking_ladder(desc), ["off", "low", "high"])
+
+    def test_ladder_falls_back_to_the_labelled_form(self):
+        desc = {"session": {"thinkingLevels": [
+            {"id": "off", "label": "off"}, {"id": "medium", "label": "medium"}]}}
+        self.assertEqual(_session_thinking_ladder(desc), ["off", "medium"])
+
+    def test_thinking_options_wins_when_both_are_present(self):
+        desc = {"session": {"thinkingOptions": ["off"],
+                            "thinkingLevels": [{"id": "max"}]}}
+        self.assertEqual(_session_thinking_ladder(desc), ["off"])
+
+    def test_no_ladder_is_None_not_empty(self):
+        # None means "unknown, pass the request through"; [] would mean "this
+        # model supports nothing", which would clamp every request away.
+        for desc in ({}, {"session": {}}, {"session": {"thinkingOptions": []}},
+                     {"session": {"thinkingLevels": [{"label": "no id"}]}}, None):
+            self.assertIsNone(_session_thinking_ladder(desc), repr(desc))
+
+    def _cache(self, td):
+        path = os.path.join(td, LADDER_CACHE_NAME)
+        return path, (json.load(open(path)) if os.path.exists(path) else None)
+
+    def test_recording_a_ladder_writes_the_cache_the_filter_reads(self):
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"OPENCLAW_BRIDGE_STATE_DIR": td}):
+                _record_thinking_ladder(["high", "off", "low"])
+            _, data = self._cache(td)
+            # Ordered by rank, because that is the order the dropdown shows.
+            self.assertEqual(data["levels"], ["off", "low", "high"])
+            self.assertIsInstance(data["updated"], int)
+
+    def test_the_cache_is_a_union_across_models(self):
+        # A dropdown built from only the last model seen would flicker between
+        # ladders as the user switches models mid-chat.
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"OPENCLAW_BRIDGE_STATE_DIR": td}):
+                _record_thinking_ladder(["off", "low", "medium", "high"])
+                _record_thinking_ladder(["off", "xhigh", "max"])
+            _, data = self._cache(td)
+            self.assertEqual(data["levels"],
+                             ["off", "low", "medium", "high", "xhigh", "max"])
+
+    def test_unknown_level_ids_never_enter_the_cache(self):
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"OPENCLAW_BRIDGE_STATE_DIR": td}):
+                _record_thinking_ladder(["low", "turbo", "high"])
+            _, data = self._cache(td)
+            self.assertEqual(data["levels"], ["low", "high"])
+
+    def test_nothing_recognisable_leaves_the_cache_untouched(self):
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"OPENCLAW_BRIDGE_STATE_DIR": td}):
+                _record_thinking_ladder([])
+                _record_thinking_ladder(["turbo"])
+                _record_thinking_ladder(None)
+            self.assertFalse(os.path.exists(os.path.join(td, LADDER_CACHE_NAME)))
+
+    def test_a_corrupt_cache_is_rebuilt_rather_than_inherited(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, LADDER_CACHE_NAME)
+            open(path, "w").write("{ not json")
+            with mock.patch.dict(os.environ, {"OPENCLAW_BRIDGE_STATE_DIR": td}):
+                _record_thinking_ladder(["off", "high"])
+            self.assertEqual(json.load(open(path))["levels"], ["off", "high"])
+
+    def test_the_pipe_shares_the_filter_clamping_rule(self):
+        # Same fragment in both artifacts, so this cannot drift. If the pipe
+        # clamped differently from what the dropdown implies, a user would pick
+        # a level and get another with no explanation.
+        got, note = clamp_to_ladder("max", ["off", "minimal", "low", "medium", "high"])
+        self.assertEqual(got, "high")
+        self.assertIn("high", note)
+        self.assertEqual(clamp_to_ladder("medium", ["off", "medium"]), ("medium", None))
+        self.assertEqual(clamp_to_ladder("high", None), ("high", None))
+        self.assertEqual(clamp_to_ladder(None, ["off"]), (None, None))
+        self.assertEqual(LEVEL_RANKS["off"], 0)
+
+    def test_the_pipe_artifact_exposes_no_Filter_class(self):
+        # Open WebUI introspects an uploaded file for Pipe/Filter/Action
+        # classes. The shared fragment is class-free precisely so bundling it
+        # into the pipe cannot make OWUI treat the pipe as a filter too.
+        import openclaw_pipe
+        self.assertFalse(hasattr(openclaw_pipe, "Filter"))
+        self.assertTrue(hasattr(openclaw_pipe, "Pipe"))

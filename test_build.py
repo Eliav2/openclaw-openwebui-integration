@@ -4,6 +4,7 @@
 Run: python3 -m unittest test_build -v
 """
 import ast
+import builtins
 import re
 import subprocess
 import sys
@@ -259,3 +260,86 @@ class StatusActionBuildTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ArtifactNameResolutionTests(unittest.TestCase):
+    """Every artifact must define every module-level name its fragments use.
+
+    An artifact is a concatenation of a chosen subset of fragments, so taking a
+    fragment without taking what that fragment references produces a file that
+    imports fine and raises NameError only when the affected line finally runs.
+    That is the worst possible time to find out, and neither the build nor a
+    smoke import will catch it: this test does the resolving statically.
+
+    Caught in review: adding a ladder-cache helper to `gateway` made the status
+    Action reference LEVEL_RANKS, which lives in `thinking`, which the Action
+    did not bundle.
+    """
+
+    ARTIFACTS = [build_mod.PIPE, build_mod.ACTION, build_mod.FILTER]
+
+    def _undefined_globals(self, path):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        defined = set(dir(builtins)) | {
+            "__name__", "__file__", "__doc__", "__builtins__", "__spec__",
+        }
+        used = {}
+
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                defined.add(node.name)
+            elif isinstance(node, ast.Import):
+                for a in node.names:
+                    defined.add(a.asname or a.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom):
+                for a in node.names:
+                    defined.add(a.asname or a.name)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for t in targets:
+                    for sub in ast.walk(t):
+                        if isinstance(sub, ast.Name):
+                            defined.add(sub.id)
+            elif isinstance(node, (ast.Name,)) and isinstance(node.ctx, ast.Store):
+                defined.add(node.id)
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                defined.add(node.name)
+            elif isinstance(node, (ast.arg,)):
+                defined.add(node.arg)
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                defined.update(node.names)
+            elif isinstance(node, ast.comprehension):
+                for sub in ast.walk(node.target):
+                    if isinstance(sub, ast.Name):
+                        defined.add(sub.id)
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                used.setdefault(node.id, node.lineno)
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    if item.optional_vars is not None:
+                        for sub in ast.walk(item.optional_vars):
+                            if isinstance(sub, ast.Name):
+                                defined.add(sub.id)
+
+        return {n: ln for n, ln in used.items() if n not in defined}
+
+    def test_every_artifact_resolves_its_own_names(self):
+        for artifact in self.ARTIFACTS:
+            with self.subTest(artifact=artifact.out.name):
+                missing = self._undefined_globals(artifact.out)
+                self.assertEqual(
+                    missing, {},
+                    f"{artifact.out.name} uses names no bundled fragment defines "
+                    f"(module_order={artifact.module_order}): {missing}")
+
+    def test_the_check_can_actually_fail(self):
+        # A test that cannot fail is indistinguishable from one that passes for
+        # the right reason, so prove the detector on a file that IS broken.
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
+            fh.write("def f():\n    return SOME_MISSING_CONSTANT\n")
+            broken = Path(fh.name)
+        try:
+            self.assertIn("SOME_MISSING_CONSTANT", self._undefined_globals(broken))
+        finally:
+            broken.unlink()
