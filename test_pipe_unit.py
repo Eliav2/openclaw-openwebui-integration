@@ -154,9 +154,11 @@ from openclaw_pipe import (
     _suppress_already_shown,
     _owui_chat_send_params,
     _session_thinking_ladder,
+    _session_model_key,
     _record_thinking_ladder,
-    _THINKING_UNSUPPORTED_RE,
+    _read_model_thinking_ladder,
     _thinking_rejection_retry_body,
+    parse_thinking_rejection,
     clamp_to_ladder,
     LEVEL_RANKS,
     LADDER_CACHE_NAME,
@@ -4440,6 +4442,64 @@ class ThinkingWiringTests(unittest.TestCase):
                 _record_thinking_ladder(None)
             self.assertFalse(os.path.exists(os.path.join(td, LADDER_CACHE_NAME)))
 
+    def test_a_per_model_ladder_is_exact_while_the_union_stays_wide(self):
+        # Two different consumers of one file. `levels` is the union, because
+        # the dropdown must not flicker as the user switches models mid-chat.
+        # `models[<key>]` is what the SEND path clamps against and has to be
+        # exact -- clamping against the union is precisely what let `high`
+        # reach a model whose only level is `off`.
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"OPENCLAW_BRIDGE_STATE_DIR": td}):
+                _record_thinking_ladder(["off", "low", "high"],
+                                        model_key="anthropic/claude-sonnet-5")
+                _record_thinking_ladder(["off"], model_key="claude-cli/claude-opus-5",
+                                        authoritative=True)
+                self.assertEqual(
+                    _read_model_thinking_ladder("claude-cli/claude-opus-5"), ["off"])
+                self.assertEqual(
+                    _read_model_thinking_ladder("anthropic/claude-sonnet-5"),
+                    ["off", "low", "high"])
+                # A model we have never seen is unknown, not unsupported.
+                self.assertIsNone(_read_model_thinking_ladder("openai/gpt-9"))
+                self.assertIsNone(_read_model_thinking_ladder(None))
+            _, data = self._cache(td)
+            self.assertEqual(data["levels"], ["off", "low", "high"])
+
+    def test_describe_never_overwrites_what_the_gateway_stated(self):
+        # `sessions.describe` resolves thinkingLevels with no model catalog in
+        # scope, so it reports the generic 8-level profile for a model whose
+        # real ladder is ["off"]. The rejection is the Gateway ruling on its
+        # own send path. A later weak observation must not undo it, or the
+        # misfire comes back once per turn forever.
+        with tempfile.TemporaryDirectory() as td:
+            key = "claude-cli/claude-opus-5"
+            with mock.patch.dict(os.environ, {"OPENCLAW_BRIDGE_STATE_DIR": td}):
+                _record_thinking_ladder(["off"], model_key=key, authoritative=True)
+                _record_thinking_ladder(["off", "low", "medium", "high"],
+                                        model_key=key)
+                self.assertEqual(_read_model_thinking_ladder(key), ["off"])
+                # A later authoritative statement DOES replace it: the model's
+                # own ladder can legitimately change under it (a gateway
+                # upgrade, a re-pinned runtime), and the Gateway is the only
+                # source allowed to say so.
+                _record_thinking_ladder(["off", "low"], model_key=key,
+                                        authoritative=True)
+                self.assertEqual(_read_model_thinking_ladder(key), ["off", "low"])
+            _, data = self._cache(td)
+            self.assertEqual(data["models"][key]["source"], "gateway")
+
+    def test_model_key_is_formatted_the_way_the_gateway_names_it(self):
+        # The cache key has to match the model ref parsed out of the rejection
+        # verbatim, or a ladder learned from a rejection is filed under a name
+        # the clamp never looks up.
+        self.assertEqual(
+            _session_model_key({"modelProvider": "claude-cli",
+                                "model": "claude-opus-5"}),
+            "claude-cli/claude-opus-5")
+        for row in ({"model": "claude-opus-5"}, {"modelProvider": "claude-cli"},
+                    {"modelProvider": "", "model": " "}, {}, None):
+            self.assertIsNone(_session_model_key(row), repr(row))
+
     def test_a_corrupt_cache_is_rebuilt_rather_than_inherited(self):
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, LADDER_CACHE_NAME)
@@ -4481,12 +4541,17 @@ class ThinkingWiringTests(unittest.TestCase):
 
 
 class ThinkingRejectionRetryTests(unittest.TestCase):
-    """A session with no `sessions.describe` row yet (its first-ever message)
-    cannot report a thinking ladder, so an explicitly requested level a model
-    can't honour goes through to the Gateway raw, which hard-rejects the
-    turn -- and because it rejects the turn, the describe row still never
-    exists, so every retry to that chat hits the identical rejection forever
-    (ELI-85 live break, found via the sim-user harness).
+    """An explicitly requested level a model can't honour reaches the Gateway,
+    which hard-rejects the turn (ELI-85 live break, found via the sim-user
+    harness). Two distinct ways that happens, and the retry has to cover both:
+
+    * the session has no `sessions.describe` row yet (its first-ever message),
+      so there is no ladder to clamp against; and because the turn is
+      rejected, the row still never appears -- every later message repeats it.
+    * the row exists and its ladder is WRONG. Describe resolves
+      `thinkingLevels` with no model catalog in scope, so it hands back the
+      generic 8-level base profile for a model whose real ladder is `["off"]`.
+      Clamping against that passes `high` straight through.
 
     The Gateway never streams this rejection as a normal event (the run
     delivers a single contentless `final`), so an earlier attempt at this fix
@@ -4500,18 +4565,26 @@ class ThinkingRejectionRetryTests(unittest.TestCase):
         'claude-opus-5. Use one of: off.'
     )
 
-    def test_regex_matches_the_real_gateway_wording(self):
-        self.assertRegex(self.REJECTION_TEXT, _THINKING_UNSUPPORTED_RE)
+    def test_the_parser_matches_the_real_gateway_wording(self):
+        # Detection and learning are the same call on purpose: whatever the
+        # retry fires on is exactly what the ladder is learned from, so the
+        # two can never disagree about what a rejection is.
+        got = parse_thinking_rejection(self.REJECTION_TEXT)
+        self.assertEqual(got, {"level": "high",
+                               "model": "claude-cli/claude-opus-5",
+                               "levels": ["off"]})
 
-    def test_regex_does_not_misfire_on_ordinary_text_about_thinking(self):
+    def test_the_parser_does_not_misfire_on_ordinary_text_about_thinking(self):
         # Narrow on purpose: must never catch genuine assistant output that
         # happens to discuss thinking levels in passing.
         for text in (
             "Let me think about supported levels here.",
             "high is not supported in this context, unrelated to models.",
+            'Thinking level "high" is not supported for some models. Use one of: off.',
+            None,
             "",
         ):
-            self.assertNotRegex(text, _THINKING_UNSUPPORTED_RE)
+            self.assertIsNone(parse_thinking_rejection(text), repr(text))
 
     def test_retry_body_built_when_recovered_text_is_the_rejection(self):
         body = {"reasoning_effort": "high", "messages": ["hi"]}

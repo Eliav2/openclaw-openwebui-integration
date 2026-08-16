@@ -255,6 +255,77 @@ FALLBACK_LEVELS = ["off", "minimal", "low", "medium", "high"]
 
 LADDER_CACHE_NAME = "thinking-ladders.json"
 
+# The Gateway's rejection lists LABELS, not ids, and for most profiles the two
+# are identical (`label: id`). The one divergence is the binary profile, which
+# labels `low` as "on". Mapping it back is the difference between learning a
+# model's real two-level ladder and learning a one-level lie.
+LEVEL_LABEL_ALIASES = {"on": "low"}
+
+# The exact anchors of the Gateway's hard validation error, e.g.:
+#   Thinking level "high" is not supported for claude-cli/claude-opus-5. Use one of: off.
+# All three must be present and in order. That is deliberately at least as
+# narrow as matching the whole sentence: it can never fire on genuine assistant
+# text that happens to discuss thinking levels.
+_REJECT_HEAD = 'Thinking level "'
+_REJECT_MID = '" is not supported for '
+_REJECT_TAIL = ". Use one of: "
+
+
+def parse_thinking_rejection(text):
+    """Read the Gateway's own rejection as an authoritative per-model ladder.
+
+    This exists because `sessions.describe` cannot be trusted for this. Describe
+    builds its ladder with no model catalog in scope, so `resolveThinkingProfile`
+    never sees the catalog's `reasoning: false` and falls through to the generic
+    base profile -- it reported all 8 levels for `claude-cli/claude-opus-5`,
+    whose real ladder is `["off"]`. The send path resolves the same question
+    WITH the catalog and rejects. So the rejection is the only place the truth
+    is stated, and throwing it away is what made this misfire once per turn
+    forever instead of once per model.
+
+    Returns None when `text` is not that rejection. Otherwise a dict:
+    `{"level": requested, "model": "provider/model", "levels": [ids]}`.
+    `levels` may be empty if every listed label is unrecognised -- the caller
+    still learns which model rejected which level, so it must check for None
+    rather than for falsiness.
+
+    Pure string parsing on purpose: this fragment is shared with the Thinking
+    filter, which imports nothing (not even `re`) so that a filter running on
+    every message can never fail on an import it did not need.
+    """
+    if not text:
+        return None
+    head = text.find(_REJECT_HEAD)
+    if head < 0:
+        return None
+    level_start = head + len(_REJECT_HEAD)
+    mid = text.find(_REJECT_MID, level_start)
+    if mid < 0:
+        return None
+    tail = text.find(_REJECT_TAIL, mid)
+    if tail < 0:
+        return None
+
+    level = text[level_start:mid].strip().lower()
+    model = text[mid + len(_REJECT_MID):tail].strip()
+    if not level or not model or " " in model:
+        # A model ref never contains a space. Anything that does means the
+        # anchors matched something that merely reads like the rejection.
+        return None
+
+    listed = text[tail + len(_REJECT_TAIL):]
+    stop = listed.find(".")
+    if stop >= 0:
+        listed = listed[:stop]
+    levels = []
+    for token in listed.split(","):
+        name = token.strip().lower()
+        name = LEVEL_LABEL_ALIASES.get(name, name)
+        if name in LEVEL_RANKS and name not in levels:
+            levels.append(name)
+    levels.sort(key=lambda lv: LEVEL_RANKS[lv])
+    return {"level": level, "model": model, "levels": levels}
+
 
 def clamp_to_ladder(level, ladder):
     """Fit a requested level to what a model actually supports.
@@ -536,31 +607,112 @@ def _session_thinking_ladder(desc: dict) -> list | None:
     return None
 
 
-def _record_thinking_ladder(levels) -> None:
-    """Fold a ladder we just saw into the cache the Thinking filter reads.
+def _session_model_key(row) -> str | None:
+    """`provider/model` for a `sessions.describe` row, or None.
 
-    The cache is a UNION across every model this bridge has seen, because Open
-    WebUI builds a valve dropdown once from the class and cannot vary it per
-    selected model. The per-model narrowing happens at send time instead, where
-    the live ladder is known. The union means the dropdown can offer a level
-    the currently selected model does not support, which is exactly what the
-    clamping note exists to explain.
+    Formatted to match the Gateway's own rejection text verbatim
+    ("...is not supported for claude-cli/claude-opus-5.") so a ladder learned
+    from a rejection and one observed from describe key the same entry.
+    """
+    row = row or {}
+    provider = str(row.get("modelProvider") or "").strip()
+    model = str(row.get("model") or "").strip()
+    if not provider or not model:
+        return None
+    return f"{provider}/{model}"
 
-    Best-effort by design: a failed write costs a slightly stale dropdown and
-    must never affect the message being sent.
+
+def _ladder_cache_path() -> str:
+    return os.path.join(_state_dir(), LADDER_CACHE_NAME)
+
+
+def _record_thinking_ladder(levels, model_key=None, authoritative=False) -> None:
+    """Fold a ladder we just saw into the cache, both as a union and per model.
+
+    Two different consumers, two different needs, one file:
+
+    * `levels` (union across every model seen) is what the Thinking filter
+      offers, because Open WebUI builds a valve dropdown once from the class
+      and cannot vary it per selected model.
+    * `models[<provider/model>]` is what the SEND path clamps against, and it
+      must be exact. Clamping against the union is what let `high` reach a
+      model whose only level is `off`.
+
+    `authoritative` marks a ladder the Gateway stated itself by rejecting a
+    send. A merely observed one (from `sessions.describe`) must never overwrite
+    it: describe resolves the ladder with no model catalog in scope and so
+    reports the generic base profile for catalog-gated models. Trusting the
+    weaker source second would undo the fix on the very next turn.
+
+    Best-effort by design: a failed write costs a stale dropdown and one more
+    rejected turn, and must never affect the message being sent.
     """
     known = [lv for lv in (levels or []) if lv in LEVEL_RANKS]
-    if not known:
-        return
-    path = os.path.join(_state_dir(), LADDER_CACHE_NAME)
+    path = _ladder_cache_path()
     current = _read_json_file(path) or {}
+
     have = current.get("levels")
     have = [x for x in have if x in LEVEL_RANKS] if isinstance(have, list) else []
     merged = sorted(set(have) | set(known), key=lambda lv: (LEVEL_RANKS[lv], lv))
-    if merged == have:
+
+    models = current.get("models")
+    models = dict(models) if isinstance(models, dict) else {}
+    model_changed = False
+    if model_key:
+        prior = models.get(model_key)
+        prior = prior if isinstance(prior, dict) else {}
+        if prior.get("source") == "gateway" and not authoritative:
+            # Keep the stated truth; a describe-sourced ladder is not evidence
+            # against it.
+            pass
+        else:
+            entry = {
+                "levels": known,
+                "source": "gateway" if authoritative else "describe",
+                "updated": int(time.time()),
+            }
+            if (prior.get("levels") != entry["levels"]
+                    or prior.get("source") != entry["source"]):
+                models[model_key] = entry
+                model_changed = True
+
+    if merged == have and not model_changed:
         return
-    if _write_json_file(path, {"levels": merged, "updated": int(time.time())}):
+    payload = {"levels": merged, "updated": int(time.time())}
+    if models:
+        payload["models"] = models
+    if not _write_json_file(path, payload):
+        return
+    if merged != have:
         pipe_log(f"thinking ladder cache updated: {merged}")
+    if model_changed:
+        pipe_log(
+            f"thinking ladder for {model_key}: {known} "
+            f"({'stated by gateway' if authoritative else 'observed'})"
+        )
+
+
+def _read_model_thinking_ladder(model_key):
+    """The exact ladder for one model, or None if we have not learned it.
+
+    None and [] mean different things here and the caller relies on it: None is
+    "unknown, pass the request through", [] would be "supports nothing", which
+    no model is. Entries that somehow persisted empty are treated as unknown.
+    """
+    if not model_key:
+        return None
+    cache = _read_json_file(_ladder_cache_path()) or {}
+    models = cache.get("models")
+    if not isinstance(models, dict):
+        return None
+    entry = models.get(model_key)
+    if not isinstance(entry, dict):
+        return None
+    levels = entry.get("levels")
+    if not isinstance(levels, list):
+        return None
+    known = [lv for lv in levels if lv in LEVEL_RANKS]
+    return known or None
 
 
 def _owui_chat_send_params(

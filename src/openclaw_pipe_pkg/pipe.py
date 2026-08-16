@@ -30,30 +30,20 @@ def _session_active_from_signals(describe_status, list_has_active_run) -> bool:
     return bool(list_has_active_run)
 
 
-# Matches the Gateway's own hard validation error, e.g.:
-#   Thinking level "high" is not supported for claude-cli/claude-opus-5. Use one of: off.
-# Deliberately narrow (exact wording, not just "thinking" + "not supported")
-# so this can never misfire on genuine assistant text that happens to discuss
-# thinking levels.
-_THINKING_UNSUPPORTED_RE = re.compile(
-    r'Thinking level "[^"]+" is not supported for \S+\. Use one of:'
-)
-
-
 def _thinking_rejection_retry_body(body, recovered, resolved_thinking):
     """Decide whether a textless ("PHANTOM") turn's preview-recovered text is
     the Gateway's permanent-brick thinking-level rejection, and build the
     retry body if so (ELI-85 follow-up).
 
-    A session with no `sessions.describe` row yet (its first-ever message)
-    can't report a thinking ladder, so `clamp_to_ladder` correctly passes an
-    explicitly requested level straight through -- and if the target model
-    can't honour it, the Gateway hard-rejects the turn. That rejection never
-    streams as a normal event (the run delivers a single contentless
-    `final`), so it only surfaces via preview recovery at the caller's final
-    fallback. And because the Gateway rejected the turn, the describe row
-    still won't exist afterward, so every retry to that chat would hit the
-    identical rejection forever unless the override is dropped.
+    `clamp_to_ladder` passes a requested level straight through whenever the
+    model's real ladder is unknown -- and if the target model can't honour it,
+    the Gateway hard-rejects the turn. That rejection never streams as a normal
+    event (the run delivers a single contentless `final`), so it only surfaces
+    via preview recovery at the caller's final fallback.
+
+    Detection is `parse_thinking_rejection`, the same parser that extracts the
+    ladder, so the thing that decides to retry and the thing that learns from
+    the retry can never disagree about what a rejection is.
 
     Returns None when `recovered` isn't that rejection (nothing to retry).
     Otherwise returns a fresh dict body with `reasoning_effort` stripped, so
@@ -64,7 +54,7 @@ def _thinking_rejection_retry_body(body, recovered, resolved_thinking):
     """
     if not recovered or resolved_thinking is None:
         return None
-    if not _THINKING_UNSUPPORTED_RE.search(recovered):
+    if parse_thinking_rejection(recovered) is None:
         return None
     retry_body = dict(body)
     retry_body.pop("reasoning_effort", None)
@@ -543,6 +533,7 @@ class Pipe:
         if requested_thinking is not None:
             requested_thinking = str(requested_thinking).strip().lower() or None
         session_thinking_ladder = None
+        session_model_key = None
 
         # --- P15: Short-circuit OWUI background tasks ---
         if __task__ and __task__ in (
@@ -745,7 +736,7 @@ class Pipe:
             # resume -- ELI-56), so a non-active status is NOT conclusive:
             # confirm against sessions.list's authoritative hasActiveRun before
             # treating the session as free to send into.
-            nonlocal session_thinking_ladder
+            nonlocal session_thinking_ladder, session_model_key
             try:
                 desc = await conn.send_request(
                     "sessions.describe", dict(key=session_key), timeout=8
@@ -753,16 +744,24 @@ class Pipe:
                 row = desc.get("session") or {}
                 status = row.get("status")
                 # Harvest the thinking ladder from the describe we are already
-                # making. It is the only RPC that reports the CURRENTLY
-                # RESOLVED model's levels, and this probe runs before every
-                # send, so the per-model validation below costs no extra round
-                # trip. Piggybacking rather than adding a describe of its own
-                # also means the ladder can never be fresher or staler than the
-                # run state it was read alongside.
+                # making. This probe runs before every send, so the per-model
+                # validation below costs no extra round trip, and piggybacking
+                # rather than adding a describe of its own means the ladder can
+                # never be fresher or staler than the run state it was read
+                # alongside.
+                #
+                # Describe is a WEAK source and is treated as one. It resolves
+                # the ladder with no model catalog in scope, so for a
+                # catalog-gated model it reports the generic base profile
+                # rather than the truth -- live, it advertised all 8 levels for
+                # claude-cli/claude-opus-5, whose real ladder is ["off"]. Good
+                # enough to seed the dropdown; not good enough to clamp a send
+                # against once the Gateway itself has ruled.
+                session_model_key = _session_model_key(row)
                 ladder = _session_thinking_ladder(desc)
                 if ladder:
                     session_thinking_ladder = ladder
-                    _record_thinking_ladder(ladder)
+                    _record_thinking_ladder(ladder, model_key=session_model_key)
                 if row.get("activeRunId") or status in _ACTIVE_RUN_STATES:
                     return True
             except Exception as ex:
@@ -834,8 +833,16 @@ class Pipe:
             # downward only and always explained: silently answering at a level
             # other than the one asked for is worse than a short note, and
             # silently erroring out is worse still.
+            #
+            # A ladder the Gateway STATED (by rejecting a send) beats the one
+            # describe reported, because describe answers this question without
+            # a model catalog and overreports for catalog-gated models. This is
+            # what makes the rejection cost one turn per model instead of one
+            # turn every turn.
+            effective_ladder = (_read_model_thinking_ladder(session_model_key)
+                                or session_thinking_ladder)
             resolved_thinking, thinking_note = clamp_to_ladder(
-                requested_thinking, session_thinking_ladder)
+                requested_thinking, effective_ladder)
             if thinking_note:
                 pipe_log(f"thinking: {thinking_note}")
                 yield f"_{thinking_note}_\n\n"
@@ -1753,17 +1760,40 @@ class Pipe:
             retry_body = _thinking_rejection_retry_body(
                 body, recovered, resolved_thinking)
             if retry_body is not None:
+                # Learn from the rejection before retrying. The Gateway just
+                # named this model's real ladder, and it is the only place that
+                # truth is stated -- describe cannot supply it. Recording it
+                # here is what stops the next turn repeating this round trip.
+                rejection = parse_thinking_rejection(recovered)
+                learned = None
+                if rejection:
+                    learned = rejection["levels"]
+                    _record_thinking_ladder(
+                        learned,
+                        model_key=rejection["model"] or session_model_key,
+                        authoritative=True,
+                    )
                 pipe_log(
                     f"thinking: Gateway rejected level {resolved_thinking!r} "
-                    f"on a session with no known ladder yet ({recovered!r}); "
-                    "retrying once without an explicit level"
+                    f"({recovered!r}); retrying once without an explicit level"
                 )
-                retry_note = (
-                    f"_This model does not support thinking level "
-                    f"{resolved_thinking!r}, and this chat hadn't talked to "
-                    f"it before to know that in advance; sending without it "
-                    f"instead._\n\n"
-                )
+                # Say only what was actually observed. The previous wording
+                # asserted a cause it never checked ("this chat hadn't talked
+                # to it before"), which was false on every turn after the
+                # first and sent anyone reading it hunting the wrong bug.
+                if learned:
+                    supported = ", ".join(repr(lv) for lv in learned)
+                    retry_note = (
+                        f"_This model only supports thinking level "
+                        f"{supported}, so {resolved_thinking!r} was dropped "
+                        f"for this message. Remembered for next time._\n\n"
+                    )
+                else:
+                    retry_note = (
+                        f"_This model does not support thinking level "
+                        f"{resolved_thinking!r}; sending without it instead._"
+                        f"\n\n"
+                    )
                 record_visible_chunk(retry_note)
                 yield retry_note
                 async for item in self._pipe_impl(

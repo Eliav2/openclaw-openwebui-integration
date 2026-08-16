@@ -155,6 +155,62 @@ check("clamping never goes up",
       c("minimal", ["off", "minimal", "low", "medium", "high"])[0], "minimal")
 
 
+print("\nreading the Gateway's rejection as a ladder")
+# The parser lives in the shared fragment, so the filter artifact carries it
+# too. Asserting it here proves the fragment stays import-free: the filter
+# imports nothing beyond pydantic, and a stray `import re` in a helper the
+# filter never calls would still break every message it touches.
+p = mod.parse_thinking_rejection
+check("the real wording yields level, model and ladder",
+      p('Thinking level "high" is not supported for claude-cli/claude-opus-5.'
+        ' Use one of: off.'),
+      {"level": "high", "model": "claude-cli/claude-opus-5", "levels": ["off"]})
+
+# The binary profile labels `low` as "on" (buildBinaryThinkingProfile). Taking
+# the label at face value would learn a one-level ladder for a two-level model
+# and clamp every request to `off`.
+check("the binary profile's 'on' label maps back to its id",
+      p('Thinking level "max" is not supported for anthropic/claude-sonnet-5.'
+        ' Use one of: off, on.')["levels"],
+      ["off", "low"])
+
+check("a listed ladder comes back ordered by rank, not as written",
+      p('Thinking level "ultra" is not supported for x/y.'
+        ' Use one of: high, off, medium.')["levels"],
+      ["off", "medium", "high"])
+check("labels are matched case-insensitively",
+      p('Thinking level "max" is not supported for x/y. Use one of: Off, High.')["levels"],
+      ["off", "high"])
+check("prose after the sentence is not swallowed into the ladder",
+      p('Thinking level "max" is not supported for x/y. Use one of: off, low.'
+        ' Pick another level and try again.')["levels"],
+      ["off", "low"])
+check("a duplicate label is listed once",
+      p('Thinking level "max" is not supported for x/y. Use one of: off, off.')["levels"],
+      ["off"])
+
+# Empty levels and "not a rejection" are different answers: the caller still
+# learns WHICH model rejected WHICH level, so it must test for None, not for
+# falsiness. Returning None here would silently skip the retry.
+parsed = p('Thinking level "max" is not supported for x/y. Use one of: turbo.')
+check("an all-unknown ladder is still a rejection", parsed is not None, True)
+check("with an empty ladder rather than a guess", parsed["levels"], [])
+
+for text in (
+    "Let me think about supported levels here.",
+    "high is not supported in this context, unrelated to models.",
+    # The anchors are there but the "model" is prose: a model ref never
+    # contains a space, and that check is what keeps this from firing on
+    # assistant output that quotes the error while discussing it.
+    'Thinking level "high" is not supported for some models. Use one of: off.',
+    'Thinking level "high" is not supported for x/y.',   # no ladder clause
+    'is not supported for x/y. Use one of: off.',        # no head
+    '',
+    None,
+):
+    check(f"not a rejection: {str(text)[:44]!r}", p(text), None)
+
+
 print("\ninlet writes the shared field")
 
 

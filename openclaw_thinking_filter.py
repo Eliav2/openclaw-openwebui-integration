@@ -111,6 +111,77 @@ FALLBACK_LEVELS = ["off", "minimal", "low", "medium", "high"]
 
 LADDER_CACHE_NAME = "thinking-ladders.json"
 
+# The Gateway's rejection lists LABELS, not ids, and for most profiles the two
+# are identical (`label: id`). The one divergence is the binary profile, which
+# labels `low` as "on". Mapping it back is the difference between learning a
+# model's real two-level ladder and learning a one-level lie.
+LEVEL_LABEL_ALIASES = {"on": "low"}
+
+# The exact anchors of the Gateway's hard validation error, e.g.:
+#   Thinking level "high" is not supported for claude-cli/claude-opus-5. Use one of: off.
+# All three must be present and in order. That is deliberately at least as
+# narrow as matching the whole sentence: it can never fire on genuine assistant
+# text that happens to discuss thinking levels.
+_REJECT_HEAD = 'Thinking level "'
+_REJECT_MID = '" is not supported for '
+_REJECT_TAIL = ". Use one of: "
+
+
+def parse_thinking_rejection(text):
+    """Read the Gateway's own rejection as an authoritative per-model ladder.
+
+    This exists because `sessions.describe` cannot be trusted for this. Describe
+    builds its ladder with no model catalog in scope, so `resolveThinkingProfile`
+    never sees the catalog's `reasoning: false` and falls through to the generic
+    base profile -- it reported all 8 levels for `claude-cli/claude-opus-5`,
+    whose real ladder is `["off"]`. The send path resolves the same question
+    WITH the catalog and rejects. So the rejection is the only place the truth
+    is stated, and throwing it away is what made this misfire once per turn
+    forever instead of once per model.
+
+    Returns None when `text` is not that rejection. Otherwise a dict:
+    `{"level": requested, "model": "provider/model", "levels": [ids]}`.
+    `levels` may be empty if every listed label is unrecognised -- the caller
+    still learns which model rejected which level, so it must check for None
+    rather than for falsiness.
+
+    Pure string parsing on purpose: this fragment is shared with the Thinking
+    filter, which imports nothing (not even `re`) so that a filter running on
+    every message can never fail on an import it did not need.
+    """
+    if not text:
+        return None
+    head = text.find(_REJECT_HEAD)
+    if head < 0:
+        return None
+    level_start = head + len(_REJECT_HEAD)
+    mid = text.find(_REJECT_MID, level_start)
+    if mid < 0:
+        return None
+    tail = text.find(_REJECT_TAIL, mid)
+    if tail < 0:
+        return None
+
+    level = text[level_start:mid].strip().lower()
+    model = text[mid + len(_REJECT_MID):tail].strip()
+    if not level or not model or " " in model:
+        # A model ref never contains a space. Anything that does means the
+        # anchors matched something that merely reads like the rejection.
+        return None
+
+    listed = text[tail + len(_REJECT_TAIL):]
+    stop = listed.find(".")
+    if stop >= 0:
+        listed = listed[:stop]
+    levels = []
+    for token in listed.split(","):
+        name = token.strip().lower()
+        name = LEVEL_LABEL_ALIASES.get(name, name)
+        if name in LEVEL_RANKS and name not in levels:
+            levels.append(name)
+    levels.sort(key=lambda lv: LEVEL_RANKS[lv])
+    return {"level": level, "model": model, "levels": levels}
+
 
 def clamp_to_ladder(level, ladder):
     """Fit a requested level to what a model actually supports.
