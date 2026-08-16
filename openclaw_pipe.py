@@ -2451,6 +2451,11 @@ class _GatewayConnection:
         self._model_patch_cache: dict[str, tuple[str | None, float]] = {}
         self._model_patch_locks: dict[str, asyncio.Lock] = {}
 
+        # Last thinking-clamp note shown per session, so a standing mismatch
+        # between the picked level and the model's ladder is explained ONCE
+        # instead of prefixing every single answer with the same italic line.
+        self._thinking_note_shown: dict[str, str] = {}
+
         # Reconnect state
         self._reconnect_attempt = 0
         self._max_backoff = 30  # seconds
@@ -2673,6 +2678,27 @@ class _GatewayConnection:
     def record_model_patched(self, session_key: str, model: str | None) -> None:
         """Record a successful sessions.patch for the cache (ELI-59)."""
         self._model_patch_cache[session_key] = (model, time.time())
+
+    def should_announce_thinking_note(self, session_key: str, note: str) -> bool:
+        """True the first time a given clamp note applies to a session.
+
+        The level is picked in a filter dropdown and then stays picked, so a
+        model that cannot honour it produces the identical note on every
+        message. Told once it is useful; repeated above every answer it is
+        noise the user has no way to dismiss, which is what it became in
+        practice. Any CHANGE (different level, different model, a ladder
+        learned from a rejection) is a new note and speaks up again.
+
+        Per connection rather than persisted on purpose: after a redeploy or a
+        reconnect the reminder is worth one repeat, and this must never be a
+        file whose staleness could silence a genuinely new mismatch.
+        """
+        if not note:
+            return False
+        if self._thinking_note_shown.get(session_key) == note:
+            return False
+        self._thinking_note_shown[session_key] = note
+        return True
 
     def invalidate_model_patch(self, session_key: str) -> None:
         """Drop the cached model for a session (ELI-59) -- called on patch
@@ -5381,7 +5407,11 @@ class Pipe:
                 requested_thinking, effective_ladder)
             if thinking_note:
                 pipe_log(f"thinking: {thinking_note}")
-                yield f"_{thinking_note}_\n\n"
+                # Logged every time, shown once: the dropdown keeps the level
+                # selected, so an unchanged mismatch would otherwise stamp the
+                # same italic line above every answer in the chat.
+                if conn.should_announce_thinking_note(session_key, thinking_note):
+                    yield f"_{thinking_note}_\n\n"
             try:
                 send_resp = await conn.send_request(
                     "chat.send",

@@ -845,7 +845,11 @@ class Pipe:
                 requested_thinking, effective_ladder)
             if thinking_note:
                 pipe_log(f"thinking: {thinking_note}")
-                yield f"_{thinking_note}_\n\n"
+                # Logged every time, shown once: the dropdown keeps the level
+                # selected, so an unchanged mismatch would otherwise stamp the
+                # same italic line above every answer in the chat.
+                if conn.should_announce_thinking_note(session_key, thinking_note):
+                    yield f"_{thinking_note}_\n\n"
             try:
                 send_resp = await conn.send_request(
                     "chat.send",

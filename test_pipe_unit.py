@@ -973,6 +973,48 @@ class SubagentToolEventRoutingTests(unittest.TestCase):
                              f"{attr} is unreachable by design -- see class docstring")
 
 
+class ThinkingNoteAnnouncementTests(unittest.TestCase):
+    """The clamp note is per-message information about a standing setting.
+
+    The level is chosen in a filter dropdown and stays chosen, so a model that
+    cannot honour it produces the same sentence on every single message. That
+    is what the user actually saw: an italic line above every answer, with no
+    way to dismiss it.
+    """
+
+    NOTE = "This model does not support thinking level 'high', using 'off' instead."
+
+    def test_the_same_note_is_shown_once_per_session(self):
+        conn = _GatewayConnection(lambda: None)
+        self.assertTrue(conn.should_announce_thinking_note("s", self.NOTE))
+        for _ in range(3):
+            self.assertFalse(conn.should_announce_thinking_note("s", self.NOTE))
+
+    def test_a_changed_note_speaks_up_again(self):
+        # A different level, a different model, or a ladder just learned from
+        # a rejection all change the sentence -- and all are news.
+        conn = _GatewayConnection(lambda: None)
+        conn.should_announce_thinking_note("s", self.NOTE)
+        self.assertTrue(conn.should_announce_thinking_note(
+            "s", "This model does not support thinking level 'max', using 'low' instead."))
+
+    def test_sessions_do_not_silence_each_other(self):
+        conn = _GatewayConnection(lambda: None)
+        conn.should_announce_thinking_note("chat-a", self.NOTE)
+        self.assertTrue(conn.should_announce_thinking_note("chat-b", self.NOTE))
+
+    def test_an_empty_note_is_never_announced(self):
+        self.assertFalse(
+            _GatewayConnection(lambda: None).should_announce_thinking_note("s", ""))
+
+    def test_the_pipe_gates_the_yield_on_it(self):
+        # The note is still logged unconditionally: suppressing it in the chat
+        # must not make a clamp invisible when diagnosing one from the logs.
+        source = inspect.getsource(Pipe._pipe_impl)
+        self.assertIn("should_announce_thinking_note(session_key, thinking_note)", source)
+        self.assertIn('pipe_log(f"thinking: {thinking_note}")', source)
+
+
 class EventConsumerMatchingTests(unittest.TestCase):
     def test_matches_exact_session_and_run(self):
         conn = _GatewayConnection(lambda: None)
