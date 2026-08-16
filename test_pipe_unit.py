@@ -155,6 +155,8 @@ from openclaw_pipe import (
     _owui_chat_send_params,
     _session_thinking_ladder,
     _record_thinking_ladder,
+    _THINKING_UNSUPPORTED_RE,
+    _thinking_rejection_retry_body,
     clamp_to_ladder,
     LEVEL_RANKS,
     LADDER_CACHE_NAME,
@@ -4476,3 +4478,81 @@ class ThinkingWiringTests(unittest.TestCase):
         import openclaw_pipe
         self.assertFalse(hasattr(openclaw_pipe, "Filter"))
         self.assertTrue(hasattr(openclaw_pipe, "Pipe"))
+
+
+class ThinkingRejectionRetryTests(unittest.TestCase):
+    """A session with no `sessions.describe` row yet (its first-ever message)
+    cannot report a thinking ladder, so an explicitly requested level a model
+    can't honour goes through to the Gateway raw, which hard-rejects the
+    turn -- and because it rejects the turn, the describe row still never
+    exists, so every retry to that chat hits the identical rejection forever
+    (ELI-85 live break, found via the sim-user harness).
+
+    The Gateway never streams this rejection as a normal event (the run
+    delivers a single contentless `final`), so an earlier attempt at this fix
+    that peeked the run's event queue for it never saw it fire. The real
+    text only surfaces via `recover_from_preview()` at `_pipe_impl`'s final
+    fallback, which is what `_thinking_rejection_retry_body` gates.
+    """
+
+    REJECTION_TEXT = (
+        'Thinking level "high" is not supported for claude-cli/'
+        'claude-opus-5. Use one of: off.'
+    )
+
+    def test_regex_matches_the_real_gateway_wording(self):
+        self.assertRegex(self.REJECTION_TEXT, _THINKING_UNSUPPORTED_RE)
+
+    def test_regex_does_not_misfire_on_ordinary_text_about_thinking(self):
+        # Narrow on purpose: must never catch genuine assistant output that
+        # happens to discuss thinking levels in passing.
+        for text in (
+            "Let me think about supported levels here.",
+            "high is not supported in this context, unrelated to models.",
+            "",
+        ):
+            self.assertNotRegex(text, _THINKING_UNSUPPORTED_RE)
+
+    def test_retry_body_built_when_recovered_text_is_the_rejection(self):
+        body = {"reasoning_effort": "high", "messages": ["hi"]}
+        retry_body = _thinking_rejection_retry_body(
+            body, self.REJECTION_TEXT, "high")
+        self.assertIsNotNone(retry_body)
+        self.assertNotIn("reasoning_effort", retry_body)
+        self.assertEqual(retry_body["messages"], ["hi"])
+        # The original body must be untouched -- the caller still needs it
+        # for logging/diagnostics after this returns.
+        self.assertEqual(body["reasoning_effort"], "high")
+
+    def test_no_retry_when_nothing_was_recovered(self):
+        self.assertIsNone(
+            _thinking_rejection_retry_body({"reasoning_effort": "high"},
+                                            None, "high"))
+
+    def test_no_retry_when_no_explicit_level_was_ever_sent(self):
+        # resolved_thinking is None whenever this chat never asked for an
+        # override (or already retried once) -- recovered text matching the
+        # rejection wording in that case is not this bug, so retrying is
+        # never correct and would loop.
+        retry_body = _thinking_rejection_retry_body(
+            {"reasoning_effort": None}, self.REJECTION_TEXT, None)
+        self.assertIsNone(retry_body)
+
+    def test_no_retry_when_recovered_text_is_unrelated(self):
+        retry_body = _thinking_rejection_retry_body(
+            {"reasoning_effort": "high"}, "Here is your answer.", "high")
+        self.assertIsNone(retry_body)
+
+    def test_retry_cannot_fire_twice_in_a_row(self):
+        # Simulates the recursive call: the first pass strips
+        # reasoning_effort, so a second pass over that same body always has
+        # resolved_thinking=None regardless of what recover_from_preview()
+        # returns -- the natural termination this fix relies on instead of
+        # an explicit recursion-guard flag.
+        first_body = {"reasoning_effort": "high"}
+        retried = _thinking_rejection_retry_body(
+            first_body, self.REJECTION_TEXT, "high")
+        self.assertIsNotNone(retried)
+        second = _thinking_rejection_retry_body(
+            retried, self.REJECTION_TEXT, None)
+        self.assertIsNone(second)

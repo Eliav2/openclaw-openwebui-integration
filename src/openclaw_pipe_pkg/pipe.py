@@ -30,6 +30,47 @@ def _session_active_from_signals(describe_status, list_has_active_run) -> bool:
     return bool(list_has_active_run)
 
 
+# Matches the Gateway's own hard validation error, e.g.:
+#   Thinking level "high" is not supported for claude-cli/claude-opus-5. Use one of: off.
+# Deliberately narrow (exact wording, not just "thinking" + "not supported")
+# so this can never misfire on genuine assistant text that happens to discuss
+# thinking levels.
+_THINKING_UNSUPPORTED_RE = re.compile(
+    r'Thinking level "[^"]+" is not supported for \S+\. Use one of:'
+)
+
+
+def _thinking_rejection_retry_body(body, recovered, resolved_thinking):
+    """Decide whether a textless ("PHANTOM") turn's preview-recovered text is
+    the Gateway's permanent-brick thinking-level rejection, and build the
+    retry body if so (ELI-85 follow-up).
+
+    A session with no `sessions.describe` row yet (its first-ever message)
+    can't report a thinking ladder, so `clamp_to_ladder` correctly passes an
+    explicitly requested level straight through -- and if the target model
+    can't honour it, the Gateway hard-rejects the turn. That rejection never
+    streams as a normal event (the run delivers a single contentless
+    `final`), so it only surfaces via preview recovery at the caller's final
+    fallback. And because the Gateway rejected the turn, the describe row
+    still won't exist afterward, so every retry to that chat would hit the
+    identical rejection forever unless the override is dropped.
+
+    Returns None when `recovered` isn't that rejection (nothing to retry).
+    Otherwise returns a fresh dict body with `reasoning_effort` stripped, so
+    resending it can no longer hit the same rejection -- which is also what
+    makes recursing on this once safe: the retried call resolves
+    `resolved_thinking` to None (`clamp_to_ladder` short-circuits on no
+    requested level), so this can't match twice in a row.
+    """
+    if not recovered or resolved_thinking is None:
+        return None
+    if not _THINKING_UNSUPPORTED_RE.search(recovered):
+        return None
+    retry_body = dict(body)
+    retry_body.pop("reasoning_effort", None)
+    return retry_body
+
+
 class Pipe:
     """
     Open WebUI Pipe that routes messages through OpenClaw Gateway via
@@ -1709,6 +1750,30 @@ class Pipe:
 
         if not aborted and not text_yielded:
             recovered = await recover_from_preview()
+            retry_body = _thinking_rejection_retry_body(
+                body, recovered, resolved_thinking)
+            if retry_body is not None:
+                pipe_log(
+                    f"thinking: Gateway rejected level {resolved_thinking!r} "
+                    f"on a session with no known ladder yet ({recovered!r}); "
+                    "retrying once without an explicit level"
+                )
+                retry_note = (
+                    f"_This model does not support thinking level "
+                    f"{resolved_thinking!r}, and this chat hadn't talked to "
+                    f"it before to know that in advance; sending without it "
+                    f"instead._\n\n"
+                )
+                record_visible_chunk(retry_note)
+                yield retry_note
+                async for item in self._pipe_impl(
+                    retry_body, __event_emitter__,
+                    __event_call__=__event_call__, __user__=__user__,
+                    __metadata__=__metadata__, __request__=__request__,
+                    __task__=__task__, __task_body__=__task_body__,
+                ):
+                    yield item
+                return
             if recovered:
                 pipe_log("  recovered assistant text at final fallback")
                 record_visible_chunk(recovered)
