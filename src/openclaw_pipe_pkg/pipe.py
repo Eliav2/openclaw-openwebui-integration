@@ -839,7 +839,17 @@ class Pipe:
             # a model catalog and overreports for catalog-gated models. This is
             # what makes the rejection cost one turn per model instead of one
             # turn every turn.
-            effective_ladder = (_read_model_thinking_ladder(session_model_key)
+            #
+            # Look up by `model_override` (the runtime-namespaced routing key,
+            # e.g. "claude-cli/claude-opus-5") before `session_model_key` (the
+            # vendor key describe resolves it to, e.g. "anthropic/claude-opus-5"
+            # -- see `_RUNTIME_PROVIDER_NAMESPACES`). The Gateway's rejection
+            # text names the model by its routing key, so that is where
+            # `_record_thinking_ladder` files the authoritative entry; reading
+            # back under the vendor key alone missed it every time and repeated
+            # the same round-trip rejection (and its note) on every turn.
+            effective_ladder = (_read_model_thinking_ladder(model_override)
+                                or _read_model_thinking_ladder(session_model_key)
                                 or session_thinking_ladder)
             resolved_thinking, thinking_note = clamp_to_ladder(
                 requested_thinking, effective_ladder)
