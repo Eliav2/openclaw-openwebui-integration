@@ -449,23 +449,43 @@ Two differences from `install.py`: it must be run from a clone (it imports from
 
 ### Installing the thinking filter
 
-Optional, and installed by hand rather than by a script. It has no installer
-because it has nothing to configure: unlike the Action it shares no valves with
-the Pipe, needs no device identity, and never talks to the Gateway itself.
+Optional, and has its own installer like the Action does:
+
+```bash
+uv run install_filter.py install   # create/update the Filter, ensure it's active, smoke test
+uv run install_filter.py status    # inspect without changing anything
+uv run install_filter.py repair    # same as install
+```
+
+It reads only `OWUI_URL`, `OWUI_EMAIL`, and `OWUI_PASSWORD` -- there's nothing
+else to configure: unlike the Action it shares no valves with the Pipe, needs
+no device identity, and never talks to the Gateway itself. It creates/updates
+the Function, then makes sure it's **Active**. It deliberately does not touch
+**Global**: attach the filter per-model instead (Workspace > Models > (model)
+> Filters), since a global filter would write `reasoning_effort` into every
+chat with every model, including non-OpenClaw ones. If it finds the Function
+already toggled global, it warns rather than silently turning that off.
+
+The equivalent manual steps, if you'd rather not run the installer:
 
 1. Open WebUI → **Admin Panel** → **Functions** → **+**
 2. Paste the contents of [`openclaw_thinking_filter.py`](./openclaw_thinking_filter.py)
-3. Save, then toggle it **Active**
+3. Save, then toggle it **Active**, and attach it to your OpenClaw models
+   (Workspace > Models > (model) > Filters)
 
-Leave it global (the default) so the toggle is available in every chat. It does
-nothing until you switch it on in a given conversation: Open WebUI does not run
-a toggled filter's `inlet` while the toggle is off, so an untouched chat behaves
-exactly as if the filter were not installed.
+Once active, it does nothing until you switch the toggle on in a given
+conversation: Open WebUI does not run a toggled filter's `inlet` while the
+toggle is off, so an untouched chat behaves exactly as if the filter were not
+installed.
 
 The Pipe should be installed first. The filter's level dropdown is populated
 from the ladder cache the Pipe writes, so before the Pipe has run once the
 dropdown falls back to the five levels every observed provider supports. See
 [Per-chat thinking control](#f-thinking).
+
+Two differences from `install.py`, the same as `install_action.py`: it must be
+run from a clone (it imports from `install.py`), and it has no `healthcheck`
+subcommand.
 
 ---
 
@@ -473,8 +493,9 @@ dropdown falls back to the five levels every observed provider supports. See
 
 There's no `uninstall` subcommand; removal is a UI action. In Open WebUI go to
 **Admin Panel → Functions** and delete `openclaw_gateway` (and
-`openclaw_status_action` if you installed it). Every install first writes the
-previous function and its valves to `backups/`, so if you only want to roll back
+`openclaw_status_action` and/or `openclaw_thinking`, if you installed them).
+Every install first writes the previous function and its valves to `backups/`,
+so if you only want to roll back
 a bad upgrade, restore the JSON from there rather than deleting.
 
 Deleting the functions does not touch `STATE_DIR`. Remove that directory too if
@@ -1298,7 +1319,8 @@ approves its own pairing request using the local `openclaw` CLI.
 
 `--with-skills` also installs the two agent-side skills that teach an agent to
 use the ask-user modal and the media path. `install_action.py` installs the
-Action and mirrors the five shared valves from the Pipe.
+Action and mirrors the five shared valves from the Pipe. `install_filter.py`
+installs the thinking Filter.
 
 Full detail in [Installation](#-installation) and [Commands](#commands).
 
