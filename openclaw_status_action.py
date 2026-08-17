@@ -352,11 +352,15 @@ def clamp_to_ladder(level, ladder):
     if want is None:
         return None, f"Unknown thinking level {level!r}, ignoring it."
 
-    at_or_below = [lv for lv in ladder if LEVEL_RANKS.get(lv, 0) <= want]
+    ranked_ladder = [lv for lv in ladder if lv in LEVEL_RANKS]
+    if not ranked_ladder:
+        return None, "This model reported no recognized thinking levels; ignoring the selection."
+
+    at_or_below = [lv for lv in ranked_ladder if LEVEL_RANKS[lv] <= want]
     if at_or_below:
-        best = max(at_or_below, key=lambda lv: LEVEL_RANKS.get(lv, 0))
+        best = max(at_or_below, key=lambda lv: LEVEL_RANKS[lv])
     else:
-        best = min(ladder, key=lambda lv: LEVEL_RANKS.get(lv, 0))
+        best = min(ranked_ladder, key=lambda lv: LEVEL_RANKS[lv])
     return best, (
         f"This model does not support thinking level {level!r}, "
         f"using {best!r} instead."
@@ -622,11 +626,12 @@ def _session_model_key(row) -> str | None:
     return f"{provider}/{model}"
 
 
-def _ladder_cache_path() -> str:
-    return os.path.join(_state_dir(), LADDER_CACHE_NAME)
+def _ladder_cache_path(state_dir: str = "") -> str:
+    return os.path.join(_state_dir(state_dir), LADDER_CACHE_NAME)
 
 
-def _record_thinking_ladder(levels, model_key=None, authoritative=False) -> None:
+def _record_thinking_ladder(levels, model_key=None, authoritative=False,
+                             state_dir: str = "") -> None:
     """Fold a ladder we just saw into the cache, both as a union and per model.
 
     Two different consumers, two different needs, one file:
@@ -648,7 +653,7 @@ def _record_thinking_ladder(levels, model_key=None, authoritative=False) -> None
     rejected turn, and must never affect the message being sent.
     """
     known = [lv for lv in (levels or []) if lv in LEVEL_RANKS]
-    path = _ladder_cache_path()
+    path = _ladder_cache_path(state_dir)
     current = _read_json_file(path) or {}
 
     have = current.get("levels")
@@ -692,7 +697,7 @@ def _record_thinking_ladder(levels, model_key=None, authoritative=False) -> None
         )
 
 
-def _read_model_thinking_ladder(model_key):
+def _read_model_thinking_ladder(model_key, state_dir: str = ""):
     """The exact ladder for one model, or None if we have not learned it.
 
     None and [] mean different things here and the caller relies on it: None is
@@ -701,7 +706,7 @@ def _read_model_thinking_ladder(model_key):
     """
     if not model_key:
         return None
-    cache = _read_json_file(_ladder_cache_path()) or {}
+    cache = _read_json_file(_ladder_cache_path(state_dir)) or {}
     models = cache.get("models")
     if not isinstance(models, dict):
         return None
@@ -1898,6 +1903,7 @@ class _GatewayConnection:
 
         self._ws = ws
         self._reconnect_attempt = 0
+        self._thinking_note_shown.clear()
         pipe_log("Connected to Gateway (persistent)")
         # NOTE: does not start/spawn the event-loop task -- that happens
         # exactly once, in `ensure_connected`. This method is also called

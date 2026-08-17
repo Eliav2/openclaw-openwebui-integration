@@ -479,7 +479,11 @@ installed.
 
 The Pipe should be installed first. The filter's level dropdown is populated
 from the ladder cache the Pipe writes, so before the Pipe has run once the
-dropdown falls back to the five levels every observed provider supports. See
+dropdown falls back to the five levels every observed provider supports. The
+dropdown is also baked in at import time, so after the Pipe has completed a
+first chat with a given model, reload or re-save the filter Function (Admin
+Panel → Functions → `openclaw_thinking` → Save) to pick up the real ladder --
+otherwise it keeps showing the fallback list until the next reload. See
 [Per-chat thinking control](#f-thinking).
 
 Two differences from `install.py`, the same as `install_action.py`: it must be
@@ -790,8 +794,11 @@ so in the chat:
 
 > _This model does not support thinking level 'ultra', using 'high' instead._
 
-Clamping is only ever downward. Asking for less thinking than requested is a
-safe degradation; quietly asking for more shows up on someone's bill.
+Clamping normally lands on the nearest level at or below what you asked for --
+that direction is a safe degradation, since quietly asking for more shows up on
+someone's bill. The one exception: if a model's ladder has nothing at or below
+the request (every supported level is higher), it falls back to that model's
+lowest supported level, which can be higher than what was requested.
 
 The filter and Open WebUI's own Advanced Params reasoning-effort control write
 the same `reasoning_effort` field, so the two are one setting rather than two

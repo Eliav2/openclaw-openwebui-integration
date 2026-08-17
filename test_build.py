@@ -262,6 +262,203 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class _Scope:
+    """One lexical scope for the name-resolution check below.
+
+    `parent` is already the correct *lookup* parent: a function's or
+    comprehension's scope points past any enclosing class body, mirroring the
+    real Python rule that a class's own namespace is invisible to nested
+    functions (only to the class body's own statements).
+    """
+
+    __slots__ = ("bindings", "parent")
+
+    def __init__(self, parent):
+        self.parent = parent
+        self.bindings = set()
+
+    def resolves(self, name):
+        scope = self
+        while scope is not None:
+            if name in scope.bindings:
+                return True
+            scope = scope.parent
+        return False
+
+
+def _nearest_non_class_scope(stack, class_scopes):
+    for scope in reversed(stack):
+        if scope not in class_scopes:
+            return scope
+    return stack[0]
+
+
+class _ScopedNameCollector:
+    """Walks a module's AST building one scope per function/class/
+    comprehension, and records every `Name` load against the scope it was
+    lexically found in. Resolution (`_Scope.resolves`) happens afterwards,
+    once every scope's bindings are complete -- a local binding in one
+    function must never appear to define a name used, unresolved, in another.
+    """
+
+    def __init__(self, module_scope):
+        self.class_scopes = set()
+        self.stack = [module_scope]
+        self.global_names = set()  # names `global`-declared in the innermost function
+        self.pending_uses = []  # (name, lineno, scope)
+
+    @property
+    def scope(self):
+        return self.stack[-1]
+
+    def bind(self, name):
+        if name in self.global_names:
+            self.stack[0].bindings.add(name)
+        else:
+            self.scope.bindings.add(name)
+
+    def bind_target(self, target):
+        for sub in ast.walk(target):
+            if isinstance(sub, ast.Name):
+                self.bind(sub.id)
+
+    def use(self, name, lineno):
+        self.pending_uses.append((name, lineno, self.scope))
+
+    def visit_body(self, stmts):
+        for stmt in stmts:
+            self.visit(stmt)
+
+    def visit(self, node):
+        method = getattr(self, f"visit_{type(node).__name__}", None)
+        if method is not None:
+            method(node)
+        else:
+            self.generic_visit(node)
+
+    def generic_visit(self, node):
+        for child in ast.iter_child_nodes(node):
+            self.visit(child)
+
+    # -- name-introducing leaves --------------------------------------------
+
+    def visit_Name(self, node):
+        if isinstance(node.ctx, ast.Load):
+            self.use(node.id, node.lineno)
+        else:
+            self.bind(node.id)
+
+    def visit_Import(self, node):
+        for alias in node.names:
+            self.bind(alias.asname or alias.name.split(".")[0])
+
+    def visit_ImportFrom(self, node):
+        for alias in node.names:
+            self.bind(alias.asname or alias.name)
+
+    def visit_Global(self, node):
+        # A declaration, not a binding: the accompanying assignment (handled
+        # via visit_Name -> bind, which checks global_names) is what actually
+        # lands the name in module scope.
+        self.global_names.update(node.names)
+
+    def visit_Nonlocal(self, node):
+        # Also just a declaration. Python requires the name to already exist
+        # in an enclosing function scope, which the normal scope chain finds
+        # without treating this statement as a binding site itself.
+        pass
+
+    def visit_ExceptHandler(self, node):
+        if node.name:
+            self.bind(node.name)
+        self.generic_visit(node)
+
+    # -- scope-introducing nodes ---------------------------------------------
+
+    def _visit_arg_annotations(self, args):
+        for a in (list(args.posonlyargs) + list(args.args) + list(args.kwonlyargs)
+                  + ([args.vararg] if args.vararg else [])
+                  + ([args.kwarg] if args.kwarg else [])):
+            if a.annotation:
+                self.visit(a.annotation)
+
+    def _visit_defaults(self, args):
+        for default in list(args.defaults) + [d for d in args.kw_defaults if d is not None]:
+            self.visit(default)
+
+    def _enter_function(self, args, visit_contents):
+        parent = _nearest_non_class_scope(self.stack, self.class_scopes)
+        scope = _Scope(parent)
+        self.stack.append(scope)
+        saved_globals = self.global_names
+        self.global_names = set()
+        for a in (list(args.posonlyargs) + list(args.args) + list(args.kwonlyargs)
+                  + ([args.vararg] if args.vararg else [])
+                  + ([args.kwarg] if args.kwarg else [])):
+            self.bind(a.arg)
+        visit_contents()
+        self.global_names = saved_globals
+        self.stack.pop()
+
+    def _visit_function(self, node):
+        self.bind(node.name)
+        for dec in node.decorator_list:
+            self.visit(dec)
+        self._visit_defaults(node.args)
+        self._visit_arg_annotations(node.args)
+        if node.returns:
+            self.visit(node.returns)
+        self._enter_function(node.args, lambda: self.visit_body(node.body))
+
+    visit_FunctionDef = _visit_function
+    visit_AsyncFunctionDef = _visit_function
+
+    def visit_Lambda(self, node):
+        self._visit_defaults(node.args)
+        self._enter_function(node.args, lambda: self.visit(node.body))
+
+    def visit_ClassDef(self, node):
+        self.bind(node.name)
+        for dec in node.decorator_list:
+            self.visit(dec)
+        for base in node.bases:
+            self.visit(base)
+        for kw in node.keywords:
+            self.visit(kw)
+        scope = _Scope(self.scope)
+        self.class_scopes.add(scope)
+        self.stack.append(scope)
+        self.visit_body(node.body)
+        self.stack.pop()
+
+    def _enter_comprehension(self, node, visit_contents):
+        # The outermost iterable is evaluated in the enclosing scope; the
+        # comprehension itself (targets, later clauses, element) is its own
+        # scope and, like a function, skips over an enclosing class body.
+        self.visit(node.generators[0].iter)
+        parent = _nearest_non_class_scope(self.stack, self.class_scopes)
+        scope = _Scope(parent)
+        self.stack.append(scope)
+        for i, gen in enumerate(node.generators):
+            self.bind_target(gen.target)
+            if i > 0:
+                self.visit(gen.iter)
+            for cond in gen.ifs:
+                self.visit(cond)
+        visit_contents()
+        self.stack.pop()
+
+    def visit_ListComp(self, node):
+        self._enter_comprehension(node, lambda: self.visit(node.elt))
+
+    visit_SetComp = visit_ListComp
+    visit_GeneratorExp = visit_ListComp
+
+    def visit_DictComp(self, node):
+        self._enter_comprehension(
+            node, lambda: (self.visit(node.key), self.visit(node.value)))
+
+
 class ArtifactNameResolutionTests(unittest.TestCase):
     """Every artifact must define every module-level name its fragments use.
 
@@ -280,48 +477,18 @@ class ArtifactNameResolutionTests(unittest.TestCase):
 
     def _undefined_globals(self, path):
         tree = ast.parse(path.read_text(), filename=str(path))
-        defined = set(dir(builtins)) | {
+        module_scope = _Scope(parent=None)
+        module_scope.bindings |= set(dir(builtins)) | {
             "__name__", "__file__", "__doc__", "__builtins__", "__spec__",
         }
-        used = {}
+        collector = _ScopedNameCollector(module_scope)
+        collector.visit_body(tree.body)
 
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                defined.add(node.name)
-            elif isinstance(node, ast.Import):
-                for a in node.names:
-                    defined.add(a.asname or a.name.split(".")[0])
-            elif isinstance(node, ast.ImportFrom):
-                for a in node.names:
-                    defined.add(a.asname or a.name)
-            elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
-                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                for t in targets:
-                    for sub in ast.walk(t):
-                        if isinstance(sub, ast.Name):
-                            defined.add(sub.id)
-            elif isinstance(node, (ast.Name,)) and isinstance(node.ctx, ast.Store):
-                defined.add(node.id)
-            elif isinstance(node, ast.ExceptHandler) and node.name:
-                defined.add(node.name)
-            elif isinstance(node, (ast.arg,)):
-                defined.add(node.arg)
-            elif isinstance(node, (ast.Global, ast.Nonlocal)):
-                defined.update(node.names)
-            elif isinstance(node, ast.comprehension):
-                for sub in ast.walk(node.target):
-                    if isinstance(sub, ast.Name):
-                        defined.add(sub.id)
-            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
-                used.setdefault(node.id, node.lineno)
-            elif isinstance(node, (ast.With, ast.AsyncWith)):
-                for item in node.items:
-                    if item.optional_vars is not None:
-                        for sub in ast.walk(item.optional_vars):
-                            if isinstance(sub, ast.Name):
-                                defined.add(sub.id)
-
-        return {n: ln for n, ln in used.items() if n not in defined}
+        missing = {}
+        for name, lineno, scope in collector.pending_uses:
+            if name not in missing and not scope.resolves(name):
+                missing[name] = lineno
+        return missing
 
     def test_every_artifact_resolves_its_own_names(self):
         for artifact in self.ARTIFACTS:
@@ -341,5 +508,26 @@ class ArtifactNameResolutionTests(unittest.TestCase):
             broken = Path(fh.name)
         try:
             self.assertIn("SOME_MISSING_CONSTANT", self._undefined_globals(broken))
+        finally:
+            broken.unlink()
+
+    def test_a_same_named_local_does_not_mask_an_unresolved_global(self):
+        # Regression for a real gap: aggregating every scope's bindings into
+        # one file-wide bag let a local `token = ...` in one function make
+        # `token` look resolved everywhere, hiding a genuinely undefined
+        # global `token` read by a different function.
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
+            fh.write(
+                "def has_local():\n"
+                "    token = 'local value'\n"
+                "    return token\n"
+                "\n"
+                "def reads_undefined_global():\n"
+                "    return token\n"
+            )
+            broken = Path(fh.name)
+        try:
+            self.assertIn("token", self._undefined_globals(broken))
         finally:
             broken.unlink()

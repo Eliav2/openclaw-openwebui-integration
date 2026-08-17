@@ -58,6 +58,13 @@ def load(state_dir=None):
     Reimported per case because the dropdown is baked into UserValves at import
     time. Testing that from a single cached import would silently only ever
     exercise the first state dir.
+
+    Deliberately does NOT restore the env var itself: callers keep reading it
+    live (`available_levels()` is not baked in at import time the way
+    UserValves is), so restoring here would break the very assertions this
+    call is set up for. Callers that use a temp dir are responsible for
+    restoring the env var once they are done with it -- see the
+    `tempfile.TemporaryDirectory` block below.
     """
     if state_dir is None:
         os.environ.pop("OPENCLAW_BRIDGE_STATE_DIR", None)
@@ -98,32 +105,44 @@ mod = load(state_dir="/nonexistent-on-purpose")
 check("falls back when there is no cache",
       mod.available_levels(), ["default", "off", "minimal", "low", "medium", "high"])
 
-with tempfile.TemporaryDirectory() as td:
-    cache = Path(td) / "thinking-ladders.json"
-    cache.write_text(json.dumps(
-        {"levels": ["high", "off", "max", "medium", "xhigh", "low", "minimal"],
-         "updated": 1786784049}))
-    m2 = load(state_dir=td)
-    check("cache drives the list, ordered by rank",
-          m2.available_levels(),
-          ["default", "off", "minimal", "low", "medium", "high", "xhigh", "max"])
-    check("the built UserValves enum matches",
-          m2.Filter.UserValves.model_json_schema()["properties"]["level"]["enum"],
-          ["default", "off", "minimal", "low", "medium", "high", "xhigh", "max"])
+# `load()` leaves OPENCLAW_BRIDGE_STATE_DIR pointed at whatever it last set,
+# since available_levels() reads it live rather than at import time (see
+# `load`'s docstring). Restore it once this whole temp-dir case is done, so a
+# path this block is about to delete does not leak into whatever the process
+# imports next.
+_state_dir_before_tempdir = os.environ.get("OPENCLAW_BRIDGE_STATE_DIR")
+try:
+    with tempfile.TemporaryDirectory() as td:
+        cache = Path(td) / "thinking-ladders.json"
+        cache.write_text(json.dumps(
+            {"levels": ["high", "off", "max", "medium", "xhigh", "low", "minimal"],
+             "updated": 1786784049}))
+        m2 = load(state_dir=td)
+        check("cache drives the list, ordered by rank",
+              m2.available_levels(),
+              ["default", "off", "minimal", "low", "medium", "high", "xhigh", "max"])
+        check("the built UserValves enum matches",
+              m2.Filter.UserValves.model_json_schema()["properties"]["level"]["enum"],
+              ["default", "off", "minimal", "low", "medium", "high", "xhigh", "max"])
 
-    cache.write_text(json.dumps({"levels": ["low", "bogus", "medium"]}))
-    check("unknown level ids in the cache are dropped",
-          load(state_dir=td).available_levels(), ["default", "low", "medium"])
+        cache.write_text(json.dumps({"levels": ["low", "bogus", "medium"]}))
+        check("unknown level ids in the cache are dropped",
+              load(state_dir=td).available_levels(), ["default", "low", "medium"])
 
-    cache.write_text("{ not json")
-    check("corrupt cache degrades to the fallback, does not raise",
-          load(state_dir=td).available_levels(),
-          ["default", "off", "minimal", "low", "medium", "high"])
+        cache.write_text("{ not json")
+        check("corrupt cache degrades to the fallback, does not raise",
+              load(state_dir=td).available_levels(),
+              ["default", "off", "minimal", "low", "medium", "high"])
 
-    cache.write_text(json.dumps({"levels": []}))
-    check("empty cache degrades to the fallback",
-          load(state_dir=td).available_levels(),
-          ["default", "off", "minimal", "low", "medium", "high"])
+        cache.write_text(json.dumps({"levels": []}))
+        check("empty cache degrades to the fallback",
+              load(state_dir=td).available_levels(),
+              ["default", "off", "minimal", "low", "medium", "high"])
+finally:
+    if _state_dir_before_tempdir is None:
+        os.environ.pop("OPENCLAW_BRIDGE_STATE_DIR", None)
+    else:
+        os.environ["OPENCLAW_BRIDGE_STATE_DIR"] = _state_dir_before_tempdir
 
 
 print("\nclamping to a model's real ladder")

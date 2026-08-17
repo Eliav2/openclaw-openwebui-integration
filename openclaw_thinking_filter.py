@@ -208,11 +208,15 @@ def clamp_to_ladder(level, ladder):
     if want is None:
         return None, f"Unknown thinking level {level!r}, ignoring it."
 
-    at_or_below = [lv for lv in ladder if LEVEL_RANKS.get(lv, 0) <= want]
+    ranked_ladder = [lv for lv in ladder if lv in LEVEL_RANKS]
+    if not ranked_ladder:
+        return None, "This model reported no recognized thinking levels; ignoring the selection."
+
+    at_or_below = [lv for lv in ranked_ladder if LEVEL_RANKS[lv] <= want]
     if at_or_below:
-        best = max(at_or_below, key=lambda lv: LEVEL_RANKS.get(lv, 0))
+        best = max(at_or_below, key=lambda lv: LEVEL_RANKS[lv])
     else:
-        best = min(ladder, key=lambda lv: LEVEL_RANKS.get(lv, 0))
+        best = min(ranked_ladder, key=lambda lv: LEVEL_RANKS[lv])
     return best, (
         f"This model does not support thinking level {level!r}, "
         f"using {best!r} instead."

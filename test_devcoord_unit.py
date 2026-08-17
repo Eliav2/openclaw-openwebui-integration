@@ -24,6 +24,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import conftest  # noqa: F401  (imports real pydantic before this file's stub can shadow it)
+
 ROOT = Path(__file__).resolve().parent
 PKG = ROOT / "src" / "openclaw_pipe_pkg"
 

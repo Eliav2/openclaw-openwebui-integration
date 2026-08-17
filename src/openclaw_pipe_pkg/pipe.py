@@ -701,7 +701,9 @@ class Pipe:
                 ladder = _session_thinking_ladder(desc)
                 if ladder:
                     session_thinking_ladder = ladder
-                    _record_thinking_ladder(ladder, model_key=session_model_key)
+                    _record_thinking_ladder(
+                        ladder, model_key=session_model_key,
+                        state_dir=getattr(self.valves, "STATE_DIR", ""))
                 if row.get("activeRunId") or status in _ACTIVE_RUN_STATES:
                     return True
             except Exception as ex:
@@ -788,8 +790,9 @@ class Pipe:
             # `_record_thinking_ladder` files the authoritative entry; reading
             # back under the vendor key alone missed it every time and repeated
             # the same round-trip rejection (and its note) on every turn.
-            effective_ladder = (_read_model_thinking_ladder(model_override)
-                                or _read_model_thinking_ladder(session_model_key)
+            _state_dir_valve = getattr(self.valves, "STATE_DIR", "")
+            effective_ladder = (_read_model_thinking_ladder(model_override, _state_dir_valve)
+                                or _read_model_thinking_ladder(session_model_key, _state_dir_valve)
                                 or session_thinking_ladder)
             resolved_thinking, thinking_note = clamp_to_ladder(
                 requested_thinking, effective_ladder)
@@ -1726,6 +1729,7 @@ class Pipe:
                         learned,
                         model_key=rejection["model"] or session_model_key,
                         authoritative=True,
+                        state_dir=getattr(self.valves, "STATE_DIR", ""),
                     )
                 pipe_log(
                     f"thinking: Gateway rejected level {resolved_thinking!r} "

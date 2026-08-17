@@ -24,5 +24,8 @@ one broken suite for another. Nothing needs the real transport to be present.
 
 try:
     import pydantic  # noqa: F401
-except Exception:  # not installed here: the per-suite stub is the fallback
-    pass
+except ModuleNotFoundError as exc:
+    if exc.name != "pydantic":
+        raise
+    # not installed here: the per-suite stub is the fallback
+

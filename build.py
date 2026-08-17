@@ -220,6 +220,10 @@ def main():
                    for a in ("--check", "--check-dev", "--check-action",
                              "--check-filter", "--check-all"))
 
+    if sum((action, filt, dev)) > 1:
+        print("Select only one of --action, --filter, or --dev", file=sys.stderr)
+        sys.exit(2)
+
     if do_all:
         if dev or action or filt:
             print("--all/--check-all already covers every distributed artifact; "
