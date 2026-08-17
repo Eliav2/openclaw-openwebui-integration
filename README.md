@@ -763,7 +763,9 @@ Your agent has to know the convention, see
 [Teaching your agent](#-teaching-your-agent-to-use-this). Implementation in
 [`src/openclaw_pipe_pkg/askuser.py`](./src/openclaw_pipe_pkg/askuser.py).
 
-_No screenshot yet._
+<p align="center">
+  <img src="./docs/img/ask-user-modal.png" alt="An OpenClaw ask-user modal rendered mid-run as a yes/no confirmation dialog" width="45%">
+</p>
 
 </details>
 
@@ -845,12 +847,19 @@ unauthenticated, see [Security notes](#-security-notes).
 <details>
 <summary><b>📎 Image input</b></summary>
 
-An image you attach in Open WebUI is forwarded to the agent as a `chat.send`
-attachment, so vision-capable models can actually see it.
+An image you attach in Open WebUI arrives as a multimodal `content` block list
+rather than the plain string OWUI sends for text-only turns. The Pipe scans
+that list for `image_url` blocks, and for each one parses the
+`data:<mime>;base64,<data>` URI OWUI actually emits, decodes it, and forwards
+it to the agent as a `chat.send` attachment with its MIME type and a file
+extension guessed from that type, so a vision-capable model receives real
+image bytes rather than a description of them.
 
-An image the Pipe cannot forward (anything not delivered as base64) produces an
-explicit note that it could not be relayed, rather than an answer confidently
-describing a picture the agent never received.
+Only the inline base64 data-URI shape is handled: there is no plain HTTP(S)
+`image_url` case to support, because OWUI does not send one for attached or
+pasted images. An image the Pipe cannot forward (any block that is not
+base64-encoded) produces an explicit note that it could not be relayed, rather
+than an answer confidently describing a picture the agent never received.
 
 Always on.
 
@@ -950,12 +959,22 @@ Valves: `DEFAULT_MODEL` (rendered as a live dropdown, not a text box),
 <details>
 <summary><b>🔎 Whitelist and size cap</b></summary>
 
-`CONFIGURED_MODELS` restricts the selector to a list of model keys you name.
-Leave it empty to list everything.
+`CONFIGURED_MODELS` is a comma-separated list of exact model keys (e.g.
+`anthropic/claude-sonnet-5`) you want in the selector; leave it empty and
+every model your Gateway reports is offered. The filter runs first, before
+the cap, and keeps discovery order rather than the order you listed the keys
+in.
 
-`MAX_MODELS` caps how many entries can appear at all, defaulting to 30 and
-accepting 1 to 100. A Gateway that knows about two hundred models should not
-produce a two-hundred-entry dropdown.
+`MAX_MODELS` then truncates whatever survives the whitelist to at most this
+many entries, defaulting to 30 and validated to a 1-100 range by the valve
+schema itself. A Gateway that knows about two hundred models should not
+produce a two-hundred-entry dropdown, and the two settings compose: a tight
+whitelist is never cut down further just because it is short, only a large
+or absent one gets capped.
+
+The `DEFAULT_MODEL` dropdown is separate and always lists every model key
+currently known, whitelist or cap notwithstanding, since picking a default
+has to stay possible even for a model the selector itself is hiding.
 
 </details>
 
@@ -963,12 +982,23 @@ produce a two-hundred-entry dropdown.
 <details>
 <summary><b>🕰️ Legacy fixed presets</b></summary>
 
-Before the selector was dynamic, the integration shipped four fixed entries:
-ChatGPT, Opus, Sonnet and GLM. Chats that picked one of those still resolve, so
-old conversations keep working.
+Before the model selector became dynamic, this integration shipped four fixed
+entries — ChatGPT, Opus, Sonnet and GLM — each hardcoded to one model. Old
+chats stored that choice as a literal string like `openclaw_gateway.opus`, and
+the Pipe still recognizes that suffix today: it is extracted from the model
+string and mapped back to a real model key, so a conversation that has been
+idle since before the dynamic selector landed keeps working exactly as it did.
 
-They exist only for backward compatibility. New chats should use the dynamic
-entries.
+The mapping is not frozen to its original values. Each preset first checks
+its matching valve (`CHATGPT_MODEL`, `OPUS_MODEL`, `SONNET_MODEL`,
+`GLM_MODEL`); if you have changed one away from its shipped default, your
+value wins, and only an untouched valve falls back to the hardcoded key.
+That matters if a provider renames or retires the underlying model:
+repointing the valve keeps years-old chats resolving without editing their
+stored model string.
+
+None of the four appear in the selector anymore. New chats should pick a live
+entry instead.
 
 Valves: `CHATGPT_MODEL`, `OPUS_MODEL`, `SONNET_MODEL`, `GLM_MODEL`.
 
@@ -1134,11 +1164,20 @@ Valve: `STATE_DIR`, default `/data/openclaw-bridge`. Design notes in
 <details>
 <summary><b>🧵 Parity finalize</b></summary>
 
-If the inline turn ends before the run does, the original message is completed
-in place with the full text and all of its tool cards, instead of the remainder
-stranding in a second detached bubble below it.
+If the inline turn ends before the run itself does — an idle self-close, a
+cancelled request, or a torn-down connection — the original Open WebUI
+message used to be left short, with the rest of the answer showing up later
+as a length-capped, tool-card-less *proactive* bubble read from
+`sessions.preview`. Parity finalize replaces that: a renderer accumulates the
+complete content, assistant text and every tool block, in order, straight
+from the same event stream the persistent connection already receives, and
+finalizes the ORIGINAL message to exactly what an uninterrupted turn would
+have produced, with no second bubble underneath it.
 
-Needs a stable Open WebUI message id to target. Always on when there is one.
+Scope is deliberately narrower than a live turn: MEDIA uploads and ask-user
+modals are not reproduced, because they need a live browser tab and never
+occur on a run that closed itself in the background. Needs a stable Open
+WebUI message id to target, and is always on when one is available.
 
 </details>
 
@@ -1167,12 +1206,17 @@ Always on.
 <details>
 <summary><b>🛑 Stop that actually stops</b></summary>
 
-The stop button aborts the Gateway run and, by default, also sends `/stop`, so a
-tool that is currently executing is actually killed rather than left running
-against a conversation nobody is reading.
+Pressing Stop in Open WebUI cancels the Pipe's async generator, which is
+caught explicitly rather than left to propagate silently: it emits a final
+forced snapshot first, so the partial answer already shown is not lost, then
+sends the Gateway a `chat.abort` for that run. Abort alone only tears down
+the streaming connection; a tool the agent kicked off keeps executing
+server-side unless something also tells the agent to stop.
 
-A final snapshot is persisted before the abort, so stopping does not lose the
-partial answer.
+That is what `/stop` is for. With `SEND_STOP_ON_CANCEL` on (the default), the
+Pipe sends it right after the abort, so a long shell command or browser
+action is actually killed instead of continuing against a chat nobody is
+watching anymore.
 
 Valve: `SEND_STOP_ON_CANCEL` (on).
 
@@ -1182,10 +1226,19 @@ Valve: `SEND_STOP_ON_CANCEL` (on).
 <details>
 <summary><b>🧟 Zombie reaping</b></summary>
 
-Redeploying the function does not leave the previous instance's connection alive
-in the background, which would otherwise write every message into your chat
-twice. Stale connections and stale file servers are both reaped through shared
-bookkeeping that survives the module reload.
+Open WebUI's function loader execs every redeploy into a brand-new Python
+module with no teardown hook on the old one. Left alone, a previous deploy's
+Gateway WebSocket connection would keep its own event loop running forever as
+a genuine zombie: still receiving broadcast events, still capable of writing
+every message into your chat a second time alongside the new connection.
+
+The fix stashes the live connection as an attribute on Open WebUI's own
+socket module, which this function never reloads, instead of a plain
+module-level singleton that would reset on every deploy. The next deploy
+finds that stashed connection, disconnects it with a short timeout, and only
+then opens its own, so redeploys self-heal without a container restart. The
+same pattern reaps the fallback media file server bound to its port, so a
+redeploy never leaves two processes fighting over it.
 
 Always on.
 
@@ -1195,12 +1248,21 @@ Always on.
 <details>
 <summary><b>🚫 Background-task short-circuiting</b></summary>
 
-Open WebUI generates titles, tags, follow-ups, emoji, autocomplete suggestions
-and search queries by quietly calling the selected model. Pointed at an agent,
-that means six extra runs against your real session: wasted tokens, polluted
-context, and confusing entries in the agent's own history.
+Open WebUI silently calls the selected model for background chores: a title
+after the first exchange, tags, a follow-up suggestion, an emoji, autocomplete
+as you type, and a search query when you use its built-in search. Each call
+arrives at the Pipe tagged with which chore it is, one of six task names OWUI
+sets internally.
 
-All six are short-circuited before they reach the Gateway.
+The Pipe checks that tag before it extracts the message, opens a Gateway
+connection, or does anything else: a match is logged and the Pipe returns
+immediately, so none of the six ever reaches your agent as a real turn. Left
+unhandled, each one would be an extra run against your actual session, wasted
+tokens, a title-generation prompt polluting the agent's context, and
+confusing entries per exchange in its own history.
+
+This is separate from [Auto-title](#f-auto-title), which is the Pipe's own
+opt-in replacement that runs on a dedicated lane instead.
 
 Always on, not configurable.
 
@@ -1258,11 +1320,19 @@ _No screenshot yet._
 <details>
 <summary><b>🧑‍🔧 Sub-agent results</b></summary>
 
-When a sub-agent finishes, its result is delivered into the parent Open WebUI
-chat as an _↳ Sub-agent_ bubble, carrying a hidden task id.
+When a sub-agent finishes, its result is written into the parent Open WebUI
+chat as its own message: a *↳ Sub-agent finished* line followed by the
+sub-agent's output, with an HTML comment carrying its task id appended after
+it. The comment renders invisibly in the chat but stays in the message's raw
+content.
 
-Clicking the toolbar button on one of those messages opens that sub-agent's
-[drawer](#f-subagent-drawer) directly, rather than the general status dialog.
+Open WebUI's Action-button mechanism only ever hands the Pipe the chat id,
+message id, model and content, never a custom field, so that hidden marker is
+the only way the button knows which sub-agent a given bubble belongs to.
+Clicking the toolbar button on one of those messages reads the marker back
+out of the message content and opens that sub-agent's
+[drawer](#f-subagent-drawer) directly, instead of the general status dialog
+every other message opens.
 
 Enabled by default.
 
