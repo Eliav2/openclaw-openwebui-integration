@@ -138,7 +138,6 @@ from openclaw_pipe import (
     _normalize_model_entry,
     _owui_chat_send_params,
     _owui_session_key,
-    _parse_whitelist,
     _preview_recovery_text,
     _provider_from_key,
     _reap_stale_gateway_connection,
@@ -3522,7 +3521,7 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DynamicModelSelectorTests(unittest.TestCase):
-    """Tests for ELI-11: dynamic model discovery, whitelist, and legacy compat."""
+    """Tests for ELI-11: dynamic model discovery."""
 
     def test_friendly_name_prefers_versioned_catalog_name_over_alias(self):
         # The alias ("opus") hides the version; the catalog name carries it.
@@ -3553,13 +3552,6 @@ class DynamicModelSelectorTests(unittest.TestCase):
         self.assertEqual(_provider_from_key("deepseek/deepseek-v4-flash"), "deepseek")
         self.assertEqual(_provider_from_key("o3-mini"), "")
 
-    def test_parse_whitelist_empty(self):
-        self.assertEqual(_parse_whitelist(""), set())
-        self.assertEqual(_parse_whitelist("   "), set())
-
-    def test_parse_whitelist_commas(self):
-        self.assertEqual(_parse_whitelist(" a , b, c "), {"a", "b", "c"})
-
     def test_pipe_selected_preset_default(self):
         pipe = Pipe()
         self.assertEqual(pipe._selected_preset({"model": "openclaw_gateway.default"}), "default")
@@ -3580,13 +3572,6 @@ class DynamicModelSelectorTests(unittest.TestCase):
             "google/gemini-3.1-pro-preview",
         )
 
-    def test_pipe_selected_preset_legacy_chatgpt(self):
-        pipe = Pipe()
-        self.assertEqual(
-            pipe._selected_preset({"model": "openclaw_gateway.chatgpt"}),
-            "chatgpt",
-        )
-
     def test_pipe_model_override_default_empty(self):
         pipe = Pipe()
         self.assertIsNone(pipe._model_override_for_preset("default"))
@@ -3596,15 +3581,7 @@ class DynamicModelSelectorTests(unittest.TestCase):
         pipe.valves.DEFAULT_MODEL = "openai/gpt-5.5"
         self.assertEqual(pipe._model_override_for_preset("default"), "openai/gpt-5.5")
 
-    def test_pipe_model_override_legacy_custom(self):
-        pipe = Pipe()
-        pipe.valves.CHATGPT_MODEL = "openai/gpt-5.5-pro"
-        self.assertEqual(
-            pipe._model_override_for_preset("chatgpt"),
-            "openai/gpt-5.5-pro",
-        )
-
-    def test_pipe_model_override_legacy_default(self):
+    def test_pipe_model_override_raw_key_passthrough(self):
         pipe = Pipe()
         self.assertEqual(
             pipe._model_override_for_preset("openai/gpt-5.5"),
@@ -3982,7 +3959,6 @@ class UnverifiedModelListTests(unittest.TestCase):
     def _pipe(self, tmp):
         p = Pipe()
         p.valves.STATE_DIR = tmp
-        p.valves.CONFIGURED_MODELS = ""
         p.valves.MAX_MODELS = 30
         return p
 
@@ -4142,7 +4118,6 @@ class ReviewFollowupRegressionTests(unittest.TestCase):
             custom = os.path.join(tmp, "custom")
             p = Pipe()
             p.valves.STATE_DIR = custom
-            p.valves.CONFIGURED_MODELS = ""
             _write_json_file(
                 os.path.join(_state_dir(custom), "models-cache.json"),
                 {"models": [{"key": "vendor/real", "name": "Real", "tags": []}]},
@@ -4152,19 +4127,6 @@ class ReviewFollowupRegressionTests(unittest.TestCase):
             self.assertTrue(any("Real" in l for l in labels), labels)
             for l in labels:
                 self.assertNotIn(UNVERIFIED_MODEL_SUFFIX, l)
-
-    def test_warning_survives_a_whitelist_that_filters_everything(self):
-        """CONFIGURED_MODELS set to real Gateway keys + an unreachable Gateway
-        emptied the example list, taking the warning with it -- leaving exactly
-        the user who most needs it with no explanation."""
-        with tempfile.TemporaryDirectory() as tmp:
-            p = Pipe()
-            p.valves.STATE_DIR = tmp
-            p.valves.CONFIGURED_MODELS = "vendor/only-mine"
-            entries = asyncio.run(p.pipes())
-            self.assertEqual(len(entries), 1)
-            self.assertIn(UNVERIFIED_MODEL_SUFFIX, entries[0]["name"])
-            self.assertEqual(entries[0]["id"], "default")
 
 
 class RepeatedAskUserMarkerTests(unittest.TestCase):

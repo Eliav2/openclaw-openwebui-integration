@@ -162,8 +162,7 @@ and **separate function** (ships as its own file and installs separately).
 
 - [**💬 Persistent sessions**](#f-sessions): one stable OpenClaw session per OWUI chat, so the agent remembers context across messages
 - [**🧭 Dynamic model selector**](#f-model-selector): one entry per model your Gateway actually knows about, discovered via `models.list`
-- [**🔎 Whitelist and size cap**](#f-model-limits): keep the selector short and curated
-- [**🕰️ Legacy fixed presets**](#f-legacy-presets): the older ChatGPT/Opus/Sonnet/GLM entries still resolve
+- [**🔎 Selector size cap**](#f-model-limits): keep the selector from flooding with every model the Gateway knows about
 
 **Status and observability**
 
@@ -540,16 +539,10 @@ that OWUI conversation's OpenClaw session to that model; switching back to
 
 Relevant valves:
 
-| Valve               | Description                                                                                                 |
-| ------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `CONFIGURED_MODELS` | Comma-separated whitelist of model keys to show. Empty = show all discovered models.                        |
-| `DEFAULT_MODEL`     | Model used when `OpenClaw · Default` is selected. Also doubles as a reference dropdown of known model keys. |
-| `MAX_MODELS`        | Safety cap on how many models the selector lists when there's no whitelist (default `30`).                  |
-
-> **Legacy presets.** The `CHATGPT_MODEL`, `OPUS_MODEL`, `SONNET_MODEL`, and
-> `GLM_MODEL` valves still produce fixed selector entries, purely so
-> conversations that already picked one keep working. Ignore them on a new
-> install; dynamic discovery replaces them.
+| Valve           | Description                                                                                                 |
+| --------------- | ----------------------------------------------------------------------------------------------------------- |
+| `DEFAULT_MODEL` | Model used when `OpenClaw · Default` is selected. Also doubles as a reference dropdown of known model keys. |
+| `MAX_MODELS`    | Safety cap on how many models the selector lists (default `30`).                                            |
 
 ### Auto-generated chat titles
 
@@ -591,7 +584,7 @@ Relevant valves:
 | Text appears all at once                              | Pipe uses `return` instead of `yield` (check your code)                                                                                                                                                                                                                                                                                                        |
 | "No GATEWAY_TOKEN configured"                         | Valve not set, go to Admin → Functions → edit valves                                                                                                                                                                                                                                                                                                           |
 | An `**Error:**` line instead of a reply               | OWUI can't reach `GATEWAY_URL`: check network connectivity from the OWUI backend                                                                                                                                                                                                                                                                               |
-| Model missing from selector                           | Run `uv run install.py repair`; it ensures the function is active/global and visible in `/api/v1/models`. Also check `CONFIGURED_MODELS` isn't filtering it out.                                                                                                                                                                                               |
+| Model missing from selector                           | Run `uv run install.py repair`; it ensures the function is active/global and visible in `/api/v1/models`. Also check `MAX_MODELS` isn't capping it out.                                                                                                                                                                                                        |
 | "pairing required"                                    | Run `uv run install.py repair` or approve the matching request with `openclaw devices approve <request-id>`                                                                                                                                                                                                                                                    |
 | Image still uses the legacy file server               | OWUI file upload failed and the integration fell back; check `OWUI_BASE_URL`, request auth/API key, and OWUI logs                                                                                                                                                                                                                                              |
 | Tool calls not showing                                | The `__event_emitter__` calls fail silently; check OWUI backend logs                                                                                                                                                                                                                                                                                           |
@@ -957,50 +950,16 @@ Valves: `DEFAULT_MODEL` (rendered as a live dropdown, not a text box),
 
 <a id="f-model-limits"></a>
 <details>
-<summary><b>🔎 Whitelist and size cap</b></summary>
+<summary><b>🔎 Selector size cap</b></summary>
 
-`CONFIGURED_MODELS` is a comma-separated list of exact model keys (e.g.
-`anthropic/claude-sonnet-5`) you want in the selector; leave it empty and
-every model your Gateway reports is offered. The filter runs first, before
-the cap, and keeps discovery order rather than the order you listed the keys
-in.
-
-`MAX_MODELS` then truncates whatever survives the whitelist to at most this
-many entries, defaulting to 30 and validated to a 1-100 range by the valve
-schema itself. A Gateway that knows about two hundred models should not
-produce a two-hundred-entry dropdown, and the two settings compose: a tight
-whitelist is never cut down further just because it is short, only a large
-or absent one gets capped.
+`MAX_MODELS` truncates the discovered model list to at most this many
+entries, defaulting to 30 and validated to a 1-100 range by the valve schema
+itself. A Gateway that knows about two hundred models should not produce a
+two-hundred-entry dropdown.
 
 The `DEFAULT_MODEL` dropdown is separate and always lists every model key
-currently known, whitelist or cap notwithstanding, since picking a default
-has to stay possible even for a model the selector itself is hiding.
-
-</details>
-
-<a id="f-legacy-presets"></a>
-<details>
-<summary><b>🕰️ Legacy fixed presets</b></summary>
-
-Before the model selector became dynamic, this integration shipped four fixed
-entries — ChatGPT, Opus, Sonnet and GLM — each hardcoded to one model. Old
-chats stored that choice as a literal string like `openclaw_gateway.opus`, and
-the Pipe still recognizes that suffix today: it is extracted from the model
-string and mapped back to a real model key, so a conversation that has been
-idle since before the dynamic selector landed keeps working exactly as it did.
-
-The mapping is not frozen to its original values. Each preset first checks
-its matching valve (`CHATGPT_MODEL`, `OPUS_MODEL`, `SONNET_MODEL`,
-`GLM_MODEL`); if you have changed one away from its shipped default, your
-value wins, and only an untouched valve falls back to the hardcoded key.
-That matters if a provider renames or retires the underlying model:
-repointing the valve keeps years-old chats resolving without editing their
-stored model string.
-
-None of the four appear in the selector anymore. New chats should pick a live
-entry instead.
-
-Valves: `CHATGPT_MODEL`, `OPUS_MODEL`, `SONNET_MODEL`, `GLM_MODEL`.
+currently known, cap notwithstanding, since picking a default has to stay
+possible even for a model the selector itself is hiding.
 
 </details>
 
@@ -1405,8 +1364,7 @@ with no file access and no restart.
 
 Connection: `GATEWAY_URL`, `GATEWAY_TOKEN`, `AGENT_ID`, `DEVICE_IDENTITY`,
 `STATE_DIR`.
-Models: `DEFAULT_MODEL`, `CONFIGURED_MODELS`, `MAX_MODELS`, plus the four legacy
-preset valves.
+Models: `DEFAULT_MODEL`, `MAX_MODELS`.
 Behaviour: `AUTO_TITLE`, `SEND_STOP_ON_CANCEL`, `USE_OWUI_FILES`,
 `OWUI_BASE_URL`, `OWUI_API_KEY`, `ENABLE_FILE_SERVER`, `FILE_SERVER_BASE_URL`.
 Thinking filter: `priority`, `override_advanced_params`, and the per-user

@@ -151,13 +151,6 @@ class Pipe:
                 "you browse OWUI from the same host. Point it at an address your "
                 "browser can reach if you depend on this fallback."
         )
-        CONFIGURED_MODELS: str = Field(
-            default="",
-            description="(Optional.) Comma-separated model keys to show in the selector, e.g. "
-                "'anthropic/claude-sonnet-5,openai/gpt-5.5'. Leave empty to show every "
-                "model your Gateway reports. The Default Model dropdown lists the keys "
-                "currently known."
-        )
         DEFAULT_MODEL: str = Field(
             default="",
             description="Model used when you pick 'OpenClaw · Default'. Leave empty to "
@@ -171,29 +164,9 @@ class Pipe:
         )
         MAX_MODELS: int = Field(
             default=30,
-            description="Maximum number of models to show in the selector when whitelist is empty.",
+            description="Maximum number of models to show in the selector.",
             ge=1,
             le=100
-        )
-        CHATGPT_MODEL: str = Field(
-            default="openai/gpt-5.5",
-            description="[Legacy -- ignore this on a new install.] Model used by the fixed "
-                "'ChatGPT' selector entry. Kept only for chats that already picked it."
-        )
-        OPUS_MODEL: str = Field(
-            default="anthropic/claude-opus-4-8",
-            description="[Legacy -- ignore this on a new install.] Model used by the fixed "
-                "'Opus' selector entry. Kept only for chats that already picked it."
-        )
-        SONNET_MODEL: str = Field(
-            default="anthropic/claude-sonnet-5",
-            description="[Legacy -- ignore this on a new install.] Model used by the fixed "
-                "'Sonnet' selector entry. Kept only for chats that already picked it."
-        )
-        GLM_MODEL: str = Field(
-            default="openrouter/z-ai/glm-5.2",
-            description="[Legacy -- ignore this on a new install.] Model used by the fixed "
-                "'GLM' selector entry. Kept only for chats that already picked it."
         )
         AUTO_TITLE: bool = Field(
             default=True,
@@ -220,13 +193,6 @@ class Pipe:
         self._current_run_id: str | None = None
         self._connection: _GatewayConnection | None = None
 
-    _LEGACY_PRESET_MAP = {
-        "chatgpt": "openai/gpt-5.5",
-        "opus": "anthropic/claude-opus-4-8",
-        "sonnet": "anthropic/claude-sonnet-5",
-        "glm": "openrouter/z-ai/glm-5.2",
-    }
-
     async def pipes(self):
         """Expose multiple OWUI model-selector entries from one pipe.
         
@@ -235,11 +201,6 @@ class Pipe:
         """
         type(self)._last_state_dir = getattr(self.valves, "STATE_DIR", "") or ""
         models, source = await _discover_models_with_source(self.valves)
-
-        # Apply whitelist filter
-        whitelist = _parse_whitelist(self.valves.CONFIGURED_MODELS)
-        if whitelist:
-            models = [m for m in models if m["key"] in whitelist]
 
         # Apply safety cap
         if len(models) > self.valves.MAX_MODELS:
@@ -263,11 +224,8 @@ class Pipe:
         # in this state: it clears the override and uses the agent's own model,
         # so it needs no Gateway round trip to be correct.
         #
-        # When CONFIGURED_MODELS lists the user's real Gateway keys but the
-        # Gateway hasn't been reached, the whitelist filters the example list to
-        # nothing and the warning disappears with it -- leaving exactly the user
-        # who most needs it (real config, unreachable Gateway) with a bare
-        # single-entry selector and no explanation. Say it on Default instead.
+        # If discovery ever comes back empty (fallback list included), say the
+        # warning on Default instead of leaving a bare, unexplained selector.
         default_name = "OpenClaw · Default"
         if unverified and not entries:
             default_name += UNVERIFIED_MODEL_SUFFIX
@@ -305,7 +263,7 @@ class Pipe:
         ]
 
     def _selected_preset(self, body):
-        """Extract the model key or legacy preset name from the OWUI model string."""
+        """Extract the model key from the OWUI model string."""
         model = str(body.get("model", ""))
         # Split on the FIRST dot only: the function id (e.g. "openclaw_gateway")
         # never contains a dot, but model keys can (e.g. "gemini-3.1-pro-preview").
@@ -313,30 +271,12 @@ class Pipe:
         suffix = model.split(".", 1)[-1]
         if suffix == "default":
             return "default"
-        if suffix in self._LEGACY_PRESET_MAP:
-            return suffix  # legacy name like "chatgpt" -- mapping handled downstream
         return suffix  # raw model key
 
     def _model_override_for_preset(self, preset):
-        """Return the model string to pass to sessions.patch.
-        
-        For legacy presets, respects user-customized legacy valve values
-        (backward compatibility) before falling back to the hardcoded mapping.
-        """
+        """Return the model string to pass to sessions.patch."""
         if preset == "default":
             return self.valves.DEFAULT_MODEL.strip() or None
-        if preset in self._LEGACY_PRESET_MAP:
-            # `_LEGACY_PRESET_MAP` is the single source of truth for each
-            # preset's default model -- don't re-hardcode it here.
-            legacy_val = {
-                "chatgpt": self.valves.CHATGPT_MODEL,
-                "opus": self.valves.OPUS_MODEL,
-                "sonnet": self.valves.SONNET_MODEL,
-                "glm": self.valves.GLM_MODEL,
-            }.get(preset, "")
-            if legacy_val and legacy_val.strip() and legacy_val.strip() != self._LEGACY_PRESET_MAP[preset]:
-                return legacy_val.strip()
-            return self._LEGACY_PRESET_MAP[preset]
         return preset
 
     # ── Auto-title helpers ──────────────────────────────────────────
