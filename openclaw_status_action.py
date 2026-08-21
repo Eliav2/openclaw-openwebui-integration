@@ -212,6 +212,161 @@ def _write_json_file(path, data):
         return False
 
 
+# --- thinking --------------------------------------------------------------
+# Shared by BOTH the Thinking filter and the Pipe: the filter offers the levels
+# and the pipe enforces them against the live session ladder, so the ranks and
+# the clamping rule have to be one implementation, not two that agree today.
+#
+# Deliberately has no imports, no classes, and no module-level names beyond the
+# five below. It is concatenated into the Pipe artifact, where every name in it
+# lands in the same flat namespace as every other fragment: a helper named like
+# one of the pipe's own (a `_state_dir`, say) would silently shadow it
+# depending on fragment order. Filter-only helpers live in `thinking_filter`
+# for exactly that reason.
+
+# ---------------------------------------------------------------------------
+# Levels
+# ---------------------------------------------------------------------------
+
+# Ranks mirror the gateway's own table (off is genuinely a level, not an
+# absence). Used to order the dropdown and to clamp downward, never upward:
+# asking for less thinking than requested is a safe degradation, asking for
+# more is a surprise on someone's bill.
+LEVEL_RANKS = {
+    "off": 0,
+    "minimal": 10,
+    "low": 20,
+    "medium": 30,
+    "adaptive": 30,
+    "high": 40,
+    "xhigh": 60,
+    "max": 70,
+    "ultra": 80,
+}
+
+# The sentinel meaning "do not send the field at all". Distinct from "off",
+# which is an explicit instruction to not think. "default" leaves the agent's
+# own configured level alone; "off" overrides it.
+UNSET = "default"
+
+# Used until the pipe has run once and written a real ladder cache. Every
+# provider observed supports at least these, so nothing here can be a lie.
+FALLBACK_LEVELS = ["off", "minimal", "low", "medium", "high"]
+
+LADDER_CACHE_NAME = "thinking-ladders.json"
+
+# The Gateway's rejection lists LABELS, not ids, and for most profiles the two
+# are identical (`label: id`). The one divergence is the binary profile, which
+# labels `low` as "on". Mapping it back is the difference between learning a
+# model's real two-level ladder and learning a one-level lie.
+LEVEL_LABEL_ALIASES = {"on": "low"}
+
+# The exact anchors of the Gateway's hard validation error, e.g.:
+#   Thinking level "high" is not supported for claude-cli/claude-opus-5. Use one of: off.
+# All three must be present and in order. That is deliberately at least as
+# narrow as matching the whole sentence: it can never fire on genuine assistant
+# text that happens to discuss thinking levels.
+_REJECT_HEAD = 'Thinking level "'
+_REJECT_MID = '" is not supported for '
+_REJECT_TAIL = ". Use one of: "
+
+
+def parse_thinking_rejection(text):
+    """Read the Gateway's own rejection as an authoritative per-model ladder.
+
+    This exists because `sessions.describe` cannot be trusted for this. Describe
+    builds its ladder with no model catalog in scope, so `resolveThinkingProfile`
+    never sees the catalog's `reasoning: false` and falls through to the generic
+    base profile -- it reported all 8 levels for `claude-cli/claude-opus-5`,
+    whose real ladder is `["off"]`. The send path resolves the same question
+    WITH the catalog and rejects. So the rejection is the only place the truth
+    is stated, and throwing it away is what made this misfire once per turn
+    forever instead of once per model.
+
+    Returns None when `text` is not that rejection. Otherwise a dict:
+    `{"level": requested, "model": "provider/model", "levels": [ids]}`.
+    `levels` may be empty if every listed label is unrecognised -- the caller
+    still learns which model rejected which level, so it must check for None
+    rather than for falsiness.
+
+    Pure string parsing on purpose: this fragment is shared with the Thinking
+    filter, which imports nothing (not even `re`) so that a filter running on
+    every message can never fail on an import it did not need.
+    """
+    if not text:
+        return None
+    head = text.find(_REJECT_HEAD)
+    if head < 0:
+        return None
+    level_start = head + len(_REJECT_HEAD)
+    mid = text.find(_REJECT_MID, level_start)
+    if mid < 0:
+        return None
+    tail = text.find(_REJECT_TAIL, mid)
+    if tail < 0:
+        return None
+
+    level = text[level_start:mid].strip().lower()
+    model = text[mid + len(_REJECT_MID):tail].strip()
+    if not level or not model or " " in model:
+        # A model ref never contains a space. Anything that does means the
+        # anchors matched something that merely reads like the rejection.
+        return None
+
+    listed = text[tail + len(_REJECT_TAIL):]
+    stop = listed.find(".")
+    if stop >= 0:
+        listed = listed[:stop]
+    levels = []
+    for token in listed.split(","):
+        name = token.strip().lower()
+        name = LEVEL_LABEL_ALIASES.get(name, name)
+        if name in LEVEL_RANKS and name not in levels:
+            levels.append(name)
+    levels.sort(key=lambda lv: LEVEL_RANKS[lv])
+    return {"level": level, "model": model, "levels": levels}
+
+
+def clamp_to_ladder(level, ladder):
+    """Fit a requested level to what a model actually supports.
+
+    Returns (resolved_level, note). `note` is None when the request went
+    through untouched, otherwise a short human sentence explaining what
+    changed, which the caller is expected to show rather than swallow.
+
+    Clamping is always downward to the nearest supported rank. If the model
+    supports nothing at or below the request (a ladder of only higher levels,
+    which no observed provider has, but which costs nothing to handle), the
+    lowest supported level is used.
+    """
+    if not level or level == UNSET:
+        return None, None
+    if not ladder:
+        # No ladder known: pass the request through and let the gateway rule on
+        # it. Silently dropping a level the user explicitly picked is worse.
+        return level, None
+    if level in ladder:
+        return level, None
+
+    want = LEVEL_RANKS.get(level)
+    if want is None:
+        return None, f"Unknown thinking level {level!r}, ignoring it."
+
+    ranked_ladder = [lv for lv in ladder if lv in LEVEL_RANKS]
+    if not ranked_ladder:
+        return None, "This model reported no recognized thinking levels; ignoring the selection."
+
+    at_or_below = [lv for lv in ranked_ladder if LEVEL_RANKS[lv] <= want]
+    if at_or_below:
+        best = max(at_or_below, key=lambda lv: LEVEL_RANKS[lv])
+    else:
+        best = min(ranked_ladder, key=lambda lv: LEVEL_RANKS[lv])
+    return best, (
+        f"This model does not support thinking level {level!r}, "
+        f"using {best!r} instead."
+    )
+
+
 # --- gateway ---------------------------------------------------------------
 GATEWAY_SCOPES = ["operator.admin", "operator.read", "operator.write"]
 
@@ -414,6 +569,168 @@ def _owui_session_key(agent_id: str, user_id: str, chat_id: str) -> str:
     return f"agent:{agent_id}:openwebui-{user_id}-{chat_id}"
 
 
+def _session_thinking_ladder(desc: dict) -> list | None:
+    """Pull the thinking levels a session's CURRENT model supports out of a
+    `sessions.describe` response.
+
+    `models.list` cannot answer this: it carries a `reasoning` boolean and
+    nothing else. `agents.list` does carry a ladder, but the agent's PRIMARY
+    model's, which is wrong the moment a session overrides the model. Only
+    describe reflects what is actually resolved for this session right now.
+
+    `thinkingLevels` is authoritative: the gateway defines it as the raw
+    `{id, label}` objects (`resolveGatewaySessionThinkingProjectionInternal`
+    -> `thinkingLevels: metadata.levels`), keyed by the canonical lowercase
+    ids (`off`, `minimal`, ...) that LEVEL_RANKS and clamp_to_ladder match
+    against. `thinkingOptions` is display-only -- the SAME gateway function
+    derives it as `metadata.levels.map(level => level.label)`, i.e. human
+    labels ("Off", "Extra High", ...), not ids. Matching a requested level
+    against labels silently breaks clamping (nothing in LEVEL_RANKS looks
+    like a label), so `thinkingOptions` must never be used for the ladder --
+    checking it first, as this used to, let an unsupported level fall
+    through the clamp and reach the gateway's own hard validation error
+    (ELI-85 field mixup, caused a live chat to hard-fail on every turn).
+    Kept only as a last-resort fallback in case a future gateway build ever
+    stops emitting `thinkingLevels` -- an imperfect ladder beats none.
+
+    Returns None (not []) when the field is absent, because "no ladder known"
+    and "this model supports nothing" have to lead to different behaviour: the
+    first passes the request through to the gateway, the second would clamp
+    every request away.
+    """
+    row = (desc or {}).get("session") or {}
+    levels = row.get("thinkingLevels")
+    if isinstance(levels, list) and levels:
+        out = [str(lv.get("id")) for lv in levels
+               if isinstance(lv, dict) and lv.get("id")]
+        if out:
+            return out
+    opts = row.get("thinkingOptions")
+    if isinstance(opts, list) and opts:
+        return [str(x).strip().lower() for x in opts]
+    return None
+
+
+def _session_model_key(row) -> str | None:
+    """`provider/model` for a `sessions.describe` row, or None.
+
+    Formatted to match the Gateway's own rejection text verbatim
+    ("...is not supported for claude-cli/claude-opus-5.") so a ladder learned
+    from a rejection and one observed from describe key the same entry.
+    """
+    row = row or {}
+    provider = str(row.get("modelProvider") or "").strip()
+    model = str(row.get("model") or "").strip()
+    if not provider or not model:
+        return None
+    return f"{provider}/{model}"
+
+
+def _ladder_cache_path(state_dir: str = "") -> str:
+    return os.path.join(_state_dir(state_dir), LADDER_CACHE_NAME)
+
+
+# Guards the ladder cache's read-merge-write sequence below. Pipe and Status
+# Action requests can land in different threads of the same OWUI process, and
+# without this a slower worker's read-merge-write can finish after a faster
+# one's and silently drop the faster worker's update. A unique temp file (see
+# _write_json_file) only makes each individual write atomic; it does nothing
+# for two workers racing on the read-then-write in between.
+_LADDER_CACHE_LOCK = threading.Lock()
+
+
+def _record_thinking_ladder(levels, model_key=None, authoritative=False,
+                             state_dir: str = "") -> None:
+    """Fold a ladder we just saw into the cache, both as a union and per model.
+
+    Two different consumers, two different needs, one file:
+
+    * `levels` (union across every model seen) is what the Thinking filter
+      offers, because Open WebUI builds a valve dropdown once from the class
+      and cannot vary it per selected model.
+    * `models[<provider/model>]` is what the SEND path clamps against, and it
+      must be exact. Clamping against the union is what let `high` reach a
+      model whose only level is `off`.
+
+    `authoritative` marks a ladder the Gateway stated itself by rejecting a
+    send. A merely observed one (from `sessions.describe`) must never overwrite
+    it: describe resolves the ladder with no model catalog in scope and so
+    reports the generic base profile for catalog-gated models. Trusting the
+    weaker source second would undo the fix on the very next turn.
+
+    Best-effort by design: a failed write costs a stale dropdown and one more
+    rejected turn, and must never affect the message being sent.
+    """
+    known = [lv for lv in (levels or []) if lv in LEVEL_RANKS]
+    path = _ladder_cache_path(state_dir)
+
+    with _LADDER_CACHE_LOCK:
+        current = _read_json_file(path) or {}
+
+        have = current.get("levels")
+        have = [x for x in have if x in LEVEL_RANKS] if isinstance(have, list) else []
+        merged = sorted(set(have) | set(known), key=lambda lv: (LEVEL_RANKS[lv], lv))
+
+        models = current.get("models")
+        models = dict(models) if isinstance(models, dict) else {}
+        model_changed = False
+        if model_key:
+            prior = models.get(model_key)
+            prior = prior if isinstance(prior, dict) else {}
+            if prior.get("source") == "gateway" and not authoritative:
+                # Keep the stated truth; a describe-sourced ladder is not
+                # evidence against it.
+                pass
+            else:
+                entry = {
+                    "levels": known,
+                    "source": "gateway" if authoritative else "describe",
+                    "updated": int(time.time()),
+                }
+                if (prior.get("levels") != entry["levels"]
+                        or prior.get("source") != entry["source"]):
+                    models[model_key] = entry
+                    model_changed = True
+
+        if merged == have and not model_changed:
+            return
+        payload = {"levels": merged, "updated": int(time.time())}
+        if models:
+            payload["models"] = models
+        if not _write_json_file(path, payload):
+            return
+    if merged != have:
+        pipe_log(f"thinking ladder cache updated: {merged}")
+    if model_changed:
+        pipe_log(
+            f"thinking ladder for {model_key}: {known} "
+            f"({'stated by gateway' if authoritative else 'observed'})"
+        )
+
+
+def _read_model_thinking_ladder(model_key, state_dir: str = ""):
+    """The exact ladder for one model, or None if we have not learned it.
+
+    None and [] mean different things here and the caller relies on it: None is
+    "unknown, pass the request through", [] would be "supports nothing", which
+    no model is. Entries that somehow persisted empty are treated as unknown.
+    """
+    if not model_key:
+        return None
+    cache = _read_json_file(_ladder_cache_path(state_dir)) or {}
+    models = cache.get("models")
+    if not isinstance(models, dict):
+        return None
+    entry = models.get(model_key)
+    if not isinstance(entry, dict):
+        return None
+    levels = entry.get("levels")
+    if not isinstance(levels, list):
+        return None
+    known = [lv for lv in levels if lv in LEVEL_RANKS]
+    return known or None
+
+
 def _owui_chat_send_params(
     session_key: str,
     message: str,
@@ -421,6 +738,7 @@ def _owui_chat_send_params(
     owui_chat_id: str | None,
     owui_user_id: str | None,
     attachments: list | None = None,
+    thinking: str | None = None,
 ) -> dict:
     params = dict(
         sessionKey=session_key,
@@ -429,6 +747,11 @@ def _owui_chat_send_params(
     )
     if attachments:
         params["attachments"] = attachments
+    # Only when actually chosen. chat.send reads an absent `thinking` as "use
+    # whatever the agent is configured for", which is a different instruction
+    # from any value we could send, "off" very much included.
+    if thinking:
+        params["thinking"] = thinking
     if owui_chat_id:
         metadata = {
             "chat_id": owui_chat_id,
@@ -978,6 +1301,11 @@ class _GatewayConnection:
         self._model_patch_cache: dict[str, tuple[str | None, float]] = {}
         self._model_patch_locks: dict[str, asyncio.Lock] = {}
 
+        # Last thinking-clamp note shown per session, so a standing mismatch
+        # between the picked level and the model's ladder is explained ONCE
+        # instead of prefixing every single answer with the same italic line.
+        self._thinking_note_shown: dict[str, str] = {}
+
         # Reconnect state
         self._reconnect_attempt = 0
         self._max_backoff = 30  # seconds
@@ -1200,6 +1528,27 @@ class _GatewayConnection:
     def record_model_patched(self, session_key: str, model: str | None) -> None:
         """Record a successful sessions.patch for the cache (ELI-59)."""
         self._model_patch_cache[session_key] = (model, time.time())
+
+    def should_announce_thinking_note(self, session_key: str, note: str) -> bool:
+        """True the first time a given clamp note applies to a session.
+
+        The level is picked in a filter dropdown and then stays picked, so a
+        model that cannot honour it produces the identical note on every
+        message. Told once it is useful; repeated above every answer it is
+        noise the user has no way to dismiss, which is what it became in
+        practice. Any CHANGE (different level, different model, a ladder
+        learned from a rejection) is a new note and speaks up again.
+
+        Per connection rather than persisted on purpose: after a redeploy or a
+        reconnect the reminder is worth one repeat, and this must never be a
+        file whose staleness could silence a genuinely new mismatch.
+        """
+        if not note:
+            return False
+        if self._thinking_note_shown.get(session_key) == note:
+            return False
+        self._thinking_note_shown[session_key] = note
+        return True
 
     def invalidate_model_patch(self, session_key: str) -> None:
         """Drop the cached model for a session (ELI-59) -- called on patch
@@ -1565,6 +1914,7 @@ class _GatewayConnection:
 
         self._ws = ws
         self._reconnect_attempt = 0
+        self._thinking_note_shown.clear()
         pipe_log("Connected to Gateway (persistent)")
         # NOTE: does not start/spawn the event-loop task -- that happens
         # exactly once, in `ensure_connected`. This method is also called
@@ -2278,10 +2628,11 @@ async def _emit_live_bootstrap_reload(user_id: str, chat_id: str, target_message
 # done:false, snapshots + finalize = done:true), exactly like the slice-1 /
 # parity paths already do.
 #
-# NOT flipped on here -- leave False. Before enabling, the terminal
-# `chat:active` event envelope still needs a live-browser confirmation
-# (see `_relay_finalize`); DB persistence guarantees reload-correctness
-# regardless, so an imperfect terminal event only costs a spinner nicety.
+# Flipped ON in 2aada56 after the live-browser confirmation this comment used to
+# be waiting for. The terminal `chat:active` envelope (see `_relay_finalize`) is
+# still the least-verified part of the path, but DB persistence guarantees
+# reload-correctness regardless, so an imperfect terminal event only costs a
+# spinner nicety. Set to False to fall back to slice-1 post-hoc delivery.
 LIVE_STREAM_RELAY_ENABLED = True
 
 # A proactive run is only eligible for relay once its session has had zero

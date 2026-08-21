@@ -66,7 +66,7 @@ Installation
 8. Pick a model in Open WebUI. The pipe asks the Gateway which models it knows
    about and lists one selector entry per model, alongside an always-present
    "OpenClaw . Default" entry that leaves the agent's own configured model
-   alone. CONFIGURED_MODELS restricts that list; MAX_MODELS caps it.
+   alone. MAX_MODELS caps how many entries it lists.
 
 Full valve reference, troubleshooting, and the agent metadata contract:
 https://github.com/Eliav2/openclaw-openwebui-integration
@@ -221,6 +221,161 @@ def _write_json_file(path, data):
     except Exception as ex:
         pipe_log(f"Failed writing {path}: {ex}")
         return False
+
+
+# --- thinking --------------------------------------------------------------
+# Shared by BOTH the Thinking filter and the Pipe: the filter offers the levels
+# and the pipe enforces them against the live session ladder, so the ranks and
+# the clamping rule have to be one implementation, not two that agree today.
+#
+# Deliberately has no imports, no classes, and no module-level names beyond the
+# five below. It is concatenated into the Pipe artifact, where every name in it
+# lands in the same flat namespace as every other fragment: a helper named like
+# one of the pipe's own (a `_state_dir`, say) would silently shadow it
+# depending on fragment order. Filter-only helpers live in `thinking_filter`
+# for exactly that reason.
+
+# ---------------------------------------------------------------------------
+# Levels
+# ---------------------------------------------------------------------------
+
+# Ranks mirror the gateway's own table (off is genuinely a level, not an
+# absence). Used to order the dropdown and to clamp downward, never upward:
+# asking for less thinking than requested is a safe degradation, asking for
+# more is a surprise on someone's bill.
+LEVEL_RANKS = {
+    "off": 0,
+    "minimal": 10,
+    "low": 20,
+    "medium": 30,
+    "adaptive": 30,
+    "high": 40,
+    "xhigh": 60,
+    "max": 70,
+    "ultra": 80,
+}
+
+# The sentinel meaning "do not send the field at all". Distinct from "off",
+# which is an explicit instruction to not think. "default" leaves the agent's
+# own configured level alone; "off" overrides it.
+UNSET = "default"
+
+# Used until the pipe has run once and written a real ladder cache. Every
+# provider observed supports at least these, so nothing here can be a lie.
+FALLBACK_LEVELS = ["off", "minimal", "low", "medium", "high"]
+
+LADDER_CACHE_NAME = "thinking-ladders.json"
+
+# The Gateway's rejection lists LABELS, not ids, and for most profiles the two
+# are identical (`label: id`). The one divergence is the binary profile, which
+# labels `low` as "on". Mapping it back is the difference between learning a
+# model's real two-level ladder and learning a one-level lie.
+LEVEL_LABEL_ALIASES = {"on": "low"}
+
+# The exact anchors of the Gateway's hard validation error, e.g.:
+#   Thinking level "high" is not supported for claude-cli/claude-opus-5. Use one of: off.
+# All three must be present and in order. That is deliberately at least as
+# narrow as matching the whole sentence: it can never fire on genuine assistant
+# text that happens to discuss thinking levels.
+_REJECT_HEAD = 'Thinking level "'
+_REJECT_MID = '" is not supported for '
+_REJECT_TAIL = ". Use one of: "
+
+
+def parse_thinking_rejection(text):
+    """Read the Gateway's own rejection as an authoritative per-model ladder.
+
+    This exists because `sessions.describe` cannot be trusted for this. Describe
+    builds its ladder with no model catalog in scope, so `resolveThinkingProfile`
+    never sees the catalog's `reasoning: false` and falls through to the generic
+    base profile -- it reported all 8 levels for `claude-cli/claude-opus-5`,
+    whose real ladder is `["off"]`. The send path resolves the same question
+    WITH the catalog and rejects. So the rejection is the only place the truth
+    is stated, and throwing it away is what made this misfire once per turn
+    forever instead of once per model.
+
+    Returns None when `text` is not that rejection. Otherwise a dict:
+    `{"level": requested, "model": "provider/model", "levels": [ids]}`.
+    `levels` may be empty if every listed label is unrecognised -- the caller
+    still learns which model rejected which level, so it must check for None
+    rather than for falsiness.
+
+    Pure string parsing on purpose: this fragment is shared with the Thinking
+    filter, which imports nothing (not even `re`) so that a filter running on
+    every message can never fail on an import it did not need.
+    """
+    if not text:
+        return None
+    head = text.find(_REJECT_HEAD)
+    if head < 0:
+        return None
+    level_start = head + len(_REJECT_HEAD)
+    mid = text.find(_REJECT_MID, level_start)
+    if mid < 0:
+        return None
+    tail = text.find(_REJECT_TAIL, mid)
+    if tail < 0:
+        return None
+
+    level = text[level_start:mid].strip().lower()
+    model = text[mid + len(_REJECT_MID):tail].strip()
+    if not level or not model or " " in model:
+        # A model ref never contains a space. Anything that does means the
+        # anchors matched something that merely reads like the rejection.
+        return None
+
+    listed = text[tail + len(_REJECT_TAIL):]
+    stop = listed.find(".")
+    if stop >= 0:
+        listed = listed[:stop]
+    levels = []
+    for token in listed.split(","):
+        name = token.strip().lower()
+        name = LEVEL_LABEL_ALIASES.get(name, name)
+        if name in LEVEL_RANKS and name not in levels:
+            levels.append(name)
+    levels.sort(key=lambda lv: LEVEL_RANKS[lv])
+    return {"level": level, "model": model, "levels": levels}
+
+
+def clamp_to_ladder(level, ladder):
+    """Fit a requested level to what a model actually supports.
+
+    Returns (resolved_level, note). `note` is None when the request went
+    through untouched, otherwise a short human sentence explaining what
+    changed, which the caller is expected to show rather than swallow.
+
+    Clamping is always downward to the nearest supported rank. If the model
+    supports nothing at or below the request (a ladder of only higher levels,
+    which no observed provider has, but which costs nothing to handle), the
+    lowest supported level is used.
+    """
+    if not level or level == UNSET:
+        return None, None
+    if not ladder:
+        # No ladder known: pass the request through and let the gateway rule on
+        # it. Silently dropping a level the user explicitly picked is worse.
+        return level, None
+    if level in ladder:
+        return level, None
+
+    want = LEVEL_RANKS.get(level)
+    if want is None:
+        return None, f"Unknown thinking level {level!r}, ignoring it."
+
+    ranked_ladder = [lv for lv in ladder if lv in LEVEL_RANKS]
+    if not ranked_ladder:
+        return None, "This model reported no recognized thinking levels; ignoring the selection."
+
+    at_or_below = [lv for lv in ranked_ladder if LEVEL_RANKS[lv] <= want]
+    if at_or_below:
+        best = max(at_or_below, key=lambda lv: LEVEL_RANKS[lv])
+    else:
+        best = min(ranked_ladder, key=lambda lv: LEVEL_RANKS[lv])
+    return best, (
+        f"This model does not support thinking level {level!r}, "
+        f"using {best!r} instead."
+    )
 
 
 # --- media -----------------------------------------------------------------
@@ -1580,6 +1735,168 @@ def _owui_session_key(agent_id: str, user_id: str, chat_id: str) -> str:
     return f"agent:{agent_id}:openwebui-{user_id}-{chat_id}"
 
 
+def _session_thinking_ladder(desc: dict) -> list | None:
+    """Pull the thinking levels a session's CURRENT model supports out of a
+    `sessions.describe` response.
+
+    `models.list` cannot answer this: it carries a `reasoning` boolean and
+    nothing else. `agents.list` does carry a ladder, but the agent's PRIMARY
+    model's, which is wrong the moment a session overrides the model. Only
+    describe reflects what is actually resolved for this session right now.
+
+    `thinkingLevels` is authoritative: the gateway defines it as the raw
+    `{id, label}` objects (`resolveGatewaySessionThinkingProjectionInternal`
+    -> `thinkingLevels: metadata.levels`), keyed by the canonical lowercase
+    ids (`off`, `minimal`, ...) that LEVEL_RANKS and clamp_to_ladder match
+    against. `thinkingOptions` is display-only -- the SAME gateway function
+    derives it as `metadata.levels.map(level => level.label)`, i.e. human
+    labels ("Off", "Extra High", ...), not ids. Matching a requested level
+    against labels silently breaks clamping (nothing in LEVEL_RANKS looks
+    like a label), so `thinkingOptions` must never be used for the ladder --
+    checking it first, as this used to, let an unsupported level fall
+    through the clamp and reach the gateway's own hard validation error
+    (ELI-85 field mixup, caused a live chat to hard-fail on every turn).
+    Kept only as a last-resort fallback in case a future gateway build ever
+    stops emitting `thinkingLevels` -- an imperfect ladder beats none.
+
+    Returns None (not []) when the field is absent, because "no ladder known"
+    and "this model supports nothing" have to lead to different behaviour: the
+    first passes the request through to the gateway, the second would clamp
+    every request away.
+    """
+    row = (desc or {}).get("session") or {}
+    levels = row.get("thinkingLevels")
+    if isinstance(levels, list) and levels:
+        out = [str(lv.get("id")) for lv in levels
+               if isinstance(lv, dict) and lv.get("id")]
+        if out:
+            return out
+    opts = row.get("thinkingOptions")
+    if isinstance(opts, list) and opts:
+        return [str(x).strip().lower() for x in opts]
+    return None
+
+
+def _session_model_key(row) -> str | None:
+    """`provider/model` for a `sessions.describe` row, or None.
+
+    Formatted to match the Gateway's own rejection text verbatim
+    ("...is not supported for claude-cli/claude-opus-5.") so a ladder learned
+    from a rejection and one observed from describe key the same entry.
+    """
+    row = row or {}
+    provider = str(row.get("modelProvider") or "").strip()
+    model = str(row.get("model") or "").strip()
+    if not provider or not model:
+        return None
+    return f"{provider}/{model}"
+
+
+def _ladder_cache_path(state_dir: str = "") -> str:
+    return os.path.join(_state_dir(state_dir), LADDER_CACHE_NAME)
+
+
+# Guards the ladder cache's read-merge-write sequence below. Pipe and Status
+# Action requests can land in different threads of the same OWUI process, and
+# without this a slower worker's read-merge-write can finish after a faster
+# one's and silently drop the faster worker's update. A unique temp file (see
+# _write_json_file) only makes each individual write atomic; it does nothing
+# for two workers racing on the read-then-write in between.
+_LADDER_CACHE_LOCK = threading.Lock()
+
+
+def _record_thinking_ladder(levels, model_key=None, authoritative=False,
+                             state_dir: str = "") -> None:
+    """Fold a ladder we just saw into the cache, both as a union and per model.
+
+    Two different consumers, two different needs, one file:
+
+    * `levels` (union across every model seen) is what the Thinking filter
+      offers, because Open WebUI builds a valve dropdown once from the class
+      and cannot vary it per selected model.
+    * `models[<provider/model>]` is what the SEND path clamps against, and it
+      must be exact. Clamping against the union is what let `high` reach a
+      model whose only level is `off`.
+
+    `authoritative` marks a ladder the Gateway stated itself by rejecting a
+    send. A merely observed one (from `sessions.describe`) must never overwrite
+    it: describe resolves the ladder with no model catalog in scope and so
+    reports the generic base profile for catalog-gated models. Trusting the
+    weaker source second would undo the fix on the very next turn.
+
+    Best-effort by design: a failed write costs a stale dropdown and one more
+    rejected turn, and must never affect the message being sent.
+    """
+    known = [lv for lv in (levels or []) if lv in LEVEL_RANKS]
+    path = _ladder_cache_path(state_dir)
+
+    with _LADDER_CACHE_LOCK:
+        current = _read_json_file(path) or {}
+
+        have = current.get("levels")
+        have = [x for x in have if x in LEVEL_RANKS] if isinstance(have, list) else []
+        merged = sorted(set(have) | set(known), key=lambda lv: (LEVEL_RANKS[lv], lv))
+
+        models = current.get("models")
+        models = dict(models) if isinstance(models, dict) else {}
+        model_changed = False
+        if model_key:
+            prior = models.get(model_key)
+            prior = prior if isinstance(prior, dict) else {}
+            if prior.get("source") == "gateway" and not authoritative:
+                # Keep the stated truth; a describe-sourced ladder is not
+                # evidence against it.
+                pass
+            else:
+                entry = {
+                    "levels": known,
+                    "source": "gateway" if authoritative else "describe",
+                    "updated": int(time.time()),
+                }
+                if (prior.get("levels") != entry["levels"]
+                        or prior.get("source") != entry["source"]):
+                    models[model_key] = entry
+                    model_changed = True
+
+        if merged == have and not model_changed:
+            return
+        payload = {"levels": merged, "updated": int(time.time())}
+        if models:
+            payload["models"] = models
+        if not _write_json_file(path, payload):
+            return
+    if merged != have:
+        pipe_log(f"thinking ladder cache updated: {merged}")
+    if model_changed:
+        pipe_log(
+            f"thinking ladder for {model_key}: {known} "
+            f"({'stated by gateway' if authoritative else 'observed'})"
+        )
+
+
+def _read_model_thinking_ladder(model_key, state_dir: str = ""):
+    """The exact ladder for one model, or None if we have not learned it.
+
+    None and [] mean different things here and the caller relies on it: None is
+    "unknown, pass the request through", [] would be "supports nothing", which
+    no model is. Entries that somehow persisted empty are treated as unknown.
+    """
+    if not model_key:
+        return None
+    cache = _read_json_file(_ladder_cache_path(state_dir)) or {}
+    models = cache.get("models")
+    if not isinstance(models, dict):
+        return None
+    entry = models.get(model_key)
+    if not isinstance(entry, dict):
+        return None
+    levels = entry.get("levels")
+    if not isinstance(levels, list):
+        return None
+    known = [lv for lv in levels if lv in LEVEL_RANKS]
+    return known or None
+
+
 def _owui_chat_send_params(
     session_key: str,
     message: str,
@@ -1587,6 +1904,7 @@ def _owui_chat_send_params(
     owui_chat_id: str | None,
     owui_user_id: str | None,
     attachments: list | None = None,
+    thinking: str | None = None,
 ) -> dict:
     params = dict(
         sessionKey=session_key,
@@ -1595,6 +1913,11 @@ def _owui_chat_send_params(
     )
     if attachments:
         params["attachments"] = attachments
+    # Only when actually chosen. chat.send reads an absent `thinking` as "use
+    # whatever the agent is configured for", which is a different instruction
+    # from any value we could send, "off" very much included.
+    if thinking:
+        params["thinking"] = thinking
     if owui_chat_id:
         metadata = {
             "chat_id": owui_chat_id,
@@ -2144,6 +2467,11 @@ class _GatewayConnection:
         self._model_patch_cache: dict[str, tuple[str | None, float]] = {}
         self._model_patch_locks: dict[str, asyncio.Lock] = {}
 
+        # Last thinking-clamp note shown per session, so a standing mismatch
+        # between the picked level and the model's ladder is explained ONCE
+        # instead of prefixing every single answer with the same italic line.
+        self._thinking_note_shown: dict[str, str] = {}
+
         # Reconnect state
         self._reconnect_attempt = 0
         self._max_backoff = 30  # seconds
@@ -2366,6 +2694,27 @@ class _GatewayConnection:
     def record_model_patched(self, session_key: str, model: str | None) -> None:
         """Record a successful sessions.patch for the cache (ELI-59)."""
         self._model_patch_cache[session_key] = (model, time.time())
+
+    def should_announce_thinking_note(self, session_key: str, note: str) -> bool:
+        """True the first time a given clamp note applies to a session.
+
+        The level is picked in a filter dropdown and then stays picked, so a
+        model that cannot honour it produces the identical note on every
+        message. Told once it is useful; repeated above every answer it is
+        noise the user has no way to dismiss, which is what it became in
+        practice. Any CHANGE (different level, different model, a ladder
+        learned from a rejection) is a new note and speaks up again.
+
+        Per connection rather than persisted on purpose: after a redeploy or a
+        reconnect the reminder is worth one repeat, and this must never be a
+        file whose staleness could silence a genuinely new mismatch.
+        """
+        if not note:
+            return False
+        if self._thinking_note_shown.get(session_key) == note:
+            return False
+        self._thinking_note_shown[session_key] = note
+        return True
 
     def invalidate_model_patch(self, session_key: str) -> None:
         """Drop the cached model for a session (ELI-59) -- called on patch
@@ -2731,6 +3080,7 @@ class _GatewayConnection:
 
         self._ws = ws
         self._reconnect_attempt = 0
+        self._thinking_note_shown.clear()
         pipe_log("Connected to Gateway (persistent)")
         # NOTE: does not start/spawn the event-loop task -- that happens
         # exactly once, in `ensure_connected`. This method is also called
@@ -3444,10 +3794,11 @@ async def _emit_live_bootstrap_reload(user_id: str, chat_id: str, target_message
 # done:false, snapshots + finalize = done:true), exactly like the slice-1 /
 # parity paths already do.
 #
-# NOT flipped on here -- leave False. Before enabling, the terminal
-# `chat:active` event envelope still needs a live-browser confirmation
-# (see `_relay_finalize`); DB persistence guarantees reload-correctness
-# regardless, so an imperfect terminal event only costs a spinner nicety.
+# Flipped ON in 2aada56 after the live-browser confirmation this comment used to
+# be waiting for. The terminal `chat:active` envelope (see `_relay_finalize`) is
+# still the least-verified part of the path, but DB persistence guarantees
+# reload-correctness regardless, so an imperfect terminal event only costs a
+# spinner nicety. Set to False to fall back to slice-1 post-hoc delivery.
 LIVE_STREAM_RELAY_ENABLED = True
 
 # A proactive run is only eligible for relay once its session has had zero
@@ -4105,13 +4456,6 @@ def _normalize_model_entry(raw: dict) -> dict:
     return {"key": key, "name": raw.get("name", model_id), "tags": tags}
 
 
-def _parse_whitelist(text: str) -> set[str]:
-    """Parse comma-separated model whitelist into a set."""
-    if not text or not text.strip():
-        return set()
-    return {x.strip() for x in text.split(",") if x.strip()}
-
-
 # Wording that points at the agent/session rather than the model. Kept NARROW
 # on purpose -- an earlier version also matched "not found", which misfiled
 # "model 'x/y' not found" as an AGENT_ID problem. Do not re-broaden these; the
@@ -4125,7 +4469,7 @@ def _explain_session_patch_failure(err, *, model_override, agent_id) -> str:
     The session key embeds AGENT_ID and this patch is the turn's first
     agent-scoped RPC, so a mistyped AGENT_ID surfaces here -- and used to be
     reported as "Model selection error", sending the user to fix
-    DEFAULT_MODEL/CONFIGURED_MODELS, which were never the problem.
+    DEFAULT_MODEL, which was never the problem.
 
     Classifying by substring is genuinely ambiguous, so the ordering matters and
     is deliberate:
@@ -4271,6 +4615,37 @@ def _session_active_from_signals(describe_status, list_has_active_run) -> bool:
     return bool(list_has_active_run)
 
 
+def _thinking_rejection_retry_body(body, recovered, resolved_thinking):
+    """Decide whether a textless ("PHANTOM") turn's preview-recovered text is
+    the Gateway's permanent-brick thinking-level rejection, and build the
+    retry body if so (ELI-85 follow-up).
+
+    `clamp_to_ladder` passes a requested level straight through whenever the
+    model's real ladder is unknown -- and if the target model can't honour it,
+    the Gateway hard-rejects the turn. That rejection never streams as a normal
+    event (the run delivers a single contentless `final`), so it only surfaces
+    via preview recovery at the caller's final fallback.
+
+    Detection is `parse_thinking_rejection`, the same parser that extracts the
+    ladder, so the thing that decides to retry and the thing that learns from
+    the retry can never disagree about what a rejection is.
+
+    Returns None when `recovered` isn't that rejection (nothing to retry).
+    Otherwise returns a fresh dict body with `reasoning_effort` stripped, so
+    resending it can no longer hit the same rejection -- which is also what
+    makes recursing on this once safe: the retried call resolves
+    `resolved_thinking` to None (`clamp_to_ladder` short-circuits on no
+    requested level), so this can't match twice in a row.
+    """
+    if not recovered or resolved_thinking is None:
+        return None
+    if parse_thinking_rejection(recovered) is None:
+        return None
+    retry_body = dict(body)
+    retry_body.pop("reasoning_effort", None)
+    return retry_body
+
+
 class Pipe:
     """
     Open WebUI Pipe that routes messages through OpenClaw Gateway via
@@ -4361,13 +4736,6 @@ class Pipe:
                 "you browse OWUI from the same host. Point it at an address your "
                 "browser can reach if you depend on this fallback."
         )
-        CONFIGURED_MODELS: str = Field(
-            default="",
-            description="(Optional.) Comma-separated model keys to show in the selector, e.g. "
-                "'anthropic/claude-sonnet-5,openai/gpt-5.5'. Leave empty to show every "
-                "model your Gateway reports. The Default Model dropdown lists the keys "
-                "currently known."
-        )
         DEFAULT_MODEL: str = Field(
             default="",
             description="Model used when you pick 'OpenClaw · Default'. Leave empty to "
@@ -4381,29 +4749,9 @@ class Pipe:
         )
         MAX_MODELS: int = Field(
             default=30,
-            description="Maximum number of models to show in the selector when whitelist is empty.",
+            description="Maximum number of models to show in the selector.",
             ge=1,
             le=100
-        )
-        CHATGPT_MODEL: str = Field(
-            default="openai/gpt-5.5",
-            description="[Legacy -- ignore this on a new install.] Model used by the fixed "
-                "'ChatGPT' selector entry. Kept only for chats that already picked it."
-        )
-        OPUS_MODEL: str = Field(
-            default="anthropic/claude-opus-4-8",
-            description="[Legacy -- ignore this on a new install.] Model used by the fixed "
-                "'Opus' selector entry. Kept only for chats that already picked it."
-        )
-        SONNET_MODEL: str = Field(
-            default="anthropic/claude-sonnet-5",
-            description="[Legacy -- ignore this on a new install.] Model used by the fixed "
-                "'Sonnet' selector entry. Kept only for chats that already picked it."
-        )
-        GLM_MODEL: str = Field(
-            default="openrouter/z-ai/glm-5.2",
-            description="[Legacy -- ignore this on a new install.] Model used by the fixed "
-                "'GLM' selector entry. Kept only for chats that already picked it."
         )
         AUTO_TITLE: bool = Field(
             default=True,
@@ -4430,13 +4778,6 @@ class Pipe:
         self._current_run_id: str | None = None
         self._connection: _GatewayConnection | None = None
 
-    _LEGACY_PRESET_MAP = {
-        "chatgpt": "openai/gpt-5.5",
-        "opus": "anthropic/claude-opus-4-8",
-        "sonnet": "anthropic/claude-sonnet-5",
-        "glm": "openrouter/z-ai/glm-5.2",
-    }
-
     async def pipes(self):
         """Expose multiple OWUI model-selector entries from one pipe.
         
@@ -4445,11 +4786,6 @@ class Pipe:
         """
         type(self)._last_state_dir = getattr(self.valves, "STATE_DIR", "") or ""
         models, source = await _discover_models_with_source(self.valves)
-
-        # Apply whitelist filter
-        whitelist = _parse_whitelist(self.valves.CONFIGURED_MODELS)
-        if whitelist:
-            models = [m for m in models if m["key"] in whitelist]
 
         # Apply safety cap
         if len(models) > self.valves.MAX_MODELS:
@@ -4473,11 +4809,8 @@ class Pipe:
         # in this state: it clears the override and uses the agent's own model,
         # so it needs no Gateway round trip to be correct.
         #
-        # When CONFIGURED_MODELS lists the user's real Gateway keys but the
-        # Gateway hasn't been reached, the whitelist filters the example list to
-        # nothing and the warning disappears with it -- leaving exactly the user
-        # who most needs it (real config, unreachable Gateway) with a bare
-        # single-entry selector and no explanation. Say it on Default instead.
+        # If discovery ever comes back empty (fallback list included), say the
+        # warning on Default instead of leaving a bare, unexplained selector.
         default_name = "OpenClaw · Default"
         if unverified and not entries:
             default_name += UNVERIFIED_MODEL_SUFFIX
@@ -4515,7 +4848,7 @@ class Pipe:
         ]
 
     def _selected_preset(self, body):
-        """Extract the model key or legacy preset name from the OWUI model string."""
+        """Extract the model key from the OWUI model string."""
         model = str(body.get("model", ""))
         # Split on the FIRST dot only: the function id (e.g. "openclaw_gateway")
         # never contains a dot, but model keys can (e.g. "gemini-3.1-pro-preview").
@@ -4523,30 +4856,12 @@ class Pipe:
         suffix = model.split(".", 1)[-1]
         if suffix == "default":
             return "default"
-        if suffix in self._LEGACY_PRESET_MAP:
-            return suffix  # legacy name like "chatgpt" -- mapping handled downstream
         return suffix  # raw model key
 
     def _model_override_for_preset(self, preset):
-        """Return the model string to pass to sessions.patch.
-        
-        For legacy presets, respects user-customized legacy valve values
-        (backward compatibility) before falling back to the hardcoded mapping.
-        """
+        """Return the model string to pass to sessions.patch."""
         if preset == "default":
             return self.valves.DEFAULT_MODEL.strip() or None
-        if preset in self._LEGACY_PRESET_MAP:
-            # `_LEGACY_PRESET_MAP` is the single source of truth for each
-            # preset's default model -- don't re-hardcode it here.
-            legacy_val = {
-                "chatgpt": self.valves.CHATGPT_MODEL,
-                "opus": self.valves.OPUS_MODEL,
-                "sonnet": self.valves.SONNET_MODEL,
-                "glm": self.valves.GLM_MODEL,
-            }.get(preset, "")
-            if legacy_val and legacy_val.strip() and legacy_val.strip() != self._LEGACY_PRESET_MAP[preset]:
-                return legacy_val.strip()
-            return self._LEGACY_PRESET_MAP[preset]
         return preset
 
     # ── Auto-title helpers ──────────────────────────────────────────
@@ -4709,14 +5024,35 @@ class Pipe:
 
     async def _pipe_impl(self, body, __event_emitter__, __event_call__=None,
                    __user__=None, __metadata__=None, __request__=None,
-                   __task__=None, __task_body__=None):
+                   __task__=None, __task_body__=None, _initial_visible_text=""):
         """Uses a shared persistent WS connection; no per-message reconnect,
         no global lock, and no 60s timeout.
+
+        `_initial_visible_text` seeds the terminal snapshot for the
+        thinking-rejection retry recursion below: the retry note belongs to
+        the turn that's ending, not the one about to start, but this call's
+        own `visible_message_text` is what the forced terminal `replace`
+        snapshot persists -- a note recorded only on the caller's copy would
+        show while streaming and vanish on reload.
         """
         if self.valves.ENABLE_FILE_SERVER:
             _start_file_server()
         preset = self._selected_preset(body)
         model_override = self._model_override_for_preset(preset)
+
+        # Per-chat thinking level (ELI-85). `reasoning_effort` is the single
+        # source of truth: Open WebUI's own Advanced Params control writes it,
+        # and so does the companion Thinking filter's toggle. Reading the field
+        # rather than a filter-specific one means either control works, and the
+        # bridge keeps working for anyone who never installs the filter.
+        # Absent means absent: no `thinking` is sent and the agent's configured
+        # level applies. Validation against the model's real ladder happens
+        # below, once describe has told us what this session resolves to.
+        requested_thinking = body.get("reasoning_effort") or None
+        if requested_thinking is not None:
+            requested_thinking = str(requested_thinking).strip().lower() or None
+        session_thinking_ladder = None
+        session_model_key = None
 
         # --- P15: Short-circuit OWUI background tasks ---
         if __task__ and __task__ in (
@@ -4919,12 +5255,34 @@ class Pipe:
             # resume -- ELI-56), so a non-active status is NOT conclusive:
             # confirm against sessions.list's authoritative hasActiveRun before
             # treating the session as free to send into.
+            nonlocal session_thinking_ladder, session_model_key
             try:
                 desc = await conn.send_request(
                     "sessions.describe", dict(key=session_key), timeout=8
                 )
                 row = desc.get("session") or {}
                 status = row.get("status")
+                # Harvest the thinking ladder from the describe we are already
+                # making. This probe runs before every send, so the per-model
+                # validation below costs no extra round trip, and piggybacking
+                # rather than adding a describe of its own means the ladder can
+                # never be fresher or staler than the run state it was read
+                # alongside.
+                #
+                # Describe is a WEAK source and is treated as one. It resolves
+                # the ladder with no model catalog in scope, so for a
+                # catalog-gated model it reports the generic base profile
+                # rather than the truth -- live, it advertised all 8 levels for
+                # claude-cli/claude-opus-5, whose real ladder is ["off"]. Good
+                # enough to seed the dropdown; not good enough to clamp a send
+                # against once the Gateway itself has ruled.
+                session_model_key = _session_model_key(row)
+                ladder = _session_thinking_ladder(desc)
+                if ladder:
+                    session_thinking_ladder = ladder
+                    _record_thinking_ladder(
+                        ladder, model_key=session_model_key,
+                        state_dir=getattr(self.valves, "STATE_DIR", ""))
                 if row.get("activeRunId") or status in _ACTIVE_RUN_STATES:
                     return True
             except Exception as ex:
@@ -4990,6 +5348,46 @@ class Pipe:
             # --- Send this message as its own fresh run (still holding the lock
             #     so the next waiter observes our run before deciding to send) ---
             idempotency_key = f"msg-{chat_id}-{time.time()}"
+            # Fit the requested level to what this session's model actually
+            # supports. The dropdown is a union across models, so a level that
+            # is real for one model can be unavailable here. Clamping is
+            # downward only and always explained: silently answering at a level
+            # other than the one asked for is worse than a short note, and
+            # silently erroring out is worse still.
+            #
+            # A ladder the Gateway STATED (by rejecting a send) beats the one
+            # describe reported, because describe answers this question without
+            # a model catalog and overreports for catalog-gated models. This is
+            # what makes the rejection cost one turn per model instead of one
+            # turn every turn.
+            #
+            # Look up by `model_override` (the runtime-namespaced routing key,
+            # e.g. "claude-cli/claude-opus-5") before `session_model_key` (the
+            # vendor key describe resolves it to, e.g. "anthropic/claude-opus-5"
+            # -- see `_RUNTIME_PROVIDER_NAMESPACES`). The Gateway's rejection
+            # text names the model by its routing key, so that is where
+            # `_record_thinking_ladder` files the authoritative entry; reading
+            # back under the vendor key alone missed it every time and repeated
+            # the same round-trip rejection (and its note) on every turn.
+            _state_dir_valve = getattr(self.valves, "STATE_DIR", "")
+            effective_ladder = (_read_model_thinking_ladder(model_override, _state_dir_valve)
+                                or _read_model_thinking_ladder(session_model_key, _state_dir_valve)
+                                or session_thinking_ladder)
+            resolved_thinking, thinking_note = clamp_to_ladder(
+                requested_thinking, effective_ladder)
+            # Held until `visible_message_text` exists below (it isn't defined
+            # yet at this point in the turn) so the note that streams here also
+            # ends up in the forced terminal snapshot -- otherwise it shows
+            # while streaming and is gone after a reload.
+            pending_clamp_note = ""
+            if thinking_note:
+                pipe_log(f"thinking: {thinking_note}")
+                # Logged every time, shown once: the dropdown keeps the level
+                # selected, so an unchanged mismatch would otherwise stamp the
+                # same italic line above every answer in the chat.
+                if conn.should_announce_thinking_note(session_key, thinking_note):
+                    pending_clamp_note = f"_{thinking_note}_\n\n"
+                    yield pending_clamp_note
             try:
                 send_resp = await conn.send_request(
                     "chat.send",
@@ -5000,6 +5398,7 @@ class Pipe:
                         owui_chat_id=owui_origin_chat_id,
                         owui_user_id=owui_origin_user_id,
                         attachments=image_attachments,
+                        thinking=resolved_thinking,
                     ),
                     timeout=30
                 )
@@ -5038,7 +5437,7 @@ class Pipe:
         # FLUSHED, so it cannot be used to dedup a cumulative catch-all event
         # while a needs-input block is being held back (ELI-80).
         assistant_received_text = ""
-        visible_message_text = ""
+        visible_message_text = _initial_visible_text + pending_clamp_note
         had_tool_block = False
         # toolCallIds announced to OWUI as `function_call` items that have
         # not been completed by a matching result item yet. Anything left
@@ -5900,6 +6299,55 @@ class Pipe:
 
         if not aborted and not text_yielded:
             recovered = await recover_from_preview()
+            retry_body = _thinking_rejection_retry_body(
+                body, recovered, resolved_thinking)
+            if retry_body is not None:
+                # Learn from the rejection before retrying. The Gateway just
+                # named this model's real ladder, and it is the only place that
+                # truth is stated -- describe cannot supply it. Recording it
+                # here is what stops the next turn repeating this round trip.
+                rejection = parse_thinking_rejection(recovered)
+                learned = None
+                if rejection:
+                    learned = rejection["levels"]
+                    _record_thinking_ladder(
+                        learned,
+                        model_key=rejection["model"] or session_model_key,
+                        authoritative=True,
+                        state_dir=getattr(self.valves, "STATE_DIR", ""),
+                    )
+                pipe_log(
+                    f"thinking: Gateway rejected level {resolved_thinking!r} "
+                    f"({recovered!r}); retrying once without an explicit level"
+                )
+                # Say only what was actually observed. The previous wording
+                # asserted a cause it never checked ("this chat hadn't talked
+                # to it before"), which was false on every turn after the
+                # first and sent anyone reading it hunting the wrong bug.
+                if learned:
+                    supported = ", ".join(repr(lv) for lv in learned)
+                    retry_note = (
+                        f"_This model only supports thinking level "
+                        f"{supported}, so {resolved_thinking!r} was dropped "
+                        f"for this message. Remembered for next time._\n\n"
+                    )
+                else:
+                    retry_note = (
+                        f"_This model does not support thinking level "
+                        f"{resolved_thinking!r}; sending without it instead._"
+                        f"\n\n"
+                    )
+                record_visible_chunk(retry_note)
+                yield retry_note
+                async for item in self._pipe_impl(
+                    retry_body, __event_emitter__,
+                    __event_call__=__event_call__, __user__=__user__,
+                    __metadata__=__metadata__, __request__=__request__,
+                    __task__=__task__, __task_body__=__task_body__,
+                    _initial_visible_text=visible_message_text,
+                ):
+                    yield item
+                return
             if recovered:
                 pipe_log("  recovered assistant text at final fallback")
                 record_visible_chunk(recovered)

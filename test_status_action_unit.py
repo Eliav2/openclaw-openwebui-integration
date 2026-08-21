@@ -12,6 +12,8 @@ import types
 import unittest
 from unittest import mock
 
+import conftest  # noqa: F401  (imports real pydantic before this file's stub can shadow it)
+
 if "websockets" not in sys.modules:
     websockets_stub = types.SimpleNamespace(
         WebSocketClientProtocol=object,

@@ -137,59 +137,75 @@ something goes wrong, jump to [Troubleshooting](#-troubleshooting).
 
 ## ✨ Features
 
-Everything here works the moment the Pipe is installed, except the two marked
-**needs agent setup**: the integration provides the mechanism, but your agent has
-to know the convention. See [Teaching your agent](#-teaching-your-agent-to-use-this).
+The complete list. Each entry links to a collapsible block in the
+[Feature reference](#-feature-reference) at the bottom of this file, with the
+full explanation, the valves that control it, and a screenshot where one exists.
 
-- **🔴 Real-time streaming**: assistant responses appear token-by-token, not
-  all at once at the end
-- **🛠️ Native tool-call rendering**: tool calls are yielded as Responses-API
-  output items, so OWUI renders them as native two-phase tool cards (spinner
-  while running, result on finish) instead of ad-hoc HTML
-- **💬 Persistent sessions**: each OWUI conversation gets a stable OpenClaw
-  session key (`agent:{AGENT_ID}:openwebui-{user_id}-{chat_id}`), so the agent
-  remembers context across messages
-- **🧭 Dynamic model selector**: the integration discovers every model the Gateway
-  knows about (`models.list`) and lists one entry per model, with an optional
-  whitelist and a size cap
-- **❓ Ask-user modal** _(needs agent setup)_: when an agent emits a line beginning with
-  `OpenClaw needs input:` (or `Codex needs input:`), the integration intercepts it and
-  pops a real OWUI input / choice / confirmation dialog mid-run, instead of
-  leaking the raw prompt into the chat as text
-  (implementation: [`src/openclaw_pipe_pkg/askuser.py`](./src/openclaw_pipe_pkg/askuser.py))
-- **📊 Status Action button** _(separate function)_: adds a message-toolbar
-  button that fetches live session/usage data from the Gateway on demand,
-  reusing the Pipe's connection when one is already open. Ships as
-  `openclaw_status_action.py` and installs separately, see
-  [Installing the companion Status Action](#installing-the-companion-status-action)
-- **👥 Subagent drawer** _(partial)_: the status dialog lists the subagents a run
-  spawned with their status and elapsed time, and opens a per-subagent drawer
-  with its transcript. **Its tool calls only appear once it finishes.** The
-  Gateway routes tool events to the connection that started a run, and a
-  subagent's run starts inside the Gateway, so no client can watch a running
-  subagent's tool calls. Measured and pinned by a test, see
-  [`src/openclaw_pipe_pkg/gateway.py`](./src/openclaw_pipe_pkg/gateway.py)
-- **🏷️ Auto-title**: generates a chat title after the first exchange on a
-  separate agent lane (`title-gen`), so it never queues behind the main
-  conversation
-- **🔐 Ed25519 device auth**: full WebSocket handshake with challenge/response,
-  with a permanent device identity that survives restarts and reinstalls
-- **🖼️ Native OWUI media support** _(needs agent setup)_: `MEDIA:` files are uploaded to the
-  Open WebUI Files API and attached to the assistant message; a plain file
-  server remains as a fallback
-- **⚙️ Configurable**: settings live in OWUI valves; device identity/token
-  also persist in a state directory so restarts do not force re-pairing
+Everything here works the moment the Pipe is installed, except entries marked
+**needs agent setup** (the integration provides the mechanism, but your agent has
+to know the convention, see [Teaching your agent](#-teaching-your-agent-to-use-this))
+and **separate function** (ships as its own file and installs separately).
+
+**In the chat**
+
+- [**🔴 Real-time streaming**](#f-streaming): replies appear token by token, not all at once at the end
+- [**🛠️ Native tool-call rendering**](#f-tool-cards): tool calls render as OWUI's own two-phase cards, expandable to their input and output
+- [**❌ Tool-failure marking**](#f-tool-failures): failed calls are labelled, and a call that never returns is closed rather than left spinning
+- [**❓ Ask-user modal**](#f-ask-user) _(needs agent setup)_: agent questions become real dialogs (text, password, yes/no, single choice, multi-select) that survive a reconnect
+- [**🧠 Per-chat thinking control**](#f-thinking) _(separate function)_: a toggle under the message box sets reasoning effort per chat, offering only the levels your models actually support
+- [**🖼️ Native media delivery**](#f-media) _(needs agent setup)_: `MEDIA:` files are uploaded to the Open WebUI Files API and attached natively
+- [**📎 Image input**](#f-image-input): images you attach are forwarded to the agent
+- [**📈 Inline usage and goal line**](#f-status-line): context, rate-limit and goal state under every reply
+- [**🏷️ Auto-title**](#f-auto-title): chats name themselves, on a separate agent lane so it never queues behind your conversation
+
+**Sessions and models**
+
+- [**💬 Persistent sessions**](#f-sessions): one stable OpenClaw session per OWUI chat, so the agent remembers context across messages
+- [**🧭 Dynamic model selector**](#f-model-selector): one entry per model your Gateway actually knows about, discovered via `models.list`
+- [**🔎 Selector size cap**](#f-model-limits): keep the selector from flooding with every model the Gateway knows about
+
+**Status and observability**
+
+- [**📊 Status Action button**](#f-status-action) _(separate function)_: context, rate limits and running subagents, fetched live on demand
+- [**🗜️ Compact from the dialog**](#f-compact): run `/compact` on the session and watch the numbers change
+- [**👥 Subagent drawer**](#f-subagent-drawer) _(partial)_: per-subagent overview, transcript and tools. **Tool calls only appear once the subagent finishes**, see the entry for why
+- [**📝 Backend diagnostics**](#f-logging): prefixed logs for every turn, snapshot decision and tool call
+
+**Reliability**
+
+- [**🔌 Persistent connection**](#f-connection): one shared WebSocket, reconnecting on its own with backoff
+- [**⏳ Concurrent-message queueing**](#f-queueing): send while the agent is busy and get a real turn, not a blank bubble
+- [**♻️ Rehydration and restart safety**](#f-rehydration): reload mid-turn and the partial answer is still there
+- [**🧵 Parity finalize**](#f-parity): a turn that ends early completes in place instead of stranding its tail in a second bubble
+- [**🩹 Preview recovery**](#f-recovery): lost events fall back to the Gateway's own transcript, and silence is never mistaken for completion
+- [**🛑 Stop that actually stops**](#f-stop): aborts the run and kills the tool that is still executing
+- [**🧟 Zombie reaping**](#f-reaping): a redeploy never leaves a duplicate connection writing every message twice
+- [**🚫 Background-task short-circuiting**](#f-background-tasks): OWUI's own title, tag, follow-up, emoji and autocomplete calls never reach your agent
+- [**🧯 Actionable errors**](#f-errors): failures name the valve, the config key and the command that fixes them
+
+**Beyond the chat**
+
+- [**📮 Proactive delivery**](#f-proactive): a cron, heartbeat or `sessions_send` reply lands in your chat with no message from you
+- [**🧑‍🔧 Sub-agent results**](#f-subagent-delivery): a finished sub-agent posts into the parent chat, clickable through to its drawer
+- [**📡 Live relay**](#f-relay): proactive runs stream into an already-open tab instead of appearing only when finished
+
+**Setup**
+
+- [**🔐 Ed25519 device auth**](#f-device-auth): challenge/response handshake, with a device identity that survives restarts and reinstalls
+- [**📦 Installer**](#f-installer): wizard, in-place updates that preserve your valves, backups, healthcheck
+- [**⚙️ Valves**](#f-valves): everything configurable from the OWUI admin UI, no file access and no restart
 
 ---
 
-## 📦 Two Functions
+## 📦 Three Functions
 
-| File                                                       | OWUI type                                                                                  | Purpose                                                                                                                              |
-| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
-| [`openclaw_pipe.py`](./openclaw_pipe.py)                   | [Pipe](https://docs.openwebui.com/features/extensibility/plugin/functions/pipe) (manifold) | The chat integration. Everything above                                                                                               |
-| [`openclaw_status_action.py`](./openclaw_status_action.py) | [Action](https://docs.openwebui.com/features/extensibility/plugin/functions/action)        | Message-toolbar button for on-demand session/usage lookups; reuses the Pipe's live connection and device identity, no second pairing |
+| File                                                             | OWUI type                                                                                  | Purpose                                                                                                                             |
+| ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
+| [`openclaw_pipe.py`](./openclaw_pipe.py)                         | [Pipe](https://docs.openwebui.com/features/extensibility/plugin/functions/pipe) (manifold) | The chat integration. Almost everything above                                                                                       |
+| [`openclaw_status_action.py`](./openclaw_status_action.py)       | [Action](https://docs.openwebui.com/features/extensibility/plugin/functions/action)        | Message-toolbar button for on-demand session/usage lookups; reuses the Pipe's live connection and device identity, no second pairing |
+| [`openclaw_thinking_filter.py`](./openclaw_thinking_filter.py)   | [Filter](https://docs.openwebui.com/features/extensibility/plugin/functions/filter)        | The per-chat thinking toggle under the message box. Optional, and imports nothing but the standard library and pydantic             |
 
-Both are generated from the same `src/openclaw_pipe_pkg/` source fragments.
+All three are generated from the same `src/openclaw_pipe_pkg/` source fragments.
 See [`docs/development.md`](./docs/development.md) if you're contributing.
 
 ---
@@ -430,12 +446,59 @@ Two differences from `install.py`: it must be run from a clone (it imports from
 
 ---
 
+### Installing the thinking filter
+
+Optional, and has its own installer like the Action does:
+
+```bash
+uv run install_filter.py install   # create/update the Filter, ensure it's active, smoke test
+uv run install_filter.py status    # inspect without changing anything
+uv run install_filter.py repair    # same as install
+```
+
+It reads only `OWUI_URL`, `OWUI_EMAIL`, and `OWUI_PASSWORD` -- there's nothing
+else to configure: unlike the Action it shares no valves with the Pipe, needs
+no device identity, and never talks to the Gateway itself. It creates/updates
+the Function, then makes sure it's **Active**. It deliberately does not touch
+**Global**: attach the filter per-model instead (Workspace > Models > (model)
+> Filters), since a global filter would write `reasoning_effort` into every
+chat with every model, including non-OpenClaw ones. If it finds the Function
+already toggled global, it warns rather than silently turning that off.
+
+The equivalent manual steps, if you'd rather not run the installer:
+
+1. Open WebUI → **Admin Panel** → **Functions** → **+**
+2. Paste the contents of [`openclaw_thinking_filter.py`](./openclaw_thinking_filter.py)
+3. Save, then toggle it **Active**, and attach it to your OpenClaw models
+   (Workspace > Models > (model) > Filters)
+
+Once active, it does nothing until you switch the toggle on in a given
+conversation: Open WebUI does not run a toggled filter's `inlet` while the
+toggle is off, so an untouched chat behaves exactly as if the filter were not
+installed.
+
+The Pipe should be installed first. The filter's level dropdown is populated
+from the ladder cache the Pipe writes, so before the Pipe has run once the
+dropdown falls back to the five levels every observed provider supports. The
+dropdown is also baked in at import time, so after the Pipe has completed a
+first chat with a given model, reload or re-save the filter Function (Admin
+Panel → Functions → `openclaw_thinking` → Save) to pick up the real ladder --
+otherwise it keeps showing the fallback list until the next reload. See
+[Per-chat thinking control](#f-thinking).
+
+Two differences from `install.py`, the same as `install_action.py`: it must be
+run from a clone (it imports from `install.py`), and it has no `healthcheck`
+subcommand.
+
+---
+
 ### Uninstalling
 
 There's no `uninstall` subcommand; removal is a UI action. In Open WebUI go to
 **Admin Panel → Functions** and delete `openclaw_gateway` (and
-`openclaw_status_action` if you installed it). Every install first writes the
-previous function and its valves to `backups/`, so if you only want to roll back
+`openclaw_status_action` and/or `openclaw_thinking`, if you installed them).
+Every install first writes the previous function and its valves to `backups/`,
+so if you only want to roll back
 a bad upgrade, restore the JSON from there rather than deleting.
 
 Deleting the functions does not touch `STATE_DIR`. Remove that directory too if
@@ -480,16 +543,10 @@ that OWUI conversation's OpenClaw session to that model; switching back to
 
 Relevant valves:
 
-| Valve               | Description                                                                                                 |
-| ------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `CONFIGURED_MODELS` | Comma-separated whitelist of model keys to show. Empty = show all discovered models.                        |
-| `DEFAULT_MODEL`     | Model used when `OpenClaw · Default` is selected. Also doubles as a reference dropdown of known model keys. |
-| `MAX_MODELS`        | Safety cap on how many models the selector lists when there's no whitelist (default `30`).                  |
-
-> **Legacy presets.** The `CHATGPT_MODEL`, `OPUS_MODEL`, `SONNET_MODEL`, and
-> `GLM_MODEL` valves still produce fixed selector entries, purely so
-> conversations that already picked one keep working. Ignore them on a new
-> install; dynamic discovery replaces them.
+| Valve           | Description                                                                                                 |
+| --------------- | ----------------------------------------------------------------------------------------------------------- |
+| `DEFAULT_MODEL` | Model used when `OpenClaw · Default` is selected. Also doubles as a reference dropdown of known model keys. |
+| `MAX_MODELS`    | Safety cap on how many models the selector lists (default `30`).                                            |
 
 ### Auto-generated chat titles
 
@@ -531,7 +588,7 @@ Relevant valves:
 | Text appears all at once                              | Pipe uses `return` instead of `yield` (check your code)                                                                                                                                                                                                                                                                                                        |
 | "No GATEWAY_TOKEN configured"                         | Valve not set, go to Admin → Functions → edit valves                                                                                                                                                                                                                                                                                                           |
 | An `**Error:**` line instead of a reply               | OWUI can't reach `GATEWAY_URL`: check network connectivity from the OWUI backend                                                                                                                                                                                                                                                                               |
-| Model missing from selector                           | Run `uv run install.py repair`; it ensures the function is active/global and visible in `/api/v1/models`. Also check `CONFIGURED_MODELS` isn't filtering it out.                                                                                                                                                                                               |
+| Model missing from selector                           | Run `uv run install.py repair`; it ensures the function is active/global and visible in `/api/v1/models`. Also check `MAX_MODELS` isn't capping it out.                                                                                                                                                                                                        |
 | "pairing required"                                    | Run `uv run install.py repair` or approve the matching request with `openclaw devices approve <request-id>`                                                                                                                                                                                                                                                    |
 | Image still uses the legacy file server               | OWUI file upload failed and the integration fell back; check `OWUI_BASE_URL`, request auth/API key, and OWUI logs                                                                                                                                                                                                                                              |
 | Tool calls not showing                                | The `__event_emitter__` calls fail silently; check OWUI backend logs                                                                                                                                                                                                                                                                                           |
@@ -583,6 +640,752 @@ and a skill you wrote yourself should never be clobbered by an installer.
 
 If you would rather not install anything, put the two conventions in your
 agent's own instructions. The skills are only a convenient carrier.
+
+---
+
+## 📖 Feature reference
+
+Every entry in [Features](#-features) links here. Expand one for the full
+explanation, the valves that control it, and a screenshot where one exists.
+
+### In the chat
+
+<a id="f-streaming"></a>
+<details>
+<summary><b>🔴 Real-time streaming</b></summary>
+
+Assistant text is yielded token by token as the Gateway emits it, so a long
+answer starts appearing immediately instead of landing in one block at the end.
+
+Two provider quirks are handled so you never see them. Some runtimes resend the
+entire reply as a final cumulative frame; the Pipe recognises text it has
+already shown and suppresses the repeat rather than printing the answer twice.
+Other events carry their text as a whole item rather than as deltas, and that
+text is relayed too instead of being dropped.
+
+Internal scaffolding never reaches the bubble either: the Sender provenance
+block (see [`docs/metadata-contract.md`](./docs/metadata-contract.md)) and the
+silent sentinels an agent uses to mean "say nothing" are both filtered out.
+
+Always on.
+
+</details>
+
+<a id="f-tool-cards"></a>
+<details>
+<summary><b>🛠️ Native tool-call rendering</b></summary>
+
+Tool calls are yielded as Responses-API output items, which means Open WebUI
+renders them with its own two-phase tool card: a spinner while the tool runs,
+the result when it finishes. Nothing here is hand-rolled HTML, so the cards
+match the rest of the UI and survive a reload.
+
+<p align="center">
+  <img src="./docs/img/tool-calls-streaming.jpg" alt="Tool calls streaming live with spinners and green checkmarks" width="40%">
+</p>
+
+Expand a card to see the arguments the agent passed and the result it got back.
+Arguments are capped at 3000 characters and results at 8000, so one enormous
+tool result cannot bury the conversation.
+
+<p align="center">
+  <img src="./docs/img/tool-call-expanded.jpg" alt="An expanded tool call showing its INPUT arguments and OUTPUT result" width="65%">
+</p>
+
+Calls that arrive without a tool-call id, and the shadow renderer used as a
+fallback, degrade to a markdown `<details type="tool_calls">` card rather than
+disappearing. The status row under the message tracks the same events in words:
+"Running \<tool\>…" then "\<tool\> done".
+
+Always on. Native cards need Open WebUI 0.10.2 or newer; on older releases they
+degrade quietly rather than erroring.
+
+</details>
+
+<a id="f-tool-failures"></a>
+<details>
+<summary><b>❌ Tool-failure marking and orphan closing</b></summary>
+
+A tool call that fails gets its card row relabelled to `<name> ❌`, and the mark
+is part of the persisted item, so it is still there after a reload. The expanded
+output opens with an explicit `❌ tool call failed` banner, which is also the
+fallback whenever the relabel cannot fire (it only applies while the failed call
+is still the last item).
+
+A tool that was announced but never produced a result, because the run was
+cancelled or the agent crashed, is closed out at the end of the turn with
+"(no result, the run ended first)". A card left spinning forever is
+indistinguishable from a hung UI, so it is never left that way.
+
+Always on.
+
+</details>
+
+<a id="f-ask-user"></a>
+<details>
+<summary><b>❓ Ask-user modal</b> <sub>(needs agent setup)</sub></summary>
+
+When the agent emits a line beginning with `OpenClaw needs input:` (or
+`Codex needs input:`), the integration intercepts it and pops a real Open WebUI
+dialog mid-run, instead of leaking the raw prompt into the chat as text that
+nobody can answer.
+
+The dialog shape is inferred from the question:
+
+| Question looks like                        | You get                                  |
+| ------------------------------------------ | ---------------------------------------- |
+| anything else                              | a titled free-text input                 |
+| mentions secret, password, api key, token  | a masked password field                  |
+| `(y/n)`, or a confirm verb plus `?`        | a native yes/no confirmation             |
+| two or more numbered options               | clickable themed choice buttons          |
+| `(multiselect)` or "select all that apply" | checkboxes plus a Submit button          |
+
+Confirmation and multi-select markers are recognised in English, Hebrew and
+Arabic.
+
+It is robust to the ways the trigger can arrive: recognised even when streamed
+one character at a time, or when it shows up mid-reply inside one cumulative
+chunk. A prompt emitted twice does not become a doubled dialog, and duplicate
+options are collapsed.
+
+The question survives a reconnect. Close the tab, come back later, and it
+re-pops on your new session for up to an hour, re-firing on each reconnect while
+the status line reads "Waiting for your reply, question is pending, reconnect
+anytime". If you dismiss it, the question appears as ordinary text with the
+marker line stripped, so nothing is lost. Once answered, the exchange is kept
+inline as a collapsible ❓ Ask User card showing both the question and your
+answer, and the run continues in the same bubble.
+
+Your agent has to know the convention, see
+[Teaching your agent](#-teaching-your-agent-to-use-this). Implementation in
+[`src/openclaw_pipe_pkg/askuser.py`](./src/openclaw_pipe_pkg/askuser.py).
+
+<p align="center">
+  <img src="./docs/img/ask-user-modal.png" alt="An OpenClaw ask-user modal rendered mid-run as a yes/no confirmation dialog" width="45%">
+</p>
+
+</details>
+
+<a id="f-thinking"></a>
+<details>
+<summary><b>🧠 Per-chat thinking control</b> <sub>(separate function)</sub></summary>
+
+Install [`openclaw_thinking_filter.py`](./openclaw_thinking_filter.py) and a
+brain-icon toggle appears in the row under the message box. Turn it on for a
+chat and pick a level in Chat Controls → Valves: `default`, `off`, `minimal`,
+`low`, `medium`, `high`, `xhigh`, `max`, `ultra`.
+
+`default` is not a level, it is the absence of one. It sends no `thinking` field
+at all and leaves whatever the agent is configured for alone. `off` is
+different: it is an explicit instruction not to think, and it does override the
+agent's setting.
+
+The dropdown only offers levels a model on your Gateway actually supports. The
+Pipe reads each session's real ladder from the `sessions.describe` it already
+makes before every send, so this costs no extra round trip, and folds what it
+sees into a cache the filter reads at import time. Until the Pipe has run once,
+the dropdown falls back to the five levels every observed provider supports.
+
+Because Open WebUI builds a valve dropdown once from the class, the list is the
+union across the models your Gateway knows about, not the ladder of the model
+you have selected right now. The Pipe closes that gap at send time by clamping
+the request down to the nearest level the current model does support, and saying
+so in the chat:
+
+> _This model does not support thinking level 'ultra', using 'high' instead._
+
+Clamping normally lands on the nearest level at or below what you asked for --
+that direction is a safe degradation, since quietly asking for more shows up on
+someone's bill. The one exception: if a model's ladder has nothing at or below
+the request (every supported level is higher), it falls back to that model's
+lowest supported level, which can be higher than what was requested.
+
+The filter and Open WebUI's own Advanced Params reasoning-effort control write
+the same `reasoning_effort` field, so the two are one setting rather than two
+that fight over it. `override_advanced_params` (on by default) decides who wins
+when both are set; turn it off to let Advanced Params own the value and use the
+toggle only to enable thinking.
+
+The filter imports nothing but the standard library and pydantic. A filter runs
+on every message, so an import it does not need is an outage it does not need.
+
+Valves: `priority`, `override_advanced_params`, and the per-user `level`.
+
+_No screenshot yet._
+
+</details>
+
+<a id="f-media"></a>
+<details>
+<summary><b>🖼️ Native media delivery</b> <sub>(needs agent setup)</sub></summary>
+
+When the agent emits `MEDIA:<file>`, the file is uploaded to Open WebUI's own
+Files API and attached to the assistant message. The rendered URL is
+same-origin, so it works over HTTPS with no mixed-content warnings, and the file
+also appears as a real attachment chip on the message.
+
+Images render inline, other file types render as a link, and anything
+unrecognised falls back to inline code rather than a broken embed. Several
+`MEDIA:` directives in one reply all resolve, not just the first.
+
+The directive is recognised even when streaming splits it mid-prefix or
+mid-filename, and one still buffered when the run ends is flushed rather than
+dropped. Writing "the MEDIA: fix" in ordinary prose does not turn the next word
+into a broken image link.
+
+A plain HTTP file server on port 18791 remains as a fallback, and doubles as an
+upload endpoint the agent can `PUT` to. It reaps its own stale instance across
+redeploys, so a reinstall never leaves a dead server squatting the port.
+
+Valves: `USE_OWUI_FILES` (on), `OWUI_BASE_URL`, `OWUI_API_KEY`,
+`ENABLE_FILE_SERVER` (on), `FILE_SERVER_BASE_URL`. The fallback server is
+unauthenticated, see [Security notes](#-security-notes).
+
+</details>
+
+<a id="f-image-input"></a>
+<details>
+<summary><b>📎 Image input</b></summary>
+
+An image you attach in Open WebUI arrives as a multimodal `content` block list
+rather than the plain string OWUI sends for text-only turns. The Pipe scans
+that list for `image_url` blocks, and for each one parses the
+`data:<mime>;base64,<data>` URI OWUI actually emits, decodes it, and forwards
+it to the agent as a `chat.send` attachment with its MIME type and a file
+extension guessed from that type, so a vision-capable model receives real
+image bytes rather than a description of them.
+
+Only the inline base64 data-URI shape is handled: there is no plain HTTP(S)
+`image_url` case to support, because OWUI does not send one for attached or
+pasted images. An image the Pipe cannot forward (any block that is not
+base64-encoded) produces an explicit note that it could not be relayed, rather
+than an answer confidently describing a picture the agent never received.
+
+Always on.
+
+</details>
+
+<a id="f-status-line"></a>
+<details>
+<summary><b>📈 Inline usage and goal line</b></summary>
+
+After every reply, a status row shows where you stand:
+
+> 🧠 45k/200k (22.5%) · ⏱ 5h 18% left (resets in 22m)
+
+One row per window that reports a reset, and a goal line when the session has
+one (`🎯 Pursuing goal (12k/50k)`, with paused, blocked, usage-limited and
+complete variants).
+
+Each fact is emitted as its own event, because Open WebUI clamps a status row to
+a single line and a combined string loses its numbers off the right edge.
+
+The data comes from `sessions.describe` and `usage.status` fetched concurrently,
+and the whole thing is best-effort: if either call fails, the reply is
+unaffected.
+
+Always on.
+
+</details>
+
+<a id="f-auto-title"></a>
+<details>
+<summary><b>🏷️ Auto-title</b></summary>
+
+After the first exchange, the chat names itself with a short title and an emoji.
+
+Generation runs on a separate agent lane (`title-gen`) and as a background task,
+so it never queues behind your conversation and a failure never surfaces. Model
+output is trimmed of quotes, extra lines and excess length before it becomes the
+title. If the `title-gen` agent does not exist on your Gateway, the feature
+skips silently.
+
+Valve: `AUTO_TITLE` (on). See
+[Auto-generated chat titles](#auto-generated-chat-titles) for the agent setup.
+
+</details>
+
+### Sessions and models
+
+<a id="f-sessions"></a>
+<details>
+<summary><b>💬 Persistent sessions</b></summary>
+
+Each Open WebUI conversation maps to a stable OpenClaw session key,
+`agent:{AGENT_ID}:openwebui-{user_id}-{chat_id}`, so the agent remembers context
+across messages and across restarts of either side.
+
+The agent also receives a provenance block naming the chat id, the user id and
+`source=openwebui`, which is what lets it tell an Open WebUI conversation apart
+from a Telegram one. Full contract in
+[`docs/metadata-contract.md`](./docs/metadata-contract.md).
+
+Valve: `AGENT_ID`.
+
+</details>
+
+<a id="f-model-selector"></a>
+<details>
+<summary><b>🧭 Dynamic model selector</b></summary>
+
+The integration calls `models.list` and lists one selector entry per model your
+Gateway actually knows about, named `<Model> (<provider>) · OpenClaw`.
+
+<p align="center">
+  <img src="./docs/img/model-selector.jpg" alt="Open WebUI model dropdown listing models discovered from the Gateway" width="45%">
+</p>
+
+`OpenClaw · Default` is always present and always works: picking it clears the
+model override and uses the agent's own model.
+
+Discovered models are cached, so the selector still shows your real models after
+a restart, before the first connection is made. Models that could not be
+verified against a live Gateway are labelled "example, Gateway not reached", in
+the selector and in the `DEFAULT_MODEL` dropdown both, so a placeholder can
+never quietly pass for one of yours.
+
+Model keys containing dots (`gemini-3.1-pro-preview`) route correctly, and
+runtime namespaces (`claude-cli/`, `codex-cli/`, `google-gemini-cli/`) are
+treated as equivalent to their provider, so a correctly applied override is
+never reported as failed. A burst of messages collapses into one
+`sessions.patch` rather than one per message.
+
+Valves: `DEFAULT_MODEL` (rendered as a live dropdown, not a text box),
+`STATE_DIR`. More in [OWUI model selector](#owui-model-selector).
+
+</details>
+
+<a id="f-model-limits"></a>
+<details>
+<summary><b>🔎 Selector size cap</b></summary>
+
+`MAX_MODELS` truncates the discovered model list to at most this many
+entries, defaulting to 30 and validated to a 1-100 range by the valve schema
+itself. A Gateway that knows about two hundred models should not produce a
+two-hundred-entry dropdown.
+
+The `DEFAULT_MODEL` dropdown is separate and always lists every model key
+currently known, cap notwithstanding, since picking a default has to stay
+possible even for a model the selector itself is hiding.
+
+</details>
+
+### Status and observability
+
+<a id="f-status-action"></a>
+<details>
+<summary><b>📊 Status Action button</b> <sub>(separate function)</sub></summary>
+
+[`openclaw_status_action.py`](./openclaw_status_action.py) adds a button to the
+message toolbar.
+
+<p align="center">
+  <img src="./docs/img/action-button.png" alt="The OpenClaw Status button in Open WebUI's message toolbar" width="30%">
+</p>
+
+It opens a dialog with three sections: Context, Rate Limits and Subagents.
+
+<p align="center">
+  <img src="./docs/img/status-modal.jpg" alt="Status dialog showing context usage, rate limits and running subagents" width="45%">
+</p>
+
+Each section has its own skeleton and fills the moment its own RPC resolves, so
+a slow subagent list does not hold up the context number. Usage bars are colour
+coded, green under 60%, amber from 60%, red from 85%, with the colours inlined
+so a theme cannot render them invisible.
+
+The footer says when it last refreshed and whether it reused the Pipe's live
+connection or opened its own. It reuses the Pipe's connection when one is open
+and otherwise falls back to the Pipe's on-disk identity, so there is never a
+second pairing to approve. The Action can never deliver proactive messages: that
+path is compiled out of this artifact, so its fallback connection cannot write
+stray text into a chat.
+
+Valves (mirrored from the Pipe by `install_action.py`): `GATEWAY_URL`,
+`GATEWAY_TOKEN`, `DEVICE_IDENTITY`, `STATE_DIR`, `AGENT_ID`. Install steps in
+[Installing the companion Status Action](#installing-the-companion-status-action).
+
+</details>
+
+<a id="f-compact"></a>
+<details>
+<summary><b>🗜️ Compact from the dialog</b></summary>
+
+A Compact pill in the status dialog header runs `/compact` on the session, shows
+a distinct "Compacting…" state while it works, and refreshes with the
+post-compaction numbers so you can see what it bought you.
+
+Bounded at 180 seconds, matching `openclaw sessions compact`'s own default RPC
+timeout. If a response is currently in progress the button refuses with "a
+response is currently in progress", rather than compacting the session out from
+under a running turn.
+
+</details>
+
+<a id="f-subagent-drawer"></a>
+<details>
+<summary><b>👥 Subagent drawer</b> <sub>(partial)</sub></summary>
+
+The status dialog lists the subagents a run spawned with their status and
+elapsed time. Click one to open a side drawer with Overview, Transcript and
+Tools tabs, refreshed by a poll loop that holds open until the subagent
+terminates.
+
+<p align="center">
+  <img src="./docs/img/subagent-drawer.jpg" alt="Subagent drawer with Overview, Transcript and Tools tabs" width="75%">
+</p>
+
+Overview shows the child's own context fill, its goal line, and its
+provider/model, which is often not the parent's.
+
+**Its tool calls only appear once it finishes.** The Gateway routes tool events
+to the connection that started a run, and a subagent's run starts inside the
+Gateway, so no client can watch a running subagent's tool calls. This is a
+routing limitation rather than a rendering bug: it was measured and is pinned by
+a test, see
+[`src/openclaw_pipe_pkg/gateway.py`](./src/openclaw_pipe_pkg/gateway.py).
+
+</details>
+
+<a id="f-logging"></a>
+<details>
+<summary><b>📝 Backend diagnostics</b></summary>
+
+Every turn logs to the Open WebUI backend log with an `[openclaw-pipe]` prefix:
+session key, run id, event count, tool starts and results, and every snapshot
+decision with its reason.
+
+There is enough there to diagnose the failure modes that are otherwise
+invisible. Duplicate completions log a message id and a text hash, so a re-fired
+completion is identifiable. A turn that produced no text at all is marked
+`[diag] PHANTOM (no text)`. Snapshot decisions log `EMITTED` or `SKIPPED` with
+the deciding condition, and the terminal line records whether the turn was
+aborted, whether text was visible, and whether it was snapshotted.
+
+Always on, not configurable.
+
+</details>
+
+### Reliability
+
+<a id="f-connection"></a>
+<details>
+<summary><b>🔌 Persistent connection</b></summary>
+
+One WebSocket connection is shared by every chat, rather than one per message.
+
+It reconnects on its own with exponential backoff from 1 second up to 30, so a
+Gateway restart needs nothing from you. A keepalive tick and a 90 second receive
+timeout mean a silently dead socket is detected rather than waited on forever.
+
+Valves: `GATEWAY_URL`, `GATEWAY_TOKEN`. The full message path is in
+[`docs/architecture.md`](./docs/architecture.md).
+
+</details>
+
+<a id="f-queueing"></a>
+<details>
+<summary><b>⏳ Concurrent-message queueing</b></summary>
+
+Send a message while the agent is still working and you get
+"⏳ Queued behind the current response…", then a real turn of your own when the
+current one finishes. What you do not get is a blank bubble, which is what the
+naive implementation produces.
+
+Liveness is read from `sessions.describe` plus `sessions.list`'s
+`hasActiveRun`, which is authoritative across multiple Open WebUI worker
+processes. It also correctly handles the gap where a parent is suspended waiting
+on a sub-agent: that session is busy, not finished, and a 2 second
+settle-confirm keeps it from being misread. A per-session send lock means two
+messages released at the same moment cannot both merge into one run.
+
+Safety ceiling of 1800 seconds. Always on.
+
+</details>
+
+<a id="f-rehydration"></a>
+<details>
+<summary><b>♻️ Rehydration and restart safety</b></summary>
+
+Reload the page mid-turn, or open the chat on another device, and you see the
+partial answer so far instead of an empty bubble. The Pipe persists a snapshot
+of the message as it streams, throttled to at most one per second or per 250
+characters.
+
+If your tab or socket dies mid-stream, a forced terminal snapshot means the
+finished text is still in the database when you come back.
+
+Device identity and token persist in `STATE_DIR`, so restarting Open WebUI or
+reloading the function never forces a re-pairing. If `STATE_DIR` is not
+writable, the Pipe degrades to `/tmp/openclaw-bridge` and logs
+`STATE_DIR unavailable` loudly rather than failing.
+
+Valve: `STATE_DIR`, default `/data/openclaw-bridge`. Design notes in
+[`docs/rehydration-persistence.md`](./docs/rehydration-persistence.md), and see
+[Restart-safe state](#restart-safe-state).
+
+</details>
+
+<a id="f-parity"></a>
+<details>
+<summary><b>🧵 Parity finalize</b></summary>
+
+If the inline turn ends before the run itself does — an idle self-close, a
+cancelled request, or a torn-down connection — the original Open WebUI
+message used to be left short, with the rest of the answer showing up later
+as a length-capped, tool-card-less *proactive* bubble read from
+`sessions.preview`. Parity finalize replaces that: a renderer accumulates the
+complete content, assistant text and every tool block, in order, straight
+from the same event stream the persistent connection already receives, and
+finalizes the ORIGINAL message to exactly what an uninterrupted turn would
+have produced, with no second bubble underneath it.
+
+Scope is deliberately narrower than a live turn: MEDIA uploads and ask-user
+modals are not reproduced, because they need a live browser tab and never
+occur on a run that closed itself in the background. Needs a stable Open
+WebUI message id to target, and is always on when one is available.
+
+</details>
+
+<a id="f-recovery"></a>
+<details>
+<summary><b>🩹 Preview recovery and idle probing</b></summary>
+
+If events are lost, the reply is recovered from the Gateway's own
+`sessions.preview` rather than showing you nothing.
+
+Silence is never treated as completion. A long tool call or a long stretch of
+silent reasoning triggers a probe every 30 seconds that confirms the run is
+still alive, rather than truncating the turn.
+
+There are still bounds, because hanging forever is its own failure: the turn
+gives up after 180 seconds with no text at all, or 5000 events without text, and
+says so explicitly. When a run does end without text, the reason comes from the
+run's real terminal state, so you see **Stopped.** or **Failed: the run did not
+complete.** rather than a generic timeout.
+
+Always on.
+
+</details>
+
+<a id="f-stop"></a>
+<details>
+<summary><b>🛑 Stop that actually stops</b></summary>
+
+Pressing Stop in Open WebUI cancels the Pipe's async generator, which is
+caught explicitly rather than left to propagate silently: it emits a final
+forced snapshot first, so the partial answer already shown is not lost, then
+sends the Gateway a `chat.abort` for that run. Abort alone only tears down
+the streaming connection; a tool the agent kicked off keeps executing
+server-side unless something also tells the agent to stop.
+
+That is what `/stop` is for. With `SEND_STOP_ON_CANCEL` on (the default), the
+Pipe sends it right after the abort, so a long shell command or browser
+action is actually killed instead of continuing against a chat nobody is
+watching anymore.
+
+Valve: `SEND_STOP_ON_CANCEL` (on).
+
+</details>
+
+<a id="f-reaping"></a>
+<details>
+<summary><b>🧟 Zombie reaping</b></summary>
+
+Open WebUI's function loader execs every redeploy into a brand-new Python
+module with no teardown hook on the old one. Left alone, a previous deploy's
+Gateway WebSocket connection would keep its own event loop running forever as
+a genuine zombie: still receiving broadcast events, still capable of writing
+every message into your chat a second time alongside the new connection.
+
+The fix stashes the live connection as an attribute on Open WebUI's own
+socket module, which this function never reloads, instead of a plain
+module-level singleton that would reset on every deploy. The next deploy
+finds that stashed connection, disconnects it with a short timeout, and only
+then opens its own, so redeploys self-heal without a container restart. The
+same pattern reaps the fallback media file server bound to its port, so a
+redeploy never leaves two processes fighting over it.
+
+Always on.
+
+</details>
+
+<a id="f-background-tasks"></a>
+<details>
+<summary><b>🚫 Background-task short-circuiting</b></summary>
+
+Open WebUI silently calls the selected model for background chores: a title
+after the first exchange, tags, a follow-up suggestion, an emoji, autocomplete
+as you type, and a search query when you use its built-in search. Each call
+arrives at the Pipe tagged with which chore it is, one of six task names OWUI
+sets internally.
+
+The Pipe checks that tag before it extracts the message, opens a Gateway
+connection, or does anything else: a match is logged and the Pipe returns
+immediately, so none of the six ever reaches your agent as a real turn. Left
+unhandled, each one would be an extra run against your actual session, wasted
+tokens, a title-generation prompt polluting the agent's context, and
+confusing entries per exchange in its own history.
+
+This is separate from [Auto-title](#f-auto-title), which is the Pipe's own
+opt-in replacement that runs on a dedicated lane instead.
+
+Always on, not configurable.
+
+</details>
+
+<a id="f-errors"></a>
+<details>
+<summary><b>🧯 Actionable errors</b></summary>
+
+Failures name the thing that fixes them.
+
+An unapproved device gets the exact commands, `openclaw devices list` and
+`openclaw devices approve <request-id>`, plus this device's id. A bad token
+names both the valve and the config key `gateway.auth.token`. A `GATEWAY_URL`
+pasted with a scheme is caught explicitly instead of failing cryptically further
+down.
+
+A wrong `AGENT_ID` says "Could not start a session on agent `x`" rather than
+sending you off to fix `DEFAULT_MODEL`, which is the misattribution the obvious
+implementation makes. Where the cause is genuinely ambiguous the message says so
+instead of guessing, and a timeout says it is usually transient and to send
+again.
+
+Always on. Symptom-first index in [Troubleshooting](#-troubleshooting).
+
+</details>
+
+### Beyond the chat
+
+<a id="f-proactive"></a>
+<details>
+<summary><b>📮 Proactive delivery</b></summary>
+
+A reply the agent produces without you asking, from a cron job, a heartbeat, or
+another session's `sessions_send`, appears in your chat as an
+_↳ Proactive message_ bubble with no user turn above it.
+
+It waits for the conversation to be genuinely idle first (120 seconds, polled,
+giving up after 600), so it never injects itself into a conversation you are
+actively using, and it never duplicates something already delivered live. An
+open tab is nudged to refresh so the message appears without you reloading.
+
+Open WebUI models a message with no preceding user turn as a variant, which
+would hide it behind a 1/2 · 2/2 swipe arrow. That is healed at the start of
+every turn, so proactive messages sit in the normal linear flow.
+
+Enabled by default (`PROACTIVE_DELIVERY_ENABLED`, a module constant rather than
+a valve). Compiled out of the Action artifact entirely.
+
+_No screenshot yet._
+
+</details>
+
+<a id="f-subagent-delivery"></a>
+<details>
+<summary><b>🧑‍🔧 Sub-agent results</b></summary>
+
+When a sub-agent finishes, its result is written into the parent Open WebUI
+chat as its own message: a *↳ Sub-agent finished* line followed by the
+sub-agent's output, with an HTML comment carrying its task id appended after
+it. The comment renders invisibly in the chat but stays in the message's raw
+content.
+
+Open WebUI's Action-button mechanism only ever hands the Pipe the chat id,
+message id, model and content, never a custom field, so that hidden marker is
+the only way the button knows which sub-agent a given bubble belongs to.
+Clicking the toolbar button on one of those messages reads the marker back
+out of the message content and opens that sub-agent's
+[drawer](#f-subagent-drawer) directly, instead of the general status dialog
+every other message opens.
+
+Enabled by default.
+
+</details>
+
+<a id="f-relay"></a>
+<details>
+<summary><b>📡 Live relay</b></summary>
+
+A proactive run streams token by token into an already-open tab, rather than
+appearing all at once when it finishes.
+
+Same sustained-idle contract as post-hoc delivery: a run is only eligible once
+its session has had no consumers for 120 seconds. When relay owns a run it
+claims that run's delivery identity, so the post-hoc path skips it and you never
+get the message twice. Database persistence is explicit on this path, which is
+what makes a reload correct regardless of what the browser received.
+
+Enabled by default (`LIVE_STREAM_RELAY_ENABLED`, with
+`LIVE_STREAM_BOOTSTRAP_ENABLED` for the refresh nudge). Both are module
+constants and can be set to `False` to fall back to post-hoc delivery.
+
+</details>
+
+### Setup
+
+<a id="f-device-auth"></a>
+<details>
+<summary><b>🔐 Ed25519 device auth</b></summary>
+
+The WebSocket handshake is a full challenge/response against an Ed25519 keypair
+generated on first run. You approve the device once on the Gateway host and
+never again: the identity and the issued token persist in `STATE_DIR` and
+survive Open WebUI restarts, function reloads and in-place reinstalls.
+
+`DEVICE_IDENTITY` holds a private key, see
+[Security notes](#-security-notes). Approval steps in
+[Approve the device in the Gateway](#approve-the-device-in-the-gateway).
+
+</details>
+
+<a id="f-installer"></a>
+<details>
+<summary><b>📦 Installer</b></summary>
+
+`install.py install --wizard` prompts for everything it needs. Reinstalling
+updates in place and preserves your existing valves, so an update never wipes
+`DEVICE_IDENTITY` and forces a re-pairing, and the previous function and valves
+are written to `backups/` first either way.
+
+`status`, `repair` and `healthcheck` subcommands inspect, fix and end-to-end
+smoke-test the installation. When run on the Gateway host, the installer
+approves its own pairing request using the local `openclaw` CLI.
+
+`--with-skills` also installs the two agent-side skills that teach an agent to
+use the ask-user modal and the media path. `install_action.py` installs the
+Action and mirrors the five shared valves from the Pipe. `install_filter.py`
+installs the thinking Filter.
+
+Full detail in [Installation](#-installation) and [Commands](#commands).
+
+</details>
+
+<a id="f-valves"></a>
+<details>
+<summary><b>⚙️ Valves</b></summary>
+
+Everything configurable is an Open WebUI valve, editable from Admin → Functions
+with no file access and no restart.
+
+Connection: `GATEWAY_URL`, `GATEWAY_TOKEN`, `AGENT_ID`, `DEVICE_IDENTITY`,
+`STATE_DIR`.
+Models: `DEFAULT_MODEL`, `MAX_MODELS`.
+Behaviour: `AUTO_TITLE`, `SEND_STOP_ON_CANCEL`, `USE_OWUI_FILES`,
+`OWUI_BASE_URL`, `OWUI_API_KEY`, `ENABLE_FILE_SERVER`, `FILE_SERVER_BASE_URL`.
+Thinking filter: `priority`, `override_advanced_params`, and the per-user
+`level`.
+
+A handful of behaviours are module constants rather than valves, because they
+change the integration's contract rather than tuning it:
+`PROACTIVE_DELIVERY_ENABLED`, `LIVE_STREAM_RELAY_ENABLED`,
+`LIVE_STREAM_BOOTSTRAP_ENABLED`.
+
+Every valve with its default is in
+[Configuration](#configuration).
+
+</details>
 
 ---
 

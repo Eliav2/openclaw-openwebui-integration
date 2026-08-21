@@ -67,13 +67,6 @@ def _normalize_model_entry(raw: dict) -> dict:
     return {"key": key, "name": raw.get("name", model_id), "tags": tags}
 
 
-def _parse_whitelist(text: str) -> set[str]:
-    """Parse comma-separated model whitelist into a set."""
-    if not text or not text.strip():
-        return set()
-    return {x.strip() for x in text.split(",") if x.strip()}
-
-
 # Wording that points at the agent/session rather than the model. Kept NARROW
 # on purpose -- an earlier version also matched "not found", which misfiled
 # "model 'x/y' not found" as an AGENT_ID problem. Do not re-broaden these; the
@@ -87,7 +80,7 @@ def _explain_session_patch_failure(err, *, model_override, agent_id) -> str:
     The session key embeds AGENT_ID and this patch is the turn's first
     agent-scoped RPC, so a mistyped AGENT_ID surfaces here -- and used to be
     reported as "Model selection error", sending the user to fix
-    DEFAULT_MODEL/CONFIGURED_MODELS, which were never the problem.
+    DEFAULT_MODEL, which was never the problem.
 
     Classifying by substring is genuinely ambiguous, so the ordering matters and
     is deliberate:

@@ -56,11 +56,31 @@ class OwuiClient:
 
     @staticmethod
     def from_env() -> "OwuiClient":
-        """Create from OWUI_URL, OWUI_EMAIL, OWUI_PASSWORD env vars."""
+        """Create from OWUI_URL, OWUI_EMAIL, OWUI_PASSWORD env vars.
+
+        Falls back to this repo's .env.local for any of the three that
+        aren't already set in the environment -- callers that invoke a
+        verify/driver script directly (not through a shell wrapper that
+        sources .env.local first) would otherwise silently authenticate
+        with an empty email/password and get a bare HTTP 400 from OWUI.
+        """
+        env = dict(os.environ)
+        if not (env.get("OWUI_URL") and env.get("OWUI_EMAIL") and env.get("OWUI_PASSWORD")):
+            dotenv_path = os.path.join(os.path.dirname(__file__), "..", ".env.local")
+            try:
+                with open(dotenv_path, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        key, _, value = line.partition("=")
+                        env.setdefault(key.strip(), value.strip())
+            except OSError:
+                pass
         return OwuiClient(
-            os.environ.get("OWUI_URL", "http://localhost:8080"),
-            os.environ.get("OWUI_EMAIL", ""),
-            os.environ.get("OWUI_PASSWORD", ""),
+            env.get("OWUI_URL", "http://localhost:8080"),
+            env.get("OWUI_EMAIL", ""),
+            env.get("OWUI_PASSWORD", ""),
         )
 
     # ── Low-level ────────────────────────────────────────────────────

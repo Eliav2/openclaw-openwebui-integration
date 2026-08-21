@@ -14,6 +14,8 @@ import types
 import asyncio
 from unittest import mock
 
+import conftest  # noqa: F401  (imports real pydantic before this file's stub can shadow it)
+
 if "websockets" not in sys.modules:
     websockets_stub = types.SimpleNamespace(
         WebSocketClientProtocol=object,
@@ -138,7 +140,6 @@ from openclaw_pipe import (
     _normalize_model_entry,
     _owui_chat_send_params,
     _owui_session_key,
-    _parse_whitelist,
     _preview_recovery_text,
     _provider_from_key,
     _reap_stale_gateway_connection,
@@ -152,6 +153,16 @@ from openclaw_pipe import (
     _SHARED_STATE_ATTR,
     _SUBAGENT_TASK_ID_MARKER_RE,
     _suppress_already_shown,
+    _owui_chat_send_params,
+    _session_thinking_ladder,
+    _session_model_key,
+    _record_thinking_ladder,
+    _read_model_thinking_ladder,
+    _thinking_rejection_retry_body,
+    parse_thinking_rejection,
+    clamp_to_ladder,
+    LEVEL_RANKS,
+    LADDER_CACHE_NAME,
     Pipe,
 )
 
@@ -961,6 +972,48 @@ class SubagentToolEventRoutingTests(unittest.TestCase):
                      "live_tool_calls", "_feed_tool_watch"):
             self.assertFalse(hasattr(conn, attr),
                              f"{attr} is unreachable by design -- see class docstring")
+
+
+class ThinkingNoteAnnouncementTests(unittest.TestCase):
+    """The clamp note is per-message information about a standing setting.
+
+    The level is chosen in a filter dropdown and stays chosen, so a model that
+    cannot honour it produces the same sentence on every single message. That
+    is what the user actually saw: an italic line above every answer, with no
+    way to dismiss it.
+    """
+
+    NOTE = "This model does not support thinking level 'high', using 'off' instead."
+
+    def test_the_same_note_is_shown_once_per_session(self):
+        conn = _GatewayConnection(lambda: None)
+        self.assertTrue(conn.should_announce_thinking_note("s", self.NOTE))
+        for _ in range(3):
+            self.assertFalse(conn.should_announce_thinking_note("s", self.NOTE))
+
+    def test_a_changed_note_speaks_up_again(self):
+        # A different level, a different model, or a ladder just learned from
+        # a rejection all change the sentence -- and all are news.
+        conn = _GatewayConnection(lambda: None)
+        conn.should_announce_thinking_note("s", self.NOTE)
+        self.assertTrue(conn.should_announce_thinking_note(
+            "s", "This model does not support thinking level 'max', using 'low' instead."))
+
+    def test_sessions_do_not_silence_each_other(self):
+        conn = _GatewayConnection(lambda: None)
+        conn.should_announce_thinking_note("chat-a", self.NOTE)
+        self.assertTrue(conn.should_announce_thinking_note("chat-b", self.NOTE))
+
+    def test_an_empty_note_is_never_announced(self):
+        self.assertFalse(
+            _GatewayConnection(lambda: None).should_announce_thinking_note("s", ""))
+
+    def test_the_pipe_gates_the_yield_on_it(self):
+        # The note is still logged unconditionally: suppressing it in the chat
+        # must not make a clamp invisible when diagnosing one from the logs.
+        source = inspect.getsource(Pipe._pipe_impl)
+        self.assertIn("should_announce_thinking_note(session_key, thinking_note)", source)
+        self.assertIn('pipe_log(f"thinking: {thinking_note}")', source)
 
 
 class EventConsumerMatchingTests(unittest.TestCase):
@@ -3470,7 +3523,7 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DynamicModelSelectorTests(unittest.TestCase):
-    """Tests for ELI-11: dynamic model discovery, whitelist, and legacy compat."""
+    """Tests for ELI-11: dynamic model discovery."""
 
     def test_friendly_name_prefers_versioned_catalog_name_over_alias(self):
         # The alias ("opus") hides the version; the catalog name carries it.
@@ -3501,13 +3554,6 @@ class DynamicModelSelectorTests(unittest.TestCase):
         self.assertEqual(_provider_from_key("deepseek/deepseek-v4-flash"), "deepseek")
         self.assertEqual(_provider_from_key("o3-mini"), "")
 
-    def test_parse_whitelist_empty(self):
-        self.assertEqual(_parse_whitelist(""), set())
-        self.assertEqual(_parse_whitelist("   "), set())
-
-    def test_parse_whitelist_commas(self):
-        self.assertEqual(_parse_whitelist(" a , b, c "), {"a", "b", "c"})
-
     def test_pipe_selected_preset_default(self):
         pipe = Pipe()
         self.assertEqual(pipe._selected_preset({"model": "openclaw_gateway.default"}), "default")
@@ -3528,13 +3574,6 @@ class DynamicModelSelectorTests(unittest.TestCase):
             "google/gemini-3.1-pro-preview",
         )
 
-    def test_pipe_selected_preset_legacy_chatgpt(self):
-        pipe = Pipe()
-        self.assertEqual(
-            pipe._selected_preset({"model": "openclaw_gateway.chatgpt"}),
-            "chatgpt",
-        )
-
     def test_pipe_model_override_default_empty(self):
         pipe = Pipe()
         self.assertIsNone(pipe._model_override_for_preset("default"))
@@ -3544,15 +3583,7 @@ class DynamicModelSelectorTests(unittest.TestCase):
         pipe.valves.DEFAULT_MODEL = "openai/gpt-5.5"
         self.assertEqual(pipe._model_override_for_preset("default"), "openai/gpt-5.5")
 
-    def test_pipe_model_override_legacy_custom(self):
-        pipe = Pipe()
-        pipe.valves.CHATGPT_MODEL = "openai/gpt-5.5-pro"
-        self.assertEqual(
-            pipe._model_override_for_preset("chatgpt"),
-            "openai/gpt-5.5-pro",
-        )
-
-    def test_pipe_model_override_legacy_default(self):
+    def test_pipe_model_override_raw_key_passthrough(self):
         pipe = Pipe()
         self.assertEqual(
             pipe._model_override_for_preset("openai/gpt-5.5"),
@@ -3930,7 +3961,6 @@ class UnverifiedModelListTests(unittest.TestCase):
     def _pipe(self, tmp):
         p = Pipe()
         p.valves.STATE_DIR = tmp
-        p.valves.CONFIGURED_MODELS = ""
         p.valves.MAX_MODELS = 30
         return p
 
@@ -4090,7 +4120,6 @@ class ReviewFollowupRegressionTests(unittest.TestCase):
             custom = os.path.join(tmp, "custom")
             p = Pipe()
             p.valves.STATE_DIR = custom
-            p.valves.CONFIGURED_MODELS = ""
             _write_json_file(
                 os.path.join(_state_dir(custom), "models-cache.json"),
                 {"models": [{"key": "vendor/real", "name": "Real", "tags": []}]},
@@ -4100,19 +4129,6 @@ class ReviewFollowupRegressionTests(unittest.TestCase):
             self.assertTrue(any("Real" in l for l in labels), labels)
             for l in labels:
                 self.assertNotIn(UNVERIFIED_MODEL_SUFFIX, l)
-
-    def test_warning_survives_a_whitelist_that_filters_everything(self):
-        """CONFIGURED_MODELS set to real Gateway keys + an unreachable Gateway
-        emptied the example list, taking the warning with it -- leaving exactly
-        the user who most needs it with no explanation."""
-        with tempfile.TemporaryDirectory() as tmp:
-            p = Pipe()
-            p.valves.STATE_DIR = tmp
-            p.valves.CONFIGURED_MODELS = "vendor/only-mine"
-            entries = asyncio.run(p.pipes())
-            self.assertEqual(len(entries), 1)
-            self.assertIn(UNVERIFIED_MODEL_SUFFIX, entries[0]["name"])
-            self.assertEqual(entries[0]["id"], "default")
 
 
 class RepeatedAskUserMarkerTests(unittest.TestCase):
@@ -4326,3 +4342,296 @@ class MarkerAfterPreambleTests(unittest.TestCase):
         data = _modal_payload_from_user_input_prompt(pending)[0]["data"]
         self.assertEqual(data["title"], "Pick a theme")
         self.assertEqual(data["options"], ["Dark", "Light", "Auto"])
+
+
+class ThinkingWiringTests(unittest.TestCase):
+    """Pipe half of the per-chat thinking control (ELI-85).
+
+    The filter offers levels; the pipe decides what is actually sendable and
+    tells the gateway. These tests cover that second half, plus the seam
+    between them: the ladder cache the filter reads is written here.
+    """
+
+    SEND_KW = dict(session_key="agent:main:openwebui-u-c", message="hi",
+                   idempotency_key="k", owui_chat_id=None, owui_user_id=None)
+
+    def test_no_thinking_field_when_nothing_was_chosen(self):
+        # Absent is a real instruction: it means "use the agent's configured
+        # level". Sending any value, including "off", would override it.
+        for value in (None, "", False):
+            params = _owui_chat_send_params(thinking=value, **self.SEND_KW)
+            self.assertNotIn("thinking", params, f"thinking={value!r}")
+
+    def test_a_chosen_level_reaches_chat_send(self):
+        params = _owui_chat_send_params(thinking="high", **self.SEND_KW)
+        self.assertEqual(params["thinking"], "high")
+
+    def test_off_is_sent_because_it_is_an_instruction_not_an_absence(self):
+        params = _owui_chat_send_params(thinking="off", **self.SEND_KW)
+        self.assertEqual(params["thinking"], "off")
+
+    def test_ladder_read_from_thinking_levels(self):
+        # thinkingLevels carries the real {id, label} objects the gateway
+        # resolves (resolveGatewaySessionThinkingProjectionInternal ->
+        # thinkingLevels: metadata.levels) -- this is the authoritative,
+        # canonical-id source clamp_to_ladder/LEVEL_RANKS match against.
+        desc = {"session": {"thinkingLevels": [
+            {"id": "off", "label": "off"}, {"id": "medium", "label": "medium"}]}}
+        self.assertEqual(_session_thinking_ladder(desc), ["off", "medium"])
+
+    def test_thinking_levels_wins_when_both_are_present(self):
+        # Regression for ELI-85's live break: the old code checked
+        # thinkingOptions FIRST and returned it as-is. thinkingOptions is
+        # display LABELS (metadata.levels.map(level => level.label)), not
+        # ids -- for a model whose label differs from its id (the realistic
+        # case, e.g. "Off" vs "off"), that ladder can never match a
+        # requested level, clamp_to_ladder falls through to "pass it to the
+        # gateway", and the gateway hard-rejects the turn with its own
+        # "Thinking level ... is not supported" error. thinkingLevels must
+        # win whenever both are present.
+        desc = {"session": {"thinkingOptions": ["Off"],
+                            "thinkingLevels": [{"id": "max"}]}}
+        self.assertEqual(_session_thinking_ladder(desc), ["max"])
+
+    def test_ladder_falls_back_to_the_labelled_form_lowercased(self):
+        # thinkingOptions is a last-resort fallback only (some future
+        # gateway build stops emitting thinkingLevels). Lowercased on the
+        # way out so a label that happens to already equal its id in casing
+        # ("off") still matches LEVEL_RANKS instead of silently ranking as
+        # unknown (rank 0) the way a bare capitalized "Off" would.
+        desc = {"session": {"thinkingOptions": ["Off", "High"]}}
+        self.assertEqual(_session_thinking_ladder(desc), ["off", "high"])
+
+    def test_no_ladder_is_None_not_empty(self):
+        # None means "unknown, pass the request through"; [] would mean "this
+        # model supports nothing", which would clamp every request away.
+        for desc in ({}, {"session": {}}, {"session": {"thinkingOptions": []}},
+                     {"session": {"thinkingLevels": [{"label": "no id"}]}}, None):
+            self.assertIsNone(_session_thinking_ladder(desc), repr(desc))
+
+    def _cache(self, td):
+        path = os.path.join(td, LADDER_CACHE_NAME)
+        return path, (json.load(open(path)) if os.path.exists(path) else None)
+
+    def test_recording_a_ladder_writes_the_cache_the_filter_reads(self):
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"OPENCLAW_BRIDGE_STATE_DIR": td}):
+                _record_thinking_ladder(["high", "off", "low"])
+            _, data = self._cache(td)
+            # Ordered by rank, because that is the order the dropdown shows.
+            self.assertEqual(data["levels"], ["off", "low", "high"])
+            self.assertIsInstance(data["updated"], int)
+
+    def test_the_cache_is_a_union_across_models(self):
+        # A dropdown built from only the last model seen would flicker between
+        # ladders as the user switches models mid-chat.
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"OPENCLAW_BRIDGE_STATE_DIR": td}):
+                _record_thinking_ladder(["off", "low", "medium", "high"])
+                _record_thinking_ladder(["off", "xhigh", "max"])
+            _, data = self._cache(td)
+            self.assertEqual(data["levels"],
+                             ["off", "low", "medium", "high", "xhigh", "max"])
+
+    def test_unknown_level_ids_never_enter_the_cache(self):
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"OPENCLAW_BRIDGE_STATE_DIR": td}):
+                _record_thinking_ladder(["low", "turbo", "high"])
+            _, data = self._cache(td)
+            self.assertEqual(data["levels"], ["low", "high"])
+
+    def test_nothing_recognisable_leaves_the_cache_untouched(self):
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"OPENCLAW_BRIDGE_STATE_DIR": td}):
+                _record_thinking_ladder([])
+                _record_thinking_ladder(["turbo"])
+                _record_thinking_ladder(None)
+            self.assertFalse(os.path.exists(os.path.join(td, LADDER_CACHE_NAME)))
+
+    def test_a_per_model_ladder_is_exact_while_the_union_stays_wide(self):
+        # Two different consumers of one file. `levels` is the union, because
+        # the dropdown must not flicker as the user switches models mid-chat.
+        # `models[<key>]` is what the SEND path clamps against and has to be
+        # exact -- clamping against the union is precisely what let `high`
+        # reach a model whose only level is `off`.
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"OPENCLAW_BRIDGE_STATE_DIR": td}):
+                _record_thinking_ladder(["off", "low", "high"],
+                                        model_key="anthropic/claude-sonnet-5")
+                _record_thinking_ladder(["off"], model_key="claude-cli/claude-opus-5",
+                                        authoritative=True)
+                self.assertEqual(
+                    _read_model_thinking_ladder("claude-cli/claude-opus-5"), ["off"])
+                self.assertEqual(
+                    _read_model_thinking_ladder("anthropic/claude-sonnet-5"),
+                    ["off", "low", "high"])
+                # A model we have never seen is unknown, not unsupported.
+                self.assertIsNone(_read_model_thinking_ladder("openai/gpt-9"))
+                self.assertIsNone(_read_model_thinking_ladder(None))
+            _, data = self._cache(td)
+            self.assertEqual(data["levels"], ["off", "low", "high"])
+
+    def test_describe_never_overwrites_what_the_gateway_stated(self):
+        # `sessions.describe` resolves thinkingLevels with no model catalog in
+        # scope, so it reports the generic 8-level profile for a model whose
+        # real ladder is ["off"]. The rejection is the Gateway ruling on its
+        # own send path. A later weak observation must not undo it, or the
+        # misfire comes back once per turn forever.
+        with tempfile.TemporaryDirectory() as td:
+            key = "claude-cli/claude-opus-5"
+            with mock.patch.dict(os.environ, {"OPENCLAW_BRIDGE_STATE_DIR": td}):
+                _record_thinking_ladder(["off"], model_key=key, authoritative=True)
+                _record_thinking_ladder(["off", "low", "medium", "high"],
+                                        model_key=key)
+                self.assertEqual(_read_model_thinking_ladder(key), ["off"])
+                # A later authoritative statement DOES replace it: the model's
+                # own ladder can legitimately change under it (a gateway
+                # upgrade, a re-pinned runtime), and the Gateway is the only
+                # source allowed to say so.
+                _record_thinking_ladder(["off", "low"], model_key=key,
+                                        authoritative=True)
+                self.assertEqual(_read_model_thinking_ladder(key), ["off", "low"])
+            _, data = self._cache(td)
+            self.assertEqual(data["models"][key]["source"], "gateway")
+
+    def test_model_key_is_formatted_the_way_the_gateway_names_it(self):
+        # The cache key has to match the model ref parsed out of the rejection
+        # verbatim, or a ladder learned from a rejection is filed under a name
+        # the clamp never looks up.
+        self.assertEqual(
+            _session_model_key({"modelProvider": "claude-cli",
+                                "model": "claude-opus-5"}),
+            "claude-cli/claude-opus-5")
+        for row in ({"model": "claude-opus-5"}, {"modelProvider": "claude-cli"},
+                    {"modelProvider": "", "model": " "}, {}, None):
+            self.assertIsNone(_session_model_key(row), repr(row))
+
+    def test_a_corrupt_cache_is_rebuilt_rather_than_inherited(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, LADDER_CACHE_NAME)
+            open(path, "w").write("{ not json")
+            with mock.patch.dict(os.environ, {"OPENCLAW_BRIDGE_STATE_DIR": td}):
+                _record_thinking_ladder(["off", "high"])
+            self.assertEqual(json.load(open(path))["levels"], ["off", "high"])
+
+    def test_the_pipe_shares_the_filter_clamping_rule(self):
+        # Same fragment in both artifacts, so this cannot drift. If the pipe
+        # clamped differently from what the dropdown implies, a user would pick
+        # a level and get another with no explanation.
+        got, note = clamp_to_ladder("max", ["off", "minimal", "low", "medium", "high"])
+        self.assertEqual(got, "high")
+        self.assertIn("high", note)
+        self.assertEqual(clamp_to_ladder("medium", ["off", "medium"]), ("medium", None))
+        self.assertEqual(clamp_to_ladder("high", None), ("high", None))
+        self.assertEqual(clamp_to_ladder(None, ["off"]), (None, None))
+        self.assertEqual(LEVEL_RANKS["off"], 0)
+
+    def test_clamp_does_not_crash_on_an_unranked_ladder_entry(self):
+        # A ladder entry outside LEVEL_RANKS (e.g. a raw display label that
+        # slipped through, or a future gateway level id this build doesn't
+        # know about yet) must degrade gracefully, not KeyError. The
+        # at_or_below filter already tolerates this via .get(lv, 0); the
+        # subsequent max() pick used to index LEVEL_RANKS[lv] directly and
+        # would crash the whole turn on exactly this input.
+        got, note = clamp_to_ladder("high", ["off", "Unranked"])
+        self.assertEqual(got, "off")
+        self.assertIn("high", note)
+
+    def test_the_pipe_artifact_exposes_no_Filter_class(self):
+        # Open WebUI introspects an uploaded file for Pipe/Filter/Action
+        # classes. The shared fragment is class-free precisely so bundling it
+        # into the pipe cannot make OWUI treat the pipe as a filter too.
+        import openclaw_pipe
+        self.assertFalse(hasattr(openclaw_pipe, "Filter"))
+        self.assertTrue(hasattr(openclaw_pipe, "Pipe"))
+
+
+class ThinkingRejectionRetryTests(unittest.TestCase):
+    """An explicitly requested level a model can't honour reaches the Gateway,
+    which hard-rejects the turn (ELI-85 live break, found via the sim-user
+    harness). Two distinct ways that happens, and the retry has to cover both:
+
+    * the session has no `sessions.describe` row yet (its first-ever message),
+      so there is no ladder to clamp against; and because the turn is
+      rejected, the row still never appears -- every later message repeats it.
+    * the row exists and its ladder is WRONG. Describe resolves
+      `thinkingLevels` with no model catalog in scope, so it hands back the
+      generic 8-level base profile for a model whose real ladder is `["off"]`.
+      Clamping against that passes `high` straight through.
+
+    The Gateway never streams this rejection as a normal event (the run
+    delivers a single contentless `final`), so an earlier attempt at this fix
+    that peeked the run's event queue for it never saw it fire. The real
+    text only surfaces via `recover_from_preview()` at `_pipe_impl`'s final
+    fallback, which is what `_thinking_rejection_retry_body` gates.
+    """
+
+    REJECTION_TEXT = (
+        'Thinking level "high" is not supported for claude-cli/'
+        'claude-opus-5. Use one of: off.'
+    )
+
+    def test_the_parser_matches_the_real_gateway_wording(self):
+        # Detection and learning are the same call on purpose: whatever the
+        # retry fires on is exactly what the ladder is learned from, so the
+        # two can never disagree about what a rejection is.
+        got = parse_thinking_rejection(self.REJECTION_TEXT)
+        self.assertEqual(got, {"level": "high",
+                               "model": "claude-cli/claude-opus-5",
+                               "levels": ["off"]})
+
+    def test_the_parser_does_not_misfire_on_ordinary_text_about_thinking(self):
+        # Narrow on purpose: must never catch genuine assistant output that
+        # happens to discuss thinking levels in passing.
+        for text in (
+            "Let me think about supported levels here.",
+            "high is not supported in this context, unrelated to models.",
+            'Thinking level "high" is not supported for some models. Use one of: off.',
+            None,
+            "",
+        ):
+            self.assertIsNone(parse_thinking_rejection(text), repr(text))
+
+    def test_retry_body_built_when_recovered_text_is_the_rejection(self):
+        body = {"reasoning_effort": "high", "messages": ["hi"]}
+        retry_body = _thinking_rejection_retry_body(
+            body, self.REJECTION_TEXT, "high")
+        self.assertIsNotNone(retry_body)
+        self.assertNotIn("reasoning_effort", retry_body)
+        self.assertEqual(retry_body["messages"], ["hi"])
+        # The original body must be untouched -- the caller still needs it
+        # for logging/diagnostics after this returns.
+        self.assertEqual(body["reasoning_effort"], "high")
+
+    def test_no_retry_when_nothing_was_recovered(self):
+        self.assertIsNone(
+            _thinking_rejection_retry_body({"reasoning_effort": "high"},
+                                            None, "high"))
+
+    def test_no_retry_when_no_explicit_level_was_ever_sent(self):
+        # resolved_thinking is None whenever this chat never asked for an
+        # override (or already retried once) -- recovered text matching the
+        # rejection wording in that case is not this bug, so retrying is
+        # never correct and would loop.
+        retry_body = _thinking_rejection_retry_body(
+            {"reasoning_effort": None}, self.REJECTION_TEXT, None)
+        self.assertIsNone(retry_body)
+
+    def test_no_retry_when_recovered_text_is_unrelated(self):
+        retry_body = _thinking_rejection_retry_body(
+            {"reasoning_effort": "high"}, "Here is your answer.", "high")
+        self.assertIsNone(retry_body)
+
+    def test_retry_cannot_fire_twice_in_a_row(self):
+        # Simulates the recursive call: the first pass strips
+        # reasoning_effort, so a second pass over that same body always has
+        # resolved_thinking=None regardless of what recover_from_preview()
+        # returns -- the natural termination this fix relies on instead of
+        # an explicit recursion-guard flag.
+        first_body = {"reasoning_effort": "high"}
+        retried = _thinking_rejection_retry_body(
+            first_body, self.REJECTION_TEXT, "high")
+        self.assertIsNotNone(retried)
+        second = _thinking_rejection_retry_body(
+            retried, self.REJECTION_TEXT, None)
+        self.assertIsNone(second)

@@ -73,6 +73,7 @@ openclaw-openwebui-integration/
 ├── build.py                    # Concatenates src/ fragments into the artifacts above
 ├── install.py                  # Automated installer/updater/healthcheck script
 ├── install_action.py           # Same, for the Status Action
+├── install_filter.py           # Same, for the thinking Filter
 ├── test_*.py                   # Unit + integration test suites (see Development)
 ├── scripts/                    # Auxiliary scripts (OWUI API client, live verifiers)
 ├── docs/                       # Architecture, metadata contract, development, design notes
