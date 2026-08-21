@@ -630,6 +630,15 @@ def _ladder_cache_path(state_dir: str = "") -> str:
     return os.path.join(_state_dir(state_dir), LADDER_CACHE_NAME)
 
 
+# Guards the ladder cache's read-merge-write sequence below. Pipe and Status
+# Action requests can land in different threads of the same OWUI process, and
+# without this a slower worker's read-merge-write can finish after a faster
+# one's and silently drop the faster worker's update. A unique temp file (see
+# _write_json_file) only makes each individual write atomic; it does nothing
+# for two workers racing on the read-then-write in between.
+_LADDER_CACHE_LOCK = threading.Lock()
+
+
 def _record_thinking_ladder(levels, model_key=None, authoritative=False,
                              state_dir: str = "") -> None:
     """Fold a ladder we just saw into the cache, both as a union and per model.
@@ -654,40 +663,42 @@ def _record_thinking_ladder(levels, model_key=None, authoritative=False,
     """
     known = [lv for lv in (levels or []) if lv in LEVEL_RANKS]
     path = _ladder_cache_path(state_dir)
-    current = _read_json_file(path) or {}
 
-    have = current.get("levels")
-    have = [x for x in have if x in LEVEL_RANKS] if isinstance(have, list) else []
-    merged = sorted(set(have) | set(known), key=lambda lv: (LEVEL_RANKS[lv], lv))
+    with _LADDER_CACHE_LOCK:
+        current = _read_json_file(path) or {}
 
-    models = current.get("models")
-    models = dict(models) if isinstance(models, dict) else {}
-    model_changed = False
-    if model_key:
-        prior = models.get(model_key)
-        prior = prior if isinstance(prior, dict) else {}
-        if prior.get("source") == "gateway" and not authoritative:
-            # Keep the stated truth; a describe-sourced ladder is not evidence
-            # against it.
-            pass
-        else:
-            entry = {
-                "levels": known,
-                "source": "gateway" if authoritative else "describe",
-                "updated": int(time.time()),
-            }
-            if (prior.get("levels") != entry["levels"]
-                    or prior.get("source") != entry["source"]):
-                models[model_key] = entry
-                model_changed = True
+        have = current.get("levels")
+        have = [x for x in have if x in LEVEL_RANKS] if isinstance(have, list) else []
+        merged = sorted(set(have) | set(known), key=lambda lv: (LEVEL_RANKS[lv], lv))
 
-    if merged == have and not model_changed:
-        return
-    payload = {"levels": merged, "updated": int(time.time())}
-    if models:
-        payload["models"] = models
-    if not _write_json_file(path, payload):
-        return
+        models = current.get("models")
+        models = dict(models) if isinstance(models, dict) else {}
+        model_changed = False
+        if model_key:
+            prior = models.get(model_key)
+            prior = prior if isinstance(prior, dict) else {}
+            if prior.get("source") == "gateway" and not authoritative:
+                # Keep the stated truth; a describe-sourced ladder is not
+                # evidence against it.
+                pass
+            else:
+                entry = {
+                    "levels": known,
+                    "source": "gateway" if authoritative else "describe",
+                    "updated": int(time.time()),
+                }
+                if (prior.get("levels") != entry["levels"]
+                        or prior.get("source") != entry["source"]):
+                    models[model_key] = entry
+                    model_changed = True
+
+        if merged == have and not model_changed:
+            return
+        payload = {"levels": merged, "updated": int(time.time())}
+        if models:
+            payload["models"] = models
+        if not _write_json_file(path, payload):
+            return
     if merged != have:
         pipe_log(f"thinking ladder cache updated: {merged}")
     if model_changed:

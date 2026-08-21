@@ -452,9 +452,16 @@ class Pipe:
 
     async def _pipe_impl(self, body, __event_emitter__, __event_call__=None,
                    __user__=None, __metadata__=None, __request__=None,
-                   __task__=None, __task_body__=None):
+                   __task__=None, __task_body__=None, _initial_visible_text=""):
         """Uses a shared persistent WS connection; no per-message reconnect,
         no global lock, and no 60s timeout.
+
+        `_initial_visible_text` seeds the terminal snapshot for the
+        thinking-rejection retry recursion below: the retry note belongs to
+        the turn that's ending, not the one about to start, but this call's
+        own `visible_message_text` is what the forced terminal `replace`
+        snapshot persists -- a note recorded only on the caller's copy would
+        show while streaming and vanish on reload.
         """
         if self.valves.ENABLE_FILE_SERVER:
             _start_file_server()
@@ -796,13 +803,19 @@ class Pipe:
                                 or session_thinking_ladder)
             resolved_thinking, thinking_note = clamp_to_ladder(
                 requested_thinking, effective_ladder)
+            # Held until `visible_message_text` exists below (it isn't defined
+            # yet at this point in the turn) so the note that streams here also
+            # ends up in the forced terminal snapshot -- otherwise it shows
+            # while streaming and is gone after a reload.
+            pending_clamp_note = ""
             if thinking_note:
                 pipe_log(f"thinking: {thinking_note}")
                 # Logged every time, shown once: the dropdown keeps the level
                 # selected, so an unchanged mismatch would otherwise stamp the
                 # same italic line above every answer in the chat.
                 if conn.should_announce_thinking_note(session_key, thinking_note):
-                    yield f"_{thinking_note}_\n\n"
+                    pending_clamp_note = f"_{thinking_note}_\n\n"
+                    yield pending_clamp_note
             try:
                 send_resp = await conn.send_request(
                     "chat.send",
@@ -852,7 +865,7 @@ class Pipe:
         # FLUSHED, so it cannot be used to dedup a cumulative catch-all event
         # while a needs-input block is being held back (ELI-80).
         assistant_received_text = ""
-        visible_message_text = ""
+        visible_message_text = _initial_visible_text + pending_clamp_note
         had_tool_block = False
         # toolCallIds announced to OWUI as `function_call` items that have
         # not been completed by a matching result item yet. Anything left
@@ -1759,6 +1772,7 @@ class Pipe:
                     __event_call__=__event_call__, __user__=__user__,
                     __metadata__=__metadata__, __request__=__request__,
                     __task__=__task__, __task_body__=__task_body__,
+                    _initial_visible_text=visible_message_text,
                 ):
                     yield item
                 return

@@ -1796,6 +1796,15 @@ def _ladder_cache_path(state_dir: str = "") -> str:
     return os.path.join(_state_dir(state_dir), LADDER_CACHE_NAME)
 
 
+# Guards the ladder cache's read-merge-write sequence below. Pipe and Status
+# Action requests can land in different threads of the same OWUI process, and
+# without this a slower worker's read-merge-write can finish after a faster
+# one's and silently drop the faster worker's update. A unique temp file (see
+# _write_json_file) only makes each individual write atomic; it does nothing
+# for two workers racing on the read-then-write in between.
+_LADDER_CACHE_LOCK = threading.Lock()
+
+
 def _record_thinking_ladder(levels, model_key=None, authoritative=False,
                              state_dir: str = "") -> None:
     """Fold a ladder we just saw into the cache, both as a union and per model.
@@ -1820,40 +1829,42 @@ def _record_thinking_ladder(levels, model_key=None, authoritative=False,
     """
     known = [lv for lv in (levels or []) if lv in LEVEL_RANKS]
     path = _ladder_cache_path(state_dir)
-    current = _read_json_file(path) or {}
 
-    have = current.get("levels")
-    have = [x for x in have if x in LEVEL_RANKS] if isinstance(have, list) else []
-    merged = sorted(set(have) | set(known), key=lambda lv: (LEVEL_RANKS[lv], lv))
+    with _LADDER_CACHE_LOCK:
+        current = _read_json_file(path) or {}
 
-    models = current.get("models")
-    models = dict(models) if isinstance(models, dict) else {}
-    model_changed = False
-    if model_key:
-        prior = models.get(model_key)
-        prior = prior if isinstance(prior, dict) else {}
-        if prior.get("source") == "gateway" and not authoritative:
-            # Keep the stated truth; a describe-sourced ladder is not evidence
-            # against it.
-            pass
-        else:
-            entry = {
-                "levels": known,
-                "source": "gateway" if authoritative else "describe",
-                "updated": int(time.time()),
-            }
-            if (prior.get("levels") != entry["levels"]
-                    or prior.get("source") != entry["source"]):
-                models[model_key] = entry
-                model_changed = True
+        have = current.get("levels")
+        have = [x for x in have if x in LEVEL_RANKS] if isinstance(have, list) else []
+        merged = sorted(set(have) | set(known), key=lambda lv: (LEVEL_RANKS[lv], lv))
 
-    if merged == have and not model_changed:
-        return
-    payload = {"levels": merged, "updated": int(time.time())}
-    if models:
-        payload["models"] = models
-    if not _write_json_file(path, payload):
-        return
+        models = current.get("models")
+        models = dict(models) if isinstance(models, dict) else {}
+        model_changed = False
+        if model_key:
+            prior = models.get(model_key)
+            prior = prior if isinstance(prior, dict) else {}
+            if prior.get("source") == "gateway" and not authoritative:
+                # Keep the stated truth; a describe-sourced ladder is not
+                # evidence against it.
+                pass
+            else:
+                entry = {
+                    "levels": known,
+                    "source": "gateway" if authoritative else "describe",
+                    "updated": int(time.time()),
+                }
+                if (prior.get("levels") != entry["levels"]
+                        or prior.get("source") != entry["source"]):
+                    models[model_key] = entry
+                    model_changed = True
+
+        if merged == have and not model_changed:
+            return
+        payload = {"levels": merged, "updated": int(time.time())}
+        if models:
+            payload["models"] = models
+        if not _write_json_file(path, payload):
+            return
     if merged != have:
         pipe_log(f"thinking ladder cache updated: {merged}")
     if model_changed:
@@ -5013,9 +5024,16 @@ class Pipe:
 
     async def _pipe_impl(self, body, __event_emitter__, __event_call__=None,
                    __user__=None, __metadata__=None, __request__=None,
-                   __task__=None, __task_body__=None):
+                   __task__=None, __task_body__=None, _initial_visible_text=""):
         """Uses a shared persistent WS connection; no per-message reconnect,
         no global lock, and no 60s timeout.
+
+        `_initial_visible_text` seeds the terminal snapshot for the
+        thinking-rejection retry recursion below: the retry note belongs to
+        the turn that's ending, not the one about to start, but this call's
+        own `visible_message_text` is what the forced terminal `replace`
+        snapshot persists -- a note recorded only on the caller's copy would
+        show while streaming and vanish on reload.
         """
         if self.valves.ENABLE_FILE_SERVER:
             _start_file_server()
@@ -5357,13 +5375,19 @@ class Pipe:
                                 or session_thinking_ladder)
             resolved_thinking, thinking_note = clamp_to_ladder(
                 requested_thinking, effective_ladder)
+            # Held until `visible_message_text` exists below (it isn't defined
+            # yet at this point in the turn) so the note that streams here also
+            # ends up in the forced terminal snapshot -- otherwise it shows
+            # while streaming and is gone after a reload.
+            pending_clamp_note = ""
             if thinking_note:
                 pipe_log(f"thinking: {thinking_note}")
                 # Logged every time, shown once: the dropdown keeps the level
                 # selected, so an unchanged mismatch would otherwise stamp the
                 # same italic line above every answer in the chat.
                 if conn.should_announce_thinking_note(session_key, thinking_note):
-                    yield f"_{thinking_note}_\n\n"
+                    pending_clamp_note = f"_{thinking_note}_\n\n"
+                    yield pending_clamp_note
             try:
                 send_resp = await conn.send_request(
                     "chat.send",
@@ -5413,7 +5437,7 @@ class Pipe:
         # FLUSHED, so it cannot be used to dedup a cumulative catch-all event
         # while a needs-input block is being held back (ELI-80).
         assistant_received_text = ""
-        visible_message_text = ""
+        visible_message_text = _initial_visible_text + pending_clamp_note
         had_tool_block = False
         # toolCallIds announced to OWUI as `function_call` items that have
         # not been completed by a matching result item yet. Anything left
@@ -6320,6 +6344,7 @@ class Pipe:
                     __event_call__=__event_call__, __user__=__user__,
                     __metadata__=__metadata__, __request__=__request__,
                     __task__=__task__, __task_body__=__task_body__,
+                    _initial_visible_text=visible_message_text,
                 ):
                     yield item
                 return
