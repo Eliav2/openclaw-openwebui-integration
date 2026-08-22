@@ -963,6 +963,41 @@ class SubagentToolEventRoutingTests(unittest.TestCase):
                              f"{attr} is unreachable by design -- see class docstring")
 
 
+class OwuiTaskShortCircuitTests(unittest.TestCase):
+    """O10 (follow-up to O8): image_prompt_generation and function_calling
+    join the no-op short-circuit; moa_response_generation must not."""
+
+    def _short_circuit_tuple(self):
+        source = inspect.getsource(Pipe._pipe_impl)
+        m = re.search(
+            r"if __task__ and __task__ in \(\s*((?:\"[a-z_]+\",?\s*)+)\)",
+            source,
+        )
+        self.assertIsNotNone(m, "could not find the __task__ short-circuit tuple")
+        return set(re.findall(r'"([a-z_]+)"', m.group(1)))
+
+    def test_original_six_still_short_circuit(self):
+        values = self._short_circuit_tuple()
+        for task in (
+            "title_generation",
+            "tags_generation",
+            "follow_up_generation",
+            "emoji_generation",
+            "autocomplete_generation",
+            "query_generation",
+        ):
+            self.assertIn(task, values)
+
+    def test_image_prompt_and_function_calling_now_short_circuit(self):
+        values = self._short_circuit_tuple()
+        self.assertIn("image_prompt_generation", values)
+        self.assertIn("function_calling", values)
+
+    def test_moa_response_generation_still_gets_a_full_agent_turn(self):
+        values = self._short_circuit_tuple()
+        self.assertNotIn("moa_response_generation", values)
+
+
 class EventConsumerMatchingTests(unittest.TestCase):
     def test_matches_exact_session_and_run(self):
         conn = _GatewayConnection(lambda: None)

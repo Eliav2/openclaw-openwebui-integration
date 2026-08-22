@@ -4718,7 +4718,15 @@ class Pipe:
         preset = self._selected_preset(body)
         model_override = self._model_override_for_preset(preset)
 
-        # --- P15: Short-circuit OWUI background tasks ---
+        # --- P15/O10: Short-circuit OWUI background tasks ---
+        # image_prompt_generation and function_calling join the no-op set: both
+        # already have a documented, silent OWUI-side fallback for an empty
+        # response (raw user message / "no tool needed" respectively -- see
+        # PLAN.md O10), so skipping them costs nothing and saves a full agent
+        # turn. moa_response_generation is deliberately excluded -- it is a
+        # user-triggered "Merge Responses" request whose only output path is
+        # the streamed content itself, so a no-op would show as a visibly
+        # empty result rather than a graceful fallback.
         if __task__ and __task__ in (
             "title_generation",
             "tags_generation",
@@ -4726,6 +4734,8 @@ class Pipe:
             "emoji_generation",
             "autocomplete_generation",
             "query_generation",
+            "image_prompt_generation",
+            "function_calling",
         ):
             pipe_log(f"Skipping OWUI background task: {__task__}")
             return
