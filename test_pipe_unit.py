@@ -2,9 +2,11 @@
 """Focused unit tests for pipe stream recovery behavior."""
 
 import unittest
+import ast
 import html
 import os
 import tempfile
+import textwrap
 import inspect
 import json
 import re
@@ -73,6 +75,7 @@ if "pydantic" not in sys.modules:
 from openclaw_pipe import (
     _GatewayConnection,
     GatewayError,
+    _is_restart_signature,
     _parse_gateway_url,
     _explain_connect_rejection,
     _explain_session_patch_failure,
@@ -4559,6 +4562,187 @@ class RestartResumeContractTests(unittest.TestCase):
         rearm = self.src.index("if await resume_after_restart():")
         self.assertIn("epoch_at_send = conn.connection_epoch",
                       self.src[rearm:rearm + 400])
+
+
+class RestartSignatureTests(unittest.TestCase):
+    """`_is_restart_signature` decides whether a run-ending error gets deferred
+    (so the idle probe can resume it) or committed to the message. Too wide and
+    a genuine agent failure is swallowed for 30s and then resumed into a run
+    that will fail the same way; too narrow and a restart truncates the answer,
+    which is the bug this whole path exists to fix."""
+
+    def test_matches_the_sigterm_death_observed_in_run_3(self):
+        """Verbatim tail of the failing proof run: the gateway was SIGTERMed
+        mid-answer and the backend reported the exit code before dying."""
+        self.assertTrue(_is_restart_signature(
+            "Claude Code process exited with code 143"))
+
+    def test_matches_sigterm_and_closed_connections_case_insensitively(self):
+        for err in (
+            "SIGTERM",
+            "terminated by sigterm",
+            "process exited with code 137",
+            "Connection closed",
+        ):
+            with self.subTest(err=err):
+                self.assertTrue(_is_restart_signature(err))
+
+    def test_does_not_match_genuine_agent_failures(self):
+        """These must still reach the user immediately -- deferring them would
+        hide a real failure behind a pointless resume attempt."""
+        for err in (
+            "rate limit exceeded",
+            "Tool 'read' failed: no such file",
+            "model returned an invalid response",
+            "unknown",
+        ):
+            with self.subTest(err=err):
+                self.assertFalse(_is_restart_signature(err))
+
+    def test_empty_error_is_not_a_restart(self):
+        self.assertFalse(_is_restart_signature(""))
+        self.assertFalse(_is_restart_signature(None))
+
+
+class RestartErrorDeferralContractTests(unittest.TestCase):
+    """Source-contract tests for the LOUD death path (a gateway restart that
+    announces itself as a terminal lifecycle error) as opposed to the silent
+    one covered by `RestartResumeContractTests`.
+
+    These exist because the load-bearing bug in this feature -- an unguarded
+    `done = True` reading the very payload that armed the deferral -- was found
+    by reading the code, not by a failing test. Without these a refactor can
+    reintroduce it and every test still passes while the fix is a no-op."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = textwrap.dedent(inspect.getsource(Pipe._pipe_impl))
+        cls.tree = ast.parse(cls.src)
+
+    def _timeout_handler(self):
+        for node in ast.walk(self.tree):
+            if (isinstance(node, ast.ExceptHandler) and node.type is not None
+                    and "TimeoutError" in ast.unparse(node.type)
+                    and "TIMEOUT -- no events on queue" in ast.unparse(node)):
+                return node
+        self.fail("no idle-probe `except asyncio.TimeoutError` handler found; "
+                  "several closures catch TimeoutError, so the idle probe is "
+                  "identified by its log marker")
+
+    def test_restart_signature_error_is_deferred_not_committed(self):
+        """The whole point: on a restart signature we must NOT yield the error
+        and must NOT close, so the loop survives to the idle probe."""
+        branch = self.src.index('elif stream == "lifecycle" and phase == "error":')
+        body = self.src[branch:branch + 700]
+        armed = body.index("pending_restart_error = err")
+        self.assertIn(
+            "if _is_restart_signature(err) and resume_attempts < max_resume_attempts:",
+            body,
+            "deferral must be gated on both the signature and the resume budget",
+        )
+        # Nothing between arming the deferral and the `else` may yield or close.
+        tail = body[armed:body.index("else:", armed)]
+        self.assertNotIn("yield", tail)
+        self.assertNotIn("done = True", tail)
+
+    def test_a_genuine_error_still_closes_the_stream(self):
+        """The `else` arm must keep the original behaviour verbatim, or a real
+        crash hangs the response until the deadman fires."""
+        branch = self.src.index('elif stream == "lifecycle" and phase == "error":')
+        body = self.src[branch:branch + 700]
+        alt = body[body.index("else:", body.index("pending_restart_error = err")):]
+        self.assertIn('yield f"\\n\\n**Error:** {err}"', alt)
+        self.assertIn("done = True", alt)
+
+    def test_deferral_is_bounded_by_the_same_resume_budget(self):
+        """A gateway crash-looping on SIGTERM must degrade to showing the error
+        rather than deferring forever."""
+        branch = self.src.index('elif stream == "lifecycle" and phase == "error":')
+        self.assertIn(
+            "resume_attempts < max_resume_attempts",
+            self.src[branch:branch + 400],
+        )
+
+    def test_payload_state_branch_cannot_close_on_the_arming_event(self):
+        """The gateway stamps state='error' on the SAME payload that carried
+        phase='error'. An unguarded `done = True` here defeats the deferral on
+        the very event that armed it -- the bypass this feature shipped with
+        and that made the fix a silent no-op."""
+        branch = self.src.index('if state in ("final", "cancelled", "error"):')
+        body = self.src[branch:branch + 500]
+        self.assertIn("if pending_restart_error:", body,
+                      "state branch lost its restart-deferral guard")
+        self.assertLess(body.index("if pending_restart_error:"),
+                        body.index("done = True"),
+                        "state branch must check the deferral before closing")
+
+    def test_aborted_branch_cannot_close_on_the_arming_event(self):
+        """Same payload, same trap: `aborted` rides along with the restart
+        error."""
+        branch = self.src.index('if data.get("aborted") is True:')
+        body = self.src[branch:branch + 400]
+        self.assertIn("if pending_restart_error:", body,
+                      "aborted branch lost its restart-deferral guard")
+        self.assertLess(body.index("if pending_restart_error:"),
+                        body.index("done = True"))
+
+    def test_every_give_up_path_flushes_a_deferred_error(self):
+        """Structural, not textual: if a future refactor adds another way out
+        of the idle/timeout branch and forgets the flush, a deferred restart
+        error would vanish and the answer would truncate SILENTLY -- strictly
+        worse than the bug we set out to fix."""
+        handler = self._timeout_handler()
+
+        # `ast.ExceptHandler` is not an `ast.stmt`, so a stmt-only walk silently
+        # skips the describe-probe's `except Exception` arm -- which is one of
+        # the give-up paths. Recurse into every AST node, and stop only at a new
+        # scope or loop, where a `break` no longer leaves the idle branch.
+        boundaries = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
+                      ast.While, ast.For, ast.AsyncFor)
+
+        def walk(node, out):
+            for _, value in ast.iter_fields(node):
+                if not isinstance(value, list):
+                    continue
+                for i, item in enumerate(value):
+                    if not isinstance(item, ast.AST):
+                        continue
+                    if isinstance(item, ast.Break):
+                        out.append((item, value, i))
+                    elif not isinstance(item, boundaries):
+                        walk(item, out)
+            return out
+
+        breaks = walk(handler, [])
+        self.assertGreaterEqual(len(breaks), 5,
+                                "expected the known give-up paths to still exist")
+        for node, siblings, idx in breaks:
+            with self.subTest(line=node.lineno):
+                flushed = any(
+                    isinstance(s, ast.If)
+                    and "pending_restart_error" in ast.unparse(s.test)
+                    for s in siblings[:idx]
+                )
+                self.assertTrue(
+                    flushed,
+                    f"break at _pipe_impl-relative line {node.lineno} leaves the "
+                    "idle branch without flushing pending_restart_error",
+                )
+
+    def test_successful_resume_clears_the_deferred_error(self):
+        """Otherwise the resumed (healthy) run appends the error of the run it
+        replaced when it finally closes."""
+        rearm = self.src.index("if await resume_after_restart():")
+        self.assertIn("pending_restart_error = None", self.src[rearm:rearm + 400])
+
+    def test_assistant_text_clears_the_deferred_error(self):
+        """Belt and braces for the case where the run turns out to be alive
+        after all: real output means it was not a fatal restart."""
+        self.assertRegex(
+            self.src,
+            r"text_yielded = True\n\s*pending_restart_error = None",
+            "streaming assistant text must clear any deferred restart error",
+        )
 
 
 if __name__ == "__main__":
