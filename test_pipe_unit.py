@@ -1691,19 +1691,37 @@ class NativeToolItemTests(unittest.TestCase):
         self.assertEqual(ev["type"], "response.output_item.added")
         item = ev["item"]
         self.assertEqual(item["type"], "function_call")
-        self.assertEqual(item["call_id"], "call-1")
+        self.assertEqual(item["id"], "call-1")
         self.assertEqual(item["name"], "Bash")
         self.assertEqual(item["arguments"], '{"command": "sleep 8"}')
         # in_progress + no matching output item is what renders as a spinner.
         self.assertEqual(item["status"], "in_progress")
         self.assertNotIn("output", item)
 
+    def test_start_event_carries_no_call_id(self):
+        """The regression that killed every tool card on OWUI 0.11.1+.
+
+        `handle_responses_streaming_event`'s added-item branch dedups on id OR
+        call_id and REPLACES on a hit, so a call_id shared with the result
+        item made the result overwrite the call. The card is built from the
+        `function_call` item alone, so overwriting it removed the card
+        outright -- chats persisted `function_call_output` with no
+        `function_call` and rendered nothing at all.
+        """
+        start = _tool_call_started_event("Bash", "call-1", "{}")
+        result = _tool_call_result_event("call-1", "x")
+        self.assertNotIn("call_id", start["item"])
+        # The ids must differ so the dedup sees two items; the result's
+        # `call_id` still equals the call's `id`, which is the pairing.
+        self.assertNotEqual(start["item"]["id"], result["item"]["id"])
+
     def test_result_event_matches_the_start_event_by_call_id(self):
-        """The shared call_id is the entire flip mechanism -- if these diverge
-        the card spins forever."""
+        """The shared call id is the entire flip mechanism -- if these diverge
+        the card spins forever. The frontend reads `call_id ?? id` off the
+        call item, so the result's `call_id` pairs with the call's `id`."""
         start = _tool_call_started_event("Bash", "call-1", "{}")
         result = _tool_call_result_event("call-1", "total 4\ndrwxr-xr-x")
-        self.assertEqual(start["item"]["call_id"], result["item"]["call_id"])
+        self.assertEqual(start["item"]["id"], result["item"]["call_id"])
         self.assertEqual(result["item"]["type"], "function_call_output")
         self.assertEqual(result["item"]["status"], "completed")
         self.assertEqual(
@@ -1821,6 +1839,51 @@ class RealHandlerReplayTests(unittest.TestCase):
             metadata_seq.append(metadata)
         return output, metadata_seq
 
+    def test_both_items_survive_the_real_handler(self):
+        """The 0.11.1 regression, replayed end to end.
+
+        `response.output_item.added` dedups on id OR call_id and replaces on a
+        hit. When the call item carried `call_id`, the result item matched it
+        and overwrote it, leaving a `function_call_output` alone in the output
+        list -- and the card is built from the `function_call`, so nothing
+        rendered. Both items must be present, and the result must pair to the
+        call by the id the frontend reads (`call_id ?? id`).
+        """
+        started = _tool_call_started_event("Bash", "call-1", '{"command": "ls"}')
+        result = _tool_call_result_event("call-1", "total 4")
+
+        output, _ = self._replay([started, result])
+
+        calls = [item for item in output if item["type"] == "function_call"]
+        results = [item for item in output if item["type"] == "function_call_output"]
+        self.assertEqual(len(calls), 1, f"function_call was swallowed: {output}")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(
+            results[0]["call_id"], calls[0].get("call_id") or calls[0]["id"]
+        )
+
+    def test_parallel_calls_all_survive_the_real_handler(self):
+        """Interleaved parallel calls must not collide with each other either."""
+        events = [
+            _tool_call_started_event("Bash", "call-1", "{}"),
+            _tool_call_started_event("Read", "call-2", "{}"),
+            _tool_call_result_event("call-1", "a"),
+            _tool_call_result_event("call-2", "b"),
+        ]
+
+        output, _ = self._replay(events)
+
+        self.assertEqual(
+            [item["type"] for item in output],
+            [
+                "function_call",
+                "function_call",
+                "function_call_output",
+                "function_call_output",
+            ],
+            f"items were merged or dropped: {output}",
+        )
+
     def test_relabel_lands_on_the_real_handler(self):
         started = _tool_call_started_event("Read", "call-1", "{}")
         relabel = _tool_call_error_relabel_event("Read")
@@ -1856,22 +1919,29 @@ class RealHandlerReplayTests(unittest.TestCase):
         function_call = next(item for item in output if item["type"] == "function_call")
         self.assertEqual(function_call["name"], "Read ❌")
 
-    def test_the_old_shape_is_confirmed_dead_code(self):
-        """Documents WHY the fix was needed: replaying the old
-        `response.output_item.done` shape through the real handler is a
-        no-op. If this ever starts passing, OWUI has fixed the dead-code
-        branch upstream and the relabel could move back to it."""
+    def test_output_item_done_is_no_longer_dead_code(self):
+        """`response.output_item.done` used to be unreachable on 0.11.0 (the
+        broader `response.<field>.done` arm matched first and skipped it),
+        which is why the relabel uses the generic `response.name.done` shape.
+        0.11.1+ reordered the branches and it now lands, replacing the item at
+        `output_index` wholesale -- default: the LAST item.
+
+        Kept as a watch on that branch, not as an endorsement: the wholesale
+        replace is strictly more dangerous than the in-place field mutation we
+        use, because a wrong default index eats a text item instead of one
+        field of it. If a future release also drops the positional default,
+        the relabel could move here.
+        """
         from test_fixture_owui_streaming_handler import (
             handle_responses_streaming_event,
         )
 
         started = _tool_call_started_event("Read", "call-1", "{}")
-        old_shape_relabel = {
+        done_shape_relabel = {
             "type": "response.output_item.done",
             "item": {
                 "type": "function_call",
-                "id": "fc_call-1",
-                "call_id": "call-1",
+                "id": "call-1",
                 "name": "Read ❌",
                 "arguments": "{}",
                 "status": "failed",
@@ -1879,10 +1949,10 @@ class RealHandlerReplayTests(unittest.TestCase):
         }
 
         output = [started["item"]]
-        output, metadata = handle_responses_streaming_event(old_shape_relabel, output)
+        output, metadata = handle_responses_streaming_event(done_shape_relabel, output)
 
-        self.assertIsNone(metadata)
-        self.assertEqual(output[0]["name"], "Read")
+        self.assertEqual(metadata, {})
+        self.assertEqual(output[0]["name"], "Read ❌")
 
 
 class ParityFinalizeTests(unittest.TestCase):
@@ -3761,10 +3831,6 @@ class SharedProactiveStateAcrossConnectionsTests(unittest.TestCase):
         self.assertIsNot(a._delivered_live, b._delivered_live)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ModelPatchCacheTests(unittest.TestCase):
     """ELI-59: per-session model-patch cache + lock (skip redundant
     sessions.patch RPCs under a same-model burst)."""
@@ -4326,3 +4392,174 @@ class MarkerAfterPreambleTests(unittest.TestCase):
         data = _modal_payload_from_user_input_prompt(pending)[0]["data"]
         self.assertEqual(data["title"], "Pick a theme")
         self.assertEqual(data["options"], ["Dark", "Light", "Auto"])
+
+
+class _HandshakeWS:
+    """Minimal Gateway handshake partner: challenge, then the connect reply."""
+
+    def __init__(self, ok=True):
+        self._frames = [
+            json.dumps({"event": "connect.challenge",
+                        "payload": {"nonce": "n", "ts": 1}}),
+            json.dumps({"ok": ok, "payload": {},
+                        "error": {"message": "connect failed"}}),
+        ]
+        self.sent = []
+
+    async def recv(self):
+        return self._frames.pop(0)
+
+    async def send(self, data):
+        self.sent.append(data)
+
+
+class ConnectionEpochTests(unittest.IsolatedAsyncioTestCase):
+    """`connection_epoch` is the only thing that separates "the queue is quiet
+    because the agent is thinking" from "the queue is quiet because the Gateway
+    restarted and took the run with it". The Gateway persists a turn only once
+    it COMPLETES, so a mid-run restart destroys the run and emits no terminal
+    event at all -- the consumer queue just goes silent. If this counter stops
+    moving on reconnect, `pipe()` silently reverts to closing the stream on
+    every restart, which is the original "you died again and did not come up"
+    bug."""
+
+    def _conn(self):
+        conn = _GatewayConnection(lambda: types.SimpleNamespace(
+            GATEWAY_URL="localhost:18789", GATEWAY_TOKEN="tok"))
+        conn._ensure_identity = lambda valves: None
+        conn._ident = {"id": "device-1"}
+        return conn
+
+    async def _connect(self, conn, ok=True):
+        ws = _HandshakeWS(ok=ok)
+
+        async def fake_connect(_url, **_kw):
+            return ws
+
+        with mock.patch.object(websockets, "connect", fake_connect, create=True), \
+                mock.patch("openclaw_pipe._sign_challenge", lambda *a, **k: {}):
+            await conn._connect_and_start()
+
+    async def test_epoch_starts_at_zero_and_bumps_once_per_connect(self):
+        conn = self._conn()
+        self.assertEqual(conn.connection_epoch, 0)
+        await self._connect(conn)
+        self.assertEqual(conn.connection_epoch, 1)
+        await self._connect(conn)
+        self.assertEqual(conn.connection_epoch, 2)
+
+    async def test_failed_connect_does_not_bump_the_epoch(self):
+        """A rejected handshake is not a new connection. Bumping here would
+        make pipe() resume a turn whose run was never actually lost."""
+        conn = self._conn()
+        with self.assertRaises(GatewayError):
+            await self._connect(conn, ok=False)
+        self.assertEqual(conn.connection_epoch, 0)
+
+    async def test_reconnect_path_bumps_the_epoch(self):
+        """The restart case reaches `_connect_and_start` via `_reconnect`, not
+        via `ensure_connected` -- that is the path the resume check depends on,
+        so cover it explicitly rather than trusting the shared tail."""
+        conn = self._conn()
+        conn._max_backoff = 0
+        conn._reconnect_attempt = 0
+        ws = _HandshakeWS()
+
+        async def fake_connect(_url, **_kw):
+            return ws
+
+        with mock.patch.object(websockets, "connect", fake_connect, create=True), \
+                mock.patch("openclaw_pipe._sign_challenge", lambda *a, **k: {}), \
+                mock.patch("asyncio.create_task"):
+            await conn._reconnect()
+
+        self.assertEqual(conn.connection_epoch, 1)
+
+
+class RestartResumeContractTests(unittest.TestCase):
+    """The resume-on-restart logic lives in closures inside `Pipe.pipe`, which
+    cannot be driven without standing up a whole OWUI request. These pin the
+    load-bearing properties of that code at source level -- the same technique
+    `test_event_loop_never_spawns_a_task` uses for the reconnect-storm
+    invariant."""
+
+    @classmethod
+    def setUpClass(cls):
+        # `Pipe.pipe` is a thin ELI-24 wrapper; the streaming loop and the
+        # resume closures live in `_pipe_impl`.
+        cls.src = inspect.getsource(Pipe._pipe_impl)
+
+    def test_epoch_is_captured_before_the_run_is_launched(self):
+        """Capturing it after `chat.send` returns would race a restart that
+        happens during the send itself."""
+        self.assertIn("epoch_at_send = conn.connection_epoch", self.src)
+        self.assertLess(
+            self.src.index("epoch_at_send = conn.connection_epoch"),
+            self.src.index('"chat.send"'),
+            "epoch must be captured before chat.send, not after",
+        )
+
+    def test_epoch_check_precedes_every_give_up_path(self):
+        """A restart and a long tool call are both just silence on the queue.
+        If the give-up branches run first, the stream closes on a run that was
+        merely destroyed rather than finished."""
+        check = self.src.index("if conn.connection_epoch != epoch_at_send:")
+        timeout = self.src.index("TIMEOUT -- no events on queue")
+        give_up = self.src.index("if not first_event_arrived:", timeout)
+        self.assertLess(timeout, check)
+        self.assertLess(check, give_up)
+
+    def test_resume_uses_a_fresh_idempotency_key(self):
+        """Reusing `idempotency_key` would make the Gateway dedupe the resume
+        against the original send and return the dead run."""
+        self.assertIn('resume_key = f"resume-{chat_id}-{time.time()}"', self.src)
+        self.assertIn("idempotency_key=resume_key", self.src)
+
+    def test_resume_does_not_replay_the_user_text(self):
+        """The user's message was persisted on the way in; re-sending it would
+        duplicate the user turn in the transcript."""
+        resume = self.src.index("async def resume_after_restart()")
+        end = self.src.index("adopt_new_run = True", resume)
+        body = self.src[resume:end]
+        self.assertIn("message=directive", body)
+        self.assertNotIn("message=user_message", body)
+
+    def test_resume_reregisters_the_consumer_for_the_new_run(self):
+        """The old queue is bound to the dead runId; events for the new run go
+        to a different key and would never be seen."""
+        resume = self.src.index("async def resume_after_restart()")
+        end = self.src.index("adopt_new_run = True", resume)
+        body = self.src[resume:end]
+        self.assertIn("conn.unregister_consumer(", body)
+        self.assertIn("queue = conn.register_consumer(session_key, new_run_id)", body)
+        self.assertLess(body.index("unregister_consumer"),
+                        body.index("queue = conn.register_consumer"))
+
+    def test_resume_resets_the_idle_deadman(self):
+        """The restart window must not count against the fresh run, or the new
+        run is declared idle the moment it starts."""
+        resume = self.src.index("async def resume_after_restart()")
+        end = self.src.index("adopt_new_run = True", resume)
+        body = self.src[resume:end]
+        self.assertIn("first_event_arrived = False", body)
+        self.assertIn("wait_started_time = time.time()", body)
+        self.assertIn("last_activity_time = time.time()", body)
+
+    def test_resume_is_bounded(self):
+        """A crash-looping Gateway must degrade to the old close-the-stream
+        behaviour instead of re-sending forever."""
+        self.assertIn("max_resume_attempts = 3", self.src)
+        self.assertIn("if resume_attempts < max_resume_attempts:", self.src)
+
+    def test_successful_resume_rearms_the_epoch(self):
+        """Without this the next idle probe sees a stale mismatch and burns
+        another resume attempt on a run that is perfectly healthy."""
+        self.assertIn("epoch_at_send = conn.connection_epoch", self.src)
+        self.assertIn("if await resume_after_restart():", self.src)
+        rearm = self.src.index("if await resume_after_restart():")
+        self.assertIn("epoch_at_send = conn.connection_epoch",
+                      self.src[rearm:rearm + 400])
+
+
+if __name__ == "__main__":
+    unittest.main()

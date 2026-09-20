@@ -1,13 +1,20 @@
-"""Verbatim extraction of Open WebUI 0.11.0's
-`handle_responses_streaming_event` (`open_webui/utils/middleware.py:478-806`),
+"""Verbatim extraction of Open WebUI 0.11.3's
+`handle_responses_streaming_event` (`open_webui/utils/middleware.py:599-940`),
 used only to pin our event-emitting tests to OWUI's actual behavior instead of
 our belief about it (see ELI-75: a docstring-inferred belief about this exact
 function was wrong for months).
 
+Re-extracted 2026-09-15 from the running 0.11.3 container. The previous copy
+was pinned to 0.11.0, where `response.output_item.added` appended
+unconditionally; 0.11.1 rewrote it to dedup by id/call_id and replace on a
+hit, which silently deleted every tool card. The stale fixture is why our
+tests still passed while the live UI rendered nothing.
+
 Pure function, zero imports, no I/O, safe to extract with
-`sed -n '478,806p' open_webui/utils/middleware.py` and re-paste here if OWUI
+`sed -n '599,940p' open_webui/utils/middleware.py` and re-paste here if OWUI
 changes this handler. Do not hand-edit the body below; if it drifts from
-upstream, re-extract instead of patching in place.
+upstream, re-extract instead of patching in place. Check the line range
+against the installed version first -- it moves between releases.
 """
 
 
@@ -37,7 +44,22 @@ def handle_responses_streaming_event(
         item = data.get('item', {})
         if item:
             new_output = list(current_output)
-            new_output.append(item)
+            output_index = data.get('output_index', len(new_output))
+            existing_index = next(
+                (
+                    idx
+                    for idx, existing in enumerate(new_output)
+                    if (item.get('id') and existing.get('id') == item.get('id'))
+                    or (item.get('call_id') and existing.get('call_id') == item.get('call_id'))
+                ),
+                None,
+            )
+            if existing_index is not None:
+                new_output[existing_index] = item
+            elif 0 <= output_index < len(new_output):
+                new_output.insert(output_index, item)
+            else:
+                new_output.append(item)
             return new_output, None
         return current_output, None
 
@@ -200,7 +222,21 @@ def handle_responses_streaming_event(
                             current_val = {} if isinstance(delta, dict) else ''
                         item[key] = deep_merge(current_val, delta)
 
-            return new_output, None
+                return new_output, None
+
+        return current_output, None
+
+    elif event_type == 'response.output_item.done':
+        # Delta Event: Output item complete
+        item = data.get('item')
+        output_index = data.get('output_index', len(current_output) - 1)
+
+        new_output = list(current_output)
+        if item and 0 <= output_index < len(current_output):
+            new_output[output_index] = item
+        elif item:
+            new_output.append(item)
+        return new_output, {}
 
     elif event_type.startswith('response.') and event_type.endswith('.done'):
         # Delta Events: response.content_part.done, response.text.done, etc.
@@ -246,12 +282,8 @@ def handle_responses_streaming_event(
                             return new_output, {}
                 return current_output, None
 
-            # 2. Skip Output Item done (handled specifically below)
-            if type_name == 'output_item':
-                pass
-
-            # 3. Generic Field Done (text.done, audio.done)
-            elif type_name not in ['completed', 'failed']:
+            # 2. Generic Field Done (text.done, audio.done)
+            if type_name not in ['completed', 'failed']:
                 output_index = data.get('output_index', len(current_output) - 1)
                 if current_output and 0 <= output_index < len(current_output):
                     key = (
@@ -295,24 +327,13 @@ def handle_responses_streaming_event(
 
         return current_output, None
 
-    elif event_type == 'response.output_item.done':
-        # Delta Event: Output item complete
-        item = data.get('item')
-        output_index = data.get('output_index', len(current_output) - 1)
-
-        new_output = list(current_output)
-        if item and 0 <= output_index < len(current_output):
-            new_output[output_index] = item
-        elif item:
-            new_output.append(item)
-        return new_output, {}
-
     elif event_type == 'response.completed':
         # State Machine Event: Completed
         response_data = data.get('response', {})
         final_output = response_data.get('output')
 
-        new_output = final_output if final_output is not None else current_output
+        # Some providers send an empty output on response.completed despite having streamed items
+        new_output = final_output if final_output else current_output
 
         # Ensure reasoning items are marked as completed in the final output
         if new_output:
@@ -338,3 +359,4 @@ def handle_responses_streaming_event(
 
     else:
         return current_output, None
+
