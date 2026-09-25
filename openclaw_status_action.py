@@ -4114,6 +4114,50 @@ def _render_limits_fill_js(data: dict) -> str:
     return _LIMITS_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
 
 
+def _limits_windows_for(usage, provider) -> list:
+    """The active provider's rate-limit windows from a `usage.status`-shaped
+    payload, reshaped for the Rate Limits section. Windows with no known
+    usedPercent are dropped."""
+    windows_data = []
+    for p in (usage or {}).get("providers", []):
+        if p.get("provider") != provider:
+            continue
+        for w in p.get("windows") or []:
+            used = w.get("usedPercent")
+            if used is None:
+                continue
+            windows_data.append({
+                "label": w.get("label"),
+                "usedPercent": used,
+                "resetIn": _relative_time(w.get("resetAt")),
+                # Raw ms timestamp, not a server-formatted clock
+                # time -- the absolute time is rendered client-side
+                # so it shows in the browser's own local timezone
+                # rather than whatever timezone this container is in.
+                "resetAtMs": w.get("resetAt"),
+            })
+        break
+    return windows_data
+
+
+async def _claude_cli_usage_windows(conn) -> list:
+    """Fallback for Claude-CLI-only setups. Since OpenClaw 2026.9.1
+    (openclaw#129052) `usage.status` never resolves the claude-cli login, so
+    with no other Anthropic credential it has no `anthropic` entry at all.
+    The companion gateway plugin (gateway-plugins/claude-cli-usage) serves
+    the same windows read-only over `claudeCliUsage.status`. A gateway
+    without that plugin answers "unknown method"; that is logged and the
+    section keeps its empty-windows note."""
+    try:
+        snapshot = await conn.send_request("claudeCliUsage.status", {}, timeout=10)
+    except Exception as ex:
+        pipe_log(f"[status-action] claudeCliUsage.status unavailable: {ex}")
+        return []
+    if (snapshot or {}).get("error"):
+        pipe_log(f"[status-action] claudeCliUsage.status: {snapshot['error']}")
+    return _limits_windows_for({"providers": [snapshot or {}]}, "anthropic")
+
+
 def _render_subagents_fill_js(data: dict) -> str:
     return _SUBAGENTS_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
 
@@ -4404,25 +4448,9 @@ class Action:
                 }})
                 return
 
-            windows_data = []
-            for p in (usage or {}).get("providers", []):
-                if p.get("provider") != provider:
-                    continue
-                for w in p.get("windows") or []:
-                    used = w.get("usedPercent")
-                    if used is None:
-                        continue
-                    windows_data.append({
-                        "label": w.get("label"),
-                        "usedPercent": used,
-                        "resetIn": _relative_time(w.get("resetAt")),
-                        # Raw ms timestamp, not a server-formatted clock
-                        # time -- the absolute time is rendered client-side
-                        # so it shows in the browser's own local timezone
-                        # rather than whatever timezone this container is in.
-                        "resetAtMs": w.get("resetAt"),
-                    })
-                break
+            windows_data = _limits_windows_for(usage, provider)
+            if not windows_data and provider == "anthropic":
+                windows_data = await _claude_cli_usage_windows(conn)
 
             await __event_emitter__({"type": "execute", "data": {"code": _render_limits_fill_js({
                 "provider": provider,

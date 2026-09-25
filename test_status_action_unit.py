@@ -417,6 +417,70 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("tasks unavailable", subagents_code)
 
 
+class ClaudeCliUsageFallbackTests(unittest.IsolatedAsyncioTestCase):
+    """Since OpenClaw 2026.9.1 usage.status has no `anthropic` entry on a
+    Claude-CLI-only setup; the Rate Limits section falls back to the
+    companion plugin's claudeCliUsage.status."""
+
+    async def _run(self, usage_status, cli_usage):
+        emitted = []
+
+        async def emitter(evt):
+            emitted.append(evt)
+
+        async def fake_send_request(method, params, timeout=5):
+            if method == "sessions.describe":
+                return {"session": {"modelProvider": "anthropic", "model": "claude-opus-5-5"}}
+            if method == "usage.status":
+                return usage_status
+            if method == "tasks.list":
+                return {"tasks": []}
+            if method == "claudeCliUsage.status":
+                if isinstance(cli_usage, Exception):
+                    raise cli_usage
+                return cli_usage
+            raise AssertionError(f"unexpected RPC: {method}")
+
+        fake_conn = mock.AsyncMock()
+        fake_conn.send_request = mock.AsyncMock(side_effect=fake_send_request)
+        with mock.patch("openclaw_status_action._get_action_connection",
+                         new=mock.AsyncMock(return_value=(fake_conn, "pipe"))):
+            await Action().action({"chat_id": "chat-1"}, __user__={"id": "user-1"}, __event_emitter__=emitter)
+        methods = [c.args[0] for c in fake_conn.send_request.call_args_list]
+        limits_code = next(c for c in _emitted_codes(emitted)
+                           if "getElementById('openclaw-status-section-limits')" in c)
+        return methods, limits_code
+
+    async def test_missing_anthropic_entry_uses_claude_cli_usage(self):
+        methods, limits_code = await self._run(
+            {"providers": [{"provider": "openai", "windows": [{"label": "720h", "usedPercent": 0}]}]},
+            {"provider": "anthropic", "source": "claude-cli", "windows": [
+                {"label": "5h", "usedPercent": 39, "resetAt": 1790376599786},
+                {"label": "Week", "usedPercent": 3, "resetAt": 1790960399786},
+            ]},
+        )
+        self.assertIn("claudeCliUsage.status", methods)
+        self.assertIn('"label": "5h"', limits_code)
+        self.assertIn('"label": "Week"', limits_code)
+        self.assertNotIn("720h", limits_code)
+
+    async def test_native_anthropic_windows_skip_the_fallback(self):
+        methods, limits_code = await self._run(
+            {"providers": [{"provider": "anthropic", "windows": [{"label": "5h", "usedPercent": 72}]}]},
+            AssertionError("fallback must not be called"),
+        )
+        self.assertNotIn("claudeCliUsage.status", methods)
+        self.assertIn('"usedPercent": 72', limits_code)
+
+    async def test_gateway_without_plugin_keeps_empty_note(self):
+        methods, limits_code = await self._run(
+            {"providers": []}, RuntimeError("unknown method: claudeCliUsage.status"),
+        )
+        self.assertIn("claudeCliUsage.status", methods)
+        self.assertIn('"windows": []', limits_code)
+        self.assertIn('"error": null', limits_code)
+
+
 class CompactTests(unittest.IsolatedAsyncioTestCase):
     """The dialog's Compact button fetches back to this same Action with a
     synthetic mode="compact" marker (see triggerCompact() in
