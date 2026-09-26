@@ -671,16 +671,39 @@ def _tool_call_started_event(name: str, tool_call_id: str, args_str: str) -> dic
     that this replaced). The frontend renders a `function_call` with no matching
     `function_call_output` as a spinner (`structuredOutput.ts::buildToolCallToken`).
 
-    Ordering is by arrival, and `response.output_item.added` simply appends, so
-    these interleave correctly with ordinary streamed text -- no output_index
-    bookkeeping needed on our side.
+    Ordering is by arrival, and `response.output_item.added` appends when it
+    does not recognise the item, so these interleave correctly with ordinary
+    streamed text -- no output_index bookkeeping needed on our side.
+
+    The tool call id goes in `id`, and `call_id` is deliberately ABSENT. OWUI
+    0.11.0 appended every added item unconditionally, so the obvious shape
+    (`id="fc_<tid>"` + `call_id="<tid>"`) was safe. 0.11.1 rewrote that branch
+    to dedup first:
+
+        existing_index = next(idx for idx, existing in enumerate(new_output)
+            if (item['id'] and existing['id'] == item['id'])
+            or (item['call_id'] and existing['call_id'] == item['call_id']))
+        if existing_index is not None: new_output[existing_index] = item
+
+    -- so the `function_call_output` we send next, which must share the call
+    id to pair, matched this item on `call_id` and REPLACED it. The card is
+    built from the `function_call` item alone (`structuredOutput.ts`: `Ye()`
+    reads `call_id ?? id` and looks the output up in a by-call_id map), so
+    losing it means no card at all: no chevron, no Output, nothing. Every
+    chat from the 0.11.1 upgrade onward persisted `fc=0 fco=N`.
+
+    Carrying the id in `id` only keeps both items distinct for the dedup
+    (`<tid>` vs `fco_<tid>`, and neither has a `call_id` the other shares)
+    while every consumer that matters reads `call_id or id`:
+    `structuredOutput.ts` for the card, `middleware.py`'s post-stream sweep
+    for the "already has a result, don't execute it" guard, and
+    `pause_for_tool_approval`, which even backfills `call_id` from `id`.
     """
     return {
         "type": "response.output_item.added",
         "item": {
             "type": "function_call",
-            "id": f"fc_{tool_call_id}",
-            "call_id": tool_call_id,
+            "id": tool_call_id,
             "name": name,
             "arguments": args_str[:3000],
             "status": "in_progress",
@@ -691,10 +714,15 @@ def _tool_call_started_event(name: str, tool_call_id: str, args_str: str) -> dic
 def _tool_call_result_event(tool_call_id: str, result_str: str) -> dict:
     """Complete a tool call announced by `_tool_call_started_event`.
 
-    A `function_call_output` sharing the same `call_id` is what flips the card
-    to done and reveals the Output section. If we never send one (run cancelled,
-    pipe torn down), the backend still marks every leftover `in_progress` item
-    completed before the final event, so a card can't be left spinning forever.
+    A `function_call_output` whose `call_id` matches the started item's id is
+    what flips the card to done and reveals the Output section. If we never
+    send one (run cancelled, pipe torn down), the backend still marks every
+    leftover `in_progress` item completed before the final event, so a card
+    can't be left spinning forever.
+
+    This item keeps `call_id`; the started item does not carry one at all. See
+    `_tool_call_started_event` for why that asymmetry is load-bearing on OWUI
+    0.11.1+.
     """
     return {
         "type": "response.output_item.added",
@@ -982,6 +1010,13 @@ class _GatewayConnection:
         self._reconnect_attempt = 0
         self._max_backoff = 30  # seconds
         self._stopped = False
+        # Bumped on every successful connect/reconnect. A consumer that
+        # captures this before `chat.send` can later tell "the queue is quiet
+        # because the agent is thinking" from "the queue is quiet because the
+        # Gateway went away and came back, taking my run with it" -- the
+        # Gateway only persists a turn once it COMPLETES, so a restart mid-run
+        # destroys it silently and no terminal event is ever emitted.
+        self.connection_epoch = 0
 
         # Next request id
         self._next_req_id = 1
@@ -1565,7 +1600,10 @@ class _GatewayConnection:
 
         self._ws = ws
         self._reconnect_attempt = 0
-        pipe_log("Connected to Gateway (persistent)")
+        self.connection_epoch += 1
+        pipe_log(
+            f"Connected to Gateway (persistent) [epoch {self.connection_epoch}]"
+        )
         # NOTE: does not start/spawn the event-loop task -- that happens
         # exactly once, in `ensure_connected`. This method is also called
         # from inside `_reconnect`, which runs from within the event-loop
@@ -4076,6 +4114,50 @@ def _render_limits_fill_js(data: dict) -> str:
     return _LIMITS_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
 
 
+def _limits_windows_for(usage, provider) -> list:
+    """The active provider's rate-limit windows from a `usage.status`-shaped
+    payload, reshaped for the Rate Limits section. Windows with no known
+    usedPercent are dropped."""
+    windows_data = []
+    for p in (usage or {}).get("providers", []):
+        if p.get("provider") != provider:
+            continue
+        for w in p.get("windows") or []:
+            used = w.get("usedPercent")
+            if used is None:
+                continue
+            windows_data.append({
+                "label": w.get("label"),
+                "usedPercent": used,
+                "resetIn": _relative_time(w.get("resetAt")),
+                # Raw ms timestamp, not a server-formatted clock
+                # time -- the absolute time is rendered client-side
+                # so it shows in the browser's own local timezone
+                # rather than whatever timezone this container is in.
+                "resetAtMs": w.get("resetAt"),
+            })
+        break
+    return windows_data
+
+
+async def _claude_cli_usage_windows(conn) -> list:
+    """Fallback for Claude-CLI-only setups. Since OpenClaw 2026.9.1
+    (openclaw#129052) `usage.status` never resolves the claude-cli login, so
+    with no other Anthropic credential it has no `anthropic` entry at all.
+    The companion gateway plugin (gateway-plugins/claude-cli-usage) serves
+    the same windows read-only over `claudeCliUsage.status`. A gateway
+    without that plugin answers "unknown method"; that is logged and the
+    section keeps its empty-windows note."""
+    try:
+        snapshot = await conn.send_request("claudeCliUsage.status", {}, timeout=10)
+    except Exception as ex:
+        pipe_log(f"[status-action] claudeCliUsage.status unavailable: {ex}")
+        return []
+    if (snapshot or {}).get("error"):
+        pipe_log(f"[status-action] claudeCliUsage.status: {snapshot['error']}")
+    return _limits_windows_for({"providers": [snapshot or {}]}, "anthropic")
+
+
 def _render_subagents_fill_js(data: dict) -> str:
     return _SUBAGENTS_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
 
@@ -4366,25 +4448,9 @@ class Action:
                 }})
                 return
 
-            windows_data = []
-            for p in (usage or {}).get("providers", []):
-                if p.get("provider") != provider:
-                    continue
-                for w in p.get("windows") or []:
-                    used = w.get("usedPercent")
-                    if used is None:
-                        continue
-                    windows_data.append({
-                        "label": w.get("label"),
-                        "usedPercent": used,
-                        "resetIn": _relative_time(w.get("resetAt")),
-                        # Raw ms timestamp, not a server-formatted clock
-                        # time -- the absolute time is rendered client-side
-                        # so it shows in the browser's own local timezone
-                        # rather than whatever timezone this container is in.
-                        "resetAtMs": w.get("resetAt"),
-                    })
-                break
+            windows_data = _limits_windows_for(usage, provider)
+            if not windows_data and provider == "anthropic":
+                windows_data = await _claude_cli_usage_windows(conn)
 
             await __event_emitter__({"type": "execute", "data": {"code": _render_limits_fill_js({
                 "provider": provider,

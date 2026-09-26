@@ -1837,16 +1837,39 @@ def _tool_call_started_event(name: str, tool_call_id: str, args_str: str) -> dic
     that this replaced). The frontend renders a `function_call` with no matching
     `function_call_output` as a spinner (`structuredOutput.ts::buildToolCallToken`).
 
-    Ordering is by arrival, and `response.output_item.added` simply appends, so
-    these interleave correctly with ordinary streamed text -- no output_index
-    bookkeeping needed on our side.
+    Ordering is by arrival, and `response.output_item.added` appends when it
+    does not recognise the item, so these interleave correctly with ordinary
+    streamed text -- no output_index bookkeeping needed on our side.
+
+    The tool call id goes in `id`, and `call_id` is deliberately ABSENT. OWUI
+    0.11.0 appended every added item unconditionally, so the obvious shape
+    (`id="fc_<tid>"` + `call_id="<tid>"`) was safe. 0.11.1 rewrote that branch
+    to dedup first:
+
+        existing_index = next(idx for idx, existing in enumerate(new_output)
+            if (item['id'] and existing['id'] == item['id'])
+            or (item['call_id'] and existing['call_id'] == item['call_id']))
+        if existing_index is not None: new_output[existing_index] = item
+
+    -- so the `function_call_output` we send next, which must share the call
+    id to pair, matched this item on `call_id` and REPLACED it. The card is
+    built from the `function_call` item alone (`structuredOutput.ts`: `Ye()`
+    reads `call_id ?? id` and looks the output up in a by-call_id map), so
+    losing it means no card at all: no chevron, no Output, nothing. Every
+    chat from the 0.11.1 upgrade onward persisted `fc=0 fco=N`.
+
+    Carrying the id in `id` only keeps both items distinct for the dedup
+    (`<tid>` vs `fco_<tid>`, and neither has a `call_id` the other shares)
+    while every consumer that matters reads `call_id or id`:
+    `structuredOutput.ts` for the card, `middleware.py`'s post-stream sweep
+    for the "already has a result, don't execute it" guard, and
+    `pause_for_tool_approval`, which even backfills `call_id` from `id`.
     """
     return {
         "type": "response.output_item.added",
         "item": {
             "type": "function_call",
-            "id": f"fc_{tool_call_id}",
-            "call_id": tool_call_id,
+            "id": tool_call_id,
             "name": name,
             "arguments": args_str[:3000],
             "status": "in_progress",
@@ -1857,10 +1880,15 @@ def _tool_call_started_event(name: str, tool_call_id: str, args_str: str) -> dic
 def _tool_call_result_event(tool_call_id: str, result_str: str) -> dict:
     """Complete a tool call announced by `_tool_call_started_event`.
 
-    A `function_call_output` sharing the same `call_id` is what flips the card
-    to done and reveals the Output section. If we never send one (run cancelled,
-    pipe torn down), the backend still marks every leftover `in_progress` item
-    completed before the final event, so a card can't be left spinning forever.
+    A `function_call_output` whose `call_id` matches the started item's id is
+    what flips the card to done and reveals the Output section. If we never
+    send one (run cancelled, pipe torn down), the backend still marks every
+    leftover `in_progress` item completed before the final event, so a card
+    can't be left spinning forever.
+
+    This item keeps `call_id`; the started item does not carry one at all. See
+    `_tool_call_started_event` for why that asymmetry is load-bearing on OWUI
+    0.11.1+.
     """
     return {
         "type": "response.output_item.added",
@@ -2148,6 +2176,13 @@ class _GatewayConnection:
         self._reconnect_attempt = 0
         self._max_backoff = 30  # seconds
         self._stopped = False
+        # Bumped on every successful connect/reconnect. A consumer that
+        # captures this before `chat.send` can later tell "the queue is quiet
+        # because the agent is thinking" from "the queue is quiet because the
+        # Gateway went away and came back, taking my run with it" -- the
+        # Gateway only persists a turn once it COMPLETES, so a restart mid-run
+        # destroys it silently and no terminal event is ever emitted.
+        self.connection_epoch = 0
 
         # Next request id
         self._next_req_id = 1
@@ -2731,7 +2766,10 @@ class _GatewayConnection:
 
         self._ws = ws
         self._reconnect_attempt = 0
-        pipe_log("Connected to Gateway (persistent)")
+        self.connection_epoch += 1
+        pipe_log(
+            f"Connected to Gateway (persistent) [epoch {self.connection_epoch}]"
+        )
         # NOTE: does not start/spawn the event-loop task -- that happens
         # exactly once, in `ensure_connected`. This method is also called
         # from inside `_reconnect`, which runs from within the event-loop
@@ -4271,6 +4309,20 @@ def _session_active_from_signals(describe_status, list_has_active_run) -> bool:
     return bool(list_has_active_run)
 
 
+def _is_restart_signature(err: str) -> bool:
+    """True when a run-ending error looks like the gateway being restarted
+    underneath us rather than a genuine agent failure."""
+    if not err:
+        return False
+    low = str(err).lower()
+    return any(s in low for s in (
+        "exited with code 143",
+        "sigterm",
+        "process exited with code",
+        "connection closed",
+    ))
+
+
 class Pipe:
     """
     Open WebUI Pipe that routes messages through OpenClaw Gateway via
@@ -4689,6 +4741,94 @@ class Pipe:
         )
         await asyncio.to_thread(urllib.request.urlopen, req, timeout=10)
 
+    async def _rest_snapshot_message(self, chat_id: str, message_id: str,
+                                      content: str, bearer_token: str | None):
+        """Persist the in-flight assistant message via OWUI's REST API.
+
+        Deliberately NOT the __event_emitter__ `replace` event, and
+        deliberately NOT `POST /api/v1/chats/{id}/messages/{message_id}`
+        either -- that dedicated endpoint calls an `event_emitter` with a
+        `chat:message` socket event, which races the live HTTP delta stream
+        exactly like `replace` does (P17/P19/P23/P25/P27, 6e5f372). This
+        uses the same whole-chat update endpoint `_set_owui_chat_title`
+        already calls mid-conversation (`POST /api/v1/chats/{id}` with no
+        `message_id` in the path), which was confirmed by reading the live
+        OWUI 0.11.0 source (`bridge-rehydration-rest-snapshot-verify`,
+        2026-08-26) to never emit any Socket.IO frame -- it writes the DB
+        row directly with nothing for the frontend's live-stream handlers
+        to even receive.
+
+        Read-modify-write is required because `chat.messages[]` (the flat,
+        active-branch array) has no server-side merge -- sending it fully
+        replaces the old array, per `routers/chats.py::update_chat_by_id`
+        (`updated_chat = {**chat.chat, **form_data.chat}`). `chat.history
+        .messages{}` (keyed by message id) merges whole-object-per-id
+        server-side (`Chats.merge_history`), so only the one patched
+        message needs to be sent there.
+        """
+        token = bearer_token or self.valves.OWUI_API_KEY
+        if not token or not chat_id or not message_id:
+            return
+        base = self.valves.OWUI_BASE_URL.rstrip('/')
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+
+        def _get_chat():
+            req = urllib.request.Request(
+                f"{base}/api/v1/chats/{chat_id}", headers=headers, method="GET",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return json.loads(resp.read().decode("utf-8", "replace"))
+
+        try:
+            current = await asyncio.to_thread(_get_chat)
+        except Exception as ex:
+            pipe_log(f"  rest_snapshot: GET failed: {ex}")
+            return
+
+        chat_obj = (current or {}).get("chat") or {}
+        messages = chat_obj.get("messages")
+        history_messages = ((chat_obj.get("history") or {}).get("messages")) or {}
+
+        target = history_messages.get(message_id)
+        if target is None and isinstance(messages, list):
+            target = next(
+                (m for m in messages if isinstance(m, dict) and m.get("id") == message_id),
+                None,
+            )
+        if target is None:
+            # Message doesn't exist yet on the OWUI side (e.g. very first
+            # chunk of a brand-new chat, before OWUI's own request handler
+            # has created the row) -- nothing to patch onto.
+            return
+
+        patched = dict(target)
+        patched["content"] = content
+
+        patch: dict = {"history": {"messages": {message_id: patched}}}
+        if isinstance(messages, list):
+            patched_messages = [
+                (patched if isinstance(m, dict) and m.get("id") == message_id else m)
+                for m in messages
+            ]
+            patch["messages"] = patched_messages
+
+        data = json.dumps({"chat": patch}).encode()
+
+        def _post_chat():
+            req = urllib.request.Request(
+                f"{base}/api/v1/chats/{chat_id}",
+                data=data, headers=headers, method="POST",
+            )
+            urllib.request.urlopen(req, timeout=10)
+
+        try:
+            await asyncio.to_thread(_post_chat)
+        except Exception as ex:
+            pipe_log(f"  rest_snapshot: POST failed: {ex}")
+
     async def pipe(self, body, __event_emitter__, __event_call__=None,
                    __user__=None, __metadata__=None, __request__=None,
                    __task__=None, __task_body__=None):
@@ -4990,6 +5130,10 @@ class Pipe:
             # --- Send this message as its own fresh run (still holding the lock
             #     so the next waiter observes our run before deciding to send) ---
             idempotency_key = f"msg-{chat_id}-{time.time()}"
+            # Epoch of the connection this run is being launched on. If it has
+            # moved by the time the queue goes quiet, the Gateway restarted
+            # underneath us and took the run with it (see `connection_epoch`).
+            epoch_at_send = conn.connection_epoch
             try:
                 send_resp = await conn.send_request(
                     "chat.send",
@@ -5020,10 +5164,14 @@ class Pipe:
         # to the complete content if this inline turn ends before the run does
         # (idle self-close / cancel / torn-down request). No-op without a stable
         # message id. See _finalize_inline_message / _TurnRenderer in gateway.py.
+        owui_message_id = (__metadata__ or {}).get("message_id")
         conn.register_run_target(
-            session_key, our_run_id, owui_origin_chat_id,
-            (__metadata__ or {}).get("message_id"),
+            session_key, our_run_id, owui_origin_chat_id, owui_message_id,
         )
+        # Extracted once up front (not just at the terminal snapshot/auto-title
+        # step further below) so the mid-run REST snapshot gate has a token to
+        # use throughout the streaming loop, not only after it ends.
+        bearer_token = _extract_request_bearer(__request__)
 
         # --- Consume events ---
         done = False
@@ -5056,6 +5204,18 @@ class Pipe:
         last_snapshot_time = 0.0
         snapshot_interval_s = 1.0
         snapshot_min_delta_chars = 250
+        # REST-API mid-run snapshot (bridge-rehydration-rest-snapshot-verify,
+        # confirmed safe 2026-08-26): a parallel, throttled persistence path
+        # for the plain assistant-text stream, which lost the `replace`-based
+        # snapshot in 6e5f372 and cannot regain it that way -- see
+        # REHYDRATION-PLAINTEXT-FIX-PROPOSAL.md for why every replace-based
+        # variant of this (P17/P19/P23/P25/P27) is unsafe at any throttle.
+        # This instead POSTs straight to the chat's DB row, which never
+        # broadcasts to the live client, so it cannot race the delta stream.
+        last_rest_snapshot_text = ""
+        last_rest_snapshot_time = 0.0
+        rest_snapshot_interval_s = 2.5
+        rest_snapshot_task: asyncio.Task | None = None
         wait_started_time = time.time()
         last_activity_time = time.time()
         idle_probe_s = 30
@@ -5063,6 +5223,12 @@ class Pipe:
         last_describe_check = 0.0
         describe_check_interval = 45
         max_events_without_text = 5000
+        # Gateway-restart resume budget. Bounded so a gateway that is crash-
+        # looping degrades into the old "close the stream" behaviour instead of
+        # re-sending forever.
+        resume_attempts = 0
+        max_resume_attempts = 3
+        pending_restart_error: str | None = None
 
         async def recover_from_preview() -> str | None:
             try:
@@ -5144,6 +5310,41 @@ class Pipe:
             if force:
                 pipe_log(f"  snapshot(force): EMITTED {len(visible_message_text)} chars")
 
+        def maybe_start_rest_snapshot():
+            """Throttled gate for the REST-API mid-run snapshot.
+
+            Fire-and-forget (background task): a GET+POST round trip inline
+            in the streaming path would stall the live delta yield every
+            time the throttle opens. Guarded so at most one is in flight at
+            once, and stops firing once the turn hits terminal flush (`done`
+            True) -- matching this project's established convention
+            (19e9fd7/2092e19) of never doing anything new right at the
+            natural end of a message, even though this path is confirmed
+            safe from the replace-vs-delta race that motivated that
+            convention (bridge-rehydration-rest-snapshot-verify, 2026-08-26).
+            """
+            nonlocal last_rest_snapshot_text, last_rest_snapshot_time, rest_snapshot_task
+            if done or not owui_message_id:
+                return
+            if not visible_message_text or visible_message_text == last_rest_snapshot_text:
+                return
+            now = time.time()
+            if (
+                last_rest_snapshot_text
+                and now - last_rest_snapshot_time < rest_snapshot_interval_s
+            ):
+                return
+            if rest_snapshot_task is not None and not rest_snapshot_task.done():
+                return
+            snapshot_text = visible_message_text
+            last_rest_snapshot_text = snapshot_text
+            last_rest_snapshot_time = now
+            rest_snapshot_task = asyncio.create_task(
+                self._rest_snapshot_message(
+                    owui_origin_chat_id, owui_message_id, snapshot_text, bearer_token,
+                )
+            )
+
         async def maybe_answer_user_input(prompt_text: str) -> UserInputResult:
             """Ask the user via an OWUI modal and deliver their answer.
 
@@ -5202,6 +5403,92 @@ class Pipe:
                 pipe_log("  answer sent, steering into active run (no new runId)")
             return UserInputResult(True, new_run_id, prompt_text=prompt_text, answer=answer)
 
+        async def resume_after_restart() -> bool:
+            """Re-launch this turn after the Gateway restarted under it.
+
+            The Gateway writes a turn to the transcript only when it COMPLETES,
+            so a restart mid-run destroys the run and no terminal event is ever
+            emitted -- the consumer queue simply goes quiet forever. OWUI itself
+            did not restart, though: the browser's HTTP response is still open
+            and this coroutine is still running. So we can start a fresh run on
+            the reconnected socket and keep streaming into the *same* assistant
+            message, which is what makes the chat carry on with no new message
+            from the human.
+
+            The user's original message is still in the transcript (it was
+            persisted on the way in), so replaying its text would duplicate the
+            user turn. We send a continuation directive instead, and tell the
+            agent about any text the user can already see so it resumes rather
+            than starting the answer over -- streamed text is immutable in the
+            live OWUI view and cannot be retracted.
+            """
+            nonlocal queue, our_run_id, first_event_arrived
+            nonlocal wait_started_time, last_activity_time, last_describe_check
+            try:
+                await conn.ensure_connected()
+            except Exception as ex:
+                pipe_log(f"  resume: gateway still unreachable: {ex}")
+                return False
+
+            already_seen = (visible_message_text or assistant_stream_text or "").strip()
+            if already_seen:
+                tail = already_seen[-1500:]
+                directive = (
+                    "[system] Your previous reply was cut off partway through "
+                    "because the gateway restarted. The user can already see "
+                    "the following partial text, and it cannot be edited or "
+                    "retracted:\n\n"
+                    f"---\n{tail}\n---\n\n"
+                    "Continue that reply seamlessly from exactly where it "
+                    "stops. Do not repeat any of it, do not restart the "
+                    "answer, and do not mention the restart."
+                )
+            else:
+                directive = (
+                    "[system] The gateway restarted before you produced any "
+                    "output, so your previous run was lost. Answer the user's "
+                    "most recent message now, from scratch. Do not mention the "
+                    "restart."
+                )
+
+            resume_key = f"resume-{chat_id}-{time.time()}"
+            try:
+                resume_resp = await conn.send_request(
+                    "chat.send",
+                    _owui_chat_send_params(
+                        session_key=session_key,
+                        message=directive,
+                        idempotency_key=resume_key,
+                        owui_chat_id=owui_origin_chat_id,
+                        owui_user_id=owui_origin_user_id,
+                    ),
+                    timeout=30,
+                )
+            except Exception as ex:
+                pipe_log(f"  resume: chat.send failed: {ex}")
+                return False
+
+            new_run_id = resume_resp.get("runId")
+            if not new_run_id:
+                pipe_log("  resume: gateway returned no runId")
+                return False
+
+            conn.unregister_consumer(session_key, our_run_id, queue=queue)
+            our_run_id = new_run_id
+            self._current_run_id = new_run_id
+            queue = conn.register_consumer(session_key, new_run_id)
+            conn.register_run_target(
+                session_key, new_run_id, owui_origin_chat_id, owui_message_id,
+            )
+            # Fresh clocks: the new run has produced nothing yet, and the idle
+            # deadman must not count the restart window against it.
+            first_event_arrived = False
+            wait_started_time = time.time()
+            last_activity_time = time.time()
+            last_describe_check = 0.0
+            pipe_log(f"  resume: new runId {new_run_id[:20]}...")
+            return True
+
         adopt_new_run = True
         try:
             while adopt_new_run:
@@ -5218,6 +5505,39 @@ class Pipe:
                                 else "60s"
                             )
                             pipe_log(f"TIMEOUT -- no events on queue for {timeout_desc}")
+
+                            # A restart is indistinguishable from a long tool
+                            # call *from the queue alone* -- both are silence.
+                            # The connection epoch is what separates them, so
+                            # check it before any of the give-up paths below,
+                            # which would otherwise close the stream on a run
+                            # that is merely gone rather than finished.
+                            if conn.connection_epoch != epoch_at_send:
+                                if resume_attempts < max_resume_attempts:
+                                    resume_attempts += 1
+                                    pipe_log(
+                                        f"  epoch {epoch_at_send} -> "
+                                        f"{conn.connection_epoch}: gateway "
+                                        f"restarted mid-run; resuming "
+                                        f"(attempt {resume_attempts}/"
+                                        f"{max_resume_attempts})"
+                                    )
+                                    await _emit_status(
+                                        __event_emitter__,
+                                        "Gateway restarted: resuming...",
+                                        done=False,
+                                    )
+                                    if await resume_after_restart():
+                                        epoch_at_send = conn.connection_epoch
+                                        pending_restart_error = None
+                                        continue
+                                    pipe_log("  resume failed; will retry on next idle probe")
+                                    continue
+                                pipe_log(
+                                    "  gateway restarted but resume budget "
+                                    "exhausted; falling through to close"
+                                )
+
                             if not first_event_arrived:
                                 elapsed = time.time() - wait_started_time
                                 status = await gateway_run_status()
@@ -5247,6 +5567,8 @@ class Pipe:
                                     yield "**Failed:** the run did not complete."
                                 else:
                                     yield "**Timeout:** Gateway accepted the message but emitted no run events."
+                                if pending_restart_error:
+                                    yield f"\n\n**Error:** {pending_restart_error}"
                                 text_yielded = True
                                 break
 
@@ -5257,6 +5579,8 @@ class Pipe:
                                 record_visible_chunk(recovered)
                                 yield recovered
                                 await maybe_emit_snapshot(force=True)
+                                if pending_restart_error:
+                                    yield f"\n\n**Error:** {pending_restart_error}"
                                 done = True
                                 break
 
@@ -5303,6 +5627,8 @@ class Pipe:
                                     if session_row is None:
                                         pipe_log("  sessions.describe: session not found")
                                         if text_yielded:
+                                            if pending_restart_error:
+                                                yield f"\n\n**Error:** {pending_restart_error}"
                                             done = True
                                             break
                                     elif session_row.get("status") in ("done", "failed", "cancelled"):
@@ -5314,6 +5640,8 @@ class Pipe:
                                             record_visible_chunk(recovered2)
                                             yield recovered2
                                             await maybe_emit_snapshot(force=True)
+                                        if pending_restart_error:
+                                            yield f"\n\n**Error:** {pending_restart_error}"
                                         done = True
                                         break
                                     else:
@@ -5331,6 +5659,8 @@ class Pipe:
                                     # true connection loss separately).
                                     if text_yielded and idle_elapsed > no_text_deadman_s:
                                         pipe_log("  describe probe unreachable and idle too long; closing")
+                                        if pending_restart_error:
+                                            yield f"\n\n**Error:** {pending_restart_error}"
                                         done = True
                                         break
 
@@ -5360,17 +5690,41 @@ class Pipe:
                             done = True
                             pipe_log("  lifecycle end -> done")
                         elif stream == "lifecycle" and phase == "error":
-                            yield f"\n\n**Error:** {data.get('error', 'unknown')}"
-                            done = True
-                            pipe_log("  lifecycle error -> done")
+                            err = str(data.get("error", "unknown"))
+                            if _is_restart_signature(err) and resume_attempts < max_resume_attempts:
+                                pending_restart_error = err
+                                pipe_log("  lifecycle error looks like a restart; deferring close pending epoch bump")
+                            else:
+                                yield f"\n\n**Error:** {err}"
+                                done = True
+                                pipe_log("  lifecycle error -> done")
 
+                        # Both of these read the SAME payload that carried the
+                        # lifecycle error above, so an unguarded `done = True`
+                        # here would defeat the restart deferral on the very
+                        # event that armed it (the gateway stamps state='error'
+                        # / aborted alongside phase='error'). While a restart is
+                        # pending we must stay in the loop so the idle probe can
+                        # reach the connection_epoch check and resume.
                         if state in ("final", "cancelled", "error"):
-                            done = True
-                            pipe_log(f"  payload state='{state}' -> done")
+                            if pending_restart_error:
+                                pipe_log(
+                                    f"  payload state='{state}' but restart "
+                                    f"deferral armed; not closing"
+                                )
+                            else:
+                                done = True
+                                pipe_log(f"  payload state='{state}' -> done")
 
                         if data.get("aborted") is True:
-                            done = True
-                            pipe_log("  data.aborted -> done")
+                            if pending_restart_error:
+                                pipe_log(
+                                    "  data.aborted but restart deferral "
+                                    "armed; not closing"
+                                )
+                            else:
+                                done = True
+                                pipe_log("  data.aborted -> done")
 
                         # --- Assistant text stream ---
                         if stream == "assistant":
@@ -5438,6 +5792,7 @@ class Pipe:
                                     continue
 
                                 text_yielded = True
+                                pending_restart_error = None
                                 # No snapshot here, regardless of whether tool blocks
                                 # exist earlier in the message. A `replace` event sets
                                 # the full message content; if it lands on (or near)
@@ -5482,10 +5837,14 @@ class Pipe:
                                 # `_suppress_already_shown` treat the *continuing*
                                 # delta stream as already-shown and suppress it --
                                 # the visible stream freezes mid-message (regression
-                                # 2026-07-18, exactly the P23/P25 hazard). Text-turn
-                                # DB back-sync must be done a different way (e.g. a
-                                # single terminal snapshot, or replace-only streaming
-                                # that never also yields), not per-delta.
+                                # 2026-07-18, exactly the P23/P25 hazard). Mid-run
+                                # DB back-sync for this path goes through the REST
+                                # snapshot gate instead (`maybe_start_rest_snapshot`,
+                                # bridge-rehydration-rest-snapshot-verify), which
+                                # writes the chat row directly and never broadcasts
+                                # to the live client, so it cannot trigger that
+                                # suppression.
+                                maybe_start_rest_snapshot()
                                 last_activity_time = time.time()
 
                         # --- Assistant text carried by item/preamble events ---
@@ -5890,7 +6249,6 @@ class Pipe:
 
         # Auto-title: generate title after first exchange (best-effort, non-blocking)
         if not aborted and text_yielded:
-            bearer_token = _extract_request_bearer(__request__)
             asyncio.create_task(
                 self._auto_title(
                     body, conn, visible_message_text,
