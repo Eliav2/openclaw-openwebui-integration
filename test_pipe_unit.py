@@ -110,6 +110,7 @@ from openclaw_pipe import (
     _relay_finalize,
     _finalize_inline_message,
     _relinearize_proactive_variants,
+    _heal_proactive_variants,
     _FALLBACK_MODELS,
     _advance_input_prompt_buffer,
     _advance_media_buffer,
@@ -2423,6 +2424,133 @@ class RelinearizeProactiveVariantsTests(unittest.TestCase):
         self.assertEqual(m["x"]["childrenIds"], ["p1"])   # oldest proactive first
         self.assertEqual(m["p1"]["childrenIds"], ["p2"])
         self.assertEqual(m["p2"]["childrenIds"], ["u2"])
+
+    def test_defers_group_that_would_reparent_an_unfinished_assistant(self):
+        """OWUI 0.12's `update_chat_by_id` keeps the stored copy of an
+        assistant message whose `done` is False, so moving a still-streaming
+        reply is dropped while the rest of the group moves. Such a group is
+        left alone until that message finishes."""
+        h = {"currentId": "a2", "messages": {
+            "x": {"role": "assistant", "childrenIds": ["proac", "a2"]},
+            "proac": {"role": "assistant", "content": "*↳ Proactive message*\n\nyo",
+                      "childrenIds": [], "timestamp": 10},
+            "a2": {"role": "assistant", "content": "", "done": False, "childrenIds": []},
+        }}
+        before = json.loads(json.dumps(h))
+        self.assertFalse(_relinearize_proactive_variants(h))
+        self.assertEqual(h, before)
+
+    def test_defers_group_with_a_still_relaying_proactive_message(self):
+        h = {"currentId": "u2", "messages": {
+            "x": {"role": "assistant", "childrenIds": ["p1", "p2", "u2"]},
+            "p1": {"role": "assistant", "content": "*↳ Proactive message*\n\na",
+                   "childrenIds": [], "timestamp": 10},
+            "p2": {"role": "assistant", "content": "*↳ Proactive message*\n\nb",
+                   "done": False, "childrenIds": [], "timestamp": 20},
+            "u2": {"role": "user", "content": "hey", "childrenIds": []},
+        }}
+        self.assertFalse(_relinearize_proactive_variants(h))
+        self.assertEqual(h["messages"]["x"]["childrenIds"], ["p1", "p2", "u2"])
+
+    def test_heal_lands_under_owui_012_update_semantics(self):
+        """The usual group (proactive + the user's next message) still heals
+        on 0.12 even though the new turn's reply is in flight: only the user
+        message moves, and 0.12 rebuilds childrenIds from parentId."""
+        h = self._variant_history()
+        h["messages"]["asstY"]["done"] = False  # 0.12 inserts the turn first
+        store = {"title": "t", "history": h}
+
+        def merge_history(existing, incoming):
+            # Port of OWUI 0.12.0 `ChatTable.merge_history`.
+            ex = (existing or {}).get("messages") or {}
+            inc = (incoming or {}).get("messages") or {}
+            merged = {mid: {**m, "childrenIds": []} for mid, m in {**ex, **inc}.items()}
+            for mid, m in merged.items():
+                if m.get("parentId") in merged:
+                    merged[m["parentId"]]["childrenIds"].append(mid)
+            cur = (incoming or {}).get("currentId")
+            if cur not in merged:
+                cur = (existing or {}).get("currentId")
+            return {**(existing or {}), **(incoming or {}), "messages": merged, "currentId": cur}
+
+        class FakeChats:
+            @staticmethod
+            async def get_chat_by_id(chat_id):
+                return types.SimpleNamespace(chat=json.loads(json.dumps(store)), title="t")
+
+            @staticmethod
+            async def update_chat_by_id(chat_id, chat):
+                # Port of OWUI 0.12.0 `ChatTable.update_chat_by_id` history rule.
+                stored = json.loads(json.dumps(store))
+                updated = {**stored, **chat}
+                updated["history"] = merge_history(stored["history"], chat["history"])
+                for mid, m in stored["history"]["messages"].items():
+                    if m.get("role") == "assistant" and (
+                        m.get("done") is False
+                        or updated["history"]["messages"][mid].get("done") is False
+                    ):
+                        updated["history"]["messages"][mid] = m
+                updated["history"] = merge_history(updated["history"], {})
+                store.clear()
+                store.update(updated)
+
+        h["messages"]["user1"]["parentId"] = None
+        for mid, m in h["messages"].items():
+            m.setdefault("parentId", None)
+        conn = _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"))
+        mod = types.ModuleType("open_webui.models.chats")
+        mod.Chats = FakeChats
+        with mock.patch.dict(sys.modules, {
+            "open_webui": types.ModuleType("open_webui"),
+            "open_webui.models": types.ModuleType("open_webui.models"),
+            "open_webui.models.chats": mod,
+        }):
+            asyncio.run(_heal_proactive_variants(conn, "chat-1"))
+        m = store["history"]["messages"]
+        self.assertEqual(m["user2"]["parentId"], "proac")
+        self.assertEqual(m["asstX"]["childrenIds"], ["proac"])
+        self.assertEqual(m["proac"]["childrenIds"], ["user2"])
+        self.assertEqual(store["history"]["currentId"], "asstY")
+
+
+class RestSnapshotOwui012Tests(unittest.TestCase):
+    """The REST mid-run snapshot is a no-op on OWUI 0.12 (its
+    `update_chat_by_id` keeps the stored copy of an unfinished assistant
+    message) and redundant there (GET /api/v1/chats/{id} overlays the live
+    stream). Measured live on 0.12.0: snapshot POSTs returned 200 while the
+    DB content stayed empty until `done`."""
+
+    @staticmethod
+    def _owui_modules(with_turn_insert: bool):
+        class FakeChats:
+            pass
+        if with_turn_insert:
+            async def insert_chat_turn(chat_id, user, user_message, message_ids):
+                return {}
+            FakeChats.insert_chat_turn = staticmethod(insert_chat_turn)
+        mod = types.ModuleType("open_webui.models.chats")
+        mod.Chats = FakeChats
+        return {
+            "open_webui": types.ModuleType("open_webui"),
+            "open_webui.models": types.ModuleType("open_webui.models"),
+            "open_webui.models.chats": mod,
+        }
+
+    def _run_snapshot(self, modules):
+        pipe = Pipe()
+        with mock.patch.dict(sys.modules, modules), \
+                mock.patch("urllib.request.urlopen",
+                           side_effect=OSError("no network in tests")) as urlopen:
+            asyncio.run(pipe._rest_snapshot_message("chat-1", "msg-1", "partial", "tok"))
+        return urlopen
+
+    def test_skipped_on_owui_012(self):
+        urlopen = self._run_snapshot(self._owui_modules(with_turn_insert=True))
+        urlopen.assert_not_called()
+
+    def test_still_runs_on_older_owui(self):
+        urlopen = self._run_snapshot(self._owui_modules(with_turn_insert=False))
+        urlopen.assert_called()
 
 
 class GatewayReconnectStormTests(unittest.IsolatedAsyncioTestCase):

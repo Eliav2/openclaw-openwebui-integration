@@ -2256,6 +2256,18 @@ def _relinearize_proactive_variants(history: dict) -> bool:
             continue
         proactive.sort(key=lambda k: (messages.get(k) or {}).get("timestamp") or 0)
         chain = proactive + others  # `others` is [] or exactly [one]
+        # Everything after chain[0] gets a new parentId. OWUI 0.12's
+        # `Chats.update_chat_by_id` keeps the STORED copy of any assistant
+        # message whose `done` is False, so re-parenting a still-streaming
+        # reply (a live-relay proactive message, or a turn in flight) is
+        # silently dropped while the rest of the group moves. Leave the whole
+        # group for a later turn's heal, when that message is finished.
+        if any(
+            (messages.get(k) or {}).get("role") == "assistant"
+            and (messages.get(k) or {}).get("done") is False
+            for k in chain[1:]
+        ):
+            continue
         # Keep only the first node under the parent; chain the rest under the
         # deepest leaf of the previous node's existing subtree (a proactive
         # message may already anchor its own tail -- e.g. a later proactive

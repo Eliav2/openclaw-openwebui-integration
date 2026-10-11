@@ -3826,6 +3826,18 @@ def _relinearize_proactive_variants(history: dict) -> bool:
             continue
         proactive.sort(key=lambda k: (messages.get(k) or {}).get("timestamp") or 0)
         chain = proactive + others  # `others` is [] or exactly [one]
+        # Everything after chain[0] gets a new parentId. OWUI 0.12's
+        # `Chats.update_chat_by_id` keeps the STORED copy of any assistant
+        # message whose `done` is False, so re-parenting a still-streaming
+        # reply (a live-relay proactive message, or a turn in flight) is
+        # silently dropped while the rest of the group moves. Leave the whole
+        # group for a later turn's heal, when that message is finished.
+        if any(
+            (messages.get(k) or {}).get("role") == "assistant"
+            and (messages.get(k) or {}).get("done") is False
+            for k in chain[1:]
+        ):
+            continue
         # Keep only the first node under the parent; chain the rest under the
         # deepest leaf of the previous node's existing subtree (a proactive
         # message may already anchor its own tail -- e.g. a later proactive
@@ -4884,6 +4896,39 @@ def _session_active_from_signals(describe_status, list_has_active_run) -> bool:
     return bool(list_has_active_run)
 
 
+def _owui_owns_inflight_message() -> bool:
+    """True when the running Open WebUI (0.12+) owns the in-flight assistant
+    message, which makes the pipe's REST mid-run snapshot a no-op.
+
+    Two 0.12 changes, measured live on 2026-10-11 against 0.12.0:
+      * `Chats.update_chat_by_id` keeps the STORED copy of any assistant
+        message whose stored or incoming `done` is False
+        (`models/chats.py::update_chat_by_id`), so the snapshot's
+        `history.messages[id]` patch is dropped. The live probe saw every
+        snapshot POST return 200 while the DB row stayed at content=0 until
+        `done`.
+      * The streaming handler keeps in-progress content/output in
+        `response_streams` (`middleware.py::save_current_response_stream`)
+        and `GET /api/v1/chats/{id}` overlays it onto the message
+        (`routers/chats.py::overlay_response_streams`). The same probe read
+        the growing text back from that GET every poll, so a client that
+        reloads mid-turn is rehydrated by OWUI itself.
+
+    `insert_chat_turn` (the 0.12 server-side turn insertion that came with
+    the `done` rule) is the feature marker. Outside OWUI, or on an older
+    OWUI, this is False and the snapshot keeps running.
+    """
+    mod = sys.modules.get("open_webui.models.chats")
+    if mod is None:
+        try:
+            import importlib
+            mod = importlib.import_module("open_webui.models.chats")
+        except Exception:
+            return False
+    chats = getattr(mod, "Chats", None)
+    return callable(getattr(chats, "insert_chat_turn", None))
+
+
 def _is_restart_signature(err: str) -> bool:
     """True when a run-ending error looks like the gateway being restarted
     underneath us rather than a genuine agent failure."""
@@ -5323,9 +5368,15 @@ class Pipe:
         .messages{}` (keyed by message id) merges whole-object-per-id
         server-side (`Chats.merge_history`), so only the one patched
         message needs to be sent there.
+
+        Skipped on OWUI 0.12+ (`_owui_owns_inflight_message`): there the
+        write is discarded for an unfinished message and OWUI serves the
+        in-flight text to reloading clients on its own.
         """
         token = bearer_token or self.valves.OWUI_API_KEY
         if not token or not chat_id or not message_id:
+            return
+        if _owui_owns_inflight_message():
             return
         base = self.valves.OWUI_BASE_URL.rstrip('/')
         headers = {
@@ -5905,6 +5956,9 @@ class Pipe:
         last_rest_snapshot_time = 0.0
         rest_snapshot_interval_s = 2.5
         rest_snapshot_task: asyncio.Task | None = None
+        # OWUI 0.12+ discards this write and rehydrates reloads itself
+        # (`_owui_owns_inflight_message`), so don't schedule it at all there.
+        rest_snapshot_enabled = not _owui_owns_inflight_message()
         wait_started_time = time.time()
         last_activity_time = time.time()
         idle_probe_s = 30
@@ -6008,7 +6062,7 @@ class Pipe:
             convention (bridge-rehydration-rest-snapshot-verify, 2026-08-26).
             """
             nonlocal last_rest_snapshot_text, last_rest_snapshot_time, rest_snapshot_task
-            if done or not owui_message_id:
+            if done or not owui_message_id or not rest_snapshot_enabled:
                 return
             if not visible_message_text or visible_message_text == last_rest_snapshot_text:
                 return

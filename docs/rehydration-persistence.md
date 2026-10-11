@@ -89,3 +89,24 @@ header) against a real streaming turn:
 
 **Never redeploy this pipe while a message in the chat you're using to verify it
 is still streaming**: that reintroduces the false-alarm duplicate.
+
+## Open WebUI 0.12 (2026-10-11)
+
+0.12 changes both halves of this picture, so the pipe's REST mid-run snapshot
+(`Pipe._rest_snapshot_message`) is skipped there (`_owui_owns_inflight_message`):
+
+- `Chats.update_chat_by_id` (`models/chats.py`) keeps the STORED copy of any
+  assistant message whose stored or incoming `done` is False. The snapshot's
+  `history.messages[id]` patch is dropped. Measured live on 0.12.0: every
+  snapshot POST returned 200 while the DB row stayed at `content=""` until
+  `done`.
+- The streaming handler keeps in-progress `content`/`output` in
+  `response_streams` (`middleware.py::save_current_response_stream`), and
+  `GET /api/v1/chats/{id}` overlays it onto the message
+  (`routers/chats.py::overlay_response_streams`). The same probe read the
+  growing text back from that GET every ~2s, so a client reloading mid-turn is
+  rehydrated by OWUI itself.
+
+The proactive-variant heal (`_heal_proactive_variants`) is hit by the same
+`done` rule: it now leaves a variant group alone while re-linking it would move
+an unfinished assistant message, and heals it on a later turn.
