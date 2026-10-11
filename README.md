@@ -1017,6 +1017,17 @@ Valves (mirrored from the Pipe by `install_action.py`): `GATEWAY_URL`,
 `GATEWAY_TOKEN`, `DEVICE_IDENTITY`, `STATE_DIR`, `AGENT_ID`. Install steps in
 [Installing the companion Status Action](#installing-the-companion-status-action).
 
+**Composer Status button (experiment).** The Pipe also adds a **Status** button
+to the message composer of OpenClaw chats, right after the OpenClaw Thinking
+chip (or at the end of the composer's chips when that chip is off). It opens
+the same dialog through this Action, so the Action must be installed. Open WebUI
+has no extension point for the composer, so the button is injected into the
+page by JavaScript: if a future Open WebUI changes the composer and the anchor
+is not found, the button simply does not appear. On Open WebUI 0.12 it appears
+as soon as a tab opens an OpenClaw chat; on older versions, after the next reply
+or the next click on the message toolbar button. Turn it off with the Pipe's
+`COMPOSER_STATUS_BUTTON` valve (an already open tab keeps it until reload).
+
 </details>
 
 <a id="f-compact"></a>
