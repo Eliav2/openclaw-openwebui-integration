@@ -21,6 +21,10 @@ whole):
   with the `Model:` line of its result. Covers the installer's route smoke
   test, which checks that the reply names the model the Gateway actually
   routed to, so the answer has to come from the tool and not from here.
+
+A tool the agent does not offer directly is called through `tool_call` when
+that is offered: from OpenClaw 2026.10 most tools are deferred behind
+`tool_search` / `tool_call` and only a core set is sent as real schemas.
 * anything else                        -> `E2E fake model reply.`
 
 Replies stream word by word so the streaming path sees several deltas.
@@ -57,8 +61,17 @@ def _text_of(content) -> str:
     return ""
 
 
+def _call(name: str, offered: list) -> dict | None:
+    """Plan a call to `name`, directly or through the deferred `tool_call`."""
+    if name in offered:
+        return {"tool": name}
+    if "tool_call" in offered:
+        return {"tool": "tool_call", "args": {"id": name, "args": {}}}
+    return None
+
+
 def plan_reply(body: dict) -> dict:
-    """Return {"text": str} or {"tool": name} for one completion request."""
+    """Return {"text": str} or {"tool": name, "args"?: dict} for one request."""
     messages = body.get("messages") or []
     # The current turn is the run of user messages after the last assistant
     # reply: the Gateway appends its own context block as a separate user
@@ -82,8 +95,9 @@ def plan_reply(body: dict) -> dict:
             line = next((ln.strip() for ln in "\n".join(tool_results).splitlines()
                          if "Model:" in ln), "E2E_NO_MODEL_LINE")
             return {"text": line}
-        if "session_status" in offered:
-            return {"tool": "session_status"}
+        call = _call("session_status", offered)
+        if call:
+            return call
         return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
 
     if "E2E_TOOL_CALL" in user_text:
@@ -92,6 +106,9 @@ def plan_reply(body: dict) -> dict:
         for name in PREFERRED_TOOLS:
             if name in offered:
                 return {"tool": name}
+        call = _call(PREFERRED_TOOLS[0], offered)
+        if call:
+            return call
         return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
 
     m = _EXACTLY.search(user_text)
@@ -153,7 +170,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if "tool" in plan:
             call = {"id": f"call_{uuid.uuid4().hex[:12]}", "type": "function",
-                    "function": {"name": plan["tool"], "arguments": "{}"}}
+                    "function": {"name": plan["tool"],
+                                 "arguments": json.dumps(plan.get("args") or {})}}
             message = {"role": "assistant", "content": None, "tool_calls": [call]}
             finish = "tool_calls"
         else:

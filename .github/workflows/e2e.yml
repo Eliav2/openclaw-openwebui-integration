@@ -3,7 +3,7 @@ name: E2E
 # The full stack, real everywhere except the model: Open WebUI in Docker, this
 # integration installed by its own installers, a real OpenClaw Gateway, and a
 # deterministic fake model (e2e/fake_llm.py). Called by ci.yml (every push and
-# PR) and compat-watch.yml (weekly, against upstream's latest).
+# PR) and compat-watch.yml (daily, against upstream's latest).
 
 on:
   workflow_call:
