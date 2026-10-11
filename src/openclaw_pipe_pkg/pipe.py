@@ -108,6 +108,77 @@ def _thinking_rejection_retry_body(body, recovered, resolved_thinking):
     return retry_body
 
 
+# Open WebUI cancels a response identically for Stop and for Send now (both
+# call stopTasksByChatId; the message queue exists only in the browser), so
+# the backend can never tell them apart. The page can: this hook, installed
+# once per page through an `execute` event, records per chat which one the
+# user pressed. Labels are OWUI's English strings (they are localized, so a
+# non-English UI falls back to the timer); Escape is OWUI's Stop shortcut,
+# and Enter in the composer while a response runs is an interrupt when the
+# message queue is off (with it on, a later Stop or Send now click
+# overwrites it).
+_INTENT_HOOK_JS = r"""
+if (!window.__ocIntentHook) {
+  window.__ocIntentHook = true;
+  window.__ocIntents = {};
+  const chat = () => (location.pathname.match(/\/c\/([^/?#]+)/) || [])[1] || null;
+  const mark = (kind) => { const c = chat(); if (c) window.__ocIntents[c] = { kind, t: Date.now() }; };
+  const running = () => !!document.querySelector('button[aria-label="Stop"], #stop-response-button');
+  document.addEventListener('click', (e) => {
+    const b = e.target && e.target.closest ? e.target.closest('button') : null;
+    if (!b) return;
+    const label = b.getAttribute('aria-label') || '';
+    if (label === 'Send now') mark('send_now');
+    else if (label === 'Stop' || b.id === 'stop-response-button') mark('stop');
+  }, true);
+  document.addEventListener('keydown', (e) => {
+    if (!running()) return;
+    if (e.key === 'Escape') { mark('stop'); return; }
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.target && e.target.closest
+        && e.target.closest('#chat-input')) mark('send_now');
+  }, true);
+}
+return true;
+"""
+
+
+def _intent_query_js(chat_id: str) -> str:
+    """Read and clear what the page recorded for `chat_id` (see
+    `_INTENT_HOOK_JS`). "none" means the hook is there but saw no click, so
+    the cancel came from elsewhere; null means no hook at all."""
+    return (
+        "const c = " + json.dumps(chat_id) + ";"
+        "const all = window.__ocIntents;"
+        "if (!all) return null;"
+        "const i = all[c]; delete all[c];"
+        "return (i && Date.now() - i.t < 60000) ? i.kind : 'none';"
+    )
+
+
+# A Send now's follow-up message is known to be coming; this only bounds a
+# browser that dies between the cancel and the send.
+_SEND_NOW_HOLD_S = 120.0
+_INTENT_QUERY_TIMEOUT_S = 3.0
+
+
+async def _settle_cancel_intent(conn, session_key, run_id, chat_id, event_call):
+    """Ask the page whether this cancel was Stop or Send now, and settle the
+    parked turn accordingly (see `settle_parked_turn`)."""
+    intent = None
+    if event_call and chat_id:
+        try:
+            resp = await asyncio.wait_for(
+                event_call({"type": "execute",
+                            "data": {"code": _intent_query_js(chat_id)}}),
+                timeout=_INTENT_QUERY_TIMEOUT_S,
+            )
+            intent = _normalize_event_call_response(resp) or None
+        except (Exception, asyncio.CancelledError) as ex:
+            pipe_log(f"  cancel intent query failed: {ex!r}")
+    pipe_log(f"  cancel intent from the page: {intent or 'unknown'}")
+    conn.settle_parked_turn(session_key, run_id, intent, hold_s=_SEND_NOW_HOLD_S)
+
+
 @dataclass
 class _TurnState:
     """What one reply still owes the user if it is cancelled or closed now.
@@ -120,6 +191,7 @@ class _TurnState:
     """
     conn: object = None
     session_key: str | None = None
+    chat_id: str | None = None
     unsent: list = field(default_factory=list)
     run_id: str | None = None
     queue: object = None
@@ -200,7 +272,10 @@ class Pipe:
         )
         INTERRUPT_GRACE_SECONDS: float = Field(
             default=10.0,
-            description="Recommended: 10. Sending a message while the agent is "
+            description="Recommended: 10. Fallback only: the Pipe asks the "
+                "page whether a cancel was Stop or Send now and acts on that "
+                "at once; this window applies when the page cannot say (a "
+                "non-English UI, API clients). Sending a message while the agent is "
                 "working (Open WebUI's Send now, or sending with the message "
                 "queue off) stops the current response. With this set, the "
                 "agent's run is kept alive instead: the new reply first shows "
@@ -671,6 +746,9 @@ class Pipe:
                     float(getattr(self.valves, "INTERRUPT_GRACE_SECONDS", 0) or 0),
                     send_stop=self.valves.SEND_STOP_ON_CANCEL,
                 )
+                await _settle_cancel_intent(
+                    turn.conn, turn.session_key, turn.run_id, turn.chat_id,
+                    __event_call__)
             raise
 
     async def _pipe_turn(self, body, __event_emitter__, __event_call__=None,
@@ -817,7 +895,16 @@ class Pipe:
             turn = _TurnState()
         turn.conn = conn
         turn.session_key = session_key
+        turn.chat_id = owui_origin_chat_id
         turn.unsent = list(_send_texts) if _send_texts else [text]
+        if owui_origin_chat_id and __event_emitter__:
+            # Lets a later cancel ask the page whether it was Stop or Send
+            # now. Idempotent in the page; fire-and-forget.
+            try:
+                await __event_emitter__(
+                    {"type": "execute", "data": {"code": _INTENT_HOOK_JS}})
+            except Exception as ex:
+                pipe_log(f"  intent hook install failed: {ex!r}")
         # What actually went out in this turn's chat.send, for the
         # thinking-rejection retry to send again.
         sent_texts = list(turn.unsent)
@@ -830,7 +917,7 @@ class Pipe:
         # seconds and the grace window is short.
         adopted_run_id = None
         adopted_queue = None
-        claimed = conn.claim_cancelled_turn(session_key)
+        claimed = await conn.claim_cancelled_turn(session_key)
         if claimed:
             if claimed["carried"]:
                 turn.unsent = claimed["carried"] + turn.unsent
@@ -2088,6 +2175,9 @@ class Pipe:
                         f"Generator {type(stop).__name__}: sending chat.abort"
                     )
                     try:
+                        await _settle_cancel_intent(
+                            conn, session_key, our_run_id,
+                            owui_origin_chat_id, __event_call__)
                         await maybe_emit_snapshot(force=True)
                         await _emit_status(__event_emitter__, "Stopped", done=True)
                     except (Exception, asyncio.CancelledError) as ex:
