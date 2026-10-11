@@ -731,15 +731,23 @@ When the agent emits a line beginning with `OpenClaw needs input:` (or
 dialog mid-run, instead of leaking the raw prompt into the chat as text that
 nobody can answer.
 
-The dialog shape is inferred from the question:
+On Open WebUI 0.11.1 and later the question renders as Open WebUI's own
+inline question card, the same one its built-in `ask_user` tool uses: a header,
+the question, one row per option with an optional description, the first
+option tagged Recommended, and an Other field for a typed answer. Older Open
+WebUI versions get the modals below.
 
-| Question looks like                        | You get                                  |
-| ------------------------------------------ | ---------------------------------------- |
-| anything else                              | a titled free-text input                 |
-| mentions secret, password, api key, token  | a masked password field                  |
-| `(y/n)`, or a confirm verb plus `?`        | a native yes/no confirmation             |
-| two or more numbered options               | clickable themed choice buttons          |
-| `(multiselect)` or "select all that apply" | checkboxes plus a Submit button          |
+| Question looks like                        | 0.11.1+                                 | older                           |
+| ------------------------------------------ | --------------------------------------- | ------------------------------- |
+| anything else                              | question card with a typed answer       | a titled free-text input        |
+| mentions secret, password, api key, token  | a masked password field                 | a masked password field         |
+| `(y/n)`, or a confirm verb plus `?`        | question card with Yes / No             | a native yes/no confirmation    |
+| two or more numbered options               | question card, one row per option       | clickable themed choice buttons |
+| `(multiselect)` or "select all that apply" | checkboxes plus a Submit button         | checkboxes plus a Submit button |
+| a JSON body with up to three `questions`   | one card that steps through each        | not supported                   |
+
+An option written as `1. Postgres - needs a server` shows `Postgres` as the
+choice and the rest as its description.
 
 Confirmation and multi-select markers are recognised in English, Hebrew and
 Arabic.
@@ -749,8 +757,8 @@ one character at a time, or when it shows up mid-reply inside one cumulative
 chunk. A prompt emitted twice does not become a doubled dialog, and duplicate
 options are collapsed.
 
-The question survives a reconnect. Close the tab, come back later, and it
-re-pops on your new session for up to an hour, re-firing on each reconnect while
+The question survives a reconnect. Close the tab or switch chats, come back
+later, and it re-pops on your new session for up to an hour, re-firing on each reconnect while
 the status line reads "Waiting for your reply, question is pending, reconnect
 anytime". If you dismiss it, the question appears as ordinary text with the
 marker line stripped, so nothing is lost. Once answered, the exchange is kept

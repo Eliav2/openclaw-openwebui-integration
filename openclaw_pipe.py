@@ -1322,6 +1322,279 @@ def _modal_payload_from_user_input_prompt(prompt_text: str) -> tuple[dict, bool]
     return {"type": "input", "data": data}, False
 
 
+_OPTION_DESCRIPTION_SEPARATORS = (" - ", " – ", " — ")
+
+# OWUI clamps a request:user_input event call to 60..240s and, when it times
+# out, removes the card itself. We ask for the maximum and re-show the card
+# after each timeout, so a question waits for as long as max_wait_s allows.
+_NATIVE_CARD_TIMEOUT_MS = 240_000
+# A card cancelled this fast was never seen: OWUI's frontend cancels
+# request:user_input at once when the user is viewing another chat.
+_NATIVE_CARD_UNSEEN_CANCEL_S = 1.5
+
+
+def _owui_supports_native_ask_user() -> bool:
+    """True when the running OWUI renders `request:user_input` as its native
+    question card (the ask_user builtin, shipped in 0.11.1)."""
+    try:
+        from open_webui.env import VERSION
+    except Exception:
+        return False
+    parts = re.findall(r"\d+", str(VERSION))[:3]
+    if len(parts) < 3:
+        return False
+    return tuple(int(p) for p in parts) >= (0, 11, 1)
+
+
+def _split_option_description(text: str) -> tuple[str, str]:
+    """"Postgres - robust, needs a server" -> ("Postgres", "robust, needs a server")."""
+    for sep in _OPTION_DESCRIPTION_SEPARATORS:
+        label, found, description = text.partition(sep)
+        if found and label.strip() and description.strip():
+            return label.strip(), description.strip()
+    return text.strip(), ""
+
+
+def _parse_ask_user_json(prompt_text: str) -> list[dict] | None:
+    """Questions from a JSON needs-input body, or None for the text form.
+
+    The body after the marker line may be a JSON object (optionally in a code
+    fence) shaped like OWUI's ask_user arguments:
+    {"questions": [{"header": ..., "question": ..., "options": [...]}]}.
+    Options are strings or {"label", "description"} objects.
+    """
+    body = _strip_input_marker_line(_truncate_at_repeated_marker(prompt_text or "")).strip()
+    fence = re.match(r"^```[a-zA-Z]*\s*\n(.*?)\n?```\s*$", body, re.DOTALL)
+    if fence:
+        body = fence.group(1).strip()
+    if not body.startswith("{"):
+        return None
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return None
+    raw_questions = parsed.get("questions") if isinstance(parsed, dict) else None
+    if not isinstance(raw_questions, list) or not raw_questions:
+        return None
+
+    allow_other = parsed.get("allow_other", True) is not False
+    questions, seen_ids = [], set()
+    for index, raw in enumerate(raw_questions):
+        if not isinstance(raw, dict):
+            continue
+        text = str(raw.get("question") or "").strip()
+        if not text:
+            continue
+        qid = str(raw.get("id") or "").strip()[:64] or f"q{index + 1}"
+        while qid in seen_ids:
+            qid = f"{qid}_{index + 1}"
+        seen_ids.add(qid)
+        options, seen_labels = [], set()
+        for opt in raw.get("options") or []:
+            if isinstance(opt, dict):
+                label = str(opt.get("label") or "").strip()
+                description = str(opt.get("description") or "").strip()
+            else:
+                label, description = _split_option_description(str(opt))
+            if label and label.lower() not in seen_labels:
+                seen_labels.add(label.lower())
+                options.append({"label": label[:80], "description": description[:240]})
+        questions.append({
+            "id": qid,
+            "header": str(raw.get("header") or "").strip()[:48] or f"Question {index + 1}",
+            "question": text[:500],
+            "options": options,
+            # A question with no options is free text, so it must accept typing.
+            "allow_other": not options or raw.get("allow_other", allow_other) is not False,
+        })
+    return questions or None
+
+
+def _native_ask_user_payload(prompt_text: str) -> dict | None:
+    """Build OWUI's native `request:user_input` question card for a prompt.
+
+    Returns None for prompts the card cannot express, which keep the legacy
+    modal: secrets (the card has no masked input) and multi-select (the card
+    picks one option per question).
+    """
+    questions = _parse_ask_user_json(prompt_text)
+    if questions is None:
+        payload, is_confirmation = _modal_payload_from_user_input_prompt(prompt_text)
+        data = payload["data"]
+        if data.get("type") == "password" or data.get("multi"):
+            return None
+        question = {
+            "id": "answer",
+            "header": data["title"],
+            "question": data["message"],
+            "options": [],
+            "allow_other": True,
+        }
+        if is_confirmation:
+            question["options"] = [
+                {"label": "Yes", "description": ""},
+                {"label": "No", "description": ""},
+            ]
+            question["allow_other"] = False
+        elif payload["type"] == "choice":
+            for label in data["options"]:
+                label, description = _split_option_description(label)
+                question["options"].append({"label": label, "description": description})
+            # The numbered list is already in `options`; showing it again in
+            # the question text would list every choice twice.
+            message = re.sub(r"(?m)^\s*\d+[.)]\s+.*$\n?", "", data["message"]).strip()
+            question["question"] = message or data["title"]
+        questions = [question]
+    return {
+        "type": "request:user_input",
+        "data": {
+            "questions": questions,
+            "allow_other": True,
+            "timeout_ms": _NATIVE_CARD_TIMEOUT_MS,
+        },
+    }
+
+
+def _format_native_answers(questions: list[dict], answers: dict) -> str:
+    """Turn the card's {question_id: answer} into the text sent to the agent.
+
+    One question returns the bare answer (the label, or what was typed), the
+    same contract the legacy modals had; a Yes/No confirmation returns
+    "yes"/"no". Several questions return one "Header: answer" line each.
+    """
+    lines = []
+    for question in questions:
+        answer = answers.get(question["id"]) if isinstance(answers, dict) else None
+        if not isinstance(answer, dict):
+            continue
+        if answer.get("type") == "other":
+            text = str(answer.get("text") or "").strip()
+        else:
+            text = str(answer.get("label") or "").strip()
+        labels = [o["label"] for o in question.get("options", [])]
+        if labels == ["Yes", "No"] and text in labels:
+            text = text.lower()
+        if text:
+            lines.append((question.get("header") or question["id"], text))
+    if not lines:
+        return ""
+    if len(questions) == 1:
+        return lines[0][1]
+    return "\n".join(f"{header}: {text}" for header, text in lines)
+
+
+async def _call_native_card_on_live_session(
+    owui_user_id: str, owui_chat_id: str | None, owui_message_id: str | None, payload: dict
+):
+    """Show the card on the user's current socket session, or return None when
+    they have none. Mirrors OWUI's own get_event_call for request:user_input:
+    a fresh interaction_id, the clamped timeout, and the closing
+    request:interaction:done event that removes the card from the screen."""
+    try:
+        from open_webui.socket.main import sio, SESSION_POOL
+    except Exception as ex:
+        pipe_log(f"  native card retry unavailable (not running inside OWUI process?): {ex}")
+        return None
+    sid = _live_session_id_for_user(owui_user_id, SESSION_POOL)
+    if not sid:
+        return None
+    interaction_id = str(uuid.uuid4())
+    data = {**payload["data"], "interaction_id": interaction_id}
+    timeout_s = min(max(data.get("timeout_ms", 120_000) / 1000, 60), 240)
+    try:
+        return await sio.call(
+            "events",
+            {
+                "chat_id": owui_chat_id,
+                "message_id": owui_message_id,
+                "data": {**payload, "data": data},
+            },
+            to=sid,
+            timeout=timeout_s,
+        )
+    except Exception as ex:
+        return {"error": f"Event call timed out: {ex!r}"}
+    finally:
+        try:
+            await sio.emit(
+                "events",
+                {
+                    "chat_id": owui_chat_id,
+                    "message_id": owui_message_id,
+                    "data": {
+                        "type": "request:interaction:done",
+                        "data": {"interaction_id": interaction_id},
+                    },
+                },
+                to=sid,
+            )
+        except Exception:
+            pass
+
+
+async def _ask_user_native_card(
+    __event_call__,
+    payload: dict,
+    *,
+    owui_user_id: str | None,
+    owui_chat_id: str | None,
+    owui_message_id: str | None,
+    max_wait_s: float,
+    poll_interval_s: float,
+    __event_emitter__=None,
+) -> str | None:
+    """Ask through OWUI's native question card until answered or cancelled.
+
+    The card is re-shown after each OWUI-side timeout, when the user comes
+    back from another chat, and on a fresh socket after a reconnect, all
+    within max_wait_s. Only an explicit Cancel ends it early (returns None).
+    """
+    questions = payload["data"]["questions"]
+    card_timeout_s = payload["data"]["timeout_ms"] / 1000
+    deadline = time.monotonic() + max_wait_s
+    use_live_session = False
+    waiting_shown = False
+    while True:
+        started = time.monotonic()
+        if use_live_session:
+            response = await _call_native_card_on_live_session(
+                owui_user_id, owui_chat_id, owui_message_id, payload
+            )
+        else:
+            response = await asyncio.wait_for(
+                __event_call__(payload), timeout=card_timeout_s + 15
+            )
+        elapsed = time.monotonic() - started
+
+        if isinstance(response, dict) and response.get("status") == "answered":
+            return _format_native_answers(questions, response.get("answers") or {}) or None
+        unseen = response is None or (isinstance(response, dict) and (
+            "error" in response
+            or elapsed < _NATIVE_CARD_UNSEEN_CANCEL_S
+            or elapsed >= card_timeout_s - 5
+        ))
+        if not unseen:
+            pipe_log("  native question card cancelled by the user")
+            return None
+        if isinstance(response, dict) and "disconnected" in str(response.get("error", "")):
+            if not owui_user_id:
+                return None
+            # OWUI's __event_call__ is bound to the session that started the
+            # turn; once that socket is gone, reach the user's new one.
+            use_live_session = True
+        if time.monotonic() + poll_interval_s >= deadline:
+            pipe_log(f"  gave up on the native question card after {int(max_wait_s)}s")
+            return None
+        if not waiting_shown:
+            waiting_shown = True
+            await _emit_status(
+                __event_emitter__,
+                "Waiting for your reply -- the question is pending in this chat",
+                done=False,
+            )
+        await asyncio.sleep(poll_interval_s)
+
+
 def _ask_user_detail_block(prompt_text: str, answer: str) -> str:
     """Render an answered ask-user prompt as a native OWUI tool-call block.
 
@@ -1334,11 +1607,17 @@ def _ask_user_detail_block(prompt_text: str, answer: str) -> str:
     was asked/answered -- instead of showing nothing (previous behavior:
     the raw prompt text was fully suppressed once answered).
     """
-    payload, _ = _modal_payload_from_user_input_prompt(prompt_text)
-    data = payload.get("data", {})
-    title = data.get("title", "Question")
-    message = data.get("message", "")
-    question_display = f"{title}\n{message}".strip() if message else title
+    json_questions = _parse_ask_user_json(prompt_text)
+    if json_questions:
+        question_display = "\n\n".join(
+            f"{q['header']}\n{q['question']}" for q in json_questions
+        )
+    else:
+        payload, _ = _modal_payload_from_user_input_prompt(prompt_text)
+        data = payload.get("data", {})
+        title = data.get("title", "Question")
+        message = data.get("message", "")
+        question_display = f"{title}\n{message}".strip() if message else title
     args_str = json.dumps({"question": question_display})
     call_id = f"ask-user-{uuid.uuid4().hex[:12]}"
     return (
@@ -1528,6 +1807,20 @@ async def _ask_user_input_modal(
     """
     if not __event_call__ or not _is_user_input_prompt(prompt_text):
         return None
+    native_payload = (
+        _native_ask_user_payload(prompt_text) if _owui_supports_native_ask_user() else None
+    )
+    if native_payload is not None:
+        return await _ask_user_native_card(
+            __event_call__,
+            native_payload,
+            owui_user_id=owui_user_id,
+            owui_chat_id=owui_chat_id,
+            owui_message_id=owui_message_id,
+            max_wait_s=max_wait_s,
+            poll_interval_s=poll_interval_s,
+            __event_emitter__=__event_emitter__,
+        )
     payload, _ = _modal_payload_from_user_input_prompt(prompt_text)
     # A clickable-choice prompt is delivered as an "execute" event that renders
     # its own button overlay; convert here so both the live call and the
