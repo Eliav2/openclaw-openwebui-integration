@@ -1261,7 +1261,7 @@ class ThinkingNoteAnnouncementTests(unittest.TestCase):
     def test_the_pipe_gates_the_yield_on_it(self):
         # The note is still logged unconditionally: suppressing it in the chat
         # must not make a clamp invisible when diagnosing one from the logs.
-        source = inspect.getsource(Pipe._pipe_impl)
+        source = inspect.getsource(Pipe._pipe_turn)
         self.assertIn("should_announce_thinking_note(session_key, thinking_note)", source)
         self.assertIn('pipe_log(f"thinking: {thinking_note}")', source)
 
@@ -1271,7 +1271,7 @@ class OwuiTaskNoopTests(unittest.TestCase):
     join the background-task no-op set; moa_response_generation must not."""
 
     def _noop_task_values(self):
-        source = inspect.getsource(Pipe._pipe_impl)
+        source = inspect.getsource(Pipe._pipe_turn)
         m = re.search(
             r"if __task__ and __task__ in \(\s*((?:\"[a-z_]+\",?\s*)+)\)",
             source,
@@ -1558,12 +1558,12 @@ class StripInputMarkerLineTests(unittest.TestCase):
         self.assertEqual(_strip_input_marker_line(""), "")
 
 
-class DeferredCancelAbortTests(unittest.IsolatedAsyncioTestCase):
+class ParkedCancelTests(unittest.IsolatedAsyncioTestCase):
     """OWUI 0.12's Send now / interrupt cancels the running response and sends
-    the new message ~0.5-0.8s later (measured 2026-10-11). An immediate
-    chat.abort on that cancel killed the turn and, through the gateway's
-    abortControlledSubagents cascade, every subagent it had spawned. The abort
-    is now deferred so the follow-up message can claim the run."""
+    the new message ~0.5-0.8s later (measured 2026-10-11). The cancelled turn
+    is parked for the grace window: its run keeps going with its events
+    buffered, and messages it had not sent yet are carried, so the follow-up
+    message takes all of it over. A plain Stop still aborts after the window."""
 
     def _conn(self):
         conn = _GatewayConnection(lambda: None)
@@ -1579,57 +1579,271 @@ class DeferredCancelAbortTests(unittest.IsolatedAsyncioTestCase):
         conn.send_stop = fake_stop
         return conn, calls
 
-    async def test_unclaimed_cancel_aborts_after_grace(self):
-        # A plain Stop: nothing follows, so the run must still be stopped.
+    async def test_unclaimed_cancel_stops_after_grace(self):
+        # A plain Stop: nothing follows, so the run must still be stopped and
+        # its buffering queue released.
         conn, calls = self._conn()
-        await conn.schedule_cancel_abort("s", "run-1", 0.05, send_stop=True)
+        q = conn.register_consumer("s", "run-1")
+        conn.park_cancelled_turn("s", "run-1", q, [], 0.05, send_stop=True)
+        await asyncio.sleep(0)
         self.assertEqual(calls, [], "abort must wait for the grace window")
+        self.assertTrue(conn._consumers, "the queue keeps buffering meanwhile")
         await asyncio.sleep(0.15)
         self.assertEqual(calls, [("abort", "s", "run-1"), ("stop", "s")])
-        self.assertIsNone(conn.claim_pending_cancel_abort("s"))
+        self.assertEqual(conn._consumers, {})
+        self.assertIsNone(conn.claim_cancelled_turn("s"))
 
-    async def test_claim_inside_grace_keeps_run_alive(self):
+    async def test_claim_inside_grace_takes_run_queue_and_messages(self):
         conn, calls = self._conn()
-        await conn.schedule_cancel_abort("s", "run-1", 0.05, send_stop=True)
-        self.assertEqual(conn.claim_pending_cancel_abort("s"), "run-1")
+        q = conn.register_consumer("s", "run-1")
+        conn.park_cancelled_turn("s", "run-1", q, ["test"], 0.05, send_stop=True)
+        claimed = conn.claim_cancelled_turn("s")
+        self.assertEqual(claimed["run_id"], "run-1")
+        self.assertIs(claimed["queue"], q)
+        self.assertEqual(claimed["carried"], ["test"])
         await asyncio.sleep(0.15)
         self.assertEqual(calls, [], "a claimed run must never be aborted")
+        self.assertIn("s:run-1", conn._consumers, "a claimed queue stays registered")
 
-    async def test_zero_grace_aborts_immediately(self):
+    async def test_zero_grace_stops_immediately(self):
         conn, calls = self._conn()
-        await conn.schedule_cancel_abort("s", "run-1", 0, send_stop=False)
+        q = conn.register_consumer("s", "run-1")
+        conn.park_cancelled_turn("s", "run-1", q, [], 0, send_stop=False)
+        await asyncio.sleep(0)
         self.assertEqual(calls, [("abort", "s", "run-1")])
-        self.assertIsNone(conn.claim_pending_cancel_abort("s"))
+        self.assertEqual(conn._consumers, {})
+        self.assertIsNone(conn.claim_cancelled_turn("s"))
 
     async def test_claim_is_per_session(self):
         conn, calls = self._conn()
-        await conn.schedule_cancel_abort("s", "run-1", 0.05, send_stop=False)
-        self.assertIsNone(conn.claim_pending_cancel_abort("other"))
+        conn.park_cancelled_turn("s", "run-1", None, [], 0.05, send_stop=False)
+        self.assertIsNone(conn.claim_cancelled_turn("other"))
         await asyncio.sleep(0.15)
         self.assertEqual(calls, [("abort", "s", "run-1")])
 
-    async def test_second_cancel_flushes_the_first_run(self):
-        # The pending abort belongs to the run that was cancelled most
-        # recently; an older one must not linger to be claimed by mistake.
+    async def test_second_park_stops_the_older_run_but_keeps_its_messages(self):
         conn, calls = self._conn()
-        await conn.schedule_cancel_abort("s", "run-1", 5, send_stop=False)
-        await conn.schedule_cancel_abort("s", "run-2", 5, send_stop=False)
+        conn.park_cancelled_turn("s", "run-1", None, ["a"], 5, send_stop=False)
+        conn.park_cancelled_turn("s", "run-2", None, ["b"], 5, send_stop=False)
+        await asyncio.sleep(0)
         self.assertEqual(calls, [("abort", "s", "run-1")])
-        self.assertEqual(conn.claim_pending_cancel_abort("s"), "run-2")
+        claimed = conn.claim_cancelled_turn("s")
+        self.assertEqual(claimed["run_id"], "run-2")
+        self.assertEqual(claimed["carried"], ["a", "b"])
 
-    def test_pipe_defers_abort_and_claims_before_model_patch(self):
+    async def test_parking_a_message_with_no_run(self):
+        # Cancelled while still queued behind a run: nothing to abort, but the
+        # message must reach the next reply.
+        conn, calls = self._conn()
+        conn.park_cancelled_turn("s", None, None, ["hello"], 0.05, send_stop=True)
+        self.assertEqual(conn.claim_cancelled_turn("s")["carried"], ["hello"])
+        await asyncio.sleep(0.1)
+        self.assertEqual(calls, [])
+
+    async def test_parked_run_is_not_backfilled_or_redelivered(self):
+        # The stopped message keeps what it showed: no parity finalize into
+        # it, and no proactive bubble for the run's tail.
+        conn, _ = self._conn()
+        conn.register_run_target("s", "run-1", "chat", "msg-1")
+        conn.park_cancelled_turn("s", "run-1", None, [], 5, send_stop=False)
+        self.assertNotIn("s:run-1", conn._run_targets)
+        self.assertTrue(conn.was_delivered_live("s", "run-1"))
+        conn.claim_cancelled_turn("s")
+
+    async def test_seed_renderer_from_buffered_queue(self):
+        conn, _ = self._conn()
+        q = conn.register_consumer("s", "run-1")
+        q.put_nowait({"payload": {"stream": "assistant", "data": {"delta": "185\n"}}})
+        conn.register_run_target("s", "run-1", "chat", "msg-2")
+        conn.seed_run_renderer("s", "run-1", q)
+        self.assertEqual(conn._run_renderers["s:run-1"].visible_text, "185\n")
+        self.assertEqual(q.qsize(), 1, "seeding must not consume the queue")
+
+    def test_pipe_claims_before_model_patch(self):
         # The grace window is seconds; sessions.patch alone can take 10s+ with
         # its retry, so the claim must come before it. And the cancel handler
-        # must go through the deferred path, never a bare conn.abort.
-        src = inspect.getsource(Pipe._pipe_impl)
-        claim = src.index("conn.claim_pending_cancel_abort(session_key)")
+        # must park, never abort directly.
+        src = inspect.getsource(Pipe._pipe_turn)
+        claim = src.index("conn.claim_cancelled_turn(session_key)")
         patch = src.index('"sessions.patch"')
         self.assertLess(claim, patch)
-        self.assertIn("conn.schedule_cancel_abort(", src)
+        self.assertIn("conn.park_cancelled_turn(", src)
         self.assertNotIn("await conn.abort(", src)
 
     def test_grace_valve_defaults_on(self):
         self.assertGreater(Pipe.Valves().INTERRUPT_GRACE_SECONDS, 0)
+
+
+class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
+    """Drive real reply generators through OWUI's ways of ending a response.
+
+    Incident 2026-10-11 (chat 0abe9bde): "count to 1500", Send now "test" at
+    184, Send now "another test" at 720. Lines 185-244 vanished in the gap
+    between the cancel and the next reply registering; the second interrupt
+    arrived as a generator close, which skipped the cancel handler, so "test"
+    was never sent and the run's tail went to the DB but not the screen.
+    """
+
+    SK = None
+
+    async def asyncSetUp(self):
+        import openclaw_pipe as ocp
+        self.ocp = ocp
+        self.conn = _GatewayConnection(lambda: None)
+        self.conn._ws = object()
+        self.sent = []
+        self.rpc = []
+        self.active = False
+        n = {"run": 0}
+
+        async def send_request(method, params, timeout=10):
+            self.rpc.append(method)
+            if method == "chat.send":
+                n["run"] += 1
+                self.sent.append(params.get("message"))
+                return {"runId": f"run-{n['run']}"}
+            if method == "sessions.describe":
+                return {"session": {"status": "running" if self.active else "done"}}
+            if method == "sessions.list":
+                return {"sessions": [{"key": self.SK, "hasActiveRun": self.active}]}
+            return {}
+
+        async def no_abort(session_key, run_id):
+            self.rpc.append("abort")
+
+        async def no_stop(session_key):
+            self.rpc.append("stop")
+
+        self.conn.send_request = send_request
+        self.conn.abort = no_abort
+        self.conn.send_stop = no_stop
+        self.conn.model_patch_cached = lambda *a, **k: True
+
+        async def get_conn(_valves):
+            return self.conn
+
+        async def noop(*a, **k):
+            return None
+
+        self.patches = [
+            mock.patch.object(ocp, "_get_gateway_connection", get_conn),
+            mock.patch.object(ocp, "_heal_proactive_variants", noop),
+            mock.patch.object(ocp, "_build_usage_status_lines", mock.AsyncMock(return_value=[])),
+        ]
+        for p in self.patches:
+            p.start()
+        self.pipe = Pipe()
+        self.pipe.valves.INTERRUPT_GRACE_SECONDS = 0.3
+        self.pipe.valves.AUTO_TITLE = False
+        type(self).SK = self.ocp._owui_session_key(
+            self.pipe.valves.AGENT_ID, "u1", "chat-1")
+
+    async def asyncTearDown(self):
+        for p in self.patches:
+            p.stop()
+
+    def _reply(self, text, msg_id):
+        async def emitter(_event):
+            return None
+        body = {"model": "openclaw_gateway.default",
+                "messages": [{"role": "user", "content": text}]}
+        meta = {"chat_id": "chat-1", "user_id": "u1", "message_id": msg_id}
+        return self.pipe._pipe_impl(body, emitter, __metadata__=meta)
+
+    def _queue(self, run_id):
+        return self.conn._consumers[f"{self.SK}:{run_id}"].queues[0]
+
+    def _delta(self, run_id, text):
+        return {"type": "event", "event": "agent", "payload": {
+            "sessionKey": self.SK, "runId": run_id,
+            "stream": "assistant", "data": {"delta": text}}}
+
+    def _final(self, run_id):
+        return {"type": "event", "event": "chat", "payload": {
+            "sessionKey": self.SK, "runId": run_id, "state": "final"}}
+
+    async def _until_registered(self, run_id):
+        for _ in range(200):
+            if f"{self.SK}:{run_id}" in self.conn._consumers:
+                return
+            await asyncio.sleep(0.005)
+        self.fail(f"{run_id} never registered")
+
+    async def _read(self, gen, want):
+        out = ""
+        while want not in out:
+            out += await asyncio.wait_for(gen.__anext__(), 2)
+        return out
+
+    async def test_send_now_twice_loses_nothing(self):
+        r1 = self._reply("count to 1500", "m1")
+        first = asyncio.ensure_future(r1.__anext__())
+        await self._until_registered("run-1")
+        self.active = True
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "1\n"))
+        self.assertIn("1", await first)
+        # OWUI closes r1 while it is suspended at a yield (Send now "test").
+        await r1.aclose()
+        # The run keeps emitting before the next reply registers: the gap.
+        q.put_nowait(self._delta("run-1", "185\n"))
+
+        r2 = self._reply("test", "m2")
+        out2 = await self._read(r2, "185")
+        q.put_nowait(self._delta("run-1", "720\n"))
+        out2 += await self._read(r2, "720")
+        await r2.aclose()  # Send now "another test", again as a close
+
+        r3 = self._reply("another test", "m3")
+        q.put_nowait(self._delta("run-1", "1500\n"))
+        q.put_nowait(self._final("run-1"))
+        out3 = await self._read(r3, "1500")
+        self.active = False
+        rest = asyncio.ensure_future(self._read(r3, "ANSWER"))
+        await self._until_registered("run-2")
+        self._queue("run-2").put_nowait(self._delta("run-2", "ANSWER"))
+        self._queue("run-2").put_nowait(self._final("run-2"))
+        out3 += await rest
+        await r3.aclose()
+
+        self.assertIn("185", out2, "events in the cancel gap must not vanish")
+        self.assertIn("720", out2)
+        self.assertNotIn("720", out3, "the continuation must not repeat itself")
+        self.assertEqual(self.sent, ["count to 1500", "test\n\nanother test"],
+                         "the interrupted reply's own message must still be sent")
+        self.assertNotIn("abort", self.rpc, "an interrupt must not stop the run")
+
+    async def test_plain_stop_still_stops(self):
+        r1 = self._reply("count", "m1")
+        first = asyncio.ensure_future(r1.__anext__())
+        await self._until_registered("run-1")
+        self.active = True
+        self._queue("run-1").put_nowait(self._delta("run-1", "1\n"))
+        await first
+        await r1.aclose()
+        await asyncio.sleep(0.5)
+        self.assertIn("abort", self.rpc)
+        self.assertEqual(self.conn._consumers, {}, "the parked queue is released")
+
+    async def test_cancel_while_queued_carries_the_message(self):
+        self.active = True  # a run this chat did not start, e.g. a scheduled turn
+        r1 = self._reply("first", "m1")
+        task = asyncio.ensure_future(r1.__anext__())
+        await asyncio.sleep(0.2)  # waiting behind the active run, nothing sent
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(self.sent, [])
+
+        self.active = False
+        r2 = self._reply("second", "m2")
+        nxt = asyncio.ensure_future(self._read(r2, "OK"))
+        await self._until_registered("run-1")
+        self._queue("run-1").put_nowait(self._delta("run-1", "OK"))
+        self._queue("run-1").put_nowait(self._final("run-1"))
+        await nxt
+        await r2.aclose()
+        self.assertEqual(self.sent, ["first\n\nsecond"])
 
 
 class SessionActiveSignalsTests(unittest.TestCase):
@@ -5134,7 +5348,7 @@ class RestartResumeContractTests(unittest.TestCase):
     def setUpClass(cls):
         # `Pipe.pipe` is a thin ELI-24 wrapper; the streaming loop and the
         # resume closures live in `_pipe_impl`.
-        cls.src = inspect.getsource(Pipe._pipe_impl)
+        cls.src = inspect.getsource(Pipe._pipe_turn)
 
     def test_epoch_is_captured_before_the_run_is_launched(self):
         """Capturing it after `chat.send` returns would race a restart that
@@ -5268,7 +5482,7 @@ class RestartErrorDeferralContractTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.src = textwrap.dedent(inspect.getsource(Pipe._pipe_impl))
+        cls.src = textwrap.dedent(inspect.getsource(Pipe._pipe_turn))
         cls.tree = ast.parse(cls.src)
 
     def _timeout_handler(self):
