@@ -3718,6 +3718,58 @@ class DiscoverModelsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(models[0]["key"], "anthropic/claude-opus-4-8")
         self.assertIn("alias:opus", models[0]["tags"])
 
+    async def test_discover_models_drops_gateway_unavailable_models(self):
+        """An allowlisted model with no credentials comes back from
+        models.list as available:false. Listing it gave OWUI a selector entry
+        that could only 401 (anthropic/claude-haiku-5-5 next to the working
+        claude-cli/claude-haiku-5-5). Shapes below are the real Gateway's."""
+        import openclaw_pipe as ocp
+
+        class FakeConn:
+            _ws = object()
+
+            class _event_loop_task:
+                @staticmethod
+                def done():
+                    return False
+
+            async def send_request(self, method, params, timeout=5):
+                return {
+                    "models": [
+                        {
+                            "id": "claude-haiku-5-5",
+                            "name": "Claude Haiku 5.5",
+                            "provider": "anthropic",
+                            "available": False,
+                            "unavailableReason": "missing-auth",
+                        },
+                        {
+                            "id": "claude-haiku-5-5",
+                            "name": "Claude Haiku 5.5",
+                            "provider": "claude-cli",
+                            "alias": "haiku",
+                            "available": True,
+                        },
+                        # Older Gateways omit the field: keep those.
+                        {"id": "gpt-5.5", "name": "GPT-5.5", "provider": "openai"},
+                    ]
+                }
+
+        class FakeValves:
+            STATE_DIR = "/tmp/openclaw-test-discover-unavailable"
+
+        orig_conn = ocp._gateway_connection
+        try:
+            ocp._gateway_connection = FakeConn()
+            models = await _discover_models(FakeValves())
+        finally:
+            ocp._gateway_connection = orig_conn
+
+        self.assertEqual(
+            [m["key"] for m in models],
+            ["claude-cli/claude-haiku-5-5", "openai/gpt-5.5"],
+        )
+
 
 class GetModelOptionsTests(unittest.TestCase):
     def test_returns_fallback_when_no_cache(self):

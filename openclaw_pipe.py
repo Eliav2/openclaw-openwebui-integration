@@ -4143,6 +4143,22 @@ def _normalize_model_entry(raw: dict) -> dict:
     return {"key": key, "name": raw.get("name", model_id), "tags": tags}
 
 
+def _usable_models(raw_models: list[dict]) -> list[dict]:
+    """Normalize `models.list` entries, dropping the ones the Gateway marks
+    `available: false` (e.g. `unavailableReason: "missing-auth"`).
+
+    An allowlisted model with no credentials still comes back from
+    `models.list`. Listing it put a selector entry in OWUI that could only
+    fail: `anthropic/claude-haiku-5-5` sat next to the working
+    `claude-cli/claude-haiku-5-5`, and picking it 401'd with "No API key
+    found for provider anthropic". Entries without the field count as usable.
+    """
+    return [
+        _normalize_model_entry(m) for m in raw_models
+        if m.get("available", True) is not False
+    ]
+
+
 def _parse_whitelist(text: str) -> set[str]:
     """Parse comma-separated model whitelist into a set."""
     if not text or not text.strip():
@@ -4257,7 +4273,7 @@ async def _discover_models_with_source(valves) -> tuple[list[dict], str]:
             resp = await conn.send_request("models.list", {}, timeout=5)
             raw_models = resp.get("models", [])
             if raw_models:
-                models = [_normalize_model_entry(m) for m in raw_models]
+                models = _usable_models(raw_models)
                 _write_json_file(
                     os.path.join(_state_dir(getattr(valves, "STATE_DIR", "")), "models-cache.json"),
                     {"models": models, "cachedAt": time.time()}
