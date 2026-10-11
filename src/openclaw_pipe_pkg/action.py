@@ -46,6 +46,10 @@
 # module/namespace, so overriding this module-level flag here affects only
 # this artifact's fallback connection, never the Pipe's.
 PROACTIVE_DELIVERY_ENABLED = False
+# Same reasoning for the out-of-band live relay: it is gated on its own
+# switch, so without this a fallback connection relayed every proactive run
+# a second time next to the Pipe's own relay.
+LIVE_STREAM_RELAY_ENABLED = False
 
 _action_fallback_connection: "_GatewayConnection | None" = None
 _action_fallback_lock = asyncio.Lock()
