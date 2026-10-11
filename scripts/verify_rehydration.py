@@ -8,10 +8,12 @@ mid-deploy on the shared OWUI. See docs/rehydration-persistence.md.
 What it checks
 --------------
 1. REHYDRATION: while the turn is running (message.done == False), the assistant
-   message's persisted `content` grows above empty. That is only possible if the
-   pipe's mid-run `replace` snapshots are landing in the DB -- i.e. a client that
-   reconnects mid-turn would see partial text. (Root bug: this used to stay empty
-   until done.)
+   message's `content` as served by GET /api/v1/chats/{id} grows above empty,
+   i.e. a client that reloads mid-turn sees partial text. On OWUI 0.11 that
+   text comes from the pipe's mid-run snapshots landing in the DB; on 0.12+ the
+   pipe skips its REST snapshot and the text comes from OWUI's own in-flight
+   overlay (`routers/chats.py::overlay_response_streams`), which the same GET
+   returns. (Root bug: this used to stay empty until done.)
 2. NO DUPLICATION: once done, neither the flat `content` nor the text extracted
    from `output` is a byte-identical whole-message double (ABCABC with no
    separator) -- the 820f6cc signature.

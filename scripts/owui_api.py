@@ -22,6 +22,7 @@ import urllib.error
 import json
 import os
 import sys
+import uuid
 from typing import Optional
 
 
@@ -94,7 +95,7 @@ class OwuiClient:
         )
         return self._json(urllib.request.urlopen(req, timeout=15))
 
-    def _post(self, path: str, data: dict) -> dict:
+    def _post(self, path: str, data: dict, timeout: int = 15) -> dict:
         body = json.dumps(data).encode()
         req = urllib.request.Request(
             f"{self.base_url}{path}",
@@ -102,7 +103,7 @@ class OwuiClient:
             headers={**self._auth_headers(), "Content-Type": "application/json"},
             method="POST",
         )
-        return self._json(urllib.request.urlopen(req, timeout=15))
+        return self._json(urllib.request.urlopen(req, timeout=timeout))
 
     def _delete(self, path: str) -> dict:
         req = urllib.request.Request(
@@ -169,8 +170,13 @@ class OwuiClient:
     ) -> dict:
         """Send a message to a chat and get the model's response.
 
-        Note: messages sent via the completions API may not persist to
-        the chat DB -- this is for testing pipe behavior, not full chat UX.
+        Sends the turn the way the OWUI frontend does: an assistant message
+        `id` plus a `user_message` (`id`, `role`, `content`, `parentId`).
+        OWUI 0.12 inserts the turn server-side (`Chats.insert_chat_turn`)
+        and answers 409 when a `chat_id` arrives without those ids. The
+        user message is parented on the chat's current leaf so the reply
+        continues the thread instead of starting a detached branch. 0.11
+        accepts the same fields.
         """
         if history is None:
             history = []
@@ -181,7 +187,31 @@ class OwuiClient:
             "stream": stream,
             "chat_id": chat_id,
         }
-        return self._post("/api/chat/completions", body)
+        if chat_id:
+            body["id"] = str(uuid.uuid4())
+            body["user_message"] = {
+                "id": str(uuid.uuid4()),
+                "role": "user",
+                "content": message,
+                "parentId": self._chat_leaf_id(chat_id),
+                "models": [model],
+            }
+        return self._post("/api/chat/completions", body, timeout=timeout)
+
+    def _chat_leaf_id(self, chat_id: str) -> Optional[str]:
+        """The chat's current last message: `history.currentId`, walked down
+        to a childless leaf (the newest child at each step)."""
+        chat_history = (self.get_chat(chat_id).get("chat") or {}).get("history") or {}
+        messages = chat_history.get("messages") or {}
+        node_id = chat_history.get("currentId")
+        seen = set()
+        while node_id in messages and node_id not in seen:
+            seen.add(node_id)
+            children = [c for c in messages[node_id].get("childrenIds") or [] if c in messages]
+            if not children:
+                break
+            node_id = children[-1]
+        return node_id if node_id in messages else None
 
 
 # ── CLI ──────────────────────────────────────────────────────────────

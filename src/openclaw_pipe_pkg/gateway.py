@@ -2136,6 +2136,84 @@ def _last_assistant_text_from_preview(preview: dict, session_key: str) -> str | 
     return None
 
 
+# How far back a proactive delivery reads the session transcript to find the
+# whole version of a clipped preview item. The run's closing assistant message
+# is normally the newest; a few extra rows cover trailing tool-only messages.
+PROACTIVE_HISTORY_LIMIT = 8
+
+# The Gateway marks a clipped preview item with a trailing "..." (800 chars
+# per item on 2026.9.x, 2000 before). Below this many chars before the marker
+# the text is too short to be a clip, and too weak an anchor to look for.
+PREVIEW_CLIP_MARKER = "..."
+PREVIEW_CLIP_MIN_PREFIX = 200
+
+
+def _preview_clip_prefix(text: str) -> str | None:
+    """The kept part of a clipped `sessions.preview` item, or None when the
+    item does not look clipped (it is then already the whole message)."""
+    if not text.endswith(PREVIEW_CLIP_MARKER):
+        return None
+    prefix = text[: -len(PREVIEW_CLIP_MARKER)].strip()
+    return prefix if len(prefix) >= PREVIEW_CLIP_MIN_PREFIX else None
+
+
+def _history_text_completing_preview(history: dict, clip_prefix: str) -> str | None:
+    """The whole text of the `chat.history` message a clipped preview item
+    was cut from: the newest assistant message whose text contains the kept
+    prefix.
+
+    Anchored on the preview on purpose. `chat.history` hides rows the preview
+    keeps (heartbeat prompts, sub-agent completion reports) and drops silent
+    replies (NO_REPLY, ANNOUNCE_SKIP), so "the newest assistant text in
+    chat.history" after a silent run is an OLDER run's reply, which would be
+    re-delivered as a proactive message.
+    """
+    messages = (history or {}).get("messages")
+    if not isinstance(messages, list) or not clip_prefix:
+        return None
+    for message in reversed(messages):
+        item = _history_item(message)
+        if not item or item.get("role") != "assistant":
+            continue
+        text = item["text"].strip()
+        if clip_prefix in text:
+            return text
+    return None
+
+
+async def _proactive_run_text(conn, session_key: str, log_prefix: str) -> str | None:
+    """The finished run's assistant text for a proactive delivery.
+
+    `sessions.preview` (limit 1) decides WHETHER this run left text to show:
+    its newest item is the run's last visible row, so a run that ended silent
+    or on its own prompt yields nothing. The Gateway clips every preview item
+    (800 chars on 2026.9.x) whatever `maxChars` asks for, so a clipped item
+    is then completed from `chat.history`, which returns the message whole
+    (same source as `_recover_turn_text`, ELI-74). If `chat.history` fails or
+    has no matching message, the clipped preview is delivered rather than
+    nothing.
+    """
+    try:
+        preview = await conn.session_preview(session_key, limit=1, max_chars=8000)
+    except Exception as ex:
+        pipe_log(f"  {log_prefix}: session_preview failed: {ex}")
+        return None
+    text = _last_assistant_text_from_preview(preview, session_key)
+    clip_prefix = _preview_clip_prefix(text) if text else None
+    if not clip_prefix:
+        return text
+    try:
+        history = await conn.session_history(session_key, limit=PROACTIVE_HISTORY_LIMIT)
+    except Exception as ex:
+        pipe_log(f"  {log_prefix}: chat.history failed: {ex}; delivering the clipped preview")
+        return text
+    full = _history_text_completing_preview(history, clip_prefix)
+    if full:
+        return full
+    pipe_log(f"  {log_prefix}: no chat.history message matches the clipped preview; delivering it as is")
+    return text
+
+
 async def _maybe_deliver_proactive_after_debounce(
     conn: "_GatewayConnection",
     session_key: str,
@@ -2256,6 +2334,18 @@ def _relinearize_proactive_variants(history: dict) -> bool:
             continue
         proactive.sort(key=lambda k: (messages.get(k) or {}).get("timestamp") or 0)
         chain = proactive + others  # `others` is [] or exactly [one]
+        # Everything after chain[0] gets a new parentId. OWUI 0.12's
+        # `Chats.update_chat_by_id` keeps the STORED copy of any assistant
+        # message whose `done` is False, so re-parenting a still-streaming
+        # reply (a live-relay proactive message, or a turn in flight) is
+        # silently dropped while the rest of the group moves. Leave the whole
+        # group for a later turn's heal, when that message is finished.
+        if any(
+            (messages.get(k) or {}).get("role") == "assistant"
+            and (messages.get(k) or {}).get("done") is False
+            for k in chain[1:]
+        ):
+            continue
         # Keep only the first node under the parent; chain the rest under the
         # deepest leaf of the previous node's existing subtree (a proactive
         # message may already anchor its own tail -- e.g. a later proactive
@@ -2877,15 +2967,9 @@ async def _deliver_proactive_owui_message(
         for stale_key in list(conn._delivered_proactive)[:100]:
             conn._delivered_proactive.pop(stale_key, None)
 
-    try:
-        preview = await conn.session_preview(session_key, limit=1, max_chars=8000)
-    except Exception as ex:
-        pipe_log(f"  proactive delivery: session_preview failed: {ex}")
-        return
-
-    text = _last_assistant_text_from_preview(preview, session_key)
+    text = await _proactive_run_text(conn, session_key, "proactive delivery")
     if not text:
-        pipe_log("  proactive delivery: no assistant text in preview, skipping")
+        pipe_log("  proactive delivery: no assistant text, skipping")
         return
 
     text = f"*↳ Proactive message*\n\n{text}"
@@ -2991,15 +3075,9 @@ async def _deliver_subagent_proactive_owui_message(
         for stale_key in list(conn._delivered_proactive)[:100]:
             conn._delivered_proactive.pop(stale_key, None)
 
-    try:
-        preview = await conn.session_preview(child_session_key, limit=1, max_chars=8000)
-    except Exception as ex:
-        pipe_log(f"  subagent proactive delivery: session_preview failed: {ex}")
-        return
-
-    text = _last_assistant_text_from_preview(preview, child_session_key)
+    text = await _proactive_run_text(conn, child_session_key, "subagent proactive delivery")
     if not text:
-        pipe_log("  subagent proactive delivery: no assistant text in preview, skipping")
+        pipe_log("  subagent proactive delivery: no assistant text, skipping")
         return
 
     label = f"Sub-agent finished: {task_title}" if task_title else "Sub-agent finished"

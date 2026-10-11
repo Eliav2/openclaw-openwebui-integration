@@ -110,6 +110,7 @@ from openclaw_pipe import (
     _relay_finalize,
     _finalize_inline_message,
     _relinearize_proactive_variants,
+    _heal_proactive_variants,
     _FALLBACK_MODELS,
     _advance_input_prompt_buffer,
     _advance_media_buffer,
@@ -134,6 +135,8 @@ from openclaw_pipe import (
     _item_assistant_text,
     _item_delta_text,
     _last_assistant_text_from_preview,
+    _history_text_completing_preview,
+    _preview_clip_prefix,
     _live_session_id_for_user,
     _maybe_deliver_proactive_after_debounce,
     _maybe_deliver_subagent_proactive,
@@ -304,6 +307,144 @@ class InterruptedTurnTailRecoveryTests(unittest.TestCase):
     def test_no_match_anywhere_is_none(self):
         conn = self._conn({"messages": []})
         self.assertIsNone(asyncio.run(_recover_turn_text(conn, self.KEY, "never asked")))
+
+
+class ProactiveDeliveryFullTextTests(unittest.TestCase):
+    """The Gateway clips every `sessions.preview` item to 800 chars (2026.9.x)
+    whatever `maxChars` asks for, so long cron/sub-agent messages used to land
+    in OWUI cut mid-sentence with "...". The preview still decides whether
+    the run left text at all; a clipped item is completed from
+    `chat.history`."""
+
+    USER_ID = "11111111-1111-1111-1111-111111111111"
+    CHAT_ID = "22222222-2222-2222-2222-222222222222"
+    LONG = "".join(f"Line {i} of the scheduled report. " for i in range(150)).strip()
+    OLDER_LONG = "".join(f"Row {i} of yesterday's answer. " for i in range(150)).strip()
+
+    def _history(self, *tail):
+        return {"messages": [
+            {"role": "user", "content": "older prompt"},
+            {"role": "assistant", "content": [{"type": "text", "text": "older reply"}]},
+            {"role": "user", "content": "[cron] daily report"},
+            *tail,
+        ]}
+
+    def _conn(self, history=None, history_error=None, preview_items=None):
+        conn = _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"))
+        if history_error is not None:
+            conn.session_history = mock.AsyncMock(side_effect=history_error)
+        else:
+            conn.session_history = mock.AsyncMock(return_value=history)
+        if preview_items is None:
+            preview_items = [{"role": "assistant", "text": self.LONG[:797] + "..."}]
+
+        async def session_preview(session_key, limit=8, max_chars=4000):
+            return {"previews": [{"key": session_key, "items": preview_items}]}
+        conn.session_preview = mock.AsyncMock(side_effect=session_preview)
+        return conn
+
+    def _deliver(self, conn, subagent=False):
+        appended = []
+
+        async def fake_append(conn_, chat_id, text, *, log_prefix, out=None):
+            appended.append(text)
+            return True
+
+        with mock.patch("openclaw_pipe._append_proactive_message_to_chat", fake_append), \
+                mock.patch("openclaw_pipe.LIVE_STREAM_BOOTSTRAP_ENABLED", False):
+            parent = _owui_session_key("main", self.USER_ID, self.CHAT_ID)
+            if subagent:
+                asyncio.run(_deliver_subagent_proactive_owui_message(
+                    conn, "agent:main:subagent:abc", "run-1", parent, "task-1", "Report"))
+            else:
+                asyncio.run(_deliver_proactive_owui_message(conn, parent, "run-1"))
+        return appended
+
+    def test_long_proactive_message_is_delivered_whole(self):
+        self.assertGreater(len(self.LONG), 800)
+        conn = self._conn(self._history(
+            {"role": "assistant", "content": [{"type": "text", "text": self.LONG}]}))
+        appended = self._deliver(conn)
+        self.assertEqual(len(appended), 1)
+        self.assertTrue(appended[0].endswith(self.LONG))
+        conn.session_history.assert_awaited_once()
+
+    def test_long_subagent_message_is_delivered_whole(self):
+        conn = self._conn(self._history(
+            {"role": "assistant", "content": [{"type": "text", "text": self.LONG}]}))
+        appended = self._deliver(conn, subagent=True)
+        self.assertEqual(len(appended), 1)
+        self.assertIn(self.LONG, appended[0])
+        self.assertIn("<!-- openclaw:taskId=task-1 -->", appended[0])
+        conn.session_history.assert_awaited_once()
+        self.assertEqual(conn.session_history.await_args.args[0], "agent:main:subagent:abc")
+
+    def test_skips_trailing_tool_only_messages(self):
+        conn = self._conn(self._history(
+            {"role": "assistant", "content": [{"type": "text", "text": self.LONG}]},
+            {"role": "assistant", "content": [{"type": "toolcall", "name": "exec"}]},
+            {"role": "user", "content": [{"type": "tool_result", "content": "ok"}]},
+        ))
+        self.assertTrue(self._deliver(conn)[0].endswith(self.LONG))
+
+    def test_short_message_needs_no_history_read(self):
+        conn = self._conn(preview_items=[{"role": "assistant", "text": "Done, all green."}])
+        self.assertEqual(self._deliver(conn), ["*↳ Proactive message*\n\nDone, all green."])
+        conn.session_history.assert_not_awaited()
+
+    def test_sentinel_delivers_nothing(self):
+        conn = self._conn(preview_items=[{"role": "assistant", "text": "NO_REPLY"}])
+        self.assertEqual(self._deliver(conn), [])
+        conn.session_history.assert_not_awaited()
+
+    def test_silent_run_does_not_redeliver_an_older_reply(self):
+        """chat.history hides a sub-agent completion report and drops the
+        parent's ANNOUNCE_SKIP, so its newest assistant text is the PREVIOUS
+        run's answer. The preview's newest row is the report itself (a user
+        row), so nothing is delivered and chat.history is never asked."""
+        conn = self._conn(
+            history={"messages": [
+                {"role": "user", "content": "earlier question"},
+                {"role": "assistant", "content": [{"type": "text", "text": self.OLDER_LONG}]},
+            ]},
+            preview_items=[{"role": "user", "text": "[sub-agent finished] report"}],
+        )
+        self.assertEqual(self._deliver(conn), [])
+        conn.session_history.assert_not_awaited()
+
+    def test_history_without_the_clipped_message_delivers_the_preview(self):
+        """Never swap in a different message: if no chat.history row carries
+        the clipped prefix, the clipped preview is delivered as is."""
+        conn = self._conn(history={"messages": [
+            {"role": "user", "content": "earlier question"},
+            {"role": "assistant", "content": [{"type": "text", "text": self.OLDER_LONG}]},
+        ]})
+        appended = self._deliver(conn)
+        self.assertEqual(appended, ["*↳ Proactive message*\n\n" + self.LONG[:797] + "..."])
+
+    def test_falls_back_to_the_preview_when_history_fails(self):
+        conn = self._conn(history_error=GatewayError("unknown method chat.history"))
+        appended = self._deliver(conn)
+        self.assertEqual(len(appended), 1)
+        self.assertTrue(appended[0].endswith("..."))  # clipped, but not nothing
+        conn.session_preview.assert_awaited_once()
+
+    def test_preview_clip_prefix(self):
+        self.assertIsNone(_preview_clip_prefix("Thinking..."))
+        self.assertIsNone(_preview_clip_prefix(self.LONG))
+        self.assertEqual(_preview_clip_prefix(self.LONG[:797] + "..."), self.LONG[:797].strip())
+
+    def test_history_match_picks_the_newest_message_with_the_prefix(self):
+        prefix = self.LONG[:797]
+        history = {"messages": [
+            {"role": "assistant", "content": [{"type": "text", "text": self.LONG + " (old copy)"}]},
+            {"role": "user", "content": "again"},
+            {"role": "assistant", "content": [{"type": "text", "text": self.LONG}]},
+            {"role": "assistant", "content": [{"type": "toolcall", "name": "exec"}]},
+        ]}
+        self.assertEqual(_history_text_completing_preview(history, prefix), self.LONG)
+        self.assertIsNone(_history_text_completing_preview(history, "not in there " * 20))
+        self.assertIsNone(_history_text_completing_preview({}, prefix))
 
 
 class ProactiveDeliveryTests(unittest.TestCase):
@@ -2423,6 +2564,133 @@ class RelinearizeProactiveVariantsTests(unittest.TestCase):
         self.assertEqual(m["x"]["childrenIds"], ["p1"])   # oldest proactive first
         self.assertEqual(m["p1"]["childrenIds"], ["p2"])
         self.assertEqual(m["p2"]["childrenIds"], ["u2"])
+
+    def test_defers_group_that_would_reparent_an_unfinished_assistant(self):
+        """OWUI 0.12's `update_chat_by_id` keeps the stored copy of an
+        assistant message whose `done` is False, so moving a still-streaming
+        reply is dropped while the rest of the group moves. Such a group is
+        left alone until that message finishes."""
+        h = {"currentId": "a2", "messages": {
+            "x": {"role": "assistant", "childrenIds": ["proac", "a2"]},
+            "proac": {"role": "assistant", "content": "*↳ Proactive message*\n\nyo",
+                      "childrenIds": [], "timestamp": 10},
+            "a2": {"role": "assistant", "content": "", "done": False, "childrenIds": []},
+        }}
+        before = json.loads(json.dumps(h))
+        self.assertFalse(_relinearize_proactive_variants(h))
+        self.assertEqual(h, before)
+
+    def test_defers_group_with_a_still_relaying_proactive_message(self):
+        h = {"currentId": "u2", "messages": {
+            "x": {"role": "assistant", "childrenIds": ["p1", "p2", "u2"]},
+            "p1": {"role": "assistant", "content": "*↳ Proactive message*\n\na",
+                   "childrenIds": [], "timestamp": 10},
+            "p2": {"role": "assistant", "content": "*↳ Proactive message*\n\nb",
+                   "done": False, "childrenIds": [], "timestamp": 20},
+            "u2": {"role": "user", "content": "hey", "childrenIds": []},
+        }}
+        self.assertFalse(_relinearize_proactive_variants(h))
+        self.assertEqual(h["messages"]["x"]["childrenIds"], ["p1", "p2", "u2"])
+
+    def test_heal_lands_under_owui_012_update_semantics(self):
+        """The usual group (proactive + the user's next message) still heals
+        on 0.12 even though the new turn's reply is in flight: only the user
+        message moves, and 0.12 rebuilds childrenIds from parentId."""
+        h = self._variant_history()
+        h["messages"]["asstY"]["done"] = False  # 0.12 inserts the turn first
+        store = {"title": "t", "history": h}
+
+        def merge_history(existing, incoming):
+            # Port of OWUI 0.12.0 `ChatTable.merge_history`.
+            ex = (existing or {}).get("messages") or {}
+            inc = (incoming or {}).get("messages") or {}
+            merged = {mid: {**m, "childrenIds": []} for mid, m in {**ex, **inc}.items()}
+            for mid, m in merged.items():
+                if m.get("parentId") in merged:
+                    merged[m["parentId"]]["childrenIds"].append(mid)
+            cur = (incoming or {}).get("currentId")
+            if cur not in merged:
+                cur = (existing or {}).get("currentId")
+            return {**(existing or {}), **(incoming or {}), "messages": merged, "currentId": cur}
+
+        class FakeChats:
+            @staticmethod
+            async def get_chat_by_id(chat_id):
+                return types.SimpleNamespace(chat=json.loads(json.dumps(store)), title="t")
+
+            @staticmethod
+            async def update_chat_by_id(chat_id, chat):
+                # Port of OWUI 0.12.0 `ChatTable.update_chat_by_id` history rule.
+                stored = json.loads(json.dumps(store))
+                updated = {**stored, **chat}
+                updated["history"] = merge_history(stored["history"], chat["history"])
+                for mid, m in stored["history"]["messages"].items():
+                    if m.get("role") == "assistant" and (
+                        m.get("done") is False
+                        or updated["history"]["messages"][mid].get("done") is False
+                    ):
+                        updated["history"]["messages"][mid] = m
+                updated["history"] = merge_history(updated["history"], {})
+                store.clear()
+                store.update(updated)
+
+        h["messages"]["user1"]["parentId"] = None
+        for mid, m in h["messages"].items():
+            m.setdefault("parentId", None)
+        conn = _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"))
+        mod = types.ModuleType("open_webui.models.chats")
+        mod.Chats = FakeChats
+        with mock.patch.dict(sys.modules, {
+            "open_webui": types.ModuleType("open_webui"),
+            "open_webui.models": types.ModuleType("open_webui.models"),
+            "open_webui.models.chats": mod,
+        }):
+            asyncio.run(_heal_proactive_variants(conn, "chat-1"))
+        m = store["history"]["messages"]
+        self.assertEqual(m["user2"]["parentId"], "proac")
+        self.assertEqual(m["asstX"]["childrenIds"], ["proac"])
+        self.assertEqual(m["proac"]["childrenIds"], ["user2"])
+        self.assertEqual(store["history"]["currentId"], "asstY")
+
+
+class RestSnapshotOwui012Tests(unittest.TestCase):
+    """The REST mid-run snapshot is a no-op on OWUI 0.12 (its
+    `update_chat_by_id` keeps the stored copy of an unfinished assistant
+    message) and redundant there (GET /api/v1/chats/{id} overlays the live
+    stream). Measured live on 0.12.0: snapshot POSTs returned 200 while the
+    DB content stayed empty until `done`."""
+
+    @staticmethod
+    def _owui_modules(with_turn_insert: bool):
+        class FakeChats:
+            pass
+        if with_turn_insert:
+            async def insert_chat_turn(chat_id, user, user_message, message_ids):
+                return {}
+            FakeChats.insert_chat_turn = staticmethod(insert_chat_turn)
+        mod = types.ModuleType("open_webui.models.chats")
+        mod.Chats = FakeChats
+        return {
+            "open_webui": types.ModuleType("open_webui"),
+            "open_webui.models": types.ModuleType("open_webui.models"),
+            "open_webui.models.chats": mod,
+        }
+
+    def _run_snapshot(self, modules):
+        pipe = Pipe()
+        with mock.patch.dict(sys.modules, modules), \
+                mock.patch("urllib.request.urlopen",
+                           side_effect=OSError("no network in tests")) as urlopen:
+            asyncio.run(pipe._rest_snapshot_message("chat-1", "msg-1", "partial", "tok"))
+        return urlopen
+
+    def test_skipped_on_owui_012(self):
+        urlopen = self._run_snapshot(self._owui_modules(with_turn_insert=True))
+        urlopen.assert_not_called()
+
+    def test_still_runs_on_older_owui(self):
+        urlopen = self._run_snapshot(self._owui_modules(with_turn_insert=False))
+        urlopen.assert_called()
 
 
 class GatewayReconnectStormTests(unittest.IsolatedAsyncioTestCase):

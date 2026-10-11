@@ -3706,6 +3706,84 @@ def _last_assistant_text_from_preview(preview: dict, session_key: str) -> str | 
     return None
 
 
+# How far back a proactive delivery reads the session transcript to find the
+# whole version of a clipped preview item. The run's closing assistant message
+# is normally the newest; a few extra rows cover trailing tool-only messages.
+PROACTIVE_HISTORY_LIMIT = 8
+
+# The Gateway marks a clipped preview item with a trailing "..." (800 chars
+# per item on 2026.9.x, 2000 before). Below this many chars before the marker
+# the text is too short to be a clip, and too weak an anchor to look for.
+PREVIEW_CLIP_MARKER = "..."
+PREVIEW_CLIP_MIN_PREFIX = 200
+
+
+def _preview_clip_prefix(text: str) -> str | None:
+    """The kept part of a clipped `sessions.preview` item, or None when the
+    item does not look clipped (it is then already the whole message)."""
+    if not text.endswith(PREVIEW_CLIP_MARKER):
+        return None
+    prefix = text[: -len(PREVIEW_CLIP_MARKER)].strip()
+    return prefix if len(prefix) >= PREVIEW_CLIP_MIN_PREFIX else None
+
+
+def _history_text_completing_preview(history: dict, clip_prefix: str) -> str | None:
+    """The whole text of the `chat.history` message a clipped preview item
+    was cut from: the newest assistant message whose text contains the kept
+    prefix.
+
+    Anchored on the preview on purpose. `chat.history` hides rows the preview
+    keeps (heartbeat prompts, sub-agent completion reports) and drops silent
+    replies (NO_REPLY, ANNOUNCE_SKIP), so "the newest assistant text in
+    chat.history" after a silent run is an OLDER run's reply, which would be
+    re-delivered as a proactive message.
+    """
+    messages = (history or {}).get("messages")
+    if not isinstance(messages, list) or not clip_prefix:
+        return None
+    for message in reversed(messages):
+        item = _history_item(message)
+        if not item or item.get("role") != "assistant":
+            continue
+        text = item["text"].strip()
+        if clip_prefix in text:
+            return text
+    return None
+
+
+async def _proactive_run_text(conn, session_key: str, log_prefix: str) -> str | None:
+    """The finished run's assistant text for a proactive delivery.
+
+    `sessions.preview` (limit 1) decides WHETHER this run left text to show:
+    its newest item is the run's last visible row, so a run that ended silent
+    or on its own prompt yields nothing. The Gateway clips every preview item
+    (800 chars on 2026.9.x) whatever `maxChars` asks for, so a clipped item
+    is then completed from `chat.history`, which returns the message whole
+    (same source as `_recover_turn_text`, ELI-74). If `chat.history` fails or
+    has no matching message, the clipped preview is delivered rather than
+    nothing.
+    """
+    try:
+        preview = await conn.session_preview(session_key, limit=1, max_chars=8000)
+    except Exception as ex:
+        pipe_log(f"  {log_prefix}: session_preview failed: {ex}")
+        return None
+    text = _last_assistant_text_from_preview(preview, session_key)
+    clip_prefix = _preview_clip_prefix(text) if text else None
+    if not clip_prefix:
+        return text
+    try:
+        history = await conn.session_history(session_key, limit=PROACTIVE_HISTORY_LIMIT)
+    except Exception as ex:
+        pipe_log(f"  {log_prefix}: chat.history failed: {ex}; delivering the clipped preview")
+        return text
+    full = _history_text_completing_preview(history, clip_prefix)
+    if full:
+        return full
+    pipe_log(f"  {log_prefix}: no chat.history message matches the clipped preview; delivering it as is")
+    return text
+
+
 async def _maybe_deliver_proactive_after_debounce(
     conn: "_GatewayConnection",
     session_key: str,
@@ -3826,6 +3904,18 @@ def _relinearize_proactive_variants(history: dict) -> bool:
             continue
         proactive.sort(key=lambda k: (messages.get(k) or {}).get("timestamp") or 0)
         chain = proactive + others  # `others` is [] or exactly [one]
+        # Everything after chain[0] gets a new parentId. OWUI 0.12's
+        # `Chats.update_chat_by_id` keeps the STORED copy of any assistant
+        # message whose `done` is False, so re-parenting a still-streaming
+        # reply (a live-relay proactive message, or a turn in flight) is
+        # silently dropped while the rest of the group moves. Leave the whole
+        # group for a later turn's heal, when that message is finished.
+        if any(
+            (messages.get(k) or {}).get("role") == "assistant"
+            and (messages.get(k) or {}).get("done") is False
+            for k in chain[1:]
+        ):
+            continue
         # Keep only the first node under the parent; chain the rest under the
         # deepest leaf of the previous node's existing subtree (a proactive
         # message may already anchor its own tail -- e.g. a later proactive
@@ -4447,15 +4537,9 @@ async def _deliver_proactive_owui_message(
         for stale_key in list(conn._delivered_proactive)[:100]:
             conn._delivered_proactive.pop(stale_key, None)
 
-    try:
-        preview = await conn.session_preview(session_key, limit=1, max_chars=8000)
-    except Exception as ex:
-        pipe_log(f"  proactive delivery: session_preview failed: {ex}")
-        return
-
-    text = _last_assistant_text_from_preview(preview, session_key)
+    text = await _proactive_run_text(conn, session_key, "proactive delivery")
     if not text:
-        pipe_log("  proactive delivery: no assistant text in preview, skipping")
+        pipe_log("  proactive delivery: no assistant text, skipping")
         return
 
     text = f"*↳ Proactive message*\n\n{text}"
@@ -4561,15 +4645,9 @@ async def _deliver_subagent_proactive_owui_message(
         for stale_key in list(conn._delivered_proactive)[:100]:
             conn._delivered_proactive.pop(stale_key, None)
 
-    try:
-        preview = await conn.session_preview(child_session_key, limit=1, max_chars=8000)
-    except Exception as ex:
-        pipe_log(f"  subagent proactive delivery: session_preview failed: {ex}")
-        return
-
-    text = _last_assistant_text_from_preview(preview, child_session_key)
+    text = await _proactive_run_text(conn, child_session_key, "subagent proactive delivery")
     if not text:
-        pipe_log("  subagent proactive delivery: no assistant text in preview, skipping")
+        pipe_log("  subagent proactive delivery: no assistant text, skipping")
         return
 
     label = f"Sub-agent finished: {task_title}" if task_title else "Sub-agent finished"
@@ -4882,6 +4960,39 @@ def _session_active_from_signals(describe_status, list_has_active_run) -> bool:
     if describe_status in _ACTIVE_RUN_STATES:
         return True
     return bool(list_has_active_run)
+
+
+def _owui_owns_inflight_message() -> bool:
+    """True when the running Open WebUI (0.12+) owns the in-flight assistant
+    message, which makes the pipe's REST mid-run snapshot a no-op.
+
+    Two 0.12 changes, measured live on 2026-10-11 against 0.12.0:
+      * `Chats.update_chat_by_id` keeps the STORED copy of any assistant
+        message whose stored or incoming `done` is False
+        (`models/chats.py::update_chat_by_id`), so the snapshot's
+        `history.messages[id]` patch is dropped. The live probe saw every
+        snapshot POST return 200 while the DB row stayed at content=0 until
+        `done`.
+      * The streaming handler keeps in-progress content/output in
+        `response_streams` (`middleware.py::save_current_response_stream`)
+        and `GET /api/v1/chats/{id}` overlays it onto the message
+        (`routers/chats.py::overlay_response_streams`). The same probe read
+        the growing text back from that GET every poll, so a client that
+        reloads mid-turn is rehydrated by OWUI itself.
+
+    `insert_chat_turn` (the 0.12 server-side turn insertion that came with
+    the `done` rule) is the feature marker. Outside OWUI, or on an older
+    OWUI, this is False and the snapshot keeps running.
+    """
+    mod = sys.modules.get("open_webui.models.chats")
+    if mod is None:
+        try:
+            import importlib
+            mod = importlib.import_module("open_webui.models.chats")
+        except Exception:
+            return False
+    chats = getattr(mod, "Chats", None)
+    return callable(getattr(chats, "insert_chat_turn", None))
 
 
 def _is_restart_signature(err: str) -> bool:
@@ -5323,9 +5434,15 @@ class Pipe:
         .messages{}` (keyed by message id) merges whole-object-per-id
         server-side (`Chats.merge_history`), so only the one patched
         message needs to be sent there.
+
+        Skipped on OWUI 0.12+ (`_owui_owns_inflight_message`): there the
+        write is discarded for an unfinished message and OWUI serves the
+        in-flight text to reloading clients on its own.
         """
         token = bearer_token or self.valves.OWUI_API_KEY
         if not token or not chat_id or not message_id:
+            return
+        if _owui_owns_inflight_message():
             return
         base = self.valves.OWUI_BASE_URL.rstrip('/')
         headers = {
@@ -5905,6 +6022,9 @@ class Pipe:
         last_rest_snapshot_time = 0.0
         rest_snapshot_interval_s = 2.5
         rest_snapshot_task: asyncio.Task | None = None
+        # OWUI 0.12+ discards this write and rehydrates reloads itself
+        # (`_owui_owns_inflight_message`), so don't schedule it at all there.
+        rest_snapshot_enabled = not _owui_owns_inflight_message()
         wait_started_time = time.time()
         last_activity_time = time.time()
         idle_probe_s = 30
@@ -6008,7 +6128,7 @@ class Pipe:
             convention (bridge-rehydration-rest-snapshot-verify, 2026-08-26).
             """
             nonlocal last_rest_snapshot_text, last_rest_snapshot_time, rest_snapshot_task
-            if done or not owui_message_id:
+            if done or not owui_message_id or not rest_snapshot_enabled:
                 return
             if not visible_message_text or visible_message_text == last_rest_snapshot_text:
                 return

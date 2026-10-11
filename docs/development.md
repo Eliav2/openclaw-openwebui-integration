@@ -61,7 +61,7 @@ because the artifacts run inside Open WebUI's interpreter.
 
 Most of the suite (`test_pipe_unit.py`, `test_status_action_unit.py`,
 `test_build.py`, `test_devcoord_unit.py`, `test_install_unit.py`,
-`test_migrate_models_unit.py`) is pure unit
+`test_migrate_models_unit.py`, `test_owui_api_unit.py`) is pure unit
 tests with no external dependencies. `test_fixture_owui_streaming_handler.py`
 is not a suite, it's a verbatim copy of Open WebUI's streaming handler, used
 as a fixture to pin tool-card rendering against the real thing.
