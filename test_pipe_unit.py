@@ -1650,6 +1650,17 @@ class ParkedCancelTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(conn.was_delivered_live("s", "run-1"))
         await conn.claim_cancelled_turn("s")
 
+    async def test_seeded_renderer_keeps_the_run_baseline(self):
+        conn, _ = self._conn()
+        q = conn.register_consumer("s", "run-1")
+        q.put_nowait({"payload": {"stream": "assistant", "data": {"delta": "2\n"}}})
+        conn.register_run_target("s", "run-1", "chat", "msg-2")
+        conn.seed_run_renderer("s", "run-1", q,
+                               run_text={"received": "1\n", "stream": "1\n", "item": ""})
+        r = conn._run_renderers["s:run-1"]
+        r.feed({"stream": "assistant", "data": {"text": "1\n2\n"}})
+        self.assertEqual(r.visible_text, "2\n")
+
     async def test_seed_renderer_from_buffered_queue(self):
         conn, _ = self._conn()
         q = conn.register_consumer("s", "run-1")
@@ -1898,6 +1909,37 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.05)
         self.assertIn("abort", self.rpc)
         self.assertEqual(self.conn._consumers, {})
+
+    async def test_adopted_run_closing_text_is_not_appended_again(self):
+        # Live 2026-10-12: the reply continuing a run showed 2327..4000 and
+        # then the whole 1..4000 again. The run's closing catch-all event
+        # carries its ENTIRE text; the adopter must diff it against the
+        # run's baseline, not against the empty one of a fresh reply.
+        r1 = self._reply("count", "m1")
+        first = asyncio.ensure_future(r1.__anext__())
+        await self._until_registered("run-1")
+        self.active = True
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "1\n"))
+        await first
+        await r1.aclose()
+
+        r2 = self._reply("next", "m2")
+        q.put_nowait(self._delta("run-1", "2\n"))
+        q.put_nowait({"type": "event", "event": "agent", "payload": {
+            "sessionKey": self.SK, "runId": "run-1", "stream": "assistant",
+            "data": {"text": "1\n2\n"}}})
+        q.put_nowait(self._final("run-1"))
+        out = await self._read(r2, "2")
+        self.active = False
+        rest = asyncio.ensure_future(self._read(r2, "ANSWER"))
+        await self._until_registered("run-2")
+        self._queue("run-2").put_nowait(self._delta("run-2", "ANSWER"))
+        self._queue("run-2").put_nowait(self._final("run-2"))
+        out += await rest
+        await r2.aclose()
+        self.assertEqual(out.count("1\n"), 0, f"run text appended again: {out!r}")
+        self.assertEqual(out.count("2\n"), 1, out)
 
     async def test_plain_stop_still_stops(self):
         r1 = self._reply("count", "m1")
