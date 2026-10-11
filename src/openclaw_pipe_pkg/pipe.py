@@ -199,6 +199,15 @@ class Pipe:
             description="Auto-generate a chat title after the first exchange (like native OWUI). "
                 "Uses a fast model; best-effort, non-blocking."
         )
+        COMPOSER_STATUS_BUTTON: bool = Field(
+            default=True,
+            description="Add an OpenClaw 'Status' button to the composer row of "
+                "OpenClaw chats (it opens the same dialog as the Status Action's "
+                "message button, so that Action must be installed). Installed "
+                "into the page at the start of each turn and when a tab opens an "
+                "OpenClaw chat. Turn off to stop delivering it; an already open "
+                "tab keeps it until reload."
+        )
         TITLE_GEN_AGENT_ID: str = Field(
             default="title-gen",
             description="Agent id used for background chat-title generation. It must "
@@ -226,6 +235,9 @@ class Pipe:
         and returns one entry per model plus a 'Default' entry.
         """
         type(self)._last_state_dir = getattr(self.valves, "STATE_DIR", "") or ""
+        # Every page load lists models, so this is the earliest point the
+        # composer watcher can start after an Open WebUI restart or redeploy.
+        _ensure_composer_watcher(lambda: self.valves)
         models, source = await _discover_models_with_source(self.valves)
 
         # Apply safety cap
@@ -652,6 +664,17 @@ class Pipe:
             )
 
         await _emit_status(__event_emitter__, "Thinking...", done=False)
+        if self.valves.COMPOSER_STATUS_BUTTON and not _initial_visible_text:
+            # Cheap and idempotent: installs the composer Status button in the
+            # tabs showing this chat (a no-op where it is already there). Once
+            # per turn: the thinking-retry recursion skips it.
+            _ensure_composer_watcher(lambda: self.valves)
+            await _emit_composer_button(
+                __event_emitter__,
+                session_id=(__metadata__ or {}).get("session_id"),
+                chat_id=(__metadata__ or {}).get("chat_id"),
+                model_prefixes=_composer_note_model(body.get("model")),
+            )
         pipe_log(f"Messages: {len(messages)}, last role: "
                  f"{messages[-1]['role'] if messages else 'NONE'}")
 

@@ -76,7 +76,8 @@ PIPE = Artifact(
     out=ROOT / "openclaw_pipe.py",
     dev_out=ROOT / "openclaw_pipe.dev.py",
     module_order=("_prelude", "identity", "state", "thinking", "media", "emit",
-                  "askuser", "gateway", "models", "pipe"),
+                  "composer", "composer_watch", "askuser", "gateway", "models",
+                  "pipe"),
 )
 
 # The status Action reuses the Pipe's connection/identity/formatting
@@ -91,8 +92,11 @@ ACTION = Artifact(
     out=ROOT / "openclaw_status_action.py",
     dev_out=None,
     module_order=("_prelude", "identity", "state", "thinking", "gateway",
-                  "emit", "action"),
+                  "emit", "composer", "action"),
 )
+# "composer" is in both: the Action and the Pipe each deliver the composer
+# Status button snippet (see composer.py), so it has one source. Its watcher
+# ("composer_watch") runs in the Pipe only.
 # "thinking" is here because ACTION takes "gateway", and gateway's ladder cache
 # helper reads LEVEL_RANKS / LADDER_CACHE_NAME from it. Python resolves those at
 # call time, not import time, so omitting the fragment would not fail the build
