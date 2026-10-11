@@ -31,17 +31,15 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
-import functools
 import json
 import os
 import shutil
 import subprocess
-import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from pathlib import Path
 
 import click
