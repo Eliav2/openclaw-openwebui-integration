@@ -144,6 +144,8 @@ from openclaw_pipe import (
     _owui_chat_send_params,
     _owui_session_key,
     _preview_recovery_text,
+    _history_recovery_text,
+    _recover_turn_text,
     _provider_from_key,
     _reap_stale_gateway_connection,
     _relative_time,
@@ -198,6 +200,110 @@ class PreviewRecoveryTests(unittest.TestCase):
         self.assertIsNone(
             _preview_recovery_text(preview, "agent:main:test", "current question")
         )
+
+
+class InterruptedTurnTailRecoveryTests(unittest.TestCase):
+    """ELI-74: a turn whose live stream was lost is read back from the session
+    transcript. It used to come from `sessions.preview`, which the Gateway
+    clips per item server-side (2000 chars then, 800 on 2026.9.x) whatever
+    `maxChars` asks for, so long replies landed cut mid-sentence with "...".
+    """
+
+    KEY = "agent:main:openwebui-u-c"
+    QUESTION = "what changed?"
+    # Longer than both server-side preview caps.
+    LONG = "".join(f"Sentence {i} of the final answer. " for i in range(200)).strip()
+
+    def _history(self):
+        # The live claude-cli layout (captured 2026-10-11): the pipe's own user
+        # message, the imported copy behind the metadata envelope, the turn's
+        # assistant messages (tool-only ones have no text), then the closing
+        # message carrying the whole turn's text.
+        envelope = (
+            "Conversation info (untrusted metadata):\n```json\n{}\n```\n\n"
+            + self.QUESTION
+        )
+        return {"messages": [
+            {"role": "user", "content": "older question"},
+            {"role": "assistant", "content": [{"type": "text", "text": "older answer"}]},
+            {"role": "user", "content": self.QUESTION,
+             "idempotencyKey": "msg-c-1:user"},
+            {"role": "user", "content": envelope},
+            {"role": "assistant", "content": [{"type": "text", "text": "I'll check."}]},
+            {"role": "assistant", "content": [
+                {"type": "toolcall", "name": "exec"}, {"type": "tool_result"}]},
+            {"role": "user", "content": [{"type": "tool_result", "content": "ok"}]},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "hmm"},
+                {"type": "text", "text": self.LONG}]},
+        ]}
+
+    @staticmethod
+    def _clipping_preview(full_text, cap=800):
+        """What the Gateway's sessions.preview returns: every item clipped."""
+        def clip(t):
+            return t if len(t) <= cap else t[:cap - 3] + "..."
+
+        async def session_preview(session_key, limit=8, max_chars=4000):
+            return {"previews": [{"key": session_key, "items": [
+                {"role": "user", "text": InterruptedTurnTailRecoveryTests.QUESTION},
+                {"role": "assistant", "text": clip(full_text)},
+            ]}]}
+        return session_preview
+
+    def _conn(self, history=None, history_error=None):
+        conn = types.SimpleNamespace()
+        if history_error is not None:
+            conn.session_history = mock.AsyncMock(side_effect=history_error)
+        else:
+            conn.session_history = mock.AsyncMock(return_value=history)
+        conn.session_preview = mock.AsyncMock(side_effect=self._clipping_preview(self.LONG))
+        return conn
+
+    def test_long_tail_survives_intact(self):
+        self.assertGreater(len(self.LONG), 2000)
+        conn = self._conn(self._history())
+        recovered = asyncio.run(_recover_turn_text(conn, self.KEY, self.QUESTION))
+        self.assertEqual(recovered, self.LONG)
+        self.assertFalse(recovered.endswith("..."))
+        conn.session_preview.assert_not_awaited()
+
+    def test_history_is_requested_with_a_budget_above_the_old_clip(self):
+        conn = self._conn(self._history())
+        asyncio.run(_recover_turn_text(conn, self.KEY, self.QUESTION))
+        conn.session_history.assert_awaited_once_with(self.KEY)
+        # The default budget the request goes out with.
+        self.assertGreaterEqual(
+            inspect.signature(_GatewayConnection.session_history)
+            .parameters["max_chars"].default,
+            len(self.LONG),
+        )
+
+    def test_returns_the_turns_closing_text_not_its_opening_preamble(self):
+        self.assertEqual(_history_recovery_text(self._history(), self.QUESTION), self.LONG)
+
+    def test_stops_at_the_next_turn(self):
+        history = self._history()
+        history["messages"] += [
+            {"role": "user", "content": "a later question"},
+            {"role": "assistant", "content": [{"type": "text", "text": "later answer"}]},
+        ]
+        self.assertEqual(_history_recovery_text(history, self.QUESTION), self.LONG)
+
+    def test_falls_back_to_the_preview_when_history_fails(self):
+        conn = self._conn(history_error=GatewayError("unknown method chat.history"))
+        recovered = asyncio.run(_recover_turn_text(conn, self.KEY, self.QUESTION))
+        self.assertTrue(recovered.endswith("..."))  # clipped, but not nothing
+        conn.session_preview.assert_awaited_once()
+
+    def test_falls_back_to_the_preview_when_history_has_no_match(self):
+        conn = self._conn({"messages": []})
+        self.assertIsNotNone(asyncio.run(_recover_turn_text(conn, self.KEY, self.QUESTION)))
+        conn.session_preview.assert_awaited_once()
+
+    def test_no_match_anywhere_is_none(self):
+        conn = self._conn({"messages": []})
+        self.assertIsNone(asyncio.run(_recover_turn_text(conn, self.KEY, "never asked")))
 
 
 class ProactiveDeliveryTests(unittest.TestCase):
@@ -4340,6 +4446,99 @@ class RepeatedAskUserMarkerTests(unittest.TestCase):
         self.assertEqual(_dedupe_options(["a", "  ", "", "a"]), ["a"])
 
 
+class MediaDirectiveDoubledFilenameTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-76. Captured 2026-07-29 (OWUI 0.10.2 baseline, Gemini 3 Flash): a
+    reply that was exactly `MEDIA:<file>.png`, with no trailing whitespace,
+    persisted as a link with the filename doubled, which 404s.
+
+    How the doubled text formed: `_advance_media_buffer` held the whole
+    directive back (no whitespace ever confirmed the filename), so nothing was
+    shown. The turn's catch-all event then carried the whole reply again; it
+    was diffed against SHOWN text (empty), looked entirely new, and was
+    appended to the buffer with no separator. The end-of-stream flush handed
+    `MEDIA:F.pngMEDIA:F.png` to `_resolve_media`, whose whitespace-only split
+    took all of it as one filename.
+
+    The stream half was closed by ELI-80 (diff the catch-all against received
+    text). The media half is fixed here: a filename now also ends at the next
+    `MEDIA:`, and a glued copy of the same directive is dropped.
+    """
+
+    BASE = "https://homeassistant.tail25faa5.ts.net:18791"
+    F = "baseline-test2-0102-1785351819.png"
+    MALFORMED = (f"![{F}MEDIA:{F}]"
+                 f"(https://homeassistant.tail25faa5.ts.net:18791/{F}MEDIA:{F})")
+    CORRECT = f"![{F}](https://homeassistant.tail25faa5.ts.net:18791/{F})"
+
+    def _stream(self, catch_all_baseline):
+        """Replay the turn through the pipe's real assistant-stream helpers.
+
+        Returns what the end-of-stream flush hands to `_resolve_media`.
+        `catch_all_baseline` picks what the catch-all is diffed against:
+        "received" (the code since ELI-80) or "shown" (the code ELI-76 hit).
+        """
+        reply = "MEDIA:" + self.F
+        prompt_pending = media_pending = received = visible = ""
+        for delta in (reply[i:i + 9] for i in range(0, len(reply), 9)):
+            received += delta
+            flush, prompt_pending = _advance_input_prompt_buffer(prompt_pending, delta)
+            if not flush:
+                continue
+            shown, media_pending = _advance_media_buffer(media_pending, flush)
+            visible += shown
+        self.assertEqual(visible, "")  # the whole directive was held back
+        if catch_all_baseline == "received":
+            delta = _catch_all_delta(reply, received, visible)
+        else:
+            delta = _item_delta_text(reply, "", visible)
+        flush, prompt_pending = _advance_input_prompt_buffer(prompt_pending, delta)
+        if flush:
+            _shown, media_pending = _advance_media_buffer(media_pending, flush)
+        return prompt_pending + media_pending
+
+    def test_issue_sequence_resolves_to_one_correct_link(self):
+        pending = self._stream("received")
+        self.assertEqual(pending, "MEDIA:" + self.F)
+        self.assertEqual(_resolve_media(pending, base_url=self.BASE), (self.CORRECT, True))
+
+    def test_shown_only_catch_all_is_what_doubled_the_directive(self):
+        """Pins the stream half of the mechanism."""
+        self.assertEqual(self._stream("shown"), f"MEDIA:{self.F}MEDIA:{self.F}")
+
+    def test_glued_duplicate_no_longer_yields_the_issue_link(self):
+        """The exact malformed link from the issue, fed its exact input."""
+        result, handled = _resolve_media(f"MEDIA:{self.F}MEDIA:{self.F}", base_url=self.BASE)
+        self.assertTrue(handled)
+        self.assertNotEqual(result, self.MALFORMED)
+        self.assertEqual(result, self.CORRECT)
+
+    def test_glued_distinct_directives_become_two_images(self):
+        result, handled = _resolve_media("MEDIA:a.pngMEDIA:b.png", base_url="https://x")
+        self.assertTrue(handled)
+        self.assertEqual(result, "![a.png](https://x/a.png)\n![b.png](https://x/b.png)")
+
+    def test_longer_name_sharing_the_prefix_is_not_swallowed(self):
+        result, _ = _resolve_media("MEDIA:a.pngMEDIA:a.png.bak", base_url="https://x")
+        self.assertEqual(result, "![a.png](https://x/a.png)\n![a.png.bak](https://x/a.png.bak)")
+
+    async def test_owui_upload_path_uploads_once_with_the_real_name(self):
+        uploads = []
+
+        def fake_upload(fpath, base_url, token):
+            uploads.append(fpath.rsplit("/", 1)[-1])
+            return {"id": "f1", "meta": {"content_type": "image/png"}}
+
+        with mock.patch("openclaw_pipe._upload_owui_file", side_effect=fake_upload), \
+             mock.patch("os.path.isfile", return_value=True):
+            result, handled = await _resolve_media_via_owui(
+                f"MEDIA:{self.F}MEDIA:{self.F}",
+                base_url="https://owui.example.com", token="tok", __event_emitter__=None,
+            )
+        self.assertTrue(handled)
+        self.assertEqual(uploads, [self.F])
+        self.assertEqual(result, f"![{self.F}](/api/v1/files/f1/content)")
+
+
 class CatchAllDuplicatesAskUserPromptTests(unittest.TestCase):
     """ELI-80. Reproduced live 2026-08-01 with a SINGLE marker emission.
 
@@ -5074,7 +5273,7 @@ class ThinkingRejectionRetryTests(unittest.TestCase):
     The Gateway never streams this rejection as a normal event (the run
     delivers a single contentless `final`), so an earlier attempt at this fix
     that peeked the run's event queue for it never saw it fire. The real
-    text only surfaces via `recover_from_preview()` at `_pipe_impl`'s final
+    text only surfaces via `recover_from_transcript()` at `_pipe_impl`'s final
     fallback, which is what `_thinking_rejection_retry_body` gates.
     """
 
@@ -5137,7 +5336,7 @@ class ThinkingRejectionRetryTests(unittest.TestCase):
     def test_retry_cannot_fire_twice_in_a_row(self):
         # Simulates the recursive call: the first pass strips
         # reasoning_effort, so a second pass over that same body always has
-        # resolved_thinking=None regardless of what recover_from_preview()
+        # resolved_thinking=None regardless of what recover_from_transcript()
         # returns -- the natural termination this fix relies on instead of
         # an explicit recursion-guard flag.
         first_body = {"reasoning_effort": "high"}

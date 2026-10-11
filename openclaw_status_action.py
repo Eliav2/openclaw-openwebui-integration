@@ -521,7 +521,12 @@ def _parse_gateway_url(raw: str) -> tuple[str, int]:
 
 
 def _preview_recovery_text(preview: dict, session_key: str, user_text: str) -> str | None:
-    """Return assistant text saved after this user message, if preview has it."""
+    """Return assistant text saved after this user message, if preview has it.
+
+    Lossy: the Gateway clips every `sessions.preview` item server-side (800
+    chars on 2026.9.x, 2000 before) whatever `maxChars` asks for. Only the
+    fallback for when `_history_recovery_text` finds nothing (ELI-74).
+    """
     previews = preview.get("previews")
     if not isinstance(previews, list):
         return None
@@ -534,7 +539,72 @@ def _preview_recovery_text(preview: dict, session_key: str, user_text: str) -> s
     if not entry:
         return None
 
-    items = entry.get("items")
+    return _recovery_text_from_items(entry.get("items"), user_text)
+
+
+# Budget for reading back an interrupted turn's tail. `chat.history` honors
+# maxChars per message (schema max 500000) up to a 128 KiB per-message byte
+# cap; 50000 chars stays under that cap even for 2-byte scripts like Hebrew.
+RECOVERY_HISTORY_LIMIT = 40
+RECOVERY_HISTORY_MAX_CHARS = 50000
+
+
+def _history_item(message) -> dict | None:
+    """Flatten one `chat.history` message to the {role, text} shape of a
+    `sessions.preview` item. Only `text` blocks count: tool calls, tool results
+    and thinking blocks are not part of the visible answer."""
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        text = "".join(
+            str(block.get("text") or "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    else:
+        text = str(message.get("text") or "")
+    return {"role": message.get("role"), "text": text}
+
+
+def _history_recovery_text(history: dict, user_text: str) -> str | None:
+    """Return the full assistant text saved after this user message, read from
+    a `chat.history` response.
+
+    This replaces `sessions.preview` as the recovery source (ELI-74): the
+    preview is clipped server-side, so a long reply recovered from it landed
+    in OWUI cut mid-sentence with a trailing "...". `chat.history` returns the
+    message whole.
+    """
+    messages = (history or {}).get("messages")
+    if not isinstance(messages, list):
+        return None
+    return _recovery_text_from_items([_history_item(m) for m in messages], user_text)
+
+
+def _recovery_user_text_matches(item_text: str, user_text: str) -> bool:
+    """True if a stored user message is the one this turn sent.
+
+    The transcript can hold it verbatim or behind the Gateway's metadata
+    envelope ("Conversation info (untrusted metadata): ...", then a blank
+    line, then the text). `sessions.preview` strips that envelope;
+    `chat.history` does not.
+    """
+    return item_text == user_text or item_text.endswith("\n" + user_text)
+
+
+def _recovery_text_from_items(items, user_text: str) -> str | None:
+    """The turn's final assistant text: the LAST non-empty assistant item after
+    the last user item matching `user_text`, stopping at the next user message.
+
+    Last, not first: a tool-using turn stores several assistant messages. On
+    the claude-cli runtime the closing one repeats the whole turn's text
+    (preambles included); on the embedded runtime it is the final answer. The
+    first one is only the opening preamble ("I'll look at ..."), which is what
+    recovery used to return.
+    """
     if not isinstance(items, list):
         return None
 
@@ -548,21 +618,49 @@ def _preview_recovery_text(preview: dict, session_key: str, user_text: str) -> s
             continue
         if item.get("role") != "user":
             continue
-        if str(item.get("text", "")).strip() == normalized_user_text:
+        if _recovery_user_text_matches(
+            str(item.get("text", "")).strip(), normalized_user_text
+        ):
             last_matching_user_index = idx
 
     if last_matching_user_index is None:
         return None
 
+    found = None
     for item in items[last_matching_user_index + 1:]:
         if not isinstance(item, dict):
             continue
-        if item.get("role") != "assistant":
-            continue
         text = str(item.get("text", "")).strip()
+        if item.get("role") == "user" and text:
+            break  # the next turn; tool results are user items with no text
+        if item.get("role") == "assistant" and text:
+            found = text
+    return found
+
+
+async def _recover_turn_text(conn, session_key: str, user_text: str) -> str | None:
+    """Read back the assistant text of a turn whose live stream was lost.
+
+    `chat.history` first, because it returns the message whole. The old
+    `sessions.preview`-only path persisted long replies clipped mid-sentence
+    with a trailing "..." (ELI-74): the Gateway caps each preview item
+    server-side, so no `maxChars` value fixes it. The preview stays as a
+    fallback for a Gateway that refuses `chat.history`.
+    """
+    try:
+        history = await conn.session_history(session_key)
+        text = _history_recovery_text(history, user_text)
         if text:
             return text
-    return None
+        pipe_log("  history recovery found no reply; trying sessions.preview")
+    except Exception as ex:
+        pipe_log(f"  history recovery failed: {ex}; trying sessions.preview")
+    try:
+        preview = await conn.session_preview(session_key)
+        return _preview_recovery_text(preview, session_key, user_text)
+    except Exception as ex:
+        pipe_log(f"  preview recovery failed: {ex}")
+        return None
 
 
 def _owui_session_key(agent_id: str, user_id: str, chat_id: str) -> str:
@@ -1794,10 +1892,22 @@ class _GatewayConnection:
 
     async def session_preview(self, session_key: str, limit: int = 8,
                               max_chars: int = 4000) -> dict:
-        """Fetch a bounded transcript preview for timeout recovery."""
+        """Fetch a bounded transcript preview. Every item comes back clipped
+        server-side (see `_preview_recovery_text`), so do not use this where
+        the whole message matters."""
         return await self.send_request(
             "sessions.preview",
             dict(keys=[session_key], limit=limit, maxChars=max_chars),
+            timeout=10
+        )
+
+    async def session_history(self, session_key: str,
+                              limit: int = RECOVERY_HISTORY_LIMIT,
+                              max_chars: int = RECOVERY_HISTORY_MAX_CHARS) -> dict:
+        """Fetch the session's recent messages unclipped, for timeout recovery."""
+        return await self.send_request(
+            "chat.history",
+            dict(sessionKey=session_key, limit=limit, maxChars=max_chars),
             timeout=10
         )
 

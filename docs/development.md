@@ -40,6 +40,15 @@ the first doc. It needs the integration deployed and a real streaming turn, it p
 chat until the turn is done and reports whether mid-run snapshots landed and
 whether the final message duplicated itself.
 
+`scripts/migrate_stale_chat_models.py` repoints chats whose saved model the
+Gateway no longer offers. Open WebUI drops an unlisted model id before the
+Pipe runs (the browser swaps in the default model, the API answers "Model not
+found"), so the Pipe cannot map old ids itself; the stored chat has to change.
+It picks each successor from the live model list (same model under another
+provider, else the newest model of the same Claude family, else `default`),
+is a dry run unless given `--apply`, writes a backup before changing anything,
+and `--restore <backup>` undoes it. Re-run it after the Gateway drops models.
+
 ### Running the tests
 
 ```bash
@@ -50,7 +59,8 @@ uv run --with pytest --with pydantic --with websockets --with cryptography \
 This is green on a fresh clone with no setup.
 
 Most of the suite (`test_pipe_unit.py`, `test_status_action_unit.py`,
-`test_build.py`, `test_devcoord_unit.py`, `test_install_unit.py`) is pure unit
+`test_build.py`, `test_devcoord_unit.py`, `test_install_unit.py`,
+`test_migrate_models_unit.py`) is pure unit
 tests with no external dependencies. `test_fixture_owui_streaming_handler.py`
 is not a suite, it's a verbatim copy of Open WebUI's streaming handler, used
 as a fixture to pin tool-card rendering against the real thing.
