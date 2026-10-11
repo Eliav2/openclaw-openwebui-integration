@@ -1,0 +1,23 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Test tooling only. pydantic, cryptography and websockets are pinned to
+  # what Open WebUI locks and move with e2e/versions.env, not on their own.
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    ignore:
+      - dependency-name: pydantic
+      - dependency-name: cryptography
+      - dependency-name: websockets
+    groups:
+      test-tooling:
+        patterns: ["*"]

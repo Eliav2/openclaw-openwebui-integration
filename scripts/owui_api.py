@@ -196,8 +196,8 @@ def _main():
     action = sys.argv[1]
 
     if action == "login":
-        t = c.login()
-        print(f"Token: ***")
+        c.login()
+        print("Token: ***")
     elif action == "list-chats":
         chats = c.list_chats()
         for ch in chats:

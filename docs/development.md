@@ -52,11 +52,12 @@ and `--restore <backup>` undoes it. Re-run it after the Gateway drops models.
 ### Running the tests
 
 ```bash
-uv run --with pytest --with pydantic --with websockets --with cryptography \
-  --with click --with rich pytest -q
+uv run --with-requirements requirements-dev.txt pytest -q
 ```
 
-This is green on a fresh clone with no setup.
+This is green on a fresh clone with no setup. `requirements-dev.txt` pins
+pydantic, cryptography and websockets to the versions Open WebUI itself locks,
+because the artifacts run inside Open WebUI's interpreter.
 
 Most of the suite (`test_pipe_unit.py`, `test_status_action_unit.py`,
 `test_build.py`, `test_devcoord_unit.py`, `test_install_unit.py`,
@@ -74,13 +75,56 @@ actually run them:
 export OWUI_URL=http://your-owui-host:8080
 export OWUI_EMAIL=admin@example.com
 export OWUI_PASSWORD=your-password
-uv run --with pytest --with pydantic --with websockets --with cryptography \
-  --with click --with rich pytest -q test_pipe.py
+uv run --with-requirements requirements-dev.txt pytest -q test_pipe.py
 ```
 
-CI (`.github/workflows/ci.yml`) runs the drift guard for both artifacts, the
-unit suite, and a load check that execs each artifact the way OWUI's plugin
-loader does, on Python 3.10 to 3.13.
+### CI
+
+Every push and PR runs `.github/workflows/ci.yml`:
+
+| Job | What it guards |
+|-----|----------------|
+| Lint | `ruff` with correctness rules only (`ruff.toml`), run on the **built artifacts** rather than the fragments, so an undefined name is caught where Open WebUI would hit it. Also `shellcheck`, `actionlint`, and a parse check of the Gateway plugin. |
+| Unit (py3.10 to 3.13) | Drift guard for every artifact, the unit suite (coverage reported on 3.11), and a load check that execs each artifact the way Open WebUI's plugin loader does. |
+| OWUI handler fixture is current | `scripts/check_owui_fixture.py` compares the vendored `handle_responses_streaming_event` with Open WebUI's source at the pinned version. A stale copy is how the tool cards once vanished while the suite stayed green. |
+| Secret scan | gitleaks over the full history. |
+| E2E | The whole stack, real everywhere except the model (below). |
+
+**E2E** (`.github/workflows/e2e.yml`, `e2e/`): starts a deterministic fake
+OpenAI-compatible model (`e2e/fake_llm.py`), a real OpenClaw Gateway pointed at
+it, and Open WebUI in Docker; installs the Pipe, Filter and Action with
+`uv run install*.py install` exactly as the README tells users to (device
+pairing and the installer's smoke test included); then runs `e2e/test_e2e.py`
+and `test_pipe.py` against it. Because the model is scripted, replies are
+asserted exactly, and a real tool call (`session_status`) is checked all the
+way into the chat Open WebUI persisted, as a `function_call` with its matching
+`function_call_output`. Gateway, Open WebUI and model logs are uploaded as an
+artifact on every run.
+
+The versions it runs against are pinned in `e2e/versions.env`. Bump them in the
+PR that makes the code work with a new release, together with the matching
+pins in `requirements-dev.txt` and a re-extracted fixture
+(`python3 scripts/check_owui_fixture.py --ref <tag> --print-upstream`).
+
+**Compat watch** (`.github/workflows/compat-watch.yml`, daily): the same E2E
+stack against `open-webui:latest` and `openclaw@latest`, and the fixture
+against upstream's latest release and `main`. A scheduled failure opens or
+updates one tracking issue, so a breaking upstream release is visible before
+the pins are bumped.
+
+**CodeQL** runs on Python, JavaScript and the workflows themselves.
+**Dependabot** updates the GitHub Actions and the test tooling weekly.
+
+To run the E2E stack on your own Linux machine (Docker, Node 24 and uv needed;
+it installs `openclaw` globally and writes `~/.openclaw/openclaw.json`, so use a
+throwaway VM or container, never a host running a real Gateway):
+
+```bash
+set -a; . e2e/versions.env; set +a
+bash e2e/start_stack.sh        # last line is an `export ...` for the test env
+export OWUI_URL=... OWUI_EMAIL=... OWUI_PASSWORD=... E2E_STACK=1   # paste it
+uv run --with-requirements requirements-dev.txt pytest -v e2e/test_e2e.py
+```
 
 ---
 

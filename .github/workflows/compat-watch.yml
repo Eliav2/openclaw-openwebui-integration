@@ -1,0 +1,72 @@
+name: Compat watch
+
+# CI pins Open WebUI and OpenClaw (e2e/versions.env) so a red PR always means
+# the PR. This workflow is the other half: it runs the same end-to-end stack
+# against what upstream ships *next*, and checks the vendored Open WebUI
+# handler against upstream's main branch, so a breaking release shows up here
+# before a user hits it. On a scheduled failure it opens (or comments on) one
+# tracking issue instead of failing silently.
+
+on:
+  schedule:
+    - cron: "17 4 * * *"  # daily, 04:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  e2e-latest:
+    name: E2E vs latest releases
+    uses: ./.github/workflows/e2e.yml
+    with:
+      lane: latest
+      owui_image: ghcr.io/open-webui/open-webui:latest
+      openclaw_version: latest
+
+  fixture-upstream:
+    name: OWUI handler fixture vs upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        ref: [latest-release, main]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Compare
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ matrix.ref }}
+        run: |
+          if [ "$REF" = "latest-release" ]; then
+            REF=$(gh api repos/open-webui/open-webui/releases/latest --jq .tag_name)
+          fi
+          python3 scripts/check_owui_fixture.py --ref "$REF"
+
+  report:
+    name: Open or update tracking issue
+    needs: [e2e-latest, fixture-upstream]
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Compat watch: upstream Open WebUI or OpenClaw broke the integration"
+          body="The scheduled compat watch failed: $RUN_URL
+
+          It runs the end-to-end stack against \`open-webui:latest\` + \`openclaw@latest\` and checks the vendored Open WebUI handler against upstream. The pinned CI lane is unaffected until \`e2e/versions.env\` is bumped; the logs artifact on the run has the Gateway, Open WebUI and fake-model logs."
+          existing=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "Still failing: $RUN_URL"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi

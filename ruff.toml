@@ -1,0 +1,31 @@
+# Correctness lint, not style. The rules picked here each name a class of bug
+# that has a real failure mode in this codebase; formatting is left alone.
+#
+# The source fragments under src/ are excluded on purpose: build.py
+# concatenates them, so each one uses names another fragment defines and a
+# per-file linter reports hundreds of false "undefined name" errors. The
+# built artifacts are linted instead, which is what Open WebUI actually runs,
+# and where an undefined name is a real NameError at runtime.
+target-version = "py310"
+extend-exclude = [
+    "src/openclaw_pipe_pkg",
+    "openclaw_pipe.dev.py",
+    # verbatim upstream copy, re-extracted rather than edited
+    "test_fixture_owui_streaming_handler.py",
+    "backups",
+]
+
+[lint]
+select = [
+    "E9",      # syntax errors
+    "F",       # pyflakes: undefined names, redefinitions, unused imports
+    "PLE",     # pylint errors
+    "RUF006",  # asyncio.create_task without a reference: the loop holds only a weak one
+]
+
+[lint.per-file-ignores]
+# Every artifact carries the shared _prelude imports, and each artifact only
+# uses some of them.
+"openclaw_*.py" = ["F401"]
+# Tests import names to assert the artifact exports them.
+"test_*.py" = ["F401", "F811"]

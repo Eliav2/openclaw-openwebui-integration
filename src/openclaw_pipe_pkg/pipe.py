@@ -2048,7 +2048,7 @@ class Pipe:
 
         # Auto-title: generate title after first exchange (best-effort, non-blocking)
         if not aborted and text_yielded:
-            asyncio.create_task(
+            spawn_background(
                 self._auto_title(
                     body, conn, visible_message_text,
                     owui_origin_chat_id, bearer_token,

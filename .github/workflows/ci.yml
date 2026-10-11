@@ -6,17 +6,52 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  # One run per PR/branch; a new push cancels the stale run. Pushes to main
+  # are never cancelled, so every merge gets a complete record.
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  test:
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.3.0
+
+      - name: Ruff (correctness rules, see ruff.toml)
+        run: uvx ruff@0.17.0 check --output-format github .
+
+      - name: Shell scripts
+        run: shellcheck e2e/*.sh
+
+      - name: Workflows (actionlint)
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
+          ./actionlint -color
+
+      - name: Gateway plugin parses
+        run: |
+          for f in gateway-plugins/*/index.js; do node --check "$f" && echo "ok $f"; done
+          for f in gateway-plugins/*/*.json; do python3 -m json.tool "$f" >/dev/null && echo "ok $f"; done
+
+  test:
+    name: Unit (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         # 3.10 is the floor install.py declares; 3.11 is what Open WebUI ships
-        # today; 3.13 is what a user running install.py on a current distro
-        # will most likely have.
+        # (and the version coverage is reported on); 3.13 is what a user
+        # running install.py on a current distro will most likely have.
         python-version: ["3.10", "3.11", "3.12", "3.13"]
-
     steps:
       - uses: actions/checkout@v7
 
@@ -24,37 +59,68 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pytest pydantic websockets cryptography click rich
+      - uses: astral-sh/setup-uv@v10.3.0
 
-      - name: Drift guard (both distributed artifacts)
-        # The artifacts are committed because OWUI installs a single flat file,
-        # so they must never fall behind src/. Checks the Pipe AND the Action --
-        # a shared fragment feeds both.
+      - name: Install dependencies
+        run: uv pip install --system -r requirements-dev.txt
+
+      - name: Drift guard (every distributed artifact)
+        # The artifacts are committed because Open WebUI installs a single
+        # flat file, so they must never fall behind src/. A shared fragment
+        # feeds several artifacts, hence --check-all.
         run: python3 build.py --check-all
 
-      - name: Run tests
-        # Integration suites skip themselves unless OWUI_EMAIL/OWUI_PASSWORD
-        # point at a live Open WebUI, so this is unit-only on CI.
-        run: pytest -q
+      - name: Unit tests
+        # The live-instance suites (test_pipe.py, scripts/test_auto_title.py,
+        # e2e/) skip themselves here; the E2E job runs them against a real stack.
+        env:
+          PY: ${{ matrix.python-version }}
+        run: |
+          if [ "$PY" = "3.11" ]; then
+            pytest -q --cov=. --cov-report=term --cov-report=markdown:"$RUNNER_TEMP/cov.md"
+            { echo "### Unit test coverage (py3.11)"; cat "$RUNNER_TEMP/cov.md"; } >> "$GITHUB_STEP_SUMMARY"
+          else
+            pytest -q
+          fi
 
       - name: Artifacts load under Open WebUI's plugin loader
-        # OWUI execs the flat file into a module and introspects a top-level
-        # Pipe/Action class. Catches an artifact that imports or instantiates
-        # cleanly in src/ but not as a standalone single file.
+        run: python3 scripts/check_artifacts_load.py
+
+  owui-fixture:
+    name: OWUI handler fixture is current
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Vendored handler matches the pinned Open WebUI
+        # The tool-card tests are only as true as this copy of upstream's code.
         run: |
-          python3 - <<'PY'
-          import sys, types
-          for name, path, cls in (
-              ("openclaw_pipe", "openclaw_pipe.py", "Pipe"),
-              ("openclaw_status_action", "openclaw_status_action.py", "Action"),
-          ):
-              mod = types.ModuleType(name)
-              sys.modules[name] = mod
-              exec(compile(open(path).read(), path, "exec"), mod.__dict__)
-              assert hasattr(mod, cls), f"{path}: no top-level {cls}"
-              getattr(mod, cls)()
-              print(f"{path}: {cls} loaded and instantiated")
-          PY
+          set -a; . e2e/versions.env; set +a
+          python3 scripts/check_owui_fixture.py --ref "$OWUI_REF"
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: gitleaks (full history)
+        # The whole history, every run: it takes about a second, and a
+        # credential that once reached a public repo is leaked no matter which
+        # commit removed it. This is a public repo.
+        run: |
+          curl -fsSL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            | tar -xz gitleaks
+          ./gitleaks git --redact --verbose .
+
+  e2e:
+    name: E2E
+    needs: [lint, test]
+    uses: ./.github/workflows/e2e.yml
+    with:
+      lane: pinned
