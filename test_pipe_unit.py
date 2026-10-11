@@ -135,7 +135,8 @@ from openclaw_pipe import (
     _item_assistant_text,
     _item_delta_text,
     _last_assistant_text_from_preview,
-    _last_assistant_text_from_history,
+    _history_text_completing_preview,
+    _preview_clip_prefix,
     _live_session_id_for_user,
     _maybe_deliver_proactive_after_debounce,
     _maybe_deliver_subagent_proactive,
@@ -309,14 +310,16 @@ class InterruptedTurnTailRecoveryTests(unittest.TestCase):
 
 
 class ProactiveDeliveryFullTextTests(unittest.TestCase):
-    """Proactive deliveries read the run's text from `chat.history`, not the
-    `sessions.preview` the Gateway clips to 800 chars per item (2026.9.x)
-    whatever `maxChars` asks for. Long cron/sub-agent messages used to land
-    in OWUI cut mid-sentence with "..."."""
+    """The Gateway clips every `sessions.preview` item to 800 chars (2026.9.x)
+    whatever `maxChars` asks for, so long cron/sub-agent messages used to land
+    in OWUI cut mid-sentence with "...". The preview still decides whether
+    the run left text at all; a clipped item is completed from
+    `chat.history`."""
 
     USER_ID = "11111111-1111-1111-1111-111111111111"
     CHAT_ID = "22222222-2222-2222-2222-222222222222"
     LONG = "".join(f"Line {i} of the scheduled report. " for i in range(150)).strip()
+    OLDER_LONG = "".join(f"Row {i} of yesterday's answer. " for i in range(150)).strip()
 
     def _history(self, *tail):
         return {"messages": [
@@ -326,17 +329,17 @@ class ProactiveDeliveryFullTextTests(unittest.TestCase):
             *tail,
         ]}
 
-    def _conn(self, history=None, history_error=None):
+    def _conn(self, history=None, history_error=None, preview_items=None):
         conn = _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"))
         if history_error is not None:
             conn.session_history = mock.AsyncMock(side_effect=history_error)
         else:
             conn.session_history = mock.AsyncMock(return_value=history)
-        clipped = self.LONG[:797] + "..."
+        if preview_items is None:
+            preview_items = [{"role": "assistant", "text": self.LONG[:797] + "..."}]
 
         async def session_preview(session_key, limit=8, max_chars=4000):
-            return {"previews": [{"key": session_key, "items": [
-                {"role": "assistant", "text": clipped}]}]}
+            return {"previews": [{"key": session_key, "items": preview_items}]}
         conn.session_preview = mock.AsyncMock(side_effect=session_preview)
         return conn
 
@@ -364,7 +367,7 @@ class ProactiveDeliveryFullTextTests(unittest.TestCase):
         appended = self._deliver(conn)
         self.assertEqual(len(appended), 1)
         self.assertTrue(appended[0].endswith(self.LONG))
-        conn.session_preview.assert_not_awaited()
+        conn.session_history.assert_awaited_once()
 
     def test_long_subagent_message_is_delivered_whole(self):
         conn = self._conn(self._history(
@@ -375,7 +378,6 @@ class ProactiveDeliveryFullTextTests(unittest.TestCase):
         self.assertIn("<!-- openclaw:taskId=task-1 -->", appended[0])
         conn.session_history.assert_awaited_once()
         self.assertEqual(conn.session_history.await_args.args[0], "agent:main:subagent:abc")
-        conn.session_preview.assert_not_awaited()
 
     def test_skips_trailing_tool_only_messages(self):
         conn = self._conn(self._history(
@@ -385,17 +387,40 @@ class ProactiveDeliveryFullTextTests(unittest.TestCase):
         ))
         self.assertTrue(self._deliver(conn)[0].endswith(self.LONG))
 
-    def test_sentinel_delivers_nothing(self):
-        conn = self._conn(self._history(
-            {"role": "assistant", "content": [{"type": "text", "text": "NO_REPLY"}]}))
-        conn.session_preview = mock.AsyncMock(return_value={"previews": [
-            {"key": _owui_session_key("main", self.USER_ID, self.CHAT_ID),
-             "items": [{"role": "assistant", "text": "NO_REPLY"}]}]})
-        self.assertEqual(self._deliver(conn), [])
+    def test_short_message_needs_no_history_read(self):
+        conn = self._conn(preview_items=[{"role": "assistant", "text": "Done, all green."}])
+        self.assertEqual(self._deliver(conn), ["*↳ Proactive message*\n\nDone, all green."])
+        conn.session_history.assert_not_awaited()
 
-    def test_does_not_redeliver_an_older_runs_reply(self):
-        # The run produced no text: the newest text row is its own prompt.
-        self.assertIsNone(_last_assistant_text_from_history(self._history()))
+    def test_sentinel_delivers_nothing(self):
+        conn = self._conn(preview_items=[{"role": "assistant", "text": "NO_REPLY"}])
+        self.assertEqual(self._deliver(conn), [])
+        conn.session_history.assert_not_awaited()
+
+    def test_silent_run_does_not_redeliver_an_older_reply(self):
+        """chat.history hides a sub-agent completion report and drops the
+        parent's ANNOUNCE_SKIP, so its newest assistant text is the PREVIOUS
+        run's answer. The preview's newest row is the report itself (a user
+        row), so nothing is delivered and chat.history is never asked."""
+        conn = self._conn(
+            history={"messages": [
+                {"role": "user", "content": "earlier question"},
+                {"role": "assistant", "content": [{"type": "text", "text": self.OLDER_LONG}]},
+            ]},
+            preview_items=[{"role": "user", "text": "[sub-agent finished] report"}],
+        )
+        self.assertEqual(self._deliver(conn), [])
+        conn.session_history.assert_not_awaited()
+
+    def test_history_without_the_clipped_message_delivers_the_preview(self):
+        """Never swap in a different message: if no chat.history row carries
+        the clipped prefix, the clipped preview is delivered as is."""
+        conn = self._conn(history={"messages": [
+            {"role": "user", "content": "earlier question"},
+            {"role": "assistant", "content": [{"type": "text", "text": self.OLDER_LONG}]},
+        ]})
+        appended = self._deliver(conn)
+        self.assertEqual(appended, ["*↳ Proactive message*\n\n" + self.LONG[:797] + "..."])
 
     def test_falls_back_to_the_preview_when_history_fails(self):
         conn = self._conn(history_error=GatewayError("unknown method chat.history"))
@@ -403,6 +428,23 @@ class ProactiveDeliveryFullTextTests(unittest.TestCase):
         self.assertEqual(len(appended), 1)
         self.assertTrue(appended[0].endswith("..."))  # clipped, but not nothing
         conn.session_preview.assert_awaited_once()
+
+    def test_preview_clip_prefix(self):
+        self.assertIsNone(_preview_clip_prefix("Thinking..."))
+        self.assertIsNone(_preview_clip_prefix(self.LONG))
+        self.assertEqual(_preview_clip_prefix(self.LONG[:797] + "..."), self.LONG[:797].strip())
+
+    def test_history_match_picks_the_newest_message_with_the_prefix(self):
+        prefix = self.LONG[:797]
+        history = {"messages": [
+            {"role": "assistant", "content": [{"type": "text", "text": self.LONG + " (old copy)"}]},
+            {"role": "user", "content": "again"},
+            {"role": "assistant", "content": [{"type": "text", "text": self.LONG}]},
+            {"role": "assistant", "content": [{"type": "toolcall", "name": "exec"}]},
+        ]}
+        self.assertEqual(_history_text_completing_preview(history, prefix), self.LONG)
+        self.assertIsNone(_history_text_completing_preview(history, "not in there " * 20))
+        self.assertIsNone(_history_text_completing_preview({}, prefix))
 
 
 class ProactiveDeliveryTests(unittest.TestCase):

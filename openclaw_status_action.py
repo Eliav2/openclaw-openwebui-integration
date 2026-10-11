@@ -2519,62 +2519,82 @@ def _last_assistant_text_from_preview(preview: dict, session_key: str) -> str | 
     return None
 
 
-# How far back a proactive delivery reads the session transcript. The run's
-# closing assistant message is the last one; a few extra rows cover trailing
-# tool-only messages.
+# How far back a proactive delivery reads the session transcript to find the
+# whole version of a clipped preview item. The run's closing assistant message
+# is normally the newest; a few extra rows cover trailing tool-only messages.
 PROACTIVE_HISTORY_LIMIT = 8
 
+# The Gateway marks a clipped preview item with a trailing "..." (800 chars
+# per item on 2026.9.x, 2000 before). Below this many chars before the marker
+# the text is too short to be a clip, and too weak an anchor to look for.
+PREVIEW_CLIP_MARKER = "..."
+PREVIEW_CLIP_MIN_PREFIX = 200
 
-def _last_assistant_text_from_history(history: dict) -> str | None:
-    """`_last_assistant_text_from_preview` for a `chat.history` response.
 
-    Walks back from the newest message: the first assistant message with
-    text is the run's answer (a silent sentinel means nothing to show), and a
-    user message with text is the run's own prompt, so stop there instead of
-    returning an older run's reply. Messages with no text blocks (tool calls,
-    tool results) are skipped.
+def _preview_clip_prefix(text: str) -> str | None:
+    """The kept part of a clipped `sessions.preview` item, or None when the
+    item does not look clipped (it is then already the whole message)."""
+    if not text.endswith(PREVIEW_CLIP_MARKER):
+        return None
+    prefix = text[: -len(PREVIEW_CLIP_MARKER)].strip()
+    return prefix if len(prefix) >= PREVIEW_CLIP_MIN_PREFIX else None
+
+
+def _history_text_completing_preview(history: dict, clip_prefix: str) -> str | None:
+    """The whole text of the `chat.history` message a clipped preview item
+    was cut from: the newest assistant message whose text contains the kept
+    prefix.
+
+    Anchored on the preview on purpose. `chat.history` hides rows the preview
+    keeps (heartbeat prompts, sub-agent completion reports) and drops silent
+    replies (NO_REPLY, ANNOUNCE_SKIP), so "the newest assistant text in
+    chat.history" after a silent run is an OLDER run's reply, which would be
+    re-delivered as a proactive message.
     """
     messages = (history or {}).get("messages")
-    if not isinstance(messages, list):
+    if not isinstance(messages, list) or not clip_prefix:
         return None
     for message in reversed(messages):
         item = _history_item(message)
-        if not item:
+        if not item or item.get("role") != "assistant":
             continue
         text = item["text"].strip()
-        if not text:
-            continue
-        if item.get("role") == "assistant":
-            return None if text in _SILENT_SENTINELS else text
-        if item.get("role") == "user":
-            return None
+        if clip_prefix in text:
+            return text
     return None
 
 
 async def _proactive_run_text(conn, session_key: str, log_prefix: str) -> str | None:
     """The finished run's assistant text for a proactive delivery.
 
-    `chat.history` first, because it returns the message whole: the
-    `sessions.preview` this used to read clips every item server-side (800
-    chars on Gateway 2026.9.x) whatever `maxChars` asks for, so long
-    proactive messages landed in OWUI cut mid-sentence with "...". Same
-    pattern as `_recover_turn_text` (ELI-74). The preview stays as the
-    fallback for a Gateway that refuses `chat.history`.
+    `sessions.preview` (limit 1) decides WHETHER this run left text to show:
+    its newest item is the run's last visible row, so a run that ended silent
+    or on its own prompt yields nothing. The Gateway clips every preview item
+    (800 chars on 2026.9.x) whatever `maxChars` asks for, so a clipped item
+    is then completed from `chat.history`, which returns the message whole
+    (same source as `_recover_turn_text`, ELI-74). If `chat.history` fails or
+    has no matching message, the clipped preview is delivered rather than
+    nothing.
     """
-    try:
-        history = await conn.session_history(session_key, limit=PROACTIVE_HISTORY_LIMIT)
-        text = _last_assistant_text_from_history(history)
-        if text:
-            return text
-        pipe_log(f"  {log_prefix}: no assistant text in chat.history, trying sessions.preview")
-    except Exception as ex:
-        pipe_log(f"  {log_prefix}: chat.history failed: {ex}; trying sessions.preview")
     try:
         preview = await conn.session_preview(session_key, limit=1, max_chars=8000)
     except Exception as ex:
         pipe_log(f"  {log_prefix}: session_preview failed: {ex}")
         return None
-    return _last_assistant_text_from_preview(preview, session_key)
+    text = _last_assistant_text_from_preview(preview, session_key)
+    clip_prefix = _preview_clip_prefix(text) if text else None
+    if not clip_prefix:
+        return text
+    try:
+        history = await conn.session_history(session_key, limit=PROACTIVE_HISTORY_LIMIT)
+    except Exception as ex:
+        pipe_log(f"  {log_prefix}: chat.history failed: {ex}; delivering the clipped preview")
+        return text
+    full = _history_text_completing_preview(history, clip_prefix)
+    if full:
+        return full
+    pipe_log(f"  {log_prefix}: no chat.history message matches the clipped preview; delivering it as is")
+    return text
 
 
 async def _maybe_deliver_proactive_after_debounce(
