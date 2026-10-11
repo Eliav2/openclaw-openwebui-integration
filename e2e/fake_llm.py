@@ -44,7 +44,6 @@ LOG_PATH = os.environ.get("FAKE_LLM_LOG", "")
 PREFERRED_TOOLS = ("session_status", "sessions_list", "memory_search")
 
 _EXACTLY = re.compile(r"exactly:?\s+([A-Za-z0-9_]{3,})")
-_MODEL_LINE = re.compile(r"^.*\bModel:\s*\S+.*$", re.MULTILINE)
 
 
 def _text_of(content) -> str:
@@ -80,8 +79,9 @@ def plan_reply(body: dict) -> dict:
 
     if "session_status" in user_text and "model line" in user_text:
         if tool_results:
-            m = _MODEL_LINE.search("\n".join(tool_results))
-            return {"text": m.group(0).strip() if m else "E2E_NO_MODEL_LINE"}
+            line = next((ln.strip() for ln in "\n".join(tool_results).splitlines()
+                         if "Model:" in ln), "E2E_NO_MODEL_LINE")
+            return {"text": line}
         if "session_status" in offered:
             return {"tool": "session_status"}
         return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
