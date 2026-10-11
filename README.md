@@ -1110,10 +1110,10 @@ Valves: `GATEWAY_URL`, `GATEWAY_TOKEN`. The full message path is in
 <details>
 <summary><b>⏳ Concurrent-message queueing</b></summary>
 
-Send a message while the agent is still working and you get
-"⏳ Queued behind the current response…", then a real turn of your own when the
-current one finishes. What you do not get is a blank bubble, which is what the
-naive implementation produces.
+Send a message while the agent is still working (from another tab, or while a
+run you did not start is active) and it waits for the current run to finish,
+then gets a real turn of its own. What you do not get is a blank bubble, which
+is what the naive implementation produces.
 
 Liveness is read from `sessions.describe` plus `sessions.list`'s
 `hasActiveRun`, which is authoritative across multiple Open WebUI worker
@@ -1228,6 +1228,14 @@ the running turn and every subagent it had spawned. So the Pipe waits
 the same chat arrives first, the run is kept, the new reply streams the rest
 of it (its remaining tool calls and text), and then answers the new message.
 A plain Stop still aborts once the window passes.
+
+Nothing is dropped along the way. The run's events are buffered from the
+moment of the cancel, so the new reply continues exactly where the old one
+stopped. A reply that is interrupted before it got to send its own message
+(Send now twice in a row, or while it waits behind a running turn) hands that
+message on, and the next reply sends it together with its own. OWUI ends a
+response either by cancelling it or by closing its stream, depending on
+timing; both are handled the same way.
 
 Valve: `INTERRUPT_GRACE_SECONDS` (3).
 

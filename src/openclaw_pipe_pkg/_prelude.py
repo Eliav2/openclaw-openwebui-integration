@@ -15,6 +15,7 @@ import time
 import threading
 import sys
 import hashlib
+import contextlib
 import re
 import mimetypes
 import urllib.error

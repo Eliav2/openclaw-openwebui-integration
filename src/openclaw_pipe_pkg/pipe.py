@@ -108,6 +108,24 @@ def _thinking_rejection_retry_body(body, recovered, resolved_thinking):
     return retry_body
 
 
+@dataclass
+class _TurnState:
+    """What one reply still owes the user if it is cancelled or closed now.
+
+    `unsent` are user messages it accepted but has not yet sent to the
+    Gateway (its own, plus any carried over from a cancelled reply).
+    `run_id` / `queue` are a run it is consuming, its own or one it adopted,
+    and the consumer queue buffering that run's events. `parked` is set once
+    the cancel was handed to `park_cancelled_turn`.
+    """
+    conn: object = None
+    session_key: str | None = None
+    unsent: list = field(default_factory=list)
+    run_id: str | None = None
+    queue: object = None
+    parked: bool = False
+
+
 class Pipe:
     """
     Open WebUI Pipe that routes messages through OpenClaw Gateway via
@@ -603,12 +621,16 @@ class Pipe:
         _devcoord_marker = _devcoord_turn_begin()
         # DEV-ONLY-END
         try:
-            async for item in self._pipe_impl(
+            # aclosing: when OWUI closes this generator, close the inner one
+            # now rather than whenever it is garbage-collected, so its cancel
+            # handling runs before the next message arrives.
+            async with contextlib.aclosing(self._pipe_impl(
                 body, __event_emitter__, __event_call__=__event_call__,
                 __user__=__user__, __metadata__=__metadata__, __request__=__request__,
                 __task__=__task__, __task_body__=__task_body__,
-            ):
-                yield item
+            )) as turn_gen:
+                async for item in turn_gen:
+                    yield item
         finally:
             # DEV-ONLY-START
             _devcoord_turn_end(_devcoord_marker)
@@ -617,7 +639,54 @@ class Pipe:
 
     async def _pipe_impl(self, body, __event_emitter__, __event_call__=None,
                    __user__=None, __metadata__=None, __request__=None,
-                   __task__=None, __task_body__=None, _initial_visible_text=""):
+                   __task__=None, __task_body__=None, _initial_visible_text="",
+                   _send_texts=None):
+        """One reply: runs `_pipe_turn`, and makes sure a cancel or close at
+        ANY point hands what the reply still owes to the next message (see
+        `park_cancelled_turn`) instead of dropping it.
+
+        `_pipe_turn` parks for itself while it is streaming a run, where it
+        also snapshots and shows "Stopped". This catches every other point:
+        before the message is sent (model patch, queue wait, a yield outside
+        the stream loop) and around the adopt / retry recursion. OWUI ends a
+        reply either by cancelling its task (CancelledError at an await) or
+        by closing the generator (GeneratorExit at a yield); both land here.
+
+        `_send_texts` replaces this request's own text as what to send, for
+        the recursions that send messages carried over from earlier replies.
+        """
+        turn = _TurnState()
+        try:
+            async with contextlib.aclosing(self._pipe_turn(
+                body, __event_emitter__, __event_call__=__event_call__,
+                __user__=__user__, __metadata__=__metadata__,
+                __request__=__request__, __task__=__task__,
+                __task_body__=__task_body__,
+                _initial_visible_text=_initial_visible_text,
+                _send_texts=_send_texts, turn=turn,
+            )) as turn_gen:
+                async for item in turn_gen:
+                    yield item
+        except (asyncio.CancelledError, GeneratorExit) as stop:
+            if (not turn.parked and turn.conn is not None and turn.session_key
+                    and (turn.unsent or turn.run_id)):
+                turn.parked = True
+                pipe_log(
+                    f"Reply {type(stop).__name__} outside the stream loop: parking "
+                    f"{len(turn.unsent)} unsent message(s), run "
+                    f"{str(turn.run_id)[:20]}"
+                )
+                turn.conn.park_cancelled_turn(
+                    turn.session_key, turn.run_id, turn.queue, turn.unsent,
+                    float(getattr(self.valves, "INTERRUPT_GRACE_SECONDS", 0) or 0),
+                    send_stop=self.valves.SEND_STOP_ON_CANCEL,
+                )
+            raise
+
+    async def _pipe_turn(self, body, __event_emitter__, __event_call__=None,
+                   __user__=None, __metadata__=None, __request__=None,
+                   __task__=None, __task_body__=None, _initial_visible_text="",
+                   _send_texts=None, turn=None):
         """Uses a shared persistent WS connection; no per-message reconnect,
         no global lock, and no 60s timeout.
 
@@ -765,18 +834,41 @@ class Pipe:
             f"text_sha={_diag_sha} text_preview={text[:48]!r}"
         )
 
+        if turn is None:
+            turn = _TurnState()
+        turn.conn = conn
+        turn.session_key = session_key
+        turn.unsent = list(_send_texts) if _send_texts else [text]
+        # What actually went out in this turn's chat.send, for the
+        # thinking-rejection retry to send again.
+        sent_texts = list(turn.unsent)
+
         # A cancel of this session's previous response that arrived just
         # before this message is OWUI's "Send now" / interrupt, not a Stop:
-        # take over that run instead of letting its deferred abort kill it
-        # (see `schedule_cancel_abort`). Claimed this early because the model
-        # patch below can take seconds and the grace window is short.
-        adopted_run_id = conn.claim_pending_cancel_abort(session_key)
-        if adopted_run_id:
-            pipe_log(
-                f"  new message right after a cancel: keeping run "
-                f"{adopted_run_id[:20]}... alive and continuing it in this "
-                "reply before sending the message"
-            )
+        # take over what it left (see `park_cancelled_turn`): its run, still
+        # running with its events buffered, and any message it had not sent
+        # yet. Claimed this early because the model patch below can take
+        # seconds and the grace window is short.
+        adopted_run_id = None
+        adopted_queue = None
+        claimed = conn.claim_cancelled_turn(session_key)
+        if claimed:
+            if claimed["carried"]:
+                turn.unsent = claimed["carried"] + turn.unsent
+                pipe_log(
+                    f"  carrying {len(claimed['carried'])} unsent message(s) "
+                    "from the cancelled reply"
+                )
+            adopted_run_id = claimed["run_id"]
+            adopted_queue = claimed["queue"]
+            if adopted_run_id:
+                turn.run_id = adopted_run_id
+                turn.queue = adopted_queue
+                pipe_log(
+                    f"  new message right after a cancel: keeping run "
+                    f"{adopted_run_id[:20]}... alive and continuing it in this "
+                    "reply before sending the message"
+                )
 
         # Heal any 1/2·2/2 variant group a previous turn's proactive delivery
         # left behind, so the proactive message shows in the normal linear flow
@@ -929,10 +1021,14 @@ class Pipe:
                 return active
             return conn.active_run_id_for_session(session_key) is not None
 
-        if adopted_run_id and not await _session_run_active():
-            # It finished during the cancel/re-send gap: nothing to continue.
+        if (adopted_run_id and adopted_queue is None
+                and not await _session_run_active()):
+            # It finished during the cancel/re-send gap and nothing buffered
+            # its events: nothing to continue. (With a parked queue the run's
+            # tail and final are waiting in it, so it is always adopted.)
             pipe_log("  adopted run already ended; sending the message normally")
             adopted_run_id = None
+            turn.run_id = None
         if adopted_run_id:
             # Stream the rest of the adopted run into THIS reply. The message
             # itself is sent afterwards, as its own run, by the recursive call
@@ -945,21 +1041,19 @@ class Pipe:
             epoch_at_send = conn.connection_epoch
             resolved_thinking = None
             pending_clamp_note = ""
-            queue = conn.register_consumer(session_key, our_run_id)
+            if adopted_queue is not None:
+                queue = adopted_queue
+            else:
+                queue = conn.register_consumer(session_key, our_run_id)
+            turn.queue = queue
             await _emit_status(
                 __event_emitter__,
                 "Continuing the current task; your message is next…",
                 done=False,
             )
         else:
-            # Immediate feedback (outside the lock) if the session is busy right now.
             if await _session_run_active():
                 pipe_log("Session has an active run (gateway-authoritative); queueing behind it")
-                await _emit_status(
-                    __event_emitter__,
-                    "⏳ Queued behind the current response…",
-                    done=False,
-                )
 
             # Serialize the queue-release -> chat.send -> run-registration critical
             # section per session. Two messages released from the queue at the same
@@ -1048,7 +1142,7 @@ class Pipe:
                         "chat.send",
                         _owui_chat_send_params(
                             session_key=session_key,
-                            message=text,
+                            message="\n\n".join(t for t in turn.unsent if t),
                             idempotency_key=idempotency_key,
                             owui_chat_id=owui_origin_chat_id,
                             owui_user_id=owui_origin_user_id,
@@ -1069,6 +1163,10 @@ class Pipe:
                 self._current_run_id = our_run_id
                 pipe_log(f"Captured runId: {our_run_id}")
                 queue = conn.register_consumer(session_key, our_run_id)
+                sent_texts = list(turn.unsent)
+                turn.unsent = []
+                turn.run_id = our_run_id
+                turn.queue = queue
         # Parity (2026-07-19): tell the persistent connection which OWUI message
         # this run streams into, so a shadow renderer can finalize that message
         # to the complete content if this inline turn ends before the run does
@@ -1078,6 +1176,8 @@ class Pipe:
         conn.register_run_target(
             session_key, our_run_id, owui_origin_chat_id, owui_message_id,
         )
+        if adopted_run_id and adopted_queue is not None:
+            conn.seed_run_renderer(session_key, our_run_id, queue)
         # Extracted once up front (not just at the terminal snapshot/auto-title
         # step further below) so the mid-run REST snapshot gate has a token to
         # use throughout the streaming loop, not only after it ends.
@@ -1980,27 +2080,40 @@ class Pipe:
                                 # once per idle_probe_s, not on every dead event.
                                 last_activity_time = time.time()
 
-                except asyncio.CancelledError:
-                    # OWUI cancelled this response: the Stop button, or Send
-                    # now / interrupt, which cancel the same way and then send
-                    # a new message. Defer the abort so that new message can
-                    # claim the run instead (see `schedule_cancel_abort`).
+                except (asyncio.CancelledError, GeneratorExit) as stop:
+                    # OWUI ended this response: the Stop button, or Send now /
+                    # interrupt, which stop it the same way and then send a
+                    # new message. It arrives as a task cancel when we are
+                    # awaiting, or as a generator close when we are suspended
+                    # at a yield (OWUI busy with the last chunk), which is
+                    # most of the time while text streams. Handling only the
+                    # cancel left the close path with no abort, no handover
+                    # and the reply's own unsent message lost (2026-10-11).
+                    #
+                    # Park first, synchronously: the run keeps going with its
+                    # events buffered, and the next message takes it over
+                    # (see `park_cancelled_turn`). The awaits after it may be
+                    # interrupted themselves; nothing depends on them.
                     aborted = True
                     grace_s = float(getattr(self.valves, "INTERRUPT_GRACE_SECONDS", 0) or 0)
-                    if grace_s > 0:
-                        pipe_log(
-                            f"Generator cancelled -- chat.abort deferred {grace_s:g}s "
-                            "in case a new message follows"
-                        )
-                    else:
-                        pipe_log("Generator cancelled -- sending chat.abort")
-                    await maybe_emit_snapshot(force=True)
-                    await _emit_status(__event_emitter__, "Stopped", done=True)
-                    await conn.schedule_cancel_abort(
-                        session_key, our_run_id, grace_s,
+                    turn.parked = True
+                    conn.park_cancelled_turn(
+                        session_key, our_run_id, queue, turn.unsent, grace_s,
                         send_stop=self.valves.SEND_STOP_ON_CANCEL,
                     )
-                    raise  # Re-raise to signal proper cancellation
+                    pipe_log(
+                        f"Generator {type(stop).__name__}: run parked "
+                        f"{grace_s:g}s with {len(turn.unsent)} unsent "
+                        "message(s), in case a new message follows"
+                        if grace_s > 0 else
+                        f"Generator {type(stop).__name__}: sending chat.abort"
+                    )
+                    try:
+                        await maybe_emit_snapshot(force=True)
+                        await _emit_status(__event_emitter__, "Stopped", done=True)
+                    except (Exception, asyncio.CancelledError) as ex:
+                        pipe_log(f"  stop snapshot/status skipped: {ex!r}")
+                    raise
 
                 else:
                     # Normal completion (no cancellation).
@@ -2124,6 +2237,12 @@ class Pipe:
                         pending_tool_calls.clear()
 
         finally:
+            # A parked queue now belongs to whoever claims the run; releasing
+            # it here would drop the events it is buffering.
+            if not turn.parked:
+                conn.unregister_consumer(session_key, our_run_id, queue=queue)
+                turn.run_id = None
+                turn.queue = None
             status_lines = []
             if not aborted and text_yielded and not adopted_run_id:
                 status_lines = await _build_usage_status_lines(conn, session_key)
@@ -2144,34 +2263,40 @@ class Pipe:
                     await _emit_status(__event_emitter__, line, done=True)
             else:
                 await _emit_status(__event_emitter__, "", done=True)
-            conn.unregister_consumer(session_key, our_run_id, queue=queue)
             self._current_session_key = None
             self._current_run_id = None
 
         pipe_log(f"DONE -- {event_count} events processed, "
                  f"text yielded: {text_yielded}")
         if adopted_run_id and not aborted:
-            # The adopted run is over; now send this request's own message, in
-            # the same reply. The recursive call does the normal queue + send
-            # (it also waits out a subagent-yield gap if the run resumes), and
+            # The adopted run is over; now send the messages this reply owes
+            # (its own, plus any carried over from cancelled replies), in the
+            # same reply. The recursive call does the normal queue + send (it
+            # also waits out a subagent-yield gap if the run resumes), and
             # owns the terminal snapshot, usage lines and auto-title. Seeding
             # it with what streamed so far keeps that snapshot complete.
+            send_texts = list(turn.unsent)
             pipe_log(
                 f"  adopted run {adopted_run_id[:20]}... finished; sending "
-                "the queued message"
+                f"{len(send_texts)} queued message(s)"
             )
             separator = "\n\n---\n\n" if visible_message_text.strip() else ""
             if separator:
                 record_visible_chunk(separator)
                 yield separator
-            async for item in self._pipe_impl(
+            # From here the recursive reply owns them, and parks them itself
+            # if it is cancelled.
+            turn.unsent = []
+            async with contextlib.aclosing(self._pipe_impl(
                 body, __event_emitter__,
                 __event_call__=__event_call__, __user__=__user__,
                 __metadata__=__metadata__, __request__=__request__,
                 __task__=__task__, __task_body__=__task_body__,
                 _initial_visible_text=visible_message_text,
-            ):
-                yield item
+                _send_texts=send_texts,
+            )) as continuation:
+                async for item in continuation:
+                    yield item
             return
         if not text_yielded:
             # DIAG (ELI-56): a no-text turn is the phantom. Emit the correlation
@@ -2259,14 +2384,16 @@ class Pipe:
                     )
                 record_visible_chunk(retry_note)
                 yield retry_note
-                async for item in self._pipe_impl(
+                async with contextlib.aclosing(self._pipe_impl(
                     retry_body, __event_emitter__,
                     __event_call__=__event_call__, __user__=__user__,
                     __metadata__=__metadata__, __request__=__request__,
                     __task__=__task__, __task_body__=__task_body__,
                     _initial_visible_text=visible_message_text,
-                ):
-                    yield item
+                    _send_texts=sent_texts,
+                )) as retry:
+                    async for item in retry:
+                        yield item
                 return
             if recovered:
                 pipe_log("  recovered assistant text at final fallback")
