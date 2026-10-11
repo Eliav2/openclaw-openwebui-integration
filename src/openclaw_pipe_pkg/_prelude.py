@@ -41,3 +41,21 @@ def pipe_log(*args):
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Background tasks
+# ---------------------------------------------------------------------------
+
+# The event loop keeps only a weak reference to a task, so a fire-and-forget
+# asyncio.create_task() can be garbage-collected before it finishes and its
+# work silently never happens. Background work goes through spawn_background,
+# which holds the reference until the task is done.
+_BACKGROUND_TASKS: set = set()
+
+
+def spawn_background(coro):
+    task = asyncio.create_task(coro)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return task

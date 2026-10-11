@@ -5348,5 +5348,55 @@ class ThinkingRejectionRetryTests(unittest.TestCase):
         self.assertIsNone(second)
 
 
+
+class TestSpawnBackground(unittest.TestCase):
+    """Fire-and-forget work must stay referenced until it finishes.
+
+    The event loop holds only a weak reference to a task; a bare
+    asyncio.create_task() whose result is dropped can be collected mid-run.
+    """
+
+    def test_task_is_held_until_done_then_released(self):
+        import asyncio
+        import gc
+        import openclaw_pipe
+
+        ran = []
+
+        async def work():
+            await asyncio.sleep(0)
+            gc.collect()
+            await asyncio.sleep(0)
+            ran.append(True)
+
+        async def main():
+            openclaw_pipe.spawn_background(work())
+            gc.collect()
+            self.assertEqual(len(openclaw_pipe._BACKGROUND_TASKS), 1)
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+        asyncio.run(main())
+        self.assertEqual(ran, [True])
+        self.assertEqual(openclaw_pipe._BACKGROUND_TASKS, set())
+
+    def test_no_bare_create_task_left_in_sources(self):
+        # A create_task whose result is discarded is exactly the bug; ruff's
+        # RUF006 enforces this in CI, this keeps it true without ruff.
+        src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "src", "openclaw_pipe_pkg")
+        offenders = []
+        for name in sorted(os.listdir(src)):
+            if not name.endswith(".py"):
+                continue
+            tree = ast.parse(open(os.path.join(src, name)).read())
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+                        and isinstance(node.value.func, ast.Attribute)
+                        and node.value.func.attr == "create_task"):
+                    offenders.append(f"{name}:{node.lineno}")
+        self.assertEqual(offenders, [], "use spawn_background() instead")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -108,6 +108,24 @@ logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Background tasks
+# ---------------------------------------------------------------------------
+
+# The event loop keeps only a weak reference to a task, so a fire-and-forget
+# asyncio.create_task() can be garbage-collected before it finishes and its
+# work silently never happens. Background work goes through spawn_background,
+# which holds the reference until the task is done.
+_BACKGROUND_TASKS: set = set()
+
+
+def spawn_background(coro):
+    task = asyncio.create_task(coro)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return task
+
+
 # --- identity --------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -2282,7 +2300,7 @@ class _GatewayConnection:
                         f"  parity: inline turn ended early; finalizing message "
                         f"for run {_evt_run[:20]}..."
                     )
-                    asyncio.create_task(
+                    spawn_background(
                         _finalize_inline_message(self, _evt_sess, _evt_run)
                     )
                     continue
@@ -2320,7 +2338,7 @@ class _GatewayConnection:
                         and evt_session not in self._pending_proactive_debounce
                     ):
                         self._pending_proactive_debounce.add(evt_session)
-                        asyncio.create_task(
+                        spawn_background(
                             _maybe_deliver_proactive_after_debounce(
                                 self, evt_session, evt_run_id
                             )
@@ -2348,7 +2366,7 @@ class _GatewayConnection:
                     and evt_session not in self._pending_proactive_debounce
                 ):
                     self._pending_proactive_debounce.add(evt_session)
-                    asyncio.create_task(
+                    spawn_background(
                         _maybe_deliver_subagent_proactive(
                             self, evt_session, evt_run_id
                         )
