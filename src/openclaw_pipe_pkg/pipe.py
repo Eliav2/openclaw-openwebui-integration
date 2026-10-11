@@ -619,6 +619,7 @@ class Pipe:
             )
         await _devcoord_wait_if_deploy_pending(on_wait=_devcoord_report_wait)
         _devcoord_marker = _devcoord_turn_begin()
+        _devcoord_beat = spawn_background(_devcoord_heartbeat(_devcoord_marker))
         # DEV-ONLY-END
         try:
             # aclosing: when OWUI closes this generator, close the inner one
@@ -633,6 +634,7 @@ class Pipe:
                     yield item
         finally:
             # DEV-ONLY-START
+            _devcoord_beat.cancel()
             _devcoord_turn_end(_devcoord_marker)
             # DEV-ONLY-END
             pass

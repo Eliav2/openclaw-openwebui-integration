@@ -220,6 +220,20 @@ class DevCoordWaitIfDeployPendingTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(elapsed, 0.35)
         self.assertGreaterEqual(len(reports), 2, "on_wait should fire more than once while waiting")
 
+    async def test_heartbeat_refreshes_the_marker_until_cancelled(self):
+        marker = devcoord._devcoord_turn_begin()
+        first = devcoord._read_json_file(marker)["beat"]
+        orig = devcoord._DEVCOORD_HEARTBEAT_S
+        try:
+            devcoord._devcoord_heartbeat.__globals__["_DEVCOORD_HEARTBEAT_S"] = 0.05
+            task = asyncio.ensure_future(devcoord._devcoord_heartbeat(marker))
+            await asyncio.sleep(0.2)
+            self.assertGreater(devcoord._read_json_file(marker)["beat"], first)
+            task.cancel()
+        finally:
+            devcoord._devcoord_heartbeat.__globals__["_DEVCOORD_HEARTBEAT_S"] = orig
+            devcoord._devcoord_turn_end(marker)
+
     async def test_no_on_wait_callback_is_fine(self):
         pending_path = devcoord._devcoord_pending_path()
         devcoord._write_json_file(pending_path, {"requested_by": "test"})
@@ -409,6 +423,27 @@ class DevCoordHttpRouteTests(unittest.TestCase):
         self.assertEqual(json.loads(body), {"inflight": 1})
         self.assertFalse(os.path.exists(stale_path), "stale marker should have been reaped")
         devcoord._devcoord_turn_end(fresh)
+
+    def test_long_turn_with_a_heartbeat_is_never_reaped(self):
+        """2026-10-11: a turn 20 minutes in was reaped by age alone, a deploy
+        went ahead under it and cut its live stream. Age is not liveness."""
+        path = os.path.join(str(devcoord._devcoord_dir()), "long-turn.json")
+        now = time.time()
+        devcoord._write_json_file(path, {"started": now - 4 * 3600, "beat": now - 5})
+        status, body = self._request("GET", "/__devcoord__/status")
+        self.assertEqual(json.loads(body), {"inflight": 1})
+        self.assertTrue(os.path.exists(path))
+        os.remove(path)
+
+    def test_marker_whose_heartbeat_stopped_is_reaped(self):
+        path = os.path.join(str(devcoord._devcoord_dir()), "dead-turn.json")
+        now = time.time()
+        devcoord._write_json_file(
+            path, {"started": now - 60,
+                   "beat": now - devcoord._DEVCOORD_STALE_BEAT_S - 10})
+        status, body = self._request("GET", "/__devcoord__/status")
+        self.assertEqual(json.loads(body), {"inflight": 0})
+        self.assertFalse(os.path.exists(path))
 
     def test_post_deploy_pending_sets_flag_readable_by_pipe(self):
         status, _ = self._request("POST", "/__devcoord__/deploy-pending")

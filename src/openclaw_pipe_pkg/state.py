@@ -74,8 +74,9 @@ def _devcoord_turn_begin():
     """Mark a turn as in-flight. Returns the marker path for _devcoord_turn_end."""
     try:
         marker = os.path.join(_devcoord_dir(), f"{uuid.uuid4().hex}.json")
+        now = time.time()
         with open(marker, "w") as f:
-            json.dump({"started": time.time()}, f)
+            json.dump({"started": now, "beat": now}, f)
         os.chmod(marker, 0o600)
         return marker
     except Exception as ex:
@@ -94,29 +95,59 @@ def _devcoord_turn_end(marker):
         pipe_log(f"devcoord: failed to clear inflight marker: {ex}")
 
 
+# Markers from before heartbeats existed carry only `started`.
 _DEVCOORD_STALE_MARKER_S = 1200  # 20 minutes
+# A live turn refreshes its marker's `beat` this often...
+_DEVCOORD_HEARTBEAT_S = 30
+# ...so one whose beat is older than this belongs to a turn that is gone.
+_DEVCOORD_STALE_BEAT_S = 180
+
+
+async def _devcoord_heartbeat(marker):
+    """Keep `marker` fresh for as long as its turn runs; cancelled at turn
+    end. Liveness has to come from the turn itself: a turn's age says
+    nothing about whether it is still running (2026-10-11, a 20-minute
+    turn was reaped as stale, a deploy went ahead under it, and its live
+    stream was cut)."""
+    if not marker:
+        return
+    while True:
+        await asyncio.sleep(_DEVCOORD_HEARTBEAT_S)
+        data = _read_json_file(marker)
+        if not data:
+            return  # reaped or ended
+        data["beat"] = time.time()
+        try:
+            with open(marker, "w") as f:
+                json.dump(data, f)
+        except Exception as ex:
+            pipe_log(f"devcoord: heartbeat write failed: {ex}")
 
 
 def _devcoord_inflight_count():
-    """Count in-flight turns, reaping any marker older than
-    _DEVCOORD_STALE_MARKER_S first.
+    """Count in-flight turns, reaping markers whose turn is gone first.
 
     A turn's `finally` normally removes its own marker, but a process that
     dies mid-turn (killed, crashed, container restarted) can leave one
     behind permanently -- and since install.py's own deploy_guard waits
     for this count to hit zero with no forced timeout of its own (ELI-24
     follow-up), a single leaked marker would otherwise block every future
-    deploy forever. 20 minutes is well above any turn seen in practice, so a
-    marker that old is far more likely leaked than a genuinely long turn.
+    deploy forever. A live turn heartbeats its marker, so a marker is
+    stale once its heartbeat stops, however long the turn has been
+    running. Markers written before heartbeats existed fall back to age.
     """
     now = time.time()
     count = 0
     for name in os.listdir(_devcoord_dir()):
         path = os.path.join(_devcoord_dir(), name)
-        data = _read_json_file(path)
-        started = (data or {}).get("started")
-        if started is not None and now - started > _DEVCOORD_STALE_MARKER_S:
-            pipe_log(f"devcoord: reaping stale inflight marker {name} (age {int(now - started)}s)")
+        data = _read_json_file(path) or {}
+        if "beat" in data:
+            seen, limit = data["beat"], _DEVCOORD_STALE_BEAT_S
+        else:
+            seen, limit = data.get("started"), _DEVCOORD_STALE_MARKER_S
+        if seen is not None and now - seen > limit:
+            pipe_log(f"devcoord: reaping stale inflight marker {name} "
+                     f"(no sign of life for {int(now - seen)}s)")
             try:
                 os.remove(path)
             except FileNotFoundError:
