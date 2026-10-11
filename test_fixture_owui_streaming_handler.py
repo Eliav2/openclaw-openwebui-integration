@@ -1,20 +1,38 @@
-"""Verbatim extraction of Open WebUI 0.11.3's
-`handle_responses_streaming_event` (`open_webui/utils/middleware.py:599-940`),
+"""Verbatim extraction of Open WebUI 0.12.0's
+`handle_responses_streaming_event` (`open_webui/utils/middleware.py:624-985`),
 used only to pin our event-emitting tests to OWUI's actual behavior instead of
 our belief about it (see ELI-75: a docstring-inferred belief about this exact
 function was wrong for months).
 
-Re-extracted 2026-09-15 from the running 0.11.3 container. The previous copy
-was pinned to 0.11.0, where `response.output_item.added` appended
-unconditionally; 0.11.1 rewrote it to dedup by id/call_id and replace on a
-hit, which silently deleted every tool card. The stale fixture is why our
-tests still passed while the live UI rendered nothing.
+Re-extracted 2026-10-11 from the running 0.12.0 container
+(`docker exec app_4d14bf22_openwebui cat
+/app/backend/open_webui/utils/middleware.py`, byte-identical to the v0.12.0
+git tag). Changes since the previous 0.11.3 copy:
+
+- 0.11.4: the `response.output_item.added` dedup now matches on `call_id`
+  only when the existing item has the same `type`. A `function_call_output`
+  can no longer replace its `function_call` through a shared `call_id`;
+  a matching `id` still replaces regardless of type.
+- 0.12.0: a `response.<x>.delta` whose `output_index` is past the end of the
+  list now creates placeholder items (type inferred from the delta) instead
+  of being dropped, and the default `output_index` on an empty list is 0
+  rather than -1.
+- 0.12.0: a bare `{"type": "error"}` event is handled and returned as
+  `{'error': data}` metadata.
+
+History: the copy before 0.11.3 was pinned to 0.11.0, where
+`response.output_item.added` appended unconditionally; 0.11.1 rewrote it to
+dedup by id/call_id and replace on a hit, which silently deleted every tool
+card. The stale fixture is why our tests still passed while the live UI
+rendered nothing.
 
 Pure function, zero imports, no I/O, safe to extract with
-`sed -n '599,940p' open_webui/utils/middleware.py` and re-paste here if OWUI
+`sed -n '624,985p' open_webui/utils/middleware.py` and re-paste here if OWUI
 changes this handler. Do not hand-edit the body below; if it drifts from
 upstream, re-extract instead of patching in place. Check the line range
-against the installed version first -- it moves between releases.
+against the installed version first, it moves between releases. Note the
+generic delta arms call OWUI's module-level `deep_merge`, which is not
+vendored here; no test currently drives those arms.
 """
 
 
@@ -50,7 +68,11 @@ def handle_responses_streaming_event(
                     idx
                     for idx, existing in enumerate(new_output)
                     if (item.get('id') and existing.get('id') == item.get('id'))
-                    or (item.get('call_id') and existing.get('call_id') == item.get('call_id'))
+                    or (
+                        item.get('call_id')
+                        and existing.get('type') == item.get('type')
+                        and existing.get('call_id') == item.get('call_id')
+                    )
                 ),
                 None,
             )
@@ -112,7 +134,21 @@ def handle_responses_streaming_event(
             delta_type = parts[1]
             delta = data.get('delta', '')
 
-            output_index = data.get('output_index', len(current_output) - 1)
+            output_index = data.get('output_index', max(len(current_output) - 1, 0))
+
+            # Chat Completions can start an item with a delta, without an added event.
+            if output_index >= len(current_output):
+                current_output = list(current_output)
+                while len(current_output) <= output_index:
+                    current_output.append(
+                        {'type': 'message', 'status': 'in_progress', 'role': 'assistant', 'content': []}
+                    )
+                current_output[output_index].update(
+                    id=data.get('item_id'),
+                    type='reasoning'
+                    if delta_type.startswith('reasoning')
+                    else ('function_call' if delta_type == 'function_call_arguments' else 'message'),
+                )
 
             if current_output and 0 <= output_index < len(current_output):
                 new_output = list(current_output)
@@ -357,6 +393,8 @@ def handle_responses_streaming_event(
         error = data.get('response', {}).get('error', {})
         return current_output, {'error': error}
 
+    elif event_type == 'error':
+        return current_output, {'error': data}
+
     else:
         return current_output, None
-
