@@ -15,30 +15,57 @@ your assistant text for a marker instead.
 ## How to ask
 
 Emit a line that **starts** with `OpenClaw needs input:` and nothing before it on
-that line. Put the question on the next line:
+that line. Put a short header on the next line, then the question:
 
 ```
 OpenClaw needs input:
+Database
 Which database should I use?
 ```
 
-The pipe intercepts the whole block, renders it as a dialog, and feeds the
-user's answer straight back to you in the same stream. Keep going once you have
-it. The raw marker is never shown to the user.
+The pipe intercepts the whole block, renders it as Open WebUI's inline question
+card, and feeds the user's answer straight back to you in the same stream. Keep
+going once you have it. The raw marker is never shown to the user. The user can
+always type their own answer in the card's Other field.
 
 ## Offering choices
 
-Number the options and the dialog becomes clickable buttons:
+Number the options and each becomes a clickable row. Add ` - ` and a short
+description after a label to show it beside the choice:
 
 ```
 OpenClaw needs input:
+Database
 Which database should I use?
-1. Postgres
-2. SQLite
+1. Postgres - robust, needs a server
+2. SQLite - one file, zero setup
 3. Let me decide later
 ```
 
-You get back the label the user clicked, for example `SQLite`.
+You get back the label the user clicked, for example `SQLite`, or the text they
+typed instead. **The card tags the first option Recommended, so list your
+recommendation first.** A yes/no question (`(y/n)`) shows Yes and No and returns
+`yes` or `no`.
+
+## Several questions at once
+
+To ask up to three related questions in one card, put a JSON object after the
+marker line:
+
+```
+OpenClaw needs input:
+{"questions": [
+  {"header": "Frequency", "question": "How often should backups run?",
+   "options": [{"label": "Daily", "description": "Every night at 03:00"},
+               {"label": "Weekly", "description": "Sundays"}]},
+  {"header": "Storage", "question": "Where should they go?",
+   "options": ["NAS - local, fast", "Cloud - offsite"]}
+]}
+```
+
+The user steps through the questions and submits once. You get one
+`Header: answer` line per question. Add `"allow_other": false` to a question to
+hide the typed answer; a question with no `options` is free text.
 
 For "pick any number of these", include a phrase like `select all that apply`
 or `(multiselect)` in the question. The dialog then renders checkboxes and a
@@ -54,12 +81,13 @@ dialog switches to a masked input automatically. You do not need to do anything.
 - **The marker must begin a line.** `... done.OpenClaw needs input:` glued onto
   the end of a sentence will not be picked up cleanly.
 - **Emit the block exactly once.** Repeating it produces a confusing dialog.
-- **Ask one question at a time.** The dialog shows one prompt.
-- **Keep option labels short.** They become buttons.
+- **One block per turn.** Need several answers? Use the JSON form, at most three
+  questions.
+- **Keep option labels short.** Put the detail in the description.
 - Do not paste the marker into ordinary prose. Mentioning it while explaining
   something is fine, but it must not start a line unless you mean it.
 
 ## When there is no answer
 
-If the user closes the dialog or does not respond, you get nothing back. Say what
+If the user presses Cancel or never responds, you get nothing back. Say what
 you are assuming and carry on, or stop and explain what you need. Do not loop.
