@@ -35,38 +35,46 @@ def test_auto_title():
     chat_id = chat.get("id")
     print(f"✓ Created chat: {chat_id}")
 
-    # First exchange
-    first_msg = "שלום, מה השעה? תענה בקצרה"
-    r1 = c.send_message(chat_id, first_msg)
-    content1 = r1.get("choices", [{}])[0].get("message", {}).get("content", "")
-    print(f"✓ Msg1: {content1[:80]}")
+    try:
+        # First exchange
+        first_msg = "שלום, מה השעה? תענה בקצרה"
+        r1 = c.send_message(chat_id, first_msg)
+        content1 = r1.get("choices", [{}])[0].get("message", {}).get("content", "")
+        print(f"✓ Msg1: {content1[:80]}")
 
-    time.sleep(3)
+        time.sleep(3)
 
-    # Second exchange (triggers auto-title)
-    r2 = c.send_message(chat_id, "תודה!", history=[
-        {"role": "user", "content": first_msg},
-        {"role": "assistant", "content": content1},
-    ])
-    content2 = r2.get("choices", [{}])[0].get("message", {}).get("content", "")
-    print(f"✓ Msg2: {content2[:80]}")
+        # Second exchange (triggers auto-title)
+        r2 = c.send_message(chat_id, "תודה!", history=[
+            {"role": "user", "content": first_msg},
+            {"role": "assistant", "content": content1},
+        ])
+        content2 = r2.get("choices", [{}])[0].get("message", {}).get("content", "")
+        print(f"✓ Msg2: {content2[:80]}")
 
-    # Wait for background auto-title task
-    print("  Waiting for title generation...")
-    time.sleep(20)
+        # Wait for background auto-title task
+        print("  Waiting for title generation...")
+        time.sleep(20)
 
-    # Verify
-    info = c.get_chat(chat_id)
-    title = info.get("title", "")
-    if title and title != first_msg:
-        print(f"✅ PASS: title = '{title}'")
-        return True
-    elif title == first_msg:
-        print(f"⚠️  WARN: title is raw first message = '{title}'")
-        return False
-    else:
-        print(f"❌ FAIL: title = '{title}' (empty or missing)")
-        return False
+        # Verify
+        info = c.get_chat(chat_id)
+        title = info.get("title", "")
+        if title and title != first_msg:
+            print(f"✅ PASS: title = '{title}'")
+            return True
+        elif title == first_msg:
+            print(f"⚠️  WARN: title is raw first message = '{title}'")
+            return False
+        else:
+            print(f"❌ FAIL: title = '{title}' (empty or missing)")
+            return False
+    finally:
+        # A test chat, not the user's: delete it so runs don't pile up.
+        try:
+            c.delete_chat(chat_id)
+            print(f"  Deleted test chat {chat_id}")
+        except Exception as ex:
+            print(f"  WARN: could not delete test chat {chat_id}: {ex}")
 
 
 if __name__ == "__main__":
