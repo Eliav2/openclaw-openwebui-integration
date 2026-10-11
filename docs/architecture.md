@@ -63,6 +63,8 @@ openclaw-openwebui-integration/
 │       ├── pipe.py              # Pipe class: valves and the integration() entry point
 │       ├── gateway.py            # WebSocket connection, handshake, event dispatch/demux
 │       ├── action.py              # Status Action class
+│       ├── composer.py            # Composer Status button: in-page JS snippet + emit helper
+│       ├── composer_watch.py      # Pipe only: pushes that snippet when a tab opens an OpenClaw chat
 │       ├── askuser.py              # "needs input:" interception + modal plumbing
 │       ├── emit.py                  # Event emission / tool-card formatting helpers
 │       ├── media.py                  # MEDIA: directive handling, OWUI Files API upload
