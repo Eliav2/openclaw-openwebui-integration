@@ -4395,6 +4395,99 @@ class RepeatedAskUserMarkerTests(unittest.TestCase):
         self.assertEqual(_dedupe_options(["a", "  ", "", "a"]), ["a"])
 
 
+class MediaDirectiveDoubledFilenameTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-76. Captured 2026-07-29 (OWUI 0.10.2 baseline, Gemini 3 Flash): a
+    reply that was exactly `MEDIA:<file>.png`, with no trailing whitespace,
+    persisted as a link with the filename doubled, which 404s.
+
+    How the doubled text formed: `_advance_media_buffer` held the whole
+    directive back (no whitespace ever confirmed the filename), so nothing was
+    shown. The turn's catch-all event then carried the whole reply again; it
+    was diffed against SHOWN text (empty), looked entirely new, and was
+    appended to the buffer with no separator. The end-of-stream flush handed
+    `MEDIA:F.pngMEDIA:F.png` to `_resolve_media`, whose whitespace-only split
+    took all of it as one filename.
+
+    The stream half was closed by ELI-80 (diff the catch-all against received
+    text). The media half is fixed here: a filename now also ends at the next
+    `MEDIA:`, and a glued copy of the same directive is dropped.
+    """
+
+    BASE = "https://homeassistant.tail25faa5.ts.net:18791"
+    F = "baseline-test2-0102-1785351819.png"
+    MALFORMED = (f"![{F}MEDIA:{F}]"
+                 f"(https://homeassistant.tail25faa5.ts.net:18791/{F}MEDIA:{F})")
+    CORRECT = f"![{F}](https://homeassistant.tail25faa5.ts.net:18791/{F})"
+
+    def _stream(self, catch_all_baseline):
+        """Replay the turn through the pipe's real assistant-stream helpers.
+
+        Returns what the end-of-stream flush hands to `_resolve_media`.
+        `catch_all_baseline` picks what the catch-all is diffed against:
+        "received" (the code since ELI-80) or "shown" (the code ELI-76 hit).
+        """
+        reply = "MEDIA:" + self.F
+        prompt_pending = media_pending = received = visible = ""
+        for delta in (reply[i:i + 9] for i in range(0, len(reply), 9)):
+            received += delta
+            flush, prompt_pending = _advance_input_prompt_buffer(prompt_pending, delta)
+            if not flush:
+                continue
+            shown, media_pending = _advance_media_buffer(media_pending, flush)
+            visible += shown
+        self.assertEqual(visible, "")  # the whole directive was held back
+        if catch_all_baseline == "received":
+            delta = _catch_all_delta(reply, received, visible)
+        else:
+            delta = _item_delta_text(reply, "", visible)
+        flush, prompt_pending = _advance_input_prompt_buffer(prompt_pending, delta)
+        if flush:
+            _shown, media_pending = _advance_media_buffer(media_pending, flush)
+        return prompt_pending + media_pending
+
+    def test_issue_sequence_resolves_to_one_correct_link(self):
+        pending = self._stream("received")
+        self.assertEqual(pending, "MEDIA:" + self.F)
+        self.assertEqual(_resolve_media(pending, base_url=self.BASE), (self.CORRECT, True))
+
+    def test_shown_only_catch_all_is_what_doubled_the_directive(self):
+        """Pins the stream half of the mechanism."""
+        self.assertEqual(self._stream("shown"), f"MEDIA:{self.F}MEDIA:{self.F}")
+
+    def test_glued_duplicate_no_longer_yields_the_issue_link(self):
+        """The exact malformed link from the issue, fed its exact input."""
+        result, handled = _resolve_media(f"MEDIA:{self.F}MEDIA:{self.F}", base_url=self.BASE)
+        self.assertTrue(handled)
+        self.assertNotEqual(result, self.MALFORMED)
+        self.assertEqual(result, self.CORRECT)
+
+    def test_glued_distinct_directives_become_two_images(self):
+        result, handled = _resolve_media("MEDIA:a.pngMEDIA:b.png", base_url="https://x")
+        self.assertTrue(handled)
+        self.assertEqual(result, "![a.png](https://x/a.png)\n![b.png](https://x/b.png)")
+
+    def test_longer_name_sharing_the_prefix_is_not_swallowed(self):
+        result, _ = _resolve_media("MEDIA:a.pngMEDIA:a.png.bak", base_url="https://x")
+        self.assertEqual(result, "![a.png](https://x/a.png)\n![a.png.bak](https://x/a.png.bak)")
+
+    async def test_owui_upload_path_uploads_once_with_the_real_name(self):
+        uploads = []
+
+        def fake_upload(fpath, base_url, token):
+            uploads.append(fpath.rsplit("/", 1)[-1])
+            return {"id": "f1", "meta": {"content_type": "image/png"}}
+
+        with mock.patch("openclaw_pipe._upload_owui_file", side_effect=fake_upload), \
+             mock.patch("os.path.isfile", return_value=True):
+            result, handled = await _resolve_media_via_owui(
+                f"MEDIA:{self.F}MEDIA:{self.F}",
+                base_url="https://owui.example.com", token="tok", __event_emitter__=None,
+            )
+        self.assertTrue(handled)
+        self.assertEqual(uploads, [self.F])
+        self.assertEqual(result, f"![{self.F}](/api/v1/files/f1/content)")
+
+
 class CatchAllDuplicatesAskUserPromptTests(unittest.TestCase):
     """ELI-80. Reproduced live 2026-08-01 with a SINGLE marker emission.
 

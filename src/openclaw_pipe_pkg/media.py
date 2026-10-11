@@ -57,6 +57,27 @@ def _advance_media_buffer(pending: str, delta: str) -> tuple[str, str]:
     return candidate, ""
 
 
+def _take_media_fname(after_prefix: str) -> tuple[str, str]:
+    """Split the text after a "MEDIA:" prefix into (filename, rest).
+
+    A filename ends at whitespace OR at the next "MEDIA:" directive. Splitting
+    on whitespace alone glued "X.pngMEDIA:X.png" into one bogus filename, and
+    the reply persisted as `![X.pngMEDIA:X.png](.../X.pngMEDIA:X.png)`, a link
+    that 404s (ELI-76). A copy of the same directive glued on with no separator
+    is dropped: nothing emits that on purpose, it is a re-delivered tail.
+    """
+    token = after_prefix.split()[0] if after_prefix else ""
+    fname = token.split(_MEDIA_TRIGGER, 1)[0]
+    rest = after_prefix[len(fname):]
+    glued = _MEDIA_TRIGGER + fname
+    while fname and rest.startswith(glued):
+        after = rest[len(glued):]
+        if after and not after[0].isspace() and not after.startswith(_MEDIA_TRIGGER):
+            break  # a different, longer filename that merely starts the same
+        rest = after
+    return fname, rest
+
+
 def _resolve_media(text, base_url=None):
     """Convert every MEDIA:filename directive in text to embedded media.
 
@@ -77,7 +98,7 @@ def _resolve_media(text, base_url=None):
         idx = remaining.index(prefix)
         before = remaining[:idx]
         after_prefix = remaining[idx + len(prefix):].strip()
-        fname = after_prefix.split()[0] if after_prefix else ""
+        fname, rest = _take_media_fname(after_prefix)
         if not fname:
             break
         if not _looks_like_media_filename(fname):
@@ -89,7 +110,7 @@ def _resolve_media(text, base_url=None):
             continue
         # Prefer HTTPS URL over base64 data URI (base64 breaks OWUI streaming parser).
         url = f"{base_url.rstrip('/')}/{fname}"
-        rest = after_prefix[len(fname):].strip()
+        rest = rest.strip()
         out += before + f"![{fname}]({url})"
         handled = True
         if rest:
@@ -182,7 +203,7 @@ async def _resolve_media_via_owui(
         idx = remaining.index(prefix)
         before = remaining[:idx]
         after_prefix = remaining[idx + len(prefix):].strip()
-        fname = after_prefix.split()[0] if after_prefix else ""
+        fname, rest = _take_media_fname(after_prefix)
         if not fname or not _looks_like_media_filename(fname):
             # Not a real directive -- e.g. prose using "MEDIA:" as a term,
             # not a file reference. Leave this occurrence as literal text
@@ -223,7 +244,7 @@ async def _resolve_media_via_owui(
         else:
             replacement = f"`{fname}`"
 
-        rest = after_prefix[len(fname):].strip()
+        rest = rest.strip()
         out += before + replacement
         uploaded_any = True
         if rest:
