@@ -74,6 +74,7 @@ if "pydantic" not in sys.modules:
     pydantic.Field = _field
     sys.modules["pydantic"] = pydantic
 
+import openclaw_pipe  # noqa: E402
 from openclaw_pipe import (
     _GatewayConnection,
     GatewayError,
@@ -141,6 +142,9 @@ from openclaw_pipe import (
     _maybe_deliver_proactive_after_debounce,
     _maybe_deliver_subagent_proactive,
     _modal_payload_from_user_input_prompt,
+    _native_ask_user_payload,
+    _format_native_answers,
+    _owui_supports_native_ask_user,
     _model_patch_matches,
     _normalize_event_call_response,
     _normalize_model_entry,
@@ -4376,6 +4380,197 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIsNone(answer)
+
+
+class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
+    """OWUI >= 0.11.1 renders `request:user_input` as its native question card."""
+
+    def setUp(self):
+        sys.modules.setdefault("open_webui", types.ModuleType("open_webui"))
+        env = types.ModuleType("open_webui.env")
+        env.VERSION = "0.12.0"
+        sys.modules["open_webui.env"] = env
+        self.addCleanup(sys.modules.pop, "open_webui.env", None)
+        # Treat every cancel as seen and every call as fast, so a test decides
+        # the outcome through the response alone.
+        patcher = mock.patch.object(openclaw_pipe, "_NATIVE_CARD_UNSEEN_CANCEL_S", -1)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_version_gate(self):
+        self.assertTrue(_owui_supports_native_ask_user())
+        sys.modules["open_webui.env"].VERSION = "0.11.0"
+        self.assertFalse(_owui_supports_native_ask_user())
+        sys.modules.pop("open_webui.env")
+        self.assertFalse(_owui_supports_native_ask_user())
+
+    def test_numbered_options_become_card_options_with_descriptions(self):
+        payload = _native_ask_user_payload(
+            "OpenClaw needs input:\n\nDatabase\nWhich database should I use?\n"
+            "1. Postgres - robust, needs a server\n2. SQLite\n3. SQLite"
+        )
+        self.assertEqual(payload["type"], "request:user_input")
+        (q,) = payload["data"]["questions"]
+        self.assertEqual(q["header"], "Database")
+        # The numbered list moves into the options instead of repeating in the text.
+        self.assertEqual(q["question"], "Which database should I use?")
+        self.assertEqual(
+            q["options"],
+            [
+                {"label": "Postgres", "description": "robust, needs a server"},
+                {"label": "SQLite", "description": ""},
+            ],
+        )
+        self.assertTrue(q["allow_other"])
+
+    def test_confirmation_becomes_yes_no_without_free_text(self):
+        payload = _native_ask_user_payload(
+            "OpenClaw needs input:\n\nDeploy\nDeploy now? (y/n)"
+        )
+        (q,) = payload["data"]["questions"]
+        self.assertEqual([o["label"] for o in q["options"]], ["Yes", "No"])
+        self.assertFalse(q["allow_other"])
+
+    def test_free_text_is_a_card_with_only_the_typed_answer(self):
+        payload = _native_ask_user_payload(
+            "OpenClaw needs input:\n\nPackage\nName the package you want"
+        )
+        (q,) = payload["data"]["questions"]
+        self.assertEqual(q["options"], [])
+        self.assertTrue(q["allow_other"])
+
+    def test_secret_and_multiselect_keep_the_legacy_modal(self):
+        self.assertIsNone(_native_ask_user_payload(
+            "OpenClaw needs input:\n\nToken\nPaste your API key"
+        ))
+        self.assertIsNone(_native_ask_user_payload(
+            "OpenClaw needs input:\n\nToppings (multiselect)\nPick\n1. Cheese\n2. Olives"
+        ))
+
+    def test_json_form_carries_several_questions(self):
+        prompt = (
+            "OpenClaw needs input:\n```json\n"
+            + json.dumps({"questions": [
+                {"header": "Frequency", "question": "How often?",
+                 "options": [{"label": "Daily", "description": "Every night"}, "Weekly - Sundays"]},
+                {"id": "where", "header": "Storage", "question": "Where to?",
+                 "options": ["NAS", "Cloud"], "allow_other": False},
+                {"header": "Name", "question": "Name the job"},
+            ]})
+            + "\n```"
+        )
+        qs = _native_ask_user_payload(prompt)["data"]["questions"]
+        self.assertEqual([q["id"] for q in qs], ["q1", "where", "q3"])
+        self.assertEqual(qs[0]["options"][1], {"label": "Weekly", "description": "Sundays"})
+        self.assertFalse(qs[1]["allow_other"])
+        # No options means free text, so typing must stay possible.
+        self.assertTrue(qs[2]["allow_other"])
+        block = _ask_user_detail_block(prompt, "x")
+        self.assertIn("Frequency", block)
+        self.assertNotIn("questions", block)
+
+    def test_format_answers(self):
+        one = [{"id": "answer", "header": "H", "options": []}]
+        self.assertEqual(
+            _format_native_answers(one, {"answer": {"type": "other", "text": " pipx "}}), "pipx"
+        )
+        yn = [{"id": "answer", "header": "H", "options": [{"label": "Yes"}, {"label": "No"}]}]
+        self.assertEqual(
+            _format_native_answers(yn, {"answer": {"type": "option", "label": "No"}}), "no"
+        )
+        two = [{"id": "a", "header": "Frequency", "options": []},
+               {"id": "b", "header": "Storage", "options": []}]
+        self.assertEqual(
+            _format_native_answers(two, {
+                "a": {"type": "option", "label": "Daily"},
+                "b": {"type": "other", "text": "S3"},
+            }),
+            "Frequency: Daily\nStorage: S3",
+        )
+
+    async def test_modal_uses_native_card_and_returns_label(self):
+        calls = []
+
+        async def event_call(event):
+            calls.append(event)
+            return {"status": "answered", "answers": {
+                "answer": {"type": "option", "option_index": 1, "label": "pipx"}}}
+
+        answer = await _ask_user_input_modal(
+            event_call, "Codex needs input:\n\nPackage\nChoose\n1. curl\n2. pipx"
+        )
+        self.assertEqual(answer, "pipx")
+        self.assertEqual(calls[0]["type"], "request:user_input")
+        self.assertEqual(calls[0]["data"]["timeout_ms"], 240_000)
+
+    async def test_explicit_cancel_stops_without_reasking(self):
+        calls = []
+
+        async def event_call(event):
+            calls.append(event)
+            return {"status": "cancelled", "answers": {}}
+
+        with mock.patch.object(openclaw_pipe, "_NATIVE_CARD_UNSEEN_CANCEL_S", 0):
+            answer = await _ask_user_input_modal(
+                event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
+                owui_user_id="user-1", max_wait_s=1, poll_interval_s=0.01,
+            )
+        self.assertIsNone(answer)
+        self.assertEqual(len(calls), 1)
+
+    async def test_timeout_and_unseen_cancel_reask(self):
+        responses = [
+            {"error": "Event call timed out. The browser tab may be inactive or closed."},
+            {"status": "cancelled", "answers": {}},  # instant: viewing another chat
+            {"status": "answered", "answers": {"answer": {"type": "option", "label": "b"}}},
+        ]
+
+        async def event_call(event):
+            return responses.pop(0)
+
+        with mock.patch.object(openclaw_pipe, "_NATIVE_CARD_UNSEEN_CANCEL_S", 10):
+            answer = await _ask_user_input_modal(
+                event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
+                owui_user_id="user-1", max_wait_s=1, poll_interval_s=0.01,
+            )
+        self.assertEqual(answer, "b")
+        self.assertEqual(responses, [])
+
+    async def test_disconnected_session_moves_to_the_users_new_socket(self):
+        sent = {"calls": [], "emits": []}
+
+        class _FakeSio:
+            async def call(self, event, data, to=None, timeout=None):
+                sent["calls"].append((data, to, timeout))
+                return {"status": "answered", "answers": {"answer": {"type": "option", "label": "a"}}}
+
+            async def emit(self, event, data, to=None):
+                sent["emits"].append(data)
+
+        socket_main = types.ModuleType("open_webui.socket.main")
+        socket_main.sio = _FakeSio()
+        socket_main.SESSION_POOL = {"sid-new": {"id": "user-1"}}
+        sys.modules.setdefault("open_webui.socket", types.ModuleType("open_webui.socket"))
+        sys.modules["open_webui.socket.main"] = socket_main
+        self.addCleanup(sys.modules.pop, "open_webui.socket.main", None)
+
+        async def event_call(event):
+            return {"error": "Client session disconnected."}
+
+        answer = await _ask_user_input_modal(
+            event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
+            owui_user_id="user-1", owui_chat_id="chat-1", owui_message_id="msg-1",
+            max_wait_s=1, poll_interval_s=0.01,
+        )
+        self.assertEqual(answer, "a")
+        data, to, timeout = sent["calls"][0]
+        self.assertEqual(to, "sid-new")
+        self.assertEqual(timeout, 240)
+        self.assertEqual(data["chat_id"], "chat-1")
+        interaction_id = data["data"]["data"]["interaction_id"]
+        # The card is removed from the screen once the call settles.
+        self.assertEqual(sent["emits"][0]["data"], {
+            "type": "request:interaction:done", "data": {"interaction_id": interaction_id}})
 
 
 class DynamicModelSelectorTests(unittest.TestCase):
