@@ -964,13 +964,8 @@ class Pipe:
         max_resume_attempts = 3
         pending_restart_error: str | None = None
 
-        async def recover_from_preview() -> str | None:
-            try:
-                preview = await conn.session_preview(session_key)
-                return _preview_recovery_text(preview, session_key, text)
-            except Exception as ex:
-                pipe_log(f"  preview recovery failed: {ex}")
-                return None
+        async def recover_from_transcript() -> str | None:
+            return await _recover_turn_text(conn, session_key, text)
 
         async def gateway_run_status() -> str | None:
             """Check the Gateway's own run status (P26).
@@ -1306,9 +1301,9 @@ class Pipe:
                                 text_yielded = True
                                 break
 
-                            recovered = await recover_from_preview()
+                            recovered = await recover_from_transcript()
                             if recovered and not text_yielded:
-                                pipe_log("  recovered assistant text from sessions.preview")
+                                pipe_log("  recovered assistant text from the session transcript")
                                 text_yielded = True
                                 record_visible_chunk(recovered)
                                 yield recovered
@@ -1367,7 +1362,7 @@ class Pipe:
                                             break
                                     elif session_row.get("status") in ("done", "failed", "cancelled"):
                                         pipe_log("  sessions.describe: session is done/failed/cancelled, checking preview")
-                                        recovered2 = await recover_from_preview()
+                                        recovered2 = await recover_from_transcript()
                                         if recovered2 and not text_yielded:
                                             pipe_log("  recovered assistant text after describe probe")
                                             text_yielded = True
@@ -1736,7 +1731,7 @@ class Pipe:
                             last_activity_time = time.time()
 
                         if not text_yielded and event_count >= max_events_without_text:
-                            recovered = await recover_from_preview()
+                            recovered = await recover_from_transcript()
                             if recovered:
                                 pipe_log("  recovered assistant text after event cap")
                                 text_yielded = True
@@ -1991,7 +1986,7 @@ class Pipe:
             )
 
         if not aborted and not text_yielded:
-            recovered = await recover_from_preview()
+            recovered = await recover_from_transcript()
             if recovered:
                 pipe_log("  recovered assistant text at final fallback")
                 record_visible_chunk(recovered)

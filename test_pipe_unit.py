@@ -143,6 +143,8 @@ from openclaw_pipe import (
     _owui_session_key,
     _parse_whitelist,
     _preview_recovery_text,
+    _history_recovery_text,
+    _recover_turn_text,
     _provider_from_key,
     _reap_stale_gateway_connection,
     _relative_time,
@@ -187,6 +189,110 @@ class PreviewRecoveryTests(unittest.TestCase):
         self.assertIsNone(
             _preview_recovery_text(preview, "agent:main:test", "current question")
         )
+
+
+class InterruptedTurnTailRecoveryTests(unittest.TestCase):
+    """ELI-74: a turn whose live stream was lost is read back from the session
+    transcript. It used to come from `sessions.preview`, which the Gateway
+    clips per item server-side (2000 chars then, 800 on 2026.9.x) whatever
+    `maxChars` asks for, so long replies landed cut mid-sentence with "...".
+    """
+
+    KEY = "agent:main:openwebui-u-c"
+    QUESTION = "what changed?"
+    # Longer than both server-side preview caps.
+    LONG = "".join(f"Sentence {i} of the final answer. " for i in range(200)).strip()
+
+    def _history(self):
+        # The live claude-cli layout (captured 2026-10-11): the pipe's own user
+        # message, the imported copy behind the metadata envelope, the turn's
+        # assistant messages (tool-only ones have no text), then the closing
+        # message carrying the whole turn's text.
+        envelope = (
+            "Conversation info (untrusted metadata):\n```json\n{}\n```\n\n"
+            + self.QUESTION
+        )
+        return {"messages": [
+            {"role": "user", "content": "older question"},
+            {"role": "assistant", "content": [{"type": "text", "text": "older answer"}]},
+            {"role": "user", "content": self.QUESTION,
+             "idempotencyKey": "msg-c-1:user"},
+            {"role": "user", "content": envelope},
+            {"role": "assistant", "content": [{"type": "text", "text": "I'll check."}]},
+            {"role": "assistant", "content": [
+                {"type": "toolcall", "name": "exec"}, {"type": "tool_result"}]},
+            {"role": "user", "content": [{"type": "tool_result", "content": "ok"}]},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "hmm"},
+                {"type": "text", "text": self.LONG}]},
+        ]}
+
+    @staticmethod
+    def _clipping_preview(full_text, cap=800):
+        """What the Gateway's sessions.preview returns: every item clipped."""
+        def clip(t):
+            return t if len(t) <= cap else t[:cap - 3] + "..."
+
+        async def session_preview(session_key, limit=8, max_chars=4000):
+            return {"previews": [{"key": session_key, "items": [
+                {"role": "user", "text": InterruptedTurnTailRecoveryTests.QUESTION},
+                {"role": "assistant", "text": clip(full_text)},
+            ]}]}
+        return session_preview
+
+    def _conn(self, history=None, history_error=None):
+        conn = types.SimpleNamespace()
+        if history_error is not None:
+            conn.session_history = mock.AsyncMock(side_effect=history_error)
+        else:
+            conn.session_history = mock.AsyncMock(return_value=history)
+        conn.session_preview = mock.AsyncMock(side_effect=self._clipping_preview(self.LONG))
+        return conn
+
+    def test_long_tail_survives_intact(self):
+        self.assertGreater(len(self.LONG), 2000)
+        conn = self._conn(self._history())
+        recovered = asyncio.run(_recover_turn_text(conn, self.KEY, self.QUESTION))
+        self.assertEqual(recovered, self.LONG)
+        self.assertFalse(recovered.endswith("..."))
+        conn.session_preview.assert_not_awaited()
+
+    def test_history_is_requested_with_a_budget_above_the_old_clip(self):
+        conn = self._conn(self._history())
+        asyncio.run(_recover_turn_text(conn, self.KEY, self.QUESTION))
+        conn.session_history.assert_awaited_once_with(self.KEY)
+        # The default budget the request goes out with.
+        self.assertGreaterEqual(
+            inspect.signature(_GatewayConnection.session_history)
+            .parameters["max_chars"].default,
+            len(self.LONG),
+        )
+
+    def test_returns_the_turns_closing_text_not_its_opening_preamble(self):
+        self.assertEqual(_history_recovery_text(self._history(), self.QUESTION), self.LONG)
+
+    def test_stops_at_the_next_turn(self):
+        history = self._history()
+        history["messages"] += [
+            {"role": "user", "content": "a later question"},
+            {"role": "assistant", "content": [{"type": "text", "text": "later answer"}]},
+        ]
+        self.assertEqual(_history_recovery_text(history, self.QUESTION), self.LONG)
+
+    def test_falls_back_to_the_preview_when_history_fails(self):
+        conn = self._conn(history_error=GatewayError("unknown method chat.history"))
+        recovered = asyncio.run(_recover_turn_text(conn, self.KEY, self.QUESTION))
+        self.assertTrue(recovered.endswith("..."))  # clipped, but not nothing
+        conn.session_preview.assert_awaited_once()
+
+    def test_falls_back_to_the_preview_when_history_has_no_match(self):
+        conn = self._conn({"messages": []})
+        self.assertIsNotNone(asyncio.run(_recover_turn_text(conn, self.KEY, self.QUESTION)))
+        conn.session_preview.assert_awaited_once()
+
+    def test_no_match_anywhere_is_none(self):
+        conn = self._conn({"messages": []})
+        self.assertIsNone(asyncio.run(_recover_turn_text(conn, self.KEY, "never asked")))
 
 
 class ProactiveDeliveryTests(unittest.TestCase):
