@@ -135,6 +135,7 @@ from openclaw_pipe import (
     _item_assistant_text,
     _item_delta_text,
     _last_assistant_text_from_preview,
+    _last_assistant_text_from_history,
     _live_session_id_for_user,
     _maybe_deliver_proactive_after_debounce,
     _maybe_deliver_subagent_proactive,
@@ -305,6 +306,103 @@ class InterruptedTurnTailRecoveryTests(unittest.TestCase):
     def test_no_match_anywhere_is_none(self):
         conn = self._conn({"messages": []})
         self.assertIsNone(asyncio.run(_recover_turn_text(conn, self.KEY, "never asked")))
+
+
+class ProactiveDeliveryFullTextTests(unittest.TestCase):
+    """Proactive deliveries read the run's text from `chat.history`, not the
+    `sessions.preview` the Gateway clips to 800 chars per item (2026.9.x)
+    whatever `maxChars` asks for. Long cron/sub-agent messages used to land
+    in OWUI cut mid-sentence with "..."."""
+
+    USER_ID = "11111111-1111-1111-1111-111111111111"
+    CHAT_ID = "22222222-2222-2222-2222-222222222222"
+    LONG = "".join(f"Line {i} of the scheduled report. " for i in range(150)).strip()
+
+    def _history(self, *tail):
+        return {"messages": [
+            {"role": "user", "content": "older prompt"},
+            {"role": "assistant", "content": [{"type": "text", "text": "older reply"}]},
+            {"role": "user", "content": "[cron] daily report"},
+            *tail,
+        ]}
+
+    def _conn(self, history=None, history_error=None):
+        conn = _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"))
+        if history_error is not None:
+            conn.session_history = mock.AsyncMock(side_effect=history_error)
+        else:
+            conn.session_history = mock.AsyncMock(return_value=history)
+        clipped = self.LONG[:797] + "..."
+
+        async def session_preview(session_key, limit=8, max_chars=4000):
+            return {"previews": [{"key": session_key, "items": [
+                {"role": "assistant", "text": clipped}]}]}
+        conn.session_preview = mock.AsyncMock(side_effect=session_preview)
+        return conn
+
+    def _deliver(self, conn, subagent=False):
+        appended = []
+
+        async def fake_append(conn_, chat_id, text, *, log_prefix, out=None):
+            appended.append(text)
+            return True
+
+        with mock.patch("openclaw_pipe._append_proactive_message_to_chat", fake_append), \
+                mock.patch("openclaw_pipe.LIVE_STREAM_BOOTSTRAP_ENABLED", False):
+            parent = _owui_session_key("main", self.USER_ID, self.CHAT_ID)
+            if subagent:
+                asyncio.run(_deliver_subagent_proactive_owui_message(
+                    conn, "agent:main:subagent:abc", "run-1", parent, "task-1", "Report"))
+            else:
+                asyncio.run(_deliver_proactive_owui_message(conn, parent, "run-1"))
+        return appended
+
+    def test_long_proactive_message_is_delivered_whole(self):
+        self.assertGreater(len(self.LONG), 800)
+        conn = self._conn(self._history(
+            {"role": "assistant", "content": [{"type": "text", "text": self.LONG}]}))
+        appended = self._deliver(conn)
+        self.assertEqual(len(appended), 1)
+        self.assertTrue(appended[0].endswith(self.LONG))
+        conn.session_preview.assert_not_awaited()
+
+    def test_long_subagent_message_is_delivered_whole(self):
+        conn = self._conn(self._history(
+            {"role": "assistant", "content": [{"type": "text", "text": self.LONG}]}))
+        appended = self._deliver(conn, subagent=True)
+        self.assertEqual(len(appended), 1)
+        self.assertIn(self.LONG, appended[0])
+        self.assertIn("<!-- openclaw:taskId=task-1 -->", appended[0])
+        conn.session_history.assert_awaited_once()
+        self.assertEqual(conn.session_history.await_args.args[0], "agent:main:subagent:abc")
+        conn.session_preview.assert_not_awaited()
+
+    def test_skips_trailing_tool_only_messages(self):
+        conn = self._conn(self._history(
+            {"role": "assistant", "content": [{"type": "text", "text": self.LONG}]},
+            {"role": "assistant", "content": [{"type": "toolcall", "name": "exec"}]},
+            {"role": "user", "content": [{"type": "tool_result", "content": "ok"}]},
+        ))
+        self.assertTrue(self._deliver(conn)[0].endswith(self.LONG))
+
+    def test_sentinel_delivers_nothing(self):
+        conn = self._conn(self._history(
+            {"role": "assistant", "content": [{"type": "text", "text": "NO_REPLY"}]}))
+        conn.session_preview = mock.AsyncMock(return_value={"previews": [
+            {"key": _owui_session_key("main", self.USER_ID, self.CHAT_ID),
+             "items": [{"role": "assistant", "text": "NO_REPLY"}]}]})
+        self.assertEqual(self._deliver(conn), [])
+
+    def test_does_not_redeliver_an_older_runs_reply(self):
+        # The run produced no text: the newest text row is its own prompt.
+        self.assertIsNone(_last_assistant_text_from_history(self._history()))
+
+    def test_falls_back_to_the_preview_when_history_fails(self):
+        conn = self._conn(history_error=GatewayError("unknown method chat.history"))
+        appended = self._deliver(conn)
+        self.assertEqual(len(appended), 1)
+        self.assertTrue(appended[0].endswith("..."))  # clipped, but not nothing
+        conn.session_preview.assert_awaited_once()
 
 
 class ProactiveDeliveryTests(unittest.TestCase):
