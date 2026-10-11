@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Unit tests for scripts/migrate_stale_chat_models.py (successor resolution)."""
 
-import ast
 import importlib.util
 import os
 import unittest
@@ -87,15 +86,10 @@ class ResolveSuccessorTests(unittest.TestCase):
         self.assertEqual(mig.resolve_successor("anthropic/claude-opus-5", {"default", "openai/gpt-5.5"})[0],
                          "default")
 
-    def test_legacy_presets_match_the_pipe(self):
-        with open(os.path.join(ROOT, "src", "openclaw_pipe_pkg", "pipe.py")) as f:
-            src = f.read()
-        for node in ast.walk(ast.parse(src)):
-            if (isinstance(node, ast.Assign) and len(node.targets) == 1
-                    and getattr(node.targets[0], "id", None) == "_LEGACY_PRESET_MAP"):
-                self.assertEqual(ast.literal_eval(node.value), mig.LEGACY_PRESETS)
-                return
-        self.fail("_LEGACY_PRESET_MAP not found in pipe.py")
+    def test_legacy_presets_still_resolve(self):
+        live = {"default", "openai/gpt-5.5", "anthropic/claude-sonnet-5-5"}
+        self.assertEqual(mig.resolve_successor("chatgpt", live)[0], "openai/gpt-5.5")
+        self.assertEqual(mig.resolve_successor("sonnet", live)[0], "anthropic/claude-sonnet-5-5")
 
 
 class PlanMigrationTests(unittest.TestCase):

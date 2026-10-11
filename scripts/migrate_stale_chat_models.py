@@ -54,8 +54,9 @@ from owui_api import OwuiClient  # noqa: E402
 
 DEFAULT_SUFFIX = "default"
 
-# Mirrors Pipe._LEGACY_PRESET_MAP in src/openclaw_pipe_pkg/pipe.py. A unit test
-# asserts the two stay equal.
+# What the retired legacy selector entries meant. The Pipe dropped its own
+# `_LEGACY_PRESET_MAP` (ELI-85), so this is now the only record; chats saved on
+# those entries still carry the bare preset name.
 LEGACY_PRESETS = {
     "chatgpt": "openai/gpt-5.5",
     "opus": "anthropic/claude-opus-4-8",
