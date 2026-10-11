@@ -1,0 +1,111 @@
+name: E2E
+
+# The full stack, real everywhere except the model: Open WebUI in Docker, this
+# integration installed by its own installers, a real OpenClaw Gateway, and a
+# deterministic fake model (e2e/fake_llm.py). Called by ci.yml (every push and
+# PR) and compat-watch.yml (weekly, against upstream's latest).
+
+on:
+  workflow_call:
+    inputs:
+      owui_image:
+        description: Open WebUI image (empty = the pinned one in e2e/versions.env)
+        type: string
+        default: ""
+      openclaw_version:
+        description: npm spec for openclaw (empty = the pinned one in e2e/versions.env)
+        type: string
+        default: ""
+      lane:
+        description: Name shown in the job title and artifact
+        type: string
+        default: pinned
+  workflow_dispatch:
+    inputs:
+      owui_image:
+        description: Open WebUI image (empty = pinned)
+        type: string
+        default: ""
+      openclaw_version:
+        description: npm spec for openclaw (empty = pinned)
+        type: string
+        default: ""
+      lane:
+        description: Lane name
+        type: string
+        default: manual
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: E2E (${{ inputs.lane }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve versions
+        env:
+          IN_OWUI_IMAGE: ${{ inputs.owui_image }}
+          IN_OPENCLAW_VERSION: ${{ inputs.openclaw_version }}
+          LANE: ${{ inputs.lane }}
+        run: |
+          set -a; . e2e/versions.env; set +a
+          OWUI_IMAGE="${IN_OWUI_IMAGE:-$OWUI_IMAGE}"
+          OPENCLAW_VERSION="${IN_OPENCLAW_VERSION:-$OPENCLAW_VERSION}"
+          echo "OWUI_IMAGE=$OWUI_IMAGE" >> "$GITHUB_ENV"
+          echo "OPENCLAW_VERSION=$OPENCLAW_VERSION" >> "$GITHUB_ENV"
+          echo "Open WebUI: $OWUI_IMAGE / OpenClaw: openclaw@$OPENCLAW_VERSION"
+          echo "### E2E lane \`$LANE\`: \`$OWUI_IMAGE\`, \`openclaw@$OPENCLAW_VERSION\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - uses: astral-sh/setup-uv@v10
+
+      - name: Pull Open WebUI image
+        # Separate step so image download time is visible on its own and a
+        # registry hiccup reads as one, not as a stack failure.
+        run: docker pull --quiet "$OWUI_IMAGE"
+
+      - name: Start the stack and install the integration
+        env:
+          E2E_LOG_DIR: ${{ runner.temp }}/e2e-logs
+        run: bash e2e/start_stack.sh
+
+      - name: End-to-end suite
+        run: |
+          uv run --with-requirements requirements-dev.txt \
+            pytest -v --junitxml="$RUNNER_TEMP/e2e-logs/junit.xml" e2e/test_e2e.py
+
+      - name: Integration suite (test_pipe.py) against the stack
+        # test_route_model_override asks a real model to call session_status and
+        # quote a line from it; the fake model cannot, and the e2e suite covers
+        # routing deterministically instead.
+        run: |
+          uv run --with-requirements requirements-dev.txt \
+            pytest -v test_pipe.py -k "not test_route_model_override"
+
+      - name: Collect logs
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/e2e-logs"
+          docker logs owui > "$RUNNER_TEMP/e2e-logs/open-webui.log" 2>&1 || true
+          cp /tmp/openclaw/*.log "$RUNNER_TEMP/e2e-logs/" 2>/dev/null || true
+          echo "--- gateway (tail)"; tail -40 "$RUNNER_TEMP/e2e-logs/gateway.log" 2>/dev/null || true
+          echo "--- open webui (pipe lines)"; grep -i "openclaw\|pipe" "$RUNNER_TEMP/e2e-logs/open-webui.log" | tail -60 || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-logs-${{ inputs.lane }}
+          path: ${{ runner.temp }}/e2e-logs
+          retention-days: 14

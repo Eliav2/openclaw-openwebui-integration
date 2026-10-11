@@ -1,0 +1,15 @@
+# Test and tooling dependencies. One list for CI and local runs:
+#   uv run --with-requirements requirements-dev.txt pytest -q
+#
+# pydantic, cryptography and websockets are the versions Open WebUI locks
+# (uv.lock at the tag in e2e/versions.env): the artifacts run inside Open
+# WebUI's interpreter, so that is what the unit suite should see. Bump them
+# together with e2e/versions.env, not on their own.
+pydantic==2.13.4
+cryptography==48.0.0
+websockets==16.0
+
+pytest==9.1.1
+pytest-cov==7.1.0
+click==8.5.0
+rich==15.0.0
