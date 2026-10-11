@@ -66,7 +66,7 @@ Installation
 8. Pick a model in Open WebUI. The pipe asks the Gateway which models it knows
    about and lists one selector entry per model, alongside an always-present
    "OpenClaw . Default" entry that leaves the agent's own configured model
-   alone. CONFIGURED_MODELS restricts that list; MAX_MODELS caps it.
+   alone. MAX_MODELS caps how many entries it lists.
 
 Full valve reference, troubleshooting, and the agent metadata contract:
 https://github.com/Eliav2/openclaw-openwebui-integration
