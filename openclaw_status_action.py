@@ -1968,9 +1968,9 @@ class _GatewayConnection:
         """Hand a cancelled reply's unfinished business to the next message.
 
         OWUI cancels a response the same way for Stop and for Send now /
-        interrupt (which then sends a new message ~0.5s later), so a cancel
-        alone cannot tell them apart. For `grace_s` the cancelled turn is
-        parked here instead of torn down:
+        interrupt (which then sends a new message): both call
+        stopTasksByChatId, and the message queue lives only in the browser.
+        So the cancelled turn is parked first and decided after:
 
         * `run_id` keeps running, and `queue` stays registered so every event
           the run emits (including ones queued but not yet shown) is buffered
@@ -1978,9 +1978,12 @@ class _GatewayConnection:
         * `carried` holds user messages the cancelled reply had accepted but
           not yet sent to the Gateway, oldest first.
 
-        `claim_cancelled_turn` takes all of it over. If nothing claims it, it
-        was a Stop: the run is aborted, the queue released and the carried
-        messages dropped (the user stopped them).
+        The caller then asks the browser which button was pressed and calls
+        `settle_parked_turn`: Stop releases it now, Send now holds it for the
+        follow-up message. `grace_s` is only the fallback for a client that
+        cannot say (no page hook, API use). `claim_cancelled_turn` takes all
+        of it over; if nothing claims it, the run is aborted, the queue
+        released and the carried messages dropped (the user stopped them).
 
         Synchronous on purpose: it runs on the generator's cancel/close path,
         where an await can itself be interrupted, so nothing here may depend
@@ -1990,6 +1993,7 @@ class _GatewayConnection:
         if previous is not None:
             if previous["task"] is not None:
                 previous["task"].cancel()
+            previous["resolved"].set()
             carried = list(previous["carried"]) + list(carried)
             if previous["queue"] is not None and previous["queue"] is not queue:
                 self.unregister_consumer(
@@ -2006,7 +2010,8 @@ class _GatewayConnection:
             self.mark_delivered_live(session_key, run_id)
 
         entry = {"run_id": run_id, "queue": queue, "carried": list(carried),
-                 "send_stop": send_stop, "task": None}
+                 "send_stop": send_stop, "task": None,
+                 "resolved": asyncio.Event()}
 
         def _release() -> None:
             if entry["queue"] is not None:
@@ -2018,28 +2023,83 @@ class _GatewayConnection:
                 spawn_background(
                     self._abort_cancelled_run(session_key, run_id, send_stop))
 
+        entry["release"] = _release
         if grace_s <= 0:
             _release()
             return
+        self._pending_cancel_aborts[session_key] = entry
+        self._arm_parked_timer(session_key, entry, grace_s)
+
+    def _arm_parked_timer(self, session_key: str, entry: dict,
+                          wait_s: float) -> None:
+        if entry["task"] is not None:
+            entry["task"].cancel()
 
         async def _fire():
-            await asyncio.sleep(grace_s)
+            await asyncio.sleep(wait_s)
             if self._pending_cancel_aborts.get(session_key) is not entry:
                 return
+            if entry.get("claiming"):
+                # A follow-up message is already here, waiting for the page's
+                # answer: only an explicit Stop may release the run now.
+                return
             self._pending_cancel_aborts.pop(session_key, None)
-            pipe_log(f"  no new message within {grace_s:g}s of the cancel: "
-                     f"stopping run {str(run_id)[:20]}...")
-            _release()
+            entry["resolved"].set()
+            pipe_log(f"  no new message within {wait_s:g}s of the cancel: "
+                     f"stopping run {str(entry['run_id'])[:20]}...")
+            entry["release"]()
 
         entry["task"] = spawn_background(_fire())
-        self._pending_cancel_aborts[session_key] = entry
 
-    def claim_cancelled_turn(self, session_key: str) -> dict | None:
+    def settle_parked_turn(self, session_key: str, run_id: str | None,
+                           intent: str | None, hold_s: float) -> None:
+        """Apply what the browser said about the cancel of `run_id`.
+
+        "stop": the user pressed Stop (or Escape), so stop now. "send_now":
+        a follow-up message is on its way, so hold the run for it; `hold_s`
+        only bounds a browser that dies before sending it. Anything else
+        (no hook, no answer) keeps the fallback timer. No-op if the turn was
+        already claimed or released.
+        """
+        entry = self._pending_cancel_aborts.get(session_key)
+        if entry is None or entry["run_id"] != run_id:
+            return
+        if intent == "stop":
+            self._pending_cancel_aborts.pop(session_key, None)
+            if entry["task"] is not None:
+                entry["task"].cancel()
+            pipe_log(f"  cancel was a Stop: stopping run {str(run_id)[:20]}... now")
+            entry["release"]()
+        elif intent == "send_now":
+            pipe_log(f"  cancel was a Send now: holding run {str(run_id)[:20]}... "
+                     f"for the follow-up message (up to {hold_s:g}s)")
+            self._arm_parked_timer(session_key, entry, hold_s)
+        else:
+            pipe_log("  cancel intent unknown (no page hook or no answer): "
+                     "keeping the fallback window")
+        entry["resolved"].set()
+
+    async def claim_cancelled_turn(self, session_key: str,
+                                   wait_s: float = 3.0) -> dict | None:
         """Take over the turn `park_cancelled_turn` parked, if any.
+
+        Waits up to `wait_s` for `settle_parked_turn`, so a Stop whose answer
+        is still on its way is honored: OWUI follows a Stop with the next
+        queued message, which must start fresh rather than continue the run
+        the user just stopped.
 
         Returns {"run_id", "queue", "carried"}; the caller now owns the run,
         its buffered queue and the carried messages.
         """
+        entry = self._pending_cancel_aborts.get(session_key)
+        if entry is None:
+            return None
+        if not entry["resolved"].is_set():
+            entry["claiming"] = True
+            try:
+                await asyncio.wait_for(entry["resolved"].wait(), wait_s)
+            except asyncio.TimeoutError:
+                pass
         entry = self._pending_cancel_aborts.pop(session_key, None)
         if entry is None:
             return None

@@ -578,7 +578,7 @@ Relevant valves:
 | `OWUI_API_KEY`         | Optional API key for uploads; the current request bearer token is preferred (default: empty)                                                                                                                                                                                |
 | `FILE_SERVER_BASE_URL` | Legacy fallback base URL for the built-in media file server, used only when `USE_OWUI_FILES` is off or an upload fails (default: `http://localhost:18791`). The **browser** resolves this URL, not OWUI, so the default only works when you browse OWUI from the same host. |
 | `SEND_STOP_ON_CANCEL`  | Send `/stop` after `chat.abort` when OWUI cancels a stream (default: `True`)                                                                                                                                                                                                |
-| `INTERRUPT_GRACE_SECONDS` | How long a cancelled stream waits for a follow-up message before aborting the run. A message inside the window (OWUI's Send now) keeps the running turn and its subagents alive (default: `10`; `0` aborts immediately) |
+| `INTERRUPT_GRACE_SECONDS` | Fallback only, for when the page cannot say whether a cancel was Stop or Send now: how long the run waits for a follow-up message before it is aborted (default: `10`; `0` aborts immediately) |
 
 ---
 
@@ -1222,15 +1222,20 @@ Valve: `SEND_STOP_ON_CANCEL` (on).
 
 **Send now is not Stop.** Open WebUI implements "Send now" on a queued
 message (and sending with its message queue turned off) as a Stop followed
-by the new message about half a second later. Aborting on that cancel killed
-the running turn and every subagent it had spawned. So the Pipe waits
-`INTERRUPT_GRACE_SECONDS` (default 10) before aborting: if a new message for
-the same chat arrives first, the run is kept, the new reply streams the rest
-of it (its remaining tool calls and text), and then answers the new message.
-A plain Stop still aborts once the window passes. The window is generous
-because OWUI's gap between the cancel and the new message varies: 0.7s in
-one measurement, 3.4s in another, so a 3s window turned a Send now into a
-Stop.
+by the new message. Both reach the server as the same task cancel, and the
+queue exists only in the browser, so the server cannot tell them apart.
+Aborting on that cancel killed the running turn and every subagent it had
+spawned.
+
+The Pipe asks the page instead. It installs a small listener in the chat
+page that records which button was pressed (Stop or Escape, versus Send
+now or Enter while a response runs), and on a cancel it reads that answer
+through Open WebUI's `execute` event. A Stop aborts the run at once. A Send
+now keeps the run alive until the new message arrives, and the new reply
+streams the rest of it (its remaining tool calls and text) before answering
+the new message. While the page's answer is on its way the run is held, so
+a Stop followed by Open WebUI auto-sending the next queued message does not
+continue the run that was stopped.
 
 Nothing is dropped along the way. The run's events are buffered from the
 moment of the cancel, so the new reply continues exactly where the old one
@@ -1239,6 +1244,11 @@ stopped. A reply that is interrupted before it got to send its own message
 message on, and the next reply sends it together with its own. OWUI ends a
 response either by cancelling it or by closing its stream, depending on
 timing; both are handled the same way.
+
+When the page cannot answer (Open WebUI in a language other than English,
+whose button labels the listener does not recognize, or a client calling
+the API directly), `INTERRUPT_GRACE_SECONDS` applies as a fallback: a new
+message inside that window keeps the run, otherwise it is aborted.
 
 Valve: `INTERRUPT_GRACE_SECONDS` (10).
 

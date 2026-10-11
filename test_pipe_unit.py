@@ -1591,13 +1591,13 @@ class ParkedCancelTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.15)
         self.assertEqual(calls, [("abort", "s", "run-1"), ("stop", "s")])
         self.assertEqual(conn._consumers, {})
-        self.assertIsNone(conn.claim_cancelled_turn("s"))
+        self.assertIsNone(await conn.claim_cancelled_turn("s"))
 
     async def test_claim_inside_grace_takes_run_queue_and_messages(self):
         conn, calls = self._conn()
         q = conn.register_consumer("s", "run-1")
         conn.park_cancelled_turn("s", "run-1", q, ["test"], 0.05, send_stop=True)
-        claimed = conn.claim_cancelled_turn("s")
+        claimed = await conn.claim_cancelled_turn("s")
         self.assertEqual(claimed["run_id"], "run-1")
         self.assertIs(claimed["queue"], q)
         self.assertEqual(claimed["carried"], ["test"])
@@ -1612,12 +1612,12 @@ class ParkedCancelTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         self.assertEqual(calls, [("abort", "s", "run-1")])
         self.assertEqual(conn._consumers, {})
-        self.assertIsNone(conn.claim_cancelled_turn("s"))
+        self.assertIsNone(await conn.claim_cancelled_turn("s"))
 
     async def test_claim_is_per_session(self):
         conn, calls = self._conn()
         conn.park_cancelled_turn("s", "run-1", None, [], 0.05, send_stop=False)
-        self.assertIsNone(conn.claim_cancelled_turn("other"))
+        self.assertIsNone(await conn.claim_cancelled_turn("other"))
         await asyncio.sleep(0.15)
         self.assertEqual(calls, [("abort", "s", "run-1")])
 
@@ -1627,7 +1627,7 @@ class ParkedCancelTests(unittest.IsolatedAsyncioTestCase):
         conn.park_cancelled_turn("s", "run-2", None, ["b"], 5, send_stop=False)
         await asyncio.sleep(0)
         self.assertEqual(calls, [("abort", "s", "run-1")])
-        claimed = conn.claim_cancelled_turn("s")
+        claimed = await conn.claim_cancelled_turn("s")
         self.assertEqual(claimed["run_id"], "run-2")
         self.assertEqual(claimed["carried"], ["a", "b"])
 
@@ -1636,7 +1636,7 @@ class ParkedCancelTests(unittest.IsolatedAsyncioTestCase):
         # message must reach the next reply.
         conn, calls = self._conn()
         conn.park_cancelled_turn("s", None, None, ["hello"], 0.05, send_stop=True)
-        self.assertEqual(conn.claim_cancelled_turn("s")["carried"], ["hello"])
+        self.assertEqual((await conn.claim_cancelled_turn("s"))["carried"], ["hello"])
         await asyncio.sleep(0.1)
         self.assertEqual(calls, [])
 
@@ -1648,7 +1648,7 @@ class ParkedCancelTests(unittest.IsolatedAsyncioTestCase):
         conn.park_cancelled_turn("s", "run-1", None, [], 5, send_stop=False)
         self.assertNotIn("s:run-1", conn._run_targets)
         self.assertTrue(conn.was_delivered_live("s", "run-1"))
-        conn.claim_cancelled_turn("s")
+        await conn.claim_cancelled_turn("s")
 
     async def test_seed_renderer_from_buffered_queue(self):
         conn, _ = self._conn()
@@ -1659,12 +1659,55 @@ class ParkedCancelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(conn._run_renderers["s:run-1"].visible_text, "185\n")
         self.assertEqual(q.qsize(), 1, "seeding must not consume the queue")
 
+    async def test_stop_intent_stops_at_once(self):
+        conn, calls = self._conn()
+        q = conn.register_consumer("s", "run-1")
+        conn.park_cancelled_turn("s", "run-1", q, ["x"], 30, send_stop=False)
+        conn.settle_parked_turn("s", "run-1", "stop", hold_s=120)
+        await asyncio.sleep(0)
+        self.assertEqual(calls, [("abort", "s", "run-1")])
+        self.assertIsNone(await conn.claim_cancelled_turn("s"))
+
+    async def test_send_now_intent_outlasts_the_fallback_window(self):
+        # OWUI sent the follow-up 3.4s after the cancel once (2026-10-11);
+        # with the page's answer no timer races it.
+        conn, calls = self._conn()
+        conn.park_cancelled_turn("s", "run-1", None, [], 0.05, send_stop=False)
+        conn.settle_parked_turn("s", "run-1", "send_now", hold_s=5)
+        await asyncio.sleep(0.2)
+        self.assertEqual(calls, [])
+        self.assertEqual((await conn.claim_cancelled_turn("s"))["run_id"], "run-1")
+
+    async def test_unknown_intent_keeps_the_fallback(self):
+        conn, calls = self._conn()
+        conn.park_cancelled_turn("s", "run-1", None, [], 0.05, send_stop=False)
+        conn.settle_parked_turn("s", "run-1", None, hold_s=5)
+        await asyncio.sleep(0.15)
+        self.assertEqual(calls, [("abort", "s", "run-1")])
+
+    async def test_claim_waits_for_a_stop_answer_in_flight(self):
+        # Stop, then OWUI auto-sends the next queued message: that message
+        # must start fresh, not continue the run the user stopped.
+        conn, calls = self._conn()
+        conn.park_cancelled_turn("s", "run-1", None, [], 30, send_stop=False)
+        claim = asyncio.ensure_future(conn.claim_cancelled_turn("s"))
+        await asyncio.sleep(0.05)
+        conn.settle_parked_turn("s", "run-1", "stop", hold_s=120)
+        self.assertIsNone(await claim)
+        self.assertEqual(calls, [("abort", "s", "run-1")])
+
+    def test_intent_query_reads_and_clears(self):
+        from openclaw_pipe import _intent_query_js
+        js = _intent_query_js("chat-1")
+        self.assertIn('"chat-1"', js)
+        self.assertIn("delete all[c]", js)
+
     def test_pipe_claims_before_model_patch(self):
         # The grace window is seconds; sessions.patch alone can take 10s+ with
         # its retry, so the claim must come before it. And the cancel handler
         # must park, never abort directly.
         src = inspect.getsource(Pipe._pipe_turn)
-        claim = src.index("conn.claim_cancelled_turn(session_key)")
+        claim = src.index("await conn.claim_cancelled_turn(session_key)")
         patch = src.index('"sessions.patch"')
         self.assertLess(claim, patch)
         self.assertIn("conn.park_cancelled_turn(", src)
@@ -1742,13 +1785,21 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         for p in self.patches:
             p.stop()
 
-    def _reply(self, text, msg_id):
-        async def emitter(_event):
-            return None
+    def _reply(self, text, msg_id, intent=None):
+        self.emitted = getattr(self, "emitted", [])
+
+        async def emitter(event):
+            self.emitted.append(event)
+
+        async def event_call(event):
+            # The page's answer to `_intent_query_js`.
+            return intent
+
         body = {"model": "openclaw_gateway.default",
                 "messages": [{"role": "user", "content": text}]}
         meta = {"chat_id": "chat-1", "user_id": "u1", "message_id": msg_id}
-        return self.pipe._pipe_impl(body, emitter, __metadata__=meta)
+        return self.pipe._pipe_impl(body, emitter, __metadata__=meta,
+                                    __event_call__=event_call if intent else None)
 
     def _queue(self, run_id):
         return self.conn._consumers[f"{self.SK}:{run_id}"].queues[0]
@@ -1812,6 +1863,41 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sent, ["count to 1500", "test\n\nanother test"],
                          "the interrupted reply's own message must still be sent")
         self.assertNotIn("abort", self.rpc, "an interrupt must not stop the run")
+
+    async def test_send_now_answer_survives_a_slow_follow_up(self):
+        # The live failure after the first deploy: the follow-up came 3.4s
+        # after the cancel and a 3s timer had already aborted the run.
+        self.pipe.valves.INTERRUPT_GRACE_SECONDS = 0.05
+        r1 = self._reply("count", "m1", intent="send_now")
+        first = asyncio.ensure_future(r1.__anext__())
+        await self._until_registered("run-1")
+        self.active = True
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "1\n"))
+        await first
+        await r1.aclose()
+        await asyncio.sleep(0.4)  # far past the fallback window
+        q.put_nowait(self._delta("run-1", "2\n"))
+        r2 = self._reply("next", "m2")
+        out = await self._read(r2, "2")
+        await r2.aclose()
+        self.assertIn("2", out)
+        self.assertNotIn("abort", self.rpc)
+        self.assertTrue(any(e.get("type") == "execute" for e in self.emitted),
+                        "the page hook is installed at turn start")
+
+    async def test_stop_answer_stops_without_waiting(self):
+        self.pipe.valves.INTERRUPT_GRACE_SECONDS = 30
+        r1 = self._reply("count", "m1", intent="stop")
+        first = asyncio.ensure_future(r1.__anext__())
+        await self._until_registered("run-1")
+        self.active = True
+        self._queue("run-1").put_nowait(self._delta("run-1", "1\n"))
+        await first
+        await r1.aclose()
+        await asyncio.sleep(0.05)
+        self.assertIn("abort", self.rpc)
+        self.assertEqual(self.conn._consumers, {})
 
     async def test_plain_stop_still_stops(self):
         r1 = self._reply("count", "m1")
