@@ -86,7 +86,13 @@ from openclaw_status_action import (  # noqa: E402
 
 
 def _emitted_codes(emitted, event_type="execute"):
-    return [e["data"]["code"] for e in emitted if e["type"] == event_type]
+    """The dialog's own execute codes. Excludes the composer Status button
+    snippet every run also delivers (covered by test_composer_unit.py), so
+    these tests keep counting only what the dialog itself renders."""
+    return [
+        e["data"]["code"] for e in emitted
+        if e["type"] == event_type and "__openclawComposerBtn" not in e["data"]["code"]
+    ]
 
 
 class RenderJsTests(unittest.TestCase):

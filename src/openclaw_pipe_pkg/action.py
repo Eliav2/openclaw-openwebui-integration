@@ -1227,7 +1227,23 @@ class Action:
                 return await self._run_subagent_detail(
                     {**body, "taskId": marker.group(1)}, __user__, __event_emitter__,
                 )
-        return await self._run_status(body, __user__, __event_emitter__)
+        try:
+            return await self._run_status(body, __user__, __event_emitter__)
+        finally:
+            # Every status run (re)delivers the composer Status button, so one
+            # spark click is enough to install it in this tab. Sent last so it
+            # never delays the dialog; idempotent and best effort (never
+            # raises). Not on compact/drawer runs: the dialog that sends those
+            # was opened by a status run, which already delivered it. The
+            # Action is global (its spark shows under every model's replies),
+            # so the chat is only vouched for when its model is the Pipe's.
+            model = body.get("model")
+            ours = isinstance(model, str) and model.startswith(_COMPOSER_DEFAULT_MODEL_PREFIX)
+            await _emit_composer_button(
+                __event_emitter__,
+                session_id=body.get("session_id"),
+                chat_id=body.get("chat_id") if ours else None,
+            )
 
     async def _run_status(self, body: dict, __user__, __event_emitter__, *, show_loading=True):
         """Fetches and renders the dialog's three sections -- Context, Rate
