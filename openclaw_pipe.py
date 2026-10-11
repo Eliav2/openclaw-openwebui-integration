@@ -5922,8 +5922,8 @@ class Pipe:
                 "the stream alone can leave the tool running."
         )
         INTERRUPT_GRACE_SECONDS: float = Field(
-            default=3.0,
-            description="Recommended: 3. Sending a message while the agent is "
+            default=10.0,
+            description="Recommended: 10. Sending a message while the agent is "
                 "working (Open WebUI's Send now, or sending with the message "
                 "queue off) stops the current response. With this set, the "
                 "agent's run is kept alive instead: the new reply first shows "

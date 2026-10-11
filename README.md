@@ -578,7 +578,7 @@ Relevant valves:
 | `OWUI_API_KEY`         | Optional API key for uploads; the current request bearer token is preferred (default: empty)                                                                                                                                                                                |
 | `FILE_SERVER_BASE_URL` | Legacy fallback base URL for the built-in media file server, used only when `USE_OWUI_FILES` is off or an upload fails (default: `http://localhost:18791`). The **browser** resolves this URL, not OWUI, so the default only works when you browse OWUI from the same host. |
 | `SEND_STOP_ON_CANCEL`  | Send `/stop` after `chat.abort` when OWUI cancels a stream (default: `True`)                                                                                                                                                                                                |
-| `INTERRUPT_GRACE_SECONDS` | How long a cancelled stream waits for a follow-up message before aborting the run. A message inside the window (OWUI's Send now) keeps the running turn and its subagents alive (default: `3`; `0` aborts immediately) |
+| `INTERRUPT_GRACE_SECONDS` | How long a cancelled stream waits for a follow-up message before aborting the run. A message inside the window (OWUI's Send now) keeps the running turn and its subagents alive (default: `10`; `0` aborts immediately) |
 
 ---
 
@@ -1224,10 +1224,13 @@ Valve: `SEND_STOP_ON_CANCEL` (on).
 message (and sending with its message queue turned off) as a Stop followed
 by the new message about half a second later. Aborting on that cancel killed
 the running turn and every subagent it had spawned. So the Pipe waits
-`INTERRUPT_GRACE_SECONDS` (default 3) before aborting: if a new message for
+`INTERRUPT_GRACE_SECONDS` (default 10) before aborting: if a new message for
 the same chat arrives first, the run is kept, the new reply streams the rest
 of it (its remaining tool calls and text), and then answers the new message.
-A plain Stop still aborts once the window passes.
+A plain Stop still aborts once the window passes. The window is generous
+because OWUI's gap between the cancel and the new message varies: 0.7s in
+one measurement, 3.4s in another, so a 3s window turned a Send now into a
+Stop.
 
 Nothing is dropped along the way. The run's events are buffered from the
 moment of the cancel, so the new reply continues exactly where the old one
@@ -1237,7 +1240,7 @@ message on, and the next reply sends it together with its own. OWUI ends a
 response either by cancelling it or by closing its stream, depending on
 timing; both are handled the same way.
 
-Valve: `INTERRUPT_GRACE_SECONDS` (3).
+Valve: `INTERRUPT_GRACE_SECONDS` (10).
 
 </details>
 
