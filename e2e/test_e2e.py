@@ -187,8 +187,11 @@ def test_tool_call_persists_as_a_native_tool_card(token):
     never stops, and a missing pair renders no card at all."""
     msg = _drive_chat_turn(token, "E2E_TOOL_CALL")
     output = msg.get("output") or []
-    calls = {i["call_id"]: i for i in output
-             if i.get("type") == "function_call" and i.get("call_id")}
+    # The started item carries its id in `id` only (no `call_id`) to survive
+    # OWUI 0.11.1's output_item dedup; OWUI pairs it via `call_id or id`, so
+    # match it the same way. See _tool_call_started_event in gateway.py.
+    calls = {i.get("call_id") or i.get("id"): i for i in output
+             if i.get("type") == "function_call" and (i.get("call_id") or i.get("id"))}
     results = {i["call_id"] for i in output
                if i.get("type") == "function_call_output" and i.get("call_id")}
     dump = json.dumps(msg)[:3000]
