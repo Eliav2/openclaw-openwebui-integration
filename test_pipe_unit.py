@@ -3169,6 +3169,143 @@ class GatewayReloadReapTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch("openclaw_pipe._gateway_connection", None):
             await _reap_stale_gateway_connection()  # must not raise
 
+    async def test_old_code_stale_connection_cannot_be_revived_after_reap(self):
+        # Connections built before `retire()` existed get pinned shut on the
+        # instance, so an in-flight run of the old module can't reconnect it.
+        fake_socket_module = self._install_fake_owui_socket_module()
+
+        class _FakeStaleConn:
+            _stopped = False
+
+            async def disconnect(self):
+                pass
+
+            async def ensure_connected(self):
+                self._stopped = False
+
+        stale = _FakeStaleConn()
+        fake_socket_module._openclaw_gateway_connection_v1 = stale
+        with mock.patch("openclaw_pipe._gateway_connection", None):
+            await _reap_stale_gateway_connection()
+
+        self.assertTrue(stale._stopped)
+        with self.assertRaises(GatewayError):
+            await stale.ensure_connected()
+
+    async def test_reap_retires_new_code_connection_and_it_stays_down(self):
+        fake_socket_module = self._install_fake_owui_socket_module()
+        stale = _GatewayConnection(lambda: None)
+        stale._connect_and_start = mock.AsyncMock()
+        fake_socket_module._openclaw_gateway_connection_v1 = stale
+
+        with mock.patch("openclaw_pipe._gateway_connection", None):
+            await _reap_stale_gateway_connection()
+
+        self.assertTrue(stale._retired)
+        with self.assertRaises(GatewayError):
+            await stale.ensure_connected()
+        stale._connect_and_start.assert_not_called()
+
+    async def test_retired_connection_keeps_serving_in_flight_run_then_closes(self):
+        conn = _GatewayConnection(lambda: None)
+        conn.register_consumer("agent:main:openwebui-u-c", "run-1")
+        conn.disconnect = mock.AsyncMock()
+
+        await conn.retire()
+        conn.disconnect.assert_not_called()
+
+        # The run's own resume path may still reconnect while it is in flight.
+        async def fake_connect_and_start():
+            conn._ws = object()
+        conn._connect_and_start = fake_connect_and_start
+        with mock.patch.object(conn, "_event_loop", mock.AsyncMock()):
+            await conn.ensure_connected()
+        self.assertIsNotNone(conn._ws)
+
+        conn.unregister_consumer("agent:main:openwebui-u-c", "run-1")
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        conn.disconnect.assert_awaited()
+
+        conn._ws = None
+        with self.assertRaises(GatewayError):
+            await conn.ensure_connected()
+
+    async def test_reap_finds_orphans_from_older_loads_but_not_other_functions(self):
+        import openclaw_pipe
+        self._install_fake_owui_socket_module()
+        me = "function_openclaw_gateway_" + "a" * 32
+
+        def make(module_name):
+            cls = type("_GatewayConnection", (), {"__module__": module_name})
+            obj = cls()
+            obj.retire = mock.AsyncMock()
+            return obj
+
+        orphan_a = make("function_openclaw_gateway_" + "b" * 32)
+        orphan_b = make("function_openclaw_gateway_" + "c" * 32)
+        action_conn = make("function_openclaw_status_action_" + "d" * 32)
+        same_load = make(me)
+
+        with mock.patch.dict(openclaw_pipe.__dict__, {"__name__": me}), \
+                mock.patch("openclaw_pipe._gateway_connection", None):
+            await _reap_stale_gateway_connection()
+
+        orphan_a.retire.assert_awaited_once()
+        orphan_b.retire.assert_awaited_once()
+        action_conn.retire.assert_not_called()
+        same_load.retire.assert_not_called()
+
+    def test_function_module_prefix(self):
+        import openclaw_pipe
+        self.assertEqual(
+            openclaw_pipe._function_module_prefix("function_openclaw_gateway_" + "f" * 32),
+            "function_openclaw_gateway",
+        )
+        self.assertEqual(openclaw_pipe._function_module_prefix("openclaw_pipe"), "openclaw_pipe")
+        self.assertEqual(
+            openclaw_pipe._function_module_prefix("function_x_notahexsuffix"),
+            "function_x_notahexsuffix",
+        )
+
+    async def _relay_begin_calls_for_idle_proactive_event(self, retired):
+        conn = _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"))
+        conn._retired = retired
+        sk = _owui_session_key(
+            "main",
+            "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        )
+        event = {
+            "type": "event",
+            "event": "agent",
+            "payload": {"sessionKey": sk, "runId": "run-p", "stream": "assistant",
+                        "data": {"delta": "hi"}},
+        }
+        sent = {"n": 0}
+
+        class FakeWS:
+            async def recv(self):
+                sent["n"] += 1
+                if sent["n"] == 1:
+                    return json.dumps(event)
+                conn._stopped = True
+                raise websockets.exceptions.ConnectionClosed("closed")
+
+        conn._ws = FakeWS()
+        begin = mock.AsyncMock()
+        with mock.patch("openclaw_pipe._relay_begin", begin), \
+                mock.patch("openclaw_pipe.LIVE_STREAM_RELAY_ENABLED", True), \
+                mock.patch.object(conn, "session_idle_for", return_value=True):
+            await conn._event_loop()
+        return begin.await_count
+
+    async def test_retired_connection_never_starts_a_live_relay(self):
+        # Control first: the same event on a live connection DOES start a
+        # relay, so the retired case below is a real negative.
+        self.assertEqual(await self._relay_begin_calls_for_idle_proactive_event(False), 1)
+        self.assertEqual(await self._relay_begin_calls_for_idle_proactive_event(True), 0)
+
     def test_remember_stores_connection_on_owui_socket_module(self):
         fake_socket_module = self._install_fake_owui_socket_module()
         conn = _GatewayConnection(lambda: None)
