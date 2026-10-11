@@ -17,6 +17,10 @@ whole):
   `session_status` tool (any harmless tool the agent offers, if that one is
   missing), then, once the tool result is in the transcript, replies
   `E2E_TOOL_DONE`. Exercises tool cards end to end.
+* `session_status` + `model line`      -> calls `session_status`, then replies
+  with the `Model:` line of its result. Covers the installer's route smoke
+  test, which checks that the reply names the model the Gateway actually
+  routed to, so the answer has to come from the tool and not from here.
 * anything else                        -> `E2E fake model reply.`
 
 Replies stream word by word so the streaming path sees several deltas.
@@ -40,6 +44,7 @@ LOG_PATH = os.environ.get("FAKE_LLM_LOG", "")
 PREFERRED_TOOLS = ("session_status", "sessions_list", "memory_search")
 
 _EXACTLY = re.compile(r"exactly:?\s+([A-Za-z0-9_]{3,})")
+_MODEL_LINE = re.compile(r"^.*\bModel:\s*\S+.*$", re.MULTILINE)
 
 
 def _text_of(content) -> str:
@@ -67,14 +72,23 @@ def plan_reply(body: dict) -> dict:
     turn = messages[last_assistant + 1:]
     user_text = "\n".join(_text_of(m.get("content")) for m in turn if m.get("role") == "user")
     after_user = turn
+    tool_results = [_text_of(m.get("content")) for m in after_user if m.get("role") == "tool"]
+    offered = [
+        (t.get("function") or {}).get("name")
+        for t in body.get("tools") or []
+    ]
+
+    if "session_status" in user_text and "model line" in user_text:
+        if tool_results:
+            m = _MODEL_LINE.search("\n".join(tool_results))
+            return {"text": m.group(0).strip() if m else "E2E_NO_MODEL_LINE"}
+        if "session_status" in offered:
+            return {"tool": "session_status"}
+        return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
 
     if "E2E_TOOL_CALL" in user_text:
-        if any(m.get("role") == "tool" for m in after_user):
+        if tool_results:
             return {"text": "E2E_TOOL_DONE"}
-        offered = [
-            (t.get("function") or {}).get("name")
-            for t in body.get("tools") or []
-        ]
         for name in PREFERRED_TOOLS:
             if name in offered:
                 return {"tool": name}
