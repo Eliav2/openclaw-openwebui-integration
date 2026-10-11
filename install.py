@@ -92,7 +92,6 @@ class Config:
     state_dir: str
     owui_api_base_url: str
     owui_api_key: str
-    chatgpt_model: str
     file_server_base_url: str
     auto_approve: bool = True
     dev_bundle: bool = False
@@ -611,7 +610,6 @@ def update_valves(client: OwuiClient, cfg: Config, preserved_valves: dict | None
         "USE_OWUI_FILES": True,
         "SEND_STOP_ON_CANCEL": True,
         "OWUI_BASE_URL": cfg.owui_api_base_url,
-        "CHATGPT_MODEL": cfg.chatgpt_model,
     }
     if cfg.owui_api_key:
         required["OWUI_API_KEY"] = cfg.owui_api_key
@@ -1014,8 +1012,6 @@ def common_options(f):
                           "(defaults to --owui-url)"),
         click.option("--owui-api-key", envvar="OWUI_API_KEY", default="",
                      help="Optional OWUI API key for native media uploads"),
-        click.option("--chatgpt-model", envvar="CHATGPT_MODEL", default="openai/gpt-5.5",
-                     show_default=True, help="OpenClaw model for the ChatGPT selector entry"),
         click.option("--file-server-base-url", envvar="FILE_SERVER_BASE_URL", default="",
                      help="Legacy media fallback base URL"),
         click.option("--auto-approve/--no-auto-approve", default=True,
