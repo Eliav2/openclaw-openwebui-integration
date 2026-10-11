@@ -88,6 +88,8 @@ class Pipe:
     - ENABLE_FILE_SERVER: start media file server (default True)
     - USE_OWUI_FILES: upload MEDIA files into OWUI Files API (default True)
     - SEND_STOP_ON_CANCEL: send /stop after chat.abort when OWUI cancels
+    - INTERRUPT_GRACE_SECONDS: how long a cancel waits for a follow-up message
+      before aborting the run (default 3; 0 aborts immediately)
     """
 
     class Valves(BaseModel):
@@ -144,6 +146,16 @@ class Pipe:
             description="Recommended. When you press Stop, also send the agent "
                 "a /stop, so a tool it is running is actually killed -- aborting "
                 "the stream alone can leave the tool running."
+        )
+        INTERRUPT_GRACE_SECONDS: float = Field(
+            default=3.0,
+            description="Recommended: 3. Sending a message while the agent is "
+                "working (Open WebUI's Send now, or sending with the message "
+                "queue off) stops the current response. With this set, the "
+                "agent's run is kept alive instead: the new reply first shows "
+                "the rest of the running turn, then answers your message. A "
+                "plain Stop with no new message still stops the run after this "
+                "many seconds. 0 stops immediately, as before."
         )
         OWUI_BASE_URL: str = Field(
             default="http://127.0.0.1:8080",
@@ -691,6 +703,19 @@ class Pipe:
             f"text_sha={_diag_sha} text_preview={text[:48]!r}"
         )
 
+        # A cancel of this session's previous response that arrived just
+        # before this message is OWUI's "Send now" / interrupt, not a Stop:
+        # take over that run instead of letting its deferred abort kill it
+        # (see `schedule_cancel_abort`). Claimed this early because the model
+        # patch below can take seconds and the grace window is short.
+        adopted_run_id = conn.claim_pending_cancel_abort(session_key)
+        if adopted_run_id:
+            pipe_log(
+                f"  new message right after a cancel: keeping run "
+                f"{adopted_run_id[:20]}... alive and continuing it in this "
+                "reply before sending the message"
+            )
+
         # Heal any 1/2·2/2 variant group a previous turn's proactive delivery
         # left behind, so the proactive message shows in the normal linear flow
         # rather than behind a swipe arrow (see _relinearize_proactive_variants).
@@ -842,123 +867,146 @@ class Pipe:
                 return active
             return conn.active_run_id_for_session(session_key) is not None
 
-        # Immediate feedback (outside the lock) if the session is busy right now.
-        if await _session_run_active():
-            pipe_log("Session has an active run (gateway-authoritative); queueing behind it")
+        if adopted_run_id and not await _session_run_active():
+            # It finished during the cancel/re-send gap: nothing to continue.
+            pipe_log("  adopted run already ended; sending the message normally")
+            adopted_run_id = None
+        if adopted_run_id:
+            # Stream the rest of the adopted run into THIS reply. The message
+            # itself is sent afterwards, as its own run, by the recursive call
+            # at the end of this turn: sending it now would steer into the
+            # live run, and the claude-cli runtime has no steering hook (the
+            # gateway acks "started", then drops the message once the run
+            # ends -- measured 2026-10-11).
+            our_run_id = adopted_run_id
+            self._current_run_id = our_run_id
+            epoch_at_send = conn.connection_epoch
+            resolved_thinking = None
+            pending_clamp_note = ""
+            queue = conn.register_consumer(session_key, our_run_id)
             await _emit_status(
                 __event_emitter__,
-                "⏳ Queued behind the current response…",
+                "Continuing the current task; your message is next…",
                 done=False,
             )
-
-        # Serialize the queue-release -> chat.send -> run-registration critical
-        # section per session. Two messages released from the queue at the same
-        # instant would otherwise both send into the same idle window; the
-        # gateway steer-merges the second into the first, which then renders
-        # nothing ("no reply text"). Holding this lock only across the wait+send
-        # (NOT the event loop below) means the next waiter re-checks AFTER our
-        # run is registered and observes it active (sessions.list hasActiveRun),
-        # so it waits its turn instead of racing us. Confirmed thundering-herd
-        # phantom: two Captured runIds 10ms apart under a burst release (ELI-56).
-        # NOTE: do NOT prepend a `/queue followup` directive here. On the
-        # 2026.7.1 gateway that directive is NOT stripped from a device
-        # chat.send -- it leaked verbatim into the delivered message.
-        async with conn.session_send_lock(session_key):
-            queue_wait_started = time.time()
-            queue_wait_cap_s = 1800  # safety ceiling; socket keepalive holds the request
-            queue_settle_s = 2.0     # re-confirm not-active before releasing
-            ever_active = False
-            while time.time() - queue_wait_started < queue_wait_cap_s:
-                if await _session_run_active():
-                    ever_active = True
-                    await asyncio.sleep(1.5)
-                    continue
-                # Not active now. If we were ever queued, settle-confirm before
-                # releasing: when a subagent finishes the parent resumes as a
-                # NEW run, and there is a brief window between the child ending
-                # and that resume registering where hasActiveRun reads false;
-                # sending in it races the resume and phantoms again (ELI-56).
-                if ever_active:
-                    await asyncio.sleep(queue_settle_s)
-                    if await _session_run_active():
-                        continue
-                break
-            if ever_active:
-                pipe_log("  active run ended; sending queued message as its own run")
-
-            # --- Send this message as its own fresh run (still holding the lock
-            #     so the next waiter observes our run before deciding to send) ---
-            idempotency_key = f"msg-{chat_id}-{time.time()}"
-            # Fit the requested level to what this session's model actually
-            # supports. The dropdown is a union across models, so a level that
-            # is real for one model can be unavailable here. Clamping is
-            # downward only and always explained: silently answering at a level
-            # other than the one asked for is worse than a short note, and
-            # silently erroring out is worse still.
-            #
-            # A ladder the Gateway STATED (by rejecting a send) beats the one
-            # describe reported, because describe answers this question without
-            # a model catalog and overreports for catalog-gated models. This is
-            # what makes the rejection cost one turn per model instead of one
-            # turn every turn.
-            #
-            # Look up by `model_override` (the runtime-namespaced routing key,
-            # e.g. "claude-cli/claude-opus-5") before `session_model_key` (the
-            # vendor key describe resolves it to, e.g. "anthropic/claude-opus-5"
-            # -- see `_RUNTIME_PROVIDER_NAMESPACES`). The Gateway's rejection
-            # text names the model by its routing key, so that is where
-            # `_record_thinking_ladder` files the authoritative entry; reading
-            # back under the vendor key alone missed it every time and repeated
-            # the same round-trip rejection (and its note) on every turn.
-            _state_dir_valve = getattr(self.valves, "STATE_DIR", "")
-            effective_ladder = (_read_model_thinking_ladder(model_override, _state_dir_valve)
-                                or _read_model_thinking_ladder(session_model_key, _state_dir_valve)
-                                or session_thinking_ladder)
-            resolved_thinking, thinking_note = clamp_to_ladder(
-                requested_thinking, effective_ladder)
-            # Held until `visible_message_text` exists below (it isn't defined
-            # yet at this point in the turn) so the note that streams here also
-            # ends up in the forced terminal snapshot -- otherwise it shows
-            # while streaming and is gone after a reload.
-            pending_clamp_note = ""
-            if thinking_note:
-                pipe_log(f"thinking: {thinking_note}")
-                # Logged every time, shown once: the dropdown keeps the level
-                # selected, so an unchanged mismatch would otherwise stamp the
-                # same italic line above every answer in the chat.
-                if conn.should_announce_thinking_note(session_key, thinking_note):
-                    pending_clamp_note = f"_{thinking_note}_\n\n"
-                    yield pending_clamp_note
-            # Epoch of the connection this run is being launched on. If it has
-            # moved by the time the queue goes quiet, the Gateway restarted
-            # underneath us and took the run with it (see `connection_epoch`).
-            epoch_at_send = conn.connection_epoch
-            try:
-                send_resp = await conn.send_request(
-                    "chat.send",
-                    _owui_chat_send_params(
-                        session_key=session_key,
-                        message=text,
-                        idempotency_key=idempotency_key,
-                        owui_chat_id=owui_origin_chat_id,
-                        owui_user_id=owui_origin_user_id,
-                        attachments=image_attachments,
-                        thinking=resolved_thinking,
-                    ),
-                    timeout=30
+        else:
+            # Immediate feedback (outside the lock) if the session is busy right now.
+            if await _session_run_active():
+                pipe_log("Session has an active run (gateway-authoritative); queueing behind it")
+                await _emit_status(
+                    __event_emitter__,
+                    "⏳ Queued behind the current response…",
+                    done=False,
                 )
-            except asyncio.TimeoutError:
-                await _emit_status(__event_emitter__, "", done=True)
-                yield "**Timeout:** Gateway did not respond to chat.send"
-                return
-            except Exception as e:
-                await _emit_status(__event_emitter__, "", done=True)
-                yield f"**Error sending message:** {e}"
-                return
-            our_run_id = send_resp.get("runId", "unknown")
-            self._current_run_id = our_run_id
-            pipe_log(f"Captured runId: {our_run_id}")
-            queue = conn.register_consumer(session_key, our_run_id)
+
+            # Serialize the queue-release -> chat.send -> run-registration critical
+            # section per session. Two messages released from the queue at the same
+            # instant would otherwise both send into the same idle window; the
+            # gateway steer-merges the second into the first, which then renders
+            # nothing ("no reply text"). Holding this lock only across the wait+send
+            # (NOT the event loop below) means the next waiter re-checks AFTER our
+            # run is registered and observes it active (sessions.list hasActiveRun),
+            # so it waits its turn instead of racing us. Confirmed thundering-herd
+            # phantom: two Captured runIds 10ms apart under a burst release (ELI-56).
+            # NOTE: do NOT prepend a `/queue followup` directive here. On the
+            # 2026.7.1 gateway that directive is NOT stripped from a device
+            # chat.send -- it leaked verbatim into the delivered message.
+            async with conn.session_send_lock(session_key):
+                queue_wait_started = time.time()
+                queue_wait_cap_s = 1800  # safety ceiling; socket keepalive holds the request
+                queue_settle_s = 2.0     # re-confirm not-active before releasing
+                ever_active = False
+                while time.time() - queue_wait_started < queue_wait_cap_s:
+                    if await _session_run_active():
+                        ever_active = True
+                        await asyncio.sleep(1.5)
+                        continue
+                    # Not active now. If we were ever queued, settle-confirm before
+                    # releasing: when a subagent finishes the parent resumes as a
+                    # NEW run, and there is a brief window between the child ending
+                    # and that resume registering where hasActiveRun reads false;
+                    # sending in it races the resume and phantoms again (ELI-56).
+                    if ever_active:
+                        await asyncio.sleep(queue_settle_s)
+                        if await _session_run_active():
+                            continue
+                    break
+                if ever_active:
+                    pipe_log("  active run ended; sending queued message as its own run")
+
+                # --- Send this message as its own fresh run (still holding the lock
+                #     so the next waiter observes our run before deciding to send) ---
+                idempotency_key = f"msg-{chat_id}-{time.time()}"
+                # Fit the requested level to what this session's model actually
+                # supports. The dropdown is a union across models, so a level that
+                # is real for one model can be unavailable here. Clamping is
+                # downward only and always explained: silently answering at a level
+                # other than the one asked for is worse than a short note, and
+                # silently erroring out is worse still.
+                #
+                # A ladder the Gateway STATED (by rejecting a send) beats the one
+                # describe reported, because describe answers this question without
+                # a model catalog and overreports for catalog-gated models. This is
+                # what makes the rejection cost one turn per model instead of one
+                # turn every turn.
+                #
+                # Look up by `model_override` (the runtime-namespaced routing key,
+                # e.g. "claude-cli/claude-opus-5") before `session_model_key` (the
+                # vendor key describe resolves it to, e.g. "anthropic/claude-opus-5"
+                # -- see `_RUNTIME_PROVIDER_NAMESPACES`). The Gateway's rejection
+                # text names the model by its routing key, so that is where
+                # `_record_thinking_ladder` files the authoritative entry; reading
+                # back under the vendor key alone missed it every time and repeated
+                # the same round-trip rejection (and its note) on every turn.
+                _state_dir_valve = getattr(self.valves, "STATE_DIR", "")
+                effective_ladder = (_read_model_thinking_ladder(model_override, _state_dir_valve)
+                                    or _read_model_thinking_ladder(session_model_key, _state_dir_valve)
+                                    or session_thinking_ladder)
+                resolved_thinking, thinking_note = clamp_to_ladder(
+                    requested_thinking, effective_ladder)
+                # Held until `visible_message_text` exists below (it isn't defined
+                # yet at this point in the turn) so the note that streams here also
+                # ends up in the forced terminal snapshot -- otherwise it shows
+                # while streaming and is gone after a reload.
+                pending_clamp_note = ""
+                if thinking_note:
+                    pipe_log(f"thinking: {thinking_note}")
+                    # Logged every time, shown once: the dropdown keeps the level
+                    # selected, so an unchanged mismatch would otherwise stamp the
+                    # same italic line above every answer in the chat.
+                    if conn.should_announce_thinking_note(session_key, thinking_note):
+                        pending_clamp_note = f"_{thinking_note}_\n\n"
+                        yield pending_clamp_note
+                # Epoch of the connection this run is being launched on. If it has
+                # moved by the time the queue goes quiet, the Gateway restarted
+                # underneath us and took the run with it (see `connection_epoch`).
+                epoch_at_send = conn.connection_epoch
+                try:
+                    send_resp = await conn.send_request(
+                        "chat.send",
+                        _owui_chat_send_params(
+                            session_key=session_key,
+                            message=text,
+                            idempotency_key=idempotency_key,
+                            owui_chat_id=owui_origin_chat_id,
+                            owui_user_id=owui_origin_user_id,
+                            attachments=image_attachments,
+                            thinking=resolved_thinking,
+                        ),
+                        timeout=30
+                    )
+                except asyncio.TimeoutError:
+                    await _emit_status(__event_emitter__, "", done=True)
+                    yield "**Timeout:** Gateway did not respond to chat.send"
+                    return
+                except Exception as e:
+                    await _emit_status(__event_emitter__, "", done=True)
+                    yield f"**Error sending message:** {e}"
+                    return
+                our_run_id = send_resp.get("runId", "unknown")
+                self._current_run_id = our_run_id
+                pipe_log(f"Captured runId: {our_run_id}")
+                queue = conn.register_consumer(session_key, our_run_id)
         # Parity (2026-07-19): tell the persistent connection which OWUI message
         # this run streams into, so a shadow renderer can finalize that message
         # to the complete content if this inline turn ends before the run does
@@ -1736,6 +1784,16 @@ class Pipe:
                                 is_error = data.get("isError") is True
                                 stored_args = self._active_tool_args.pop(tool_call_id, None)
                                 args_str = stored_args or json.dumps(data.get("args", {}))
+                                if (
+                                    adopted_run_id and tool_call_id
+                                    and tool_call_id not in pending_tool_calls
+                                ):
+                                    # Started under the reply that was
+                                    # interrupted, so this reply has no card
+                                    # for the result to complete: open one.
+                                    pending_tool_calls.add(tool_call_id)
+                                    yield _tool_call_started_event(name, tool_call_id, args_str)
+                                    relabelable_tool_call = tool_call_id
                                 pipe_log(
                                     f"  Tool result: {name} ({len(result_str)} chars)"
                                     f"{' [error]' if is_error else ''}"
@@ -1858,15 +1916,25 @@ class Pipe:
                                 last_activity_time = time.time()
 
                 except asyncio.CancelledError:
-                    # OWUI stop button → abort the gateway run
+                    # OWUI cancelled this response: the Stop button, or Send
+                    # now / interrupt, which cancel the same way and then send
+                    # a new message. Defer the abort so that new message can
+                    # claim the run instead (see `schedule_cancel_abort`).
                     aborted = True
-                    pipe_log("Generator cancelled -- sending chat.abort")
+                    grace_s = float(getattr(self.valves, "INTERRUPT_GRACE_SECONDS", 0) or 0)
+                    if grace_s > 0:
+                        pipe_log(
+                            f"Generator cancelled -- chat.abort deferred {grace_s:g}s "
+                            "in case a new message follows"
+                        )
+                    else:
+                        pipe_log("Generator cancelled -- sending chat.abort")
                     await maybe_emit_snapshot(force=True)
                     await _emit_status(__event_emitter__, "Stopped", done=True)
-                    await conn.abort(session_key, our_run_id)
-                    if self.valves.SEND_STOP_ON_CANCEL:
-                        pipe_log("Generator cancelled -- sending /stop fallback")
-                        await conn.send_stop(session_key)
+                    await conn.schedule_cancel_abort(
+                        session_key, our_run_id, grace_s,
+                        send_stop=self.valves.SEND_STOP_ON_CANCEL,
+                    )
                     raise  # Re-raise to signal proper cancellation
 
                 else:
@@ -1967,7 +2035,10 @@ class Pipe:
                     #
                     # Skip while re-entering for a modal follow-up: the snapshot must
                     # only land once the run is truly finished, not between turns.
-                    if not adopt_new_run and had_tool_block:
+                    # Not for an adopted run either: this reply keeps streaming
+                    # the queued message's answer, and a `replace` now would
+                    # freeze those deltas (P23/P25).
+                    if not adopt_new_run and had_tool_block and not adopted_run_id:
                         await maybe_emit_snapshot(force=True)
 
                     # Resolve any tool call that was announced but never got a
@@ -1989,9 +2060,12 @@ class Pipe:
 
         finally:
             status_lines = []
-            if not aborted and text_yielded:
+            if not aborted and text_yielded and not adopted_run_id:
                 status_lines = await _build_usage_status_lines(conn, session_key)
-            if status_lines:
+            if adopted_run_id and not aborted:
+                await _emit_status(
+                    __event_emitter__, "Sending your message…", done=False)
+            elif status_lines:
                 # One `status` event per fact (context / rate-limit / goal) so
                 # each row stays inside OWUI's per-line clamp instead of one
                 # long combined line getting cut off. All of them already
@@ -2011,6 +2085,29 @@ class Pipe:
 
         pipe_log(f"DONE -- {event_count} events processed, "
                  f"text yielded: {text_yielded}")
+        if adopted_run_id and not aborted:
+            # The adopted run is over; now send this request's own message, in
+            # the same reply. The recursive call does the normal queue + send
+            # (it also waits out a subagent-yield gap if the run resumes), and
+            # owns the terminal snapshot, usage lines and auto-title. Seeding
+            # it with what streamed so far keeps that snapshot complete.
+            pipe_log(
+                f"  adopted run {adopted_run_id[:20]}... finished; sending "
+                "the queued message"
+            )
+            separator = "\n\n---\n\n" if visible_message_text.strip() else ""
+            if separator:
+                record_visible_chunk(separator)
+                yield separator
+            async for item in self._pipe_impl(
+                body, __event_emitter__,
+                __event_call__=__event_call__, __user__=__user__,
+                __metadata__=__metadata__, __request__=__request__,
+                __task__=__task__, __task_body__=__task_body__,
+                _initial_visible_text=visible_message_text,
+            ):
+                yield item
+            return
         if not text_yielded:
             # DIAG (ELI-56): a no-text turn is the phantom. Emit the correlation
             # keys so it can be matched to a duplicate/re-fired completion above

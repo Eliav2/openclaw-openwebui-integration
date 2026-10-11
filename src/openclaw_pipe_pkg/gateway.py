@@ -1049,6 +1049,18 @@ class _GatewayConnection:
         # hasActiveRun) closes that thundering-herd race. ELI-56.
         self._session_send_locks: dict[str, asyncio.Lock] = {}
 
+        # Deferred aborts for cancelled turns, {session_key: {"run_id", "task"}}.
+        # OWUI 0.12 has no "send while running" that keeps the running turn:
+        # both its interrupt path and the queued message's "Send now" call
+        # stopTasksByChatId and then submit the new message ~0.5-0.8s later
+        # (measured live 2026-10-11). An immediate chat.abort on that cancel
+        # kills the turn AND every subagent it spawned (the gateway's
+        # chat.abort cascades through abortControlledSubagents). So the abort
+        # waits a short grace window, and a new message for the same session
+        # inside it claims the run instead of letting it die. A plain Stop
+        # (no follow-up message) still aborts once the window passes.
+        self._pending_cancel_aborts: dict[str, dict] = {}
+
         # ELI-59: last model applied per session, {session_key: (model, ts)}.
         # A burst of near-simultaneous messages on one session all issue the
         # SAME idempotent sessions.patch; under that contention the RPC can
@@ -1558,6 +1570,60 @@ class _GatewayConnection:
             pipe_log(f"  sent chat.abort for run {run_id[:20]}...")
         except Exception as e:
             pipe_log(f"  abort send failed: {e}")
+
+    async def _abort_cancelled_run(self, session_key: str, run_id: str,
+                                   send_stop: bool) -> None:
+        await self.abort(session_key, run_id)
+        if send_stop:
+            pipe_log("Generator cancelled -- sending /stop fallback")
+            await self.send_stop(session_key)
+
+    async def schedule_cancel_abort(self, session_key: str, run_id: str,
+                                    grace_s: float, send_stop: bool) -> None:
+        """Abort `run_id` after `grace_s` unless a new message for the same
+        session claims it first (`claim_pending_cancel_abort`).
+
+        `grace_s <= 0` aborts right away, which is the pre-2026-10-11
+        behavior. Only one abort is pending per session: a second cancel
+        flushes the first immediately rather than letting it be claimed by a
+        message that was meant for the newer run.
+        """
+        previous = self._pending_cancel_aborts.pop(session_key, None)
+        if previous is not None:
+            previous["task"].cancel()
+            if previous["run_id"] != run_id:
+                await self._abort_cancelled_run(
+                    session_key, previous["run_id"], previous["send_stop"])
+        if grace_s <= 0:
+            await self._abort_cancelled_run(session_key, run_id, send_stop)
+            return
+
+        async def _fire():
+            await asyncio.sleep(grace_s)
+            entry = self._pending_cancel_aborts.get(session_key)
+            if entry is None or entry["run_id"] != run_id:
+                return
+            self._pending_cancel_aborts.pop(session_key, None)
+            pipe_log(
+                f"  no new message within {grace_s:g}s of the cancel: "
+                f"aborting run {run_id[:20]}..."
+            )
+            await self._abort_cancelled_run(session_key, run_id, send_stop)
+
+        self._pending_cancel_aborts[session_key] = {
+            "run_id": run_id,
+            "send_stop": send_stop,
+            "task": asyncio.create_task(_fire()),
+        }
+
+    def claim_pending_cancel_abort(self, session_key: str) -> str | None:
+        """Cancel the pending abort for this session, if any, and return the
+        run id it would have aborted. The caller now owns that run."""
+        entry = self._pending_cancel_aborts.pop(session_key, None)
+        if entry is None:
+            return None
+        entry["task"].cancel()
+        return entry["run_id"]
 
     async def send_stop(self, session_key: str):
         """Send the stronger /stop command for runtimes where chat.abort is incomplete."""

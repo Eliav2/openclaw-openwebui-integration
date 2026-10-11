@@ -1417,6 +1417,80 @@ class StripInputMarkerLineTests(unittest.TestCase):
         self.assertEqual(_strip_input_marker_line(""), "")
 
 
+class DeferredCancelAbortTests(unittest.IsolatedAsyncioTestCase):
+    """OWUI 0.12's Send now / interrupt cancels the running response and sends
+    the new message ~0.5-0.8s later (measured 2026-10-11). An immediate
+    chat.abort on that cancel killed the turn and, through the gateway's
+    abortControlledSubagents cascade, every subagent it had spawned. The abort
+    is now deferred so the follow-up message can claim the run."""
+
+    def _conn(self):
+        conn = _GatewayConnection(lambda: None)
+        calls = []
+
+        async def fake_abort(session_key, run_id):
+            calls.append(("abort", session_key, run_id))
+
+        async def fake_stop(session_key):
+            calls.append(("stop", session_key))
+
+        conn.abort = fake_abort
+        conn.send_stop = fake_stop
+        return conn, calls
+
+    async def test_unclaimed_cancel_aborts_after_grace(self):
+        # A plain Stop: nothing follows, so the run must still be stopped.
+        conn, calls = self._conn()
+        await conn.schedule_cancel_abort("s", "run-1", 0.05, send_stop=True)
+        self.assertEqual(calls, [], "abort must wait for the grace window")
+        await asyncio.sleep(0.15)
+        self.assertEqual(calls, [("abort", "s", "run-1"), ("stop", "s")])
+        self.assertIsNone(conn.claim_pending_cancel_abort("s"))
+
+    async def test_claim_inside_grace_keeps_run_alive(self):
+        conn, calls = self._conn()
+        await conn.schedule_cancel_abort("s", "run-1", 0.05, send_stop=True)
+        self.assertEqual(conn.claim_pending_cancel_abort("s"), "run-1")
+        await asyncio.sleep(0.15)
+        self.assertEqual(calls, [], "a claimed run must never be aborted")
+
+    async def test_zero_grace_aborts_immediately(self):
+        conn, calls = self._conn()
+        await conn.schedule_cancel_abort("s", "run-1", 0, send_stop=False)
+        self.assertEqual(calls, [("abort", "s", "run-1")])
+        self.assertIsNone(conn.claim_pending_cancel_abort("s"))
+
+    async def test_claim_is_per_session(self):
+        conn, calls = self._conn()
+        await conn.schedule_cancel_abort("s", "run-1", 0.05, send_stop=False)
+        self.assertIsNone(conn.claim_pending_cancel_abort("other"))
+        await asyncio.sleep(0.15)
+        self.assertEqual(calls, [("abort", "s", "run-1")])
+
+    async def test_second_cancel_flushes_the_first_run(self):
+        # The pending abort belongs to the run that was cancelled most
+        # recently; an older one must not linger to be claimed by mistake.
+        conn, calls = self._conn()
+        await conn.schedule_cancel_abort("s", "run-1", 5, send_stop=False)
+        await conn.schedule_cancel_abort("s", "run-2", 5, send_stop=False)
+        self.assertEqual(calls, [("abort", "s", "run-1")])
+        self.assertEqual(conn.claim_pending_cancel_abort("s"), "run-2")
+
+    def test_pipe_defers_abort_and_claims_before_model_patch(self):
+        # The grace window is seconds; sessions.patch alone can take 10s+ with
+        # its retry, so the claim must come before it. And the cancel handler
+        # must go through the deferred path, never a bare conn.abort.
+        src = inspect.getsource(Pipe._pipe_impl)
+        claim = src.index("conn.claim_pending_cancel_abort(session_key)")
+        patch = src.index('"sessions.patch"')
+        self.assertLess(claim, patch)
+        self.assertIn("conn.schedule_cancel_abort(", src)
+        self.assertNotIn("await conn.abort(", src)
+
+    def test_grace_valve_defaults_on(self):
+        self.assertGreater(Pipe.Valves().INTERRUPT_GRACE_SECONDS, 0)
+
+
 class SessionActiveSignalsTests(unittest.TestCase):
     """ELI-56: a concurrent message must queue behind a run that only LOOKS
     done. When a turn calls sessions_yield to await a subagent, describe.status
