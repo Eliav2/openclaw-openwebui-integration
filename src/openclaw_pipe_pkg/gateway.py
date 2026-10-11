@@ -1594,7 +1594,8 @@ class _GatewayConnection:
 
     def park_cancelled_turn(self, session_key: str, run_id: str | None,
                             queue: asyncio.Queue | None, carried: list[str],
-                            grace_s: float, send_stop: bool) -> None:
+                            grace_s: float, send_stop: bool,
+                            run_text: dict | None = None) -> None:
         """Hand a cancelled reply's unfinished business to the next message.
 
         OWUI cancels a response the same way for Stop and for Send now /
@@ -1606,7 +1607,12 @@ class _GatewayConnection:
           the run emits (including ones queued but not yet shown) is buffered
           rather than dropped;
         * `carried` holds user messages the cancelled reply had accepted but
-          not yet sent to the Gateway, oldest first.
+          not yet sent to the Gateway, oldest first;
+        * `run_text` holds the run's text dedup baselines up to the cut
+          ({"received", "stream", "item"}). The run's closing events repeat
+          its WHOLE text; a claimer that starts from empty baselines takes all
+          of it for new and appends the entire reply again (seen live
+          2026-10-12: 2327..4000 followed by 1..4000).
 
         The caller then asks the browser which button was pressed and calls
         `settle_parked_turn`: Stop releases it now, Send now holds it for the
@@ -1641,7 +1647,7 @@ class _GatewayConnection:
 
         entry = {"run_id": run_id, "queue": queue, "carried": list(carried),
                  "send_stop": send_stop, "task": None,
-                 "resolved": asyncio.Event()}
+                 "resolved": asyncio.Event(), "run_text": run_text}
 
         def _release() -> None:
             if entry["queue"] is not None:
@@ -1736,17 +1742,24 @@ class _GatewayConnection:
         if entry["task"] is not None:
             entry["task"].cancel()
         return {"run_id": entry["run_id"], "queue": entry["queue"],
-                "carried": list(entry["carried"])}
+                "carried": list(entry["carried"]),
+                "run_text": entry.get("run_text")}
 
     def seed_run_renderer(self, session_key: str, run_id: str,
-                          queue: asyncio.Queue) -> None:
-        """Feed a freshly registered shadow renderer the events still waiting
-        in `queue`. An adopted run's buffered events were dispatched before
-        this reply registered its own target, so without this its parity
-        finalize would be missing them."""
+                          queue: asyncio.Queue,
+                          run_text: dict | None = None) -> None:
+        """Bring a freshly registered shadow renderer level with an adopted
+        run: give it the run's dedup baselines (so the closing whole-text
+        events are not appended again) and feed it the events still waiting
+        in `queue`, which were dispatched before this reply registered its
+        own target. Without this its parity finalize would miss the buffered
+        text and duplicate the rest."""
         renderer = self._run_renderers.get(f"{session_key}:{run_id}")
         if renderer is None:
             return
+        if run_text:
+            renderer._assistant_stream_text = run_text.get("received", "")
+            renderer._last_item_text = run_text.get("item", "")
         for msg in list(getattr(queue, "_queue", ())):
             try:
                 renderer.feed(msg.get("payload", {}))

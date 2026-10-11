@@ -4194,7 +4194,8 @@ class _GatewayConnection:
 
     def park_cancelled_turn(self, session_key: str, run_id: str | None,
                             queue: asyncio.Queue | None, carried: list[str],
-                            grace_s: float, send_stop: bool) -> None:
+                            grace_s: float, send_stop: bool,
+                            run_text: dict | None = None) -> None:
         """Hand a cancelled reply's unfinished business to the next message.
 
         OWUI cancels a response the same way for Stop and for Send now /
@@ -4206,7 +4207,12 @@ class _GatewayConnection:
           the run emits (including ones queued but not yet shown) is buffered
           rather than dropped;
         * `carried` holds user messages the cancelled reply had accepted but
-          not yet sent to the Gateway, oldest first.
+          not yet sent to the Gateway, oldest first;
+        * `run_text` holds the run's text dedup baselines up to the cut
+          ({"received", "stream", "item"}). The run's closing events repeat
+          its WHOLE text; a claimer that starts from empty baselines takes all
+          of it for new and appends the entire reply again (seen live
+          2026-10-12: 2327..4000 followed by 1..4000).
 
         The caller then asks the browser which button was pressed and calls
         `settle_parked_turn`: Stop releases it now, Send now holds it for the
@@ -4241,7 +4247,7 @@ class _GatewayConnection:
 
         entry = {"run_id": run_id, "queue": queue, "carried": list(carried),
                  "send_stop": send_stop, "task": None,
-                 "resolved": asyncio.Event()}
+                 "resolved": asyncio.Event(), "run_text": run_text}
 
         def _release() -> None:
             if entry["queue"] is not None:
@@ -4336,17 +4342,24 @@ class _GatewayConnection:
         if entry["task"] is not None:
             entry["task"].cancel()
         return {"run_id": entry["run_id"], "queue": entry["queue"],
-                "carried": list(entry["carried"])}
+                "carried": list(entry["carried"]),
+                "run_text": entry.get("run_text")}
 
     def seed_run_renderer(self, session_key: str, run_id: str,
-                          queue: asyncio.Queue) -> None:
-        """Feed a freshly registered shadow renderer the events still waiting
-        in `queue`. An adopted run's buffered events were dispatched before
-        this reply registered its own target, so without this its parity
-        finalize would be missing them."""
+                          queue: asyncio.Queue,
+                          run_text: dict | None = None) -> None:
+        """Bring a freshly registered shadow renderer level with an adopted
+        run: give it the run's dedup baselines (so the closing whole-text
+        events are not appended again) and feed it the events still waiting
+        in `queue`, which were dispatched before this reply registered its
+        own target. Without this its parity finalize would miss the buffered
+        text and duplicate the rest."""
         renderer = self._run_renderers.get(f"{session_key}:{run_id}")
         if renderer is None:
             return
+        if run_text:
+            renderer._assistant_stream_text = run_text.get("received", "")
+            renderer._last_item_text = run_text.get("item", "")
         for msg in list(getattr(queue, "_queue", ())):
             try:
                 renderer.feed(msg.get("payload", {}))
@@ -6369,6 +6382,7 @@ class _TurnState:
     unsent: list = field(default_factory=list)
     run_id: str | None = None
     queue: object = None
+    run_text: dict | None = None
     parked: bool = False
 
 
@@ -6916,6 +6930,7 @@ class Pipe:
                     turn.session_key, turn.run_id, turn.queue, turn.unsent,
                     float(getattr(self.valves, "INTERRUPT_GRACE_SECONDS", 0) or 0),
                     send_stop=self.valves.SEND_STOP_ON_CANCEL,
+                    run_text=turn.run_text,
                 )
                 await _settle_cancel_intent(
                     turn.conn, turn.session_key, turn.run_id, turn.chat_id,
@@ -7099,6 +7114,7 @@ class Pipe:
         # seconds and the grace window is short.
         adopted_run_id = None
         adopted_queue = None
+        adopted_run_text = None
         claimed = await conn.claim_cancelled_turn(session_key)
         if claimed:
             if claimed["carried"]:
@@ -7110,8 +7126,10 @@ class Pipe:
             adopted_run_id = claimed["run_id"]
             adopted_queue = claimed["queue"]
             if adopted_run_id:
+                adopted_run_text = claimed.get("run_text")
                 turn.run_id = adopted_run_id
                 turn.queue = adopted_queue
+                turn.run_text = adopted_run_text
                 pipe_log(
                     f"  new message right after a cancel: keeping run "
                     f"{adopted_run_id[:20]}... alive and continuing it in this "
@@ -7276,7 +7294,9 @@ class Pipe:
             # tail and final are waiting in it, so it is always adopted.)
             pipe_log("  adopted run already ended; sending the message normally")
             adopted_run_id = None
+            adopted_run_text = None
             turn.run_id = None
+            turn.run_text = None
         if adopted_run_id:
             # Stream the rest of the adopted run into THIS reply. The message
             # itself is sent afterwards, as its own run, by the recursive call
@@ -7415,6 +7435,7 @@ class Pipe:
                 turn.unsent = []
                 turn.run_id = our_run_id
                 turn.queue = queue
+                turn.run_text = None
         # Parity (2026-07-19): tell the persistent connection which OWUI message
         # this run streams into, so a shadow renderer can finalize that message
         # to the complete content if this inline turn ends before the run does
@@ -7425,7 +7446,8 @@ class Pipe:
             session_key, our_run_id, owui_origin_chat_id, owui_message_id,
         )
         if adopted_run_id and adopted_queue is not None:
-            conn.seed_run_renderer(session_key, our_run_id, queue)
+            conn.seed_run_renderer(session_key, our_run_id, queue,
+                                   run_text=adopted_run_text)
         # Extracted once up front (not just at the terminal snapshot/auto-title
         # step further below) so the mid-run REST snapshot gate has a token to
         # use throughout the streaming loop, not only after it ends.
@@ -7444,6 +7466,13 @@ class Pipe:
         # FLUSHED, so it cannot be used to dedup a cumulative catch-all event
         # while a needs-input block is being held back (ELI-80).
         assistant_received_text = ""
+        if adopted_run_text:
+            # Continuing a run another reply started: its text baselines carry
+            # over (see `park_cancelled_turn`), while what THIS reply shows,
+            # `visible_message_text`, starts empty.
+            assistant_received_text = adopted_run_text.get("received", "")
+            assistant_stream_text = adopted_run_text.get("stream", "")
+            last_item_text = adopted_run_text.get("item", "")
         visible_message_text = _initial_visible_text + pending_clamp_note
         had_tool_block = False
         # toolCallIds announced to OWUI as `function_call` items that have
@@ -8348,6 +8377,9 @@ class Pipe:
                     conn.park_cancelled_turn(
                         session_key, our_run_id, queue, turn.unsent, grace_s,
                         send_stop=self.valves.SEND_STOP_ON_CANCEL,
+                        run_text={"received": assistant_received_text,
+                                  "stream": assistant_stream_text,
+                                  "item": last_item_text},
                     )
                     pipe_log(
                         f"Generator {type(stop).__name__}: run parked "
