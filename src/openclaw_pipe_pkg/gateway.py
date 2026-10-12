@@ -1004,6 +1004,8 @@ def _shared_gateway_state() -> dict | None:
     state.setdefault("delivered_proactive", {})
     state.setdefault("session_last_activity", {})
     state.setdefault("pending_proactive_debounce", set())
+    state.setdefault("proactive_runs", {})
+    state.setdefault("last_final_run", {})
     state.setdefault("chat_write_locks", {})
     return state
 
@@ -1165,6 +1167,19 @@ class _GatewayConnection:
         # each spawn their own watcher for the same session.
         self._pending_proactive_debounce: set[str] = (
             _shared["pending_proactive_debounce"] if _shared is not None else set()
+        )
+        # Every unwatched run a session's watcher holds, oldest first. The one
+        # watcher delivers each of them with that run's own text, so a second
+        # run ending inside the debounce window is queued, not skipped
+        # (2026-10-12).
+        self._proactive_runs: dict[str, list[str]] = (
+            _shared["proactive_runs"] if _shared is not None else {}
+        )
+        # The newest run that ended in each session, watched or not. A run
+        # whose text can't be found by its id may only fall back to "the
+        # session's newest reply" while it is still the newest run.
+        self._last_final_run: dict[str, str] = (
+            _shared["last_final_run"] if _shared is not None else {}
         )
 
         # Per-chat write locks serializing the two proactive-delivery paths
@@ -2084,6 +2099,8 @@ class _GatewayConnection:
                 _relay_key = (
                     f"{_evt_sess}:{_evt_run}" if (_evt_sess and _evt_run) else None
                 )
+                if payload.get("state") == "final" and _evt_sess and _evt_run:
+                    self._last_final_run[_evt_sess] = _evt_run
                 if LIVE_STREAM_RELAY_ENABLED and _relay_key in self._relay_sessions:
                     if consumers:
                         # A live consumer appeared for a run we were relaying --
@@ -2182,14 +2199,17 @@ class _GatewayConnection:
                         self.parse_owui_session_key(evt_session)
                         and not self.has_any_consumer_for_session(evt_session)
                         and not self.was_delivered_live(evt_session, evt_run_id)
-                        and evt_session not in self._pending_proactive_debounce
                     ):
-                        self._pending_proactive_debounce.add(evt_session)
-                        spawn_background(
-                            _maybe_deliver_proactive_after_debounce(
-                                self, evt_session, evt_run_id
+                        queued = self._proactive_runs.setdefault(evt_session, [])
+                        if evt_run_id not in queued:
+                            queued.append(evt_run_id)
+                        if evt_session not in self._pending_proactive_debounce:
+                            self._pending_proactive_debounce.add(evt_session)
+                            spawn_background(
+                                _maybe_deliver_proactive_after_debounce(
+                                    self, evt_session, evt_run_id
+                                )
                             )
-                        )
                         continue
 
                 # ── Proactive delivery for finished sub-agent tasks ──
@@ -2346,8 +2366,52 @@ def _history_text_completing_preview(history: dict, clip_prefix: str) -> str | N
     return None
 
 
-async def _proactive_run_text(conn, session_key: str, log_prefix: str) -> str | None:
+# How far back a proactive delivery looks for the run's own closing message.
+# Other runs may have ended after it (the delivery waits for the session to go
+# idle), so this reaches further than PROACTIVE_HISTORY_LIMIT.
+PROACTIVE_RUN_HISTORY_LIMIT = 60
+
+
+def _history_text_for_run(history: dict, run_id: str) -> tuple[bool, str | None]:
+    """The closing assistant text one specific run saved, found by its id.
+
+    The Gateway stamps a run's closing assistant message with
+    `idempotencyKey = "cli-assistant:<runId>"` (claude-cli runner), so the
+    run's own reply is found by identity, not by position. Returns
+    (found, text); text is None when the run ended silent.
+    """
+    messages = (history or {}).get("messages")
+    if not isinstance(messages, list) or not run_id:
+        return False, None
+    wanted = {run_id, f"cli-assistant:{run_id}"}
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        meta = message.get("__openclaw")
+        keys = {message.get("idempotencyKey"),
+                meta.get("idempotencyKey") if isinstance(meta, dict) else None}
+        if not keys & wanted:
+            continue
+        text = ((_history_item(message) or {}).get("text") or "").strip()
+        if not text:
+            fallback = message.get("openclawStreamFallback")
+            if isinstance(fallback, dict):
+                text = str(fallback.get("replacementText") or "").strip()
+        return True, (text if text and text not in _SILENT_SENTINELS else None)
+    return False, None
+
+
+async def _proactive_run_text(conn, session_key: str, log_prefix: str,
+                              run_id: str | None = None) -> str | None:
     """The finished run's assistant text for a proactive delivery.
+
+    With `run_id`, the run's own closing message is looked up by identity
+    first (`_history_text_for_run`). The delivery waits for the session to go
+    idle, and by then a LATER run may have replied: "the session's newest
+    reply" was that later run's text, so it was delivered twice and this run's
+    reply never (2026-10-12, a message sent while a sub-agent's completion run
+    was going). When the run can't be found by id, the newest-reply fallback
+    below is only used while this run is still the session's newest run.
 
     `sessions.preview` (limit 1) decides WHETHER this run left text to show:
     its newest item is the run's last visible row, so a run that ended silent
@@ -2358,6 +2422,24 @@ async def _proactive_run_text(conn, session_key: str, log_prefix: str) -> str | 
     has no matching message, the clipped preview is delivered rather than
     nothing.
     """
+    history = None
+    if run_id:
+        try:
+            history = await conn.session_history(session_key, limit=PROACTIVE_RUN_HISTORY_LIMIT)
+        except Exception as ex:
+            pipe_log(f"  {log_prefix}: chat.history failed: {ex}")
+            history = None
+        found, run_text = _history_text_for_run(history, run_id)
+        if found:
+            return run_text
+        newest = getattr(conn, "_last_final_run", {}).get(session_key, run_id)
+        if newest != run_id:
+            pipe_log(
+                f"  {log_prefix}: run {run_id[:20]}... has no reply of its own in "
+                f"chat.history and run {str(newest)[:20]}... ended after it; "
+                "not delivering the newer run's text"
+            )
+            return None
     try:
         preview = await conn.session_preview(session_key, limit=1, max_chars=8000)
     except Exception as ex:
@@ -2367,11 +2449,12 @@ async def _proactive_run_text(conn, session_key: str, log_prefix: str) -> str | 
     clip_prefix = _preview_clip_prefix(text) if text else None
     if not clip_prefix:
         return text
-    try:
-        history = await conn.session_history(session_key, limit=PROACTIVE_HISTORY_LIMIT)
-    except Exception as ex:
-        pipe_log(f"  {log_prefix}: chat.history failed: {ex}; delivering the clipped preview")
-        return text
+    if history is None:
+        try:
+            history = await conn.session_history(session_key, limit=PROACTIVE_HISTORY_LIMIT)
+        except Exception as ex:
+            pipe_log(f"  {log_prefix}: chat.history failed: {ex}; delivering the clipped preview")
+            return text
     full = _history_text_completing_preview(history, clip_prefix)
     if full:
         return full
@@ -2412,16 +2495,24 @@ async def _maybe_deliver_proactive_after_debounce(
                 return
             await asyncio.sleep(poll_interval_s)
             waited += poll_interval_s
-        if conn.was_delivered_live(session_key, run_id):
-            # The run got shown to a (re)connected live tab while we were
-            # waiting out the debounce window -- that tab already persists
-            # it via OWUI's own client-side flow, so proactively delivering
-            # now would be a pure duplicate.
-            pipe_log(f"  proactive delivery: {session_key[:40]}... run "
-                      f"{run_id[:20]}... was delivered live during debounce wait, skipping")
-            return
-        await _deliver_proactive_owui_message(conn, session_key, run_id)
+        # Every run queued while this watcher waited, oldest first; a run
+        # that ends while these are delivered joins the same list.
+        queued = conn._proactive_runs.setdefault(session_key, [])
+        if run_id not in queued:
+            queued.insert(0, run_id)
+        while queued:
+            rid = queued.pop(0)
+            if conn.was_delivered_live(session_key, rid):
+                # The run got shown to a (re)connected live tab while we were
+                # waiting out the debounce window -- that tab already persists
+                # it via OWUI's own client-side flow, so proactively delivering
+                # now would be a pure duplicate.
+                pipe_log(f"  proactive delivery: {session_key[:40]}... run "
+                          f"{rid[:20]}... was delivered live during debounce wait, skipping")
+                continue
+            await _deliver_proactive_owui_message(conn, session_key, rid)
     finally:
+        conn._proactive_runs.pop(session_key, None)
         conn._pending_proactive_debounce.discard(session_key)
 
 
@@ -3132,7 +3223,7 @@ async def _deliver_proactive_owui_message(
         for stale_key in list(conn._delivered_proactive)[:100]:
             conn._delivered_proactive.pop(stale_key, None)
 
-    text = await _proactive_run_text(conn, session_key, "proactive delivery")
+    text = await _proactive_run_text(conn, session_key, "proactive delivery", run_id=run_id)
     if not text:
         pipe_log("  proactive delivery: no assistant text, skipping")
         return
