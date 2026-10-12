@@ -80,6 +80,7 @@ import time
 import threading
 import sys
 import hashlib
+import contextlib
 import re
 import mimetypes
 import urllib.error
@@ -1961,52 +1962,179 @@ class _GatewayConnection:
             pipe_log("Generator cancelled -- sending /stop fallback")
             await self.send_stop(session_key)
 
-    async def schedule_cancel_abort(self, session_key: str, run_id: str,
-                                    grace_s: float, send_stop: bool) -> None:
-        """Abort `run_id` after `grace_s` unless a new message for the same
-        session claims it first (`claim_pending_cancel_abort`).
+    def park_cancelled_turn(self, session_key: str, run_id: str | None,
+                            queue: asyncio.Queue | None, carried: list[str],
+                            grace_s: float, send_stop: bool,
+                            run_text: dict | None = None) -> None:
+        """Hand a cancelled reply's unfinished business to the next message.
 
-        `grace_s <= 0` aborts right away, which is the pre-2026-10-11
-        behavior. Only one abort is pending per session: a second cancel
-        flushes the first immediately rather than letting it be claimed by a
-        message that was meant for the newer run.
+        OWUI cancels a response the same way for Stop and for Send now /
+        interrupt (which then sends a new message): both call
+        stopTasksByChatId, and the message queue lives only in the browser.
+        So the cancelled turn is parked first and decided after:
+
+        * `run_id` keeps running, and `queue` stays registered so every event
+          the run emits (including ones queued but not yet shown) is buffered
+          rather than dropped;
+        * `carried` holds user messages the cancelled reply had accepted but
+          not yet sent to the Gateway, oldest first;
+        * `run_text` holds the run's text dedup baselines up to the cut
+          ({"received", "stream", "item"}). The run's closing events repeat
+          its WHOLE text; a claimer that starts from empty baselines takes all
+          of it for new and appends the entire reply again (seen live
+          2026-10-12: 2327..4000 followed by 1..4000).
+
+        The caller then asks the browser which button was pressed and calls
+        `settle_parked_turn`: Stop releases it now, Send now holds it for the
+        follow-up message. `grace_s` is only the fallback for a client that
+        cannot say (no page hook, API use). `claim_cancelled_turn` takes all
+        of it over; if nothing claims it, the run is aborted, the queue
+        released and the carried messages dropped (the user stopped them).
+
+        Synchronous on purpose: it runs on the generator's cancel/close path,
+        where an await can itself be interrupted, so nothing here may depend
+        on one. The Gateway calls go to background tasks.
         """
         previous = self._pending_cancel_aborts.pop(session_key, None)
         if previous is not None:
-            previous["task"].cancel()
-            if previous["run_id"] != run_id:
-                await self._abort_cancelled_run(
-                    session_key, previous["run_id"], previous["send_stop"])
+            if previous["task"] is not None:
+                previous["task"].cancel()
+            previous["resolved"].set()
+            carried = list(previous["carried"]) + list(carried)
+            if previous["queue"] is not None and previous["queue"] is not queue:
+                self.unregister_consumer(
+                    session_key, previous["run_id"], queue=previous["queue"])
+            if previous["run_id"] and previous["run_id"] != run_id:
+                spawn_background(self._abort_cancelled_run(
+                    session_key, previous["run_id"], previous["send_stop"]))
+        if run_id:
+            # The cancelled message keeps what it showed (the caller's forced
+            # snapshot). The run's tail belongs to whoever claims it: never
+            # back-filled into the stopped message, never re-delivered as a
+            # proactive bubble.
+            self.unregister_run_target(session_key, run_id)
+            self.mark_delivered_live(session_key, run_id)
+
+        entry = {"run_id": run_id, "queue": queue, "carried": list(carried),
+                 "send_stop": send_stop, "task": None,
+                 "resolved": asyncio.Event(), "run_text": run_text}
+
+        def _release() -> None:
+            if entry["queue"] is not None:
+                self.unregister_consumer(session_key, run_id, queue=entry["queue"])
+            if entry["carried"]:
+                pipe_log(f"  stopped: dropping {len(entry['carried'])} unsent "
+                         "message(s)")
+            if run_id:
+                spawn_background(
+                    self._abort_cancelled_run(session_key, run_id, send_stop))
+
+        entry["release"] = _release
         if grace_s <= 0:
-            await self._abort_cancelled_run(session_key, run_id, send_stop)
+            _release()
             return
+        self._pending_cancel_aborts[session_key] = entry
+        self._arm_parked_timer(session_key, entry, grace_s)
+
+    def _arm_parked_timer(self, session_key: str, entry: dict,
+                          wait_s: float) -> None:
+        if entry["task"] is not None:
+            entry["task"].cancel()
 
         async def _fire():
-            await asyncio.sleep(grace_s)
-            entry = self._pending_cancel_aborts.get(session_key)
-            if entry is None or entry["run_id"] != run_id:
+            await asyncio.sleep(wait_s)
+            if self._pending_cancel_aborts.get(session_key) is not entry:
+                return
+            if entry.get("claiming"):
+                # A follow-up message is already here, waiting for the page's
+                # answer: only an explicit Stop may release the run now.
                 return
             self._pending_cancel_aborts.pop(session_key, None)
-            pipe_log(
-                f"  no new message within {grace_s:g}s of the cancel: "
-                f"aborting run {run_id[:20]}..."
-            )
-            await self._abort_cancelled_run(session_key, run_id, send_stop)
+            entry["resolved"].set()
+            pipe_log(f"  no new message within {wait_s:g}s of the cancel: "
+                     f"stopping run {str(entry['run_id'])[:20]}...")
+            entry["release"]()
 
-        self._pending_cancel_aborts[session_key] = {
-            "run_id": run_id,
-            "send_stop": send_stop,
-            "task": asyncio.create_task(_fire()),
-        }
+        entry["task"] = spawn_background(_fire())
 
-    def claim_pending_cancel_abort(self, session_key: str) -> str | None:
-        """Cancel the pending abort for this session, if any, and return the
-        run id it would have aborted. The caller now owns that run."""
+    def settle_parked_turn(self, session_key: str, run_id: str | None,
+                           intent: str | None, hold_s: float) -> None:
+        """Apply what the browser said about the cancel of `run_id`.
+
+        "stop": the user pressed Stop (or Escape), so stop now. "send_now":
+        a follow-up message is on its way, so hold the run for it; `hold_s`
+        only bounds a browser that dies before sending it. Anything else
+        (no hook, no answer) keeps the fallback timer. No-op if the turn was
+        already claimed or released.
+        """
+        entry = self._pending_cancel_aborts.get(session_key)
+        if entry is None or entry["run_id"] != run_id:
+            return
+        if intent == "stop":
+            self._pending_cancel_aborts.pop(session_key, None)
+            if entry["task"] is not None:
+                entry["task"].cancel()
+            pipe_log(f"  cancel was a Stop: stopping run {str(run_id)[:20]}... now")
+            entry["release"]()
+        elif intent == "send_now":
+            pipe_log(f"  cancel was a Send now: holding run {str(run_id)[:20]}... "
+                     f"for the follow-up message (up to {hold_s:g}s)")
+            self._arm_parked_timer(session_key, entry, hold_s)
+        else:
+            pipe_log("  cancel intent unknown (no page hook or no answer): "
+                     "keeping the fallback window")
+        entry["resolved"].set()
+
+    async def claim_cancelled_turn(self, session_key: str,
+                                   wait_s: float = 3.0) -> dict | None:
+        """Take over the turn `park_cancelled_turn` parked, if any.
+
+        Waits up to `wait_s` for `settle_parked_turn`, so a Stop whose answer
+        is still on its way is honored: OWUI follows a Stop with the next
+        queued message, which must start fresh rather than continue the run
+        the user just stopped.
+
+        Returns {"run_id", "queue", "carried"}; the caller now owns the run,
+        its buffered queue and the carried messages.
+        """
+        entry = self._pending_cancel_aborts.get(session_key)
+        if entry is None:
+            return None
+        if not entry["resolved"].is_set():
+            entry["claiming"] = True
+            try:
+                await asyncio.wait_for(entry["resolved"].wait(), wait_s)
+            except asyncio.TimeoutError:
+                pass
         entry = self._pending_cancel_aborts.pop(session_key, None)
         if entry is None:
             return None
-        entry["task"].cancel()
-        return entry["run_id"]
+        if entry["task"] is not None:
+            entry["task"].cancel()
+        return {"run_id": entry["run_id"], "queue": entry["queue"],
+                "carried": list(entry["carried"]),
+                "run_text": entry.get("run_text")}
+
+    def seed_run_renderer(self, session_key: str, run_id: str,
+                          queue: asyncio.Queue,
+                          run_text: dict | None = None) -> None:
+        """Bring a freshly registered shadow renderer level with an adopted
+        run: give it the run's dedup baselines (so the closing whole-text
+        events are not appended again) and feed it the events still waiting
+        in `queue`, which were dispatched before this reply registered its
+        own target. Without this its parity finalize would miss the buffered
+        text and duplicate the rest."""
+        renderer = self._run_renderers.get(f"{session_key}:{run_id}")
+        if renderer is None:
+            return
+        if run_text:
+            renderer._assistant_stream_text = run_text.get("received", "")
+            renderer._last_item_text = run_text.get("item", "")
+        for msg in list(getattr(queue, "_queue", ())):
+            try:
+                renderer.feed(msg.get("payload", {}))
+            except Exception as ex:
+                pipe_log(f"  shadow renderer seed failed: {ex}")
 
     async def send_stop(self, session_key: str):
         """Send the stronger /stop command for runtimes where chat.abort is incomplete."""
