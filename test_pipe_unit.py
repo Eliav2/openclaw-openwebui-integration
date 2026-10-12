@@ -116,6 +116,8 @@ from openclaw_pipe import (
     _history_renderer,
     _history_run_messages,
     _stub_turn,
+    _stub_completion,
+    _output_from,
     _history_user_run_id,
     _reconcile_stub,
     ORPHAN_STUB_NOTE,
@@ -1587,6 +1589,53 @@ class StubTurnTests(unittest.TestCase):
         self.assertEqual(_history_user_run_id(_turn_history()["messages"][2]), "msg-c-stub-1-1.0")
 
 
+REPORT_HEAD = "The current patch is `9c1d240`: the parent-death tie. " * 6
+REPORT_MIDDLE = ("The sessions were deleted, but the claude process count did not drop. "
+                 * 5 + "Next I'm posting the Linear updates on ELI-89/")
+REPORT_TAIL = "90/91.\n\n**Ready.** All three of your conditions are in place. " * 8
+
+
+def _relay_run_history(*, twice=False):
+    """2af17834 shape: the run's closing message carries its whole text (the
+    transcript kept no tool messages for it)."""
+    text = REPORT_HEAD + REPORT_MIDDLE + REPORT_TAIL
+    msgs = [{"role": "user", "content": "review", "idempotencyKey": "msg-c-r-1.0:user"},
+            {"role": "assistant", "idempotencyKey": "cli-assistant:msg-c-r-1.0",
+             "content": [{"type": "text", "text": text}]}]
+    if twice:
+        msgs += [{"role": "user", "content": "again", "idempotencyKey": "msg-c-r-2.0:user"},
+                 {"role": "assistant", "idempotencyKey": "cli-assistant:msg-c-r-2.0",
+                  "content": [{"type": "text", "text": text}]}]
+    return {"messages": msgs}
+
+
+class StubCompletionTests(unittest.TestCase):
+    """A bubble cut off mid-run is finished with the rest of its run; the
+    bubble's own text must match exactly, once, in one run."""
+
+    def test_a_cut_off_middle_is_completed_to_the_end_of_its_run(self):
+        done = _stub_completion(_relay_run_history(), REPORT_MIDDLE)
+        self.assertEqual(done["run_id"], "msg-c-r-1.0")
+        self.assertTrue(done["text"].startswith(REPORT_MIDDLE.strip()))
+        self.assertTrue(done["text"].endswith(REPORT_TAIL.strip()))
+        self.assertNotIn(REPORT_HEAD.strip()[:40], done["text"], "the head is the previous bubble's")
+        self.assertEqual(done["output"][0]["content"][0]["text"].strip(), done["text"])
+
+    def test_no_completion_on_an_ambiguous_short_edited_or_complete_bubble(self):
+        self.assertIsNone(_stub_completion(_relay_run_history(twice=True), REPORT_MIDDLE))
+        self.assertIsNone(_stub_completion(_relay_run_history(), "Next I'm posting"))
+        self.assertIsNone(_stub_completion(_relay_run_history(), REPORT_MIDDLE.replace("ELI-89", "ELI-8")))
+        self.assertIsNone(_stub_completion(_relay_run_history(), REPORT_MIDDLE + REPORT_TAIL))
+
+    def test_output_from_cuts_the_straddling_item_and_drops_earlier_cards(self):
+        out = [{"type": "message", "content": [{"text": "abc"}]},
+               {"type": "function_call", "id": "t1"},
+               {"type": "message", "content": [{"text": "defgh"}]},
+               {"type": "function_call", "id": "t2"}]
+        got = _output_from(out, 5)
+        self.assertEqual([i.get("id") or i["content"][0]["text"] for i in got], ["fgh", "t2"])
+
+
 class OrphanStubReconcileTests(unittest.IsolatedAsyncioTestCase):
     """ELI-90: replies an Open WebUI restart orphaned (empty, done=False
     forever) are finished from the Gateway transcript, waiting for a run
@@ -1738,6 +1787,27 @@ class OrphanStubReconcileTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB, wait=False), "wait")
         self.assertIs(self._stub()["done"], False)
+
+    async def test_a_relay_bubble_cut_off_mid_run_gets_the_rest_of_its_run(self):
+        """2af17834/120d8b36: the relay bubble stopped mid-sentence, 30 chars
+        before the run's report, and was left as is."""
+        self.history, self.active = _relay_run_history(), False
+        self.chat["history"]["messages"]["u1"]["role"] = "assistant"  # a relay's parent
+        self._stub()["content"] = REPORT_MIDDLE
+        await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB)
+        self.assertIs(self._stub()["done"], True)
+        self.assertTrue(self._stub()["content"].startswith(REPORT_MIDDLE.strip()))
+        self.assertIn("**Ready.** All three", self._stub()["content"])
+
+    async def test_a_cut_off_bubble_whose_rest_shows_below_is_only_closed(self):
+        self.history, self.active = _relay_run_history(), False
+        self._stub()["content"] = REPORT_MIDDLE
+        self._stub()["childrenIds"] = ["later"]
+        self.chat["history"]["messages"]["later"] = {
+            "role": "assistant", "content": REPORT_TAIL, "childrenIds": []}
+        await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB)
+        self.assertEqual(self._stub()["content"], REPORT_MIDDLE)
+        self.assertIs(self._stub()["done"], True)
 
     async def test_a_reply_still_streaming_in_this_process_is_left_alone(self):
         self.history, self.active, self.live_task = _turn_history(), False, True
