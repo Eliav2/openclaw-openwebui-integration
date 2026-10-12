@@ -1134,7 +1134,7 @@ class Pipe:
             # ends -- measured 2026-10-11).
             our_run_id = adopted_run_id
             self._current_run_id = our_run_id
-            epoch_at_send = conn.connection_epoch
+            epoch_at_send = conn.gateway_restarts
             resolved_thinking = None
             pending_clamp_note = ""
             if adopted_queue is not None:
@@ -1231,8 +1231,8 @@ class Pipe:
                         yield pending_clamp_note
                 # Epoch of the connection this run is being launched on. If it has
                 # moved by the time the queue goes quiet, the Gateway restarted
-                # underneath us and took the run with it (see `connection_epoch`).
-                epoch_at_send = conn.connection_epoch
+                # underneath us and took the run with it (see `gateway_restarts`).
+                epoch_at_send = conn.gateway_restarts
                 try:
                     send_resp = await conn.send_request(
                         "chat.send",
@@ -1301,6 +1301,54 @@ class Pipe:
             assistant_received_text = adopted_run_text.get("received", "")
             assistant_stream_text = adopted_run_text.get("stream", "")
             last_item_text = adopted_run_text.get("item", "")
+        # Offsets in `assistant_received_text` where events were lost (a
+        # Gateway socket drop, see `_mark_event_gap`), and which OWUI reply
+        # showed the run from which offset, so a lost chunk can be put back
+        # into the reply it belongs to. Both are run-level and travel with an
+        # adopted run.
+        run_gaps: list[int] = list((adopted_run_text or {}).get("gaps", []))
+        run_segments: list[dict] = list((adopted_run_text or {}).get("segments", []))
+        if chat_id and owui_message_id:
+            # The reply that showed the run until now has stopped streaming,
+            # so OWUI has saved it; repairs that waited for it can go in.
+            for seg in run_segments:
+                for repair in _take_gap_repairs(chat_id, seg["message_id"]):
+                    _schedule_gap_repair(conn, repair, streaming=False)
+            run_segments.append({"message_id": owui_message_id,
+                                 "start": len(assistant_received_text)})
+
+        def reconcile_whole_text(whole: str) -> str | None:
+            """After a gap, line the run's whole text up with what arrived
+            and put each lost chunk back into the reply that showed it.
+            Returns the text after the last received piece (the only new
+            text), or None when there is no gap or `whole` does not line up
+            (an item carrying one segment, not the whole run), which leaves
+            the gaps pending for the next whole text."""
+            if not run_gaps or not chat_id:
+                return None
+            aligned = _align_whole_text(whole, assistant_received_text, run_gaps)
+            if aligned is None:
+                return None
+            tail, missing = aligned
+            run_gaps.clear()
+            for offset, chunk in missing:
+                seg = next((sg for sg in reversed(run_segments) if sg["start"] <= offset),
+                           run_segments[0] if run_segments else None)
+                if seg is None:
+                    continue
+                nxt = next((sg["start"] for sg in run_segments if sg["start"] > seg["start"]),
+                           len(assistant_received_text))
+                repair = {
+                    "user_id": owui_origin_user_id, "chat_id": chat_id,
+                    "message_id": seg["message_id"], "chunk": chunk,
+                    "before": assistant_received_text[offset:min(offset + _GAP_ANCHOR_CHARS, nxt)],
+                    "after": assistant_received_text[max(seg["start"], offset - _GAP_ANCHOR_CHARS):offset],
+                }
+                pipe_log(f"  event gap: {len(chunk)} chars lost at offset {offset}; "
+                         f"repairing message {seg['message_id'][:8]}...")
+                _schedule_gap_repair(conn, repair,
+                                     streaming=seg["message_id"] == owui_message_id)
+            return tail
         visible_message_text = _initial_visible_text + pending_clamp_note
         had_tool_block = False
         # toolCallIds announced to OWUI as `function_call` items that have
@@ -1629,12 +1677,12 @@ class Pipe:
                             # check it before any of the give-up paths below,
                             # which would otherwise close the stream on a run
                             # that is merely gone rather than finished.
-                            if conn.connection_epoch != epoch_at_send:
+                            if conn.gateway_restarts != epoch_at_send:
                                 if resume_attempts < max_resume_attempts:
                                     resume_attempts += 1
                                     pipe_log(
-                                        f"  epoch {epoch_at_send} -> "
-                                        f"{conn.connection_epoch}: gateway "
+                                        f"  restarts {epoch_at_send} -> "
+                                        f"{conn.gateway_restarts}: gateway "
                                         f"restarted mid-run; resuming "
                                         f"(attempt {resume_attempts}/"
                                         f"{max_resume_attempts})"
@@ -1645,7 +1693,7 @@ class Pipe:
                                         done=False,
                                     )
                                     if await resume_after_restart():
-                                        epoch_at_send = conn.connection_epoch
+                                        epoch_at_send = conn.gateway_restarts
                                         pending_restart_error = None
                                         continue
                                     pipe_log("  resume failed; will retry on next idle probe")
@@ -1783,6 +1831,12 @@ class Pipe:
 
                             continue
 
+                        if msg.get("type") == _GAP_MARKER_TYPE:
+                            run_gaps.append(len(assistant_received_text))
+                            pipe_log(f"  event gap at offset {len(assistant_received_text)} "
+                                     "(Gateway socket dropped)")
+                            continue
+
                         event_count += 1
                         first_event_arrived = True
                         payload = msg.get("payload", {})
@@ -1822,7 +1876,7 @@ class Pipe:
                         # event that armed it (the gateway stamps state='error'
                         # / aborted alongside phase='error'). While a restart is
                         # pending we must stay in the loop so the idle probe can
-                        # reach the connection_epoch check and resume.
+                        # reach the gateway_restarts check and resume.
                         if state in ("final", "cancelled", "error"):
                             if pending_restart_error:
                                 pipe_log(
@@ -1858,11 +1912,16 @@ class Pipe:
                                 # time. Diff it against what's already been streamed,
                                 # same as the item-event dedup below.
                                 raw_text = data.get("text") or ""
+                                gap_tail = reconcile_whole_text(raw_text) if raw_text else None
                                 before = _item_delta_text(
                                     raw_text, "", assistant_received_text
                                 ) if raw_text else ""
-                                delta = _catch_all_delta(
-                                    raw_text, assistant_received_text, visible_message_text
+                                delta = (
+                                    _suppress_already_shown(gap_tail, visible_message_text)
+                                    if gap_tail is not None
+                                    else _catch_all_delta(
+                                        raw_text, assistant_received_text, visible_message_text
+                                    )
                                 )
                                 if before and not delta:
                                     pipe_log(
@@ -1986,7 +2045,8 @@ class Pipe:
                                     last_item_text = item_text
                                     last_activity_time = time.time()
                                     continue
-                                item_delta = _item_delta_text(
+                                gap_tail = reconcile_whole_text(item_text)
+                                item_delta = gap_tail if gap_tail is not None else _item_delta_text(
                                     item_text, last_item_text, assistant_stream_text
                                 )
                                 last_item_text = item_text
@@ -2207,7 +2267,9 @@ class Pipe:
                         send_stop=self.valves.SEND_STOP_ON_CANCEL,
                         run_text={"received": assistant_received_text,
                                   "stream": assistant_stream_text,
-                                  "item": last_item_text},
+                                  "item": last_item_text,
+                                  "gaps": run_gaps,
+                                  "segments": run_segments},
                     )
                     pipe_log(
                         f"Generator {type(stop).__name__}: run parked "
@@ -2419,6 +2481,28 @@ class Pipe:
                 f"text_sha={getattr(self, '_diag_text_sha', None)} "
                 f"first_event_arrived={first_event_arrived} aborted={aborted}"
             )
+
+        if run_gaps and not aborted and our_run_id:
+            # Events were lost and no whole-text event lined up with them
+            # during the run: the run's own closing message in the transcript
+            # (`cli-assistant:<runId>`, see `_history_text_for_run`) is the
+            # whole text. Its tail, if the lost events were the last ones,
+            # belongs at the end of this reply.
+            try:
+                hist = await conn.session_history(session_key, limit=PROACTIVE_RUN_HISTORY_LIMIT)
+            except Exception as ex:
+                hist = None
+                pipe_log(f"  event gap: chat.history failed: {ex}")
+            found, whole = _history_text_for_run(hist, our_run_id)
+            tail = (reconcile_whole_text(whole) if found and whole else None) or ""
+            if run_gaps:
+                pipe_log(f"  {len(run_gaps)} event gap(s) and no whole text lines up for run "
+                         f"{str(our_run_id)[:20]}...; the lost text cannot be put back")
+            elif tail and not visible_message_text.endswith(tail):
+                pipe_log(f"  event gap: {len(tail)} chars lost at the end of the run, appended")
+                record_visible_chunk(tail)
+                yield tail
+                text_yielded = True
 
         # Terminal back-sync (ELI-57): persist the completed turn's visible text
         # to the OWUI DB with one final `replace` snapshot. OWUI only saves

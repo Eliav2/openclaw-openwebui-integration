@@ -374,6 +374,20 @@ def _start_file_server(port=18791):
                 self.send_response(200)
                 self.end_headers()
                 return
+            if self.path.rstrip("/") == "/__devcoord__/drop-gateway-ws":
+                # Live test of a mid-run socket drop (repro_socket_drop.py).
+                # Close the Gateway socket from this thread, exactly as a
+                # network drop ends it: the event loop sees ConnectionClosed,
+                # marks the gap and reconnects.
+                conn = _gateway_connection
+                loop = getattr(conn, "_loop", None) if conn else None
+                ok = bool(loop and conn._ws)
+                if ok:
+                    asyncio.run_coroutine_threadsafe(conn._ws.close(), loop)
+                pipe_log(f"[devcoord] test socket drop requested: {'closing' if ok else 'no socket'}")
+                self.send_response(200 if ok else 409)
+                self.end_headers()
+                return
             # DEV-ONLY-END
             self._handle_upload()
 
