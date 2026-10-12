@@ -6433,11 +6433,11 @@ async def _relay_abort(conn: "_GatewayConnection", key: str) -> None:
 # matched to their runs in the Gateway transcript and finished from it.
 
 ORPHAN_STUB_NOTE = (
-    "*No reply arrived for this message: the turn was cut off (Open WebUI "
-    "restarted or lost the run) and its reply is not in the OpenClaw session "
-    "transcript. Send the message again if you still need an answer.*"
+    "*This reply was cut off before it finished (Open WebUI restarted or "
+    "lost the run), and no reply for it could be recovered from OpenClaw. "
+    "Send the message again if you still need an answer.*"
 )
-ORPHAN_STUB_SILENT_NOTE = "*The run for this message ended without a reply.*"
+ORPHAN_STUB_SILENT_NOTE = "*The run for this message stopped without leaving a reply in the transcript.*"
 
 
 def _history_user_run_id(message) -> str | None:
@@ -6452,29 +6452,48 @@ def _history_user_run_id(message) -> str | None:
     return key[:-len(":user")] if key.endswith(":user") and len(key) > 5 else None
 
 
-def _stub_turn(history: dict, stub_id: str, user_text: str) -> dict | None:
+def _run_id_sent_at(run_id: str) -> float | None:
+    """The send time the pipe writes at the end of its run ids
+    (`msg-<chat>-[<message>-]<time.time()>`)."""
+    try:
+        return float(run_id.rsplit("-", 1)[1]) if run_id.startswith("msg-") else None
+    except (IndexError, ValueError):
+        return None
+
+
+def _stub_turn(history: dict, stub_id: str, user_text: str,
+               stub_ts: float | None = None) -> dict | None:
     """The transcript turn an OWUI reply stub was waiting for:
-    {"run_id", "messages", "closed"}, or None when the transcript has none.
+    {"run_id", "messages", "closed", "by"}, or None when the transcript has
+    none.
 
     The pipe puts the OWUI message id into the run id (`msg-<chat>-<message>-
-    <time>`), so the turn is found by identity. A run sent before that
-    (or by an older pipe) is found by its user text instead, the newest match
-    winning, as `_recovery_text_from_items` does. `messages` runs to the run's
-    closing message (`cli-assistant:<runId>`) or the next turn; `closed` says
-    whether the run is over by the transcript alone."""
+    <time>`), so the turn is found by identity (`by` "id"). A run sent
+    before that is found by its user text (`by` "text"): with `stub_ts` (the
+    stub's creation time) the first matching run sent at or after it, since
+    the pipe sends after Open WebUI creates the stub and the same short text
+    ("works?") recurs; without it the newest match. `messages` runs to the
+    run's closing message (`cli-assistant:<runId>`) or the next turn;
+    `closed` says whether the run is over by the transcript alone."""
     messages = (history or {}).get("messages")
     if not isinstance(messages, list):
         return None
     starts = [i for i, m in enumerate(messages) if _history_user_run_id(m)]
-    pick = None
+    pick, by = None, "id"
     if stub_id:
-        by_id = [i for i in starts if stub_id in _history_user_run_id(messages[i])]
+        by_id = [i for i in starts if f"-{stub_id}-" in _history_user_run_id(messages[i])]
         pick = by_id[-1] if by_id else None
     text = (user_text or "").strip()
     if pick is None and text:
-        by_text = [i for i in starts if _recovery_user_text_matches(
+        by, by_text = "text", [i for i in starts if _recovery_user_text_matches(
             ((_history_item(messages[i]) or {}).get("text") or "").strip(), text)]
-        pick = by_text[-1] if by_text else None
+        if stub_ts is not None:
+            # 2s of slack: Open WebUI stamps whole seconds.
+            by_text = [i for i in by_text
+                       if (_run_id_sent_at(_history_user_run_id(messages[i])) or 0) >= stub_ts - 2]
+            pick = by_text[0] if by_text else None
+        else:
+            pick = by_text[-1] if by_text else None
     if pick is None:
         return None
     run_id = _history_user_run_id(messages[pick])
@@ -6484,8 +6503,15 @@ def _stub_turn(history: dict, stub_id: str, user_text: str) -> dict | None:
     for j, m in enumerate(turn):
         meta = m.get("__openclaw") if isinstance(m, dict) and isinstance(m.get("__openclaw"), dict) else {}
         if isinstance(m, dict) and closing in (m.get("idempotencyKey"), meta.get("idempotencyKey")):
-            return {"run_id": run_id, "messages": turn[:j + 1], "closed": True}
-    return {"run_id": run_id, "messages": turn, "closed": end < len(messages)}
+            return {"run_id": run_id, "messages": turn[:j + 1], "closed": True, "by": by}
+    return {"run_id": run_id, "messages": turn, "closed": end < len(messages), "by": by}
+
+
+def _owui_message_ts(message: dict) -> float | None:
+    ts = message.get("timestamp")
+    if isinstance(ts, (int, float)) and ts > 0:
+        return ts / 1000 if ts > 1e11 else float(ts)  # ms or s
+    return None
 
 
 async def _owui_chat_has_live_task(chat_id: str) -> bool:
@@ -6531,7 +6557,8 @@ async def _orphan_stub_for_run(conn: "_GatewayConnection", chat, stub_id: str,
         pipe_log(f"  orphan stub: chat.history failed: {ex}")
         return None
     parent = msgs.get(stub.get("parentId")) or {}
-    turn = _stub_turn(hist, stub_id, _coerce_text(parent.get("content")))
+    user_text = _coerce_text(parent.get("content")) if parent.get("role") == "user" else ""
+    turn = _stub_turn(hist, stub_id, user_text, _owui_message_ts(stub))
     return turn if turn and turn["run_id"] == run_id else None
 
 
@@ -6559,9 +6586,10 @@ async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
             pipe_log(f"  orphan stub {stub_id[:8]}...: chat.history failed: {ex}")
             return
         parent = msgs.get(stub.get("parentId")) or {}
-        turn = _stub_turn(hist, stub_id, _coerce_text(parent.get("content")))
-        if turn and turn["closed"]:
-            break
+        user_text = _coerce_text(parent.get("content")) if parent.get("role") == "user" else ""
+        turn = _stub_turn(hist, stub_id, user_text, _owui_message_ts(stub))
+        if turn is None or turn["closed"]:
+            break  # no run to wait for, or it is over
         active = await _session_list_active(conn, session_key)
         if active is None:
             return
@@ -6574,12 +6602,26 @@ async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
         await changed.wait()
 
     run_id = (turn or {}).get("run_id")
-    rendered = _history_renderer(turn["messages"]) if turn else _TurnRenderer()
-    text = rendered.text.strip()
-    if not text and not rendered.output:
-        rendered._add_text(ORPHAN_STUB_SILENT_NOTE if turn else ORPHAN_STUB_NOTE)
-        text = rendered.text
-    output = rendered.finished_output()
+    # What the stub already shows is never replaced on a guess: a stub with
+    # content (older pipes streamed into it, the relay snapshots into it) is
+    # rebuilt only from a run matched by identity, else just closed.
+    has_content = bool(_coerce_text(stub.get("content")).strip() or stub.get("output"))
+    fields: dict = {"done": True}
+    output: list | None = None
+    text = ""
+    if turn and (turn["by"] == "id" or not has_content):
+        rendered = _history_renderer(turn["messages"])
+        if not rendered.text.strip() and not rendered.output and not has_content:
+            rendered._add_text(ORPHAN_STUB_SILENT_NOTE)
+        if rendered.output:
+            output = rendered.finished_output()
+            text = rendered.text.strip()
+            fields.update(content=text, output=output)
+    elif not has_content:
+        rendered = _TurnRenderer()
+        rendered._add_text(ORPHAN_STUB_NOTE)
+        output, text = rendered.finished_output(), rendered.text
+        fields.update(content=text, output=output)
     async with conn._chat_write_lock(chat_id):
         chat = await Chats.get_chat_by_id(chat_id)
         msgs = ((chat.chat or {}).get("history") or {}).get("messages") or {} if chat else {}
@@ -6591,17 +6633,21 @@ async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
                 return  # live relay or proactive delivery owns this run
             conn._delivered_proactive[claim] = True
             conn.mark_delivered_live(session_key, run_id)
-        await Chats.upsert_message_to_chat_by_id_and_message_id(
-            chat_id, stub_id, {"content": text, "output": output, "done": True},
-        )
-    await _relay_emit_event(chat.user_id, chat_id, stub_id,
-                            {"type": "chat:completion", "data": {"output": output}})
+        await Chats.upsert_message_to_chat_by_id_and_message_id(chat_id, stub_id, fields)
+    if output is not None:
+        await _relay_emit_event(chat.user_id, chat_id, stub_id,
+                                {"type": "chat:completion", "data": {"output": output}})
     await _relay_emit_event(chat.user_id, chat_id, stub_id,
                             {"type": "chat:active", "data": {"active": False}})
-    cards = sum(1 for i in output if i.get("type") == "function_call")
-    source = f"run {run_id[:40]}" if run_id else "no run in the transcript"
-    pipe_log(f"  orphan stub {stub_id[:8]}... in chat {chat_id[:8]}... finished from "
-             f"{source} ({len(text)} chars, {cards} tool card(s)) (ELI-90)")
+    cards = sum(1 for i in output or [] if i.get("type") == "function_call")
+    if output is None:
+        how = "closed, content kept"
+    elif run_id:
+        how = f"filled from run {run_id[:48]} by {turn['by']}"
+    else:
+        how = "no run in the transcript, note written"
+    pipe_log(f"  orphan stub {stub_id[:8]}... in chat {chat_id[:8]}...: {how} "
+             f"({len(text)} chars, {cards} tool card(s)) (ELI-90)")
 
 
 async def _orphan_stub_ids(prefixes: list[str]) -> list[tuple[str, str]]:

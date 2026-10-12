@@ -1571,6 +1571,17 @@ class StubTurnTests(unittest.TestCase):
         self.assertTrue(turn["closed"])
         self.assertNotIn("later answer", json.dumps(turn["messages"]))
 
+    def test_a_repeated_text_matches_the_first_run_sent_after_the_stub(self):
+        hist = _turn_history(run="msg-c-100.5", text="works?")
+        hist["messages"] += [
+            {"role": "user", "content": "works?", "idempotencyKey": "msg-c-200.5:user"},
+            {"role": "assistant", "content": [{"type": "text", "text": "second"}],
+             "idempotencyKey": "cli-assistant:msg-c-200.5"}]
+        self.assertEqual(_stub_turn(hist, "s", "works?", 100.0)["run_id"], "msg-c-100.5")
+        self.assertEqual(_stub_turn(hist, "s", "works?", 199.0)["run_id"], "msg-c-200.5")
+        self.assertIsNone(_stub_turn(hist, "s", "works?", 300.0))
+        self.assertEqual(_stub_turn(hist, "s", "works?", 100.0)["by"], "text")
+
     def test_the_imported_copy_of_the_user_message_starts_no_turn(self):
         self.assertIsNone(_history_user_run_id(_turn_history()["messages"][3]))
         self.assertEqual(_history_user_run_id(_turn_history()["messages"][2]), "msg-c-stub-1-1.0")
@@ -1689,6 +1700,27 @@ class OrphanStubReconcileTests(unittest.IsolatedAsyncioTestCase):
         await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB)
         self.assertIs(self._stub()["done"], True)
         self.assertEqual(self._stub()["content"], ORPHAN_STUB_NOTE)
+
+    async def test_content_a_stub_already_shows_is_not_replaced_on_a_text_match(self):
+        self.history, self.active = _turn_history(run="msg-c-1.0"), False
+        self._stub()["content"] = "what streamed before"
+        await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB)
+        self.assertIs(self._stub()["done"], True)
+        self.assertEqual(self._stub()["content"], "what streamed before")
+        self.assertNotIn("output", self._stub())
+
+    async def test_content_is_replaced_when_the_run_matches_by_identity(self):
+        self.history, self.active = _turn_history(), False
+        self._stub()["content"] = "Reading th"
+        await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB)
+        self.assertEqual(self._stub()["content"], "Reading them. Found it.")
+
+    async def test_a_stub_with_content_and_no_run_is_closed_as_is(self):
+        self.history, self.active = {"messages": []}, False
+        self._stub()["content"] = "partial"
+        await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB)
+        self.assertEqual(self._stub()["content"], "partial")
+        self.assertIs(self._stub()["done"], True)
 
     async def test_a_reply_still_streaming_in_this_process_is_left_alone(self):
         self.history, self.active, self.live_task = _turn_history(), False, True
