@@ -391,21 +391,72 @@ class ProactiveDeliveryFullTextTests(unittest.TestCase):
         ))
         self.assertTrue(self._deliver(conn)[0].endswith(self.LONG))
 
-    def test_short_message_needs_no_history_read(self):
+    def test_short_message_needs_one_history_read(self):
+        # The one read is the run lookup by id; the short preview needs no
+        # second read to complete it.
         conn = self._conn(preview_items=[{"role": "assistant", "text": "Done, all green."}])
         self.assertEqual(self._deliver(conn), ["*↳ Proactive message*\n\nDone, all green."])
-        conn.session_history.assert_not_awaited()
+        conn.session_history.assert_awaited_once()
 
     def test_sentinel_delivers_nothing(self):
         conn = self._conn(preview_items=[{"role": "assistant", "text": "NO_REPLY"}])
         self.assertEqual(self._deliver(conn), [])
-        conn.session_history.assert_not_awaited()
+        conn.session_history.assert_awaited_once()
+
+    def _keyed(self, run_id, text, role="assistant"):
+        return {"role": role, "content": [{"type": "text", "text": text}],
+                "idempotencyKey": f"cli-assistant:{run_id}" if role == "assistant"
+                else f"{run_id}:user"}
+
+    def test_delivers_its_own_reply_not_a_later_runs(self):
+        """2026-10-12, live: a sub-agent's completion run (unwatched) ended,
+        then the user's next message ran and was shown inline. The delivery
+        waits for the session to go idle, and by then the newest reply was
+        the second run's, so it was posted twice and the first run's reply
+        never. The run's own reply is found by its id."""
+        conn = self._conn(
+            history={"messages": [
+                {"role": "user", "content": "[sub-agent finished] report"},
+                self._keyed("run-1", "The sub-agent did not complete the task."),
+                self._keyed("run-2", "MSG2: reply with exactly MSG2-ANSWER", role="user"),
+                self._keyed("run-2", "MSG2-ANSWER"),
+            ]},
+            preview_items=[{"role": "assistant", "text": "MSG2-ANSWER"}],
+        )
+        self.assertEqual(self._deliver(conn), [
+            "*↳ Proactive message*\n\nThe sub-agent did not complete the task."])
+
+    def test_run_found_by_id_but_silent_delivers_nothing(self):
+        conn = self._conn(
+            history={"messages": [self._keyed("run-1", "NO_REPLY")]},
+            preview_items=[{"role": "assistant", "text": "an older reply"}],
+        )
+        self.assertEqual(self._deliver(conn), [])
+
+    def test_unidentified_run_never_takes_a_newer_runs_text(self):
+        """No message carries the run's id (another runner, or it scrolled out
+        of the window) and a newer run has ended since: the newest reply is
+        that run's, so nothing is delivered rather than a duplicate."""
+        conn = self._conn(
+            history={"messages": [{"role": "assistant", "content": "MSG2-ANSWER"}]},
+            preview_items=[{"role": "assistant", "text": "MSG2-ANSWER"}],
+        )
+        parent = _owui_session_key("main", self.USER_ID, self.CHAT_ID)
+        conn._last_final_run[parent] = "run-2"
+        self.assertEqual(self._deliver(conn), [])
+
+    def test_unidentified_newest_run_still_uses_the_preview(self):
+        conn = self._conn(preview_items=[{"role": "assistant", "text": "Done, all green."}])
+        parent = _owui_session_key("main", self.USER_ID, self.CHAT_ID)
+        conn._last_final_run[parent] = "run-1"
+        self.assertEqual(self._deliver(conn), ["*↳ Proactive message*\n\nDone, all green."])
 
     def test_silent_run_does_not_redeliver_an_older_reply(self):
         """chat.history hides a sub-agent completion report and drops the
         parent's ANNOUNCE_SKIP, so its newest assistant text is the PREVIOUS
         run's answer. The preview's newest row is the report itself (a user
-        row), so nothing is delivered and chat.history is never asked."""
+        row), so nothing is delivered. chat.history is read once, for the run's
+        own message, which a silent run doesn't have."""
         conn = self._conn(
             history={"messages": [
                 {"role": "user", "content": "earlier question"},
@@ -414,7 +465,7 @@ class ProactiveDeliveryFullTextTests(unittest.TestCase):
             preview_items=[{"role": "user", "text": "[sub-agent finished] report"}],
         )
         self.assertEqual(self._deliver(conn), [])
-        conn.session_history.assert_not_awaited()
+        conn.session_history.assert_awaited_once()
 
     def test_history_without_the_clipped_message_delivers_the_preview(self):
         """Never swap in a different message: if no chat.history row carries
@@ -1528,6 +1579,72 @@ class ProactiveDebounceWatcherTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertNotIn(session_key, conn._pending_proactive_debounce)
+
+    async def test_delivers_every_queued_run_in_order(self):
+        """Two unwatched runs ended inside one debounce window: the single
+        watcher delivers both, oldest first, each with its own run id."""
+        conn = self._conn()
+        session_key = _owui_session_key(
+            "main", "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        )
+        conn._pending_proactive_debounce.add(session_key)
+        conn._proactive_runs[session_key] = ["run-1", "run-2"]
+        delivered = []
+
+        async def fake_deliver(c, sk, rid):
+            delivered.append(rid)
+            if rid == "run-1":  # a third run ends while the first is delivered
+                conn._proactive_runs[session_key].append("run-3")
+
+        with mock.patch("openclaw_pipe.PROACTIVE_DELIVERY_ENABLED", True), mock.patch(
+            "openclaw_pipe._deliver_proactive_owui_message", side_effect=fake_deliver
+        ):
+            await _maybe_deliver_proactive_after_debounce(
+                conn, session_key, "run-1",
+                min_idle_s=0, poll_interval_s=0.02, max_wait_s=2,
+            )
+
+        self.assertEqual(delivered, ["run-1", "run-2", "run-3"])
+        self.assertNotIn(session_key, conn._proactive_runs)
+        self.assertNotIn(session_key, conn._pending_proactive_debounce)
+
+    async def test_second_unwatched_final_is_queued_not_skipped(self):
+        """The event loop used to drop a second unwatched run's final while
+        the session already had a watcher, so that run was never delivered."""
+        conn = self._conn()
+        session_key = _owui_session_key(
+            "main", "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        )
+        frames = [
+            {"type": "event", "event": "chat", "payload": {
+                "sessionKey": session_key, "runId": rid, "state": "final"}}
+            for rid in ("run-1", "run-2")
+        ]
+
+        class FakeWS:
+            async def recv(self_):
+                if frames:
+                    return json.dumps(frames.pop(0))
+                conn._stopped = True
+                return json.dumps({"type": "event", "event": "tick"})
+
+        watchers = []
+
+        async def fake_watcher(c, sk, rid, **kw):
+            watchers.append(rid)
+
+        conn._ws = FakeWS()
+        with mock.patch("openclaw_pipe.PROACTIVE_DELIVERY_ENABLED", True), mock.patch(
+            "openclaw_pipe._maybe_deliver_proactive_after_debounce", side_effect=fake_watcher
+        ):
+            await conn._event_loop()
+            await asyncio.sleep(0)
+
+        self.assertEqual(conn._proactive_runs[session_key], ["run-1", "run-2"])
+        self.assertEqual(watchers, ["run-1"])  # one watcher per session
+        self.assertEqual(conn._last_final_run[session_key], "run-2")
 
 
 class StripInputMarkerLineTests(unittest.TestCase):
