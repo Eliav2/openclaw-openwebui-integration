@@ -675,7 +675,6 @@ def _gap_repair_fields(message: dict, chunk: str, before: str, after: str) -> di
     string is derived), so the chunk goes into the text part that holds the
     anchor; `content` is kept in step when present.
     """
-    import copy
     fields: dict = {}
     output = copy.deepcopy(message.get("output") or [])
     placed = False
@@ -1106,13 +1105,56 @@ class _TurnRenderer:
 
     def __init__(self):
         self.visible_text = ""
+        # The same run the way OWUI 0.12 stores a streamed reply: `text` is the
+        # message `content` (assistant text only) and `output` holds the
+        # Responses-API items the cards are drawn from. The frontend renders
+        # `output` whenever a message has one, so a tool block baked into
+        # `content` as markdown is no card there (ELI-92).
+        self.text = ""
+        self.output: list[dict] = []
         self._assistant_stream_text = ""
         self._last_item_text = ""
         self._active_tool_args: dict[str, str] = {}
+        self._tool_items: dict[str, dict] = {}
+        self._tool_results: set[str] = set()
 
     def _add(self, chunk: str) -> None:
         if chunk:
             self.visible_text += chunk
+
+    def _add_text(self, chunk: str) -> None:
+        if not chunk:
+            return
+        self._add(chunk)
+        self.text += chunk
+        last = self.output[-1] if self.output else None
+        if last is None or last.get("type") != "message":
+            last = {
+                "type": "message",
+                "id": f"msg_{uuid.uuid4().hex[:24]}",
+                "status": "in_progress",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": ""}],
+            }
+            self.output.append(last)
+        last["content"][0]["text"] += chunk
+
+    def _tool_item(self, name: str, tcid: str, args_str: str) -> dict:
+        item = self._tool_items.get(tcid)
+        if item is None:
+            item = _tool_call_started_event(name, tcid, args_str)["item"]
+            self._tool_items[tcid] = item
+            self.output.append(item)
+        return item
+
+    def finished_output(self) -> list[dict]:
+        """`output` as stored once the run is over: OWUI marks every item
+        still in progress completed before its final write, and so do we."""
+        out = copy.deepcopy(self.output)
+        for item in out:
+            if item.get("status") == "in_progress":
+                item["status"] = "completed"
+        return out
 
     def feed(self, payload: dict) -> None:
         data = payload.get("data", {}) or {}
@@ -1138,7 +1180,7 @@ class _TurnRenderer:
                 ):
                     return
                 self._assistant_stream_text += delta
-                self._add(delta)
+                self._add_text(delta)
 
         if stream == "item":
             item_text = _item_assistant_text(data)
@@ -1148,23 +1190,34 @@ class _TurnRenderer:
                 )
                 self._last_item_text = item_text
                 item_delta = _suppress_already_shown(item_delta, self.visible_text)
-                self._add(item_delta)
+                self._add_text(item_delta)
 
         if stream == "tool":
+            tcid = data.get("toolCallId", "")
             if phase == "start":
-                tcid = data.get("toolCallId", "")
                 if tcid:
-                    self._active_tool_args[tcid] = json.dumps(data.get("args", {}))
+                    args_str = json.dumps(data.get("args", {}))
+                    self._active_tool_args[tcid] = args_str
+                    self._tool_item(name, tcid, args_str)
             elif phase == "result":
+                if tcid and tcid in self._tool_results:
+                    return
                 result = data.get("result", {})
                 result_str = json.dumps(result) if not isinstance(result, str) else result
-                tcid = data.get("toolCallId", "")
                 args_str = self._active_tool_args.pop(tcid, None) or json.dumps(
                     data.get("args", {})
                 )
                 self._add(_render_tool_result_block(
                     name, tcid, args_str, result_str, data.get("meta", "")
                 ))
+                if tcid:
+                    self._tool_results.add(tcid)
+                    item = self._tool_item(name, tcid, args_str)
+                    item["status"] = "completed"
+                    if data.get("isError") is True:
+                        item["name"] = f"{name} {TOOL_ERROR_MARK}"
+                        result_str = _tool_error_banner(result_str)
+                    self.output.append(_tool_call_result_event(tcid, result_str)["item"])
 
 
 # ---------------------------------------------------------------------------
@@ -1454,11 +1507,118 @@ class _GatewayConnection:
         # introduce time (a zombie sees the claim and never double-introduces).
         self._relay_sessions: dict[str, "_RelayState"] = {}
 
-        # NOTE (ELI-26): there is deliberately no live tool-call buffer here.
-        # A drawer watching a *running* subagent cannot get its tool calls from
-        # this connection, and that is a Gateway routing property, not an
-        # oversight -- see `_dispatch_event`'s note on tool events. Measured
-        # 2026-07-30, do not re-add a watch without re-measuring first.
+        # Sessions whose transcript events (`session.tool`) this connection
+        # asked for with `sessions.messages.subscribe`. A subscription ends
+        # with the socket, so `_subscribe_all` renews every one after each
+        # connect. Tool events for one call can arrive twice (as the run's
+        # initiator AND as a subscriber); `_tool_events_seen` keeps the first.
+        self._message_subscriptions: set[str] = set()
+        self._subscriptions_stale = False
+        # One Event per session someone is waiting on, set by the next
+        # `sessions.changed` that carries run state for it (ELI-88).
+        self._session_change_waiters: dict[str, asyncio.Event] = {}
+        self._tool_events_seen: dict[tuple, bool] = {}
+
+    async def _subscribe_all(self) -> None:
+        """Renew this socket's subscriptions: the session index
+        (`sessions.changed`, which carries run start/settle), and transcript
+        events for every OWUI session subscribed so far."""
+        try:
+            await self.send_request("sessions.subscribe", {}, timeout=15)
+        except Exception as ex:
+            pipe_log(f"  sessions.subscribe failed: {ex}")
+        for key in list(self._message_subscriptions):
+            await self._subscribe_messages(key)
+        # A relay whose run settled while the socket was down never hears its
+        # final or the settle push; ask once, now that pushes flow again.
+        for state in [s for s in self._relay_sessions.values() if s.gap]:
+            try:
+                lst = await self.send_request("sessions.list", {}, timeout=15)
+            except Exception as ex:
+                pipe_log(f"  relay gap check failed: {ex}")
+                break
+            rows = {r.get("key"): r for r in (lst.get("sessions") or [])}
+            row = rows.get(state.session_key)
+            if row is not None and row.get("hasActiveRun") is False:
+                spawn_background(_relay_finalize_settled(self, state))
+
+    async def _subscribe_messages(self, session_key: str) -> bool:
+        try:
+            await self.send_request(
+                "sessions.messages.subscribe", {"key": session_key}, timeout=15
+            )
+            return True
+        except Exception as ex:
+            pipe_log(f"  sessions.messages.subscribe {session_key[-36:]} failed: {ex}")
+            return False
+
+    async def ensure_message_subscription(self, session_key: str) -> None:
+        """Receive `session.tool` for `session_key` from now on. Tool events
+        reach the connection that STARTED a run as `agent` events; everyone
+        else, including this connection after a reconnect and for any run the
+        Gateway starts itself (restart recovery, wakes, announces), gets them
+        only as `session.tool` on a transcript subscription (ELI-92)."""
+        if not session_key or session_key in self._message_subscriptions:
+            return
+        self._message_subscriptions.add(session_key)
+        if not await self._subscribe_messages(session_key):
+            self._message_subscriptions.discard(session_key)
+
+    def _first_tool_event(self, payload: dict) -> bool:
+        """False for a tool event this connection already dispatched: the
+        same call's start/result can arrive both as the initiator's `agent`
+        event and as a subscriber's `session.tool`."""
+        data = payload.get("data") or {}
+        tcid = data.get("toolCallId")
+        phase = data.get("phase")
+        if not tcid or phase not in ("start", "result"):
+            return True
+        key = (payload.get("sessionKey"), tcid, phase)
+        if key in self._tool_events_seen:
+            return False
+        self._tool_events_seen[key] = True
+        if len(self._tool_events_seen) > 4000:
+            for stale in list(self._tool_events_seen)[:2000]:
+                self._tool_events_seen.pop(stale, None)
+        return True
+
+    def session_change_event(self, session_key: str) -> asyncio.Event:
+        """An Event set by the next pushed change to `session_key`'s run state
+        (`sessions.changed` with `hasActiveRun`: run started, run settled).
+
+        Take it BEFORE reading the state, then wait on it only if the read
+        said busy: a change landing between the read and the wait has already
+        set it, so no change can slip through and no polling is needed. A
+        socket drop sets every waiter too (the change may be among the lost
+        events), so a waiter always re-reads after a gap."""
+        ev = self._session_change_waiters.get(session_key)
+        if ev is None:
+            ev = self._session_change_waiters[session_key] = asyncio.Event()
+        return ev
+
+    def _wake_session_waiters(self, session_key: str | None = None) -> None:
+        keys = [session_key] if session_key else list(self._session_change_waiters)
+        for key in keys:
+            ev = self._session_change_waiters.pop(key, None)
+            if ev is not None:
+                ev.set()
+
+    def _on_sessions_changed(self, payload: dict) -> None:
+        """A session row changed. Waiters on its run state re-read it, and an
+        OWUI session whose run just started gets a transcript subscription
+        before its first tool call (measured: run start is pushed ~3s ahead of
+        the first `session.tool`)."""
+        key = payload.get("sessionKey") or payload.get("key") or ""
+        if key and "hasActiveRun" in payload:
+            self._wake_session_waiters(key)
+        if key and payload.get("hasActiveRun") is False:
+            for state in list(self._relay_sessions.values()):
+                if state.session_key == key:
+                    spawn_background(_relay_finalize_settled(self, state))
+        if (payload.get("hasActiveRun") and key
+                and key not in self._message_subscriptions
+                and self.parse_owui_session_key(key)):
+            spawn_background(self.ensure_message_subscription(key))
 
     def register_run_target(self, session_key: str, run_id: str,
                             chat_id: str | None, message_id: str | None) -> None:
@@ -2091,6 +2251,9 @@ class _GatewayConnection:
                 n += 1
         if n:
             pipe_log(f"  marked an event gap in {n} run queue(s)")
+        for state in self._relay_sessions.values():
+            state.gap = True
+        self._wake_session_waiters()
 
     def _note_gateway_boot(self, boot_id: str | None) -> None:
         """Count a Gateway restart only when its boot id changes."""
@@ -2213,6 +2376,9 @@ class _GatewayConnection:
         pipe_log(
             f"Connected to Gateway (persistent) [epoch {self.connection_epoch}]"
         )
+        # Subscriptions belong to the socket. Their requests resolve on the
+        # event loop, which is not reading yet here, so it renews them.
+        self._subscriptions_stale = True
         # NOTE: does not start/spawn the event-loop task -- that happens
         # exactly once, in `ensure_connected`. This method is also called
         # from inside `_reconnect`, which runs from within the event-loop
@@ -2293,6 +2459,9 @@ class _GatewayConnection:
                 if self._ws is None:
                     await self._reconnect()
                     continue
+                if self._subscriptions_stale:
+                    self._subscriptions_stale = False
+                    spawn_background(self._subscribe_all())
                 msg = json.loads(await asyncio.wait_for(self._ws.recv(), timeout=90))
 
                 # ── Request-response matching ──
@@ -2318,32 +2487,37 @@ class _GatewayConnection:
                     continue
 
                 # ── Event dispatch ──
-                # On tool events and why the subagents drawer can't see another
-                # session's (ELI-26, measured against the live gateway
-                # 2026-07-30 with two connections on one session key):
+                # On tool events (re-measured 2026-10-12, gateway 2026.9.x;
+                # the 2026-07-30 ELI-26 measurement predates `session.tool`):
                 #
-                #   * There is no `session.tool` event family. Tool activity
-                #     arrives as `agent` with payload.stream == "tool", phase
-                #     start/result -- the same events `_TurnRenderer` already
-                #     folds into inline chat cards below.
-                #   * Those events are delivered ONLY to connections registered
-                #     as tool-event recipients of that specific runId, which the
-                #     Gateway does when a connection *starts* the run. A plain
-                #     `sessions.messages.subscribe` observer receives the run's
-                #     assistant/thinking/lifecycle events but zero tool events.
-                #     (Measured: initiator 4 tool events, subscriber 0, same run.)
-                #   * A subagent's run is started inside the Gateway, not by us,
-                #     so this connection can never be one of its recipients.
+                #   * The connection that STARTS a run gets its tool activity
+                #     as `agent` events with payload.stream == "tool".
+                #   * Any connection subscribed to the session with
+                #     `sessions.messages.subscribe` gets the same payloads as
+                #     `session.tool` events, whoever started the run (measured:
+                #     observer got 3 start + 3 result, zero `agent` tool
+                #     events). That covers this connection after a reconnect,
+                #     and runs the Gateway starts itself (ELI-92).
                 #
-                # So the drawer's Tools tab is limited to what chat.history has
-                # flushed, and a running subagent's calls all appear at once on
-                # completion. Closing that gap needs a Gateway-side change, not
-                # a pipe-side one.
+                # Both are folded into one path below, first copy wins.
+                if msg.get("type") == "event" and msg.get("event") == "sessions.changed":
+                    self._on_sessions_changed(msg.get("payload") or {})
+                    continue
+                if msg.get("type") == "event" and msg.get("event") == "session.tool":
+                    # Same payload as an `agent` tool event (stream "tool",
+                    # data.phase/name/toolCallId/args/result), so it takes the
+                    # same path: inline turn, shadow renderer, live relay.
+                    p = msg.get("payload") or {}
+                    msg = {"type": "event", "event": "agent", "payload": {
+                        k: p[k] for k in ("runId", "sessionKey", "sessionId", "stream",
+                                          "data", "seq", "ts") if k in p}}
                 if msg.get("type") != "event" or \
                    msg.get("event") not in ("agent", "chat"):
                     continue
 
                 payload = msg.get("payload", {})
+                if payload.get("stream") == "tool" and not self._first_tool_event(payload):
+                    continue
 
                 # ── Parity shadow render (2026-07-19) ──
                 # Feed every event of a run we're tracking into its shadow
@@ -2650,6 +2824,9 @@ def _history_text_completing_preview(history: dict, clip_prefix: str) -> str | N
 # Other runs may have ended after it (the delivery waits for the session to go
 # idle), so this reaches further than PROACTIVE_HISTORY_LIMIT.
 PROACTIVE_RUN_HISTORY_LIMIT = 60
+# Messages to read when rebuilding a whole run from `chat.history`: each tool
+# call is a message of its own (measured: 119 calls = 154 messages).
+RUN_HISTORY_LIMIT = 600
 
 
 def _history_text_for_run(history: dict, run_id: str) -> tuple[bool, str | None]:
@@ -2679,6 +2856,76 @@ def _history_text_for_run(history: dict, run_id: str) -> tuple[bool, str | None]
                 text = str(fallback.get("replacementText") or "").strip()
         return True, (text if text and text not in _SILENT_SENTINELS else None)
     return False, None
+
+
+def _history_renderer(messages: list) -> "_TurnRenderer":
+    """A `_TurnRenderer` fed one run's `chat.history` messages instead of its
+    live events, so a run whose events were lost still ends as the same
+    `text` + `output` items (ELI-88/90/92).
+
+    claude-cli imports its transcript into the session as it goes: assistant
+    messages whose blocks are `text`, `toolcall` {id, name, arguments} and
+    `tool_result` {tool_use_id, content, is_error}, in order. The run's closing
+    message (`cli-assistant:<runId>`) repeats all of its text, so it only
+    counts when nothing before it carried text (a plain, tool-free reply)."""
+    r = _TurnRenderer()
+    closing = None
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
+        keys = (str(message.get("idempotencyKey") or ""), str(meta.get("idempotencyKey") or ""))
+        if any(k.startswith("cli-assistant:") for k in keys):
+            closing = message
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict):
+                continue
+            kind = block.get("type")
+            if kind == "text" and block.get("text"):
+                r.feed({"stream": "assistant", "data": {"delta": block["text"]}})
+            elif kind == "toolcall" and block.get("id"):
+                r.feed({"stream": "tool", "data": {
+                    "phase": "start", "name": block.get("name", ""),
+                    "toolCallId": block["id"], "args": block.get("arguments") or {}}})
+            elif kind == "tool_result" and block.get("tool_use_id"):
+                result = block.get("content")
+                if isinstance(result, list):
+                    result = "".join(str(b.get("text") or "") for b in result if isinstance(b, dict))
+                r.feed({"stream": "tool", "data": {
+                    "phase": "result", "name": block.get("name", ""),
+                    "toolCallId": block["tool_use_id"], "result": result or "",
+                    "isError": block.get("is_error") is True}})
+    if closing is not None and not r.text.strip():
+        text = ((_history_item(closing) or {}).get("text") or "").strip()
+        if text and text not in _SILENT_SENTINELS:
+            r.feed({"stream": "assistant", "data": {"delta": text}})
+    return r
+
+
+def _history_run_messages(history: dict, run_id: str) -> list | None:
+    """One run's messages in `chat.history`: everything after the user
+    message that started it, through its closing message
+    (`cli-assistant:<runId>`). None when the run has not closed yet."""
+    messages = (history or {}).get("messages")
+    if not isinstance(messages, list) or not run_id:
+        return None
+    wanted = {run_id, f"cli-assistant:{run_id}"}
+    for end in range(len(messages) - 1, -1, -1):
+        message = messages[end]
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
+        if not {message.get("idempotencyKey"), meta.get("idempotencyKey")} & wanted:
+            continue
+        start = end
+        while start > 0 and (messages[start - 1] or {}).get("role") != "user":
+            start -= 1
+        return messages[start:end + 1]
+    return None
 
 
 async def _proactive_run_text(conn, session_key: str, log_prefix: str,
@@ -3136,9 +3383,46 @@ class _RelayState:
     message_id: str | None = None      # None until `introduced`
     old_leaf_id: str | None = None     # bootstrap `execute` target
     introduced: bool = False
-    emitted_len: int = 0               # chars of content already sent to the tab
-    last_snapshot_content: str = ""
+    gap: bool = False                  # events were lost while the socket was down
+    sent_output: list = field(default_factory=list)  # `output` the tab holds
+    last_snapshot_output: list = field(default_factory=list)
     last_snapshot_ts: float = 0.0
+
+
+def _relay_output_events(sent: list[dict], current: list[dict]) -> list[dict]:
+    """Responses stream events that take a tab's `message.output` from
+    `sent` to `current`, in the shapes OWUI's `applyResponseStreamEvent`
+    (structuredOutput.ts) folds: a new item is `output_item.added` with an
+    explicit `output_index` (without one it is spliced in BEFORE the last
+    item), grown message text is an `output_text.delta` on the item's id
+    (which also extends `message.content`), and any other change to an
+    existing item is `output_item.done`, which replaces it."""
+    events: list[dict] = []
+    for i, item in enumerate(current):
+        old = sent[i] if i < len(sent) else None
+        is_message = item.get("type") == "message"
+        text = (item.get("content") or [{}])[0].get("text", "") if is_message else ""
+        if old is None:
+            added = copy.deepcopy(item)
+            if is_message:
+                added["content"] = [{"type": "output_text", "text": ""}]
+            events.append({"type": "response.output_item.added",
+                           "output_index": i, "item": added})
+            if text:
+                events.append({"type": "response.output_text.delta", "item_id": item["id"],
+                               "output_index": i, "content_index": 0, "delta": text})
+            continue
+        if is_message and old.get("id") == item.get("id"):
+            old_text = (old.get("content") or [{}])[0].get("text", "")
+            if text != old_text and text.startswith(old_text):
+                events.append({"type": "response.output_text.delta", "item_id": item["id"],
+                               "output_index": i, "content_index": 0,
+                               "delta": text[len(old_text):]})
+                continue
+        if item != old:
+            events.append({"type": "response.output_item.done",
+                           "output_index": i, "item": copy.deepcopy(item)})
+    return events
 
 
 def _relay_content_is_showable(text: str) -> bool:
@@ -3183,7 +3467,7 @@ async def _relay_emit_event(user_id: str, chat_id: str, message_id: str | None,
 
 async def _relay_persist_content(conn: "_GatewayConnection", chat_id: str,
                                  message_id: str | None, content: str, *,
-                                 done: bool) -> None:
+                                 done: bool, output: list | None = None) -> None:
     """Write the in-flight/final content into the DB message, under the same
     per-chat write lock the proactive paths use. Keeps reload parity mid-stream
     (a tab reopened while a run streams shows the last snapshot) and is the
@@ -3196,10 +3480,13 @@ async def _relay_persist_content(conn: "_GatewayConnection", chat_id: str,
     except Exception as ex:
         pipe_log(f"  live relay persist unavailable (not inside OWUI process?): {ex}")
         return
+    fields: dict = {"content": content, "done": done}
+    if output:
+        fields["output"] = output
     try:
         async with conn._chat_write_lock(chat_id):
             await Chats.upsert_message_to_chat_by_id_and_message_id(
-                chat_id, message_id, {"content": content, "done": done},
+                chat_id, message_id, fields,
             )
     except Exception as ex:
         pipe_log(f"  live relay persist failed: {ex}")
@@ -3248,7 +3535,8 @@ async def _relay_introduce(conn: "_GatewayConnection", state: "_RelayState") -> 
             if stale_key != key:
                 conn._delivered_proactive.pop(stale_key, None)
 
-    content = state.renderer.visible_text
+    content = state.renderer.text
+    output = copy.deepcopy(state.renderer.output)
     out: dict = {}
     if not await _append_proactive_message_to_chat(
         conn, state.chat_id, content, log_prefix="live relay introduce", out=out
@@ -3260,14 +3548,15 @@ async def _relay_introduce(conn: "_GatewayConnection", state: "_RelayState") -> 
     state.message_id = out.get("new_message_id")
     state.old_leaf_id = out.get("old_leaf_id")
     state.introduced = True
-    state.emitted_len = len(content)
-    state.last_snapshot_content = content
+    state.sent_output = output
+    state.last_snapshot_output = output
     state.last_snapshot_ts = time.time()
     # Mark the freshly-appended message as still-generating (the append helper
     # doesn't set `done`); a reload before the first snapshot shows a pending
-    # bubble, not a spuriously-complete one.
+    # bubble, not a spuriously-complete one. The `output` items go in with it,
+    # before the bootstrap reload below, so the reloaded tab starts from them.
     await _relay_persist_content(
-        conn, state.chat_id, state.message_id, content, done=False
+        conn, state.chat_id, state.message_id, content, done=False, output=output
     )
     # Bootstrap: make any open tab reload and pick up the pending message so
     # subsequent `message`/`replace` events (which the frontend only applies to
@@ -3311,42 +3600,44 @@ async def _relay_feed_event(conn: "_GatewayConnection", session_key: str,
         else:
             return  # nothing to show yet; keep accumulating
 
-    # Stream the newly-appended text as an append delta (renderer content only
-    # ever grows, so a plain suffix slice is the delta).
-    if len(content) > state.emitted_len:
-        delta = content[state.emitted_len:]
-        if await _relay_emit_event(
-            state.user_id, state.chat_id, state.message_id,
-            {"type": "message", "data": {"content": delta}},
-        ):
-            state.emitted_len = len(content)
-
     if is_final:
-        await _relay_finalize(conn, state, content)
+        await _relay_finalize(conn, state)
         return
 
-    # Throttled full-content re-anchor: idempotent `replace` that self-heals any
-    # append lost during the bootstrap reload, and keeps the DB current so a
-    # mid-stream reopen rehydrates the partial reply.
-    now = time.time()
-    if (
-        content != state.last_snapshot_content
-        and (now - state.last_snapshot_ts) >= _RELAY_SNAPSHOT_MIN_INTERVAL_S
-    ):
-        state.last_snapshot_content = content
-        state.last_snapshot_ts = now
-        state.emitted_len = len(content)
+    # Stream what changed as Responses events: text deltas and tool cards
+    # appear in the open tab as they happen, the same items OWUI itself
+    # streams for a turn it drives (ELI-92).
+    output = state.renderer.output
+    for ev in _relay_output_events(state.sent_output, output):
         await _relay_emit_event(
             state.user_id, state.chat_id, state.message_id,
-            {"type": "replace", "data": {"content": content}},
+            {"type": "response:completion", "data": ev},
+        )
+    state.sent_output = copy.deepcopy(output)
+
+    # Throttled full re-anchor: a `chat:completion` carrying the whole `output`
+    # replaces the tab's copy outright, which self-heals any event lost while
+    # the tab was mid-`location.reload()` from the bootstrap step, and the DB
+    # write keeps a mid-stream reopen current.
+    now = time.time()
+    if (
+        output != state.last_snapshot_output
+        and (now - state.last_snapshot_ts) >= _RELAY_SNAPSHOT_MIN_INTERVAL_S
+    ):
+        snapshot = copy.deepcopy(output)
+        state.last_snapshot_output = snapshot
+        state.last_snapshot_ts = now
+        await _relay_emit_event(
+            state.user_id, state.chat_id, state.message_id,
+            {"type": "chat:completion", "data": {"output": snapshot}},
         )
         await _relay_persist_content(
-            conn, state.chat_id, state.message_id, content, done=False
+            conn, state.chat_id, state.message_id, state.renderer.text,
+            done=False, output=snapshot,
         )
 
 
-async def _relay_finalize(conn: "_GatewayConnection", state: "_RelayState",
-                          content: str) -> None:
+async def _relay_finalize(conn: "_GatewayConnection", state: "_RelayState") -> None:
     """Complete a relayed run: authoritative done:true DB write, a final full
     `replace` so the live tab shows the complete content, then a
     `chat:active:false` event to settle the frontend's generating state. Always
@@ -3355,13 +3646,15 @@ async def _relay_finalize(conn: "_GatewayConnection", state: "_RelayState",
     try:
         if not state.introduced or not state.message_id:
             return
-        final_content = (content or "").strip() or state.last_snapshot_content
+        final_content = state.renderer.text.strip()
+        final_output = state.renderer.finished_output()
         await _relay_persist_content(
-            conn, state.chat_id, state.message_id, final_content, done=True
+            conn, state.chat_id, state.message_id, final_content, done=True,
+            output=final_output,
         )
         await _relay_emit_event(
             state.user_id, state.chat_id, state.message_id,
-            {"type": "replace", "data": {"content": final_content}},
+            {"type": "chat:completion", "data": {"output": final_output}},
         )
         # Terminal signal: once a pending assistant leaf exists (it does -- we
         # introduced it), OWUI's chatEventHandler treats chat:active:false as a
@@ -3372,14 +3665,63 @@ async def _relay_finalize(conn: "_GatewayConnection", state: "_RelayState",
             state.user_id, state.chat_id, state.message_id,
             {"type": "chat:active", "data": {"active": False}},
         )
+        tools = sum(1 for i in final_output if i.get("type") == "function_call")
         pipe_log(
             f"  live relay: finalized message {str(state.message_id)[:8]}... "
-            f"in chat {state.chat_id[:8]}... ({len(final_content)} chars)"
+            f"in chat {state.chat_id[:8]}... ({len(final_content)} chars, "
+            f"{tools} tool card(s))"
         )
     except Exception as ex:
         pipe_log(f"  live relay finalize failed: {ex}")
     finally:
         conn._relay_sessions.pop(key, None)
+
+
+async def _relay_finalize_settled(conn: "_GatewayConnection", state: "_RelayState") -> None:
+    """The relayed run's session went idle but the relay never saw the run's
+    final: it was lost with the socket (ELI-88, chat 2af17834 19:15: the
+    bubble stayed at "Next I'm posting the Linear updates on ELI-89/" with
+    done=False forever). Take the run's text and tool calls from
+    `chat.history` when it has closed there, else keep what streamed, and
+    finalize."""
+    key = f"{state.session_key}:{state.run_id}"
+    if conn._relay_sessions.get(key) is not state:
+        return  # finalized meanwhile
+    try:
+        hist = await conn.session_history(state.session_key, limit=RUN_HISTORY_LIMIT)
+    except Exception as ex:
+        hist = None
+        pipe_log(f"  live relay settle: chat.history failed: {ex}")
+    run_messages = _history_run_messages(hist, state.run_id)
+    if run_messages is None:
+        # Not closed in the transcript: only an authoritative idle read may
+        # end it (a coalesced settle push can trail the next run's start).
+        try:
+            lst = await conn.send_request("sessions.list", {}, timeout=15)
+        except Exception as ex:
+            pipe_log(f"  live relay settle: sessions.list failed: {ex}")
+            return
+        row = next((r for r in (lst.get("sessions") or [])
+                    if r.get("key") == state.session_key), None)
+        if row is None or row.get("hasActiveRun") is not False:
+            return
+    if conn._relay_sessions.get(key) is not state:
+        return
+    if run_messages:
+        rebuilt = _history_renderer(run_messages)
+        if rebuilt.output:
+            state.renderer = rebuilt
+    pipe_log(
+        f"  live relay: run {state.run_id[:20]}... settled without a final reaching "
+        f"us; finalizing from {'chat.history' if run_messages else 'what streamed'}"
+    )
+    if not state.introduced:
+        if not _relay_content_is_showable(state.renderer.visible_text or ""):
+            conn._relay_sessions.pop(key, None)
+            return
+        if not await _relay_introduce(conn, state):
+            return
+    await _relay_finalize(conn, state)
 
 
 async def _relay_abort(conn: "_GatewayConnection", key: str) -> None:
@@ -3392,7 +3734,7 @@ async def _relay_abort(conn: "_GatewayConnection", key: str) -> None:
     if state is None:
         return
     if state.introduced and state.message_id:
-        await _relay_finalize(conn, state, state.renderer.visible_text or "")
+        await _relay_finalize(conn, state)
     else:
         conn._relay_sessions.pop(key, None)
 
@@ -3448,13 +3790,22 @@ async def _finalize_inline_message(
                 # Update the existing assistant message in place: OWUI's upsert
                 # merges these fields into it, keeping role/parentId/childrenIds/
                 # model. This is the parity case -- same bubble, full content.
+                # OWUI 0.12 draws the message from `output` whenever it has
+                # one, so the run's items replace it; `content` is text only,
+                # as OWUI stores it.
+                fields: dict = {"content": content, "done": True}
+                if renderer.output:
+                    fields = {"content": renderer.text.strip(), "done": True,
+                              "output": renderer.finished_output()}
                 async with conn._chat_write_lock(chat_id):
                     await Chats.upsert_message_to_chat_by_id_and_message_id(
-                        chat_id, message_id, {"content": content, "done": True},
+                        chat_id, message_id, fields,
                     )
                 pipe_log(
                     f"  parity finalize: completed assistant message "
-                    f"{message_id[:8]}... in place ({len(content)} chars)"
+                    f"{message_id[:8]}... in place ({len(content)} chars, "
+                    f"{sum(1 for i in fields.get('output', []) if i.get('type') == 'function_call')}"
+                    " tool card(s))"
                 )
             else:
                 # Original id missing or not an assistant message -- never

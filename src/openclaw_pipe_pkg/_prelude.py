@@ -16,6 +16,7 @@ import threading
 import sys
 import hashlib
 import contextlib
+import copy
 import re
 import mimetypes
 import urllib.error

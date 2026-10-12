@@ -797,6 +797,7 @@ class Pipe:
             requested_thinking = str(requested_thinking).strip().lower() or None
         session_thinking_ladder = None
         session_model_key = None
+        session_runtime = None
 
         # --- P15: Short-circuit OWUI background tasks ---
         # O10 addendum: image_prompt_generation and function_calling also get
@@ -1028,6 +1029,10 @@ class Pipe:
             )
             return
 
+        # Tool cards for this session's runs whoever started them, including
+        # this reply's own run after a reconnect (see `ensure_message_subscription`).
+        await conn.ensure_message_subscription(session_key)
+
         # --- Concurrency: queue behind an active run, never steer-merge ---
         # A message that arrives while a run is active must become its OWN run,
         # not a steer-merge into the active run. Steer-merging (the gateway's
@@ -1069,13 +1074,14 @@ class Pipe:
             # resume -- ELI-56), so a non-active status is NOT conclusive:
             # confirm against sessions.list's authoritative hasActiveRun before
             # treating the session as free to send into.
-            nonlocal session_thinking_ladder, session_model_key
+            nonlocal session_thinking_ladder, session_model_key, session_runtime
             try:
                 desc = await conn.send_request(
                     "sessions.describe", dict(key=session_key), timeout=8
                 )
                 row = desc.get("session") or {}
                 status = row.get("status")
+                session_runtime = (row.get("agentRuntime") or {}).get("id") or session_runtime
                 # Harvest the thinking ladder from the describe we are already
                 # making. This probe runs before every send, so the per-model
                 # validation below costs no extra round trip, and piggybacking
@@ -1148,9 +1154,6 @@ class Pipe:
                 done=False,
             )
         else:
-            if await _session_run_active():
-                pipe_log("Session has an active run (gateway-authoritative); queueing behind it")
-
             # Serialize the queue-release -> chat.send -> run-registration critical
             # section per session. Two messages released from the queue at the same
             # instant would otherwise both send into the same idle window; the
@@ -1164,27 +1167,32 @@ class Pipe:
             # 2026.7.1 gateway that directive is NOT stripped from a device
             # chat.send -- it leaked verbatim into the delivered message.
             async with conn.session_send_lock(session_key):
-                queue_wait_started = time.time()
-                queue_wait_cap_s = 1800  # safety ceiling; socket keepalive holds the request
-                queue_settle_s = 2.0     # re-confirm not-active before releasing
+                # Wait for the Gateway to push that the run settled
+                # (`sessions.changed`, see `session_change_event`), re-reading
+                # the authoritative state after each change. No poll, no
+                # settle window and no ceiling (ELI-88): the old 30-minute
+                # ceiling released a message into a run that was still going,
+                # where the Gateway queued it and claude-cli dropped it. A
+                # resume that starts right after a settle is caught after the
+                # send instead (see `enqueued_not_started`). Stop cancels this
+                # wait like any other.
                 ever_active = False
-                while time.time() - queue_wait_started < queue_wait_cap_s:
-                    if await _session_run_active():
+                while True:
+                    changed = conn.session_change_event(session_key)
+                    if not await _session_run_active():
+                        break
+                    if not ever_active:
                         ever_active = True
-                        await asyncio.sleep(1.5)
-                        continue
-                    # Not active now. If we were ever queued, settle-confirm before
-                    # releasing: when a subagent finishes the parent resumes as a
-                    # NEW run, and there is a brief window between the child ending
-                    # and that resume registering where hasActiveRun reads false;
-                    # sending in it races the resume and phantoms again (ELI-56).
-                    if ever_active:
-                        await asyncio.sleep(queue_settle_s)
-                        if await _session_run_active():
-                            continue
-                    break
+                        pipe_log("Session has an active run (gateway-authoritative); "
+                                 "queueing behind it")
+                        await _emit_status(
+                            __event_emitter__,
+                            "Queued: waiting for the current run to finish…",
+                            done=False,
+                        )
+                    await changed.wait()
                 if ever_active:
-                    pipe_log("  active run ended; sending queued message as its own run")
+                    pipe_log("  active run settled; sending queued message as its own run")
 
                 # --- Send this message as its own fresh run (still holding the lock
                 #     so the next waiter observes our run before deciding to send) ---
@@ -1287,6 +1295,10 @@ class Pipe:
         text_yielded = False
         aborted = False
         first_event_arrived = False
+        # The Gateway acks every chat.send with "started"; one that it queued
+        # behind a run (or steered into one) instead gets a lone `chat` final
+        # with no message as its first and only event.
+        enqueued_not_started = False
         last_item_text = ""
         assistant_stream_text = ""
         # Everything the gateway has sent for this turn, including text the
@@ -1845,6 +1857,9 @@ class Pipe:
                         name = data.get("name", "")
                         phase = data.get("phase", "")
                         state = payload.get("state", "")
+                        if (event_count == 1 and state == "final" and msg.get("event") == "chat"
+                                and not payload.get("message")):
+                            enqueued_not_started = True
 
                         # --- P16: Double-check session/run match ---
                         evt_session = payload.get("sessionKey", "")
@@ -2471,6 +2486,43 @@ class Pipe:
                 async for item in continuation:
                     yield item
             return
+        if (enqueued_not_started and not text_yielded and not aborted
+                and not adopted_run_id and session_runtime == "claude-cli"
+                and our_run_id and sent_texts):
+            # A run started between the idle read and the send (a sub-agent's
+            # parent resuming, a wake), and the Gateway queued this message
+            # behind it. claude-cli cannot run a queued turn: it fails with
+            # "Reply operation has no active tool authority snapshot" once the
+            # active run ends (the followup path binds no tool authority,
+            # ELI-87), so the message would be lost. Take it back while it is
+            # queued, wait for that run to settle, and send it again.
+            try:
+                await conn.send_request(
+                    "chat.abort", {"sessionKey": session_key, "runId": our_run_id},
+                    timeout=15,
+                )
+                took_back = True
+            except Exception as ex:
+                took_back = False
+                pipe_log(f"  could not take back queued message: {ex}")
+            if took_back:
+                pipe_log(
+                    f"  message was queued behind a run that started first "
+                    f"(run {str(our_run_id)[:20]}...); took it back, resending once idle"
+                )
+                conn.unregister_run_target(session_key, our_run_id)
+                async with contextlib.aclosing(self._pipe_impl(
+                    body, __event_emitter__,
+                    __event_call__=__event_call__, __user__=__user__,
+                    __metadata__=__metadata__, __request__=__request__,
+                    __task__=__task__, __task_body__=__task_body__,
+                    _initial_visible_text=visible_message_text,
+                    _send_texts=sent_texts,
+                )) as again:
+                    async for item in again:
+                        yield item
+                return
+
         if not text_yielded:
             # DIAG (ELI-56): a no-text turn is the phantom. Emit the correlation
             # keys so it can be matched to a duplicate/re-fired completion above
