@@ -5530,7 +5530,8 @@ def _history_run_messages(history: dict, run_id: str) -> list | None:
 
 
 async def _proactive_run_text(conn, session_key: str, log_prefix: str,
-                              run_id: str | None = None) -> str | None:
+                              run_id: str | None = None,
+                              out: dict | None = None) -> str | None:
     """The finished run's assistant text for a proactive delivery.
 
     With `run_id`, the run's own closing message is looked up by identity
@@ -5553,10 +5554,14 @@ async def _proactive_run_text(conn, session_key: str, log_prefix: str,
     history = None
     if run_id:
         try:
-            history = await conn.session_history(session_key, limit=PROACTIVE_RUN_HISTORY_LIMIT)
+            # Wide enough for the whole run: `out["history"]` also feeds its
+            # tool cards (`_proactive_run_output`).
+            history = await conn.session_history(session_key, limit=RUN_HISTORY_LIMIT)
         except Exception as ex:
             pipe_log(f"  {log_prefix}: chat.history failed: {ex}")
             history = None
+        if out is not None:
+            out["history"] = history
         found, run_text = _history_text_for_run(history, run_id)
         if found:
             return run_text
@@ -5588,6 +5593,29 @@ async def _proactive_run_text(conn, session_key: str, log_prefix: str,
         return full
     pipe_log(f"  {log_prefix}: no chat.history message matches the clipped preview; delivering it as is")
     return text
+
+
+def _proactive_run_output(history: dict | None, run_id: str,
+                          label: str) -> list | None:
+    """The run's `output` items, rebuilt from `chat.history`, when it used
+    tools: OWUI 0.12 draws a message from `output` when it has one, and a run
+    delivered after the fact (a sub-agent's parent resuming, a wake) never
+    streamed through a reply that could have shown its cards (ELI-92). None
+    for a tool-free run, which keeps the plain-text message. `label` leads
+    the first text item, as it leads `content`."""
+    run_messages = _history_run_messages(history, run_id)
+    if not run_messages:
+        return None
+    output = _history_renderer(run_messages).finished_output()
+    if not any(i.get("type") == "function_call" for i in output):
+        return None
+    if output[0].get("type") == "message":
+        output[0]["content"][0]["text"] = label + output[0]["content"][0]["text"]
+    else:
+        output.insert(0, {"type": "message", "id": f"msg_{uuid.uuid4().hex[:24]}",
+                          "status": "completed", "role": "assistant",
+                          "content": [{"type": "output_text", "text": label.rstrip()}]})
+    return output
 
 
 async def _maybe_deliver_proactive_after_debounce(
@@ -5790,7 +5818,7 @@ async def _heal_proactive_variants(conn: "_GatewayConnection", chat_id: str) -> 
 
 async def _append_proactive_message_to_chat(
     conn: "_GatewayConnection", chat_id: str, text: str, *, log_prefix: str,
-    out: dict | None = None,
+    out: dict | None = None, extra_fields: dict | None = None,
 ) -> bool:
     """Persist one assistant message onto the tail of an OWUI chat.
 
@@ -5855,6 +5883,8 @@ async def _append_proactive_message_to_chat(
             if model_id:
                 message_fields["model"] = model_id
                 message_fields["modelName"] = old_leaf.get("modelName") or model_id
+            if extra_fields:
+                message_fields.update(extra_fields)
 
             await Chats.upsert_message_to_chat_by_id_and_message_id(
                 chat_id, new_message_id, message_fields,
@@ -6455,20 +6485,29 @@ async def _deliver_proactive_owui_message(
         for stale_key in list(conn._delivered_proactive)[:100]:
             conn._delivered_proactive.pop(stale_key, None)
 
-    text = await _proactive_run_text(conn, session_key, "proactive delivery", run_id=run_id)
+    text_out: dict = {}
+    text = await _proactive_run_text(conn, session_key, "proactive delivery",
+                                     run_id=run_id, out=text_out)
     if not text:
         pipe_log("  proactive delivery: no assistant text, skipping")
         return
 
-    text = f"*↳ Proactive message*\n\n{text}"
+    label = "*↳ Proactive message*\n\n"
+    text = f"{label}{text}"
+    extra = {"done": True}
+    output = _proactive_run_output(text_out.get("history"), run_id, label)
+    if output:
+        extra["output"] = output
 
     append_out: dict = {}
     if await _append_proactive_message_to_chat(
-        conn, chat_id, text, log_prefix="proactive delivery", out=append_out
+        conn, chat_id, text, log_prefix="proactive delivery", out=append_out,
+        extra_fields=extra,
     ):
+        cards = sum(1 for i in output or [] if i.get("type") == "function_call")
         pipe_log(
             f"  proactive delivery: persisted message into chat {chat_id[:8]}... "
-            f"for user {user_id[:8]}... ({len(text)} chars)"
+            f"for user {user_id[:8]}... ({len(text)} chars, {cards} tool card(s))"
         )
         if LIVE_STREAM_BOOTSTRAP_ENABLED:
             await _emit_live_bootstrap_reload(user_id, chat_id, append_out.get("old_leaf_id"))

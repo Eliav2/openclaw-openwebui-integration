@@ -359,8 +359,10 @@ class ProactiveDeliveryFullTextTests(unittest.TestCase):
     def _deliver(self, conn, subagent=False):
         appended = []
 
-        async def fake_append(conn_, chat_id, text, *, log_prefix, out=None):
+        async def fake_append(conn_, chat_id, text, *, log_prefix, out=None,
+                              extra_fields=None):
             appended.append(text)
+            self.extra = extra_fields
             return True
 
         with mock.patch("openclaw_pipe._append_proactive_message_to_chat", fake_append), \
@@ -405,6 +407,22 @@ class ProactiveDeliveryFullTextTests(unittest.TestCase):
         # second read to complete it.
         conn = self._conn(preview_items=[{"role": "assistant", "text": "Done, all green."}])
         self.assertEqual(self._deliver(conn), ["*↳ Proactive message*\n\nDone, all green."])
+        conn.session_history.assert_awaited_once()
+
+    def test_a_run_that_used_tools_is_delivered_with_its_cards(self):
+        """ELI-92 (live 2026-10-12, chat 00a1ea65): a sub-agent's parent
+        resumed, ran Bash, and its reply was delivered after the fact as text
+        only. Its items are rebuilt from the same chat.history read."""
+        hist = _cli_history("run-1")
+        conn = self._conn(hist, preview_items=[{"role": "assistant",
+                                                "text": "Reading them. Found it."}])
+        appended = self._deliver(conn)
+        self.assertEqual(appended, ["*↳ Proactive message*\n\nReading them. Found it."])
+        output = self.extra["output"]
+        self.assertEqual([i["type"] for i in output],
+                         ["message", "function_call", "function_call_output", "message"])
+        self.assertTrue(output[0]["content"][0]["text"].startswith("*↳ Proactive message*"))
+        self.assertTrue(self.extra["done"])
         conn.session_history.assert_awaited_once()
 
     def test_sentinel_delivers_nothing(self):
