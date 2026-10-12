@@ -2428,6 +2428,14 @@ class Pipe:
             # A parked queue now belongs to whoever claims the run; releasing
             # it here would drop the events it is buffering.
             if not turn.parked:
+                if done and not aborted and our_run_id:
+                    # The run ended in this reply. Its trailing `chat` final
+                    # lands after this consumer is gone and must not read as
+                    # "the reply ended before its run" (parity would rewrite
+                    # the message OWUI is about to save) or as a run nobody
+                    # showed (proactive delivery).
+                    conn.mark_delivered_live(session_key, our_run_id)
+                    conn.unregister_run_target(session_key, our_run_id)
                 conn.unregister_consumer(session_key, our_run_id, queue=queue)
                 turn.run_id = None
                 turn.queue = None

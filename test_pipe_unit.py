@@ -2292,6 +2292,25 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
             out += chunk if isinstance(chunk, str) else ""
         self.assertIn("hi there", out)
 
+    async def test_a_reply_that_saw_its_run_end_leaves_no_parity_target(self):
+        """The inline loop ends on `lifecycle end` and drops its consumer; the
+        run's trailing `chat` final arrives after that. Measured live
+        2026-10-12: every normal turn then ran the parity finalize ("inline
+        turn ended early") and rewrote the message OWUI was about to save."""
+        gen = self._reply("hello", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "hi"))
+        q.put_nowait({"type": "event", "event": "agent", "payload": {
+            "sessionKey": self.SK, "runId": "run-1", "stream": "lifecycle",
+            "data": {"phase": "end"}}})
+        await asyncio.wait_for(first, 2)
+        async for _ in gen:
+            pass
+        self.assertNotIn(f"{self.SK}:run-1", self.conn._run_targets)
+        self.assertTrue(self.conn.was_delivered_live(self.SK, "run-1"))
+
     async def test_a_socket_gap_makes_the_waiter_read_again(self):
         """The settle can be among the events lost while the socket was down,
         so a gap wakes every waiter to re-read the state."""
