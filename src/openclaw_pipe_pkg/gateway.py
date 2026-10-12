@@ -1083,6 +1083,11 @@ class _GatewayConnection:
         self._reconnect_attempt = 0
         self._max_backoff = 30  # seconds
         self._stopped = False
+        # Set once a newer deploy of this function has taken over (see
+        # `retire()`). A retired connection still serves runs it already
+        # has consumers for, but never relays or delivers proactively and
+        # never reconnects once those runs are gone.
+        self._retired = False
         # Bumped on every successful connect/reconnect. A consumer that
         # captures this before `chat.send` can later tell "the queue is quiet
         # because the agent is thinking" from "the queue is quiet because the
@@ -1240,6 +1245,12 @@ class _GatewayConnection:
         """Ensure the WS connection is up; connect/reconnect if needed."""
         if self._ws and self._event_loop_task and not self._event_loop_task.done():
             return
+        if self._retired and not self._consumers:
+            # Reviving a retired connection is how orphans piled up: each one
+            # kept relaying every proactive run with its own (older) code.
+            raise GatewayError(
+                "gateway connection retired: a newer deploy of the pipe owns it now"
+            )
         async with self._init_lock:
             if self._ws and self._event_loop_task and not self._event_loop_task.done():
                 return
@@ -1371,6 +1382,9 @@ class _GatewayConnection:
             del self._consumers[key]
         self._touch_session_activity(session_key)
         pipe_log(f"  unregistered consumer: {key[:60]}...")
+        if self._retired and not self._consumers:
+            pipe_log("  retired gateway connection: last run finished, closing")
+            spawn_background(self.disconnect())
 
     def _touch_session_activity(self, session_key: str):
         self._session_last_activity[session_key] = time.time()
@@ -1771,6 +1785,23 @@ class _GatewayConnection:
         except Exception as e:
             pipe_log(f"  /stop fallback failed: {e}")
 
+    async def retire(self):
+        """Step down in favor of a newer deploy's connection.
+
+        Runs that already have a consumer here keep being served until they
+        unregister (cutting them would lose the reply); everything else stops
+        now. Once the last consumer leaves, the connection closes itself and
+        `ensure_connected` refuses to bring it back.
+        """
+        self._retired = True
+        if self._consumers:
+            pipe_log(
+                f"  retired gateway connection: serving {len(self._consumers)} "
+                "in-flight run(s) before closing"
+            )
+            return
+        await self.disconnect()
+
     async def disconnect(self):
         """Gracefully close the connection."""
         self._stopped = True
@@ -2065,6 +2096,7 @@ class _GatewayConnection:
                         continue
                 elif (
                     LIVE_STREAM_RELAY_ENABLED
+                    and not self._retired
                     and _relay_key is not None
                     and not consumers
                     and payload.get("state") != "final"
@@ -2140,7 +2172,12 @@ class _GatewayConnection:
                 # needs its own identity-based check, not a longer timer.
                 evt_session = payload.get("sessionKey", "")
                 evt_run_id = payload.get("runId", "")
-                if PROACTIVE_DELIVERY_ENABLED and evt_session and payload.get("state") == "final":
+                if (
+                    PROACTIVE_DELIVERY_ENABLED
+                    and not self._retired
+                    and evt_session
+                    and payload.get("state") == "final"
+                ):
                     if (
                         self.parse_owui_session_key(evt_session)
                         and not self.has_any_consumer_for_session(evt_session)
@@ -2170,6 +2207,7 @@ class _GatewayConnection:
                 # "idle" and defeat the point of debouncing at all).
                 if (
                     PROACTIVE_DELIVERY_ENABLED
+                    and not self._retired
                     and evt_session
                     and payload.get("state") == "final"
                     and self.is_subagent_session_key(evt_session)
@@ -2363,7 +2401,7 @@ async def _maybe_deliver_proactive_after_debounce(
     try:
         waited = 0.0
         while not conn.session_idle_for(session_key, min_idle_s=min_idle_s):
-            if not PROACTIVE_DELIVERY_ENABLED:
+            if not PROACTIVE_DELIVERY_ENABLED or conn._retired:
                 pipe_log("  proactive delivery: disabled mid-debounce, abandoning wait")
                 return
             if waited >= max_wait_s:
@@ -3155,7 +3193,7 @@ async def _maybe_deliver_subagent_proactive(
 
         waited = 0.0
         while not conn.session_idle_for(parent_session_key, min_idle_s=min_idle_s):
-            if not PROACTIVE_DELIVERY_ENABLED:
+            if not PROACTIVE_DELIVERY_ENABLED or conn._retired:
                 pipe_log("  subagent proactive delivery: disabled mid-debounce, abandoning wait")
                 return
             if waited >= max_wait_s:
@@ -3238,19 +3276,79 @@ _gateway_init_lock = asyncio.Lock()
 _STALE_CONN_ATTR = "_openclaw_gateway_connection_v1"
 
 
+def _function_module_prefix(module_name: str) -> str:
+    """`function_<id>_<hex>` -> `function_<id>`. OWUI 0.12 names every load of
+    a Function this way (utils/plugin.py `load_function_module_by_id`), so the
+    prefix tells "an older load of this same Function" apart from the Status
+    Action, whose connection must be left alone."""
+    head, sep, tail = module_name.rpartition("_")
+    if sep and len(tail) == 32 and all(c in "0123456789abcdef" for c in tail):
+        return head
+    return module_name
+
+
+def _orphaned_gateway_connections(current) -> list:
+    """Live `_GatewayConnection`s created by OLDER loads of this Function.
+
+    The single stashed attribute only ever named the previous deploy's
+    connection; one that an in-flight run revived after being reaped dropped
+    out of it and lived on. Scanning the heap is the only handle on those.
+    """
+    import gc
+    prefix = _function_module_prefix(__name__)
+    if not prefix.startswith("function_"):
+        return []
+    found = []
+    for obj in gc.get_objects():
+        cls = type(obj)
+        if cls.__name__ != "_GatewayConnection" or obj is current:
+            continue
+        mod = getattr(cls, "__module__", "") or ""
+        if mod == __name__ or _function_module_prefix(mod) != prefix:
+            continue
+        found.append(obj)
+    return found
+
+
+async def _retire_stale_connection(stale) -> None:
+    retire = getattr(stale, "retire", None)
+    if retire is not None:
+        await asyncio.wait_for(retire(), timeout=5)
+        return
+    # Built before `retire()` existed: its own ensure_connected would revive
+    # it, so pin both entry points shut on the instance before closing it.
+    async def _refuse(*_a, **_k):
+        raise GatewayError("gateway connection retired by a newer deploy")
+    stale._stopped = True
+    stale.ensure_connected = _refuse
+    stale._connect_and_start = _refuse
+    await asyncio.wait_for(stale.disconnect(), timeout=5)
+
+
 async def _reap_stale_gateway_connection() -> None:
     try:
         import open_webui.socket.main as _owui_socket_main
     except Exception:
         return
+    stale_conns = []
     stale = getattr(_owui_socket_main, _STALE_CONN_ATTR, None)
-    if stale is None or stale is _gateway_connection:
-        return
+    if stale is not None and stale is not _gateway_connection:
+        stale_conns.append(stale)
     try:
-        await asyncio.wait_for(stale.disconnect(), timeout=5)
-        pipe_log("  reaped stale gateway connection from a previous deploy")
+        for obj in _orphaned_gateway_connections(_gateway_connection):
+            if not any(obj is s for s in stale_conns):
+                stale_conns.append(obj)
     except Exception as ex:
-        pipe_log(f"  failed to reap stale gateway connection (non-fatal): {ex}")
+        pipe_log(f"  orphan scan failed (non-fatal): {ex}")
+    for conn in stale_conns:
+        try:
+            await _retire_stale_connection(conn)
+            pipe_log(
+                "  reaped stale gateway connection from a previous deploy "
+                f"({type(conn).__module__})"
+            )
+        except Exception as ex:
+            pipe_log(f"  failed to reap stale gateway connection (non-fatal): {ex}")
 
 
 def _remember_gateway_connection(conn: _GatewayConnection) -> None:
