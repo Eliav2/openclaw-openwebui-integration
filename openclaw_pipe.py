@@ -3217,6 +3217,219 @@ def _item_assistant_text(data: dict) -> str:
     return ""
 
 
+# Queue item `_GatewayConnection._mark_event_gap` puts where events were lost.
+_GAP_MARKER_TYPE = "_pipe_gap"
+# Text on each side of a gap used to find where a repaired chunk goes.
+_GAP_ANCHOR_CHARS = 120
+
+
+def _align_whole_text(whole: str, received: str, gaps) -> tuple[str, list] | None:
+    """Line up what a run actually sent (`whole`) with what reached us.
+
+    `received` is the run's text as it arrived, `gaps` the offsets in it
+    where a gap marker sat (events lost on a socket drop). Between gaps the
+    received text is contiguous, so each piece is found in `whole` in order;
+    whatever `whole` has between pieces is what was lost there. Returns
+    (tail, missing): `tail` is what follows the last received piece (new
+    text), `missing` a list of (offset in `received`, lost text). None when
+    a piece is not in `whole`: then it is not the same text and nothing is
+    repaired.
+    """
+    if not whole or not received:
+        return None
+    cuts = sorted({g for g in gaps or () if 0 <= g <= len(received)})
+    bounds = [0, *cuts, len(received)]
+    j = 0
+    missing = []
+    for a, b in zip(bounds, bounds[1:]):
+        piece = received[a:b]
+        if not piece:
+            continue
+        pos = whole.find(piece, j)
+        if pos < 0:
+            return None
+        if pos > j:
+            missing.append((a, whole[j:pos]))
+        j = pos + len(piece)
+    return whole[j:], missing
+
+
+def _insert_at_anchor(text: str, chunk: str, before: str, after: str) -> str | None:
+    """`text` with `chunk` put in front of `before`, or right after `after`."""
+    if before:
+        i = text.find(before)
+        if i >= 0:
+            return text[:i] + chunk + text[i:]
+    if after:
+        i = text.rfind(after)
+        if i >= 0:
+            i += len(after)
+            return text[:i] + chunk + text[i:]
+    return None
+
+
+def _gap_repair_fields(message: dict, chunk: str, before: str, after: str) -> dict | None:
+    """The DB fields that put `chunk` back into an OWUI message, or None.
+
+    OWUI 0.12 renders and saves a reply from its `output` items (the content
+    string is derived), so the chunk goes into the text part that holds the
+    anchor; `content` is kept in step when present.
+    """
+    import copy
+    fields: dict = {}
+    output = copy.deepcopy(message.get("output") or [])
+    placed = False
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        for part in item.get("content") or []:
+            if isinstance(part, dict) and part.get("type") == "output_text":
+                new = _insert_at_anchor(part.get("text") or "", chunk, before, after)
+                if new is not None:
+                    part["text"] = new
+                    placed = True
+                    break
+        if placed:
+            break
+    if placed:
+        fields["output"] = output
+    content = message.get("content")
+    if isinstance(content, str) and content:
+        new_content = _insert_at_anchor(content, chunk, before, after)
+        if new_content is not None:
+            fields["content"] = new_content
+    if output and not placed:
+        return None  # the screen renders `output`; a content-only fix would not show
+    return fields or None
+
+
+def _gap_repair_registry() -> dict:
+    """Repairs waiting for a reply that is still streaming, by
+    "<chat_id>:<message_id>". Shared across redeploys like the other
+    bookkeeping, so a repair registered by one module instance is applied by
+    the sink whichever instance is current."""
+    state = _shared_gateway_state()
+    if state is None:
+        return _LOCAL_GAP_REPAIRS
+    return state.setdefault("pending_gap_repairs", {})
+
+
+_LOCAL_GAP_REPAIRS: dict = {}
+
+
+async def _apply_gap_repair(conn, repair: dict) -> bool:
+    """Put a lost chunk back into a reply OWUI has finished saving, in the DB
+    and in every open tab (a `chat:completion` carrying only `output` replaces
+    that one message's items, without a reload and without marking it done).
+    """
+    chat_id, message_id = repair["chat_id"], repair["message_id"]
+    try:
+        from open_webui.models.chats import Chats
+    except Exception as ex:
+        pipe_log(f"  gap repair unavailable (not inside OWUI process?): {ex}")
+        return False
+    try:
+        async with conn._chat_write_lock(chat_id):
+            chat = await Chats.get_chat_by_id(chat_id)
+            messages = ((chat.chat.get("history") or {}).get("messages") or {}) if chat else {}
+            message = messages.get(message_id)
+            if not message:
+                pipe_log(f"  gap repair: message {message_id[:8]}... not found; "
+                         f"{len(repair['chunk'])} chars stay missing")
+                return False
+            fields = _gap_repair_fields(message, repair["chunk"],
+                                        repair.get("before", ""), repair.get("after", ""))
+            if not fields:
+                pipe_log(f"  gap repair: no anchor in message {message_id[:8]}...; "
+                         f"{len(repair['chunk'])} chars stay missing")
+                return False
+            await Chats.upsert_message_to_chat_by_id_and_message_id(chat_id, message_id, fields)
+        live = {"output": fields["output"]} if "output" in fields else {"content": fields["content"]}
+        await _relay_emit_event(repair["user_id"], chat_id, message_id,
+                                {"type": "chat:completion", "data": live})
+        pipe_log(f"  gap repair: put {len(repair['chunk'])} lost chars back into "
+                 f"message {message_id[:8]}...")
+        return True
+    except Exception as ex:
+        pipe_log(f"  gap repair failed: {ex}")
+        return False
+
+
+def _schedule_gap_repair(conn, repair: dict, *, streaming: bool) -> None:
+    """Apply now, or once OWUI has saved the reply that is still streaming.
+
+    A reply that stopped streaming is already saved: a finished one before
+    `chat.finished`, a stopped one before OWUI's stop endpoint returns (it
+    awaits the cancelled task), which is before the next reply could start.
+    The one still streaming is saved from its `output` when the stream ends,
+    which would overwrite a repair made now, so that repair waits for
+    `chat.finished` (`_GapRepairSink`) or for the reply that adopts its run.
+    """
+    if not streaming:
+        spawn_background(_apply_gap_repair(conn, repair))
+        return
+    key = f"{repair['chat_id']}:{repair['message_id']}"
+    _gap_repair_registry().setdefault(key, []).append(repair)
+    _ensure_gap_repair_sink()
+    pipe_log(f"  gap repair for message {repair['message_id'][:8]}... waits for its final save")
+
+
+def _take_gap_repairs(chat_id: str, message_id: str) -> list:
+    return _gap_repair_registry().pop(f"{chat_id}:{message_id}", [])
+
+
+async def _on_chat_finished(data: dict) -> None:
+    repairs = _take_gap_repairs(str(data.get("chat_id")), str(data.get("message_id")))
+    if not repairs:
+        return
+    conn = _gateway_connection
+    if conn is None:
+        return
+    for repair in repairs:
+        await _apply_gap_repair(conn, repair)
+
+
+class _GapRepairSink:
+    """OWUI event sink: `chat.finished` fires after the reply's final save
+    (`publish_chat_finished_event`, after the upsert in middleware.py). It
+    stays registered across redeploys, so it calls whichever handler the
+    current module instance stored, never its own (stale) code."""
+
+    openclaw_gap_repair_sink = True
+
+    async def handle_event(self, app, event, request=None) -> None:
+        if getattr(event, "event", None) != "chat.finished":
+            return
+        state = _shared_gateway_state() or {}
+        handler = state.get("gap_repair_on_finished") or _on_chat_finished
+        try:
+            await handler(getattr(event, "data", None) or {})
+        except Exception as ex:
+            pipe_log(f"  gap repair sink failed: {ex}")
+
+
+def _ensure_gap_repair_sink() -> None:
+    try:
+        import open_webui.events as owui_events
+    except Exception:
+        return
+    state = _shared_gateway_state()
+    if state is not None:
+        state["gap_repair_on_finished"] = _on_chat_finished
+    sinks = getattr(owui_events, "EVENT_SINKS", None)
+    if isinstance(sinks, list) and not any(
+        getattr(s, "openclaw_gap_repair_sink", False) for s in sinks
+    ):
+        sinks.append(_GapRepairSink())
+
+
+# How much of the already-received text anchors a cumulative text that does not
+# extend it by prefix. Long enough that a match means "this text contains what
+# we have", never a coincidence of a short phrase ("OK.", "Done.").
+_WHOLE_TEXT_ANCHOR_CHARS = 200
+_MIN_WHOLE_TEXT_ANCHOR_CHARS = 64
+
+
 def _item_delta_text(item_text: str, last_item_text: str, assistant_stream_text: str) -> str:
     """Compute the new text (if any) an `item` event adds beyond what's
     already been shown, either by a prior `item` event or by the regular
@@ -3234,6 +3447,20 @@ def _item_delta_text(item_text: str, last_item_text: str, assistant_stream_text:
         return ""
     if item_text.startswith(baseline):
         return item_text[len(baseline):]
+    # Not a prefix extension. If the item still contains the tail of what was
+    # already received, it is the cumulative text with something missing
+    # from the middle or the start (events lost while the Gateway socket was
+    # reconnecting): only what follows that tail is new. Returning the whole
+    # item here posted a second full copy of a 4000-line reply (2026-10-12).
+    # The missing piece is put back by the gap repair, not appended here.
+    # Shorter anchors too: the hole may sit inside the longest one.
+    for n in (_WHOLE_TEXT_ANCHOR_CHARS, 128, _MIN_WHOLE_TEXT_ANCHOR_CHARS):
+        anchor = baseline[-n:]
+        if len(anchor) < _MIN_WHOLE_TEXT_ANCHOR_CHARS:
+            break
+        pos = item_text.rfind(anchor)
+        if pos >= 0:
+            return item_text[pos + len(anchor):]
     return item_text
 
 
@@ -3697,6 +3924,16 @@ class _GatewayConnection:
         # Gateway only persists a turn once it COMPLETES, so a restart mid-run
         # destroys it silently and no terminal event is ever emitted.
         self.connection_epoch = 0
+        # A reconnect is not a restart. `hello-ok.server.bootId` names the
+        # Gateway process: same id after a reconnect = the same Gateway, its
+        # runs are still going; a new id = it restarted and took them with it.
+        # Treating every reconnect as a restart sent a bogus "gateway
+        # restarted, resume" turn into live sessions and closed their OWUI
+        # replies while the real run kept going (2026-10-12, a 1s WebSocket
+        # drop under host memory pressure). `gateway_restarts` only counts
+        # real restarts; consumers compare it, not `connection_epoch`.
+        self.gateway_boot_id: str | None = None
+        self.gateway_restarts = 0
 
         # Next request id
         self._next_req_id = 1
@@ -3872,6 +4109,7 @@ class _GatewayConnection:
             self._stopped = False
             await self._connect_and_start()
             if not self._event_loop_task or self._event_loop_task.done():
+                self._loop = asyncio.get_running_loop()
                 self._event_loop_task = asyncio.create_task(self._event_loop())
 
     async def send_request(self, method: str, params: dict, timeout: float = 10) -> dict:
@@ -4436,6 +4674,42 @@ class _GatewayConnection:
 
     # ── Internal ────────────────────────────────────────────────────
 
+    def _mark_event_gap(self) -> None:
+        """Put a gap marker into every run queue, in stream order.
+
+        The Gateway has no event replay (sequence numbers are per connection),
+        so whatever it sent while this socket was down is gone. The marker
+        sits exactly between the last event before the drop and the first one
+        after, which is where the run's text has a hole; the consumer turns
+        it into an offset and `_align_whole_text` puts the text back once the
+        run's whole text is known.
+        """
+        n = 0
+        for consumer in list(self._consumers.values()):
+            for q in consumer.queues:
+                q.put_nowait({"type": _GAP_MARKER_TYPE})
+                n += 1
+        if n:
+            pipe_log(f"  marked an event gap in {n} run queue(s)")
+
+    def _note_gateway_boot(self, boot_id: str | None) -> None:
+        """Count a Gateway restart only when its boot id changes."""
+        first = self.connection_epoch <= 1
+        if boot_id is None:
+            # TEMPORARY fallback for a Gateway that sends no bootId (older
+            # than 2026.9.x): a reconnect may be a restart, so count it as
+            # one, which is the behaviour before boot ids existed.
+            if not first:
+                self.gateway_restarts += 1
+                pipe_log("  reconnected; Gateway sent no bootId, treating it as a restart")
+            return
+        if self.gateway_boot_id is not None and boot_id != self.gateway_boot_id:
+            self.gateway_restarts += 1
+            pipe_log(f"  Gateway restarted (bootId {self.gateway_boot_id[:8]} -> {boot_id[:8]})")
+        elif not first:
+            pipe_log(f"  reconnected to the same Gateway (bootId {boot_id[:8]}); runs continue")
+        self.gateway_boot_id = boot_id
+
     async def _connect_and_start(self):
         """Connect, handshake, and start the event loop task."""
         valves = self._valves()
@@ -4535,6 +4809,7 @@ class _GatewayConnection:
         self._reconnect_attempt = 0
         self.connection_epoch += 1
         self._thinking_note_shown.clear()
+        self._note_gateway_boot((hello_ok.get("server") or {}).get("bootId"))
         pipe_log(
             f"Connected to Gateway (persistent) [epoch {self.connection_epoch}]"
         )
@@ -4850,14 +5125,19 @@ class _GatewayConnection:
             except asyncio.TimeoutError:
                 # No events for 90s but connection is still alive
                 continue
-            except websockets.exceptions.ConnectionClosed:
-                pipe_log("WS disconnected -- reconnecting...")
+            except websockets.exceptions.ConnectionClosed as e:
+                pipe_log(
+                    "WS disconnected -- reconnecting... "
+                    f"(code {getattr(e, 'code', None)}, reason {getattr(e, 'reason', '')!r})"
+                )
                 self._ws = None
+                self._mark_event_gap()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 pipe_log(f"Event loop error: {e}")
                 self._ws = None
+                self._mark_event_gap()
 
     async def _reconnect(self):
         """Reconnect with exponential backoff.
@@ -7397,7 +7677,7 @@ class Pipe:
             # ends -- measured 2026-10-11).
             our_run_id = adopted_run_id
             self._current_run_id = our_run_id
-            epoch_at_send = conn.connection_epoch
+            epoch_at_send = conn.gateway_restarts
             resolved_thinking = None
             pending_clamp_note = ""
             if adopted_queue is not None:
@@ -7494,8 +7774,8 @@ class Pipe:
                         yield pending_clamp_note
                 # Epoch of the connection this run is being launched on. If it has
                 # moved by the time the queue goes quiet, the Gateway restarted
-                # underneath us and took the run with it (see `connection_epoch`).
-                epoch_at_send = conn.connection_epoch
+                # underneath us and took the run with it (see `gateway_restarts`).
+                epoch_at_send = conn.gateway_restarts
                 try:
                     send_resp = await conn.send_request(
                         "chat.send",
@@ -7564,6 +7844,54 @@ class Pipe:
             assistant_received_text = adopted_run_text.get("received", "")
             assistant_stream_text = adopted_run_text.get("stream", "")
             last_item_text = adopted_run_text.get("item", "")
+        # Offsets in `assistant_received_text` where events were lost (a
+        # Gateway socket drop, see `_mark_event_gap`), and which OWUI reply
+        # showed the run from which offset, so a lost chunk can be put back
+        # into the reply it belongs to. Both are run-level and travel with an
+        # adopted run.
+        run_gaps: list[int] = list((adopted_run_text or {}).get("gaps", []))
+        run_segments: list[dict] = list((adopted_run_text or {}).get("segments", []))
+        if chat_id and owui_message_id:
+            # The reply that showed the run until now has stopped streaming,
+            # so OWUI has saved it; repairs that waited for it can go in.
+            for seg in run_segments:
+                for repair in _take_gap_repairs(chat_id, seg["message_id"]):
+                    _schedule_gap_repair(conn, repair, streaming=False)
+            run_segments.append({"message_id": owui_message_id,
+                                 "start": len(assistant_received_text)})
+
+        def reconcile_whole_text(whole: str) -> str | None:
+            """After a gap, line the run's whole text up with what arrived
+            and put each lost chunk back into the reply that showed it.
+            Returns the text after the last received piece (the only new
+            text), or None when there is no gap or `whole` does not line up
+            (an item carrying one segment, not the whole run), which leaves
+            the gaps pending for the next whole text."""
+            if not run_gaps or not chat_id:
+                return None
+            aligned = _align_whole_text(whole, assistant_received_text, run_gaps)
+            if aligned is None:
+                return None
+            tail, missing = aligned
+            run_gaps.clear()
+            for offset, chunk in missing:
+                seg = next((sg for sg in reversed(run_segments) if sg["start"] <= offset),
+                           run_segments[0] if run_segments else None)
+                if seg is None:
+                    continue
+                nxt = next((sg["start"] for sg in run_segments if sg["start"] > seg["start"]),
+                           len(assistant_received_text))
+                repair = {
+                    "user_id": owui_origin_user_id, "chat_id": chat_id,
+                    "message_id": seg["message_id"], "chunk": chunk,
+                    "before": assistant_received_text[offset:min(offset + _GAP_ANCHOR_CHARS, nxt)],
+                    "after": assistant_received_text[max(seg["start"], offset - _GAP_ANCHOR_CHARS):offset],
+                }
+                pipe_log(f"  event gap: {len(chunk)} chars lost at offset {offset}; "
+                         f"repairing message {seg['message_id'][:8]}...")
+                _schedule_gap_repair(conn, repair,
+                                     streaming=seg["message_id"] == owui_message_id)
+            return tail
         visible_message_text = _initial_visible_text + pending_clamp_note
         had_tool_block = False
         # toolCallIds announced to OWUI as `function_call` items that have
@@ -7892,12 +8220,12 @@ class Pipe:
                             # check it before any of the give-up paths below,
                             # which would otherwise close the stream on a run
                             # that is merely gone rather than finished.
-                            if conn.connection_epoch != epoch_at_send:
+                            if conn.gateway_restarts != epoch_at_send:
                                 if resume_attempts < max_resume_attempts:
                                     resume_attempts += 1
                                     pipe_log(
-                                        f"  epoch {epoch_at_send} -> "
-                                        f"{conn.connection_epoch}: gateway "
+                                        f"  restarts {epoch_at_send} -> "
+                                        f"{conn.gateway_restarts}: gateway "
                                         f"restarted mid-run; resuming "
                                         f"(attempt {resume_attempts}/"
                                         f"{max_resume_attempts})"
@@ -7908,7 +8236,7 @@ class Pipe:
                                         done=False,
                                     )
                                     if await resume_after_restart():
-                                        epoch_at_send = conn.connection_epoch
+                                        epoch_at_send = conn.gateway_restarts
                                         pending_restart_error = None
                                         continue
                                     pipe_log("  resume failed; will retry on next idle probe")
@@ -8046,6 +8374,12 @@ class Pipe:
 
                             continue
 
+                        if msg.get("type") == _GAP_MARKER_TYPE:
+                            run_gaps.append(len(assistant_received_text))
+                            pipe_log(f"  event gap at offset {len(assistant_received_text)} "
+                                     "(Gateway socket dropped)")
+                            continue
+
                         event_count += 1
                         first_event_arrived = True
                         payload = msg.get("payload", {})
@@ -8085,7 +8419,7 @@ class Pipe:
                         # event that armed it (the gateway stamps state='error'
                         # / aborted alongside phase='error'). While a restart is
                         # pending we must stay in the loop so the idle probe can
-                        # reach the connection_epoch check and resume.
+                        # reach the gateway_restarts check and resume.
                         if state in ("final", "cancelled", "error"):
                             if pending_restart_error:
                                 pipe_log(
@@ -8121,11 +8455,16 @@ class Pipe:
                                 # time. Diff it against what's already been streamed,
                                 # same as the item-event dedup below.
                                 raw_text = data.get("text") or ""
+                                gap_tail = reconcile_whole_text(raw_text) if raw_text else None
                                 before = _item_delta_text(
                                     raw_text, "", assistant_received_text
                                 ) if raw_text else ""
-                                delta = _catch_all_delta(
-                                    raw_text, assistant_received_text, visible_message_text
+                                delta = (
+                                    _suppress_already_shown(gap_tail, visible_message_text)
+                                    if gap_tail is not None
+                                    else _catch_all_delta(
+                                        raw_text, assistant_received_text, visible_message_text
+                                    )
                                 )
                                 if before and not delta:
                                     pipe_log(
@@ -8249,7 +8588,8 @@ class Pipe:
                                     last_item_text = item_text
                                     last_activity_time = time.time()
                                     continue
-                                item_delta = _item_delta_text(
+                                gap_tail = reconcile_whole_text(item_text)
+                                item_delta = gap_tail if gap_tail is not None else _item_delta_text(
                                     item_text, last_item_text, assistant_stream_text
                                 )
                                 last_item_text = item_text
@@ -8470,7 +8810,9 @@ class Pipe:
                         send_stop=self.valves.SEND_STOP_ON_CANCEL,
                         run_text={"received": assistant_received_text,
                                   "stream": assistant_stream_text,
-                                  "item": last_item_text},
+                                  "item": last_item_text,
+                                  "gaps": run_gaps,
+                                  "segments": run_segments},
                     )
                     pipe_log(
                         f"Generator {type(stop).__name__}: run parked "
@@ -8682,6 +9024,28 @@ class Pipe:
                 f"text_sha={getattr(self, '_diag_text_sha', None)} "
                 f"first_event_arrived={first_event_arrived} aborted={aborted}"
             )
+
+        if run_gaps and not aborted and our_run_id:
+            # Events were lost and no whole-text event lined up with them
+            # during the run: the run's own closing message in the transcript
+            # (`cli-assistant:<runId>`, see `_history_text_for_run`) is the
+            # whole text. Its tail, if the lost events were the last ones,
+            # belongs at the end of this reply.
+            try:
+                hist = await conn.session_history(session_key, limit=PROACTIVE_RUN_HISTORY_LIMIT)
+            except Exception as ex:
+                hist = None
+                pipe_log(f"  event gap: chat.history failed: {ex}")
+            found, whole = _history_text_for_run(hist, our_run_id)
+            tail = (reconcile_whole_text(whole) if found and whole else None) or ""
+            if run_gaps:
+                pipe_log(f"  {len(run_gaps)} event gap(s) and no whole text lines up for run "
+                         f"{str(our_run_id)[:20]}...; the lost text cannot be put back")
+            elif tail and not visible_message_text.endswith(tail):
+                pipe_log(f"  event gap: {len(tail)} chars lost at the end of the run, appended")
+                record_visible_chunk(tail)
+                yield tail
+                text_yielded = True
 
         # Terminal back-sync (ELI-57): persist the completed turn's visible text
         # to the OWUI DB with one final `replace` snapshot. OWUI only saves
