@@ -188,12 +188,27 @@ That is the variant-group cause P14 was healing, removed at the source. `opencla
 plus a process-wide registry of live connection ids (on `open_webui.socket.main`) lets a
 writer take over a message only when its recorded writer is no longer alive.
 
-**When.** M is created on R's first showable content, not on `phase:start`. The rule is the
-one the relay uses today (`_relay_content_is_showable`, gateway.py:3496): non-empty text
-that is not a silent sentinel or a prefix of one. Tool cards rendered before that are part
-of the renderer's output and go in with M. A run that ends silent (`NO_REPLY`, heartbeat
-`HEARTBEAT_OK`) never gets a message. This matches what the proactive path does today
-("no assistant text, skipping").
+**When (condition B).** M is created on R's first showable item, not on `phase:start`.
+Showable means either of these, whichever comes first:
+
+* a tool call start (`stream:"tool"`, `phase:"start"`), so an agent turn that runs tools
+  for minutes shows its cards live from the first one;
+* assistant text that is not a silent sentinel or a prefix of one
+  (`_relay_content_is_showable`, gateway.py:3496).
+
+Exception: a run whose agent payload carries `isHeartbeat:true`
+(`server-chat-CbnqM5f6.mjs:822`) never gets a message. The Gateway hides heartbeat chat
+output itself (`shouldHideHeartbeatChatOutput`, `:593`), and heartbeat tool cards in a user
+chat would be noise.
+
+A run that ends with only a sentinel (`NO_REPLY`, `ANNOUNCE_SKIP`) behaves as follows:
+
+* No tool calls: it never gets a message. That matches what today's path does ("no
+  assistant text, skipping").
+* After tool calls: M already exists, so it is finalized with its tool cards and no text,
+  `done:true`. The sentinel itself is never written. The cards stay, because the user
+  already watched them stream and they are the record of what the run did. Deleting a
+  message the user has seen would be a worse surprise than a card-only message.
 
 **Showing it in an open tab without a reload.** Open WebUI 0.12 has a native multi-tab
 protocol. Tabs that have a chat open join room `chat:{chat_id}` (`socket/main.py:715-742`,
@@ -245,9 +260,33 @@ messages (`_history_run_messages` + `_history_renderer`, gateway.py:2875-2942). 
 transcript does not have R yet (claude-cli sometimes writes only the closing text), it keeps
 what streamed, which is complete unless a gap was recorded. It writes
 `done:true, content, output` under the transaction, emits a final `chat:completion` and
-`chat:active {active:false}`, and lets the Open WebUI task finish. A `yielded:true`
-terminal ends this message too. The parent's resume after its sub-agents is a new run with
-its own message (case 8).
+`chat:active {active:false}`, and lets the Open WebUI task finish.
+
+**Yield (condition A).** A `yielded:true` terminal ends this message too, and the parent's
+resume after its sub-agents is a new run with its own message. **This is today's behavior
+on main, so it is no regression.** Evidence: three runs of an inline user turn that calls
+`sessions_spawn` + `sessions_yield` and then resumes.
+
+* `runs/deploy-main/yield-main.log`: the 18:51 subagent-wait test, chat `0ee165a9`, on
+  main's code.
+  * Reply `02eac227` closed `done:true` at the yield ("...and I've yielded. It is still
+    running, so I'll reply with SUBAGENT-DONE... when its completion event arrives").
+  * The resume came as a separate `*↳ Proactive message*` bubble, `2d65853b`
+    ("SUBAGENT-DONE-d6013359").
+  * The child's own text came as a third bubble, `↳ Sub-agent`, `31e95c10`.
+* `runs/accept-composer-2.log` (20:20Z): same shape. Reply `6bfad4fd` done at the yield,
+  resume `77fc7ec8` separate, sub-agent bubble `bf27c30c`.
+* `runs/accept-composer3-1.log` (21:23Z): same shape. Reply `83ecadfb` done at the yield,
+  resume `326f0de9` separate, sub-agent bubble `75770bf8`.
+
+What changes:
+
+* The resume message loses its `*↳ Proactive message*` header.
+* The third `↳ Sub-agent` bubble no longer appears. The child's result reaches the chat
+  through the parent's resume, which quotes it. That is the duplicate P6 removes, and it
+  was approved with the design.
+* Merging the resume into the yielded reply would be a behavior change. It is not
+  proposed.
 
 ### 2.6 User turns use the same writer when their request ends early
 
@@ -282,11 +321,34 @@ request died with the process.
    recorded timestamps, not a wait. M2 verifies that `updatedAt` moves at run end.
 5. **Gateway restart mid-run (ELI-90).** The new `bootId` (gateway.py:2271) says the runs
    are gone. The Gateway's own recovery starts a run on every session that was `running`
-   (dist above). That run is a non-pipe run on the same key. For an open user reply, the
-   entry adopts it into the same M (one reply, as today). For an agent turn, M is finalized
-   from the transcript with the existing cut-off note if the run left nothing, and the
-   recovery run gets its own message. The pipe stops sending its own resume directive,
-   subject to M3.
+   (dist above). That run is a non-pipe run on the same key. It continues the message of
+   the run it recovers, user turn or agent turn alike, so one interrupted reply stays one
+   message. The pipe stops sending its own resume directive, subject to M3.
+
+   **Link rule (condition E).** Recovery run R' belongs to the message of source run S when
+   all three hold:
+
+   1. **The Gateway restarted.** `hello-ok.server.bootId` differs from the one S was sent
+      under (gateway.py:2271-2287).
+   2. **R' is a restart recovery.** Its admitted user turn `R':user` in `chat.history`
+      carries `provenance:{kind:"internal_system", sourceTool:
+      "main_session_restart_recovery"}`. Dist: the recovery dispatch sets
+      `idempotencyKey: recoveryRunId` and that `inputProvenance`
+      (`main-session-restart-recovery-CPJjd8da.mjs:441`, `:452-456`). It is seen live in
+      this session's own transcript: `eaf12616-...:user` and `42641a9c-...:user`, both with
+      that provenance.
+   3. **S is the run R' recovers.** The Gateway recovers the session's
+      `restartRecoveryDeliverySourceRunId`. Every admitted run overwrites that field with
+      its own id: `chat.send` writes `clientRunId` (`chat-send-handler-kZQfUabO.mjs:635-636`)
+      and the `agent` method writes `sourceRunId` (`agent-command-C9QUtzmi.mjs:1019`). So S
+      is the newest admitted run on the key before R', and in the transcript S is the newest
+      `<id>:user` before `R':user` that is not itself a recovery.
+
+   M is then `message_id(S)` by the identity rule (2.2): the `M` inside `msg-<chat>-<M>-...`
+   for a user turn, or `uuid5(key:S)` for an agent turn. Every input is a recorded field.
+   The session row does not expose the source-run field (`sessions.describe` checked live;
+   none of the `restartRecovery*` keys are in it), which is why the transcript order is used.
+   M3 proves all three conditions on a real restart.
 6. **WS reconnect, same `bootId`.** Runs continue. Every open entry gets a gap mark
    (gateway.py:2250). `_subscribe_all` re-reads `sessions.list`; a run that ended during
    the drop is finalized from the transcript (2.5). Gap repair (P21) stays for inline
@@ -326,7 +388,9 @@ yet chained.
 * Old messages keep their content and their header text. They are ordinary assistant
   messages to Open WebUI, and nothing in the new path reads or rewrites them. The Action's
   task-id click (P24) stays as a documented read-only shim for the 33 sub-agent messages.
-* Variant groups: today they are healed only when the user next writes in that chat
+* Variant groups (condition G: a separate step after the merge, not in the phase 2 PR,
+  with the copy diff going to the manager first): today they are healed only when the user
+  next writes in that chat
   (pipe.py:974). After the delete, the 87 stay as 1/2 and 2/2 swipes unless migrated.
   Proposal: move `_relinearize_proactive_variants` into a workspace script, not the pipe.
   1. Copy the DB.
@@ -393,6 +457,14 @@ ticket. Cases:
 * tab closed then opened mid-turn
 * user message while an agent turn streams
 * gateway reconnect mid agent turn
+* Stop during an agent turn (condition C): the run is aborted and M is finalized with what it
+  had
+* Send now during an agent turn (C): M keeps the whole run, and the queued message gets its
+  own reply after
+* two agent turns back to back (C): two messages chained, no variant group
+* OWUI down during the run (case 4) and gateway restart mid-run (case 5), for both an agent
+  turn and a user turn: these need a restart, which the manager runs in a window. The worker
+  prepares the scenario and the checks and hands over with NEEDS-MANAGER.
 
 Each case is checked for:
 
@@ -428,9 +500,15 @@ and comes back for approval.
   DB `parentId` plus the page.
 * **M2** `sessions.list` `updatedAt` for an OWUI session moves when a run ends (case 4,
   ended during downtime).
-* **M3** After a real Gateway restart, the recovery run's `sessions.changed` start reaches
-  the pipe after its reconnect, or `sessions.list` lists it in `activeRunIds`. If neither
-  holds, the pipe directive (P28) stays and is re-keyed to `msg-<chat>-<M>-resume-<t>`.
+* **M3** (needs a Gateway restart; the manager runs it) After a real Gateway restart with
+  one user turn and one agent turn in flight, each of these must hold:
+  * the recovery run's `sessions.changed` start reaches the pipe after its reconnect, or
+    `sessions.list` lists it in `activeRunIds`;
+  * `R':user` carries the `main_session_restart_recovery` provenance;
+  * the newest non-recovery `<id>:user` before it is the interrupted run.
+
+  If the first does not hold, the pipe directive (P28) stays and is re-keyed to
+  `msg-<chat>-<M>-resume-<t>`.
 * **M4** A chat whose only active Open WebUI task is the writer's shows as generating, and
   the composer queues instead of sending. If not, case 7 still holds through `pipe()`'s
   existing wait, and this becomes a nicety.
