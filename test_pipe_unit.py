@@ -6745,6 +6745,22 @@ class ConnectionEpochTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(conn.connection_epoch, 1)
 
+    async def test_socket_accepts_gateway_frames_over_one_mib(self):
+        """2026-10-12: websockets' default 1 MiB frame cap made the client
+        close the whole Gateway connection (1009) on a 3.1 MB `chat.history`
+        reply, dropping every session's events (repro_ws_max_size.py)."""
+        conn = self._conn()
+        seen = {}
+
+        async def fake_connect(_url, **kw):
+            seen.update(kw)
+            return _HandshakeWS()
+
+        with mock.patch.object(websockets, "connect", fake_connect, create=True), \
+                mock.patch("openclaw_pipe._sign_challenge", lambda *a, **k: {}):
+            await conn._connect_and_start()
+        self.assertGreaterEqual(seen.get("max_size") or 0, 16 * 1024 * 1024)
+
     async def test_reconnect_to_the_same_gateway_is_not_a_restart(self):
         """2026-10-12: a 1s WebSocket drop (same Gateway, same bootId) was
         counted as a restart; the pipe sent a resume turn into two live

@@ -405,6 +405,14 @@ class GatewayError(Exception):
 # and tunable in one place rather than inherited silently.
 _GATEWAY_CONNECT_TIMEOUT_S = 10.0
 
+# Largest Gateway frame the socket accepts. websockets defaults to 1 MiB and
+# answers a bigger frame by closing the WHOLE connection (1009, "message too
+# big"), dropping every session's events: a 952-message `chat.history` is
+# 3.1 MB, and one large tool result in an agent or `session.message` event is
+# enough (measured 2026-10-12, repro_ws_max_size.py). Bounded, not None, so a
+# runaway frame still can't take the Open WebUI process's memory with it.
+GATEWAY_WS_MAX_SIZE = 64 * 1024 * 1024
+
 
 def _explain_connect_rejection(message: str, *, device_id: str | None = None) -> str:
     """Turn the Gateway's terse connect rejection into something actionable.
@@ -2692,7 +2700,8 @@ class _GatewayConnection:
         # if you tune either.
         try:
             ws = await asyncio.wait_for(
-                websockets.connect(f"ws://{host}:{port}", ping_interval=None),
+                websockets.connect(f"ws://{host}:{port}", ping_interval=None,
+                                   max_size=GATEWAY_WS_MAX_SIZE),
                 timeout=_GATEWAY_CONNECT_TIMEOUT_S,
             )
         except asyncio.TimeoutError:
