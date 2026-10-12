@@ -6225,11 +6225,16 @@ async def _relay_introduce(conn: "_GatewayConnection", state: "_RelayState") -> 
         # What streamed since then is only the tail; the transcript holds the
         # run so far, so the stub restarts from that.
         state.adopted = True
-        rebuilt = _history_renderer((out.get("turn") or {}).get("messages") or [])
+        turn = out.get("turn") or {}
+        rebuilt = _history_renderer(turn.get("messages") or [])
         if rebuilt.output:
             state.renderer = rebuilt
-            content = rebuilt.text
-            output = copy.deepcopy(rebuilt.output)
+        elif turn.get("prior_output"):
+            # claude-cli writes a run into the transcript only when it ends;
+            # until then the stub keeps what it showed before the restart.
+            state.renderer.output[0:0] = turn["prior_output"]
+        content = state.renderer.text
+        output = copy.deepcopy(state.renderer.output)
     state.sent_output = output
     state.last_snapshot_output = output
     state.last_snapshot_ts = time.time()
@@ -6553,12 +6558,20 @@ async def _session_list_active(conn: "_GatewayConnection", session_key: str) -> 
 async def _orphan_stub_for_run(conn: "_GatewayConnection", chat, stub_id: str,
                                session_key: str, run_id: str) -> dict | None:
     """The transcript turn of `run_id` if OWUI message `stub_id` is its
-    orphaned reply stub: an unfinished assistant message no Open WebUI task
-    is generating, whose turn in the transcript is this run. Else None."""
+    orphaned reply stub: an assistant message no Open WebUI task is
+    generating, whose turn in the transcript is this run. Else None.
+
+    Unfinished (`done: False`, an OOM kill), or closed while the run went on:
+    a graceful Open WebUI stop cancels the reply and saves it `done: True`
+    with what it had (2026-10-12: 2 of 6 cards, no text). The second case is
+    only taken on an identity match, the run id naming this message, and its
+    saved `output` is returned as `turn["prior_output"]`."""
     msgs = ((chat.chat or {}).get("history") or {}).get("messages") or {}
     stub = msgs.get(stub_id) or {}
-    if stub.get("role") != "assistant" or stub.get("done") is not False:
+    if stub.get("role") != "assistant":
         return None
+    if stub.get("done") is not False and f"-{stub_id}-" not in (run_id or ""):
+        return None  # a finished reply, not this run's: no transcript read
     if await _owui_chat_has_live_task(chat.id):
         return None
     try:
@@ -6569,7 +6582,12 @@ async def _orphan_stub_for_run(conn: "_GatewayConnection", chat, stub_id: str,
     parent = msgs.get(stub.get("parentId")) or {}
     user_text = _coerce_text(parent.get("content")) if parent.get("role") == "user" else ""
     turn = _stub_turn(hist, stub_id, user_text, _owui_message_ts(stub))
-    return turn if turn and turn["run_id"] == run_id else None
+    if not turn or turn["run_id"] != run_id:
+        return None
+    if stub.get("done") is not False and turn["by"] != "id":
+        return None
+    turn["prior_output"] = copy.deepcopy(stub.get("output") or [])
+    return turn
 
 
 # A long session's whole transcript (952 messages for 0abe9bde) takes the

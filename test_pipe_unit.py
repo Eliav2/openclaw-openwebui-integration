@@ -1767,6 +1767,39 @@ class OrphanStubReconcileTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self._stub()["content"], "Reading them. Found it.")
         self.assertIs(self._stub()["done"], True)
 
+    async def test_relay_adopts_its_stub_that_a_graceful_stop_closed(self):
+        """2026-10-12 run 3: `ha apps restart` cancelled the reply and Open
+        WebUI saved it done=True with 2 of the run's cards; the relay then
+        added a second bubble with the rest."""
+        prior = [_tool_call_started_event("Bash", "toolu_0", "{}")["item"]]
+        self._stub().update(done=True, output=prior)
+        # Mid-run, claude-cli's transcript holds only the user message.
+        self.history = {"messages": _turn_history(closed=False)["messages"][:4]}
+        state = _RelayState(session_key=self.sk, run_id=self.RUN, user_id=self.USER,
+                            chat_id=self.CHAT, renderer=_TurnRenderer())
+        self.conn._relay_sessions[f"{self.sk}:{self.RUN}"] = state
+        state.renderer.feed({"stream": "assistant", "data": {"delta": "tail"}})
+        self.assertTrue(await _relay_introduce(self.conn, state))
+        self.assertEqual(state.message_id, self.STUB)
+        self.assertEqual(set(self.chat["history"]["messages"]), {"u1", self.STUB})
+        self.assertEqual(self._stub()["output"][0]["id"], "toolu_0",
+                         "what the stub showed stays until the run closes")
+        self.assertIs(self._stub()["done"], False)
+        self.history = _turn_history()
+        await _relay_finalize(self.conn, state)
+        self.assertEqual(self._stub()["content"], "Reading them. Found it.")
+        self.assertIs(self._stub()["done"], True)
+
+    async def test_a_closed_stub_matched_only_by_text_is_not_adopted(self):
+        self._stub()["done"] = True
+        self.history = _turn_history(run="msg-c-1.0")
+        state = _RelayState(session_key=self.sk, run_id="msg-c-1.0", user_id=self.USER,
+                            chat_id=self.CHAT, renderer=_TurnRenderer())
+        self.conn._relay_sessions[f"{self.sk}:msg-c-1.0"] = state
+        state.renderer.feed({"stream": "assistant", "data": {"delta": "Wake reply"}})
+        self.assertTrue(await _relay_introduce(self.conn, state))
+        self.assertNotEqual(state.message_id, self.STUB)
+
     async def test_relay_of_another_run_appends_and_leaves_the_stub(self):
         state = _RelayState(session_key=self.sk, run_id="announce:x", user_id=self.USER,
                             chat_id=self.CHAT, renderer=_TurnRenderer())
