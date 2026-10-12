@@ -365,6 +365,8 @@ class Pipe:
         # Every page load lists models, so this is the earliest point the
         # composer watcher can start after an Open WebUI restart or redeploy.
         _ensure_composer_watcher(lambda: self.valves)
+        # ...and the earliest point to finish replies a restart orphaned.
+        _ensure_orphan_reconcile(lambda: self.valves)
         models, source = await _discover_models_with_source(self.valves)
 
         # Apply safety cap
@@ -854,6 +856,7 @@ class Pipe:
                 "only the text below was sent.)_\n\n"
             )
 
+        _ensure_orphan_reconcile(lambda: self.valves)
         await _emit_status(__event_emitter__, "Thinking...", done=False)
         if self.valves.COMPOSER_STATUS_BUTTON and not _initial_visible_text:
             # Cheap and idempotent: installs the composer Status button in the
@@ -1196,7 +1199,12 @@ class Pipe:
 
                 # --- Send this message as its own fresh run (still holding the lock
                 #     so the next waiter observes our run before deciding to send) ---
-                idempotency_key = f"msg-{chat_id}-{time.time()}"
+                # The OWUI message id in the run id ties the run to the reply
+                # it streams into, so a reply orphaned by an Open WebUI restart
+                # is matched to its run by identity (ELI-90, `_stub_turn`).
+                reply_id = (__metadata__ or {}).get("message_id")
+                idempotency_key = (f"msg-{chat_id}-{reply_id}-{time.time()}" if reply_id
+                                   else f"msg-{chat_id}-{time.time()}")
                 # Fit the requested level to what this session's model actually
                 # supports. The dropdown is a union across models, so a level that
                 # is real for one model can be unavailable here. Clamping is

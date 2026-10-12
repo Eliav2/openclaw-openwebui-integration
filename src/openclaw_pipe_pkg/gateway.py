@@ -1541,6 +1541,10 @@ class _GatewayConnection:
             row = rows.get(state.session_key)
             if row is not None and row.get("hasActiveRun") is False:
                 spawn_background(_relay_finalize_settled(self, state))
+        # A waiter that read run state before the subscription existed would
+        # sleep through a settle it was never sent; make every waiter read
+        # again now that settles are pushed.
+        self._wake_session_waiters()
 
     async def _subscribe_messages(self, session_key: str) -> bool:
         try:
@@ -3008,7 +3012,9 @@ def _proactive_run_output(history: dict | None, run_id: str,
     output = _history_renderer(run_messages).finished_output()
     if not any(i.get("type") == "function_call" for i in output):
         return None
-    if output[0].get("type") == "message":
+    if not label:
+        pass
+    elif output[0].get("type") == "message":
         output[0]["content"][0]["text"] = label + output[0]["content"][0]["text"]
     else:
         output.insert(0, {"type": "message", "id": f"msg_{uuid.uuid4().hex[:24]}",
@@ -3218,8 +3224,16 @@ async def _heal_proactive_variants(conn: "_GatewayConnection", chat_id: str) -> 
 async def _append_proactive_message_to_chat(
     conn: "_GatewayConnection", chat_id: str, text: str, *, log_prefix: str,
     out: dict | None = None, extra_fields: dict | None = None,
+    adopt: dict | None = None,
 ) -> bool:
     """Persist one assistant message onto the tail of an OWUI chat.
+
+    `adopt` ({"session_key", "run_id", "fields"}): when the chat's leaf is
+    the orphaned reply stub of exactly this run (`_orphan_stub_for_run`,
+    ELI-90), `fields` are written INTO that stub instead of appending a
+    second bubble under it; `out["adopted"]` is then True and both
+    `old_leaf_id` and `new_message_id` name the stub, and `out["turn"]` is
+    the run's transcript slice.
 
     Shared write path for both proactive-delivery functions
     (`_deliver_proactive_owui_message` and its sub-agent sibling), which did
@@ -3260,6 +3274,19 @@ async def _append_proactive_message_to_chat(
                 return False
             history = chat.chat.get("history", {}) or {}
             old_leaf_id = _deepest_leaf_id(history.get("messages") or {}, history.get("currentId"))
+            if adopt and old_leaf_id:
+                turn = await _orphan_stub_for_run(
+                    conn, chat, old_leaf_id, adopt["session_key"], adopt["run_id"])
+                if turn is not None:
+                    await Chats.upsert_message_to_chat_by_id_and_message_id(
+                        chat_id, old_leaf_id, dict(adopt.get("fields") or {}),
+                    )
+                    pipe_log(f"  {log_prefix}: wrote run {adopt['run_id'][:20]}... into "
+                             f"its orphaned reply {old_leaf_id[:8]}... (ELI-90)")
+                    if out is not None:
+                        out.update(old_leaf_id=old_leaf_id, new_message_id=old_leaf_id,
+                                   adopted=True, turn=turn)
+                    return True
             new_message_id = str(uuid.uuid4())
             old_leaf = (history.get("messages") or {}).get(old_leaf_id, {}) if old_leaf_id else {}
             model_id = old_leaf.get("model") or next(iter(chat.chat.get("models") or []), None)
@@ -3414,6 +3441,7 @@ class _RelayState:
     old_leaf_id: str | None = None     # bootstrap `execute` target
     introduced: bool = False
     gap: bool = False                  # events were lost while the socket was down
+    adopted: bool = False              # writes into the run's orphaned reply stub (ELI-90)
     sent_output: list = field(default_factory=list)  # `output` the tab holds
     last_snapshot_output: list = field(default_factory=list)
     last_snapshot_ts: float = 0.0
@@ -3568,8 +3596,11 @@ async def _relay_introduce(conn: "_GatewayConnection", state: "_RelayState") -> 
     content = state.renderer.text
     output = copy.deepcopy(state.renderer.output)
     out: dict = {}
+    adopt = {"session_key": state.session_key, "run_id": state.run_id,
+             "fields": {"content": content, "done": False, "output": output}}
     if not await _append_proactive_message_to_chat(
-        conn, state.chat_id, content, log_prefix="live relay introduce", out=out
+        conn, state.chat_id, content, log_prefix="live relay introduce", out=out,
+        adopt=adopt,
     ):
         # Persist failed -- release the claim so the post-hoc path can still try.
         conn._delivered_proactive.pop(key, None)
@@ -3578,6 +3609,16 @@ async def _relay_introduce(conn: "_GatewayConnection", state: "_RelayState") -> 
     state.message_id = out.get("new_message_id")
     state.old_leaf_id = out.get("old_leaf_id")
     state.introduced = True
+    if out.get("adopted"):
+        # The stub is this run's own reply, cut off by an Open WebUI restart.
+        # What streamed since then is only the tail; the transcript holds the
+        # run so far, so the stub restarts from that.
+        state.adopted = True
+        rebuilt = _history_renderer((out.get("turn") or {}).get("messages") or [])
+        if rebuilt.output:
+            state.renderer = rebuilt
+            content = rebuilt.text
+            output = copy.deepcopy(rebuilt.output)
     state.sent_output = output
     state.last_snapshot_output = output
     state.last_snapshot_ts = time.time()
@@ -3676,6 +3717,18 @@ async def _relay_finalize(conn: "_GatewayConnection", state: "_RelayState") -> N
     try:
         if not state.introduced or not state.message_id:
             return
+        if state.adopted:
+            # Adopted mid-run: the renderer saw only the tail live. The closed
+            # transcript has the whole run.
+            try:
+                hist = await conn.session_history(state.session_key, limit=RUN_HISTORY_LIMIT)
+                run_messages = _history_run_messages(hist, state.run_id)
+            except Exception as ex:
+                run_messages = None
+                pipe_log(f"  live relay finalize: chat.history failed: {ex}")
+            rebuilt = _history_renderer(run_messages or [])
+            if rebuilt.output:
+                state.renderer = rebuilt
         final_content = state.renderer.text.strip()
         final_output = state.renderer.finished_output()
         await _relay_persist_content(
@@ -3767,6 +3820,248 @@ async def _relay_abort(conn: "_GatewayConnection", key: str) -> None:
         await _relay_finalize(conn, state)
     else:
         conn._relay_sessions.pop(key, None)
+
+
+# ── Orphaned reply stubs (ELI-90) ──
+# Open WebUI writes a reply's assistant message (`done: False`) before the
+# pipe sends anything, and only the request that streams the reply ever sets
+# `done: True`. When Open WebUI restarts mid-turn (three OOM kills on
+# 2026-10-12 16:21-16:25 UTC), that request is gone: the run finishes in the
+# Gateway, but the chat keeps an empty bubble that looks like it is still
+# running, forever. On the first load after the restart these stubs are
+# matched to their runs in the Gateway transcript and finished from it.
+
+ORPHAN_STUB_NOTE = (
+    "*No reply arrived for this message: the turn was cut off (Open WebUI "
+    "restarted or lost the run) and its reply is not in the OpenClaw session "
+    "transcript. Send the message again if you still need an answer.*"
+)
+ORPHAN_STUB_SILENT_NOTE = "*The run for this message ended without a reply.*"
+
+
+def _history_user_run_id(message) -> str | None:
+    """The run a transcript user message started: the Gateway keys the user
+    message a `chat.send` adds as `<runId>:user` (the run id is the send's
+    idempotencyKey). None for any other message, including the copy the
+    runtime imports next to it."""
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return None
+    meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
+    key = str(message.get("idempotencyKey") or meta.get("idempotencyKey") or "")
+    return key[:-len(":user")] if key.endswith(":user") and len(key) > 5 else None
+
+
+def _stub_turn(history: dict, stub_id: str, user_text: str) -> dict | None:
+    """The transcript turn an OWUI reply stub was waiting for:
+    {"run_id", "messages", "closed"}, or None when the transcript has none.
+
+    The pipe puts the OWUI message id into the run id (`msg-<chat>-<message>-
+    <time>`), so the turn is found by identity. A run sent before that
+    (or by an older pipe) is found by its user text instead, the newest match
+    winning, as `_recovery_text_from_items` does. `messages` runs to the run's
+    closing message (`cli-assistant:<runId>`) or the next turn; `closed` says
+    whether the run is over by the transcript alone."""
+    messages = (history or {}).get("messages")
+    if not isinstance(messages, list):
+        return None
+    starts = [i for i, m in enumerate(messages) if _history_user_run_id(m)]
+    pick = None
+    if stub_id:
+        by_id = [i for i in starts if stub_id in _history_user_run_id(messages[i])]
+        pick = by_id[-1] if by_id else None
+    text = (user_text or "").strip()
+    if pick is None and text:
+        by_text = [i for i in starts if _recovery_user_text_matches(
+            ((_history_item(messages[i]) or {}).get("text") or "").strip(), text)]
+        pick = by_text[-1] if by_text else None
+    if pick is None:
+        return None
+    run_id = _history_user_run_id(messages[pick])
+    end = next((i for i in starts if i > pick), len(messages))
+    turn = messages[pick + 1:end]
+    closing = f"cli-assistant:{run_id}"
+    for j, m in enumerate(turn):
+        meta = m.get("__openclaw") if isinstance(m, dict) and isinstance(m.get("__openclaw"), dict) else {}
+        if isinstance(m, dict) and closing in (m.get("idempotencyKey"), meta.get("idempotencyKey")):
+            return {"run_id": run_id, "messages": turn[:j + 1], "closed": True}
+    return {"run_id": run_id, "messages": turn, "closed": end < len(messages)}
+
+
+async def _owui_chat_has_live_task(chat_id: str) -> bool:
+    """True while Open WebUI runs a task for `chat_id` (a reply being
+    generated by this process). Answers True when it cannot tell, so a
+    reply that is still streaming is never overwritten."""
+    try:
+        from open_webui.main import app
+        from open_webui.tasks import list_task_ids_by_item_id
+        return bool(await list_task_ids_by_item_id(getattr(app.state, "redis", None), chat_id))
+    except Exception as ex:
+        pipe_log(f"  orphan stub: cannot read Open WebUI tasks ({ex}); leaving chat {chat_id[:8]}... alone")
+        return True
+
+
+async def _session_list_active(conn: "_GatewayConnection", session_key: str) -> bool | None:
+    """`sessions.list` `hasActiveRun` for one session (counts a sub-agent
+    yield gap as active, unlike `sessions.describe`). False when the Gateway
+    lists no such session, None when it can't be asked."""
+    try:
+        lst = await conn.send_request("sessions.list", {}, timeout=15)
+    except Exception as ex:
+        pipe_log(f"  orphan stub: sessions.list failed: {ex}")
+        return None
+    row = next((r for r in (lst.get("sessions") or []) if r.get("key") == session_key), None)
+    return bool(row and row.get("hasActiveRun"))
+
+
+async def _orphan_stub_for_run(conn: "_GatewayConnection", chat, stub_id: str,
+                               session_key: str, run_id: str) -> dict | None:
+    """The transcript turn of `run_id` if OWUI message `stub_id` is its
+    orphaned reply stub: an unfinished assistant message no Open WebUI task
+    is generating, whose turn in the transcript is this run. Else None."""
+    msgs = ((chat.chat or {}).get("history") or {}).get("messages") or {}
+    stub = msgs.get(stub_id) or {}
+    if stub.get("role") != "assistant" or stub.get("done") is not False:
+        return None
+    if await _owui_chat_has_live_task(chat.id):
+        return None
+    try:
+        hist = await conn.session_history(session_key, limit=RUN_HISTORY_LIMIT)
+    except Exception as ex:
+        pipe_log(f"  orphan stub: chat.history failed: {ex}")
+        return None
+    parent = msgs.get(stub.get("parentId")) or {}
+    turn = _stub_turn(hist, stub_id, _coerce_text(parent.get("content")))
+    return turn if turn and turn["run_id"] == run_id else None
+
+
+async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
+                          chat_id: str, stub_id: str) -> None:
+    """Finish one orphaned reply stub from its run in the transcript. A run
+    still going is waited for on the pushed settle (`sessions.changed`), not
+    on a timer; a run that relay or proactive delivery claims meanwhile is
+    theirs, and they write into this same stub."""
+    from open_webui.models.chats import Chats
+    waiting = False
+    while True:
+        chat = await Chats.get_chat_by_id(chat_id)
+        msgs = ((chat.chat or {}).get("history") or {}).get("messages") or {} if chat else {}
+        stub = msgs.get(stub_id) or {}
+        if stub.get("role") != "assistant" or stub.get("done") is not False:
+            return  # gone or finished meanwhile
+        if await _owui_chat_has_live_task(chat_id):
+            return  # a live request owns it
+        session_key = _owui_session_key(agent_id, chat.user_id, chat_id)
+        changed = conn.session_change_event(session_key)
+        try:
+            hist = await conn.session_history(session_key, limit=RUN_HISTORY_LIMIT)
+        except Exception as ex:
+            pipe_log(f"  orphan stub {stub_id[:8]}...: chat.history failed: {ex}")
+            return
+        parent = msgs.get(stub.get("parentId")) or {}
+        turn = _stub_turn(hist, stub_id, _coerce_text(parent.get("content")))
+        if turn and turn["closed"]:
+            break
+        active = await _session_list_active(conn, session_key)
+        if active is None:
+            return
+        if not active:
+            break
+        if not waiting:
+            waiting = True
+            pipe_log(f"  orphan stub {stub_id[:8]}... in chat {chat_id[:8]}...: "
+                     "its run is still going; finishing it when the run settles")
+        await changed.wait()
+
+    run_id = (turn or {}).get("run_id")
+    rendered = _history_renderer(turn["messages"]) if turn else _TurnRenderer()
+    text = rendered.text.strip()
+    if not text and not rendered.output:
+        rendered._add_text(ORPHAN_STUB_SILENT_NOTE if turn else ORPHAN_STUB_NOTE)
+        text = rendered.text
+    output = rendered.finished_output()
+    async with conn._chat_write_lock(chat_id):
+        chat = await Chats.get_chat_by_id(chat_id)
+        msgs = ((chat.chat or {}).get("history") or {}).get("messages") or {} if chat else {}
+        if (msgs.get(stub_id) or {}).get("done") is not False:
+            return
+        if run_id:
+            claim = f"{session_key}:{run_id}"
+            if claim in conn._delivered_proactive:
+                return  # live relay or proactive delivery owns this run
+            conn._delivered_proactive[claim] = True
+            conn.mark_delivered_live(session_key, run_id)
+        await Chats.upsert_message_to_chat_by_id_and_message_id(
+            chat_id, stub_id, {"content": text, "output": output, "done": True},
+        )
+    await _relay_emit_event(chat.user_id, chat_id, stub_id,
+                            {"type": "chat:completion", "data": {"output": output}})
+    await _relay_emit_event(chat.user_id, chat_id, stub_id,
+                            {"type": "chat:active", "data": {"active": False}})
+    cards = sum(1 for i in output if i.get("type") == "function_call")
+    source = f"run {run_id[:40]}" if run_id else "no run in the transcript"
+    pipe_log(f"  orphan stub {stub_id[:8]}... in chat {chat_id[:8]}... finished from "
+             f"{source} ({len(text)} chars, {cards} tool card(s)) (ELI-90)")
+
+
+async def _orphan_stub_ids(prefixes: list[str]) -> list[tuple[str, str]]:
+    """(chat_id, message_id) of every unfinished assistant message a model of
+    this pipe wrote. Open WebUI keeps a row per message in `chat_message`
+    whose id is `<chat_id>-<message_id>`."""
+    from sqlalchemy import or_, select
+    from open_webui.internal.db import get_async_db_context
+    from open_webui.models.chat_messages import ChatMessage
+    async with get_async_db_context() as db:
+        rows = (await db.execute(
+            select(ChatMessage.chat_id, ChatMessage.id)
+            .where(ChatMessage.role == "assistant")
+            .where(ChatMessage.done.is_(False))
+            .where(or_(*[ChatMessage.model_id.startswith(p) for p in prefixes]))
+        )).all()
+    out = []
+    for chat_id, composite in rows:
+        prefix = f"{chat_id}-"
+        out.append((chat_id, composite[len(prefix):] if composite.startswith(prefix) else composite))
+    return out
+
+
+_orphan_reconcile_task: "asyncio.Task | None" = None
+
+
+async def _reconcile_orphan_stubs(valves_getter) -> None:
+    try:
+        conn = await _get_gateway_connection(valves_getter)
+        agent_id = getattr(valves_getter(), "AGENT_ID", "") or "main"
+        stubs = await _orphan_stub_ids(
+            _composer_model_prefixes(own_id=_composer_own_function_id()))
+    except Exception as ex:
+        pipe_log(f"  orphan stub reconcile could not start: {ex}")
+        return
+    if stubs:
+        pipe_log(f"  orphan stub reconcile: {len(stubs)} unfinished OpenClaw "
+                 "repl(y/ies) in Open WebUI")
+    for chat_id, stub_id in stubs:
+        spawn_background(_reconcile_stub_logged(conn, agent_id, chat_id, stub_id))
+
+
+async def _reconcile_stub_logged(conn, agent_id, chat_id, stub_id) -> None:
+    try:
+        await _reconcile_stub(conn, agent_id, chat_id, stub_id)
+    except Exception as ex:
+        pipe_log(f"  orphan stub {stub_id[:8]}... in chat {chat_id[:8]}...: reconcile failed: {ex}")
+
+
+def _ensure_orphan_reconcile(valves_getter) -> None:
+    """Once per load of this Function inside Open WebUI (a restart reloads
+    it; so does a deploy, which is harmless: a reply still streaming has a
+    live task and is skipped)."""
+    global _orphan_reconcile_task
+    if _orphan_reconcile_task is not None:
+        return
+    try:
+        import open_webui.models.chat_messages  # noqa: F401  (inside Open WebUI only)
+    except Exception:
+        return
+    _orphan_reconcile_task = spawn_background(_reconcile_orphan_stubs(valves_getter))
 
 
 async def _finalize_inline_message(
@@ -3891,6 +4186,13 @@ async def _deliver_proactive_owui_message(
         pipe_log("  proactive delivery: no assistant text, skipping")
         return
 
+    # A run whose reply stub an Open WebUI restart orphaned is that stub's
+    # answer, not a proactive message: it goes into the stub unlabeled.
+    adopt_fields: dict = {"content": text, "done": True}
+    plain_output = _proactive_run_output(text_out.get("history"), run_id, "")
+    if plain_output:
+        adopt_fields["output"] = plain_output
+
     label = "*↳ Proactive message*\n\n"
     text = f"{label}{text}"
     extra = {"done": True}
@@ -3902,7 +4204,10 @@ async def _deliver_proactive_owui_message(
     if await _append_proactive_message_to_chat(
         conn, chat_id, text, log_prefix="proactive delivery", out=append_out,
         extra_fields=extra,
+        adopt={"session_key": session_key, "run_id": run_id, "fields": adopt_fields},
     ):
+        if append_out.get("adopted"):
+            output = plain_output
         cards = sum(1 for i in output or [] if i.get("type") == "function_call")
         pipe_log(
             f"  proactive delivery: persisted message into chat {chat_id[:8]}... "

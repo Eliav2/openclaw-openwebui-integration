@@ -115,6 +115,13 @@ from openclaw_pipe import (
     _relay_output_events,
     _history_renderer,
     _history_run_messages,
+    _stub_turn,
+    _history_user_run_id,
+    _reconcile_stub,
+    ORPHAN_STUB_NOTE,
+    _RelayState,
+    _relay_introduce,
+    _deliver_proactive_owui_message,
     TOOL_ERROR_MARK,
     _relay_feed_event,
     _relay_finalize,
@@ -360,7 +367,7 @@ class ProactiveDeliveryFullTextTests(unittest.TestCase):
         appended = []
 
         async def fake_append(conn_, chat_id, text, *, log_prefix, out=None,
-                              extra_fields=None):
+                              extra_fields=None, adopt=None):
             appended.append(text)
             self.extra = extra_fields
             return True
@@ -1503,6 +1510,231 @@ class HistoryRunRebuildTests(unittest.TestCase):
         r = _history_renderer(_history_run_messages(_cli_history(), "run-1"))
         self.assertEqual(r.text, "old answer")
         self.assertEqual([i["type"] for i in r.output], ["message"])
+
+
+def _turn_history(stub_id="stub-1", *, run="msg-c-stub-1-1.0", closed=True,
+                  text="check the logs", later=False):
+    """A turn as the Gateway stores a `chat.send` on claude-cli (measured
+    2026-10-12, session 1b877b13): the user message keyed `<runId>:user`,
+    the copy the runtime imports behind its metadata envelope, the imported
+    assistant messages, then the closing `cli-assistant:<runId>`."""
+    imported = {"importedFrom": "claude-cli"}
+    msgs = [
+        {"role": "user", "content": "earlier", "idempotencyKey": "msg-c-old-0.5:user"},
+        {"role": "assistant", "content": [{"type": "text", "text": "old"}],
+         "idempotencyKey": "cli-assistant:msg-c-old-0.5"},
+        {"role": "user", "content": text, "idempotencyKey": f"{run}:user"},
+        {"role": "user", "content": "Conversation info (untrusted metadata): {}\n\n" + text},
+        {"role": "assistant", "__openclaw": imported,
+         "content": [{"type": "text", "text": "Reading them."}]},
+        {"role": "assistant", "__openclaw": imported, "content": [
+            {"type": "toolcall", "id": "toolu_1", "name": "Bash",
+             "arguments": {"command": "tail log"}},
+            {"type": "tool_result", "tool_use_id": "toolu_1", "name": "Bash",
+             "content": [{"type": "text", "text": "ERROR x"}]}]},
+    ]
+    if closed:
+        msgs += [
+            {"role": "assistant", "__openclaw": imported,
+             "content": [{"type": "text", "text": " Found it."}]},
+            {"role": "assistant", "idempotencyKey": f"cli-assistant:{run}",
+             "content": [{"type": "text", "text": "Reading them. Found it."}]},
+        ]
+    if later:
+        msgs += [{"role": "user", "content": "next", "idempotencyKey": "msg-c-x-9.0:user"},
+                 {"role": "assistant", "content": [{"type": "text", "text": "later answer"}],
+                  "idempotencyKey": "cli-assistant:msg-c-x-9.0"}]
+    return {"messages": msgs}
+
+
+class StubTurnTests(unittest.TestCase):
+    """ELI-90: an orphaned reply stub is matched to its run in the transcript."""
+
+    def test_found_by_the_reply_id_inside_the_run_id(self):
+        turn = _stub_turn(_turn_history(), "stub-1", "some other text")
+        self.assertEqual(turn["run_id"], "msg-c-stub-1-1.0")
+        self.assertTrue(turn["closed"])
+        self.assertEqual(turn["messages"][-1]["idempotencyKey"], "cli-assistant:msg-c-stub-1-1.0")
+        r = _history_renderer(turn["messages"])
+        self.assertEqual(r.text, "Reading them. Found it.")
+        self.assertEqual(sum(1 for i in r.output if i["type"] == "function_call"), 1)
+
+    def test_older_run_ids_fall_back_to_the_user_text(self):
+        hist = _turn_history(run="msg-c-1.0")
+        self.assertEqual(_stub_turn(hist, "stub-1", "check the logs")["run_id"], "msg-c-1.0")
+        self.assertIsNone(_stub_turn(hist, "stub-1", "never sent"))
+
+    def test_open_turn_is_not_closed_until_the_transcript_says_so(self):
+        self.assertFalse(_stub_turn(_turn_history(closed=False), "stub-1", "")["closed"])
+        # A later turn means this one is over even without a closing message.
+        turn = _stub_turn(_turn_history(closed=False, later=True), "stub-1", "")
+        self.assertTrue(turn["closed"])
+        self.assertNotIn("later answer", json.dumps(turn["messages"]))
+
+    def test_the_imported_copy_of_the_user_message_starts_no_turn(self):
+        self.assertIsNone(_history_user_run_id(_turn_history()["messages"][3]))
+        self.assertEqual(_history_user_run_id(_turn_history()["messages"][2]), "msg-c-stub-1-1.0")
+
+
+class OrphanStubReconcileTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-90: replies an Open WebUI restart orphaned (empty, done=False
+    forever) are finished from the Gateway transcript, waiting for a run
+    still going on its pushed settle, never on a clock."""
+
+    USER = "11111111-1111-1111-1111-111111111111"
+    CHAT = "22222222-2222-2222-2222-222222222222"
+    STUB = "stub-1"
+    RUN = "msg-c-stub-1-1.0"
+
+    def setUp(self):
+        self.sk = _owui_session_key("main", self.USER, self.CHAT)
+        self.chat = {"history": {"currentId": self.STUB, "messages": {
+            "u1": {"role": "user", "content": "check the logs", "childrenIds": [self.STUB]},
+            self.STUB: {"role": "assistant", "content": "", "done": False,
+                        "parentId": "u1", "childrenIds": [], "model": "openclaw_gateway.m"},
+        }}}
+        self.history = _turn_history(closed=False)
+        self.active = True
+        self.live_task = False
+        test = self
+
+        class FakeChat:
+            def __init__(self):
+                self.chat, self.id, self.user_id = test.chat, test.CHAT, test.USER
+
+        class FakeChats:
+            @staticmethod
+            async def get_chat_by_id(chat_id):
+                return FakeChat()
+
+            @staticmethod
+            async def upsert_message_to_chat_by_id_and_message_id(chat_id, message_id, message):
+                msgs = test.chat["history"]["messages"]
+                msgs[message_id] = {**msgs.get(message_id, {}), **message}
+                test.chat["history"]["currentId"] = message_id
+                return FakeChat()
+
+        chats_mod = types.ModuleType("open_webui.models.chats")
+        chats_mod.Chats = FakeChats
+        socket_main = types.ModuleType("open_webui.socket.main")
+        self.sio = mock.AsyncMock()
+        socket_main.sio = self.sio
+        self.modules = {"open_webui": types.ModuleType("open_webui"),
+                        "open_webui.models": types.ModuleType("open_webui.models"),
+                        "open_webui.models.chats": chats_mod,
+                        "open_webui.socket": types.ModuleType("open_webui.socket"),
+                        "open_webui.socket.main": socket_main}
+        self.conn = _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"))
+
+        async def send_request(method, params, timeout=10):
+            if method == "chat.history":
+                return copy.deepcopy(test.history)
+            if method == "sessions.list":
+                return {"sessions": [{"key": test.sk, "hasActiveRun": test.active}]}
+            raise AssertionError(method)
+        self.conn.send_request = send_request
+
+        async def live(chat_id):
+            return test.live_task
+        patches = [mock.patch.dict(sys.modules, self.modules),
+                   mock.patch("openclaw_pipe._owui_chat_has_live_task", live)]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    @staticmethod
+    async def _spin():
+        for _ in range(50):
+            await asyncio.sleep(0)
+
+    def _stub(self):
+        return self.chat["history"]["messages"][self.STUB]
+
+    def _emits(self, kind):
+        return [c.args[1]["data"] for c in self.sio.emit.await_args_list
+                if c.args[0] == "events" and c.args[1]["data"]["type"] == kind]
+
+    async def test_a_finished_run_fills_its_stub_with_text_and_cards(self):
+        self.history, self.active = _turn_history(), False
+        await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB)
+        stub = self._stub()
+        self.assertIs(stub["done"], True)
+        self.assertEqual(stub["content"], "Reading them. Found it.")
+        self.assertEqual([i["type"] for i in stub["output"]],
+                         ["message", "function_call", "function_call_output", "message"])
+        self.assertEqual(self.chat["history"]["currentId"], self.STUB, "no new message")
+        self.assertEqual(self._emits("chat:completion")[-1]["data"]["output"], stub["output"])
+        self.assertEqual(len(self._emits("chat:active")), 1)
+        self.assertIn(f"{self.sk}:{self.RUN}", self.conn._delivered_proactive,
+                      "proactive delivery must not deliver the run a second time")
+
+    async def test_a_running_run_is_finished_on_the_pushed_settle(self):
+        task = asyncio.create_task(_reconcile_stub(self.conn, "main", self.CHAT, self.STUB))
+        await self._spin()
+        self.assertFalse(task.done(), "must wait for the run, not finish a partial")
+        self.assertIs(self._stub()["done"], False)
+        # Unrelated change for the same session: re-reads, still running.
+        self.conn._on_sessions_changed({"sessionKey": self.sk, "hasActiveRun": True})
+        await self._spin()
+        self.assertFalse(task.done())
+        self.history, self.active = _turn_history(), False
+        self.conn._on_sessions_changed({"sessionKey": self.sk, "hasActiveRun": False})
+        await self._spin()
+        self.assertTrue(task.done())
+        self.assertEqual(self._stub()["content"], "Reading them. Found it.")
+        self.assertIs(self._stub()["done"], True)
+
+    async def test_a_message_that_never_reached_the_gateway_gets_an_honest_note(self):
+        self.history, self.active = {"messages": []}, False
+        await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB)
+        self.assertIs(self._stub()["done"], True)
+        self.assertEqual(self._stub()["content"], ORPHAN_STUB_NOTE)
+
+    async def test_a_reply_still_streaming_in_this_process_is_left_alone(self):
+        self.history, self.active, self.live_task = _turn_history(), False, True
+        await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB)
+        self.assertIs(self._stub()["done"], False)
+        self.assertEqual(self.sio.emit.await_count, 0)
+
+    async def test_a_run_relay_already_claimed_is_left_to_the_relay(self):
+        self.history, self.active = _turn_history(), False
+        self.conn._delivered_proactive[f"{self.sk}:{self.RUN}"] = True
+        await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB)
+        self.assertIs(self._stub()["done"], False)
+
+    async def test_relay_of_the_stubs_own_run_writes_into_the_stub(self):
+        state = _RelayState(session_key=self.sk, run_id=self.RUN, user_id=self.USER,
+                            chat_id=self.CHAT, renderer=_TurnRenderer())
+        self.conn._relay_sessions[f"{self.sk}:{self.RUN}"] = state
+        state.renderer.feed({"stream": "assistant", "data": {"delta": " Found"}})
+        self.assertTrue(await _relay_introduce(self.conn, state))
+        self.assertEqual(state.message_id, self.STUB)
+        self.assertTrue(state.adopted)
+        self.assertEqual(set(self.chat["history"]["messages"]), {"u1", self.STUB})
+        # Seeded from the transcript: the part before the restart is there.
+        self.assertTrue(self._stub()["content"].startswith("Reading them."))
+        self.history = _turn_history()
+        await _relay_finalize(self.conn, state)
+        self.assertEqual(self._stub()["content"], "Reading them. Found it.")
+        self.assertIs(self._stub()["done"], True)
+
+    async def test_relay_of_another_run_appends_and_leaves_the_stub(self):
+        state = _RelayState(session_key=self.sk, run_id="announce:x", user_id=self.USER,
+                            chat_id=self.CHAT, renderer=_TurnRenderer())
+        self.conn._relay_sessions[f"{self.sk}:announce:x"] = state
+        state.renderer.feed({"stream": "assistant", "data": {"delta": "Wake reply"}})
+        self.assertTrue(await _relay_introduce(self.conn, state))
+        self.assertNotEqual(state.message_id, self.STUB)
+        self.assertFalse(state.adopted)
+        self.assertIs(self._stub()["done"], False)
+
+    async def test_proactive_delivery_of_the_stubs_run_is_unlabeled_in_the_stub(self):
+        self.history, self.active = _turn_history(), False
+        await _deliver_proactive_owui_message(self.conn, self.sk, self.RUN)
+        self.assertEqual(set(self.chat["history"]["messages"]), {"u1", self.STUB})
+        self.assertEqual(self._stub()["content"], "Reading them. Found it.")
+        self.assertNotIn("Proactive", json.dumps(self._stub()))
+        self.assertEqual(sum(1 for i in self._stub()["output"] if i["type"] == "function_call"), 1)
 
 
 class RelayOutputEventTests(unittest.TestCase):
