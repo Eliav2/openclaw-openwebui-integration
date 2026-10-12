@@ -4582,12 +4582,13 @@ class _GatewayConnection:
 
     async def session_history(self, session_key: str,
                               limit: int = RECOVERY_HISTORY_LIMIT,
-                              max_chars: int = RECOVERY_HISTORY_MAX_CHARS) -> dict:
+                              max_chars: int = RECOVERY_HISTORY_MAX_CHARS,
+                              timeout: float = 10) -> dict:
         """Fetch the session's recent messages unclipped, for timeout recovery."""
         return await self.send_request(
             "chat.history",
             dict(sessionKey=session_key, limit=limit, maxChars=max_chars),
-            timeout=10
+            timeout=timeout
         )
 
     async def abort(self, session_key: str, run_id: str):
@@ -6562,12 +6563,18 @@ async def _orphan_stub_for_run(conn: "_GatewayConnection", chat, stub_id: str,
     return turn if turn and turn["run_id"] == run_id else None
 
 
+# A long session's whole transcript (952 messages for 0abe9bde) takes the
+# Gateway well over the default 10s RPC bound to serialize.
+ORPHAN_HISTORY_TIMEOUT_S = 60
+
+
 async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
-                          chat_id: str, stub_id: str) -> None:
+                          chat_id: str, stub_id: str, *, wait: bool = True) -> str:
     """Finish one orphaned reply stub from its run in the transcript. A run
     still going is waited for on the pushed settle (`sessions.changed`), not
-    on a timer; a run that relay or proactive delivery claims meanwhile is
-    theirs, and they write into this same stub."""
+    on a timer, or with `wait=False` reported as "wait"; a run that relay or
+    proactive delivery claims meanwhile is theirs, and they write into this
+    same stub. Returns "done", "wait" or "skip"."""
     from open_webui.models.chats import Chats
     waiting = False
     while True:
@@ -6575,16 +6582,17 @@ async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
         msgs = ((chat.chat or {}).get("history") or {}).get("messages") or {} if chat else {}
         stub = msgs.get(stub_id) or {}
         if stub.get("role") != "assistant" or stub.get("done") is not False:
-            return  # gone or finished meanwhile
+            return "skip"  # gone or finished meanwhile
         if await _owui_chat_has_live_task(chat_id):
-            return  # a live request owns it
+            return "skip"  # a live request owns it
         session_key = _owui_session_key(agent_id, chat.user_id, chat_id)
         changed = conn.session_change_event(session_key)
         try:
-            hist = await conn.session_history(session_key, limit=RUN_HISTORY_LIMIT)
+            hist = await conn.session_history(session_key, limit=RUN_HISTORY_LIMIT,
+                                              timeout=ORPHAN_HISTORY_TIMEOUT_S)
         except Exception as ex:
-            pipe_log(f"  orphan stub {stub_id[:8]}...: chat.history failed: {ex}")
-            return
+            pipe_log(f"  orphan stub {stub_id[:8]}...: chat.history failed: {ex!r}")
+            return "skip"
         parent = msgs.get(stub.get("parentId")) or {}
         user_text = _coerce_text(parent.get("content")) if parent.get("role") == "user" else ""
         turn = _stub_turn(hist, stub_id, user_text, _owui_message_ts(stub))
@@ -6592,9 +6600,11 @@ async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
             break  # no run to wait for, or it is over
         active = await _session_list_active(conn, session_key)
         if active is None:
-            return
+            return "skip"
         if not active:
             break
+        if not wait:
+            return "wait"
         if not waiting:
             waiting = True
             pipe_log(f"  orphan stub {stub_id[:8]}... in chat {chat_id[:8]}...: "
@@ -6626,14 +6636,23 @@ async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
         chat = await Chats.get_chat_by_id(chat_id)
         msgs = ((chat.chat or {}).get("history") or {}).get("messages") or {} if chat else {}
         if (msgs.get(stub_id) or {}).get("done") is not False:
-            return
-        if run_id:
-            claim = f"{session_key}:{run_id}"
+            return "skip"
+        claim = f"{session_key}:{run_id}" if run_id else None
+        if claim:
             if claim in conn._delivered_proactive:
-                return  # live relay or proactive delivery owns this run
+                return "skip"  # live relay or proactive delivery owns this run
             conn._delivered_proactive[claim] = True
+        # Open WebUI answers None, logging nothing, when the write fails (its
+        # transaction raised and was rolled back).
+        if await Chats.upsert_message_to_chat_by_id_and_message_id(
+                chat_id, stub_id, fields) is None:
+            if claim:
+                conn._delivered_proactive.pop(claim, None)
+            pipe_log(f"  orphan stub {stub_id[:8]}... in chat {chat_id[:8]}...: "
+                     "Open WebUI did not save the write (ELI-90)")
+            return "skip"
+        if run_id:
             conn.mark_delivered_live(session_key, run_id)
-        await Chats.upsert_message_to_chat_by_id_and_message_id(chat_id, stub_id, fields)
     if output is not None:
         await _relay_emit_event(chat.user_id, chat_id, stub_id,
                                 {"type": "chat:completion", "data": {"output": output}})
@@ -6648,6 +6667,7 @@ async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
         how = "no run in the transcript, note written"
     pipe_log(f"  orphan stub {stub_id[:8]}... in chat {chat_id[:8]}...: {how} "
              f"({len(text)} chars, {cards} tool card(s)) (ELI-90)")
+    return "done"
 
 
 async def _orphan_stub_ids(prefixes: list[str]) -> list[tuple[str, str]]:
@@ -6686,15 +6706,25 @@ async def _reconcile_orphan_stubs(valves_getter) -> None:
     if stubs:
         pipe_log(f"  orphan stub reconcile: {len(stubs)} unfinished OpenClaw "
                  "repl(y/ies) in Open WebUI")
+    # One at a time: Open WebUI's SQLite rejected most of 45 concurrent chat
+    # writes (2026-10-12). Only a stub whose run is still going gets its own
+    # task, to wait for that run's settle.
+    counts: dict = {}
     for chat_id, stub_id in stubs:
-        spawn_background(_reconcile_stub_logged(conn, agent_id, chat_id, stub_id))
+        status = await _reconcile_stub_logged(conn, agent_id, chat_id, stub_id, wait=False)
+        counts[status] = counts.get(status, 0) + 1
+        if status == "wait":
+            spawn_background(_reconcile_stub_logged(conn, agent_id, chat_id, stub_id))
+    if stubs:
+        pipe_log(f"  orphan stub reconcile: {counts}")
 
 
-async def _reconcile_stub_logged(conn, agent_id, chat_id, stub_id) -> None:
+async def _reconcile_stub_logged(conn, agent_id, chat_id, stub_id, *, wait=True) -> str:
     try:
-        await _reconcile_stub(conn, agent_id, chat_id, stub_id)
+        return await _reconcile_stub(conn, agent_id, chat_id, stub_id, wait=wait)
     except Exception as ex:
-        pipe_log(f"  orphan stub {stub_id[:8]}... in chat {chat_id[:8]}...: reconcile failed: {ex}")
+        pipe_log(f"  orphan stub {stub_id[:8]}... in chat {chat_id[:8]}...: reconcile failed: {ex!r}")
+        return "failed"
 
 
 def _ensure_orphan_reconcile(valves_getter) -> None:

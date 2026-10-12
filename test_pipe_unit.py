@@ -1722,6 +1722,23 @@ class OrphanStubReconcileTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self._stub()["content"], "partial")
         self.assertIs(self._stub()["done"], True)
 
+    async def test_a_write_open_webui_refuses_is_not_claimed(self):
+        self.history, self.active = _turn_history(), False
+
+        async def refuse(chat_id, message_id, message):
+            return None
+        chats = self.modules["open_webui.models.chats"].Chats
+        with mock.patch.object(chats, "upsert_message_to_chat_by_id_and_message_id", refuse):
+            self.assertEqual(await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB), "skip")
+        self.assertNotIn(f"{self.sk}:{self.RUN}", self.conn._delivered_proactive,
+                         "proactive delivery must still be able to deliver it")
+        self.assertIs(self._stub()["done"], False)
+
+    async def test_without_wait_a_running_run_is_reported_not_awaited(self):
+        self.assertEqual(
+            await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB, wait=False), "wait")
+        self.assertIs(self._stub()["done"], False)
+
     async def test_a_reply_still_streaming_in_this_process_is_left_alone(self):
         self.history, self.active, self.live_task = _turn_history(), False, True
         await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB)
