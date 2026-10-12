@@ -411,7 +411,7 @@ manager re-runs at least three cases.
 **Rollback:**
 
 1. Revert the merge commit and redeploy main's previous artifact (install.py backs up the
-   live function before every deploy: `_backup_function`, install.py:375-388).
+   live function before every deploy: `backup_function`, install.py:377).
 2. Messages written by the new path are plain assistant messages with extra `meta` keys,
    which the old code reads as normal messages. No DB change needs undoing.
 3. The variant migration (section 4) is separate, applied only with its own backup, and
