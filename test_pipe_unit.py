@@ -7,6 +7,8 @@ import html
 import os
 import tempfile
 import textwrap
+import contextlib
+import copy
 import inspect
 import json
 import re
@@ -110,6 +112,17 @@ from openclaw_pipe import (
     _RelayState,
     _relay_content_is_showable,
     _relay_begin,
+    _relay_output_events,
+    _history_renderer,
+    _history_run_messages,
+    _stub_turn,
+    _history_user_run_id,
+    _reconcile_stub,
+    ORPHAN_STUB_NOTE,
+    _RelayState,
+    _relay_introduce,
+    _deliver_proactive_owui_message,
+    TOOL_ERROR_MARK,
     _relay_feed_event,
     _relay_finalize,
     _finalize_inline_message,
@@ -353,8 +366,10 @@ class ProactiveDeliveryFullTextTests(unittest.TestCase):
     def _deliver(self, conn, subagent=False):
         appended = []
 
-        async def fake_append(conn_, chat_id, text, *, log_prefix, out=None):
+        async def fake_append(conn_, chat_id, text, *, log_prefix, out=None,
+                              extra_fields=None, adopt=None):
             appended.append(text)
+            self.extra = extra_fields
             return True
 
         with mock.patch("openclaw_pipe._append_proactive_message_to_chat", fake_append), \
@@ -399,6 +414,22 @@ class ProactiveDeliveryFullTextTests(unittest.TestCase):
         # second read to complete it.
         conn = self._conn(preview_items=[{"role": "assistant", "text": "Done, all green."}])
         self.assertEqual(self._deliver(conn), ["*↳ Proactive message*\n\nDone, all green."])
+        conn.session_history.assert_awaited_once()
+
+    def test_a_run_that_used_tools_is_delivered_with_its_cards(self):
+        """ELI-92 (live 2026-10-12, chat 00a1ea65): a sub-agent's parent
+        resumed, ran Bash, and its reply was delivered after the fact as text
+        only. Its items are rebuilt from the same chat.history read."""
+        hist = _cli_history("run-1")
+        conn = self._conn(hist, preview_items=[{"role": "assistant",
+                                                "text": "Reading them. Found it."}])
+        appended = self._deliver(conn)
+        self.assertEqual(appended, ["*↳ Proactive message*\n\nReading them. Found it."])
+        output = self.extra["output"]
+        self.assertEqual([i["type"] for i in output],
+                         ["message", "function_call", "function_call_output", "message"])
+        self.assertTrue(output[0]["content"][0]["text"].startswith("*↳ Proactive message*"))
+        self.assertTrue(self.extra["done"])
         conn.session_history.assert_awaited_once()
 
     def test_sentinel_delivers_nothing(self):
@@ -1185,24 +1216,126 @@ class LiveRelayTests(unittest.TestCase):
         self.assertEqual(execs[0]["message_id"], old_leaf_id)
         self.assertIn("location.reload()", execs[0]["data"]["data"]["code"])
 
-        # Streamed live: post-introduce text goes out as append deltas (the
-        # introduce-time prefix rides the DB message the reloaded tab loads,
-        # not a duplicate append), a final full `replace` re-anchors the tab to
-        # the complete content, then a terminal chat:active false settles it.
-        appends = self._emitted(fake_sio, "message")
-        self.assertTrue(appends, "expected at least one append `message` event")
-        streamed = "".join(a["data"]["data"]["content"] for a in appends)
-        self.assertTrue(streamed, "append deltas should carry the post-introduce text")
+        # Streamed live as Responses events the tab folds into its `output`
+        # (the introduce-time prefix rides the DB message the reloaded tab
+        # loads, not a duplicate delta), a final `chat:completion` re-anchors
+        # the tab to the complete `output`, then chat:active false settles it.
+        live = [e["data"]["data"] for e in self._emitted(fake_sio, "response:completion")]
+        streamed = "".join(e["delta"] for e in live
+                           if e["type"] == "response.output_text.delta")
+        self.assertTrue(streamed, "deltas should carry the post-introduce text")
         self.assertTrue("Hello world".endswith(streamed))
-        replaces = self._emitted(fake_sio, "replace")
-        self.assertTrue(replaces, "expected a final `replace` snapshot")
-        self.assertEqual(replaces[-1]["data"]["data"]["content"], "Hello world")
+        finals = self._emitted(fake_sio, "chat:completion")
+        self.assertTrue(finals, "expected a final `chat:completion` snapshot")
+        output = finals[-1]["data"]["data"]["output"]
+        self.assertEqual([i["type"] for i in output], ["message"])
+        self.assertEqual(output[0]["content"][0]["text"], "Hello world")
+        self.assertEqual(output[0]["status"], "completed")
+        self.assertEqual(assistants[0]["output"], output, "DB and tab hold the same items")
         self.assertEqual(len(self._emitted(fake_sio, "chat:active")), 1)
 
         # Relay state cleaned up; run's proactive-dedup identity claimed so the
         # post-hoc path won't ALSO deliver it.
         self.assertEqual(conn._relay_sessions, {})
         self.assertIn(f"{sk}:run-1", conn._delivered_proactive)
+
+    def test_tool_calls_become_cards_live_and_in_the_db(self):
+        """ELI-92: a relayed run's tool calls are `function_call` and
+        `function_call_output` items, live and stored, not text."""
+        conn = self._conn()
+        sk = self._session_key()
+        modules, chat_state, fake_sio, _old = self._fakes()
+
+        def tool(phase, **data):
+            return {"sessionKey": sk, "runId": "run-t", "stream": "tool",
+                    "data": {"phase": phase, "name": "Bash", "toolCallId": "t1", **data}}
+
+        async def drive():
+            await _relay_begin(conn, sk, "run-t", self._evt(sk, "run-t", "Checking."))
+            await _relay_feed_event(conn, sk, "run-t", tool("start", args={"command": "ls"}))
+            await _relay_feed_event(conn, sk, "run-t", tool("result", result="a b"))
+            await _relay_feed_event(conn, sk, "run-t", self._evt(sk, "run-t", " Done."))
+            await _relay_feed_event(conn, sk, "run-t", self._evt(sk, "run-t", final=True))
+
+        with mock.patch.dict(sys.modules, modules):
+            asyncio.run(drive())
+
+        msg = [m for m in chat_state["history"]["messages"].values()
+               if m.get("role") == "assistant"][0]
+        self.assertEqual([i["type"] for i in msg["output"]],
+                         ["message", "function_call", "function_call_output", "message"])
+        call = msg["output"][1]
+        self.assertEqual((call["id"], call["name"], call["status"]), ("t1", "Bash", "completed"))
+        self.assertNotIn("call_id", call, "0.11.1 dedup: the call item carries no call_id")
+        self.assertEqual(msg["output"][2]["call_id"], "t1")
+        self.assertEqual(msg["content"], "Checking. Done.", "content is text only")
+        self.assertTrue(msg["done"])
+
+        live = [e["data"]["data"] for e in self._emitted(fake_sio, "response:completion")]
+        added = [(e["output_index"], e["item"]["type"]) for e in live
+                 if e["type"] == "response.output_item.added"]
+        self.assertIn((1, "function_call"), added)
+        self.assertIn((2, "function_call_output"), added)
+        self.assertIn((3, "message"), added)
+
+    def test_relay_that_lost_its_final_finishes_on_the_settle_push(self):
+        """ELI-88 (chat 2af17834, 19:15): the socket dropped, the relayed
+        run's final was among the lost events, and the bubble stayed cut off
+        with done=False. The settle push finalizes it from chat.history."""
+        conn = self._conn()
+        sk = self._session_key()
+        modules, chat_state, fake_sio, _old = self._fakes()
+        hist = _cli_history("run-g")
+
+        async def session_history(key, limit=0):
+            return hist
+
+        conn.session_history = session_history
+
+        async def drive():
+            await _relay_begin(conn, sk, "run-g", self._evt(sk, "run-g", "Reading them."))
+            conn._mark_event_gap()  # the final is lost with the socket
+            conn._on_sessions_changed({"sessionKey": sk, "hasActiveRun": False,
+                                       "reason": "chat.run.settled"})
+            for _ in range(50):
+                await asyncio.sleep(0)
+
+        with mock.patch.dict(sys.modules, modules):
+            asyncio.run(drive())
+
+        msg = [m for m in chat_state["history"]["messages"].values()
+               if m.get("role") == "assistant"][0]
+        self.assertTrue(msg["done"])
+        self.assertEqual(msg["content"], "Reading them. Found it.")
+        self.assertEqual([i["type"] for i in msg["output"]],
+                         ["message", "function_call", "function_call_output", "message"])
+        self.assertEqual(conn._relay_sessions, {})
+
+    def test_settle_push_does_not_end_a_relay_whose_run_is_still_going(self):
+        """A coalesced settle can trail the next run's start: without a
+        closing message in the transcript, only an idle read ends a relay."""
+        conn = self._conn()
+        sk = self._session_key()
+        modules, chat_state, fake_sio, _old = self._fakes()
+
+        async def session_history(key, limit=0):
+            return {"messages": []}
+
+        async def send_request(method, params, timeout=10):
+            return {"sessions": [{"key": sk, "hasActiveRun": True}]}
+
+        conn.session_history = session_history
+        conn.send_request = send_request
+
+        async def drive():
+            await _relay_begin(conn, sk, "run-h", self._evt(sk, "run-h", "Working."))
+            conn._on_sessions_changed({"sessionKey": sk, "hasActiveRun": False})
+            for _ in range(50):
+                await asyncio.sleep(0)
+
+        with mock.patch.dict(sys.modules, modules):
+            asyncio.run(drive())
+        self.assertIn(f"{sk}:run-h", conn._relay_sessions)
 
     def test_sentinel_only_run_never_introduces_a_bubble(self):
         conn = self._conn()
@@ -1246,40 +1379,518 @@ class LiveRelayTests(unittest.TestCase):
             await _relay_feed_event(conn, sk, run_id, self._evt(sk, run_id, final=True))
 
 
-class SubagentToolEventRoutingTests(unittest.TestCase):
-    """Documents, in the suite, why the drawer has no live tool-call watch.
+class SessionToolEventTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-92: tool activity of a run this connection did not start.
 
-    Measured against the live gateway 2026-07-30 with two device-signed
-    connections on one session key while a real turn ran 2 Bash calls:
+    Re-measured 2026-10-12 against the live gateway (gw_events_probe.py: an
+    observer subscribed with `sessions.messages.subscribe` while the CLI ran a
+    3-call claude-cli turn). The observer got 3 start + 3 result as
+    `session.tool` events, with the same payload as an `agent` tool event, and
+    no `agent` tool events. The connection that started the run gets them as
+    `agent` events. (The 2026-07-30 measurement that found no `session.tool`
+    family predates it.) So the reader folds `session.tool` into the `agent`
+    path and keeps the first copy of each (call, phase)."""
 
-      * the connection that STARTED the run    -> 4 `agent`/stream="tool" events
-      * a `sessions.messages.subscribe` observer -> 0 tool events
-        (it did receive 15 thinking + 5 assistant + lifecycle events, so the
-        subscription itself was live -- tool events specifically are withheld)
+    SK = _owui_session_key("main", "11111111-1111-1111-1111-111111111111",
+                           "22222222-2222-2222-2222-222222222222")
 
-    There is also no `session.tool` event family; an earlier attempt at this
-    feature subscribed for one and buffered nothing. Tool activity is `agent`
-    with payload.stream == "tool", phase start/result, which `_TurnRenderer`
-    already consumes for the pipe's OWN runs (see TurnRendererTests).
+    async def _run_loop(self, conn, frames):
+        frames = list(frames)
 
-    Consequence: the reader loop must NOT grow a branch that buffers another
-    session's tool events -- it would be dead code. Closing the gap needs the
-    Gateway to fan tool events out to session-message subscribers, or a new RPC.
-    """
+        class ScriptedWS:
+            async def recv(self_):
+                if frames:
+                    return json.dumps(frames.pop(0))
+                conn._stopped = True
+                raise asyncio.TimeoutError
 
-    def test_reader_loop_dispatches_only_agent_and_chat(self):
-        """The event filter is deliberately ("agent", "chat"). A third family
-        for tool watching would never fire, so nothing should add one."""
-        source = inspect.getsource(_GatewayConnection._event_loop)
-        self.assertIn('msg.get("event") not in ("agent", "chat")', source)
-        self.assertNotIn("session.tool\"", source)
+        conn._ws = ScriptedWS()
+        await conn._event_loop()
+        for _ in range(5):
+            await asyncio.sleep(0)
 
-    def test_no_live_tool_watch_surface_exists(self):
+    def _tool(self, event, phase, run_id="run-1"):
+        payload = {"runId": run_id, "sessionKey": self.SK, "stream": "tool",
+                   "data": {"phase": phase, "name": "Bash", "toolCallId": "t1",
+                            "args": {"command": "ls"}}}
+        if event == "session.tool":
+            payload["displayName"] = "session row fields ride along"
+        return {"type": "event", "event": event, "payload": payload}
+
+    async def test_session_tool_reaches_the_runs_consumer_as_a_tool_event(self):
         conn = _GatewayConnection(lambda: None)
-        for attr in ("watch_session_tools", "unwatch_session_tools",
-                     "live_tool_calls", "_feed_tool_watch"):
-            self.assertFalse(hasattr(conn, attr),
-                             f"{attr} is unreachable by design -- see class docstring")
+        q = conn.register_consumer(self.SK, "run-1")
+        await self._run_loop(conn, [self._tool("session.tool", "start")])
+        msg = q.get_nowait()
+        self.assertEqual(msg["event"], "agent")
+        self.assertEqual(msg["payload"]["data"]["toolCallId"], "t1")
+        self.assertNotIn("displayName", msg["payload"])
+
+    async def test_initiator_and_subscriber_copies_are_dispatched_once(self):
+        conn = _GatewayConnection(lambda: None)
+        q = conn.register_consumer(self.SK, "run-1")
+        await self._run_loop(conn, [
+            self._tool("agent", "start"), self._tool("session.tool", "start"),
+            self._tool("session.tool", "result"), self._tool("agent", "result"),
+        ])
+        phases = []
+        while not q.empty():
+            phases.append(q.get_nowait()["payload"]["data"]["phase"])
+        self.assertEqual(phases, ["start", "result"])
+
+    async def test_a_run_starting_in_an_owui_session_subscribes_its_transcript_once(self):
+        conn = _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"))
+        conn.send_request = mock.AsyncMock(return_value={})
+        started = {"type": "event", "event": "sessions.changed",
+                   "payload": {"sessionKey": self.SK, "hasActiveRun": True,
+                               "reason": "chat.run.started"}}
+        other = {"type": "event", "event": "sessions.changed",
+                 "payload": {"sessionKey": "agent:main:subagent:x", "hasActiveRun": True}}
+        await self._run_loop(conn, [started, started, other])
+        calls = [c.args for c in conn.send_request.await_args_list]
+        self.assertEqual(calls, [("sessions.messages.subscribe", {"key": self.SK})])
+
+    async def test_a_new_socket_renews_every_subscription(self):
+        conn = _GatewayConnection(lambda: None)
+        conn.send_request = mock.AsyncMock(return_value={})
+        conn._message_subscriptions = {self.SK}
+        conn._subscriptions_stale = True
+        await self._run_loop(conn, [])
+        calls = [c.args for c in conn.send_request.await_args_list]
+        self.assertEqual(calls, [("sessions.subscribe", {}),
+                                 ("sessions.messages.subscribe", {"key": self.SK})])
+        self.assertFalse(conn._subscriptions_stale)
+
+
+def _cli_history(run_id="run-9"):
+    """A run as claude-cli imports it into `chat.history` (shapes measured
+    2026-10-12 on session 0abe9bde): imported assistant messages with text /
+    toolcall / tool_result blocks, then the closing `cli-assistant:<runId>`
+    message that repeats all of the run's text."""
+    imported = {"importedFrom": "claude-cli"}
+    return {"messages": [
+        {"role": "user", "content": "earlier question"},
+        {"role": "assistant", "content": [{"type": "text", "text": "old answer"}],
+         "idempotencyKey": "cli-assistant:run-1"},
+        {"role": "user", "content": "check the logs"},
+        {"role": "assistant", "__openclaw": imported,
+         "content": [{"type": "text", "text": "Reading them."}]},
+        {"role": "assistant", "__openclaw": imported, "content": [
+            {"type": "toolcall", "id": "toolu_1", "name": "Bash",
+             "arguments": {"command": "tail log"}}]},
+        {"role": "assistant", "__openclaw": imported, "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "name": "Bash",
+             "content": [{"type": "text", "text": "ERROR x"}]}]},
+        {"role": "assistant", "__openclaw": imported,
+         "content": [{"type": "text", "text": " Found it."}]},
+        {"role": "assistant", "idempotencyKey": f"cli-assistant:{run_id}",
+         "content": [{"type": "text", "text": "Reading them. Found it."}]},
+    ]}
+
+
+class HistoryRunRebuildTests(unittest.TestCase):
+    """A run whose events were lost is rebuilt from `chat.history` into the
+    same `text` + `output` the live renderer would have produced."""
+
+    def test_run_slice_is_from_its_user_message_to_its_closing_message(self):
+        msgs = _history_run_messages(_cli_history(), "run-9")
+        self.assertEqual(len(msgs), 5)
+        self.assertEqual(msgs[-1]["idempotencyKey"], "cli-assistant:run-9")
+        self.assertIsNone(_history_run_messages(_cli_history(), "run-unknown"))
+
+    def test_rebuild_interleaves_text_and_cards_without_repeating_the_closing_text(self):
+        r = _history_renderer(_history_run_messages(_cli_history(), "run-9"))
+        self.assertEqual(r.text, "Reading them. Found it.")
+        self.assertEqual([i["type"] for i in r.output],
+                         ["message", "function_call", "function_call_output", "message"])
+        self.assertEqual(r.output[1]["arguments"], json.dumps({"command": "tail log"}))
+        self.assertEqual(r.output[2]["output"][0]["text"], "ERROR x")
+
+    def test_tool_free_reply_comes_from_the_closing_message(self):
+        r = _history_renderer(_history_run_messages(_cli_history(), "run-1"))
+        self.assertEqual(r.text, "old answer")
+        self.assertEqual([i["type"] for i in r.output], ["message"])
+
+
+def _turn_history(stub_id="stub-1", *, run="msg-c-stub-1-1.0", closed=True,
+                  text="check the logs", later=False):
+    """A turn as the Gateway stores a `chat.send` on claude-cli (measured
+    2026-10-12, session 1b877b13): the user message keyed `<runId>:user`,
+    the copy the runtime imports behind its metadata envelope, the imported
+    assistant messages, then the closing `cli-assistant:<runId>`."""
+    imported = {"importedFrom": "claude-cli"}
+    msgs = [
+        {"role": "user", "content": "earlier", "idempotencyKey": "msg-c-old-0.5:user"},
+        {"role": "assistant", "content": [{"type": "text", "text": "old"}],
+         "idempotencyKey": "cli-assistant:msg-c-old-0.5"},
+        {"role": "user", "content": text, "idempotencyKey": f"{run}:user"},
+        {"role": "user", "content": "Conversation info (untrusted metadata): {}\n\n" + text},
+        {"role": "assistant", "__openclaw": imported,
+         "content": [{"type": "text", "text": "Reading them."}]},
+        {"role": "assistant", "__openclaw": imported, "content": [
+            {"type": "toolcall", "id": "toolu_1", "name": "Bash",
+             "arguments": {"command": "tail log"}},
+            {"type": "tool_result", "tool_use_id": "toolu_1", "name": "Bash",
+             "content": [{"type": "text", "text": "ERROR x"}]}]},
+    ]
+    if closed:
+        msgs += [
+            {"role": "assistant", "__openclaw": imported,
+             "content": [{"type": "text", "text": " Found it."}]},
+            {"role": "assistant", "idempotencyKey": f"cli-assistant:{run}",
+             "content": [{"type": "text", "text": "Reading them. Found it."}]},
+        ]
+    if later:
+        msgs += [{"role": "user", "content": "next", "idempotencyKey": "msg-c-x-9.0:user"},
+                 {"role": "assistant", "content": [{"type": "text", "text": "later answer"}],
+                  "idempotencyKey": "cli-assistant:msg-c-x-9.0"}]
+    return {"messages": msgs}
+
+
+class StubTurnTests(unittest.TestCase):
+    """ELI-90: an orphaned reply stub is matched to its run in the transcript."""
+
+    def test_found_by_the_reply_id_inside_the_run_id(self):
+        turn = _stub_turn(_turn_history(), "stub-1", "some other text")
+        self.assertEqual(turn["run_id"], "msg-c-stub-1-1.0")
+        self.assertTrue(turn["closed"])
+        self.assertEqual(turn["messages"][-1]["idempotencyKey"], "cli-assistant:msg-c-stub-1-1.0")
+        r = _history_renderer(turn["messages"])
+        self.assertEqual(r.text, "Reading them. Found it.")
+        self.assertEqual(sum(1 for i in r.output if i["type"] == "function_call"), 1)
+
+    def test_older_run_ids_fall_back_to_the_user_text(self):
+        hist = _turn_history(run="msg-c-1.0")
+        self.assertEqual(_stub_turn(hist, "stub-1", "check the logs")["run_id"], "msg-c-1.0")
+        self.assertIsNone(_stub_turn(hist, "stub-1", "never sent"))
+
+    def test_open_turn_is_not_closed_until_the_transcript_says_so(self):
+        self.assertFalse(_stub_turn(_turn_history(closed=False), "stub-1", "")["closed"])
+        # A later turn means this one is over even without a closing message.
+        turn = _stub_turn(_turn_history(closed=False, later=True), "stub-1", "")
+        self.assertTrue(turn["closed"])
+        self.assertNotIn("later answer", json.dumps(turn["messages"]))
+
+    def test_a_repeated_text_matches_the_first_run_sent_after_the_stub(self):
+        hist = _turn_history(run="msg-c-100.5", text="works?")
+        hist["messages"] += [
+            {"role": "user", "content": "works?", "idempotencyKey": "msg-c-200.5:user"},
+            {"role": "assistant", "content": [{"type": "text", "text": "second"}],
+             "idempotencyKey": "cli-assistant:msg-c-200.5"}]
+        self.assertEqual(_stub_turn(hist, "s", "works?", 100.0)["run_id"], "msg-c-100.5")
+        self.assertEqual(_stub_turn(hist, "s", "works?", 199.0)["run_id"], "msg-c-200.5")
+        self.assertIsNone(_stub_turn(hist, "s", "works?", 300.0))
+        self.assertEqual(_stub_turn(hist, "s", "works?", 100.0)["by"], "text")
+
+    def test_the_imported_copy_of_the_user_message_starts_no_turn(self):
+        self.assertIsNone(_history_user_run_id(_turn_history()["messages"][3]))
+        self.assertEqual(_history_user_run_id(_turn_history()["messages"][2]), "msg-c-stub-1-1.0")
+
+
+class OrphanStubReconcileTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-90: replies an Open WebUI restart orphaned (empty, done=False
+    forever) are finished from the Gateway transcript, waiting for a run
+    still going on its pushed settle, never on a clock."""
+
+    USER = "11111111-1111-1111-1111-111111111111"
+    CHAT = "22222222-2222-2222-2222-222222222222"
+    STUB = "stub-1"
+    RUN = "msg-c-stub-1-1.0"
+
+    def setUp(self):
+        self.sk = _owui_session_key("main", self.USER, self.CHAT)
+        self.chat = {"history": {"currentId": self.STUB, "messages": {
+            "u1": {"role": "user", "content": "check the logs", "childrenIds": [self.STUB]},
+            self.STUB: {"role": "assistant", "content": "", "done": False,
+                        "parentId": "u1", "childrenIds": [], "model": "openclaw_gateway.m"},
+        }}}
+        self.history = _turn_history(closed=False)
+        self.active = True
+        self.live_task = False
+        test = self
+
+        class FakeChat:
+            def __init__(self):
+                self.chat, self.id, self.user_id = test.chat, test.CHAT, test.USER
+
+        class FakeChats:
+            @staticmethod
+            async def get_chat_by_id(chat_id):
+                return FakeChat()
+
+            @staticmethod
+            async def upsert_message_to_chat_by_id_and_message_id(chat_id, message_id, message):
+                msgs = test.chat["history"]["messages"]
+                msgs[message_id] = {**msgs.get(message_id, {}), **message}
+                test.chat["history"]["currentId"] = message_id
+                return FakeChat()
+
+        chats_mod = types.ModuleType("open_webui.models.chats")
+        chats_mod.Chats = FakeChats
+        socket_main = types.ModuleType("open_webui.socket.main")
+        self.sio = mock.AsyncMock()
+        socket_main.sio = self.sio
+        self.modules = {"open_webui": types.ModuleType("open_webui"),
+                        "open_webui.models": types.ModuleType("open_webui.models"),
+                        "open_webui.models.chats": chats_mod,
+                        "open_webui.socket": types.ModuleType("open_webui.socket"),
+                        "open_webui.socket.main": socket_main}
+        self.conn = _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"))
+
+        async def send_request(method, params, timeout=10):
+            if method == "chat.history":
+                return copy.deepcopy(test.history)
+            if method == "sessions.list":
+                return {"sessions": [{"key": test.sk, "hasActiveRun": test.active}]}
+            raise AssertionError(method)
+        self.conn.send_request = send_request
+
+        async def live(chat_id):
+            return test.live_task
+        patches = [mock.patch.dict(sys.modules, self.modules),
+                   mock.patch("openclaw_pipe._owui_chat_has_live_task", live)]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    @staticmethod
+    async def _spin():
+        for _ in range(50):
+            await asyncio.sleep(0)
+
+    def _stub(self):
+        return self.chat["history"]["messages"][self.STUB]
+
+    def _emits(self, kind):
+        return [c.args[1]["data"] for c in self.sio.emit.await_args_list
+                if c.args[0] == "events" and c.args[1]["data"]["type"] == kind]
+
+    async def test_a_finished_run_fills_its_stub_with_text_and_cards(self):
+        self.history, self.active = _turn_history(), False
+        await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB)
+        stub = self._stub()
+        self.assertIs(stub["done"], True)
+        self.assertEqual(stub["content"], "Reading them. Found it.")
+        self.assertEqual([i["type"] for i in stub["output"]],
+                         ["message", "function_call", "function_call_output", "message"])
+        self.assertEqual(self.chat["history"]["currentId"], self.STUB, "no new message")
+        self.assertEqual(self._emits("chat:completion")[-1]["data"]["output"], stub["output"])
+        self.assertEqual(len(self._emits("chat:active")), 1)
+        self.assertIn(f"{self.sk}:{self.RUN}", self.conn._delivered_proactive,
+                      "proactive delivery must not deliver the run a second time")
+
+    async def test_a_running_run_is_finished_on_the_pushed_settle(self):
+        task = asyncio.create_task(_reconcile_stub(self.conn, "main", self.CHAT, self.STUB))
+        await self._spin()
+        self.assertFalse(task.done(), "must wait for the run, not finish a partial")
+        self.assertIs(self._stub()["done"], False)
+        # Unrelated change for the same session: re-reads, still running.
+        self.conn._on_sessions_changed({"sessionKey": self.sk, "hasActiveRun": True})
+        await self._spin()
+        self.assertFalse(task.done())
+        self.history, self.active = _turn_history(), False
+        self.conn._on_sessions_changed({"sessionKey": self.sk, "hasActiveRun": False})
+        await self._spin()
+        self.assertTrue(task.done())
+        self.assertEqual(self._stub()["content"], "Reading them. Found it.")
+        self.assertIs(self._stub()["done"], True)
+
+    async def test_a_message_that_never_reached_the_gateway_gets_an_honest_note(self):
+        self.history, self.active = {"messages": []}, False
+        await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB)
+        self.assertIs(self._stub()["done"], True)
+        self.assertEqual(self._stub()["content"], ORPHAN_STUB_NOTE)
+
+    async def test_content_a_stub_already_shows_is_not_replaced_on_a_text_match(self):
+        self.history, self.active = _turn_history(run="msg-c-1.0"), False
+        self._stub()["content"] = "what streamed before"
+        await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB)
+        self.assertIs(self._stub()["done"], True)
+        self.assertEqual(self._stub()["content"], "what streamed before")
+        self.assertNotIn("output", self._stub())
+
+    async def test_content_is_replaced_when_the_run_matches_by_identity(self):
+        self.history, self.active = _turn_history(), False
+        self._stub()["content"] = "Reading th"
+        await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB)
+        self.assertEqual(self._stub()["content"], "Reading them. Found it.")
+
+    async def test_a_stub_with_content_and_no_run_is_closed_as_is(self):
+        self.history, self.active = {"messages": []}, False
+        self._stub()["content"] = "partial"
+        await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB)
+        self.assertEqual(self._stub()["content"], "partial")
+        self.assertIs(self._stub()["done"], True)
+
+    async def test_a_write_open_webui_refuses_is_not_claimed(self):
+        self.history, self.active = _turn_history(), False
+
+        async def refuse(chat_id, message_id, message):
+            return None
+        chats = self.modules["open_webui.models.chats"].Chats
+        with mock.patch.object(chats, "upsert_message_to_chat_by_id_and_message_id", refuse):
+            self.assertEqual(await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB), "skip")
+        self.assertNotIn(f"{self.sk}:{self.RUN}", self.conn._delivered_proactive,
+                         "proactive delivery must still be able to deliver it")
+        self.assertIs(self._stub()["done"], False)
+
+    async def test_without_wait_a_running_run_is_reported_not_awaited(self):
+        self.assertEqual(
+            await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB, wait=False), "wait")
+        self.assertIs(self._stub()["done"], False)
+
+    async def test_a_reply_still_streaming_in_this_process_is_left_alone(self):
+        self.history, self.active, self.live_task = _turn_history(), False, True
+        await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB)
+        self.assertIs(self._stub()["done"], False)
+        self.assertEqual(self.sio.emit.await_count, 0)
+
+    async def test_a_run_relay_already_claimed_is_left_to_the_relay(self):
+        self.history, self.active = _turn_history(), False
+        self.conn._delivered_proactive[f"{self.sk}:{self.RUN}"] = True
+        await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB)
+        self.assertIs(self._stub()["done"], False)
+
+    async def test_relay_of_the_stubs_own_run_writes_into_the_stub(self):
+        state = _RelayState(session_key=self.sk, run_id=self.RUN, user_id=self.USER,
+                            chat_id=self.CHAT, renderer=_TurnRenderer())
+        self.conn._relay_sessions[f"{self.sk}:{self.RUN}"] = state
+        state.renderer.feed({"stream": "assistant", "data": {"delta": " Found"}})
+        self.assertTrue(await _relay_introduce(self.conn, state))
+        self.assertEqual(state.message_id, self.STUB)
+        self.assertTrue(state.adopted)
+        self.assertEqual(set(self.chat["history"]["messages"]), {"u1", self.STUB})
+        # Seeded from the transcript: the part before the restart is there.
+        self.assertTrue(self._stub()["content"].startswith("Reading them."))
+        self.history = _turn_history()
+        await _relay_finalize(self.conn, state)
+        self.assertEqual(self._stub()["content"], "Reading them. Found it.")
+        self.assertIs(self._stub()["done"], True)
+
+    async def test_relay_adopts_its_stub_that_a_graceful_stop_closed(self):
+        """2026-10-12 run 3: `ha apps restart` cancelled the reply and Open
+        WebUI saved it done=True with 2 of the run's cards; the relay then
+        added a second bubble with the rest."""
+        prior = [_tool_call_started_event("Bash", "toolu_0", "{}")["item"]]
+        self._stub().update(done=True, output=prior)
+        # Mid-run, claude-cli's transcript holds only the user message.
+        self.history = {"messages": _turn_history(closed=False)["messages"][:4]}
+        state = _RelayState(session_key=self.sk, run_id=self.RUN, user_id=self.USER,
+                            chat_id=self.CHAT, renderer=_TurnRenderer())
+        self.conn._relay_sessions[f"{self.sk}:{self.RUN}"] = state
+        state.renderer.feed({"stream": "assistant", "data": {"delta": "tail"}})
+        self.assertTrue(await _relay_introduce(self.conn, state))
+        self.assertEqual(state.message_id, self.STUB)
+        self.assertEqual(set(self.chat["history"]["messages"]), {"u1", self.STUB})
+        self.assertEqual(self._stub()["output"][0]["id"], "toolu_0",
+                         "what the stub showed stays until the run closes")
+        self.assertIs(self._stub()["done"], False)
+        self.history = _turn_history()
+        await _relay_finalize(self.conn, state)
+        self.assertEqual(self._stub()["content"], "Reading them. Found it.")
+        self.assertIs(self._stub()["done"], True)
+
+    async def test_a_closed_stub_matched_only_by_text_is_not_adopted(self):
+        self._stub()["done"] = True
+        self.history = _turn_history(run="msg-c-1.0")
+        state = _RelayState(session_key=self.sk, run_id="msg-c-1.0", user_id=self.USER,
+                            chat_id=self.CHAT, renderer=_TurnRenderer())
+        self.conn._relay_sessions[f"{self.sk}:msg-c-1.0"] = state
+        state.renderer.feed({"stream": "assistant", "data": {"delta": "Wake reply"}})
+        self.assertTrue(await _relay_introduce(self.conn, state))
+        self.assertNotEqual(state.message_id, self.STUB)
+
+    async def test_relay_of_another_run_appends_and_leaves_the_stub(self):
+        state = _RelayState(session_key=self.sk, run_id="announce:x", user_id=self.USER,
+                            chat_id=self.CHAT, renderer=_TurnRenderer())
+        self.conn._relay_sessions[f"{self.sk}:announce:x"] = state
+        state.renderer.feed({"stream": "assistant", "data": {"delta": "Wake reply"}})
+        self.assertTrue(await _relay_introduce(self.conn, state))
+        self.assertNotEqual(state.message_id, self.STUB)
+        self.assertFalse(state.adopted)
+        self.assertIs(self._stub()["done"], False)
+
+    async def test_proactive_delivery_of_the_stubs_run_is_unlabeled_in_the_stub(self):
+        self.history, self.active = _turn_history(), False
+        await _deliver_proactive_owui_message(self.conn, self.sk, self.RUN)
+        self.assertEqual(set(self.chat["history"]["messages"]), {"u1", self.STUB})
+        self.assertEqual(self._stub()["content"], "Reading them. Found it.")
+        self.assertNotIn("Proactive", json.dumps(self._stub()))
+        self.assertEqual(sum(1 for i in self._stub()["output"] if i["type"] == "function_call"), 1)
+
+
+class RelayOutputEventTests(unittest.TestCase):
+    """`_relay_output_events`: the Responses events that take the tab's
+    `message.output` from what it holds to the renderer's current items."""
+
+    @staticmethod
+    def _msg(mid, text):
+        return {"type": "message", "id": mid, "status": "in_progress", "role": "assistant",
+                "content": [{"type": "output_text", "text": text}]}
+
+    def test_new_message_is_added_empty_then_filled_by_a_delta(self):
+        evs = _relay_output_events([], [self._msg("m1", "Hi")])
+        self.assertEqual([e["type"] for e in evs],
+                         ["response.output_item.added", "response.output_text.delta"])
+        self.assertEqual(evs[0]["output_index"], 0)
+        self.assertEqual(evs[0]["item"]["content"][0]["text"], "")
+        self.assertEqual((evs[1]["item_id"], evs[1]["delta"]), ("m1", "Hi"))
+
+    def test_grown_text_is_only_the_new_part(self):
+        evs = _relay_output_events([self._msg("m1", "Hi")], [self._msg("m1", "Hi there")])
+        self.assertEqual([(e["type"], e.get("delta")) for e in evs],
+                         [("response.output_text.delta", " there")])
+
+    def test_changed_tool_item_is_replaced_and_new_items_are_indexed(self):
+        call = {"type": "function_call", "id": "t1", "name": "Bash", "status": "in_progress"}
+        done = {**call, "status": "completed"}
+        out = {"type": "function_call_output", "id": "fco_t1", "call_id": "t1"}
+        evs = _relay_output_events([self._msg("m1", "a"), call],
+                                   [self._msg("m1", "a"), done, out])
+        self.assertEqual([(e["type"], e["output_index"]) for e in evs],
+                         [("response.output_item.done", 1), ("response.output_item.added", 2)])
+
+    def test_nothing_changed_sends_nothing(self):
+        same = [self._msg("m1", "a")]
+        self.assertEqual(_relay_output_events(same, copy.deepcopy(same)), [])
+
+
+class TurnRendererOutputTests(unittest.TestCase):
+    """The renderer keeps the run as OWUI 0.12 stores a reply: text-only
+    `text` and Responses `output` items (ELI-92)."""
+
+    def test_text_and_tools_interleave_as_items(self):
+        r = _TurnRenderer()
+        r.feed({"stream": "assistant", "data": {"delta": "Looking."}})
+        r.feed({"stream": "tool", "data": {"phase": "start", "name": "Read",
+                                           "toolCallId": "t1", "args": {"p": 1}}})
+        r.feed({"stream": "tool", "data": {"phase": "result", "name": "Read",
+                                           "toolCallId": "t1", "result": "x"}})
+        r.feed({"stream": "tool", "data": {"phase": "result", "name": "Read",
+                                           "toolCallId": "t1", "result": "x"}})
+        r.feed({"stream": "assistant", "data": {"delta": " Found it."}})
+        self.assertEqual([i["type"] for i in r.output],
+                         ["message", "function_call", "function_call_output", "message"])
+        self.assertEqual(r.text, "Looking. Found it.")
+        self.assertEqual(r.output[1]["status"], "completed")
+        self.assertEqual(r.output[1]["arguments"], json.dumps({"p": 1}))
+
+    def test_failed_call_is_marked_and_explained(self):
+        r = _TurnRenderer()
+        r.feed({"stream": "tool", "data": {"phase": "result", "name": "Bash",
+                                           "toolCallId": "t2", "result": "boom",
+                                           "isError": True}})
+        self.assertEqual(r.output[0]["name"], f"Bash {TOOL_ERROR_MARK}")
+        self.assertIn("tool call failed", r.output[1]["output"][0]["text"])
+
+    def test_finished_output_completes_open_items_without_touching_the_live_copy(self):
+        r = _TurnRenderer()
+        r.feed({"stream": "assistant", "data": {"delta": "Hi"}})
+        r.feed({"stream": "tool", "data": {"phase": "start", "name": "Bash",
+                                           "toolCallId": "t3", "args": {}}})
+        done = r.finished_output()
+        self.assertEqual({i["status"] for i in done}, {"completed"})
+        self.assertEqual(r.output[1]["status"], "in_progress")
 
 
 class ThinkingNoteAnnouncementTests(unittest.TestCase):
@@ -1871,7 +2482,9 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.conn._ws = object()
         self.sent = []
         self.rpc = []
+        self.aborts = []
         self.active = False
+        self.runtime = None
         n = {"run": 0}
 
         async def send_request(method, params, timeout=10):
@@ -1880,8 +2493,12 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
                 n["run"] += 1
                 self.sent.append(params.get("message"))
                 return {"runId": f"run-{n['run']}"}
+            if method == "chat.abort":
+                self.aborts.append(params)
+                return {"aborted": True}
             if method == "sessions.describe":
-                return {"session": {"status": "running" if self.active else "done"}}
+                return {"session": {"status": "running" if self.active else "done",
+                                    "agentRuntime": {"id": self.runtime}}}
             if method == "sessions.list":
                 return {"sessions": [{"key": self.SK, "hasActiveRun": self.active}]}
             return {}
@@ -1960,6 +2577,134 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         while want not in out:
             out += await asyncio.wait_for(gen.__anext__(), 2)
         return out
+
+    @staticmethod
+    async def _spin():
+        """Let every ready task run until it blocks. No clock involved."""
+        for _ in range(50):
+            await asyncio.sleep(0)
+
+    def _settled(self, active):
+        self.active = active
+        self.conn._on_sessions_changed({
+            "sessionKey": self.SK, "hasActiveRun": active,
+            "reason": "chat.run.started" if active else "chat.run.settled"})
+
+    async def test_message_waits_for_the_pushed_settle_not_a_timer(self):
+        """ELI-88 (2026-10-12, chat 0abe9bde): a message sent while a
+        73-minute claude-cli run was going sat in the pipe's queue until the
+        queue's 30-minute ceiling released it into the still-running run; the
+        Gateway queued it there and claude-cli dropped it. It must wait until
+        the Gateway pushes that the run settled, however long that is, re-read
+        once per pushed change (no polling), then send once."""
+        self.active = True
+        gen = self._reply("hello", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._spin()
+        self.assertEqual(self.sent, [])
+        self.assertTrue(any("Queued: waiting" in str(e) for e in self.emitted))
+        reads = self.rpc.count("sessions.describe")
+
+        await self._spin()
+        self.assertEqual(self.rpc.count("sessions.describe"), reads, "nothing pushed, nothing read")
+
+        self._settled(True)  # the run moves on, still busy
+        await self._spin()
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.rpc.count("sessions.describe"), reads + 1)
+
+        self._settled(False)
+        await self._until_registered("run-1")
+        self.assertEqual(self.sent, ["hello"])
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "hi there"))
+        q.put_nowait(self._final("run-1"))
+        out = await asyncio.wait_for(first, 2)
+        async for chunk in gen:
+            out += chunk if isinstance(chunk, str) else ""
+        self.assertIn("hi there", out)
+
+    async def test_a_reply_that_saw_its_run_end_leaves_no_parity_target(self):
+        """The inline loop ends on `lifecycle end` and drops its consumer; the
+        run's trailing `chat` final arrives after that. Measured live
+        2026-10-12: every normal turn then ran the parity finalize ("inline
+        turn ended early") and rewrote the message OWUI was about to save."""
+        gen = self._reply("hello", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "hi"))
+        q.put_nowait({"type": "event", "event": "agent", "payload": {
+            "sessionKey": self.SK, "runId": "run-1", "stream": "lifecycle",
+            "data": {"phase": "end"}}})
+        await asyncio.wait_for(first, 2)
+        async for _ in gen:
+            pass
+        self.assertNotIn(f"{self.SK}:run-1", self.conn._run_targets)
+        self.assertTrue(self.conn.was_delivered_live(self.SK, "run-1"))
+
+    async def test_a_socket_gap_makes_the_waiter_read_again(self):
+        """The settle can be among the events lost while the socket was down,
+        so a gap wakes every waiter to re-read the state."""
+        self.active = True
+        gen = self._reply("hello", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._spin()
+        self.assertEqual(self.sent, [])
+        self.active = False  # settled while the socket was down: never pushed
+        self.conn._mark_event_gap()
+        await self._until_registered("run-1")
+        self.assertEqual(self.sent, ["hello"])
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "hi"))
+        q.put_nowait(self._final("run-1"))
+        await asyncio.wait_for(first, 2)
+        async for _ in gen:
+            pass
+
+    async def test_claude_cli_message_queued_behind_a_new_run_is_taken_back_and_resent(self):
+        """The race the old 2-second settle window papered over: a run starts
+        (a sub-agent's parent resuming) between the idle read and the send.
+        The Gateway acks "started" but queues the message, which shows as a
+        lone empty final. On claude-cli a queued turn fails when it drains
+        ("no active tool authority snapshot"), so the pipe takes it back with
+        chat.abort on that runId, waits for the settle, and sends it again."""
+        self.runtime = "claude-cli"
+        gen = self._reply("hello", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        self.active = True  # the resume won the race
+        self._queue("run-1").put_nowait(self._final("run-1"))
+        await self._spin()
+        self.assertEqual(self.aborts, [{"sessionKey": self.SK, "runId": "run-1"}])
+        self.assertEqual(self.sent, ["hello"], "not resent while the run is going")
+
+        self._settled(False)
+        await self._until_registered("run-2")
+        self.assertEqual(self.sent, ["hello", "hello"])
+        q = self._queue("run-2")
+        q.put_nowait(self._delta("run-2", "answer"))
+        q.put_nowait(self._final("run-2"))
+        out = await asyncio.wait_for(first, 2)
+        async for chunk in gen:
+            out += chunk if isinstance(chunk, str) else ""
+        self.assertIn("answer", out)
+        self.assertEqual(len(self.aborts), 1)
+
+    async def test_api_runtime_steered_message_is_not_taken_back(self):
+        """An API runtime takes a mid-run message into the live run (it has
+        an injection hook), so a lone empty final there is not a lost message."""
+        self.runtime = "openai"
+        gen = self._reply("hello", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        self._queue("run-1").put_nowait(self._final("run-1"))
+        with contextlib.suppress(StopAsyncIteration):
+            await asyncio.wait_for(first, 2)
+            async for _ in gen:
+                pass
+        self.assertEqual(self.aborts, [])
+        self.assertEqual(self.sent, ["hello"])
 
     def _whole(self, run_id, text):
         # claude-cli closes a turn with a catch-all carrying the WHOLE reply.
@@ -3004,8 +3749,11 @@ class ParityFinalizeTests(unittest.TestCase):
         self._run_with_fake_chats(conn, sk, "run-1", chat_state)
 
         msg = chat_state["history"]["messages"]["asst-1"]
-        self.assertIn("Full answer text.", msg["content"])
-        self.assertIn('<details type="tool_calls"', msg["content"])
+        # OWUI 0.12 draws the message from `output`; `content` is text only.
+        self.assertEqual(msg["content"], "Full answer text.")
+        self.assertEqual([i["type"] for i in msg["output"]],
+                         ["message", "function_call", "function_call_output"])
+        self.assertEqual(msg["output"][1]["id"], "t1")
         self.assertTrue(msg["done"])
         # target cleaned up
         self.assertNotIn(f"{sk}:run-1", conn._run_targets)
@@ -6029,6 +6777,22 @@ class ConnectionEpochTests(unittest.IsolatedAsyncioTestCase):
             await conn._reconnect()
 
         self.assertEqual(conn.connection_epoch, 1)
+
+    async def test_socket_accepts_gateway_frames_over_one_mib(self):
+        """2026-10-12: websockets' default 1 MiB frame cap made the client
+        close the whole Gateway connection (1009) on a 3.1 MB `chat.history`
+        reply, dropping every session's events (repro_ws_max_size.py)."""
+        conn = self._conn()
+        seen = {}
+
+        async def fake_connect(_url, **kw):
+            seen.update(kw)
+            return _HandshakeWS()
+
+        with mock.patch.object(websockets, "connect", fake_connect, create=True), \
+                mock.patch("openclaw_pipe._sign_challenge", lambda *a, **k: {}):
+            await conn._connect_and_start()
+        self.assertGreaterEqual(seen.get("max_size") or 0, 16 * 1024 * 1024)
 
     async def test_reconnect_to_the_same_gateway_is_not_a_restart(self):
         """2026-10-12: a 1s WebSocket drop (same Gateway, same bootId) was
