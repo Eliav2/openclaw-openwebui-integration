@@ -82,7 +82,7 @@ from openclaw_pipe import (
     ACTION_RUN_PREFIX, TURN_NS, _run_id_sent_at, parse_pipe_run_id, pipe_run_id, turn_message_id,
     _claim_turn_message, _register_turn_writer, _retire_turn_writer,
     MAX_TURN_RESUMES, next_continuation, turn_owner,
-    active_run_from_history, recovery_source_run, run_message_id,
+    recovery_source_run, run_message_id,
     _GatewayConnection,
     GatewayError,
     _is_restart_signature,
@@ -7739,6 +7739,22 @@ class OomResumeLoopTest(unittest.TestCase):
         self.assertEqual(MAX_TURN_RESUMES, 3)
         self.assertEqual(decisions, ["resume", "resume", "resume", "finalize"])
 
+    def test_no_resume_while_a_recovery_holds_the_session(self):
+        """Manager note 2 / M3-crash: main's resume, sent while recovery
+        f2445aa8 ran, was queued as a follow-up and failed as 04351f67
+        ("Reply operation has no active tool authority snapshot"). A row
+        whose session has an active run never gets a resume, whatever R's
+        own error: the decision is taken again on that run's settle."""
+        oom = "Claude Code process exited with code 143"
+        self.assertEqual(next_continuation({"status": "running", "hasActiveRun": True}, False, 0),
+                         "gateway")
+        for status in ("failed", "killed"):
+            with self.subTest(status):
+                row = {"status": status, "lastRunError": oom, "hasActiveRun": True}
+                self.assertEqual(next_continuation(row, True, 0), "wait")
+        settled = {"status": "failed", "lastRunError": oom, "hasActiveRun": False}
+        self.assertEqual(next_continuation(settled, False, 0), "resume")
+
     def test_the_gateway_and_nobody_cases_never_spend_the_budget(self):
         self.assertEqual(next_continuation(_row("running"), False, 0), "gateway")
         self.assertEqual(next_continuation(_row("killed", aborted=True), False, 0), "finalize")
@@ -7855,10 +7871,25 @@ class RecoveryLinkTests(unittest.TestCase):
         self.assertEqual(run_message_id(self.KEY, self.CHAT, other, self.history()),
                          turn_message_id(self.KEY, other, self.CHAT))
 
-    def test_the_active_run_is_the_newest_admitted_turn_without_a_close(self):
-        self.assertEqual(active_run_from_history(self.history(closed=False)), self.REC)
-        self.assertIsNone(active_run_from_history(self.history(closed=True)))
-        self.assertIsNone(active_run_from_history([]))
+    def test_the_transcript_cannot_name_the_active_run(self):
+        """Why no message is opened from the transcript (manager note 1): a
+        queued follow-up runs with NO transcript turn (M3-crash: 04351f67 ran
+        after recovery f2445aa8 and left nothing, checked live). So 'run R
+        still active' and 'R failed unclosed, queued follow-up F active' are
+        the same transcript. The writer opens a snapshot session's message on
+        the run's first event, which carries its runId, and never guesses."""
+        r_active = [self.user(self.SRC), {"role": "assistant", "content": [{"type": "toolcall"}]}]
+        r_failed_then_f_active = copy.deepcopy(r_active)  # F leaves no trace while it runs
+        self.assertEqual(r_active, r_failed_then_f_active)
+        self.assertFalse(hasattr(openclaw_pipe, "active_run_from_history"),
+                         "no transcript inference of the active run")
+
+    def test_a_queued_follow_up_never_takes_the_recoverys_message(self):
+        """04351f67 has no admitted turn, so rule E cannot call it a recovery:
+        it maps to its own (agent-turn) id, never into M."""
+        f = "04351f67-dbc3-4533-b2aa-2a0d88d79da0"
+        self.assertIsNone(recovery_source_run(self.history(), f))
+        self.assertNotEqual(run_message_id(self.KEY, self.CHAT, f, self.history()), self.M)
 
 
 if __name__ == "__main__":

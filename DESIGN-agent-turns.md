@@ -169,14 +169,14 @@ only their `chat final` and `phase:"end"`. So the start push is not enough on it
      `hasActiveRun: true` but no `activeRunIds`.** The function omits `runIds` whenever
      the session has an embedded run state (`session-active-runs-BURU1M8_.mjs:90`). So the
      guarantee is "the session has an active run", not its id. The pipe records the session
-     as active-unknown and gets the id from one of two places:
-     * the run's first event that carries `runId` (`chat` deltas and finals reach every
-       connection; the M3 watcher saw other sessions' finals);
-     * `chat.history`, where the run's admitted `<id>:user` turn is persisted when the run
-       is admitted. The newest such turn with no `cli-assistant:<id>` closing turn is the
-       active run. In the crash window, `f2445aa8:user` carried the recovery provenance.
-
-     Rule E then maps that id to M.
+     as active-unknown and opens the run's message on the run's first event, which carries
+     its `runId`: `chat` deltas and finals reach every connection (the M3 watcher saw
+     other sessions' finals). Rule E then maps that id to M.
+   * **No inference from the transcript (manager note 1).** A queued follow-up runs with no
+     transcript turn at all: `04351f67` ran after recovery `f2445aa8` and left nothing,
+     checked live. "Run R still active" and "R failed unclosed, and a queued follow-up F
+     is active" therefore produce the same transcript. The pipe does not guess, so nothing
+     is opened before the first event (`test_the_transcript_cannot_name_the_active_run`).
 3. **A run that ended before the list** (for example a short recovery) is covered by the
    ended-while-away rule, case 4: the session's `updatedAt` is newer than the chat's
    `updated_at`, so `chat.history` is read, and every closed `cli-assistant:<R>` without a
@@ -421,6 +421,13 @@ already persisted as terminal, and the Gateway recovers only rows that are `runn
 cannot be both. A resume run is an ordinary run, so if it is cut too, the same table applies
 to it. If a crash then cuts the resume run, the recovery's prior turn is
 `msg-<chat>-<M>-resume-<t>`, which rule E maps to M.
+
+**Never into a busy session (manager note 2).** If the session has an active run
+(`hasActiveRun: true`), no resume is sent, whatever R's own error was. `next_continuation`
+returns `wait`, and the decision is taken again on that run's settle. A resume sent into a busy
+session is queued as a follow-up, and after a restart recovery such a follow-up fails ("Reply
+operation has no active tool authority snapshot", `04351f67`). That is the failure main hit
+(`test_no_resume_while_a_recovery_holds_the_session`).
 
 **When the resume is sent.** At once, on the classifying row. If `chat.send` is
 refused (the Gateway is closing, the socket is gone), the resume stays on R's entry and is

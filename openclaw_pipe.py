@@ -431,12 +431,18 @@ def turn_owner(row: dict, stop_notice_before: bool = False) -> str:
 
 def next_continuation(row: dict, stop_notice_before: bool, resumes_so_far: int) -> str:
     """What the writer of M does when its run settles: `gateway` (keep M open
-    for the recovery run), `resume` (send msg-<chat>-<M>-resume-<t>), or
-    `finalize`. The resume budget is counted on M, so a resume that is cut
-    the same way again (an OOM loop) ends after MAX_TURN_RESUMES."""
+    for the recovery run), `wait` (another run holds the session: send
+    nothing, decide again on its settle), `resume` (send
+    msg-<chat>-<M>-resume-<t>), or `finalize`. A resume sent into a busy
+    session is queued as a follow-up, and after a restart recovery that
+    follow-up fails (M3-crash 04351f67), so a session with an active run
+    never gets one. The budget is counted on M, so a resume that is cut the
+    same way again (an OOM loop) ends after MAX_TURN_RESUMES."""
     owner = turn_owner(row, stop_notice_before)
     if owner == "gateway":
         return "gateway"
+    if (row or {}).get("hasActiveRun"):
+        return "wait"
     if owner == "pipe" and resumes_so_far < MAX_TURN_RESUMES:
         return "resume"
     return "finalize"
@@ -491,18 +497,6 @@ def run_message_id(session_key: str, chat_id: str, run_id: str, messages: list |
     recovery (rule E), else its own (turn_message_id)."""
     source = recovery_source_run(messages, run_id) if messages else None
     return turn_message_id(session_key, source or run_id, chat_id)
-
-
-def active_run_from_history(messages: list) -> str | None:
-    """The run still going on a session whose snapshot gave no run ids: the
-    newest admitted turn, if its run has no closing `cli-assistant:` turn.
-    Runs on one session are sequential, so only the newest can be open; an
-    interrupted older run never closes and is not active."""
-    turns = _history_user_turns(messages)
-    if not turns:
-        return None
-    newest = turns[-1][0]
-    return None if newest in _history_closed_runs(messages) else newest
 
 
 # --- thinking --------------------------------------------------------------
