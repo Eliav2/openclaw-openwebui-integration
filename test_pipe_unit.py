@@ -6842,6 +6842,7 @@ class InlineEndSignalTests(unittest.IsolatedAsyncioTestCase):
                 a, b = params["model"].split("/", 1)
                 return {"resolved": {"modelProvider": a, "model": b}}
             if method == "chat.send":
+                test.consumers_at_send = list(test.conn._consumers)
                 return {"runId": params["idempotencyKey"], "status": "started"}
             if method == "chat.history":
                 return copy.deepcopy(test.history)
@@ -6947,6 +6948,12 @@ class InlineEndSignalTests(unittest.IsolatedAsyncioTestCase):
         await _turn_resync(self.conn)
         text = await self.ended()
         self.assertIn("After it.", text)
+
+    async def test_the_reply_listens_before_it_sends(self):
+        """Review 2af1 R12: a run's first events can arrive before chat.send
+        returns. With no consumer yet they went to the turn writer, which took
+        the reply's message over while the reply still streamed."""
+        self.assertEqual(self.consumers_at_send, [f"{self.sk}:{self.run}"])
 
     def test_no_silence_timer_is_left_in_the_inline_loop(self):
         src = inspect.getsource(openclaw_pipe.Pipe._pipe_turn)

@@ -8657,6 +8657,12 @@ class Pipe:
                     if conn.should_announce_thinking_note(session_key, thinking_note):
                         pending_clamp_note = f"_{thinking_note}_\n\n"
                         yield pending_clamp_note
+                # Listen before sending: the run's first events can arrive
+                # before chat.send returns, and with no consumer they would go
+                # to the turn writer, which takes this reply's message over
+                # while the reply still streams (review 2af1 R12). The run id
+                # is the idempotency key.
+                queue = conn.register_consumer(session_key, idempotency_key)
                 try:
                     send_resp = await conn.send_request(
                         "chat.send",
@@ -8672,17 +8678,21 @@ class Pipe:
                         timeout=30
                     )
                 except asyncio.TimeoutError:
+                    conn.unregister_consumer(session_key, idempotency_key, queue=queue)
                     await _emit_status(__event_emitter__, "", done=True)
                     yield "**Timeout:** Gateway did not respond to chat.send"
                     return
                 except Exception as e:
+                    conn.unregister_consumer(session_key, idempotency_key, queue=queue)
                     await _emit_status(__event_emitter__, "", done=True)
                     yield f"**Error sending message:** {e}"
                     return
-                our_run_id = send_resp.get("runId", "unknown")
+                our_run_id = send_resp.get("runId") or idempotency_key
                 self._current_run_id = our_run_id
                 pipe_log(f"Captured runId: {our_run_id}")
-                queue = conn.register_consumer(session_key, our_run_id)
+                if our_run_id != idempotency_key:
+                    conn.unregister_consumer(session_key, idempotency_key, queue=queue)
+                    queue = conn.register_consumer(session_key, our_run_id)
                 sent_texts = list(turn.unsent)
                 turn.unsent = []
                 turn.run_id = our_run_id
