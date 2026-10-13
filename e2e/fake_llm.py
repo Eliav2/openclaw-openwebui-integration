@@ -27,6 +27,8 @@ that is offered: from OpenClaw 2026.10 most tools are deferred behind
 `tool_search` / `tool_call` and only a core set is sent as real schemas.
 * `E2E_SLOW TOKEN`                     -> replies `TOKEN slow-1 ... slow-10`, one
   word a second, so a turn can be queued behind a run that is still going.
+  `E2E_SLOW:<n> TOKEN` sends n words instead of 10 (a run that outlasts an
+  Open WebUI stop).
 * anything else                        -> `E2E fake model reply.`
 
 Replies stream word by word so the streaming path sees several deltas.
@@ -50,7 +52,7 @@ LOG_PATH = os.environ.get("FAKE_LLM_LOG", "")
 PREFERRED_TOOLS = ("session_status", "sessions_list", "memory_search")
 
 _EXACTLY = re.compile(r"exactly:?\s+([A-Za-z0-9_]{3,})")
-_SLOW = re.compile(r"E2E_SLOW\s+([A-Za-z0-9_]{3,})")
+_SLOW = re.compile(r"E2E_SLOW(?::(\d{1,3}))?\s+([A-Za-z0-9_]{3,})")
 SLOW_WORDS = 10
 
 
@@ -117,8 +119,9 @@ def plan_reply(body: dict) -> dict:
 
     m = _SLOW.search(user_text)
     if m:
-        words = " ".join(f"slow-{i}" for i in range(1, SLOW_WORDS + 1))
-        return {"text": f"{m.group(1)} {words}", "delay": 1.0}
+        count = int(m.group(1) or SLOW_WORDS)
+        words = " ".join(f"slow-{i}" for i in range(1, count + 1))
+        return {"text": f"{m.group(2)} {words}", "delay": 1.0}
     m = _EXACTLY.search(user_text)
     if m:
         return {"text": m.group(1)}

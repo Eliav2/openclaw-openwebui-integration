@@ -201,6 +201,25 @@ class EndedWhileDownTests(unittest.IsolatedAsyncioTestCase):
         await self.startup()
         self.assertNotIn(M, [mid for mid, _ in self.writes], "the ELI-90 pass owns done:false")
 
+    async def test_a_recovery_that_closed_while_down_lands_in_the_interrupted_reply(self):
+        """Rule E: the Gateway restarted mid-run (RUN has no closer) and its
+        recovery closed while Open WebUI was down. Both spans go into M."""
+        hist = _turn_history(run=RUN, closed=False)
+        rec = "rec-1"
+        hist["messages"] += [
+            {"role": "user", "content": "[System] continue", "idempotencyKey": f"{rec}:user",
+             "provenance": {"kind": "internal_system", "sourceTool": "main_session_restart_recovery"}},
+            {"role": "assistant", "__openclaw": {"importedFrom": "claude-cli"},
+             "content": [{"type": "text", "text": "Found it."}]},
+            {"role": "assistant", "idempotencyKey": f"cli-assistant:{rec}", "timestamp": CLOSED_MS,
+             "content": [{"type": "text", "text": "Found it."}]}]
+        self.history = hist
+        await self.startup()
+        m = self.msg()
+        self.assertEqual(_cards(m.get("output")), 1, "the interrupted run's card")
+        self.assertIn("Found it.", m["content"], "the recovery's text")
+        self.assertEqual(set(self.chat["history"]["messages"]), {"u1", M})
+
     async def test_a_missing_chat_is_skipped(self):
         self.row["key"] = _owui_session_key("main", USER, "55555555-5555-5555-5555-555555555555")
         await self.startup()

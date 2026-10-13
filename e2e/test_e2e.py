@@ -346,3 +346,86 @@ def test_a_message_queued_behind_a_wake_does_not_cut_it(token):
         f"the wake was cut by the queued turn: {json.dumps(wake)[:1500]}")
     assert "E2E_QUEUED_REPLY" not in wake[0]["content"]
     _assert_clean(token, chat_id, msgs)
+
+
+# ── A run that ends while Open WebUI is stopped (ELI-94) ─────────────────────
+# Keep this last: it stops and starts the Open WebUI container. A graceful stop
+# cancels the request streaming the reply and saves the message done:true with
+# what it had. The run goes on in the Gateway and closes while Open WebUI is
+# down. On the next start the reply must hold the whole run.
+
+import shutil  # noqa: E402
+
+DOWN_RUN_WORDS = 40
+
+
+def _session_row(key: str) -> dict:
+    rows = _gw("sessions.list", {"search": key[-36:], "limit": 10}).get("sessions") or []
+    return next((r for r in rows if r.get("key") == key), {})
+
+
+def _until(what: str, check, timeout_s: float = WAKE_TIMEOUT_S, every_s: float = 1.0):
+    """Poll `check` (a real state read) until it returns a truthy value."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        got = check()
+        if got:
+            return got
+        time.sleep(every_s)
+    pytest.fail(f"timed out after {timeout_s:.0f}s waiting for {what}")
+
+
+def _owui_up() -> bool:
+    try:
+        with urllib.request.urlopen(BASE + "/health", timeout=5) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(shutil.which("docker") is None, reason="needs the e2e stack's Open WebUI container")
+def test_a_reply_whose_run_ends_while_owui_is_stopped_is_completed_on_start(token):
+    now = int(time.time())
+    uid, aid = str(uuid.uuid4()), str(uuid.uuid4())
+    prompt = f"E2E_SLOW:{DOWN_RUN_WORDS} E2E_DOWN"
+    user = {"id": uid, "parentId": None, "childrenIds": [aid], "role": "user",
+            "content": prompt, "timestamp": now, "models": [DEFAULT_MODEL]}
+    assistant = {"id": aid, "parentId": uid, "childrenIds": [], "role": "assistant",
+                 "content": "", "model": DEFAULT_MODEL, "timestamp": now, "done": False}
+    chat = {"title": "E2E down", "models": [DEFAULT_MODEL],
+            "history": {"messages": {uid: user, aid: assistant}, "currentId": aid},
+            "messages": [user, assistant], "files": [], "tags": [], "timestamp": now * 1000}
+    status, created = _request("POST", "/api/v1/chats/new", {"chat": chat}, token)
+    assert status == 200, created
+    chat_id = created["id"]
+    key = _session_key(token, chat_id)
+    status, ack = _request("POST", "/api/chat/completions", {
+        "model": DEFAULT_MODEL, "messages": [{"role": "user", "content": prompt}],
+        "stream": True, "chat_id": chat_id, "id": aid, "session_id": f"e2e-{uuid.uuid4().hex[:8]}",
+        "parent_id": uid, "user_message": user}, token)
+    assert status == 200, ack
+
+    # Stop Open WebUI while the run streams (the Gateway's own state says so).
+    _until("the run to start", lambda: _session_row(key).get("hasActiveRun"))
+    subprocess.run(["docker", "stop", "-t", "30", "owui"], check=True, capture_output=True)
+    assert _session_row(key).get("hasActiveRun"), (
+        f"the run ended before Open WebUI was down; raise DOWN_RUN_WORDS ({DOWN_RUN_WORDS})")
+    # The run closes while Open WebUI is down.
+    _until("the run to end", lambda: not _session_row(key).get("hasActiveRun"), timeout_s=120)
+    subprocess.run(["docker", "start", "owui"], check=True, capture_output=True)
+    _until("Open WebUI to come back", _owui_up, timeout_s=300, every_s=2)
+
+    # The precondition this test is about: the stop saved a partial, finished reply.
+    before = _chat_messages(token, chat_id)[aid]
+    assert before.get("done") is True and f"slow-{DOWN_RUN_WORDS}" not in (before.get("content") or ""), (
+        f"precondition: Open WebUI's stop should leave a partial done:true reply: {json.dumps(before)[:1500]}")
+
+    # The first model listing after a start runs the startup reconcile.
+    status, _models = _request("GET", "/api/models", token=token)
+    assert status == 200
+    msgs = _wait_for(token, chat_id, [f"slow-{DOWN_RUN_WORDS}"])
+    holders = [k for k, m in msgs.items() if f"slow-{DOWN_RUN_WORDS}" in (m.get("content") or "")]
+    assert holders == [aid], f"the end of the run went to {holders}, not the reply {aid}"
+    assert msgs[aid]["content"].strip().startswith("E2E_DOWN slow-1"), msgs[aid]["content"][:300]
+    assert [k for k, m in msgs.items() if m.get("role") == "assistant"] == [aid], "a second reply"
+    _assert_clean(token, chat_id, msgs)
