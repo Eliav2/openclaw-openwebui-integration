@@ -6100,6 +6100,28 @@ class AgentTurnRoutingTests(_RoutingCase):
         (_mid, m), = self.new_messages().items()
         self.assertIs(m["done"], False, "the recovery still runs: M stays open for it")
 
+    async def test_handover_keeps_the_requests_start_with_no_transcript(self):
+        """Review 2af1 Strong5: the transcript rebuilds the full text and hid a
+        dropped shadow renderer. With no transcript only the renderer can
+        supply what the request already showed."""
+        run = pipe_run_id(self.CHAT, self.STUB)
+        self.add_stub(self.STUB, content="Reading them.")
+        self.conn.register_run_target(self.key, run, self.CHAT, self.STUB)
+        self.conn._run_renderers[f"{self.key}:{run}"].feed(_delta("Reading them."))
+        self.assertTrue(await self.dispatch(run, _tool("start", tcid="toolu_1")))
+        await self.spin()
+        await self.dispatch(run, _tool("result", tcid="toolu_1"))
+        await self.dispatch(run, _delta(" Found it."))
+        await self.dispatch(run, {"state": "final"})
+        self.history = {"messages": []}
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "done", "lastRunId": run})
+        await self.spin()
+        self.assertEqual(self.new_messages().keys(), {self.STUB}, "no second message")
+        m = self.owui.msgs()[self.STUB]
+        self.assertIs(m["done"], True)
+        self.assertEqual(m["content"], "Reading them. Found it.")
+
     async def test_handover_an_inline_reply_that_ends_early_continues_in_its_own_message(self):
         run = pipe_run_id(self.CHAT, self.STUB)
         self.add_stub(self.STUB, content="Reading them.")
@@ -6261,12 +6283,20 @@ class RegressionPlanTests(_RoutingCase):
                         _tool("result", tcid="toolu_1"), _delta(" Found it."), {"state": "final"}):
             for conn in (self.conn, other):
                 self.assertTrue(await _turn_route_event(conn, self.ev(self.RUN, payload)))
+        await self.spin()
+        # The deterministic uuid5 gives one message even if both wrote it:
+        # count the writers' own effects (review 2af1, Strong2).
+        n_tasks = len(self.owui.tasks)
+        n_intro = len(self.owui.events("chat:messages"))
         for conn in (self.conn, other):
             conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
                                        "status": "done", "lastRunId": self.RUN})
         await self.spin()
         (_mid, m), = self.new_messages().items()
         self.assertEqual((m["content"], m["done"], self.cards(m)), ("Reading them. Found it.", True, 1))
+        self.assertEqual(n_tasks, 1, "one Open WebUI task: only one connection writes M")
+        self.assertEqual(n_intro, 1, "M introduced once")
+        self.assertEqual(len(self.owui.events("chat:completion")), 1, "M finalized once")
 
     async def test_tool_cards_from_the_transcript(self):
         """ToolCardsFromTranscriptTest: events after the first tool call were
@@ -6346,12 +6376,27 @@ class RegressionPlanTests(_RoutingCase):
 
     async def test_owner_rule_crash_sends_no_resume(self):
         """No terminal ever arrives; after hello the session is active (the
-        recovery runs): nothing is sent and M stays open."""
-        self.sent_send = []
+        recovery runs): nothing is sent and M stays open. The fake answers
+        sessions.list with the crash-time row and accepts chat.send, so a pipe
+        that ignored the active snapshot would reach the owner rule and resume
+        (review 2af1, Strong4: the old fake raised, and the pipe swallowed it)."""
+        row = {"key": self.key, "status": "running", "hasActiveRun": True}
+        inner = self.conn.send_request
+
+        async def send_request(method, params, timeout=10):
+            if method == "sessions.list":
+                self.sent.append((method, params))
+                return {"sessions": [row]}
+            if method == "chat.send":
+                self.sent.append((method, params))
+                return {"runId": params["idempotencyKey"], "status": "started"}
+            return await inner(method, params, timeout)
+        self.conn.send_request = send_request
         await _turn_route_event(self.conn, self.ev(self.RUN, _delta("Reading them.")))
         self.conn.active_run_snapshot = {self.key: []}
         await _turn_after_hello(self.conn)
         await self.spin()
+        self.assertNotIn("sessions.list", [m for m, _ in self.sent], "the active snapshot is honoured")
         self.assertNotIn("chat.send", [m for m, _ in self.sent])
         (_mid, m), = self.new_messages().items()
         self.assertIs(m["done"], False)
