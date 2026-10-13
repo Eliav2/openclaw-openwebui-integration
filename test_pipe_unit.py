@@ -6697,13 +6697,14 @@ class InlineOwnerRuleTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SessionIdRunTests(_RoutingCase):
-    """Live 2026-10-13 02:54-03:13Z, chat 0abe9bde. A pipe-started run's inline
-    reply M closed done:true, but the claude-cli turn kept working (a background
-    task). Once the Gateway run ends its chat-run link is gone, so the CLI's
-    later tool events carry the bare internal run id, which is the sessionId
-    (server-chat-CbnqM5f6.mjs:794 `chatLink?.clientRunId ?? evt.runId`). The
-    writer keyed them as a run of their own: new message uuid5(key:sessionId),
-    and the session was already settled, so no settle ever ended it."""
+    """Live 2026-10-13, chat 0abe9bde, pipe 62b9927. A cron wake into the
+    session ran 03:02:39-03:26:39Z. The cron executor runs it with
+    runId = sessionId (run-executor.runtime-ro-4Z0fM.mjs:499), and the row kept
+    hasActiveRun:false the whole time. The writer opened 96b8c998 =
+    uuid5(key:sessionId). At 03:13:46Z a manager message queued behind the wake
+    pushed a settle row (hasActiveRun:false, lastRunId = the previous user
+    turn), which ended the wake's writer 13 minutes early. Its later events hit
+    "held by another writer" and were lost."""
 
     SID = "ad9e461b-724a-4797-9b3f-befa1090e36b"
     M = "7c5fe99c-cb51-4f24-90ca-1fd2bc78ae28"
@@ -6713,26 +6714,36 @@ class SessionIdRunTests(_RoutingCase):
         self.R = pipe_run_id(self.CHAT, self.M)
         self.add_stub(self.M, content="Deploying in the background.", done=True)
         self.conn.mark_delivered_live(self.key, self.R)
-        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
-                                        "status": "done", "lastRunId": self.R,
-                                        "sessionId": self.SID, "reason": "chat.run.settled"})
-        await self.spin()
+        self.history = {"messages": []}
 
     def sid_ev(self, payload):
         return {"sessionKey": self.key, "runId": self.SID, "sessionId": self.SID, **payload}
 
-    async def test_a_session_id_is_never_a_run(self):
-        await _turn_route_event(self.conn, self.sid_ev(_tool("start", tcid="toolu_7")))
-        await _turn_route_event(self.conn, self.sid_ev(_tool("result", tcid="toolu_7")))
-        await self.spin()
-        self.assertNotIn(turn_message_id(self.key, self.SID, self.CHAT), self.owui.msgs(),
-                         "a writer keyed by the sessionId opened a message of its own")
-        self.assertFalse([k for k in self.conn._turn_pumps if k[1] == self.SID])
+    def new_messages(self):
+        return {k: v for k, v in super().new_messages().items() if k != self.M}
 
-    async def test_no_message_is_left_generating(self):
-        await _turn_route_event(self.conn, self.sid_ev(_tool("start", tcid="toolu_7")))
-        await _turn_route_event(self.conn, self.sid_ev(_tool("result", tcid="toolu_7")))
+    async def test_another_runs_settle_row_does_not_end_the_wake(self):
+        await _turn_route_event(self.conn, self.sid_ev(_delta("Reruns all passed.")))
         await self.spin()
-        open_ = [k for k, m in self.new_messages().items()
-                 if m.get("role") == "assistant" and m.get("done") is False]
-        self.assertEqual(open_, [], "a continuation with no run of its own has no terminal")
+        # The queued user message's row: idle, and naming another run.
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "done", "lastRunId": self.R})
+        await self.spin()
+        await _turn_route_event(self.conn, self.sid_ev(_delta(" Tests written.")))
+        await _turn_route_event(self.conn, self.sid_ev({"state": "final"}))
+        await self.spin()
+        (mid, m), = self.new_messages().items()
+        self.assertIs(m["done"], True)
+        self.assertEqual(m["content"], "Reruns all passed. Tests written.",
+                         "the wake's tail after a foreign settle row was lost")
+
+    async def test_two_cron_wakes_get_two_messages(self):
+        for text in ("First wake.", "Second wake."):
+            await _turn_route_event(self.conn, self.sid_ev(_delta(text)))
+            await _turn_route_event(self.conn, self.sid_ev({"state": "final"}))
+            self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                            "status": "done", "lastRunId": self.SID})
+            await self.spin()
+        texts = sorted(m["content"] for m in self.new_messages().values())
+        self.assertEqual(texts, ["First wake.", "Second wake."],
+                         "runId == sessionId is not unique per run: the second wake reused the first message")
