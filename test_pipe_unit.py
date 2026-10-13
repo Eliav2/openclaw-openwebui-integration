@@ -5351,6 +5351,59 @@ class ExitTextFixtureTest(unittest.TestCase):
                          "re-extract with scripts/extract_openclaw_exit_errors.py --write")
 
 
+class CronPromptFixtureTest(unittest.TestCase):
+    """ELI-103: a wake is found by its admitted user turn's TEXT, the prefix
+    `[cron:<jobId> <name>]`; the turn has no structured cron field. The
+    fixture holds the exact dist lines that build it; this test renders them
+    and, when the dist is installed here, fails if they have changed."""
+
+    FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "test_fixture_openclaw_cron_prompt.json")
+    DIST = ExitTextFixtureTest.DIST
+    JOB = "1542eaee-50d8-4583-8d9b-d28bb12e0145"
+
+    def setUp(self):
+        self.fx = json.load(open(self.FIXTURE))
+
+    def render(self, name, message, time_line="Current time: x"):
+        base = re.search(r"`([^`]*)`", self.fx["base"]["source"]).group(1)
+        base = (base.replace("${input.job.id}", self.JOB).replace("${input.job.name}", name)
+                .replace("${message}", message)).strip()
+        body = re.search(r"`([^`]*)`", self.fx["command_body"]["source"]).group(1)
+        self.assertNotIn("${", body.replace("${base}", "").replace("${timeLine}", ""), body)
+        return body.replace("${base}", base).replace("\\n", "\n").replace("${timeLine}", time_line)
+
+    def turn(self, text):
+        return {"role": "user", "content": text, "idempotencyKey": "turn-1:user", "timestamp": 5}
+
+    def test_a_rendered_wake_prompt_is_a_wake_turn_of_its_job(self):
+        for name in ("eli103-wake", "nightly digest (v2)"):
+            with self.subTest(name):
+                got = wake_turns([self.turn(self.render(name, "Check the queue."))])
+                self.assertEqual([t["job"] for t in got], [self.JOB])
+
+    def test_the_text_seen_live_is_a_wake_turn(self):
+        for label, text in self.fx["observed_turn_texts"].items():
+            with self.subTest(label):
+                self.assertEqual([t["job"] for t in wake_turns([self.turn(text)])], [self.JOB])
+
+    def test_the_installed_dist_still_has_the_fixture_lines(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
+        try:
+            from extract_openclaw_cron_prompt import extract
+        finally:
+            sys.path.pop(0)
+        if not os.path.isdir(self.DIST):
+            self.skipTest(f"no OpenClaw dist at {self.DIST}")
+        got = extract(self.DIST)
+        self.assertIsNotNone(got, "the cron prompt lines are gone from the dist: re-check wake_turns")
+        for part in ("base", "command_body"):
+            self.assertEqual(got[part]["source"], self.fx[part]["source"],
+                             f"OpenClaw {got['openclaw_version']} changed the cron prompt "
+                             f"(fixture: {self.fx['openclaw_version']}); re-check _CRON_PROMPT_RE, "
+                             "then re-extract with scripts/extract_openclaw_cron_prompt.py --write")
+
+
 class OomResumeLoopTest(unittest.TestCase):
     """A claude child is the first OOM victim (oom_score_adj 1000). A resume
     that is OOM-killed again must not loop: the budget is counted on M."""

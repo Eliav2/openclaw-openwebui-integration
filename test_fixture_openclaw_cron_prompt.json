@@ -1,0 +1,15 @@
+{
+ "observed_turn_texts": {
+  "probe_eli103_wake_events_2026-10-13": "[cron:1542eaee-50d8-4583-8d9b-d28bb12e0145 eli103-wake-events-c9b9bb78] This is a test. Use the Bash tool 4 times, one call at a time"
+ },
+ "openclaw_version": "2026.9.3",
+ "file": "isolated-agent-C_VaOV3U.mjs",
+ "base": {
+  "line": 1066,
+  "source": "const base = `[cron:${input.job.id} ${input.job.name}] ${message}`.trim();"
+ },
+ "command_body": {
+  "line": 1085,
+  "source": "} else commandBody = `${base}\\n${timeLine}`.trim();"
+ }
+}
