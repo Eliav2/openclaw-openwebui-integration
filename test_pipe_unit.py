@@ -6936,6 +6936,59 @@ class HandoverRewriteTests(_RoutingCase):
         self.assertIs(m["done"], True)
         self.assertEqual(m["content"], "Let me ask. Blue it is.")
 
+    # Known gap of PR #20: the card for an answered prompt was a rewrite the
+    # inline reply kept in the Open WebUI process. After an Open WebUI restart
+    # the writer rebuilt M from the transcript and showed the raw prompt. The
+    # transcript holds both halves: the prompt ends the question run's text,
+    # and the answer is the answer run's own user turn.
+
+    def card_answer(self, content):
+        hit = re.search(r'<details type="tool_calls" done="true" id="ask-user-[0-9a-f]+" '
+                        r'name="Ask User" arguments="([^"]*)" result="([^"]*)"', content)
+        return (html.unescape(hit.group(1)), html.unescape(hit.group(2))) if hit else None
+
+    async def test_after_an_owui_restart_an_answered_question_is_still_a_card(self):
+        run1 = pipe_run_id(self.CHAT, self.STUB)
+        run2 = pipe_run_id(self.CHAT, self.STUB, "input")
+        self.add_stub(self.STUB, content="Let me ask.\n")
+        self.history = {"messages": self.closed_run(run1, "Let me ask.\n" + self.PROMPT)
+                        + self.closed_run(run2, "Blue it is.", user="2. Blue")}
+        await self.dispatch(run2, _delta("Blue it is."))
+        await self.dispatch(run2, {"state": "final"})
+        await self.settle(run2)
+        m = self.owui.msgs()[self.STUB]
+        self.assertIs(m["done"], True)
+        self.assertNotIn("needs input", m["content"])
+        self.assertEqual(self.card_answer(m["content"]),
+                         ('{"question": "Color?\\nPick one\\n1. Red\\n2. Blue"}', "2. Blue"))
+        self.assertTrue(m["content"].startswith("Let me ask.\n"))
+        self.assertTrue(m["content"].endswith("Blue it is."))
+        self.assertNotIn("needs input", json.dumps(m["output"]))
+
+    async def test_a_card_the_reply_recorded_is_kept_as_it_was(self):
+        """In the same process the inline reply's own card (its id) stays."""
+        run1 = pipe_run_id(self.CHAT, self.STUB)
+        run2 = pipe_run_id(self.CHAT, self.STUB, "input")
+        self.add_stub(self.STUB, content="Let me ask.\n" + self.CARD)
+        self.conn.note_turn_rewrite(self.CHAT, self.STUB, self.PROMPT, self.CARD)
+        self.history = {"messages": self.closed_run(run1, "Let me ask.\n" + self.PROMPT)
+                        + self.closed_run(run2, "Blue it is.", user="2. Blue")}
+        await self.dispatch(run2, _delta("Blue it is."))
+        await self.dispatch(run2, {"state": "final"})
+        await self.settle(run2)
+        self.assertEqual(self.owui.msgs()[self.STUB]["content"], "Let me ask.\n" + self.CARD + "Blue it is.")
+
+    async def test_a_question_nobody_answered_shows_without_its_marker_line(self):
+        """An agent turn's prompt gets no modal from the writer: it shows as
+        the inline reply's fallback does, the question without the internal
+        directive line (the writer-side half of ELI-58)."""
+        self.history = {"messages": self.closed_run(self.RUN, "Before I go on:\n" + self.PROMPT)}
+        await self.dispatch(self.RUN, _delta("Before I go on:\n" + self.PROMPT))
+        await self.dispatch(self.RUN, {"state": "final"})
+        await self.settle(self.RUN)
+        (_mid, m), = self.new_messages().items()
+        self.assertEqual(m["content"], "Before I go on:\nColor?\nPick one\n1. Red\n2. Blue")
+
     async def test_a_routed_handover_keeps_the_turns_thinking_level(self):
         """R6: the handover that `_turn_route_event` makes (the request ended
         first) carries the level like `hand_over_run` does, so a resume keeps it."""
