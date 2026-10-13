@@ -249,3 +249,69 @@ def run_message_id(session_key: str, chat_id: str, run_id: str, messages: list |
     recovery (rule E), else its own (turn_message_id)."""
     source = recovery_source_run(messages, run_id) if messages else None
     return turn_message_id(session_key, source or run_id, chat_id)
+
+
+# ---------------------------------------------------------------------------
+# Cron wakes: one run id for every wake into a session (ELI-103)
+# ---------------------------------------------------------------------------
+# The cron executor runs a session wake with runId = the session's sessionId
+# (run-executor.runtime-ro-4Z0fM.mjs:499), so the id names no single wake.
+# What does: the wake's own admitted user turn, `<logicalTurnId>:user` with the
+# prompt `[cron:<jobId> <name>] ...` (isolated-agent-C_VaOV3U.mjs:1066) and no
+# provenance. On claude-cli it is committed before the CLI starts, so before
+# the wake's first event (cli-runner-9MSP9PU4.mjs:1370 awaits it ahead of
+# runCliRecovery). The next wake's turn is committed only once this wake's
+# execution has ended (session work admission). So the wake's turn is the
+# newest one committed at or before the event's `ts`. The run's closing
+# message is keyed `cli-assistant:<sessionId>` and deduplicated by that key
+# (session-accessor-CX17Bx59.mjs:3343-3347), so only the first wake into a
+# session ever gets one: never end or rebuild a wake from it.
+
+_CRON_PROMPT_RE = re.compile(r"^\[cron:(?P<job>[^\s\]]+)[\s\]]")
+
+
+def wake_turns(messages: list) -> list:
+    """[{key, at, job}] of the cron wake user turns, in transcript order: `key`
+    is the turn id (its `:user` key without the suffix), `at` its commit time
+    (`recordTimestampMs`), `job` the cron job id from its prompt."""
+    out = []
+    for m in messages or []:
+        key = _history_user_run_id(m)
+        if not key or parse_pipe_run_id(key) or m.get("provenance"):
+            continue
+        hit = _CRON_PROMPT_RE.match(((_history_item(m) or {}).get("text") or "").lstrip())
+        if not hit:
+            continue
+        meta = m.get("__openclaw") if isinstance(m.get("__openclaw"), dict) else {}
+        at = meta.get("recordTimestampMs") or m.get("timestamp")
+        out.append({"key": key, "at": at if isinstance(at, (int, float)) else None,
+                    "job": hit.group("job")})
+    return out
+
+
+def wake_turn_at(messages: list, at_ms: float, bound=frozenset()) -> dict | None:
+    """The wake whose event was emitted at `at_ms`: the newest wake turn
+    committed at or before it that no earlier wake on this session took
+    (`bound`). None while it is not committed yet (the embedded runtime writes
+    the user turn without awaiting it, embedded-agent-DNQn_PMM.mjs:5891): the
+    caller tries again on the wake's next event."""
+    for turn in reversed(wake_turns(messages)):
+        if turn["at"] is not None and turn["at"] <= at_ms:
+            return None if turn["key"] in bound else turn
+    return None
+
+
+def wake_span(messages: list, start_ms: float, end_ms: float) -> list:
+    """A wake's assistant messages: runs on one session are serialized, and
+    claude-cli imports its transcript stamped with the CLI's own times, so
+    everything the wake wrote lies between its turn's commit and its terminal.
+    A user turn queued meanwhile is committed inside that window too; it is
+    not the wake's and is left out."""
+    out = []
+    for m in messages or []:
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        ts = m.get("timestamp")
+        if isinstance(ts, (int, float)) and start_ms <= ts <= end_ms:
+            out.append(m)
+    return out

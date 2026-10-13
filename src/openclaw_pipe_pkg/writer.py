@@ -181,7 +181,7 @@ class _TurnWriter:
     def __init__(self, conn: "_GatewayConnection", *, session_key: str, chat_id: str,
                  user_id: str, run_id: str, message_id: str | None,
                  takeover: bool = False, renderer: "_TurnRenderer | None" = None,
-                 thinking: str | None = None):
+                 thinking: str | None = None, wake: dict | None = None):
         self.conn = conn
         self.session_key, self.chat_id, self.user_id = session_key, chat_id, user_id
         self.run_id, self.message_id = run_id, message_id
@@ -191,6 +191,9 @@ class _TurnWriter:
         self.renderer = renderer if renderer is not None else _TurnRenderer()
         # A user turn's level (ELI-85): its resume continues the same reply.
         self.thinking = thinking
+        # A cron wake (ELI-103): {key, at, job} of its turn, and `end` once its
+        # terminal arrived. Its transcript span is a time window, not a run id.
+        self.wake = wake
         self.opened = False
         self.task_id: str | None = None
         self.parent_id: str | None = None
@@ -394,13 +397,16 @@ class _TurnWriter:
             except Exception as ex:
                 hist = None
                 pipe_log(f"  turn writer: chat.history failed at the end: {ex!r}")
-            if hist:
-                self._adopt_recoveries_from(hist.get("messages") or [])
-            per_run = [_history_span_messages(hist, r) for r in self.runs] if hist else [None]
-            if all(m is not None for m in per_run):
-                rebuilt = _history_renderer([m for msgs in per_run for m in msgs])
-                if rebuilt.output:
-                    self.renderer = rebuilt
+            if self.wake is not None:
+                self._rebuild_wake(hist)
+            else:
+                if hist:
+                    self._adopt_recoveries_from(hist.get("messages") or [])
+                per_run = [_history_span_messages(hist, r) for r in self.runs] if hist else [None]
+                if all(m is not None for m in per_run):
+                    rebuilt = _history_renderer([m for msgs in per_run for m in msgs])
+                    if rebuilt.output:
+                        self.renderer = rebuilt
             if not self.opened:
                 if not (self._showable() or note) or not await self.open(takeover=self.takeover):
                     return
@@ -422,6 +428,19 @@ class _TurnWriter:
                      f"{tools} tool card(s), {len(self.runs)} run(s))")
         finally:
             self._done.set()
+
+    def _rebuild_wake(self, hist: dict | None) -> None:
+        """Repair lost events from the wake's window of the transcript. A wake
+        has no closing message to prove its span complete (only the first wake
+        into a session gets one), so the transcript replaces what streamed only
+        when it holds at least as much: it never takes content away."""
+        if not hist or self.wake.get("at") is None or self.wake.get("end") is None:
+            return
+        rebuilt = _history_renderer(wake_span(hist.get("messages"), self.wake["at"],
+                                              self.wake["end"]))
+        if (len(rebuilt.output) >= len(self.renderer.output)
+                and len(rebuilt.text) >= len(self.renderer.text) and rebuilt.output):
+            self.renderer = rebuilt
 
     async def _stopped(self) -> None:
         """Open WebUI cancelled the writer's task. Stop and Send now both do
@@ -484,6 +503,8 @@ class _RunPump:
         self.writer: "_TurnWriter | None" = None
         self.handover: dict | None = None  # {message_id, renderer} of a request that ended early
         self.stop_notice_before = False
+        self.wake = False               # a cron wake: runId is the sessionId (ELI-103)
+        self.held: list = []            # a wake's events before its turn is known
 
 
 async def _turn_route_event(conn: "_GatewayConnection", payload: dict) -> bool:
@@ -494,6 +515,7 @@ async def _turn_route_event(conn: "_GatewayConnection", payload: dict) -> bool:
     sess, run = payload.get("sessionKey") or "", payload.get("runId") or ""
     if not (getattr(conn, "writes_turns", False) and sess and run) or conn._retired:
         return False
+    conn.note_session_id(sess, payload.get("sessionId"))
     parsed = conn.parse_owui_session_key(sess)
     if not parsed or conn.consumers_for_event(payload):
         return False
@@ -594,10 +616,16 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
                                       renderer=handed["renderer"], thinking=handed.get("thinking"))
             conn._turn_writers[(chat_id, handed["message_id"])] = pump.writer
             await pump.writer.feed(None)
+        elif re.fullmatch(_UUID_RE, run) and run == await conn.session_id_for(sess):
+            pump.wake = True
         else:
             pump.writer = await _turn_writer_for(conn, sess, run, user_id, chat_id)
         while True:
             kind, item = await pump.queue.get()
+            if pump.wake:
+                if await _wake_step(conn, sess, run, user_id, chat_id, pump, kind, item):
+                    return
+                continue
             writer = pump.writer
             if kind == "event":
                 if writer is not None:
@@ -618,6 +646,102 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
             conn._turn_pumps.pop((sess, run), None)
 
 
+def _is_terminal_event(payload: dict) -> bool:
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    return payload.get("state") in ("final", "error", "aborted") or (
+        payload.get("stream") == "lifecycle" and data.get("phase") in ("end", "error"))
+
+
+def _event_ms(payload: dict) -> float:
+    """When the Gateway emitted the event: agent events carry `ts`
+    (agent-events enrichAgentEvent); a chat event has none, and the receive
+    time on this host stands in (the Gateway runs on the same clock)."""
+    ts = payload.get("ts")
+    return float(ts) if isinstance(ts, (int, float)) else time.time() * 1000
+
+
+async def _wake_bind(conn: "_GatewayConnection", sess: str, run: str, user_id: str,
+                     chat_id: str, pump: _RunPump, at_ms: float) -> None:
+    """Give the wake its message: the one its own admitted turn names. Until
+    that turn is committed (the embedded runtime), the events wait."""
+    try:
+        messages = (await conn.session_history(sess, limit=50, max_chars=200)).get("messages")
+    except Exception as ex:
+        pipe_log(f"  turn writer: chat.history for a wake failed: {ex!r}")
+        return
+    bound = conn._wake_turns_bound.setdefault(sess, set())
+    turn = wake_turn_at(messages, at_ms, bound)
+    if turn is None:
+        return
+    bound.add(turn["key"])
+    mid = turn_message_id(sess, turn["key"], chat_id)
+    pump.writer = _TurnWriter(conn, session_key=sess, chat_id=chat_id, user_id=user_id,
+                              run_id=run, message_id=mid, wake=dict(turn))
+    conn._turn_writers[(chat_id, mid)] = pump.writer
+    pipe_log(f"  turn writer: wake turn {turn['key'][:8]}... (cron job {turn['job'][:8]}...) "
+             f"is message {mid[:8]}...")
+
+
+async def _wake_step(conn: "_GatewayConnection", sess: str, run: str, user_id: str,
+                     chat_id: str, pump: _RunPump, kind: str, item) -> bool:
+    """One queue item of a cron wake. A session row never ends a wake: the
+    row stays idle while it runs, and a row pushed for another run (a message
+    queued behind it) says nothing about it. Its own terminal event does.
+    True when the wake is over and the pump can go."""
+    if kind == "settled":
+        return False
+    if kind == "wake-ended":
+        await _wake_finish(conn, sess, run, pump, item)
+        return True
+    if pump.writer is None:
+        pump.held.append(item)
+        await _wake_bind(conn, sess, run, user_id, chat_id, pump, _event_ms(item))
+        if pump.writer is not None:
+            held, pump.held = pump.held, []
+            for ev in held:
+                await pump.writer.feed(ev)
+    else:
+        await pump.writer.feed(item)
+    if _is_terminal_event(item):
+        await _wake_finish(conn, sess, run, pump, _event_ms(item))
+        return True
+    return False
+
+
+async def _wake_finish(conn: "_GatewayConnection", sess: str, run: str, pump: _RunPump,
+                       end_ms: float) -> None:
+    writer = pump.writer
+    if writer is None:
+        pipe_log(f"  turn writer: a wake on {sess[-12:]} ended before its turn was found; "
+                 f"{len(pump.held)} event(s) not shown")
+    else:
+        writer.wake["end"] = end_ms
+        await writer.finalize()
+        conn._turn_writers.pop((writer.chat_id, writer.message_id), None)
+    # The next wake reuses this run id: nothing remembered for it may carry over.
+    conn._turn_skip_runs.pop((sess, run), None)
+    conn._delivered_live.pop(f"{sess}:{run}", None)
+
+
+async def _wake_resync(conn: "_GatewayConnection") -> None:
+    """After a reconnect: end the wakes whose terminal this socket missed. The
+    row cannot say (it is idle during a wake); the cron job can: it carries
+    `runningAtMs` while it runs and a one-shot job is deleted once it ran."""
+    wakes = [(k, p) for k, p in conn._turn_pumps.items()
+             if p.wake and p.writer is not None and p.writer.wake]
+    if not wakes:
+        return
+    try:
+        jobs = (await conn.send_request("cron.list", {"includeDisabled": True}, timeout=15)).get("jobs")
+    except Exception as ex:
+        pipe_log(f"  turn writer: cron.list after hello failed: {ex!r}")
+        return
+    running = {j.get("id") for j in jobs or [] if (j.get("state") or {}).get("runningAtMs")}
+    for (_sess, _run), pump in wakes:
+        if pump.writer.wake["job"] not in running:
+            pump.queue.put_nowait(("wake-ended", time.time() * 1000))
+
+
 async def _turn_after_hello(conn: "_GatewayConnection") -> None:
     """After a reconnect: send resumes the closing Gateway refused, and end
     the runs whose session is no longer active though no settle reached this
@@ -626,6 +750,7 @@ async def _turn_after_hello(conn: "_GatewayConnection") -> None:
         if writer.pending_resume:
             await writer.on_hello()
     await _turn_resync(conn, skip=set(conn.active_run_snapshot))
+    await _wake_resync(conn)
 
 
 async def _turn_resync(conn: "_GatewayConnection", skip: set = frozenset()) -> None:

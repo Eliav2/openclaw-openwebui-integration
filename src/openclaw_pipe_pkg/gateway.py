@@ -1363,6 +1363,8 @@ class _GatewayConnection:
         self._turn_pumps: dict = {}     # (session_key, run_id) -> _RunPump
         self._turn_writers: dict = {}   # (chat_id, message_id) -> _TurnWriter
         self._turn_skip_runs: dict = {}  # (session_key, run_id) of heartbeat runs
+        self._session_ids: dict = {}     # session_key -> sessionId (a cron wake's run id)
+        self._wake_turns_bound: dict = {}  # session_key -> wake turn keys given a message
         self._turn_resolve_lock = asyncio.Lock()
         self._frame_seq: int | None = None
         self._stop_notice_seen = False  # `shutdown` without restartExpectedMs on this socket
@@ -1592,6 +1594,7 @@ class _GatewayConnection:
         before its first tool call (measured: run start is pushed ~3s ahead of
         the first `session.tool`)."""
         key = payload.get("sessionKey") or payload.get("key") or ""
+        self.note_session_id(key, payload.get("sessionId"))
         if key and "hasActiveRun" in payload:
             self._wake_session_waiters(key)
         if key and payload.get("hasActiveRun") is False:
@@ -1600,6 +1603,28 @@ class _GatewayConnection:
                 and key not in self._message_subscriptions
                 and self.parse_owui_session_key(key)):
             spawn_background(self.ensure_message_subscription(key))
+
+    def note_session_id(self, session_key: str, session_id) -> None:
+        if session_key and isinstance(session_id, str) and session_id:
+            self._session_ids[session_key] = session_id
+
+    async def session_id_for(self, session_key: str) -> str | None:
+        """The session's sessionId, which is also the run id of every cron wake
+        into it. Session rows and lifecycle / session.tool events carry it;
+        assistant and chat events do not, so a wake whose first event is one
+        of those reads the row."""
+        known = self._session_ids.get(session_key)
+        if known:
+            return known
+        try:
+            lst = await self.send_request("sessions.list", {"search": session_key[-36:], "limit": 10},
+                                          timeout=15)
+        except Exception as ex:
+            pipe_log(f"  sessionId read for {session_key[-12:]} failed: {ex!r}")
+            return None
+        for row in lst.get("sessions") or []:
+            self.note_session_id(row.get("key") or "", row.get("sessionId"))
+        return self._session_ids.get(session_key)
 
     def register_run_target(self, session_key: str, run_id: str,
                             chat_id: str | None, message_id: str | None) -> None:
