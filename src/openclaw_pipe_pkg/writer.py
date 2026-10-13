@@ -200,6 +200,7 @@ class _TurnWriter:
         self.runs = [run_id]            # every run written into M: the first, then resumes / recoveries
         self.resumes = 0                # resume budget, counted on M (MAX_TURN_RESUMES)
         self.pending_resume = False     # a resume the Gateway refused; sent on the next hello-ok
+        self.awaiting_row = False       # kept open for a Gateway recovery (R2)
         self.closed = False             # nothing more to write (ended, or M is someone else's)
         self.sent_output: list = []     # the `output` open tabs hold
         self._emit = None
@@ -339,9 +340,15 @@ class _TurnWriter:
             return
         decision = next_continuation(row, stop_notice_before, self.resumes)
         if decision in ("gateway", "wait"):
+            # The pump stays (R2): the recovery run takes M over (rule E), or a
+            # later row leaves `running`. A recovery the Gateway gives up on
+            # tombstones the row to failed (main-session-restart-recovery-
+            # CPJjd8da.mjs:1150), which is that row.
+            self.awaiting_row = True
             pipe_log(f"  turn writer: {self.message_id and self.message_id[:8]}... stays open "
                      f"({decision}) after run {self.run_id[:24]}...")
             return
+        self.awaiting_row = False
         if decision == "resume":
             self.resumes += 1
             self.pending_resume = True
@@ -662,6 +669,8 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
                 await writer.end(item, stop_notice_before=pump.stop_notice_before)
                 if writer.closed:
                     conn._turn_writers.pop((chat_id, writer.message_id), None)
+                elif writer.awaiting_row and writer.run_id == run:
+                    continue  # R2: the next row of the session decides again
             return
     except Exception as ex:
         pipe_log(f"  turn writer: pump for run {run[:24]}... failed: {ex!r}")
