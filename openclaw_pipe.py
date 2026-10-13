@@ -7034,19 +7034,48 @@ def _event_ms(payload: dict) -> float:
     return float(ts) if isinstance(ts, (int, float)) else time.time() * 1000
 
 
+# chat.history returns at most this many messages (CHAT_HISTORY_MAX_ENTRIES,
+# chat-history-constants-C-H8nkgi.mjs:3).
+CHAT_HISTORY_MAX = 1000
+
+
 async def _wake_bind(conn: "_GatewayConnection", sess: str, run: str, user_id: str,
-                     chat_id: str, pump: _RunPump, at_ms: float) -> None:
-    """Give the wake its message: the one its own admitted turn names. Until
-    that turn is committed (the embedded runtime), the events wait."""
+                     chat_id: str, pump: _RunPump, at_ms: float) -> tuple[str, float | None]:
+    """Give the wake its message: the one its own admitted turn names.
+    Returns ("bound", the job run's start), ("wait", None) while a cron job
+    of this session runs but its turn is not readable yet (the embedded
+    runtime commits it after the first events), or ("stray", None): nothing
+    runs a wake into this session, so the event is not a wake's (review
+    2af1 N2)."""
     try:
-        messages = (await conn.session_history(sess, limit=50, max_chars=200)).get("messages")
+        jobs = (await conn.send_request("cron.list", {"includeDisabled": True}, timeout=15)).get("jobs")
     except Exception as ex:
-        pipe_log(f"  turn writer: chat.history for a wake failed: {ex!r}")
-        return
+        pipe_log(f"  turn writer: cron.list for a wake failed: {ex!r}")
+        return "wait", None
+    starts = [(j.get("state") or {}).get("runningAtMs") for j in jobs or []
+              if j.get("sessionTarget") == f"session:{sess}"]
+    running_start = min((s for s in starts if isinstance(s, (int, float))), default=None)
     bound = conn._wake_turns_bound.setdefault(sess, set())
-    turn = wake_turn_at(messages, at_ms, bound)
-    if turn is None or not await _wake_job_covers(conn, turn, at_ms):
-        return
+    # The turn is committed after its job started: read back until the window
+    # holds a message older than that start (review 2af1: a fixed 50-message
+    # window lost a wake that had written more before a reconnect).
+    limit, turn = 50, None
+    while True:
+        try:
+            messages = (await conn.session_history(sess, limit=limit, max_chars=200)).get("messages") or []
+        except Exception as ex:
+            pipe_log(f"  turn writer: chat.history for a wake failed: {ex!r}")
+            return "wait", None
+        turn = wake_turn_at(messages, at_ms, bound)
+        oldest = min((m.get("timestamp") for m in messages
+                      if isinstance(m.get("timestamp"), (int, float))), default=None)
+        if (turn is not None or running_start is None or len(messages) < limit
+                or limit >= CHAT_HISTORY_MAX or (oldest is not None and oldest < running_start)):
+            break
+        limit = min(limit * 4, CHAT_HISTORY_MAX)
+    start = await _wake_job_start(conn, turn, at_ms, jobs) if turn is not None else None
+    if start is None:
+        return ("wait", None) if running_start is not None else ("stray", None)
     bound.add(turn["key"])
     mid = turn_message_id(sess, turn["key"], chat_id)
     pump.writer = _TurnWriter(conn, session_key=sess, chat_id=chat_id, user_id=user_id,
@@ -7054,31 +7083,41 @@ async def _wake_bind(conn: "_GatewayConnection", sess: str, run: str, user_id: s
     conn._turn_writers[(chat_id, mid)] = pump.writer
     pipe_log(f"  turn writer: wake turn {turn['key'][:8]}... (cron job {turn['job'][:8]}...) "
              f"is message {mid[:8]}...")
+    return "bound", start
 
 
-async def _wake_job_covers(conn: "_GatewayConnection", turn: dict, at_ms: float) -> bool:
-    """Is the event at `at_ms` this wake turn's? Its cron job must be running
-    since before the turn was written (`state.runningAtMs`), or have a
-    finished run whose window holds both the turn and the event (`cron.runs`,
-    kept after a one-shot job is deleted). Anything else that runs with
-    runId = sessionId (a node agent command, a compaction) is not a wake and
-    opens no message (live 2026-10-13: runningAtMs 1791863926518 precedes the
-    turn's commit 1791863928462). An RPC failure answers False: the events
-    wait for the next one."""
-    job = turn.get("job")
+async def _wake_job_start(conn: "_GatewayConnection", turn: dict, at_ms: float,
+                          jobs: list | None) -> float | None:
+    """When the cron job run that wrote wake turn `turn` started, if the event
+    at `at_ms` is that run's; else None. The job must be running since before
+    the turn was written (`state.runningAtMs`), or have a finished run whose
+    window holds both the turn and the event (`cron.runs`, kept after a
+    one-shot job is deleted). Anything else that runs with runId = sessionId
+    (a node agent command, a compaction) is not a wake and opens no message
+    (live 2026-10-13: runningAtMs 1791863926518 precedes the turn's commit
+    1791863928462). An RPC failure answers None: the events wait."""
+    job, at = turn.get("job"), turn.get("at") or 0
+    running = next(((j.get("state") or {}).get("runningAtMs") for j in jobs or []
+                    if j.get("id") == job), None)
+    if running and running <= at:
+        return running
+    run = await _wake_job_run(conn, job, at)
+    if run is not None and at_ms <= (run.get("ts") or 0):
+        return run.get("runAtMs") or 0
+    return None
+
+
+async def _wake_job_run(conn: "_GatewayConnection", job: str, turn_at: float) -> dict | None:
+    """The finished `cron.runs` entry of `job` whose run wrote a turn at
+    `turn_at`: started before it, finished after it."""
     try:
-        jobs = (await conn.send_request("cron.list", {"includeDisabled": True}, timeout=15)).get("jobs")
-        running = next(((j.get("state") or {}).get("runningAtMs") for j in jobs or []
-                        if j.get("id") == job), None)
-        if running and running <= (turn.get("at") or 0):
-            return True
         runs = (await conn.send_request("cron.runs", {"id": job, "limit": 20}, timeout=15)).get("entries")
     except Exception as ex:
-        pipe_log(f"  turn writer: cron state for wake job {str(job)[:8]}... failed: {ex!r}")
-        return False
-    at = turn.get("at") or 0
-    return any(e.get("action") == "finished" and (e.get("runAtMs") or 0) <= at
-               and at_ms <= (e.get("ts") or 0) for e in runs or [])
+        pipe_log(f"  turn writer: cron.runs for wake job {str(job)[:8]}... failed: {ex!r}")
+        return None
+    done = [e for e in runs or [] if e.get("action") == "finished"
+            and (e.get("runAtMs") or 0) <= turn_at <= (e.get("ts") or 0)]
+    return min(done, key=lambda e: e.get("ts") or 0, default=None)
 
 
 async def _wake_step(conn: "_GatewayConnection", sess: str, run: str, user_id: str,
@@ -7107,11 +7146,20 @@ async def _wake_step(conn: "_GatewayConnection", sess: str, run: str, user_id: s
         return True
     if pump.writer is None:
         pump.held.append(item)
-        await _wake_bind(conn, sess, run, user_id, chat_id, pump, _event_ms(item))
+        state, start = await _wake_bind(conn, sess, run, user_id, chat_id, pump, _event_ms(item))
+        if state == "stray":
+            # Nothing runs a wake into this session: these events are no
+            # wake's, and holding them would hand them to the next wake, which
+            # reuses this run id (review 2af1 N2). The next event is judged anew.
+            pipe_log(f"  turn writer: {len(pump.held)} sessionId event(s) on {sess[-12:]} with no "
+                     "running cron wake: not shown")
+            pump.held.clear()
+            return True
         if pump.writer is not None:
             held, pump.held = pump.held, []
             for ev in held:
-                await pump.writer.feed(ev)
+                if _event_ms(ev) >= start:  # older ones predate this wake's run
+                    await pump.writer.feed(ev)
     else:
         await pump.writer.feed(item)
     if _is_terminal_event(item):
@@ -7152,8 +7200,14 @@ async def _wake_resync(conn: "_GatewayConnection") -> None:
         return
     running = {j.get("id") for j in jobs or [] if (j.get("state") or {}).get("runningAtMs")}
     for (_sess, _run), pump in wakes:
-        if pump.writer.wake["job"] not in running:
-            pump.queue.put_nowait(("wake-ended", time.time() * 1000))
+        wake = pump.writer.wake
+        if wake["job"] not in running:
+            # The wake ended at its job run's finish, not now: a run queued
+            # behind it may have written since (review 2af1 N1). Unknown
+            # (None): the transcript is not used, the message keeps what it
+            # streamed.
+            run = await _wake_job_run(conn, wake["job"], wake.get("at") or 0)
+            pump.queue.put_nowait(("wake-ended", (run or {}).get("ts")))
 
 
 async def _adopt_turn_message(conn: "_GatewayConnection", *, chat_id: str, user_id: str,

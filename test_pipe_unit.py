@@ -7553,12 +7553,18 @@ class SessionIdRunTests(_RoutingCase):
         self.now += 1000
         return self.now
 
-    def wake_turn(self, key, text="Wake (worker ELI-100): deploy finished."):
-        """The cron executor marks its job running, then commits the wake's
-        user turn before the CLI starts."""
-        at = self.tick()
+    def start_job(self):
+        """The cron executor marks its job running before the run's first event."""
         self.jobs = [{"id": self.JOB, "sessionTarget": f"session:{self.key}",
-                      "state": {"runningAtMs": at - 400}}]
+                      "state": {"runningAtMs": self.tick()}}]
+
+    def wake_turn(self, key, text="Wake (worker ELI-100): deploy finished.", started=False):
+        """The cron executor marks its job running (unless `started` already),
+        then commits the wake's user turn before the CLI starts."""
+        at = self.tick()
+        if not started:
+            self.jobs = [{"id": self.JOB, "sessionTarget": f"session:{self.key}",
+                          "state": {"runningAtMs": at - 400}}]
         self.history["messages"].append({
             "role": "user", "content": f"[cron:{self.JOB} eli100-wake] {text}",
             "idempotencyKey": f"{key}:user", "timestamp": at - 150,
@@ -7609,6 +7615,107 @@ class SessionIdRunTests(_RoutingCase):
 
     def new_messages(self):
         return {k: v for k, v in super().new_messages().items() if k != self.M}
+
+    async def test_a_wake_ended_after_a_reconnect_keeps_only_its_own_reply(self):
+        """Review 2af1 N1 (review_d22ff82_test.py): the resync ended the wake at
+        the reconnect time, and the queued run's reply written since landed in
+        the wake's message. The end is the job run's finish (cron.runs ts)."""
+        self.wake_turn(self.W1)
+        await _turn_route_event(self.conn, self.sid_ev(_delta("Working.")))
+        await self.spin()
+        self.queued_turn()
+        self.imported("Working. Done.")
+        self.job_finished()
+        self.imported("Status: all green.")
+        self.history["messages"].append({"role": "assistant", "timestamp": self.tick(),
+                                         "content": "Status: all green.",
+                                         "__openclaw": {"idempotencyKey": f"cli-assistant:{self.R}"}})
+        await _wake_resync(self.conn)
+        await self.spin()
+        (m,) = self.new_messages().values()
+        self.assertIs(m["done"], True)
+        self.assertEqual(m["content"], "Working. Done.")
+
+    async def test_with_no_finish_time_the_wake_keeps_what_it_streamed(self):
+        self.wake_turn(self.W1)
+        await _turn_route_event(self.conn, self.sid_ev(_delta("Working.")))
+        await self.spin()
+        self.jobs = []  # gone, and cron.runs has no entry for it
+        self.imported("Working. Done.")
+        self.imported("Someone else's reply.")
+        await _wake_resync(self.conn)
+        await self.spin()
+        (m,) = self.new_messages().values()
+        self.assertIs(m["done"], True)
+        self.assertEqual(m["content"], "Working.")
+
+    async def test_stray_events_do_not_land_in_the_next_wake(self):
+        """Review 2af1 N2: a stray (runId = sessionId, no running wake) was held
+        by a pump that lived on, and the next wake flushed it as its own."""
+        await self.wake(self.W1, "First wake.")
+        await _turn_route_event(self.conn, self.sid_ev(_tool("start", tcid="toolu_stray")))
+        await self.spin()
+        self.assertNotIn((self.key, self.SID), self.conn._turn_pumps, "the stray pump is closed")
+        await self.wake(self.W2, "Second wake.")
+        second = self.new_messages()[turn_message_id(self.key, self.W2, self.CHAT)]
+        self.assertEqual([i for i in second.get("output") or [] if i.get("type") == "function_call"], [])
+        self.assertEqual(second["content"], "Second wake.")
+
+    async def test_held_events_older_than_the_wakes_job_run_are_dropped(self):
+        early = self.sid_ev(_tool("start", tcid="toolu_early"))  # emitted before the job started
+        self.start_job()
+        await _turn_route_event(self.conn, early)
+        await self.spin()
+        self.wake_turn(self.W1, started=True)
+        await _turn_route_event(self.conn, self.sid_ev(_delta("Own text.")))
+        await _turn_route_event(self.conn, self.sid_ev({"state": "final"}))
+        await self.spin()
+        (m,) = self.new_messages().values()
+        self.assertEqual(m["content"], "Own text.")
+        self.assertEqual([i for i in m.get("output") or [] if i.get("type") == "function_call"], [])
+
+    async def test_a_wake_turn_beyond_the_first_50_messages_is_found(self):
+        """Review 2af1: a fresh pump (a new connection, a held first event) read
+        only the newest 50 messages; a wake that had written more before was
+        never bound. The read widens until it reaches before the job's start."""
+        plain = self.conn.send_request
+        limits = []
+
+        async def send_request(method, params, timeout=10):
+            if method == "chat.history":
+                limits.append(params.get("limit"))
+                msgs = self.history["messages"]
+                return {"messages": copy.deepcopy(msgs[-params.get("limit", 1000):])}
+            return await plain(method, params, timeout)
+        self.conn.send_request = send_request
+        self.wake_turn(self.W1)
+        for i in range(120):
+            self.imported(f"step {i}")
+        await _turn_route_event(self.conn, self.sid_ev(_delta("Still going.")))
+        await self.spin()
+        self.assertEqual(list(self.new_messages()), [turn_message_id(self.key, self.W1, self.CHAT)])
+        self.assertEqual(limits[:2], [50, 200])
+
+    async def test_the_read_stops_once_it_reaches_before_the_jobs_start(self):
+        """The widening is bounded by the signal, not by a guess: once the page
+        reaches before the running job's start, the turn is not in the
+        transcript yet, and reading further back cannot find it."""
+        plain = self.conn.send_request
+        limits = []
+
+        async def send_request(method, params, timeout=10):
+            if method == "chat.history":
+                limits.append(params.get("limit"))
+                return {"messages": copy.deepcopy(self.history["messages"][-params.get("limit", 1000):])}
+            return await plain(method, params, timeout)
+        self.conn.send_request = send_request
+        for i in range(300):
+            self.imported(f"old {i}")
+        self.start_job()
+        await _turn_route_event(self.conn, self.sid_ev(_delta("Early.")))
+        await self.spin()
+        self.assertEqual(limits, [50])
+        self.assertEqual(self.new_messages(), {})
 
     async def test_a_sessionid_run_with_no_running_wake_opens_nothing(self):
         """Review (c): a node agent command or a compaction also runs with
@@ -7741,10 +7848,11 @@ class SessionIdRunTests(_RoutingCase):
         """The embedded runtime commits the user turn without awaiting it
         (embedded-agent-DNQn_PMM.mjs:5891): the first event can come first."""
         await self.wake(self.W1, "First wake.")
+        self.start_job()
         await _turn_route_event(self.conn, self.sid_ev(_delta("Second ")))
         await self.spin()
         self.assertEqual(len(self.new_messages()), 1, "bound to the previous wake's turn")
-        self.wake_turn(self.W2)
+        self.wake_turn(self.W2, started=True)
         await _turn_route_event(self.conn, self.sid_ev(_delta("wake.")))
         await _turn_route_event(self.conn, self.sid_ev({"state": "final"}))
         await self.spin()
@@ -7822,9 +7930,9 @@ class RetiredWriterTests(_RoutingCase):
             if method == "cron.list":
                 return {"jobs": copy.deepcopy(test.jobs)}
             if method == "cron.runs":
-                return {"entries": []}
+                return {"entries": [e for e in test.cron_runs if e["jobId"] == params.get("id")]}
             return await plain(method, params, timeout)
-        self.jobs = []
+        self.jobs, self.cron_runs = [], []
         self.send_request = send_request
         self.conn.send_request = send_request
 
@@ -7900,7 +8008,11 @@ class RetiredWriterTests(_RoutingCase):
         self.history["messages"].append({"role": "assistant", "timestamp": 3000,
                                          "__openclaw": {"importedFrom": "claude-cli"},
                                          "content": [{"type": "text", "text": "Smoke PASS."}]})
-        self.jobs = []  # the one-shot job ran and was deleted
+        self.jobs = []  # the one-shot job ran and was deleted; cron.runs keeps its run
+        self.cron_runs = [{"jobId": "job-9", "action": "finished", "runAtMs": 900, "ts": 3500}]
+        self.history["messages"].append({"role": "assistant", "timestamp": 4000,
+                                         "__openclaw": {"importedFrom": "claude-cli"},
+                                         "content": [{"type": "text", "text": "A queued reply."}]})
         b = self.successor()
         await self.adopt(b, mid)  # cron.list: the job is gone, the wake is over
         m = self.owui.msgs()[mid]
