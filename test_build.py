@@ -220,20 +220,15 @@ class StatusActionBuildTests(unittest.TestCase):
         self.assertNotIn(build_mod.DEV_ONLY_END, built)
         self.assertNotIn("DEV-ONLY", built)
 
-    def test_proactive_delivery_disabled_for_fallback_connection(self):
-        """The Action's own fallback connection must never run the Pipe's
-        proactive-message-delivery logic (see action.py's module-level
-        override and its docstring for why) -- the override must be the
-        LAST assignment of this name in the built file, since gateway.py's
-        own `= True` is defined earlier and Python module execution is
-        top-to-bottom."""
-        built = ACTION_BUILT.read_text()
-        true_idx = built.rindex("PROACTIVE_DELIVERY_ENABLED = True")
-        false_idx = built.rindex("PROACTIVE_DELIVERY_ENABLED = False")
-        self.assertGreater(
-            false_idx, true_idx,
-            "override must appear after gateway.py's default to win",
-        )
+    def test_fallback_connection_writes_no_turns(self):
+        """The Action's own fallback connection only makes RPCs, so every run
+        looks unconsumed to it: it must never write turns next to the Pipe's
+        connection. Every connection the Action builds says so."""
+        action_src = (PKG / "action.py").read_text()
+        calls = re.findall(r"_GatewayConnection\(([^)]*)\)", action_src)
+        self.assertTrue(calls)
+        for args in calls:
+            self.assertIn("writes_turns=False", args)
 
     def test_does_not_reuse_pipe_stale_conn_write_path(self):
         """The Action fragment must never call _remember_gateway_connection

@@ -227,16 +227,6 @@ def _history_user_turns(messages: list) -> list:
     return out
 
 
-def _history_closed_runs(messages: list) -> set:
-    closed = set()
-    for m in messages or []:
-        meta = m.get("__openclaw") if isinstance(m.get("__openclaw"), dict) else {}
-        for k in (m.get("idempotencyKey"), meta.get("idempotencyKey")):
-            if isinstance(k, str) and k.startswith("cli-assistant:"):
-                closed.add(k[len("cli-assistant:"):])
-    return closed
-
-
 def recovery_source_run(messages: list, run_id: str) -> str | None:
     """Rule E: for a restart-recovery run (its `<id>:user` turn carries the
     `main_session_restart_recovery` provenance, dist

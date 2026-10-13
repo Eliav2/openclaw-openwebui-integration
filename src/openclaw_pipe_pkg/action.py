@@ -32,24 +32,10 @@
 #      shared attribute) so it can never collide with the Pipe's bookkeeping
 #      either.
 #
-# This fragment reuses gateway.py verbatim (see build.py's ACTION artifact),
-# which includes `_event_loop()`'s proactive-message-delivery behavior: if a
-# "final" event arrives on a connection with no registered consumer for its
-# session, gateway.py writes the assistant's reply straight into OWUI chat
-# history (see `_deliver_proactive_owui_message`). This Action never calls
-# `register_consumer()` -- it only ever does request/response RPCs -- so a
-# fallback connection would always look "idle" to that logic. In the
-# reuse-the-Pipe's-connection path this is a non-issue (we're just borrowing
-# a reference to make calls into an event loop the Pipe already owns and
-# already registers real consumers on); it only matters for our OWN fallback
-# connection's OWN event loop. Each build produces a fully separate Python
-# module/namespace, so overriding this module-level flag here affects only
-# this artifact's fallback connection, never the Pipe's.
-PROACTIVE_DELIVERY_ENABLED = False
-# Same reasoning for the out-of-band live relay: it is gated on its own
-# switch, so without this a fallback connection relayed every proactive run
-# a second time next to the Pipe's own relay.
-LIVE_STREAM_RELAY_ENABLED = False
+# This fragment reuses gateway.py verbatim (see build.py's ACTION artifact).
+# Its fallback connection is built with `writes_turns=False`: it only makes
+# request/response RPCs, so every run would look unconsumed to it, and it
+# must never write turns next to the Pipe's own connection.
 
 _action_fallback_connection: "_GatewayConnection | None" = None
 _action_fallback_lock = asyncio.Lock()
@@ -1210,11 +1196,10 @@ class Action:
         openSubagentDrawer() in _MODAL_OPEN_JS_TEMPLATE), reusing this same
         endpoint rather than registering a second Action.
 
-        A real toolbar click on a proactively-delivered sub-agent-finished
-        message is also mode-less (OWUI itself never sends a "mode"), but
-        carries a hidden `<!-- openclaw:taskId=... -->` marker in
-        `body["content"]` (see `_deliver_subagent_proactive_owui_message` in
-        gateway.py) -- there's deliberately no separate Action/button for
+        A real toolbar click on an old sub-agent-finished message (written
+        by bridge versions before ELI-100) is also mode-less (OWUI itself
+        never sends a "mode"), but carries a hidden
+        `<!-- openclaw:taskId=... -->` marker in `body["content"]` -- there's deliberately no separate Action/button for
         this: a second OWUI Function, plus flipping the existing one off
         "global", was more infra and config risk than the payoff of a
         visually distinct icon. Detected here and redirected

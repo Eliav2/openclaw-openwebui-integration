@@ -867,10 +867,10 @@ class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SubagentProactiveMessageClickTests(unittest.IsolatedAsyncioTestCase):
-    """A real OWUI toolbar click on a proactively-delivered sub-agent-finished
-    message is mode-less (OWUI itself never sends "mode") but carries a
-    hidden `<!-- openclaw:taskId=... -->` marker in body["content"] (see
-    `_deliver_subagent_proactive_owui_message` in gateway.py). Deliberately
+    """A real OWUI toolbar click on an old sub-agent-finished message (written
+    by bridge versions before ELI-100; read-only shim `_SUBAGENT_TASK_ID_MARKER_RE`)
+    is mode-less (OWUI itself never sends "mode") but carries a hidden
+    `<!-- openclaw:taskId=... -->` marker in body["content"]. Deliberately
     no separate Action/button for this -- the
     existing default click handler detects the marker and redirects into
     the same subagent-detail drawer instead of the general status dialog."""

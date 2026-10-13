@@ -968,11 +968,6 @@ class Pipe:
                     "reply before sending the message"
                 )
 
-        # Heal any 1/2·2/2 variant group a previous turn's proactive delivery
-        # left behind, so the proactive message shows in the normal linear flow
-        # rather than behind a swipe arrow (see _relinearize_proactive_variants).
-        await _heal_proactive_variants(conn, owui_origin_chat_id)
-
         # Apply the model with one retry. sessions.patch is idempotent (set the
         # session's model to a fixed value), and under a burst of near-
         # simultaneous messages the RPC can transiently time out or return a
@@ -1055,8 +1050,8 @@ class Pipe:
         # let a concurrent message fall through to a fresh chat.send while the
         # gateway still had an active run -- the gateway steer-merged it and
         # returned a runId that instantly emits a single 'final' with no text,
-        # so the bubble rendered nothing and the real answer leaked out via
-        # proactive delivery. (Verified from live pipe logs 2026-07-18.)
+        # so the bubble rendered nothing and the real answer leaked out as a
+        # separate message. (Verified from live pipe logs 2026-07-18.)
         async def _list_has_active_run() -> bool | None:
             """Authoritative live run signal from sessions.list (hasActiveRun).
             Returns None if the probe fails or our session isn't in the list."""
@@ -2246,12 +2241,12 @@ class Pipe:
                             # call or a stretch of silent model reasoning looks
                             # identical to a finished run from here, and closing
                             # on it strands the rest of the turn as a detached
-                            # proactive bubble (root cause of the 2026-07-19
+                            # bubble (root cause of the 2026-07-19
                             # "my reply came at the end as a separate bubble"
                             # reports). Confirm with the gateway first; only
                             # close if the run is genuinely terminal, otherwise
                             # stay alive so the inline message keeps streaming to
-                            # completion (no proactive/finalize needed at all).
+                            # completion (no handover needed at all).
                             status = await gateway_run_status()
                             if status in ("done", "failed", "cancelled"):
                                 pipe_log(
@@ -2547,7 +2542,7 @@ class Pipe:
             # DIAG (ELI-56): a no-text turn is the phantom. Emit the correlation
             # keys so it can be matched to a duplicate/re-fired completion above
             # (same text_sha / owui_msg_id) and to the run that actually carried
-            # the answer (which then leaks out via proactive delivery).
+            # the answer (which then leaks out as a separate message).
             pipe_log(
                 f"  [diag] PHANTOM (no text): our_run_id={str(our_run_id)[:40]} "
                 f"text_sha={getattr(self, '_diag_text_sha', None)} "
@@ -2561,7 +2556,7 @@ class Pipe:
             # whole text. Its tail, if the lost events were the last ones,
             # belongs at the end of this reply.
             try:
-                hist = await conn.session_history(session_key, limit=PROACTIVE_RUN_HISTORY_LIMIT)
+                hist = await conn.session_history(session_key, limit=RUN_TEXT_HISTORY_LIMIT)
             except Exception as ex:
                 hist = None
                 pipe_log(f"  event gap: chat.history failed: {ex}")
