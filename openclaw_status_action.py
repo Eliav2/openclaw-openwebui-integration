@@ -4428,6 +4428,7 @@ class _RunPump:
         self.stop_notice_before = False
         self.wake = False               # a cron wake: runId is the sessionId (ELI-103)
         self.held: list = []            # a wake's events before its turn is known
+        self.heartbeat = False          # a wake-id run the Gateway flagged isHeartbeat
 
 
 async def _turn_route_event(conn: "_GatewayConnection", payload: dict) -> bool:
@@ -4479,6 +4480,8 @@ def _note_heartbeat_run(conn: "_GatewayConnection", payload: dict) -> None:
     sess, run = payload.get("sessionKey"), payload.get("runId")
     if payload.get("isHeartbeat") is not True or not (sess and run):
         return
+    if run == conn._session_ids.get(sess):
+        return  # a wake's id: never skip it for good (handled in _wake_step)
     conn._turn_skip_runs[(sess, run)] = True
     if len(conn._turn_skip_runs) > 500:
         for stale in list(conn._turn_skip_runs)[:250]:
@@ -4598,7 +4601,7 @@ async def _wake_bind(conn: "_GatewayConnection", sess: str, run: str, user_id: s
         return
     bound = conn._wake_turns_bound.setdefault(sess, set())
     turn = wake_turn_at(messages, at_ms, bound)
-    if turn is None:
+    if turn is None or not await _wake_job_covers(conn, turn, at_ms):
         return
     bound.add(turn["key"])
     mid = turn_message_id(sess, turn["key"], chat_id)
@@ -4609,6 +4612,31 @@ async def _wake_bind(conn: "_GatewayConnection", sess: str, run: str, user_id: s
              f"is message {mid[:8]}...")
 
 
+async def _wake_job_covers(conn: "_GatewayConnection", turn: dict, at_ms: float) -> bool:
+    """Is the event at `at_ms` this wake turn's? Its cron job must be running
+    since before the turn was written (`state.runningAtMs`), or have a
+    finished run whose window holds both the turn and the event (`cron.runs`,
+    kept after a one-shot job is deleted). Anything else that runs with
+    runId = sessionId (a node agent command, a compaction) is not a wake and
+    opens no message (live 2026-10-13: runningAtMs 1791863926518 precedes the
+    turn's commit 1791863928462). An RPC failure answers False: the events
+    wait for the next one."""
+    job = turn.get("job")
+    try:
+        jobs = (await conn.send_request("cron.list", {"includeDisabled": True}, timeout=15)).get("jobs")
+        running = next(((j.get("state") or {}).get("runningAtMs") for j in jobs or []
+                        if j.get("id") == job), None)
+        if running and running <= (turn.get("at") or 0):
+            return True
+        runs = (await conn.send_request("cron.runs", {"id": job, "limit": 20}, timeout=15)).get("entries")
+    except Exception as ex:
+        pipe_log(f"  turn writer: cron state for wake job {str(job)[:8]}... failed: {ex!r}")
+        return False
+    at = turn.get("at") or 0
+    return any(e.get("action") == "finished" and (e.get("runAtMs") or 0) <= at
+               and at_ms <= (e.get("ts") or 0) for e in runs or [])
+
+
 async def _wake_step(conn: "_GatewayConnection", sess: str, run: str, user_id: str,
                      chat_id: str, pump: _RunPump, kind: str, item) -> bool:
     """One queue item of a cron wake. A session row never ends a wake: the
@@ -4616,6 +4644,19 @@ async def _wake_step(conn: "_GatewayConnection", sess: str, run: str, user_id: s
     queued behind it) says nothing about it. Its own terminal event does.
     True when the wake is over and the pump can go."""
     if kind == "settled":
+        return False
+    if kind == "event" and (pump.heartbeat or item.get("isHeartbeat") is True):
+        # Condition B by the run's resolved identity, not by its id: the skip
+        # table is keyed by run id, which a wake shares with every other wake
+        # (ELI-103 f). Nothing more of this run is shown; its terminal frees
+        # the id for the next wake.
+        pump.heartbeat = True
+        pump.held.clear()
+        if pump.writer is not None and not pump.writer.opened:
+            pump.writer.closed = True
+        if _is_terminal_event(item):
+            await _wake_finish(conn, sess, run, pump, _event_ms(item))
+            return True
         return False
     if kind == "wake-ended":
         await _wake_finish(conn, sess, run, pump, item)
@@ -4639,11 +4680,13 @@ async def _wake_finish(conn: "_GatewayConnection", sess: str, run: str, pump: _R
                        end_ms: float) -> None:
     writer = pump.writer
     if writer is None:
-        pipe_log(f"  turn writer: a wake on {sess[-12:]} ended before its turn was found; "
-                 f"{len(pump.held)} event(s) not shown")
+        if not pump.heartbeat:
+            pipe_log(f"  turn writer: a sessionId run on {sess[-12:]} ended with no running "
+                     f"cron wake turn; {len(pump.held)} event(s) not shown")
     else:
-        writer.wake["end"] = end_ms
-        await writer.finalize()
+        if not writer.closed:  # a heartbeat that already showed something is finished too
+            writer.wake["end"] = end_ms
+            await writer.finalize()
         conn._turn_writers.pop((writer.chat_id, writer.message_id), None)
     # The next wake reuses this run id: nothing remembered for it may carry over.
     conn._turn_skip_runs.pop((sess, run), None)
