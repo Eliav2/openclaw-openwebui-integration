@@ -6089,6 +6089,16 @@ class TurnWriterEndTests(_TurnWriterCase):
         self.assertIs(self.m()["done"], False)
         self.assertEqual(w.resumes, 1)
 
+    async def test_a_resume_keeps_the_handed_over_thinking_level(self):
+        """An inline turn handed over carries the level the user picked
+        (ELI-85); the resume continues the same reply at that level."""
+        w = await self.opened_writer()
+        w.thinking = "high"
+        await w.end({"status": "failed", "hasActiveRun": False,
+                     "lastRunError": "Claude Code process exited with code 143"})
+        (send,) = [p for m, p in self.sent if m == "chat.send"]
+        self.assertEqual(send.get("thinking"), "high")
+
     async def test_a_refused_resume_is_sent_on_the_next_hello(self):
         w = await self.opened_writer()
         self.refuse_send = True
@@ -6809,3 +6819,154 @@ class EventGapTests(unittest.IsolatedAsyncioTestCase):
             await _GapRepairSink().handle_event(None, event)
         self.assertEqual(seen, ["lost"])
         self.assertEqual(ocp._take_gap_repairs("c", "m"), [])
+
+
+class InlineOwnerRuleTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-100 DESIGN 2.7 for the inline user turn (item 1 of the order).
+
+    M3-crash (2026-10-13 00:33Z, user turn): the Gateway recovered the run
+    (f2445aa8) and main's inline loop ALSO resumed it on the epoch bump; the
+    resume was queued behind the recovery as a follow-up, failed 67 ms after it
+    ("no active tool authority snapshot"), and the reply closed empty. An
+    interrupted inline turn therefore decides nothing itself: it ends its
+    request and hands M to the turn writer, whose settled row decides by the
+    owner rule. A real error and a Stop end the reply as before."""
+
+    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
+    _queue = NoDroppedMessagesTests._queue
+    _delta = NoDroppedMessagesTests._delta
+    _until_registered = NoDroppedMessagesTests._until_registered
+    # A handover needs a session key the connection can parse back.
+    USER, CHAT = str(uuid.UUID(int=1)), str(uuid.UUID(int=2))
+
+    async def asyncSetUp(self):
+        await NoDroppedMessagesTests.asyncSetUp(self)
+        agent = self.pipe.valves.AGENT_ID
+        self.conn._valves = lambda: types.SimpleNamespace(AGENT_ID=agent)
+        type(self).SK = self.ocp._owui_session_key(agent, self.USER, self.CHAT)
+        self.handed = []
+
+        async def pump_loop(conn, sess, run, parsed, pump):
+            self.handed.append((sess, run, pump))
+        p = mock.patch.object(self.ocp, "_turn_pump_loop", pump_loop)
+        p.start()
+        self.patches.append(p)
+
+    def _reply(self, text, msg_id):
+        async def emitter(event):
+            pass
+        body = {"model": "openclaw_gateway.default",
+                "messages": [{"role": "user", "content": text}]}
+        meta = {"chat_id": self.CHAT, "user_id": self.USER, "message_id": msg_id}
+        return self.pipe._pipe_impl(body, emitter, __metadata__=meta)
+
+    def _event(self, event, **payload):
+        return {"type": "event", "event": event,
+                "payload": {"sessionKey": self.SK, "runId": "run-1", **payload}}
+
+    def _lifecycle_error(self, err):
+        # The Gateway stamps state='error' on the same payload.
+        return self._event("agent", stream="lifecycle", state="error",
+                           data={"phase": "error", "error": err})
+
+    def _aborted(self):
+        return self._event("chat", state="aborted")
+
+    async def _turn(self, *steps):
+        """A user turn whose run streams one delta, then `steps`: an event for
+        its queue, or a callable acting on the connection."""
+        gen = self._reply("hello", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "Reading them."))
+        for step in steps:
+            if callable(step):
+                step()
+            else:
+                q.put_nowait(step)
+        async def drain():
+            out = await first
+            async for chunk in gen:
+                out += chunk if isinstance(chunk, str) else ""
+            return out
+        # Bounds the test only: a turn that waits for an idle probe hangs here.
+        out = await asyncio.wait_for(drain(), 5)
+        for _ in range(20):
+            await asyncio.sleep(0)
+        return out
+
+    def _restart(self):
+        self.conn.connection_epoch = 2
+        self.conn.gateway_boot_id = "boot-A"
+        self.conn._note_gateway_boot("boot-B")
+
+    def assert_handed_over(self, out, *, stop_notice_before=False):
+        (sess, run, pump), = self.handed
+        self.assertEqual((sess, run), (self.SK, "run-1"))
+        self.assertEqual(pump.handover["message_id"], "m1")
+        self.assertIs(pump.stop_notice_before, stop_notice_before)
+        self.assertEqual(self.sent, ["hello"], "the inline turn sends no resume of its own")
+        self.assertNotIn("**Error:**", out)
+        self.assertNotIn(f"{self.SK}:run-1", self.conn._consumers)
+        self.assertNotIn(f"{self.SK}:run-1", self.conn._run_targets)
+        self.assertFalse(self.conn.was_delivered_live(self.SK, "run-1"),
+                         "the writer still owns the run's later events")
+
+    def assert_not_handed_over(self):
+        self.assertEqual(self.handed, [])
+        self.assertEqual(self.sent, ["hello"])
+
+    async def test_crash_hands_over_instead_of_resuming(self):
+        """A new boot id after the reconnect, no terminal: the inline turn
+        must not resume (the Gateway recovers a `running` row, F1)."""
+        out = await self._turn(self._restart)
+        self.assert_handed_over(out)
+
+    async def test_container_stop_exit_143_hands_over(self):
+        """`ha apps restart`: the CLI child exits 143 before the Gateway
+        closes (M3 window 1). The writer reads the `failed` row and resumes."""
+        out = await self._turn(self._lifecycle_error("Claude Code process exited with code 143"))
+        self.assert_handed_over(out)
+
+    async def test_gateway_stop_abort_hands_over_with_the_notice(self):
+        out = await self._turn(lambda: self.conn._on_shutdown({"reason": "gateway stopping"}),
+                               self._aborted())
+        self.assert_handed_over(out, stop_notice_before=True)
+
+    async def test_restart_mode_abort_hands_over_to_the_recovery(self):
+        """In restart mode the aborted row stays `running`: the writer keeps M
+        open for the Gateway's recovery run."""
+        out = await self._turn(lambda: self.conn._on_shutdown(
+            {"reason": "gateway restarting", "restartExpectedMs": 1500}), self._aborted())
+        self.assert_handed_over(out)
+
+    async def test_an_abort_without_a_shutdown_is_a_stop(self):
+        out = await self._turn(self._aborted())
+        self.assert_not_handed_over()
+        self.assertNotIn("**Error:**", out)
+
+    async def test_a_real_error_is_shown_inline(self):
+        out = await self._turn(self._lifecycle_error("429 rate limited"))
+        self.assert_not_handed_over()
+        self.assertIn("**Error:** 429 rate limited", out)
+
+    async def test_a_cli_exit_1_is_not_an_outside_kill(self):
+        """Main's `_is_restart_signature` matched any `process exited with
+        code` and resumed a CLI that failed on its own."""
+        out = await self._turn(self._lifecycle_error("Claude Code process exited with code 1"))
+        self.assert_not_handed_over()
+        self.assertIn("**Error:** Claude Code process exited with code 1", out)
+
+    async def test_the_handover_carries_the_thinking_level(self):
+        """The writer's resume must run at the level the user picked (ELI-85),
+        as main's inline resume did."""
+        await self._turn(self._restart)
+        (_s, _r, pump), = self.handed
+        self.assertIn("thinking", pump.handover)
+
+    async def test_a_handover_after_a_restart_reads_the_row(self):
+        """The restart marker can reach the inline loop after the post-hello
+        resync already ran; the handover then reads the row itself."""
+        await self._turn(self._restart)
+        self.assertIn("sessions.list", self.rpc)
