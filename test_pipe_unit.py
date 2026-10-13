@@ -6427,7 +6427,11 @@ class AgentTurnRoutingTests(_RoutingCase):
         self.assertEqual(self.conn._turn_pumps, {})
         q = self.conn.register_consumer(self.key, a_run)
         self.addCleanup(self.conn.unregister_consumer, self.key, a_run, queue=q)
-        self.assertEqual(q.get_nowait()["data"]["delta"], "Reading a.py.")
+        # As a frame: the inline loop reads `msg["payload"]` (a bare payload
+        # was read as an empty event and its text dropped).
+        frame = q.get_nowait()
+        self.assertEqual((frame["type"], frame["event"]), ("event", "agent"))
+        self.assertEqual(frame["payload"]["data"]["delta"], "Reading a.py.")
 
     async def test_a_held_run_is_a_turn_again_when_the_reply_ends_without_it(self):
         self.add_stub(self.STUB, content="Which file?")
@@ -6471,7 +6475,7 @@ class AgentTurnRoutingTests(_RoutingCase):
         q = self.conn.register_consumer(self.key, a_run)
         self.addCleanup(self.conn.unregister_consumer, self.key, a_run, queue=q)
         await self.spin()
-        self.assertEqual([q.get_nowait()["data"]["delta"] for _ in range(q.qsize())],
+        self.assertEqual([q.get_nowait()["payload"]["data"]["delta"] for _ in range(q.qsize())],
                          ["Reading", " a.py."])
         self.assertEqual(self.conn._turn_pumps, {})
 
@@ -6484,7 +6488,7 @@ class AgentTurnRoutingTests(_RoutingCase):
         self.conn._held_for_live[(self.key, a_run)] = [self.ev(a_run, _delta("late"))]
         self.conn.drain_held(self.key, a_run)
         self.assertEqual(self.conn.unreachable_held_drains, 1)
-        self.assertEqual(q.get_nowait()["data"]["delta"], "late")
+        self.assertEqual(q.get_nowait()["payload"]["data"]["delta"], "late")
         self.assertEqual(self.conn._turn_pumps, {})
 
     async def test_another_messages_run_is_not_held(self):
