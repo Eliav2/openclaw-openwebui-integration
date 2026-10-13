@@ -406,6 +406,24 @@ class ComposerWatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cfg["sessionId"], "sidA")
         self.assertEqual(cfg["chatId"], "oc")
 
+    async def test_the_push_installs_the_stop_send_now_intent_hook(self):
+        """ELI-100 case 8, live gate 2026-10-13: a tab that opens a chat after
+        its agent turn started never got the intent hook (the writer installs
+        it only when it opens M), so Stop on an agent turn read as "unknown"
+        and did not abort it. Every tab that opens an OpenClaw chat gets it."""
+        pool = {"sidA": {"id": "alice", "chat_ids": ["oc"]}}
+        w = _TestWatcher(pool, self.chats)
+        await w.tick(now=100.0)
+        await w.tick(now=102.0)
+        code = w.sent[0][1]["data"]["data"]["code"]
+        self.assertIn("__ocIntentHook", code)
+        fd, path = tempfile.mkstemp(suffix=".js")
+        with os.fdopen(fd, "w") as fh:
+            fh.write(code)
+        self.addCleanup(os.unlink, path)
+        proc = subprocess.run(["node", "--check", path], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
     async def test_no_ack_retries_then_gives_up(self):
         # The tab drops the event (no ack) while it has not loaded the chat yet.
         pool = {"sidA": {"id": "alice", "chat_ids": ["oc"]}}
