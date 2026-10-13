@@ -7661,6 +7661,57 @@ class InlineOwnerRuleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.handed, [])
         self.assertEqual(self.sent, ["hello"])
 
+    def _tool_start(self, tcid="toolu_1"):
+        return self._event("agent", stream="tool", data={
+            "phase": "start", "name": "Bash", "toolCallId": tcid, "args": {"command": "sleep 25"}})
+
+    async def _turn_items(self, *steps):
+        """`_turn`, but returning the Responses items the request yielded."""
+        gen = self._reply("hello", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "Reading them."))
+        for step in steps:
+            step() if callable(step) else q.put_nowait(step)
+
+        async def drain():
+            got = [await first]
+            async for chunk in gen:
+                got.append(chunk)
+            return got
+        got = await asyncio.wait_for(drain(), 5)
+        for _ in range(20):
+            await asyncio.sleep(0)
+        return [c["item"] for c in got if isinstance(c, dict) and c.get("type") == "response.output_item.added"]
+
+    def assert_no_call_left_for_open_webui(self, items):
+        """Open WebUI's post-stream sweep (middleware.py, Responses API path)
+        executes every `function_call` of the stream whose `call_id or id` has
+        no `function_call_output`, then calls the model again with the result.
+        For our cards that is `Error: Tool "Bash" not found.`, sent back to
+        this pipe as a new turn."""
+        handled = {i.get("call_id") for i in items if i.get("type") == "function_call_output"}
+        calls = [i.get("call_id") or i.get("id") for i in items if i.get("type") == "function_call"]
+        self.assertTrue(calls, "the test must stream a tool card")
+        self.assertEqual([c for c in calls if c not in handled], [])
+
+    async def test_a_crash_mid_tool_leaves_no_card_for_open_webui_to_run(self):
+        """M3 crash window (2026-10-13 21:21Z, user and ask cases): the
+        Gateway was killed while Bash ran. The request ended with the card
+        open, Open WebUI ran "Bash", got `Error: Tool "Bash" not found.` and
+        sent it back; that turn became a third run whose stream overwrote the
+        writer's finished reply (the Gateway's recovery, 6 tool cards)."""
+        items = await self._turn_items(self._tool_start(), self._restart)
+        self.assertEqual(len(self.handed), 1)
+        self.assert_no_call_left_for_open_webui(items)
+
+    async def test_an_exit_143_mid_tool_leaves_no_card_for_open_webui_to_run(self):
+        items = await self._turn_items(
+            self._tool_start(), self._lifecycle_error("Claude Code process exited with code 143"))
+        self.assertEqual(len(self.handed), 1)
+        self.assert_no_call_left_for_open_webui(items)
+
     async def test_crash_hands_over_instead_of_resuming(self):
         """A new boot id after the reconnect, no terminal: the inline turn
         must not resume (the Gateway recovers a `running` row, F1)."""

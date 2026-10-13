@@ -9864,14 +9864,23 @@ class Pipe:
                     # 2026-07-25, where a delivered call stayed `in_progress`
                     # in the persisted item and only rendered as done because
                     # its result item happened to exist. So close them here
-                    # rather than relying on that. A handed-over run is not
-                    # over: its writer completes the cards.
-                    if not adopt_new_run and pending_tool_calls and not handed_over:
+                    # rather than relying on that.
+                    #
+                    # A handed-over run is not over (its writer completes the
+                    # cards from the renderer it was handed), but this
+                    # request's output must still close them: Open WebUI's
+                    # post-stream sweep executes every `function_call` of the
+                    # stream that has no `function_call_output`, gets `Error:
+                    # Tool "Bash" not found.` and sends that back as a new
+                    # turn, whose stream then overwrites the writer's reply
+                    # (M3 crash window, 2026-10-13). Only the yielded items are
+                    # closed; the handed renderer keeps the call open.
+                    if not adopt_new_run and pending_tool_calls:
+                        note = ("(interrupted -- the reply continues when the run resumes)"
+                                if handed_over else "(no result -- the run ended first)")
                         for orphan_id in list(pending_tool_calls):
                             pipe_log(f"  closing orphaned tool call {orphan_id}")
-                            yield _tool_call_result_event(
-                                orphan_id, "(no result -- the run ended first)"
-                            )
+                            yield _tool_call_result_event(orphan_id, note)
                         pending_tool_calls.clear()
 
         finally:
