@@ -689,6 +689,13 @@ def _turn_route_now(conn: "_GatewayConnection", payload: dict) -> bool:
         # A request showed this run to the end, or a Stop / Send now closed
         # its message: a late event reopens nothing.
         return True
+    if not _turn_kind_known(conn, sess, run, payload):
+        return True
+    return _turn_queue(conn, sess, run, parsed, payload)
+
+
+def _turn_queue(conn: "_GatewayConnection", sess: str, run: str, parsed: tuple,
+                payload: dict) -> bool:
     pump = conn._turn_pumps.get((sess, run))
     if pump is None:
         pump = conn._turn_pumps[(sess, run)] = _RunPump()
@@ -713,22 +720,77 @@ def _turn_route_now(conn: "_GatewayConnection", payload: dict) -> bool:
 
 def _note_heartbeat_run(conn: "_GatewayConnection", payload: dict) -> None:
     """Condition B: a heartbeat run never gets a message. Its agent events
-    carry isHeartbeat (server-chat-CbnqM5f6.mjs:791, 823-826); its session.tool
-    copies do not, so the run is remembered."""
+    carry isHeartbeat (server-chat-CbnqM5f6.mjs:791, 823-826); its chat events
+    and session.tool copies do not, so the run is remembered, and what it sent
+    before its first flagged event is dropped (`_turn_kind_known`)."""
     sess, run = payload.get("sessionKey"), payload.get("runId")
     if payload.get("isHeartbeat") is not True or not (sess and run):
         return
     if run == conn._session_ids.get(sess):
         return  # a wake's id: never skip it for good (handled in _wake_step)
+    held = conn._turn_unkinded.pop((sess, run), None)
+    if held:
+        pipe_log(f"  turn writer: heartbeat run {run[:24]}...: {len(held)} earlier event(s) not shown")
     conn._turn_skip_runs[(sess, run)] = True
     if len(conn._turn_skip_runs) > 500:
         for stale in list(conn._turn_skip_runs)[:250]:
             conn._turn_skip_runs.pop(stale, None)
 
 
+# Bounds on runs held unclassified: a run is classified by its first agent
+# event, so anything past these is a leak, not a wait.
+_UNKINDED_RUNS_MAX = 64
+_UNKINDED_EVENTS_MAX = 500
+
+
+def _classifies(payload: dict) -> bool:
+    """An event that tells a heartbeat run from any other: an agent event of
+    its own (not a session.tool copy, which the receive loop rebuilds without
+    the flag, and not a tool event, the stream those copies share), or the
+    run's end, which comes after its flagged lifecycle end."""
+    stream = payload.get("stream")
+    return (bool(stream) and stream != "tool") or _is_terminal_event(payload)
+
+
+def _turn_kind_known(conn: "_GatewayConnection", sess: str, run: str, payload: dict) -> bool:
+    """Review 2af1 R7: an agent run's events may reach the writer only once the
+    run is known not to be a heartbeat. Until then they are held in order;
+    the run's first classifying event releases them ahead of itself, its
+    first flagged one drops them (`_note_heartbeat_run`), and its session's
+    settled row releases them too (`_turn_settled`). A pipe run (the pipe
+    started it) and a cron wake (`_wake_step` judges it) need no wait."""
+    if (sess, run) in conn._turn_kinded or parse_pipe_run_id(run) is not None \
+            or run == conn._session_ids.get(sess):
+        return True
+    if not _classifies(payload):
+        held = conn._turn_unkinded.setdefault((sess, run), [])
+        if len(held) < _UNKINDED_EVENTS_MAX:
+            held.append(payload)
+        while len(conn._turn_unkinded) > _UNKINDED_RUNS_MAX:
+            stale = next(iter(conn._turn_unkinded))
+            pipe_log(f"  turn writer: run {stale[1][:24]}... never classified: released")
+            _release_unkinded(conn, *stale)
+        return False
+    _release_unkinded(conn, sess, run)
+    return True
+
+
+def _release_unkinded(conn: "_GatewayConnection", sess: str, run: str) -> None:
+    conn._turn_kinded[(sess, run)] = True
+    if len(conn._turn_kinded) > 500:
+        for stale in list(conn._turn_kinded)[:250]:
+            conn._turn_kinded.pop(stale, None)
+    for ev in conn._turn_unkinded.pop((sess, run), []):
+        _turn_route_now(conn, ev)
+
+
 def _turn_settled(conn: "_GatewayConnection", session_key: str, row: dict) -> None:
     """The session went idle: every run pumped on it has ended. Its settled
-    row decides each writer's next step (DESIGN 2.5, 2.7)."""
+    row decides each writer's next step (DESIGN 2.5, 2.7). A run still held
+    unclassified is no heartbeat (its flagged lifecycle end would have come
+    first) and is released ahead of the row."""
+    for (sess, run) in [k for k in conn._turn_unkinded if k[0] == session_key]:
+        _release_unkinded(conn, sess, run)
     for (sess, _run), pump in list(conn._turn_pumps.items()):
         if sess == session_key:
             pump.queue.put_nowait(("settled", row))
@@ -1060,7 +1122,7 @@ async def _turn_resync(conn: "_GatewayConnection", skip: set = frozenset()) -> N
     settle was missed. Inline replies get the row busy or idle: one that lost
     its own final and settle in the gap looks for its closer even while a
     later run keeps the session busy (review 2af1 N3)."""
-    idle = {sess for (sess, _run) in conn._turn_pumps if sess not in skip}
+    idle = {sess for (sess, _run) in [*conn._turn_pumps, *conn._turn_unkinded] if sess not in skip}
     idle |= {c.session_key for c in list(conn._consumers.values()) if c.session_key not in skip}
     for sess in idle:
         read_at = time.monotonic()

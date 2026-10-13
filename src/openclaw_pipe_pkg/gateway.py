@@ -1394,6 +1394,10 @@ class _GatewayConnection:
         self._turn_pumps: dict = {}     # (session_key, run_id) -> _RunPump
         self._turn_writers: dict = {}   # (chat_id, message_id) -> _TurnWriter
         self._turn_skip_runs: dict = {}  # (session_key, run_id) of heartbeat runs
+        # (session_key, run_id) -> events of an agent run not yet known to be
+        # no heartbeat, and the runs known (review 2af1 R7, `_turn_kind_known`)
+        self._turn_unkinded: dict = {}
+        self._turn_kinded: dict = {}
         self._session_ids: dict = {}     # session_key -> sessionId (a cron wake's run id)
         self._wake_turns_bound: dict = {}  # session_key -> wake turn keys given a message
         self._turn_resolve_lock = asyncio.Lock()
