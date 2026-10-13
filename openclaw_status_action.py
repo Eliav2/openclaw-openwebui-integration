@@ -1954,7 +1954,7 @@ class _GatewayConnection:
     auto-reconnects on disconnect with exponential backoff.
     """
 
-    def __init__(self, valves_ref):
+    def __init__(self, valves_ref, writes_turns: bool = True):
         # Weak reference to Pipe valves (re-read on each call)
         self._valves = valves_ref
         self._ws: websockets.WebSocketClientProtocol | None = None
@@ -2023,6 +2023,11 @@ class _GatewayConnection:
         # recorded writer is no longer in the process registry can be taken
         # over (DESIGN 2.3); retire() removes it.
         self.writer_id = f"{os.getpid()}:{uuid.uuid4()}"
+        # The Status Action's own connection only makes RPCs: it never writes turns.
+        self.writes_turns = writes_turns
+        self._turn_pumps: dict = {}     # (session_key, run_id) -> _RunPump
+        self._turn_writers: dict = {}   # (chat_id, message_id) -> _TurnWriter
+        self._stop_notice_seen = False  # `shutdown` without restartExpectedMs on this socket
         # Bumped on every successful connect/reconnect. A consumer that
         # captures this before `chat.send` can later tell "the queue is quiet
         # because the agent is thinking" from "the queue is quiet because the
@@ -2191,6 +2196,8 @@ class _GatewayConnection:
             pipe_log(f"  sessions.subscribe failed: {ex}")
         else:
             self._note_active_snapshot(((resp or {}).get("list") or {}).get("sessions") or [])
+            self._stop_notice_seen = False
+            spawn_background(_turn_after_hello(self))
         for key in list(self._message_subscriptions):
             await self._subscribe_messages(key)
         # A relay whose run settled while the socket was down never hears its
@@ -2292,6 +2299,7 @@ class _GatewayConnection:
         if key and "hasActiveRun" in payload:
             self._wake_session_waiters(key)
         if key and payload.get("hasActiveRun") is False:
+            _turn_settled(self, key, payload)
             for state in list(self._relay_sessions.values()):
                 if state.session_key == key:
                     spawn_background(_relay_finalize_settled(self, state))
@@ -3186,6 +3194,12 @@ class _GatewayConnection:
                 if msg.get("type") == "event" and msg.get("event") == "sessions.changed":
                     self._on_sessions_changed(msg.get("payload") or {})
                     continue
+                if msg.get("type") == "event" and msg.get("event") == "shutdown":
+                    # DESIGN 2.7 F4: no restartExpectedMs = stop mode, whose aborted
+                    # runs the Gateway never recovers.
+                    if (msg.get("payload") or {}).get("restartExpectedMs") is None:
+                        self._stop_notice_seen = True
+                    continue
                 if msg.get("type") == "event" and msg.get("event") == "session.tool":
                     # Same payload as an `agent` tool event (stream "tool",
                     # data.phase/name/toolCallId/args/result), so it takes the
@@ -3218,6 +3232,10 @@ class _GatewayConnection:
                             pipe_log(f"  shadow renderer feed failed: {ex}")
 
                 consumers = self.consumers_for_event(payload)
+
+                # ── ELI-100: a run no live request consumes is a turn ──
+                if not consumers and await _turn_route_event(self, payload):
+                    continue
 
                 # ── ELI-62 live relay (step 4, slice 2) ──
                 # When enabled (kill switch default OFF -- see
@@ -5415,6 +5433,14 @@ class _TurnWriter:
             self.runs.append(run_id)
         self.run_id = run_id
 
+    def _adopt_recoveries_from(self, messages: list) -> None:
+        """Restart recoveries that rule E maps to M and whose events never
+        reached this socket (they ran while it was down, case 4)."""
+        for run, tool in _history_user_turns(messages):
+            if (tool == RECOVERY_SOURCE_TOOL and run not in self.runs
+                    and run_message_id(self.session_key, self.chat_id, run, messages) == self.message_id):
+                self.runs.append(run)
+
     async def end(self, row: dict, stop_notice_before: bool = False) -> None:
         """The current run settled; `row` is its settled session row (DESIGN
         2.5, 2.7). Keep M open for a recovery or a busy session, resume an
@@ -5484,7 +5510,9 @@ class _TurnWriter:
             except Exception as ex:
                 hist = None
                 pipe_log(f"  turn writer: chat.history failed at the end: {ex!r}")
-            per_run = [_history_run_messages(hist, r) for r in self.runs] if hist else [None]
+            if hist:
+                self._adopt_recoveries_from(hist.get("messages") or [])
+            per_run = [_history_span_messages(hist, r) for r in self.runs] if hist else [None]
             if all(m is not None for m in per_run):
                 rebuilt = _history_renderer([m for msgs in per_run for m in msgs])
                 if rebuilt.output:
@@ -5530,6 +5558,142 @@ class _TurnWriter:
             if not self.closed:
                 spawn_background(self._stopped())
             raise
+
+
+# ---------------------------------------------------------------------------
+# Routing: which writer gets a run's events (DESIGN 2.1, 2.2)
+# ---------------------------------------------------------------------------
+# The socket's receive loop also reads RPC replies, so it must never await an
+# RPC itself. Each routed run gets a queue and a pump task: the pump resolves
+# the run's message (rule E reads the transcript once for a non-pipe run) and
+# then feeds the run's events and its settle in order.
+
+
+def _history_span_messages(history: dict, run_id: str) -> list | None:
+    """One run's messages in `chat.history`, or None while it may still be
+    writing. A closed run ends at its `cli-assistant:<runId>`; a run cut off
+    with no closing turn (a crash, an outside kill) ends where the next
+    admitted turn (a recovery, a resume) begins."""
+    closed = _history_run_messages(history, run_id)
+    if closed is not None:
+        return closed
+    messages = (history or {}).get("messages")
+    if not isinstance(messages, list):
+        return None
+    starts = [i for i, m in enumerate(messages) if _history_user_run_id(m)]
+    for n, i in enumerate(starts):
+        if _history_user_run_id(messages[i]) == run_id and n + 1 < len(starts):
+            return messages[i + 1:starts[n + 1]]
+    return None
+
+
+class _RunPump:
+    def __init__(self):
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.writer: "_TurnWriter | None" = None
+        self.stop_notice_before = False
+
+
+async def _turn_route_event(conn: "_GatewayConnection", payload: dict) -> bool:
+    """Queue `payload` for its run's writer when the run is a turn this
+    connection writes: an OWUI session key, no live request consuming it, and
+    not an inline turn's own run (that one is handed over, DESIGN 2.6). True
+    when handled here."""
+    sess, run = payload.get("sessionKey") or "", payload.get("runId") or ""
+    if not (getattr(conn, "writes_turns", False) and sess and run) or conn._retired:
+        return False
+    parsed = conn.parse_owui_session_key(sess)
+    if not parsed or conn.consumers_for_event(payload) or f"{sess}:{run}" in conn._run_targets:
+        return False
+    if run.startswith(ACTION_RUN_PREFIX):
+        return True  # the Status Action's own runs render nothing
+    pump = conn._turn_pumps.get((sess, run))
+    if pump is None:
+        pump = conn._turn_pumps[(sess, run)] = _RunPump()
+        spawn_background(_turn_pump_loop(conn, sess, run, parsed, pump))
+        spawn_background(conn.ensure_message_subscription(sess))
+    if payload.get("state") in ("final", "error", "aborted"):
+        pump.stop_notice_before = conn._stop_notice_seen
+    pump.queue.put_nowait(("event", payload))
+    return True
+
+
+def _turn_settled(conn: "_GatewayConnection", session_key: str, row: dict) -> None:
+    """The session went idle: every run pumped on it has ended. Its settled
+    row decides each writer's next step (DESIGN 2.5, 2.7)."""
+    for (sess, _run), pump in list(conn._turn_pumps.items()):
+        if sess == session_key:
+            pump.queue.put_nowait(("settled", row))
+
+
+async def _turn_writer_for(conn: "_GatewayConnection", sess: str, run: str,
+                           user_id: str, chat_id: str) -> "_TurnWriter | None":
+    messages = None
+    if parse_pipe_run_id(run) is None:
+        # Not a pipe run: a restart recovery writes into the message of the run
+        # it recovers (rule E), which only the transcript names.
+        try:
+            messages = (await conn.session_history(sess, limit=50, max_chars=200)).get("messages")
+        except Exception as ex:
+            pipe_log(f"  turn writer: chat.history for rule E failed: {ex!r}")
+    mid = run_message_id(sess, chat_id, run, messages)
+    if mid is None:
+        return None
+    writer = conn._turn_writers.get((chat_id, mid))
+    if writer is not None and not writer.closed:
+        writer.adopt(run)
+        return writer
+    writer = _TurnWriter(conn, session_key=sess, chat_id=chat_id, user_id=user_id,
+                         run_id=run, message_id=mid)
+    conn._turn_writers[(chat_id, mid)] = writer
+    return writer
+
+
+async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
+                          parsed: tuple, pump: _RunPump) -> None:
+    user_id, chat_id = parsed
+    try:
+        pump.writer = await _turn_writer_for(conn, sess, run, user_id, chat_id)
+        while True:
+            kind, item = await pump.queue.get()
+            writer = pump.writer
+            if kind == "event":
+                if writer is not None:
+                    await writer.feed(item)
+                continue
+            # Only the pump of the writer's current run ends it: an interrupted
+            # run's pump also gets the session's settle once its recovery has
+            # taken M over, and the recovery's own pump may still hold events.
+            if writer is not None and writer.run_id == run:
+                await writer.end(item, stop_notice_before=pump.stop_notice_before)
+                if writer.closed:
+                    conn._turn_writers.pop((chat_id, writer.message_id), None)
+            return
+    except Exception as ex:
+        pipe_log(f"  turn writer: pump for run {run[:24]}... failed: {ex!r}")
+    finally:
+        if conn._turn_pumps.get((sess, run)) is pump:
+            conn._turn_pumps.pop((sess, run), None)
+
+
+async def _turn_after_hello(conn: "_GatewayConnection") -> None:
+    """After a reconnect: send resumes the closing Gateway refused, and end
+    the runs whose session is no longer active though no settle reached this
+    socket (it was down). Sessions still active wait for their own settle."""
+    for writer in list(conn._turn_writers.values()):
+        if writer.pending_resume:
+            await writer.on_hello()
+    idle = {sess for (sess, _run) in conn._turn_pumps if sess not in conn.active_run_snapshot}
+    for sess in idle:
+        try:
+            lst = await conn.send_request("sessions.list", {"search": sess[-36:], "limit": 10},
+                                          timeout=15)
+        except Exception as ex:
+            pipe_log(f"  turn writer: row read after hello failed: {ex!r}")
+            continue
+        row = next((r for r in (lst.get("sessions") or []) if r.get("key") == sess), None)
+        if row is not None and not row.get("hasActiveRun"):
+            _turn_settled(conn, sess, row)
 
 
 # --- emit ------------------------------------------------------------------
@@ -6278,7 +6442,7 @@ async def _get_action_connection(valves_getter):
     if _action_fallback_connection is None:
         async with _action_fallback_lock:
             if _action_fallback_connection is None:
-                conn = _GatewayConnection(valves_getter)
+                conn = _GatewayConnection(valves_getter, writes_turns=False)
                 await conn.ensure_connected()
                 _action_fallback_connection = conn
                 return conn, "action-own"

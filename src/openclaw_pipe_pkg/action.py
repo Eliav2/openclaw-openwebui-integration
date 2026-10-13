@@ -70,7 +70,7 @@ async def _get_action_connection(valves_getter):
     if _action_fallback_connection is None:
         async with _action_fallback_lock:
             if _action_fallback_connection is None:
-                conn = _GatewayConnection(valves_getter)
+                conn = _GatewayConnection(valves_getter, writes_turns=False)
                 await conn.ensure_connected()
                 _action_fallback_connection = conn
                 return conn, "action-own"

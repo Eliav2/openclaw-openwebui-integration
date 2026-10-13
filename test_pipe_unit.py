@@ -82,7 +82,7 @@ from openclaw_pipe import (
     ACTION_RUN_PREFIX, TURN_NS, _run_id_sent_at, parse_pipe_run_id, pipe_run_id, turn_message_id,
     _claim_turn_message, _register_turn_writer, _retire_turn_writer,
     MAX_TURN_RESUMES, next_continuation, turn_owner,
-    recovery_source_run, run_message_id, _TurnWriter,
+    recovery_source_run, run_message_id, _TurnWriter, _turn_route_event, _turn_after_hello, _history_span_messages,
     _GatewayConnection,
     GatewayError,
     _is_restart_signature,
@@ -2124,7 +2124,10 @@ class ProactiveDebounceWatcherTests(unittest.IsolatedAsyncioTestCase):
     a sustained period, and must never deliver if the session stays busy."""
 
     def _conn(self, agent_id="main"):
-        return _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID=agent_id))
+        # Legacy proactive path, kept on a connection that writes no turns until
+        # W4c deletes it (the turn writer takes these runs otherwise).
+        return _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID=agent_id),
+                                  writes_turns=False)
 
     async def test_delivers_once_session_settles_idle(self):
         conn = self._conn()
@@ -4321,7 +4324,8 @@ class GatewayReloadReapTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def _relay_begin_calls_for_idle_proactive_event(self, retired):
-        conn = _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"))
+        conn = _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"),
+                                  writes_turns=False)  # legacy path until W4c
         conn._retired = retired
         sk = _owui_session_key(
             "main",
@@ -8243,6 +8247,190 @@ class TurnWriterEndTests(_TurnWriterCase):
         self.assertIs(self.m()["done"], True)
         self.assertNotIn("NO_REPLY", self.m()["content"])
         self.assertIn("function_call", [i["type"] for i in self.m()["output"]])
+
+
+
+class AgentTurnRoutingTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-100 DESIGN 2.1-2.5 wired: a run on an OWUI key that no live request
+    consumes is written by a turn writer, as one ordinary message."""
+
+    USER = "2d206eab-acac-4945-bd2f-7e8b6365de8c"
+    CHAT = "24c342e4-50fa-442e-9b93-c215ed135f3a"
+    RUN = "agent-run-1"
+    REC = "8f27e4c8-ed9a-4acf-9df1-992ee2f4e801"
+
+    async def asyncSetUp(self):
+        self.owui = _FakeOwuiChat(self, self.CHAT)
+        self.addAsyncCleanup(self.owui.cancel_tasks)
+        self.conn = _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"))
+        self.key = _owui_session_key("main", self.USER, self.CHAT)
+        self.history = _turn_history(run=self.RUN)
+        self.sent = []
+        test = self
+
+        async def send_request(method, params, timeout=10):
+            test.sent.append((method, copy.deepcopy(params)))
+            if method == "chat.history":
+                return copy.deepcopy(test.history)
+            if method in ("sessions.messages.subscribe", "chat.abort"):
+                return {}
+            raise AssertionError(method)
+        self.conn.send_request = send_request
+
+    async def spin(self, n=300):
+        for _ in range(n):
+            await asyncio.sleep(0)
+
+    def ev(self, run, payload):
+        return {"sessionKey": self.key, "runId": run, **payload}
+
+    async def run_turn(self, run, *, text=("Reading them.", " Found it."), settle=None):
+        self.conn._on_sessions_changed({"sessionKey": self.key, "phase": "start", "runId": run,
+                                        "hasActiveRun": True, "status": "running"})
+        handled = [await _turn_route_event(self.conn, self.ev(run, _delta(text[0])))]
+        handled.append(await _turn_route_event(self.conn, self.ev(run, _tool("start", tcid="toolu_1"))))
+        handled.append(await _turn_route_event(self.conn, self.ev(run, _tool("result", tcid="toolu_1"))))
+        handled.append(await _turn_route_event(self.conn, self.ev(run, _delta(text[1]))))
+        handled.append(await _turn_route_event(self.conn, self.ev(run, {"state": "final"})))
+        self.conn._on_sessions_changed(settle or {"sessionKey": self.key, "hasActiveRun": False,
+                                                  "status": "done", "lastRunId": run,
+                                                  "reason": "chat.run.settled"})
+        await self.spin()
+        return handled
+
+    def new_messages(self):
+        return {k: v for k, v in self.owui.msgs().items() if k not in ("q1", "a1")}
+
+    async def test_an_agent_turn_renders_as_one_ordinary_message(self):
+        handled = await self.run_turn(self.RUN)
+        self.assertTrue(all(handled))
+        (mid, m), = self.new_messages().items()
+        self.assertEqual(mid, turn_message_id(self.key, self.RUN, self.CHAT))
+        self.assertEqual((m["parentId"], m["done"]), ("a1", True))
+        self.assertEqual(m["content"], "Reading them. Found it.")
+        self.assertNotIn("Proactive message", m["content"])
+        self.assertEqual(sum(1 for i in m["output"] if i["type"] == "function_call"), 1)
+        self.assertEqual(self.conn._relay_sessions, {}, "the old relay never engaged")
+        self.assertIn(("sessions.messages.subscribe", {"key": self.key}), self.sent,
+                      "tool events of a run this socket did not start come as session.tool")
+
+    async def test_a_recovery_continues_the_interrupted_message(self):
+        # The interrupted run streamed, then the Gateway crashed: the row is running.
+        self.history = {"messages": [
+            {"role": "user", "content": "x", "idempotencyKey": f"{self.RUN}:user"},
+            {"role": "user", "content": "[System] continue", "idempotencyKey": f"{self.REC}:user",
+             "provenance": {"kind": "internal_system", "sourceTool": "main_session_restart_recovery"}}]}
+        await _turn_route_event(self.conn, self.ev(self.RUN, _delta("Reading them.")))
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": True,
+                                        "status": "running"})
+        await self.spin()
+        await self.run_turn(self.REC, text=("Again.", " Found it."),
+                            settle={"sessionKey": self.key, "hasActiveRun": False, "status": "done",
+                                    "lastRunId": self.REC, "reason": "chat.run.settled"})
+        (mid, m), = self.new_messages().items()
+        self.assertEqual(mid, turn_message_id(self.key, self.RUN, self.CHAT),
+                         "rule E: the recovery writes into the interrupted run's message")
+        self.assertIs(m["done"], True)
+        self.assertIn("Again.", m["content"])
+
+    def crashed_then_recovered_history(self):
+        """RUN streamed, the Gateway died (no closing turn for RUN), and boot
+        recovered it as REC, which ran to the end (M3-crash shape)."""
+        imported = {"importedFrom": "claude-cli"}
+        return {"messages": [
+            {"role": "user", "content": "x", "idempotencyKey": f"{self.RUN}:user"},
+            {"role": "assistant", "__openclaw": imported,
+             "content": [{"type": "text", "text": "Reading them."}]},
+            {"role": "user", "content": "[System] continue", "idempotencyKey": f"{self.REC}:user",
+             "provenance": {"kind": "internal_system", "sourceTool": "main_session_restart_recovery"}},
+            {"role": "assistant", "__openclaw": imported, "content": [
+                {"type": "toolcall", "id": "toolu_9", "name": "Bash", "arguments": {"command": "tail"}},
+                {"type": "tool_result", "tool_use_id": "toolu_9", "name": "Bash",
+                 "content": [{"type": "text", "text": "ok"}]}]},
+            {"role": "assistant", "__openclaw": imported,
+             "content": [{"type": "text", "text": " Found it."}]},
+            {"role": "assistant", "idempotencyKey": f"cli-assistant:{self.REC}",
+             "content": [{"type": "text", "text": "Found it."}]}]}
+
+    async def test_a_recovery_that_ended_while_away_is_folded_in(self):
+        """Case 4: the recovery ran and ended while this socket was down, so
+        none of its events arrived. Its settle (or the row read after hello)
+        ends RUN's writer, and the finalize takes the recovery from the
+        transcript by rule E."""
+        await _turn_route_event(self.conn, self.ev(self.RUN, _delta("Reading them.")))
+        await self.spin()
+        self.history = self.crashed_then_recovered_history()
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "done", "lastRunId": self.REC})
+        await self.spin()
+        (mid, m), = self.new_messages().items()
+        self.assertEqual(mid, turn_message_id(self.key, self.RUN, self.CHAT))
+        self.assertIs(m["done"], True)
+        self.assertEqual(m["content"], "Reading them. Found it.")
+        self.assertEqual(sum(1 for i in m["output"] if i["type"] == "function_call"), 1,
+                         "the recovery's tool card comes from the transcript")
+
+    async def test_after_hello_an_idle_session_ends_its_open_writer(self):
+        """No settle reached this socket (it was down). The first hello's
+        snapshot does not list the session as active, so its row is read and
+        ends the writer: no wait for a push that already happened."""
+        await _turn_route_event(self.conn, self.ev(self.RUN, _delta("Reading them.")))
+        await self.spin()
+        self.history = self.crashed_then_recovered_history()
+        row = {"key": self.key, "hasActiveRun": False, "status": "done", "lastRunId": self.REC}
+        inner = self.conn.send_request
+
+        async def send_request(method, params, timeout=10):
+            if method == "sessions.list":
+                self.sent.append((method, params))
+                return {"sessions": [row]}
+            return await inner(method, params, timeout)
+        self.conn.send_request = send_request
+        self.conn.active_run_snapshot = {}
+        await _turn_after_hello(self.conn)
+        await self.spin()
+        (_mid, m), = self.new_messages().items()
+        self.assertIs(m["done"], True)
+        self.assertEqual(m["content"], "Reading them. Found it.")
+
+    async def test_after_hello_an_active_session_waits_for_its_settle(self):
+        await _turn_route_event(self.conn, self.ev(self.RUN, _delta("Reading them.")))
+        await self.spin()
+        self.conn.active_run_snapshot = {self.key: []}
+        await _turn_after_hello(self.conn)
+        await self.spin()
+        self.assertNotIn("sessions.list", [m for m, _ in self.sent])
+        (_mid, m), = self.new_messages().items()
+        self.assertIs(m["done"], False, "the recovery still runs: M stays open for it")
+
+    async def test_a_run_a_live_request_consumes_is_not_routed(self):
+        q = self.conn.register_consumer(self.key, "msg-run")
+        self.addCleanup(self.conn.unregister_consumer, self.key, "msg-run", queue=q)
+        self.assertFalse(await _turn_route_event(self.conn, self.ev("msg-run", _delta("hi"))))
+
+    async def test_the_action_connection_never_writes_turns(self):
+        conn = _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"), writes_turns=False)
+        self.assertFalse(await _turn_route_event(conn, self.ev(self.RUN, _delta("hi"))))
+
+    async def test_a_retired_connection_writes_no_turns(self):
+        self.conn._retired = True
+        self.assertFalse(await _turn_route_event(self.conn, self.ev(self.RUN, _delta("hi"))))
+        self.assertEqual(self.conn._turn_pumps, {})
+
+    def test_an_interrupted_runs_span_ends_at_the_next_admitted_turn(self):
+        hist = self.crashed_then_recovered_history()
+        span = _history_span_messages(hist, self.RUN)
+        self.assertEqual([m.get("content") for m in span if m["role"] == "assistant"],
+                         [[{"type": "text", "text": "Reading them."}]])
+        self.assertEqual(len(_history_span_messages(hist, self.REC)), 3)
+        self.assertIsNone(_history_span_messages(
+            {"messages": hist["messages"][:2]}, self.RUN), "still the newest turn: not over")
+
+    async def test_the_status_actions_runs_are_swallowed(self):
+        self.assertTrue(await _turn_route_event(
+            self.conn, self.ev(f"{ACTION_RUN_PREFIX}compact-x-1.0", _delta("Compacted."))))
+        await self.spin()
+        self.assertEqual(self.new_messages(), {})
 
 
 if __name__ == "__main__":

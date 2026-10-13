@@ -1313,7 +1313,7 @@ class _GatewayConnection:
     auto-reconnects on disconnect with exponential backoff.
     """
 
-    def __init__(self, valves_ref):
+    def __init__(self, valves_ref, writes_turns: bool = True):
         # Weak reference to Pipe valves (re-read on each call)
         self._valves = valves_ref
         self._ws: websockets.WebSocketClientProtocol | None = None
@@ -1382,6 +1382,11 @@ class _GatewayConnection:
         # recorded writer is no longer in the process registry can be taken
         # over (DESIGN 2.3); retire() removes it.
         self.writer_id = f"{os.getpid()}:{uuid.uuid4()}"
+        # The Status Action's own connection only makes RPCs: it never writes turns.
+        self.writes_turns = writes_turns
+        self._turn_pumps: dict = {}     # (session_key, run_id) -> _RunPump
+        self._turn_writers: dict = {}   # (chat_id, message_id) -> _TurnWriter
+        self._stop_notice_seen = False  # `shutdown` without restartExpectedMs on this socket
         # Bumped on every successful connect/reconnect. A consumer that
         # captures this before `chat.send` can later tell "the queue is quiet
         # because the agent is thinking" from "the queue is quiet because the
@@ -1550,6 +1555,8 @@ class _GatewayConnection:
             pipe_log(f"  sessions.subscribe failed: {ex}")
         else:
             self._note_active_snapshot(((resp or {}).get("list") or {}).get("sessions") or [])
+            self._stop_notice_seen = False
+            spawn_background(_turn_after_hello(self))
         for key in list(self._message_subscriptions):
             await self._subscribe_messages(key)
         # A relay whose run settled while the socket was down never hears its
@@ -1651,6 +1658,7 @@ class _GatewayConnection:
         if key and "hasActiveRun" in payload:
             self._wake_session_waiters(key)
         if key and payload.get("hasActiveRun") is False:
+            _turn_settled(self, key, payload)
             for state in list(self._relay_sessions.values()):
                 if state.session_key == key:
                     spawn_background(_relay_finalize_settled(self, state))
@@ -2545,6 +2553,12 @@ class _GatewayConnection:
                 if msg.get("type") == "event" and msg.get("event") == "sessions.changed":
                     self._on_sessions_changed(msg.get("payload") or {})
                     continue
+                if msg.get("type") == "event" and msg.get("event") == "shutdown":
+                    # DESIGN 2.7 F4: no restartExpectedMs = stop mode, whose aborted
+                    # runs the Gateway never recovers.
+                    if (msg.get("payload") or {}).get("restartExpectedMs") is None:
+                        self._stop_notice_seen = True
+                    continue
                 if msg.get("type") == "event" and msg.get("event") == "session.tool":
                     # Same payload as an `agent` tool event (stream "tool",
                     # data.phase/name/toolCallId/args/result), so it takes the
@@ -2577,6 +2591,10 @@ class _GatewayConnection:
                             pipe_log(f"  shadow renderer feed failed: {ex}")
 
                 consumers = self.consumers_for_event(payload)
+
+                # ── ELI-100: a run no live request consumes is a turn ──
+                if not consumers and await _turn_route_event(self, payload):
+                    continue
 
                 # ── ELI-62 live relay (step 4, slice 2) ──
                 # When enabled (kill switch default OFF -- see

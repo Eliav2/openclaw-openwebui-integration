@@ -202,6 +202,14 @@ class _TurnWriter:
             self.runs.append(run_id)
         self.run_id = run_id
 
+    def _adopt_recoveries_from(self, messages: list) -> None:
+        """Restart recoveries that rule E maps to M and whose events never
+        reached this socket (they ran while it was down, case 4)."""
+        for run, tool in _history_user_turns(messages):
+            if (tool == RECOVERY_SOURCE_TOOL and run not in self.runs
+                    and run_message_id(self.session_key, self.chat_id, run, messages) == self.message_id):
+                self.runs.append(run)
+
     async def end(self, row: dict, stop_notice_before: bool = False) -> None:
         """The current run settled; `row` is its settled session row (DESIGN
         2.5, 2.7). Keep M open for a recovery or a busy session, resume an
@@ -271,7 +279,9 @@ class _TurnWriter:
             except Exception as ex:
                 hist = None
                 pipe_log(f"  turn writer: chat.history failed at the end: {ex!r}")
-            per_run = [_history_run_messages(hist, r) for r in self.runs] if hist else [None]
+            if hist:
+                self._adopt_recoveries_from(hist.get("messages") or [])
+            per_run = [_history_span_messages(hist, r) for r in self.runs] if hist else [None]
             if all(m is not None for m in per_run):
                 rebuilt = _history_renderer([m for msgs in per_run for m in msgs])
                 if rebuilt.output:
@@ -317,3 +327,139 @@ class _TurnWriter:
             if not self.closed:
                 spawn_background(self._stopped())
             raise
+
+
+# ---------------------------------------------------------------------------
+# Routing: which writer gets a run's events (DESIGN 2.1, 2.2)
+# ---------------------------------------------------------------------------
+# The socket's receive loop also reads RPC replies, so it must never await an
+# RPC itself. Each routed run gets a queue and a pump task: the pump resolves
+# the run's message (rule E reads the transcript once for a non-pipe run) and
+# then feeds the run's events and its settle in order.
+
+
+def _history_span_messages(history: dict, run_id: str) -> list | None:
+    """One run's messages in `chat.history`, or None while it may still be
+    writing. A closed run ends at its `cli-assistant:<runId>`; a run cut off
+    with no closing turn (a crash, an outside kill) ends where the next
+    admitted turn (a recovery, a resume) begins."""
+    closed = _history_run_messages(history, run_id)
+    if closed is not None:
+        return closed
+    messages = (history or {}).get("messages")
+    if not isinstance(messages, list):
+        return None
+    starts = [i for i, m in enumerate(messages) if _history_user_run_id(m)]
+    for n, i in enumerate(starts):
+        if _history_user_run_id(messages[i]) == run_id and n + 1 < len(starts):
+            return messages[i + 1:starts[n + 1]]
+    return None
+
+
+class _RunPump:
+    def __init__(self):
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.writer: "_TurnWriter | None" = None
+        self.stop_notice_before = False
+
+
+async def _turn_route_event(conn: "_GatewayConnection", payload: dict) -> bool:
+    """Queue `payload` for its run's writer when the run is a turn this
+    connection writes: an OWUI session key, no live request consuming it, and
+    not an inline turn's own run (that one is handed over, DESIGN 2.6). True
+    when handled here."""
+    sess, run = payload.get("sessionKey") or "", payload.get("runId") or ""
+    if not (getattr(conn, "writes_turns", False) and sess and run) or conn._retired:
+        return False
+    parsed = conn.parse_owui_session_key(sess)
+    if not parsed or conn.consumers_for_event(payload) or f"{sess}:{run}" in conn._run_targets:
+        return False
+    if run.startswith(ACTION_RUN_PREFIX):
+        return True  # the Status Action's own runs render nothing
+    pump = conn._turn_pumps.get((sess, run))
+    if pump is None:
+        pump = conn._turn_pumps[(sess, run)] = _RunPump()
+        spawn_background(_turn_pump_loop(conn, sess, run, parsed, pump))
+        spawn_background(conn.ensure_message_subscription(sess))
+    if payload.get("state") in ("final", "error", "aborted"):
+        pump.stop_notice_before = conn._stop_notice_seen
+    pump.queue.put_nowait(("event", payload))
+    return True
+
+
+def _turn_settled(conn: "_GatewayConnection", session_key: str, row: dict) -> None:
+    """The session went idle: every run pumped on it has ended. Its settled
+    row decides each writer's next step (DESIGN 2.5, 2.7)."""
+    for (sess, _run), pump in list(conn._turn_pumps.items()):
+        if sess == session_key:
+            pump.queue.put_nowait(("settled", row))
+
+
+async def _turn_writer_for(conn: "_GatewayConnection", sess: str, run: str,
+                           user_id: str, chat_id: str) -> "_TurnWriter | None":
+    messages = None
+    if parse_pipe_run_id(run) is None:
+        # Not a pipe run: a restart recovery writes into the message of the run
+        # it recovers (rule E), which only the transcript names.
+        try:
+            messages = (await conn.session_history(sess, limit=50, max_chars=200)).get("messages")
+        except Exception as ex:
+            pipe_log(f"  turn writer: chat.history for rule E failed: {ex!r}")
+    mid = run_message_id(sess, chat_id, run, messages)
+    if mid is None:
+        return None
+    writer = conn._turn_writers.get((chat_id, mid))
+    if writer is not None and not writer.closed:
+        writer.adopt(run)
+        return writer
+    writer = _TurnWriter(conn, session_key=sess, chat_id=chat_id, user_id=user_id,
+                         run_id=run, message_id=mid)
+    conn._turn_writers[(chat_id, mid)] = writer
+    return writer
+
+
+async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
+                          parsed: tuple, pump: _RunPump) -> None:
+    user_id, chat_id = parsed
+    try:
+        pump.writer = await _turn_writer_for(conn, sess, run, user_id, chat_id)
+        while True:
+            kind, item = await pump.queue.get()
+            writer = pump.writer
+            if kind == "event":
+                if writer is not None:
+                    await writer.feed(item)
+                continue
+            # Only the pump of the writer's current run ends it: an interrupted
+            # run's pump also gets the session's settle once its recovery has
+            # taken M over, and the recovery's own pump may still hold events.
+            if writer is not None and writer.run_id == run:
+                await writer.end(item, stop_notice_before=pump.stop_notice_before)
+                if writer.closed:
+                    conn._turn_writers.pop((chat_id, writer.message_id), None)
+            return
+    except Exception as ex:
+        pipe_log(f"  turn writer: pump for run {run[:24]}... failed: {ex!r}")
+    finally:
+        if conn._turn_pumps.get((sess, run)) is pump:
+            conn._turn_pumps.pop((sess, run), None)
+
+
+async def _turn_after_hello(conn: "_GatewayConnection") -> None:
+    """After a reconnect: send resumes the closing Gateway refused, and end
+    the runs whose session is no longer active though no settle reached this
+    socket (it was down). Sessions still active wait for their own settle."""
+    for writer in list(conn._turn_writers.values()):
+        if writer.pending_resume:
+            await writer.on_hello()
+    idle = {sess for (sess, _run) in conn._turn_pumps if sess not in conn.active_run_snapshot}
+    for sess in idle:
+        try:
+            lst = await conn.send_request("sessions.list", {"search": sess[-36:], "limit": 10},
+                                          timeout=15)
+        except Exception as ex:
+            pipe_log(f"  turn writer: row read after hello failed: {ex!r}")
+            continue
+        row = next((r for r in (lst.get("sessions") or []) if r.get("key") == sess), None)
+        if row is not None and not row.get("hasActiveRun"):
+            _turn_settled(conn, sess, row)
