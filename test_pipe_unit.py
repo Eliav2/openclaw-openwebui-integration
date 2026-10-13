@@ -6955,6 +6955,87 @@ class InlineEndSignalTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(timer, src)
 
 
+class TitleRunSignalTests(unittest.IsolatedAsyncioTestCase):
+    """Review 2af1 timers: the auto-title run is read from its own events (its
+    assistant text and final) or its settle row, not by polling
+    `sessions.preview` every 3 s for ~21 s, which dropped the title whenever
+    the title agent took longer."""
+
+    async def asyncSetUp(self):
+        self.pipe = openclaw_pipe.Pipe()
+        self.conn = _GatewayConnection(lambda: self.pipe.valves)
+        self.calls, self.history = [], {"messages": []}
+        test = self
+
+        async def send_request(method, params, timeout=10):
+            test.calls.append((method, params))
+            if method == "chat.send":
+                test.run = params["idempotencyKey"]
+                test.sk = params["sessionKey"]
+                return {"runId": test.run, "status": "started"}
+            if method == "chat.history":
+                return copy.deepcopy(test.history)
+            raise AssertionError(f"unexpected {method}")
+        self.conn.send_request = send_request
+        self.task = asyncio.ensure_future(self.pipe._generate_title_text(self.conn, "hi", "hello"))
+        for _ in range(100):
+            await asyncio.sleep(0)
+            if any(m == "chat.send" for m, _ in self.calls):
+                break
+
+    async def asyncTearDown(self):
+        self.task.cancel()
+        await asyncio.gather(self.task, return_exceptions=True)
+
+    def put(self, msg):
+        (consumer,) = [c for k, c in self.conn._consumers.items() if k.startswith(self.sk)]
+        for q in consumer.queues:
+            q.put_nowait(msg)
+
+    def ev(self, event, **payload):
+        return {"type": "event", "event": event,
+                "payload": {"sessionKey": self.sk, "runId": self.run, **payload}}
+
+    async def test_the_title_comes_from_the_runs_own_events(self):
+        self.put(self.ev("agent", stream="assistant", data={"delta": "\U0001F527 Fixing "}))
+        self.put(self.ev("agent", stream="assistant", data={"delta": "the pipe"}))
+        self.put(self.ev("chat", state="final"))
+        self.assertEqual(await asyncio.wait_for(self.task, 1), "\U0001F527 Fixing the pipe")
+        self.assertNotIn("sessions.preview", [m for m, _ in self.calls])
+        self.assertFalse(self.conn._consumers, "the consumer is released")
+
+    async def test_a_run_settled_without_its_final_is_read_from_the_transcript(self):
+        self.history = {"messages": [
+            {"role": "assistant", "content": [{"type": "text", "text": "Title Here"}],
+             "idempotencyKey": f"cli-assistant:{self.run}"}]}
+        self.put({"type": openclaw_pipe._ROW_MARKER_TYPE, "resync": False,
+                  "row": {"hasActiveRun": False, "status": "done", "lastRunId": self.run}})
+        self.assertEqual(await asyncio.wait_for(self.task, 1), "Title Here")
+
+    async def test_a_failed_title_run_gives_no_title(self):
+        self.put(self.ev("agent", stream="lifecycle", data={"phase": "error", "error": "boom"}))
+        self.assertIsNone(await asyncio.wait_for(self.task, 1))
+        self.assertFalse(self.conn._consumers)
+
+    async def test_the_consumer_exists_before_the_send(self):
+        """A fast title run must not finish before anyone listens (R12 shape)."""
+        consumers_at_send = []
+        orig = self.conn.send_request
+
+        async def send_request(method, params, timeout=10):
+            if method == "chat.send":
+                consumers_at_send.append(list(self.conn._consumers))
+            return await orig(method, params, timeout)
+        self.conn.send_request = send_request
+        task = asyncio.ensure_future(self.pipe._generate_title_text(self.conn, "a", "b"))
+        for _ in range(50):
+            await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        self.assertTrue(consumers_at_send and any("title-gen" in k for k in consumers_at_send[0]),
+                        consumers_at_send)
+
+
 class RunSpanTests(unittest.TestCase):
     """A run's messages in chat.history never include another run's."""
 

@@ -7854,18 +7854,17 @@ class Pipe:
                                     assistant_msg: str) -> str | None:
         """Use a lightweight model call to generate a 3-5 word title + emoji.
 
-        Sends a chat.send to a temp session, then polls sessions.preview
-        until the model's response is available. Avoids the complexity of
-        registering consumers and consuming raw gateway events.
+        Sends a chat.send to a temp session and reads the run from its own
+        signals: its assistant text up to its final event, or, when the final
+        was lost, its settle row and the transcript (review 2af1 timers). The
+        old 7 x 3 s `sessions.preview` poll dropped any title slower than that.
 
         Runs under TITLE_GEN_AGENT_ID (a separate configured agent from
         AGENT_ID), not the main conversation's agent. A bare/unprefixed
         sessionKey previously defaulted onto the SAME agent as the live
         conversation, so this background call shared its CLI process/queue
-        lane -- when the main conversation was busy (any heavy tool-call
-        turn), title-gen queued behind it and routinely missed this
-        function's ~21s polling window, silently dropping the title
-        (2026-07-10 regression). A distinct agent id gets its own lane.
+        lane and queued behind any heavy turn (2026-07-10 regression). A
+        distinct agent id gets its own lane.
         """
         prompt = (
             "Create a concise title (3-5 words) with a relevant emoji "
@@ -7877,48 +7876,52 @@ class Pipe:
 
         agent_id = self.valves.TITLE_GEN_AGENT_ID.strip() or "title-gen"
         title_session = f"agent:{agent_id}:title-gen-{uuid.uuid4().hex[:12]}"
-
-        # 1. Send the title-gen prompt to a new session
+        run_id = f"title-{title_session}"
+        # Listen before sending: a fast run can end before chat.send returns.
+        queue = conn.register_consumer(title_session, run_id)
         try:
-            await conn.send_request(
-                "chat.send",
-                dict(
-                    sessionKey=title_session,
-                    message=prompt,
-                    idempotencyKey=f"title-{title_session}",
-                ),
-                timeout=15,
-            )
-        except Exception as e:
-            pipe_log(f"Auto-title: chat.send failed: {e}")
-            return None
-
-        # 2. Poll sessions.preview until the model responds (up to ~20s)
-        for attempt in range(7):
-            await asyncio.sleep(3)
             try:
-                preview = await conn.send_request(
-                    "sessions.preview",
-                    dict(keys=[title_session], limit=3, maxChars=600),
-                    timeout=8,
+                resp = await conn.send_request(
+                    "chat.send",
+                    dict(sessionKey=title_session, message=prompt, idempotencyKey=run_id),
+                    timeout=15,
                 )
-            except Exception:
-                continue
-
-            # Extract the last assistant message from the preview
-            previews = preview.get("previews", [])
-            if not previews:
-                continue
-            items = previews[0].get("items", [])
-            for item in reversed(items):
-                if isinstance(item, dict) and item.get("role") == "assistant":
-                    title = str(item.get("text", "")).strip()
-                    if title:
-                        pipe_log(f"Auto-title: got title from preview (attempt {attempt+1})")
-                        return self._clean_title_text(title)
-
-        pipe_log("Auto-title: no assistant response in preview after polling")
-        return None
+            except Exception as e:
+                pipe_log(f"Auto-title: chat.send failed: {e}")
+                return None
+            if resp.get("runId") and resp["runId"] != run_id:
+                conn.unregister_consumer(title_session, run_id, queue=queue)
+                run_id = resp["runId"]
+                queue = conn.register_consumer(title_session, run_id)
+            text = ""
+            while True:
+                msg = await queue.get()
+                kind = msg.get("type")
+                if kind == _RESTART_MARKER_TYPE:
+                    pipe_log("Auto-title: Gateway restarted; no title")
+                    return None
+                if kind == _ROW_MARKER_TYPE:
+                    row = msg.get("row") or {}
+                    if row.get("hasActiveRun") is False and (
+                            msg.get("resync") or row.get("lastRunId") == run_id):
+                        hist = await conn.session_history(title_session, limit=10)
+                        found, whole = _history_text_for_run(hist, run_id)
+                        return self._clean_title_text(whole or text) if (found or text) else None
+                    continue
+                payload = msg.get("payload") or {}
+                data = payload.get("data") or {}
+                if payload.get("stream") == "assistant":
+                    text += data.get("delta") or ""
+                if payload.get("stream") == "lifecycle" and data.get("phase") == "error":
+                    pipe_log(f"Auto-title: title run failed: {data.get('error')}")
+                    return None
+                if payload.get("state") in ("error", "aborted"):
+                    return None
+                if payload.get("state") == "final":
+                    final = _coerce_text(payload.get("message")) if payload.get("message") else ""
+                    return self._clean_title_text(final or text)
+        finally:
+            conn.unregister_consumer(title_session, run_id)
 
     @staticmethod
     def _clean_title_text(raw: str) -> str | None:
