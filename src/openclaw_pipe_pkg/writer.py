@@ -83,6 +83,98 @@ def _output_item_boundary(sent: list, current: list) -> bool:
     return False
 
 
+# Open WebUI cancels a response identically for Stop and for Send now (both
+# call stopTasksByChatId; the message queue exists only in the browser), so
+# the backend can never tell them apart. The page can: this hook, installed
+# once per page through an `execute` event, records per chat which one the
+# user pressed. Labels are OWUI's English strings (they are localized, so a
+# non-English UI falls back to the timer); Escape is OWUI's Stop shortcut,
+# and Enter in the composer while a response runs is an interrupt when the
+# message queue is off (with it on, a later Stop or Send now click
+# overwrites it).
+_INTENT_HOOK_JS = r"""
+if (!window.__ocIntentHook) {
+  window.__ocIntentHook = true;
+  window.__ocIntents = {};
+  const chat = () => (location.pathname.match(/\/c\/([^/?#]+)/) || [])[1] || null;
+  const mark = (kind) => { const c = chat(); if (c) window.__ocIntents[c] = { kind, t: Date.now() }; };
+  const running = () => !!document.querySelector('button[aria-label="Stop"], #stop-response-button');
+  document.addEventListener('click', (e) => {
+    const b = e.target && e.target.closest ? e.target.closest('button') : null;
+    if (!b) return;
+    const label = b.getAttribute('aria-label') || '';
+    if (label === 'Send now') mark('send_now');
+    else if (label === 'Stop' || b.id === 'stop-response-button') mark('stop');
+  }, true);
+  document.addEventListener('keydown', (e) => {
+    if (!running()) return;
+    if (e.key === 'Escape') { mark('stop'); return; }
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.target && e.target.closest
+        && e.target.closest('#chat-input')) mark('send_now');
+  }, true);
+}
+return true;
+"""
+
+
+def _intent_query_js(chat_id: str) -> str:
+    """Read and clear what the page recorded for `chat_id` (see
+    `_INTENT_HOOK_JS`). "none" means the hook is there but saw no click, so
+    the cancel came from elsewhere; null means no hook at all."""
+    return (
+        "const c = " + json.dumps(chat_id) + ";"
+        "const all = window.__ocIntents;"
+        "if (!all) return null;"
+        "const i = all[c]; delete all[c];"
+        "return (i && Date.now() - i.t < 60000) ? i.kind : 'none';"
+    )
+
+
+# The page's answer to an intent query is an RPC reply; this bounds a tab that
+# never answers (it is not a wait for anything to happen).
+_INTENT_QUERY_TIMEOUT_S = 3.0
+
+
+def _intent_answer(resp) -> str | None:
+    if isinstance(resp, str):
+        return resp.strip() or None
+    if isinstance(resp, dict) and "error" not in resp:
+        for key in ("value", "result", "text"):
+            if isinstance(resp.get(key), str):
+                return resp[key].strip() or None
+    return None
+
+
+async def _page_cancel_intent(user_id: str, chat_id: str, message_id: str) -> str | None:
+    """Which button cancelled the writer's task: "stop", "send_now", or None
+    (no tab of this user shows the chat, no hook, or no click recorded). Asks
+    every tab showing the chat (OWUI's SESSION_POOL[sid]["chat_ids"]); a
+    Stop anywhere wins."""
+    try:
+        from open_webui.socket import main as socket_main
+    except Exception:
+        return None
+    pool = getattr(socket_main, "SESSION_POOL", None) or {}
+    sids = [sid for sid, sess in list(pool.items())
+            if isinstance(sess, dict) and sess.get("id") == user_id
+            and chat_id in (sess.get("chat_ids") or [])]
+    answers = set()
+    for sid in sids:
+        try:
+            resp = await socket_main.sio.call("events", {
+                "chat_id": chat_id, "message_id": message_id,
+                "data": {"type": "execute", "data": {"code": _intent_query_js(chat_id)}},
+            }, to=sid, timeout=_INTENT_QUERY_TIMEOUT_S)
+        except Exception as ex:
+            pipe_log(f"  turn writer: intent query to {sid[:8]}... failed: {ex!r}")
+            continue
+        answers.add(_intent_answer(resp))
+    for kind in ("stop", "send_now"):
+        if kind in answers:
+            return kind
+    return None
+
+
 class _TurnWriter:
     """Writes run `run_id` into message `message_id` of chat `chat_id`."""
 
@@ -130,6 +222,12 @@ class _TurnWriter:
         self.task_id, _ = await create_task(_owui_redis(), self._hold(), id=self.chat_id)
         await _set_turn_meta(self.chat_id, self.message_id, {"task_id": self.task_id})
         self.opened = True
+        try:
+            # Case 8: lets a cancel of this task ask the page whether it was
+            # Stop or Send now. Idempotent in the page.
+            await (await self._emitter())({"type": "execute", "data": {"code": _INTENT_HOOK_JS}})
+        except Exception as ex:
+            pipe_log(f"  turn writer: intent hook install failed: {ex!r}")
         pipe_log(f"  turn writer: opened {self.message_id[:8]}... ({claim['how']}) for run "
                  f"{self.run_id[:24]}... in chat {self.chat_id[:8]}...")
         return True
@@ -315,8 +413,15 @@ class _TurnWriter:
             self._done.set()
 
     async def _stopped(self) -> None:
-        """Open WebUI cancelled the writer's task (the page's Stop): abort the
-        run and finalize what M has."""
+        """Open WebUI cancelled the writer's task. Stop and Send now both do
+        that (DESIGN case 8), so the page is asked which: Stop aborts the run
+        and finalizes what M has; Send now or no answer keeps writing M to the
+        run's end, and the queued message runs after it (case 7)."""
+        intent = await _page_cancel_intent(self.user_id, self.chat_id, self.message_id)
+        pipe_log(f"  turn writer: task of {self.message_id[:8]}... cancelled, page intent "
+                 f"{intent or 'unknown'}")
+        if intent != "stop" or self.closed:
+            return
         try:
             await self.conn.send_request(
                 "chat.abort", {"sessionKey": self.session_key, "runId": self.run_id}, timeout=15)
@@ -383,6 +488,15 @@ async def _turn_route_event(conn: "_GatewayConnection", payload: dict) -> bool:
         return False
     if run.startswith(ACTION_RUN_PREFIX):
         return True  # the Status Action's own runs render nothing
+    if payload.get("isHeartbeat") is True:
+        # Condition B: a heartbeat run never gets a message. Its later events
+        # can come without the flag (session.tool), so the run is remembered.
+        conn._turn_skip_runs[(sess, run)] = True
+        if len(conn._turn_skip_runs) > 500:
+            for stale in list(conn._turn_skip_runs)[:250]:
+                conn._turn_skip_runs.pop(stale, None)
+    if (sess, run) in conn._turn_skip_runs:
+        return True
     if conn.was_delivered_live(sess, run):
         # A request showed this run to the end, or a Stop / Send now closed
         # its message: a late event reopens nothing.

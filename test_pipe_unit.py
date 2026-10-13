@@ -82,7 +82,8 @@ from openclaw_pipe import (
     ACTION_RUN_PREFIX, TURN_NS, _run_id_sent_at, parse_pipe_run_id, pipe_run_id, turn_message_id,
     _claim_turn_message, _register_turn_writer, _retire_turn_writer,
     MAX_TURN_RESUMES, next_continuation, turn_owner,
-    recovery_source_run, run_message_id, _TurnWriter, _turn_route_event, _turn_after_hello, _history_span_messages, _register_turn_writer, _retire_turn_writer,
+    recovery_source_run, run_message_id, _TurnWriter, _INTENT_HOOK_JS,
+    _turn_route_event, _turn_after_hello, _history_span_messages,
     _GatewayConnection,
     GatewayError,
     _is_restart_signature,
@@ -5814,9 +5815,17 @@ class _FakeOwuiChat:
             async def upsert_message(mid, chat_id, user_id, m, db=None):
                 fake.rows[mid] = copy.deepcopy(m)
 
+        # The page: each sid shows chats (OWUI's SESSION_POOL[sid]["chat_ids"])
+        # and its intent hook answers a query with what was clicked.
+        self.session_pool, self.page_intent, self.calls = {}, {}, []
+
         class Sio:
-            async def emit(self, event, data, room=None):
-                fake.emits.append((event, copy.deepcopy(data), room))
+            async def emit(self, event, data, room=None, to=None):
+                fake.emits.append((event, copy.deepcopy(data), room or to))
+
+            async def call(self, event, data, to=None, timeout=None):
+                fake.calls.append((event, copy.deepcopy(data), to))
+                return fake.page_intent.get(to)
 
         async def get_event_emitter(meta, update_db=True):
             fake.emitter_update_db = update_db
@@ -5840,7 +5849,8 @@ class _FakeOwuiChat:
             for k, v in attrs.items():
                 setattr(m, k, v)
             return m
-        self.socket_main = mod("open_webui.socket.main", sio=Sio(), get_event_emitter=get_event_emitter)
+        self.socket_main = mod("open_webui.socket.main", sio=Sio(), get_event_emitter=get_event_emitter,
+                               SESSION_POOL=self.session_pool)
         mods = {"open_webui": mod("open_webui"), "open_webui.models": mod("open_webui.models"),
                 "open_webui.models.chats": mod("open_webui.models.chats", Chats=Chats),
                 "open_webui.models.chat_messages": mod("open_webui.models.chat_messages",
@@ -6106,16 +6116,49 @@ class TurnWriterEndTests(_TurnWriterCase):
         self.assertNotIn("chat.send", [m for m, _ in self.sent])
         self.assertIs(self.m()["done"], False)
 
-    async def test_stop_aborts_the_run_and_finalizes_what_it_has(self):
-        w = await self.opened_writer()
+    async def cancel_from_the_page(self, w, answer):
+        """The page cancels the writer's task (Stop or Send now both do);
+        its intent hook answers `answer` when asked which button it was."""
+        self.owui.session_pool.update({"sid-1": {"id": self.USER, "chat_ids": [self.CHAT]},
+                                       "sid-other": {"id": self.USER, "chat_ids": ["c2"]}})
+        self.owui.page_intent["sid-1"] = answer
         _, task = self.owui.tasks[w.task_id]
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         for _ in range(200):
             await asyncio.sleep(0)
+
+    async def test_the_writer_installs_the_page_intent_hook_when_it_opens_m(self):
+        await self.opened_writer()
+        self.assertIn(_INTENT_HOOK_JS, [e["data"]["code"] for e in self.owui.events("execute")])
+
+    async def test_stop_aborts_the_run_and_finalizes_what_it_has(self):
+        w = await self.opened_writer()
+        await self.cancel_from_the_page(w, "stop")
+        (_e, call, sid), = self.owui.calls
+        self.assertEqual((sid, call["message_id"]), ("sid-1", "m1"),
+                         "only a tab showing this chat is asked, about M")
         self.assertIn(("chat.abort", {"sessionKey": self.KEY, "runId": self.RUN}), self.sent)
         self.assertIs(self.m()["done"], True)
         self.assertTrue(w.closed)
+
+    async def test_send_now_keeps_writing_the_agent_turn(self):
+        """DESIGN case 8: Send now cancels the task too, but the run keeps
+        its message to the end; the queued message runs after (case 7)."""
+        w = await self.opened_writer()
+        await self.cancel_from_the_page(w, "send_now")
+        self.assertNotIn("chat.abort", [m for m, _ in self.sent])
+        self.assertFalse(w.closed)
+        await w.feed(_delta(" Found it."))
+        await w.end({"status": "done", "hasActiveRun": False, "lastRunId": self.RUN})
+        self.assertIs(self.m()["done"], True)
+        self.assertEqual(self.m()["content"], "Reading them. Found it.")
+
+    async def test_an_unknown_intent_keeps_writing(self):
+        w = await self.opened_writer()
+        await self.cancel_from_the_page(w, None)
+        self.assertNotIn("chat.abort", [m for m, _ in self.sent])
+        self.assertFalse(w.closed)
 
     async def test_a_silent_run_with_tools_keeps_its_cards_and_no_sentinel(self):
         self.history = {"messages": []}
@@ -6365,6 +6408,19 @@ class AgentTurnRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.dispatch(run, _tool("result", tcid="toolu_1")))
         await self.spin()
         self.assertEqual(self.owui.msgs()[self.STUB]["done"], True)
+        self.assertEqual(self.conn._turn_pumps, {})
+
+    async def test_a_heartbeat_run_never_gets_a_message(self):
+        """Condition B: a run whose agent events carry isHeartbeat:true
+        (server-chat-CbnqM5f6.mjs:791, 823-826) renders nothing, including
+        its later events that come without the flag (session.tool)."""
+        hb = {**_delta("HEARTBEAT check"), "isHeartbeat": True}
+        self.assertTrue(await _turn_route_event(self.conn, self.ev(self.RUN, hb)))
+        self.assertTrue(await _turn_route_event(self.conn, self.ev(self.RUN, _tool("start", tcid="t"))))
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "done", "lastRunId": self.RUN})
+        await self.spin()
+        self.assertEqual(self.new_messages(), {})
         self.assertEqual(self.conn._turn_pumps, {})
 
     async def test_a_run_a_live_request_consumes_is_not_routed(self):

@@ -1358,6 +1358,7 @@ class _GatewayConnection:
         self.writes_turns = writes_turns
         self._turn_pumps: dict = {}     # (session_key, run_id) -> _RunPump
         self._turn_writers: dict = {}   # (chat_id, message_id) -> _TurnWriter
+        self._turn_skip_runs: dict = {}  # (session_key, run_id) of heartbeat runs
         self._stop_notice_seen = False  # `shutdown` without restartExpectedMs on this socket
         # Bumped on every successful connect/reconnect. A consumer that
         # captures this before `chat.send` can later tell "the queue is quiet

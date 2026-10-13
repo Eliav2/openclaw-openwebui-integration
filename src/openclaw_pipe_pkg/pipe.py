@@ -108,57 +108,9 @@ def _thinking_rejection_retry_body(body, recovered, resolved_thinking):
     return retry_body
 
 
-# Open WebUI cancels a response identically for Stop and for Send now (both
-# call stopTasksByChatId; the message queue exists only in the browser), so
-# the backend can never tell them apart. The page can: this hook, installed
-# once per page through an `execute` event, records per chat which one the
-# user pressed. Labels are OWUI's English strings (they are localized, so a
-# non-English UI falls back to the timer); Escape is OWUI's Stop shortcut,
-# and Enter in the composer while a response runs is an interrupt when the
-# message queue is off (with it on, a later Stop or Send now click
-# overwrites it).
-_INTENT_HOOK_JS = r"""
-if (!window.__ocIntentHook) {
-  window.__ocIntentHook = true;
-  window.__ocIntents = {};
-  const chat = () => (location.pathname.match(/\/c\/([^/?#]+)/) || [])[1] || null;
-  const mark = (kind) => { const c = chat(); if (c) window.__ocIntents[c] = { kind, t: Date.now() }; };
-  const running = () => !!document.querySelector('button[aria-label="Stop"], #stop-response-button');
-  document.addEventListener('click', (e) => {
-    const b = e.target && e.target.closest ? e.target.closest('button') : null;
-    if (!b) return;
-    const label = b.getAttribute('aria-label') || '';
-    if (label === 'Send now') mark('send_now');
-    else if (label === 'Stop' || b.id === 'stop-response-button') mark('stop');
-  }, true);
-  document.addEventListener('keydown', (e) => {
-    if (!running()) return;
-    if (e.key === 'Escape') { mark('stop'); return; }
-    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.target && e.target.closest
-        && e.target.closest('#chat-input')) mark('send_now');
-  }, true);
-}
-return true;
-"""
-
-
-def _intent_query_js(chat_id: str) -> str:
-    """Read and clear what the page recorded for `chat_id` (see
-    `_INTENT_HOOK_JS`). "none" means the hook is there but saw no click, so
-    the cancel came from elsewhere; null means no hook at all."""
-    return (
-        "const c = " + json.dumps(chat_id) + ";"
-        "const all = window.__ocIntents;"
-        "if (!all) return null;"
-        "const i = all[c]; delete all[c];"
-        "return (i && Date.now() - i.t < 60000) ? i.kind : 'none';"
-    )
-
-
 # A Send now's follow-up message is known to be coming; this only bounds a
 # browser that dies between the cancel and the send.
 _SEND_NOW_HOLD_S = 120.0
-_INTENT_QUERY_TIMEOUT_S = 3.0
 
 
 async def _settle_cancel_intent(conn, session_key, run_id, chat_id, event_call):
