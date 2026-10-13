@@ -7934,11 +7934,17 @@ class _FakeOwuiChat:
             async def emit(self, event, data, room=None):
                 fake.emits.append((event, copy.deepcopy(data), room))
 
-        async def get_event_emitter(meta):
+        async def get_event_emitter(meta, update_db=True):
+            fake.emitter_update_db = update_db
             async def emit(event):
                 fake.emits.append(("events", {"chat_id": meta["chat_id"], "message_id": meta["message_id"],
                                               "data": copy.deepcopy(event)}, f"user:{meta['user_id']}"))
             return emit
+
+        self.streams = []
+
+        async def save_response_stream(redis, task_id, chat_id, message_id, content, output):
+            fake.streams.append((task_id, message_id, content, copy.deepcopy(output)))
 
         async def create_task(redis, coroutine, id=None, task_id=None):
             task_id = task_id or f"task-{len(fake.tasks) + 1}"
@@ -7957,7 +7963,8 @@ class _FakeOwuiChat:
                                                        ChatMessages=ChatMessages),
                 "open_webui.socket": mod("open_webui.socket"),
                 "open_webui.socket.main": self.socket_main,
-                "open_webui.tasks": mod("open_webui.tasks", create_task=create_task),
+                "open_webui.tasks": mod("open_webui.tasks", create_task=create_task,
+                                        save_response_stream=save_response_stream),
                 "open_webui.main": mod("open_webui.main", app=types.SimpleNamespace(
                     state=types.SimpleNamespace(redis=None))),
                 "sqlalchemy": mod("sqlalchemy"), "sqlalchemy.orm": mod("sqlalchemy.orm"),
@@ -7979,12 +7986,7 @@ class _FakeOwuiChat:
         await asyncio.gather(*(t for _, t in self.tasks.values()), return_exceptions=True)
 
 
-class TurnWriterOpenTests(unittest.IsolatedAsyncioTestCase):
-    """ELI-100 DESIGN 2.3: opening a run's message: claim it at the tail,
-    introduce it to open tabs with the shared `chat:messages` event (M1), and
-    register the writer with Open WebUI's task registry so the page shows the
-    chat as generating and its Stop button reaches the writer (M4, M5)."""
-
+class _TurnWriterCase(unittest.IsolatedAsyncioTestCase):
     USER, CHAT = "u1", "c1"
     KEY = "agent:main:openwebui-u1-c1"
 
@@ -7996,6 +7998,13 @@ class TurnWriterOpenTests(unittest.IsolatedAsyncioTestCase):
     def writer(self, run="agent-run-1", message_id="m1"):
         return _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT,
                            user_id=self.USER, run_id=run, message_id=message_id)
+
+
+class TurnWriterOpenTests(_TurnWriterCase):
+    """ELI-100 DESIGN 2.3: opening a run's message: claim it at the tail,
+    introduce it to open tabs with the shared `chat:messages` event (M1), and
+    register the writer with Open WebUI's task registry so the page shows the
+    chat as generating and its Stop button reaches the writer (M4, M5)."""
 
     async def test_open_claims_introduces_and_registers_a_task(self):
         w = self.writer()
@@ -8029,6 +8038,71 @@ class TurnWriterOpenTests(unittest.IsolatedAsyncioTestCase):
         w = self.writer(run=f"{ACTION_RUN_PREFIX}compact-c1-1.0", message_id=None)
         self.assertFalse(await w.open())
         self.assertEqual(set(self.owui.msgs()), {"q1", "a1"})
+
+
+
+def _delta(text):
+    return {"stream": "assistant", "data": {"delta": text}}
+
+
+def _tool(phase, tcid="t1", name="Bash", result="ok"):
+    data = {"phase": phase, "name": name, "toolCallId": tcid, "args": {"command": "ls"}}
+    if phase == "result":
+        data["result"] = result
+    return {"stream": "tool", "data": data}
+
+
+class TurnWriterStreamTests(_TurnWriterCase):
+    """ELI-100 DESIGN 2.3 (when, condition B) and 2.4 (streaming)."""
+
+    async def test_text_opens_only_once_it_is_showable(self):
+        w = self.writer()
+        for chunk in ("NO_", "RE"):  # still a prefix of the NO_REPLY sentinel
+            await w.feed(_delta(chunk))
+        self.assertFalse(w.opened)
+        await w.feed(_delta("ST of the answer"))
+        self.assertTrue(w.opened)
+        self.assertEqual(self.owui.msgs()["m1"]["done"], False)
+
+    async def test_a_sentinel_only_run_never_opens(self):
+        w = self.writer()
+        await w.feed(_delta("NO_REPLY"))
+        self.assertFalse(w.opened)
+        self.assertEqual(set(self.owui.msgs()), {"q1", "a1"})
+
+    async def test_a_tool_start_opens_before_any_text(self):
+        """Condition B: a tool-heavy agent turn shows its cards from the first call."""
+        w = self.writer()
+        await w.feed(_tool("start"))
+        self.assertTrue(w.opened)
+        added = [e["data"] for e in self.owui.events("response:completion")]
+        self.assertEqual([a["type"] for a in added], ["response.output_item.added"])
+        self.assertEqual(added[0]["item"]["type"], "function_call")
+
+    async def test_events_stream_to_the_users_room_without_db_side_effects(self):
+        w = self.writer()
+        await w.feed(_delta("Hello"))
+        await w.feed(_delta(" world"))
+        kinds = [e["data"]["type"] for e in self.owui.events("response:completion")]
+        self.assertEqual(kinds, ["response.output_item.added", "response.output_text.delta",
+                                 "response.output_text.delta"])
+        self.assertIs(self.owui.emitter_update_db, False, "the writer owns the DB writes")
+
+    async def test_the_db_is_written_on_item_boundaries_and_the_stream_on_every_event(self):
+        w = self.writer()
+        await w.feed(_delta("Reading"))           # opens: first item
+        writes_after_open = self.owui.msgs()["m1"].get("content")
+        await w.feed(_delta(" the logs"))         # same item: stream only
+        self.assertEqual(self.owui.msgs()["m1"].get("content"), writes_after_open)
+        await w.feed(_tool("start"))              # new item: boundary
+        self.assertEqual(self.owui.msgs()["m1"]["content"].strip()[:16], "Reading the logs")
+        self.assertEqual([i["type"] for i in self.owui.msgs()["m1"]["output"]],
+                         ["message", "function_call"])
+        await w.feed(_tool("result"))             # tool result: boundary
+        self.assertIn("function_call_output", [i["type"] for i in self.owui.msgs()["m1"]["output"]])
+        self.assertIs(self.owui.msgs()["m1"]["done"], False)
+        self.assertEqual(len(self.owui.streams), 4, "the response stream gets every event")
+        self.assertEqual(self.owui.streams[-1][0], w.task_id)
 
 
 if __name__ == "__main__":

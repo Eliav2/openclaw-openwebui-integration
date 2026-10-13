@@ -7481,6 +7481,21 @@ def _owui_redis():
     return getattr(getattr(app, "state", None), "redis", None)
 
 
+def _output_item_boundary(sent: list, current: list) -> bool:
+    """True when `current` has a new item, or an item other than a growing
+    message text changed (a tool result, a finished card)."""
+    if len(current) != len(sent):
+        return True
+    for i, (old, new) in enumerate(zip(sent, current)):
+        if old == new:
+            continue
+        growing_text = (i == len(current) - 1 and new.get("type") == "message"
+                        and old.get("id") == new.get("id"))
+        if not growing_text:
+            return True
+    return False
+
+
 class _TurnWriter:
     """Writes run `run_id` into message `message_id` of chat `chat_id`."""
 
@@ -7493,6 +7508,9 @@ class _TurnWriter:
         self.opened = False
         self.task_id: str | None = None
         self.parent_id: str | None = None
+        self.closed = False             # nothing more to write (ended, or M is someone else's)
+        self.sent_output: list = []     # the `output` open tabs hold
+        self._emit = None
         self._done = asyncio.Event()
 
     async def open(self, takeover: bool = False) -> bool:
@@ -7521,6 +7539,69 @@ class _TurnWriter:
         pipe_log(f"  turn writer: opened {self.message_id[:8]}... ({claim['how']}) for run "
                  f"{self.run_id[:24]}... in chat {self.chat_id[:8]}...")
         return True
+
+    def _showable(self) -> bool:
+        """Condition B: a tool call start, or text that is not a silent
+        sentinel or a prefix of one. Whichever comes first."""
+        if any(i.get("type") == "function_call" for i in self.renderer.output):
+            return True
+        return _relay_content_is_showable(self.renderer.visible_text or "")
+
+    async def feed(self, payload: dict) -> None:
+        """One event of the run: grow the renderer, open the message on the
+        first showable item, then stream what changed."""
+        if self.closed:
+            return
+        try:
+            self.renderer.feed(payload)
+        except Exception as ex:
+            pipe_log(f"  turn writer: renderer feed failed: {ex}")
+        if not self.opened:
+            if not self._showable():
+                return
+            if not await self.open():
+                self.closed = True
+                return
+        await self._stream()
+
+    async def _emitter(self):
+        if self._emit is None:
+            from open_webui.socket.main import get_event_emitter
+
+            # update_db=False: the writer owns this message's DB writes.
+            self._emit = await get_event_emitter(
+                {"chat_id": self.chat_id, "message_id": self.message_id,
+                 "user_id": self.user_id}, update_db=False)
+        return self._emit
+
+    async def _stream(self) -> None:
+        """Emit the output change as Responses events (Open WebUI forwards a
+        throttled shared copy to the chat room), keep the response stream
+        current for a tab that opens the chat mid-turn, and write the DB on
+        item boundaries (a new item, a tool result), not per text delta."""
+        output = self.renderer.output
+        emit = await self._emitter()
+        for ev in _relay_output_events(self.sent_output, output):
+            await emit({"type": "response:completion", "data": ev})
+        boundary = _output_item_boundary(self.sent_output, output)
+        self.sent_output = copy.deepcopy(output)
+        from open_webui.tasks import save_response_stream
+
+        await save_response_stream(_owui_redis(), self.task_id, self.chat_id, self.message_id,
+                                   self.renderer.text, self.sent_output)
+        if boundary:
+            await self._persist(done=False)
+
+    async def _persist(self, *, done: bool, output: list | None = None) -> None:
+        from open_webui.models.chats import Chats
+
+        try:
+            await Chats.upsert_message_to_chat_by_id_and_message_id(
+                self.chat_id, self.message_id,
+                {"content": self.renderer.text, "output": output if output is not None
+                 else copy.deepcopy(self.renderer.output), "done": done})
+        except Exception as ex:
+            pipe_log(f"  turn writer: persist failed: {ex}")
 
     async def _hold(self) -> None:
         """The Open WebUI task: alive exactly while this writer owns the run."""
