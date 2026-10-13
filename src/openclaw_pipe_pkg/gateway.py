@@ -1451,6 +1451,7 @@ class _GatewayConnection:
         # arrived before its reply registered for it, while that reply still
         # streams the message: never a turn writer's (review 2af1 N6).
         self._held_for_live: dict[tuple[str, str], list] = {}
+        self.unreachable_held_drains = 0
         self._delivered_live: dict[str, float] = (
             _shared["delivered_live"] if _shared is not None else {}
         )
@@ -1959,7 +1960,13 @@ class _GatewayConnection:
         if not held:
             return
         consumer = self._consumers.get(f"{session_key}:{run_id}")
-        if consumer is not None:  # registered meanwhile: its queue takes them
+        if consumer is not None:
+            # Unreachable: `register_consumer` takes a run's held events
+            # before its queue exists. Counted and logged so a path that
+            # breaks this shows; the events still reach the reply.
+            self.unreachable_held_drains += 1
+            pipe_log(f"  ERROR unreachable: {len(held)} held event(s) for an already-registered "
+                     f"consumer of {run_id[:24]}... (count {self.unreachable_held_drains})")
             for q in consumer.queues:
                 for ev in held:
                     q.put_control(ev)

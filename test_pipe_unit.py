@@ -6402,6 +6402,18 @@ class AgentTurnRoutingTests(_RoutingCase):
                          ["Reading", " a.py."])
         self.assertEqual(self.conn._turn_pumps, {})
 
+    async def test_held_events_for_a_registered_consumer_are_counted_and_still_delivered(self):
+        """Unreachable through register_consumer, which takes held events
+        first; forced here so the guard is proven to count and deliver."""
+        a_run = pipe_run_id(self.CHAT, self.STUB, "input")
+        q = self.conn.register_consumer(self.key, a_run)
+        self.addCleanup(self.conn.unregister_consumer, self.key, a_run, queue=q)
+        self.conn._held_for_live[(self.key, a_run)] = [self.ev(a_run, _delta("late"))]
+        self.conn.drain_held(self.key, a_run)
+        self.assertEqual(self.conn.unreachable_held_drains, 1)
+        self.assertEqual(q.get_nowait()["data"]["delta"], "late")
+        self.assertEqual(self.conn._turn_pumps, {})
+
     async def test_another_messages_run_is_not_held(self):
         q = self.conn.register_consumer(self.key, pipe_run_id(self.CHAT, "other-message"))
         self.addCleanup(self.conn.unregister_consumer, self.key,
