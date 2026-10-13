@@ -82,7 +82,7 @@ from openclaw_pipe import (
     ACTION_RUN_PREFIX, TURN_NS, _run_id_sent_at, parse_pipe_run_id, pipe_run_id, turn_message_id,
     _claim_turn_message, _register_turn_writer, _retire_turn_writer,
     MAX_TURN_RESUMES, next_continuation, turn_owner,
-    recovery_source_run, run_message_id,
+    recovery_source_run, run_message_id, _TurnWriter,
     _GatewayConnection,
     GatewayError,
     _is_restart_signature,
@@ -7890,6 +7890,145 @@ class RecoveryLinkTests(unittest.TestCase):
         f = "04351f67-dbc3-4533-b2aa-2a0d88d79da0"
         self.assertIsNone(recovery_source_run(self.history(), f))
         self.assertNotEqual(run_message_id(self.KEY, self.CHAT, f, self.history()), self.M)
+
+
+
+class _FakeOwuiChat:
+    """A one-chat Open WebUI for the turn writer: the chat row behind a real
+    lock (Chats._chat_transaction), chat_message rows, the socket server and
+    the task registry, installed as the open_webui modules the writer
+    imports."""
+
+    def __init__(self, testcase, chat_id="c1"):
+        self.chat_id = chat_id
+        self.chat = types.SimpleNamespace(chat={"models": ["openclaw_gateway.m"], "history": {
+            "currentId": "a1", "messages": {
+                "q1": {"id": "q1", "role": "user", "parentId": None, "childrenIds": ["a1"]},
+                "a1": {"id": "a1", "role": "assistant", "parentId": "q1", "childrenIds": [],
+                       "model": "openclaw_gateway.m", "done": True},
+            }}}, current_message_id="a1", updated_at=0)
+        self.rows, self.emits, self.tasks = {}, [], {}
+        lock = asyncio.Lock()
+        fake = self
+
+        class Chats:
+            @staticmethod
+            @contextlib.asynccontextmanager
+            async def _chat_transaction(chat_id):
+                async with lock:
+                    await asyncio.sleep(0)
+                    yield ("db", fake.chat)
+
+            @staticmethod
+            async def upsert_message_to_chat_by_id_and_message_id(chat_id, message_id, message):
+                msgs = fake.chat.chat["history"]["messages"]
+                msgs[message_id] = {**msgs.get(message_id, {}), **message}
+                return fake.chat
+
+        class ChatMessages:
+            @staticmethod
+            async def upsert_message(mid, chat_id, user_id, m, db=None):
+                fake.rows[mid] = copy.deepcopy(m)
+
+        class Sio:
+            async def emit(self, event, data, room=None):
+                fake.emits.append((event, copy.deepcopy(data), room))
+
+        async def get_event_emitter(meta):
+            async def emit(event):
+                fake.emits.append(("events", {"chat_id": meta["chat_id"], "message_id": meta["message_id"],
+                                              "data": copy.deepcopy(event)}, f"user:{meta['user_id']}"))
+            return emit
+
+        async def create_task(redis, coroutine, id=None, task_id=None):
+            task_id = task_id or f"task-{len(fake.tasks) + 1}"
+            fake.tasks[task_id] = (id, asyncio.ensure_future(coroutine))
+            return task_id, fake.tasks[task_id][1]
+
+        def mod(name, **attrs):
+            m = types.ModuleType(name)
+            for k, v in attrs.items():
+                setattr(m, k, v)
+            return m
+        self.socket_main = mod("open_webui.socket.main", sio=Sio(), get_event_emitter=get_event_emitter)
+        mods = {"open_webui": mod("open_webui"), "open_webui.models": mod("open_webui.models"),
+                "open_webui.models.chats": mod("open_webui.models.chats", Chats=Chats),
+                "open_webui.models.chat_messages": mod("open_webui.models.chat_messages",
+                                                       ChatMessages=ChatMessages),
+                "open_webui.socket": mod("open_webui.socket"),
+                "open_webui.socket.main": self.socket_main,
+                "open_webui.tasks": mod("open_webui.tasks", create_task=create_task),
+                "open_webui.main": mod("open_webui.main", app=types.SimpleNamespace(
+                    state=types.SimpleNamespace(redis=None))),
+                "sqlalchemy": mod("sqlalchemy"), "sqlalchemy.orm": mod("sqlalchemy.orm"),
+                "sqlalchemy.orm.attributes": mod("sqlalchemy.orm.attributes",
+                                                 flag_modified=lambda obj, name: None)}
+        p = mock.patch.dict(sys.modules, mods)
+        p.start()
+        testcase.addCleanup(p.stop)
+
+    def msgs(self):
+        return self.chat.chat["history"]["messages"]
+
+    def events(self, kind):
+        return [d["data"] for e, d, room in self.emits if e == "events" and d["data"].get("type") == kind]
+
+    async def cancel_tasks(self):
+        for _, t in self.tasks.values():
+            t.cancel()
+        await asyncio.gather(*(t for _, t in self.tasks.values()), return_exceptions=True)
+
+
+class TurnWriterOpenTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-100 DESIGN 2.3: opening a run's message: claim it at the tail,
+    introduce it to open tabs with the shared `chat:messages` event (M1), and
+    register the writer with Open WebUI's task registry so the page shows the
+    chat as generating and its Stop button reaches the writer (M4, M5)."""
+
+    USER, CHAT = "u1", "c1"
+    KEY = "agent:main:openwebui-u1-c1"
+
+    async def asyncSetUp(self):
+        self.owui = _FakeOwuiChat(self, self.CHAT)
+        self.conn = _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"))
+        self.addAsyncCleanup(self.owui.cancel_tasks)
+
+    def writer(self, run="agent-run-1", message_id="m1"):
+        return _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT,
+                           user_id=self.USER, run_id=run, message_id=message_id)
+
+    async def test_open_claims_introduces_and_registers_a_task(self):
+        w = self.writer()
+        self.assertTrue(await w.open())
+        m = self.owui.msgs()["m1"]
+        self.assertEqual((m["parentId"], m["done"]), ("a1", False))
+        intro = [d for e, d, room in self.owui.emits
+                 if e == "events" and d["data"]["type"] == "chat:messages"]
+        self.assertEqual(len(intro), 1)
+        self.assertEqual(intro[0]["data"]["data"]["currentId"], "m1")
+        self.assertTrue(intro[0]["shared"])
+        self.assertEqual([r for e, d, r in self.owui.emits if d["data"]["type"] == "chat:messages"],
+                         [f"chat:{self.CHAT}"], "to the chat room, where every open tab is")
+        self.assertEqual(set(intro[0]["data"]["data"]["messages"]), {"m1", "a1"})
+        (task_id, (item, _)), = self.owui.tasks.items()
+        self.assertEqual(item, self.CHAT, "listed for the chat: the page shows it as generating")
+        self.assertEqual(m["meta"]["task_id"], task_id, "Open WebUI finds the task by meta.task_id")
+        self.assertEqual(w.task_id, task_id)
+
+    async def test_a_message_another_writer_holds_is_not_opened_again(self):
+        _register_turn_writer("other")
+        self.addCleanup(_retire_turn_writer, "other")
+        await _claim_turn_message(self.CHAT, self.USER, "m1", "agent-run-1", "other")
+        emits_before = len(self.owui.emits)
+        w = self.writer()
+        self.assertFalse(await w.open())
+        self.assertEqual(len(self.owui.emits), emits_before, "nothing introduced")
+        self.assertEqual(self.owui.tasks, {}, "no second task")
+
+    async def test_the_status_actions_runs_never_open(self):
+        w = self.writer(run=f"{ACTION_RUN_PREFIX}compact-c1-1.0", message_id=None)
+        self.assertFalse(await w.open())
+        self.assertEqual(set(self.owui.msgs()), {"q1", "a1"})
 
 
 if __name__ == "__main__":

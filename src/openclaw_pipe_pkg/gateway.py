@@ -1378,6 +1378,10 @@ class _GatewayConnection:
         # has consumers for, but never relays or delivers proactively and
         # never reconnects once those runs are gone.
         self._retired = False
+        # ELI-100: this connection's identity as a turn writer. A message whose
+        # recorded writer is no longer in the process registry can be taken
+        # over (DESIGN 2.3); retire() removes it.
+        self.writer_id = f"{os.getpid()}:{uuid.uuid4()}"
         # Bumped on every successful connect/reconnect. A consumer that
         # captures this before `chat.send` can later tell "the queue is quiet
         # because the agent is thinking" from "the queue is quiet because the
@@ -2243,6 +2247,7 @@ class _GatewayConnection:
         `ensure_connected` refuses to bring it back.
         """
         self._retired = True
+        _retire_turn_writer(self.writer_id)
         if self._consumers:
             pipe_log(
                 f"  retired gateway connection: serving {len(self._consumers)} "
