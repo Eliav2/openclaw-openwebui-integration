@@ -338,7 +338,7 @@ class SessionToolEventTests(unittest.IsolatedAsyncioTestCase):
                 if frames:
                     return json.dumps(frames.pop(0))
                 conn._stopped = True
-                raise asyncio.TimeoutError
+                raise asyncio.CancelledError  # stop, not a tick timeout (which marks a gap)
 
         conn._ws = ScriptedWS()
         await conn._event_loop()
@@ -2105,6 +2105,88 @@ class GatewayReconnectStormTests(unittest.IsolatedAsyncioTestCase):
         conn._ws = None
         with self.assertRaises(GatewayError):
             await conn.send_request("sessions.describe", {"key": "k"}, timeout=1)
+
+
+class TickWatchTests(unittest.IsolatedAsyncioTestCase):
+    """Review 2af1 R13: the Gateway sends a `tick` event every
+    `policy.tickIntervalMs` of hello-ok (server-maintenance-Wf2jQ0wx.mjs:156,
+    30 s), and its own client closes the socket after twice that with no frame
+    (client-CKDmO6tp.mjs:1447-1459, "tick timeout"). A half-open socket sends
+    nothing and never closes: the pipe's 90 s receive timeout only looped, so
+    every run on it stayed stuck."""
+
+    def conn(self):
+        conn = _GatewayConnection(lambda: None)
+        conn._max_backoff = 0
+        conn._tick_interval_s = 0.05
+        return conn
+
+    async def test_a_silent_socket_is_closed_and_replaced_after_two_tick_intervals(self):
+        conn = self.conn()
+        aborted, reconnects = [], []
+
+        class HalfOpen:
+            transport = types.SimpleNamespace(abort=lambda: aborted.append(True))
+
+            async def recv(self):
+                await asyncio.sleep(3600)
+
+        class Fresh:
+            async def recv(self):
+                conn._stopped = True
+                raise websockets.exceptions.ConnectionClosed("closed")
+
+        async def connect_and_start():
+            reconnects.append(time.monotonic())
+            conn._ws = Fresh()
+        conn._connect_and_start = connect_and_start
+        conn._ws = HalfOpen()
+        gaps = []
+        conn._mark_event_gap = lambda: gaps.append(True)
+        t0 = time.monotonic()
+        await asyncio.wait_for(conn._event_loop(), 5)
+        self.assertEqual(len(reconnects), 1, "one new socket")
+        self.assertGreaterEqual(reconnects[0] - t0, 0.1, "not before two intervals")
+        self.assertEqual(aborted, [True], "the dead socket is torn down")
+        self.assertTrue(gaps, "runs learn their events may be lost")
+
+    async def test_ticks_keep_a_quiet_socket(self):
+        conn = self.conn()
+        n = {"recv": 0}
+
+        class Ticking:
+            async def recv(self):
+                n["recv"] += 1
+                if n["recv"] > 8:
+                    conn._stopped = True
+                    raise websockets.exceptions.ConnectionClosed("closed")
+                await asyncio.sleep(0.03)
+                return json.dumps({"type": "event", "event": "tick", "payload": {"ts": 1}})
+
+        async def connect_and_start():
+            raise AssertionError("a ticking socket was replaced")
+        conn._connect_and_start = connect_and_start
+        conn._ws = Ticking()
+        await asyncio.wait_for(conn._event_loop(), 5)
+        self.assertGreater(n["recv"], 8)
+
+    async def test_hello_sets_the_interval(self):
+        conn = _GatewayConnection(lambda: types.SimpleNamespace(
+            GATEWAY_URL="localhost:18789", GATEWAY_TOKEN="tok"))
+        conn._ensure_identity = lambda valves: None
+        conn._ident = {"id": "device-1"}
+        self.assertEqual(conn._tick_interval_s, 30.0, "the Gateway's default before a hello")
+        ws = _HandshakeWS()
+        hello = json.loads(ws._frames[1])
+        hello["payload"]["policy"] = {"tickIntervalMs": 12000}
+        ws._frames[1] = json.dumps(hello)
+
+        async def fake_connect(_url, **_kw):
+            return ws
+        with mock.patch.object(websockets, "connect", fake_connect, create=True), \
+                mock.patch("openclaw_pipe._sign_challenge", lambda *a, **k: {}):
+            await conn._connect_and_start()
+        self.assertEqual(conn._tick_interval_s, 12.0)
 
 
 class GatewayReloadReapTests(unittest.IsolatedAsyncioTestCase):
@@ -6318,7 +6400,7 @@ class RegressionPlanTests(_RoutingCase):
                 if frames:
                     return json.dumps(frames.pop(0))
                 conn._stopped = True
-                raise asyncio.TimeoutError
+                raise asyncio.CancelledError  # stop, not a tick timeout (which marks a gap)
 
         conn._ws = ScriptedWS()
         await conn._event_loop()

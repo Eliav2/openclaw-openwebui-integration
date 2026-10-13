@@ -2049,6 +2049,11 @@ class _GatewayConnection:
         # Reconnect state
         self._reconnect_attempt = 0
         self._max_backoff = 30  # seconds
+        # The Gateway sends a `tick` event every `policy.tickIntervalMs` of
+        # hello-ok (30 s, server-maintenance-Wf2jQ0wx.mjs:156); its own client
+        # drops a socket that sent no frame for twice that ("tick timeout",
+        # client-CKDmO6tp.mjs:1447-1459). The event loop does the same.
+        self._tick_interval_s = 30.0
         self._stopped = False
         # Set once a newer deploy of this function has taken over (see
         # `retire()`). A retired connection still serves runs it already
@@ -3031,6 +3036,9 @@ class _GatewayConnection:
 
         self._ws = ws
         self._frame_seq = None  # frame seq counts per socket
+        tick_ms = (hello_ok.get("policy") or {}).get("tickIntervalMs")
+        if isinstance(tick_ms, (int, float)) and tick_ms > 0:
+            self._tick_interval_s = tick_ms / 1000
         self._reconnect_attempt = 0
         self.connection_epoch += 1
         self._thinking_note_shown.clear()
@@ -3124,7 +3132,8 @@ class _GatewayConnection:
                 if self._subscriptions_stale:
                     self._subscriptions_stale = False
                     spawn_background(self._subscribe_all())
-                msg = json.loads(await asyncio.wait_for(self._ws.recv(), timeout=90))
+                msg = json.loads(await asyncio.wait_for(self._ws.recv(),
+                                                        timeout=2 * self._tick_interval_s))
 
                 # ── Dropped frames ──
                 # Event frames carry a per-socket `seq`; the Gateway advances it
@@ -3245,8 +3254,16 @@ class _GatewayConnection:
                 # This efficiently filters cross-session bleed (P16).
 
             except asyncio.TimeoutError:
-                # No events for 90s but connection is still alive
-                continue
+                # Not even a tick for two intervals: the socket is dead without
+                # having closed (half-open), so every run on it would wait
+                # forever (review 2af1 R13). Tear it down and reconnect.
+                pipe_log(f"  tick timeout: no frame for {2 * self._tick_interval_s:.0f}s, "
+                         "reconnecting")
+                transport = getattr(self._ws, "transport", None)
+                if transport is not None:
+                    transport.abort()
+                self._ws = None
+                self._mark_event_gap()
             except websockets.exceptions.ConnectionClosed as e:
                 pipe_log(
                     "WS disconnected -- reconnecting... "
