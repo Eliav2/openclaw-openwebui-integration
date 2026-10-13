@@ -278,6 +278,27 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         c.send_request.assert_not_awaited()
         self.assertEqual(self.restricted.send_request.await_count, 3)
 
+    async def test_a_guest_send_leaves_out_the_admin_only_fields(self):
+        """The Gateway refuses a chat.send carrying system provenance or
+        originating route fields from a connection without operator.admin
+        ("system provenance fields require admin scope"). An owner's send keeps
+        the conversation metadata block; a guest's goes without it."""
+        k_owner, k_guest = self.key(self.OWNER), self.key(self.GUEST)
+        c = self.conn(self.OWNER)
+        owner_params = openclaw_pipe._owui_chat_send_params(k_owner, "hi", "i1", "chat-1", self.OWNER)
+        guest_params = openclaw_pipe._owui_chat_send_params(k_guest, "hi", "i2", "chat-2", self.GUEST)
+        guest_params.update({f: "x" for f in openclaw_pipe.ADMIN_ONLY_SEND_FIELDS})
+        await openclaw_pipe._run_request(c, openclaw_pipe.RUN_SEND, owner_params)
+        await openclaw_pipe._run_request(c, openclaw_pipe.RUN_SEND, guest_params)
+        sent_owner = c.send_request.await_args.args[1]
+        sent_guest = self.restricted.send_request.await_args.args[1]
+        self.assertIn("systemProvenanceReceipt", sent_owner)
+        for f in openclaw_pipe.ADMIN_ONLY_SEND_FIELDS:
+            self.assertNotIn(f, sent_guest)
+        self.assertEqual({k: sent_guest[k] for k in ("sessionKey", "message", "idempotencyKey")},
+                         {"sessionKey": k_guest, "message": "hi", "idempotencyKey": "i2"})
+        self.assertIn("systemProvenanceReceipt", guest_params)  # caller's dict untouched
+
     async def test_a_key_without_a_user_is_not_the_owners(self):
         c = self.conn(self.OWNER)
         await self.send(c, "agent:main:somewhere-else")

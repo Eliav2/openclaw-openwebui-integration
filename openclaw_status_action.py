@@ -794,6 +794,19 @@ def _is_owner_user(owners: frozenset, user_id, email) -> bool:
 # the owner's when the connection that sends it holds operator.admin, so these
 # go out only through `_run_request`, which picks the connection.
 RUN_SEND, RUN_ABORT, RUN_PATCH = "chat.send", "chat.abort", "sessions.patch"
+# chat.send fields the Gateway accepts only from an operator.admin connection
+# ("system provenance fields require admin scope"). A send over the restricted
+# connection leaves them out, so a non-owner turn carries no conversation
+# metadata block.
+ADMIN_ONLY_SEND_FIELDS = (
+    "systemInputProvenance",
+    "systemProvenanceReceipt",
+    "suppressCommandInterpretation",
+    "originatingChannel",
+    "originatingTo",
+    "originatingAccountId",
+    "originatingThreadId",
+)
 _OWUI_KEY_USER = re.compile(r"^agent:[^:]+:openwebui-([0-9a-fA-F-]{36})-")
 
 
@@ -4560,6 +4573,11 @@ async def _run_request(conn, method: str, params: dict, *, timeout: float = 10,
     if owner is None:
         owner = await _sender_is_owner(conn, params.get("sessionKey") or params.get("key") or "")
     target = conn if owner else await _get_restricted_connection(conn._valves)
+    if not owner and method == RUN_SEND:
+        dropped = [f for f in ADMIN_ONLY_SEND_FIELDS if f in params]
+        if dropped:
+            params = {k: v for k, v in params.items() if k not in dropped}
+            pipe_log(f"  non-owner chat.send: left out admin-only fields {dropped}")
     if not wait:
         await target._ws.send(json.dumps(dict(type="req", id="abort" if method == RUN_ABORT
                                               else f"run-{uuid.uuid4().hex[:8]}",
