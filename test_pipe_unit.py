@@ -84,6 +84,7 @@ from openclaw_pipe import (
     MAX_TURN_RESUMES, next_continuation, turn_owner,
     recovery_source_run, run_message_id, _TurnWriter, _INTENT_HOOK_JS,
     _turn_route_event, _turn_after_hello, _history_span_messages,
+    wake_turns, wake_turn_at, wake_span, _wake_resync,
     _gateway_run_status,
     _GatewayConnection,
     GatewayError,
@@ -6697,17 +6698,28 @@ class InlineOwnerRuleTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SessionIdRunTests(_RoutingCase):
-    """Live 2026-10-13, chat 0abe9bde, pipe 62b9927. A cron wake into the
-    session ran 03:02:39-03:26:39Z. The cron executor runs it with
-    runId = sessionId (run-executor.runtime-ro-4Z0fM.mjs:499), and the row kept
-    hasActiveRun:false the whole time. The writer opened 96b8c998 =
-    uuid5(key:sessionId). At 03:13:46Z a manager message queued behind the wake
-    pushed a settle row (hasActiveRun:false, lastRunId = the previous user
-    turn), which ended the wake's writer 13 minutes early. Its later events hit
-    "held by another writer" and were lost."""
+    """ELI-103. The cron executor runs every wake into a session with
+    runId = sessionId (run-executor.runtime-ro-4Z0fM.mjs:499): the id names no
+    single wake, and the row stays hasActiveRun:false while a wake runs.
+
+    Live 2026-10-13, chat 0abe9bde, pipe 62b9927: a wake ran 03:02:39-03:26:39Z.
+    The writer opened 96b8c998 = uuid5(key:sessionId). At 03:13:46Z a manager
+    message queued behind the wake pushed a settle row (lastRunId = the previous
+    user turn), which ended the wake's writer 13 minutes early. On main 787a471
+    the next wake (03:34Z) got the first wake's tail instead of its own text.
+
+    A wake is identified by its own admitted user turn `<turnId>:user`
+    (`[cron:<job> <name>] ...`), committed before its first event on
+    claude-cli (cli-runner-9MSP9PU4.mjs:1370). Its closing message
+    `cli-assistant:<sessionId>` exists for the first wake only (deduplicated by
+    key, session-accessor-CX17Bx59.mjs:3343): live seq 74 (wake 1d549bd7) has
+    none."""
 
     SID = "ad9e461b-724a-4797-9b3f-befa1090e36b"
     M = "7c5fe99c-cb51-4f24-90ca-1fd2bc78ae28"
+    JOB = "f8f7cc90-5a10-4a5f-a12d-aa30402f9371"
+    W1 = "98a3ba9e-f500-4875-85f1-c181040bca1a"
+    W2 = "1d549bd7-80a0-448a-ab9e-3dcbcad0015b"
 
     async def asyncSetUp(self):
         await super().asyncSetUp()
@@ -6715,17 +6727,79 @@ class SessionIdRunTests(_RoutingCase):
         self.add_stub(self.M, content="Deploying in the background.", done=True)
         self.conn.mark_delivered_live(self.key, self.R)
         self.history = {"messages": []}
+        self.now = 1_791_860_559_000
+        self.jobs = []
+        # A row of this session reached the socket earlier: its sessionId is known.
+        self.conn.note_session_id(self.key, self.SID)
+        plain = self.conn.send_request
+        test = self
+
+        async def send_request(method, params, timeout=10):
+            if method == "cron.list":
+                test.sent.append((method, copy.deepcopy(params)))
+                return {"jobs": copy.deepcopy(test.jobs)}
+            if method == "sessions.list":
+                test.sent.append((method, copy.deepcopy(params)))
+                return {"sessions": [{"key": test.key, "sessionId": test.SID, "hasActiveRun": False}]}
+            return await plain(method, params, timeout)
+        self.conn.send_request = send_request
+
+    def tick(self):
+        self.now += 1000
+        return self.now
+
+    def wake_turn(self, key, text="Wake (worker ELI-100): deploy finished."):
+        """The cron executor commits the wake's user turn before the CLI starts."""
+        at = self.tick()
+        self.history["messages"].append({
+            "role": "user", "content": f"[cron:{self.JOB} eli100-wake] {text}",
+            "idempotencyKey": f"{key}:user", "timestamp": at - 150,
+            "__openclaw": {"idempotencyKey": f"{key}:user", "recordTimestampMs": at}})
+
+    def queued_turn(self, text="[manager] status?"):
+        """A chat.send queued behind the wake: committed at admission."""
+        run = pipe_run_id(self.CHAT, "efe80f6a-ffb4-48eb-a044-f9b99d2e4fe6")
+        at = self.tick()
+        self.history["messages"].append({
+            "role": "user", "content": text, "idempotencyKey": f"{run}:user", "timestamp": at,
+            "__openclaw": {"idempotencyKey": f"{run}:user", "recordTimestampMs": at}})
+
+    def imported(self, text):
+        """claude-cli's own transcript, imported at the run's end with its own times."""
+        self.history["messages"].append({"role": "assistant", "timestamp": self.tick(),
+                                         "__openclaw": {"importedFrom": "claude-cli"},
+                                         "content": [{"type": "text", "text": text}]})
+
+    def closing(self, text):
+        key = f"cli-assistant:{self.SID}"
+        if not any((m.get("__openclaw") or {}).get("idempotencyKey") == key
+                   for m in self.history["messages"]):  # deduplicated by key
+            self.history["messages"].append({"role": "assistant", "content": text, "timestamp": self.tick(),
+                                             "__openclaw": {"idempotencyKey": key}})
 
     def sid_ev(self, payload):
-        return {"sessionKey": self.key, "runId": self.SID, "sessionId": self.SID, **payload}
+        return {"sessionKey": self.key, "runId": self.SID, "ts": self.tick(), **payload}
+
+    async def wake(self, key, *texts):
+        self.wake_turn(key)
+        for text in texts:
+            await _turn_route_event(self.conn, self.sid_ev(_delta(text)))
+        self.imported("".join(texts))
+        self.closing("".join(texts))
+        await _turn_route_event(self.conn, self.sid_ev({"state": "final"}))
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "done", "lastRunId": self.SID})
+        await self.spin()
 
     def new_messages(self):
         return {k: v for k, v in super().new_messages().items() if k != self.M}
 
     async def test_another_runs_settle_row_does_not_end_the_wake(self):
+        self.wake_turn(self.W1)
         await _turn_route_event(self.conn, self.sid_ev(_delta("Reruns all passed.")))
         await self.spin()
         # The queued user message's row: idle, and naming another run.
+        self.queued_turn()
         self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
                                         "status": "done", "lastRunId": self.R})
         await self.spin()
@@ -6733,17 +6807,106 @@ class SessionIdRunTests(_RoutingCase):
         await _turn_route_event(self.conn, self.sid_ev({"state": "final"}))
         await self.spin()
         (mid, m), = self.new_messages().items()
+        self.assertEqual(mid, turn_message_id(self.key, self.W1, self.CHAT))
         self.assertIs(m["done"], True)
         self.assertEqual(m["content"], "Reruns all passed. Tests written.",
                          "the wake's tail after a foreign settle row was lost")
 
     async def test_two_cron_wakes_get_two_messages(self):
-        for text in ("First wake.", "Second wake."):
-            await _turn_route_event(self.conn, self.sid_ev(_delta(text)))
-            await _turn_route_event(self.conn, self.sid_ev({"state": "final"}))
-            self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
-                                            "status": "done", "lastRunId": self.SID})
-            await self.spin()
-        texts = sorted(m["content"] for m in self.new_messages().values())
-        self.assertEqual(texts, ["First wake.", "Second wake."],
+        await self.wake(self.W1, "First wake.")
+        await self.wake(self.W2, "Second wake.")
+        got = {mid: m["content"] for mid, m in self.new_messages().items()}
+        self.assertEqual(got, {turn_message_id(self.key, self.W1, self.CHAT): "First wake.",
+                               turn_message_id(self.key, self.W2, self.CHAT): "Second wake."},
                          "runId == sessionId is not unique per run: the second wake reused the first message")
+        self.assertTrue(all(m["done"] is True for m in self.new_messages().values()))
+
+    async def test_the_second_wake_is_not_rebuilt_from_the_first_wakes_closing(self):
+        """Main 787a471, 03:34Z: the second wake's bubble got the first wake's
+        tail, because `cli-assistant:<sessionId>` is the first wake's."""
+        await self.wake(self.W1, "First wake.")
+        await self.wake(self.W2, "Second wake.")
+        second = self.new_messages()[turn_message_id(self.key, self.W2, self.CHAT)]
+        self.assertNotIn("First", second["content"])
+
+    async def test_lost_deltas_are_repaired_from_the_wakes_own_window(self):
+        await self.wake(self.W1, "First wake.")
+        self.wake_turn(self.W2)
+        await _turn_route_event(self.conn, self.sid_ev(_delta("Second wake.")))
+        # " All done." never reached the socket; the import has it.
+        self.imported("Second wake. All done.")
+        await _turn_route_event(self.conn, self.sid_ev({"state": "final"}))
+        await self.spin()
+        second = self.new_messages()[turn_message_id(self.key, self.W2, self.CHAT)]
+        self.assertEqual(second["content"], "Second wake. All done.")
+
+    async def test_a_turn_queued_behind_the_wake_is_not_the_wakes(self):
+        self.wake_turn(self.W1)
+        self.queued_turn()  # committed between the wake's turn and its first event
+        await _turn_route_event(self.conn, self.sid_ev(_delta("Reruns all passed.")))
+        await _turn_route_event(self.conn, self.sid_ev({"state": "final"}))
+        await self.spin()
+        self.assertEqual(list(self.new_messages()), [turn_message_id(self.key, self.W1, self.CHAT)])
+
+    async def test_a_wake_whose_turn_is_not_committed_yet_waits_for_it(self):
+        """The embedded runtime commits the user turn without awaiting it
+        (embedded-agent-DNQn_PMM.mjs:5891): the first event can come first."""
+        await self.wake(self.W1, "First wake.")
+        await _turn_route_event(self.conn, self.sid_ev(_delta("Second ")))
+        await self.spin()
+        self.assertEqual(len(self.new_messages()), 1, "bound to the previous wake's turn")
+        self.wake_turn(self.W2)
+        await _turn_route_event(self.conn, self.sid_ev(_delta("wake.")))
+        await _turn_route_event(self.conn, self.sid_ev({"state": "final"}))
+        await self.spin()
+        second = self.new_messages()[turn_message_id(self.key, self.W2, self.CHAT)]
+        self.assertEqual(second["content"], "Second wake.")
+
+    async def test_the_session_id_is_read_from_the_row_when_no_event_carried_it(self):
+        self.conn._session_ids.clear()
+        await self.wake(self.W1, "First wake.")
+        self.assertIn("sessions.list", [m for m, _ in self.sent])
+        self.assertEqual(list(self.new_messages()), [turn_message_id(self.key, self.W1, self.CHAT)])
+
+    async def test_after_a_reconnect_the_cron_job_says_whether_the_wake_ended(self):
+        self.wake_turn(self.W1)
+        await _turn_route_event(self.conn, self.sid_ev(_delta("Working.")))
+        await self.spin()
+        self.jobs = [{"id": self.JOB, "state": {"runningAtMs": self.now}}]
+        await _wake_resync(self.conn)
+        await self.spin()
+        (m,) = self.new_messages().values()
+        self.assertIs(m["done"], False, "a running wake was ended")
+        self.jobs = []  # a one-shot job is deleted once it ran
+        await _wake_resync(self.conn)
+        await self.spin()
+        (m,) = self.new_messages().values()
+        self.assertIs(m["done"], True)
+        self.assertFalse(self.conn._turn_pumps)
+
+
+class WakeTurnTests(unittest.TestCase):
+    def msg(self, key, text, at, **extra):
+        return {"role": "user", "content": text, "idempotencyKey": f"{key}:user",
+                "__openclaw": {"recordTimestampMs": at}, **extra}
+
+    def test_only_cron_prompts_without_provenance_are_wakes(self):
+        msgs = [self.msg("w1", "[cron:job-1 nightly] go", 10),
+                self.msg("s1", "[cron:job-1 x] via sessions_send", 11,
+                         provenance={"kind": "inter_session", "sourceTool": "sessions_send"}),
+                self.msg(pipe_run_id("c" * 8 + "-1111-2222-3333-444455556666",
+                                     "d" * 8 + "-1111-2222-3333-444455556666"), "[cron:job-1 typed]", 12),
+                self.msg("u1", "hello", 13)]
+        self.assertEqual(wake_turns(msgs), [{"key": "w1", "at": 10, "job": "job-1"}])
+
+    def test_the_newest_turn_committed_by_the_event_not_yet_bound(self):
+        msgs = [self.msg("w1", "[cron:a n] x", 10), self.msg("w2", "[cron:b n] y", 20)]
+        self.assertEqual(wake_turn_at(msgs, 25)["key"], "w2")
+        self.assertEqual(wake_turn_at(msgs, 15)["key"], "w1")
+        self.assertIsNone(wake_turn_at(msgs, 25, {"w2"}), "w2 taken: this wake's turn is not in yet")
+        self.assertIsNone(wake_turn_at(msgs, 5))
+
+    def test_the_span_is_the_wakes_window_without_user_turns(self):
+        msgs = [{"role": "assistant", "timestamp": 5}, self.msg("q", "queued", 15),
+                {"role": "assistant", "timestamp": 15}, {"role": "assistant", "timestamp": 30}]
+        self.assertEqual(wake_span(msgs, 10, 20), [{"role": "assistant", "timestamp": 15}])
