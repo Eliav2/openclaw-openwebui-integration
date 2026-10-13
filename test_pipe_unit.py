@@ -7929,6 +7929,118 @@ class InlineOwnerRuleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("sessions.list", self.rpc)
 
 
+class ApiCallerOwnerRuleTests(unittest.IsolatedAsyncioTestCase):
+    """Review 2af1 R14: an interrupted reply hands its Open WebUI message to
+    the turn writer, which applies the owner rule. A request through the API
+    names no message, so there was nothing to hand over: after a Gateway
+    restart it waited forever, and after an outside kill it ended with the
+    error. With no message, the reply applies the owner rule itself, in its
+    own stream: it resumes, follows the Gateway's recovery run, or ends."""
+
+    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
+    _queue = NoDroppedMessagesTests._queue
+    _delta = NoDroppedMessagesTests._delta
+    _final = NoDroppedMessagesTests._final
+    _until_registered = NoDroppedMessagesTests._until_registered
+    _event = InlineOwnerRuleTests._event
+    _lifecycle_error = InlineOwnerRuleTests._lifecycle_error
+    _restart = InlineOwnerRuleTests._restart
+    USER, CHAT = InlineOwnerRuleTests.USER, InlineOwnerRuleTests.CHAT
+    REC = "8f27e4c8-ed9a-4acf-9df1-992ee2f4e801"
+
+    async def asyncSetUp(self):
+        await InlineOwnerRuleTests.asyncSetUp(self)
+        self.history = {"messages": []}
+        inner = self.conn.send_request
+
+        async def send_request(method, params, timeout=10):
+            if method == "chat.history":
+                self.rpc.append(method)
+                return copy.deepcopy(self.history)
+            return await inner(method, params, timeout)
+        self.conn.send_request = send_request
+
+    def _api_reply(self):
+        async def emitter(event):
+            pass
+        body = {"model": "openclaw_gateway.default", "messages": [{"role": "user", "content": "hello"}]}
+        return self.pipe._pipe_impl(body, emitter, __metadata__={"chat_id": self.CHAT, "user_id": self.USER})
+
+    async def _start(self):
+        """The API reply streams `Reading them.` of run-1; returns the task
+        draining it."""
+        gen = self._api_reply()
+
+        async def drain():
+            out = ""
+            async for chunk in gen:
+                out += chunk if isinstance(chunk, str) else ""
+            return out
+        task = asyncio.ensure_future(drain())
+        await self._until_registered("run-1")
+        self._queue("run-1").put_nowait(self._delta("run-1", "Reading them."))
+        await self.spin()
+        return task
+
+    async def spin(self, n=50):
+        for _ in range(n):
+            await asyncio.sleep(0)
+
+    def row(self, **row):
+        self.conn._on_sessions_changed({"sessionKey": self.SK, **row})
+
+    async def test_an_outside_kill_is_resumed_in_the_same_stream(self):
+        task = await self._start()
+        self._queue("run-1").put_nowait(self._lifecycle_error("Claude Code process exited with code 143"))
+        await self.spin()
+        self.row(hasActiveRun=False, status="failed", lastRunId="run-1",
+                 lastRunError="Claude Code process exited with code 143")
+        await self._until_registered("run-2")
+        self.assertEqual(len(self.sent), 2)
+        self.assertIn("Reading them.", self.sent[1], "the resume says what the user already sees")
+        self._queue("run-2").put_nowait(self._delta("run-2", " Found it."))
+        self._queue("run-2").put_nowait(self._final("run-2"))
+        out = await asyncio.wait_for(task, 5)
+        self.assertIn("Reading them. Found it.", out)
+        self.assertNotIn("**Error:**", out)
+        self.assertEqual(self.handed, [], "no turn writer: there is no message")
+
+    async def test_a_crash_follows_the_gateways_recovery_run(self):
+        task = await self._start()
+        self._restart()
+        await self.spin()
+        # The recovery's first events come before the reply knows it is the
+        # recovery of its run: held, not given to a turn writer.
+        rec = lambda payload: {"sessionKey": self.SK, "runId": self.REC, **payload}
+        await _turn_route_event(self.conn, rec({"stream": "lifecycle", "data": {"phase": "start"}}))
+        await _turn_route_event(self.conn, rec({"stream": "assistant", "data": {"delta": " Found it."}}))
+        self.history = {"messages": [
+            {"role": "user", "content": "hello", "idempotencyKey": "run-1:user"},
+            {"role": "user", "content": "[System] continue", "idempotencyKey": f"{self.REC}:user",
+             "provenance": {"kind": "internal_system", "sourceTool": "main_session_restart_recovery"}}]}
+        self.row(hasActiveRun=True, status="running", phase="start", runId=self.REC)
+        await self._until_registered(self.REC)
+        self._queue(self.REC).put_nowait({"type": "event", "event": "chat", "payload": rec({"state": "final"})})
+        out = await asyncio.wait_for(task, 5)
+        self.assertIn("Reading them. Found it.", out)
+        self.assertNotIn("**Error:**", out)
+        self.assertEqual(self.sent, ["hello"], "the Gateway continues it: no resume of our own")
+        self.assertEqual(self.handed, [])
+
+    async def test_a_recovery_the_gateway_gives_up_on_ends_the_reply(self):
+        """R2's bound: the Gateway tombstones a recovery it gives up on to
+        `failed` (main-session-restart-recovery-CPJjd8da.mjs:1150)."""
+        task = await self._start()
+        self._restart()
+        await self.spin()
+        self.row(hasActiveRun=False, status="failed", lastRunId="run-1",
+                 lastRunError="restart recovery gave up")
+        out = await asyncio.wait_for(task, 5)
+        self.assertIn("Reading them.", out)
+        self.assertIn("**Error:** restart recovery gave up", out)
+        self.assertEqual(self.sent, ["hello"])
+
+
 class SessionIdRunTests(_RoutingCase):
     """ELI-103. The cron executor runs every wake into a session with
     runId = sessionId (run-executor.runtime-ro-4Z0fM.mjs:499): the id names no
