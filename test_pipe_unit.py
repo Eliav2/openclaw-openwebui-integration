@@ -12,6 +12,7 @@ import copy
 import inspect
 import json
 import re
+import subprocess
 import sys
 import time
 import types
@@ -5373,6 +5374,46 @@ class ClaimTurnMessageTests(unittest.IsolatedAsyncioTestCase):
         r = await self.claim("a1", "msg-run", takeover=True)
         self.assertEqual((r["claimed"], r["how"]), (True, "takeover"))
         self.assertEqual(self.msgs()["a1"]["meta"]["openclaw_writer"], "w1")
+
+    # Review 2af1 R8: writer liveness was this process's set only, so with
+    # more than one Open WebUI worker every other worker's live writer looked
+    # gone and its message was taken over mid-stream. The other worker here is
+    # a real second process that mints its writer id the way the pipe does.
+
+    def other_worker(self, stay_alive):
+        code = ("import sys, types, conftest, openclaw_pipe\n"
+                "c = openclaw_pipe._GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID='main'))\n"
+                "print(c.writer_id, flush=True)\n"
+                + ("sys.stdin.read()\n" if stay_alive else ""))
+        proc = subprocess.Popen([sys.executable, "-c", code], cwd=os.path.dirname(os.path.abspath(__file__)),
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        writer = proc.stdout.readline().strip()
+        if stay_alive:
+            self.addCleanup(proc.wait, 30)
+            self.addCleanup(proc.stdin.close)
+        else:
+            proc.wait(30)
+        self.assertTrue(writer)
+        return writer
+
+    async def test_a_live_writer_in_another_worker_is_not_taken(self):
+        writer = self.other_worker(stay_alive=True)
+        await self.claim("m1", "run-1", writer=writer)
+        r = await self.claim("m1", "run-1", writer="w2")
+        self.assertEqual((r["claimed"], r["how"]), (False, "taken"))
+        self.assertEqual(self.msgs()["m1"]["meta"]["openclaw_writer"], writer)
+
+    async def test_a_writer_whose_worker_exited_is_taken_over(self):
+        writer = self.other_worker(stay_alive=False)
+        await self.claim("m1", "run-1", writer=writer)
+        r = await self.claim("m1", "run-1", writer="w2")
+        self.assertEqual((r["claimed"], r["how"]), (True, "takeover"))
+
+    async def test_a_retired_writer_of_this_process_is_taken_over(self):
+        conn = _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"))
+        await self.claim("m1", "run-1", writer=conn.writer_id)   # never registered: retired
+        r = await self.claim("m1", "run-1", writer="w2")
+        self.assertEqual((r["claimed"], r["how"]), (True, "takeover"))
 
 
 
