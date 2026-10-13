@@ -3798,6 +3798,89 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent["emits"][0]["data"], {
             "type": "request:interaction:done", "data": {"interaction_id": interaction_id}})
 
+    # ELI-58 live repro (2026-10-13, chat c83d7eb7, pipe cb5a7cb): the card was
+    # pending, the user reloaded the chat. OWUI's call on the gone socket timed
+    # out only after 240 s, and the re-fire then went to the user's FIRST
+    # socket in SESSION_POOL (another tab, another worker's client), so the
+    # reloaded chat never showed the card again. OWUI 0.12 records the chats
+    # each socket views (`SESSION_POOL[sid]["chat_ids"]`, events:chat join).
+
+    def fake_socket(self, pool, answer="a"):
+        sent = []
+
+        class _FakeSio:
+            async def call(self, event, data, to=None, timeout=None):
+                sent.append(to)
+                return {"status": "answered", "answers": {"answer": {"type": "option", "label": answer}}}
+
+            async def emit(self, event, data, to=None):
+                pass
+        socket_main = types.ModuleType("open_webui.socket.main")
+        socket_main.sio = _FakeSio()
+        socket_main.SESSION_POOL = pool
+        sys.modules.setdefault("open_webui.socket", types.ModuleType("open_webui.socket"))
+        sys.modules["open_webui.socket.main"] = socket_main
+        self.addCleanup(sys.modules.pop, "open_webui.socket.main", None)
+        return sent
+
+    async def test_the_card_comes_back_on_the_tab_viewing_the_chat(self):
+        pool = {"sid-other": {"id": "user-1", "chat_ids": ["chat-x"]},
+                "sid-tab": {"id": "user-1", "chat_ids": ["chat-1"]}}
+        sent = self.fake_socket(pool)
+
+        async def event_call(event):
+            return {"error": "Client session disconnected."}
+
+        answer = await _ask_user_input_modal(
+            event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
+            owui_user_id="user-1", owui_chat_id="chat-1", owui_message_id="msg-1",
+            max_wait_s=1, poll_interval_s=0.01)
+        self.assertEqual(answer, "a")
+        self.assertEqual(sent, ["sid-tab"], "never another chat's tab")
+
+    async def test_with_no_tab_on_the_chat_the_card_waits_for_one(self):
+        pool = {"sid-other": {"id": "user-1", "chat_ids": ["chat-x"]}}
+        sent = self.fake_socket(pool)
+
+        async def event_call(event):
+            return {"error": "Client session disconnected."}
+
+        async def user_opens_the_chat():
+            await asyncio.sleep(0.05)
+            pool["sid-tab"] = {"id": "user-1", "chat_ids": ["chat-1"]}
+        opener = asyncio.ensure_future(user_opens_the_chat())
+        answer = await _ask_user_input_modal(
+            event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
+            owui_user_id="user-1", owui_chat_id="chat-1", owui_message_id="msg-1",
+            max_wait_s=1, poll_interval_s=0.01)
+        await opener
+        self.assertEqual(answer, "a")
+        self.assertEqual(sent, ["sid-tab"])
+
+    async def test_a_reload_moves_the_card_without_waiting_out_owuis_timeout(self):
+        """The first call is pending on the reloaded tab's old socket; OWUI
+        answers it only after its 240 s timeout. The old socket leaving
+        SESSION_POOL is the signal."""
+        pool = {"sid-old": {"id": "user-1", "chat_ids": ["chat-1"]}}
+        sent = self.fake_socket(pool)
+        pending = asyncio.get_running_loop().create_future()
+
+        async def event_call(event):
+            return await pending                       # OWUI's 240 s wait
+
+        async def reload_tab():
+            await asyncio.sleep(0.05)
+            del pool["sid-old"]
+            pool["sid-new"] = {"id": "user-1", "chat_ids": ["chat-1"]}
+        reloader = asyncio.ensure_future(reload_tab())
+        answer = await asyncio.wait_for(_ask_user_input_modal(
+            event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
+            owui_user_id="user-1", owui_chat_id="chat-1", owui_message_id="msg-1",
+            owui_session_id="sid-old", max_wait_s=5, poll_interval_s=0.01), 2)
+        await reloader
+        self.assertEqual(answer, "a")
+        self.assertEqual(sent, ["sid-new"])
+
 
 class DynamicModelSelectorTests(unittest.TestCase):
     """Tests for ELI-11: dynamic model discovery."""
