@@ -8056,6 +8056,53 @@ class SessionIdRunTests(_RoutingCase):
         self.assertEqual([o["type"] for o in m["output"]], ["function_call", "function_call_output", "message"])
         self.assertEqual(m["content"], "WQ-DONE")
 
+    async def test_a_wake_that_failed_before_its_turn_opens_nothing_and_its_retry_gets_its_own(self):
+        """Gate 2026-10-13 (two-wakes, chat 5327e981): job b fired while wake a
+        ran. Cron admission compares the session entry with its snapshot
+        (isolated-agent-C_VaOV3U.mjs:885-889, any field but label, pinnedAt,
+        updatedAt) and threw CronSessionLifecycleClaimError "changed while
+        starting work. Retry." 143 ms in: no turn, no event, sessionId null in
+        cron.runs. The scheduler retries that before execution starts
+        (service-DYcTh1Yv.mjs:670, backoff 30 s / 60 s / 300 s, 3 retries); b
+        ran 30 s later."""
+        job_b, w_b = "3277885d-d0e5-4059-87c1-0432adafdba5", "c4b6f7a2-0d1e-4f5a-9b8c-7d6e5f4a3b2c"
+        self.wake_turn(self.W1)
+        await _turn_route_event(self.conn, self.sid_ev(_delta("First ")))
+        b_start = self.tick()  # b's failed attempt: running for 143 ms
+        self.jobs.append({"id": job_b, "sessionTarget": f"session:{self.key}",
+                          "state": {"runningAtMs": b_start}})
+        await _turn_route_event(self.conn, self.sid_ev(_delta("wake.")))
+        self.jobs = [j for j in self.jobs if j["id"] != job_b]
+        self.cron_runs.append({"jobId": job_b, "action": "finished", "status": "error", "runAtMs": b_start,
+                               "ts": self.tick(), "sessionId": None,
+                               "error": f'Session "{self.key}" changed while starting work. Retry.'})
+        self.imported("First wake.")
+        self.closing("First wake.")
+        await _turn_route_event(self.conn, self.sid_ev({"state": "final"}))
+        self.job_finished()
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "done", "lastRunId": self.SID})
+        await self.spin()
+        self.assertEqual(list(self.new_messages()), [turn_message_id(self.key, self.W1, self.CHAT)],
+                         "the failed attempt opened a message")
+        # The retry, 30 s later: its own turn, its own message.
+        at = self.tick()
+        self.jobs = [{"id": job_b, "sessionTarget": f"session:{self.key}", "state": {"runningAtMs": at - 400}}]
+        self.history["messages"].append({
+            "role": "user", "content": f"[cron:{job_b} eli103-gate-b] Second.", "timestamp": at - 150,
+            "idempotencyKey": f"{w_b}:user", "__openclaw": {"idempotencyKey": f"{w_b}:user",
+                                                           "recordTimestampMs": at}})
+        await _turn_route_event(self.conn, self.sid_ev(_delta("Second wake.")))
+        self.imported("Second wake.")
+        await _turn_route_event(self.conn, self.sid_ev({"state": "final"}))
+        self.job_finished()
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "done", "lastRunId": self.SID})
+        await self.spin()
+        got = {mid: (m["content"], m["done"]) for mid, m in self.new_messages().items()}
+        self.assertEqual(got, {turn_message_id(self.key, self.W1, self.CHAT): ("First wake.", True),
+                               turn_message_id(self.key, w_b, self.CHAT): ("Second wake.", True)})
+
     async def test_a_turn_queued_behind_the_wake_is_not_the_wakes(self):
         self.wake_turn(self.W1)
         self.queued_turn()  # committed between the wake's turn and its first event
