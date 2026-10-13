@@ -1108,10 +1108,10 @@ class _TurnRenderer:
     dispatches, so the run's ORIGINAL OWUI message can be finalized to exactly
     what a non-interrupted turn would have stored.
 
-    Scope: assistant text deltas, item-carried text, and tool-result blocks --
-    the substance of the long autonomous turns this path exists for. MEDIA
-    uploads and ask-user modals are intentionally NOT reproduced (they need the
-    live browser and don't occur on a self-closed background tail).
+    Scope: assistant text deltas, item-carried text, and tool-result blocks.
+    It holds the raw run text: the turn writer shows a resolved `MEDIA:` image
+    and an answered ask-user card through the rewrites the inline reply
+    recorded (`note_turn_rewrite`, review 2af1 R4).
     """
 
     def __init__(self):
@@ -1271,6 +1271,7 @@ def _shared_gateway_state() -> dict | None:
     state.setdefault("delivered_live", {})
     state.setdefault("claimed_runs", {})
     state.setdefault("chat_write_locks", {})
+    state.setdefault("turn_rewrites", {})
     return state
 
 
@@ -1438,6 +1439,14 @@ class _GatewayConnection:
         # its own events; a zombie connection never registers a target.
         self._run_targets: dict[str, dict] = {}
         self._run_renderers: dict[str, "_TurnRenderer"] = {}
+        # What the inline reply showed in place of raw run text, by
+        # "chat_id:message_id": [(raw, shown)] for each resolved `MEDIA:`
+        # directive and each ask-user prompt (its card, or its fallback text).
+        # A turn writer that takes the message over repeats them (review 2af1
+        # R4). Shared, so a successor deploy's writer has them too.
+        self._turn_rewrites: dict[str, list] = (
+            _shared["turn_rewrites"] if _shared is not None else {}
+        )
 
         # Sessions whose transcript events (`session.tool`) this connection
         # asked for with `sessions.messages.subscribe`. A subscription ends
@@ -1577,7 +1586,8 @@ class _GatewayConnection:
             return False
         pump = self._turn_pumps[(session_key, run_id)] = _RunPump()
         pump.handover = {"message_id": target["message_id"],
-                         "renderer": self._run_renderers.get(key), "thinking": thinking}
+                         "renderer": self._run_renderers.get(key),
+                         "thinking": thinking or target.get("thinking")}
         pump.stop_notice_before = self._stop_notice_seen
         self.unregister_run_target(session_key, run_id)
         spawn_background(_turn_pump_loop(self, session_key, run_id, parsed, pump))
@@ -1627,14 +1637,17 @@ class _GatewayConnection:
         return self._session_ids.get(session_key)
 
     def register_run_target(self, session_key: str, run_id: str,
-                            chat_id: str | None, message_id: str | None) -> None:
+                            chat_id: str | None, message_id: str | None,
+                            thinking: str | None = None) -> None:
         """Remember that this run streams into OWUI message `message_id` in
         `chat_id`, and start a shadow `_TurnRenderer` for it. No-op without both
-        ids (e.g. a chat with no stable message id yet)."""
+        ids (e.g. a chat with no stable message id yet). `thinking`: the
+        turn's level, which a writer's resume keeps (review 2af1 R6)."""
         if not (chat_id and message_id and run_id):
             return
         key = f"{session_key}:{run_id}"
-        self._run_targets[key] = {"chat_id": chat_id, "message_id": message_id}
+        self._run_targets[key] = {"chat_id": chat_id, "message_id": message_id,
+                                  "thinking": thinking}
         self._run_renderers[key] = _TurnRenderer()
         # Bound memory: a run that never emits a terminal would otherwise leak
         # its target/renderer forever. Far above any real concurrency.
@@ -1647,6 +1660,41 @@ class _GatewayConnection:
         key = f"{session_key}:{run_id}"
         self._run_targets.pop(key, None)
         self._run_renderers.pop(key, None)
+
+    def continue_run_target(self, session_key: str, run_id: str, next_run_id: str) -> None:
+        """The inline reply moved from `run_id` to `next_run_id` (an ask-user
+        answer run): the target and its shadow renderer follow it, so a
+        handover of the answer run continues the same reply (review 2af1 R9;
+        the writer finds the question run in the transcript as a pipe run of
+        the same message). The question run was shown to its end: its late
+        events open nothing."""
+        key = f"{session_key}:{run_id}"
+        target = self._run_targets.pop(key, None)
+        renderer = self._run_renderers.pop(key, None)
+        self.mark_delivered_live(session_key, run_id)
+        if target is None:
+            return
+        nkey = f"{session_key}:{next_run_id}"
+        self._run_targets[nkey] = target
+        self._run_renderers[nkey] = renderer if renderer is not None else _TurnRenderer()
+
+    def note_turn_rewrite(self, chat_id: str | None, message_id: str | None,
+                          raw: str, shown: str) -> None:
+        """The inline reply showed `shown` where its run said `raw` (a resolved
+        `MEDIA:` directive, an ask-user prompt's card). A writer that takes
+        the message over shows the same (review 2af1 R4)."""
+        if not (chat_id and message_id and raw) or raw == shown:
+            return
+        key = f"{chat_id}:{message_id}"
+        rewrites = self._turn_rewrites.setdefault(key, [])
+        if (raw, shown) not in rewrites:
+            rewrites.append((raw, shown))
+        if len(self._turn_rewrites) > 200:
+            for stale in list(self._turn_rewrites)[:100]:
+                self._turn_rewrites.pop(stale, None)
+
+    def turn_rewrites(self, chat_id: str, message_id: str) -> list:
+        return list(self._turn_rewrites.get(f"{chat_id}:{message_id}") or [])
 
     def _chat_write_lock(self, chat_id: str) -> asyncio.Lock:
         """Return the process-wide `asyncio.Lock` for serializing the

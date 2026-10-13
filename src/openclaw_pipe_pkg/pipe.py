@@ -1241,6 +1241,7 @@ class Pipe:
         owui_message_id = (__metadata__ or {}).get("message_id")
         conn.register_run_target(
             session_key, our_run_id, owui_origin_chat_id, owui_message_id,
+            thinking=resolved_thinking,
         )
         if adopted_run_id and adopted_queue is not None:
             conn.seed_run_renderer(session_key, our_run_id, queue,
@@ -1617,7 +1618,10 @@ class Pipe:
                                         if text_yielded:
                                             done = True
                                             break
-                                    elif session_row.get("status") in ("done", "failed", "cancelled"):
+                                    elif (session_row.get("status") in ("done", "failed", "cancelled")
+                                          and await _session_list_active(conn, session_key) is False):
+                                        # describe says "done" in a sub-agent yield gap;
+                                        # hasActiveRun does not (ELI-56, review 2af1 R4).
                                         pipe_log("  sessions.describe: session is done/failed/cancelled, checking preview")
                                         recovered2 = await recover_from_transcript()
                                         if recovered2 and not text_yielded:
@@ -1814,6 +1818,10 @@ class Pipe:
                                     )
                                     if handled:
                                         pipe_log("  resolved MEDIA: directive")
+                                        # A writer that takes this reply over
+                                        # shows the same image (review 2af1 R4).
+                                        conn.note_turn_rewrite(owui_origin_chat_id, owui_message_id,
+                                                               delta, resolved)
                                         record_visible_chunk(resolved)
                                         yield resolved
                                         await maybe_emit_snapshot()
@@ -1844,6 +1852,7 @@ class Pipe:
                             if item_text:
                                 answer_res = await maybe_answer_user_input(item_text)
                                 if answer_res.handled:
+                                    detail_block = ""
                                     if answer_res.answer:
                                         detail_block = _ask_user_detail_block(
                                             answer_res.prompt_text or item_text, answer_res.answer
@@ -1851,8 +1860,14 @@ class Pipe:
                                         record_visible_chunk(detail_block)
                                         yield detail_block
                                         await maybe_emit_snapshot(force=True)
+                                    conn.note_turn_rewrite(owui_origin_chat_id, owui_message_id,
+                                                           answer_res.prompt_text or item_text,
+                                                           detail_block)
                                     if answer_res.new_run_id and answer_res.new_run_id != our_run_id:
                                         pipe_log(f"  needs-input handled, switching to run {answer_res.new_run_id[:20]}...")
+                                        # The answer run continues this reply (R9).
+                                        conn.continue_run_target(session_key, our_run_id,
+                                                                 answer_res.new_run_id)
                                         conn.unregister_consumer(session_key, our_run_id, queue=queue)
                                         queue = conn.register_consumer(session_key, answer_res.new_run_id)
                                         our_run_id = answer_res.new_run_id
@@ -1880,7 +1895,10 @@ class Pipe:
                                 # its raw "OpenClaw needs input:" marker line.
                                 # Strip it defensively.
                                 if _is_user_input_prompt(item_delta):
-                                    item_delta = _strip_input_marker_line(item_delta)
+                                    stripped = _strip_input_marker_line(item_delta)
+                                    conn.note_turn_rewrite(owui_origin_chat_id, owui_message_id,
+                                                           item_delta, stripped)
+                                    item_delta = stripped
                                 if item_delta:
                                     text_yielded = True
                                     pipe_log("  yielded text from item event")
@@ -2124,6 +2142,7 @@ class Pipe:
                             # re-detection, dedup and snapshot handling as any other
                             # run instead of a separate, drift-prone copy of the loop.
                             text_yielded = True
+                            detail_block = ""
                             if answer_res.answer:
                                 detail_block = _ask_user_detail_block(
                                     answer_res.prompt_text or pending_prompt_text, answer_res.answer
@@ -2131,9 +2150,14 @@ class Pipe:
                                 record_visible_chunk(detail_block)
                                 yield detail_block
                                 await maybe_emit_snapshot(force=True)
+                            conn.note_turn_rewrite(owui_origin_chat_id, owui_message_id,
+                                                   pending_prompt_text, detail_block)
                             pending_prompt_text = ""
                             if answer_res.new_run_id and answer_res.new_run_id != our_run_id:
                                 pipe_log(f"  continuing into new run: {answer_res.new_run_id[:20]}...")
+                                # The answer run continues this reply (R9).
+                                conn.continue_run_target(session_key, our_run_id,
+                                                         answer_res.new_run_id)
                                 conn.unregister_consumer(session_key, our_run_id, queue=queue)
                                 queue = conn.register_consumer(session_key, answer_res.new_run_id)
                                 our_run_id = answer_res.new_run_id
@@ -2150,6 +2174,8 @@ class Pipe:
                             # never leak the literal "OpenClaw needs input:"
                             # directive line as visible text.
                             fallback = _strip_input_marker_line(pending_prompt_text)
+                            conn.note_turn_rewrite(owui_origin_chat_id, owui_message_id,
+                                                   pending_prompt_text, fallback)
                             if fallback:
                                 record_visible_chunk(fallback)
                                 yield fallback
@@ -2170,6 +2196,9 @@ class Pipe:
                             __request__=__request__,
                             __event_emitter__=__event_emitter__,
                         )
+                        if handled:
+                            conn.note_turn_rewrite(owui_origin_chat_id, owui_message_id,
+                                                   pending_media_text, resolved)
                         record_visible_chunk(resolved)
                         yield resolved
                         text_yielded = True

@@ -6459,6 +6459,158 @@ class RegressionPlanTests(_RoutingCase):
         self.assertEqual(self.new_messages(), {})
 
 
+class HandoverRewriteTests(_RoutingCase):
+    """Review 2af1 R4 (P28), R6, R9: a handed-over reply ends as the inline
+    reply showed it. The inline reply turns a `MEDIA:` directive into an image
+    and an answered ask-user prompt into a card; the writer rebuilds from the
+    shadow renderer and the transcript, which hold the raw text. Main kept the
+    whole turn inline, so losing either after a handover is a regression."""
+
+    PROMPT = "OpenClaw needs input:\n\nColor?\nPick one\n1. Red\n2. Blue"
+    CARD = ('\n<details type="tool_calls" done="true" id="ask-user-abc" name="Ask User" '
+            'arguments="{}" result="Blue">\n<summary>Ask User</summary>\n</details>\n')
+
+    def closed_run(self, run, text, user="go"):
+        imported = {"importedFrom": "claude-cli"}
+        return [{"role": "user", "content": user, "idempotencyKey": f"{run}:user"},
+                {"role": "assistant", "__openclaw": imported, "content": [{"type": "text", "text": text}]},
+                {"role": "assistant", "idempotencyKey": f"cli-assistant:{run}",
+                 "content": [{"type": "text", "text": text}]}]
+
+    async def settle(self, run):
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "done", "lastRunId": run})
+        await self.spin()
+
+    async def test_a_handover_keeps_an_image_the_reply_resolved(self):
+        run = pipe_run_id(self.CHAT, self.STUB)
+        raw, shown = "Here: MEDIA:shot.png\n", "Here: ![shot.png](/api/v1/files/f1/content)\n"
+        self.add_stub(self.STUB, content=shown)
+        self.conn.register_run_target(self.key, run, self.CHAT, self.STUB)
+        self.conn._run_renderers[f"{self.key}:{run}"].feed(_delta(raw))
+        self.conn.note_turn_rewrite(self.CHAT, self.STUB, raw, shown)
+        await self.dispatch(run, _delta("Done."))
+        await self.spin()
+        live = self.owui.streams[-1][2]
+        self.assertIn("![shot.png](/api/v1/files/f1/content)", live, "the live view too")
+        await self.dispatch(run, {"state": "final"})
+        self.history = {"messages": self.closed_run(run, raw + "Done.")}
+        await self.settle(run)
+        m = self.owui.msgs()[self.STUB]
+        self.assertIs(m["done"], True)
+        self.assertEqual(m["content"], shown + "Done.")
+        self.assertNotIn("MEDIA:", json.dumps(m["output"]))
+
+    async def test_an_image_that_arrives_after_the_handover_is_resolved_once(self):
+        run = pipe_run_id(self.CHAT, self.STUB)
+        self.add_stub(self.STUB, content="Look.")
+        self.conn.register_run_target(self.key, run, self.CHAT, self.STUB)
+        self.conn._run_renderers[f"{self.key}:{run}"].feed(_delta("Look. "))
+        calls = []
+
+        async def resolve(text, **kw):
+            calls.append(text)
+            return text.replace("MEDIA:late.png", "![late.png](/api/v1/files/f2/content)"), True
+        with mock.patch.object(openclaw_pipe, "_resolve_media_text", resolve):
+            await self.dispatch(run, _delta("MEDIA:la"))
+            await self.spin()
+            self.assertNotIn("MEDIA:la", self.owui.streams[-1][2], "a partial directive is held back")
+            await self.dispatch(run, _delta("te.png\nNice."))
+            await self.dispatch(run, {"state": "final"})
+            self.history = {"messages": self.closed_run(run, "Look. MEDIA:late.png\nNice.")}
+            await self.settle(run)
+        m = self.owui.msgs()[self.STUB]
+        self.assertEqual(m["content"], "Look. ![late.png](/api/v1/files/f2/content)\nNice.")
+        self.assertEqual(calls, ["MEDIA:late.png"], "uploaded once, not on every write")
+
+    async def test_an_answered_question_card_survives_a_handover_of_the_answer_run(self):
+        """R9: the answer run continues the reply; a handover of it must keep
+        the question run's text and the card the reply showed for it."""
+        run1 = pipe_run_id(self.CHAT, self.STUB)
+        run2 = pipe_run_id(self.CHAT, self.STUB, "input")
+        self.add_stub(self.STUB, content="Let me ask.\n" + self.CARD)
+        self.conn.register_run_target(self.key, run1, self.CHAT, self.STUB)
+        shadow = self.conn._run_renderers[f"{self.key}:{run1}"]
+        shadow.feed(_delta("Let me ask.\n"))
+        shadow.feed(_delta(self.PROMPT))
+        self.conn.note_turn_rewrite(self.CHAT, self.STUB, self.PROMPT, self.CARD)
+        self.conn.continue_run_target(self.key, run1, run2)
+        await self.dispatch(run2, _delta("Blue it is."))
+        await self.spin()
+        self.assertEqual(self.owui.streams[-1][2], "Let me ask.\n" + self.CARD + "Blue it is.",
+                         "live, the answer run continues the reply the page shows")
+        await self.dispatch(run2, {"state": "final"})
+        self.history = {"messages": self.closed_run(run1, "Let me ask.\n" + self.PROMPT)
+                        + self.closed_run(run2, "Blue it is.", user="2")}
+        await self.settle(run2)
+        self.assertEqual(self.new_messages().keys(), {self.STUB}, "no second message")
+        m = self.owui.msgs()[self.STUB]
+        self.assertIs(m["done"], True)
+        self.assertEqual(m["content"], "Let me ask.\n" + self.CARD + "Blue it is.")
+
+    async def test_the_question_runs_late_events_open_nothing_after_the_switch(self):
+        """The reply moved on to the answer run; the question run's trailing
+        final must not hand M over while the reply still streams."""
+        run1 = pipe_run_id(self.CHAT, self.STUB)
+        run2 = pipe_run_id(self.CHAT, self.STUB, "input")
+        self.add_stub(self.STUB)
+        self.conn.register_run_target(self.key, run1, self.CHAT, self.STUB)
+        self.conn._run_renderers[f"{self.key}:{run1}"].feed(_delta("Let me ask."))
+        self.conn.continue_run_target(self.key, run1, run2)
+        self.assertTrue(await self.dispatch(run1, {"state": "final"}))
+        await self.spin()
+        self.assertNotIn((self.key, run1), self.conn._turn_pumps)
+        self.assertNotIn("meta", self.owui.msgs()[self.STUB], "nobody claimed M")
+        self.assertIn(f"{self.key}:{run2}", self.conn._run_targets)
+
+    async def test_after_an_owui_restart_the_answer_run_keeps_the_question_run(self):
+        """No target survives an Open WebUI restart: the transcript names
+        every pipe run of M, in order."""
+        run1 = pipe_run_id(self.CHAT, self.STUB)
+        run2 = pipe_run_id(self.CHAT, self.STUB, "input")
+        self.add_stub(self.STUB, content="Let me ask.")
+        self.history = {"messages": self.closed_run(run1, "Let me ask.")
+                        + self.closed_run(run2, " Blue it is.", user="2")}
+        await self.dispatch(run2, _delta(" Blue it is."))
+        await self.dispatch(run2, {"state": "final"})
+        await self.settle(run2)
+        m = self.owui.msgs()[self.STUB]
+        self.assertIs(m["done"], True)
+        self.assertEqual(m["content"], "Let me ask. Blue it is.")
+
+    async def test_a_routed_handover_keeps_the_turns_thinking_level(self):
+        """R6: the handover that `_turn_route_event` makes (the request ended
+        first) carries the level like `hand_over_run` does, so a resume keeps it."""
+        run = pipe_run_id(self.CHAT, self.STUB)
+        self.add_stub(self.STUB)
+        self.conn.register_run_target(self.key, run, self.CHAT, self.STUB, thinking="high")
+        self.conn._run_renderers[f"{self.key}:{run}"].feed(_delta("Reading."))
+        await self.dispatch(run, _delta(" More."))
+        await self.spin()
+        self.assertEqual(self.conn._turn_writers[(self.CHAT, self.STUB)].thinking, "high")
+
+
+class InlineRewriteWiringTests(unittest.TestCase):
+    """The inline reply records each rewrite the writer must repeat, and moves
+    its target to an answer run (R4, R9). Checked on the source: the inline
+    loop has no unit harness (e2e drives it)."""
+
+    def test_the_inline_reply_records_its_rewrites_and_answer_runs(self):
+        src = inspect.getsource(openclaw_pipe.Pipe._pipe_turn)
+        self.assertEqual(src.count("conn.continue_run_target("), 2, "both answer switches")
+        self.assertGreaterEqual(src.count("conn.note_turn_rewrite("), 5,
+                                "2 MEDIA sites, 2 answered cards, 1 fallback prompt")
+        self.assertIn("thinking=resolved_thinking", src.split("conn.register_run_target(")[1][:200])
+
+    def test_the_idle_describe_close_also_needs_no_active_run(self):
+        """Review 2af1 R4 (P27): describe reads "done" in a sub-agent yield gap
+        while hasActiveRun is still true (ELI-56); closing on describe alone
+        cut the reply and dropped the rest."""
+        src = inspect.getsource(openclaw_pipe.Pipe._pipe_turn)
+        branch = src.split('session_row.get("status") in ("done", "failed", "cancelled")')[1][:200]
+        self.assertIn("await _session_list_active(conn, session_key) is False", branch)
+
+
 class RunSpanTests(unittest.TestCase):
     """A run's messages in chat.history never include another run's."""
 

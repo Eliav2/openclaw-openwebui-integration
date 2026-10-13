@@ -1808,10 +1808,10 @@ class _TurnRenderer:
     dispatches, so the run's ORIGINAL OWUI message can be finalized to exactly
     what a non-interrupted turn would have stored.
 
-    Scope: assistant text deltas, item-carried text, and tool-result blocks --
-    the substance of the long autonomous turns this path exists for. MEDIA
-    uploads and ask-user modals are intentionally NOT reproduced (they need the
-    live browser and don't occur on a self-closed background tail).
+    Scope: assistant text deltas, item-carried text, and tool-result blocks.
+    It holds the raw run text: the turn writer shows a resolved `MEDIA:` image
+    and an answered ask-user card through the rewrites the inline reply
+    recorded (`note_turn_rewrite`, review 2af1 R4).
     """
 
     def __init__(self):
@@ -1971,6 +1971,7 @@ def _shared_gateway_state() -> dict | None:
     state.setdefault("delivered_live", {})
     state.setdefault("claimed_runs", {})
     state.setdefault("chat_write_locks", {})
+    state.setdefault("turn_rewrites", {})
     return state
 
 
@@ -2138,6 +2139,14 @@ class _GatewayConnection:
         # its own events; a zombie connection never registers a target.
         self._run_targets: dict[str, dict] = {}
         self._run_renderers: dict[str, "_TurnRenderer"] = {}
+        # What the inline reply showed in place of raw run text, by
+        # "chat_id:message_id": [(raw, shown)] for each resolved `MEDIA:`
+        # directive and each ask-user prompt (its card, or its fallback text).
+        # A turn writer that takes the message over repeats them (review 2af1
+        # R4). Shared, so a successor deploy's writer has them too.
+        self._turn_rewrites: dict[str, list] = (
+            _shared["turn_rewrites"] if _shared is not None else {}
+        )
 
         # Sessions whose transcript events (`session.tool`) this connection
         # asked for with `sessions.messages.subscribe`. A subscription ends
@@ -2277,7 +2286,8 @@ class _GatewayConnection:
             return False
         pump = self._turn_pumps[(session_key, run_id)] = _RunPump()
         pump.handover = {"message_id": target["message_id"],
-                         "renderer": self._run_renderers.get(key), "thinking": thinking}
+                         "renderer": self._run_renderers.get(key),
+                         "thinking": thinking or target.get("thinking")}
         pump.stop_notice_before = self._stop_notice_seen
         self.unregister_run_target(session_key, run_id)
         spawn_background(_turn_pump_loop(self, session_key, run_id, parsed, pump))
@@ -2327,14 +2337,17 @@ class _GatewayConnection:
         return self._session_ids.get(session_key)
 
     def register_run_target(self, session_key: str, run_id: str,
-                            chat_id: str | None, message_id: str | None) -> None:
+                            chat_id: str | None, message_id: str | None,
+                            thinking: str | None = None) -> None:
         """Remember that this run streams into OWUI message `message_id` in
         `chat_id`, and start a shadow `_TurnRenderer` for it. No-op without both
-        ids (e.g. a chat with no stable message id yet)."""
+        ids (e.g. a chat with no stable message id yet). `thinking`: the
+        turn's level, which a writer's resume keeps (review 2af1 R6)."""
         if not (chat_id and message_id and run_id):
             return
         key = f"{session_key}:{run_id}"
-        self._run_targets[key] = {"chat_id": chat_id, "message_id": message_id}
+        self._run_targets[key] = {"chat_id": chat_id, "message_id": message_id,
+                                  "thinking": thinking}
         self._run_renderers[key] = _TurnRenderer()
         # Bound memory: a run that never emits a terminal would otherwise leak
         # its target/renderer forever. Far above any real concurrency.
@@ -2347,6 +2360,41 @@ class _GatewayConnection:
         key = f"{session_key}:{run_id}"
         self._run_targets.pop(key, None)
         self._run_renderers.pop(key, None)
+
+    def continue_run_target(self, session_key: str, run_id: str, next_run_id: str) -> None:
+        """The inline reply moved from `run_id` to `next_run_id` (an ask-user
+        answer run): the target and its shadow renderer follow it, so a
+        handover of the answer run continues the same reply (review 2af1 R9;
+        the writer finds the question run in the transcript as a pipe run of
+        the same message). The question run was shown to its end: its late
+        events open nothing."""
+        key = f"{session_key}:{run_id}"
+        target = self._run_targets.pop(key, None)
+        renderer = self._run_renderers.pop(key, None)
+        self.mark_delivered_live(session_key, run_id)
+        if target is None:
+            return
+        nkey = f"{session_key}:{next_run_id}"
+        self._run_targets[nkey] = target
+        self._run_renderers[nkey] = renderer if renderer is not None else _TurnRenderer()
+
+    def note_turn_rewrite(self, chat_id: str | None, message_id: str | None,
+                          raw: str, shown: str) -> None:
+        """The inline reply showed `shown` where its run said `raw` (a resolved
+        `MEDIA:` directive, an ask-user prompt's card). A writer that takes
+        the message over shows the same (review 2af1 R4)."""
+        if not (chat_id and message_id and raw) or raw == shown:
+            return
+        key = f"{chat_id}:{message_id}"
+        rewrites = self._turn_rewrites.setdefault(key, [])
+        if (raw, shown) not in rewrites:
+            rewrites.append((raw, shown))
+        if len(self._turn_rewrites) > 200:
+            for stale in list(self._turn_rewrites)[:100]:
+                self._turn_rewrites.pop(stale, None)
+
+    def turn_rewrites(self, chat_id: str, message_id: str) -> list:
+        return list(self._turn_rewrites.get(f"{chat_id}:{message_id}") or [])
 
     def _chat_write_lock(self, chat_id: str) -> asyncio.Lock:
         """Return the process-wide `asyncio.Lock` for serializing the
@@ -4103,12 +4151,14 @@ class _TurnWriter:
         self.opened = False
         self.task_id: str | None = None
         self.parent_id: str | None = None
-        self.runs = [run_id]            # every run written into M: the first, then resumes / recoveries
+        # every run written into M, in transcript order (_adopt_recoveries_from)
+        self.runs = [run_id]
         self.resumes = 0                # resume budget, counted on M (MAX_TURN_RESUMES)
         self.pending_resume = False     # a resume the Gateway refused; sent on the next hello-ok
         self.awaiting_row = False       # kept open for a Gateway recovery (R2)
         self.closed = False             # nothing more to write (ended, or M is someone else's)
         self.sent_output: list = []     # the `output` open tabs hold
+        self._media_failed: set = set()  # MEDIA directives that did not resolve
         self._emit = None
         self._done = asyncio.Event()
         # Two pumps feed one writer when a recovery continues M; only one may
@@ -4197,7 +4247,7 @@ class _TurnWriter:
         throttled shared copy to the chat room), keep the response stream
         current for a tab that opens the chat mid-turn, and write the DB on
         item boundaries (a new item, a tool result), not per text delta."""
-        output = self.renderer.output
+        output, text = await self._view(final=False)
         emit = await self._emitter()
         for ev in _relay_output_events(self.sent_output, output):
             await emit({"type": "response:completion", "data": ev})
@@ -4206,9 +4256,57 @@ class _TurnWriter:
         from open_webui.tasks import save_response_stream
 
         await save_response_stream(_owui_redis(), self.task_id, self.chat_id, self.message_id,
-                                   self.renderer.text, self.sent_output)
+                                   text, self.sent_output)
         if boundary:
-            await self._persist(done=False)
+            await self._persist(done=False, output=output, text=text)
+
+    def _rewrite(self, text: str) -> str:
+        for raw, shown in self.conn.turn_rewrites(self.chat_id, self.message_id or ""):
+            if raw in text:
+                text = text.replace(raw, shown)
+        return text
+
+    async def _view(self, *, final: bool) -> tuple[list, str]:
+        """(output, text) of M as the inline reply shows a run (review 2af1
+        R4): the rewrites it recorded (an image for a `MEDIA:` directive, a
+        card for an answered ask-user prompt) applied to the renderer, a
+        directive that first came after the handover resolved here, and,
+        while the run streams, a directive whose filename is still arriving
+        held back, as the inline reply holds it."""
+        await self._resolve_media(self._rewrite(self.renderer.text), final)
+        output = self.renderer.finished_output() if final else copy.deepcopy(self.renderer.output)
+        hold = None if final else globals().get("_advance_media_buffer")
+
+        def show(text: str, tail: bool) -> str:
+            text = self._rewrite(text)
+            return hold("", text)[0] if hold and tail else text
+        for n, item in enumerate(output):
+            if item.get("type") == "message" and item.get("content"):
+                part = item["content"][0]
+                part["text"] = show(part.get("text") or "", n == len(output) - 1)
+        return output, show(self.renderer.text, True)
+
+    async def _resolve_media(self, text: str, final: bool) -> None:
+        """Upload each complete `MEDIA:` directive the inline reply never saw,
+        once, the way it does (`_resolve_media_text`: Open WebUI's files, else
+        the file server), and record the result as a rewrite. Absent in the
+        Status Action's build, which writes no turns."""
+        resolve = globals().get("_resolve_media_text")
+        if resolve is None or "MEDIA:" not in text:
+            return
+        for directive in _media_directives(text, final):
+            if directive in self._media_failed:
+                continue
+            try:
+                shown, handled = await resolve(directive, valves=self.conn._valves(),
+                                               __event_emitter__=await self._emitter())
+            except Exception as ex:
+                pipe_log(f"  turn writer: {directive[:60]} did not resolve: {ex!r}")
+                shown, handled = directive, False
+            if handled and shown != directive:
+                self.conn.note_turn_rewrite(self.chat_id, self.message_id, directive, shown)
+            else:
+                self._media_failed.add(directive)
 
     async def _persist(self, *, done: bool, output: list | None = None,
                        text: str | None = None) -> None:
@@ -4231,12 +4329,18 @@ class _TurnWriter:
         self.run_id = run_id
 
     def _adopt_recoveries_from(self, messages: list) -> None:
-        """Restart recoveries that rule E maps to M and whose events never
-        reached this socket (they ran while it was down, case 4)."""
+        """Runs written into M whose events never reached this writer: restart
+        recoveries that rule E maps to M (they ran while the socket was down,
+        case 4), and pipe runs naming M, such as the question run an ask-user
+        answer run continues after an Open WebUI restart left no target
+        (review 2af1 R9). M's runs are put in transcript order."""
+        order = []
         for run, tool in _history_user_turns(messages):
-            if (tool == RECOVERY_SOURCE_TOOL and run not in self.runs
+            if run in self.runs or (
+                    (tool == RECOVERY_SOURCE_TOOL or parse_pipe_run_id(run) is not None)
                     and run_message_id(self.session_key, self.chat_id, run, messages) == self.message_id):
-                self.runs.append(run)
+                order.append(run)
+        self.runs = [*order, *(r for r in self.runs if r not in order)]
 
     async def end(self, row: dict, stop_notice_before: bool = False) -> None:
         """The current run settled; `row` is its settled session row (DESIGN
@@ -4327,9 +4431,9 @@ class _TurnWriter:
             if not self.opened:
                 if not (self._showable() or note) or not await self.open(takeover=self.takeover):
                     return
-            output = [i for i in self.renderer.finished_output()
-                      if not _is_sentinel_message_item(i)]
-            text = self.renderer.text.strip()
+            output, text = await self._view(final=True)
+            output = [i for i in output if not _is_sentinel_message_item(i)]
+            text = text.strip()
             if text in _SILENT_SENTINELS:
                 text = ""
             if note:
@@ -4409,6 +4513,26 @@ class _TurnWriter:
 # then feeds the run's events and its settle in order.
 
 
+def _media_directives(text: str, final: bool) -> list[str]:
+    """Each complete `MEDIA:<file>` directive in `text`, as written, by the
+    inline reply's grammar (`_take_media_fname`). The last one is complete
+    once something follows its filename, or when the run is over."""
+    take, looks = globals().get("_take_media_fname"), globals().get("_looks_like_media_filename")
+    out, i = [], 0
+    while take and looks:
+        idx = text.find("MEDIA:", i)
+        if idx < 0:
+            break
+        after = text[idx + len("MEDIA:"):]
+        stripped = after.strip()
+        fname, rest = take(stripped)
+        end = idx + len("MEDIA:") + (len(after) - len(after.lstrip())) + len(stripped) - len(rest)
+        if fname and looks(fname) and (final or end < len(text)) and text[idx:end] not in out:
+            out.append(text[idx:end])
+        i = idx + len("MEDIA:")
+    return out
+
+
 def _history_span_messages(history: dict, run_id: str) -> list | None:
     """One run's messages in `chat.history`, or None while it may still be
     writing. A closed run ends at its `cli-assistant:<runId>`; a run cut off
@@ -4468,7 +4592,8 @@ async def _turn_route_event(conn: "_GatewayConnection", payload: dict) -> bool:
             # writer continues in the same message from the shadow renderer,
             # which already holds this event.
             pump.handover = {"message_id": target["message_id"],
-                             "renderer": conn._run_renderers.get(f"{sess}:{run}")}
+                             "renderer": conn._run_renderers.get(f"{sess}:{run}"),
+                             "thinking": target.get("thinking")}
             conn.unregister_run_target(sess, run)
         spawn_background(_turn_pump_loop(conn, sess, run, parsed, pump))
         spawn_background(conn.ensure_message_subscription(sess))
