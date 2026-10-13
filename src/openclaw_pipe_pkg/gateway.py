@@ -1386,9 +1386,10 @@ class _GatewayConnection:
         # never reconnects once those runs are gone.
         self._retired = False
         # ELI-100: this connection's identity as a turn writer. A message whose
-        # recorded writer is no longer in the process registry can be taken
-        # over (DESIGN 2.3); retire() removes it.
-        self.writer_id = f"{os.getpid()}:{uuid.uuid4()}"
+        # recorded writer is gone (`_turn_writer_alive`: retired here, or its
+        # worker process exited) can be taken over (DESIGN 2.3); retire()
+        # removes it.
+        self.writer_id = turn_writer_id()
         # The Status Action's own connection only makes RPCs: it never writes turns.
         self.writes_turns = writes_turns
         self._turn_pumps: dict = {}     # (session_key, run_id) -> _RunPump
@@ -3124,7 +3125,7 @@ async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
             # that writer is gone (a retired deploy, a dead process), this
             # connection adopts it. Another request's task in the chat is no
             # reason to leave it.
-            if writer in _live_turn_writers():
+            if _turn_writer_alive(writer):
                 return "skip"
             return await _adopt_turn_message(
                 conn, chat_id=chat_id, user_id=chat.user_id, message_id=stub_id,
@@ -3185,7 +3186,7 @@ async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
         current = msgs.get(stub_id) or {}
         if current.get("done") is not False:
             return "skip"
-        if (current.get("meta") or {}).get("openclaw_writer") in _live_turn_writers():
+        if _turn_writer_alive((current.get("meta") or {}).get("openclaw_writer")):
             return "skip"  # a turn writer took it over (DESIGN 2.6) and finishes it
         claim = f"{session_key}:{run_id}" if run_id else None
         if claim:

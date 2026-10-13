@@ -335,14 +335,62 @@ def _retire_turn_writer(writer_id: str) -> None:
     _live_turn_writers().discard(writer_id)
 
 
+# Writer ids name their process, so another Open WebUI worker's writer can
+# be judged (review 2af1 R8): `<host>/<boot>/<pid>.<start>:<uuid>`, with the
+# kernel's boot id and the process start time guarding against a reused pid.
+# A writer of this process is alive while its connection is (the set above);
+# one of another process on this host while that process runs. A writer of
+# another host or boot, or an older pipe's `<pid>:<uuid>`, is judged gone, as
+# before: a takeover across hosts needs a shared lease, which a single-host
+# Open WebUI does not.
+_WRITER_ID_RE = re.compile(r"^(?P<host>[^/]*)/(?P<boot>[^/]*)/(?P<pid>\d+)\.(?P<start>\d+):")
+
+
+def _proc_start(pid: int) -> str | None:
+    """Start time of process `pid` (/proc/<pid>/stat field 22), None if gone."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def _boot_id() -> str:
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            return f.read().strip()[:8]
+    except OSError:
+        return ""
+
+
+def turn_writer_id() -> str:
+    import socket
+    pid = os.getpid()
+    return f"{socket.gethostname()}/{_boot_id()}/{pid}.{_proc_start(pid) or 0}:{uuid.uuid4()}"
+
+
+def _turn_writer_alive(writer: str | None) -> bool:
+    if not writer:
+        return False
+    if writer in _live_turn_writers():
+        return True
+    m = _WRITER_ID_RE.match(writer)
+    if not m or int(m.group("pid")) == os.getpid():
+        return False
+    import socket
+    if (m.group("host"), m.group("boot")) != (socket.gethostname(), _boot_id()):
+        return False
+    return _proc_start(int(m.group("pid"))) == m.group("start")
+
+
 def _writer_may_take_over(existing: dict) -> bool:
     """A message another writer recorded can be taken only when that writer
-    is gone (its connection retired or its process restarted) and the
-    message is unfinished. A message with no recorded writer is Open WebUI's
-    own stub for a user turn; only its own inline request hands it over
+    is gone (its connection retired or its process exited) and the message
+    is unfinished. A message with no recorded writer is Open WebUI's own stub
+    for a user turn; only its own inline request hands it over
     (`takeover=True`, DESIGN 2.6)."""
     writer = (existing.get("meta") or {}).get("openclaw_writer")
-    return bool(writer) and existing.get("done") is False and writer not in _live_turn_writers()
+    return bool(writer) and existing.get("done") is False and not _turn_writer_alive(writer)
 
 
 async def _claim_turn_message(chat_id: str, user_id: str, message_id: str, run_id: str,
@@ -370,7 +418,7 @@ async def _claim_turn_message(chat_id: str, user_id: str, message_id: str, run_i
         existing = msgs.get(message_id)
         if existing is not None:
             holder = (existing.get("meta") or {}).get("openclaw_writer")
-            held = bool(holder) and holder != writer_id and holder in _live_turn_writers()
+            held = bool(holder) and holder != writer_id and _turn_writer_alive(holder)
             if held or not (takeover or _writer_may_take_over(existing)):
                 return {"claimed": False, "how": "taken", "message_id": message_id,
                         "parent": existing.get("parentId"), "messages": {}}
@@ -2103,9 +2151,10 @@ class _GatewayConnection:
         # never reconnects once those runs are gone.
         self._retired = False
         # ELI-100: this connection's identity as a turn writer. A message whose
-        # recorded writer is no longer in the process registry can be taken
-        # over (DESIGN 2.3); retire() removes it.
-        self.writer_id = f"{os.getpid()}:{uuid.uuid4()}"
+        # recorded writer is gone (`_turn_writer_alive`: retired here, or its
+        # worker process exited) can be taken over (DESIGN 2.3); retire()
+        # removes it.
+        self.writer_id = turn_writer_id()
         # The Status Action's own connection only makes RPCs: it never writes turns.
         self.writes_turns = writes_turns
         self._turn_pumps: dict = {}     # (session_key, run_id) -> _RunPump
@@ -3841,7 +3890,7 @@ async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
             # that writer is gone (a retired deploy, a dead process), this
             # connection adopts it. Another request's task in the chat is no
             # reason to leave it.
-            if writer in _live_turn_writers():
+            if _turn_writer_alive(writer):
                 return "skip"
             return await _adopt_turn_message(
                 conn, chat_id=chat_id, user_id=chat.user_id, message_id=stub_id,
@@ -3902,7 +3951,7 @@ async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
         current = msgs.get(stub_id) or {}
         if current.get("done") is not False:
             return "skip"
-        if (current.get("meta") or {}).get("openclaw_writer") in _live_turn_writers():
+        if _turn_writer_alive((current.get("meta") or {}).get("openclaw_writer")):
             return "skip"  # a turn writer took it over (DESIGN 2.6) and finishes it
         claim = f"{session_key}:{run_id}" if run_id else None
         if claim:
