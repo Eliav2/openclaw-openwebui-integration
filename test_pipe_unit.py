@@ -7140,6 +7140,65 @@ class SilentAnnounceTests(_RoutingCase):
         self.assertEqual(self.new_messages(), {})
 
 
+class IntentHookStopIconTests(unittest.TestCase):
+    """Review 2af1 R15: the page hook told Stop from Send now by the English
+    aria-label, so in any other UI language a Stop read as "unknown" and the
+    run kept going. It now also matches the Stop button's icon, which is not
+    translated. The fixture holds Open WebUI's button templates labelled
+    t("Stop") (scripts/extract_owui_stop_button.py, re-extract on upgrade)."""
+
+    FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "test_fixture_owui_stop_button.json")
+
+    def test_the_hook_matches_the_composer_stop_icon(self):
+        marker = re.search(r"STOP_ICON = '([^']+)'", openclaw_pipe._INTENT_HOOK_JS).group(1)
+        templates = [t["template"] for t in json.load(open(self.FIXTURE))["templates"]]
+        composer = [t for t in templates if "<path" in t and t.startswith("<button class=\"bg-white")]
+        self.assertEqual(len(composer), 2, "the composer's Stop button, both input variants")
+        for t in composer:
+            self.assertIn(f'd="{marker}', t)
+
+    def test_a_stop_click_in_another_language_is_recorded_as_stop(self):
+        """Runs the hook under node with a stub page: a click on the fixture's
+        composer Stop button labelled in Hebrew records "stop"."""
+        import shutil
+        import subprocess
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("no node")
+        script = textwrap.dedent("""
+            const listeners = {};
+            const mkPath = (d) => ({ getAttribute: (k) => (k === 'd' ? d : null) });
+            const button = (label, d) => ({
+              id: '', getAttribute: (k) => (k === 'aria-label' ? label : null),
+              querySelectorAll: () => (d ? [mkPath(d)] : []),
+              closest() { return this; },
+            });
+            const D = process.argv[2];
+            const stop = button('\u05e2\u05e6\u05d5\u05e8', D);
+            global.window = {};
+            global.location = { pathname: '/c/chat-1' };
+            global.document = {
+              addEventListener: (k, f) => { listeners[k] = f; },
+              querySelectorAll: () => [stop],
+            };
+            const hook = new Function(process.argv[1]);
+            hook();
+            listeners.click({ target: stop });
+            console.log(JSON.stringify({ intent: window.__ocIntents['chat-1'].kind }));
+        """)
+        tpl = next(t["template"] for t in json.load(open(self.FIXTURE))["templates"]
+                   if t["template"].startswith("<button class=\"bg-white"))
+        d = re.search(r' d="([^"]+)"', tpl).group(1)
+        out = subprocess.run([node, "-e", script, openclaw_pipe._INTENT_HOOK_JS, d],
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(out.stdout)["intent"], "stop")
+
+    def test_no_english_only_running_check_is_left(self):
+        self.assertNotIn('querySelector(\'button[aria-label="Stop"]', openclaw_pipe._INTENT_HOOK_JS)
+
+
 class RunSpanTests(unittest.TestCase):
     """A run's messages in chat.history never include another run's."""
 

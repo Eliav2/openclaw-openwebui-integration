@@ -6322,13 +6322,17 @@ if (!window.__ocIntentHook) {
   window.__ocIntents = {};
   const chat = () => (location.pathname.match(/\/c\/([^/?#]+)/) || [])[1] || null;
   const mark = (kind) => { const c = chat(); if (c) window.__ocIntents[c] = { kind, t: Date.now() }; };
-  const running = () => !!document.querySelector('button[aria-label="Stop"], #stop-response-button');
+  // The Stop button's aria-label is translated; its icon is not (R15).
+  const STOP_ICON = 'M2.25 12c0-5.385 4.365-9.75 9.75-9.75s9.75';
+  const isStop = (b) => b.getAttribute('aria-label') === 'Stop' || b.id === 'stop-response-button'
+    || [...b.querySelectorAll('svg path')].some((p) => (p.getAttribute('d') || '').startsWith(STOP_ICON));
+  const running = () => [...document.querySelectorAll('button')].some(isStop);
   document.addEventListener('click', (e) => {
     const b = e.target && e.target.closest ? e.target.closest('button') : null;
     if (!b) return;
-    const label = b.getAttribute('aria-label') || '';
-    if (label === 'Send now') mark('send_now');
-    else if (label === 'Stop' || b.id === 'stop-response-button') mark('stop');
+    // Send now needs no mark: an unknown intent already keeps writing.
+    if (b.getAttribute('aria-label') === 'Send now') mark('send_now');
+    else if (isStop(b)) mark('stop');
   }, true);
   document.addEventListener('keydown', (e) => {
     if (!running()) return;
