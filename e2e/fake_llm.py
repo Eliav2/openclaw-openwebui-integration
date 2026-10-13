@@ -25,6 +25,8 @@ whole):
 A tool the agent does not offer directly is called through `tool_call` when
 that is offered: from OpenClaw 2026.10 most tools are deferred behind
 `tool_search` / `tool_call` and only a core set is sent as real schemas.
+* `E2E_SLOW TOKEN`                     -> replies `TOKEN slow-1 ... slow-10`, one
+  word a second, so a turn can be queued behind a run that is still going.
 * anything else                        -> `E2E fake model reply.`
 
 Replies stream word by word so the streaming path sees several deltas.
@@ -48,6 +50,8 @@ LOG_PATH = os.environ.get("FAKE_LLM_LOG", "")
 PREFERRED_TOOLS = ("session_status", "sessions_list", "memory_search")
 
 _EXACTLY = re.compile(r"exactly:?\s+([A-Za-z0-9_]{3,})")
+_SLOW = re.compile(r"E2E_SLOW\s+([A-Za-z0-9_]{3,})")
+SLOW_WORDS = 10
 
 
 def _text_of(content) -> str:
@@ -111,6 +115,10 @@ def plan_reply(body: dict) -> dict:
             return call
         return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
 
+    m = _SLOW.search(user_text)
+    if m:
+        words = " ".join(f"slow-{i}" for i in range(1, SLOW_WORDS + 1))
+        return {"text": f"{m.group(1)} {words}", "delay": 1.0}
     m = _EXACTLY.search(user_text)
     if m:
         return {"text": m.group(1)}
@@ -208,7 +216,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             for piece in _chunks(plan["text"]):
                 emit({"content": piece})
-                time.sleep(0.02)
+                time.sleep(plan.get("delay", 0.02))
         emit({}, finish_reason=finish)
         if (body.get("stream_options") or {}).get("include_usage"):
             chunk = {"id": cid, "object": "chat.completion.chunk", "created": created,
