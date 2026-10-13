@@ -58,7 +58,7 @@ Verdicts: **delete**, **fold** (the behavior moves into the single path, the cod
 | P25 | `PROACTIVE_DELIVERY_ENABLED = True` (gateway.py:1249) and its history comment | gateway.py:1225-1249 | delete |
 | P26 | `_SILENT_SENTINELS` | gateway.py:2760 | keep (a run that says only `NO_REPLY` gets no message) |
 | P27 | Inline idle close on `sessions.describe` status | pipe.py:2235-2269, `gateway_run_status` pipe.py:1422-1446 | delete. This is the suspect for "reply closed mid-run" (ELI-88 repro 1): `describe.status` reads `done` during a sub-agent yield gap (gateway.py comment at 1073-1079, memory `gateway-active-run-signal`). A reply ends only on its run's terminal (section 2.5). |
-| P28 | Restart resume directive `resume_after_restart` | pipe.py:1580-1675 | fold, pending one measurement (section 7, M3): the Gateway already starts its own recovery run for every session that was `running` (dist `main-session-restart-recovery-CPJjd8da.mjs:166`, `:1578-1597` with `statuses:["running"]`). That run is a non-pipe run on the same key, so the single path continues the open reply with it. A pipe directive on top of it is a second continuation. |
+| P28 | Restart resume directive `resume_after_restart` | pipe.py:1580-1675 | **keep, re-keyed and re-triggered** (M3 window 2026-10-12 23:54Z, manager decision 1). Key `msg-<chat>-<M>-resume-<t>` so the identity rule (2.2) puts it in M. It fires on the owner rule (2.7), not on `_is_restart_signature` (pipe.py:66-76, any `process exited with code`, `connection closed`) plus the 30 s idle probe and epoch bump (pipe.py:1696-1720, 1888-1891). It covers agent turns too (2.7). |
 
 ### 1.2 Flags, shared maps, locks
 
@@ -299,6 +299,110 @@ adoption of an orphaned stub (gateway.py:3287-3299, 3622-3636) and the stub comp
 PR #19. The orphan reconcile (P20) is the same handover done at startup, for runs whose
 request died with the process.
 
+### 2.7 Interrupted runs: one owner per run (M3 result, ELI-90)
+
+M3 (window 2026-10-12 23:54Z, `ha apps restart`) showed that the Gateway does **not** recover
+every interrupted run. Both runs ended `chat state:error` + `sessions.changed phase:error` in
+the old boot, before the shutdown, so at boot neither session was `running` and the Gateway
+started no recovery run. Main's pipe resumed the user turn (`resume-0df93712-...`, reply
+`c153f06b` done, 7 cards). The agent turn stayed `status: failed`, `lastRunError: "Claude
+Code process exited with code 143"`, with no continuation (its relay message `988dc34e` has 1
+card and no text). Case 5 as first written ("the pipe stops sending its own resume") is wrong
+for this path.
+
+**Dist facts the rule stands on.**
+
+* F1. Recovery touches only rows whose persisted status is `running`. At boot,
+  `markStartupOrphanedMainSessionsForRecovery` scans `statuses:["running"]`
+  (`main-session-restart-recovery-marking-CvQ2iWW3.mjs:222-262`, `statuses` at :235, :240). Recovery dispatch needs
+  `isMainSessionRecoveryPending`: `status === "running" && abortedLastRun === true`
+  (`main-session-recovery-state-CLSHE2xG.mjs:119-121`).
+* F2. A run's terminal persists `status` from its outcome. The one exception is a cancel
+  with `stopReason:"restart"`, which keeps `running` and sets `abortedLastRun`
+  (`session-lifecycle-state-C7hBzJwC.mjs:89-90, 102`). A user or RPC abort gives `killed`;
+  an error gives `failed`, with `lastRunError`.
+* F3. The four ways a run is cut:
+  * **Restart mode.** SIGUSR1, a restart intent on SIGTERM, or an in-process restart:
+    `server.close({restartExpectedMs:1500})` (`run-CiAIvodT.mjs:1082-1086`).
+    `markActiveRunsForRestartRecovery` marks the live runs, then `abortActiveRuns(restart)`
+    cancels them with `stopReason:"restart"` (`server-close.runtime.js:148-186, 189-218,
+    222-250`). The rows stay `running`, so **the Gateway recovers**.
+  * **Gateway stop mode.** SIGTERM with no restart intent goes to `request("stop")`
+    (`run-CiAIvodT.mjs:1215-1225`), and `prepareGatewayRunShutdown` with `restart:false`
+    only aborts, `stopReason:"rpc"` (`server-close.runtime.js:222-226`). Nothing is
+    marked, the rows go `killed`, and **nobody recovers**.
+  * **Container stop (`ha apps restart`).** Every process gets SIGTERM. The claude-cli
+    child exits 143 before the Gateway closes: the error push came 0.06 s after the
+    signal and the 1012 close 0.26 s after (`runs/m3-watch-window1-graceful.jsonl`). Its
+    error text is `Claude Code process exited with code 143` (`cli-transport-CXSP7FlN.mjs:96`),
+    so the row is `failed` and **nobody recovers**. That is what M3 saw.
+  * **Crash (SIGKILL, OOM).** No terminal is persisted, so the row is still `running` at
+    boot and **the Gateway recovers** (F1).
+* F4. Before any run is aborted, the Gateway broadcasts `shutdown {reason,
+  restartExpectedMs?}` to every client (`server-start-BB-IxTAg.mjs:1595-1603`, first step of
+  `prepareClose`, `:1699-1700`; `server-shutdown-Dd8ozitC.mjs:21-26`). `restartExpectedMs` is
+  present only in restart mode.
+* F5. The terminal `sessions.changed` phase `end|error` push is built with the active-run
+  overlay (`buildSessionEventSnapshot(..., includeActiveRunState=true)`,
+  `server-chat-CbnqM5f6.mjs:311-327, 455`). It still says `status: running,
+  hasActiveRun: true` (measured in the crash dry run, 2026-10-13 00:14Z,
+  `runs/m3-watch.jsonl`). The settled row comes in the next push for the key, which has
+  `hasActiveRun: false` and carries `status`, `abortedLastRun`, `lastRunId` and
+  `lastRunError` (`session-event-payload-6u50DozL.mjs:81, 103-105`). There are two
+  sources, and both fire after the run's dispatch has finished:
+  * `reason: "chat.run.settled"` for `chat.send` runs, from a `finally`
+    (`chat-send-handler-kZQfUabO.mjs:3214-3222`). Measured: `status: done,
+    hasActiveRun: false, lastRunId: R`.
+  * `reason: "agent.input.settled"` for `agent`-method runs (`principal-BVWseYi9.mjs:3007-3027`).
+
+**The rule.** The pipe reads the persisted row of R's session from one of two places:
+* the settled push after R's terminal (F5);
+* the first `sessions.list` after the reconnect, when no settled push reached it (crash,
+  dropped frame).
+
+The stop-mode notice in row 3 must come before R's terminal on the same connection.
+
+| R's row | Owner | Pipe does |
+|---|---|---|
+| `status: running`, or no terminal at all | Gateway (F1-F3) | keeps M open and links the recovery run by rule E (case 5) |
+| `failed` and `lastRunError` matches `process exited with (code 143\|code 137\|signal SIG*)` | pipe | resume directive `msg-<chat>-<M>-resume-<t>` into M |
+| `killed` after a `shutdown` without `restartExpectedMs` on this connection (F4) | pipe | the same resume |
+| `killed` with no such notice | nobody (a Stop) | finalizes M |
+| `failed` with any other error | nobody (a real error) | shows the error in M, as today |
+| `lastRunId` is a newer run | that run | nothing; rule E links a recovery run |
+
+**Why there is never a double continuation.** The pipe resumes only rows the Gateway has
+already persisted as terminal, and the Gateway recovers only rows that are `running`. A row
+cannot be both. A resume run is an ordinary run, so if it is cut too, the same table applies
+to it. If a crash then cuts the resume run, the recovery's prior turn is
+`msg-<chat>-<M>-resume-<t>`, which rule E maps to M.
+
+**When the resume is sent.** At once, on the classifying row. If `chat.send` is
+refused (the Gateway is closing, the socket is gone), the resume stays on R's entry and is
+sent on the next `hello-ok`. Both triggers are events: there is no idle probe and no wait.
+The bound is today's `max_resume_attempts = 3` per M (pipe.py:1416), which is a count, not
+a timer.
+
+**Agent turns (manager decision 3).** They follow the same rule as user turns: the same
+mechanism, the same directive, written into the agent turn's M. Today on main such a turn
+is lost (above). The suggested heartbeat/cron exception is already covered by the Gateway's
+own scope, and the pipe reuses it so that both sides agree on what is worth continuing:
+
+* Cron runs never reach an OWUI key as a session push (`server-chat-CbnqM5f6.mjs:445`
+  returns for cron-run-scoped keys).
+* Recovery skips sub-agent, cron and ACP keys (`isMainRestartRecoveryCandidate`,
+  `main-session-recovery-state-CLSHE2xG.mjs:114-118`).
+
+The pipe resumes only on keys that predicate accepts. Every OWUI key passes it, so no
+separate exception list exists.
+
+**Fails on main** (each is a test in section 6):
+
+* The container stop: the agent turn is lost.
+* A crash: main's idle probe sees the epoch bump and resumes while the Gateway also
+  recovers, which is a double continuation. M3-crash measures this.
+* `_is_restart_signature` resumes a CLI that exited with code 1.
+
 ## 3. Cases
 
 1. **Tab open on this chat.** `chat:messages` adds M at the tail and moves the view to it.
@@ -319,11 +423,16 @@ request died with the process.
    read `chat.history` and give every closed run (`cli-assistant:<R>`) that lacks a
    finished `message_id(R)` its message, from the transcript. This is a comparison of two
    recorded timestamps, not a wait. M2 verifies that `updatedAt` moves at run end.
-5. **Gateway restart mid-run (ELI-90).** The new `bootId` (gateway.py:2271) says the runs
-   are gone. The Gateway's own recovery starts a run on every session that was `running`
-   (dist above). That run is a non-pipe run on the same key. It continues the message of
-   the run it recovers, user turn or agent turn alike, so one interrupted reply stays one
-   message. The pipe stops sending its own resume directive, subject to M3.
+5. **Gateway restart mid-run (ELI-90).** Who continues R is decided by the owner rule
+   (2.7), on R's persisted row:
+   * **Gateway.** In a crash or a restart-mode shutdown the row is still `running`, and the
+     Gateway's recovery run continues M. That run is a non-pipe run on the same key, linked
+     by rule E below.
+   * **Pipe.** After a container stop or a gateway stop-mode shutdown the row is terminal,
+     and the pipe's resume run `msg-<chat>-<M>-resume-<t>` continues M.
+
+   Either way it is one continuation, into the same message, for user and agent turns
+   alike.
 
    **Link rule (condition E).** Recovery run R' belongs to the message of source run S when
    all three hold:
@@ -412,6 +521,7 @@ Turn path, pipe.py and gateway.py:
 | `_RELAY_MIN_IDLE_S = 120` via `session_idle_for` | gateway.py:3432, 1866-1891, 2585 | remove |
 | `_RELAY_SNAPSHOT_MIN_INTERVAL_S = 1.0` | gateway.py:3439, 3704-3723 | remove. Persist on item boundaries and keep live text in the response stream (2.3, 2.4). |
 | Inline idle close, `idle_probe_s = 30` + describe | pipe.py:1407, 2235-2269 | remove (P27; end only on terminal, 2.5) |
+| Restart resume trigger: the same 30 s idle probe plus the epoch bump, after a deferred `_is_restart_signature` error | pipe.py:1696-1720, 1885-1891 | remove. The resume fires on the owner rule (2.7): R's terminal push or the first `sessions.list` after `hello-ok`. |
 | First-event wait 60 s + describe probe | pipe.py:1684-1719 | remove. A quiet queue before the first event is answered by run state (`sessions.changed` / `sessions.list`), which the queue wait already uses. |
 | `no_text_deadman_s = 180`, `describe_check_interval = 45`, `max_events_without_text` | pipe.py:1408-1411 | remove. A live run is waited on, and a dead one has a terminal or a settle. |
 | `rest_snapshot_interval_s = 2.5` | pipe.py:1400-1404 | remove if the minimum supported Open WebUI is 0.12, where it is already off (`_owui_owns_inflight_message`). Otherwise keep as it is, with no change in behavior. |
@@ -443,6 +553,34 @@ the branch:
   during the gap gets its message.
 * `NoMidRunCloseTest`: `describe.status = "done"` while `hasActiveRun` is true does not
   end an inline reply. On main it does after 30 s idle.
+* `OrphanStubAdoptedWithoutHistoryTest` (the 2026-10-12 23:29Z incident, this manager chat
+  `0abe9bde`, Open WebUI OOM-restarted mid-turn).
+  * On main: the startup reconcile marked stub `8acdce95` "its run is still going". When
+    the run settled, `_orphan_stub_for_run` failed with `chat.history failed: ` (an
+    exception with an empty message, 4 times, at gateway.py:3976-3980) and returned None.
+    The relay then introduced a new message `32e095ae` (5872 chars, 7 cards) under an empty
+    `done:false` stub.
+  * Test: a chat holds stub M with `done:false`, run `msg-<chat>-<M>-<t>` arrives on a
+    connection with no consumer, and `session_history` raises `TimeoutError()`. Expected:
+    the run writes into M (identity from the run id, 2.2, no transcript read needed) and M
+    ends `done:true` with the run's text and cards. No second message.
+* `UserTurnNoTabTest` (side finding of the M3 dry run, 2026-10-12, main, no tab open): a user
+  turn sent through the API with no page left the stub `done:false` and empty, and the answer
+  arrived as a second bubble with 1 of 5 cards. The agent turn got 2 of 5 cards. Expected:
+  one message M, `done:true`, 5 cards.
+* `OwnerRuleTest` (2.7), one case per row of the table. Each is fed the dist-shaped event
+  sequence: the terminal push with the `running` overlay, then the settled push.
+  * container stop (failed, exit 143) -> resume into M;
+  * restart mode (running + abortedLastRun) -> no resume, recovery linked;
+  * crash (no terminal, row `running` after hello) -> no resume;
+  * gateway stop (killed after `shutdown` without `restartExpectedMs`) -> resume;
+  * user Stop (killed, no notice) -> no resume;
+  * real error, and CLI exit 1 -> no resume.
+
+  On main, the crash case resumes (a double continuation), the agent-turn container stop
+  is lost, and exit 1 resumes.
+* `ResumeQueuedUntilHelloTest`: `chat.send` for the resume is refused while the Gateway
+  closes, and it is sent on the next `hello-ok`, with no time advance.
 * Plus the old -> new list in 1.4, which goes in the PR body.
 
 **Grep gate on the merged tree:** zero `Proactive message`, zero `PROACTIVE_`, zero
@@ -509,6 +647,20 @@ and comes back for approval.
 
   If the first does not hold, the pipe directive (P28) stays and is re-keyed to
   `msg-<chat>-<M>-resume-<t>`.
+
+  **Result, window 2026-10-12 23:54Z (container stop): FAIL for "the Gateway recovers every
+  interrupted run".** No recovery run at all. Both rows were terminal before the shutdown
+  (2.7). Two boots, 0 seq gaps, smoke keys 0. P28 stays, re-keyed, and is triggered by the
+  owner rule.
+
+  **M3-crash** (the ELI-99 kill test as the restart, `m3_orchestrate.sh crash`, prepared,
+  not yet run). The rule says the Gateway owns both runs. Passes if, for both turns:
+  * a recovery run exists;
+  * rule E links it to the source run;
+  * its start push reaches a reconnected client.
+
+  On main, a pipe resume next to the recovery is expected for the user turn (a double
+  continuation). That is recorded as a fails-on-main datum, not as an M3 failure.
 * **M4** A chat whose only active Open WebUI task is the writer's shows as generating, and
   the composer queues instead of sending. If not, case 7 still holds through `pipe()`'s
   existing wait, and this becomes a nicety.
