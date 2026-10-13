@@ -1359,6 +1359,8 @@ class _GatewayConnection:
         self._turn_pumps: dict = {}     # (session_key, run_id) -> _RunPump
         self._turn_writers: dict = {}   # (chat_id, message_id) -> _TurnWriter
         self._turn_skip_runs: dict = {}  # (session_key, run_id) of heartbeat runs
+        self._turn_resolve_lock = asyncio.Lock()
+        self._frame_seq: int | None = None
         self._stop_notice_seen = False  # `shutdown` without restartExpectedMs on this socket
         # Bumped on every successful connect/reconnect. A consumer that
         # captures this before `chat.send` can later tell "the queue is quiet
@@ -2202,6 +2204,7 @@ class _GatewayConnection:
             pipe_log(f"Device token captured: {self._device_token[:20]}...")
 
         self._ws = ws
+        self._frame_seq = None  # frame seq counts per socket
         self._reconnect_attempt = 0
         self.connection_epoch += 1
         self._thinking_note_shown.clear()
@@ -2297,6 +2300,21 @@ class _GatewayConnection:
                     spawn_background(self._subscribe_all())
                 msg = json.loads(await asyncio.wait_for(self._ws.recv(), timeout=90))
 
+                # ── Dropped frames ──
+                # Event frames carry a per-socket `seq`; the Gateway advances it
+                # without sending when this client is slow and the event is
+                # dropIfSlow (server-start-BB-IxTAg.mjs:3205-3207), and says so
+                # nowhere else. A dropped frame may be a run's text (repaired
+                # like a reconnect gap) or a settle push (open writers re-read
+                # their session rows).
+                _seq = msg.get("seq")
+                if msg.get("type") == "event" and isinstance(_seq, int):
+                    if self._frame_seq is not None and _seq != self._frame_seq + 1:
+                        pipe_log(f"  frame seq gap: expected {self._frame_seq + 1}, got {_seq}")
+                        self._mark_event_gap()
+                        spawn_background(_turn_resync(self))
+                    self._frame_seq = _seq
+
                 # ── Request-response matching ──
                 if msg.get("type") == "res":
                     req_id = msg.get("id")
@@ -2317,6 +2335,7 @@ class _GatewayConnection:
 
                 # ── Tick keepalive (silently consume) ──
                 if msg.get("event") == "tick" or msg.get("payload", {}).get("isHeartbeat"):
+                    _note_heartbeat_run(self, msg.get("payload") or {})
                     continue
 
                 # ── Event dispatch ──
@@ -2774,7 +2793,7 @@ async def _session_list_active(conn: "_GatewayConnection", session_key: str) -> 
     try:
         lst = await conn.send_request("sessions.list", {}, timeout=15)
     except Exception as ex:
-        pipe_log(f"  orphan stub: sessions.list failed: {ex}")
+        pipe_log(f"  sessions.list for {session_key[-36:][:8]}... failed: {ex}")
         return None
     row = next((r for r in (lst.get("sessions") or []) if r.get("key") == session_key), None)
     return bool(row and row.get("hasActiveRun"))

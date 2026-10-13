@@ -84,6 +84,7 @@ from openclaw_pipe import (
     MAX_TURN_RESUMES, next_continuation, turn_owner,
     recovery_source_run, run_message_id, _TurnWriter, _INTENT_HOOK_JS,
     _turn_route_event, _turn_after_hello, _history_span_messages,
+    _gateway_run_status,
     _GatewayConnection,
     GatewayError,
     _is_restart_signature,
@@ -6173,9 +6174,9 @@ class TurnWriterEndTests(_TurnWriterCase):
 
 
 
-class AgentTurnRoutingTests(unittest.IsolatedAsyncioTestCase):
-    """ELI-100 DESIGN 2.1-2.5 wired: a run on an OWUI key that no live request
-    consumes is written by a turn writer, as one ordinary message."""
+class _RoutingCase(unittest.IsolatedAsyncioTestCase):
+    """A connection wired to a fake Open WebUI chat, fed events and session
+    pushes the way the receive loop feeds them."""
 
     USER = "2d206eab-acac-4945-bd2f-7e8b6365de8c"
     CHAT = "24c342e4-50fa-442e-9b93-c215ed135f3a"
@@ -6224,6 +6225,49 @@ class AgentTurnRoutingTests(unittest.IsolatedAsyncioTestCase):
     def new_messages(self):
         return {k: v for k, v in self.owui.msgs().items() if k not in ("q1", "a1")}
 
+    # ── Handover (DESIGN 2.6): a user turn whose request ends before its run ──
+
+    STUB = "8acdce95-1111-4222-8333-444455556666"
+
+    def add_stub(self, mid, **fields):
+        msgs = self.owui.chat.chat["history"]["messages"]
+        msgs["a1"]["childrenIds"] = [mid]
+        msgs[mid] = {"id": mid, "role": "assistant", "parentId": "a1", "childrenIds": [],
+                     "content": "", "output": [], "done": False, **fields}
+        self.owui.chat.chat["history"]["currentId"] = mid
+
+    async def dispatch(self, run, payload):
+        """What the receive loop does for one event: the shadow renderer of a
+        tracked run is fed first, then the event is routed."""
+        shadow = self.conn._run_renderers.get(f"{self.key}:{run}")
+        if shadow is not None:
+            shadow.feed(payload)
+        return await _turn_route_event(self.conn, self.ev(run, payload))
+
+    def crashed_then_recovered_history(self):
+        """RUN streamed, the Gateway died (no closing turn for RUN), and boot
+        recovered it as REC, which ran to the end (M3-crash shape)."""
+        imported = {"importedFrom": "claude-cli"}
+        return {"messages": [
+            {"role": "user", "content": "x", "idempotencyKey": f"{self.RUN}:user"},
+            {"role": "assistant", "__openclaw": imported,
+             "content": [{"type": "text", "text": "Reading them."}]},
+            {"role": "user", "content": "[System] continue", "idempotencyKey": f"{self.REC}:user",
+             "provenance": {"kind": "internal_system", "sourceTool": "main_session_restart_recovery"}},
+            {"role": "assistant", "__openclaw": imported, "content": [
+                {"type": "toolcall", "id": "toolu_9", "name": "Bash", "arguments": {"command": "tail"}},
+                {"type": "tool_result", "tool_use_id": "toolu_9", "name": "Bash",
+                 "content": [{"type": "text", "text": "ok"}]}]},
+            {"role": "assistant", "__openclaw": imported,
+             "content": [{"type": "text", "text": " Found it."}]},
+            {"role": "assistant", "idempotencyKey": f"cli-assistant:{self.REC}",
+             "content": [{"type": "text", "text": "Found it."}]}]}
+
+
+class AgentTurnRoutingTests(_RoutingCase):
+    """ELI-100 DESIGN 2.1-2.5 wired: a run on an OWUI key that no live request
+    consumes is written by a turn writer, as one ordinary message."""
+
     async def test_an_agent_turn_renders_as_one_ordinary_message(self):
         handled = await self.run_turn(self.RUN)
         self.assertTrue(all(handled))
@@ -6253,25 +6297,6 @@ class AgentTurnRoutingTests(unittest.IsolatedAsyncioTestCase):
                          "rule E: the recovery writes into the interrupted run's message")
         self.assertIs(m["done"], True)
         self.assertIn("Again.", m["content"])
-
-    def crashed_then_recovered_history(self):
-        """RUN streamed, the Gateway died (no closing turn for RUN), and boot
-        recovered it as REC, which ran to the end (M3-crash shape)."""
-        imported = {"importedFrom": "claude-cli"}
-        return {"messages": [
-            {"role": "user", "content": "x", "idempotencyKey": f"{self.RUN}:user"},
-            {"role": "assistant", "__openclaw": imported,
-             "content": [{"type": "text", "text": "Reading them."}]},
-            {"role": "user", "content": "[System] continue", "idempotencyKey": f"{self.REC}:user",
-             "provenance": {"kind": "internal_system", "sourceTool": "main_session_restart_recovery"}},
-            {"role": "assistant", "__openclaw": imported, "content": [
-                {"type": "toolcall", "id": "toolu_9", "name": "Bash", "arguments": {"command": "tail"}},
-                {"type": "tool_result", "tool_use_id": "toolu_9", "name": "Bash",
-                 "content": [{"type": "text", "text": "ok"}]}]},
-            {"role": "assistant", "__openclaw": imported,
-             "content": [{"type": "text", "text": " Found it."}]},
-            {"role": "assistant", "idempotencyKey": f"cli-assistant:{self.REC}",
-             "content": [{"type": "text", "text": "Found it."}]}]}
 
     async def test_a_recovery_that_ended_while_away_is_folded_in(self):
         """Case 4: the recovery ran and ended while this socket was down, so
@@ -6323,25 +6348,6 @@ class AgentTurnRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("sessions.list", [m for m, _ in self.sent])
         (_mid, m), = self.new_messages().items()
         self.assertIs(m["done"], False, "the recovery still runs: M stays open for it")
-
-    # ── Handover (DESIGN 2.6): a user turn whose request ends before its run ──
-
-    STUB = "8acdce95-1111-4222-8333-444455556666"
-
-    def add_stub(self, mid, **fields):
-        msgs = self.owui.chat.chat["history"]["messages"]
-        msgs["a1"]["childrenIds"] = [mid]
-        msgs[mid] = {"id": mid, "role": "assistant", "parentId": "a1", "childrenIds": [],
-                     "content": "", "output": [], "done": False, **fields}
-        self.owui.chat.chat["history"]["currentId"] = mid
-
-    async def dispatch(self, run, payload):
-        """What the receive loop does for one event: the shadow renderer of a
-        tracked run is fed first, then the event is routed."""
-        shadow = self.conn._run_renderers.get(f"{self.key}:{run}")
-        if shadow is not None:
-            shadow.feed(payload)
-        return await _turn_route_event(self.conn, self.ev(run, payload))
 
     async def test_handover_an_inline_reply_that_ends_early_continues_in_its_own_message(self):
         run = pipe_run_id(self.CHAT, self.STUB)
@@ -6451,6 +6457,241 @@ class AgentTurnRoutingTests(unittest.IsolatedAsyncioTestCase):
             self.conn, self.ev(f"{ACTION_RUN_PREFIX}compact-x-1.0", _delta("Compacted."))))
         await self.spin()
         self.assertEqual(self.new_messages(), {})
+
+
+class RegressionPlanTests(_RoutingCase):
+    """DESIGN section 6: each fails on main 787a471 (no writer exists there)
+    and passes here."""
+
+    def tool_history(self, run, n, text="Done."):
+        """A closed run whose transcript holds `n` tool calls."""
+        imported = {"importedFrom": "claude-cli"}
+        msgs = [{"role": "user", "content": "go", "idempotencyKey": f"{run}:user"}]
+        for i in range(n):
+            msgs.append({"role": "assistant", "__openclaw": imported, "content": [
+                {"type": "toolcall", "id": f"toolu_{i}", "name": "Bash", "arguments": {"command": f"c{i}"}},
+                {"type": "tool_result", "tool_use_id": f"toolu_{i}", "name": "Bash",
+                 "content": [{"type": "text", "text": "ok"}]}]})
+        msgs += [{"role": "assistant", "__openclaw": imported, "content": [{"type": "text", "text": text}]},
+                 {"role": "assistant", "idempotencyKey": f"cli-assistant:{run}",
+                  "content": [{"type": "text", "text": text}]}]
+        return {"messages": msgs}
+
+    def cards(self, m):
+        return sum(1 for i in m["output"] if i["type"] == "function_call")
+
+    def settled(self, run, **row):
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "lastRunId": run, **row})
+
+    async def scripted_loop(self, conn, frames):
+        frames = list(frames)
+
+        class ScriptedWS:
+            async def recv(self_):
+                if frames:
+                    return json.dumps(frames.pop(0))
+                conn._stopped = True
+                raise asyncio.TimeoutError
+
+        conn._ws = ScriptedWS()
+        await conn._event_loop()
+        await self.spin()
+
+    async def test_two_connections_one_message(self):
+        """TwoConnectionsOneMessageTest: two live connections (a deploy's old
+        and new one) get the same run; the chat row lock lets one claim M."""
+        other = _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"))
+        other.send_request = self.conn.send_request
+        for conn in (self.conn, other):
+            _register_turn_writer(conn.writer_id)
+            self.addCleanup(_retire_turn_writer, conn.writer_id)
+        for payload in (_delta("Reading them."), _tool("start", tcid="toolu_1"),
+                        _tool("result", tcid="toolu_1"), _delta(" Found it."), {"state": "final"}):
+            for conn in (self.conn, other):
+                self.assertTrue(await _turn_route_event(conn, self.ev(self.RUN, payload)))
+        for conn in (self.conn, other):
+            conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                       "status": "done", "lastRunId": self.RUN})
+        await self.spin()
+        (_mid, m), = self.new_messages().items()
+        self.assertEqual((m["content"], m["done"], self.cards(m)), ("Reading them. Found it.", True, 1))
+
+    async def test_tool_cards_from_the_transcript(self):
+        """ToolCardsFromTranscriptTest: events after the first tool call were
+        lost; M ends with the transcript's cards."""
+        await _turn_route_event(self.conn, self.ev(self.RUN, _tool("start", tcid="toolu_0")))
+        self.history = self.tool_history(self.RUN, 3)
+        self.settled(self.RUN, status="done")
+        await self.spin()
+        (_mid, m), = self.new_messages().items()
+        self.assertEqual((self.cards(m), m["content"], m["done"]), (3, "Done.", True))
+
+    async def test_user_turn_with_no_tab(self):
+        """UserTurnNoTabTest (M3 dry run, 2026-10-12): a user turn sent through
+        the API, request gone before its run: one message M, 5 cards."""
+        run = pipe_run_id(self.CHAT, self.STUB)
+        self.add_stub(self.STUB)
+        self.conn.register_run_target(self.key, run, self.CHAT, self.STUB)
+        await self.dispatch(run, _tool("start", tcid="toolu_0"))
+        self.history = self.tool_history(run, 5)
+        self.settled(run, status="done")
+        await self.spin()
+        self.assertEqual(self.new_messages().keys(), {self.STUB})
+        m = self.owui.msgs()[self.STUB]
+        self.assertEqual((self.cards(m), m["done"]), (5, True))
+
+    async def owner_case(self, settled_row, *, stop_notice=False, terminal="error"):
+        """The run streams, its terminal arrives with the active-run overlay
+        push, then the settled row (dist-shaped, DESIGN 2.7)."""
+        self.sent_send = []
+        inner = self.conn.send_request
+
+        async def send_request(method, params, timeout=10):
+            if method == "chat.send":
+                self.sent_send.append(params)
+                return {"runId": params["idempotencyKey"], "status": "started"}
+            return await inner(method, params, timeout)
+        self.conn.send_request = send_request
+        await _turn_route_event(self.conn, self.ev(self.RUN, _delta("Reading them.")))
+        self.conn._stop_notice_seen = stop_notice
+        await _turn_route_event(self.conn, self.ev(self.RUN, {"state": terminal}))
+        self.conn._on_sessions_changed({"sessionKey": self.key, "phase": "end", "runId": self.RUN,
+                                        "status": "running", "hasActiveRun": True})
+        self.history = {"messages": []}
+        self.settled(self.RUN, **settled_row)
+        await self.spin()
+        (_mid, m), = self.new_messages().items()
+        return m
+
+    async def test_owner_rule_container_stop_resumes_into_m(self):
+        m = await self.owner_case({"status": "failed",
+                                   "lastRunError": "Claude Code process exited with code 143"})
+        (send,) = self.sent_send
+        self.assertTrue(send["idempotencyKey"].startswith(
+            f"msg-{self.CHAT}-{turn_message_id(self.key, self.RUN, self.CHAT)}-resume-"))
+        self.assertIs(m["done"], False)
+
+    async def test_owner_rule_restart_mode_leaves_m_to_the_recovery(self):
+        m = await self.owner_case({"status": "running", "abortedLastRun": True})
+        self.assertEqual(self.sent_send, [])
+        self.assertIs(m["done"], False)
+
+    async def test_owner_rule_gateway_stop_resumes(self):
+        m = await self.owner_case({"status": "killed"}, stop_notice=True, terminal="aborted")
+        self.assertEqual(len(self.sent_send), 1)
+        self.assertIs(m["done"], False)
+
+    async def test_owner_rule_user_stop_and_real_errors_end_m(self):
+        for row in ({"status": "killed"},
+                    {"status": "failed", "lastRunError": "rate limited"},
+                    {"status": "failed", "lastRunError": "Claude Code process exited with code 1"}):
+            with self.subTest(row=row):
+                await self.asyncTearDown() if hasattr(self, "asyncTearDown") else None
+                await self.asyncSetUp()
+                m = await self.owner_case(row, terminal="aborted" if row["status"] == "killed" else "error")
+                self.assertEqual(self.sent_send, [])
+                self.assertIs(m["done"], True)
+
+    async def test_owner_rule_crash_sends_no_resume(self):
+        """No terminal ever arrives; after hello the session is active (the
+        recovery runs): nothing is sent and M stays open."""
+        self.sent_send = []
+        await _turn_route_event(self.conn, self.ev(self.RUN, _delta("Reading them.")))
+        self.conn.active_run_snapshot = {self.key: []}
+        await _turn_after_hello(self.conn)
+        await self.spin()
+        self.assertNotIn("chat.send", [m for m, _ in self.sent])
+        (_mid, m), = self.new_messages().items()
+        self.assertIs(m["done"], False)
+
+    async def test_crash_double_continuation(self):
+        """CrashDoubleContinuationTest (M3-crash, user turn): on main the pipe
+        also sent resume-..., queued behind recovery f2445aa8, and the reply
+        closed on its immediate empty final. Here: no pipe resume, and M gets
+        the recovery's card and text."""
+        await _turn_route_event(self.conn, self.ev(self.RUN, _delta("Reading them.")))
+        self.conn.active_run_snapshot = {self.key: []}
+        await _turn_after_hello(self.conn)
+        self.history = self.crashed_then_recovered_history()
+        for payload in (_tool("start", tcid="toolu_9"), _tool("result", tcid="toolu_9"),
+                        _delta(" Found it."), {"state": "final"}):
+            await _turn_route_event(self.conn, self.ev(self.REC, payload))
+        self.settled(self.REC, status="done")
+        await self.spin()
+        self.assertNotIn("chat.send", [m for m, _ in self.sent])
+        (mid, m), = self.new_messages().items()
+        self.assertEqual(mid, turn_message_id(self.key, self.RUN, self.CHAT))
+        self.assertEqual((m["content"], self.cards(m), m["done"]), ("Reading them. Found it.", 1, True))
+
+    async def test_a_frame_seq_gap_resyncs_open_writers(self):
+        """SeqGapRecoveryTest: the Gateway drops a frame for a slow client and
+        only the per-socket frame seq shows it (server-start-BB-IxTAg.mjs:
+        3205-3207). The settle push was the dropped frame: the row is read and
+        the writer ends. A run whose start was dropped still gets its message
+        from its next event."""
+        row = {"key": self.key, "hasActiveRun": False, "status": "done", "lastRunId": self.RUN}
+        inner = self.conn.send_request
+
+        async def send_request(method, params, timeout=10):
+            if method == "sessions.list":
+                self.sent.append((method, params))
+                return {"sessions": [row]}
+            return await inner(method, params, timeout)
+        self.conn.send_request = send_request
+        self.history = _turn_history(run=self.RUN)
+        ev = lambda seq, payload: {"type": "event", "event": "agent", "seq": seq,
+                                   "payload": self.ev(self.RUN, payload)}
+        await self.scripted_loop(self.conn, [
+            ev(7, _delta("Reading them.")),          # seq 5-6 (the start push) dropped
+            ev(8, _tool("start", tcid="toolu_1")),
+            ev(9, {"state": "final"}),
+            {"type": "event", "event": "tick", "seq": 11, "payload": {}},  # 10 (settle) dropped
+        ])
+        self.assertIn("sessions.list", [m for m, _ in self.sent])
+        (_mid, m), = self.new_messages().items()
+        self.assertEqual((m["content"], m["done"]), ("Reading them. Found it.", True))
+
+    async def test_a_heartbeat_runs_session_tool_events_open_nothing(self):
+        """The receive loop drops events flagged isHeartbeat before routing;
+        the run's session.tool copies carry no flag and must not open M."""
+        hb = {"type": "event", "event": "agent",
+              "payload": {**self.ev(self.RUN, _delta("checking")), "isHeartbeat": True}}
+        tool = {"type": "event", "event": "session.tool",
+                "payload": self.ev(self.RUN, _tool("start", tcid="toolu_1"))}
+        await self.scripted_loop(self.conn, [hb, tool])
+        self.assertEqual(self.new_messages(), {})
+
+
+class NoMidRunCloseTests(unittest.IsolatedAsyncioTestCase):
+    """NoMidRunCloseTest: `sessions.describe` says "done" during a sub-agent
+    yield gap while `sessions.list` still has the run active (ELI-56). The
+    inline reply's idle probe must not read that as the end of the run; on
+    main it closed the reply after 30 s of silence."""
+
+    SK = _owui_session_key("main", "11111111-1111-1111-1111-111111111111",
+                           "22222222-2222-2222-2222-222222222222")
+
+    def conn(self, describe, active):
+        conn = _GatewayConnection(lambda: None)
+
+        async def send_request(method, params, timeout=10):
+            if method == "sessions.describe":
+                return {"session": {"status": describe}}
+            if method == "sessions.list":
+                return {"sessions": [{"key": self.SK, "hasActiveRun": active}]}
+            raise AssertionError(method)
+        conn.send_request = send_request
+        return conn
+
+    async def test_done_while_the_run_is_active_is_running(self):
+        self.assertEqual(await _gateway_run_status(self.conn("done", True), self.SK), "running")
+
+    async def test_done_and_idle_is_done(self):
+        self.assertEqual(await _gateway_run_status(self.conn("done", False), self.SK), "done")
+
+    async def test_an_active_describe_needs_no_list(self):
+        self.assertEqual(await _gateway_run_status(self.conn("running", False), self.SK), "running")
 
 
 if __name__ == "__main__":

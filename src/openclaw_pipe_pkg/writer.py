@@ -198,11 +198,18 @@ class _TurnWriter:
         self.sent_output: list = []     # the `output` open tabs hold
         self._emit = None
         self._done = asyncio.Event()
+        # Two pumps feed one writer when a recovery continues M; only one may
+        # claim it.
+        self._open_lock = asyncio.Lock()
 
     async def open(self, takeover: bool = False) -> bool:
         """Claim the message, introduce it to open tabs and register the
         writer's task. False when there is nothing to open (a run that renders
         nothing) or another live writer holds the message."""
+        async with self._open_lock:
+            return await self._open(takeover)
+
+    async def _open(self, takeover: bool) -> bool:
         if self.opened:
             return True
         if not self.message_id:
@@ -488,13 +495,7 @@ async def _turn_route_event(conn: "_GatewayConnection", payload: dict) -> bool:
         return False
     if run.startswith(ACTION_RUN_PREFIX):
         return True  # the Status Action's own runs render nothing
-    if payload.get("isHeartbeat") is True:
-        # Condition B: a heartbeat run never gets a message. Its later events
-        # can come without the flag (session.tool), so the run is remembered.
-        conn._turn_skip_runs[(sess, run)] = True
-        if len(conn._turn_skip_runs) > 500:
-            for stale in list(conn._turn_skip_runs)[:250]:
-                conn._turn_skip_runs.pop(stale, None)
+    _note_heartbeat_run(conn, payload)
     if (sess, run) in conn._turn_skip_runs:
         return True
     if conn.was_delivered_live(sess, run):
@@ -522,6 +523,19 @@ async def _turn_route_event(conn: "_GatewayConnection", payload: dict) -> bool:
     return True
 
 
+def _note_heartbeat_run(conn: "_GatewayConnection", payload: dict) -> None:
+    """Condition B: a heartbeat run never gets a message. Its agent events
+    carry isHeartbeat (server-chat-CbnqM5f6.mjs:791, 823-826); its session.tool
+    copies do not, so the run is remembered."""
+    sess, run = payload.get("sessionKey"), payload.get("runId")
+    if payload.get("isHeartbeat") is not True or not (sess and run):
+        return
+    conn._turn_skip_runs[(sess, run)] = True
+    if len(conn._turn_skip_runs) > 500:
+        for stale in list(conn._turn_skip_runs)[:250]:
+            conn._turn_skip_runs.pop(stale, None)
+
+
 def _turn_settled(conn: "_GatewayConnection", session_key: str, row: dict) -> None:
     """The session went idle: every run pumped on it has ended. Its settled
     row decides each writer's next step (DESIGN 2.5, 2.7)."""
@@ -532,6 +546,14 @@ def _turn_settled(conn: "_GatewayConnection", session_key: str, row: dict) -> No
 
 async def _turn_writer_for(conn: "_GatewayConnection", sess: str, run: str,
                            user_id: str, chat_id: str) -> "_TurnWriter | None":
+    # Two runs can name one message (a recovery and the run it recovers). The
+    # one resolved second must find the first one's writer, not open its own,
+    # so resolving and registering is one step per connection.
+    async with conn._turn_resolve_lock:
+        return await _turn_writer_for_locked(conn, sess, run, user_id, chat_id)
+
+
+async def _turn_writer_for_locked(conn, sess, run, user_id, chat_id):
     messages = None
     if parse_pipe_run_id(run) is None:
         # Not a pipe run: a restart recovery writes into the message of the run
@@ -599,7 +621,13 @@ async def _turn_after_hello(conn: "_GatewayConnection") -> None:
     for writer in list(conn._turn_writers.values()):
         if writer.pending_resume:
             await writer.on_hello()
-    idle = {sess for (sess, _run) in conn._turn_pumps if sess not in conn.active_run_snapshot}
+    await _turn_resync(conn, skip=set(conn.active_run_snapshot))
+
+
+async def _turn_resync(conn: "_GatewayConnection", skip: set = frozenset()) -> None:
+    """Read the row of every session with an open pump (except `skip`, known
+    active) and end the ones that went idle while their settle was missed."""
+    idle = {sess for (sess, _run) in conn._turn_pumps if sess not in skip}
     for sess in idle:
         try:
             lst = await conn.send_request("sessions.list", {"search": sess[-36:], "limit": 10},

@@ -4209,6 +4209,8 @@ class _GatewayConnection:
         self._turn_pumps: dict = {}     # (session_key, run_id) -> _RunPump
         self._turn_writers: dict = {}   # (chat_id, message_id) -> _TurnWriter
         self._turn_skip_runs: dict = {}  # (session_key, run_id) of heartbeat runs
+        self._turn_resolve_lock = asyncio.Lock()
+        self._frame_seq: int | None = None
         self._stop_notice_seen = False  # `shutdown` without restartExpectedMs on this socket
         # Bumped on every successful connect/reconnect. A consumer that
         # captures this before `chat.send` can later tell "the queue is quiet
@@ -5052,6 +5054,7 @@ class _GatewayConnection:
             pipe_log(f"Device token captured: {self._device_token[:20]}...")
 
         self._ws = ws
+        self._frame_seq = None  # frame seq counts per socket
         self._reconnect_attempt = 0
         self.connection_epoch += 1
         self._thinking_note_shown.clear()
@@ -5147,6 +5150,21 @@ class _GatewayConnection:
                     spawn_background(self._subscribe_all())
                 msg = json.loads(await asyncio.wait_for(self._ws.recv(), timeout=90))
 
+                # ── Dropped frames ──
+                # Event frames carry a per-socket `seq`; the Gateway advances it
+                # without sending when this client is slow and the event is
+                # dropIfSlow (server-start-BB-IxTAg.mjs:3205-3207), and says so
+                # nowhere else. A dropped frame may be a run's text (repaired
+                # like a reconnect gap) or a settle push (open writers re-read
+                # their session rows).
+                _seq = msg.get("seq")
+                if msg.get("type") == "event" and isinstance(_seq, int):
+                    if self._frame_seq is not None and _seq != self._frame_seq + 1:
+                        pipe_log(f"  frame seq gap: expected {self._frame_seq + 1}, got {_seq}")
+                        self._mark_event_gap()
+                        spawn_background(_turn_resync(self))
+                    self._frame_seq = _seq
+
                 # ── Request-response matching ──
                 if msg.get("type") == "res":
                     req_id = msg.get("id")
@@ -5167,6 +5185,7 @@ class _GatewayConnection:
 
                 # ── Tick keepalive (silently consume) ──
                 if msg.get("event") == "tick" or msg.get("payload", {}).get("isHeartbeat"):
+                    _note_heartbeat_run(self, msg.get("payload") or {})
                     continue
 
                 # ── Event dispatch ──
@@ -5624,7 +5643,7 @@ async def _session_list_active(conn: "_GatewayConnection", session_key: str) -> 
     try:
         lst = await conn.send_request("sessions.list", {}, timeout=15)
     except Exception as ex:
-        pipe_log(f"  orphan stub: sessions.list failed: {ex}")
+        pipe_log(f"  sessions.list for {session_key[-36:][:8]}... failed: {ex}")
         return None
     row = next((r for r in (lst.get("sessions") or []) if r.get("key") == session_key), None)
     return bool(row and row.get("hasActiveRun"))
@@ -6136,11 +6155,18 @@ class _TurnWriter:
         self.sent_output: list = []     # the `output` open tabs hold
         self._emit = None
         self._done = asyncio.Event()
+        # Two pumps feed one writer when a recovery continues M; only one may
+        # claim it.
+        self._open_lock = asyncio.Lock()
 
     async def open(self, takeover: bool = False) -> bool:
         """Claim the message, introduce it to open tabs and register the
         writer's task. False when there is nothing to open (a run that renders
         nothing) or another live writer holds the message."""
+        async with self._open_lock:
+            return await self._open(takeover)
+
+    async def _open(self, takeover: bool) -> bool:
         if self.opened:
             return True
         if not self.message_id:
@@ -6426,13 +6452,7 @@ async def _turn_route_event(conn: "_GatewayConnection", payload: dict) -> bool:
         return False
     if run.startswith(ACTION_RUN_PREFIX):
         return True  # the Status Action's own runs render nothing
-    if payload.get("isHeartbeat") is True:
-        # Condition B: a heartbeat run never gets a message. Its later events
-        # can come without the flag (session.tool), so the run is remembered.
-        conn._turn_skip_runs[(sess, run)] = True
-        if len(conn._turn_skip_runs) > 500:
-            for stale in list(conn._turn_skip_runs)[:250]:
-                conn._turn_skip_runs.pop(stale, None)
+    _note_heartbeat_run(conn, payload)
     if (sess, run) in conn._turn_skip_runs:
         return True
     if conn.was_delivered_live(sess, run):
@@ -6460,6 +6480,19 @@ async def _turn_route_event(conn: "_GatewayConnection", payload: dict) -> bool:
     return True
 
 
+def _note_heartbeat_run(conn: "_GatewayConnection", payload: dict) -> None:
+    """Condition B: a heartbeat run never gets a message. Its agent events
+    carry isHeartbeat (server-chat-CbnqM5f6.mjs:791, 823-826); its session.tool
+    copies do not, so the run is remembered."""
+    sess, run = payload.get("sessionKey"), payload.get("runId")
+    if payload.get("isHeartbeat") is not True or not (sess and run):
+        return
+    conn._turn_skip_runs[(sess, run)] = True
+    if len(conn._turn_skip_runs) > 500:
+        for stale in list(conn._turn_skip_runs)[:250]:
+            conn._turn_skip_runs.pop(stale, None)
+
+
 def _turn_settled(conn: "_GatewayConnection", session_key: str, row: dict) -> None:
     """The session went idle: every run pumped on it has ended. Its settled
     row decides each writer's next step (DESIGN 2.5, 2.7)."""
@@ -6470,6 +6503,14 @@ def _turn_settled(conn: "_GatewayConnection", session_key: str, row: dict) -> No
 
 async def _turn_writer_for(conn: "_GatewayConnection", sess: str, run: str,
                            user_id: str, chat_id: str) -> "_TurnWriter | None":
+    # Two runs can name one message (a recovery and the run it recovers). The
+    # one resolved second must find the first one's writer, not open its own,
+    # so resolving and registering is one step per connection.
+    async with conn._turn_resolve_lock:
+        return await _turn_writer_for_locked(conn, sess, run, user_id, chat_id)
+
+
+async def _turn_writer_for_locked(conn, sess, run, user_id, chat_id):
     messages = None
     if parse_pipe_run_id(run) is None:
         # Not a pipe run: a restart recovery writes into the message of the run
@@ -6537,7 +6578,13 @@ async def _turn_after_hello(conn: "_GatewayConnection") -> None:
     for writer in list(conn._turn_writers.values()):
         if writer.pending_resume:
             await writer.on_hello()
-    idle = {sess for (sess, _run) in conn._turn_pumps if sess not in conn.active_run_snapshot}
+    await _turn_resync(conn, skip=set(conn.active_run_snapshot))
+
+
+async def _turn_resync(conn: "_GatewayConnection", skip: set = frozenset()) -> None:
+    """Read the row of every session with an open pump (except `skip`, known
+    active) and end the ones that went idle while their settle was missed."""
+    idle = {sess for (sess, _run) in conn._turn_pumps if sess not in skip}
     for sess in idle:
         try:
             lst = await conn.send_request("sessions.list", {"search": sess[-36:], "limit": 10},
@@ -6889,6 +6936,31 @@ async def _settle_cancel_intent(conn, session_key, run_id, chat_id, event_call):
             pipe_log(f"  cancel intent query failed: {ex!r}")
     pipe_log(f"  cancel intent from the page: {intent or 'unknown'}")
     conn.settle_parked_turn(session_key, run_id, intent, hold_s=_SEND_NOW_HOLD_S)
+
+
+async def _gateway_run_status(conn, session_key: str) -> str | None:
+    """The Gateway's own run status (P26), for a reply that has been quiet.
+
+    A quiet queue does not mean the run ended: it may be queued behind
+    another run, in a long tool call, or in a sub-agent yield gap. Returns
+    the `sessions.describe` status ("running", "done", "failed",
+    "cancelled", ...), so callers can tell a user stop from a dead run. A
+    terminal status is checked against `sessions.list` `hasActiveRun`, which
+    counts a yield gap as active where describe already says "done"
+    (ELI-56); then it is "running". None when the probe failed or the
+    session is unknown."""
+    try:
+        desc = await conn.send_request("sessions.describe", dict(key=session_key), timeout=8)
+    except Exception as ex:
+        pipe_log(f"  initial describe probe failed: {ex}")
+        return None
+    session_row = desc.get("session")
+    if session_row is None:
+        return None
+    status = session_row.get("status")
+    if status in ("done", "failed", "cancelled") and await _session_list_active(conn, session_key):
+        return "running"
+    return status
 
 
 @dataclass
@@ -8112,30 +8184,7 @@ class Pipe:
             return await _recover_turn_text(conn, session_key, text)
 
         async def gateway_run_status() -> str | None:
-            """Check the Gateway's own run status (P26).
-
-            A quiet queue before the first event ever arrives does not mean
-            the message was lost -- it may simply be queued behind another
-            active run in the same session (e.g. a long-running agent task).
-            Only `sessions.describe` is authoritative; ask it before treating
-            60s of silence as a dead run. Returns the raw status string
-            (e.g. "active", "done", "failed", "cancelled") so callers can
-            tell a user-initiated stop apart from a genuinely dead run;
-            None means the probe itself failed or the session is unknown.
-            """
-            try:
-                desc = await conn.send_request(
-                    "sessions.describe",
-                    dict(key=session_key),
-                    timeout=8,
-                )
-            except Exception as ex:
-                pipe_log(f"  initial describe probe failed: {ex}")
-                return None
-            session_row = desc.get("session")
-            if session_row is None:
-                return None
-            return session_row.get("status")
+            return await _gateway_run_status(conn, session_key)
 
         def record_visible_chunk(chunk: str):
             nonlocal visible_message_text, relabelable_tool_call

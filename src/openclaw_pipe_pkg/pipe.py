@@ -131,6 +131,31 @@ async def _settle_cancel_intent(conn, session_key, run_id, chat_id, event_call):
     conn.settle_parked_turn(session_key, run_id, intent, hold_s=_SEND_NOW_HOLD_S)
 
 
+async def _gateway_run_status(conn, session_key: str) -> str | None:
+    """The Gateway's own run status (P26), for a reply that has been quiet.
+
+    A quiet queue does not mean the run ended: it may be queued behind
+    another run, in a long tool call, or in a sub-agent yield gap. Returns
+    the `sessions.describe` status ("running", "done", "failed",
+    "cancelled", ...), so callers can tell a user stop from a dead run. A
+    terminal status is checked against `sessions.list` `hasActiveRun`, which
+    counts a yield gap as active where describe already says "done"
+    (ELI-56); then it is "running". None when the probe failed or the
+    session is unknown."""
+    try:
+        desc = await conn.send_request("sessions.describe", dict(key=session_key), timeout=8)
+    except Exception as ex:
+        pipe_log(f"  initial describe probe failed: {ex}")
+        return None
+    session_row = desc.get("session")
+    if session_row is None:
+        return None
+    status = session_row.get("status")
+    if status in ("done", "failed", "cancelled") and await _session_list_active(conn, session_key):
+        return "running"
+    return status
+
+
 @dataclass
 class _TurnState:
     """What one reply still owes the user if it is cancelled or closed now.
@@ -1367,30 +1392,7 @@ class Pipe:
             return await _recover_turn_text(conn, session_key, text)
 
         async def gateway_run_status() -> str | None:
-            """Check the Gateway's own run status (P26).
-
-            A quiet queue before the first event ever arrives does not mean
-            the message was lost -- it may simply be queued behind another
-            active run in the same session (e.g. a long-running agent task).
-            Only `sessions.describe` is authoritative; ask it before treating
-            60s of silence as a dead run. Returns the raw status string
-            (e.g. "active", "done", "failed", "cancelled") so callers can
-            tell a user-initiated stop apart from a genuinely dead run;
-            None means the probe itself failed or the session is unknown.
-            """
-            try:
-                desc = await conn.send_request(
-                    "sessions.describe",
-                    dict(key=session_key),
-                    timeout=8,
-                )
-            except Exception as ex:
-                pipe_log(f"  initial describe probe failed: {ex}")
-                return None
-            session_row = desc.get("session")
-            if session_row is None:
-                return None
-            return session_row.get("status")
+            return await _gateway_run_status(conn, session_key)
 
         def record_visible_chunk(chunk: str):
             nonlocal visible_message_text, relabelable_tool_call
