@@ -154,11 +154,12 @@ def _generate_device_identity():
     return dict(id=did, publicKey=pub_b64, privateKey=pem)
 
 
-def _sign_challenge(ident, nonce, ts, token_str=""):
-    """Sign the WebSocket challenge using the device identity."""
+def _sign_challenge(ident, nonce, ts, token_str="", scopes=None):
+    """Sign the WebSocket challenge using the device identity. The Gateway
+    checks the scope list in the signed payload against the scopes requested."""
     parts = [
         "v2", ident["id"], "webchat", "cli", "operator",
-        ",".join(GATEWAY_SCOPES), str(ts), token_str, nonce
+        ",".join(GATEWAY_SCOPES if scopes is None else scopes), str(ts), token_str, nonce
     ]
     pk = serialization.load_pem_private_key(
         ident["privateKey"].encode(), password=None, backend=default_backend()
@@ -770,6 +771,23 @@ def clamp_to_ladder(level, ladder):
 
 # --- gateway ---------------------------------------------------------------
 GATEWAY_SCOPES = ["operator.admin", "operator.read", "operator.write"]
+# A connection for users not in OWNER_USERS. Without operator.admin the
+# Gateway does not record its turns as the owner's, and the agent withholds
+# owner-only tools from them. read: history, sessions, models, usage and the
+# event subscriptions. write: send, abort and the model override.
+RESTRICTED_SCOPES = ["operator.read", "operator.write"]
+
+
+def _parse_owner_users(raw: str) -> frozenset:
+    """OWNER_USERS as a set of lowercase user ids and emails."""
+    return frozenset(p.strip().lower() for p in (raw or "").split(",") if p.strip())
+
+
+def _is_owner_user(owners: frozenset, user_id, email) -> bool:
+    """An empty list makes everyone an owner (the behaviour before the valve)."""
+    if not owners:
+        return True
+    return any(v and str(v).strip().lower() in owners for v in (user_id, email))
 
 
 # ---------------------------------------------------------------------------

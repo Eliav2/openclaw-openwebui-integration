@@ -4,6 +4,23 @@
 # ------------------------------------------------------------------
 
 GATEWAY_SCOPES = ["operator.admin", "operator.read", "operator.write"]
+# A connection for users not in OWNER_USERS. Without operator.admin the
+# Gateway does not record its turns as the owner's, and the agent withholds
+# owner-only tools from them. read: history, sessions, models, usage and the
+# event subscriptions. write: send, abort and the model override.
+RESTRICTED_SCOPES = ["operator.read", "operator.write"]
+
+
+def _parse_owner_users(raw: str) -> frozenset:
+    """OWNER_USERS as a set of lowercase user ids and emails."""
+    return frozenset(p.strip().lower() for p in (raw or "").split(",") if p.strip())
+
+
+def _is_owner_user(owners: frozenset, user_id, email) -> bool:
+    """An empty list makes everyone an owner (the behaviour before the valve)."""
+    if not owners:
+        return True
+    return any(v and str(v).strip().lower() in owners for v in (user_id, email))
 
 
 # ---------------------------------------------------------------------------

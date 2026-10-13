@@ -27,11 +27,12 @@ def _generate_device_identity():
     return dict(id=did, publicKey=pub_b64, privateKey=pem)
 
 
-def _sign_challenge(ident, nonce, ts, token_str=""):
-    """Sign the WebSocket challenge using the device identity."""
+def _sign_challenge(ident, nonce, ts, token_str="", scopes=None):
+    """Sign the WebSocket challenge using the device identity. The Gateway
+    checks the scope list in the signed payload against the scopes requested."""
     parts = [
         "v2", ident["id"], "webchat", "cli", "operator",
-        ",".join(GATEWAY_SCOPES), str(ts), token_str, nonce
+        ",".join(GATEWAY_SCOPES if scopes is None else scopes), str(ts), token_str, nonce
     ]
     pk = serialization.load_pem_private_key(
         ident["privateKey"].encode(), password=None, backend=default_backend()

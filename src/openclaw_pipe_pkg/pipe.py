@@ -236,6 +236,17 @@ class Pipe:
                 "to /tmp, and you will be asked to approve the device again "
                 "after every restart."
         )
+        OWNER_USERS: str = Field(
+            default="",
+            description="Open WebUI user ids or emails, comma-separated, whose "
+                "chats act with full owner rights on the Gateway. Leave empty "
+                "and every user acts as the owner (the old behaviour). When set, "
+                "everyone else talks to the Gateway over a separate connection "
+                "with read and write access only, so the agent withholds "
+                "owner-only tools (automations, outbound messaging, sessions "
+                "admin, terminal) from their turns. Use it whenever someone "
+                "other than the Gateway's owner can sign in to Open WebUI."
+        )
         AGENT_ID: str = Field(
             default="main",
             description="Which OpenClaw agent handles these chats. Leave as "
