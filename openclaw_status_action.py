@@ -2367,16 +2367,22 @@ class _GatewayConnection:
             spawn_background(self.ensure_message_subscription(key))
 
     def row_to_consumers(self, session_key: str, row: dict, resync: bool = False,
-                         read_at: float | None = None) -> None:
+                         read_at: float | None = None, outside_loop: bool = False) -> None:
         """Hand session row `row` to every inline reply of `session_key`.
         `read_at`: when the row was read, if not just now (a resync's read
-        started before its reply came back)."""
+        started before its reply came back). `outside_loop`: put by a task,
+        not the receive loop, which may be waiting to put an earlier event
+        into a full queue; the row waits its turn behind it (review 2af1
+        N9), in a task per queue so one stalled reply holds up no other."""
         marker = {"type": _ROW_MARKER_TYPE, "row": row, "resync": resync,
                   "read_at": time.monotonic() if read_at is None else read_at}
         for key, consumer in list(self._consumers.items()):
             if key.startswith(f"{session_key}:"):
                 for q in consumer.queues:
-                    q.put_control(dict(marker))
+                    if outside_loop:
+                        spawn_background(q.put(dict(marker)))
+                    else:
+                        q.put_control(dict(marker))
 
     def note_session_id(self, session_key: str, session_id) -> None:
         if session_key and isinstance(session_id, str) and session_id:
@@ -2644,21 +2650,40 @@ class _GatewayConnection:
             held.append(payload)
 
     def _release_held(self, session_key: str) -> None:
-        """A reply ended without taking the runs held for it: they are turns
-        again, routed in their order of arrival."""
+        """A reply ended. The runs held for it stay held until they drain, in
+        their order of arrival (review 2af1 N7, N8): into the run's own queue
+        if a reply registers for it (`register_consumer`; the ask-user switch
+        registers right after this release), before the run's next event
+        (`_turn_route_now`), or here, in the background, for a run that sends
+        no more."""
         try:
             asyncio.get_running_loop()
         except RuntimeError:
             return  # no loop, no events to route (a sync teardown)
         for (sess, run) in list(self._held_for_live):
-            if sess == session_key and not self.live_reply_owns(sess, run):
-                held = self._held_for_live.pop((sess, run))
-                pipe_log(f"  {len(held)} held event(s) of {run[:24]}... released to the turn writer")
+            if sess == session_key:
+                async def drain(sess=sess, run=run):
+                    self.drain_held(sess, run)
+                spawn_background(drain())
 
-                async def route(held=held):
-                    for ev in held:
-                        await _turn_route_event(self, ev)
-                spawn_background(route())
+    def drain_held(self, session_key: str, run_id: str) -> None:
+        """Route the held events of a run no live reply owns any more, in
+        order and synchronously: the router never awaits, so nothing routed
+        for the run can come between them."""
+        if self.live_reply_owns(session_key, run_id):
+            return
+        held = self._held_for_live.pop((session_key, run_id), None)
+        if not held:
+            return
+        consumer = self._consumers.get(f"{session_key}:{run_id}")
+        if consumer is not None:  # registered meanwhile: its queue takes them
+            for q in consumer.queues:
+                for ev in held:
+                    q.put_control(ev)
+            return
+        pipe_log(f"  {len(held)} held event(s) of {run_id[:24]}... released to the turn writer")
+        for ev in held:
+            _turn_route_now(self, ev)
 
     def mark_delivered_live(self, session_key: str, run_id: str):
         """Record that this run's final event was just dispatched to a live
@@ -4726,10 +4751,15 @@ class _RunPump:
 
 
 async def _turn_route_event(conn: "_GatewayConnection", payload: dict) -> bool:
+    return _turn_route_now(conn, payload)
+
+
+def _turn_route_now(conn: "_GatewayConnection", payload: dict) -> bool:
     """Queue `payload` for its run's writer when the run is a turn this
     connection writes: an OWUI session key and no live request consuming it.
     A run whose request ended before it is handed over (DESIGN 2.6). True
-    when handled here."""
+    when handled here. Never awaits: held events drain through it in order
+    (`drain_held`)."""
     sess, run = payload.get("sessionKey") or "", payload.get("runId") or ""
     if not (getattr(conn, "writes_turns", False) and sess and run) or conn._retired:
         return False
@@ -4739,6 +4769,8 @@ async def _turn_route_event(conn: "_GatewayConnection", payload: dict) -> bool:
         return False
     if run.startswith(ACTION_RUN_PREFIX):
         return True  # the Status Action's own runs render nothing
+    if (sess, run) in conn._held_for_live:
+        conn.drain_held(sess, run)  # the earlier ones first (review 2af1 N7)
     if conn.live_reply_owns(sess, run):
         conn.hold_for_live(sess, run, payload)
         return True
@@ -5135,7 +5167,7 @@ async def _turn_resync(conn: "_GatewayConnection", skip: set = frozenset()) -> N
             continue
         if not row.get("hasActiveRun"):
             _turn_settled(conn, sess, row)
-        conn.row_to_consumers(sess, row, resync=True, read_at=read_at)
+        conn.row_to_consumers(sess, row, resync=True, read_at=read_at, outside_loop=True)
 
 
 # --- emit ------------------------------------------------------------------

@@ -649,10 +649,15 @@ class _RunPump:
 
 
 async def _turn_route_event(conn: "_GatewayConnection", payload: dict) -> bool:
+    return _turn_route_now(conn, payload)
+
+
+def _turn_route_now(conn: "_GatewayConnection", payload: dict) -> bool:
     """Queue `payload` for its run's writer when the run is a turn this
     connection writes: an OWUI session key and no live request consuming it.
     A run whose request ended before it is handed over (DESIGN 2.6). True
-    when handled here."""
+    when handled here. Never awaits: held events drain through it in order
+    (`drain_held`)."""
     sess, run = payload.get("sessionKey") or "", payload.get("runId") or ""
     if not (getattr(conn, "writes_turns", False) and sess and run) or conn._retired:
         return False
@@ -662,6 +667,8 @@ async def _turn_route_event(conn: "_GatewayConnection", payload: dict) -> bool:
         return False
     if run.startswith(ACTION_RUN_PREFIX):
         return True  # the Status Action's own runs render nothing
+    if (sess, run) in conn._held_for_live:
+        conn.drain_held(sess, run)  # the earlier ones first (review 2af1 N7)
     if conn.live_reply_owns(sess, run):
         conn.hold_for_live(sess, run, payload)
         return True
@@ -1058,4 +1065,4 @@ async def _turn_resync(conn: "_GatewayConnection", skip: set = frozenset()) -> N
             continue
         if not row.get("hasActiveRun"):
             _turn_settled(conn, sess, row)
-        conn.row_to_consumers(sess, row, resync=True, read_at=read_at)
+        conn.row_to_consumers(sess, row, resync=True, read_at=read_at, outside_loop=True)

@@ -6367,6 +6367,41 @@ class AgentTurnRoutingTests(_RoutingCase):
         self.assertIn((self.key, a_run), self.conn._turn_pumps)
         self.assertEqual(self.conn._held_for_live, {})
 
+    async def test_held_events_drain_before_the_runs_next_event(self):
+        """Review 2af1 N7: the release routed the held events in a background
+        task, and the run's next event, routed at once, overtook them."""
+        self.add_stub(self.STUB, content="")
+        q_run = pipe_run_id(self.CHAT, self.STUB)
+        self.conn.register_consumer(self.key, q_run)
+        r_run = pipe_run_id(self.CHAT, self.STUB, "resume")
+        for text in ("One.", " Two."):
+            await _turn_route_event(self.conn, self.ev(r_run, _delta(text)))
+        self.conn.unregister_consumer(self.key, q_run)
+        await _turn_route_event(self.conn, self.ev(r_run, _delta(" Three.")))
+        pump = self.conn._turn_pumps[(self.key, r_run)]
+        queued = []
+        while not pump.queue.empty():
+            queued.append(pump.queue.get_nowait()[1]["data"]["delta"])
+        self.assertEqual(queued, ["One.", " Two.", " Three."])
+        self.assertEqual(self.conn._held_for_live, {})
+
+    async def test_held_events_reach_the_reply_that_registers_right_after_the_release(self):
+        """Review 2af1 N8: the ask-user switch unregisters the question run and
+        registers the answer run in one step; the release in between must not
+        route or lose what was held for the answer run."""
+        q_run = pipe_run_id(self.CHAT, self.STUB)
+        self.conn.register_consumer(self.key, q_run)
+        a_run = pipe_run_id(self.CHAT, self.STUB, "input")
+        for text in ("Reading", " a.py."):
+            await _turn_route_event(self.conn, self.ev(a_run, _delta(text)))
+        self.conn.unregister_consumer(self.key, q_run)
+        q = self.conn.register_consumer(self.key, a_run)
+        self.addCleanup(self.conn.unregister_consumer, self.key, a_run, queue=q)
+        await self.spin()
+        self.assertEqual([q.get_nowait()["data"]["delta"] for _ in range(q.qsize())],
+                         ["Reading", " a.py."])
+        self.assertEqual(self.conn._turn_pumps, {})
+
     async def test_another_messages_run_is_not_held(self):
         q = self.conn.register_consumer(self.key, pipe_run_id(self.CHAT, "other-message"))
         self.addCleanup(self.conn.unregister_consumer, self.key,
@@ -6870,6 +6905,32 @@ class ControlMarkerBoundTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([q.get_nowait()["type"] for _ in range(3)],
                          [openclaw_pipe._ROW_MARKER_TYPE, openclaw_pipe._GAP_MARKER_TYPE,
                           openclaw_pipe._RESTART_MARKER_TYPE])
+
+
+class OutsideLoopMarkerTests(unittest.IsolatedAsyncioTestCase):
+    """Review 2af1 N9: the receive loop may be waiting to put an event into a
+    full queue. A row a resync task puts must not pass that event: with no
+    closer, the row ends the reply and the event is lost."""
+
+    async def test_a_resync_row_waits_behind_an_event_the_loop_is_putting(self):
+        conn = _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"))
+        q = conn.register_consumer("agent:main:k", "run-1")
+        for i in range(500):
+            q.put_nowait({"n": i})
+        blocked = asyncio.ensure_future(q.put({"n": "Z"}))  # the loop, waiting for room
+        await asyncio.sleep(0)
+        conn.row_to_consumers("agent:main:k", {"hasActiveRun": False}, resync=True, outside_loop=True)
+        await asyncio.sleep(0)
+        got = []
+        while len(got) < 502:
+            got.append(await asyncio.wait_for(q.get(), 1))
+        await blocked
+        self.assertEqual(got[500], {"n": "Z"})
+        self.assertEqual(got[501]["type"], openclaw_pipe._ROW_MARKER_TYPE)
+
+    async def test_the_resync_hands_its_rows_over_from_outside_the_loop(self):
+        src = inspect.getsource(openclaw_pipe._turn_resync)
+        self.assertIn("outside_loop=True", src)
 
 
 class InlineEndSignalTests(unittest.IsolatedAsyncioTestCase):
