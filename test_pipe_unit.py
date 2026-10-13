@@ -81,6 +81,7 @@ import openclaw_pipe  # noqa: E402
 from openclaw_pipe import (
     ACTION_RUN_PREFIX, TURN_NS, _run_id_sent_at, parse_pipe_run_id, pipe_run_id, turn_message_id,
     _claim_turn_message, _register_turn_writer, _retire_turn_writer,
+    MAX_TURN_RESUMES, next_continuation, turn_owner,
     _GatewayConnection,
     GatewayError,
     _is_restart_signature,
@@ -7630,6 +7631,117 @@ class ClaimTurnMessageTests(unittest.IsolatedAsyncioTestCase):
         r = await self.claim("a1", "msg-run", takeover=True)
         self.assertEqual((r["claimed"], r["how"]), (True, "takeover"))
         self.assertEqual(self.msgs()["a1"]["meta"]["openclaw_writer"], "w1")
+
+
+
+def _row(status, err=None, aborted=False, run="R"):
+    """A settled session row as the Gateway pushes it (DESIGN 2.7, F5)."""
+    return {"status": status, "lastRunError": err, "abortedLastRun": aborted, "lastRunId": run}
+
+
+class TurnOwnerTests(unittest.TestCase):
+    """ELI-100 DESIGN 2.7: who continues an interrupted run, from its
+    persisted row. One case per shutdown kind, as measured or read in dist."""
+
+    def test_the_four_shutdown_kinds(self):
+        exit143 = "Claude Code process exited with code 143"
+        cases = [
+            ("container stop: child exits 143 first", _row("failed", exit143), False, "pipe"),
+            ("restart mode: cancelled stopReason restart", _row("running", aborted=True), False, "gateway"),
+            ("crash: no terminal, row still running", _row("running"), False, "gateway"),
+            ("gateway stop mode: rpc abort after the notice", _row("killed", aborted=True), True, "pipe"),
+        ]
+        for name, row, notice, want in cases:
+            with self.subTest(name):
+                self.assertEqual(turn_owner(row, notice), want)
+
+    def test_runs_nobody_continues(self):
+        cases = [
+            ("a user Stop", _row("killed", aborted=True)),
+            ("a real error", _row("failed", "429 rate limited")),
+            ("a CLI that exits 1", _row("failed", "Claude Code process exited with code 1")),
+            ("a finished run", _row("done")),
+            ("no row", {}),
+        ]
+        for name, row in cases:
+            with self.subTest(name):
+                self.assertEqual(turn_owner(row, False), "none")
+
+    def test_the_gateway_owns_a_running_row_even_after_a_notice(self):
+        self.assertEqual(turn_owner(_row("running", aborted=True), True), "gateway")
+
+
+class ExitTextFixtureTest(unittest.TestCase):
+    """The owner rule matches the Gateway's exit-error TEXT: the dist has no
+    structured exit field (DESIGN 2.7). The fixture is the exact source line
+    extracted from the installed dist; this test renders its templates and,
+    when the dist is installed here, fails if the line has changed."""
+
+    FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "test_fixture_openclaw_exit_errors.json")
+    DIST = os.environ.get("OPENCLAW_DIST", "/config/.node_global/lib/node_modules/openclaw/dist")
+
+    def setUp(self):
+        self.fx = json.load(open(self.FIXTURE))
+        self.templates = re.findall(r"`([^`]*\$\{(?:signal|code)\}[^`]*)`", self.fx["source"])
+
+    def render(self, **values):
+        for t in self.templates:
+            key = "signal" if "${signal}" in t else "code"
+            if key in values:
+                return t.replace("${" + key + "}", str(values[key]))
+        raise AssertionError(f"no template for {values}")
+
+    def test_the_fixture_has_both_templates(self):
+        self.assertEqual(len(self.templates), 2, self.fx["source"])
+
+    def test_each_rendered_exit_classifies_as_the_rule_says(self):
+        for values, want in (({"code": 143}, "pipe"), ({"code": 137}, "pipe"),
+                             ({"signal": "SIGKILL"}, "pipe"), ({"signal": "SIGTERM"}, "pipe"),
+                             ({"code": 1}, "none"), ({"code": 1430}, "none")):
+            with self.subTest(values):
+                self.assertEqual(turn_owner(_row("failed", self.render(**values)), False), want)
+
+    def test_the_text_seen_live_classifies_as_pipe(self):
+        for name, text in self.fx["observed_row_texts"].items():
+            with self.subTest(name):
+                self.assertEqual(turn_owner(_row("failed", text), False), "pipe")
+
+    def test_the_installed_dist_still_has_the_fixture_line(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
+        try:
+            from extract_openclaw_exit_errors import extract
+        finally:
+            sys.path.pop(0)
+        if not os.path.isdir(self.DIST):
+            self.skipTest(f"no OpenClaw dist at {self.DIST}")
+        got = extract(self.DIST)
+        self.assertIsNotNone(got, "the exit-error line is gone from the dist: re-check the owner rule")
+        self.assertEqual(got["source"], self.fx["source"],
+                         f"OpenClaw {got['openclaw_version']} changed the exit-error text "
+                         f"(fixture: {self.fx['openclaw_version']}); re-check turn_owner, then "
+                         "re-extract with scripts/extract_openclaw_exit_errors.py --write")
+
+
+class OomResumeLoopTest(unittest.TestCase):
+    """A claude child is the first OOM victim (oom_score_adj 1000). A resume
+    that is OOM-killed again must not loop: the budget is counted on M."""
+
+    def test_four_consecutive_oom_kills_stop_after_the_budget(self):
+        oom = _row("failed", "Claude Code process exited with code 137")
+        resumes, decisions = 0, []
+        for _ in range(MAX_TURN_RESUMES + 1):
+            d = next_continuation(oom, False, resumes)
+            decisions.append(d)
+            if d == "resume":
+                resumes += 1
+        self.assertEqual(MAX_TURN_RESUMES, 3)
+        self.assertEqual(decisions, ["resume", "resume", "resume", "finalize"])
+
+    def test_the_gateway_and_nobody_cases_never_spend_the_budget(self):
+        self.assertEqual(next_continuation(_row("running"), False, 0), "gateway")
+        self.assertEqual(next_continuation(_row("killed", aborted=True), False, 0), "finalize")
+        self.assertEqual(next_continuation(_row("done"), False, 0), "finalize")
 
 
 if __name__ == "__main__":

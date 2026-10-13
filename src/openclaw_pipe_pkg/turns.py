@@ -153,3 +153,49 @@ async def _claim_turn_message(chat_id: str, user_id: str, message_id: str, run_i
             await ChatMessages.upsert_message(mid, chat_id, user_id, m, db=db)
         return {"claimed": True, "how": how, "message_id": message_id, "parent": parent,
                 "messages": changed}
+
+
+# ---------------------------------------------------------------------------
+# Owner rule: who continues an interrupted run (DESIGN 2.7)
+# ---------------------------------------------------------------------------
+# Read from the run's PERSISTED session row: the settled push after its
+# terminal (hasActiveRun false), or the first sessions.list after hello-ok.
+# The Gateway recovers only rows still `running`; the pipe resumes only rows
+# already terminal with an outside kill, so one run never gets two
+# continuations.
+
+MAX_TURN_RESUMES = 3
+# The child's exit reaches the row only as this text (no structured field;
+# dist cli-transport line pinned in test_fixture_openclaw_exit_errors.json,
+# re-checked against the installed dist by ExitTextFixtureTest): SIGTERM
+# (143) and SIGKILL / OOM (137) by exit code, or a raw signal.
+_EXTERNAL_KILL_RE = re.compile(r"process exited with (?:code (?:143|137)\b|signal SIG[A-Z]+)")
+
+
+def turn_owner(row: dict, stop_notice_before: bool = False) -> str:
+    """`gateway`, `pipe` or `none` for an interrupted run's settled row.
+
+    `stop_notice_before`: a `shutdown` event without `restartExpectedMs`
+    reached this connection before the run's terminal (a stop-mode abort,
+    which the Gateway never recovers)."""
+    status = (row or {}).get("status")
+    if status == "running":
+        return "gateway"
+    if status == "failed" and _EXTERNAL_KILL_RE.search(str(row.get("lastRunError") or "")):
+        return "pipe"
+    if status == "killed" and stop_notice_before:
+        return "pipe"
+    return "none"
+
+
+def next_continuation(row: dict, stop_notice_before: bool, resumes_so_far: int) -> str:
+    """What the writer of M does when its run settles: `gateway` (keep M open
+    for the recovery run), `resume` (send msg-<chat>-<M>-resume-<t>), or
+    `finalize`. The resume budget is counted on M, so a resume that is cut
+    the same way again (an OOM loop) ends after MAX_TURN_RESUMES."""
+    owner = turn_owner(row, stop_notice_before)
+    if owner == "gateway":
+        return "gateway"
+    if owner == "pipe" and resumes_so_far < MAX_TURN_RESUMES:
+        return "resume"
+    return "finalize"
