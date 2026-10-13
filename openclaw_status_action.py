@@ -4240,6 +4240,25 @@ TURN_CUT_OFF_NOTE = ("_(This reply was cut off: the run was interrupted again af
                      f"{MAX_TURN_RESUMES} attempts to continue it.)_")
 
 
+def _needs_input_line_re() -> "re.Pattern | None":
+    """A needs-input directive line (`_USER_INPUT_TRIGGER_PREFIXES`) with the
+    blank lines after it, which the inline reply never shows
+    (`_strip_input_marker_line`). None in the Status Action's build."""
+    prefixes = globals().get("_USER_INPUT_TRIGGER_PREFIXES")
+    if not prefixes:
+        return None
+    return re.compile(r"(?m)^[ \t]*(?:%s)[^\n]*(?:\n+|$)" % "|".join(map(re.escape, prefixes)))
+
+
+def _run_prompt_text(span: list | None) -> str:
+    """The needs-input prompt a run's text ends with, from its trigger line
+    on, as the renderer shows it; "" when there is none."""
+    line = _needs_input_line_re()
+    text = _history_renderer(span).text if span and line else ""
+    hits = [m.start() for m in line.finditer(text)] if text else []
+    return text[hits[-1]:] if hits else ""
+
+
 def _is_sentinel_message_item(item: dict) -> bool:
     if item.get("type") != "message":
         return False
@@ -4498,7 +4517,35 @@ class _TurnWriter:
         for raw, shown in self.conn.turn_rewrites(self.chat_id, self.message_id or ""):
             if raw in text:
                 text = text.replace(raw, shown)
-        return text
+        # A prompt nobody answered here shows as the inline reply's fallback
+        # does: without its internal directive line (the writer side of ELI-58).
+        line = _needs_input_line_re()
+        return line.sub("", text) if line else text
+
+    def _note_transcript_answers(self, messages: list) -> None:
+        """An answered ask-user prompt is a card, rebuilt from the transcript
+        when the inline reply's own rewrite is gone (an Open WebUI restart,
+        a known gap of PR #20): the prompt ends the text of the run before
+        the answer run, and the answer is the answer run's own user turn. A
+        rewrite the reply recorded is kept as it was. Absent in the Status
+        Action's build, which writes no turns."""
+        block = globals().get("_ask_user_detail_block")
+        if block is None or not self.message_id:
+            return
+        recorded = {raw for raw, _ in self.conn.turn_rewrites(self.chat_id, self.message_id)}
+        hist, prev = {"messages": messages}, None
+        for run, _tool in _history_user_turns(messages):
+            if run_message_id(self.session_key, self.chat_id, run, messages) != self.message_id:
+                continue
+            parsed = parse_pipe_run_id(run)
+            if prev is not None and parsed and parsed["kind"] == "input":
+                prompt = _run_prompt_text(_history_span_messages(hist, prev))
+                answer = next((((_history_item(m) or {}).get("text") or "").strip() for m in messages
+                               if _history_user_run_id(m) == run), "")
+                if prompt and answer and prompt not in recorded:
+                    self.conn.note_turn_rewrite(self.chat_id, self.message_id, prompt,
+                                                block(prompt, answer))
+            prev = run
 
     async def _view(self, *, final: bool) -> tuple[list, str]:
         """(output, text) of M as the inline reply shows a run (review 2af1
@@ -4657,6 +4704,8 @@ class _TurnWriter:
             else:
                 if hist:
                     self._adopt_recoveries_from(hist.get("messages") or [])
+                if hist:
+                    self._note_transcript_answers(hist.get("messages") or [])
                 per_run = [_history_span_messages(hist, r) for r in self.runs] if hist else [None]
                 if all(m is not None for m in per_run):
                     rebuilt = _history_renderer([m for msgs in per_run for m in msgs])
