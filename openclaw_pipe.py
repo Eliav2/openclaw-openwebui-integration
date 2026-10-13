@@ -4321,6 +4321,12 @@ class _GatewayConnection:
         # connect. Tool events for one call can arrive twice (as the run's
         # initiator AND as a subscriber); `_tool_events_seen` keeps the first.
         self._message_subscriptions: set[str] = set()
+        # OWUI session key -> run ids active when this socket last subscribed
+        # (ELI-100 DESIGN 2.1): runs that started before the subscription,
+        # restart recovery above all, whose start push this socket never got.
+        # An empty list means "active, ids not given": the Gateway omits
+        # activeRunIds for claude-cli runs (session-active-runs-BURU1M8_.mjs:91).
+        self.active_run_snapshot: dict[str, list[str]] = {}
         self._subscriptions_stale = False
         # One Event per session someone is waiting on, set by the next
         # `sessions.changed` that carries run state for it (ELI-88).
@@ -4332,9 +4338,14 @@ class _GatewayConnection:
         (`sessions.changed`, which carries run start/settle), and transcript
         events for every OWUI session subscribed so far."""
         try:
-            await self.send_request("sessions.subscribe", {}, timeout=15)
+            # List params make it one request: the Gateway registers this
+            # socket for pushes, THEN lists (sessions-subscriptions:21-36), so a
+            # run is in this snapshot or its start push comes after it.
+            resp = await self.send_request("sessions.subscribe", {"activeOnly": True}, timeout=15)
         except Exception as ex:
             pipe_log(f"  sessions.subscribe failed: {ex}")
+        else:
+            self._note_active_snapshot(((resp or {}).get("list") or {}).get("sessions") or [])
         for key in list(self._message_subscriptions):
             await self._subscribe_messages(key)
         # A relay whose run settled while the socket was down never hears its
@@ -4353,6 +4364,18 @@ class _GatewayConnection:
         # sleep through a settle it was never sent; make every waiter read
         # again now that settles are pushed.
         self._wake_session_waiters()
+
+    def _note_active_snapshot(self, rows: list) -> None:
+        """Keep the active runs of OWUI sessions from a subscribe snapshot."""
+        snap = {}
+        for row in rows:
+            key = str(row.get("key") or "")
+            runs = [r for r in (row.get("activeRunIds") or []) if r]
+            if (runs or row.get("hasActiveRun")) and self.parse_owui_session_key(key):
+                snap[key] = runs
+        self.active_run_snapshot = snap
+        if snap:
+            pipe_log(f"  subscribe snapshot: {len(snap)} OWUI session(s) with an active run")
 
     async def _subscribe_messages(self, session_key: str) -> bool:
         try:

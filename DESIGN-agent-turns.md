@@ -165,6 +165,18 @@ only their `chat final` and `phase:"end"`. So the start push is not enough on it
    * Push after the registration: the pipe gets the push. Push before the registration:
      t(visible) <= t(push) < t(register) < t(list). The run is therefore in the list,
      unless it has already ended.
+   * **Measured live (2026-10-13 ~01:00Z): for claude-cli runs the list gives
+     `hasActiveRun: true` but no `activeRunIds`.** The function omits `runIds` whenever
+     the session has an embedded run state (`session-active-runs-BURU1M8_.mjs:91`). So the
+     guarantee is "the session has an active run", not its id. The pipe records the session
+     as active-unknown and gets the id from one of two places:
+     * the run's first event that carries `runId` (`chat` deltas and finals reach every
+       connection; the M3 watcher saw other sessions' finals);
+     * `chat.history`, where the run's admitted `<id>:user` turn is persisted when the run
+       is admitted. The newest such turn with no `cli-assistant:<id>` closing turn is the
+       active run. In the crash window, `f2445aa8:user` carried the recovery provenance.
+
+     Rule E then maps that id to M.
 3. **A run that ended before the list** (for example a short recovery) is covered by the
    ended-while-away rule, case 4: the session's `updatedAt` is newer than the chat's
    `updated_at`, so `chat.history` is read, and every closed `cli-assistant:<R>` without a

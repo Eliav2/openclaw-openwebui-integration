@@ -1461,7 +1461,7 @@ class SessionToolEventTests(unittest.IsolatedAsyncioTestCase):
         conn._subscriptions_stale = True
         await self._run_loop(conn, [])
         calls = [c.args for c in conn.send_request.await_args_list]
-        self.assertEqual(calls, [("sessions.subscribe", {}),
+        self.assertEqual(calls, [("sessions.subscribe", {"activeOnly": True}),
                                  ("sessions.messages.subscribe", {"key": self.SK})])
         self.assertFalse(conn._subscriptions_stale)
 
@@ -7742,6 +7742,65 @@ class OomResumeLoopTest(unittest.TestCase):
         self.assertEqual(next_continuation(_row("running"), False, 0), "gateway")
         self.assertEqual(next_continuation(_row("killed", aborted=True), False, 0), "finalize")
         self.assertEqual(next_continuation(_row("done"), False, 0), "finalize")
+
+
+
+class HelloSubscribeSnapshotTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-100 DESIGN 2.1 (M3-crash): restart recovery starts at boot, before
+    the pipe subscribes, so its start push is never seen. Every hello
+    subscribes WITH list params: one request in which the Gateway registers
+    the subscriber and then lists (sessions-subscriptions-CeMquS--.mjs:21-36).
+    Its reply is the snapshot of the runs already active."""
+
+    USER = "2d206eab-acac-4945-bd2f-7e8b6365de8c"
+    CHAT = "0c5d682c-afaa-44f9-99a9-ada05599c997"
+
+    def setUp(self):
+        self.conn = _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"))
+        self.calls = []
+        self.key = _owui_session_key("main", self.USER, self.CHAT)
+        self.key2 = _owui_session_key("main", self.USER, "24c342e4-50fa-442e-9b93-c215ed135f3a")
+        self.key3 = _owui_session_key("main", self.USER, "11111111-2222-4333-8444-555566667777")
+        test = self
+
+        async def send_request(method, params, timeout=10):
+            test.calls.append((method, params))
+            if method == "sessions.subscribe":
+                return {"subscribed": True, "list": {"sessions": [
+                    {"key": test.key, "hasActiveRun": True,
+                     "activeRunIds": ["f2445aa8-aeda-47d8-af7b-cf853aae34e6"]},
+                    {"key": "agent:main:main", "hasActiveRun": True, "activeRunIds": ["hb-1"]},
+                    # live shape for a claude-cli run: active, no ids (2026-10-13 00:5xZ)
+                    {"key": test.key2, "hasActiveRun": True, "status": "running"},
+                    {"key": test.key3, "hasActiveRun": False, "status": "done"},
+                ]}}
+            raise AssertionError(method)
+        self.conn.send_request = send_request
+
+    async def test_one_subscribe_request_carries_the_list(self):
+        await self.conn._subscribe_all()
+        subs = [p for m, p in self.calls if m == "sessions.subscribe"]
+        self.assertEqual(len(subs), 1)
+        self.assertEqual(subs[0], {"activeOnly": True},
+                         "list params make the Gateway list right after registering")
+        self.assertNotIn("sessions.list", [m for m, _ in self.calls],
+                         "a separate list would leave a gap after the subscribe")
+
+    async def test_active_owui_runs_from_the_snapshot_are_kept(self):
+        await self.conn._subscribe_all()
+        self.assertEqual(self.conn.active_run_snapshot,
+                         {self.key: ["f2445aa8-aeda-47d8-af7b-cf853aae34e6"], self.key2: []},
+                         "active runs are known without their start push (ids when the Gateway "
+                         "gives them); idle and non-OWUI sessions ignored")
+
+    async def test_a_failed_subscribe_keeps_the_previous_snapshot(self):
+        self.conn.active_run_snapshot = {"k": ["r"]}
+
+        async def failing(method, params, timeout=10):
+            raise GatewayError("UNAVAILABLE", "closing")
+        self.conn.send_request = failing
+        await self.conn._subscribe_all()
+        self.assertEqual(self.conn.active_run_snapshot, {"k": ["r"]})
 
 
 if __name__ == "__main__":
