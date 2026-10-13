@@ -6704,6 +6704,77 @@ class RegressionPlanTests(_RoutingCase):
         await self.scripted_loop(self.conn, [hb, tool])
         self.assertEqual(self.new_messages(), {})
 
+    # Review 2af1 R7: a heartbeat run is known only by the isHeartbeat flag on
+    # its agent events. Its chat events never carry it (server-chat-CbnqM5f6
+    # emitChatDelta / emitChatTerminal build their own payload), and a frame
+    # can come before the run's first flagged one: a chat delta (both are
+    # buffered and flushed apart), or a session.tool copy, which the review
+    # names (on 2026.9.3 the Gateway suppresses a heartbeat's tool events,
+    # :833, :934, but an earlier or later Gateway may not).
+
+    def hb_frame(self, payload):
+        return {"type": "event", "event": "agent",
+                "payload": {**self.ev(self.RUN, payload), "isHeartbeat": True}}
+
+    def frame(self, event, payload):
+        return {"type": "event", "event": event, "payload": self.ev(self.RUN, payload)}
+
+    async def test_a_heartbeat_whose_session_tool_comes_first_opens_nothing(self):
+        await self.scripted_loop(self.conn, [
+            self.frame("session.tool", _tool("start", tcid="toolu_1")),
+            self.hb_frame({"stream": "lifecycle", "data": {"phase": "start"}}),
+            self.frame("session.tool", _tool("result", tcid="toolu_1")),
+            self.hb_frame({"stream": "lifecycle", "data": {"phase": "end"}}),
+            self.frame("chat", {"state": "final"}),
+        ])
+        self.settled(self.RUN, status="done")
+        await self.spin()
+        self.assertEqual(self.new_messages(), {})
+        self.assertEqual(self.conn._turn_pumps, {})
+
+    async def test_a_heartbeat_whose_chat_delta_comes_first_opens_nothing(self):
+        await self.scripted_loop(self.conn, [
+            self.frame("chat", {"state": "delta", "message": {
+                "role": "assistant", "content": [{"type": "text", "text": "Checking the inbox."}]}}),
+            self.hb_frame(_delta("Checking the inbox.")),
+            self.hb_frame({"stream": "lifecycle", "data": {"phase": "end"}}),
+            self.frame("chat", {"state": "final"}),
+        ])
+        self.settled(self.RUN, status="done")
+        await self.spin()
+        self.assertEqual(self.new_messages(), {})
+
+    async def test_an_agent_turn_whose_session_tool_comes_first_keeps_its_order(self):
+        """The other side of R7: an unflagged first frame is held, not
+        dropped, and goes out first once the run is known not to be a
+        heartbeat."""
+        self.history = self.tool_history(self.RUN, 1, text="Found it.")
+        await self.scripted_loop(self.conn, [
+            self.frame("session.tool", _tool("start", tcid="toolu_0")),
+            self.frame("agent", _delta("Found it.")),
+            self.frame("session.tool", _tool("result", tcid="toolu_0")),
+            self.frame("chat", {"state": "final"}),
+        ])
+        self.settled(self.RUN, status="done")
+        await self.spin()
+        (_mid, m), = self.new_messages().items()
+        self.assertEqual((self.cards(m), m["content"], m["done"]), (1, "Found it.", True))
+        self.assertEqual([i["type"] for i in m["output"]][0], "function_call", "the held card is first")
+
+    async def test_an_agent_turn_seen_only_as_tool_copies_still_ends_with_its_message(self):
+        """Events lost after a reconnect: only session.tool copies reached
+        this connection. The settled row releases them; a heartbeat would
+        have been flagged by its lifecycle end, which precedes the settle."""
+        self.history = self.tool_history(self.RUN, 2)
+        await self.scripted_loop(self.conn, [
+            self.frame("session.tool", _tool("start", tcid="toolu_0")),
+            self.frame("session.tool", _tool("result", tcid="toolu_0")),
+        ])
+        self.settled(self.RUN, status="done")
+        await self.spin()
+        (_mid, m), = self.new_messages().items()
+        self.assertEqual((self.cards(m), m["content"], m["done"]), (2, "Done.", True))
+
 
 class HandoverRewriteTests(_RoutingCase):
     """Review 2af1 R4 (P28), R6, R9: a handed-over reply ends as the inline
