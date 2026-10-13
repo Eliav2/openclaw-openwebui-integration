@@ -383,6 +383,22 @@ def _owui_up() -> bool:
         return False
 
 
+def _down_state(token: str, chat_id: str, key: str) -> str:
+    """What the startup reconcile reads, for a failure message."""
+    row = _session_row(key)
+    status, got = _request("GET", f"/api/v1/chats/{chat_id}", token=token)
+    hist = _gw("chat.history", {"sessionKey": key, "limit": 100})
+    lines = [f"session row: {json.dumps({k: row.get(k) for k in ('updatedAt', 'hasActiveRun', 'status', 'sessionId', 'lastRunId')})}",
+             f"chat updated_at: {got.get('updated_at') if status == 200 else status}"]
+    for m in hist.get("messages") or []:
+        meta = m.get("__openclaw") if isinstance(m.get("__openclaw"), dict) else {}
+        text = m.get("content") if isinstance(m.get("content"), str) else " ".join(
+            b.get("text") or b.get("type") or "" for b in m.get("content") or [] if isinstance(b, dict))
+        lines.append(f"  {m.get('role')} key={m.get('idempotencyKey')} meta_key={meta.get('idempotencyKey')} "
+                     f"ts={m.get('timestamp')} meta={sorted(meta)} text={str(text)[-60:]!r}")
+    return "\n".join(lines)
+
+
 @pytest.mark.skipif(shutil.which("docker") is None, reason="needs the e2e stack's Open WebUI container")
 def test_a_reply_whose_run_ends_while_owui_is_stopped_is_completed_on_start(token):
     now = int(time.time())
@@ -423,7 +439,10 @@ def test_a_reply_whose_run_ends_while_owui_is_stopped_is_completed_on_start(toke
     # The first model listing after a start runs the startup reconcile.
     status, _models = _request("GET", "/api/models", token=token)
     assert status == 200
-    msgs = _wait_for(token, chat_id, [f"slow-{DOWN_RUN_WORDS}"])
+    try:
+        msgs = _wait_for(token, chat_id, [f"slow-{DOWN_RUN_WORDS}"])
+    except pytest.fail.Exception as ex:
+        pytest.fail(f"{ex}\n{_down_state(token, chat_id, key)}")
     holders = [k for k, m in msgs.items() if f"slow-{DOWN_RUN_WORDS}" in (m.get("content") or "")]
     assert holders == [aid], f"the end of the run went to {holders}, not the reply {aid}"
     assert msgs[aid]["content"].strip().startswith("E2E_DOWN slow-1"), msgs[aid]["content"][:300]
