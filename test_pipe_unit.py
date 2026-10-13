@@ -418,9 +418,9 @@ def _cli_history(run_id="run-9"):
             {"type": "tool_result", "tool_use_id": "toolu_1", "name": "Bash",
              "content": [{"type": "text", "text": "ERROR x"}]}]},
         {"role": "assistant", "__openclaw": imported,
-         "content": [{"type": "text", "text": " Found it."}]},
+         "content": [{"type": "text", "text": "Found it."}]},
         {"role": "assistant", "idempotencyKey": f"cli-assistant:{run_id}",
-         "content": [{"type": "text", "text": "Reading them. Found it."}]},
+         "content": [{"type": "text", "text": "Reading them.\n\nFound it."}]},
     ]}
 
 
@@ -436,7 +436,7 @@ class HistoryRunRebuildTests(unittest.TestCase):
 
     def test_rebuild_interleaves_text_and_cards_without_repeating_the_closing_text(self):
         r = _history_renderer(_history_run_messages(_cli_history(), "run-9"))
-        self.assertEqual(r.text, "Reading them. Found it.")
+        self.assertEqual(r.text, "Reading them.\n\nFound it.")
         self.assertEqual([i["type"] for i in r.output],
                          ["message", "function_call", "function_call_output", "message"])
         self.assertEqual(r.output[1]["arguments"], json.dumps({"command": "tail log"}))
@@ -446,6 +446,38 @@ class HistoryRunRebuildTests(unittest.TestCase):
         r = _history_renderer(_history_run_messages(_cli_history(), "run-1"))
         self.assertEqual(r.text, "old answer")
         self.assertEqual([i["type"] for i in r.output], ["message"])
+
+    @staticmethod
+    def _two_text_blocks(closer=True):
+        """Restart window 2026-10-13 11:26Z (chat 89bb045d, run msg-89bb045d-...):
+        a preamble, five Bash calls, the answer. The Gateway's closing message
+        joins the two text blocks with a blank line; the live stream carried it
+        as the second message item "\n\nUSER-DONE-9e127db9" (read from OWUI)."""
+        imported = {"importedFrom": "claude-cli"}
+        msgs = [{"role": "assistant", "__openclaw": imported,
+                 "content": [{"type": "text", "text": "Running the five sleep steps one at a time."}]}]
+        for n in range(1, 3):
+            msgs.append({"role": "assistant", "__openclaw": imported, "content": [
+                {"type": "toolcall", "id": f"toolu_{n}", "name": "Bash", "arguments": {"command": "x"}},
+                {"type": "tool_result", "tool_use_id": f"toolu_{n}", "name": "Bash",
+                 "content": [{"type": "text", "text": f"step-{n}"}]}]})
+        msgs.append({"role": "assistant", "__openclaw": imported,
+                     "content": [{"type": "text", "text": "USER-DONE-9e127db9"}]})
+        if closer:
+            msgs.append({"role": "assistant", "idempotencyKey": "cli-assistant:msg-89bb045d-1", "content": [
+                {"type": "text", "text": "Running the five sleep steps one at a time.\n\nUSER-DONE-9e127db9"}]})
+        return msgs
+
+    def test_text_after_a_tool_is_joined_the_way_the_gateway_streamed_it(self):
+        r = _history_renderer(self._two_text_blocks())
+        self.assertEqual(r.text, "Running the five sleep steps one at a time.\n\nUSER-DONE-9e127db9")
+        texts = [i["content"][0]["text"] for i in r.output if i["type"] == "message"]
+        self.assertEqual(texts, ["Running the five sleep steps one at a time.", "\n\nUSER-DONE-9e127db9"])
+
+    def test_without_a_closing_message_text_blocks_get_the_gateways_blank_line(self):
+        """An aborted run has no closer: the join does not depend on one."""
+        r = _history_renderer(self._two_text_blocks(closer=False))
+        self.assertEqual(r.text, "Running the five sleep steps one at a time.\n\nUSER-DONE-9e127db9")
 
 
 def _turn_history(stub_id="stub-1", *, run="msg-c-stub-1-1.0", closed=True,
@@ -472,9 +504,9 @@ def _turn_history(stub_id="stub-1", *, run="msg-c-stub-1-1.0", closed=True,
     if closed:
         msgs += [
             {"role": "assistant", "__openclaw": imported,
-             "content": [{"type": "text", "text": " Found it."}]},
+             "content": [{"type": "text", "text": "Found it."}]},
             {"role": "assistant", "idempotencyKey": f"cli-assistant:{run}",
-             "content": [{"type": "text", "text": "Reading them. Found it."}]},
+             "content": [{"type": "text", "text": "Reading them.\n\nFound it."}]},
         ]
     if later:
         msgs += [{"role": "user", "content": "next", "idempotencyKey": "msg-c-x-9.0:user"},
@@ -492,7 +524,7 @@ class StubTurnTests(unittest.TestCase):
         self.assertTrue(turn["closed"])
         self.assertEqual(turn["messages"][-1]["idempotencyKey"], "cli-assistant:msg-c-stub-1-1.0")
         r = _history_renderer(turn["messages"])
-        self.assertEqual(r.text, "Reading them. Found it.")
+        self.assertEqual(r.text, "Reading them.\n\nFound it.")
         self.assertEqual(sum(1 for i in r.output if i["type"] == "function_call"), 1)
 
     def test_older_run_ids_fall_back_to_the_user_text(self):
@@ -614,7 +646,7 @@ class OrphanStubReconcileTests(unittest.IsolatedAsyncioTestCase):
         self.conn._on_sessions_changed({"sessionKey": self.sk, "hasActiveRun": False})
         await self._spin()
         self.assertTrue(task.done())
-        self.assertEqual(self._stub()["content"], "Reading them. Found it.")
+        self.assertEqual(self._stub()["content"], "Reading them.\n\nFound it.")
         self.assertIs(self._stub()["done"], True)
 
     async def test_a_gone_writers_message_is_adopted_even_with_another_task_in_the_chat(self):
@@ -651,7 +683,7 @@ class OrphanStubReconcileTests(unittest.IsolatedAsyncioTestCase):
         self.history, self.active = _turn_history(), False
         self._stub()["content"] = "Reading th"
         await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB)
-        self.assertEqual(self._stub()["content"], "Reading them. Found it.")
+        self.assertEqual(self._stub()["content"], "Reading them.\n\nFound it.")
 
     async def test_a_stub_with_content_and_no_run_is_closed_as_is(self):
         self.history, self.active = {"messages": []}, False
@@ -5922,7 +5954,7 @@ class TurnWriterEndTests(_TurnWriterCase):
         w = await self.opened_writer()
         await w.end({"status": "done", "hasActiveRun": False, "lastRunId": self.RUN})
         self.assertIs(self.m()["done"], True)
-        self.assertEqual(self.m()["content"], "Reading them. Found it.")
+        self.assertEqual(self.m()["content"], "Reading them.\n\nFound it.")
         self.assertEqual([i["type"] for i in self.m()["output"]],
                          ["message", "function_call", "function_call_output", "message"])
         self.assertEqual(self.owui.events("chat:active")[-1]["data"], {"active": False})
@@ -6036,10 +6068,10 @@ class TurnWriterEndTests(_TurnWriterCase):
         await self.cancel_from_the_page(w, "send_now")
         self.assertNotIn("chat.abort", [m for m, _ in self.sent])
         self.assertFalse(w.closed)
-        await w.feed(_delta(" Found it."))
+        await w.feed(_delta("\n\nFound it."))
         await w.end({"status": "done", "hasActiveRun": False, "lastRunId": self.RUN})
         self.assertIs(self.m()["done"], True)
-        self.assertEqual(self.m()["content"], "Reading them. Found it.")
+        self.assertEqual(self.m()["content"], "Reading them.\n\nFound it.")
 
     async def test_an_unknown_intent_keeps_writing(self):
         w = await self.opened_writer()
@@ -6094,7 +6126,7 @@ class _RoutingCase(unittest.IsolatedAsyncioTestCase):
     def ev(self, run, payload):
         return {"sessionKey": self.key, "runId": run, **payload}
 
-    async def run_turn(self, run, *, text=("Reading them.", " Found it."), settle=None):
+    async def run_turn(self, run, *, text=("Reading them.", "\n\nFound it."), settle=None):
         self.conn._on_sessions_changed({"sessionKey": self.key, "phase": "start", "runId": run,
                                         "hasActiveRun": True, "status": "running"})
         handled = [await _turn_route_event(self.conn, self.ev(run, _delta(text[0])))]
@@ -6145,7 +6177,7 @@ class _RoutingCase(unittest.IsolatedAsyncioTestCase):
                 {"type": "tool_result", "tool_use_id": "toolu_9", "name": "Bash",
                  "content": [{"type": "text", "text": "ok"}]}]},
             {"role": "assistant", "__openclaw": imported,
-             "content": [{"type": "text", "text": " Found it."}]},
+             "content": [{"type": "text", "text": "Found it."}]},
             {"role": "assistant", "idempotencyKey": f"cli-assistant:{self.REC}",
              "content": [{"type": "text", "text": "Found it."}]}]}
 
@@ -6160,7 +6192,7 @@ class AgentTurnRoutingTests(_RoutingCase):
         (mid, m), = self.new_messages().items()
         self.assertEqual(mid, turn_message_id(self.key, self.RUN, self.CHAT))
         self.assertEqual((m["parentId"], m["done"]), ("a1", True))
-        self.assertEqual(m["content"], "Reading them. Found it.")
+        self.assertEqual(m["content"], "Reading them.\n\nFound it.")
         self.assertEqual(sum(1 for i in m["output"] if i["type"] == "function_call"), 1)
         self.assertIn(("sessions.messages.subscribe", {"key": self.key}), self.sent,
                       "tool events of a run this socket did not start come as session.tool")
@@ -6175,7 +6207,7 @@ class AgentTurnRoutingTests(_RoutingCase):
         self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": True,
                                         "status": "running"})
         await self.spin()
-        await self.run_turn(self.REC, text=("Again.", " Found it."),
+        await self.run_turn(self.REC, text=("Again.", "\n\nFound it."),
                             settle={"sessionKey": self.key, "hasActiveRun": False, "status": "done",
                                     "lastRunId": self.REC, "reason": "chat.run.settled"})
         (mid, m), = self.new_messages().items()
@@ -6198,7 +6230,7 @@ class AgentTurnRoutingTests(_RoutingCase):
         (mid, m), = self.new_messages().items()
         self.assertEqual(mid, turn_message_id(self.key, self.RUN, self.CHAT))
         self.assertIs(m["done"], True)
-        self.assertEqual(m["content"], "Reading them. Found it.")
+        self.assertEqual(m["content"], "Reading them.\n\nFound it.")
         self.assertEqual(sum(1 for i in m["output"] if i["type"] == "function_call"), 1,
                          "the recovery's tool card comes from the transcript")
 
@@ -6223,7 +6255,7 @@ class AgentTurnRoutingTests(_RoutingCase):
         await self.spin()
         (_mid, m), = self.new_messages().items()
         self.assertIs(m["done"], True)
-        self.assertEqual(m["content"], "Reading them. Found it.")
+        self.assertEqual(m["content"], "Reading them.\n\nFound it.")
 
     async def test_after_hello_an_active_session_waits_for_its_settle(self):
         await _turn_route_event(self.conn, self.ev(self.RUN, _delta("Reading them.")))
@@ -6246,7 +6278,7 @@ class AgentTurnRoutingTests(_RoutingCase):
         self.assertTrue(await self.dispatch(run, _tool("start", tcid="toolu_1")))
         await self.spin()
         await self.dispatch(run, _tool("result", tcid="toolu_1"))
-        await self.dispatch(run, _delta(" Found it."))
+        await self.dispatch(run, _delta("\n\nFound it."))
         await self.dispatch(run, {"state": "final"})
         self.history = {"messages": []}
         self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
@@ -6255,7 +6287,7 @@ class AgentTurnRoutingTests(_RoutingCase):
         self.assertEqual(self.new_messages().keys(), {self.STUB}, "no second message")
         m = self.owui.msgs()[self.STUB]
         self.assertIs(m["done"], True)
-        self.assertEqual(m["content"], "Reading them. Found it.")
+        self.assertEqual(m["content"], "Reading them.\n\nFound it.")
 
     async def test_handover_an_inline_reply_that_ends_early_continues_in_its_own_message(self):
         run = pipe_run_id(self.CHAT, self.STUB)
@@ -6265,7 +6297,7 @@ class AgentTurnRoutingTests(_RoutingCase):
         # The request is gone (no consumer): the run's next events.
         self.assertTrue(await self.dispatch(run, _tool("start", tcid="toolu_1")))
         await self.dispatch(run, _tool("result", tcid="toolu_1"))
-        await self.dispatch(run, _delta(" Found it."))
+        await self.dispatch(run, _delta("\n\nFound it."))
         await self.dispatch(run, {"state": "final"})
         self.history = _turn_history(run=run)
         self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
@@ -6274,7 +6306,7 @@ class AgentTurnRoutingTests(_RoutingCase):
         self.assertEqual(self.new_messages().keys(), {self.STUB}, "no second message")
         m = self.owui.msgs()[self.STUB]
         self.assertIs(m["done"], True)
-        self.assertEqual(m["content"], "Reading them. Found it.")
+        self.assertEqual(m["content"], "Reading them.\n\nFound it.")
         self.assertEqual(sum(1 for i in m["output"] if i["type"] == "function_call"), 1)
         self.assertEqual(m["meta"]["openclaw_writer"], self.conn.writer_id)
         self.assertNotIn(f"{self.key}:{run}", self.conn._run_targets, "the shadow is retired")
@@ -6494,7 +6526,7 @@ class RegressionPlanTests(_RoutingCase):
             _register_turn_writer(conn.writer_id)
             self.addCleanup(_retire_turn_writer, conn.writer_id)
         for payload in (_delta("Reading them."), _tool("start", tcid="toolu_1"),
-                        _tool("result", tcid="toolu_1"), _delta(" Found it."), {"state": "final"}):
+                        _tool("result", tcid="toolu_1"), _delta("\n\nFound it."), {"state": "final"}):
             for conn in (self.conn, other):
                 self.assertTrue(await _turn_route_event(conn, self.ev(self.RUN, payload)))
         await self.spin()
@@ -6507,7 +6539,7 @@ class RegressionPlanTests(_RoutingCase):
                                        "status": "done", "lastRunId": self.RUN})
         await self.spin()
         (_mid, m), = self.new_messages().items()
-        self.assertEqual((m["content"], m["done"], self.cards(m)), ("Reading them. Found it.", True, 1))
+        self.assertEqual((m["content"], m["done"], self.cards(m)), ("Reading them.\n\nFound it.", True, 1))
         self.assertEqual(n_tasks, 1, "one Open WebUI task: only one connection writes M")
         self.assertEqual(n_intro, 1, "M introduced once")
         self.assertEqual(len(self.owui.events("chat:completion")), 1, "M finalized once")
@@ -6625,14 +6657,14 @@ class RegressionPlanTests(_RoutingCase):
         await _turn_after_hello(self.conn)
         self.history = self.crashed_then_recovered_history()
         for payload in (_tool("start", tcid="toolu_9"), _tool("result", tcid="toolu_9"),
-                        _delta(" Found it."), {"state": "final"}):
+                        _delta("\n\nFound it."), {"state": "final"}):
             await _turn_route_event(self.conn, self.ev(self.REC, payload))
         self.settled(self.REC, status="done")
         await self.spin()
         self.assertNotIn("chat.send", [m for m, _ in self.sent])
         (mid, m), = self.new_messages().items()
         self.assertEqual(mid, turn_message_id(self.key, self.RUN, self.CHAT))
-        self.assertEqual((m["content"], self.cards(m), m["done"]), ("Reading them. Found it.", 1, True))
+        self.assertEqual((m["content"], self.cards(m), m["done"]), ("Reading them.\n\nFound it.", 1, True))
 
     async def test_a_frame_seq_gap_resyncs_open_writers(self):
         """SeqGapRecoveryTest: the Gateway drops a frame for a slow client and
@@ -6660,7 +6692,7 @@ class RegressionPlanTests(_RoutingCase):
         ])
         self.assertIn("sessions.list", [m for m, _ in self.sent])
         (_mid, m), = self.new_messages().items()
-        self.assertEqual((m["content"], m["done"]), ("Reading them. Found it.", True))
+        self.assertEqual((m["content"], m["done"]), ("Reading them.\n\nFound it.", True))
 
     async def test_a_heartbeat_runs_session_tool_events_open_nothing(self):
         """The receive loop drops events flagged isHeartbeat before routing;
@@ -8240,14 +8272,14 @@ class RetiredWriterTests(_RoutingCase):
         self.assertEqual(await self.adopt(b, mid), "adopted")
         m = self.owui.msgs()[mid]
         self.assertIs(m["done"], True)
-        self.assertEqual(m["content"], "Reading them. Found it.")
+        self.assertEqual(m["content"], "Reading them.\n\nFound it.")
 
     async def test_a_successor_continues_a_run_still_going(self):
         mid, _ = await self.start_turn_then_retire()
         b = self.successor()
         await self.adopt(b, mid)
         self.assertIs(self.owui.msgs()[mid]["done"], False, "a running run was finished")
-        await _turn_route_event(b, self.ev(self.RUN, _delta(" Found it.")))
+        await _turn_route_event(b, self.ev(self.RUN, _delta("\n\nFound it.")))
         await _turn_route_event(b, self.ev(self.RUN, {"state": "final"}))
         self.active = False
         b._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False, "status": "done",
@@ -8255,7 +8287,7 @@ class RetiredWriterTests(_RoutingCase):
         await self.spin()
         m = self.owui.msgs()[mid]
         self.assertIs(m["done"], True)
-        self.assertEqual(m["content"], "Reading them. Found it.")
+        self.assertEqual(m["content"], "Reading them.\n\nFound it.")
         self.assertEqual(list(self.new_messages()), [mid], "the successor opened a second message")
 
     async def test_a_wake_is_adopted_with_its_own_turn(self):
@@ -8289,7 +8321,7 @@ class RetiredWriterTests(_RoutingCase):
     async def test_a_message_another_pump_already_writes_is_left_to_it(self):
         mid, _ = await self.start_turn_then_retire()
         b = self.successor()
-        await _turn_route_event(b, self.ev(self.RUN, _delta(" Found it.")))
+        await _turn_route_event(b, self.ev(self.RUN, _delta("\n\nFound it.")))
         self.assertEqual(await self.adopt(b, mid), "skip")
 
 
@@ -8335,7 +8367,7 @@ class GatewayOwnerNeverRecoversTests(_RoutingCase):
             {"role": "user", "content": "[System] continue", "idempotencyKey": f"{self.REC}:user",
              "provenance": {"kind": "internal_system", "sourceTool": "main_session_restart_recovery"}}]}
         await self.keep_open()
-        await self.run_turn(self.REC, text=("Again.", " Found it."),
+        await self.run_turn(self.REC, text=("Again.", "\n\nFound it."),
                             settle={"sessionKey": self.key, "hasActiveRun": False, "status": "done",
                                     "lastRunId": self.REC, "reason": "chat.run.settled"})
         (m,) = self.new_messages().values()

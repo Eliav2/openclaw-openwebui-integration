@@ -3495,9 +3495,16 @@ def _history_renderer(messages: list) -> "_TurnRenderer":
     messages whose blocks are `text`, `toolcall` {id, name, arguments} and
     `tool_result` {tool_use_id, content, is_error}, in order. The run's closing
     message (`cli-assistant:<runId>`) repeats all of its text, so it only
-    counts when nothing before it carried text (a plain, tool-free reply)."""
+    counts when nothing before it carried text (a plain, tool-free reply).
+
+    Text after a tool call is joined to the text before it with the separator
+    the Gateway's live stream inserts there (`sawToolUseSinceText`), so the
+    rebuild equals what streamed (it streams as "\n\n<text>").
+    Plain concatenation glued a preamble to the answer ("...one at a time.
+    USER-DONE" with no break, restart window 2026-10-13)."""
     r = _TurnRenderer()
     closing = None
+    tool_since_text = False   # the Gateway's `sawToolUseSinceText`
     for message in messages:
         if not isinstance(message, dict) or message.get("role") != "assistant":
             continue
@@ -3514,8 +3521,11 @@ def _history_renderer(messages: list) -> "_TurnRenderer":
                 continue
             kind = block.get("type")
             if kind == "text" and block.get("text"):
-                r.feed({"stream": "assistant", "data": {"delta": block["text"]}})
+                lead = _message_boundary_separator(r.text, block["text"]) if tool_since_text else ""
+                tool_since_text = False
+                r.feed({"stream": "assistant", "data": {"delta": lead + block["text"]}})
             elif kind == "toolcall" and block.get("id"):
+                tool_since_text = True
                 r.feed({"stream": "tool", "data": {
                     "phase": "start", "name": block.get("name", ""),
                     "toolCallId": block["id"], "args": block.get("arguments") or {}}})
@@ -3532,6 +3542,18 @@ def _history_renderer(messages: list) -> "_TurnRenderer":
         if text and text not in _SILENT_SENTINELS:
             r.feed({"stream": "assistant", "data": {"delta": text}})
     return r
+
+
+def _message_boundary_separator(previous: str, nxt: str) -> str:
+    """The newlines the Gateway inserts between two assistant messages of a
+    claude-cli run (`missingMessageBoundarySeparator`,
+    cli-live-session-registry-CS2DCATp.mjs:375 on 2026.9.3): enough for a
+    blank line, counting the newlines both sides already have."""
+    if not previous:
+        return ""
+    trailing = len(previous[-2:]) - len(previous[-2:].rstrip("\n"))
+    leading = len(nxt[:2]) - len(nxt[:2].lstrip("\n"))
+    return "\n" * max(0, 2 - trailing - leading)
 
 
 def _is_closing_message(message) -> bool:
