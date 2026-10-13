@@ -6055,6 +6055,14 @@ class TurnWriterEndTests(_TurnWriterCase):
                 self.assertIn("rerun", d)
                 self.assertIn("finish", d)
 
+    async def test_the_writers_resume_sends_the_directive(self):
+        w = await self.opened_writer()
+        await w.end({"status": "failed", "hasActiveRun": False,
+                     "lastRunError": "Claude Code process exited with code 143"})
+        sends = [p for m, p in self.sent if m == "chat.send"]
+        self.assertEqual(sends[0]["message"],
+                         openclaw_pipe._resume_directive(w.renderer.visible_text))
+
     async def asyncSetUp(self):
         await super().asyncSetUp()
         self.history = _turn_history(run=self.RUN)
