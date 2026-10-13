@@ -258,8 +258,6 @@ class StaleFileServerReapTests(unittest.TestCase):
     zombie (P33/P36): stash the server on OWUI's own stable module so the
     next deploy can reap it first."""
 
-    PORT = 28792
-
     def setUp(self):
         self.stub_owui_socket_main = types.ModuleType("open_webui.socket.main")
         sys.modules["open_webui"] = types.ModuleType("open_webui")
@@ -306,16 +304,19 @@ class StaleFileServerReapTests(unittest.TestCase):
         return False
 
     def test_second_deploy_reaps_first_and_rebinds_same_port(self):
-        devcoord._start_file_server(port=self.PORT)
-        self.assertTrue(self._wait_up(self.PORT), "first server never came up")
+        # Port 0: a fixed port is shared by every suite on the host, and a
+        # second suite running at the same time answers this one's requests.
+        devcoord._start_file_server(port=0)
         first_server = getattr(self.stub_owui_socket_main, devcoord._STALE_FILE_SERVER_ATTR)
-        self.assertIsNotNone(first_server)
+        self.assertIsNotNone(first_server, "first server never bound")
+        port = first_server.server_address[1]
+        self.assertTrue(self._wait_up(port), "first server never came up")
 
         # Simulate the next deploy: a "new module" (fresh _file_server_started)
         # trying to bind the same port while the old one is still listening.
         devcoord._start_file_server.__globals__["_file_server_started"] = False
-        devcoord._start_file_server(port=self.PORT)
-        self.assertTrue(self._wait_up(self.PORT), "second server never came up")
+        devcoord._start_file_server(port=port)
+        self.assertTrue(self._wait_up(port), "second server never came up")
 
         second_server = getattr(self.stub_owui_socket_main, devcoord._STALE_FILE_SERVER_ATTR)
         self.assertIsNot(first_server, second_server, "reap did not replace the stashed server")
@@ -333,8 +334,6 @@ class DevCoordHttpRouteTests(unittest.TestCase):
     """End-to-end: actually start the file server and hit the devcoord
     routes over HTTP, the same way install.py --dev-bundle will."""
 
-    PORT = 28791  # distinct from the real 18791 to avoid clobbering it in dev
-
     @classmethod
     def setUpClass(cls):
         cls.tmpdir = tempfile.mkdtemp(prefix="devcoord-http-test-")
@@ -343,7 +342,21 @@ class DevCoordHttpRouteTests(unittest.TestCase):
         # A previous class may have left this True, which would make
         # _start_file_server return without binding anything.
         devcoord._start_file_server.__globals__["_file_server_started"] = False
-        devcoord._start_file_server(port=cls.PORT)
+        # The server is stashed on Open WebUI's socket module; a stub gives
+        # this class its own server object and so its own port.
+        cls._old_modules = {n: sys.modules.get(n) for n in
+                            ("open_webui", "open_webui.socket", "open_webui.socket.main")}
+        sys.modules["open_webui"] = types.ModuleType("open_webui")
+        sys.modules["open_webui.socket"] = types.ModuleType("open_webui.socket")
+        sys.modules["open_webui.socket.main"] = types.ModuleType("open_webui.socket.main")
+        # Port 0, not a fixed one: _start_file_server swallows a bind error,
+        # so on a port another suite holds, these tests silently talked to
+        # that suite's server and read its state (5 failures, 2026-10-13).
+        devcoord._start_file_server(port=0)
+        server = getattr(sys.modules["open_webui.socket.main"], devcoord._STALE_FILE_SERVER_ATTR, None)
+        if server is None:
+            raise RuntimeError("file server did not bind")
+        cls.PORT = server.server_address[1]
         deadline = time.time() + 2.0
         last_err = None
         while time.time() < deadline:
@@ -369,6 +382,11 @@ class DevCoordHttpRouteTests(unittest.TestCase):
                 except Exception:
                     pass
         devcoord._start_file_server.__globals__["_file_server_started"] = False
+        for name, mod in cls._old_modules.items():
+            if mod is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = mod
         if cls._old_env is None:
             os.environ.pop("OPENCLAW_BRIDGE_STATE_DIR", None)
         else:
