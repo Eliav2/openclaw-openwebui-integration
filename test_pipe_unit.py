@@ -1767,6 +1767,30 @@ class OrphanStubReconcileTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self._stub()["content"], "Reading them. Found it.")
         self.assertIs(self._stub()["done"], True)
 
+    @unittest.expectedFailure  # fails on main 787a471; ELI-100 phase 2 (DESIGN 2.2, 2.6) fixes it
+    async def test_relay_writes_into_the_stub_its_run_id_names_when_history_fails(self):
+        """2026-10-12 23:29Z, chat 0abe9bde: Open WebUI was OOM-restarted
+        mid-turn. When run msg-0abe9bde-...-8acdce95-... settled, the stub
+        check logged `orphan stub: chat.history failed: ` (an exception with
+        an empty message, 4 times) and the relay introduced a second message
+        32e095ae under the empty done=False stub 8acdce95. The run id names
+        its message: no transcript read is needed to know where it goes."""
+        async def send_request(method, params, timeout=10):
+            if method == "chat.history":
+                raise asyncio.TimeoutError()
+            if method == "sessions.list":
+                return {"sessions": [{"key": self.sk, "hasActiveRun": False}]}
+            raise AssertionError(method)
+        self.conn.send_request = send_request
+        state = _RelayState(session_key=self.sk, run_id=self.RUN, user_id=self.USER,
+                            chat_id=self.CHAT, renderer=_TurnRenderer())
+        self.conn._relay_sessions[f"{self.sk}:{self.RUN}"] = state
+        state.renderer.feed({"stream": "assistant", "data": {"delta": "Found it."}})
+        self.assertTrue(await _relay_introduce(self.conn, state))
+        self.assertEqual(set(self.chat["history"]["messages"]), {"u1", self.STUB},
+                         "no second message next to the stub")
+        self.assertEqual(state.message_id, self.STUB)
+
     async def test_relay_adopts_its_stub_that_a_graceful_stop_closed(self):
         """2026-10-12 run 3: `ha apps restart` cancelled the reply and Open
         WebUI saved it done=True with 2 of the run's cards; the relay then
