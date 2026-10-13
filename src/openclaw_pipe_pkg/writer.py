@@ -555,18 +555,14 @@ class _TurnWriter:
         """A sub-agent's completion the parent answered with silence (NO_REPLY)
         still shows the child's result, as one card (review 2af1 R10): its
         label from the parent's spawn call, its result from the child's own
-        transcript. Nothing when the child's result cannot be read."""
+        transcript, or what was kept of it before a `cleanup: "delete"` (its
+        chat final, or the transcript read as the announce run started).
+        Nothing when the child's result cannot be had."""
         child = next(filter(None, (parse_announce_run_id(r) for r in self.runs)), None)
         if child is None:
             return
-        try:
-            child_hist = await self.conn.session_history(child["child_session"], limit=20)
-        except Exception as ex:
-            pipe_log(f"  turn writer: child transcript of {child['child_session'][-12:]} "
-                     f"unreadable: {ex!r}")
-            return
-        found, result = _history_text_for_run(child_hist, child["child_run"])
-        if not (found and result):
+        result = await _child_result(self.conn, child)
+        if not result:
             return
         label = None
         for m in (hist or {}).get("messages") or []:
@@ -722,7 +718,10 @@ def _turn_route_now(conn: "_GatewayConnection", payload: dict) -> bool:
         return False
     conn.note_session_id(sess, payload.get("sessionId"))
     parsed = conn.parse_owui_session_key(sess)
-    if not parsed or conn.consumers_for_event(payload):
+    if not parsed:
+        _note_child_result(conn, payload)
+        return False
+    if conn.consumers_for_event(payload):
         return False
     if run.startswith(ACTION_RUN_PREFIX):
         return True  # the Status Action's own runs render nothing
@@ -759,12 +758,57 @@ def _turn_queue(conn: "_GatewayConnection", sess: str, run: str, parsed: tuple,
             conn.unregister_run_target(sess, run)
         spawn_background(_turn_pump_loop(conn, sess, run, parsed, pump))
         spawn_background(conn.ensure_message_subscription(sess))
+        child = parse_announce_run_id(run)
+        if child is not None:
+            # Read before the Gateway deletes a `cleanup: "delete"` child,
+            # which it does once this announcement is delivered.
+            spawn_background(_child_result(conn, child))
         if target is not None:
             return True
     if payload.get("state") in ("final", "error", "aborted"):
         pump.stop_notice_before = conn._stop_notice_seen
     pump.queue.put_nowait(("event", payload))
     return True
+
+
+def _note_child_result(conn: "_GatewayConnection", payload: dict) -> None:
+    """Keep the result of a sub-agent an Open WebUI session spawned, from its
+    own chat final (`spawnedBy` = the parent, server-chat-CbnqM5f6.mjs
+    emitChatTerminal): a `cleanup: "delete"` child is gone by the time its
+    announce run ends (subagent-announce-BIG31XbZ.mjs:413), and a silent
+    announce shows this result (review 2af1 R10)."""
+    if payload.get("state") != "final" or not conn.parse_owui_session_key(payload.get("spawnedBy") or ""):
+        return
+    text = (_history_item(payload.get("message")) or {}).get("text") or ""
+    if text.strip():
+        _keep_child_result(conn, payload["sessionKey"], payload["runId"], text.strip())
+
+
+def _keep_child_result(conn: "_GatewayConnection", child_session: str, child_run: str,
+                       text: str) -> None:
+    conn._child_results[(child_session, child_run)] = text
+    if len(conn._child_results) > 200:
+        for stale in list(conn._child_results)[:100]:
+            conn._child_results.pop(stale, None)
+
+
+async def _child_result(conn: "_GatewayConnection", child: dict) -> str | None:
+    """The result of the sub-agent run an announce run names: kept from its
+    chat final, else read from its transcript (and kept), else None."""
+    key = (child["child_session"], child["child_run"])
+    if key in conn._child_results:
+        return conn._child_results[key]
+    try:
+        child_hist = await conn.session_history(child["child_session"], limit=20)
+    except Exception as ex:
+        pipe_log(f"  turn writer: child transcript of {child['child_session'][-12:]} "
+                 f"unreadable: {ex!r}")
+        return None
+    found, result = _history_text_for_run(child_hist, child["child_run"])
+    if not (found and result):
+        return None
+    _keep_child_result(conn, *key, result)
+    return result
 
 
 def _note_heartbeat_run(conn: "_GatewayConnection", payload: dict) -> None:

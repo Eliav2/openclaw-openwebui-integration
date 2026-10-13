@@ -1399,6 +1399,8 @@ class _GatewayConnection:
         # no heartbeat, and the runs known (review 2af1 R7, `_turn_kind_known`)
         self._turn_unkinded: dict = {}
         self._turn_kinded: dict = {}
+        # (child session, child run) -> a sub-agent's result (review 2af1 R10)
+        self._child_results: dict = {}
         self._session_ids: dict = {}     # session_key -> sessionId (a cron wake's run id)
         self._wake_turns_bound: dict = {}  # session_key -> wake turn keys given a message
         self._turn_resolve_lock = asyncio.Lock()
