@@ -6227,6 +6227,20 @@ def _history_closed_runs(messages: list) -> list:
     return out
 
 
+def _settled_run_span(history: dict, run_id: str) -> list | None:
+    """The messages of a run the session row reports settled (no active run,
+    `lastRunId`): its span up to its closer or the next admitted turn, else,
+    as the newest turn, everything after its user turn."""
+    span = _history_span_messages(history, run_id)
+    if span is not None:
+        return span
+    messages = (history or {}).get("messages")
+    for i, m in enumerate(messages if isinstance(messages, list) else []):
+        if _history_user_run_id(m) == run_id:
+            return messages[i + 1:]
+    return None
+
+
 async def _reconcile_ended_while_down(conn: "_GatewayConnection", agent_id: str) -> None:
     """ELI-94, DESIGN-agent-turns.md case 4. A graceful Open WebUI stop saves
     the reply it cancels `done: true` with what it had; the run goes on and
@@ -6258,25 +6272,32 @@ async def _reconcile_ended_while_down(conn: "_GatewayConnection", agent_id: str)
         if int(updated // 1000) <= written:
             continue
         fixed += await _reconcile_chat_ended_runs(conn, key, chat_id, written,
-                                                  session_id=row.get("sessionId"))
+                                                  session_id=row.get("sessionId"),
+                                                  last_run=row.get("lastRunId"), settled_ms=updated)
     if fixed:
         pipe_log(f"  ended-while-down reconcile: completed {fixed} repl(y/ies) (ELI-94)")
 
 
 async def _reconcile_chat_ended_runs(conn: "_GatewayConnection", session_key: str,
                                      chat_id: str, written: int, *,
-                                     session_id: str | None) -> int:
+                                     session_id: str | None, last_run: str | None = None,
+                                     settled_ms: float | None = None) -> int:
     """Rebuild every finished reply in `chat_id` whose run closed after the
     chat was last written (`written`, whole seconds) and that holds less than
-    the transcript. Returns how many were written."""
+    the transcript. A run closed by its transcript closer, or the session
+    row's `lastRunId`, settled at the row's `updatedAt` (`settled_ms`; the
+    embedded runtime writes no closer). Returns how many were written."""
     from open_webui.models.chats import Chats
     if await _owui_chat_has_live_task(chat_id):
         return 0  # a reply is streaming: its own request finishes it
     hist = await conn.session_history(session_key, limit=RUN_HISTORY_LIMIT,
                                       timeout=ORPHAN_HISTORY_TIMEOUT_S)
     messages = (hist or {}).get("messages") or []
+    closed = _history_closed_runs(messages)
+    if last_run and settled_ms and last_run not in {r for r, _ms in closed}:
+        closed.append((last_run, settled_ms))
     targets: dict = {}
-    for run, closed_ms in _history_closed_runs(messages):
+    for run, closed_ms in closed:
         # A wake's closer is keyed by the sessionId and deduplicated (ELI-103).
         if run == session_id or int(closed_ms // 1000) <= written:
             continue
@@ -6289,7 +6310,8 @@ async def _reconcile_chat_ended_runs(conn: "_GatewayConnection", session_key: st
                 if r != session_id and run_message_id(session_key, chat_id, r, messages) == mid]
         if run not in runs:
             runs.append(run)
-        spans = [_history_span_messages(hist, r) for r in runs]
+        spans = [_settled_run_span(hist, r) if r == last_run else _history_span_messages(hist, r)
+                 for r in runs]
         if any(s is None for s in spans):
             continue  # a run written into it has not closed
         rendered = _history_renderer([m for s in spans for m in s])

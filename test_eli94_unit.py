@@ -220,6 +220,45 @@ class EndedWhileDownTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Found it.", m["content"], "the recovery's text")
         self.assertEqual(set(self.chat["history"]["messages"]), {"u1", M})
 
+    def embedded(self, *, newer_turn=False):
+        """The run as the embedded runtime stores it (e2e 2026-10-13, run
+        38405904032): no closing key, `timestamp` is when the message began
+        (before the chat's write), the run id only in `__openclaw.runId`.
+        The settled session row is the end signal."""
+        msgs = [{"role": "user", "content": "check the logs", "idempotencyKey": f"{RUN}:user",
+                 "timestamp": T0 * 1000 - 900},
+                {"role": "assistant", "timestamp": T0 * 1000 - 700,
+                 "__openclaw": {"runId": RUN, "recordTimestampMs": CLOSED_MS},
+                 "content": [{"type": "text", "text": "Reading them. Found it."}]}]
+        if newer_turn:
+            msgs.append({"role": "user", "content": "and now?", "timestamp": CLOSED_MS + 20,
+                         "idempotencyKey": f"msg-{CHAT}-later-1791880099.0:user"})
+            msgs.append({"role": "assistant", "timestamp": CLOSED_MS + 30,
+                         "__openclaw": {"runId": f"msg-{CHAT}-later-1791880099.0"},
+                         "content": [{"type": "text", "text": "Looking again"}]})
+        self.history = {"messages": msgs}
+
+    async def test_an_embedded_run_settled_while_down_completes_its_reply(self):
+        self.embedded()
+        await self.startup()
+        self.assertEqual(self.msg()["content"], "Reading them. Found it.")
+        self.assertIs(self.msg()["done"], True)
+        self.assertEqual(set(self.chat["history"]["messages"]), {"u1", M})
+
+    async def test_a_run_that_settled_in_the_second_of_the_write_is_left_alone(self):
+        self.embedded()
+        self.row["updatedAt"] = T0 * 1000 + 900
+        await self.startup()
+        self.assertEqual(self.writes, [])
+
+    async def test_a_turn_admitted_after_the_settled_run_bounds_its_span(self):
+        """A new run began between the row and the transcript read: the
+        settled run's reply stops at that run's user turn."""
+        self.embedded(newer_turn=True)
+        await self.startup()
+        self.assertEqual(self.msg()["content"], "Reading them. Found it.")
+        self.assertEqual([mid for mid, _ in self.writes], [M], "the new run's reply is not touched")
+
     async def test_a_missing_chat_is_skipped(self):
         self.row["key"] = _owui_session_key("main", USER, "55555555-5555-5555-5555-555555555555")
         await self.startup()
