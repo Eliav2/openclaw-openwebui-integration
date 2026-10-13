@@ -6330,6 +6330,147 @@ async def _reconcile_orphan_stubs(valves_getter) -> None:
             spawn_background(_reconcile_stub_logged(conn, agent_id, chat_id, stub_id))
     if stubs:
         pipe_log(f"  orphan stub reconcile: {counts}")
+    try:
+        await _reconcile_ended_while_down(conn, agent_id)
+    except Exception as ex:
+        pipe_log(f"  ended-while-down reconcile failed: {ex!r}")
+
+
+def _history_closed_runs(messages: list) -> list:
+    """[(run_id, closing timestamp ms)] of the runs `chat.history` shows as
+    closed: a claude-cli run by its `cli-assistant:<runId>` message, an
+    embedded run by an assistant message keyed with the run id itself."""
+    started = {run for run, _tool in _history_user_turns(messages)}
+    out = []
+    for m in messages or []:
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        meta = m.get("__openclaw") if isinstance(m.get("__openclaw"), dict) else {}
+        for k in (m.get("idempotencyKey"), meta.get("idempotencyKey")):
+            k = str(k or "")
+            run = k[len("cli-assistant:"):] if k.startswith("cli-assistant:") else (k if k in started else "")
+            if run and isinstance(m.get("timestamp"), (int, float)):
+                out.append((run, m["timestamp"]))
+                break
+    return out
+
+
+def _settled_run_span(history: dict, run_id: str) -> list | None:
+    """The messages of a run the session row reports settled (no active run,
+    `lastRunId`): its span up to its closer or the next admitted turn, else,
+    as the newest turn, everything after its user turn."""
+    span = _history_span_messages(history, run_id)
+    if span is not None:
+        return span
+    messages = (history or {}).get("messages")
+    for i, m in enumerate(messages if isinstance(messages, list) else []):
+        if _history_user_run_id(m) == run_id:
+            return messages[i + 1:]
+    return None
+
+
+async def _reconcile_ended_while_down(conn: "_GatewayConnection", agent_id: str) -> None:
+    """ELI-94, DESIGN-agent-turns.md case 4. A graceful Open WebUI stop saves
+    the reply it cancels `done: true` with what it had; the run goes on and
+    closes while Open WebUI is down, so no event reaches this process and
+    the ELI-90 pass (done:false only) skips it. Two recorded timestamps say
+    which chats missed something: the session row's `updatedAt` (bumped when
+    a run ends) newer than the chat's `updated_at`. In those, a run that
+    closed in a later second than the chat's last write is rebuilt from the
+    transcript into its message (identity rule, rule E for recoveries)."""
+    from open_webui.models.chats import Chats
+    lst = await conn.send_request("sessions.list", {}, timeout=15)
+    prefix = f"agent:{agent_id}:openwebui-"
+    fixed = 0
+    for row in lst.get("sessions") or []:
+        key = row.get("key") or ""
+        if not key.startswith(prefix) or row.get("hasActiveRun"):
+            continue  # not ours, or a run still going: the handover (2.6) owns it
+        after = key[len(prefix):]
+        if len(after) != 73 or after[36] != "-":
+            continue
+        user_id, chat_id = after[:36], after[37:]
+        updated = row.get("updatedAt")
+        if not isinstance(updated, (int, float)):
+            continue
+        chat = await Chats.get_chat_by_id(chat_id)
+        if chat is None or chat.user_id != user_id:
+            continue
+        written = int(getattr(chat, "updated_at", 0) or 0)
+        if int(updated // 1000) <= written:
+            continue
+        fixed += await _reconcile_chat_ended_runs(conn, key, chat_id, written,
+                                                  session_id=row.get("sessionId"),
+                                                  last_run=row.get("lastRunId"), settled_ms=updated)
+    if fixed:
+        pipe_log(f"  ended-while-down reconcile: completed {fixed} repl(y/ies) (ELI-94)")
+
+
+async def _reconcile_chat_ended_runs(conn: "_GatewayConnection", session_key: str,
+                                     chat_id: str, written: int, *,
+                                     session_id: str | None, last_run: str | None = None,
+                                     settled_ms: float | None = None) -> int:
+    """Rebuild every finished reply in `chat_id` whose run closed after the
+    chat was last written (`written`, whole seconds) and that holds less than
+    the transcript. A run closed by its transcript closer, or the session
+    row's `lastRunId`, settled at the row's `updatedAt` (`settled_ms`; the
+    embedded runtime writes no closer). Returns how many were written."""
+    from open_webui.models.chats import Chats
+    if await _owui_chat_has_live_task(chat_id):
+        return 0  # a reply is streaming: its own request finishes it
+    hist = await conn.session_history(session_key, limit=RUN_HISTORY_LIMIT,
+                                      timeout=ORPHAN_HISTORY_TIMEOUT_S)
+    messages = (hist or {}).get("messages") or []
+    closed = _history_closed_runs(messages)
+    if last_run and settled_ms and last_run not in {r for r, _ms in closed}:
+        closed.append((last_run, settled_ms))
+    targets: dict = {}
+    for run, closed_ms in closed:
+        # A wake's closer is keyed by the sessionId and deduplicated (ELI-103).
+        if run == session_id or int(closed_ms // 1000) <= written:
+            continue
+        mid = run_message_id(session_key, chat_id, run, messages)
+        if mid:
+            targets.setdefault(mid, run)
+    fixed = 0
+    for mid, run in targets.items():
+        runs = [r for r, _tool in _history_user_turns(messages)
+                if r != session_id and run_message_id(session_key, chat_id, r, messages) == mid]
+        if run not in runs:
+            runs.append(run)
+        spans = [_settled_run_span(hist, r) if r == last_run else _history_span_messages(hist, r)
+                 for r in runs]
+        if any(s is None for s in spans):
+            continue  # a run written into it has not closed
+        rendered = _history_renderer([m for s in spans for m in s])
+        output = rendered.finished_output()
+        text = rendered.text.strip()
+        if not output:
+            continue
+        async with conn._chat_write_lock(chat_id):
+            chat = await Chats.get_chat_by_id(chat_id)
+            msgs = ((chat.chat or {}).get("history") or {}).get("messages") or {} if chat else {}
+            current = msgs.get(mid) or {}
+            if current.get("role") != "assistant" or current.get("done") is not True:
+                continue  # missing, or still generating: the ELI-90 pass owns done:false
+            held_cards = sum(1 for i in current.get("output") or [] if i.get("type") == "function_call")
+            cards = sum(1 for i in output if i.get("type") == "function_call")
+            held_text = _coerce_text(current.get("content")).strip()
+            if cards < held_cards or (cards == held_cards and len(text) <= len(held_text)):
+                continue  # holds as much as the transcript: never rewritten
+            if await Chats.upsert_message_to_chat_by_id_and_message_id(
+                    chat_id, mid, {"content": text, "output": output, "done": True}) is None:
+                pipe_log(f"  ended-while-down {mid[:8]}... in chat {chat_id[:8]}...: "
+                         "Open WebUI did not save the write (ELI-94)")
+                continue
+            conn.mark_delivered_live(session_key, run)
+        await _relay_emit_event(chat.user_id, chat_id, mid,
+                                {"type": "chat:completion", "data": {"output": output}})
+        pipe_log(f"  ended-while-down {mid[:8]}... in chat {chat_id[:8]}...: completed from "
+                 f"{len(runs)} run(s) ({len(text)} chars, {cards} tool card(s), "
+                 f"held {held_cards}) (ELI-94)")
+        fixed += 1
+    return fixed
 
 
 async def _reconcile_stub_logged(conn, agent_id, chat_id, stub_id, *, wait=True) -> str:

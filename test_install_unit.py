@@ -94,13 +94,16 @@ class DowngradeGuardTests(unittest.TestCase):
             def log_message(self, *a):
                 pass
 
-        cls.port = 28798
-        cls.server = http.server.HTTPServer(("127.0.0.1", cls.port), Handler)
+        # Port 0: a fixed port collides with another suite running at the
+        # same time (setUpClass failed with EADDRINUSE, 2026-10-13).
+        cls.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        cls.port = cls.server.server_address[1]
         threading.Thread(target=cls.server.serve_forever, daemon=True).start()
 
     @classmethod
     def tearDownClass(cls):
         cls.server.shutdown()
+        cls.server.server_close()
 
     def test_allows_plain_deploy_when_live_pipe_is_not_dev_bundle(self):
         inst.DEVCOORD_PORT = 1  # nothing listening -- simulates a plain live pipe
