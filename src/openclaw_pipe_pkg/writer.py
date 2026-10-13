@@ -75,6 +75,22 @@ def _run_prompt_text(span: list | None) -> str:
     return text[hits[-1]:] if hits else ""
 
 
+def _resume_directive(shown: str | None) -> str:
+    """The message a resume sends: continue from what the user already sees."""
+    shown = (shown or "").strip()
+    if shown:
+        return (
+            "[system] Your previous reply was cut off partway through. The user can "
+            "already see the following partial text, and it cannot be edited or "
+            f"retracted:\n\n---\n{shown[-1500:]}\n---\n\n"
+            "Continue that reply seamlessly from exactly where it stops. Do not repeat "
+            "any of it, do not restart the answer, and do not mention the interruption.")
+    return (
+        "[system] Your previous run was cut off before you produced any output. "
+        "Answer the most recent message now, from scratch. Do not mention the "
+        "interruption.")
+
+
 def _is_sentinel_message_item(item: dict) -> bool:
     if item.get("type") != "message":
         return False
@@ -474,19 +490,7 @@ class _TurnWriter:
             await self._send_resume()
 
     async def _send_resume(self) -> None:
-        shown = (self.renderer.visible_text or "").strip()
-        if shown:
-            directive = (
-                "[system] Your previous reply was cut off partway through. The user can "
-                "already see the following partial text, and it cannot be edited or "
-                f"retracted:\n\n---\n{shown[-1500:]}\n---\n\n"
-                "Continue that reply seamlessly from exactly where it stops. Do not repeat "
-                "any of it, do not restart the answer, and do not mention the interruption.")
-        else:
-            directive = (
-                "[system] Your previous run was cut off before you produced any output. "
-                "Answer the most recent message now, from scratch. Do not mention the "
-                "interruption.")
+        directive = _resume_directive(self.renderer.visible_text)
         key = pipe_run_id(self.chat_id, self.message_id, "resume")
         try:
             resp = await self.conn.send_request("chat.send", _owui_chat_send_params(

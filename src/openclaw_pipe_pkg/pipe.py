@@ -1422,6 +1422,70 @@ class Pipe:
         # An interrupted run is not continued here: its message goes to the
         # turn writer, whose settled row decides who continues it (DESIGN 2.7).
         handed_over = False
+        # A reply with no Open WebUI message (an API request) has nothing to
+        # hand over: it applies the owner rule itself, in its own stream
+        # (review 2af1 R14). Set while it waits for the interrupted run's row.
+        awaiting_owner = False
+        owner_notice_before = False
+        owner_resumes = 0
+        owner_run = None
+
+        def await_owner() -> None:
+            nonlocal awaiting_owner, owner_notice_before, owner_run
+            awaiting_owner, owner_notice_before = True, conn._stop_notice_seen
+            owner_run = conn._awaiting_owner[session_key] = our_run_id
+            pipe_log(f"  run {our_run_id[:24]}... interrupted, no message to hand over: "
+                     "its row decides here")
+            spawn_background(conn.push_row(session_key))
+
+        async def owner_step(row: dict):
+            """One row while the reply waits for its run's owner (DESIGN 2.7):
+            ("switch", run, queue) to continue in the Gateway's recovery run
+            or a resume sent here, ("end", note) to finish, None to wait."""
+            nonlocal owner_resumes
+            decision = next_continuation(row, owner_notice_before, owner_resumes)
+            if decision == "gateway":
+                # The Gateway recovers it as a run whose turn names this one
+                # (rule E); until that turn is committed, the next row looks again.
+                try:
+                    messages = (await conn.session_history(session_key, limit=50,
+                                                           max_chars=200)).get("messages") or []
+                except Exception as ex:
+                    pipe_log(f"  chat.history for the recovery failed: {ex!r}")
+                    return None
+                rec = next((r for r, _t in _history_user_turns(messages)
+                            if recovery_source_run(messages, r) == our_run_id), None)
+                if rec is None:
+                    return None
+                pipe_log(f"  following the Gateway's recovery run {rec[:24]}...")
+                return ("switch", rec, conn.register_consumer(session_key, rec))
+            if decision == "wait":
+                return None
+            if decision == "resume":
+                key = f"msg-{chat_id}-resume-{time.time()}"
+                resume_queue = conn.register_consumer(session_key, key)
+                try:
+                    resp = await conn.send_request("chat.send", _owui_chat_send_params(
+                        session_key=session_key, message=_resume_directive(visible_message_text),
+                        idempotency_key=key, owui_chat_id=owui_origin_chat_id,
+                        owui_user_id=owui_origin_user_id, thinking=resolved_thinking), timeout=30)
+                except Exception as ex:
+                    # The Gateway is closing: its next hello reads the row again.
+                    conn.unregister_consumer(session_key, key, queue=resume_queue)
+                    pipe_log(f"  resume refused ({ex}); trying again on the next row")
+                    return None
+                owner_resumes += 1
+                new_run = resp.get("runId") or key
+                if new_run != key:
+                    conn.unregister_consumer(session_key, key, queue=resume_queue)
+                    resume_queue = conn.register_consumer(session_key, new_run)
+                pipe_log(f"  resumed as {new_run[:32]}... ({owner_resumes}/{MAX_TURN_RESUMES})")
+                return ("switch", new_run, resume_queue)
+            if turn_owner(row, owner_notice_before) == "pipe":
+                return ("end", TURN_CUT_OFF_NOTE)
+            if (row or {}).get("status") in ("failed", "timeout") and row.get("lastRunError"):
+                return ("end", f"**Error:** {row['lastRunError']}")
+            return ("end", None)
 
         async def recover_from_transcript() -> str | None:
             """The run's text read back: by its run id, else by its user text,
@@ -1650,6 +1714,30 @@ class Pipe:
                         # row (below), a Gateway restart (handed over).
                         msg = await queue.get()
 
+                        if msg.get("type") == _ROW_MARKER_TYPE and awaiting_owner:
+                            step = await owner_step(msg.get("row") or {})
+                            if step is None:
+                                continue
+                            if step[0] == "end":
+                                if step[1]:
+                                    note = f"\n\n{step[1]}" if visible_message_text.strip() else step[1]
+                                    record_visible_chunk(note)
+                                    yield note
+                                    text_yielded = True
+                                done = True
+                            else:
+                                # The reply continues in the run that continues
+                                # this one: its events (held until now) and its end.
+                                _kind, new_run, new_queue = step
+                                conn.unregister_consumer(session_key, our_run_id, queue=queue)
+                                queue, our_run_id = new_queue, new_run
+                                self._current_run_id = our_run_id
+                                turn.run_id, turn.queue = our_run_id, queue
+                                admitted_at, signals_lost = time.monotonic(), False
+                            awaiting_owner = False
+                            conn.stop_awaiting_owner(session_key, owner_run)
+                            continue
+
                         if msg.get("type") == _ROW_MARKER_TYPE:
                             row = msg.get("row") or {}
                             if row.get("status") == "queued" and not first_event_arrived \
@@ -1701,6 +1789,10 @@ class Pipe:
                             if conn.hand_over_run(session_key, our_run_id,
                                                   thinking=resolved_thinking, read_row=True):
                                 handed_over = done = True
+                            elif awaiting_owner:
+                                spawn_background(conn.push_row(session_key))
+                            elif not owui_message_id:
+                                await_owner()
                             else:
                                 pipe_log("  Gateway restarted; no message to hand over, waiting")
                             continue
@@ -1744,11 +1836,13 @@ class Pipe:
                         # decides neither: the turn writer takes the message
                         # and the settled row picks the owner. Without a
                         # message to hand over, it ends here like any error.
-                        if ((_EXTERNAL_KILL_RE.search(err) or (aborted_run and conn._shutdown_seen))
-                                and conn.hand_over_run(session_key, our_run_id,
-                                                       thinking=resolved_thinking)):
-                            handed_over = done = True
-                            continue
+                        if _EXTERNAL_KILL_RE.search(err) or (aborted_run and conn._shutdown_seen):
+                            if conn.hand_over_run(session_key, our_run_id, thinking=resolved_thinking):
+                                handed_over = done = True
+                                continue
+                            if not owui_message_id:
+                                await_owner()
+                                continue
                         if stream == "lifecycle" and phase == "end":
                             done = True
                             pipe_log("  lifecycle end -> done")
@@ -2251,6 +2345,8 @@ class Pipe:
                         pending_tool_calls.clear()
 
         finally:
+            if awaiting_owner:
+                conn.stop_awaiting_owner(session_key, owner_run)
             # A parked queue now belongs to whoever claims the run; releasing
             # it here would drop the events it is buffering.
             if not turn.parked:

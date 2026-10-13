@@ -1409,6 +1409,9 @@ class _GatewayConnection:
         self._turn_kinded: dict = {}
         # (child session, child run) -> a sub-agent's result (review 2af1 R10)
         self._child_results: dict = {}
+        # session_key -> run id of an inline reply with no Open WebUI message
+        # waiting for its interrupted run's owner (review 2af1 R14)
+        self._awaiting_owner: dict = {}
         self._session_ids: dict = {}     # session_key -> sessionId (a cron wake's run id)
         self._wake_turns_bound: dict = {}  # session_key -> wake turn keys given a message
         self._turn_resolve_lock = asyncio.Lock()
@@ -1683,6 +1686,24 @@ class _GatewayConnection:
                     else:
                         q.put_control(dict(marker))
 
+    async def push_row(self, session_key: str) -> None:
+        """Read the session's row now and hand it to its inline replies."""
+        try:
+            lst = await self.send_request("sessions.list", {"search": session_key[-36:], "limit": 10},
+                                          timeout=15)
+        except Exception as ex:
+            pipe_log(f"  row read for {session_key[-12:]} failed: {ex!r}")
+            return
+        row = next((r for r in (lst.get("sessions") or []) if r.get("key") == session_key), None)
+        if row is not None:
+            self.row_to_consumers(session_key, row, outside_loop=True)
+
+    def stop_awaiting_owner(self, session_key: str, run_id: str) -> None:
+        """The reply decided: the agent runs held for it go on (`_release_held`)."""
+        if self._awaiting_owner.get(session_key) == run_id:
+            del self._awaiting_owner[session_key]
+            self._release_held(session_key)
+
     def note_session_id(self, session_key: str, session_id) -> None:
         if session_key and isinstance(session_id, str) and session_id:
             self._session_ids[session_key] = session_id
@@ -1934,6 +1955,12 @@ class _GatewayConnection:
         events wait for that reply (`register_consumer`) instead of opening a
         second writer on the message (review 2af1 N6)."""
         parsed = parse_pipe_run_id(run_id)
+        waiting = self._awaiting_owner.get(session_key)
+        if waiting and parsed is None and run_id != waiting:
+            # A reply with no message waits for its run's owner (R14): any
+            # agent run here may be the Gateway's recovery of it. It waits
+            # until the reply has read the transcript (rule E).
+            return True
         if parsed is None or parsed["kind"] == "reply":
             return False
         for c in list(self._consumers.values()):
