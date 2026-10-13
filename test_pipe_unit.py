@@ -7515,6 +7515,54 @@ class SilentAnnounceTests(_RoutingCase):
         await self.announce_run("NO_REPLY")
         self.assertEqual(self.new_messages(), {})
 
+    # Known gap of PR #20: with `cleanup: "delete"` the Gateway deletes the
+    # child once the announcement is delivered (subagent-announce-BIG31XbZ.mjs
+    # :413, in the flow's `finally`), so the card read at the end found no
+    # transcript. The child's result is caught before that: its own chat final
+    # (broadcast to this connection, which has no session-scoped cap, with
+    # `spawnedBy` = the parent, server-chat-CbnqM5f6.mjs emitChatTerminal), or
+    # its transcript read when the announce run starts.
+
+    def child_final(self, text="SUB-DONE-R10"):
+        return {"sessionKey": self.CHILD, "runId": self.CHILD_RUN, "spawnedBy": self.key,
+                "state": "final", "message": {"role": "assistant",
+                                              "content": [{"type": "text", "text": text}]}}
+
+    def card_result(self):
+        (m,) = self.new_messages().values()
+        calls = [i for i in m["output"] if i["type"] == "function_call"]
+        self.assertEqual(len(calls), 1)
+        self.assertIn("R10 probe sub-agent", calls[0]["arguments"])
+        return json.dumps([i for i in m["output"] if i["type"] == "function_call_output"])
+
+    async def test_a_deleted_childs_result_seen_in_its_final_still_shows(self):
+        await _turn_route_event(self.conn, self.child_final())
+        self.child_history = None            # cleanup: "delete"
+        await self.announce_run("NO_REPLY")
+        self.assertIn("SUB-DONE-R10", self.card_result())
+
+    async def test_a_child_deleted_while_the_announce_runs_still_shows(self):
+        """No child final reached this connection (a socket gap): the
+        transcript is read as the announce run starts, before the delete."""
+        self.history = self.parent_history("NO_REPLY")
+        await _turn_route_event(self.conn, self.ev(self.announce, {"stream": "lifecycle",
+                                                                   "data": {"phase": "start"}}))
+        await self.spin()
+        self.child_history = None            # deleted once the announcement is delivered
+        await _turn_route_event(self.conn, self.ev(self.announce, _delta("NO_REPLY")))
+        await _turn_route_event(self.conn, self.ev(self.announce, {"state": "final"}))
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "done", "lastRunId": self.announce})
+        await self.spin()
+        self.assertIn("SUB-DONE-R10", self.card_result())
+
+    async def test_another_sessions_child_final_is_not_kept(self):
+        other = {**self.child_final(), "spawnedBy": "agent:main:main"}
+        await _turn_route_event(self.conn, other)
+        self.child_history = None
+        await self.announce_run("NO_REPLY")
+        self.assertEqual(self.new_messages(), {})
+
     async def test_a_silent_requester_settle_wake_stays_silent(self):
         """`announce:requester-settle:...` wakes a yielded parent for a batch
         of children; its own silence is the parent's, not a missing result."""
