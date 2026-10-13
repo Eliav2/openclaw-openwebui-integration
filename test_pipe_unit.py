@@ -84,7 +84,7 @@ from openclaw_pipe import (
     MAX_TURN_RESUMES, next_continuation, turn_owner,
     recovery_source_run, run_message_id, _TurnWriter, _INTENT_HOOK_JS,
     _turn_route_event, _turn_after_hello, _history_span_messages,
-    wake_turns, wake_turn_at, wake_span, _wake_resync,
+    wake_turns, wake_turn_at, wake_span, _wake_resync, _adopt_turn_message,
     _gateway_run_status,
     _GatewayConnection,
     GatewayError,
@@ -616,6 +616,22 @@ class OrphanStubReconcileTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(task.done())
         self.assertEqual(self._stub()["content"], "Reading them. Found it.")
         self.assertIs(self._stub()["done"], True)
+
+    async def test_a_gone_writers_message_is_adopted_even_with_another_task_in_the_chat(self):
+        self._stub()["meta"] = {"openclaw_writer": "1:gone", "openclaw_run": "agent-run-1"}
+        self.live_task = True
+        with mock.patch("openclaw_pipe._adopt_turn_message", mock.AsyncMock(return_value="adopted")) as adopt:
+            got = await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB)
+        self.assertEqual(got, "adopted")
+        self.assertEqual(adopt.await_args.kwargs["meta"]["openclaw_run"], "agent-run-1")
+
+    async def test_a_live_writers_message_is_left_to_it(self):
+        _register_turn_writer("1:alive")
+        self.addCleanup(_retire_turn_writer, "1:alive")
+        self._stub()["meta"] = {"openclaw_writer": "1:alive", "openclaw_run": "agent-run-1"}
+        with mock.patch("openclaw_pipe._adopt_turn_message", mock.AsyncMock()) as adopt:
+            self.assertEqual(await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB), "skip")
+        adopt.assert_not_awaited()
 
     async def test_a_message_that_never_reached_the_gateway_gets_an_honest_note(self):
         self.history, self.active = {"messages": []}, False
@@ -6910,3 +6926,113 @@ class WakeTurnTests(unittest.TestCase):
         msgs = [{"role": "assistant", "timestamp": 5}, self.msg("q", "queued", 15),
                 {"role": "assistant", "timestamp": 15}, {"role": "assistant", "timestamp": 30}]
         self.assertEqual(wake_span(msgs, 10, 20), [{"role": "assistant", "timestamp": 15}])
+
+
+class RetiredWriterTests(_RoutingCase):
+    """ELI-103 step 4. Live 2026-10-13: the rollback to main retired the
+    62b9927 connection, but its writer's Open WebUI task 03904655 stayed
+    registered, so efe80f6a showed generating and orphan repair skipped the
+    chat until the task was stopped by hand. A retired writer ends its task;
+    the successor adopts the message and finishes it once its run is over."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.active = False
+        plain = self.conn.send_request
+        test = self
+
+        async def send_request(method, params, timeout=10):
+            if method == "sessions.list":
+                test.sent.append((method, copy.deepcopy(params)))
+                return {"sessions": [{"key": test.key, "hasActiveRun": test.active,
+                                      "status": "running" if test.active else "done",
+                                      "lastRunId": test.RUN}]}
+            if method == "cron.list":
+                return {"jobs": []}
+            return await plain(method, params, timeout)
+        self.send_request = send_request
+        self.conn.send_request = send_request
+
+    def successor(self):
+        conn = _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"))
+        conn.send_request = self.send_request
+        return conn
+
+    async def start_turn_then_retire(self):
+        """A's writer streamed half a turn, then a deploy retired A."""
+        self.active = True
+        await _turn_route_event(self.conn, self.ev(self.RUN, _delta("Reading them.")))
+        await self.spin()
+        (mid, m), = self.new_messages().items()
+        (task_id, (_chat, task)), = self.owui.tasks.items()
+        self.assertFalse(task.done())
+        await self.conn.retire()
+        await self.spin()
+        return mid, task
+
+    async def adopt(self, conn, mid):
+        msg = self.owui.msgs()[mid]
+        got = await _adopt_turn_message(conn, chat_id=self.CHAT, user_id=self.USER,
+                                        session_key=self.key, message_id=mid, meta=msg["meta"])
+        await self.spin()
+        return got
+
+    async def test_retire_ends_the_writers_task_and_leaves_its_message_open(self):
+        mid, task = await self.start_turn_then_retire()
+        self.assertTrue(task.done(), "a retired writer's Open WebUI task stayed registered")
+        self.assertIs(self.owui.msgs()[mid]["done"], False)
+        self.assertFalse(self.conn._turn_pumps, "the retired connection's pump kept waiting")
+
+    async def test_a_successor_finishes_a_run_that_ended_meanwhile(self):
+        mid, _ = await self.start_turn_then_retire()
+        self.active = False  # the run ended while no connection listened
+        b = self.successor()
+        self.assertEqual(await self.adopt(b, mid), "adopted")
+        m = self.owui.msgs()[mid]
+        self.assertIs(m["done"], True)
+        self.assertEqual(m["content"], "Reading them. Found it.")
+
+    async def test_a_successor_continues_a_run_still_going(self):
+        mid, _ = await self.start_turn_then_retire()
+        b = self.successor()
+        await self.adopt(b, mid)
+        self.assertIs(self.owui.msgs()[mid]["done"], False, "a running run was finished")
+        await _turn_route_event(b, self.ev(self.RUN, _delta(" Found it.")))
+        await _turn_route_event(b, self.ev(self.RUN, {"state": "final"}))
+        self.active = False
+        b._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False, "status": "done",
+                                "lastRunId": self.RUN, "reason": "chat.run.settled"})
+        await self.spin()
+        m = self.owui.msgs()[mid]
+        self.assertIs(m["done"], True)
+        self.assertEqual(m["content"], "Reading them. Found it.")
+        self.assertEqual(list(self.new_messages()), [mid], "the successor opened a second message")
+
+    async def test_a_wake_is_adopted_with_its_own_turn(self):
+        sid, w = "ad9e461b-724a-4797-9b3f-befa1090e36b", "1d549bd7-80a0-448a-ab9e-3dcbcad0015b"
+        self.conn.note_session_id(self.key, sid)
+        self.history = {"messages": [
+            {"role": "user", "content": "[cron:job-9 wake] go", "idempotencyKey": f"{w}:user",
+             "__openclaw": {"recordTimestampMs": 1000}}]}
+        await _turn_route_event(self.conn, {"sessionKey": self.key, "runId": sid, "ts": 2000,
+                                            **_delta("Smoke ")})
+        await self.spin()
+        (mid, m), = self.new_messages().items()
+        self.assertEqual(m["meta"]["openclaw_wake"], {"key": w, "at": 1000, "job": "job-9"})
+        await self.conn.retire()
+        await self.spin()
+        self.history["messages"].append({"role": "assistant", "timestamp": 3000,
+                                         "__openclaw": {"importedFrom": "claude-cli"},
+                                         "content": [{"type": "text", "text": "Smoke PASS."}]})
+        b = self.successor()
+        await self.adopt(b, mid)  # cron.list: the job is gone, the wake is over
+        m = self.owui.msgs()[mid]
+        self.assertIs(m["done"], True)
+        self.assertEqual(m["content"], "Smoke PASS.")
+
+    async def test_a_message_another_pump_already_writes_is_left_to_it(self):
+        mid, _ = await self.start_turn_then_retire()
+        b = self.successor()
+        await _turn_route_event(b, self.ev(self.RUN, _delta(" Found it.")))
+        self.assertEqual(await self.adopt(b, mid), "skip")
+
