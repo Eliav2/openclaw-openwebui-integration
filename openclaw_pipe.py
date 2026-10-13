@@ -7439,6 +7439,32 @@ def _thinking_rejection_retry_body(body, recovered, resolved_thinking):
 _SEND_NOW_HOLD_S = 120.0
 
 
+async def _current_load(pipe, request):
+    """The Pipe of the load Open WebUI serves now, when `pipe` belongs to an
+    older load of this Function; else None (ELI-102).
+
+    A deploy execs the new content into a new module, and the first request
+    there retires the old load's connection. A turn the old load admitted but
+    had not yet connected (the dev build holds new turns while a deploy is
+    pending, 24 min on 2026-10-13) then met the retired connection and was
+    lost as "gateway connection retired". Open WebUI's own lookup
+    (`get_function_module_by_id`, which also sets the valves) names the
+    current load."""
+    prefix = _function_module_prefix(__name__)
+    if request is None or not prefix.startswith("function_"):
+        return None
+    try:
+        from open_webui.functions import get_function_module_by_id
+
+        current = await get_function_module_by_id(request, prefix[len("function_"):])
+    except Exception as ex:
+        pipe_log(f"  current load lookup failed, serving this turn here: {ex!r}")
+        return None
+    if current is None or current is pipe or type(current).__module__ == __name__:
+        return None
+    return current
+
+
 async def _settle_cancel_intent(conn, session_key, run_id, chat_id, event_call):
     """Ask the page whether this cancel was Stop or Send now, and settle the
     parked turn accordingly (see `settle_parked_turn`)."""
@@ -7991,6 +8017,18 @@ class Pipe:
         Thin wrapper around _pipe_impl so dev-only deploy-coordination hooks
         (ELI-24) can bracket every turn without re-indenting the whole body.
         """
+        current = await _current_load(self, __request__)
+        if current is not None:
+            pipe_log("Turn admitted by a superseded load of this Function: the current "
+                     f"load ({type(current).__module__}) serves it")
+            async with contextlib.aclosing(current.pipe(
+                body, __event_emitter__, __event_call__=__event_call__,
+                __user__=__user__, __metadata__=__metadata__, __request__=__request__,
+                __task__=__task__, __task_body__=__task_body__,
+            )) as turn_gen:
+                async for item in turn_gen:
+                    yield item
+            return
         try:
             # aclosing: when OWUI closes this generator, close the inner one
             # now rather than whenever it is garbage-collected, so its cancel

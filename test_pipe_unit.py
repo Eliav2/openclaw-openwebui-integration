@@ -6664,6 +6664,78 @@ class InlineRewriteWiringTests(unittest.TestCase):
         self.assertIn("await _session_list_active(conn, session_key) is False", branch)
 
 
+class SupersededLoadTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-102 (chat 56b98d09, bubble d04f9254, 2026-10-13 01:52:57Z): a turn
+    an older load of the Function admitted met that load's retired connection
+    and was lost as "gateway connection retired". The current load serves it."""
+
+    OLD = "function_openclaw_gateway_" + "a" * 32
+
+    def setUp(self):
+        self.lookups = []
+        self.current = None
+        test = self
+
+        async def get_function_module_by_id(request, function_id):
+            test.lookups.append(function_id)
+            if isinstance(test.current, Exception):
+                raise test.current
+            return test.current
+        mods = {"open_webui": types.ModuleType("open_webui"),
+                "open_webui.functions": types.SimpleNamespace(
+                    get_function_module_by_id=get_function_module_by_id)}
+        for p in (mock.patch.dict(sys.modules, mods),
+                  mock.patch.object(openclaw_pipe, "__name__", self.OLD)):
+            p.start()
+            self.addCleanup(p.stop)
+        # The old load's connection, retired by the new load's first request.
+        retired = _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"))
+        retired._retired = True
+        p = mock.patch.object(openclaw_pipe, "_gateway_connection", retired)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def new_load(self):
+        class Current:
+            __module__ = "function_openclaw_gateway_" + "b" * 32
+
+            def __init__(self):
+                self.calls = []
+
+            async def pipe(self, body, __event_emitter__, **kw):
+                self.calls.append((body, kw))
+                yield "served by the current load"
+        return Current()
+
+    async def turn(self, pipe):
+        body = {"model": "openclaw_gateway.m", "messages": [{"role": "user", "content": "hi"}]}
+        meta = {"chat_id": "c1", "message_id": "m1", "session_id": "s1"}
+
+        async def emit(_):
+            pass
+        return [x async for x in pipe.pipe(body, emit, __user__={"id": "u1"}, __metadata__=meta,
+                                           __request__=object())]
+
+    async def test_a_turn_of_a_superseded_load_is_served_by_the_current_load(self):
+        self.current = self.new_load()
+        out = await self.turn(openclaw_pipe.Pipe())
+        self.assertEqual(out, ["served by the current load"])
+        self.assertEqual(self.lookups, ["openclaw_gateway"])
+        (body, kw), = self.current.calls
+        self.assertEqual(kw["__metadata__"]["message_id"], "m1", "the same turn, unchanged")
+
+    async def test_the_current_load_serves_its_own_turn(self):
+        pipe = openclaw_pipe.Pipe()
+        self.current = pipe
+        out = await self.turn(pipe)
+        self.assertTrue(out and "retired" in out[-1], out)  # its own path, here the retired conn
+
+    async def test_a_failed_lookup_serves_the_turn_here(self):
+        self.current = RuntimeError("db locked")
+        out = await self.turn(openclaw_pipe.Pipe())
+        self.assertTrue(out and "retired" in out[-1], out)
+
+
 class RunSpanTests(unittest.TestCase):
     """A run's messages in chat.history never include another run's."""
 
