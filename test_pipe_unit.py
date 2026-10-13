@@ -6694,3 +6694,45 @@ class InlineOwnerRuleTests(unittest.IsolatedAsyncioTestCase):
         resync already ran; the handover then reads the row itself."""
         await self._turn(self._restart)
         self.assertIn("sessions.list", self.rpc)
+
+
+class SessionIdRunTests(_RoutingCase):
+    """Live 2026-10-13 02:54-03:13Z, chat 0abe9bde. A pipe-started run's inline
+    reply M closed done:true, but the claude-cli turn kept working (a background
+    task). Once the Gateway run ends its chat-run link is gone, so the CLI's
+    later tool events carry the bare internal run id, which is the sessionId
+    (server-chat-CbnqM5f6.mjs:794 `chatLink?.clientRunId ?? evt.runId`). The
+    writer keyed them as a run of their own: new message uuid5(key:sessionId),
+    and the session was already settled, so no settle ever ended it."""
+
+    SID = "ad9e461b-724a-4797-9b3f-befa1090e36b"
+    M = "7c5fe99c-cb51-4f24-90ca-1fd2bc78ae28"
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.R = pipe_run_id(self.CHAT, self.M)
+        self.add_stub(self.M, content="Deploying in the background.", done=True)
+        self.conn.mark_delivered_live(self.key, self.R)
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "done", "lastRunId": self.R,
+                                        "sessionId": self.SID, "reason": "chat.run.settled"})
+        await self.spin()
+
+    def sid_ev(self, payload):
+        return {"sessionKey": self.key, "runId": self.SID, "sessionId": self.SID, **payload}
+
+    async def test_a_session_id_is_never_a_run(self):
+        await _turn_route_event(self.conn, self.sid_ev(_tool("start", tcid="toolu_7")))
+        await _turn_route_event(self.conn, self.sid_ev(_tool("result", tcid="toolu_7")))
+        await self.spin()
+        self.assertNotIn(turn_message_id(self.key, self.SID, self.CHAT), self.owui.msgs(),
+                         "a writer keyed by the sessionId opened a message of its own")
+        self.assertFalse([k for k in self.conn._turn_pumps if k[1] == self.SID])
+
+    async def test_no_message_is_left_generating(self):
+        await _turn_route_event(self.conn, self.sid_ev(_tool("start", tcid="toolu_7")))
+        await _turn_route_event(self.conn, self.sid_ev(_tool("result", tcid="toolu_7")))
+        await self.spin()
+        open_ = [k for k, m in self.new_messages().items()
+                 if m.get("role") == "assistant" and m.get("done") is False]
+        self.assertEqual(open_, [], "a continuation with no run of its own has no terminal")
