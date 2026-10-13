@@ -6409,6 +6409,33 @@ TURN_CUT_OFF_NOTE = ("_(This reply was cut off: the run was interrupted again af
                      f"{MAX_TURN_RESUMES} attempts to continue it.)_")
 
 
+def _resume_directive(shown: str | None) -> str:
+    """The message a resume sends: continue from what the user already sees.
+
+    A resume follows an outside kill (the owner rule), which also kills any
+    tool call still running. Its result then reads like the command failing
+    (`Exit code 137`), and a resume that does not say why stopped there and
+    asked the user what to do (M3 window, 2026-10-13: 4 of 4)."""
+    cause = (
+        "The Gateway restarted or your process was killed from outside while you "
+        "were working. A tool call that was still running was killed by that, so "
+        "its result (such as exit code 137 or 143) says nothing about the command "
+        "itself: rerun it if the request still needs it.")
+    shown = (shown or "").strip()
+    if shown:
+        return (
+            f"[system] Your previous reply was cut off partway through. {cause} The "
+            "user can already see the following partial text, and it cannot be edited "
+            f"or retracted:\n\n---\n{shown[-1500:]}\n---\n\n"
+            "Continue that reply seamlessly from exactly where it stops and finish the "
+            "request. Do not repeat any of it, do not restart the answer, and do not "
+            "mention the interruption.")
+    return (
+        f"[system] Your previous run was cut off before you produced any output. {cause} "
+        "Answer the most recent message now and finish the request. Do not mention "
+        "the interruption.")
+
+
 def _is_sentinel_message_item(item: dict) -> bool:
     if item.get("type") != "message":
         return False
@@ -6780,20 +6807,8 @@ class _TurnWriter:
             await self._send_resume()
 
     async def _send_resume(self) -> None:
-        shown = (self.renderer.visible_text or "").strip()
-        if shown:
-            directive = (
-                "[system] Your previous reply was cut off partway through. The user can "
-                "already see the following partial text, and it cannot be edited or "
-                f"retracted:\n\n---\n{shown[-1500:]}\n---\n\n"
-                "Continue that reply seamlessly from exactly where it stops. Do not repeat "
-                "any of it, do not restart the answer, and do not mention the interruption.")
-        else:
-            directive = (
-                "[system] Your previous run was cut off before you produced any output. "
-                "Answer the most recent message now, from scratch. Do not mention the "
-                "interruption.")
-        key = pipe_run_id(self.chat_id, self.message_id, "resume")
+        directive = _resume_directive(self.renderer.visible_text)
+        key =pipe_run_id(self.chat_id, self.message_id, "resume")
         try:
             resp = await self.conn.send_request("chat.send", _owui_chat_send_params(
                 session_key=self.session_key, message=directive, idempotency_key=key,

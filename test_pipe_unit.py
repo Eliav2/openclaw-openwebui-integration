@@ -5915,6 +5915,30 @@ class TurnWriterEndTests(_TurnWriterCase):
 
     RUN = "agent-run-1"
 
+    def test_the_resume_says_the_interruption_killed_the_tool_and_asks_to_finish(self):
+        """M3 window (2026-10-13 20:47-21:20Z), 4 of 4 graceful restarts: the
+        restart killed the Bash child, the transcript showed `Exit code 137`,
+        and every resumed run read that as the command failing ("usually the
+        kernel OOM killer"), stopped, and asked the user what to do. The
+        user's request was never finished. The resume must say why the
+        reply was cut off, that a tool call cut off with it was killed by
+        that and not by the command, and that the request is to be finished."""
+        for shown in ("Running step 1.", ""):
+            with self.subTest(shown=shown):
+                d = openclaw_pipe._resume_directive(shown).lower()
+                self.assertIn("gateway", d)
+                self.assertIn("tool call", d)
+                self.assertIn("rerun", d)
+                self.assertIn("finish", d)
+
+    async def test_the_writers_resume_sends_the_directive(self):
+        w = await self.opened_writer()
+        await w.end({"status": "failed", "hasActiveRun": False,
+                     "lastRunError": "Claude Code process exited with code 143"})
+        sends = [p for m, p in self.sent if m == "chat.send"]
+        self.assertEqual(sends[0]["message"],
+                         openclaw_pipe._resume_directive(w.renderer.visible_text))
+
     async def asyncSetUp(self):
         await super().asyncSetUp()
         self.history = _turn_history(run=self.RUN)
