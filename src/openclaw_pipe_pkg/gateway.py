@@ -1525,7 +1525,7 @@ class _GatewayConnection:
         # (ELI-100 DESIGN 2.1): runs that started before the subscription,
         # restart recovery above all, whose start push this socket never got.
         # An empty list means "active, ids not given": the Gateway omits
-        # activeRunIds for claude-cli runs (session-active-runs-BURU1M8_.mjs:91).
+        # activeRunIds for claude-cli runs (session-active-runs-BURU1M8_.mjs:90).
         self.active_run_snapshot: dict[str, list[str]] = {}
         self._subscriptions_stale = False
         # One Event per session someone is waiting on, set by the next

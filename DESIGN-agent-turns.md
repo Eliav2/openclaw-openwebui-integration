@@ -167,7 +167,7 @@ only their `chat final` and `phase:"end"`. So the start push is not enough on it
      unless it has already ended.
    * **Measured live (2026-10-13 ~01:00Z): for claude-cli runs the list gives
      `hasActiveRun: true` but no `activeRunIds`.** The function omits `runIds` whenever
-     the session has an embedded run state (`session-active-runs-BURU1M8_.mjs:91`). So the
+     the session has an embedded run state (`session-active-runs-BURU1M8_.mjs:90`). So the
      guarantee is "the session has an active run", not its id. The pipe records the session
      as active-unknown and gets the id from one of two places:
      * the run's first event that carries `runId` (`chat` deltas and finals reach every
