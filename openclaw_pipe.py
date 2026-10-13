@@ -2620,6 +2620,7 @@ async def _call_native_card_on_live_session(
     sid = _live_session_id_for_user(owui_user_id, SESSION_POOL, owui_chat_id)
     if not sid:
         return None
+    pipe_log(f"  question card: showing it on session {sid[:8]}...")
     interaction_id = str(uuid.uuid4())
     data = {**payload["data"], "interaction_id": interaction_id}
     timeout_s = min(max(data.get("timeout_ms", 120_000) / 1000, 60), 240)
