@@ -103,8 +103,9 @@ async def _claim_turn_message(chat_id: str, user_id: str, message_id: str, run_i
     """Claim message `message_id` for run `run_id` in chat `chat_id`.
 
     Under the chat's row lock (`Chats._chat_transaction`): if the message
-    exists, it is someone's already, unless `takeover` (the inline request
-    handing over its own reply) or its recorded writer is gone. Otherwise it
+    exists, it is someone's already, unless `takeover` (a pipe run taking its
+    own stub, DESIGN 2.6) or its recorded writer is gone. Another live
+    writer's message is never taken. Otherwise it
     is inserted under the deepest leaf, which becomes its parent, and
     `currentId` moves to it. The `chat_message` row is mirrored as
     `insert_chat_turn` does.
@@ -121,7 +122,9 @@ async def _claim_turn_message(chat_id: str, user_id: str, message_id: str, run_i
         msgs = history.setdefault("messages", {})
         existing = msgs.get(message_id)
         if existing is not None:
-            if not (takeover or _writer_may_take_over(existing)):
+            holder = (existing.get("meta") or {}).get("openclaw_writer")
+            held = bool(holder) and holder != writer_id and holder in _live_turn_writers()
+            if held or not (takeover or _writer_may_take_over(existing)):
                 return {"claimed": False, "how": "taken", "message_id": message_id,
                         "parent": existing.get("parentId"), "messages": {}}
             meta = {**(existing.get("meta") or {}), "openclaw_run": run_id,

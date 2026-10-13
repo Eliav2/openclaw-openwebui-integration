@@ -82,7 +82,7 @@ from openclaw_pipe import (
     ACTION_RUN_PREFIX, TURN_NS, _run_id_sent_at, parse_pipe_run_id, pipe_run_id, turn_message_id,
     _claim_turn_message, _register_turn_writer, _retire_turn_writer,
     MAX_TURN_RESUMES, next_continuation, turn_owner,
-    recovery_source_run, run_message_id, _TurnWriter, _turn_route_event, _turn_after_hello, _history_span_messages,
+    recovery_source_run, run_message_id, _TurnWriter, _turn_route_event, _turn_after_hello, _history_span_messages, _register_turn_writer, _retire_turn_writer,
     _GatewayConnection,
     GatewayError,
     _is_restart_signature,
@@ -130,7 +130,6 @@ from openclaw_pipe import (
     TOOL_ERROR_MARK,
     _relay_feed_event,
     _relay_finalize,
-    _finalize_inline_message,
     _relinearize_proactive_variants,
     _heal_proactive_variants,
     _FALLBACK_MODELS,
@@ -1771,30 +1770,6 @@ class OrphanStubReconcileTests(unittest.IsolatedAsyncioTestCase):
         await _relay_finalize(self.conn, state)
         self.assertEqual(self._stub()["content"], "Reading them. Found it.")
         self.assertIs(self._stub()["done"], True)
-
-    @unittest.expectedFailure  # fails on main 787a471; ELI-100 phase 2 (DESIGN 2.2, 2.6) fixes it
-    async def test_relay_writes_into_the_stub_its_run_id_names_when_history_fails(self):
-        """2026-10-12 23:29Z, chat 0abe9bde: Open WebUI was OOM-restarted
-        mid-turn. When run msg-0abe9bde-...-8acdce95-... settled, the stub
-        check logged `orphan stub: chat.history failed: ` (an exception with
-        an empty message, 4 times) and the relay introduced a second message
-        32e095ae under the empty done=False stub 8acdce95. The run id names
-        its message: no transcript read is needed to know where it goes."""
-        async def send_request(method, params, timeout=10):
-            if method == "chat.history":
-                raise asyncio.TimeoutError()
-            if method == "sessions.list":
-                return {"sessions": [{"key": self.sk, "hasActiveRun": False}]}
-            raise AssertionError(method)
-        self.conn.send_request = send_request
-        state = _RelayState(session_key=self.sk, run_id=self.RUN, user_id=self.USER,
-                            chat_id=self.CHAT, renderer=_TurnRenderer())
-        self.conn._relay_sessions[f"{self.sk}:{self.RUN}"] = state
-        state.renderer.feed({"stream": "assistant", "data": {"delta": "Found it."}})
-        self.assertTrue(await _relay_introduce(self.conn, state))
-        self.assertEqual(set(self.chat["history"]["messages"]), {"u1", self.STUB},
-                         "no second message next to the stub")
-        self.assertEqual(state.message_id, self.STUB)
 
     async def test_relay_adopts_its_stub_that_a_graceful_stop_closed(self):
         """2026-10-12 run 3: `ha apps restart` cancelled the reply and Open
@@ -3721,116 +3696,6 @@ class RealHandlerReplayTests(unittest.TestCase):
 
         self.assertEqual(metadata, {})
         self.assertEqual(output[0]["name"], "Read ❌")
-
-
-class ParityFinalizeTests(unittest.TestCase):
-    """Parity finalize: when the inline turn ends before the run does, the
-    ORIGINAL assistant message is completed in place with the full content --
-    never a user message, and never when a live tab already has it."""
-
-    def _conn(self, agent_id="main"):
-        return _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID=agent_id))
-
-    def _session(self):
-        return _owui_session_key(
-            "main", "11111111-1111-1111-1111-111111111111",
-            "22222222-2222-2222-2222-222222222222",
-        )
-
-    def _run_with_fake_chats(self, conn, session_key, run_id, chat_state):
-        class FakeChat:
-            def __init__(self, chat):
-                self.chat = chat
-
-        class FakeChats:
-            @staticmethod
-            async def get_chat_by_id(chat_id):
-                return FakeChat(chat_state)
-
-            @staticmethod
-            async def upsert_message_to_chat_by_id_and_message_id(chat_id, message_id, message):
-                history = chat_state["history"]
-                messages = history.setdefault("messages", {})
-                messages[message_id] = {**messages.get(message_id, {}), **message}
-                history["currentId"] = message_id
-                return FakeChat(chat_state)
-
-        fake_chats_module = types.ModuleType("open_webui.models.chats")
-        fake_chats_module.Chats = FakeChats
-        with mock.patch.dict(sys.modules, {
-            "open_webui": types.ModuleType("open_webui"),
-            "open_webui.models": types.ModuleType("open_webui.models"),
-            "open_webui.models.chats": fake_chats_module,
-        }):
-            asyncio.run(_finalize_inline_message(conn, session_key, run_id))
-
-    def test_completes_assistant_message_in_place(self):
-        conn = self._conn()
-        sk = self._session()
-        conn.register_run_target(sk, "run-1", "chat-1", "asst-1")
-        r = conn._run_renderers[f"{sk}:run-1"]
-        r.feed({"stream": "assistant", "data": {"delta": "Full answer text."}})
-        r.feed({"stream": "tool", "data": {"phase": "result", "name": "Bash",
-                                           "toolCallId": "t1", "result": "ok"}})
-
-        chat_state = {"history": {"currentId": "asst-1", "messages": {
-            "user-1": {"role": "user", "content": "hi", "childrenIds": ["asst-1"]},
-            "asst-1": {"role": "assistant", "content": "Full ans", "done": True,
-                       "parentId": "user-1", "childrenIds": []},
-        }}}
-        self._run_with_fake_chats(conn, sk, "run-1", chat_state)
-
-        msg = chat_state["history"]["messages"]["asst-1"]
-        # OWUI 0.12 draws the message from `output`; `content` is text only.
-        self.assertEqual(msg["content"], "Full answer text.")
-        self.assertEqual([i["type"] for i in msg["output"]],
-                         ["message", "function_call", "function_call_output"])
-        self.assertEqual(msg["output"][1]["id"], "t1")
-        self.assertTrue(msg["done"])
-        # target cleaned up
-        self.assertNotIn(f"{sk}:run-1", conn._run_targets)
-
-    def test_never_overwrites_a_user_message(self):
-        """Critical safety: if the target id resolves to a user message (should
-        never happen, but must never corrupt one), finalize appends a new tail
-        instead of overwriting it in place."""
-        conn = self._conn()
-        sk = self._session()
-        conn.register_run_target(sk, "run-2", "chat-1", "user-1")  # wrong id -> user
-        conn._run_renderers[f"{sk}:run-2"].feed(
-            {"stream": "assistant", "data": {"delta": "assistant tail content"}})
-
-        chat_state = {"history": {"currentId": "user-1", "messages": {
-            "user-1": {"role": "user", "content": "original user text",
-                       "childrenIds": []},
-        }}}
-        self._run_with_fake_chats(conn, sk, "run-2", chat_state)
-
-        # the user message must be untouched
-        self.assertEqual(
-            chat_state["history"]["messages"]["user-1"]["content"], "original user text")
-        # and the content landed as a NEW assistant message, not lost
-        assts = [m for m in chat_state["history"]["messages"].values()
-                 if m.get("role") == "assistant"]
-        self.assertTrue(any("assistant tail content" in (m.get("content") or "") for m in assts))
-
-    def test_noop_when_delivered_live(self):
-        conn = self._conn()
-        sk = self._session()
-        conn.register_run_target(sk, "run-3", "chat-1", "asst-3")
-        conn._run_renderers[f"{sk}:run-3"].feed(
-            {"stream": "assistant", "data": {"delta": "tail"}})
-        conn.mark_delivered_live(sk, "run-3")
-
-        chat_state = {"history": {"currentId": "asst-3", "messages": {
-            "asst-3": {"role": "assistant", "content": "partial", "done": True,
-                       "childrenIds": []},
-        }}}
-        self._run_with_fake_chats(conn, sk, "run-3", chat_state)
-
-        # untouched -- a live tab already persisted it
-        self.assertEqual(
-            chat_state["history"]["messages"]["asst-3"]["content"], "partial")
 
 
 class RelinearizeProactiveVariantsTests(unittest.TestCase):
@@ -8402,6 +8267,92 @@ class AgentTurnRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("sessions.list", [m for m, _ in self.sent])
         (_mid, m), = self.new_messages().items()
         self.assertIs(m["done"], False, "the recovery still runs: M stays open for it")
+
+    # ── Handover (DESIGN 2.6): a user turn whose request ends before its run ──
+
+    STUB = "8acdce95-1111-4222-8333-444455556666"
+
+    def add_stub(self, mid, **fields):
+        msgs = self.owui.chat.chat["history"]["messages"]
+        msgs["a1"]["childrenIds"] = [mid]
+        msgs[mid] = {"id": mid, "role": "assistant", "parentId": "a1", "childrenIds": [],
+                     "content": "", "output": [], "done": False, **fields}
+        self.owui.chat.chat["history"]["currentId"] = mid
+
+    async def dispatch(self, run, payload):
+        """What the receive loop does for one event: the shadow renderer of a
+        tracked run is fed first, then the event is routed."""
+        shadow = self.conn._run_renderers.get(f"{self.key}:{run}")
+        if shadow is not None:
+            shadow.feed(payload)
+        return await _turn_route_event(self.conn, self.ev(run, payload))
+
+    async def test_handover_an_inline_reply_that_ends_early_continues_in_its_own_message(self):
+        run = pipe_run_id(self.CHAT, self.STUB)
+        self.add_stub(self.STUB, content="Reading them.")
+        self.conn.register_run_target(self.key, run, self.CHAT, self.STUB)
+        self.conn._run_renderers[f"{self.key}:{run}"].feed(_delta("Reading them."))
+        # The request is gone (no consumer): the run's next events.
+        self.assertTrue(await self.dispatch(run, _tool("start", tcid="toolu_1")))
+        await self.dispatch(run, _tool("result", tcid="toolu_1"))
+        await self.dispatch(run, _delta(" Found it."))
+        await self.dispatch(run, {"state": "final"})
+        self.history = _turn_history(run=run)
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "done", "lastRunId": run})
+        await self.spin()
+        self.assertEqual(self.new_messages().keys(), {self.STUB}, "no second message")
+        m = self.owui.msgs()[self.STUB]
+        self.assertIs(m["done"], True)
+        self.assertEqual(m["content"], "Reading them. Found it.")
+        self.assertEqual(sum(1 for i in m["output"] if i["type"] == "function_call"), 1)
+        self.assertEqual(m["meta"]["openclaw_writer"], self.conn.writer_id)
+        self.assertNotIn(f"{self.key}:{run}", self.conn._run_targets, "the shadow is retired")
+
+    async def test_handover_after_an_owui_restart_takes_the_stub_its_run_id_names(self):
+        """2026-10-12 23:29Z, chat 0abe9bde (fails on main 787a471, where it
+        was `test_relay_writes_into_the_stub_its_run_id_names_when_history_fails`):
+        Open WebUI was OOM-restarted mid-turn, so no request and no target
+        remain. chat.history failed with an empty TimeoutError, and main's
+        relay introduced a second message 32e095ae under the empty done=False
+        stub 8acdce95. The run id names its message: no transcript read is
+        needed to know where it goes."""
+        run = pipe_run_id(self.CHAT, self.STUB)
+        self.add_stub(self.STUB)
+        inner = self.conn.send_request
+
+        async def send_request(method, params, timeout=10):
+            if method == "chat.history":
+                raise asyncio.TimeoutError()
+            return await inner(method, params, timeout)
+        self.conn.send_request = send_request
+        self.assertTrue(await self.dispatch(run, _delta("Found it.")))
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "done", "lastRunId": run})
+        await self.spin()
+        self.assertEqual(self.new_messages().keys(), {self.STUB}, "no second message next to the stub")
+        m = self.owui.msgs()[self.STUB]
+        self.assertEqual((m["content"], m["done"]), ("Found it.", True))
+
+    async def test_handover_never_takes_a_message_another_live_writer_holds(self):
+        run = pipe_run_id(self.CHAT, self.STUB)
+        self.add_stub(self.STUB, content="theirs", meta={"openclaw_writer": "other-writer"})
+        _register_turn_writer("other-writer")
+        self.addCleanup(_retire_turn_writer, "other-writer")
+        await self.dispatch(run, _delta("mine"))
+        await self.spin()
+        m = self.owui.msgs()[self.STUB]
+        self.assertEqual((m["content"], m["meta"]["openclaw_writer"]), ("theirs", "other-writer"))
+        self.assertEqual(self.new_messages().keys(), {self.STUB})
+
+    async def test_a_late_event_of_a_run_shown_live_reopens_nothing(self):
+        run = pipe_run_id(self.CHAT, self.STUB)
+        self.add_stub(self.STUB, content="Done.", done=True)
+        self.conn.mark_delivered_live(self.key, run)
+        self.assertTrue(await self.dispatch(run, _tool("result", tcid="toolu_1")))
+        await self.spin()
+        self.assertEqual(self.owui.msgs()[self.STUB]["done"], True)
+        self.assertEqual(self.conn._turn_pumps, {})
 
     async def test_a_run_a_live_request_consumes_is_not_routed(self):
         q = self.conn.register_consumer(self.key, "msg-run")

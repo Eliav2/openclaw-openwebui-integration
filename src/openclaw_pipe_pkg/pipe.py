@@ -1280,11 +1280,11 @@ class Pipe:
                 turn.run_id = our_run_id
                 turn.queue = queue
                 turn.run_text = None
-        # Parity (2026-07-19): tell the persistent connection which OWUI message
-        # this run streams into, so a shadow renderer can finalize that message
-        # to the complete content if this inline turn ends before the run does
-        # (idle self-close / cancel / torn-down request). No-op without a stable
-        # message id. See _finalize_inline_message / _TurnRenderer in gateway.py.
+        # Tell the persistent connection which OWUI message this run streams
+        # into, so a turn writer continues that message from a shadow renderer
+        # if this inline turn ends before the run does (cancel, close, a
+        # torn-down request). No-op without a stable message id. See
+        # _turn_route_event (writer.py) and _TurnRenderer (gateway.py).
         owui_message_id = (__metadata__ or {}).get("message_id")
         conn.register_run_target(
             session_key, our_run_id, owui_origin_chat_id, owui_message_id,
@@ -2443,9 +2443,9 @@ class Pipe:
                 if done and not aborted and our_run_id:
                     # The run ended in this reply. Its trailing `chat` final
                     # lands after this consumer is gone and must not read as
-                    # "the reply ended before its run" (parity would rewrite
-                    # the message OWUI is about to save) or as a run nobody
-                    # showed (proactive delivery).
+                    # "the reply ended before its run" (a handover would
+                    # rewrite the message OWUI is about to save) or as a run
+                    # nobody showed.
                     conn.mark_delivered_live(session_key, our_run_id)
                     conn.unregister_run_target(session_key, our_run_id)
                 conn.unregister_consumer(session_key, our_run_id, queue=queue)

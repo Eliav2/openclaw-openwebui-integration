@@ -87,11 +87,15 @@ class _TurnWriter:
     """Writes run `run_id` into message `message_id` of chat `chat_id`."""
 
     def __init__(self, conn: "_GatewayConnection", *, session_key: str, chat_id: str,
-                 user_id: str, run_id: str, message_id: str | None):
+                 user_id: str, run_id: str, message_id: str | None,
+                 takeover: bool = False, renderer: "_TurnRenderer | None" = None):
         self.conn = conn
         self.session_key, self.chat_id, self.user_id = session_key, chat_id, user_id
         self.run_id, self.message_id = run_id, message_id
-        self.renderer = _TurnRenderer()
+        # A pipe run's message already exists (Open WebUI's stub): the writer
+        # takes it over instead of inserting one (DESIGN 2.6).
+        self.takeover = takeover
+        self.renderer = renderer if renderer is not None else _TurnRenderer()
         self.opened = False
         self.task_id: str | None = None
         self.parent_id: str | None = None
@@ -137,19 +141,21 @@ class _TurnWriter:
             return True
         return _relay_content_is_showable(self.renderer.visible_text or "")
 
-    async def feed(self, payload: dict) -> None:
+    async def feed(self, payload: dict | None) -> None:
         """One event of the run: grow the renderer, open the message on the
-        first showable item, then stream what changed."""
+        first showable item, then stream what changed. None streams what the
+        renderer already holds (a handover's shadow renderer)."""
         if self.closed:
             return
         try:
-            self.renderer.feed(payload)
+            if payload is not None:
+                self.renderer.feed(payload)
         except Exception as ex:
             pipe_log(f"  turn writer: renderer feed failed: {ex}")
         if not self.opened:
             if not self._showable():
                 return
-            if not await self.open():
+            if not await self.open(takeover=self.takeover):
                 self.closed = True
                 return
         await self._stream()
@@ -287,7 +293,7 @@ class _TurnWriter:
                 if rebuilt.output:
                     self.renderer = rebuilt
             if not self.opened:
-                if not (self._showable() or note) or not await self.open():
+                if not (self._showable() or note) or not await self.open(takeover=self.takeover):
                     return
             output = [i for i in self.renderer.finished_output()
                       if not _is_sentinel_message_item(i)]
@@ -360,27 +366,42 @@ class _RunPump:
     def __init__(self):
         self.queue: asyncio.Queue = asyncio.Queue()
         self.writer: "_TurnWriter | None" = None
+        self.handover: dict | None = None  # {message_id, renderer} of a request that ended early
         self.stop_notice_before = False
 
 
 async def _turn_route_event(conn: "_GatewayConnection", payload: dict) -> bool:
     """Queue `payload` for its run's writer when the run is a turn this
-    connection writes: an OWUI session key, no live request consuming it, and
-    not an inline turn's own run (that one is handed over, DESIGN 2.6). True
+    connection writes: an OWUI session key and no live request consuming it.
+    A run whose request ended before it is handed over (DESIGN 2.6). True
     when handled here."""
     sess, run = payload.get("sessionKey") or "", payload.get("runId") or ""
     if not (getattr(conn, "writes_turns", False) and sess and run) or conn._retired:
         return False
     parsed = conn.parse_owui_session_key(sess)
-    if not parsed or conn.consumers_for_event(payload) or f"{sess}:{run}" in conn._run_targets:
+    if not parsed or conn.consumers_for_event(payload):
         return False
     if run.startswith(ACTION_RUN_PREFIX):
         return True  # the Status Action's own runs render nothing
+    if conn.was_delivered_live(sess, run):
+        # A request showed this run to the end, or a Stop / Send now closed
+        # its message: a late event reopens nothing.
+        return True
     pump = conn._turn_pumps.get((sess, run))
     if pump is None:
         pump = conn._turn_pumps[(sess, run)] = _RunPump()
+        target = conn._run_targets.get(f"{sess}:{run}")
+        if target is not None:
+            # DESIGN 2.6: the request streaming this run ended before it. The
+            # writer continues in the same message from the shadow renderer,
+            # which already holds this event.
+            pump.handover = {"message_id": target["message_id"],
+                             "renderer": conn._run_renderers.get(f"{sess}:{run}")}
+            conn.unregister_run_target(sess, run)
         spawn_background(_turn_pump_loop(conn, sess, run, parsed, pump))
         spawn_background(conn.ensure_message_subscription(sess))
+        if target is not None:
+            return True
     if payload.get("state") in ("final", "error", "aborted"):
         pump.stop_notice_before = conn._stop_notice_seen
     pump.queue.put_nowait(("event", payload))
@@ -412,8 +433,12 @@ async def _turn_writer_for(conn: "_GatewayConnection", sess: str, run: str,
     if writer is not None and not writer.closed:
         writer.adopt(run)
         return writer
+    # A pipe run names Open WebUI's stub for its turn: after an Open WebUI
+    # restart no request or target is left, and the writer takes the stub
+    # over unless another live writer holds it.
     writer = _TurnWriter(conn, session_key=sess, chat_id=chat_id, user_id=user_id,
-                         run_id=run, message_id=mid)
+                         run_id=run, message_id=mid,
+                         takeover=parse_pipe_run_id(run) is not None)
     conn._turn_writers[(chat_id, mid)] = writer
     return writer
 
@@ -422,7 +447,15 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
                           parsed: tuple, pump: _RunPump) -> None:
     user_id, chat_id = parsed
     try:
-        pump.writer = await _turn_writer_for(conn, sess, run, user_id, chat_id)
+        handed = pump.handover
+        if handed is not None:
+            pump.writer = _TurnWriter(conn, session_key=sess, chat_id=chat_id, user_id=user_id,
+                                      run_id=run, message_id=handed["message_id"], takeover=True,
+                                      renderer=handed["renderer"])
+            conn._turn_writers[(chat_id, handed["message_id"])] = pump.writer
+            await pump.writer.feed(None)
+        else:
+            pump.writer = await _turn_writer_for(conn, sess, run, user_id, chat_id)
         while True:
             kind, item = await pump.queue.get()
             writer = pump.writer

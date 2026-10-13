@@ -344,8 +344,9 @@ async def _claim_turn_message(chat_id: str, user_id: str, message_id: str, run_i
     """Claim message `message_id` for run `run_id` in chat `chat_id`.
 
     Under the chat's row lock (`Chats._chat_transaction`): if the message
-    exists, it is someone's already, unless `takeover` (the inline request
-    handing over its own reply) or its recorded writer is gone. Otherwise it
+    exists, it is someone's already, unless `takeover` (a pipe run taking its
+    own stub, DESIGN 2.6) or its recorded writer is gone. Another live
+    writer's message is never taken. Otherwise it
     is inserted under the deepest leaf, which becomes its parent, and
     `currentId` moves to it. The `chat_message` row is mirrored as
     `insert_chat_turn` does.
@@ -362,7 +363,9 @@ async def _claim_turn_message(chat_id: str, user_id: str, message_id: str, run_i
         msgs = history.setdefault("messages", {})
         existing = msgs.get(message_id)
         if existing is not None:
-            if not (takeover or _writer_may_take_over(existing)):
+            holder = (existing.get("meta") or {}).get("openclaw_writer")
+            held = bool(holder) and holder != writer_id and holder in _live_turn_writers()
+            if held or not (takeover or _writer_may_take_over(existing)):
                 return {"claimed": False, "how": "taken", "message_id": message_id,
                         "parent": existing.get("parentId"), "messages": {}}
             meta = {**(existing.get("meta") or {}), "openclaw_run": run_id,
@@ -3953,7 +3956,7 @@ class _TurnRenderer:
     """Reconstructs the visible assistant content of a run from its raw gateway
     event stream, mirroring the inline pipe loop's rendering.
 
-    Purpose (parity, 2026-07-19): when the inline pipe generator ends BEFORE a
+    Purpose (2026-07-19; handover since ELI-100): when the inline pipe generator ends BEFORE a
     long run finishes (idle self-close, cancel, or a torn-down request), the
     tail used to survive only as a truncated, tool-block-less *proactive*
     bubble read from a length-capped `sessions.preview`. This renderer instead
@@ -4359,14 +4362,13 @@ class _GatewayConnection:
             _shared["chat_write_locks"] if _shared is not None else {}
         )
 
-        # Parity bookkeeping (2026-07-19). For a run that a live pipe() call is
-        # rendering into a known OWUI message, `_run_targets[key]` holds that
-        # message's (chat_id, message_id) and `_run_renderers[key]` a
-        # `_TurnRenderer` accumulating the full content from this run's event
-        # stream -- so if the inline turn ends before the run does (idle
-        # self-close / cancel / torn-down request), the run's final can finalize
-        # the ORIGINAL message to the complete content instead of stranding the
-        # tail in a truncated, tool-block-less proactive bubble. Instance-local
+        # Shadow bookkeeping. For a run that a live pipe() call is rendering
+        # into a known OWUI message, `_run_targets[key]` holds that message's
+        # (chat_id, message_id) and `_run_renderers[key]` a `_TurnRenderer`
+        # accumulating the full content from this run's event stream -- so if
+        # the inline turn ends before the run does (cancel, close, a torn-down
+        # request), a turn writer continues the SAME message from it
+        # (`_turn_route_event`, DESIGN 2.6). Instance-local
         # (not shared): only the singleton connection runs pipe() and dispatches
         # its own events; a zombie connection never registers a target.
         self._run_targets: dict[str, dict] = {}
@@ -5070,8 +5072,8 @@ class _GatewayConnection:
         run: give it the run's dedup baselines (so the closing whole-text
         events are not appended again) and feed it the events still waiting
         in `queue`, which were dispatched before this reply registered its
-        own target. Without this its parity finalize would miss the buffered
-        text and duplicate the rest."""
+        own target. Without this a handover to a turn writer would miss the
+        buffered text and duplicate the rest."""
         renderer = self._run_renderers.get(f"{session_key}:{run_id}")
         if renderer is None:
             return
@@ -5432,11 +5434,11 @@ class _GatewayConnection:
                 if payload.get("stream") == "tool" and not self._first_tool_event(payload):
                     continue
 
-                # ── Parity shadow render (2026-07-19) ──
+                # ── Shadow render ──
                 # Feed every event of a run we're tracking into its shadow
                 # `_TurnRenderer`, whether or not a live consumer is still
-                # attached: the inline turn can end at any point, and we must
-                # already hold the complete content to finalize its message.
+                # attached: the inline turn can end at any point, and the turn
+                # writer it hands over to starts from this content.
                 _evt_sess = payload.get("sessionKey", "")
                 _evt_run = payload.get("runId", "")
                 if _evt_sess and _evt_run:
@@ -5507,27 +5509,6 @@ class _GatewayConnection:
                         self.unregister_run_target(payload["sessionKey"], payload["runId"])
                     for q in consumers[0].queues:
                         await q.put(msg)
-                    continue
-
-                # ── Parity finalize (2026-07-19) ──
-                # A final arrived with NO live consumer, but we were tracking
-                # this run's OWUI message -- i.e. the inline pipe() turn ended
-                # before the run did. Complete the ORIGINAL message with the
-                # full shadow-rendered content, in place, instead of letting
-                # the tail fall through to the detached/truncated proactive
-                # new-bubble path below.
-                if (
-                    payload.get("state") == "final"
-                    and _evt_sess and _evt_run
-                    and f"{_evt_sess}:{_evt_run}" in self._run_targets
-                ):
-                    pipe_log(
-                        f"  parity: inline turn ended early; finalizing message "
-                        f"for run {_evt_run[:20]}..."
-                    )
-                    spawn_background(
-                        _finalize_inline_message(self, _evt_sess, _evt_run)
-                    )
                     continue
 
                 # ── Proactive delivery for idle OWUI sessions (P33/ELI-17/ELI-19) ──
@@ -7070,91 +7051,6 @@ def _ensure_orphan_reconcile(valves_getter) -> None:
     _orphan_reconcile_task = spawn_background(_reconcile_orphan_stubs(valves_getter))
 
 
-async def _finalize_inline_message(
-    conn: "_GatewayConnection", session_key: str, run_id: str
-) -> None:
-    """Parity path (2026-07-19): when a run's inline pipe() turn ended before
-    the run itself finished, write the COMPLETE shadow-rendered content into
-    the ORIGINAL OWUI message the turn was streaming into.
-
-    Result is parity with a turn that was never interrupted -- same message,
-    full assistant text + every tool block, marked done -- instead of the tail
-    stranding in a truncated, tool-block-less, detached proactive bubble.
-
-    Safety: only ever overwrites an *assistant* message in place. If the target
-    id is missing or isn't an assistant message (must never clobber a user
-    turn), it falls back to appending the full content as a new tail message so
-    nothing is lost and nothing is corrupted.
-    """
-    key = f"{session_key}:{run_id}"
-    try:
-        target = conn._run_targets.get(key)
-        renderer = conn._run_renderers.get(key)
-        if not target or renderer is None:
-            return
-        if conn.was_delivered_live(session_key, run_id):
-            return  # a live tab already persisted it via OWUI's own flow
-        content = (renderer.visible_text or "").strip()
-        if not content:
-            return
-        dedup = f"finalize:{key}"
-        if dedup in conn._delivered_proactive:
-            return
-        conn._delivered_proactive[dedup] = True
-
-        chat_id = target["chat_id"]
-        message_id = target["message_id"]
-        try:
-            from open_webui.models.chats import Chats
-        except Exception as ex:
-            pipe_log(f"  parity finalize unavailable (not inside OWUI process?): {ex}")
-            return
-
-        try:
-            chat = await Chats.get_chat_by_id(chat_id)
-            if chat is None:
-                pipe_log(f"  parity finalize: chat {chat_id[:8]}... not found")
-                return
-            messages = (chat.chat.get("history", {}) or {}).get("messages", {}) or {}
-            existing = messages.get(message_id)
-            if existing and existing.get("role") == "assistant":
-                # Update the existing assistant message in place: OWUI's upsert
-                # merges these fields into it, keeping role/parentId/childrenIds/
-                # model. This is the parity case -- same bubble, full content.
-                # OWUI 0.12 draws the message from `output` whenever it has
-                # one, so the run's items replace it; `content` is text only,
-                # as OWUI stores it.
-                fields: dict = {"content": content, "done": True}
-                if renderer.output:
-                    fields = {"content": renderer.text.strip(), "done": True,
-                              "output": renderer.finished_output()}
-                async with conn._chat_write_lock(chat_id):
-                    await Chats.upsert_message_to_chat_by_id_and_message_id(
-                        chat_id, message_id, fields,
-                    )
-                pipe_log(
-                    f"  parity finalize: completed assistant message "
-                    f"{message_id[:8]}... in place ({len(content)} chars, "
-                    f"{sum(1 for i in fields.get('output', []) if i.get('type') == 'function_call')}"
-                    " tool card(s))"
-                )
-            else:
-                # Original id missing or not an assistant message -- never
-                # overwrite it. Append the full content as a new tail message
-                # (still complete, with tool blocks) so the turn isn't lost.
-                if await _append_proactive_message_to_chat(
-                    conn, chat_id, content, log_prefix="parity finalize (fallback append)"
-                ):
-                    pipe_log(
-                        f"  parity finalize: original id absent, appended full "
-                        f"content as new tail ({len(content)} chars)"
-                    )
-        except Exception as ex:
-            pipe_log(f"  parity finalize failed: {ex}")
-    finally:
-        conn.unregister_run_target(session_key, run_id)
-
-
 async def _deliver_proactive_owui_message(
     conn: "_GatewayConnection", session_key: str, run_id: str
 ) -> None:
@@ -7534,11 +7430,15 @@ class _TurnWriter:
     """Writes run `run_id` into message `message_id` of chat `chat_id`."""
 
     def __init__(self, conn: "_GatewayConnection", *, session_key: str, chat_id: str,
-                 user_id: str, run_id: str, message_id: str | None):
+                 user_id: str, run_id: str, message_id: str | None,
+                 takeover: bool = False, renderer: "_TurnRenderer | None" = None):
         self.conn = conn
         self.session_key, self.chat_id, self.user_id = session_key, chat_id, user_id
         self.run_id, self.message_id = run_id, message_id
-        self.renderer = _TurnRenderer()
+        # A pipe run's message already exists (Open WebUI's stub): the writer
+        # takes it over instead of inserting one (DESIGN 2.6).
+        self.takeover = takeover
+        self.renderer = renderer if renderer is not None else _TurnRenderer()
         self.opened = False
         self.task_id: str | None = None
         self.parent_id: str | None = None
@@ -7584,19 +7484,21 @@ class _TurnWriter:
             return True
         return _relay_content_is_showable(self.renderer.visible_text or "")
 
-    async def feed(self, payload: dict) -> None:
+    async def feed(self, payload: dict | None) -> None:
         """One event of the run: grow the renderer, open the message on the
-        first showable item, then stream what changed."""
+        first showable item, then stream what changed. None streams what the
+        renderer already holds (a handover's shadow renderer)."""
         if self.closed:
             return
         try:
-            self.renderer.feed(payload)
+            if payload is not None:
+                self.renderer.feed(payload)
         except Exception as ex:
             pipe_log(f"  turn writer: renderer feed failed: {ex}")
         if not self.opened:
             if not self._showable():
                 return
-            if not await self.open():
+            if not await self.open(takeover=self.takeover):
                 self.closed = True
                 return
         await self._stream()
@@ -7734,7 +7636,7 @@ class _TurnWriter:
                 if rebuilt.output:
                     self.renderer = rebuilt
             if not self.opened:
-                if not (self._showable() or note) or not await self.open():
+                if not (self._showable() or note) or not await self.open(takeover=self.takeover):
                     return
             output = [i for i in self.renderer.finished_output()
                       if not _is_sentinel_message_item(i)]
@@ -7807,27 +7709,42 @@ class _RunPump:
     def __init__(self):
         self.queue: asyncio.Queue = asyncio.Queue()
         self.writer: "_TurnWriter | None" = None
+        self.handover: dict | None = None  # {message_id, renderer} of a request that ended early
         self.stop_notice_before = False
 
 
 async def _turn_route_event(conn: "_GatewayConnection", payload: dict) -> bool:
     """Queue `payload` for its run's writer when the run is a turn this
-    connection writes: an OWUI session key, no live request consuming it, and
-    not an inline turn's own run (that one is handed over, DESIGN 2.6). True
+    connection writes: an OWUI session key and no live request consuming it.
+    A run whose request ended before it is handed over (DESIGN 2.6). True
     when handled here."""
     sess, run = payload.get("sessionKey") or "", payload.get("runId") or ""
     if not (getattr(conn, "writes_turns", False) and sess and run) or conn._retired:
         return False
     parsed = conn.parse_owui_session_key(sess)
-    if not parsed or conn.consumers_for_event(payload) or f"{sess}:{run}" in conn._run_targets:
+    if not parsed or conn.consumers_for_event(payload):
         return False
     if run.startswith(ACTION_RUN_PREFIX):
         return True  # the Status Action's own runs render nothing
+    if conn.was_delivered_live(sess, run):
+        # A request showed this run to the end, or a Stop / Send now closed
+        # its message: a late event reopens nothing.
+        return True
     pump = conn._turn_pumps.get((sess, run))
     if pump is None:
         pump = conn._turn_pumps[(sess, run)] = _RunPump()
+        target = conn._run_targets.get(f"{sess}:{run}")
+        if target is not None:
+            # DESIGN 2.6: the request streaming this run ended before it. The
+            # writer continues in the same message from the shadow renderer,
+            # which already holds this event.
+            pump.handover = {"message_id": target["message_id"],
+                             "renderer": conn._run_renderers.get(f"{sess}:{run}")}
+            conn.unregister_run_target(sess, run)
         spawn_background(_turn_pump_loop(conn, sess, run, parsed, pump))
         spawn_background(conn.ensure_message_subscription(sess))
+        if target is not None:
+            return True
     if payload.get("state") in ("final", "error", "aborted"):
         pump.stop_notice_before = conn._stop_notice_seen
     pump.queue.put_nowait(("event", payload))
@@ -7859,8 +7776,12 @@ async def _turn_writer_for(conn: "_GatewayConnection", sess: str, run: str,
     if writer is not None and not writer.closed:
         writer.adopt(run)
         return writer
+    # A pipe run names Open WebUI's stub for its turn: after an Open WebUI
+    # restart no request or target is left, and the writer takes the stub
+    # over unless another live writer holds it.
     writer = _TurnWriter(conn, session_key=sess, chat_id=chat_id, user_id=user_id,
-                         run_id=run, message_id=mid)
+                         run_id=run, message_id=mid,
+                         takeover=parse_pipe_run_id(run) is not None)
     conn._turn_writers[(chat_id, mid)] = writer
     return writer
 
@@ -7869,7 +7790,15 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
                           parsed: tuple, pump: _RunPump) -> None:
     user_id, chat_id = parsed
     try:
-        pump.writer = await _turn_writer_for(conn, sess, run, user_id, chat_id)
+        handed = pump.handover
+        if handed is not None:
+            pump.writer = _TurnWriter(conn, session_key=sess, chat_id=chat_id, user_id=user_id,
+                                      run_id=run, message_id=handed["message_id"], takeover=True,
+                                      renderer=handed["renderer"])
+            conn._turn_writers[(chat_id, handed["message_id"])] = pump.writer
+            await pump.writer.feed(None)
+        else:
+            pump.writer = await _turn_writer_for(conn, sess, run, user_id, chat_id)
         while True:
             kind, item = await pump.queue.get()
             writer = pump.writer
@@ -9387,11 +9316,11 @@ class Pipe:
                 turn.run_id = our_run_id
                 turn.queue = queue
                 turn.run_text = None
-        # Parity (2026-07-19): tell the persistent connection which OWUI message
-        # this run streams into, so a shadow renderer can finalize that message
-        # to the complete content if this inline turn ends before the run does
-        # (idle self-close / cancel / torn-down request). No-op without a stable
-        # message id. See _finalize_inline_message / _TurnRenderer in gateway.py.
+        # Tell the persistent connection which OWUI message this run streams
+        # into, so a turn writer continues that message from a shadow renderer
+        # if this inline turn ends before the run does (cancel, close, a
+        # torn-down request). No-op without a stable message id. See
+        # _turn_route_event (writer.py) and _TurnRenderer (gateway.py).
         owui_message_id = (__metadata__ or {}).get("message_id")
         conn.register_run_target(
             session_key, our_run_id, owui_origin_chat_id, owui_message_id,
@@ -10550,9 +10479,9 @@ class Pipe:
                 if done and not aborted and our_run_id:
                     # The run ended in this reply. Its trailing `chat` final
                     # lands after this consumer is gone and must not read as
-                    # "the reply ended before its run" (parity would rewrite
-                    # the message OWUI is about to save) or as a run nobody
-                    # showed (proactive delivery).
+                    # "the reply ended before its run" (a handover would
+                    # rewrite the message OWUI is about to save) or as a run
+                    # nobody showed.
                     conn.mark_delivered_live(session_key, our_run_id)
                     conn.unregister_run_target(session_key, our_run_id)
                 conn.unregister_consumer(session_key, our_run_id, queue=queue)
