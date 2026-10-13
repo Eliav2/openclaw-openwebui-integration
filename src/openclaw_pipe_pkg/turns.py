@@ -42,6 +42,23 @@ def parse_pipe_run_id(run_id: str) -> dict | None:
     return {"chat": m.group("chat"), "message": m.group("message"), "kind": kind}
 
 
+def parse_announce_run_id(run_id: str) -> dict | None:
+    """{child_session, child_run} of a sub-agent announce run, else None.
+
+    The Gateway runs a child's completion in the parent session with run id
+    `announce:` + `v1:<childSessionKey>:<childRunId>` (announce-idempotency-
+    D7LnUTJR.mjs:4-10), suffixed `:wake` or `:retry-<n>` on redelivery. A
+    `announce:requester-settle:...` run wakes a yielded parent for a batch
+    of children and names no single child."""
+    if not (run_id or "").startswith("announce:v1:"):
+        return None
+    rest = re.sub(r":(?:wake|retry-\d+)$", "", run_id[len("announce:v1:"):])
+    child_session, _, child_run = rest.rpartition(":")
+    if not child_session.startswith("agent:") or not child_run:
+        return None
+    return {"child_session": child_session, "child_run": child_run}
+
+
 def turn_message_id(session_key: str, run_id: str, chat_id: str | None = None) -> str | None:
     """The Open WebUI message run `run_id` on `session_key` renders into, or
     None when it renders nothing (the Status Action's own runs). A pipe run

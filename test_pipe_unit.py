@@ -7036,6 +7036,103 @@ class TitleRunSignalTests(unittest.IsolatedAsyncioTestCase):
                         consumers_at_send)
 
 
+class AnnounceRunIdTests(unittest.TestCase):
+    CHILD = "agent:main:subagent:8b40b654-9b17-4fed-a36f-7f2031dbcb32"
+
+    def test_shapes(self):
+        want = {"child_session": self.CHILD, "child_run": "r-1"}
+        for rid in (f"announce:v1:{self.CHILD}:r-1", f"announce:v1:{self.CHILD}:r-1:wake",
+                    f"announce:v1:{self.CHILD}:r-1:retry-2"):
+            with self.subTest(rid):
+                self.assertEqual(openclaw_pipe.parse_announce_run_id(rid), want)
+        for rid in ("announce:requester-settle:main:k:r-1", "msg-c-m-1.0", "", None):
+            with self.subTest(rid):
+                self.assertIsNone(openclaw_pipe.parse_announce_run_id(rid))
+
+
+class SilentAnnounceTests(_RoutingCase):
+    """Review 2af1 R10: a sub-agent's completion reaches the parent as an
+    announce run, id `announce:v1:<childSessionKey>:<childRunId>`
+    (announce-idempotency-D7LnUTJR.mjs:4-10), whose closing message is
+    `cli-assistant:<that id>` and which has no user turn in chat.history
+    (live probe runs/r10-probe, 2026-10-13). When the parent answers it with
+    NO_REPLY, nothing showed the child's result."""
+
+    CHILD = "agent:main:subagent:8b40b654-9b17-4fed-a36f-7f2031dbcb32"
+    CHILD_RUN = "df81c6dc-3035-49fc-89d4-55ecf4e339ce"
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.announce = f"announce:v1:{self.CHILD}:{self.CHILD_RUN}"
+        self.child_history = {"messages": [
+            {"role": "user", "content": "Reply with exactly SUB-DONE-R10.",
+             "idempotencyKey": f"{self.CHILD_RUN}:user"},
+            {"role": "assistant", "content": [{"type": "text", "text": "SUB-DONE-R10"}],
+             "idempotencyKey": f"cli-assistant:{self.CHILD_RUN}"}]}
+        test, parent = self, self.conn.send_request
+
+        async def send_request(method, params, timeout=10):
+            if method == "chat.history" and params.get("sessionKey") == test.CHILD:
+                test.sent.append((method, copy.deepcopy(params)))
+                if test.child_history is None:
+                    raise GatewayError("session not found")
+                return copy.deepcopy(test.child_history)
+            return await parent(method, params, timeout)
+        self.conn.send_request = send_request
+
+    def parent_history(self, reply):
+        imported = {"importedFrom": "claude-cli"}
+        return {"messages": [
+            {"role": "user", "content": "spawn it", "idempotencyKey": "msg-x-1.0:user"},
+            {"role": "assistant", "__openclaw": imported, "content": [
+                {"type": "toolcall", "id": "toolu_s", "name": "mcp__openclaw__sessions_spawn",
+                 "arguments": {"task": "Reply with exactly SUB-DONE-R10.", "label": "R10 probe sub-agent"}},
+                {"type": "tool_result", "tool_use_id": "toolu_s", "content": [{"type": "text", "text":
+                    json.dumps({"status": "accepted", "childSessionKey": self.CHILD,
+                                "runId": self.CHILD_RUN})}]}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "SPAWNED"}],
+             "idempotencyKey": "cli-assistant:msg-x-1.0"},
+            {"role": "assistant", "content": [{"type": "text", "text": reply}],
+             "idempotencyKey": f"cli-assistant:{self.announce}"}]}
+
+    async def announce_run(self, reply):
+        self.history = self.parent_history(reply)
+        await _turn_route_event(self.conn, self.ev(self.announce, _delta(reply)))
+        await _turn_route_event(self.conn, self.ev(self.announce, {"state": "final"}))
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "done", "lastRunId": self.announce})
+        await self.spin()
+
+    async def test_a_silent_announce_shows_the_childs_result_as_a_card(self):
+        await self.announce_run("NO_REPLY")
+        (m,) = self.new_messages().values()
+        self.assertIs(m["done"], True)
+        self.assertNotIn("NO_REPLY", m.get("content") or "")
+        calls = [i for i in m["output"] if i["type"] == "function_call"]
+        outputs = [i for i in m["output"] if i["type"] == "function_call_output"]
+        self.assertEqual(len(calls), 1)
+        self.assertIn("R10 probe sub-agent", calls[0]["arguments"])
+        self.assertIn("SUB-DONE-R10", json.dumps(outputs))
+
+    async def test_an_announce_the_parent_answered_shows_only_the_answer(self):
+        await self.announce_run("The sub-agent returned SUB-DONE-R10.")
+        (m,) = self.new_messages().values()
+        self.assertEqual(m["content"], "The sub-agent returned SUB-DONE-R10.")
+        self.assertFalse([i for i in m["output"] if i["type"] == "function_call"])
+
+    async def test_a_silent_announce_whose_child_is_gone_stays_silent(self):
+        self.child_history = None
+        await self.announce_run("NO_REPLY")
+        self.assertEqual(self.new_messages(), {})
+
+    async def test_a_silent_requester_settle_wake_stays_silent(self):
+        """`announce:requester-settle:...` wakes a yielded parent for a batch
+        of children; its own silence is the parent's, not a missing result."""
+        self.announce = f"announce:requester-settle:main:{self.key}:{self.CHILD_RUN}"
+        await self.announce_run("NO_REPLY")
+        self.assertEqual(self.new_messages(), {})
+
+
 class RunSpanTests(unittest.TestCase):
     """A run's messages in chat.history never include another run's."""
 

@@ -283,6 +283,23 @@ def parse_pipe_run_id(run_id: str) -> dict | None:
     return {"chat": m.group("chat"), "message": m.group("message"), "kind": kind}
 
 
+def parse_announce_run_id(run_id: str) -> dict | None:
+    """{child_session, child_run} of a sub-agent announce run, else None.
+
+    The Gateway runs a child's completion in the parent session with run id
+    `announce:` + `v1:<childSessionKey>:<childRunId>` (announce-idempotency-
+    D7LnUTJR.mjs:4-10), suffixed `:wake` or `:retry-<n>` on redelivery. A
+    `announce:requester-settle:...` run wakes a yielded parent for a batch
+    of children and names no single child."""
+    if not (run_id or "").startswith("announce:v1:"):
+        return None
+    rest = re.sub(r":(?:wake|retry-\d+)$", "", run_id[len("announce:v1:"):])
+    child_session, _, child_run = rest.rpartition(":")
+    if not child_session.startswith("agent:") or not child_run:
+        return None
+    return {"child_session": child_session, "child_run": child_run}
+
+
 def turn_message_id(session_key: str, run_id: str, chat_id: str | None = None) -> str | None:
     """The Open WebUI message run `run_id` on `session_key` renders into, or
     None when it renders nothing (the Status Action's own runs). A pipe run
@@ -6681,6 +6698,8 @@ class _TurnWriter:
                     rebuilt = _history_renderer([m for msgs in per_run for m in msgs])
                     if rebuilt.output:
                         self.renderer = rebuilt
+                if not (self._showable() or note):
+                    await self._show_silent_announce(hist)
             if not self.opened:
                 if not (self._showable() or note) or not await self.open(takeover=self.takeover):
                     return
@@ -6702,6 +6721,40 @@ class _TurnWriter:
                      f"{tools} tool card(s), {len(self.runs)} run(s))")
         finally:
             self._done.set()
+
+    async def _show_silent_announce(self, hist: dict | None) -> None:
+        """A sub-agent's completion the parent answered with silence (NO_REPLY)
+        still shows the child's result, as one card (review 2af1 R10): its
+        label from the parent's spawn call, its result from the child's own
+        transcript. Nothing when the child's result cannot be read."""
+        child = next(filter(None, (parse_announce_run_id(r) for r in self.runs)), None)
+        if child is None:
+            return
+        try:
+            child_hist = await self.conn.session_history(child["child_session"], limit=20)
+        except Exception as ex:
+            pipe_log(f"  turn writer: child transcript of {child['child_session'][-12:]} "
+                     f"unreadable: {ex!r}")
+            return
+        found, result = _history_text_for_run(child_hist, child["child_run"])
+        if not (found and result):
+            return
+        label = None
+        for m in (hist or {}).get("messages") or []:
+            blocks = m.get("content") if isinstance(m.get("content"), list) else []
+            calls = {b.get("id"): b for b in blocks if isinstance(b, dict) and b.get("type") == "toolcall"}
+            for b in blocks:
+                if (isinstance(b, dict) and b.get("type") == "tool_result"
+                        and child["child_session"] in json.dumps(b.get("content"))
+                        and b.get("tool_use_id") in calls):
+                    args = calls[b["tool_use_id"]].get("arguments") or {}
+                    label = args.get("label") or args.get("task")
+        tcid = f"subagent-{child['child_run']}"
+        args_str = json.dumps({"label": label or child["child_session"]})
+        call = _tool_call_started_event("Sub-agent", tcid, args_str)["item"]
+        call["status"] = "completed"
+        self.renderer = _TurnRenderer()
+        self.renderer.output = [call, _tool_call_result_event(tcid, result)["item"]]
 
     def release(self) -> None:
         """This writer's connection was retired by a newer deploy: end the Open
