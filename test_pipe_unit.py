@@ -7128,3 +7128,52 @@ class RetiredWriterTests(_RoutingCase):
         await _turn_route_event(b, self.ev(self.RUN, _delta(" Found it.")))
         self.assertEqual(await self.adopt(b, mid), "skip")
 
+
+
+class GatewayOwnerNeverRecoversTests(_RoutingCase):
+    """Review 2af1 R2 (ReviewGatewayOwnerNeverRecovers): a settled row that
+    says `running` keeps M open for the Gateway's recovery. When the Gateway
+    gives up, it tombstones the row to failed
+    (main-session-restart-recovery-CPJjd8da.mjs:1150): that row closes M."""
+
+    async def keep_open(self):
+        await _turn_route_event(self.conn, self.ev(self.RUN, _delta("Working on it.")))
+        await self.spin()
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "running", "lastRunId": self.RUN})
+        await self.spin()
+        (m,) = self.new_messages().values()
+        self.assertIs(m["done"], False, "precondition: M kept open for the Gateway's recovery")
+
+    async def test_a_tombstoned_recovery_closes_the_message(self):
+        await self.keep_open()
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "failed", "lastRunId": self.RUN,
+                                        "lastRunError": "recovery skipped"})
+        await self.spin()
+        (m,) = self.new_messages().values()
+        self.assertIs(m["done"], True, "M stays done:false forever: no pump is left to end it")
+        self.assertIn("recovery skipped", m["content"])
+        self.assertFalse(self.conn._turn_pumps)
+
+    async def test_the_row_still_running_keeps_waiting(self):
+        await self.keep_open()
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "running", "lastRunId": self.RUN})
+        await self.spin()
+        (m,) = self.new_messages().values()
+        self.assertIs(m["done"], False)
+        self.assertIn((self.key, self.RUN), self.conn._turn_pumps)
+
+    async def test_a_recovery_that_takes_the_message_over_releases_the_pump(self):
+        self.history = {"messages": [
+            {"role": "user", "content": "x", "idempotencyKey": f"{self.RUN}:user"},
+            {"role": "user", "content": "[System] continue", "idempotencyKey": f"{self.REC}:user",
+             "provenance": {"kind": "internal_system", "sourceTool": "main_session_restart_recovery"}}]}
+        await self.keep_open()
+        await self.run_turn(self.REC, text=("Again.", " Found it."),
+                            settle={"sessionKey": self.key, "hasActiveRun": False, "status": "done",
+                                    "lastRunId": self.REC, "reason": "chat.run.settled"})
+        (m,) = self.new_messages().values()
+        self.assertIs(m["done"], True)
+        self.assertFalse(self.conn._turn_pumps, "the interrupted run's pump leaked")
