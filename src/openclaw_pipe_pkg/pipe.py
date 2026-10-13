@@ -1396,13 +1396,8 @@ class Pipe:
         # OWUI 0.12+ discards this write and rehydrates reloads itself
         # (`_owui_owns_inflight_message`), so don't schedule it at all there.
         rest_snapshot_enabled = not _owui_owns_inflight_message()
-        wait_started_time = time.time()
-        last_activity_time = time.time()
-        idle_probe_s = 30
-        no_text_deadman_s = 180
-        last_describe_check = 0.0
-        describe_check_interval = 45
         max_events_without_text = 5000
+        queued_shown = False
         # An interrupted run is not continued here: its message goes to the
         # turn writer, whose settled row decides who continues it (DESIGN 2.7).
         handed_over = False
@@ -1410,8 +1405,32 @@ class Pipe:
         async def recover_from_transcript() -> str | None:
             return await _recover_turn_text(conn, session_key, text)
 
-        async def gateway_run_status() -> str | None:
-            return await _gateway_run_status(conn, session_key)
+        async def settled_tail(row: dict) -> str:
+            """What this reply still owes once its run settled with no final
+            event here: the run's text after what arrived (its closing message
+            in the transcript), or, for a run that showed nothing, why."""
+            try:
+                hist = await conn.session_history(session_key, limit=RUN_TEXT_HISTORY_LIMIT)
+            except Exception as ex:
+                pipe_log(f"  settled run: chat.history failed: {ex!r}")
+                hist = None
+            found, whole = _history_text_for_run(hist, our_run_id) if hist else (False, None)
+            if found and whole:
+                gap_tail = reconcile_whole_text(whole)
+                if gap_tail is not None:
+                    return gap_tail
+                if whole.startswith(assistant_received_text):
+                    return whole[len(assistant_received_text):]
+                return "" if text_yielded else whole
+            if text_yielded:
+                return ""
+            status = row.get("status")
+            if status in ("cancelled", "killed"):
+                return "**Stopped.**"
+            if status in ("failed", "timeout"):
+                err = row.get("lastRunError")
+                return f"**Error:** {err}" if err else "**Failed:** the run did not complete."
+            return await recover_from_transcript() or ""
 
         def record_visible_chunk(chunk: str):
             nonlocal visible_message_text, relabelable_tool_call
@@ -1560,136 +1579,37 @@ class Pipe:
                 adopt_new_run = False
                 try:
                     while not done:
-                        try:
-                            recv_timeout = idle_probe_s if first_event_arrived else 60
-                            msg = await asyncio.wait_for(queue.get(), timeout=recv_timeout)
-                        except asyncio.TimeoutError:
-                            timeout_desc = (
-                                f"{idle_probe_s}s"
-                                if first_event_arrived
-                                else "60s"
-                            )
-                            pipe_log(f"TIMEOUT -- no events on queue for {timeout_desc}")
+                        # No silence timer: a quiet queue is a long tool call or
+                        # model thinking as often as a dead run. The run's own
+                        # signals end the reply: its terminal event, its settle
+                        # row (below), a Gateway restart (handed over).
+                        msg = await queue.get()
 
-                            if not first_event_arrived:
-                                elapsed = time.time() - wait_started_time
-                                status = await gateway_run_status()
-                                still_active = status is not None and status not in (
-                                    "done", "failed", "cancelled",
-                                )
-                                if elapsed < no_text_deadman_s and still_active:
-                                    pipe_log(
-                                        "  no run events yet but session still active "
-                                        "(queued behind other work); continuing to wait"
-                                    )
-                                    await _emit_status(
-                                        __event_emitter__,
-                                        "Waiting -- your message is queued behind an "
-                                        "active response...",
-                                        done=False,
-                                    )
-                                    continue
-                                # `status` distinguishes a user-initiated stop (Gateway
-                                # reports "cancelled") from a run that genuinely never
-                                # produced output -- the two used to show the same
-                                # generic "Timeout" wording, which was misleading when
-                                # the run was simply aborted, not stuck (2026-07-11).
-                                if status == "cancelled":
-                                    yield "**Stopped.**"
-                                elif status == "failed":
-                                    yield "**Failed:** the run did not complete."
-                                else:
-                                    yield "**Timeout:** Gateway accepted the message but emitted no run events."
-                                text_yielded = True
-                                break
-
-                            recovered = await recover_from_transcript()
-                            if recovered and not text_yielded:
-                                pipe_log("  recovered assistant text from the session transcript")
-                                text_yielded = True
-                                record_visible_chunk(recovered)
-                                yield recovered
-                                await maybe_emit_snapshot(force=True)
-                                done = True
-                                break
-
-                            # A quiet queue for idle_probe_s does NOT mean the run is
-                            # done -- a long tool call or a stretch of agent reasoning
-                            # with no intermediate events looks identical from here.
-                            # Only `sessions.describe` (the Gateway's own run status)
-                            # is authoritative; never close on silence alone, whether
-                            # or not text has already streamed.
-                            idle_elapsed = time.time() - last_activity_time
-                            if not text_yielded:
-                                elapsed = time.time() - wait_started_time
-                                if elapsed < no_text_deadman_s:
-                                    pipe_log(
-                                        "  idle but no assistant text yet; "
-                                        "continuing to wait for terminal event"
-                                    )
-                                    await _emit_status(
-                                        __event_emitter__,
-                                        "Waiting for final answer...",
-                                        done=False,
-                                    )
-                            else:
-                                pipe_log(
-                                    f"  idle for {idle_elapsed:.0f}s after streaming text; "
-                                    "verifying the run is actually done before closing"
-                                )
+                        if msg.get("type") == _ROW_MARKER_TYPE:
+                            row = msg.get("row") or {}
+                            if row.get("status") == "queued" and not first_event_arrived \
+                                    and not queued_shown:
+                                queued_shown = True
                                 await _emit_status(
                                     __event_emitter__,
-                                    "Still working...",
+                                    "Waiting -- your message is queued behind an "
+                                    "active response...",
                                     done=False,
                                 )
-
-                            # Periodically check if the Gateway still has an active run
-                            if time.time() - last_describe_check >= describe_check_interval:
-                                last_describe_check = time.time()
-                                try:
-                                    desc = await conn.send_request(
-                                        "sessions.describe",
-                                        dict(key=session_key),
-                                        timeout=8
-                                    )
-                                    session_row = desc.get("session")
-                                    if session_row is None:
-                                        pipe_log("  sessions.describe: session not found")
-                                        if text_yielded:
-                                            done = True
-                                            break
-                                    elif (session_row.get("status") in ("done", "failed", "cancelled")
-                                          and await _session_list_active(conn, session_key) is False):
-                                        # describe says "done" in a sub-agent yield gap;
-                                        # hasActiveRun does not (ELI-56, review 2af1 R4).
-                                        pipe_log("  sessions.describe: session is done/failed/cancelled, checking preview")
-                                        recovered2 = await recover_from_transcript()
-                                        if recovered2 and not text_yielded:
-                                            pipe_log("  recovered assistant text after describe probe")
-                                            text_yielded = True
-                                            record_visible_chunk(recovered2)
-                                            yield recovered2
-                                            await maybe_emit_snapshot(force=True)
-                                        done = True
-                                        break
-                                    else:
-                                        pipe_log(
-                                            f"  sessions.describe: status="
-                                            f"{session_row.get('status','unknown')} -- "
-                                            "still active, keep waiting"
-                                        )
-                                except Exception as ex:
-                                    pipe_log(f"  sessions.describe probe failed: {ex}")
-                                    # Belt-and-suspenders: if we can't even confirm
-                                    # status and have been idle far longer than the
-                                    # normal deadman budget, give up rather than hang
-                                    # forever (should be rare -- WS reconnect handles
-                                    # true connection loss separately).
-                                    if text_yielded and idle_elapsed > no_text_deadman_s:
-                                        pipe_log("  describe probe unreachable and idle too long; closing")
-                                        done = True
-                                        break
-
+                            if row.get("hasActiveRun") is False and (
+                                    msg.get("resync") or row.get("lastRunId") == our_run_id):
+                                # The run settled while its terminal event never
+                                # reached this reply (dropped frame, socket gap).
+                                # Its transcript has what was lost.
+                                pipe_log(f"  run settled (row status {row.get('status')}, "
+                                         f"resync={bool(msg.get('resync'))}) without its final")
+                                tail = await settled_tail(row)
+                                if tail:
+                                    record_visible_chunk(tail)
+                                    yield tail
+                                    text_yielded = True
+                                    await maybe_emit_snapshot(force=True)
+                                done = True
                             continue
 
                         if msg.get("type") == _RESTART_MARKER_TYPE:
@@ -1811,7 +1731,6 @@ class Pipe:
                                     _advance_input_prompt_buffer(pending_prompt_text, delta)
                                 )
                                 if not flush_text:
-                                    last_activity_time = time.time()
                                     continue
                                 delta = flush_text
 
@@ -1824,7 +1743,6 @@ class Pipe:
                                     pending_media_text, delta
                                 )
                                 if not delta:
-                                    last_activity_time = time.time()
                                     continue
 
                                 text_yielded = True
@@ -1865,7 +1783,6 @@ class Pipe:
                                         record_visible_chunk(resolved)
                                         yield resolved
                                         await maybe_emit_snapshot()
-                                        last_activity_time = time.time()
                                         continue
                                 assistant_stream_text += delta
                                 record_visible_chunk(delta)
@@ -1884,7 +1801,6 @@ class Pipe:
                                 # to the live client, so it cannot trigger that
                                 # suppression.
                                 maybe_start_rest_snapshot()
-                                last_activity_time = time.time()
 
                         # --- Assistant text carried by item/preamble events ---
                         if stream == "item":
@@ -1913,7 +1829,6 @@ class Pipe:
                                         our_run_id = answer_res.new_run_id
                                     done = False
                                     last_item_text = item_text
-                                    last_activity_time = time.time()
                                     continue
                                 gap_tail = reconcile_whole_text(item_text)
                                 item_delta = gap_tail if gap_tail is not None else _item_delta_text(
@@ -1944,7 +1859,6 @@ class Pipe:
                                     pipe_log("  yielded text from item event")
                                     record_visible_chunk(item_delta)
                                     yield item_delta
-                                    last_activity_time = time.time()
 
                         # --- Tool call events ---
                         if stream == "tool":
@@ -1975,7 +1889,6 @@ class Pipe:
                                     f"Running {name}...",
                                     done=False,
                                 )
-                                last_activity_time = time.time()
 
                             elif phase == "result":
                                 result = data.get("result", {})
@@ -2052,14 +1965,12 @@ class Pipe:
                                     f"{name} done",
                                     done=True,
                                 )
-                                last_activity_time = time.time()
 
                         # --- Item events (progress) ---
                         if stream == "item":
                             pipe_log(f"  Item: kind={data.get('kind','')} "
                                      f"status={data.get('status','')} "
                                      f"title={str(data.get('title',''))[:50]}")
-                            last_activity_time = time.time()
 
                         if not text_yielded and event_count >= max_events_without_text:
                             recovered = await recover_from_transcript()
@@ -2081,42 +1992,6 @@ class Pipe:
                                 await maybe_emit_snapshot(force=True)
                                 text_yielded = True
                             done = True
-
-                        if (
-                            not done
-                            and first_event_arrived
-                            and text_yielded
-                            and time.time() - last_activity_time > idle_probe_s
-                        ):
-                            # Do NOT hard-close on a 30s silent gap: a long tool
-                            # call or a stretch of silent model reasoning looks
-                            # identical to a finished run from here, and closing
-                            # on it strands the rest of the turn as a detached
-                            # bubble (root cause of the 2026-07-19
-                            # "my reply came at the end as a separate bubble"
-                            # reports). Confirm with the gateway first; only
-                            # close if the run is genuinely terminal, otherwise
-                            # stay alive so the inline message keeps streaming to
-                            # completion (no handover needed at all).
-                            status = await gateway_run_status()
-                            if status in ("done", "failed", "cancelled"):
-                                pipe_log(
-                                    f"  idle {idle_probe_s}s + gateway status="
-                                    f"{status}: closing"
-                                )
-                                done = True
-                            else:
-                                pipe_log(
-                                    f"  idle {idle_probe_s}s but gateway status="
-                                    f"{status or 'unknown'} -- run still active, "
-                                    "staying alive"
-                                )
-                                await _emit_status(
-                                    __event_emitter__, "Still working...", done=False
-                                )
-                                # Reset the idle clock so we re-probe roughly
-                                # once per idle_probe_s, not on every dead event.
-                                last_activity_time = time.time()
 
                 except (asyncio.CancelledError, GeneratorExit) as stop:
                     # OWUI ended this response: the Stop button, or Send now /
@@ -2205,9 +2080,6 @@ class Pipe:
                                 pipe_log("  continuing in the same run after modal answer")
                             done = False
                             adopt_new_run = True
-                            # Fresh activity clock so the idle-probe self-close does not
-                            # fire immediately against a stale pre-answer timestamp.
-                            last_activity_time = time.time()
                         else:
                             # Modal not handled (cancelled / dismissed / gave up
                             # on reconnect). Show the prompt as a fallback, but

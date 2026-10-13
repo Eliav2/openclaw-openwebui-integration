@@ -1331,6 +1331,13 @@ _GAP_MARKER_TYPE = "_pipe_gap"
 # when a reconnect lands on a new Gateway process: the run may be gone, and
 # its owner (DESIGN 2.7) is decided from its row, not by the reply.
 _RESTART_MARKER_TYPE = "_pipe_restart"
+# Queue item carrying a session row to the inline replies of that session:
+# `{"type", "row", "resync"}`. A run's own settle row (hasActiveRun false,
+# lastRunId = the run) ends its reply even when its final event was lost;
+# `resync` marks a row read after a reconnect or a frame gap, where an idle
+# session means every admitted run is over; a `queued` row tells a reply
+# waiting for its first event why (review 2af1 timers).
+_ROW_MARKER_TYPE = "_pipe_row"
 # Text on each side of a gap used to find where a repaired chunk goes.
 _GAP_ANCHOR_CHARS = 120
 
@@ -2312,12 +2319,21 @@ class _GatewayConnection:
         self.note_session_id(key, payload.get("sessionId"))
         if key and "hasActiveRun" in payload:
             self._wake_session_waiters(key)
+            self.row_to_consumers(key, payload)
         if key and payload.get("hasActiveRun") is False:
             _turn_settled(self, key, payload)
         if (payload.get("hasActiveRun") and key
                 and key not in self._message_subscriptions
                 and self.parse_owui_session_key(key)):
             spawn_background(self.ensure_message_subscription(key))
+
+    def row_to_consumers(self, session_key: str, row: dict, resync: bool = False) -> None:
+        """Hand session row `row` to every inline reply of `session_key`."""
+        marker = {"type": _ROW_MARKER_TYPE, "row": row, "resync": resync}
+        for key, consumer in list(self._consumers.items()):
+            if key.startswith(f"{session_key}:"):
+                for q in consumer.queues:
+                    q.put_nowait(dict(marker))
 
     def note_session_id(self, session_key: str, session_id) -> None:
         if session_key and isinstance(session_id, str) and session_id:
@@ -4912,9 +4928,11 @@ async def _turn_after_hello(conn: "_GatewayConnection") -> None:
 
 
 async def _turn_resync(conn: "_GatewayConnection", skip: set = frozenset()) -> None:
-    """Read the row of every session with an open pump (except `skip`, known
-    active) and end the ones that went idle while their settle was missed."""
+    """Read the row of every session with an open pump or an inline reply
+    (except `skip`, known active) and end the ones that went idle while their
+    settle was missed."""
     idle = {sess for (sess, _run) in conn._turn_pumps if sess not in skip}
+    idle |= {c.session_key for c in list(conn._consumers.values()) if c.session_key not in skip}
     for sess in idle:
         try:
             lst = await conn.send_request("sessions.list", {"search": sess[-36:], "limit": 10},
@@ -4925,6 +4943,7 @@ async def _turn_resync(conn: "_GatewayConnection", skip: set = frozenset()) -> N
         row = next((r for r in (lst.get("sessions") or []) if r.get("key") == sess), None)
         if row is not None and not row.get("hasActiveRun"):
             _turn_settled(conn, sess, row)
+            conn.row_to_consumers(sess, row, resync=True)
 
 
 # --- emit ------------------------------------------------------------------

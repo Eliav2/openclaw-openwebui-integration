@@ -83,7 +83,7 @@ from openclaw_pipe import (
     _claim_turn_message, _register_turn_writer, _retire_turn_writer,
     MAX_TURN_RESUMES, next_continuation, turn_owner,
     recovery_source_run, run_message_id, _TurnWriter, _INTENT_HOOK_JS,
-    _turn_route_event, _turn_after_hello, _history_span_messages,
+    _turn_route_event, _turn_after_hello, _turn_resync, _history_span_messages,
     wake_turns, wake_turn_at, wake_span, _wake_resync, _adopt_turn_message,
     _gateway_run_status,
     _GatewayConnection,
@@ -6737,13 +6737,6 @@ class InlineRewriteWiringTests(unittest.TestCase):
                                 "2 MEDIA sites, 2 answered cards, 1 fallback prompt")
         self.assertIn("thinking=resolved_thinking", src.split("conn.register_run_target(")[1][:200])
 
-    def test_the_idle_describe_close_also_needs_no_active_run(self):
-        """Review 2af1 R4 (P27): describe reads "done" in a sub-agent yield gap
-        while hasActiveRun is still true (ELI-56); closing on describe alone
-        cut the reply and dropped the rest."""
-        src = inspect.getsource(openclaw_pipe.Pipe._pipe_turn)
-        branch = src.split('session_row.get("status") in ("done", "failed", "cancelled")')[1][:200]
-        self.assertIn("await _session_list_active(conn, session_key) is False", branch)
 
 
 class SupersededLoadTests(unittest.IsolatedAsyncioTestCase):
@@ -6816,6 +6809,150 @@ class SupersededLoadTests(unittest.IsolatedAsyncioTestCase):
         self.current = RuntimeError("db locked")
         out = await self.turn(openclaw_pipe.Pipe())
         self.assertTrue(out and "retired" in out[-1], out)
+
+
+class InlineEndSignalTests(unittest.IsolatedAsyncioTestCase):
+    """Review 2af1 timers: an inline reply ends on its run's own signals, never
+    on silence. The Gateway settles every run with its own row
+    (`sessions.changed`, reason `chat.run.settled`, hasActiveRun false,
+    lastRunId = the run; live probe runs/eli103-probe 2026-10-13), and a
+    queued send shows `status: queued` on the row. The 60 s first-event wait,
+    the 180 s deadman, the 30 s idle probe and the 45 s describe poll stood in
+    for those signals."""
+
+    CHAT = "22222222-2222-2222-2222-222222222222"
+    MSG = "33333333-3333-3333-3333-333333333333"
+
+    async def asyncSetUp(self):
+        self.pipe = openclaw_pipe.Pipe()
+        self.conn = _GatewayConnection(lambda: self.pipe.valves)
+        self.frames, self.calls, self.emitted, self.out = asyncio.Queue(), [], [], []
+        self.history = {"messages": []}
+        self.rows = []
+        test = self
+
+        class WS:
+            async def recv(self_):
+                return json.dumps(await test.frames.get())
+        self.conn._ws = WS()
+
+        async def send_request(method, params, timeout=10):
+            test.calls.append((method, params))
+            if method == "sessions.patch":
+                a, b = params["model"].split("/", 1)
+                return {"resolved": {"modelProvider": a, "model": b}}
+            if method == "chat.send":
+                return {"runId": params["idempotencyKey"], "status": "started"}
+            if method == "chat.history":
+                return copy.deepcopy(test.history)
+            if method == "sessions.list":
+                return {"sessions": copy.deepcopy(test.rows)}
+            return {}
+        self.conn.send_request = send_request
+
+        async def ensure():
+            pass
+        self.conn.ensure_connected = ensure
+        self.loop_task = asyncio.ensure_future(self.conn._event_loop())
+
+        async def get_conn(_v):
+            return self.conn
+        p = mock.patch.object(openclaw_pipe, "_get_gateway_connection", get_conn)
+        p.start()
+        self.addCleanup(p.stop)
+
+        async def emit(e):
+            test.emitted.append(e)
+        body = {"model": "openclaw_gateway.anthropic/claude-haiku-5-5", "stream": True,
+                "messages": [{"role": "user", "content": "hi"}]}
+        meta = {"chat_id": self.CHAT, "message_id": self.MSG, "session_id": "s"}
+
+        async def consume():
+            async for x in self.pipe.pipe(body, emit, __user__={"id": "u1"}, __metadata__=meta):
+                test.out.append(x)
+        self.reply = asyncio.ensure_future(consume())
+        for _ in range(300):
+            await asyncio.sleep(0.01)
+            if self.conn._consumers:
+                break
+        (key,) = self.conn._consumers
+        self.sk, self.run = key.split(":msg-", 1)[0], "msg-" + key.split(":msg-", 1)[1]
+        self.rows = [{"key": self.sk, "hasActiveRun": True, "status": "running"}]
+
+    async def asyncTearDown(self):
+        for t in (self.reply, self.loop_task):
+            t.cancel()
+        await asyncio.gather(self.reply, self.loop_task, return_exceptions=True)
+
+    async def push(self, event, payload):
+        await self.frames.put({"type": "event", "event": event, "payload": payload})
+        await asyncio.sleep(0.05)
+
+    async def delta(self, text, run=None):
+        await self.push("agent", {"runId": run or self.run, "sessionKey": self.sk,
+                                  "stream": "assistant", "data": {"delta": text}})
+
+    async def row(self, **row):
+        await self.push("sessions.changed", {"sessionKey": self.sk, **row})
+
+    async def settled(self, run=None):
+        self.rows = [{"key": self.sk, "hasActiveRun": False, "status": "done",
+                      "lastRunId": run or self.run}]
+        await self.row(hasActiveRun=False, status="done", lastRunId=run or self.run,
+                       reason="chat.run.settled")
+
+    async def ended(self, within=2.0):
+        await asyncio.wait_for(asyncio.shield(self.reply), within)
+        return "".join(x for x in self.out if isinstance(x, str))
+
+    def closed_run(self, text):
+        return [{"role": "user", "content": "hi", "idempotencyKey": f"{self.run}:user"},
+                {"role": "assistant", "content": [{"type": "text", "text": text}],
+                 "idempotencyKey": f"cli-assistant:{self.run}"}]
+
+    async def test_a_reply_whose_final_was_lost_ends_on_its_settled_row(self):
+        await self.delta("Hello there.")
+        self.history = {"messages": self.closed_run("Hello there.")}
+        await self.settled()
+        self.assertIn("Hello there.", await self.ended())
+
+    async def test_a_run_with_no_event_ends_on_its_row_with_its_transcript_text(self):
+        self.history = {"messages": self.closed_run("Recovered.")}
+        await self.settled()
+        self.assertIn("Recovered.", await self.ended())
+
+    async def test_another_runs_settled_row_does_not_end_the_reply(self):
+        await self.delta("Part one.")
+        await self.settled(run="some-other-run")
+        self.assertFalse(self.reply.done())
+        await self.delta(" Part two.")
+        await self.push("chat", {"runId": self.run, "sessionKey": self.sk, "state": "final"})
+        text = await self.ended()
+        self.assertIn("Part one. Part two.", text)
+
+    async def test_a_queued_send_shows_queued_from_its_row(self):
+        await self.row(hasActiveRun=True, status="queued", reason="run-capacity")
+        shown = [e["data"].get("description", "") for e in self.emitted if e.get("type") == "status"]
+        self.assertTrue(any("queued" in d for d in shown), shown)
+        self.assertFalse(self.reply.done())
+
+    async def test_a_reconnect_resync_ends_a_reply_whose_run_ended_while_away(self):
+        """The socket was down when the run ended: its final and its settle
+        are lost, and a later run moved lastRunId on. The row read after the
+        reconnect is idle, so nothing of this run is still coming."""
+        await self.delta("Before the drop.")
+        self.history = {"messages": self.closed_run("Before the drop. After it.")}
+        self.rows = [{"key": self.sk, "hasActiveRun": False, "status": "done",
+                      "lastRunId": "a-later-run"}]
+        await _turn_resync(self.conn)
+        text = await self.ended()
+        self.assertIn("After it.", text)
+
+    def test_no_silence_timer_is_left_in_the_inline_loop(self):
+        src = inspect.getsource(openclaw_pipe.Pipe._pipe_turn)
+        for timer in ("idle_probe_s", "no_text_deadman_s", "describe_check_interval",
+                      "recv_timeout"):
+            self.assertNotIn(timer, src)
 
 
 class RunSpanTests(unittest.TestCase):
