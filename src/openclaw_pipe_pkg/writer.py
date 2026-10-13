@@ -180,7 +180,8 @@ class _TurnWriter:
 
     def __init__(self, conn: "_GatewayConnection", *, session_key: str, chat_id: str,
                  user_id: str, run_id: str, message_id: str | None,
-                 takeover: bool = False, renderer: "_TurnRenderer | None" = None):
+                 takeover: bool = False, renderer: "_TurnRenderer | None" = None,
+                 thinking: str | None = None):
         self.conn = conn
         self.session_key, self.chat_id, self.user_id = session_key, chat_id, user_id
         self.run_id, self.message_id = run_id, message_id
@@ -188,6 +189,8 @@ class _TurnWriter:
         # takes it over instead of inserting one (DESIGN 2.6).
         self.takeover = takeover
         self.renderer = renderer if renderer is not None else _TurnRenderer()
+        # A user turn's level (ELI-85): its resume continues the same reply.
+        self.thinking = thinking
         self.opened = False
         self.task_id: str | None = None
         self.parent_id: str | None = None
@@ -367,7 +370,8 @@ class _TurnWriter:
         try:
             resp = await self.conn.send_request("chat.send", _owui_chat_send_params(
                 session_key=self.session_key, message=directive, idempotency_key=key,
-                owui_chat_id=self.chat_id, owui_user_id=self.user_id), timeout=30)
+                owui_chat_id=self.chat_id, owui_user_id=self.user_id,
+                thinking=self.thinking), timeout=30)
         except Exception as ex:
             pipe_log(f"  turn writer: resume refused ({ex}); sending it on the next hello")
             return
@@ -587,7 +591,7 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
         if handed is not None:
             pump.writer = _TurnWriter(conn, session_key=sess, chat_id=chat_id, user_id=user_id,
                                       run_id=run, message_id=handed["message_id"], takeover=True,
-                                      renderer=handed["renderer"])
+                                      renderer=handed["renderer"], thinking=handed.get("thinking"))
             conn._turn_writers[(chat_id, handed["message_id"])] = pump.writer
             await pump.writer.feed(None)
         else:

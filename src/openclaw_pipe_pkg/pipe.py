@@ -63,20 +63,6 @@ def _owui_owns_inflight_message() -> bool:
     return callable(getattr(chats, "insert_chat_turn", None))
 
 
-def _is_restart_signature(err: str) -> bool:
-    """True when a run-ending error looks like the gateway being restarted
-    underneath us rather than a genuine agent failure."""
-    if not err:
-        return False
-    low = str(err).lower()
-    return any(s in low for s in (
-        "exited with code 143",
-        "sigterm",
-        "process exited with code",
-        "connection closed",
-    ))
-
-
 def _thinking_rejection_retry_body(body, recovered, resolved_thinking):
     """Decide whether a textless ("PHANTOM") turn's preview-recovered text is
     the Gateway's permanent-brick thinking-level rejection, and build the
@@ -1115,7 +1101,6 @@ class Pipe:
             # ends -- measured 2026-10-11).
             our_run_id = adopted_run_id
             self._current_run_id = our_run_id
-            epoch_at_send = conn.gateway_restarts
             resolved_thinking = None
             pending_clamp_note = ""
             if adopted_queue is not None:
@@ -1217,10 +1202,6 @@ class Pipe:
                     if conn.should_announce_thinking_note(session_key, thinking_note):
                         pending_clamp_note = f"_{thinking_note}_\n\n"
                         yield pending_clamp_note
-                # Epoch of the connection this run is being launched on. If it has
-                # moved by the time the queue goes quiet, the Gateway restarted
-                # underneath us and took the run with it (see `gateway_restarts`).
-                epoch_at_send = conn.gateway_restarts
                 try:
                     send_resp = await conn.send_request(
                         "chat.send",
@@ -1381,12 +1362,9 @@ class Pipe:
         last_describe_check = 0.0
         describe_check_interval = 45
         max_events_without_text = 5000
-        # Gateway-restart resume budget. Bounded so a gateway that is crash-
-        # looping degrades into the old "close the stream" behaviour instead of
-        # re-sending forever.
-        resume_attempts = 0
-        max_resume_attempts = 3
-        pending_restart_error: str | None = None
+        # An interrupted run is not continued here: its message goes to the
+        # turn writer, whose settled row decides who continues it (DESIGN 2.7).
+        handed_over = False
 
         async def recover_from_transcript() -> str | None:
             return await _recover_turn_text(conn, session_key, text)
@@ -1535,98 +1513,6 @@ class Pipe:
                 pipe_log("  answer sent, steering into active run (no new runId)")
             return UserInputResult(True, new_run_id, prompt_text=prompt_text, answer=answer)
 
-        async def resume_after_restart() -> bool:
-            """Re-launch this turn after the Gateway restarted under it.
-
-            The Gateway writes a turn to the transcript only when it COMPLETES,
-            so a restart mid-run destroys the run and no terminal event is ever
-            emitted -- the consumer queue simply goes quiet forever. OWUI itself
-            did not restart, though: the browser's HTTP response is still open
-            and this coroutine is still running. So we can start a fresh run on
-            the reconnected socket and keep streaming into the *same* assistant
-            message, which is what makes the chat carry on with no new message
-            from the human.
-
-            The user's original message is still in the transcript (it was
-            persisted on the way in), so replaying its text would duplicate the
-            user turn. We send a continuation directive instead, and tell the
-            agent about any text the user can already see so it resumes rather
-            than starting the answer over -- streamed text is immutable in the
-            live OWUI view and cannot be retracted.
-            """
-            nonlocal queue, our_run_id, first_event_arrived
-            nonlocal wait_started_time, last_activity_time, last_describe_check
-            try:
-                await conn.ensure_connected()
-            except Exception as ex:
-                pipe_log(f"  resume: gateway still unreachable: {ex}")
-                return False
-
-            already_seen = (visible_message_text or assistant_stream_text or "").strip()
-            if already_seen:
-                tail = already_seen[-1500:]
-                directive = (
-                    "[system] Your previous reply was cut off partway through "
-                    "because the gateway restarted. The user can already see "
-                    "the following partial text, and it cannot be edited or "
-                    "retracted:\n\n"
-                    f"---\n{tail}\n---\n\n"
-                    "Continue that reply seamlessly from exactly where it "
-                    "stops. Do not repeat any of it, do not restart the "
-                    "answer, and do not mention the restart."
-                )
-            else:
-                directive = (
-                    "[system] The gateway restarted before you produced any "
-                    "output, so your previous run was lost. Answer the user's "
-                    "most recent message now, from scratch. Do not mention the "
-                    "restart."
-                )
-
-            # The resume continues this reply: its run id names it (ELI-100 2.2).
-            resume_key = (pipe_run_id(chat_id, owui_message_id, "resume") if owui_message_id
-                          else f"resume-{chat_id}-{time.time()}")
-            try:
-                resume_resp = await conn.send_request(
-                    "chat.send",
-                    _owui_chat_send_params(
-                        session_key=session_key,
-                        message=directive,
-                        idempotency_key=resume_key,
-                        owui_chat_id=owui_origin_chat_id,
-                        owui_user_id=owui_origin_user_id,
-                        # Same level the lost run was launched at (ELI-85).
-                        # Leaving it off would silently fall back to the
-                        # agent's configured level for the rest of the reply.
-                        thinking=resolved_thinking,
-                    ),
-                    timeout=30,
-                )
-            except Exception as ex:
-                pipe_log(f"  resume: chat.send failed: {ex}")
-                return False
-
-            new_run_id = resume_resp.get("runId")
-            if not new_run_id:
-                pipe_log("  resume: gateway returned no runId")
-                return False
-
-            conn.unregister_consumer(session_key, our_run_id, queue=queue)
-            our_run_id = new_run_id
-            self._current_run_id = new_run_id
-            queue = conn.register_consumer(session_key, new_run_id)
-            conn.register_run_target(
-                session_key, new_run_id, owui_origin_chat_id, owui_message_id,
-            )
-            # Fresh clocks: the new run has produced nothing yet, and the idle
-            # deadman must not count the restart window against it.
-            first_event_arrived = False
-            wait_started_time = time.time()
-            last_activity_time = time.time()
-            last_describe_check = 0.0
-            pipe_log(f"  resume: new runId {new_run_id[:20]}...")
-            return True
-
         adopt_new_run = True
         try:
             while adopt_new_run:
@@ -1643,38 +1529,6 @@ class Pipe:
                                 else "60s"
                             )
                             pipe_log(f"TIMEOUT -- no events on queue for {timeout_desc}")
-
-                            # A restart is indistinguishable from a long tool
-                            # call *from the queue alone* -- both are silence.
-                            # The connection epoch is what separates them, so
-                            # check it before any of the give-up paths below,
-                            # which would otherwise close the stream on a run
-                            # that is merely gone rather than finished.
-                            if conn.gateway_restarts != epoch_at_send:
-                                if resume_attempts < max_resume_attempts:
-                                    resume_attempts += 1
-                                    pipe_log(
-                                        f"  restarts {epoch_at_send} -> "
-                                        f"{conn.gateway_restarts}: gateway "
-                                        f"restarted mid-run; resuming "
-                                        f"(attempt {resume_attempts}/"
-                                        f"{max_resume_attempts})"
-                                    )
-                                    await _emit_status(
-                                        __event_emitter__,
-                                        "Gateway restarted: resuming...",
-                                        done=False,
-                                    )
-                                    if await resume_after_restart():
-                                        epoch_at_send = conn.gateway_restarts
-                                        pending_restart_error = None
-                                        continue
-                                    pipe_log("  resume failed; will retry on next idle probe")
-                                    continue
-                                pipe_log(
-                                    "  gateway restarted but resume budget "
-                                    "exhausted; falling through to close"
-                                )
 
                             if not first_event_arrived:
                                 elapsed = time.time() - wait_started_time
@@ -1705,8 +1559,6 @@ class Pipe:
                                     yield "**Failed:** the run did not complete."
                                 else:
                                     yield "**Timeout:** Gateway accepted the message but emitted no run events."
-                                if pending_restart_error:
-                                    yield f"\n\n**Error:** {pending_restart_error}"
                                 text_yielded = True
                                 break
 
@@ -1717,8 +1569,6 @@ class Pipe:
                                 record_visible_chunk(recovered)
                                 yield recovered
                                 await maybe_emit_snapshot(force=True)
-                                if pending_restart_error:
-                                    yield f"\n\n**Error:** {pending_restart_error}"
                                 done = True
                                 break
 
@@ -1765,8 +1615,6 @@ class Pipe:
                                     if session_row is None:
                                         pipe_log("  sessions.describe: session not found")
                                         if text_yielded:
-                                            if pending_restart_error:
-                                                yield f"\n\n**Error:** {pending_restart_error}"
                                             done = True
                                             break
                                     elif session_row.get("status") in ("done", "failed", "cancelled"):
@@ -1778,8 +1626,6 @@ class Pipe:
                                             record_visible_chunk(recovered2)
                                             yield recovered2
                                             await maybe_emit_snapshot(force=True)
-                                        if pending_restart_error:
-                                            yield f"\n\n**Error:** {pending_restart_error}"
                                         done = True
                                         break
                                     else:
@@ -1797,11 +1643,20 @@ class Pipe:
                                     # true connection loss separately).
                                     if text_yielded and idle_elapsed > no_text_deadman_s:
                                         pipe_log("  describe probe unreachable and idle too long; closing")
-                                        if pending_restart_error:
-                                            yield f"\n\n**Error:** {pending_restart_error}"
                                         done = True
                                         break
 
+                            continue
+
+                        if msg.get("type") == _RESTART_MARKER_TYPE:
+                            # A new Gateway process: the run may be recovered
+                            # by it (a crash leaves its row `running`) or need
+                            # a resume. Its row decides, in the turn writer.
+                            if conn.hand_over_run(session_key, our_run_id,
+                                                  thinking=resolved_thinking, read_row=True):
+                                handed_over = done = True
+                            else:
+                                pipe_log("  Gateway restarted; no message to hand over, waiting")
                             continue
 
                         if msg.get("type") == _GAP_MARKER_TYPE:
@@ -1833,45 +1688,30 @@ class Pipe:
                             continue
 
                         # --- Completion signals (multiple sources) ---
+                        err = (str(data.get("error", "unknown"))
+                               if stream == "lifecycle" and phase == "error" else "")
+                        aborted_run = state == "aborted" or data.get("aborted") is True
+                        # DESIGN 2.7: an outside kill of the CLI, or an abort
+                        # after a shutdown notice, may be continued by the
+                        # Gateway (a `running` row) or by a resume. The reply
+                        # decides neither: the turn writer takes the message
+                        # and the settled row picks the owner. Without a
+                        # message to hand over, it ends here like any error.
+                        if ((_EXTERNAL_KILL_RE.search(err) or (aborted_run and conn._shutdown_seen))
+                                and conn.hand_over_run(session_key, our_run_id,
+                                                       thinking=resolved_thinking)):
+                            handed_over = done = True
+                            continue
                         if stream == "lifecycle" and phase == "end":
                             done = True
                             pipe_log("  lifecycle end -> done")
-                        elif stream == "lifecycle" and phase == "error":
-                            err = str(data.get("error", "unknown"))
-                            if _is_restart_signature(err) and resume_attempts < max_resume_attempts:
-                                pending_restart_error = err
-                                pipe_log("  lifecycle error looks like a restart; deferring close pending epoch bump")
-                            else:
-                                yield f"\n\n**Error:** {err}"
-                                done = True
-                                pipe_log("  lifecycle error -> done")
-
-                        # Both of these read the SAME payload that carried the
-                        # lifecycle error above, so an unguarded `done = True`
-                        # here would defeat the restart deferral on the very
-                        # event that armed it (the gateway stamps state='error'
-                        # / aborted alongside phase='error'). While a restart is
-                        # pending we must stay in the loop so the idle probe can
-                        # reach the gateway_restarts check and resume.
-                        if state in ("final", "cancelled", "error"):
-                            if pending_restart_error:
-                                pipe_log(
-                                    f"  payload state='{state}' but restart "
-                                    f"deferral armed; not closing"
-                                )
-                            else:
-                                done = True
-                                pipe_log(f"  payload state='{state}' -> done")
-
-                        if data.get("aborted") is True:
-                            if pending_restart_error:
-                                pipe_log(
-                                    "  data.aborted but restart deferral "
-                                    "armed; not closing"
-                                )
-                            else:
-                                done = True
-                                pipe_log("  data.aborted -> done")
+                        elif err:
+                            yield f"\n\n**Error:** {err}"
+                            done = True
+                            pipe_log("  lifecycle error -> done")
+                        if state in ("final", "cancelled", "error", "aborted") or aborted_run:
+                            done = True
+                            pipe_log(f"  payload state='{state}' aborted={aborted_run} -> done")
 
                         # --- Assistant text stream ---
                         if stream == "assistant":
@@ -1944,7 +1784,6 @@ class Pipe:
                                     continue
 
                                 text_yielded = True
-                                pending_restart_error = None
                                 # No snapshot here, regardless of whether tool blocks
                                 # exist earlier in the message. A `replace` event sets
                                 # the full message content; if it lands on (or near)
@@ -2365,7 +2204,8 @@ class Pipe:
                     # Not for an adopted run either: this reply keeps streaming
                     # the queued message's answer, and a `replace` now would
                     # freeze those deltas (P23/P25).
-                    if not adopt_new_run and had_tool_block and not adopted_run_id:
+                    if (not adopt_new_run and had_tool_block and not adopted_run_id
+                            and not handed_over):
                         await maybe_emit_snapshot(force=True)
 
                     # Resolve any tool call that was announced but never got a
@@ -2376,8 +2216,9 @@ class Pipe:
                     # 2026-07-25, where a delivered call stayed `in_progress`
                     # in the persisted item and only rendered as done because
                     # its result item happened to exist. So close them here
-                    # rather than relying on that.
-                    if not adopt_new_run and pending_tool_calls:
+                    # rather than relying on that. A handed-over run is not
+                    # over: its writer completes the cards.
+                    if not adopt_new_run and pending_tool_calls and not handed_over:
                         for orphan_id in list(pending_tool_calls):
                             pipe_log(f"  closing orphaned tool call {orphan_id}")
                             yield _tool_call_result_event(
@@ -2389,7 +2230,7 @@ class Pipe:
             # A parked queue now belongs to whoever claims the run; releasing
             # it here would drop the events it is buffering.
             if not turn.parked:
-                if done and not aborted and our_run_id:
+                if done and not aborted and our_run_id and not handed_over:
                     # The run ended in this reply. Its trailing `chat` final
                     # lands after this consumer is gone and must not read as
                     # "the reply ended before its run" (a handover would
@@ -2401,7 +2242,7 @@ class Pipe:
                 turn.run_id = None
                 turn.queue = None
             status_lines = []
-            if not aborted and text_yielded and not adopted_run_id:
+            if not aborted and text_yielded and not adopted_run_id and not handed_over:
                 status_lines = await _build_usage_status_lines(conn, session_key)
             if adopted_run_id and not aborted:
                 await _emit_status(

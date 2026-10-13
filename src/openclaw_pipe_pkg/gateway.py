@@ -627,6 +627,10 @@ def _item_assistant_text(data: dict) -> str:
 
 # Queue item `_GatewayConnection._mark_event_gap` puts where events were lost.
 _GAP_MARKER_TYPE = "_pipe_gap"
+# Queue item `_GatewayConnection._note_gateway_boot` puts in every run queue
+# when a reconnect lands on a new Gateway process: the run may be gone, and
+# its owner (DESIGN 2.7) is decided from its row, not by the reply.
+_RESTART_MARKER_TYPE = "_pipe_restart"
 # Text on each side of a gap used to find where a repaired chunk goes.
 _GAP_ANCHOR_CHARS = 120
 
@@ -1362,6 +1366,7 @@ class _GatewayConnection:
         self._turn_resolve_lock = asyncio.Lock()
         self._frame_seq: int | None = None
         self._stop_notice_seen = False  # `shutdown` without restartExpectedMs on this socket
+        self._shutdown_seen = False     # any `shutdown` on this socket
         # Bumped on every successful connect/reconnect. A consumer that
         # captures this before `chat.send` can later tell "the queue is quiet
         # because the agent is thinking" from "the queue is quiet because the
@@ -1464,6 +1469,7 @@ class _GatewayConnection:
         else:
             self._note_active_snapshot(((resp or {}).get("list") or {}).get("sessions") or [])
             self._stop_notice_seen = False
+            self._shutdown_seen = False
             spawn_background(_turn_after_hello(self))
         for key in list(self._message_subscriptions):
             await self._subscribe_messages(key)
@@ -1544,6 +1550,41 @@ class _GatewayConnection:
             ev = self._session_change_waiters.pop(key, None)
             if ev is not None:
                 ev.set()
+
+    def _on_shutdown(self, payload: dict) -> None:
+        """DESIGN 2.7 F4: the Gateway announces its close before it aborts any
+        run. No restartExpectedMs = stop mode, whose aborted runs it never
+        recovers; with it, restart mode, whose aborted rows stay `running`."""
+        self._shutdown_seen = True
+        if payload.get("restartExpectedMs") is None:
+            self._stop_notice_seen = True
+
+    def hand_over_run(self, session_key: str, run_id: str, *,
+                      thinking: str | None = None, read_row: bool = False) -> bool:
+        """An interrupted run's request ends without continuing it: the turn
+        writer takes its message over (DESIGN 2.6) and the run's settled row
+        decides who continues it (2.7), so a reply never resumes a run the
+        Gateway recovers. `read_row`: the row is read now, for a handover
+        that can come after the post-hello resync. False when there is no
+        message to hand over."""
+        key = f"{session_key}:{run_id}"
+        target = self._run_targets.get(key)
+        parsed = self.parse_owui_session_key(session_key)
+        if (target is None or not parsed or not self.writes_turns or self._retired
+                or (session_key, run_id) in self._turn_pumps):
+            return False
+        pump = self._turn_pumps[(session_key, run_id)] = _RunPump()
+        pump.handover = {"message_id": target["message_id"],
+                         "renderer": self._run_renderers.get(key), "thinking": thinking}
+        pump.stop_notice_before = self._stop_notice_seen
+        self.unregister_run_target(session_key, run_id)
+        spawn_background(_turn_pump_loop(self, session_key, run_id, parsed, pump))
+        spawn_background(self.ensure_message_subscription(session_key))
+        if read_row:
+            spawn_background(_turn_resync(self, skip=set(self.active_run_snapshot)))
+        pipe_log(f"  handed run {run_id[:24]}... over to the turn writer "
+                 f"(message {target['message_id'][:8]}...)")
+        return True
 
     def _on_sessions_changed(self, payload: dict) -> None:
         """A session row changed. Waiters on its run state re-read it, and an
@@ -2089,6 +2130,12 @@ class _GatewayConnection:
             pipe_log(f"  marked an event gap in {n} run queue(s)")
         self._wake_session_waiters()
 
+    def _mark_gateway_restart(self) -> None:
+        """Tell every live reply that its run's Gateway process is gone."""
+        for consumer in list(self._consumers.values()):
+            for q in consumer.queues:
+                q.put_nowait({"type": _RESTART_MARKER_TYPE})
+
     def _note_gateway_boot(self, boot_id: str | None) -> None:
         """Count a Gateway restart only when its boot id changes."""
         first = self.connection_epoch <= 1
@@ -2099,10 +2146,12 @@ class _GatewayConnection:
             if not first:
                 self.gateway_restarts += 1
                 pipe_log("  reconnected; Gateway sent no bootId, treating it as a restart")
+                self._mark_gateway_restart()
             return
         if self.gateway_boot_id is not None and boot_id != self.gateway_boot_id:
             self.gateway_restarts += 1
             pipe_log(f"  Gateway restarted (bootId {self.gateway_boot_id[:8]} -> {boot_id[:8]})")
+            self._mark_gateway_restart()
         elif not first:
             pipe_log(f"  reconnected to the same Gateway (bootId {boot_id[:8]}); runs continue")
         self.gateway_boot_id = boot_id
@@ -2356,10 +2405,7 @@ class _GatewayConnection:
                     self._on_sessions_changed(msg.get("payload") or {})
                     continue
                 if msg.get("type") == "event" and msg.get("event") == "shutdown":
-                    # DESIGN 2.7 F4: no restartExpectedMs = stop mode, whose aborted
-                    # runs the Gateway never recovers.
-                    if (msg.get("payload") or {}).get("restartExpectedMs") is None:
-                        self._stop_notice_seen = True
+                    self._on_shutdown(msg.get("payload") or {})
                     continue
                 if msg.get("type") == "event" and msg.get("event") == "session.tool":
                     # Same payload as an `agent` tool event (stream "tool",

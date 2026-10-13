@@ -344,6 +344,13 @@ adoption of an orphaned stub (gateway.py:3287-3299, 3622-3636) and the stub comp
 PR #19. The orphan reconcile (P20) is the same handover done at startup, for runs whose
 request died with the process.
 
+An interrupted run is one more such path. The inline turn never resumes a run itself. On an
+outside kill of the CLI (the 2.7 exit text), an abort after a `shutdown` notice, or a new
+`bootId` after a reconnect, it hands M to the writer (`hand_over_run`) and ends its request.
+R's settled row then picks the owner by 2.7, read from the next push, or read at once when
+the handover comes after the post-hello resync. `resume_after_restart`, the epoch-bump probe
+and `_is_restart_signature` are gone.
+
 ### 2.7 Interrupted runs: one owner per run (M3 result, ELI-90)
 
 M3 (window 2026-10-12 23:54Z, `ha apps restart`) showed that the Gateway does **not** recover
