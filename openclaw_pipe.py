@@ -5029,6 +5029,10 @@ class _GatewayConnection:
         """
         self._retired = True
         _retire_turn_writer(self.writer_id)
+        for writer in list(self._turn_writers.values()):
+            writer.release()
+        for pump in list(self._turn_pumps.values()):
+            pump.queue.put_nowait(("retired", None))
         if self._consumers:
             pipe_log(
                 f"  retired gateway connection: serving {len(self._consumers)} "
@@ -5822,6 +5826,18 @@ async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
         stub = msgs.get(stub_id) or {}
         if stub.get("role") != "assistant" or stub.get("done") is not False:
             return "skip"  # gone or finished meanwhile
+        writer = (stub.get("meta") or {}).get("openclaw_writer")
+        if writer:
+            # A turn writer's message: its own writer finishes it, or, once
+            # that writer is gone (a retired deploy, a dead process), this
+            # connection adopts it. Another request's task in the chat is no
+            # reason to leave it.
+            if writer in _live_turn_writers():
+                return "skip"
+            return await _adopt_turn_message(
+                conn, chat_id=chat_id, user_id=chat.user_id, message_id=stub_id,
+                session_key=_owui_session_key(agent_id, chat.user_id, chat_id),
+                meta=stub.get("meta") or {})
         if await _owui_chat_has_live_task(chat_id):
             return "skip"  # a live request owns it
         session_key = _owui_session_key(agent_id, chat.user_id, chat_id)
@@ -6343,7 +6359,11 @@ class _TurnWriter:
         from open_webui.tasks import create_task
 
         self.task_id, _ = await create_task(_owui_redis(), self._hold(), id=self.chat_id)
-        await _set_turn_meta(self.chat_id, self.message_id, {"task_id": self.task_id})
+        meta = {"task_id": self.task_id}
+        if self.wake is not None:
+            # What a successor needs to adopt this message (ELI-103 step 4).
+            meta["openclaw_wake"] = {k: self.wake.get(k) for k in ("key", "at", "job")}
+        await _set_turn_meta(self.chat_id, self.message_id, meta)
         self.opened = True
         try:
             # Case 8: lets a cancel of this task ask the page whether it was
@@ -6539,6 +6559,19 @@ class _TurnWriter:
         finally:
             self._done.set()
 
+    def release(self) -> None:
+        """This writer's connection was retired by a newer deploy: end the Open
+        WebUI task now and write nothing more. A task left registered keeps the
+        chat "generating" and makes orphan repair skip the chat (live 2026-10-13,
+        task 03904655 of retired 62b9927 held efe80f6a). M stays unfinished
+        with this writer recorded, which no longer counts as live, so the
+        successor adopts it (`_adopt_turn_message`) and finishes it once its
+        run is over."""
+        if self.closed:
+            return
+        self.closed = True
+        self._done.set()
+
     def _rebuild_wake(self, hist: dict | None) -> None:
         """Repair lost events from the wake's window of the transcript. A wake
         has no closing message to prove its span complete (only the first wake
@@ -6720,7 +6753,9 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
     user_id, chat_id = parsed
     try:
         handed = pump.handover
-        if handed is not None:
+        if pump.writer is not None:
+            pass  # adopted from a gone writer's message (_adopt_turn_message)
+        elif handed is not None:
             pump.writer = _TurnWriter(conn, session_key=sess, chat_id=chat_id, user_id=user_id,
                                       run_id=run, message_id=handed["message_id"], takeover=True,
                                       renderer=handed["renderer"], thinking=handed.get("thinking"))
@@ -6732,6 +6767,8 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
             pump.writer = await _turn_writer_for(conn, sess, run, user_id, chat_id)
         while True:
             kind, item = await pump.queue.get()
+            if kind == "retired":
+                return
             if pump.wake:
                 if await _wake_step(conn, sess, run, user_id, chat_id, pump, kind, item):
                     return
@@ -6850,6 +6887,43 @@ async def _wake_resync(conn: "_GatewayConnection") -> None:
     for (_sess, _run), pump in wakes:
         if pump.writer.wake["job"] not in running:
             pump.queue.put_nowait(("wake-ended", time.time() * 1000))
+
+
+async def _adopt_turn_message(conn: "_GatewayConnection", *, chat_id: str, user_id: str,
+                              session_key: str, message_id: str, meta: dict) -> str:
+    """Take over message `message_id`, which a turn writer of a retired or
+    dead connection left unfinished. Its meta names the run (and a wake's
+    turn). Later events of the run reach the pump made here; a run already
+    over is finished now. Returns "adopted" or "skip"."""
+    run = meta.get("openclaw_run")
+    if not run or (session_key, run) in conn._turn_pumps or conn._retired:
+        return "skip"
+    pump = conn._turn_pumps[(session_key, run)] = _RunPump()
+    wake = meta.get("openclaw_wake") if isinstance(meta.get("openclaw_wake"), dict) else None
+    if wake and wake.get("key"):
+        pump.wake = True
+        conn._wake_turns_bound.setdefault(session_key, set()).add(wake["key"])
+    pump.writer = _TurnWriter(conn, session_key=session_key, chat_id=chat_id, user_id=user_id,
+                              run_id=run, message_id=message_id, takeover=True,
+                              wake=dict(wake) if pump.wake else None)
+    conn._turn_writers[(chat_id, message_id)] = pump.writer
+    spawn_background(_turn_pump_loop(conn, session_key, run, (user_id, chat_id), pump))
+    spawn_background(conn.ensure_message_subscription(session_key))
+    pipe_log(f"  turn writer: adopted {message_id[:8]}... (run {run[:24]}...) from writer "
+             f"{str(meta.get('openclaw_writer'))[:12]}...")
+    if pump.wake:
+        await _wake_resync(conn)
+        return "adopted"
+    try:
+        lst = await conn.send_request("sessions.list", {"search": session_key[-36:], "limit": 10},
+                                      timeout=15)
+    except Exception as ex:
+        pipe_log(f"  turn writer: row read for an adopted message failed: {ex!r}")
+        return "adopted"
+    row = next((r for r in (lst.get("sessions") or []) if r.get("key") == session_key), None)
+    if row is not None and not row.get("hasActiveRun"):
+        pump.queue.put_nowait(("settled", row))
+    return "adopted"
 
 
 async def _turn_after_hello(conn: "_GatewayConnection") -> None:

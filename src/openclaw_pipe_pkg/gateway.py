@@ -2109,6 +2109,10 @@ class _GatewayConnection:
         """
         self._retired = True
         _retire_turn_writer(self.writer_id)
+        for writer in list(self._turn_writers.values()):
+            writer.release()
+        for pump in list(self._turn_pumps.values()):
+            pump.queue.put_nowait(("retired", None))
         if self._consumers:
             pipe_log(
                 f"  retired gateway connection: serving {len(self._consumers)} "
@@ -2902,6 +2906,18 @@ async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
         stub = msgs.get(stub_id) or {}
         if stub.get("role") != "assistant" or stub.get("done") is not False:
             return "skip"  # gone or finished meanwhile
+        writer = (stub.get("meta") or {}).get("openclaw_writer")
+        if writer:
+            # A turn writer's message: its own writer finishes it, or, once
+            # that writer is gone (a retired deploy, a dead process), this
+            # connection adopts it. Another request's task in the chat is no
+            # reason to leave it.
+            if writer in _live_turn_writers():
+                return "skip"
+            return await _adopt_turn_message(
+                conn, chat_id=chat_id, user_id=chat.user_id, message_id=stub_id,
+                session_key=_owui_session_key(agent_id, chat.user_id, chat_id),
+                meta=stub.get("meta") or {})
         if await _owui_chat_has_live_task(chat_id):
             return "skip"  # a live request owns it
         session_key = _owui_session_key(agent_id, chat.user_id, chat_id)
