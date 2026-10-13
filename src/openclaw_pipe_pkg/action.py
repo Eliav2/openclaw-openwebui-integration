@@ -1505,7 +1505,7 @@ class Action:
             # same reasoning gateway.py's existing send_stop already applies
             # to its own chat.send("/stop") call.
             compact_params["deliver"] = False
-            send_resp = await conn.send_request("chat.send", compact_params, timeout=30)
+            send_resp = await _run_request(conn, RUN_SEND, compact_params, timeout=30)
         except Exception as ex:
             pipe_log(f"[status-action] compact chat.send failed: {ex}")
             await __event_emitter__({

@@ -790,6 +790,13 @@ def _is_owner_user(owners: frozenset, user_id, email) -> bool:
     return any(v and str(v).strip().lower() in owners for v in (user_id, email))
 
 
+# The requests that start, steer or end a run. The Gateway records a turn as
+# the owner's when the connection that sends it holds operator.admin, so these
+# go out only through `_run_request`, which picks the connection.
+RUN_SEND, RUN_ABORT, RUN_PATCH = "chat.send", "chat.abort", "sessions.patch"
+_OWUI_KEY_USER = re.compile(r"^agent:[^:]+:openwebui-([0-9a-fA-F-]{36})-")
+
+
 # ---------------------------------------------------------------------------
 # Custom exceptions
 # ---------------------------------------------------------------------------
@@ -2149,9 +2156,17 @@ class _GatewayConnection:
     auto-reconnects on disconnect with exponential backoff.
     """
 
-    def __init__(self, valves_ref, writes_turns: bool = True):
+    def __init__(self, valves_ref, writes_turns: bool = True, scopes: list | None = None,
+                 identity_name: str = "identity", requests_only: bool = False):
         # Weak reference to Pipe valves (re-read on each call)
         self._valves = valves_ref
+        # The scopes this connection requests and signs. A connection built with
+        # RESTRICTED_SCOPES has its own device identity (`identity_name`) and
+        # only sends requests (`requests_only`: no subscriptions, it renders
+        # nothing); see `_run_request`.
+        self.scopes = list(GATEWAY_SCOPES if scopes is None else scopes)
+        self._identity_name = identity_name
+        self.requests_only = requests_only
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._event_loop_task: asyncio.Task | None = None
         self._init_lock = asyncio.Lock()
@@ -2928,12 +2943,8 @@ class _GatewayConnection:
     async def abort(self, session_key: str, run_id: str):
         """Send chat.abort for an active run."""
         try:
-            await self._ws.send(json.dumps(dict(
-                type="req", id="abort", method="chat.abort", params=dict(
-                    sessionKey=session_key,
-                    runId=run_id,
-                )
-            )))
+            await _run_request(self, RUN_ABORT, dict(sessionKey=session_key, runId=run_id),
+                               wait=False)
             pipe_log(f"  sent chat.abort for run {run_id[:20]}...")
         except Exception as e:
             pipe_log(f"  abort send failed: {e}")
@@ -3133,8 +3144,8 @@ class _GatewayConnection:
     async def send_stop(self, session_key: str):
         """Send the stronger /stop command for runtimes where chat.abort is incomplete."""
         try:
-            resp = await self.send_request(
-                "chat.send",
+            resp = await _run_request(
+                self, RUN_SEND,
                 dict(
                     sessionKey=session_key,
                     message="/stop",
@@ -3294,7 +3305,8 @@ class _GatewayConnection:
             raise GatewayError("Bad handshake -- expected connect.challenge")
 
         c = challenge["payload"]
-        signed = _sign_challenge(self._ident, c["nonce"], c["ts"], token_str=token)
+        signed = _sign_challenge(self._ident, c["nonce"], c["ts"], token_str=token,
+                                 scopes=self.scopes)
 
         auth = dict(token=token)
         if self._device_token:
@@ -3306,7 +3318,7 @@ class _GatewayConnection:
                 client=dict(id="webchat", version="1",
                             platform="linux", mode="cli"),
                 role="operator",
-                scopes=GATEWAY_SCOPES,
+                scopes=self.scopes,
                 auth=auth,
                 device=signed,
                 locale="en-US",
@@ -3344,18 +3356,20 @@ class _GatewayConnection:
             f"Connected to Gateway (persistent) [epoch {self.connection_epoch}]"
         )
         # Subscriptions belong to the socket. Their requests resolve on the
-        # event loop, which is not reading yet here, so it renews them.
-        self._subscriptions_stale = True
+        # event loop, which is not reading yet here, so it renews them. A
+        # requests-only connection has none: the main connection renders.
+        self._subscriptions_stale = not self.requests_only
         # NOTE: does not start/spawn the event-loop task -- that happens
         # exactly once, in `ensure_connected`. This method is also called
         # from inside `_reconnect`, which runs from within the event-loop
         # task itself; spawning another task here would duplicate it.
 
     def _identity_path(self, valves):
-        return os.path.join(_state_dir(getattr(valves, "STATE_DIR", "")), "identity.json")
+        return os.path.join(_state_dir(getattr(valves, "STATE_DIR", "")), f"{self._identity_name}.json")
 
     def _device_token_path(self, valves):
-        return os.path.join(_state_dir(getattr(valves, "STATE_DIR", "")), "device-token.json")
+        suffix = self._identity_name[len("identity"):]
+        return os.path.join(_state_dir(getattr(valves, "STATE_DIR", "")), f"device-token{suffix}.json")
 
     def _load_device_token(self, valves):
         if self._device_token:
@@ -3391,7 +3405,9 @@ class _GatewayConnection:
             self._load_device_token(valves)
             return
 
-        if valves.DEVICE_IDENTITY:
+        # The DEVICE_IDENTITY valve names the main identity only; a restricted
+        # connection always has its own.
+        if self._identity_name == "identity" and getattr(valves, "DEVICE_IDENTITY", ""):
             ident = _parse_device_identity(valves.DEVICE_IDENTITY)
             if ident and ident.get("id") and ident.get("privateKey"):
                 self._ident = ident
@@ -3404,6 +3420,8 @@ class _GatewayConnection:
         self._ident = _generate_device_identity()
         _write_json_file(identity_path, self._ident)
         pipe_log(f"Generated new device identity and saved it to {identity_path}")
+        if self._identity_name != "identity":
+            return
         print(
             f"DEVICE_IDENTITY={json.dumps(self._ident, separators=(',',':'))}",
             flush=True
@@ -4444,6 +4462,112 @@ async def _get_gateway_connection(valves_getter) -> _GatewayConnection:
         return conn
 
 
+# ---------------------------------------------------------------------------
+# Owner users (OWNER_USERS valve)
+# ---------------------------------------------------------------------------
+# The main connection holds operator.admin, so every turn it sends is the
+# owner's and gets owner-only tools. For a chat whose user is not in
+# OWNER_USERS, every request that starts, steers or ends a run goes over a
+# second connection with RESTRICTED_SCOPES and its own device identity. Reading
+# and rendering stay on the main connection: they do not make a turn the
+# owner's, and the main connection remains the only one that writes into Open
+# WebUI (ELI-100).
+
+_restricted_connection: "_GatewayConnection | None" = None
+_restricted_init_lock = asyncio.Lock()
+
+
+async def _get_restricted_connection(valves_getter) -> "_GatewayConnection":
+    """The connection for non-owner users' run requests: read + write scopes,
+    identity `identity-restricted.json`, requests only."""
+    global _restricted_connection
+    async with _restricted_init_lock:
+        if _restricted_connection is None:
+            conn = _GatewayConnection(valves_getter, writes_turns=False, scopes=RESTRICTED_SCOPES,
+                                      identity_name="identity-restricted", requests_only=True)
+            await conn.ensure_connected()
+            _restricted_connection = conn
+            return conn
+    await _restricted_connection.ensure_connected()
+    return _restricted_connection
+
+
+async def _owui_call(fn, *args):
+    out = fn(*args)
+    return await out if asyncio.iscoroutine(out) else out
+
+
+async def _owner_users_setting(conn) -> "str | None":
+    """OWNER_USERS as configured, or None when it cannot be read. The Pipe's
+    connection carries the Pipe's valves; the Status Action's own connection
+    does not, so the setting is read from the Pipe function's saved valves."""
+    valves_getter = getattr(conn, "_valves", None)
+    raw = getattr(valves_getter() if callable(valves_getter) else None, "OWNER_USERS", None)
+    if isinstance(raw, str):
+        return raw
+    try:
+        from open_webui.models.functions import Functions
+    except ImportError:
+        return ""  # not inside Open WebUI: there is no valve to set
+    try:
+        found = ""
+        for fn in await _owui_call(Functions.get_functions_by_type, "pipe") or []:
+            saved = await _owui_call(Functions.get_function_valves_by_id, fn.id) or {}
+            if isinstance(saved, dict) and saved.get("OWNER_USERS"):
+                found = ",".join(x for x in (found, saved["OWNER_USERS"]) if x)
+        return found
+    except Exception as ex:
+        pipe_log(f"  owner users: could not read the Pipe's valves ({ex!r}); treating as not owner")
+        return None
+
+
+async def _user_email(user_id: str) -> "str | None":
+    try:
+        from open_webui.models.users import Users
+        user = await _owui_call(Users.get_user_by_id, user_id)
+        return getattr(user, "email", None) if user else None
+    except Exception:
+        return None
+
+
+async def _sender_is_owner(conn, session_key: str) -> bool:
+    """Whether a run request for `session_key` may go out as the owner's. An
+    empty OWNER_USERS keeps the old behaviour (everyone is). Otherwise the
+    chat's user (from the session key, with that user's email) must be on the
+    list; anything that cannot be decided is not the owner's."""
+    raw = await _owner_users_setting(conn)
+    if raw is None:
+        return False
+    owners = _parse_owner_users(raw)
+    if not owners:
+        return True
+    m = _OWUI_KEY_USER.match(session_key or "")
+    if not m:
+        return False
+    user_id = m.group(1)
+    if user_id.lower() in owners:
+        return True
+    return _is_owner_user(owners, user_id, await _user_email(user_id))
+
+
+async def _run_request(conn, method: str, params: dict, *, timeout: float = 10,
+                       owner: "bool | None" = None, wait: bool = True):
+    """Send a request that starts, steers or ends a run (`RUN_SEND`,
+    `RUN_ABORT`, `RUN_PATCH`) on the connection the chat's owner status calls
+    for: `conn` for an owner, the restricted connection otherwise. `owner`
+    overrides the decision from the session key (a title run, whose session
+    is not the chat's). `wait=False` sends without waiting for the answer."""
+    if owner is None:
+        owner = await _sender_is_owner(conn, params.get("sessionKey") or params.get("key") or "")
+    target = conn if owner else await _get_restricted_connection(conn._valves)
+    if not wait:
+        await target._ws.send(json.dumps(dict(type="req", id="abort" if method == RUN_ABORT
+                                              else f"run-{uuid.uuid4().hex[:8]}",
+                                              method=method, params=params)))
+        return None
+    return await target.send_request(method, params, timeout=timeout)
+
+
 # --- writer ----------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -5132,7 +5256,7 @@ class _TurnWriter:
                                       self.request_attachments)
         key = pipe_run_id(self.chat_id, self.message_id, "resume")
         try:
-            resp = await self.conn.send_request("chat.send", _owui_chat_send_params(
+            resp = await _run_request(self.conn, RUN_SEND, _owui_chat_send_params(
                 session_key=self.session_key, message=directive, idempotency_key=key,
                 owui_chat_id=self.chat_id, owui_user_id=self.user_id,
                 thinking=self.thinking), timeout=30)
@@ -5338,8 +5462,8 @@ class _TurnWriter:
         if intent != "stop" or self.closed:
             return
         try:
-            await self.conn.send_request(
-                "chat.abort", {"sessionKey": self.session_key, "runId": self.run_id}, timeout=15)
+            await _run_request(
+                self.conn, RUN_ABORT, {"sessionKey": self.session_key, "runId": self.run_id}, timeout=15)
         except Exception as ex:
             pipe_log(f"  turn writer: chat.abort failed: {ex}")
         await self.finalize()
@@ -8143,7 +8267,7 @@ class Action:
             # same reasoning gateway.py's existing send_stop already applies
             # to its own chat.send("/stop") call.
             compact_params["deliver"] = False
-            send_resp = await conn.send_request("chat.send", compact_params, timeout=30)
+            send_resp = await _run_request(conn, RUN_SEND, compact_params, timeout=30)
         except Exception as ex:
             pipe_log(f"[status-action] compact chat.send failed: {ex}")
             await __event_emitter__({

@@ -1122,7 +1122,7 @@ class ParkedCancelTests(unittest.IsolatedAsyncioTestCase):
         # must park, never abort directly.
         src = inspect.getsource(Pipe._pipe_turn)
         claim = src.index("await conn.claim_cancelled_turn(session_key)")
-        patch = src.index('"sessions.patch"')
+        patch = src.index("RUN_PATCH")
         self.assertLess(claim, patch)
         self.assertIn("conn.park_cancelled_turn(", src)
         self.assertNotIn("await conn.abort(", src)
@@ -7695,7 +7695,7 @@ class InlineRewriteWiringTests(unittest.TestCase):
         # Review 2af1 N6: the answer run is listened for, and its target moved,
         # before its chat.send.
         ask = src.split("async def maybe_answer_user_input", 1)[1]
-        send = ask.index('"chat.send"')
+        send = ask.index("RUN_SEND")
         self.assertLess(ask.index("conn.register_consumer(session_key, idempotency_key)"), send)
         self.assertLess(ask.index("conn.continue_run_target(session_key, our_run_id, idempotency_key"), send)
         self.assertGreaterEqual(src.count("conn.note_turn_rewrite("), 5,

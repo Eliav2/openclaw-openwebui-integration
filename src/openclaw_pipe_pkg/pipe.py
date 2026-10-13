@@ -449,7 +449,7 @@ class Pipe:
     # ── Auto-title helpers ──────────────────────────────────────────
 
     async def _auto_title(self, body, conn, visible_message_text,
-                          owui_origin_chat_id, bearer_token):
+                          owui_origin_chat_id, bearer_token, session_key=""):
         """Generate a chat title and set it via OWUI's REST API.
 
         Fires after the SECOND successful exchange (first message + response),
@@ -477,7 +477,10 @@ class Pipe:
         pipe_log(f"Auto-title: generating title for chat {owui_origin_chat_id}")
 
         try:
-            title = await self._generate_title_text(conn, user_text, assistant_preview)
+            # The title run carries this chat's text, so it goes out with the
+            # chat's owner status (OWNER_USERS), not the owner's.
+            owner = await _sender_is_owner(conn, session_key)
+            title = await self._generate_title_text(conn, user_text, assistant_preview, owner=owner)
             if not title:
                 return
             await self._set_owui_chat_title(owui_origin_chat_id, title, bearer_token)
@@ -486,7 +489,7 @@ class Pipe:
             pipe_log(f"Auto-title: failed (non-fatal): {e}")
 
     async def _generate_title_text(self, conn, user_msg: str,
-                                    assistant_msg: str) -> str | None:
+                                    assistant_msg: str, owner: bool = True) -> str | None:
         """Use a lightweight model call to generate a 3-5 word title + emoji.
 
         Sends a chat.send to a temp session and reads the run from its own
@@ -516,10 +519,10 @@ class Pipe:
         queue = conn.register_consumer(title_session, run_id)
         try:
             try:
-                resp = await conn.send_request(
-                    "chat.send",
+                resp = await _run_request(
+                    conn, RUN_SEND,
                     dict(sessionKey=title_session, message=prompt, idempotencyKey=run_id),
-                    timeout=15,
+                    timeout=15, owner=owner,
                 )
             except Exception as e:
                 pipe_log(f"Auto-title: chat.send failed: {e}")
@@ -1007,8 +1010,8 @@ class Pipe:
             else:
                 for _patch_attempt in range(2):
                     try:
-                        patch_resp = await conn.send_request(
-                            "sessions.patch",
+                        patch_resp = await _run_request(
+                            conn, RUN_PATCH,
                             dict(key=session_key, model=model_override),
                             timeout=10
                         )
@@ -1264,8 +1267,8 @@ class Pipe:
                 # is the idempotency key.
                 queue = conn.register_consumer(session_key, idempotency_key)
                 try:
-                    send_resp = await conn.send_request(
-                        "chat.send",
+                    send_resp = await _run_request(
+                        conn, RUN_SEND,
                         _owui_chat_send_params(
                             session_key=session_key,
                             message="\n\n".join(t for t in turn.unsent if t),
@@ -1477,7 +1480,7 @@ class Pipe:
                 key = f"msg-{chat_id}-resume-{time.time()}"
                 resume_queue = conn.register_consumer(session_key, key)
                 try:
-                    resp = await conn.send_request("chat.send", _owui_chat_send_params(
+                    resp = await _run_request(conn, RUN_SEND, _owui_chat_send_params(
                         session_key=session_key, message=_resume_directive(visible_message_text, text),
                         idempotency_key=key, owui_chat_id=owui_origin_chat_id,
                         owui_user_id=owui_origin_user_id, thinking=resolved_thinking), timeout=30)
@@ -1674,8 +1677,8 @@ class Pipe:
                 conn.unregister_consumer(session_key, idempotency_key, queue=answer_queue)
                 conn.continue_run_target(session_key, idempotency_key, our_run_id, shown=False)
             try:
-                send_resp = await conn.send_request(
-                    "chat.send",
+                send_resp = await _run_request(
+                    conn, RUN_SEND,
                     _owui_chat_send_params(
                         session_key=session_key,
                         message=answer,
@@ -2458,8 +2461,8 @@ class Pipe:
             # ELI-87), so the message would be lost. Take it back while it is
             # queued, wait for that run to settle, and send it again.
             try:
-                await conn.send_request(
-                    "chat.abort", {"sessionKey": session_key, "runId": our_run_id},
+                await _run_request(
+                    conn, RUN_ABORT, {"sessionKey": session_key, "runId": our_run_id},
                     timeout=15,
                 )
                 took_back = True
@@ -2546,7 +2549,7 @@ class Pipe:
             spawn_background(
                 self._auto_title(
                     body, conn, visible_message_text,
-                    owui_origin_chat_id, bearer_token,
+                    owui_origin_chat_id, bearer_token, session_key=session_key,
                 )
             )
 

@@ -690,7 +690,7 @@ class _TurnWriter:
                                       self.request_attachments)
         key = pipe_run_id(self.chat_id, self.message_id, "resume")
         try:
-            resp = await self.conn.send_request("chat.send", _owui_chat_send_params(
+            resp = await _run_request(self.conn, RUN_SEND, _owui_chat_send_params(
                 session_key=self.session_key, message=directive, idempotency_key=key,
                 owui_chat_id=self.chat_id, owui_user_id=self.user_id,
                 thinking=self.thinking), timeout=30)
@@ -896,8 +896,8 @@ class _TurnWriter:
         if intent != "stop" or self.closed:
             return
         try:
-            await self.conn.send_request(
-                "chat.abort", {"sessionKey": self.session_key, "runId": self.run_id}, timeout=15)
+            await _run_request(
+                self.conn, RUN_ABORT, {"sessionKey": self.session_key, "runId": self.run_id}, timeout=15)
         except Exception as ex:
             pipe_log(f"  turn writer: chat.abort failed: {ex}")
         await self.finalize()
