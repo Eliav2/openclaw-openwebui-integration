@@ -131,6 +131,8 @@ emits it.
 The pipe already subscribes (gateway.py:1530-1535) and already handles `sessions.changed`
 (gateway.py:2517, 1618). Phase 2 adds: on `phase:"start"` for an OWUI key
 (`parse_owui_session_key`, gateway.py:1893), open a run entry for `clientRunId or runId`.
+The start push alone misses runs that start before the pipe is subscribed, for example
+restart recovery at boot. The handshake below covers them.
 
 **A dropped push is detectable.** `sessions.changed` is sent with `dropIfSlow:true`. The
 broadcaster still spends a sequence number on a dropped event (`server-start-BB-IxTAg.mjs:3192-3207`:
@@ -140,6 +142,37 @@ event was dropped, and the pipe re-reads `sessions.list` (`activeRunIds`) and op
 for runs it does not know. A non-droppable event that overflows closes the socket with
 1008 "slow consumer" (`:3209-3214`), which takes the reconnect path. Today the pipe ignores
 the frame `seq` entirely.
+
+**Every `hello-ok` subscribes and lists in one request (M3-crash).** In the crash window
+(2026-10-13 00:33-00:37Z) the pipe never saw the recovery runs' `phase:"start"`. The Gateway
+starts recovery at boot, before any client has connected and subscribed. The watcher saw
+only their `chat final` and `phase:"end"`. So the start push is not enough on its own:
+
+1. On every `hello-ok` the pipe sends `sessions.subscribe` **with list params**. The handler
+   registers the subscriber first (`context.subscribeSessionEvents(connId)`,
+   `sessions-subscriptions-CeMquS--.mjs:21-22`) and then runs `sessionsListHandler` in the
+   same request (`:27-36`). The reply is the list: subscribe, then list, with no gap between
+   the two calls.
+2. **A run that starts around the subscribe is caught by one of the two.**
+   * The start push and `activeRunIds` both come from the same function,
+     `resolveVisibleActiveSessionRunState` (`session-active-runs-BURU1M8_.mjs:62`). The push
+     reaches it through `resolveSessionActiveRunState` (`server-runtime-subscriptions-B1FHK14L.mjs:1401`);
+     `sessions.list` uses the projector built on it (`session-active-runs-BURU1M8_.mjs:95`,
+     `sessions-read-CtBfOtH4.mjs:576-597`).
+   * Every start push recorded carries `hasActiveRun: true` (2 of 2 in the crash window,
+     `runs/m3-watch-window2-crash.jsonl`). So a run is visible in `activeRunIds` no later
+     than its start push is built: t(visible) <= t(push).
+   * Push after the registration: the pipe gets the push. Push before the registration:
+     t(visible) <= t(push) < t(register) < t(list). The run is therefore in the list,
+     unless it has already ended.
+3. **A run that ended before the list** (for example a short recovery) is covered by the
+   ended-while-away rule, case 4: the session's `updatedAt` is newer than the chat's
+   `updated_at`, so `chat.history` is read, and every closed `cli-assistant:<R>` without a
+   finished message gets one. A recovery run maps to its source message through rule E.
+   The session row is bumped when a run ends: M2 measured this, and in the crash window the
+   agent session's `updatedAt` 1791851832978 is at or after the recovery's closing message
+   `cli-assistant:8f27e4c8` at 1791851832894. So a recovery that ended before the pipe
+   reconnected still gets its message, without a start push.
 
 ### 2.2 Identity: which message belongs to run R
 
@@ -396,6 +429,50 @@ own scope, and the pipe reuses it so that both sides agree on what is worth cont
 The pipe resumes only on keys that predicate accepts. Every OWUI key passes it, so no
 separate exception list exists.
 
+**The text match (approval condition).** The dist has no structured exit field. The row
+schema has only `lastRunError: string` (`sessions-row-BVZA0ilu.mjs:154`). It is filled by
+`resolveSessionRunError` (`session-run-error-BdVGP1JC.mjs:37-40`), which passes
+`outcome.error` through `renderUserFacingText` and redaction (`:9-12`). The child's exit
+reaches it only as the `Error` text built at `cli-transport-CXSP7FlN.mjs:96`. So the pipe
+matches text, and option (b) guards the match:
+
+* a checked-in fixture holds that exact source line, extracted from the installed dist
+  (version recorded), plus the row text seen live in window 1;
+* the unit test renders the fixture's templates for 143, 137, 1 and `SIGKILL`, and checks
+  the classifier on each;
+* when the installed dist is present, the test extracts the line again and fails if it
+  differs from the fixture. An OpenClaw upgrade that rewords the error therefore fails the
+  suite instead of silently dropping resumes.
+
+**OOM loop.** A claude child is the first OOM victim (`oom_score_adj=1000`, ELI-89). One that
+is OOM-killed with the Gateway alive leaves `failed` + exit 137, so the pipe resumes. If the
+resume is OOM-killed too, the same row comes back. `max_resume_attempts = 3` per M is counted
+on M, not per run. After the third, M is finalized with what it has and a cut-off note, and
+no fourth run is sent. A unit test drives four consecutive 137 rows.
+
+**M3 results.**
+
+* Window 1, 2026-10-12 23:54Z, container stop (`ha apps restart`): both rows were terminal
+  before the shutdown, and no recovery ran.
+  * Owner rule: pipe for both runs. Main resumed the user turn and lost the agent turn.
+* Window 2, 2026-10-13 00:33-00:37Z, crash (ELI-99 kill test, PASS, relaunch 50 s): boots 2,
+  1006 close, no `shutdown` notice. `owner_rule_holds=true`, `E_rule_holds=true`.
+  * Agent turn: recovery `8f27e4c8` links to `m3-agent-91c29446`, and reply `df1c154f` is
+    done with 6 cards and `AGENT-DONE`.
+  * User turn: recovery `f2445aa8` links to the source. On main, though, the user's content
+    was lost:
+    * Main's pipe also sent `resume-0c5d682c-...`, which is the double continuation. It
+      arrived while the recovery was active, so the Gateway queued it as a follow-up: an
+      immediate `chat final` (`chat-send-handler-kZQfUabO.mjs:3206`) and no transcript turn.
+    * When the recovery ended (log 00:37:18.148 "restart recovery terminal ...
+      f2445aa8"), the follow-up ran as `04351f67` and failed 67 ms later: "Embedded agent
+      failed before reply: Reply operation has no active tool authority snapshot". It is
+      now the session's `lastRunId`, with `status: failed`.
+    * Main's reply `7371727a` closed on the queued final, `done:true`, 1 card and "_(This
+      turn produced no reply text.)_". The recovery's 6 cards and `USER-DONE` went nowhere.
+  * `M3_pass` was false only because neither recovery's `phase:"start"` reached the
+    watcher. That is the handshake gap closed in 2.1.
+
 **Fails on main** (each is a test in section 6):
 
 * The container stop: the agent turn is lost.
@@ -579,6 +656,15 @@ the branch:
 
   On main, the crash case resumes (a double continuation), the agent-turn container stop
   is lost, and exit 1 resumes.
+* `CrashDoubleContinuationTest` (M3-crash, user turn): a crash, then recovery `f2445aa8`
+  starts at boot. On main the pipe also sends `resume-...`, which the Gateway queues behind
+  the recovery. The reply closes on the queued run's immediate final, with no text and 1 of
+  6 cards. Expected: no pipe resume (the row is `running`), and M gets the recovery's 6 cards
+  and text.
+* `RecoveryStartedBeforeSubscribeTest`: the recovery's start push never arrives. The run is
+  in the `sessions.subscribe` list reply (still active), or it has already ended and is
+  found by the case 4 rule. Either way it writes into M.
+* `ExitTextFixtureTest` and `OomResumeLoopTest` (2.7).
 * `ResumeQueuedUntilHelloTest`: `chat.send` for the resume is refused while the Gateway
   closes, and it is sent on the next `hello-ok`, with no time advance.
 * Plus the old -> new list in 1.4, which goes in the PR body.
