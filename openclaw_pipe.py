@@ -2617,7 +2617,7 @@ async def _call_native_card_on_live_session(
     except Exception as ex:
         pipe_log(f"  native card retry unavailable (not running inside OWUI process?): {ex}")
         return None
-    sid = _live_session_id_for_user(owui_user_id, SESSION_POOL)
+    sid = _live_session_id_for_user(owui_user_id, SESSION_POOL, owui_chat_id)
     if not sid:
         return None
     interaction_id = str(uuid.uuid4())
@@ -2663,6 +2663,7 @@ async def _ask_user_native_card(
     owui_message_id: str | None,
     max_wait_s: float,
     poll_interval_s: float,
+    owui_session_id: str | None = None,
     __event_emitter__=None,
 ) -> str | None:
     """Ask through OWUI's native question card until answered or cancelled.
@@ -2670,6 +2671,8 @@ async def _ask_user_native_card(
     The card is re-shown after each OWUI-side timeout, when the user comes
     back from another chat, and on a fresh socket after a reconnect, all
     within max_wait_s. Only an explicit Cancel ends it early (returns None).
+    `owui_session_id`: the socket the turn started on; once it is gone the
+    card moves to the tab viewing the chat without waiting out OWUI's call.
     """
     questions = payload["data"]["questions"]
     card_timeout_s = payload["data"]["timeout_ms"] / 1000
@@ -2683,8 +2686,8 @@ async def _ask_user_native_card(
                 owui_user_id, owui_chat_id, owui_message_id, payload
             )
         else:
-            response = await asyncio.wait_for(
-                __event_call__(payload), timeout=card_timeout_s + 15
+            response = await _event_call_while_session_lives(
+                __event_call__, payload, owui_session_id, card_timeout_s + 15, poll_interval_s
             )
         elapsed = time.monotonic() - started
 
@@ -2804,17 +2807,49 @@ def _normalize_event_call_response(response) -> str:
     return ""
 
 
-def _live_session_id_for_user(user_id: str, session_pool) -> str | None:
+def _live_session_id_for_user(user_id: str, session_pool, chat_id: str | None = None) -> str | None:
     """Find a currently-connected OWUI session_id belonging to user_id.
 
     session_pool is OWUI's own SESSION_POOL dict (sid -> user dict with an
     'id' field), imported live from the running process -- see
     _retry_modal_on_reconnect for why this only works inside OWUI itself.
+
+    With `chat_id`, only a socket viewing that chat: OWUI 0.12 records the
+    chats a socket has joined (`chat_ids`, events:chat join/leave). The
+    user's first socket can be another tab or another client, where the card
+    never shows (ELI-58 live repro). The newest such socket is the tab the
+    user opened last; with none, None, so the card waits for the user to
+    open the chat. An OWUI that records no `chat_ids` gets any socket.
     """
-    for sid, session in list(session_pool.items()):
-        if session and session.get("id") == user_id:
-            return sid
-    return None
+    mine = [(sid, s) for sid, s in list(session_pool.items()) if s and s.get("id") == user_id]
+    if chat_id and any("chat_ids" in s for _sid, s in mine):
+        viewing = [sid for sid, s in mine if chat_id in (s.get("chat_ids") or [])]
+        return viewing[-1] if viewing else None
+    return mine[0][0] if mine else None
+
+
+async def _event_call_while_session_lives(__event_call__, payload: dict, session_id: str | None,
+                                          timeout_s: float, poll_interval_s: float):
+    """`__event_call__(payload)`, given up once the socket it is bound to
+    leaves OWUI's SESSION_POOL (the tab was reloaded or closed): OWUI answers
+    a call on a gone socket only at its own timeout, up to 240 s, and the
+    card can be shown on the user's new socket only after that (ELI-58 live
+    repro). Answers as OWUI does for a gone socket."""
+    call = asyncio.ensure_future(asyncio.wait_for(__event_call__(payload), timeout=timeout_s))
+    try:
+        from open_webui.socket.main import SESSION_POOL
+    except Exception:
+        SESSION_POOL = None
+    if not session_id or SESSION_POOL is None:
+        return await call
+    while True:
+        done, _ = await asyncio.wait({call}, timeout=poll_interval_s)
+        if done:
+            return call.result()
+        if session_id not in SESSION_POOL:
+            call.cancel()
+            pipe_log(f"  question card: session {session_id[:8]}... is gone; showing it on the user's tab")
+            return {"error": "Client session disconnected."}
 
 
 async def _retry_modal_on_reconnect(
@@ -2866,7 +2901,7 @@ async def _retry_modal_on_reconnect(
     dismissed_sid: str | None = None
     while time.monotonic() < deadline:
         await asyncio.sleep(poll_interval_s)
-        sid = _live_session_id_for_user(owui_user_id, SESSION_POOL)
+        sid = _live_session_id_for_user(owui_user_id, SESSION_POOL, owui_chat_id)
         if not sid:
             # Fully disconnected again; a later reconnect (even reusing this
             # sid) should re-fire.
@@ -2918,6 +2953,7 @@ async def _ask_user_input_modal(
     owui_message_id: str | None = None,
     max_wait_s: float = 3600,
     poll_interval_s: float = 5,
+    owui_session_id: str | None = None,
     __event_emitter__=None,
 ) -> str | None:
     """Ask the user through OWUI's modal input API when available.
@@ -2943,6 +2979,7 @@ async def _ask_user_input_modal(
             owui_message_id=owui_message_id,
             max_wait_s=max_wait_s,
             poll_interval_s=poll_interval_s,
+            owui_session_id=owui_session_id,
             __event_emitter__=__event_emitter__,
         )
     payload, _ = _modal_payload_from_user_input_prompt(prompt_text)
@@ -9510,6 +9547,7 @@ class Pipe:
                     owui_user_id=reconnect_user_id,
                     owui_chat_id=owui_origin_chat_id,
                     owui_message_id=(__metadata__ or {}).get("message_id"),
+                    owui_session_id=(__metadata__ or {}).get("session_id"),
                     __event_emitter__=__event_emitter__,
                 )
             except Exception as ex:

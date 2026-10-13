@@ -1637,6 +1637,7 @@ class Pipe:
                     owui_user_id=reconnect_user_id,
                     owui_chat_id=owui_origin_chat_id,
                     owui_message_id=(__metadata__ or {}).get("message_id"),
+                    owui_session_id=(__metadata__ or {}).get("session_id"),
                     __event_emitter__=__event_emitter__,
                 )
             except Exception as ex:
