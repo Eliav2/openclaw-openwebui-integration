@@ -389,9 +389,11 @@ class RestrictedConnectionTests(unittest.TestCase):
 
     def test_the_main_connection_keeps_its_file_names(self):
         c = openclaw_pipe._GatewayConnection(lambda: None)
-        v = types.SimpleNamespace(STATE_DIR="/x")
+        d = tempfile.mkdtemp()  # `_state_dir` creates the directory, so it must be writable
+        self.addCleanup(os.rmdir, d)
+        v = types.SimpleNamespace(STATE_DIR=d)
         self.assertEqual((c._identity_path(v), c._device_token_path(v)),
-                         ("/x/identity.json", "/x/device-token.json"))
+                         (f"{d}/identity.json", f"{d}/device-token.json"))
         self.assertEqual((c.scopes, c.requests_only), (GATEWAY_SCOPES, False))
 
 
