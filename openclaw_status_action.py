@@ -1354,6 +1354,8 @@ _RESTART_MARKER_TYPE = "_pipe_restart"
 # `resync` marks a row read after a reconnect or a frame gap, where an idle
 # session means every admitted run is over; a `queued` row tells a reply
 # waiting for its first event why (review 2af1 timers).
+# `read_at` (time.monotonic) is when the row was read: a reply trusts an idle
+# row only when it was read after its run was admitted (review 2af1 N4).
 _ROW_MARKER_TYPE = "_pipe_row"
 # Text on each side of a gap used to find where a repaired chunk goes.
 _GAP_ANCHOR_CHARS = 120
@@ -1999,6 +2001,22 @@ def _shared_gateway_state() -> dict | None:
     return state
 
 
+class _RunQueue(asyncio.Queue):
+    """A run's event queue. Events wait for room (`await put`): a reply read
+    slower than its run streams holds the receive loop back instead of losing
+    text. Control markers (a gap, a restart, a session row) go in past the
+    bound: they are few, a lost one can leave a reply that never ends, and
+    the receive loop that puts them must never wait or raise (review 2af1 N5:
+    QueueFull there killed the loop and every run on the connection hung)."""
+
+    def put_control(self, item) -> None:
+        bound, self._maxsize = self._maxsize, 0
+        try:
+            self.put_nowait(item)
+        finally:
+            self._maxsize = bound
+
+
 @dataclass
 class _Consumer:
     """An active run consumer -- its ``asyncio.Queue`` receives events."""
@@ -2146,6 +2164,10 @@ class _GatewayConnection:
         # unrelated turns happen to end with the same short text (e.g. "OK.",
         # "Done."), and unlike the debounce timer alone, it doesn't depend on
         # how long the session stays quiet afterward.
+        # Events of a run continuing a message (an ask-user answer) that
+        # arrived before its reply registered for it, while that reply still
+        # streams the message: never a turn writer's (review 2af1 N6).
+        self._held_for_live: dict[tuple[str, str], list] = {}
         self._delivered_live: dict[str, float] = (
             _shared["delivered_live"] if _shared is not None else {}
         )
@@ -2344,13 +2366,17 @@ class _GatewayConnection:
                 and self.parse_owui_session_key(key)):
             spawn_background(self.ensure_message_subscription(key))
 
-    def row_to_consumers(self, session_key: str, row: dict, resync: bool = False) -> None:
-        """Hand session row `row` to every inline reply of `session_key`."""
-        marker = {"type": _ROW_MARKER_TYPE, "row": row, "resync": resync}
+    def row_to_consumers(self, session_key: str, row: dict, resync: bool = False,
+                         read_at: float | None = None) -> None:
+        """Hand session row `row` to every inline reply of `session_key`.
+        `read_at`: when the row was read, if not just now (a resync's read
+        started before its reply came back)."""
+        marker = {"type": _ROW_MARKER_TYPE, "row": row, "resync": resync,
+                  "read_at": time.monotonic() if read_at is None else read_at}
         for key, consumer in list(self._consumers.items()):
             if key.startswith(f"{session_key}:"):
                 for q in consumer.queues:
-                    q.put_nowait(dict(marker))
+                    q.put_control(dict(marker))
 
     def note_session_id(self, session_key: str, session_id) -> None:
         if session_key and isinstance(session_id, str) and session_id:
@@ -2399,17 +2425,21 @@ class _GatewayConnection:
         self._run_targets.pop(key, None)
         self._run_renderers.pop(key, None)
 
-    def continue_run_target(self, session_key: str, run_id: str, next_run_id: str) -> None:
+    def continue_run_target(self, session_key: str, run_id: str, next_run_id: str,
+                            shown: bool = True) -> None:
         """The inline reply moved from `run_id` to `next_run_id` (an ask-user
         answer run): the target and its shadow renderer follow it, so a
         handover of the answer run continues the same reply (review 2af1 R9;
         the writer finds the question run in the transcript as a pipe run of
         the same message). The question run was shown to its end: its late
-        events open nothing."""
+        events open nothing. `shown=False` moves the target only: the answer
+        is not sent yet (review 2af1 N6), or its send failed and the target
+        moves back."""
         key = f"{session_key}:{run_id}"
         target = self._run_targets.pop(key, None)
         renderer = self._run_renderers.pop(key, None)
-        self.mark_delivered_live(session_key, run_id)
+        if shown:
+            self.mark_delivered_live(session_key, run_id)
         if target is None:
             return
         nkey = f"{session_key}:{next_run_id}"
@@ -2564,8 +2594,10 @@ class _GatewayConnection:
             consumer = _Consumer(session_key=session_key, run_id=run_id)
             self._consumers[key] = consumer
             pipe_log(f"  registered consumer: {key[:60]}...")
-        q = asyncio.Queue(maxsize=500)
+        q = _RunQueue(maxsize=500)
         consumer.queues.append(q)
+        for ev in self._held_for_live.pop((session_key, run_id), []):
+            q.put_nowait(ev)  # the run's first events, held for this reply (N6)
         return q
 
     def unregister_consumer(self, session_key: str, run_id: str, queue: asyncio.Queue | None = None):
@@ -2585,10 +2617,48 @@ class _GatewayConnection:
                 pass
         if not consumer.queues or queue is None:
             del self._consumers[key]
+            self._release_held(session_key)
         pipe_log(f"  unregistered consumer: {key[:60]}...")
         if self._retired and not self._consumers:
             pipe_log("  retired gateway connection: last run finished, closing")
             spawn_background(self.disconnect())
+
+    def live_reply_owns(self, session_key: str, run_id: str) -> bool:
+        """True when `run_id` continues a message (an ask-user answer, a
+        resume) that a live inline reply of another run still streams: its
+        events wait for that reply (`register_consumer`) instead of opening a
+        second writer on the message (review 2af1 N6)."""
+        parsed = parse_pipe_run_id(run_id)
+        if parsed is None or parsed["kind"] == "reply":
+            return False
+        for c in list(self._consumers.values()):
+            other = parse_pipe_run_id(c.run_id) if c.session_key == session_key else None
+            if (other and c.run_id != run_id and other["chat"] == parsed["chat"]
+                    and other["message"] == parsed["message"]):
+                return True
+        return False
+
+    def hold_for_live(self, session_key: str, run_id: str, payload: dict) -> None:
+        held = self._held_for_live.setdefault((session_key, run_id), [])
+        if len(held) < 500:
+            held.append(payload)
+
+    def _release_held(self, session_key: str) -> None:
+        """A reply ended without taking the runs held for it: they are turns
+        again, routed in their order of arrival."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no loop, no events to route (a sync teardown)
+        for (sess, run) in list(self._held_for_live):
+            if sess == session_key and not self.live_reply_owns(sess, run):
+                held = self._held_for_live.pop((sess, run))
+                pipe_log(f"  {len(held)} held event(s) of {run[:24]}... released to the turn writer")
+
+                async def route(held=held):
+                    for ev in held:
+                        await _turn_route_event(self, ev)
+                spawn_background(route())
 
     def mark_delivered_live(self, session_key: str, run_id: str):
         """Record that this run's final event was just dispatched to a live
@@ -2939,7 +3009,7 @@ class _GatewayConnection:
         n = 0
         for consumer in list(self._consumers.values()):
             for q in consumer.queues:
-                q.put_nowait({"type": _GAP_MARKER_TYPE})
+                q.put_control({"type": _GAP_MARKER_TYPE})
                 n += 1
         if n:
             pipe_log(f"  marked an event gap in {n} run queue(s)")
@@ -2949,7 +3019,7 @@ class _GatewayConnection:
         """Tell every live reply that its run's Gateway process is gone."""
         for consumer in list(self._consumers.values()):
             for q in consumer.queues:
-                q.put_nowait({"type": _RESTART_MARKER_TYPE})
+                q.put_control({"type": _RESTART_MARKER_TYPE})
 
     def _note_gateway_boot(self, boot_id: str | None) -> None:
         """Count a Gateway restart only when its boot id changes."""
@@ -3307,9 +3377,12 @@ class _GatewayConnection:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                pipe_log(f"Event loop error: {e}")
+                pipe_log(f"Event loop error: {e!r}")
                 self._ws = None
-                self._mark_event_gap()
+                try:
+                    self._mark_event_gap()
+                except Exception as ex:  # the loop outlives any one failure
+                    pipe_log(f"  event gap marking failed: {ex!r}")
 
     async def _reconnect(self):
         """Reconnect with exponential backoff.
@@ -4666,6 +4739,9 @@ async def _turn_route_event(conn: "_GatewayConnection", payload: dict) -> bool:
         return False
     if run.startswith(ACTION_RUN_PREFIX):
         return True  # the Status Action's own runs render nothing
+    if conn.live_reply_owns(sess, run):
+        conn.hold_for_live(sess, run, payload)
+        return True
     _note_heartbeat_run(conn, payload)
     if (sess, run) in conn._turn_skip_runs:
         return True
@@ -5041,10 +5117,13 @@ async def _turn_after_hello(conn: "_GatewayConnection") -> None:
 async def _turn_resync(conn: "_GatewayConnection", skip: set = frozenset()) -> None:
     """Read the row of every session with an open pump or an inline reply
     (except `skip`, known active) and end the ones that went idle while their
-    settle was missed."""
+    settle was missed. Inline replies get the row busy or idle: one that lost
+    its own final and settle in the gap looks for its closer even while a
+    later run keeps the session busy (review 2af1 N3)."""
     idle = {sess for (sess, _run) in conn._turn_pumps if sess not in skip}
     idle |= {c.session_key for c in list(conn._consumers.values()) if c.session_key not in skip}
     for sess in idle:
+        read_at = time.monotonic()
         try:
             lst = await conn.send_request("sessions.list", {"search": sess[-36:], "limit": 10},
                                           timeout=15)
@@ -5052,9 +5131,11 @@ async def _turn_resync(conn: "_GatewayConnection", skip: set = frozenset()) -> N
             pipe_log(f"  turn writer: row read after hello failed: {ex!r}")
             continue
         row = next((r for r in (lst.get("sessions") or []) if r.get("key") == sess), None)
-        if row is not None and not row.get("hasActiveRun"):
+        if row is None:
+            continue
+        if not row.get("hasActiveRun"):
             _turn_settled(conn, sess, row)
-            conn.row_to_consumers(sess, row, resync=True)
+        conn.row_to_consumers(sess, row, resync=True, read_at=read_at)
 
 
 # --- emit ------------------------------------------------------------------

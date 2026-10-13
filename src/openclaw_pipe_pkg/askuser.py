@@ -699,6 +699,8 @@ class UserInputResult:
     new_run_id: str | None = None
     prompt_text: str | None = None
     answer: str | None = None
+    # The answer run's consumer queue, registered before its send (N6).
+    queue: object = None
 
 
 def _normalize_event_call_response(response) -> str:

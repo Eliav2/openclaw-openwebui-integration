@@ -662,6 +662,9 @@ async def _turn_route_event(conn: "_GatewayConnection", payload: dict) -> bool:
         return False
     if run.startswith(ACTION_RUN_PREFIX):
         return True  # the Status Action's own runs render nothing
+    if conn.live_reply_owns(sess, run):
+        conn.hold_for_live(sess, run, payload)
+        return True
     _note_heartbeat_run(conn, payload)
     if (sess, run) in conn._turn_skip_runs:
         return True
@@ -1037,10 +1040,13 @@ async def _turn_after_hello(conn: "_GatewayConnection") -> None:
 async def _turn_resync(conn: "_GatewayConnection", skip: set = frozenset()) -> None:
     """Read the row of every session with an open pump or an inline reply
     (except `skip`, known active) and end the ones that went idle while their
-    settle was missed."""
+    settle was missed. Inline replies get the row busy or idle: one that lost
+    its own final and settle in the gap looks for its closer even while a
+    later run keeps the session busy (review 2af1 N3)."""
     idle = {sess for (sess, _run) in conn._turn_pumps if sess not in skip}
     idle |= {c.session_key for c in list(conn._consumers.values()) if c.session_key not in skip}
     for sess in idle:
+        read_at = time.monotonic()
         try:
             lst = await conn.send_request("sessions.list", {"search": sess[-36:], "limit": 10},
                                           timeout=15)
@@ -1048,6 +1054,8 @@ async def _turn_resync(conn: "_GatewayConnection", skip: set = frozenset()) -> N
             pipe_log(f"  turn writer: row read after hello failed: {ex!r}")
             continue
         row = next((r for r in (lst.get("sessions") or []) if r.get("key") == sess), None)
-        if row is not None and not row.get("hasActiveRun"):
+        if row is None:
+            continue
+        if not row.get("hasActiveRun"):
             _turn_settled(conn, sess, row)
-            conn.row_to_consumers(sess, row, resync=True)
+        conn.row_to_consumers(sess, row, resync=True, read_at=read_at)

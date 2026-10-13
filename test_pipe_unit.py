@@ -6342,6 +6342,38 @@ class AgentTurnRoutingTests(_RoutingCase):
         self.addCleanup(self.conn.unregister_consumer, self.key, "msg-run", queue=q)
         self.assertFalse(await _turn_route_event(self.conn, self.ev("msg-run", _delta("hi"))))
 
+    async def test_an_answer_run_waits_for_the_reply_streaming_its_message(self):
+        """Review 2af1 N6: an answer run's early event, before its reply
+        registered for it, is held, not handed to a turn writer, and reaches
+        the reply's queue when it registers."""
+        q_run = pipe_run_id(self.CHAT, self.STUB)
+        live = self.conn.register_consumer(self.key, q_run)
+        self.addCleanup(self.conn.unregister_consumer, self.key, q_run, queue=live)
+        a_run = pipe_run_id(self.CHAT, self.STUB, "input")
+        self.assertTrue(await _turn_route_event(self.conn, self.ev(a_run, _delta("Reading a.py."))))
+        self.assertEqual(self.conn._turn_pumps, {})
+        q = self.conn.register_consumer(self.key, a_run)
+        self.addCleanup(self.conn.unregister_consumer, self.key, a_run, queue=q)
+        self.assertEqual(q.get_nowait()["data"]["delta"], "Reading a.py.")
+
+    async def test_a_held_run_is_a_turn_again_when_the_reply_ends_without_it(self):
+        self.add_stub(self.STUB, content="Which file?")
+        q_run = pipe_run_id(self.CHAT, self.STUB)
+        live = self.conn.register_consumer(self.key, q_run)
+        a_run = pipe_run_id(self.CHAT, self.STUB, "input")
+        await _turn_route_event(self.conn, self.ev(a_run, _delta("Reading a.py.")))
+        self.conn.unregister_consumer(self.key, q_run, queue=live)
+        await self.spin()
+        self.assertIn((self.key, a_run), self.conn._turn_pumps)
+        self.assertEqual(self.conn._held_for_live, {})
+
+    async def test_another_messages_run_is_not_held(self):
+        q = self.conn.register_consumer(self.key, pipe_run_id(self.CHAT, "other-message"))
+        self.addCleanup(self.conn.unregister_consumer, self.key,
+                        pipe_run_id(self.CHAT, "other-message"), queue=q)
+        self.assertFalse(self.conn.live_reply_owns(self.key, pipe_run_id(self.CHAT, self.STUB, "input")))
+        self.assertFalse(self.conn.live_reply_owns(self.key, pipe_run_id(self.CHAT, "other-message")))
+
     async def test_the_action_connection_never_writes_turns(self):
         conn = _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"), writes_turns=False)
         self.assertFalse(await _turn_route_event(conn, self.ev(self.RUN, _delta("hi"))))
@@ -6732,7 +6764,14 @@ class InlineRewriteWiringTests(unittest.TestCase):
 
     def test_the_inline_reply_records_its_rewrites_and_answer_runs(self):
         src = inspect.getsource(openclaw_pipe.Pipe._pipe_turn)
-        self.assertEqual(src.count("conn.continue_run_target("), 2, "both answer switches")
+        self.assertEqual(src.count("switch_to_answer_run(answer_res)"), 2, "both answer switches")
+        self.assertEqual(src.count("answer_res.queue or conn.register_consumer("), 2)
+        # Review 2af1 N6: the answer run is listened for, and its target moved,
+        # before its chat.send.
+        ask = src.split("async def maybe_answer_user_input", 1)[1]
+        send = ask.index('"chat.send"')
+        self.assertLess(ask.index("conn.register_consumer(session_key, idempotency_key)"), send)
+        self.assertLess(ask.index("conn.continue_run_target(session_key, our_run_id, idempotency_key"), send)
         self.assertGreaterEqual(src.count("conn.note_turn_rewrite("), 5,
                                 "2 MEDIA sites, 2 answered cards, 1 fallback prompt")
         self.assertIn("thinking=resolved_thinking", src.split("conn.register_run_target(")[1][:200])
@@ -6809,6 +6848,28 @@ class SupersededLoadTests(unittest.IsolatedAsyncioTestCase):
         self.current = RuntimeError("db locked")
         out = await self.turn(openclaw_pipe.Pipe())
         self.assertTrue(out and "retired" in out[-1], out)
+
+
+class ControlMarkerBoundTests(unittest.IsolatedAsyncioTestCase):
+    """Review 2af1 N5: a reply read slower than its run streams keeps its
+    queue full. A row, gap or restart marker for it then raised QueueFull in
+    the receive loop, and the gap marking in its handler raised again: the
+    loop died and every run on the connection hung."""
+
+    async def test_markers_go_past_the_bound_of_a_full_queue(self):
+        conn = _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"))
+        q = conn.register_consumer("agent:main:k", "run-1")
+        for i in range(500):
+            q.put_nowait({"n": i})
+        conn.row_to_consumers("agent:main:k", {"hasActiveRun": True})
+        conn._mark_event_gap()
+        conn._mark_gateway_restart()
+        self.assertEqual(q.qsize(), 503)
+        self.assertTrue(q.full(), "events still wait for room")
+        self.assertEqual([q.get_nowait()["n"] for _ in range(500)], list(range(500)))
+        self.assertEqual([q.get_nowait()["type"] for _ in range(3)],
+                         [openclaw_pipe._ROW_MARKER_TYPE, openclaw_pipe._GAP_MARKER_TYPE,
+                          openclaw_pipe._RESTART_MARKER_TYPE])
 
 
 class InlineEndSignalTests(unittest.IsolatedAsyncioTestCase):
@@ -6948,6 +7009,58 @@ class InlineEndSignalTests(unittest.IsolatedAsyncioTestCase):
         await _turn_resync(self.conn)
         text = await self.ended()
         self.assertIn("After it.", text)
+
+    async def test_after_a_gap_a_later_runs_settle_ends_the_reply(self):
+        """Review 2af1 N3: the final and the settle were lost in a gap, and a
+        later run kept the session busy at the resync. The first idle row
+        after it ends the reply, though it names the later run."""
+        await self.delta("Before the drop.")
+        await _turn_resync(self.conn)  # busy, and no closer yet
+        await asyncio.sleep(0.1)
+        self.assertFalse(self.reply.done())
+        self.history = {"messages": self.closed_run("Before the drop. After it.")}
+        await self.settled(run="a-later-run")
+        self.assertIn("After it.", await self.ended())
+
+    async def test_after_a_gap_the_runs_closer_ends_the_reply_while_another_run_is_busy(self):
+        await self.delta("Before the drop.")
+        self.history = {"messages": self.closed_run("Before the drop. After it.")}
+        await _turn_resync(self.conn)  # busy with a later run
+        self.assertIn("After it.", await self.ended())
+
+    async def test_a_resync_without_the_runs_closer_waits(self):
+        await self.delta("Still working.")
+        await _turn_resync(self.conn)
+        await asyncio.sleep(0.1)
+        self.assertFalse(self.reply.done())
+
+    async def test_a_row_read_before_the_admission_does_not_end_the_reply(self):
+        """Review 2af1 N4: a resync read the row before chat.send returned."""
+        self.history = {"messages": [
+            {"role": "user", "content": "hi", "idempotencyKey": "msg-previous:user"},
+            {"role": "assistant", "content": [{"type": "text", "text": "Yesterday's answer."}],
+             "idempotencyKey": "cli-assistant:msg-previous"}]}
+        idle = {"key": self.sk, "hasActiveRun": False, "status": "done", "lastRunId": "msg-previous"}
+        self.conn.row_to_consumers(self.sk, idle, resync=True, read_at=0.0)
+        await asyncio.sleep(0.1)
+        self.assertFalse(self.reply.done())
+        await self.delta("Today's answer.")
+        await self.push("chat", {"runId": self.run, "sessionKey": self.sk, "state": "final"})
+        text = await self.ended()
+        self.assertNotIn("Yesterday", text)
+        self.assertIn("Today's answer.", text)
+
+    async def test_a_run_seen_nowhere_never_takes_another_runs_text(self):
+        """N4: idle after the admission, nothing of this run seen, and no
+        closer under its id: the session's last reply is not this one's."""
+        self.history = {"messages": [
+            {"role": "user", "content": "hi", "idempotencyKey": "msg-previous:user"},
+            {"role": "assistant", "content": [{"type": "text", "text": "Yesterday's answer."}],
+             "idempotencyKey": "cli-assistant:msg-previous"}]}
+        self.rows = [{"key": self.sk, "hasActiveRun": False, "status": "done",
+                      "lastRunId": "msg-previous"}]
+        await _turn_resync(self.conn)
+        self.assertNotIn("Yesterday", await self.ended())
 
     async def test_the_reply_listens_before_it_sends(self):
         """Review 2af1 R12: a run's first events can arrive before chat.send

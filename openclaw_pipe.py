@@ -2721,6 +2721,8 @@ class UserInputResult:
     new_run_id: str | None = None
     prompt_text: str | None = None
     answer: str | None = None
+    # The answer run's consumer queue, registered before its send (N6).
+    queue: object = None
 
 
 def _normalize_event_call_response(response) -> str:
@@ -3574,6 +3576,8 @@ _RESTART_MARKER_TYPE = "_pipe_restart"
 # `resync` marks a row read after a reconnect or a frame gap, where an idle
 # session means every admitted run is over; a `queued` row tells a reply
 # waiting for its first event why (review 2af1 timers).
+# `read_at` (time.monotonic) is when the row was read: a reply trusts an idle
+# row only when it was read after its run was admitted (review 2af1 N4).
 _ROW_MARKER_TYPE = "_pipe_row"
 # Text on each side of a gap used to find where a repaired chunk goes.
 _GAP_ANCHOR_CHARS = 120
@@ -4219,6 +4223,22 @@ def _shared_gateway_state() -> dict | None:
     return state
 
 
+class _RunQueue(asyncio.Queue):
+    """A run's event queue. Events wait for room (`await put`): a reply read
+    slower than its run streams holds the receive loop back instead of losing
+    text. Control markers (a gap, a restart, a session row) go in past the
+    bound: they are few, a lost one can leave a reply that never ends, and
+    the receive loop that puts them must never wait or raise (review 2af1 N5:
+    QueueFull there killed the loop and every run on the connection hung)."""
+
+    def put_control(self, item) -> None:
+        bound, self._maxsize = self._maxsize, 0
+        try:
+            self.put_nowait(item)
+        finally:
+            self._maxsize = bound
+
+
 @dataclass
 class _Consumer:
     """An active run consumer -- its ``asyncio.Queue`` receives events."""
@@ -4366,6 +4386,10 @@ class _GatewayConnection:
         # unrelated turns happen to end with the same short text (e.g. "OK.",
         # "Done."), and unlike the debounce timer alone, it doesn't depend on
         # how long the session stays quiet afterward.
+        # Events of a run continuing a message (an ask-user answer) that
+        # arrived before its reply registered for it, while that reply still
+        # streams the message: never a turn writer's (review 2af1 N6).
+        self._held_for_live: dict[tuple[str, str], list] = {}
         self._delivered_live: dict[str, float] = (
             _shared["delivered_live"] if _shared is not None else {}
         )
@@ -4564,13 +4588,17 @@ class _GatewayConnection:
                 and self.parse_owui_session_key(key)):
             spawn_background(self.ensure_message_subscription(key))
 
-    def row_to_consumers(self, session_key: str, row: dict, resync: bool = False) -> None:
-        """Hand session row `row` to every inline reply of `session_key`."""
-        marker = {"type": _ROW_MARKER_TYPE, "row": row, "resync": resync}
+    def row_to_consumers(self, session_key: str, row: dict, resync: bool = False,
+                         read_at: float | None = None) -> None:
+        """Hand session row `row` to every inline reply of `session_key`.
+        `read_at`: when the row was read, if not just now (a resync's read
+        started before its reply came back)."""
+        marker = {"type": _ROW_MARKER_TYPE, "row": row, "resync": resync,
+                  "read_at": time.monotonic() if read_at is None else read_at}
         for key, consumer in list(self._consumers.items()):
             if key.startswith(f"{session_key}:"):
                 for q in consumer.queues:
-                    q.put_nowait(dict(marker))
+                    q.put_control(dict(marker))
 
     def note_session_id(self, session_key: str, session_id) -> None:
         if session_key and isinstance(session_id, str) and session_id:
@@ -4619,17 +4647,21 @@ class _GatewayConnection:
         self._run_targets.pop(key, None)
         self._run_renderers.pop(key, None)
 
-    def continue_run_target(self, session_key: str, run_id: str, next_run_id: str) -> None:
+    def continue_run_target(self, session_key: str, run_id: str, next_run_id: str,
+                            shown: bool = True) -> None:
         """The inline reply moved from `run_id` to `next_run_id` (an ask-user
         answer run): the target and its shadow renderer follow it, so a
         handover of the answer run continues the same reply (review 2af1 R9;
         the writer finds the question run in the transcript as a pipe run of
         the same message). The question run was shown to its end: its late
-        events open nothing."""
+        events open nothing. `shown=False` moves the target only: the answer
+        is not sent yet (review 2af1 N6), or its send failed and the target
+        moves back."""
         key = f"{session_key}:{run_id}"
         target = self._run_targets.pop(key, None)
         renderer = self._run_renderers.pop(key, None)
-        self.mark_delivered_live(session_key, run_id)
+        if shown:
+            self.mark_delivered_live(session_key, run_id)
         if target is None:
             return
         nkey = f"{session_key}:{next_run_id}"
@@ -4784,8 +4816,10 @@ class _GatewayConnection:
             consumer = _Consumer(session_key=session_key, run_id=run_id)
             self._consumers[key] = consumer
             pipe_log(f"  registered consumer: {key[:60]}...")
-        q = asyncio.Queue(maxsize=500)
+        q = _RunQueue(maxsize=500)
         consumer.queues.append(q)
+        for ev in self._held_for_live.pop((session_key, run_id), []):
+            q.put_nowait(ev)  # the run's first events, held for this reply (N6)
         return q
 
     def unregister_consumer(self, session_key: str, run_id: str, queue: asyncio.Queue | None = None):
@@ -4805,10 +4839,48 @@ class _GatewayConnection:
                 pass
         if not consumer.queues or queue is None:
             del self._consumers[key]
+            self._release_held(session_key)
         pipe_log(f"  unregistered consumer: {key[:60]}...")
         if self._retired and not self._consumers:
             pipe_log("  retired gateway connection: last run finished, closing")
             spawn_background(self.disconnect())
+
+    def live_reply_owns(self, session_key: str, run_id: str) -> bool:
+        """True when `run_id` continues a message (an ask-user answer, a
+        resume) that a live inline reply of another run still streams: its
+        events wait for that reply (`register_consumer`) instead of opening a
+        second writer on the message (review 2af1 N6)."""
+        parsed = parse_pipe_run_id(run_id)
+        if parsed is None or parsed["kind"] == "reply":
+            return False
+        for c in list(self._consumers.values()):
+            other = parse_pipe_run_id(c.run_id) if c.session_key == session_key else None
+            if (other and c.run_id != run_id and other["chat"] == parsed["chat"]
+                    and other["message"] == parsed["message"]):
+                return True
+        return False
+
+    def hold_for_live(self, session_key: str, run_id: str, payload: dict) -> None:
+        held = self._held_for_live.setdefault((session_key, run_id), [])
+        if len(held) < 500:
+            held.append(payload)
+
+    def _release_held(self, session_key: str) -> None:
+        """A reply ended without taking the runs held for it: they are turns
+        again, routed in their order of arrival."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no loop, no events to route (a sync teardown)
+        for (sess, run) in list(self._held_for_live):
+            if sess == session_key and not self.live_reply_owns(sess, run):
+                held = self._held_for_live.pop((sess, run))
+                pipe_log(f"  {len(held)} held event(s) of {run[:24]}... released to the turn writer")
+
+                async def route(held=held):
+                    for ev in held:
+                        await _turn_route_event(self, ev)
+                spawn_background(route())
 
     def mark_delivered_live(self, session_key: str, run_id: str):
         """Record that this run's final event was just dispatched to a live
@@ -5159,7 +5231,7 @@ class _GatewayConnection:
         n = 0
         for consumer in list(self._consumers.values()):
             for q in consumer.queues:
-                q.put_nowait({"type": _GAP_MARKER_TYPE})
+                q.put_control({"type": _GAP_MARKER_TYPE})
                 n += 1
         if n:
             pipe_log(f"  marked an event gap in {n} run queue(s)")
@@ -5169,7 +5241,7 @@ class _GatewayConnection:
         """Tell every live reply that its run's Gateway process is gone."""
         for consumer in list(self._consumers.values()):
             for q in consumer.queues:
-                q.put_nowait({"type": _RESTART_MARKER_TYPE})
+                q.put_control({"type": _RESTART_MARKER_TYPE})
 
     def _note_gateway_boot(self, boot_id: str | None) -> None:
         """Count a Gateway restart only when its boot id changes."""
@@ -5527,9 +5599,12 @@ class _GatewayConnection:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                pipe_log(f"Event loop error: {e}")
+                pipe_log(f"Event loop error: {e!r}")
                 self._ws = None
-                self._mark_event_gap()
+                try:
+                    self._mark_event_gap()
+                except Exception as ex:  # the loop outlives any one failure
+                    pipe_log(f"  event gap marking failed: {ex!r}")
 
     async def _reconnect(self):
         """Reconnect with exponential backoff.
@@ -6886,6 +6961,9 @@ async def _turn_route_event(conn: "_GatewayConnection", payload: dict) -> bool:
         return False
     if run.startswith(ACTION_RUN_PREFIX):
         return True  # the Status Action's own runs render nothing
+    if conn.live_reply_owns(sess, run):
+        conn.hold_for_live(sess, run, payload)
+        return True
     _note_heartbeat_run(conn, payload)
     if (sess, run) in conn._turn_skip_runs:
         return True
@@ -7261,10 +7339,13 @@ async def _turn_after_hello(conn: "_GatewayConnection") -> None:
 async def _turn_resync(conn: "_GatewayConnection", skip: set = frozenset()) -> None:
     """Read the row of every session with an open pump or an inline reply
     (except `skip`, known active) and end the ones that went idle while their
-    settle was missed."""
+    settle was missed. Inline replies get the row busy or idle: one that lost
+    its own final and settle in the gap looks for its closer even while a
+    later run keeps the session busy (review 2af1 N3)."""
     idle = {sess for (sess, _run) in conn._turn_pumps if sess not in skip}
     idle |= {c.session_key for c in list(conn._consumers.values()) if c.session_key not in skip}
     for sess in idle:
+        read_at = time.monotonic()
         try:
             lst = await conn.send_request("sessions.list", {"search": sess[-36:], "limit": 10},
                                           timeout=15)
@@ -7272,9 +7353,11 @@ async def _turn_resync(conn: "_GatewayConnection", skip: set = frozenset()) -> N
             pipe_log(f"  turn writer: row read after hello failed: {ex!r}")
             continue
         row = next((r for r in (lst.get("sessions") or []) if r.get("key") == sess), None)
-        if row is not None and not row.get("hasActiveRun"):
+        if row is None:
+            continue
+        if not row.get("hasActiveRun"):
             _turn_settled(conn, sess, row)
-            conn.row_to_consumers(sess, row, resync=True)
+        conn.row_to_consumers(sess, row, resync=True, read_at=read_at)
 
 
 # --- models ----------------------------------------------------------------
@@ -8766,6 +8849,14 @@ class Pipe:
             session_key, our_run_id, owui_origin_chat_id, owui_message_id,
             thinking=resolved_thinking,
         )
+        # When the Gateway had admitted this reply's run (chat.send returned;
+        # an adopted run already ran). An idle row read after it means the
+        # run is over; one read before may show the previous run's settle
+        # (review 2af1 N4).
+        admitted_at = float("-inf") if adopted_run_id else time.monotonic()
+        # A gap or a resync since: this run's own final and settle may be
+        # lost, so another run's settle row may be the first sign it ended.
+        signals_lost = False
         if adopted_run_id and adopted_queue is not None:
             conn.seed_run_renderer(session_key, our_run_id, queue,
                                    run_text=adopted_run_text)
@@ -8886,12 +8977,27 @@ class Pipe:
         handed_over = False
 
         async def recover_from_transcript() -> str | None:
+            """The run's text read back: by its run id, else by its user text,
+            which only a run seen here may use. With nothing of it seen, the
+            session's last reply may be another run's (review 2af1 N4)."""
+            try:
+                hist = await conn.session_history(session_key, limit=RUN_TEXT_HISTORY_LIMIT)
+                found, whole = _history_text_for_run(hist, our_run_id)
+                if found and whole:
+                    return whole
+            except Exception as ex:
+                pipe_log(f"  recovery by run id: chat.history failed: {ex!r}")
+            if not first_event_arrived:
+                pipe_log("  recovery: nothing of this run seen, no text by its id")
+                return None
             return await _recover_turn_text(conn, session_key, text)
 
-        async def settled_tail(row: dict) -> str:
+        async def settled_tail(row: dict, closer_only: bool = False) -> str | None:
             """What this reply still owes once its run settled with no final
             event here: the run's text after what arrived (its closing message
-            in the transcript), or, for a run that showed nothing, why."""
+            in the transcript), or, for a run that showed nothing, why.
+            `closer_only`: the session is busy, maybe with a later run, so
+            only this run's own closer says it ended; None without one."""
             try:
                 hist = await conn.session_history(session_key, limit=RUN_TEXT_HISTORY_LIMIT)
             except Exception as ex:
@@ -8905,6 +9011,8 @@ class Pipe:
                 if whole.startswith(assistant_received_text):
                     return whole[len(assistant_received_text):]
                 return "" if text_yielded else whole
+            if closer_only:
+                return "" if found else None
             if text_yielded:
                 return ""
             status = row.get("status")
@@ -9031,6 +9139,16 @@ class Pipe:
             # The answer continues this reply: its run id names it (ELI-100 2.2).
             idempotency_key = (pipe_run_id(chat_id, owui_message_id, "input") if owui_message_id
                                else f"user-input-{chat_id}-{time.time()}")
+            # Listen before sending, as for the first send (R12): the answer
+            # run's first events can arrive before chat.send returns, and with
+            # no consumer and no target they would open a second writer on
+            # this reply's message (review 2af1 N6).
+            answer_queue = conn.register_consumer(session_key, idempotency_key)
+            conn.continue_run_target(session_key, our_run_id, idempotency_key, shown=False)
+
+            def unlisten():
+                conn.unregister_consumer(session_key, idempotency_key, queue=answer_queue)
+                conn.continue_run_target(session_key, idempotency_key, our_run_id, shown=False)
             try:
                 send_resp = await conn.send_request(
                     "chat.send",
@@ -9047,14 +9165,31 @@ class Pipe:
                 # Delivery failed: report not-handled so the caller falls back
                 # to showing the prompt text (better than a silent stall).
                 pipe_log(f"  sending answer back failed: {ex}")
+                unlisten()
                 return UserInputResult(False, None)
             new_run_id = send_resp.get("runId") or None
+            if new_run_id != idempotency_key:
+                unlisten()  # steered into the live run, or renamed: as before
+                answer_queue = None
+            else:
+                nonlocal admitted_at, signals_lost
+                admitted_at, signals_lost = time.monotonic(), False
             await _emit_status(__event_emitter__, "Answer sent; continuing...", done=False)
             if new_run_id:
                 pipe_log(f"  answer sent, new runId: {new_run_id[:20]}...")
             else:
                 pipe_log("  answer sent, steering into active run (no new runId)")
-            return UserInputResult(True, new_run_id, prompt_text=prompt_text, answer=answer)
+            return UserInputResult(True, new_run_id, prompt_text=prompt_text, answer=answer,
+                                   queue=answer_queue)
+
+        def switch_to_answer_run(answer_res: UserInputResult) -> None:
+            """The reply continues in the answer run (R9). Its target moved
+            before the send when its consumer was registered then (N6); the
+            question run was shown to its end either way."""
+            if answer_res.queue is not None:
+                conn.mark_delivered_live(session_key, our_run_id)
+            else:
+                conn.continue_run_target(session_key, our_run_id, answer_res.new_run_id)
 
         adopt_new_run = True
         try:
@@ -9079,14 +9214,31 @@ class Pipe:
                                     "active response...",
                                     done=False,
                                 )
+                            # Read after this run was admitted, an idle session
+                            # means it is over, whichever run settled last. That
+                            # is the end signal once its own may have been lost
+                            # in a gap (review 2af1 N3). A row read before the
+                            # admission shows nothing about it (N4).
+                            admitted = msg.get("read_at", time.monotonic()) >= admitted_at
+                            if admitted and msg.get("resync"):
+                                signals_lost = True
+                            tail = None
                             if row.get("hasActiveRun") is False and (
-                                    msg.get("resync") or row.get("lastRunId") == our_run_id):
+                                    row.get("lastRunId") == our_run_id
+                                    or (admitted and signals_lost)):
                                 # The run settled while its terminal event never
                                 # reached this reply (dropped frame, socket gap).
                                 # Its transcript has what was lost.
                                 pipe_log(f"  run settled (row status {row.get('status')}, "
-                                         f"resync={bool(msg.get('resync'))}) without its final")
+                                         f"last run {str(row.get('lastRunId'))[:24]}) without its final")
                                 tail = await settled_tail(row)
+                            elif row.get("hasActiveRun") and msg.get("resync") and admitted:
+                                # After a gap the session is busy, maybe with a
+                                # later run: this run's closer says it ended.
+                                tail = await settled_tail(row, closer_only=True)
+                                if tail is not None:
+                                    pipe_log("  run closed in the transcript during a gap")
+                            if tail is not None:
                                 if tail:
                                     record_visible_chunk(tail)
                                     yield tail
@@ -9107,6 +9259,7 @@ class Pipe:
                             continue
 
                         if msg.get("type") == _GAP_MARKER_TYPE:
+                            signals_lost = True
                             run_gaps.append(len(assistant_received_text))
                             pipe_log(f"  event gap at offset {len(assistant_received_text)} "
                                      "(Gateway socket dropped)")
@@ -9305,10 +9458,10 @@ class Pipe:
                                     if answer_res.new_run_id and answer_res.new_run_id != our_run_id:
                                         pipe_log(f"  needs-input handled, switching to run {answer_res.new_run_id[:20]}...")
                                         # The answer run continues this reply (R9).
-                                        conn.continue_run_target(session_key, our_run_id,
-                                                                 answer_res.new_run_id)
+                                        switch_to_answer_run(answer_res)
                                         conn.unregister_consumer(session_key, our_run_id, queue=queue)
-                                        queue = conn.register_consumer(session_key, answer_res.new_run_id)
+                                        queue = answer_res.queue or conn.register_consumer(
+                                            session_key, answer_res.new_run_id)
                                         our_run_id = answer_res.new_run_id
                                     done = False
                                     last_item_text = item_text
@@ -9554,10 +9707,10 @@ class Pipe:
                             if answer_res.new_run_id and answer_res.new_run_id != our_run_id:
                                 pipe_log(f"  continuing into new run: {answer_res.new_run_id[:20]}...")
                                 # The answer run continues this reply (R9).
-                                conn.continue_run_target(session_key, our_run_id,
-                                                         answer_res.new_run_id)
+                                switch_to_answer_run(answer_res)
                                 conn.unregister_consumer(session_key, our_run_id, queue=queue)
-                                queue = conn.register_consumer(session_key, answer_res.new_run_id)
+                                queue = answer_res.queue or conn.register_consumer(
+                                    session_key, answer_res.new_run_id)
                                 our_run_id = answer_res.new_run_id
                             else:
                                 pipe_log("  continuing in the same run after modal answer")
