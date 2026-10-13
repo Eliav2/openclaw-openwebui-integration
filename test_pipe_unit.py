@@ -82,6 +82,7 @@ from openclaw_pipe import (
     ACTION_RUN_PREFIX, TURN_NS, _run_id_sent_at, parse_pipe_run_id, pipe_run_id, turn_message_id,
     _claim_turn_message, _register_turn_writer, _retire_turn_writer,
     MAX_TURN_RESUMES, next_continuation, turn_owner,
+    active_run_from_history, recovery_source_run, run_message_id,
     _GatewayConnection,
     GatewayError,
     _is_restart_signature,
@@ -7801,6 +7802,63 @@ class HelloSubscribeSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.conn.send_request = failing
         await self.conn._subscribe_all()
         self.assertEqual(self.conn.active_run_snapshot, {"k": ["r"]})
+
+
+
+class RecoveryLinkTests(unittest.TestCase):
+    """ELI-100 rule E and the active run behind a snapshot without ids, on the
+    shape of the M3-crash transcript (2026-10-13 00:33Z, chat 0c5d682c)."""
+
+    CHAT = "0c5d682c-afaa-44f9-99a9-ada05599c997"
+    M = "7371727a-1373-4108-9650-13b909f067b7"
+    KEY = f"agent:main:openwebui-2d206eab-acac-4945-bd2f-7e8b6365de8c-{CHAT}"
+    SRC = f"msg-{CHAT}-{M}-1791851610.194554"
+    REC = "f2445aa8-aeda-47d8-af7b-cf853aae34e6"
+
+    @staticmethod
+    def user(run, tool=None):
+        m = {"role": "user", "idempotencyKey": f"{run}:user", "content": "x"}
+        if tool:
+            m["provenance"] = {"kind": "internal_system", "sourceTool": tool}
+        return m
+
+    @staticmethod
+    def close(run):
+        return {"role": "assistant", "content": "done",
+                "__openclaw": {"idempotencyKey": f"cli-assistant:{run}"}}
+
+    def history(self, closed=True):
+        msgs = [self.user(self.SRC), self.user(self.REC, "main_session_restart_recovery"),
+                {"role": "assistant", "content": [{"type": "toolcall"}]}]
+        return msgs + ([self.close(self.REC)] if closed else [])
+
+    def test_the_recovery_maps_to_the_interrupted_runs_message(self):
+        self.assertEqual(recovery_source_run(self.history(), self.REC), self.SRC)
+        self.assertEqual(run_message_id(self.KEY, self.CHAT, self.REC, self.history()), self.M)
+
+    def test_a_recovery_after_a_pipe_resume_maps_to_the_same_message(self):
+        resume = f"msg-{self.CHAT}-{self.M}-resume-1791851723.6"
+        msgs = [self.user(self.SRC), self.user(resume), self.user(self.REC, "main_session_restart_recovery")]
+        self.assertEqual(recovery_source_run(msgs, self.REC), resume)
+        self.assertEqual(run_message_id(self.KEY, self.CHAT, self.REC, msgs), self.M)
+
+    def test_a_recovery_of_an_agent_turn_maps_to_that_turns_message(self):
+        msgs = [self.user("m3-agent-91c29446"),
+                self.user("8f27e4c8-ed9a-4acf-9df1-992ee2f4e801", "main_session_restart_recovery")]
+        self.assertEqual(run_message_id(self.KEY, self.CHAT, "8f27e4c8-ed9a-4acf-9df1-992ee2f4e801", msgs),
+                         turn_message_id(self.KEY, "m3-agent-91c29446", self.CHAT))
+
+    def test_an_ordinary_run_is_not_a_recovery(self):
+        self.assertIsNone(recovery_source_run(self.history(), self.SRC))
+        self.assertEqual(run_message_id(self.KEY, self.CHAT, self.SRC, self.history()), self.M)
+        other = "04351f67-dbc3-4533-b2aa-2a0d88d79da0"
+        self.assertEqual(run_message_id(self.KEY, self.CHAT, other, self.history()),
+                         turn_message_id(self.KEY, other, self.CHAT))
+
+    def test_the_active_run_is_the_newest_admitted_turn_without_a_close(self):
+        self.assertEqual(active_run_from_history(self.history(closed=False)), self.REC)
+        self.assertIsNone(active_run_from_history(self.history(closed=True)))
+        self.assertIsNone(active_run_from_history([]))
 
 
 if __name__ == "__main__":

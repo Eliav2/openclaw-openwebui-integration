@@ -431,6 +431,69 @@ def next_continuation(row: dict, stop_notice_before: bool, resumes_so_far: int) 
     return "finalize"
 
 
+# ---------------------------------------------------------------------------
+# Rule E and the active run, from the transcript (DESIGN 2.1, case 5)
+# ---------------------------------------------------------------------------
+
+RECOVERY_SOURCE_TOOL = "main_session_restart_recovery"
+
+
+def _history_user_turns(messages: list) -> list:
+    """[(run_id, provenance sourceTool)] of the admitted user turns, in order."""
+    out = []
+    for m in messages or []:
+        run = _history_user_run_id(m)
+        if run:
+            out.append((run, (m.get("provenance") or {}).get("sourceTool")))
+    return out
+
+
+def _history_closed_runs(messages: list) -> set:
+    closed = set()
+    for m in messages or []:
+        meta = m.get("__openclaw") if isinstance(m.get("__openclaw"), dict) else {}
+        for k in (m.get("idempotencyKey"), meta.get("idempotencyKey")):
+            if isinstance(k, str) and k.startswith("cli-assistant:"):
+                closed.add(k[len("cli-assistant:"):])
+    return closed
+
+
+def recovery_source_run(messages: list, run_id: str) -> str | None:
+    """Rule E: for a restart-recovery run (its `<id>:user` turn carries the
+    `main_session_restart_recovery` provenance, dist
+    main-session-restart-recovery-CPJjd8da.mjs:441, 452-456), the run it
+    recovers: the newest non-recovery admitted turn before it, which is what
+    the Gateway's restartRecoveryDeliverySourceRunId names
+    (chat-send-handler-kZQfUabO.mjs:635-636, agent-command-C9QUtzmi.mjs:1019).
+    None for any other run."""
+    turns = _history_user_turns(messages)
+    for i, (run, tool) in enumerate(turns):
+        if run == run_id:
+            if tool != RECOVERY_SOURCE_TOOL:
+                return None
+            return next((r for r, t in reversed(turns[:i]) if t != RECOVERY_SOURCE_TOOL), None)
+    return None
+
+
+def run_message_id(session_key: str, chat_id: str, run_id: str, messages: list | None = None) -> str | None:
+    """The message run `run_id` writes into: its source run's for a restart
+    recovery (rule E), else its own (turn_message_id)."""
+    source = recovery_source_run(messages, run_id) if messages else None
+    return turn_message_id(session_key, source or run_id, chat_id)
+
+
+def active_run_from_history(messages: list) -> str | None:
+    """The run still going on a session whose snapshot gave no run ids: the
+    newest admitted turn, if its run has no closing `cli-assistant:` turn.
+    Runs on one session are sequential, so only the newest can be open; an
+    interrupted older run never closes and is not active."""
+    turns = _history_user_turns(messages)
+    if not turns:
+        return None
+    newest = turns[-1][0]
+    return None if newest in _history_closed_runs(messages) else newest
+
+
 # --- thinking --------------------------------------------------------------
 # Shared by BOTH the Thinking filter and the Pipe: the filter offers the levels
 # and the pipe enforces them against the live session ladder, so the ranks and
