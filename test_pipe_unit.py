@@ -7982,6 +7982,7 @@ class ApiCallerOwnerRuleTests(unittest.IsolatedAsyncioTestCase):
             return out
         task = asyncio.ensure_future(drain())
         await self._until_registered("run-1")
+        self.active = True                   # sessions.list: the run is going
         self._queue("run-1").put_nowait(self._delta("run-1", "Reading them."))
         await self.spin()
         return task
