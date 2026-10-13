@@ -532,6 +532,30 @@ new devices or requiring repeated approvals.
 > point `STATE_DIR` at a real persistent volume. `/data` is not mounted in
 > every OWUI deployment.
 
+### Owner users (`OWNER_USERS`)
+
+By default every Open WebUI user talks to the agent as the Gateway's owner.
+OpenClaw gives owner turns tools that act on your whole setup: scheduling
+automations, sending messages on your other channels, managing sessions, the
+terminal. If people other than you can sign in to Open WebUI, list yourself in
+the `OWNER_USERS` valve (Open WebUI user ids or emails, comma-separated).
+
+Users not on the list then reach the Gateway over a second connection with its
+own device identity (`STATE_DIR/identity-restricted.json`) and only the
+`operator.read` and `operator.write` scopes. The Gateway does not treat their
+turns as the owner's, so the agent does not offer them owner-only tools. Every
+request that starts, stops or steers a run in their chats goes over that
+connection, including the ones the integration sends on its own (a resume
+after a Gateway restart, a chat title). On a loopback Gateway the second device
+pairs silently; on a remote one, approve it like the first.
+
+This is not a sandbox: everything an agent turn may do without owner rights
+stays available to every user, which can include reading other sessions and
+the agent's memory, depending on your OpenClaw tool policy. Restrict those in
+OpenClaw if your users should not see each other's chats.
+
+Leave the valve empty to keep the old behaviour.
+
 ### OWUI model selector
 
 The integration is a manifold function: `pipes()` calls the Gateway's `models.list`

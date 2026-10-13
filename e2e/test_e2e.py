@@ -348,6 +348,133 @@ def test_a_message_queued_behind_a_wake_does_not_cut_it(token):
     _assert_clean(token, chat_id, msgs)
 
 
+# ── Owner users (OWNER_USERS) ─────────────────────────────────────────────────
+# With OWNER_USERS set, a user not on the list reaches the Gateway over a
+# connection without operator.admin: the Gateway records none of that user's
+# turns as the owner's (`__openclaw.senderIsOwner`, written only for admin
+# senders) and the agent withholds owner-only tools. Every run request in such
+# a chat, including the ones the pipe sends after a Gateway restart (a resume)
+# and the Gateway's own recovery, must stay that way.
+
+import shutil  # noqa: E402
+
+PIPE_FUNCTION_ID = DEFAULT_MODEL.split(".", 1)[0]
+
+
+def _set_owner_users(token: str, value: str) -> None:
+    status, valves = _request("GET", f"/api/v1/functions/id/{PIPE_FUNCTION_ID}/valves", token=token)
+    assert status == 200, valves
+    valves = dict(valves or {})
+    valves["OWNER_USERS"] = value
+    status, out = _request("POST", f"/api/v1/functions/id/{PIPE_FUNCTION_ID}/valves/update", valves, token)
+    assert status == 200, out
+
+
+@pytest.fixture(scope="module")
+def guest_token(token) -> str:
+    """A second Open WebUI account, not on OWNER_USERS. An Open WebUI admin, so
+    model access is not in the way: OWNER_USERS is about the Gateway's owner,
+    not Open WebUI roles."""
+    email, password = f"guest-{uuid.uuid4().hex[:8]}@e2e.invalid", uuid.uuid4().hex
+    status, body = _request("POST", "/api/v1/auths/add", {"name": "E2E Guest", "email": email,
+                                                          "password": password, "role": "admin"}, token)
+    assert status == 200, body
+    status, body = _request("POST", "/api/v1/auths/signin", {"email": email, "password": password})
+    assert status == 200 and body.get("token"), body
+    return body["token"]
+
+
+@pytest.fixture
+def owner_users_set(token):
+    status, me = _request("GET", "/api/v1/auths/", token=token)
+    assert status == 200, me
+    _set_owner_users(token, me["email"])
+    yield me
+    _set_owner_users(token, "")
+
+
+def _user_turns(key: str) -> list:
+    """[(turn id, senderIsOwner)] of the admitted user turns in the transcript."""
+    out = []
+    for m in _gw("chat.history", {"sessionKey": key, "limit": 100}).get("messages") or []:
+        meta = m.get("__openclaw") if isinstance(m.get("__openclaw"), dict) else {}
+        ikey = str(m.get("idempotencyKey") or meta.get("idempotencyKey") or "")
+        if m.get("role") == "user" and ikey.endswith(":user"):
+            out.append((ikey[:-len(":user")], meta.get("senderIsOwner")))
+    return out
+
+
+def test_a_user_not_in_owner_users_gets_replies_without_owner_rights(token, guest_token, owner_users_set):
+    g_chat, g_msg = _chat_turn(guest_token, "Respond with exactly: E2E_GUEST_REPLY")
+    o_chat, o_msg = _chat_turn(token, "Respond with exactly: E2E_OWNER_REPLY")
+    # The guest's run was sent on the restricted connection and rendered by the
+    # main one: the whole reply still arrives.
+    assert g_msg.get("content", "").strip() == "E2E_GUEST_REPLY", g_msg
+    assert o_msg.get("content", "").strip() == "E2E_OWNER_REPLY", o_msg
+    owner_turns = _user_turns(_session_key(token, o_chat))
+    guest_turns = _user_turns(_session_key(guest_token, g_chat))
+    # Precondition: this Gateway records the owner marker at all.
+    assert owner_turns and all(o is True for _t, o in owner_turns), owner_turns
+    assert guest_turns and not any(o is True for _t, o in guest_turns), guest_turns
+
+
+def _gateway_up() -> bool:
+    try:
+        return subprocess.run(["openclaw", "gateway", "call", "sessions.list", "--json", "--params", "{}"],
+                              capture_output=True, timeout=30).returncode == 0
+    except Exception:
+        return False
+
+
+def _kill_and_restart_gateway() -> None:
+    """A crash (SIGKILL), then a fresh `openclaw gateway run`, as start_stack.sh runs it."""
+    subprocess.run(["pkill", "-9", "-f", "openclaw gateway run"], check=False)
+    _until("the Gateway to be gone", lambda: subprocess.run(
+        ["pgrep", "-f", "openclaw gateway run"], capture_output=True).returncode != 0, timeout_s=30)
+    log_dir = os.path.join(os.environ.get("RUNNER_TEMP", "/tmp"), "e2e-logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log = open(os.path.join(log_dir, "gateway-after-restart.log"), "a")
+    subprocess.Popen(["openclaw", "gateway", "run"], stdout=log, stderr=subprocess.STDOUT,
+                     start_new_session=True)
+    _until("the Gateway to come back", _gateway_up, timeout_s=180, every_s=2)
+
+
+@pytest.mark.skipif(shutil.which("pkill") is None, reason="needs to restart the e2e stack's Gateway")
+def test_a_guest_run_continued_after_a_gateway_crash_stays_without_owner_rights(
+        token, guest_token, owner_users_set):
+    now = int(time.time())
+    uid, aid = str(uuid.uuid4()), str(uuid.uuid4())
+    prompt = "E2E_SLOW:30 E2E_GUESTCUT"
+    user = {"id": uid, "parentId": None, "childrenIds": [aid], "role": "user",
+            "content": prompt, "timestamp": now, "models": [DEFAULT_MODEL]}
+    assistant = {"id": aid, "parentId": uid, "childrenIds": [], "role": "assistant",
+                 "content": "", "model": DEFAULT_MODEL, "timestamp": now, "done": False}
+    chat = {"title": "E2E guest crash", "models": [DEFAULT_MODEL],
+            "history": {"messages": {uid: user, aid: assistant}, "currentId": aid},
+            "messages": [user, assistant], "files": [], "tags": [], "timestamp": now * 1000}
+    status, created = _request("POST", "/api/v1/chats/new", {"chat": chat}, guest_token)
+    assert status == 200, created
+    chat_id = created["id"]
+    key = _session_key(guest_token, chat_id)
+    status, ack = _request("POST", "/api/chat/completions", {
+        "model": DEFAULT_MODEL, "messages": [{"role": "user", "content": prompt}],
+        "stream": True, "chat_id": chat_id, "id": aid, "session_id": f"e2e-{uuid.uuid4().hex[:8]}",
+        "parent_id": uid, "user_message": user}, guest_token)
+    assert status == 200, ack
+    _until("the guest run to start", lambda: _session_row(key).get("hasActiveRun"))
+    _kill_and_restart_gateway()
+
+    def settled():
+        msg = _chat_messages(guest_token, chat_id).get(aid) or {}
+        return msg.get("done") is True and not _session_row(key).get("hasActiveRun")
+    _until("the guest reply to settle after the restart", settled, timeout_s=300, every_s=3)
+    turns = _user_turns(key)
+    # Precondition: something continued the run after the crash (the
+    # Gateway's recovery or the pipe's resume), so its turn is checked too.
+    assert len(turns) >= 2, f"no turn after the crash, nothing to check: {turns}\n{_down_state(guest_token, chat_id, key)}"
+    assert not any(o is True for _t, o in turns), f"an owner turn in a guest chat: {turns}"
+
+
 # ── A run that ends while Open WebUI is stopped (ELI-94) ─────────────────────
 # Keep this last: it stops and starts the Open WebUI container. A graceful stop
 # cancels the request streaming the reply and saves the message done:true with
