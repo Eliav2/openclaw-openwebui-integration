@@ -8022,6 +8022,40 @@ class SessionIdRunTests(_RoutingCase):
         second = self.new_messages()[turn_message_id(self.key, self.W2, self.CHAT)]
         self.assertEqual(second["content"], "Second wake. All done.")
 
+    async def test_a_transcript_without_the_wakes_tool_calls_never_replaces_its_cards(self):
+        """Gate 2026-10-13 (a3bfac2, wake-then-user, chat 6ad6778d): with a
+        user turn queued behind it, the wake's claude-cli session was never
+        imported; chat.history held its text but none of its 4 tool calls. A
+        rebuild from that window must keep the cards that streamed, whatever
+        the item count says."""
+        self.wake_turn(self.W1)
+        await _turn_route_event(self.conn, self.sid_ev(_tool("start", tcid="toolu_a")))
+        # The call's result and the wake's text never reached the socket (a
+        # gap): one streamed item. The transcript renders one too, its text,
+        # with no tool call: an item count calls that "at least as much".
+        self.imported("WQ-DONE")
+        await _turn_route_event(self.conn, self.sid_ev({"state": "final"}))
+        await self.spin()
+        (m,) = self.new_messages().values()
+        self.assertIs(m["done"], True)
+        calls = [o.get("call_id") or o.get("id") for o in m["output"] if o["type"] == "function_call"]
+        self.assertEqual(calls, ["toolu_a"], "the streamed card was replaced by a transcript without it")
+
+    async def test_a_transcript_with_the_wakes_calls_still_repairs_what_the_gap_lost(self):
+        self.wake_turn(self.W1)
+        await _turn_route_event(self.conn, self.sid_ev(_tool("start", tcid="toolu_a")))
+        self.history["messages"].append({
+            "role": "assistant", "timestamp": self.tick(), "__openclaw": {"importedFrom": "claude-cli"},
+            "content": [{"type": "toolcall", "id": "toolu_a", "name": "Bash", "arguments": {"command": "ls"}},
+                        {"type": "tool_result", "tool_use_id": "toolu_a", "name": "Bash",
+                         "content": [{"type": "text", "text": "WQ-step-1"}]}]})
+        self.imported("WQ-DONE")
+        await _turn_route_event(self.conn, self.sid_ev({"state": "final"}))
+        await self.spin()
+        (m,) = self.new_messages().values()
+        self.assertEqual([o["type"] for o in m["output"]], ["function_call", "function_call_output", "message"])
+        self.assertEqual(m["content"], "WQ-DONE")
+
     async def test_a_turn_queued_behind_the_wake_is_not_the_wakes(self):
         self.wake_turn(self.W1)
         self.queued_turn()  # committed between the wake's turn and its first event

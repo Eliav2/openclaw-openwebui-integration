@@ -558,9 +558,19 @@ class _TurnWriter:
             return
         rebuilt = _history_renderer(wake_span(hist.get("messages"), self.wake["at"],
                                               self.wake["end"]))
-        if (len(rebuilt.output) >= len(self.renderer.output)
+        # Every card that streamed must be in it: the transcript may lack a
+        # wake's tool calls entirely (gate 2026-10-13: no import of the wake's
+        # CLI session with a user turn queued behind it), and an item count
+        # takes a text item for a card.
+        streamed_calls = {o.get("id") for o in self.renderer.output if o.get("type") == "function_call"}
+        rebuilt_calls = {o.get("id") for o in rebuilt.output if o.get("type") == "function_call"}
+        if (streamed_calls <= rebuilt_calls
+                and len(rebuilt.output) >= len(self.renderer.output)
                 and len(rebuilt.text) >= len(self.renderer.text) and rebuilt.output):
             self.renderer = rebuilt
+        elif streamed_calls - rebuilt_calls:
+            pipe_log(f"  turn writer: the transcript lacks {len(streamed_calls - rebuilt_calls)} of the "
+                     f"wake's {len(streamed_calls)} streamed call(s); keeping what streamed")
 
     async def _stopped(self) -> None:
         """Open WebUI cancelled the writer's task. Stop and Send now both do
