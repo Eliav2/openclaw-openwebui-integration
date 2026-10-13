@@ -8105,6 +8105,146 @@ class TurnWriterStreamTests(_TurnWriterCase):
         self.assertEqual(self.owui.streams[-1][0], w.task_id)
 
 
+
+class TurnWriterEndTests(_TurnWriterCase):
+    """ELI-100 DESIGN 2.5 (end on the run's settled row, from the transcript),
+    2.7 (resume / gateway / wait, budget on M) and Stop."""
+
+    RUN = "agent-run-1"
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.history = _turn_history(run=self.RUN)
+        self.sent = []
+        self.refuse_send = False
+        test = self
+
+        async def send_request(method, params, timeout=10):
+            test.sent.append((method, copy.deepcopy(params)))
+            if method == "chat.history":
+                return copy.deepcopy(test.history)
+            if method == "chat.send":
+                if test.refuse_send:
+                    raise GatewayError("UNAVAILABLE: gateway closing")
+                return {"runId": params["idempotencyKey"], "status": "started"}
+            if method == "chat.abort":
+                return {"aborted": True}
+            raise AssertionError(method)
+        self.conn.send_request = send_request
+
+    async def opened_writer(self):
+        w = self.writer(run=self.RUN)
+        await w.feed(_delta("Reading them."))
+        await w.feed(_tool("start", tcid="toolu_1"))
+        self.assertTrue(w.opened)
+        return w
+
+    def m(self):
+        return self.owui.msgs()["m1"]
+
+    async def task_done(self, w):
+        _, task = self.owui.tasks[w.task_id]
+        await asyncio.wait_for(asyncio.shield(task), 1)
+        return task
+
+    async def test_a_settled_run_is_finalized_from_its_transcript(self):
+        w = await self.opened_writer()
+        await w.end({"status": "done", "hasActiveRun": False, "lastRunId": self.RUN})
+        self.assertIs(self.m()["done"], True)
+        self.assertEqual(self.m()["content"], "Reading them. Found it.")
+        self.assertEqual([i["type"] for i in self.m()["output"]],
+                         ["message", "function_call", "function_call_output", "message"])
+        self.assertEqual(self.owui.events("chat:active")[-1]["data"], {"active": False})
+        self.assertTrue((await self.task_done(w)).done(), "the Open WebUI task ends with the run")
+        self.assertTrue(w.closed)
+
+    async def test_without_a_transcript_what_streamed_is_kept(self):
+        self.history = {"messages": []}
+        w = await self.opened_writer()
+        await w.end({"status": "done", "hasActiveRun": False, "lastRunId": self.RUN})
+        self.assertIs(self.m()["done"], True)
+        self.assertEqual(self.m()["content"].strip()[:13], "Reading them.")
+
+    async def test_a_real_error_is_shown_and_not_resumed(self):
+        w = await self.opened_writer()
+        await w.end({"status": "failed", "lastRunError": "429 rate limited", "hasActiveRun": False})
+        self.assertIs(self.m()["done"], True)
+        self.assertIn("429 rate limited", self.m()["content"])
+        self.assertNotIn("chat.send", [m for m, _ in self.sent])
+
+    async def test_a_running_row_keeps_the_message_open_for_the_recovery(self):
+        w = await self.opened_writer()
+        await w.end({"status": "running", "hasActiveRun": True})
+        self.assertIs(self.m()["done"], False)
+        self.assertFalse(w.closed)
+        self.assertNotIn("chat.send", [m for m, _ in self.sent])
+        w.adopt("f2445aa8-aeda-47d8-af7b-cf853aae34e6")
+        self.assertEqual(w.run_id, "f2445aa8-aeda-47d8-af7b-cf853aae34e6")
+
+    async def test_an_outside_kill_is_resumed_into_the_same_message(self):
+        w = await self.opened_writer()
+        await w.end({"status": "failed", "hasActiveRun": False,
+                     "lastRunError": "Claude Code process exited with code 143"})
+        sends = [p for m, p in self.sent if m == "chat.send"]
+        self.assertEqual(len(sends), 1)
+        self.assertTrue(sends[0]["idempotencyKey"].startswith("msg-c1-m1-resume-"),
+                        "keyed to the message it continues")
+        self.assertIn("cut off", sends[0]["message"])
+        self.assertEqual(w.run_id, sends[0]["idempotencyKey"])
+        self.assertIs(self.m()["done"], False)
+        self.assertEqual(w.resumes, 1)
+
+    async def test_a_refused_resume_is_sent_on_the_next_hello(self):
+        w = await self.opened_writer()
+        self.refuse_send = True
+        await w.end({"status": "failed", "hasActiveRun": False,
+                     "lastRunError": "Claude Code process exited with code 143"})
+        self.assertTrue(w.pending_resume)
+        self.refuse_send = False
+        await w.on_hello()
+        self.assertEqual(len([m for m, _ in self.sent if m == "chat.send"]), 2)
+        self.assertFalse(w.pending_resume)
+
+    async def test_an_oom_loop_stops_after_the_budget_with_a_note(self):
+        w = await self.opened_writer()
+        oom = {"status": "failed", "hasActiveRun": False,
+               "lastRunError": "Claude Code process exited with code 137"}
+        for _ in range(MAX_TURN_RESUMES + 1):
+            await w.end(oom)
+        self.assertEqual(len([m for m, _ in self.sent if m == "chat.send"]), MAX_TURN_RESUMES)
+        self.assertIs(self.m()["done"], True)
+        self.assertIn("cut off", self.m()["content"])
+
+    async def test_a_busy_session_waits(self):
+        w = await self.opened_writer()
+        await w.end({"status": "failed", "hasActiveRun": True,
+                     "lastRunError": "Claude Code process exited with code 143"})
+        self.assertNotIn("chat.send", [m for m, _ in self.sent])
+        self.assertIs(self.m()["done"], False)
+
+    async def test_stop_aborts_the_run_and_finalizes_what_it_has(self):
+        w = await self.opened_writer()
+        _, task = self.owui.tasks[w.task_id]
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        for _ in range(200):
+            await asyncio.sleep(0)
+        self.assertIn(("chat.abort", {"sessionKey": self.KEY, "runId": self.RUN}), self.sent)
+        self.assertIs(self.m()["done"], True)
+        self.assertTrue(w.closed)
+
+    async def test_a_silent_run_with_tools_keeps_its_cards_and_no_sentinel(self):
+        self.history = {"messages": []}
+        w = self.writer(run=self.RUN)
+        await w.feed(_tool("start", tcid="toolu_1"))
+        await w.feed(_tool("result", tcid="toolu_1"))
+        await w.feed(_delta("NO_REPLY"))
+        await w.end({"status": "done", "hasActiveRun": False})
+        self.assertIs(self.m()["done"], True)
+        self.assertNotIn("NO_REPLY", self.m()["content"])
+        self.assertIn("function_call", [i["type"] for i in self.m()["output"]])
+
+
 if __name__ == "__main__":
     unittest.main()
 
