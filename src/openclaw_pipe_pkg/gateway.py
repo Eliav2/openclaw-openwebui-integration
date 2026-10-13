@@ -192,6 +192,14 @@ RECOVERY_HISTORY_LIMIT = 40
 RECOVERY_HISTORY_MAX_CHARS = 50000
 
 
+def _event_frame(payload: dict) -> dict:
+    """A routed event payload as the receive loop hands frames to an inline
+    reply, which reads `msg["payload"]`: a `chat` event has a state and no
+    stream, anything else (including a rebuilt session.tool copy) is `agent`."""
+    event = "chat" if "state" in payload and "stream" not in payload else "agent"
+    return {"type": "event", "event": event, "payload": payload}
+
+
 def _history_item(message) -> dict | None:
     """Flatten one `chat.history` message to the {role, text} shape of a
     `sessions.preview` item. Only `text` blocks count: tool calls, tool results
@@ -1894,7 +1902,7 @@ class _GatewayConnection:
         q = _RunQueue(maxsize=500)
         consumer.queues.append(q)
         for ev in self._held_for_live.pop((session_key, run_id), []):
-            q.put_nowait(ev)  # the run's first events, held for this reply (N6)
+            q.put_nowait(_event_frame(ev))  # the run's first events, held for this reply (N6)
         return q
 
     def unregister_consumer(self, session_key: str, run_id: str, queue: asyncio.Queue | None = None):
@@ -1976,7 +1984,7 @@ class _GatewayConnection:
                      f"consumer of {run_id[:24]}... (count {self.unreachable_held_drains})")
             for q in consumer.queues:
                 for ev in held:
-                    q.put_control(ev)
+                    q.put_control(_event_frame(ev))
             return
         pipe_log(f"  {len(held)} held event(s) of {run_id[:24]}... released to the turn writer")
         for ev in held:
