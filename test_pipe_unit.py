@@ -80,6 +80,7 @@ if "pydantic" not in sys.modules:
 import openclaw_pipe  # noqa: E402
 from openclaw_pipe import (
     ACTION_RUN_PREFIX, TURN_NS, _run_id_sent_at, parse_pipe_run_id, pipe_run_id, turn_message_id,
+    _claim_turn_message, _register_turn_writer, _retire_turn_writer,
     _GatewayConnection,
     GatewayError,
     _is_restart_signature,
@@ -7509,6 +7510,126 @@ class TurnIdentityTests(unittest.TestCase):
         src = open(os.path.join(os.path.dirname(__file__), "src", "openclaw_pipe_pkg",
                                 "action.py")).read()
         self.assertIn('idempotency_key=f"{ACTION_RUN_PREFIX}compact-', src)
+
+
+
+class ClaimTurnMessageTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-100 DESIGN 2.3: the claim of a run's message under the chat's row
+    lock. The fake transaction holds a real per-chat lock and yields between
+    reading the chat and committing, so concurrent claims really interleave."""
+
+    CHAT, USER = "c1", "u1"
+
+    def setUp(self):
+        self.chat = types.SimpleNamespace(chat={"models": ["openclaw_gateway.m"], "history": {
+            "currentId": "a1", "messages": {
+                "q1": {"id": "q1", "role": "user", "parentId": None, "childrenIds": ["a1"]},
+                "a1": {"id": "a1", "role": "assistant", "parentId": "q1", "childrenIds": [],
+                       "model": "openclaw_gateway.m", "done": True},
+            }}}, current_message_id="a1", updated_at=0)
+        self.rows = {}
+        lock = asyncio.Lock()
+        test = self
+
+        class Chats:
+            @staticmethod
+            @contextlib.asynccontextmanager
+            async def _chat_transaction(chat_id):
+                async with lock:
+                    await asyncio.sleep(0)
+                    yield ("db", test.chat)
+
+        class ChatMessages:
+            @staticmethod
+            async def upsert_message(mid, chat_id, user_id, m, db=None):
+                test.rows[mid] = copy.deepcopy(m)
+
+        chats_mod = types.ModuleType("open_webui.models.chats")
+        chats_mod.Chats = Chats
+        cm_mod = types.ModuleType("open_webui.models.chat_messages")
+        cm_mod.ChatMessages = ChatMessages
+        attrs = types.ModuleType("sqlalchemy.orm.attributes")
+        attrs.flag_modified = lambda obj, name: None
+        self.socket_main = types.ModuleType("open_webui.socket.main")
+        mods = {"open_webui": types.ModuleType("open_webui"),
+                "open_webui.models": types.ModuleType("open_webui.models"),
+                "open_webui.models.chats": chats_mod,
+                "open_webui.models.chat_messages": cm_mod,
+                "open_webui.socket": types.ModuleType("open_webui.socket"),
+                "open_webui.socket.main": self.socket_main,
+                "sqlalchemy": types.ModuleType("sqlalchemy"),
+                "sqlalchemy.orm": types.ModuleType("sqlalchemy.orm"),
+                "sqlalchemy.orm.attributes": attrs}
+        p = mock.patch.dict(sys.modules, mods)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def msgs(self):
+        return self.chat.chat["history"]["messages"]
+
+    async def claim(self, mid, run, writer="w1", takeover=False):
+        return await _claim_turn_message(self.CHAT, self.USER, mid, run, writer, takeover)
+
+    async def test_a_new_message_goes_under_the_tail_and_becomes_current(self):
+        r = await self.claim("m1", "run-1")
+        self.assertEqual((r["claimed"], r["how"], r["parent"]), (True, "new", "a1"))
+        m = self.msgs()["m1"]
+        self.assertEqual((m["role"], m["done"], m["content"], m["output"]), ("assistant", False, "", []))
+        self.assertEqual(m["meta"], {"openclaw_run": "run-1", "openclaw_writer": "w1"})
+        self.assertEqual(m["model"], "openclaw_gateway.m")
+        self.assertEqual(self.msgs()["a1"]["childrenIds"], ["m1"])
+        self.assertEqual(self.chat.chat["history"]["currentId"], "m1")
+        self.assertEqual(self.chat.current_message_id, "m1")
+        self.assertEqual(set(self.rows), {"m1", "a1"}, "chat_message rows mirrored")
+        self.assertEqual(set(r["messages"]), {"m1", "a1"})
+
+    async def test_the_tail_is_the_deepest_leaf_not_a_stale_current_id(self):
+        self.chat.chat["history"]["currentId"] = "q1"
+        r = await self.claim("m1", "run-1")
+        self.assertEqual(r["parent"], "a1", "never a sibling of a1")
+
+    async def test_three_concurrent_claims_of_one_run_make_one_message(self):
+        for i in range(3):  # three live connections (an old deploy's and new ones)
+            _register_turn_writer(f"w{i}")
+            self.addCleanup(_retire_turn_writer, f"w{i}")
+        rs = await asyncio.gather(*(self.claim("m1", "run-1", writer=f"w{i}") for i in range(3)))
+        self.assertEqual(sum(r["claimed"] for r in rs), 1)
+        self.assertEqual(self.msgs()["a1"]["childrenIds"], ["m1"])
+
+    async def test_two_runs_starting_together_chain_and_never_branch(self):
+        r1, r2 = await asyncio.gather(self.claim("m1", "run-1"), self.claim("m2", "run-2"))
+        self.assertEqual(r1["parent"], "a1")
+        self.assertEqual(r2["parent"], "m1")
+        self.assertTrue(all(len(m.get("childrenIds") or []) <= 1 for m in self.msgs().values()),
+                        "no variant group")
+
+    async def test_a_message_with_a_live_writer_is_not_taken(self):
+        _register_turn_writer("w1")
+        self.addCleanup(_retire_turn_writer, "w1")
+        await self.claim("m1", "run-1", writer="w1")
+        r = await self.claim("m1", "run-1", writer="w2")
+        self.assertEqual((r["claimed"], r["how"]), (False, "taken"))
+        self.assertEqual(self.msgs()["m1"]["meta"]["openclaw_writer"], "w1")
+
+    async def test_a_message_whose_writer_is_gone_is_taken_over_in_place(self):
+        await self.claim("m1", "run-1", writer="dead-writer")
+        r = await self.claim("m1", "run-1", writer="w2")
+        self.assertEqual((r["claimed"], r["how"], r["parent"]), (True, "takeover", "a1"))
+        self.assertEqual(self.msgs()["m1"]["meta"]["openclaw_writer"], "w2")
+        self.assertEqual(self.msgs()["a1"]["childrenIds"], ["m1"], "not inserted twice")
+
+    async def test_a_finished_message_is_never_taken_over(self):
+        await self.claim("m1", "run-1", writer="dead-writer")
+        self.msgs()["m1"]["done"] = True
+        self.assertFalse((await self.claim("m1", "run-1", writer="w2"))["claimed"])
+
+    async def test_open_webuis_own_stub_is_handed_over_only_by_its_request(self):
+        self.msgs()["a1"].update(done=False, content="")
+        self.assertFalse((await self.claim("a1", "msg-run"))["claimed"],
+                         "no recorded writer: not an orphan by itself")
+        r = await self.claim("a1", "msg-run", takeover=True)
+        self.assertEqual((r["claimed"], r["how"]), (True, "takeover"))
+        self.assertEqual(self.msgs()["a1"]["meta"]["openclaw_writer"], "w1")
 
 
 if __name__ == "__main__":

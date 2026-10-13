@@ -285,6 +285,106 @@ def turn_message_id(session_key: str, run_id: str, chat_id: str | None = None) -
     return str(uuid.uuid5(TURN_NS, f"{session_key}:{run_id}"))
 
 
+# ---------------------------------------------------------------------------
+# Claim: one message per run, anchored at the tail (DESIGN 2.3)
+# ---------------------------------------------------------------------------
+# The claim lives in Open WebUI's DB under the chat's row lock, not in a
+# process map, so an old deploy's connection, a new one and a restarted
+# process all agree: whoever inserts M first owns it, and two different runs
+# that start together chain off the tail each reads under the lock.
+
+_TURN_WRITERS_ATTR = "_openclaw_turn_writers"
+
+
+def _live_turn_writers() -> set:
+    """Writer ids of the connections alive in this Open WebUI process. Kept on
+    `open_webui.socket.main` so every load of this Function (a redeploy keeps
+    the old module objects alive until they are reaped) shares one set."""
+    mod = sys.modules.get("open_webui.socket.main")
+    if mod is None:
+        return set()
+    writers = getattr(mod, _TURN_WRITERS_ATTR, None)
+    if writers is None:
+        writers = set()
+        setattr(mod, _TURN_WRITERS_ATTR, writers)
+    return writers
+
+
+def _register_turn_writer(writer_id: str) -> None:
+    _live_turn_writers().add(writer_id)
+
+
+def _retire_turn_writer(writer_id: str) -> None:
+    _live_turn_writers().discard(writer_id)
+
+
+def _writer_may_take_over(existing: dict) -> bool:
+    """A message another writer recorded can be taken only when that writer
+    is gone (its connection retired or its process restarted) and the
+    message is unfinished. A message with no recorded writer is Open WebUI's
+    own stub for a user turn; only its own inline request hands it over
+    (`takeover=True`, DESIGN 2.6)."""
+    writer = (existing.get("meta") or {}).get("openclaw_writer")
+    return bool(writer) and existing.get("done") is False and writer not in _live_turn_writers()
+
+
+async def _claim_turn_message(chat_id: str, user_id: str, message_id: str, run_id: str,
+                              writer_id: str, takeover: bool = False) -> dict:
+    """Claim message `message_id` for run `run_id` in chat `chat_id`.
+
+    Under the chat's row lock (`Chats._chat_transaction`): if the message
+    exists, it is someone's already, unless `takeover` (the inline request
+    handing over its own reply) or its recorded writer is gone. Otherwise it
+    is inserted under the deepest leaf, which becomes its parent, and
+    `currentId` moves to it. The `chat_message` row is mirrored as
+    `insert_chat_turn` does.
+
+    Returns {claimed, how: new|takeover|taken, message_id, parent, messages}:
+    `messages` holds the changed nodes, for the `chat:messages` introduce."""
+    from open_webui.models.chats import Chats
+    from open_webui.models.chat_messages import ChatMessages
+    from sqlalchemy.orm.attributes import flag_modified
+
+    async with Chats._chat_transaction(chat_id) as (db, chat):
+        data = chat.chat or {}
+        history = data.get("history") or {"messages": {}, "currentId": None}
+        msgs = history.setdefault("messages", {})
+        existing = msgs.get(message_id)
+        if existing is not None:
+            if not (takeover or _writer_may_take_over(existing)):
+                return {"claimed": False, "how": "taken", "message_id": message_id,
+                        "parent": existing.get("parentId"), "messages": {}}
+            meta = {**(existing.get("meta") or {}), "openclaw_run": run_id,
+                    "openclaw_writer": writer_id}
+            msgs[message_id] = {**existing, "meta": meta}
+            changed = {message_id: msgs[message_id]}
+            how, parent = "takeover", existing.get("parentId")
+        else:
+            parent = _deepest_leaf_id(msgs, history.get("currentId"))
+            leaf = msgs.get(parent) or {}
+            model = leaf.get("model") or next(iter(data.get("models") or []), None)
+            msgs[message_id] = {
+                "id": message_id, "parentId": parent, "childrenIds": [], "role": "assistant",
+                "content": "", "output": [], "done": False, "model": model,
+                "modelName": leaf.get("modelName") or model, "timestamp": int(time.time()),
+                "meta": {"openclaw_run": run_id, "openclaw_writer": writer_id},
+            }
+            changed = {message_id: msgs[message_id]}
+            if parent:
+                msgs[parent] = {**leaf, "childrenIds": [*(leaf.get("childrenIds") or []), message_id]}
+                changed[parent] = msgs[parent]
+            history["currentId"] = message_id
+            chat.current_message_id = message_id
+            how = "new"
+        chat.chat = {**data, "history": history}
+        flag_modified(chat, "chat")
+        chat.updated_at = int(time.time())
+        for mid, m in changed.items():
+            await ChatMessages.upsert_message(mid, chat_id, user_id, m, db=db)
+        return {"claimed": True, "how": how, "message_id": message_id, "parent": parent,
+                "messages": changed}
+
+
 # --- thinking --------------------------------------------------------------
 # Shared by BOTH the Thinking filter and the Pipe: the filter offers the levels
 # and the pipe enforces them against the live session ladder, so the ranks and
