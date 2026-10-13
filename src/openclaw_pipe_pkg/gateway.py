@@ -2556,10 +2556,21 @@ def _history_renderer(messages: list) -> "_TurnRenderer":
     return r
 
 
+def _is_closing_message(message) -> bool:
+    """A run's closing assistant message (`cli-assistant:<runId>`)."""
+    if not isinstance(message, dict) or message.get("role") != "assistant":
+        return False
+    meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
+    return any(str(k or "").startswith("cli-assistant:")
+               for k in (message.get("idempotencyKey"), meta.get("idempotencyKey")))
+
+
 def _history_run_messages(history: dict, run_id: str) -> list | None:
     """One run's messages in `chat.history`: everything after the user
-    message that started it, through its closing message
-    (`cli-assistant:<runId>`). None when the run has not closed yet."""
+    message that started it, or after the previous run's closing message
+    (a run with no user turn, e.g. a sub-agent announce), through its own
+    closing message (`cli-assistant:<runId>`). None when the run has not
+    closed yet."""
     messages = (history or {}).get("messages")
     if not isinstance(messages, list) or not run_id:
         return None
@@ -2572,7 +2583,8 @@ def _history_run_messages(history: dict, run_id: str) -> list | None:
         if not {message.get("idempotencyKey"), meta.get("idempotencyKey")} & wanted:
             continue
         start = end
-        while start > 0 and (messages[start - 1] or {}).get("role") != "user":
+        while start > 0 and (messages[start - 1] or {}).get("role") != "user" \
+                and not _is_closing_message(messages[start - 1]):
             start -= 1
         return messages[start:end + 1]
     return None

@@ -6663,6 +6663,35 @@ class RegressionPlanTests(_RoutingCase):
         self.assertEqual(self.new_messages(), {})
 
 
+class RunSpanTests(unittest.TestCase):
+    """A run's messages in chat.history never include another run's."""
+
+    def test_an_announce_run_without_a_user_turn_does_not_take_the_parents_card(self):
+        """Live gate 2026-10-13 (chat a72bba4c): a sub-agent announce run
+        (`announce:v1:...`) has no `<id>:user` turn. Its span ran back to the
+        parent run's user message and took the parent's sessions_spawn card
+        and closing message, so the announce message showed a card it never
+        made. Same span on main (_proactive_run_output)."""
+        imported = {"importedFrom": "claude-cli"}
+        parent, ann = "msg-c-m-1.0", "announce:v1:agent:main:subagent:x:y"
+        hist = {"messages": [
+            {"role": "user", "content": "spawn", "idempotencyKey": f"{parent}:user"},
+            {"role": "user", "content": "Conversation info (untrusted metadata): {}"},
+            {"role": "assistant", "__openclaw": imported, "content": [
+                {"type": "toolcall", "id": "toolu_s", "name": "sessions_spawn", "arguments": {}},
+                {"type": "tool_result", "tool_use_id": "toolu_s", "content": [{"type": "text", "text": "ok"}]}]},
+            {"role": "assistant", "idempotencyKey": f"cli-assistant:{parent}",
+             "content": [{"type": "text", "text": "SPAWNED"}]},
+            {"role": "assistant", "idempotencyKey": f"cli-assistant:{ann}",
+             "content": [{"type": "text", "text": "The check finished."}]}]}
+        span = _history_span_messages(hist, ann)
+        self.assertEqual([m.get("idempotencyKey") for m in span], [f"cli-assistant:{ann}"])
+        r = _history_renderer(span)
+        self.assertEqual((r.text.strip(), r.output and sum(
+            1 for i in r.finished_output() if i["type"] == "function_call")), ("The check finished.", 0))
+        self.assertEqual(len(_history_span_messages(hist, parent)), 2, "the parent keeps its own")
+
+
 class NoMidRunCloseTests(unittest.IsolatedAsyncioTestCase):
     """NoMidRunCloseTest: `sessions.describe` says "done" during a sub-agent
     yield gap while `sessions.list` still has the run active (ELI-56). The
