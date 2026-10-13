@@ -70,6 +70,10 @@ cat >"$HOME/.openclaw/openclaw.json" <<EOF
 EOF
 openclaw config validate
 nohup openclaw gateway run >"$LOG_DIR/gateway.log" 2>&1 &
+# The crash test kills this pid (and its children) and nothing else, so it can
+# never hit a Gateway the stack did not start.
+GATEWAY_PID_FILE="$LOG_DIR/gateway.pid"
+echo $! >"$GATEWAY_PID_FILE"
 wait_for "OpenClaw Gateway" 120 grep -q "\[gateway\] ready" "$LOG_DIR/gateway.log" \
   || { tail -50 "$LOG_DIR/gateway.log"; exit 1; }
 echo "::endgroup::"
@@ -114,8 +118,9 @@ if [[ -n "${GITHUB_ENV:-}" ]]; then
     echo "OWUI_EMAIL=$OWUI_EMAIL"
     echo "OWUI_PASSWORD=$OWUI_PASSWORD"
     echo "E2E_STACK=1"
+    echo "E2E_GATEWAY_PID_FILE=$GATEWAY_PID_FILE"
   } >>"$GITHUB_ENV"
 else
-  echo "export OWUI_URL=$OWUI_URL OWUI_EMAIL=$OWUI_EMAIL OWUI_PASSWORD=$OWUI_PASSWORD E2E_STACK=1"
+  echo "export OWUI_URL=$OWUI_URL OWUI_EMAIL=$OWUI_EMAIL OWUI_PASSWORD=$OWUI_PASSWORD E2E_STACK=1 E2E_GATEWAY_PID_FILE=$GATEWAY_PID_FILE"
 fi
 echo "stack ready"

@@ -426,20 +426,58 @@ def _gateway_up() -> bool:
         return False
 
 
+GATEWAY_PID_FILE = os.environ.get("E2E_GATEWAY_PID_FILE", "")
+
+
+def _alive(pid: int) -> bool:
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return False
+
+
+def _pid_tree(pid: int) -> list[int]:
+    """`pid` and its descendants. The Gateway may run as a child of the
+    `openclaw` launcher, and its process title is not its command line, so
+    a name match would miss it (and could hit a Gateway the stack didn't start)."""
+    out, todo = [], [pid]
+    while todo:
+        p = todo.pop()
+        out.append(p)
+        kids = subprocess.run(["pgrep", "-P", str(p)], capture_output=True, text=True).stdout.split()
+        todo.extend(int(k) for k in kids)
+    return [p for p in out if _alive(p)]
+
+
 def _kill_and_restart_gateway() -> None:
-    """A crash (SIGKILL), then a fresh `openclaw gateway run`, as start_stack.sh runs it."""
-    subprocess.run(["pkill", "-9", "-f", "openclaw gateway run"], check=False)
-    _until("the Gateway to be gone", lambda: subprocess.run(
-        ["pgrep", "-f", "openclaw gateway run"], capture_output=True).returncode != 0, timeout_s=30)
-    log_dir = os.path.join(os.environ.get("RUNNER_TEMP", "/tmp"), "e2e-logs")
-    os.makedirs(log_dir, exist_ok=True)
-    log = open(os.path.join(log_dir, "gateway-after-restart.log"), "a")
-    subprocess.Popen(["openclaw", "gateway", "run"], stdout=log, stderr=subprocess.STDOUT,
-                     start_new_session=True)
-    _until("the Gateway to come back", _gateway_up, timeout_s=180, every_s=2)
+    """A crash (SIGKILL) of the Gateway start_stack.sh launched, then a fresh
+    `openclaw gateway run` the way it runs it."""
+    with open(GATEWAY_PID_FILE) as f:
+        pids = _pid_tree(int(f.read().strip()))
+    assert pids, f"the stack's Gateway (pid file {GATEWAY_PID_FILE}) is not running"
+    for p in pids:
+        os.kill(p, 9)
+    _until("the Gateway to be gone", lambda: not any(_alive(p) for p in pids), timeout_s=30)
+    log_path = os.path.join(os.path.dirname(GATEWAY_PID_FILE), "gateway-after-restart.log")
+    log = open(log_path, "a")
+    proc = subprocess.Popen(["openclaw", "gateway", "run"], stdout=log, stderr=subprocess.STDOUT,
+                            start_new_session=True)
+    with open(GATEWAY_PID_FILE, "w") as f:
+        f.write(str(proc.pid))
+
+    def back():
+        # A relaunch that exits (say, because the old Gateway still owns the
+        # state directory) must fail here, not pass on the old one answering.
+        if proc.poll() is not None:
+            with open(log_path) as f:
+                pytest.fail(f"the relaunched Gateway exited ({proc.returncode}): {f.read()[-2000:]}")
+        return _gateway_up()
+    _until("the Gateway to come back", back, timeout_s=180, every_s=2)
 
 
-@pytest.mark.skipif(shutil.which("pkill") is None, reason="needs to restart the e2e stack's Gateway")
+@pytest.mark.skipif(not GATEWAY_PID_FILE or shutil.which("pgrep") is None,
+                    reason="needs the pid of the e2e stack's Gateway (E2E_GATEWAY_PID_FILE)")
 def test_a_guest_run_continued_after_a_gateway_crash_stays_without_owner_rights(
         token, guest_token, owner_users_set):
     now = int(time.time())
