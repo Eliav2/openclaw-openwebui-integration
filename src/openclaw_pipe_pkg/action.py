@@ -1509,7 +1509,8 @@ class Action:
             compact_params = _owui_chat_send_params(
                 session_key=session_key,
                 message="/compact",
-                idempotency_key=f"compact-{chat_id}-{time.time()}",
+                # ACTION_RUN_PREFIX: the turn path never gives this run a message.
+                idempotency_key=f"{ACTION_RUN_PREFIX}compact-{chat_id}-{time.time()}",
                 owui_chat_id=chat_id,
                 owui_user_id=user_id,
             )

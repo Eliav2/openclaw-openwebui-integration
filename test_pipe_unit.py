@@ -16,6 +16,7 @@ import sys
 import time
 import types
 import asyncio
+import uuid
 from unittest import mock
 
 import conftest  # noqa: F401  (imports real pydantic before this file's stub can shadow it)
@@ -78,6 +79,7 @@ if "pydantic" not in sys.modules:
 
 import openclaw_pipe  # noqa: E402
 from openclaw_pipe import (
+    ACTION_RUN_PREFIX, TURN_NS, _run_id_sent_at, parse_pipe_run_id, pipe_run_id, turn_message_id,
     _GatewayConnection,
     GatewayError,
     _is_restart_signature,
@@ -6880,8 +6882,9 @@ class RestartResumeContractTests(unittest.TestCase):
     def test_resume_uses_a_fresh_idempotency_key(self):
         """Reusing `idempotency_key` would make the Gateway dedupe the resume
         against the original send and return the dead run."""
-        self.assertIn('resume_key = f"resume-{chat_id}-{time.time()}"', self.src)
+        self.assertIn('pipe_run_id(chat_id, owui_message_id, "resume")', self.src)
         self.assertIn("idempotency_key=resume_key", self.src)
+        self.assertNotEqual(pipe_run_id("c", "m", "resume"), "msg-c-m-1.0")
 
     def test_resume_does_not_replay_the_user_text(self):
         """The user's message was persisted on the way in; re-sending it would
@@ -7459,6 +7462,53 @@ class TestSpawnBackground(unittest.TestCase):
                         and node.value.func.attr == "create_task"):
                     offenders.append(f"{name}:{node.lineno}")
         self.assertEqual(offenders, [], "use spawn_background() instead")
+
+
+
+class TurnIdentityTests(unittest.TestCase):
+    """ELI-100 DESIGN 2.2: the message a run renders into, from its id alone."""
+
+    CHAT = "0abe9bde-9b86-4ef3-8a46-a3a98ed9410a"
+    M = "8acdce95-1111-4222-8333-444455556666"
+    KEY = f"agent:main:openwebui-2d206eab-acac-4945-bd2f-7e8b6365de8c-{CHAT}"
+
+    def test_the_replys_own_run_names_its_message(self):
+        run = pipe_run_id(self.CHAT, self.M)
+        self.assertEqual(parse_pipe_run_id(run)["kind"], "reply")
+        self.assertEqual(turn_message_id(self.KEY, run, self.CHAT), self.M)
+
+    def test_input_and_resume_runs_continue_the_same_message(self):
+        for kind in ("input", "resume"):
+            run = pipe_run_id(self.CHAT, self.M, kind)
+            self.assertTrue(run.startswith(f"msg-{self.CHAT}-{self.M}-{kind}-"))
+            self.assertEqual(parse_pipe_run_id(run)["kind"], kind)
+            self.assertEqual(turn_message_id(self.KEY, run, self.CHAT), self.M)
+            self.assertIsNotNone(_run_id_sent_at(run), "the send time stays last")
+
+    def test_an_agent_turn_gets_a_stable_derived_id(self):
+        a = turn_message_id(self.KEY, "m3-agent-1f257b6e", self.CHAT)
+        self.assertEqual(a, turn_message_id(self.KEY, "m3-agent-1f257b6e", self.CHAT))
+        self.assertEqual(a, str(uuid.uuid5(TURN_NS, f"{self.KEY}:m3-agent-1f257b6e")))
+        self.assertNotEqual(a, turn_message_id(self.KEY, "m3-agent-other", self.CHAT))
+
+    def test_a_pipe_run_id_from_another_chat_is_not_trusted(self):
+        other = "11111111-2222-4333-8444-555566667777"
+        run = pipe_run_id(other, self.M)
+        self.assertNotEqual(turn_message_id(self.KEY, run, self.CHAT), self.M)
+
+    def test_old_unkeyed_runs_are_agent_turns(self):
+        for run in (f"msg-{self.CHAT}-1791849271.07", f"resume-{self.CHAT}-1791849383.28",
+                    f"user-input-{self.CHAT}-1.0"):
+            self.assertIsNone(parse_pipe_run_id(run))
+            self.assertEqual(turn_message_id(self.KEY, run, self.CHAT),
+                             str(uuid.uuid5(TURN_NS, f"{self.KEY}:{run}")))
+
+    def test_the_status_actions_runs_get_no_message(self):
+        self.assertIsNone(turn_message_id(self.KEY, f"{ACTION_RUN_PREFIX}compact-{self.CHAT}-1.0"))
+        self.assertIsNone(turn_message_id(self.KEY, ""))
+        src = open(os.path.join(os.path.dirname(__file__), "src", "openclaw_pipe_pkg",
+                                "action.py")).read()
+        self.assertIn('idempotency_key=f"{ACTION_RUN_PREFIX}compact-', src)
 
 
 if __name__ == "__main__":

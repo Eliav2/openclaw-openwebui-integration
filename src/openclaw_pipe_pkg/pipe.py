@@ -1203,7 +1203,7 @@ class Pipe:
                 # it streams into, so a reply orphaned by an Open WebUI restart
                 # is matched to its run by identity (ELI-90, `_stub_turn`).
                 reply_id = (__metadata__ or {}).get("message_id")
-                idempotency_key = (f"msg-{chat_id}-{reply_id}-{time.time()}" if reply_id
+                idempotency_key = (pipe_run_id(chat_id, reply_id) if reply_id
                                    else f"msg-{chat_id}-{time.time()}")
                 # Fit the requested level to what this session's model actually
                 # supports. The dropdown is a union across models, so a level that
@@ -1558,7 +1558,9 @@ class Pipe:
                 return UserInputResult(False, None)
             pipe_log("  user input answered via OWUI modal")
             await _emit_status(__event_emitter__, "Sending answer...", done=False)
-            idempotency_key = f"user-input-{chat_id}-{time.time()}"
+            # The answer continues this reply: its run id names it (ELI-100 2.2).
+            idempotency_key = (pipe_run_id(chat_id, owui_message_id, "input") if owui_message_id
+                               else f"user-input-{chat_id}-{time.time()}")
             try:
                 send_resp = await conn.send_request(
                     "chat.send",
@@ -1632,7 +1634,9 @@ class Pipe:
                     "restart."
                 )
 
-            resume_key = f"resume-{chat_id}-{time.time()}"
+            # The resume continues this reply: its run id names it (ELI-100 2.2).
+            resume_key = (pipe_run_id(chat_id, owui_message_id, "resume") if owui_message_id
+                          else f"resume-{chat_id}-{time.time()}")
             try:
                 resume_resp = await conn.send_request(
                     "chat.send",
