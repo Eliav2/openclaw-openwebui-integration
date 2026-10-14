@@ -147,9 +147,12 @@ def login(page: Page, token: str) -> None:
 def dismiss_popups(page: Page) -> None:
     """The first-login changelog and similar one-time dialogs."""
     for label in ("Okay, Let's Go!", "Okay", "Got it"):
-        btn = page.get_by_role("button", name=label)
-        if btn.count() and btn.first.is_visible():
-            btn.first.click()
+        btn = page.get_by_role("button", name=label, exact=True)
+        try:
+            if btn.count() and btn.first.is_visible():
+                btn.first.click(timeout=3000)
+        except Exception:
+            pass  # it closed on its own between the check and the click
     page.keyboard.press("Escape")
 
 
