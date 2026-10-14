@@ -1,4 +1,4 @@
-The complete feature list, grouped by where you meet it. Each entry links to the page and section with the full explanation, the valves that control it, and a screenshot where one exists.
+The complete feature list, grouped by where you meet it. Each entry links to the page and section with the full explanation, the valves that control it, and a screenshot of it (or, for the parts with nothing on screen, the log lines that show them).
 
 Applies to: Pipe, Action, Filter
 

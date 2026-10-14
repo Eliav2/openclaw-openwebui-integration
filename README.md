@@ -25,7 +25,7 @@ Chat with your OpenClaw agents from Open WebUI, on your phone, and watch them wo
 - **Cron jobs and sub-agent results** reply in the chat, live.
 - **Survives restarts** and reconnects.
 
-[Full feature list](./docs/features/index.md)
+[Full feature list](./docs/features/index.md) · [In pictures](#in-pictures)
 
 ## Quick start
 
@@ -103,27 +103,35 @@ OpenClaw also ships an [OpenAI-compatible `/v1` endpoint](https://docs.openclaw.
 
 What an older release loses, and the test runs behind these numbers: [Versions](./docs/versions.md).
 
-## More screenshots
+## In pictures
 
 <p align="center">
   <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./docs/img/tool-card-expanded-dark.png">
+    <img src="./docs/img/tool-card-expanded-light.png" alt="Live tool cards: a tool card opened to its command and its output" width="300">
+  </picture>
+  <picture>
     <source media="(prefers-color-scheme: dark)" srcset="./docs/img/question-card-dark.png">
-    <img src="./docs/img/question-card-light.png" alt="A question from the agent as a card with three options and a Recommended tag" width="300">
+    <img src="./docs/img/question-card-light.png" alt="Questions as dialogs: a question from the agent as a card with three options and a Recommended tag" width="300">
   </picture>
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="./docs/img/status-dialog-dark.png">
-    <img src="./docs/img/status-dialog-light.png" alt="The Status dialog: context used, 5-hour and weekly rate limits, two running sub-agents" width="300">
+    <img src="./docs/img/status-dialog-light.png" alt="Status: context used, 5-hour and weekly rate limits, two running sub-agents" width="300">
   </picture>
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./docs/img/subagent-drawer-dark.png">
-    <img src="./docs/img/subagent-drawer-light.png" alt="A running sub-agent's drawer, showing its task and what it has read so far" width="300">
+    <source media="(prefers-color-scheme: dark)" srcset="./docs/img/model-picker-dark.png">
+    <img src="./docs/img/model-picker-light.png" alt="Every Gateway model: the model picker open, listing the models the Gateway knows" width="300">
   </picture>
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./docs/img/tool-card-expanded-dark.png">
-    <img src="./docs/img/tool-card-expanded-light.png" alt="A tool card opened to its command and its output" width="300">
+    <source media="(prefers-color-scheme: dark)" srcset="./docs/img/agent-turn-dark.png">
+    <img src="./docs/img/agent-turn-light.png" alt="Cron jobs: a reply a cron job wrote into the open chat, with no message from you" width="300">
+  </picture>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./docs/img/reload-mid-reply-dark.png">
+    <img src="./docs/img/reload-mid-reply-light.png" alt="Survives restarts: a reply right after a page reload, the answer so far still there and growing" width="300">
   </picture>
 </p>
-<p align="center"><sub>A question mid-reply, the Status dialog, a sub-agent's drawer, and a tool card opened. The rate limits are sample data.</sub></p>
+<p align="center"><sub>The list under "What you get", in order: a tool card opened, a question mid-reply, the Status dialog, the model picker, a cron reply in an open chat, and a reply after a page reload. The rate limits are sample data. Every feature's own screenshot is on its page in the <a href="./docs/features/index.md">feature list</a>.</sub></p>
 
 ## Docs
 

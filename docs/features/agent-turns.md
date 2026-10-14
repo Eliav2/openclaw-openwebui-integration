@@ -37,6 +37,9 @@ Heartbeats never get a message: the Gateway hides heartbeat output itself, and h
 
 A sub-agent's own session is not a chat, so nothing is written for it directly. Its result reaches the chat through the parent:
 
+![The parent's first reply, then its reply to the sub-agent's result, with no message from you in between](../img/subagent-result-light.png#gh-light-mode-only)
+![The parent's first reply, then its reply to the sub-agent's result, with no message from you in between](../img/subagent-result-dark.png#gh-dark-mode-only)
+
 - **Parent idle:** the Gateway hands the result to the parent as a new run. That run is an ordinary reply in the chat, and it usually quotes or summarises the result.
 - **Parent still running:** the result is steered into the running parent run, and shows up in the reply you are already watching.
 - **Parent answers with silence** (`NO_REPLY`): you still get the result, as one **Sub-agent** card labelled with the name the parent gave it when it spawned it. Expand the card to read the result.

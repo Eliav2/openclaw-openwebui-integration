@@ -8,6 +8,19 @@ Valves: [`DEVICE_IDENTITY`](../configuration.md#device_identity), [`STATE_DIR`](
 
 The WebSocket handshake is a full challenge/response against an Ed25519 key pair generated on first run. The first time a new key connects, the Gateway holds it as a pending pairing request. Once you approve it, the Gateway issues a device token, and the Pipe uses both from then on.
 
+What the installer prints for a new device, and what the Pipe logs once it is paired (excerpts):
+
+```text
+  ! Generated new device identity: 133c1b884175ef2906a0...
+  ! This new identity must be approved once by OpenClaw.
+```
+
+```text
+[openclaw-pipe] Using device identity from /data/openclaw-bridge/identity.json
+[openclaw-pipe] Using persisted device token
+[openclaw-pipe] Connected to Gateway (persistent) [epoch 1]
+```
+
 `DEVICE_IDENTITY` holds a private key. Treat it, and the files below, as secrets: see [Security](../security.md).
 
 ## Approve the device in the Gateway

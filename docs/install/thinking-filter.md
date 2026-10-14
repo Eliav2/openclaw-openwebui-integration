@@ -65,6 +65,9 @@ Once active, it does nothing until you switch the toggle on in a given conversat
 
 The Pipe should be installed first. The filter's level dropdown is filled from a cache the Pipe writes, `STATE_DIR/thinking-ladders.json`, with the levels it has seen your models support. Before the Pipe has run once, the dropdown falls back to the five levels every observed provider supports: `off`, `minimal`, `low`, `medium`, `high`.
 
+![The level choices in Chat Controls > Valves](../img/thinking-level-light.png#gh-light-mode-only)
+![The level choices in Chat Controls > Valves](../img/thinking-level-dark.png#gh-dark-mode-only)
+
 The dropdown is baked in when Open WebUI loads the filter. So after the Pipe has completed a first chat with a given model, reload or re-save the filter function (**Admin Panel** → **Functions** → `openclaw_thinking` → **Save**) to pick up the real levels. Otherwise it keeps showing the fallback list until the next reload.
 
 The filter looks for the cache in the `OPENCLAW_BRIDGE_STATE_DIR` environment variable of the Open WebUI container, or `/data/openclaw-bridge`. It does not read the Pipe's `STATE_DIR` valve. If you set the Pipe's `STATE_DIR` to another directory, set `OPENCLAW_BRIDGE_STATE_DIR` to the same path, or the dropdown stays on the fallback list.

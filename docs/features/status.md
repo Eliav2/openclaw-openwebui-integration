@@ -14,6 +14,9 @@ _The rate limits in this screenshot are sample data._
 
 The Status Action adds a button to the message toolbar. It opens a dialog with three sections: Context, Rate Limits and Subagents.
 
+![The OpenClaw Status button on a reply's toolbar](../img/toolbar-button-light.png#gh-light-mode-only)
+![The OpenClaw Status button on a reply's toolbar](../img/toolbar-button-dark.png#gh-dark-mode-only)
+
 Each section has its own skeleton and fills the moment its own request returns, so a slow sub-agent list does not hold up the context number. Usage bars are colour coded (green under 60%, amber from 60%, red from 85%), with the colours inlined so a theme cannot make them invisible.
 
 The footer says when the dialog last refreshed and whether it used the Pipe's live connection (`via pipe`) or opened its own (`via action-own`). It reuses the Pipe's connection when one is open, and otherwise connects with the Pipe's saved device identity from `STATE_DIR`, so there is never a second device to approve. The Action's own connection only reads: it never writes a reply into a chat.
@@ -27,6 +30,12 @@ Rate limits come from the Gateway's `usage.status`. On a Gateway whose only Anth
 ## Compact
 
 A Compact pill in the dialog header runs `/compact` on the session. While it works, the dialog shows a distinct "Compacting..." state, then refreshes with the numbers after compaction, so you can see what it bought you.
+
+![The Context section before compacting](../img/compact-before-light.png#gh-light-mode-only)
+![The Context section before compacting](../img/compact-before-dark.png#gh-dark-mode-only)
+
+![The same section after Compact](../img/compact-after-light.png#gh-light-mode-only)
+![The same section after Compact](../img/compact-after-dark.png#gh-dark-mode-only)
 
 It waits up to 180 seconds, the same as the default timeout of `openclaw sessions compact`. If it takes longer, the dialog says so; compaction may still finish in the background.
 
@@ -61,6 +70,9 @@ The Tools tab reads both transcript shapes, so it works the same for either runt
 ## Status button in the composer
 
 The Pipe also adds a **Status** button to the composer row of OpenClaw chats, right after the OpenClaw Thinking chip (or at the end of the composer's chips when that chip is off). It opens the same dialog through the Status Action, so the Action must be installed.
+
+![The Status button in the composer, next to the integrations button](../img/composer-status-light.png#gh-light-mode-only)
+![The Status button in the composer, next to the integrations button](../img/composer-status-dark.png#gh-dark-mode-only)
 
 Open WebUI has no extension point for the composer, so the button is put into the page by JavaScript. If a future Open WebUI changes the composer and the anchor is not found, the button simply does not appear. On Open WebUI 0.12 it appears as soon as a tab opens an OpenClaw chat; on older releases, after the next reply or the next click on the toolbar button.
 
