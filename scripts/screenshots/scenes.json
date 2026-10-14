@@ -2,6 +2,23 @@
   "_comment": "Scripted model replies for the README screenshots (capture.py). A scene is picked by a phrase from the user's own message; step n answers the request that carries n tool results. Child scenes come first: a sub-agent's prompt can quote its parent's request.",
   "scenes": [
     {
+      "match": "Create a concise title",
+      "steps": [
+        {
+          "say": "🌦️ Hourly view release plan"
+        }
+      ]
+    },
+    {
+      "match": "came back with 99.98%",
+      "steps": [
+        {
+          "say": "The uptime check is back: 99.98% over the last 30 days, with one 9-minute outage on Tuesday night while the cache volume was resized. Nothing to fix; I'd only add an alert on the volume filling up.",
+          "delay": 0.03
+        }
+      ]
+    },
+    {
       "match": "Price out Fly.io",
       "steps": [
         {
@@ -168,6 +185,134 @@
       "steps": [
         {
           "say": "Hi Sam, I'm here. I can run commands and read or edit files in your workspace, look things up, and run jobs on a schedule, like a check every morning. What should we start with?",
+          "delay": 0.03
+        }
+      ]
+    },
+    {
+      "match": "Check the uptime of the forecast API",
+      "steps": [
+        {
+          "say": "",
+          "tool": "read",
+          "args": {
+            "path": "forecast/README.md"
+          }
+        },
+        {
+          "say": "Uptime came back with 99.98% over the last 30 days. One outage: 9 minutes on Tuesday night, during the cache volume resize."
+        }
+      ]
+    },
+    {
+      "match": "how reliable the forecast API has been",
+      "steps": [
+        {
+          "say": "I'll have a helper go through the uptime history while we keep talking.",
+          "tool": "sessions_spawn",
+          "args": {
+            "task": "Check the uptime of the forecast API over the last 30 days and list any outages.",
+            "label": "Uptime check"
+          }
+        },
+        {
+          "say": "The uptime check is running in the background. I'll tell you what it finds."
+        }
+      ]
+    },
+    {
+      "match": "Draft the release notes for the hourly view",
+      "steps": [
+        {
+          "say": "Here's a draft for the release notes.\n\n**Hourly forecast.** The day screen now has an hourly strip: temperature, rain chance and wind for the next 24 hours, so you can see exactly when the rain starts and stops. Tap an hour to see the details. **Faster startup.** Forecasts are cached for ten minutes, so opening the app again no longer refetches everything, and it works offline for a short while. **Units.** Wind speed now follows your km/h or mph setting everywhere, including the hourly strip and the weekly outlook. **Under the hood.** The forecast API client retries a failed request once before it shows an error, and the cache lives on its own volume. Want me to shorten it for the app store listing?",
+          "delay": 0.25
+        }
+      ]
+    },
+    {
+      "match": "Let's plan the hourly view release",
+      "steps": [
+        {
+          "say": "Sure. What's left: the rain colours on the hourly strip, a cache test, and the release notes. The strip and the test are small; the notes depend on what you want to call out.",
+          "delay": 0.03
+        }
+      ]
+    },
+    {
+      "match": "What should go in the release notes?",
+      "steps": [
+        {
+          "say": "Lead with the hourly strip, since that's what people will notice. Then the faster startup from the ten-minute cache, and the wind units fix as a one-liner.",
+          "delay": 0.03
+        }
+      ]
+    },
+    {
+      "match": "Start with the build",
+      "steps": [
+        {
+          "say": "",
+          "tool": "exec",
+          "args": {
+            "command": "cd forecast && python3 -m compileall -q src && echo build ok",
+            "title": "Build the app"
+          }
+        },
+        {
+          "say": "The build is clean. Next is the staging deploy script, which doesn't exist yet.",
+          "delay": 0.03
+        }
+      ]
+    },
+    {
+      "match": "What does this chart say about the afternoon?",
+      "steps": [
+        {
+          "say": "Rain from about 3 PM to 6 PM, the lighter bars, while the temperature drops from 22 to 17 degrees. A dry morning and a wet commute home: take a jacket.",
+          "delay": 0.03
+        }
+      ]
+    },
+    {
+      "match": "Run the full test suite for the forecast app",
+      "steps": [
+        {
+          "say": "Running the whole suite. It takes a couple of minutes.",
+          "tool": "exec",
+          "args": {
+            "command": "cd forecast && sleep 90 && python3 -m compileall -q src && echo all tests passed",
+            "title": "Run the full test suite",
+            "yieldMs": 120000
+          }
+        },
+        {
+          "say": "All tests passed."
+        }
+      ]
+    },
+    {
+      "match": "Rebuild the forecast cache",
+      "steps": [
+        {
+          "say": "Rebuilding the cache from the forecast API.",
+          "tool": "exec",
+          "args": {
+            "command": "cd forecast && sleep 20 && python3 -m compileall -q src && echo cache rebuilt",
+            "title": "Rebuild the forecast cache",
+            "yieldMs": 40000
+          }
+        },
+        {
+          "say": "The cache is rebuilt: 24 hours for each saved place.",
+          "delay": 0.03
+        }
+      ]
+    },
+    {
+      "match": "Which branch is this on?",
+      "steps": [
+        {
+          "say": "It's on main. There are no other branches in the repo yet.",
           "delay": 0.03
         }
       ]

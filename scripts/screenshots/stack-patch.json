@@ -11,7 +11,11 @@
             "id": "nova",
             "name": "Nova",
             "contextWindow": 200000,
-            "maxTokens": 8192
+            "maxTokens": 8192,
+            "input": [
+              "text",
+              "image"
+            ]
           },
           {
             "id": "nova-mini",
@@ -29,7 +33,11 @@
             "id": "nova-vision",
             "name": "Nova Vision",
             "contextWindow": 200000,
-            "maxTokens": 8192
+            "maxTokens": 8192,
+            "input": [
+              "text",
+              "image"
+            ]
           }
         ]
       }
