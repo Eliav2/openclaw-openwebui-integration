@@ -5615,13 +5615,14 @@ def _media_directives(text: str, final: bool) -> list[str]:
 
 def _replace_directive(text: str, raw: str, shown: str) -> str:
     """`text` with `shown` for each occurrence of the directive `raw` that
-    the inline reply's grammar resolves, none quoted in code (ELI-111)."""
-    scan = globals().get("_media_scan")
-    out, pos = "", 0
-    for start, end, _fname in (scan(text)[0] if scan else []):
-        if text[start:end] == raw:
-            out, pos = out + text[pos:start] + shown, end
-    return out + text[pos:]
+    the inline reply's grammar resolves, none quoted in code (ELI-111), and
+    the text after it on a line of its own, as the inline reply saves it
+    (`_replace_media`; ELI-117). Absent in the Status Action's build."""
+    scan, replace = globals().get("_media_scan"), globals().get("_replace_media")
+    if not (scan and replace):
+        return text
+    hits = [d for d in scan(text)[0] if text[d[0]:d[1]] == raw]
+    return replace(text, hits, lambda _fname: shown) if hits else text
 
 
 async def _transcript_view(conn: "_GatewayConnection", *, session_key: str, chat_id: str,

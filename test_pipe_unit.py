@@ -10069,6 +10069,105 @@ class ToolCardOutputTextTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(card, f"{TOOL_ERROR_MARK} tool call failed\n\nls: cannot access 'x'")
 
 
+class _InlineReply:
+    """A pipe reply with a scripted Gateway (`NoDroppedMessagesTests`), for
+    a test that also needs another harness."""
+
+    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
+    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
+    _queue = NoDroppedMessagesTests._queue
+    _delta = NoDroppedMessagesTests._delta
+    _final = NoDroppedMessagesTests._final
+    _until_registered = NoDroppedMessagesTests._until_registered
+
+    def fail(self, msg):
+        raise AssertionError(msg)
+
+    async def saved(self, chunks, base_url) -> tuple[str, list]:
+        """(content, output) Open WebUI saves for one run streaming `chunks`,
+        a directive resolved through the file server at `base_url`."""
+        await self.asyncSetUp()
+        try:
+            self.pipe.valves.USE_OWUI_FILES = False
+            self.pipe.valves.FILE_SERVER_BASE_URL = base_url
+
+            async def emitter(event):
+                pass
+            body = {"model": "openclaw_gateway.default", "messages": [{"role": "user", "content": "go"}]}
+            meta = {"chat_id": "chat-1", "user_id": "u1", "message_id": "m1"}
+            gen = self.pipe._pipe_impl(body, emitter, __metadata__=meta)
+
+            async def drain():
+                return [c async for c in gen]
+            task = asyncio.ensure_future(drain())
+            await self._until_registered("run-1")
+            q = self._queue("run-1")
+            for c in chunks:
+                q.put_nowait(self._delta("run-1", c))
+            q.put_nowait(self._final("run-1"))
+            return _owui_saved(await asyncio.wait_for(task, 5))   # bounds the test only
+        finally:
+            await self.asyncTearDown()
+
+
+def _message_texts(output: list) -> list:
+    return ["".join(str(p.get("text", "")) for p in i.get("content") or [])
+            for i in output if i.get("type") == "message"]
+
+
+class WriterMediaLineTests(_RoutingCase):
+    """ELI-117 (found during ELI-113): the turn writer saved the text after a
+    `MEDIA:` directive on the directive's line as written, while the inline
+    reply puts it on a line of its own, so `MEDIA:a.png more` was saved
+    differently by the path that finalized the reply. One rule for both:
+    the same text, inline or handed over, saves the same content and output
+    items."""
+
+    closed_run = HandoverRewriteTests.closed_run
+    settle = HandoverRewriteTests.settle
+    BASE = "https://x"
+    TEXTS = (
+        "Here: MEDIA:x.png more",
+        "Shot MEDIA:x.png\nnext line",
+        "a MEDIA:x.png   \n\n  b",
+        "Two: MEDIA:x.png MEDIA:y.png end",
+        "Done: MEDIA:x.png\n",
+        "Quoted `MEDIA:x.png ` stays, real: MEDIA:y.png then",
+    )
+
+    async def _handed_over(self, text) -> tuple[str, list]:
+        """(content, output) the turn writer saves for a run the inline reply
+        never streamed, its directives resolved through the same server."""
+        run = pipe_run_id(self.CHAT, self.STUB)
+        self.add_stub(self.STUB, content="")
+        self.conn.register_run_target(self.key, run, self.CHAT, self.STUB)
+
+        async def resolve(directive, **kw):
+            fname = directive.split(":", 1)[1].strip()
+            return f"![{fname}]({self.BASE}/{fname})", True
+        with mock.patch.object(openclaw_pipe, "_resolve_media_text", resolve):
+            await self.dispatch(run, _delta(text))
+            await self.dispatch(run, {"state": "final"})
+            self.history = {"messages": self.closed_run(run, text)}
+            await self.settle(run)
+        m = self.owui.msgs()[self.STUB]
+        self.assertIs(m["done"], True)
+        return m["content"], m["output"]
+
+    async def test_inline_and_handed_over_replies_save_the_same(self):
+        for text in self.TEXTS:
+            with self.subTest(text=text):
+                await self.asyncSetUp()
+                inline_content, inline_output = await _InlineReply().saved([text], self.BASE)
+                content, output = await self._handed_over(text)
+                self.assertEqual(content, inline_content)
+                self.assertEqual(_message_texts(output), _message_texts(inline_output))
+
+    async def test_the_text_after_a_directive_is_on_its_own_line(self):
+        content, _output = await self._handed_over("Here: MEDIA:x.png more")
+        self.assertEqual(content, f"Here: ![x.png]({self.BASE}/x.png)\nmore")
+
+
 class HandoverMediaCodeAwareTests(_RoutingCase):
     """ELI-111, the writer side: a handed-over reply resolves a directive the
     way the inline reply does, and an image recorded for a prose directive is
