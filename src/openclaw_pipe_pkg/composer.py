@@ -48,7 +48,7 @@
 # reply that is streaming into the same tab.
 # ---------------------------------------------------------------------------
 
-_COMPOSER_BUTTON_VERSION = "2"
+_COMPOSER_BUTTON_VERSION = "3"
 
 # The Status Action's function id (install_action.py's FUNCTION_ID; the
 # dialog's own JS calls the same fixed id) and the Pipe's default function id.
@@ -279,7 +279,10 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
     b.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" '
       + 'stroke-width="1.75" stroke="currentColor" aria-hidden="true" class="size-4">'
       + '<path stroke-linecap="round" stroke-linejoin="round" d="' + SPARK_PATH + '"/></svg>'
-      + '<span class="pr-0.5">Status</span>';
+      // Icon-only below `sm`, like Open WebUI's own composer chips: at phone
+      // width the chip row's overflow cut the label to "Stat" (ELI-123). The
+      // title and aria-label still name it. Both classes ship in Open WebUI's CSS.
+      + '<span class="pr-0.5 hidden sm:inline">Status</span>';
     b.addEventListener('click', function (e) {
       e.preventDefault();
       e.stopPropagation();

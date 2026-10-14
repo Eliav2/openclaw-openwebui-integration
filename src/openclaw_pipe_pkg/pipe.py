@@ -2126,7 +2126,7 @@ class Pipe:
 
                             elif phase == "result":
                                 result = data.get("result", {})
-                                result_str = json.dumps(result) if not isinstance(result, str) else result
+                                result_str = _tool_result_text(result)
                                 tool_call_id = data.get("toolCallId", "")
                                 # The Gateway already tells us the outcome
                                 # (`execute.runtime`'s emitCliToolResult); the

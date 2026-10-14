@@ -1769,6 +1769,14 @@ def _attr(value: str) -> str:
     )
 
 
+# `output_index` for an item that goes at the end of Open WebUI's output
+# list. Both of its reducers append an `output_item.added` whose index is at
+# or past the end; without one, the backend appends but the chat tab splices
+# the item in before the last one (ELI-122). The pipe cannot see that list
+# (a tag in the text can add items to it), so it names no exact length.
+_OUTPUT_APPEND_INDEX = 1 << 30
+
+
 def _tool_call_started_event(name: str, tool_call_id: str, args_str: str) -> dict:
     """Announce a tool call as a Responses-API output item (live spinner).
 
@@ -1785,9 +1793,12 @@ def _tool_call_started_event(name: str, tool_call_id: str, args_str: str) -> dic
     that this replaced). The frontend renders a `function_call` with no matching
     `function_call_output` as a spinner (`structuredOutput.ts::buildToolCallToken`).
 
-    Ordering is by arrival, and `response.output_item.added` appends when it
-    does not recognise the item, so these interleave correctly with ordinary
-    streamed text -- no output_index bookkeeping needed on our side.
+    Ordering is by arrival: the item goes at the end of the output list, after
+    the text streamed before it. It says so with `output_index`
+    (`_OUTPUT_APPEND_INDEX`): the backend appends an item without one, but
+    the chat tab's reducer (`structuredOutput.ts::applyResponseStreamEvent`)
+    splices it in BEFORE the last item, so the live card showed above the
+    text written before the call until a reload (ELI-122).
 
     The tool call id goes in `id`, and `call_id` is deliberately ABSENT. OWUI
     0.11.0 appended every added item unconditionally, so the obvious shape
@@ -1815,6 +1826,7 @@ def _tool_call_started_event(name: str, tool_call_id: str, args_str: str) -> dic
     """
     return {
         "type": "response.output_item.added",
+        "output_index": _OUTPUT_APPEND_INDEX,
         "item": {
             "type": "function_call",
             "id": tool_call_id,
@@ -1840,6 +1852,7 @@ def _tool_call_result_event(tool_call_id: str, result_str: str) -> dict:
     """
     return {
         "type": "response.output_item.added",
+        "output_index": _OUTPUT_APPEND_INDEX,
         "item": {
             "type": "function_call_output",
             "id": f"fco_{tool_call_id}",
@@ -1848,6 +1861,33 @@ def _tool_call_result_event(tool_call_id: str, result_str: str) -> dict:
             "status": "completed",
         },
     }
+
+
+def _tool_result_text(result) -> str:
+    """The text a tool card shows for a tool event's `result`.
+
+    OpenClaw sends a string, a list of content blocks, or the agent-tool
+    envelope `{"content": [...], "details": {...}}` (`sanitizeToolResult`).
+    The card shows the content: text blocks one per line, an image (its data
+    is already stripped) as a short note. `details` is the tool's metadata
+    (status, exit code, cwd, ...), not its output; dumping the whole envelope
+    put it in every card (ELI-121). Anything else is shown as JSON.
+    """
+    if isinstance(result, str):
+        return result
+    blocks = result.get("content") if isinstance(result, dict) else result
+    if not isinstance(blocks, list):
+        return json.dumps(result)
+    lines = []
+    for block in blocks:
+        kind = block.get("type") if isinstance(block, dict) else None
+        if kind == "text" and isinstance(block.get("text"), str):
+            lines.append(block["text"])
+        elif kind == "image":
+            lines.append(f"[{block.get('mimeType') or 'an'} image]")
+        else:
+            lines.append(block if isinstance(block, str) else json.dumps(block))
+    return "\n".join(lines)
 
 
 TOOL_ERROR_MARK = "❌"
@@ -2043,7 +2083,7 @@ class _TurnRenderer:
                 if tcid and tcid in self._tool_results:
                     return
                 result = data.get("result", {})
-                result_str = json.dumps(result) if not isinstance(result, str) else result
+                result_str = _tool_result_text(result)
                 args_str = self._active_tool_args.pop(tcid, None) or json.dumps(
                     data.get("args", {})
                 )
@@ -5575,13 +5615,14 @@ def _media_directives(text: str, final: bool) -> list[str]:
 
 def _replace_directive(text: str, raw: str, shown: str) -> str:
     """`text` with `shown` for each occurrence of the directive `raw` that
-    the inline reply's grammar resolves, none quoted in code (ELI-111)."""
-    scan = globals().get("_media_scan")
-    out, pos = "", 0
-    for start, end, _fname in (scan(text)[0] if scan else []):
-        if text[start:end] == raw:
-            out, pos = out + text[pos:start] + shown, end
-    return out + text[pos:]
+    the inline reply's grammar resolves, none quoted in code (ELI-111), and
+    the text after it on a line of its own, as the inline reply saves it
+    (`_replace_media`; ELI-117). Absent in the Status Action's build."""
+    scan, replace = globals().get("_media_scan"), globals().get("_replace_media")
+    if not (scan and replace):
+        return text
+    hits = [d for d in scan(text)[0] if text[d[0]:d[1]] == raw]
+    return replace(text, hits, lambda _fname: shown) if hits else text
 
 
 async def _transcript_view(conn: "_GatewayConnection", *, session_key: str, chat_id: str,
@@ -6389,7 +6430,7 @@ async def _emit_message_snapshot(__event_emitter__, content):
 # reply that is streaming into the same tab.
 # ---------------------------------------------------------------------------
 
-_COMPOSER_BUTTON_VERSION = "2"
+_COMPOSER_BUTTON_VERSION = "3"
 
 # The Status Action's function id (install_action.py's FUNCTION_ID; the
 # dialog's own JS calls the same fixed id) and the Pipe's default function id.
@@ -6620,7 +6661,10 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
     b.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" '
       + 'stroke-width="1.75" stroke="currentColor" aria-hidden="true" class="size-4">'
       + '<path stroke-linecap="round" stroke-linejoin="round" d="' + SPARK_PATH + '"/></svg>'
-      + '<span class="pr-0.5">Status</span>';
+      // Icon-only below `sm`, like Open WebUI's own composer chips: at phone
+      // width the chip row's overflow cut the label to "Stat" (ELI-123). The
+      // title and aria-label still name it. Both classes ship in Open WebUI's CSS.
+      + '<span class="pr-0.5 hidden sm:inline">Status</span>';
     b.addEventListener('click', function (e) {
       e.preventDefault();
       e.stopPropagation();
@@ -6978,8 +7022,9 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
 
   function sectionHeader(text) {
     const h = document.createElement('div');
-    h.className = 'text-[10px] font-semibold tracking-wide uppercase '
+    h.className = 'font-semibold tracking-wide uppercase '
       + 'text-gray-400 dark:text-gray-500 mb-1.5';
+    h.style.fontSize = '10px';  // inline: see the panel's width below
     h.textContent = text;
     return h;
   }
@@ -7112,7 +7157,7 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
 
   const panel = document.createElement('div');
   panel.className = 'bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 '
-    + 'rounded-2xl shadow-2xl border border-gray-100 dark:border-gray-800 p-5';
+    + 'rounded-2xl shadow-xl border border-gray-100 dark:border-gray-800 p-5';
   // Inline, not a `w-[380px] max-w-[90vw]` utility class: same reasoning as
   // barColor() below -- an arbitrary-value class OWUI's own Tailwind build
   // never scanned out of its own source can silently carry zero CSS.
@@ -7269,17 +7314,19 @@ _CONTEXT_FILL_JS_TEMPLATE = r"""
   const headerRow = document.createElement('div');
   headerRow.className = 'flex items-center justify-between mb-1.5';
   const headerLabel = document.createElement('div');
-  headerLabel.className = 'text-[10px] font-semibold tracking-wide uppercase '
+  headerLabel.className = 'font-semibold tracking-wide uppercase '
     + 'text-gray-400 dark:text-gray-500';
+  headerLabel.style.fontSize = '10px';
   headerLabel.textContent = 'Context';
   headerRow.appendChild(headerLabel);
   if (S.identity.chatId && S.identity.messageId && S.identity.sessionId) {
     const compactBtn = document.createElement('button');
     compactBtn.type = 'button';
     compactBtn.textContent = 'Compact';
-    compactBtn.className = 'text-[10px] font-medium px-2 py-0.5 rounded-full '
+    compactBtn.className = 'font-medium px-2 py-0.5 rounded-full '
       + 'border border-gray-200 dark:border-gray-700 text-gray-500 dark:text-gray-400 '
-      + 'hover:text-gray-800 dark:hover:text-gray-100 hover:border-gray-300 dark:hover:border-gray-600';
+      + 'hover:text-gray-800 dark:hover:text-gray-100';
+    compactBtn.style.fontSize = '10px';
     compactBtn.onclick = S.triggerCompact;
     headerRow.appendChild(compactBtn);
   }
@@ -7452,7 +7499,8 @@ _SUBAGENTS_FILL_JS_TEMPLATE = r"""
     row.appendChild(body);
 
     const elapsed = document.createElement('span');
-    elapsed.className = 'text-[10px] text-gray-400 dark:text-gray-500 shrink-0 mt-1.5';
+    elapsed.className = 'text-gray-400 dark:text-gray-500 shrink-0 mt-1.5';
+    elapsed.style.fontSize = '10px';
     elapsed.textContent = S.elapsedTime(t.startedAt, t.endedAt);
     row.appendChild(elapsed);
 
@@ -7485,7 +7533,11 @@ _DRAWER_OPEN_JS_TEMPLATE = r"""
 
   const root = document.createElement('div');
   root.id = 'openclaw-drawer-root';
-  root.className = 'fixed inset-0 z-[10000]';
+  root.className = 'fixed inset-0';
+  // Inline: Open WebUI's CSS has no `z-[10000]` rule, so with the class the
+  // drawer had no z-index at all and opened behind the Status dialog
+  // (z-[9999]), which then swallowed every click on it (ELI-118).
+  root.style.zIndex = '10000';
 
   const backdrop = document.createElement('div');
   backdrop.className = 'absolute inset-0';
@@ -7496,7 +7548,7 @@ _DRAWER_OPEN_JS_TEMPLATE = r"""
   const panel = document.createElement('div');
   panel.className = 'absolute right-0 top-0 bottom-0 '
     + 'bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 '
-    + 'shadow-2xl border-l border-gray-100 dark:border-gray-800 flex flex-col';
+    + 'shadow-xl border-l border-gray-100 dark:border-gray-800 flex flex-col';
   // Inline, not a `w-[420px] max-w-[92vw]` utility class -- same reasoning
   // as the status modal's panel above. min() keeps this mobile-first: a
   // narrow viewport wins the 88vw side (leaves a visible margin so the
@@ -7730,7 +7782,8 @@ _DRAWER_TRANSCRIPT_FILL_JS_TEMPLATE = r"""
     const row = document.createElement('div');
     row.className = 'text-xs mb-2.5 ' + (ROLE_STYLE[m.role] || ROLE_STYLE.assistant);
     const roleLabel = document.createElement('div');
-    roleLabel.className = 'text-[10px] uppercase tracking-wide text-gray-400 dark:text-gray-500 mb-0.5';
+    roleLabel.className = 'uppercase tracking-wide text-gray-400 dark:text-gray-500 mb-0.5';
+    roleLabel.style.fontSize = '10px';
     roleLabel.textContent = m.role;
     row.appendChild(roleLabel);
     const text = document.createElement('div');
@@ -7802,8 +7855,9 @@ _DRAWER_TOOLS_FILL_JS_TEMPLATE = r"""
 
     if (c.result) {
       const resultLabel = document.createElement('div');
-      resultLabel.className = 'text-[10px] uppercase tracking-wide text-gray-400 '
+      resultLabel.className = 'uppercase tracking-wide text-gray-400 '
         + 'dark:text-gray-500 mt-1.5';
+      resultLabel.style.fontSize = '10px';
       resultLabel.textContent = 'Result';
       details.appendChild(resultLabel);
       const resultEl = document.createElement('pre');
@@ -7920,6 +7974,16 @@ def _subagent_task_text(text):
     return task or None
 
 
+# A spawn's first message in any whitespace form: lastMessagePreview flattens
+# it to one line, so the header-on-its-own-line test above does not apply.
+_SUBAGENT_SPAWN_RE = re.compile(
+    r"^\s*(?:<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\s*)?\[Subagent Context\].*\[Subagent Task\]", re.S)
+
+
+def _is_spawn_message(text):
+    return isinstance(text, str) and bool(_SUBAGENT_SPAWN_RE.match(text))
+
+
 def _subagent_task_texts(previews_resp):
     """{child key: task text} from a sessions.preview answer. The preview
     holds a session's newest items, so a long-running child's first message
@@ -7939,6 +8003,9 @@ def _subagent_row(row, task_text=None):
     as the Tasks API had it, else the spawn label, else the key."""
     status = _subagent_status(row.get("status"))
     preview = row.get("lastMessagePreview")
+    if _is_spawn_message(preview):
+        # Just spawned: the newest message is still the task (ELI-119).
+        preview = None
     return {
         "id": row["key"],
         "title": task_text or row.get("label") or row["key"],
@@ -8002,12 +8069,20 @@ def _extract_transcript_and_tools(messages: list) -> tuple[list, list]:
     text_rows: list = []
     tool_calls: list = []
     pending_by_id: dict = {}
+
+    def add_text(role, text):
+        if role == "user" and _is_spawn_message(text):
+            # A child's first message is the Gateway's spawn wrapper: show
+            # the task in it, as the Subagents row does.
+            text = _subagent_task_text(text) or text
+        text_rows.append({"role": role, "text": text})
+
     for m in messages or []:
         role = m.get("role")
         content = m.get("content")
         if isinstance(content, str):
             if content.strip():
-                text_rows.append({"role": role, "text": content})
+                add_text(role, content)
             continue
         if not isinstance(content, list):
             continue
@@ -8041,7 +8116,7 @@ def _extract_transcript_and_tools(messages: list) -> tuple[list, list]:
                     # chat tool cards already do.
                     call["isError"] = bool(item.get("is_error"))
         if text_parts:
-            text_rows.append({"role": role, "text": "\n".join(text_parts)})
+            add_text(role, "\n".join(text_parts))
     return text_rows, tool_calls
 
 
