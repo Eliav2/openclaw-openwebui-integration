@@ -9992,6 +9992,36 @@ class LiveToolCardOrderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_item_order(live), _item_order(saved))
 
 
+class ModelPatchFailureTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-131: a failed model patch is reported, not retried after a sleep.
+    The retry (July, one burst of 8 messages in 3 s) never saved a reply: the
+    burst is one patch since ELI-59's lock and cache, and every failure Open
+    WebUI shows since (model not allowed, Gateway timeouts) failed twice."""
+
+    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
+    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
+
+    async def test_a_failed_patch_is_one_rpc_and_an_explained_reply(self):
+        self.conn.model_patch_cached = lambda *a, **k: False
+        sent = self.conn.send_request
+
+        async def send_request(method, params, timeout=10):
+            if method == "sessions.patch":
+                self.rpc.append(method)
+                raise GatewayError("model not allowed: claude-cli/claude-opus-5")
+            return await sent(method, params, timeout)
+        self.conn.send_request = send_request
+        self.pipe.valves.DEFAULT_MODEL = "claude-cli/claude-opus-5"
+        gen = NoDroppedMessagesTests._reply(self, "hi", "m1")
+
+        async def drain():
+            return [c async for c in gen]
+        chunks = await asyncio.wait_for(drain(), 5)   # bounds the test only
+        self.assertEqual(self.rpc.count("sessions.patch"), 1)
+        self.assertNotIn("chat.send", self.rpc)
+        self.assertIn("Model selection error", "".join(c for c in chunks if isinstance(c, str)))
+
+
 class LongToolOnlyRunTests(unittest.IsolatedAsyncioTestCase):
     """ELI-132: a run that sends thousands of tool events before its first
     text is a live run, not a stuck one. The pipe used to end the reply after

@@ -995,17 +995,14 @@ class Pipe:
                     "reply before sending the message"
                 )
 
-        # Apply the model with one retry. sessions.patch is idempotent (set the
-        # session's model to a fixed value), and under a burst of near-
-        # simultaneous messages the RPC can transiently time out or return a
-        # racing/stale row (observed once at ~8 messages in 3s). A single retry
-        # absorbs that blip instead of surfacing a scary "Model selection error"
-        # to the user; a genuine misconfig still fails on the second attempt.
-        # ELI-59 (fuller fix): the burst's patches are all redundant -- same
+        # Apply the model. ELI-59: a burst's patches are all redundant -- same
         # session, same model -- so (a) a per-session lock collapses them to one
         # in-flight RPC, and (b) a TTL cache of the last applied model lets the
         # waiters (and the next ~60s of same-model messages) skip the RPC
-        # entirely. Failure invalidates the cache so nothing sticks.
+        # entirely. Failure invalidates the cache so nothing sticks. A failure
+        # is reported, not retried: the July retry never saved a reply (every
+        # failure since, a model not allowed or a Gateway timeout, failed
+        # twice; ELI-131).
         patch_err = None
         async with conn.model_patch_lock(session_key):
             if conn.model_patch_cached(session_key, model_override):
@@ -1014,35 +1011,27 @@ class Pipe:
                     f"{model_override or 'agent default'})"
                 )
             else:
-                for _patch_attempt in range(2):
-                    try:
-                        patch_resp = await _run_request(
-                            conn, RUN_PATCH,
-                            dict(key=session_key, model=model_override),
-                            timeout=10
+                try:
+                    patch_resp = await _run_request(
+                        conn, RUN_PATCH,
+                        dict(key=session_key, model=model_override),
+                        timeout=10
+                    )
+                    if not _model_patch_matches(model_override, patch_resp):
+                        resolved_model = _resolved_model_key(patch_resp)
+                        raise GatewayError(
+                            "model override did not apply "
+                            f"(wanted {model_override or 'agent default'}, "
+                            f"got {resolved_model or 'agent default'})"
                         )
-                        if not _model_patch_matches(model_override, patch_resp):
-                            resolved_model = _resolved_model_key(patch_resp)
-                            raise GatewayError(
-                                "model override did not apply "
-                                f"(wanted {model_override or 'agent default'}, "
-                                f"got {resolved_model or 'agent default'})"
-                            )
-                        if model_override:
-                            pipe_log(f"Applied model override: {model_override}")
-                        else:
-                            pipe_log("Cleared model override; using agent default")
-                        conn.record_model_patched(session_key, model_override)
-                        patch_err = None
-                        break
-                    except Exception as e:
-                        patch_err = e
-                        pipe_log(
-                            f"  [diag] model patch attempt {_patch_attempt + 1} failed: "
-                            f"{type(e).__name__}: {e!r}"
-                        )
-                        if _patch_attempt == 0:
-                            await asyncio.sleep(0.5)
+                    if model_override:
+                        pipe_log(f"Applied model override: {model_override}")
+                    else:
+                        pipe_log("Cleared model override; using agent default")
+                    conn.record_model_patched(session_key, model_override)
+                except Exception as e:
+                    patch_err = e
+                    pipe_log(f"  [diag] model patch failed: {type(e).__name__}: {e!r}")
                 if patch_err is not None:
                     conn.invalidate_model_patch(session_key)
         if patch_err is not None:
