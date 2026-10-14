@@ -8101,8 +8101,10 @@ def _extract_transcript_and_tools(messages: list) -> tuple[list, list]:
             elif item_type == "tool_result":
                 call = pending_by_id.get(item.get("tool_use_id"))
                 if call is not None:
-                    result = item.get("content")
-                    call["result"] = result if isinstance(result, str) else json.dumps(result)
+                    # The output, by the chat tool cards' rule (gateway.py):
+                    # not the block list or the {content, details} envelope
+                    # as JSON (ELI-125).
+                    call["result"] = _tool_result_text(item.get("content"))
                     # Real tool_result rows carry is_error; surfacing it here
                     # lets the card mark a failure the same way the inline
                     # chat tool cards already do.
