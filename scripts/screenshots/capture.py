@@ -111,6 +111,32 @@ def wait_api(token: str, chat_id: str, needle: str, timeout_s: float = 180) -> N
     raise TimeoutError(f"{needle!r} not in a finished reply of {chat_id} after {timeout_s:.0f}s")
 
 
+def wait_children_answering(phrases: tuple, timeout_s: float = 120) -> None:
+    """Until the scripted model has answered each sub-agent's request that
+    carries its tool result (step 1 of its scene): read from the fake model's
+    request log, the one place that sees the children's turns directly."""
+    log = os.environ.get("E2E_FAKE_LLM_LOG", "")
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        seen = set()
+        try:
+            with open(log, encoding="utf-8") as fh:
+                for line in fh:
+                    rec = json.loads(line)
+                    msgs = rec["request"].get("messages") or []
+                    # The child's own turn: its user message is the task. The
+                    # parent's requests quote the task only inside a tool call.
+                    users = json.dumps([m.get("content") for m in msgs if m.get("role") == "user"])
+                    if any(m.get("role") == "tool" for m in msgs):
+                        seen |= {p for p in phrases if p in users}
+        except OSError:
+            pass
+        if seen == set(phrases):
+            return
+        time.sleep(1)
+    raise TimeoutError(f"sub-agents not answering after {timeout_s:.0f}s: {phrases}")
+
+
 def schedule_wake(session_key: str, message: str, in_s: float) -> None:
     at = (datetime.datetime.now(datetime.timezone.utc)
           + datetime.timedelta(seconds=in_s)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
@@ -305,14 +331,17 @@ class Scenes:
         wait_js(page, f"() => {{ const a = {LAST_ASSISTANT}; return a && a.innerText.includes('side by side'); }}",
                 "the parent's reply")
         set_title(self.token, chat, "Hosting for the forecast app")
+        # Open the dialog once both sub-agents are mid-answer (each has had its
+        # tool result back and is streaming prose), as the scripted model saw it.
+        wait_children_answering(("Price out Fly.io", "Price out Render"))
         page.locator('button[aria-label="OpenClaw status"]').click()
         root = "#openclaw-status-modal-root"
         wait_js(page, f"""() => {{
           const r = document.querySelector('{root}'); if (!r) return false;
           const t = r.innerText;
-          return t.includes('Subagents (2)') && r.querySelectorAll('.animate-pulse').length >= 2
-            && /5h/.test(t) && !r.querySelector('.animate-spin');
-        }}""", "the status dialog with two running sub-agents and rate limits", 60_000)
+          return t.includes('Subagents (2)') && t.includes('Fly.io') && t.includes('Render')
+            && /5h/.test(t) && /Week/.test(t);
+        }}""", "the status dialog with two sub-agents and rate limits", 60_000)
         self.s.shot(page, "status-dialog", text_selector=root)
         page.locator(f"{root} button", has_text="Fly.io").first.click()
         page.wait_for_selector("#openclaw-drawer-root", timeout=30_000)
@@ -332,7 +361,7 @@ class Scenes:
     def thinking(self, page: Page) -> None:
         page.goto(f"{BASE}/c/{self.hero_chat}")
         page.wait_for_selector("#chat-input")
-        page.locator("button[aria-label='Integrations'], button[aria-label='More'], #integration-menu-button").first.click()
+        page.locator("button[aria-label='Integrations']").first.click()
         wait_js(page, "() => /thinking/i.test(document.body.innerText)", "the thinking toggle in the menu", 30_000)
         self.s.shot(page, "thinking-toggle")
         page.keyboard.press("Escape")
@@ -357,13 +386,15 @@ class Scenes:
         last = page.locator(".chat-assistant").last
         last.wait_for(timeout=60_000)
         last.hover()
+        page.locator('button[aria-label="OpenClaw Status"]').last.wait_for(timeout=30_000)
+        # A 300 px strip of the message toolbar that ends at the Status button.
         clip = """() => {
-          const a = [...document.querySelectorAll('.chat-assistant')].pop();
-          const btns = [...a.querySelectorAll('button')].filter(b => b.offsetParent && b.getBoundingClientRect().bottom > a.getBoundingClientRect().bottom - 60);
-          const r = btns.reduce((acc, b) => { const q = b.getBoundingClientRect();
-            return {l: Math.min(acc.l, q.left), t: Math.min(acc.t, q.top), r: Math.max(acc.r, q.right), b: Math.max(acc.b, q.bottom)}; },
-            {l: 1e9, t: 1e9, r: 0, b: 0});
-          return {x: Math.max(0, r.l - 12), y: Math.max(0, r.t - 10), width: Math.min(300, r.r - r.l + 24), height: r.b - r.t + 20};
+          const b = [...document.querySelectorAll('button[aria-label="OpenClaw Status"]')].pop();
+          let row = b.parentElement;
+          while (row && !row.querySelector('button[aria-label="Copy"]')) row = row.parentElement;
+          const r = (row || b).getBoundingClientRect(), q = b.getBoundingClientRect();
+          const right = q.right + 12;
+          return {x: Math.max(0, right - 300), y: Math.max(0, r.top - 8), width: 300, height: r.height + 16};
         }"""
         self.s.shot(page, "toolbar-button", clip_js=clip, text_selector=".chat-assistant >> nth=-1")
 
