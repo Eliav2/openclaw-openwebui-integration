@@ -364,6 +364,12 @@ class Scenes:
         self.s.shot(page, "status-dialog", text_selector=root)
         page.locator(f"{root} button", has_text="Fly.io").first.click()
         page.wait_for_selector("#openclaw-drawer-root", timeout=30_000)
+        z = page.evaluate("""() => ({
+          drawer: getComputedStyle(document.querySelector('#openclaw-drawer-root')).zIndex,
+          dialog: getComputedStyle(document.querySelector('#openclaw-status-modal-root')).zIndex})""")
+        print(f"  computed z-index: {z}", flush=True)
+        if z["drawer"] == "auto" or (z["dialog"] != "auto" and int(z["drawer"]) <= int(z["dialog"])):
+            raise AssertionError(f"the sub-agent drawer opens behind the status dialog (computed z-index {z})")
         page.locator("#openclaw-drawer-root button", has_text="Transcript").first.click()
         wait_js(page, """() => { const d = document.querySelector('#openclaw-drawer-root');
                  return d && d.innerText.includes('forecast/README.md'); }""",
@@ -413,7 +419,7 @@ class Scenes:
           let row = b.parentElement;
           while (row && !row.querySelector('button[aria-label="Copy"]')) row = row.parentElement;
           const r = (row || b).getBoundingClientRect(), q = b.getBoundingClientRect();
-          const right = q.right + 12;
+          const right = q.right + 6;
           return {x: Math.max(0, right - 300), y: Math.max(0, r.top - 8), width: 300, height: r.height + 16};
         }"""
         self.s.shot(page, "toolbar-button", clip_js=clip, text_selector=".chat-assistant >> nth=-1")
