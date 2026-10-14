@@ -549,6 +549,13 @@ connection, including the ones the integration sends on its own (a resume
 after a Gateway restart, a chat title). On a loopback Gateway the second device
 pairs silently; on a remote one, approve it like the first.
 
+The agent still learns who is writing. The Gateway accepts the "Conversation
+info (untrusted metadata)" block (chat id, user id) only from an admin
+connection, so for these users the integration puts the same block at the
+start of the message text, which is where the Gateway would have put it.
+It stays labelled untrusted, and a user can type a look-alike block, so treat
+it as a hint, never as proof of identity. Owner rights never come from it.
+
 This is not a sandbox: everything an agent turn may do without owner rights
 stays available to every user, which can include reading other sessions and
 the agent's memory, depending on your OpenClaw tool policy. Restrict those in
