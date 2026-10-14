@@ -33,7 +33,13 @@ that is offered: from OpenClaw 2026.10 most tools are deferred behind
   `E2E_DEPLOY_START` and a call, then `E2E_DEPLOY_MID mid-1 ... mid-20` one
   word a second and a second call, then `E2E_DEPLOY_END end-1 ... end-10` one
   word a second. Long enough for the Pipe to be redeployed while it streams.
-* anything else                        -> `E2E fake model reply.`
+* a scene from $FAKE_LLM_SCENES (JSON)  -> scripted multi-step replies for the
+  README screenshots (scripts/screenshots/scenes.json). A scene is picked by a
+  phrase in the user's own message, so the request in a screenshot reads like
+  a real one. Step n of a scene answers the request that carries n tool
+  results; a step can say something and call a tool in the same message.
+* anything else                        -> `E2E fake model reply.` (or
+  $FAKE_LLM_DEFAULT)
 
 Replies stream word by word so the streaming path sees several deltas.
 
@@ -51,8 +57,9 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-MODEL_ID = "e2e-echo"
+MODEL_ID = os.environ.get("FAKE_LLM_MODEL_ID", "e2e-echo")
 LOG_PATH = os.environ.get("FAKE_LLM_LOG", "")
+DEFAULT_REPLY = os.environ.get("FAKE_LLM_DEFAULT", "E2E fake model reply.")
 PREFERRED_TOOLS = ("session_status", "sessions_list", "memory_search")
 
 _EXACTLY = re.compile(r"exactly:?\s+([A-Za-z0-9_]{3,})")
@@ -90,6 +97,38 @@ def _harmless_call(offered: list) -> dict | None:
     return _call(PREFERRED_TOOLS[0], offered)
 
 
+def _load_scenes() -> list:
+    path = os.environ.get("FAKE_LLM_SCENES", "")
+    if not path:
+        return []
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)["scenes"]
+
+
+SCENES = _load_scenes()
+
+
+def _scene_step(user_text: str, n_results: int, offered: list) -> dict | None:
+    """The scripted reply for this request, if the user's message names a scene.
+    Returns {"text": str, "tool"?: name, "args"?: dict, "delay"?: s}."""
+    for scene in SCENES:
+        if scene["match"] not in user_text:
+            continue
+        steps = scene["steps"]
+        step = steps[min(n_results, len(steps) - 1)]
+        out = {"text": step.get("say", ""), "delay": step.get("delay", 0.02)}
+        if "tool" in step and n_results < len(steps) - 1:
+            call = _call(step["tool"], offered)
+            if call:
+                if step["tool"] in offered:
+                    call["args"] = step.get("args") or {}
+                else:
+                    call["args"]["args"] = step.get("args") or {}
+                out.update(call)
+        return out
+    return None
+
+
 def plan_reply(body: dict) -> dict:
     """Return {"text": str}, {"tool": name, "args"?: dict}, or both (text, then
     the call) for one request."""
@@ -110,6 +149,10 @@ def plan_reply(body: dict) -> dict:
         (t.get("function") or {}).get("name")
         for t in body.get("tools") or []
     ]
+
+    scripted = _scene_step(user_text, len(tool_results), offered)
+    if scripted is not None:
+        return scripted
 
     if "session_status" in user_text and "model line" in user_text:
         if tool_results:
@@ -162,7 +205,7 @@ def plan_reply(body: dict) -> dict:
     m = _EXACTLY.search(user_text)
     if m:
         return {"text": m.group(1)}
-    return {"text": "E2E fake model reply."}
+    return {"text": DEFAULT_REPLY}
 
 
 def _chunks(text: str) -> list[str]:
@@ -220,7 +263,8 @@ class Handler(BaseHTTPRequestHandler):
             call = {"id": f"call_{uuid.uuid4().hex[:12]}", "type": "function",
                     "function": {"name": plan["tool"],
                                  "arguments": json.dumps(plan.get("args") or {})}}
-            message = {"role": "assistant", "content": plan.get("text"), "tool_calls": [call]}
+            message = {"role": "assistant", "content": plan.get("text") or None,
+                       "tool_calls": [call]}
             finish = "tool_calls"
         else:
             message = {"role": "assistant", "content": plan["text"]}

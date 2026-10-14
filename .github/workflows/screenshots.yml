@@ -1,0 +1,122 @@
+name: Screenshots
+
+# The README and docs screenshots, taken from the real stack on a GitHub
+# runner: Open WebUI, this integration as installed by its own installers, a
+# real OpenClaw Gateway running real tools, and a scripted model
+# (scripts/screenshots/scenes.json). Chromium in a phone viewport, light and
+# dark. Run it by hand after a UI change; the images come back as an artifact
+# to review, and the ones that are kept get committed under docs/img/.
+#
+# The stack differs from the E2E one only in what shows up on screen: the
+# scripted model is served as "Nova" models of a "local" provider, the admin
+# is "Sam", and a test-only plugin (scripts/screenshots/sample-usage) serves
+# sample rate limits for the Status dialog.
+
+on:
+  workflow_dispatch:
+    inputs:
+      only:
+        description: Comma-separated shot names (empty = all)
+        type: string
+        default: ""
+  pull_request:
+    paths:
+      - scripts/screenshots/**
+      - .github/workflows/screenshots.yml
+
+permissions:
+  contents: read
+
+jobs:
+  screenshots:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve versions
+        run: |
+          set -a; . e2e/versions.env; set +a
+          echo "OWUI_IMAGE=$OWUI_IMAGE" >> "$GITHUB_ENV"
+          echo "OPENCLAW_VERSION=$OPENCLAW_VERSION" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - uses: astral-sh/setup-uv@v10.3.0
+
+      - name: Pull Open WebUI image
+        run: docker pull --quiet "$OWUI_IMAGE"
+
+      - name: Sample project for the scenes
+        run: bash scripts/screenshots/sample_project.sh "$HOME/.openclaw/workspace"
+
+      - name: Start the stack and install the integration
+        env:
+          E2E_LOG_DIR: ${{ runner.temp }}/logs
+          STACK_ADMIN_NAME: Sam
+          STACK_ADMIN_EMAIL: sam@example.com
+          FAKE_LLM_SCENES: ${{ github.workspace }}/scripts/screenshots/scenes.json
+          FAKE_LLM_DEFAULT: Sure.
+        run: |
+          sed "s|@SCREENSHOTS_DIR@|$PWD/scripts/screenshots|" scripts/screenshots/stack-patch.json \
+            > "$RUNNER_TEMP/stack-patch.json"
+          STACK_CONFIG_PATCH="$RUNNER_TEMP/stack-patch.json" bash e2e/start_stack.sh
+
+      - name: Install Chromium for Playwright
+        run: uv run --with playwright==1.64.0 python -m playwright install --with-deps chromium
+
+      - name: Capture
+        env:
+          ONLY: ${{ inputs.only }}
+        run: |
+          uv run --with playwright==1.64.0 python scripts/screenshots/capture.py \
+            --out "$RUNNER_TEMP/img" ${ONLY:+--only "$ONLY"}
+
+      - name: Optimize and report sizes
+        if: always()
+        run: |
+          uv run --with pyoxipng==9.1.1 python - <<'EOF'
+          import glob, os, oxipng
+          files = sorted(glob.glob(os.path.join(os.environ["RUNNER_TEMP"], "img", "*.png")))
+          total = 0
+          lines = ["| image | KB |", "|---|---|"]
+          for f in files:
+              oxipng.optimize(f, level=4, strip=oxipng.StripChunks.safe())
+              kb = os.path.getsize(f) / 1024
+              total += kb
+              flag = " (over 250)" if kb > 250 else ""
+              lines.append(f"| {os.path.basename(f)} | {kb:.0f}{flag} |")
+          lines.append(f"| **total** | **{total:.0f}** |")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
+              fh.write("### Screenshots\n\n" + "\n".join(lines) + "\n")
+          print("\n".join(lines))
+          EOF
+
+      - name: Collect logs
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/logs"
+          docker logs owui > "$RUNNER_TEMP/logs/open-webui.log" 2>&1 || true
+          cp /tmp/openclaw/*.log "$RUNNER_TEMP/logs/" 2>/dev/null || true
+
+      - name: Upload images
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: screenshots
+          path: ${{ runner.temp }}/img
+          retention-days: 14
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: screenshots-logs
+          path: ${{ runner.temp }}/logs
+          retention-days: 7
