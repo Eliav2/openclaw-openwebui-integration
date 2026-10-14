@@ -209,6 +209,42 @@ def test_tool_call_persists_as_a_native_tool_card(token):
     assert "E2E_TOOL_DONE" in json.dumps(output) + (msg.get("content") or ""), dump
 
 
+# ── The Status Action's CSS classes exist in Open WebUI's stylesheet (ELI-118)
+# Open WebUI ships a prebuilt Tailwind stylesheet: a class its own source never
+# uses has no rule, and the Action's element silently renders without it (the
+# sub-agent drawer had no z-index and opened behind the Status dialog).
+
+import sys  # noqa: E402
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
+import owui_css  # noqa: E402
+
+
+@pytest.fixture(scope="module")
+def shipped_css_classes() -> set:
+    return owui_css.css_class_names(owui_css.shipped_css(BASE))
+
+
+def test_every_status_action_class_is_in_the_shipped_css(shipped_css_classes):
+    missing = sorted(owui_css.action_classes() - shipped_css_classes)
+    assert not missing, f"no CSS rule in this Open WebUI for: {missing}"
+
+
+def test_vendored_css_class_list_matches_the_pinned_image(shipped_css_classes):
+    """The unit suite checks the Action against test_fixture_owui_css_classes.txt
+    offline; that list has to be the pinned image's real one."""
+    with open(owui_css.VERSIONS_ENV, encoding="utf-8") as fh:
+        pinned_image = next(line.split("=", 1)[1].strip() for line in fh
+                            if line.startswith("OWUI_IMAGE="))
+    if os.environ.get("OWUI_IMAGE", pinned_image) != pinned_image:
+        pytest.skip("not the pinned Open WebUI image")
+    _, vendored = owui_css.read_fixture()
+    assert vendored == shipped_css_classes, (
+        "test_fixture_owui_css_classes.txt is stale; regenerate with "
+        f"`python3 scripts/owui_css.py dump`: only vendored {sorted(vendored - shipped_css_classes)[:20]}, "
+        f"only shipped {sorted(shipped_css_classes - vendored)[:20]}")
+
+
 # ── Cron wakes into an Open WebUI chat (ELI-103) ─────────────────────────────
 # Every wake into a session runs with runId = the sessionId, and only the first
 # one gets a closing transcript message. Each wake must still become its own
