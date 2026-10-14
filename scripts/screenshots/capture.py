@@ -92,6 +92,24 @@ def quiet_background_tasks(token: str) -> None:
     api("POST", f"/api/v1/functions/id/{fid}/valves/update", valves, token)
 
 
+def attach_filter(token: str, model_id: str, filter_id: str) -> None:
+    """Attach a Filter to a model the way the README tells a user to
+    (Workspace > Models > the model > Filters): through the model's settings,
+    which for a Pipe model creates its settings row on first save."""
+    try:
+        model = api("GET", f"/api/v1/models/model?id={model_id}", token=token)
+    except RuntimeError:
+        model = None
+    if model:
+        meta = dict(model.get("meta") or {})
+        meta["filterIds"] = sorted(set(meta.get("filterIds") or []) | {filter_id})
+        api("POST", f"/api/v1/models/model/update?id={model_id}", {**model, "meta": meta}, token)
+    else:
+        api("POST", "/api/v1/models/create", {
+            "id": model_id, "base_model_id": None, "name": "OpenClaw · Default",
+            "meta": {"filterIds": [filter_id]}, "params": {}, "is_active": True}, token)
+
+
 def set_title(token: str, chat_id: str, title: str) -> None:
     api("POST", f"/api/v1/chats/{chat_id}", {"chat": {"title": title}}, token)
 
@@ -300,8 +318,8 @@ class Scenes:
         page.goto(f"{BASE}/c/{self.hero_chat}")
         wait_js(page, f"() => {{ const s = ({CARDS_STATE})(); return s && s.done >= 3; }}", "three finished cards")
         page.locator(".chat-assistant").last.locator("[role=button]").first.click()
-        wait_js(page, f"() => {{ const a = {LAST_ASSISTANT}; return a && a.querySelector('.tool-call-body'); }}",
-                "the opened card's body")
+        wait_js(page, f"() => {{ const a = {LAST_ASSISTANT}; return a && /output/i.test(a.innerText) && a.innerText.includes('git log'); }}",
+                "the opened card's input and output")
         self.s.shot(page, "tool-card-expanded", selector=".chat-assistant >> nth=-1")
 
     def composer_status(self, page: Page) -> None:
@@ -319,7 +337,8 @@ class Scenes:
     def question(self, page: Page) -> None:
         new_chat(page)
         chat = send(page, "Can you set up CI for the forecast app?")
-        wait_js(page, f"() => {{ const a = {LAST_ASSISTANT}; return a && a.innerText.includes('Where should the checks run?') && a.innerText.includes('Only on my machine'); }}",
+        # Open WebUI 0.12 shows the card above the composer, not in the message.
+        wait_js(page, "() => { const t = document.body.innerText; return t.includes('Where should the checks run?') && t.includes('Only on my machine') && /recommended/i.test(t); }",
                 "the question card with its options")
         set_title(self.token, chat, "CI for the forecast app")
         self.s.shot(page, "question-card")
@@ -338,9 +357,9 @@ class Scenes:
         root = "#openclaw-status-modal-root"
         wait_js(page, f"""() => {{
           const r = document.querySelector('{root}'); if (!r) return false;
-          const t = r.innerText;
-          return t.includes('Subagents (2)') && t.includes('Fly.io') && t.includes('Render')
-            && /5h/.test(t) && /Week/.test(t);
+          const t = r.innerText;  // section headers are uppercased by CSS
+          return /subagents \(2\)/i.test(t) && t.includes('Fly.io') && t.includes('Render')
+            && /5h/.test(t) && /week/i.test(t);
         }}""", "the status dialog with two sub-agents and rate limits", 60_000)
         self.s.shot(page, "status-dialog", text_selector=root)
         page.locator(f"{root} button", has_text="Fly.io").first.click()
@@ -359,6 +378,7 @@ class Scenes:
         page.keyboard.press("Escape")
 
     def thinking(self, page: Page) -> None:
+        attach_filter(self.token, MODEL, "openclaw_thinking")
         page.goto(f"{BASE}/c/{self.hero_chat}")
         page.wait_for_selector("#chat-input")
         page.locator("button[aria-label='Integrations']").first.click()
