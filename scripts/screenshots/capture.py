@@ -320,6 +320,11 @@ class Shooter:
     def shot(self, page: Page, name: str, *, selector: str | None = None,
              clip_js: str | None = None, text_selector: str | None = None) -> None:
         """Light and dark: the viewport, one element, or a JS-computed clip."""
+        # A toast from another chat's reply is never the subject of a shot.
+        page.evaluate("""() => { if (document.getElementById('shot-no-toasts')) return;
+          const s = document.createElement('style'); s.id = 'shot-no-toasts';
+          s.textContent = '[data-sonner-toaster], section[aria-label^="Notifications"] { display: none !important; }';
+          document.head.appendChild(s); }""")
         for theme in THEMES:
             set_theme(page, theme)
             page.wait_for_timeout(150)  # one frame for the class swap to paint
@@ -491,6 +496,16 @@ class Scenes:
                    && [...a.querySelectorAll('img')].some(i => i.complete && i.naturalWidth > 0); }}""",
                 "the cron reply with its chart loaded")
         self.s.shot(page, "media-turn")
+        # The saved markdown, as the message editor shows it: where the text
+        # after the directive ended up is easier to see here than rendered.
+        last = page.locator(".chat-assistant").last
+        last.hover()
+        last.locator('button[aria-label="Edit"]').first.click()
+        wait_js(page, f"""() => {{ const a = {LAST_ASSISTANT};
+                 return a && [...a.querySelectorAll('textarea')].some(t => t.value.includes('bike out')); }}""",
+                "the reply's markdown in the editor", 30_000)
+        self.s.shot(page, "media-turn-source", selector=".chat-assistant >> nth=-1")
+        page.keyboard.press("Escape")
 
     def toolbar(self, page: Page) -> None:
         """#10: the Status button on the message toolbar, desktop width."""
