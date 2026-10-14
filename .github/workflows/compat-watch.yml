@@ -46,6 +46,7 @@ jobs:
             REF=$(gh api repos/open-webui/open-webui/releases/latest --jq .tag_name)
           fi
           python3 scripts/check_owui_fixture.py --ref "$REF"
+          python3 scripts/check_owui_frontend_fixture.py --ref "$REF"
 
   report:
     name: Open or update tracking issue

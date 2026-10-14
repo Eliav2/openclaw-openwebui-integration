@@ -1002,6 +1002,14 @@ def _attr(value: str) -> str:
     )
 
 
+# `output_index` for an item that goes at the end of Open WebUI's output
+# list. Both of its reducers append an `output_item.added` whose index is at
+# or past the end; without one, the backend appends but the chat tab splices
+# the item in before the last one (ELI-122). The pipe cannot see that list
+# (a tag in the text can add items to it), so it names no exact length.
+_OUTPUT_APPEND_INDEX = 1 << 30
+
+
 def _tool_call_started_event(name: str, tool_call_id: str, args_str: str) -> dict:
     """Announce a tool call as a Responses-API output item (live spinner).
 
@@ -1018,9 +1026,12 @@ def _tool_call_started_event(name: str, tool_call_id: str, args_str: str) -> dic
     that this replaced). The frontend renders a `function_call` with no matching
     `function_call_output` as a spinner (`structuredOutput.ts::buildToolCallToken`).
 
-    Ordering is by arrival, and `response.output_item.added` appends when it
-    does not recognise the item, so these interleave correctly with ordinary
-    streamed text -- no output_index bookkeeping needed on our side.
+    Ordering is by arrival: the item goes at the end of the output list, after
+    the text streamed before it. It says so with `output_index`
+    (`_OUTPUT_APPEND_INDEX`): the backend appends an item without one, but
+    the chat tab's reducer (`structuredOutput.ts::applyResponseStreamEvent`)
+    splices it in BEFORE the last item, so the live card showed above the
+    text written before the call until a reload (ELI-122).
 
     The tool call id goes in `id`, and `call_id` is deliberately ABSENT. OWUI
     0.11.0 appended every added item unconditionally, so the obvious shape
@@ -1048,6 +1059,7 @@ def _tool_call_started_event(name: str, tool_call_id: str, args_str: str) -> dic
     """
     return {
         "type": "response.output_item.added",
+        "output_index": _OUTPUT_APPEND_INDEX,
         "item": {
             "type": "function_call",
             "id": tool_call_id,
@@ -1073,6 +1085,7 @@ def _tool_call_result_event(tool_call_id: str, result_str: str) -> dict:
     """
     return {
         "type": "response.output_item.added",
+        "output_index": _OUTPUT_APPEND_INDEX,
         "item": {
             "type": "function_call_output",
             "id": f"fco_{tool_call_id}",

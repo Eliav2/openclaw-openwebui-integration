@@ -86,7 +86,7 @@ Every push and PR runs `.github/workflows/ci.yml`:
 |-----|----------------|
 | Lint | `ruff` with correctness rules only (`ruff.toml`), run on the **built artifacts** rather than the fragments, so an undefined name is caught where Open WebUI would hit it. Also `shellcheck`, `actionlint`, and a parse check of the Gateway plugin. |
 | Unit (py3.10 to 3.13) | Drift guard for every artifact, the unit suite (coverage reported on 3.11), and a load check that execs each artifact the way Open WebUI's plugin loader does. |
-| OWUI handler fixture is current | `scripts/check_owui_fixture.py` compares the vendored `handle_responses_streaming_event` with Open WebUI's source at the pinned version. A stale copy is how the tool cards once vanished while the suite stayed green. |
+| OWUI handler fixture is current | `scripts/check_owui_fixture.py` compares the vendored `handle_responses_streaming_event` with Open WebUI's source at the pinned version. A stale copy is how the tool cards once vanished while the suite stayed green. `scripts/check_owui_frontend_fixture.py` does the same for the chat tab's live reducer (`applyResponseStreamEvent`, run with bun by the live-order tests). |
 | Secret scan | gitleaks over the full history. |
 | E2E | The whole stack, real everywhere except the model (below). |
 

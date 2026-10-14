@@ -12,6 +12,7 @@ import copy
 import inspect
 import json
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -9766,27 +9767,130 @@ class MediaDirectiveCodeAwareTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("A stray ` tick, ![x.png](https://x/x.png)\nand", before)
 
 
-def _owui_saved(chunks) -> tuple[str, list]:
-    """(content, output) Open WebUI 0.12 saves for a pipe's yields
-    (`middleware.py` streaming loop): `content` joins the text chunks
-    (`content_parts`); a text chunk appends to the last message item, or
-    opens one after any other item; a dict goes through the vendored
+def _owui_stream(chunks) -> tuple[str, list, list]:
+    """(content, output, live) for a pipe's yields as Open WebUI 0.12's
+    streaming loop (`middleware.py`) handles them. `content` joins the text
+    chunks (`content_parts`). `output` is the backend's list, which is saved:
+    a text chunk appends to the last message item, or opens one after any
+    other item; a dict goes through the vendored
     `handle_responses_streaming_event`; the last message's text is stripped
-    when the stream ends."""
+    when the stream ends. `live` is what the backend sends the chat tab
+    (`emit_response_completion_event`): a text chunk as an
+    `output_text.delta` on its target item's id and index, a dict as is."""
     from test_fixture_owui_streaming_handler import handle_responses_streaming_event
-    output, parts = [], []
+    output, parts, live = [], [], []
     for c in chunks:
         if isinstance(c, str):
+            if not c:
+                continue
             parts.append(c)
             if not output or output[-1].get("type") != "message":
-                output.append({"type": "message", "role": "assistant",
+                output.append({"type": "message", "id": f"msg_{len(output)}", "role": "assistant",
                                "content": [{"type": "output_text", "text": ""}]})
             output[-1]["content"][-1]["text"] += c
-        elif isinstance(c, dict):
+            live.append({"type": "response.output_text.delta", "item_id": output[-1]["id"],
+                         "output_index": len(output) - 1,
+                         "content_index": len(output[-1]["content"]) - 1, "delta": c})
+        elif isinstance(c, dict) and c.get("type", "").startswith("response."):
             output, _ = handle_responses_streaming_event(c, output)
+            live.append(c)
     if output and output[-1].get("type") == "message":
         output[-1]["content"][-1]["text"] = output[-1]["content"][-1]["text"].strip()
-    return "".join(parts), output
+    return "".join(parts), output, live
+
+
+def _owui_saved(chunks) -> tuple[str, list]:
+    """(content, output) Open WebUI 0.12 saves for a pipe's yields."""
+    content, output, _live = _owui_stream(chunks)
+    return content, output
+
+
+def _owui_live_output(events: list) -> list:
+    """The output list an Open WebUI 0.12 chat tab renders while the reply
+    streams: `events` folded by the vendored frontend reducer
+    (`test_fixture_owui_structured_output.ts`), run with bun."""
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "owui_live_fold.ts")
+    done = subprocess.run(["bun", script], input=json.dumps(events), capture_output=True,
+                          text=True, check=True, timeout=60)
+    return json.loads(done.stdout)
+
+
+def _item_order(output: list) -> list:
+    """Each output item as (type, id or call_id, message text)."""
+    return [(i.get("type"), i.get("call_id") or i.get("id"),
+             "".join(str(p.get("text", "")) for p in i.get("content") or []).strip()
+             if i.get("type") == "message" else None) for i in output]
+
+
+class LiveToolCardOrderTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-122 (ELI-110 screenshots, run 38605371115): while a reply
+    streamed, the text written before a tool call showed under that call's
+    card; after a reload the order was right. The tab folds a tool card's
+    `output_item.added` with the frontend reducer, which splices an item with
+    no `output_index` in before the last one, while the backend (what is
+    saved) appends it. What the tab shows live must be what is saved."""
+
+    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
+    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
+    _queue = NoDroppedMessagesTests._queue
+    _delta = NoDroppedMessagesTests._delta
+    _final = NoDroppedMessagesTests._final
+    _until_registered = NoDroppedMessagesTests._until_registered
+
+    def _tool(self, phase, tcid, **data):
+        return {"type": "event", "event": "agent", "payload": {
+            "sessionKey": self.SK, "runId": "run-1", "stream": "tool",
+            "data": {"phase": phase, "toolCallId": tcid, "name": "Bash", "args": {"command": "ls"},
+                     **data}}}
+
+    async def _run(self, events):
+        """One run fed `events` (str = text delta); (saved, live) outputs."""
+        if shutil.which("bun") is None:
+            if os.environ.get("CI"):
+                self.fail("bun is missing: the live-order tests must run in CI")
+            self.skipTest("bun runs the vendored Open WebUI frontend reducer")
+
+        async def emitter(event):
+            pass
+        body = {"model": "openclaw_gateway.default", "messages": [{"role": "user", "content": "go"}]}
+        meta = {"chat_id": "chat-1", "user_id": "u1", "message_id": "m1"}
+        gen = self.pipe._pipe_impl(body, emitter, __metadata__=meta)
+
+        async def drain():
+            return [c async for c in gen]
+        task = asyncio.ensure_future(drain())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        for ev in events:
+            q.put_nowait(self._delta("run-1", ev) if isinstance(ev, str) else ev)
+        q.put_nowait(self._final("run-1"))
+        _content, saved, live = _owui_stream(await asyncio.wait_for(task, 5))   # bounds the test only
+        return saved, _owui_live_output(live)
+
+    async def test_text_before_a_tool_call_shows_above_its_card(self):
+        saved, live = await self._run([
+            "Let me look first.", self._tool("start", "t1"),
+            self._tool("result", "t1", result="a.txt"), "Found it."])
+        self.assertEqual([t for t, _id, _x in _item_order(saved)],
+                         ["message", "function_call", "function_call_output", "message"])
+        self.assertEqual(_item_order(live), _item_order(saved))
+
+    async def test_parallel_and_back_to_back_calls_keep_their_order_live(self):
+        saved, live = await self._run([
+            "Two at once.", self._tool("start", "t1"), self._tool("start", "t2"),
+            self._tool("result", "t2", result="b"), self._tool("result", "t1", result="a"),
+            "Then one more.", self._tool("start", "t3"), self._tool("result", "t3", result="c"),
+            "Done."])
+        self.assertEqual([t for t, _id, _x in _item_order(saved)],
+                         ["message", "function_call", "function_call", "function_call_output",
+                          "function_call_output", "message", "function_call",
+                          "function_call_output", "message"])
+        self.assertEqual(_item_order(live), _item_order(saved))
+
+    async def test_a_reply_that_starts_with_a_tool_call(self):
+        saved, live = await self._run([
+            self._tool("start", "t1"), self._tool("result", "t1", result="x"), "After."])
+        self.assertEqual(_item_order(live), _item_order(saved))
 
 
 class MediaDirectiveLineBreakTests(unittest.IsolatedAsyncioTestCase):
