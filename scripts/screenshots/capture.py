@@ -552,6 +552,18 @@ class Scenes:
         self.s.shot(page, "media-turn-source")
         page.keyboard.press("Escape")
 
+    def failed_tool_live(self, page: Page) -> None:
+        """A tool that failed, shown while the reply is still streaming: a
+        `read` of a file that isn't there, then a long `exec` still running."""
+        new_chat(page)
+        chat = send(page, "Can you redeploy the forecast app to staging?")
+        wait_js(page, f"() => {{ const s = ({CARDS_STATE})(); return s && s.done >= 1 && s.active >= 1; }}",
+                "one finished card and one running")
+        rows = page.evaluate(f"() => [...{LAST_ASSISTANT}.querySelectorAll('[role=button]')].map(b => b.innerText)")
+        print(f"  card rows: {json.dumps(rows)}", flush=True)
+        set_title(self.token, chat, "Deploy to staging")
+        self.s.shot(page, "failed-tool-live")
+
     def toolbar(self, page: Page) -> None:
         """#10: the Status button on the message toolbar, desktop width."""
         page.goto(f"{BASE}/c/{self.hero_chat}")
@@ -598,6 +610,7 @@ def main(argv=None) -> int:
             shooter.run("model-picker", scenes.model_picker, page)
             shooter.run("agent-turn", scenes.agent_turn, page)
             shooter.run("media-turn", scenes.media_turn, page)
+            shooter.run("failed-tool-live", scenes.failed_tool_live, page)
             if scenes.hero_chat:
                 desk = browser.new_context(**DESKTOP, locale="en-US",
                                            timezone_id="America/New_York", color_scheme="light")

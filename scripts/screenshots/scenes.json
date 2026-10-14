@@ -137,6 +137,31 @@
           "say": "Will do: every morning at 7:00, before you leave."
         }
       ]
+    },
+    {
+      "match": "redeploy the forecast app to staging",
+      "steps": [
+        {
+          "say": "I'll start from the deploy script.",
+          "tool": "read",
+          "args": {
+            "path": "forecast/deploy/run.sh"
+          }
+        },
+        {
+          "say": "There's no deploy script in the repo, so I'll build the app directly first.",
+          "tool": "exec",
+          "args": {
+            "command": "cd forecast && sleep 25 && python3 -m compileall -q src && echo build ok",
+            "title": "Build the app for staging",
+            "yieldMs": 40000
+          }
+        },
+        {
+          "say": "The build is clean. Staging has no deploy script yet, so I stopped there: want me to add one that builds the image and restarts the staging container?",
+          "delay": 0.03
+        }
+      ]
     }
   ]
 }
