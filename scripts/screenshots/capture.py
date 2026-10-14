@@ -163,10 +163,15 @@ def send(page: Page, text: str) -> str:
     """Type `text` in the composer like a person, send it, return the chat id."""
     box = page.locator("#chat-input")
     box.click()
+    # The composer keeps a draft across chats; start from an empty box.
+    page.keyboard.press("Control+A")
+    page.keyboard.press("Backspace")
     page.keyboard.type(text, delay=5)
-    page.keyboard.press("Enter")
-    page.wait_for_url(re.compile(r"/c/[0-9a-f-]+"), timeout=60_000)
-    return page.url.rsplit("/c/", 1)[1].split("?")[0]
+    # On a touch device Enter is a newline, so send the way a phone user does.
+    page.locator("#send-message-button").click()
+    # Open WebUI moves to /c/<id> with history.replaceState: no navigation event.
+    wait_js(page, "() => /^\\/c\\/[0-9a-f-]+/.test(location.pathname)", "the new chat's URL", 60_000)
+    return page.evaluate("() => location.pathname").split("/c/", 1)[1].strip("/")
 
 
 def wait_js(page: Page, js: str, what: str, timeout_ms: int = TURN_TIMEOUT_MS) -> None:
