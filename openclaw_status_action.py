@@ -1863,6 +1863,33 @@ def _tool_call_result_event(tool_call_id: str, result_str: str) -> dict:
     }
 
 
+def _tool_result_text(result) -> str:
+    """The text a tool card shows for a tool event's `result`.
+
+    OpenClaw sends a string, a list of content blocks, or the agent-tool
+    envelope `{"content": [...], "details": {...}}` (`sanitizeToolResult`).
+    The card shows the content: text blocks one per line, an image (its data
+    is already stripped) as a short note. `details` is the tool's metadata
+    (status, exit code, cwd, ...), not its output; dumping the whole envelope
+    put it in every card (ELI-121). Anything else is shown as JSON.
+    """
+    if isinstance(result, str):
+        return result
+    blocks = result.get("content") if isinstance(result, dict) else result
+    if not isinstance(blocks, list):
+        return json.dumps(result)
+    lines = []
+    for block in blocks:
+        kind = block.get("type") if isinstance(block, dict) else None
+        if kind == "text" and isinstance(block.get("text"), str):
+            lines.append(block["text"])
+        elif kind == "image":
+            lines.append(f"[{block.get('mimeType') or 'an'} image]")
+        else:
+            lines.append(block if isinstance(block, str) else json.dumps(block))
+    return "\n".join(lines)
+
+
 TOOL_ERROR_MARK = "❌"
 
 
@@ -2056,7 +2083,7 @@ class _TurnRenderer:
                 if tcid and tcid in self._tool_results:
                     return
                 result = data.get("result", {})
-                result_str = json.dumps(result) if not isinstance(result, str) else result
+                result_str = _tool_result_text(result)
                 args_str = self._active_tool_args.pop(tcid, None) or json.dumps(
                     data.get("args", {})
                 )

@@ -9966,6 +9966,109 @@ class MediaDirectiveLineBreakTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await self._saved(list(text)), whole)
 
 
+def _card_output_text(output: list, call_id: str) -> str:
+    """The Output a tool card shows: Open WebUI 0.12's `getToolResultText`
+    (`structuredOutput.ts`), the text parts of the call's
+    `function_call_output`, images left out."""
+    item = next(i for i in output if i.get("type") == "function_call_output"
+                and i.get("call_id") == call_id)
+    return "".join(str(p.get("text", "")) for p in item.get("output") or []
+                   if p.get("type") != "input_image" and p.get("text") is not None)
+
+
+class ToolCardOutputTextTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-121 (ELI-110 screenshots, run 38605371115): a tool card's Output
+    showed the result envelope, `{"content": [...], "details": {..., "cwd":
+    ...}}`, instead of the command's output: the pipe and the turn renderer
+    json-dumped the whole result. OpenClaw sends a tool result as a string,
+    a list of content blocks, or the agent-tool envelope (`content` +
+    `details`, `sanitizeToolResult`); the card shows the content's text, and
+    `details` (status, exit code, cwd, ...) stays out of it."""
+
+    # The exec tool's result as OpenClaw sends it (`ExecToolDetails`,
+    # bash-tools.exec-types.ts; `sanitizeToolResult` keeps both keys).
+    ENVELOPE = {"content": [{"type": "text", "text": "README.md\nsrc"}],
+                "details": {"status": "completed", "exitCode": 0, "durationMs": 14,
+                            "aggregated": "README.md\nsrc", "cwd": "/home/runner/work"}}
+    CASES = (
+        (ENVELOPE, "README.md\nsrc"),
+        ({"content": [{"type": "text", "text": "line 1"}, {"type": "text", "text": "line 2"}],
+          "details": {"truncated": False}}, "line 1\nline 2"),
+        ({"content": [{"type": "text", "text": "Shot taken."},
+                      {"type": "image", "mimeType": "image/png", "bytes": 2048, "omitted": True}],
+          "details": {"path": "/tmp/s.png"}}, "Shot taken.\n[image/png image]"),
+        ([{"type": "text", "text": "from a CLI tool"}], "from a CLI tool"),
+        ("plain text", "plain text"),
+        ({"ok": True, "count": 2}, json.dumps({"ok": True, "count": 2})),
+    )
+
+    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
+    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
+    _queue = NoDroppedMessagesTests._queue
+    _final = NoDroppedMessagesTests._final
+    _until_registered = NoDroppedMessagesTests._until_registered
+
+    def _tool(self, phase, **data):
+        return {"type": "event", "event": "agent", "payload": {
+            "sessionKey": self.SK, "runId": "run-1", "stream": "tool",
+            "data": {"phase": phase, "toolCallId": "t1", "name": "exec",
+                     "args": {"command": "ls"}, **data}}}
+
+    async def _inline_card(self, result, is_error=False) -> str:
+        """What the card shows after a pipe run with one tool call."""
+        async def emitter(event):
+            pass
+        body = {"model": "openclaw_gateway.default", "messages": [{"role": "user", "content": "go"}]}
+        meta = {"chat_id": "chat-1", "user_id": "u1", "message_id": "m1"}
+        gen = self.pipe._pipe_impl(body, emitter, __metadata__=meta)
+
+        async def drain():
+            return [c async for c in gen]
+        task = asyncio.ensure_future(drain())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._tool("start"))
+        q.put_nowait(self._tool("result", result=result, isError=is_error))
+        q.put_nowait(self._final("run-1"))
+        _content, output = _owui_saved(await asyncio.wait_for(task, 5))   # bounds the test only
+        return _card_output_text(output, "t1")
+
+    @staticmethod
+    def _renderer_card(result, is_error=False) -> str:
+        r = _TurnRenderer()
+        r.feed({"stream": "tool", "data": {"phase": "start", "name": "exec", "toolCallId": "t1",
+                                           "args": {"command": "ls"}}})
+        r.feed({"stream": "tool", "data": {"phase": "result", "name": "exec", "toolCallId": "t1",
+                                           "result": result, "isError": is_error}})
+        return _card_output_text(r.output, "t1")
+
+    async def test_the_inline_card_shows_the_output(self):
+        for result, shown in self.CASES:
+            with self.subTest(result=result):
+                await self.asyncTearDown()
+                await self.asyncSetUp()
+                self.assertEqual(await self._inline_card(result), shown)
+
+    def test_a_handed_over_card_shows_the_output(self):
+        for result, shown in self.CASES:
+            with self.subTest(result=result):
+                self.assertEqual(self._renderer_card(result), shown)
+
+    async def test_details_never_reach_the_card(self):
+        inline = await self._inline_card(self.ENVELOPE)
+        for card in (inline, self._renderer_card(self.ENVELOPE)):
+            self.assertNotIn("cwd", card)
+            self.assertNotIn("details", card)
+            self.assertNotIn('"content"', card)
+
+    async def test_a_failed_call_explains_itself_with_the_output(self):
+        err = {"content": [{"type": "text", "text": "ls: cannot access 'x'"}],
+               "details": {"status": "failed", "exitCode": 2, "cwd": "/w"}}
+        for card in (await self._inline_card(err, is_error=True),
+                     self._renderer_card(err, is_error=True)):
+            self.assertEqual(card, f"{TOOL_ERROR_MARK} tool call failed\n\nls: cannot access 'x'")
+
+
 class HandoverMediaCodeAwareTests(_RoutingCase):
     """ELI-111, the writer side: a handed-over reply resolves a directive the
     way the inline reply does, and an image recorded for a prose directive is
