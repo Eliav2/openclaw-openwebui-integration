@@ -7492,7 +7492,7 @@ class _TurnWriter:
                 per_run = [_history_span_messages(hist, r) for r in self.runs] if hist else [None]
                 if all(m is not None for m in per_run):
                     rebuilt = _history_renderer([m for msgs in per_run for m in msgs])
-                    if rebuilt.output:
+                    if rebuilt.output and self._holds_streamed_calls(rebuilt, "run's"):
                         self.renderer = rebuilt
                 if not (self._showable() or note):
                     await self._show_silent_announce(hist)
@@ -7574,15 +7574,22 @@ class _TurnWriter:
         # wake's tool calls entirely (gate 2026-10-13: no import of the wake's
         # CLI session with a user turn queued behind it), and an item count
         # takes a text item for a card.
-        streamed_calls = {o.get("id") for o in self.renderer.output if o.get("type") == "function_call"}
-        rebuilt_calls = {o.get("id") for o in rebuilt.output if o.get("type") == "function_call"}
-        if (streamed_calls <= rebuilt_calls
+        if (self._holds_streamed_calls(rebuilt, "wake's")
                 and len(rebuilt.output) >= len(self.renderer.output)
                 and len(rebuilt.text) >= len(self.renderer.text) and rebuilt.output):
             self.renderer = rebuilt
-        elif streamed_calls - rebuilt_calls:
-            pipe_log(f"  turn writer: the transcript lacks {len(streamed_calls - rebuilt_calls)} of the "
-                     f"wake's {len(streamed_calls)} streamed call(s); keeping what streamed")
+
+    def _holds_streamed_calls(self, rebuilt, whose: str) -> bool:
+        """Whether a transcript rebuild holds every tool call that streamed
+        into M. A transcript can lack them all: a wake's CLI session not yet
+        imported (gate 2026-10-13), or an aborted claude-cli run, whose tool
+        calls are never imported (run 64028b9f, 2026-10-14)."""
+        streamed = {o.get("id") for o in self.renderer.output if o.get("type") == "function_call"}
+        missing = streamed - {o.get("id") for o in rebuilt.output if o.get("type") == "function_call"}
+        if missing:
+            pipe_log(f"  turn writer: the transcript lacks {len(missing)} of the {whose} "
+                     f"{len(streamed)} streamed call(s); keeping what streamed")
+        return not missing
 
     async def _stopped(self) -> None:
         """Open WebUI cancelled the writer's task. Stop and Send now both do

@@ -6339,6 +6339,43 @@ class TurnWriterEndTests(_TurnWriterCase):
         self.assertIs(self.m()["done"], True)
         self.assertTrue(w.closed)
 
+    def _aborted_transcript(self, text="Reading them."):
+        """An aborted claude-cli run as the Gateway stores it (chat 0abe9bde,
+        run 64028b9f, 2026-10-14 05:37:25): chat.abort writes the streamed
+        text as a gateway-injected message, the CLI then writes its own
+        aborted closer with the same text, and none of the run's tool calls
+        is ever imported."""
+        self.history = {"messages": [
+            {"role": "user", "content": "check the logs", "idempotencyKey": f"{self.RUN}:user"},
+            {"role": "assistant", "provider": "openclaw", "model": "gateway-injected",
+             "stopReason": "stop", "idempotencyKey": f"{self.RUN}:assistant",
+             "openclawAbort": {"aborted": True, "origin": "rpc", "runId": self.RUN},
+             "content": [{"type": "text", "text": text}]},
+            {"role": "assistant", "provider": "claude-cli", "stopReason": "aborted",
+             "idempotencyKey": f"cli-assistant:{self.RUN}",
+             "content": [{"type": "text", "text": text}]},
+        ]}
+
+    async def test_an_aborted_runs_transcript_never_replaces_its_cards(self):
+        """The aborted run's transcript holds its text twice and no tool call.
+        Finalizing from it must keep the cards that streamed, with the text
+        once, whether the writer's own Stop or the settled row ends it."""
+        for how in ("stop", "settled"):
+            with self.subTest(how=how):
+                await self.asyncSetUp()
+                self._aborted_transcript()
+                w = await self.opened_writer()
+                await w.feed(_tool("result", tcid="toolu_1"))
+                if how == "stop":
+                    await self.cancel_from_the_page(w, "stop")
+                else:
+                    await w.end({"status": "done", "hasActiveRun": False, "lastRunId": self.RUN})
+                self.assertIs(self.m()["done"], True)
+                calls = [o.get("call_id") or o.get("id") for o in self.m()["output"]
+                         if o["type"] == "function_call"]
+                self.assertEqual(calls, ["toolu_1"], "the streamed card was dropped")
+                self.assertEqual(self.m()["content"].count("Reading them."), 1)
+
     async def test_send_now_keeps_writing_the_agent_turn(self):
         """DESIGN case 8: Send now cancels the task too, but the run keeps
         its message to the end; the queued message runs after (case 7)."""
