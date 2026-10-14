@@ -126,7 +126,7 @@
       "match": "Morning chart for the forecast app",
       "steps": [
         {
-          "say": "Here's today's hourly forecast:\nMEDIA:hourly-forecast.png\nRain moves in after 3 PM, so take the bike out this morning."
+          "say": "Here's today's hourly forecast:\nMEDIA:hourly-forecast.png Rain moves in after 3 PM, so take the bike out this morning."
         }
       ]
     },
