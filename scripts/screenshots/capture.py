@@ -173,6 +173,30 @@ def dump_children(session_key: str) -> None:
         print(f"  child row (now={now_ms}): {json.dumps(fields)}", flush=True)
 
 
+def dump_child_history_shapes(session_key: str) -> None:
+    """Print the shape of each child's chat.history (roles, block types and
+    the tool-linking keys, no text), the input of the drawer's Tools tab."""
+    def call(method, params):
+        out = subprocess.run(["openclaw", "gateway", "call", method, "--json", "--params", json.dumps(params)],
+                             capture_output=True, text=True, timeout=90)
+        try:
+            return json.loads(out.stdout[out.stdout.find("{"):])
+        except ValueError:
+            print(f"  {method} unreadable: {out.stderr[-500:]}")
+            return {}
+    for row in call("sessions.list", {"spawnedBy": session_key, "limit": 50}).get("sessions") or []:
+        shapes = []
+        for m in call("chat.history", {"sessionKey": row["key"], "limit": 50}).get("messages") or []:
+            c = m.get("content")
+            blocks = "str" if isinstance(c, str) else [
+                {k: (type(v).__name__ if k == "content" else v) for k, v in b.items()
+                 if k in ("type", "id", "tool_use_id", "toolCallId", "content")}
+                for b in c or [] if isinstance(b, dict)]
+            shapes.append({"role": m.get("role"), "blocks": blocks,
+                           **{k: m[k] for k in ("toolCallId", "toolName") if k in m}})
+        print(f"  child history {row['key'][-12:]}: {json.dumps(shapes)}", flush=True)
+
+
 def forecast_chart_png(width: int = 600, height: int = 260) -> bytes:
     """A small bar chart of hourly temperatures as a PNG, standard library
     only: the image the media scene's reply shows."""
@@ -451,6 +475,16 @@ class Scenes:
                  return d && /tool\\s*result/i.test(d.innerText) && d.innerText.includes('Forecast'); }""",
                 "the drawer transcript with the child's tool call", 60_000)
         self.s.shot(page, "subagent-drawer", text_selector="#openclaw-drawer-root")
+        # The Tools tab, its first card opened: what a tool's result looks like there.
+        dump_child_history_shapes(f"agent:main:openwebui-{me['id']}-{chat}")
+        page.locator("#openclaw-drawer-root button", has_text="Tools").first.click()
+        wait_js(page, """() => { const s = document.querySelector('#openclaw-drawer-section-tools');
+                 return s && !s.querySelector('.animate-pulse') && s.innerText.trim().length > 0; }""",
+                "the drawer's Tools tab", 30_000)
+        if page.locator("#openclaw-drawer-section-tools summary").count():
+            page.locator("#openclaw-drawer-section-tools summary").first.click()
+        print("  tools tab: " + json.dumps(page.locator("#openclaw-drawer-section-tools").inner_text()[:600]), flush=True)
+        self.s.shot(page, "subagent-drawer-tools", text_selector="#openclaw-drawer-root")
         # Back to the dialog, a while after it opened: a running row's elapsed
         # time has moved on from what the dialog first showed (ELI-120).
         page.mouse.click(12, 400)  # the drawer's backdrop, left of its panel
