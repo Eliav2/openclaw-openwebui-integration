@@ -795,6 +795,30 @@ class ExtractTranscriptAndToolsTests(unittest.TestCase):
         ])
         self.assertTrue(tool_calls[0]["isError"])
 
+    def test_a_result_shows_its_output_not_the_raw_envelope(self):
+        """ELI-125: a tool_result's content can be a list of blocks or the
+        agent-tool envelope {content, details}. The Tools tab shows the
+        output, the same rule as the chat's tool cards (ELI-121), not the
+        whole thing as JSON with the tool's metadata in it."""
+        results = {
+            "text blocks": ([{"type": "text", "text": "a1b2 Fix the cache"}, {"type": "text", "text": "c3d4 Docs"}],
+                            "a1b2 Fix the cache\nc3d4 Docs"),
+            "envelope": ({"content": [{"type": "text", "text": "build ok"}],
+                          "details": {"status": "completed", "exitCode": 0, "cwd": "/home/sam/forecast"}},
+                         "build ok"),
+            "an image": ([{"type": "image", "mimeType": "image/png"}], "[image/png image]"),
+            "a string": ("plain output", "plain output"),
+        }
+        for label, (content, shown) in results.items():
+            with self.subTest(label):
+                _rows, tool_calls = _extract_transcript_and_tools([
+                    {"role": "assistant", "content": [
+                        {"type": "toolcall", "id": "t1", "name": "exec", "arguments": {"command": "git log"}},
+                        {"type": "tool_result", "tool_use_id": "t1", "content": content},
+                    ]},
+                ])
+                self.assertEqual(tool_calls[0]["result"], shown)
+
     def test_running_session_history_yields_no_tool_calls(self):
         """The regression this whole live-buffer path exists for.
 
