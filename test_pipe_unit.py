@@ -9766,6 +9766,102 @@ class MediaDirectiveCodeAwareTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("A stray ` tick, ![x.png](https://x/x.png)\nand", before)
 
 
+def _owui_saved(chunks) -> tuple[str, list]:
+    """(content, output) Open WebUI 0.12 saves for a pipe's yields
+    (`middleware.py` streaming loop): `content` joins the text chunks
+    (`content_parts`); a text chunk appends to the last message item, or
+    opens one after any other item; a dict goes through the vendored
+    `handle_responses_streaming_event`; the last message's text is stripped
+    when the stream ends."""
+    from test_fixture_owui_streaming_handler import handle_responses_streaming_event
+    output, parts = [], []
+    for c in chunks:
+        if isinstance(c, str):
+            parts.append(c)
+            if not output or output[-1].get("type") != "message":
+                output.append({"type": "message", "role": "assistant",
+                               "content": [{"type": "output_text", "text": ""}]})
+            output[-1]["content"][-1]["text"] += c
+        elif isinstance(c, dict):
+            output, _ = handle_responses_streaming_event(c, output)
+    if output and output[-1].get("type") == "message":
+        output[-1]["content"][-1]["text"] = output[-1]["content"][-1]["text"].strip()
+    return "".join(parts), output
+
+
+class MediaDirectiveLineBreakTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-113 (found during ELI-111, 2026-10-14): the line break after a
+    streamed directive was dropped when the chunk ended right after it, so
+    the next line was glued onto the image: `Real: MEDIA:c.p` + `ng\\n` +
+    `Next line` was saved as `![c.png](...)Next line`. Where a stream is cut
+    must not change what Open WebUI saves."""
+
+    BASE = "https://x"
+    IMG = "![c.png](https://x/c.png)"
+
+    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
+    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
+    _queue = NoDroppedMessagesTests._queue
+    _delta = NoDroppedMessagesTests._delta
+    _final = NoDroppedMessagesTests._final
+    _until_registered = NoDroppedMessagesTests._until_registered
+
+    async def _saved(self, chunks):
+        """Stream `chunks` as one run's deltas; (content, message texts)
+        Open WebUI saves."""
+        self.pipe.valves.USE_OWUI_FILES = False
+        self.pipe.valves.FILE_SERVER_BASE_URL = self.BASE
+
+        async def emitter(event):
+            pass
+        body = {"model": "openclaw_gateway.default", "messages": [{"role": "user", "content": "go"}]}
+        meta = {"chat_id": "chat-1", "user_id": "u1", "message_id": "m1"}
+        gen = self.pipe._pipe_impl(body, emitter, __metadata__=meta)
+
+        async def drain():
+            return [c async for c in gen]
+        task = asyncio.ensure_future(drain())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        for c in chunks:
+            q.put_nowait(self._delta("run-1", c))
+        q.put_nowait(self._final("run-1"))
+        content, output = _owui_saved(await asyncio.wait_for(task, 5))   # bounds the test only
+        texts = [p["text"] for i in output if i.get("type") == "message" for p in i["content"]]
+        return content, texts
+
+    async def _fresh(self):
+        await self.asyncTearDown()
+        await self.asyncSetUp()
+
+    def test_a_stream_holds_the_break_until_the_next_line_starts(self):
+        self.assertEqual(_advance_media_buffer("", "Real: MEDIA:c.png\n"), ("Real: ", "MEDIA:c.png\n"))
+        self.assertEqual(_advance_media_buffer("MEDIA:c.png\n", "Next"), ("MEDIA:c.png\nNext", ""))
+        self.assertEqual(_resolve_media("MEDIA:c.png\n", base_url=self.BASE), (self.IMG, True))
+
+    async def test_the_reported_split_keeps_the_line_break(self):
+        content, texts = await self._saved(["Real: MEDIA:c.p", "ng\n", "Next line"])
+        self.assertEqual(content, f"Real: {self.IMG}\nNext line")
+        self.assertEqual(texts, [f"Real: {self.IMG}\nNext line"])
+
+    async def test_a_line_break_ending_a_chunk_after_a_directive_is_kept(self):
+        content, texts = await self._saved(["Real: MEDIA:c.png\nmore\n", "next"])
+        self.assertEqual(content, f"Real: {self.IMG}\nmore\nnext")
+        self.assertEqual(texts, [f"Real: {self.IMG}\nmore\nnext"])
+
+    async def test_every_split_saves_what_one_chunk_saves(self):
+        text = "Real: MEDIA:c.png\nNext line\nMEDIA:d.png  and more\nend\n"
+        whole = await self._saved([text])
+        self.assertEqual(whole[0], f"Real: {self.IMG}\nNext line\n![d.png](https://x/d.png)\nand more\nend\n")
+        for cut in range(1, len(text)):
+            with self.subTest(cut=cut):
+                await self._fresh()
+                self.assertEqual(await self._saved([text[:cut], text[cut:]]), whole)
+        with self.subTest(chunk=1):
+            await self._fresh()
+            self.assertEqual(await self._saved(list(text)), whole)
+
+
 class HandoverMediaCodeAwareTests(_RoutingCase):
     """ELI-111, the writer side: a handed-over reply resolves a directive the
     way the inline reply does, and an image recorded for a prose directive is

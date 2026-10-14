@@ -961,7 +961,9 @@ def _media_scan(text: str, ctx: str = "", final: bool = True):
         stripped = after.strip()
         fname, rest = _take_media_fname(stripped)
         end = i + (len(after) - len(after.lstrip())) + len(stripped) - len(rest)
-        complete = final or end < len(text)
+        # The line break after a directive depends on what follows it, so a
+        # stream holds it until something does (ELI-113).
+        complete = final or bool(text[end:].strip())
         if not complete or (open_at is not None and idx >= open_at
                             and _looks_like_media_filename(fname)):
             hold = idx
@@ -979,13 +981,15 @@ def _media_scan(text: str, ctx: str = "", final: bool = True):
 
 def _replace_media(text: str, directives, replacement) -> str:
     """`text` with each directive (from `_media_scan`) replaced by
-    `replacement(filename)`, and the text after it on a line of its own."""
+    `replacement(filename)`, and the text after it on a line of its own.
+    Nothing else changes: a streamed chunk's own trailing line break is the
+    next chunk's line start (ELI-113)."""
     out, pos = "", 0
     for start, end, fname in directives:
         rest = text[end:]
         out += text[pos:start] + replacement(fname) + ("\n" if rest.strip() else "")
         pos = end + len(rest) - len(rest.lstrip())
-    return out + text[pos:].rstrip()
+    return out + text[pos:]
 
 
 def _resolve_media(text, base_url=None, ctx=""):
