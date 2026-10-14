@@ -347,11 +347,15 @@ def last_text_has(*needles: str, lacks: str | None = None) -> str:
 
 
 def visible_text(page: Page, selector: str | None = None) -> str:
-    """The text a reader can see, field values included (an input's value is
-    not part of innerText, and a token in a valve field is still on screen)."""
+    """The text a reader can see, with the values of the fields on screen (an
+    input's value is not part of innerText, and a token in a valve field is
+    still on screen)."""
     root = page.locator(selector).first if selector else page.locator("body")
     return root.evaluate("""el => el.innerText + '\\n' +
-        [...el.querySelectorAll('input, textarea')].map(f => f.value).join('\\n')""")
+        [...el.querySelectorAll('input, textarea')].filter(f => {
+          const r = f.getBoundingClientRect();
+          return r.bottom > 0 && r.top < innerHeight && r.width > 0;
+        }).map(f => f.value).join('\\n')""")
 
 
 class Shooter:
@@ -674,9 +678,19 @@ class Scenes:
         print("  before: " + json.dumps(before), flush=True)
         self.s.shot(page, "compact-before", selector=sec)
         page.locator("#openclaw-status-modal-root button", has_text="Compact").first.click()
-        wait_js(page, f"""() => {{ const s = document.querySelector('{sec}');
-                 return s && /200k/.test(s.innerText) && s.innerText !== {json.dumps(before)}; }}""",
-                "the context numbers after compacting", 150_000)
+        wait_js(page, f"() => {{ const s = document.querySelector('{sec}'); return s && /200k/.test(s.innerText); }}",
+                "the dialog back from compacting", 150_000)
+        # The dialog refreshes once, as compacting ends; the Gateway can report
+        # the new size a moment later, so look again the way a person would.
+        deadline = time.time() + 90
+        while page.locator(sec).inner_text() == before:
+            if time.time() > deadline:
+                raise TimeoutError(f"context unchanged after compacting: {before!r}")
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(5000)
+            page.locator('button[aria-label="OpenClaw status"]').click()
+            wait_js(page, f"() => {{ const s = document.querySelector('{sec}'); return s && /200k/.test(s.innerText); }}",
+                    "the dialog reopened", 60_000)
         print("  after: " + json.dumps(page.locator(sec).inner_text()), flush=True)
         self.s.shot(page, "compact-after", selector=sec)
         page.keyboard.press("Escape")
@@ -707,6 +721,8 @@ class Scenes:
         """Two messages in one chat; the Pipe's auto-title names it after the
         second, and the phone header shows the title."""
         old = pipe_valves(self.token, AUTO_TITLE=True)
+        tasks = api("GET", "/api/v1/tasks/config", token=self.token)
+        api("POST", "/api/v1/tasks/config/update", {**tasks, "ENABLE_FOLLOW_UP_GENERATION": True}, self.token)
         try:
             new_chat(page)
             chat = send(page, "Help me plan the hourly view release.")
@@ -720,6 +736,7 @@ class Scenes:
                 time.sleep(2)
         finally:
             pipe_valves(self.token, **old)
+            api("POST", "/api/v1/tasks/config/update", tasks, self.token)
         page.goto(f"{BASE}/c/{chat}")
         wait_js(page, "() => document.body.innerText.includes('Hourly view release plan')", "the title on screen", 30_000)
         self.s.shot(page, "chat-titles")

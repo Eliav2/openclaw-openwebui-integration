@@ -48,7 +48,16 @@
       "model": {
         "primary": "local/nova"
       }
-    }
+    },
+    "list": [
+      {
+        "id": "main",
+        "default": true
+      },
+      {
+        "id": "title-gen"
+      }
+    ]
   },
   "plugins": {
     "load": {
