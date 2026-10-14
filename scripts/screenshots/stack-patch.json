@@ -9,19 +9,27 @@
         "models": [
           {
             "id": "nova",
-            "name": "Nova"
+            "name": "Nova",
+            "contextWindow": 200000,
+            "maxTokens": 8192
           },
           {
             "id": "nova-mini",
-            "name": "Nova Mini"
+            "name": "Nova Mini",
+            "contextWindow": 200000,
+            "maxTokens": 8192
           },
           {
             "id": "nova-pro",
-            "name": "Nova Pro"
+            "name": "Nova Pro",
+            "contextWindow": 200000,
+            "maxTokens": 8192
           },
           {
             "id": "nova-vision",
-            "name": "Nova Vision"
+            "name": "Nova Vision",
+            "contextWindow": 200000,
+            "maxTokens": 8192
           }
         ]
       }

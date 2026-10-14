@@ -4,52 +4,122 @@
     {
       "match": "Price out Fly.io",
       "steps": [
-        {"say": "", "tool": "read", "args": {"path": "forecast/README.md"}},
-        {"say": "Fly.io: a shared-cpu-1x machine with 512 MB RAM in Frankfurt runs about $3.20 a month, and a 1 GB volume adds $0.15. The free allowance covers outbound traffic at this size. Deploys are a single fly deploy from the repo, and the existing Dockerfile works as is. Scaling to a second region later is one command, which matters if the forecast API gets traffic from outside Europe. Checking the current price page and the volume snapshot policy before I report back.", "delay": 1.6}
+        {
+          "say": "",
+          "tool": "read",
+          "args": {
+            "path": "forecast/README.md"
+          }
+        },
+        {
+          "say": "Fly.io: a shared-cpu-1x machine with 512 MB RAM in Frankfurt runs about $3.20 a month, and a 1 GB volume adds $0.15. The free allowance covers outbound traffic at this size. Deploys are a single fly deploy from the repo, and the existing Dockerfile works as is. Scaling to a second region later is one command, which matters if the forecast API gets traffic from outside Europe. Checking the current price page and the volume snapshot policy before I report back.",
+          "delay": 1.6
+        }
       ]
     },
     {
       "match": "Price out Render",
       "steps": [
-        {"say": "", "tool": "read", "args": {"path": "forecast/README.md"}},
-        {"say": "Render: the Starter web service is $7 a month with 512 MB RAM, and a 1 GB persistent disk adds $0.25. Frankfurt is available. It builds straight from GitHub on every push, so there is nothing to run locally. Free instances sleep after fifteen minutes, which would break the morning forecast job, so the paid tier is the realistic one. Looking at the cron job pricing next, since the app refreshes forecasts every hour.", "delay": 1.6}
+        {
+          "say": "",
+          "tool": "read",
+          "args": {
+            "path": "forecast/README.md"
+          }
+        },
+        {
+          "say": "Render: the Starter web service is $7 a month with 512 MB RAM, and a 1 GB persistent disk adds $0.25. Frankfurt is available. It builds straight from GitHub on every push, so there is nothing to run locally. Free instances sleep after fifteen minutes, which would break the morning forecast job, so the paid tier is the realistic one. Looking at the cron job pricing next, since the app refreshes forecasts every hour.",
+          "delay": 1.6
+        }
       ]
     },
     {
       "match": "Morning build check",
       "steps": [
-        {"say": "", "tool": "exec", "args": {"command": "cd forecast && git log -3 --format='%h %ad %s' --date=short", "title": "Commits since the last build"}},
-        {"say": "Morning! Last night's build passed. The two commits after it only touch the docs, so nothing needs you today."}
+        {
+          "say": "",
+          "tool": "exec",
+          "args": {
+            "command": "cd forecast && git log -3 --format='%h %ad %s' --date=short",
+            "title": "Commits since the last build"
+          }
+        },
+        {
+          "say": "Morning! Last night's build passed. The two commits after it only touch the docs, so nothing needs you today."
+        }
       ]
     },
     {
       "match": "What changed in this repo this week",
       "steps": [
-        {"say": "I'll start with the commit log for the last seven days.", "tool": "exec", "args": {"command": "cd forecast && git log --oneline --since='7 days ago'", "title": "Commits from the last week"}},
-        {"say": "", "tool": "read", "args": {"path": "forecast/CHANGELOG.md"}},
-        {"say": "", "tool": "exec", "args": {"command": "cd forecast && sleep 25 && python3 -m compileall -q src && echo build ok", "title": "Check that the app still builds", "yieldMs": 40000}},
-        {"say": "Here's the week in the forecast app:\n\n- **Hourly view.** The day screen now has an hourly strip with temperature and rain chance.\n- **Faster startup.** Forecasts are cached for ten minutes, so reopening the app no longer refetches everything.\n- **Units fix.** Wind speed respected the Celsius/Fahrenheit switch but not km/h vs mph. That's fixed.\n- **Docs.** The README has a new setup section.\n\nThe build is clean, and nothing in the changelog is marked as breaking.", "delay": 0.03}
+        {
+          "say": "I'll start with the commit log for the last seven days.",
+          "tool": "exec",
+          "args": {
+            "command": "cd forecast && git log --oneline --since='7 days ago'",
+            "title": "Commits from the last week"
+          }
+        },
+        {
+          "say": "Now the changelog, to see what was called out.",
+          "tool": "read",
+          "args": {
+            "path": "forecast/CHANGELOG.md"
+          }
+        },
+        {
+          "say": "And a quick check that it still builds.",
+          "tool": "exec",
+          "args": {
+            "command": "cd forecast && sleep 25 && python3 -m compileall -q src && echo build ok",
+            "title": "Check that the app still builds",
+            "yieldMs": 40000
+          }
+        },
+        {
+          "say": "Here's the week in the forecast app:\n\n- **Hourly view.** The day screen now has an hourly strip with temperature and rain chance.\n- **Faster startup.** Forecasts are cached for ten minutes, so reopening the app no longer refetches everything.\n- **Units fix.** Wind speed respected the Celsius/Fahrenheit switch but not km/h vs mph. That's fixed.\n- **Docs.** The README has a new setup section.\n\nThe build is clean, and nothing in the changelog is marked as breaking.",
+          "delay": 0.03
+        }
       ]
     },
     {
       "match": "set up CI for the forecast app",
       "steps": [
-        {"say": "Sure. One decision first, since it changes the whole setup:", "tool": "ask_user", "args": {"questions": [{"id": "ci_provider", "header": "CI", "question": "Where should the checks run?", "options": [{"label": "GitHub Actions (Recommended)", "description": "Free for this repo, and the code already lives on GitHub."}, {"label": "GitLab CI", "description": "Needs a mirror of the repo on GitLab."}, {"label": "Only on my machine", "description": "A pre-push hook, no hosted CI."}]}]}},
-        {"say": "Got it. I'll add the workflow and open a pull request."}
+        {
+          "say": "Sure. One decision first, since it changes the whole setup.\n\nOpenClaw needs input:\n{\"questions\": [{\"id\": \"ci_provider\", \"header\": \"CI\", \"question\": \"Where should the checks run?\", \"options\": [{\"label\": \"GitHub Actions\", \"description\": \"Free for this repo, and the code already lives on GitHub.\"}, {\"label\": \"GitLab CI\", \"description\": \"Needs a mirror of the repo on GitLab.\"}, {\"label\": \"Only on my machine\", \"description\": \"A pre-push hook, no hosted CI.\"}]}]}"
+        }
       ]
     },
     {
       "match": "Compare hosting for the forecast app",
       "steps": [
-        {"say": "I'll split this up so the research runs in parallel.", "tool": "sessions_spawn", "args": {"task": "Price out Fly.io for the forecast app: one small machine, a 1 GB volume, EU region.", "label": "Fly.io pricing"}},
-        {"say": "", "tool": "sessions_spawn", "args": {"task": "Price out Render for the forecast app: one web service, a 1 GB disk, EU region.", "label": "Render pricing"}},
-        {"say": "Two researchers are on it, one for Fly.io and one for Render. I'll put their numbers side by side when both report back."}
+        {
+          "say": "I'll split this up so the research runs in parallel.",
+          "tool": "sessions_spawn",
+          "args": {
+            "task": "Price out Fly.io for the forecast app: one small machine, a 1 GB volume, EU region.",
+            "label": "Fly.io pricing"
+          }
+        },
+        {
+          "say": "",
+          "tool": "sessions_spawn",
+          "args": {
+            "task": "Price out Render for the forecast app: one web service, a 1 GB disk, EU region.",
+            "label": "Render pricing"
+          }
+        },
+        {
+          "say": "Two researchers are on it, one for Fly.io and one for Render. I'll put their numbers side by side when both report back."
+        }
       ]
     },
     {
       "match": "check the overnight build",
       "steps": [
-        {"say": "Will do. I'll check every morning at 7:00 and only write when something needs you."}
+        {
+          "say": "Will do. I'll check every morning at 7:00 and only write when something needs you."
+        }
       ]
     }
   ]
