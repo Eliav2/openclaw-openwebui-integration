@@ -8072,6 +8072,14 @@ def _extract_transcript_and_tools(messages: list) -> tuple[list, list]:
     for m in messages or []:
         role = m.get("role")
         content = m.get("content")
+        if role == "toolResult":
+            # OpenClaw's own shape, outside claude-cli imports: the result is
+            # a message of its own, paired by toolCallId with a `toolCall`
+            # block. It also stays in the Transcript, as before.
+            call = pending_by_id.get(m.get("toolCallId"))
+            if call is not None:
+                call["result"] = _tool_result_text(content)
+                call["isError"] = bool(m.get("isError"))
         if isinstance(content, str):
             if content.strip():
                 text_rows.append({"role": role, "text": content})
@@ -8085,7 +8093,7 @@ def _extract_transcript_and_tools(messages: list) -> tuple[list, list]:
             item_type = item.get("type")
             if item_type == "text" and item.get("text"):
                 text_parts.append(item["text"])
-            elif item_type == "toolcall":
+            elif item_type in ("toolcall", "toolCall"):
                 call = {
                     "id": item.get("id"),
                     "name": item.get("name") or "tool",
