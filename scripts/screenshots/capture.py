@@ -660,9 +660,12 @@ class Scenes:
         wait_js(page, "() => document.body.innerText.includes('🎯')", "the goal row", 60_000)
         print("  status rows: " + json.dumps(page.evaluate(f"() => {LAST_ASSISTANT}.innerText")[:400]), flush=True)
         clip = f"""() => {{
-          const a = {LAST_ASSISTANT}; a.scrollIntoView({{block: 'end'}});
-          const r = a.getBoundingClientRect();
-          return {{x: 0, y: Math.max(0, r.top - 8), width: innerWidth, height: Math.min(r.height + 16, innerHeight)}};
+          const c = document.getElementById('messages-container');
+          if (c) c.scrollTop = c.scrollHeight;  // the last message, whole, above the composer
+          const r = {LAST_ASSISTANT}.getBoundingClientRect();
+          const nav = document.querySelector('nav');
+          const top = Math.max(r.top - 8, nav ? nav.getBoundingClientRect().bottom : 0);
+          return {{x: 0, y: top, width: innerWidth, height: Math.min(r.bottom + 8, innerHeight) - top}};
         }}"""
         self.s.shot(page, "usage-goal", clip_js=clip, text_selector=".chat-assistant >> nth=-1")
 
@@ -703,7 +706,12 @@ class Scenes:
         wait_js(page, last_text_has("running in the background"), "the parent's first reply")
         set_title(self.token, chat, "Forecast API uptime")
         wait_js(page, last_text_has("99.98%", "alert on the volume"), "the parent's reply to the result")
-        self.s.shot(page, "subagent-result")
+        clip = """() => {
+          const box = document.getElementById('message-input-container');
+          const bottom = box ? box.getBoundingClientRect().top - 8 : innerHeight;
+          return {x: 0, y: 0, width: innerWidth, height: Math.min(bottom, innerHeight)};
+        }"""
+        self.s.shot(page, "subagent-result", clip_js=clip)
 
     def error_message(self, page: Page) -> None:
         """An actionable error: AGENT_ID names an agent the Gateway lacks."""
@@ -845,7 +853,7 @@ class Scenes:
         owner.wait_for(timeout=30_000)
         # Owner Users at the top: the connection valves above it hold the
         # Gateway token and the device key.
-        owner.evaluate("el => el.scrollIntoView({block: 'start'})")
+        owner.evaluate("el => { el.scrollIntoView({block: 'start'}); el.closest('[role=dialog]').scrollBy(0, -16); }")
         page.wait_for_timeout(300)
         self.s.shot(page, "valves", text_selector='div[role="dialog"][aria-modal="true"] >> nth=-1')
         page.keyboard.press("Escape")
