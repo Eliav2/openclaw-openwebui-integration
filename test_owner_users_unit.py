@@ -119,10 +119,11 @@ class NoRunRequestBypassesTheRouterTests(unittest.TestCase):
         self.assertEqual(offenders, [], "run requests that bypass _run_request")
 
     def test_every_run_request_call_site_is_routed(self):
-        """The 11 places that start, steer or end a run (PHASE-B-PLAN.md)."""
+        """The places that start, steer or end a run: the 11 in PHASE-B-PLAN.md
+        and the writer's question-card answer (#21)."""
         calls = [f"{name}:{n.lineno}" for name, tree in self._trees() for n in ast.walk(tree)
                  if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "_run_request"]
-        self.assertEqual(len(calls), 11, calls)
+        self.assertEqual(len(calls), 12, calls)
 
 
 
@@ -368,6 +369,47 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.dict(sys.modules, {"open_webui.models.functions": mod}):
             await self.send(c, self.key(self.OWNER))
         self.assertEqual(self.restricted.send_request.await_count, 2, "unreadable setting: not the owner's")
+
+
+class GuestQuestionCardAnswerTests(test_pipe_unit.WriterQuestionCardTests):
+    """The writer's question card (ELI-107 option 1, #21) sends the user's
+    answer as a new run of the reply. For a chat whose user is not on
+    OWNER_USERS that run goes over the restricted connection, as the guest's
+    own message does; on the admin connection it would be the owner's turn."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.conn._valves = lambda: types.SimpleNamespace(AGENT_ID="main", OWNER_USERS="someone-else@example.org")
+        self.restricted = mock.MagicMock()
+        test = self
+
+        async def restricted_send(method, params, timeout=10):
+            test.restricted_sent.append((method, params))
+            return {"runId": params["idempotencyKey"], "status": "started"}
+        self.restricted_sent = []
+        self.restricted.send_request = restricted_send
+        for name, value in (("_get_restricted_connection", mock.AsyncMock(return_value=self.restricted)),
+                            ("_user_email", mock.AsyncMock(return_value="guest@example.org"))):
+            p = mock.patch.object(openclaw_pipe, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    async def test_a_guests_answer_goes_over_the_restricted_connection(self):
+        self.owui.session_pool["sid-tab"] = {"id": self.USER, "chat_ids": [self.CHAT]}
+        self.owui.page_intent["sid-tab"] = self.ANSWERED
+        await self.ask_run()
+        self.assertEqual(self.sends(), [], "the answer went out on the admin connection")
+        (method, params), = self.restricted_sent
+        self.assertEqual(method, "chat.send")
+        self.assertEqual(set(params), {"sessionKey", "message", "idempotencyKey"}, "no admin-only field")
+        self.assertTrue(params["message"].startswith("Conversation info (untrusted metadata):\n"))
+        self.assertTrue(params["message"].endswith("```\n\nBlue"))
+
+
+# Only the test above: the inherited ones check the owner's path.
+for _name in [n for n in dir(test_pipe_unit.WriterQuestionCardTests)
+              if n.startswith("test_") and n not in GuestQuestionCardAnswerTests.__dict__]:
+    setattr(GuestQuestionCardAnswerTests, _name, None)
 
 
 class RestrictedConnectionTests(unittest.TestCase):

@@ -7590,7 +7590,7 @@ class _TurnWriter:
             return False
         key = pipe_run_id(self.chat_id, self.message_id, "input")
         try:
-            resp = await self.conn.send_request("chat.send", _owui_chat_send_params(
+            resp = await _run_request(self.conn, RUN_SEND, _owui_chat_send_params(
                 session_key=self.session_key, message=answer, idempotency_key=key,
                 owui_chat_id=self.chat_id, owui_user_id=self.user_id,
                 thinking=self.thinking), timeout=30)
