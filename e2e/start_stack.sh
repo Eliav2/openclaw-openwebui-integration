@@ -11,6 +11,11 @@
 # Inputs (env): OWUI_IMAGE, OPENCLAW_VERSION (npm spec, e.g. 2026.9.3 or latest),
 # E2E_LOG_DIR. Writes the credentials the test suite needs to $GITHUB_ENV when
 # running under Actions.
+#
+# Optional, for the screenshots workflow (scripts/screenshots): STACK_ADMIN_NAME
+# and STACK_ADMIN_EMAIL for the admin account, and STACK_CONFIG_PATCH, a JSON5
+# patch applied to the Gateway config before it starts (other model names, an
+# extra plugin). FAKE_LLM_* variables reach the fake model as they are.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -21,7 +26,8 @@ LOG_DIR="${E2E_LOG_DIR:-$PWD/e2e-logs}"
 mkdir -p "$LOG_DIR"
 
 OWUI_URL="http://localhost:8080"
-OWUI_EMAIL="e2e-admin@example.com"
+OWUI_EMAIL="${STACK_ADMIN_EMAIL:-e2e-admin@example.com}"
+OWUI_ADMIN_NAME="${STACK_ADMIN_NAME:-E2E Admin}"
 OWUI_PASSWORD="e2e-$(openssl rand -hex 12)"
 GATEWAY_TOKEN="e2e-$(openssl rand -hex 16)"
 FAKE_LLM_PORT=18999
@@ -69,6 +75,9 @@ cat >"$HOME/.openclaw/openclaw.json" <<EOF
   "agents": {"defaults": {"model": {"primary": "fake/e2e-echo"}}}
 }
 EOF
+if [[ -n "${STACK_CONFIG_PATCH:-}" ]]; then
+  openclaw config patch --file "$STACK_CONFIG_PATCH"
+fi
 openclaw config validate
 nohup openclaw gateway run >"$LOG_DIR/gateway.log" 2>&1 &
 # The crash test kills this pid (and its children) and nothing else, so it can
@@ -95,7 +104,7 @@ curl -fsS "$OWUI_URL/api/version"; echo
 
 # The first account to sign up becomes the admin.
 curl -fsS -X POST "$OWUI_URL/api/v1/auths/signup" -H 'Content-Type: application/json' \
-  -d "{\"name\":\"E2E Admin\",\"email\":\"$OWUI_EMAIL\",\"password\":\"$OWUI_PASSWORD\"}" >/dev/null
+  -d "{\"name\":\"$OWUI_ADMIN_NAME\",\"email\":\"$OWUI_EMAIL\",\"password\":\"$OWUI_PASSWORD\"}" >/dev/null
 echo "admin account created"
 echo "::endgroup::"
 
