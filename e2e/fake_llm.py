@@ -208,6 +208,18 @@ def plan_reply(body: dict) -> dict:
     return {"text": DEFAULT_REPLY}
 
 
+def _usage(body: dict, plan: dict) -> dict:
+    """Token counts for the reply. Fixed and tiny by default; with
+    FAKE_LLM_USAGE=estimate, about one token per four characters of the
+    request and the reply, so context numbers on screen look like a real
+    session's (the README screenshots)."""
+    if os.environ.get("FAKE_LLM_USAGE") != "estimate":
+        return {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+    prompt = len(json.dumps(body.get("messages") or [])) // 4 + len(json.dumps(body.get("tools") or [])) // 4
+    completion = max(1, len(plan.get("text") or "") // 4 + len(json.dumps(plan.get("args") or {})) // 4)
+    return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
+
+
 def _chunks(text: str) -> list[str]:
     words = text.split(" ")
     return [w if i == 0 else " " + w for i, w in enumerate(words)]
@@ -257,7 +269,7 @@ class Handler(BaseHTTPRequestHandler):
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         created = int(time.time())
         model = body.get("model") or MODEL_ID
-        usage = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        usage = _usage(body, plan)
 
         if "tool" in plan:
             call = {"id": f"call_{uuid.uuid4().hex[:12]}", "type": "function",

@@ -110,6 +110,22 @@ def attach_filter(token: str, model_id: str, filter_id: str) -> None:
             "meta": {"filterIds": [filter_id]}, "params": {}, "is_active": True}, token)
 
 
+def pipe_valves(token: str, **changes) -> dict:
+    """Set some of the Pipe's valves; returns the values they replaced."""
+    fid = "openclaw_gateway"
+    valves = api("GET", f"/api/v1/functions/id/{fid}/valves", token=token) or {}
+    old = {k: valves.get(k) for k in changes}
+    valves.update(changes)
+    for k in [k for k, v in valves.items() if v is None]:
+        del valves[k]  # a valve that was never set goes back to its default
+    api("POST", f"/api/v1/functions/id/{fid}/valves/update", valves, token)
+    return old
+
+
+def chat_title(token: str, chat_id: str) -> str:
+    return (api("GET", f"/api/v1/chats/{chat_id}", token=token).get("title") or "")
+
+
 def set_title(token: str, chat_id: str, title: str) -> None:
     api("POST", f"/api/v1/chats/{chat_id}", {"chat": {"title": title}}, token)
 
@@ -322,10 +338,24 @@ CARDS_STATE = f"""() => {{
 }}"""
 
 
+def last_text_has(*needles: str, lacks: str | None = None) -> str:
+    """JS predicate: the last assistant message shows every needle (and not `lacks`)."""
+    cond = " && ".join(f"t.includes({json.dumps(n)})" for n in needles)
+    if lacks:
+        cond += f" && !t.includes({json.dumps(lacks)})"
+    return f"() => {{ const a = {LAST_ASSISTANT}; if (!a) return false; const t = a.innerText; return {cond}; }}"
+
+
 def visible_text(page: Page, selector: str | None = None) -> str:
-    if selector:
-        return page.locator(selector).first.inner_text()
-    return page.evaluate("() => document.body.innerText")
+    """The text a reader can see, with the values of the fields on screen (an
+    input's value is not part of innerText, and a token in a valve field is
+    still on screen)."""
+    root = page.locator(selector).first if selector else page.locator("body")
+    return root.evaluate("""el => el.innerText + '\\n' +
+        [...el.querySelectorAll('input, textarea')].filter(f => {
+          const r = f.getBoundingClientRect();
+          return r.bottom > 0 && r.top < innerHeight && r.width > 0;
+        }).map(f => f.value).join('\\n')""")
 
 
 class Shooter:
@@ -538,10 +568,10 @@ class Scenes:
         set_title(self.token, chat, "Overnight build check")
         me = api("GET", "/api/v1/auths/", token=self.token)
         schedule_wake(f"agent:main:openwebui-{me['id']}-{chat}", "Morning build check for the forecast app", 5)
-        wait_api(self.token, chat, "nothing needs you today")
-        page.goto(f"{BASE}/c/{chat}")
+        # The tab stays open on the chat: the cron reply has to arrive in it
+        # live, with no reload (agent turns, "open tabs update live").
         wait_js(page, f"() => {{ const a = {LAST_ASSISTANT}; return a && a.innerText.includes('nothing needs you today'); }}",
-                "the cron reply on screen")
+                "the cron reply arriving in the open tab")
         self.s.shot(page, "agent-turn")
 
     def media_turn(self, page: Page) -> None:
@@ -601,6 +631,235 @@ class Scenes:
         set_title(self.token, chat, "Deploy to staging")
         self.s.shot(page, "failed-tool-live")
 
+    def streaming_and_reload(self, page: Page) -> None:
+        """A long reply mid-stream, then the same reply after a page reload
+        while it is still being written: the answer so far is still there."""
+        new_chat(page)
+        chat = send(page, "Draft the release notes for the hourly view.")
+        set_title(self.token, chat, "Release notes draft")
+        wait_js(page, last_text_has("Hourly forecast", "Tap an hour", lacks="Faster startup"),
+                "the reply part-way through")
+        self.s.shot(page, "streaming")
+        page.reload()
+        page.wait_for_selector("#chat-input", timeout=60_000)
+        wait_js(page, last_text_has("Hourly forecast", "Faster startup", lacks="app store"),
+                "the partial answer after the reload, still growing")
+        self.s.shot(page, "reload-mid-reply")
+        wait_js(page, last_text_has("app store"), "the finished reply")
+
+    def usage_goal(self, page: Page) -> None:
+        """The status rows under a reply: context, the rate-limit window, and
+        the session's goal, which the agent set with its create_goal tool."""
+        new_chat(page)
+        chat = send(page, "Keep at it until the hourly view is on staging.")
+        wait_js(page, last_text_has("Goal set"), "the reply that sets the goal")
+        send(page, "Start with the build.")
+        wait_js(page, last_text_has("Next is the staging deploy script"), "the reply")
+        set_title(self.token, chat, "Hourly view to staging")
+        page.locator(".chat-assistant").last.get_by_text(re.compile("200k")).first.click()
+        wait_js(page, "() => document.body.innerText.includes('🎯')", "the goal row", 60_000)
+        print("  status rows: " + json.dumps(page.evaluate(f"() => {LAST_ASSISTANT}.innerText")[:400]), flush=True)
+        clip = f"""() => {{
+          // The last message, its top just under the chat's sticky header.
+          const nav = document.querySelector('nav');
+          const navBottom = nav ? nav.getBoundingClientRect().bottom : 0;
+          const c = document.getElementById('messages-container');
+          if (c) c.scrollTop += {LAST_ASSISTANT}.getBoundingClientRect().top - navBottom - 12;
+          const r = {LAST_ASSISTANT}.getBoundingClientRect();
+          const top = Math.max(r.top - 8, navBottom);
+          return {{x: 0, y: top, width: innerWidth, height: Math.min(r.bottom + 8, innerHeight) - top}};
+        }}"""
+        self.s.shot(page, "usage-goal", clip_js=clip, text_selector=".chat-assistant >> nth=-1")
+
+    def compact(self, page: Page) -> None:
+        """The Status dialog's context section before and after its Compact
+        button, on the hero chat (three tool calls of history)."""
+        page.goto(f"{BASE}/c/{self.hero_chat}")
+        page.locator('button[aria-label="OpenClaw status"]').click()
+        sec = "#openclaw-status-section-context"
+        wait_js(page, f"() => {{ const s = document.querySelector('{sec}'); return s && /\\d+(\\.\\d+)?k?\\s*\\/\\s*200k/i.test(s.innerText); }}",
+                "the context numbers", 60_000)
+        before = page.locator(sec).inner_text()
+        print("  before: " + json.dumps(before), flush=True)
+        self.s.shot(page, "compact-before", selector=sec)
+        page.locator("#openclaw-status-modal-root button", has_text="Compact").first.click()
+        wait_js(page, f"() => {{ const s = document.querySelector('{sec}'); return s && /200k/.test(s.innerText); }}",
+                "the dialog back from compacting", 150_000)
+        # The dialog refreshes once, as compacting ends; the Gateway can report
+        # the new size a moment later, so look again the way a person would.
+        deadline = time.time() + 90
+        while page.locator(sec).inner_text() == before:
+            if time.time() > deadline:
+                raise TimeoutError(f"context unchanged after compacting: {before!r}")
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(5000)
+            page.locator('button[aria-label="OpenClaw status"]').click()
+            wait_js(page, f"() => {{ const s = document.querySelector('{sec}'); return s && /200k/.test(s.innerText); }}",
+                    "the dialog reopened", 60_000)
+        print("  after: " + json.dumps(page.locator(sec).inner_text()), flush=True)
+        self.s.shot(page, "compact-after", selector=sec)
+        page.keyboard.press("Escape")
+
+    def subagent_result(self, page: Page) -> None:
+        """A sub-agent finishes while its parent is idle: the parent's reply
+        to the result lands in the chat as a normal reply."""
+        new_chat(page)
+        chat = send(page, "Can you find out how reliable the forecast API has been lately?")
+        wait_js(page, last_text_has("running in the background"), "the parent's first reply")
+        set_title(self.token, chat, "Forecast API uptime")
+        wait_js(page, last_text_has("99.98%", "alert on the volume"), "the parent's reply to the result")
+        clip = """() => {
+          const box = document.getElementById('message-input-container');
+          const bottom = box ? box.getBoundingClientRect().top - 8 : innerHeight;
+          return {x: 0, y: 0, width: innerWidth, height: Math.min(bottom, innerHeight)};
+        }"""
+        self.s.shot(page, "subagent-result", clip_js=clip)
+
+    def error_message(self, page: Page) -> None:
+        """An actionable error: AGENT_ID names an agent the Gateway lacks."""
+        old = pipe_valves(self.token, AGENT_ID="research")
+        try:
+            new_chat(page)
+            chat = send(page, "Can you check the staging logs?")
+            wait_js(page, last_text_has('"research"'), "the error reply")
+            set_title(self.token, chat, "Staging logs")
+            self.s.shot(page, "error-message")
+        finally:
+            pipe_valves(self.token, **old)
+
+    def chat_titles(self, page: Page) -> None:
+        """Two messages in one chat; the Pipe's auto-title names it after the
+        second, and the phone header shows the title."""
+        old = pipe_valves(self.token, AUTO_TITLE=True)
+        tasks = api("GET", "/api/v1/tasks/config", token=self.token)
+        api("POST", "/api/v1/tasks/config/update", {**tasks, "ENABLE_FOLLOW_UP_GENERATION": True}, self.token)
+        try:
+            new_chat(page)
+            chat = send(page, "Help me plan the hourly view release.")
+            wait_js(page, last_text_has("What's left"), "the first reply")
+            send(page, "What should go in the release notes?")
+            wait_js(page, last_text_has("Lead with the hourly strip"), "the second reply")
+            deadline = time.time() + 120
+            while "Hourly view release plan" not in chat_title(self.token, chat):
+                if time.time() > deadline:
+                    raise TimeoutError(f"no auto title, still {chat_title(self.token, chat)!r}")
+                time.sleep(2)
+        finally:
+            pipe_valves(self.token, **old)
+            api("POST", "/api/v1/tasks/config/update", tasks, self.token)
+        page.goto(f"{BASE}/c/{chat}")
+        wait_js(page, "() => document.body.innerText.includes('Hourly view release plan')", "the title on screen", 30_000)
+        self.s.shot(page, "chat-titles")
+
+    def stop(self, page: Page) -> None:
+        """Stop while a long tool is still running: the run ends and the
+        running card is closed, not left spinning."""
+        new_chat(page)
+        chat = send(page, "Run all the checks for the forecast app.")
+        wait_js(page, f"() => {{ const s = ({CARDS_STATE})(); return s && s.active >= 1; }}", "the running checks card")
+        set_title(self.token, chat, "All checks")
+        page.wait_for_timeout(3000)  # a few seconds into the run, as a person would
+        page.locator('button[aria-label="Stop"]').click()
+        wait_js(page, f"""() => {{ const a = {LAST_ASSISTANT}; const s = ({CARDS_STATE})();
+                 const m = a && a.closest('[id^=message-]');
+                 return s && s.active === 0 && m && m.querySelector('button[aria-label="Copy"]'); }}""",
+                "the stopped reply", 60_000)
+        rows = page.evaluate(f"() => [...{LAST_ASSISTANT}.querySelectorAll('[role=button]')].map(b => b.innerText)")
+        print(f"  card rows after stop: {json.dumps(rows)}", flush=True)
+        self.s.shot(page, "stop")
+
+    def _busy_then_queue(self, page: Page, title: str) -> str:
+        new_chat(page)
+        chat = send(page, "Rebuild the forecast cache.")
+        wait_js(page, f"() => {{ const s = ({CARDS_STATE})(); return s && s.active >= 1; }}", "the running rebuild card")
+        set_title(self.token, chat, title)
+        # A phone composer sends with the button, not Enter; while a reply
+        # runs, Open WebUI queues the message above the composer.
+        page.locator("#chat-input").click()
+        page.keyboard.type("Which branch is this on?", delay=5)
+        page.locator("#send-message-button").click()
+        page.locator('button[aria-label="Send now"]').first.wait_for(timeout=30_000)
+        return chat
+
+    def queued(self, page: Page) -> None:
+        """A message sent while the agent works: queued, then answered for real."""
+        self._busy_then_queue(page, "Cache rebuild")
+        self.s.shot(page, "message-queued")
+        wait_js(page, last_text_has("It's on main"), "the queued message's own reply", TURN_TIMEOUT_MS)
+
+    def send_now(self, page: Page) -> None:
+        """Send now on a queued message: the running reply finishes, then the
+        new message gets its own answer."""
+        self._busy_then_queue(page, "Cache rebuild, send now")
+        page.locator('button[aria-label="Send now"]').first.click()
+        wait_js(page, """() => { const all = [...document.querySelectorAll('.chat-assistant')].map(a => a.innerText).join('\\n');
+                 return all.includes('The cache is rebuilt') && all.includes("It's on main"); }""",
+                "the finished rebuild and the answer to the new message")
+        wait_js(page, f"() => {{ const m = {LAST_ASSISTANT}.closest('[id^=message-]'); return m && m.querySelector('button[aria-label=\"Copy\"]'); }}",
+                "the answer finished", 60_000)
+        self.s.shot(page, "send-now")
+
+    def image_input(self, page: Page) -> None:
+        """An image attached in the composer reaches the agent."""
+        path = os.path.join(self.s.out, "debug", "hourly-forecast.png")
+        with open(path, "wb") as fh:
+            fh.write(forecast_chart_png())
+        new_chat(page)
+        page.locator('input[type="file"][multiple]').set_input_files(path)
+        page.locator('#message-input-container button[aria-label="Show image preview"] img').wait_for(timeout=30_000)
+        page.locator("#chat-input").click()
+        page.keyboard.type("What does this chart say about the afternoon?", delay=5)
+        wait_js(page, "() => { const b = document.querySelector('#send-message-button'); return b && !b.disabled; }",
+                "the upload to finish", 60_000)
+        page.locator("#send-message-button").click()
+        wait_js(page, "() => /^\\/c\\/[0-9a-f-]+/.test(location.pathname)", "the new chat's URL", 60_000)
+        chat = page.evaluate("() => location.pathname").split("/c/", 1)[1].strip("/")
+        wait_js(page, last_text_has("wet commute home"), "the reply about the chart")
+        set_title(self.token, chat, "Afternoon forecast")
+        self.s.shot(page, "image-input")
+
+    def thinking_level(self, page: Page) -> None:
+        """The thinking level, a per-user valve of the filter, with its choices.
+        A <select>'s native popup is not in a headless screenshot, so the same
+        element is drawn as a list (size = its option count)."""
+        page.goto(f"{BASE}/c/{self.hero_chat}")
+        page.wait_for_selector("#chat-input")
+        page.locator('button[aria-label="Controls"]').click()
+        page.locator('button[aria-expanded]', has_text="Valves").first.click()
+        page.locator('select:has(option[value="functions"])').first.select_option("functions")
+        page.locator('select:has(option[value="openclaw_thinking"])').first.select_option("openclaw_thinking")
+        box = page.locator(".chat-control-valves")
+        box.wait_for(timeout=30_000)
+        if not box.locator("select").count():
+            box.get_by_role("button", name="Default").first.click()  # Default -> Custom shows the field
+        sel = box.locator("select").first
+        sel.wait_for(timeout=30_000)
+        print("  levels: " + json.dumps(sel.evaluate("s => [...s.options].map(o => o.value)")), flush=True)
+        sel.evaluate("s => { s.size = s.options.length; }")
+        clip = """() => {
+          const b = document.querySelector('.chat-control-valves');
+          b.scrollIntoView({block: 'center'});
+          const r = b.getBoundingClientRect();
+          return {x: 0, y: Math.max(0, r.top - 60), width: innerWidth, height: Math.min(r.height + 120, innerHeight)};
+        }"""
+        self.s.shot(page, "thinking-level", clip_js=clip, text_selector=".chat-control-valves")
+        page.locator('button[aria-label="Close"]').first.click()
+
+    def admin_valves(self, page: Page) -> None:
+        """The Pipe's valves in the admin panel, from Owner Users down."""
+        page.goto(f"{BASE}/admin/functions")
+        row = page.locator('div[role="button"]', has_text="OpenClaw Gateway").first
+        row.locator('button[aria-label="Valves"]').click()
+        dialog = page.locator('div[role="dialog"][aria-modal="true"]').last
+        owner = dialog.get_by_text("Owner Users", exact=True).first
+        owner.wait_for(timeout=30_000)
+        # Owner Users at the top: the connection valves above it hold the
+        # Gateway token and the device key.
+        owner.evaluate("el => { el.scrollIntoView({block: 'start'}); el.closest('[role=dialog]').scrollBy(0, -16); }")
+        page.wait_for_timeout(300)
+        self.s.shot(page, "valves", text_selector='div[role="dialog"][aria-modal="true"] >> nth=-1')
+        page.keyboard.press("Escape")
+
     def toolbar(self, page: Page) -> None:
         """#10: the Status button on the message toolbar, desktop width."""
         page.goto(f"{BASE}/c/{self.hero_chat}")
@@ -649,6 +908,19 @@ def main(argv=None) -> int:
             shooter.run("media-turn", scenes.media_turn, page)
             shooter.run("failed-tool-live", scenes.failed_tool_live, page)
             shooter.run("first-reply", scenes.first_reply, page)
+            shooter.run("streaming", scenes.streaming_and_reload, page)
+            shooter.run("usage-goal", scenes.usage_goal, page)
+            shooter.run("subagent-result", scenes.subagent_result, page)
+            shooter.run("error-message", scenes.error_message, page)
+            shooter.run("chat-titles", scenes.chat_titles, page)
+            shooter.run("stop", scenes.stop, page)
+            shooter.run("message-queued", scenes.queued, page)
+            shooter.run("send-now", scenes.send_now, page)
+            shooter.run("image-input", scenes.image_input, page)
+            shooter.run("valves", scenes.admin_valves, page)
+            if scenes.hero_chat:
+                shooter.run("thinking-level", scenes.thinking_level, page)
+                shooter.run("compact-before", scenes.compact, page)
             if scenes.hero_chat:
                 desk = browser.new_context(**DESKTOP, locale="en-US",
                                            timezone_id="America/New_York", color_scheme="light")
