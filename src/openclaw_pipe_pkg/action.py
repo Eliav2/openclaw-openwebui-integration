@@ -264,7 +264,7 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     identity: IDENTITY, isDark: isDark, barColor: barColor, makeBar: makeBar,
     sectionHeader: sectionHeader, errorEl: errorEl,
     skeletonSection: skeletonSection, touchFooter: touchFooter,
-    triggerCompact: triggerCompact, elapsedTime: elapsedTime,
+    triggerCompact: triggerCompact, elapsedTime: elapsedTime, toMs: toMs,
     openSubagentDrawer: openSubagentDrawer,
   };
 
@@ -322,6 +322,24 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     }
   };
   document.addEventListener('keydown', onKey);
+
+  // A running sub-agent's elapsed time counts up while the dialog is open
+  // (ELI-120): the Subagents fill writes it once, so a child spawned a
+  // second before the dialog opened kept saying "1s". The fill marks those
+  // cells with data-openclaw-started-ms; one ticker per dialog rewrites
+  // them every second and stops itself once the dialog is gone. Reopening
+  // replaces the previous dialog, so its ticker is cleared first.
+  if (window.__openclawStatusTicker) clearInterval(window.__openclawStatusTicker);
+  const ticker = setInterval(function() {
+    if (!root.isConnected) {
+      clearInterval(ticker);
+      return;
+    }
+    root.querySelectorAll('[data-openclaw-started-ms]').forEach(function(el) {
+      el.textContent = elapsedTime(Number(el.dataset.openclawStartedMs), null);
+    });
+  }, 1000);
+  window.__openclawStatusTicker = ticker;
 
   document.body.appendChild(root);
 })();
@@ -620,6 +638,11 @@ _SUBAGENTS_FILL_JS_TEMPLATE = r"""
     elapsed.className = 'text-gray-400 dark:text-gray-500 shrink-0 mt-1.5';
     elapsed.style.fontSize = '10px';
     elapsed.textContent = S.elapsedTime(t.startedAt, t.endedAt);
+    const startMs = S.toMs(t.startedAt);
+    // Still running: the dialog's ticker keeps this one counting up.
+    if (t.status === 'running' && !t.endedAt && startMs != null) {
+      elapsed.dataset.openclawStartedMs = String(startMs);
+    }
     row.appendChild(elapsed);
 
     section.appendChild(row);
