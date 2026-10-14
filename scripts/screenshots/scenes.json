@@ -316,6 +316,23 @@
           "delay": 0.03
         }
       ]
+    },
+    {
+      "match": "Keep at it until the hourly view is on staging",
+      "steps": [
+        {
+          "say": "",
+          "tool": "create_goal",
+          "args": {
+            "objective": "Ship the hourly view to staging",
+            "token_budget": 50000
+          }
+        },
+        {
+          "say": "Goal set: the hourly view on staging. I'll work through the build, the deploy script and a smoke check.",
+          "delay": 0.03
+        }
+      ]
     }
   ]
 }

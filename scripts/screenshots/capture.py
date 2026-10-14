@@ -116,6 +116,8 @@ def pipe_valves(token: str, **changes) -> dict:
     valves = api("GET", f"/api/v1/functions/id/{fid}/valves", token=token) or {}
     old = {k: valves.get(k) for k in changes}
     valves.update(changes)
+    for k in [k for k, v in valves.items() if v is None]:
+        del valves[k]  # a valve that was never set goes back to its default
     api("POST", f"/api/v1/functions/id/{fid}/valves/update", valves, token)
     return old
 
@@ -641,12 +643,10 @@ class Scenes:
 
     def usage_goal(self, page: Page) -> None:
         """The status rows under a reply: context, the rate-limit window, and
-        the session's goal, set with the Gateway's own /goal command."""
+        the session's goal, which the agent set with its create_goal tool."""
         new_chat(page)
-        chat = send(page, "/goal ship the hourly view to staging by Friday")
-        wait_js(page, f"() => {{ const a = {LAST_ASSISTANT}; return a && a.innerText.trim().length > 0; }}",
-                "the /goal confirmation")
-        print("  /goal reply: " + json.dumps(page.evaluate(f"() => {LAST_ASSISTANT}.innerText")[:300]), flush=True)
+        chat = send(page, "Keep at it until the hourly view is on staging.")
+        wait_js(page, last_text_has("Goal set"), "the reply that sets the goal")
         send(page, "Start with the build.")
         wait_js(page, last_text_has("Next is the staging deploy script"), "the reply")
         set_title(self.token, chat, "Hourly view to staging")
@@ -686,6 +686,10 @@ class Scenes:
         wait_js(page, last_text_has("running in the background"), "the parent's first reply")
         set_title(self.token, chat, "Forecast API uptime")
         wait_js(page, last_text_has("99.98%", "alert on the volume"), "the parent's reply to the result")
+        wait_js(page, f"() => {{ const m = {LAST_ASSISTANT}.closest('[id^=message-]'); return m && m.querySelector('button[aria-label=\"Copy\"]'); }}",
+                "that reply finished", 60_000)
+        page.goto(f"{BASE}/c/{chat}")  # the header shows the chat's title
+        wait_js(page, last_text_has("alert on the volume"), "the chat reopened")
         self.s.shot(page, "subagent-result")
 
     def error_message(self, page: Page) -> None:
@@ -694,7 +698,7 @@ class Scenes:
         try:
             new_chat(page)
             chat = send(page, "Can you check the staging logs?")
-            wait_js(page, last_text_has("Could not start a session"), "the error reply")
+            wait_js(page, last_text_has('"research"'), "the error reply")
             set_title(self.token, chat, "Staging logs")
             self.s.shot(page, "error-message")
         finally:
@@ -720,6 +724,113 @@ class Scenes:
         page.goto(f"{BASE}/c/{chat}")
         wait_js(page, "() => document.body.innerText.includes('Hourly view release plan')", "the title on screen", 30_000)
         self.s.shot(page, "chat-titles")
+
+    def stop(self, page: Page) -> None:
+        """Stop while a long tool is still running: the run ends and the
+        running card is closed, not left spinning."""
+        new_chat(page)
+        chat = send(page, "Run the full test suite for the forecast app.")
+        wait_js(page, f"() => {{ const s = ({CARDS_STATE})(); return s && s.active >= 1; }}", "the running test card")
+        set_title(self.token, chat, "Full test suite")
+        page.wait_for_timeout(3000)  # a few seconds into the run, as a person would
+        page.locator('button[aria-label="Stop"]').click()
+        wait_js(page, f"""() => {{ const a = {LAST_ASSISTANT}; const s = ({CARDS_STATE})();
+                 const m = a && a.closest('[id^=message-]');
+                 return s && s.active === 0 && m && m.querySelector('button[aria-label="Copy"]'); }}""",
+                "the stopped reply", 60_000)
+        rows = page.evaluate(f"() => [...{LAST_ASSISTANT}.querySelectorAll('[role=button]')].map(b => b.innerText)")
+        print(f"  card rows after stop: {json.dumps(rows)}", flush=True)
+        self.s.shot(page, "stop")
+
+    def _busy_then_queue(self, page: Page, title: str) -> str:
+        new_chat(page)
+        chat = send(page, "Rebuild the forecast cache.")
+        wait_js(page, f"() => {{ const s = ({CARDS_STATE})(); return s && s.active >= 1; }}", "the running rebuild card")
+        set_title(self.token, chat, title)
+        # A phone composer sends with the button, not Enter; while a reply
+        # runs, Open WebUI queues the message above the composer.
+        page.locator("#chat-input").click()
+        page.keyboard.type("Which branch is this on?", delay=5)
+        page.locator("#send-message-button").click()
+        page.locator('button[aria-label="Send now"]').first.wait_for(timeout=30_000)
+        return chat
+
+    def queued(self, page: Page) -> None:
+        """A message sent while the agent works: queued, then answered for real."""
+        self._busy_then_queue(page, "Cache rebuild")
+        self.s.shot(page, "message-queued")
+        wait_js(page, last_text_has("It's on main"), "the queued message's own reply", TURN_TIMEOUT_MS)
+
+    def send_now(self, page: Page) -> None:
+        """Send now on a queued message: the running reply finishes, then the
+        new message gets its own answer."""
+        self._busy_then_queue(page, "Cache rebuild, send now")
+        page.locator('button[aria-label="Send now"]').first.click()
+        wait_js(page, """() => { const all = [...document.querySelectorAll('.chat-assistant')].map(a => a.innerText).join('\\n');
+                 return all.includes('The cache is rebuilt') && all.includes("It's on main"); }""",
+                "the finished rebuild and the answer to the new message")
+        page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+        self.s.shot(page, "send-now")
+
+    def image_input(self, page: Page) -> None:
+        """An image attached in the composer reaches the agent."""
+        path = os.path.join(self.s.out, "debug", "hourly-forecast.png")
+        with open(path, "wb") as fh:
+            fh.write(forecast_chart_png())
+        new_chat(page)
+        page.locator('input[type="file"][multiple]').set_input_files(path)
+        page.locator('#message-input-container button[aria-label="Show image preview"] img').wait_for(timeout=30_000)
+        page.locator("#chat-input").click()
+        page.keyboard.type("What does this chart say about the afternoon?", delay=5)
+        wait_js(page, "() => { const b = document.querySelector('#send-message-button'); return b && !b.disabled; }",
+                "the upload to finish", 60_000)
+        page.locator("#send-message-button").click()
+        wait_js(page, "() => /^\\/c\\/[0-9a-f-]+/.test(location.pathname)", "the new chat's URL", 60_000)
+        chat = page.evaluate("() => location.pathname").split("/c/", 1)[1].strip("/")
+        wait_js(page, last_text_has("wet commute home"), "the reply about the chart")
+        set_title(self.token, chat, "Afternoon forecast")
+        self.s.shot(page, "image-input")
+
+    def thinking_level(self, page: Page) -> None:
+        """The thinking level, a per-user valve of the filter, with its choices.
+        A <select>'s native popup is not in a headless screenshot, so the same
+        element is drawn as a list (size = its option count)."""
+        page.goto(f"{BASE}/c/{self.hero_chat}")
+        page.wait_for_selector("#chat-input")
+        page.locator('button[aria-label="Controls"]').click()
+        page.locator('button[aria-expanded]', has_text="Valves").first.click()
+        page.locator('select:has(option[value="functions"])').first.select_option("functions")
+        page.locator('select:has(option[value="openclaw_thinking"])').first.select_option("openclaw_thinking")
+        box = page.locator(".chat-control-valves")
+        box.wait_for(timeout=30_000)
+        if not box.locator("select").count():
+            box.get_by_role("button", name="Default").first.click()  # Default -> Custom shows the field
+        sel = box.locator("select").first
+        sel.wait_for(timeout=30_000)
+        print("  levels: " + json.dumps(sel.evaluate("s => [...s.options].map(o => o.value)")), flush=True)
+        sel.evaluate("s => { s.size = s.options.length; }")
+        clip = """() => {
+          const b = document.querySelector('.chat-control-valves');
+          b.scrollIntoView({block: 'center'});
+          const r = b.getBoundingClientRect();
+          return {x: 0, y: Math.max(0, r.top - 60), width: innerWidth, height: Math.min(r.height + 80, innerHeight)};
+        }"""
+        self.s.shot(page, "thinking-level", clip_js=clip, text_selector=".chat-control-valves")
+        page.locator('button[aria-label="Close"]').first.click()
+
+    def admin_valves(self, page: Page) -> None:
+        """The Pipe's valves in the admin panel: the top of the list, and the
+        Owner Users field."""
+        page.goto(f"{BASE}/admin/functions")
+        row = page.locator('div[role="button"]', has_text="OpenClaw Gateway").first
+        row.locator('button[aria-label="Valves"]').click()
+        dialog = page.locator('div[role="dialog"][aria-modal="true"]').last
+        dialog.get_by_text("Gateway Url", exact=False).first.wait_for(timeout=30_000)
+        self.s.shot(page, "valves", text_selector='div[role="dialog"][aria-modal="true"] >> nth=-1')
+        dialog.get_by_text("Owner Users", exact=True).first.scroll_into_view_if_needed()
+        page.wait_for_timeout(300)
+        self.s.shot(page, "owner-users", text_selector='div[role="dialog"][aria-modal="true"] >> nth=-1')
+        page.keyboard.press("Escape")
 
     def toolbar(self, page: Page) -> None:
         """#10: the Status button on the message toolbar, desktop width."""
@@ -774,7 +885,13 @@ def main(argv=None) -> int:
             shooter.run("subagent-result", scenes.subagent_result, page)
             shooter.run("error-message", scenes.error_message, page)
             shooter.run("chat-titles", scenes.chat_titles, page)
+            shooter.run("stop", scenes.stop, page)
+            shooter.run("message-queued", scenes.queued, page)
+            shooter.run("send-now", scenes.send_now, page)
+            shooter.run("image-input", scenes.image_input, page)
+            shooter.run("valves", scenes.admin_valves, page)
             if scenes.hero_chat:
+                shooter.run("thinking-level", scenes.thinking_level, page)
                 shooter.run("compact-before", scenes.compact, page)
             if scenes.hero_chat:
                 desk = browser.new_context(**DESKTOP, locale="en-US",
