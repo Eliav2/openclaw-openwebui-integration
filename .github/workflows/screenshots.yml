@@ -66,6 +66,7 @@ jobs:
           STACK_ADMIN_EMAIL: sam@example.com
           FAKE_LLM_SCENES: ${{ github.workspace }}/scripts/screenshots/scenes.json
           FAKE_LLM_DEFAULT: Sure.
+          FAKE_LLM_USAGE: estimate
         run: |
           sed "s|@SCREENSHOTS_DIR@|$PWD/scripts/screenshots|" scripts/screenshots/stack-patch.json \
             > "$RUNNER_TEMP/stack-patch.json"
