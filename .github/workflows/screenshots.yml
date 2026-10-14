@@ -19,6 +19,9 @@ on:
         description: Comma-separated shot names (empty = all)
         type: string
         default: ""
+  push:
+    # A fix branch merged onto this one, to see the fix in the real UI.
+    branches: ["verify/**"]
   pull_request:
     paths:
       - scripts/screenshots/**
