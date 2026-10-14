@@ -9992,6 +9992,47 @@ class LiveToolCardOrderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_item_order(live), _item_order(saved))
 
 
+class LongToolOnlyRunTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-132: a run that sends thousands of tool events before its first
+    text is a live run, not a stuck one. The pipe used to end the reply after
+    5000 events without text, with a "Timeout" note, while the run went on;
+    its answer and the rest of its cards never reached the message."""
+
+    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
+    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
+    _queue = NoDroppedMessagesTests._queue
+    _delta = NoDroppedMessagesTests._delta
+    _final = NoDroppedMessagesTests._final
+    _until_registered = NoDroppedMessagesTests._until_registered
+    _tool = LiveToolCardOrderTests._tool
+
+    async def test_thousands_of_tool_events_without_text_finish_the_reply(self):
+        calls = 2600    # 5200 tool events before any text
+        async def emitter(event):
+            pass
+        body = {"model": "openclaw_gateway.default", "messages": [{"role": "user", "content": "go"}]}
+        meta = {"chat_id": "chat-1", "user_id": "u1", "message_id": "m1"}
+        gen = self.pipe._pipe_impl(body, emitter, __metadata__=meta)
+
+        async def drain():
+            return [c async for c in gen]
+        task = asyncio.ensure_future(drain())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        # As the receive loop does: each event waits for room in the run's
+        # bounded queue, so the reply reads them as they come.
+        for i in range(calls):
+            await q.put(self._tool("start", f"t{i}"))
+            await q.put(self._tool("result", f"t{i}", result="ok"))
+        await q.put(self._delta("run-1", "All 2600 checks passed."))
+        await q.put(self._final("run-1"))
+        content, saved, _live = _owui_stream(await asyncio.wait_for(task, 60))   # bounds the test only
+        self.assertNotIn("Timeout", content)
+        self.assertEqual(content.strip(), "All 2600 checks passed.")
+        self.assertEqual(len(_card_names(saved)), calls)
+        self.assertEqual(sum(1 for i in saved if i.get("type") == "function_call_output"), calls)
+
+
 def _card_names(output: list) -> dict:
     """Each tool card's name (the collapsed row), by call id."""
     return {i.get("call_id") or i.get("id"): i.get("name")

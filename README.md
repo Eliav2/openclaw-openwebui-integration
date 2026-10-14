@@ -1222,18 +1222,16 @@ WebUI message id to target, and is always on when one is available.
 
 <a id="f-recovery"></a>
 <details>
-<summary><b>🩹 Preview recovery and idle probing</b></summary>
+<summary><b>🩹 Preview recovery</b></summary>
 
-If events are lost, the reply is recovered from the Gateway's own
-`sessions.preview` rather than showing you nothing.
+If events are lost, the reply is recovered from the Gateway's own transcript
+(`chat.history`) rather than showing you nothing.
 
-Silence is never treated as completion. A long tool call or a long stretch of
-silent reasoning triggers a probe every 30 seconds that confirms the run is
-still alive, rather than truncating the turn.
-
-There are still bounds, because hanging forever is its own failure: the turn
-gives up after 180 seconds with no text at all, or 5000 events without text, and
-says so explicitly. When a run does end without text, the reason comes from the
+Silence is never treated as completion, and neither is a long run. There is no
+timer and no event count: a long tool call, a long stretch of silent reasoning
+or thousands of tool calls before the first word all keep the reply open. The
+reply ends on the run's own signals: its final event, or the session going idle
+once the run settled. When a run ends without text, the reason comes from the
 run's real terminal state, so you see **Stopped.** or **Failed: the run did not
 complete.** rather than a generic timeout.
 

@@ -1432,7 +1432,6 @@ class Pipe:
         # OWUI 0.12+ discards this write and rehydrates reloads itself
         # (`_owui_owns_inflight_message`), so don't schedule it at all there.
         rest_snapshot_enabled = not _owui_owns_inflight_message()
-        max_events_without_text = 5000
         queued_shown = False
         # An interrupted run is not continued here: its message goes to the
         # turn writer, whose settled row decides who continues it (DESIGN 2.7).
@@ -2182,27 +2181,6 @@ class Pipe:
                             pipe_log(f"  Item: kind={data.get('kind','')} "
                                      f"status={data.get('status','')} "
                                      f"title={str(data.get('title',''))[:50]}")
-
-                        if not text_yielded and event_count >= max_events_without_text:
-                            recovered = await recover_from_transcript()
-                            if recovered:
-                                pipe_log("  recovered assistant text after event cap")
-                                text_yielded = True
-                                record_visible_chunk(recovered)
-                                yield recovered
-                                await maybe_emit_snapshot(force=True)
-                            else:
-                                timeout_text = (
-                                    "\n\n**Timeout:** The run emitted too many progress "
-                                    "events without assistant text. The pipe kept the "
-                                    "run from ending as `(no response)`, but the Gateway "
-                                    "did not provide visible output."
-                                )
-                                record_visible_chunk(timeout_text)
-                                yield timeout_text
-                                await maybe_emit_snapshot(force=True)
-                                text_yielded = True
-                            done = True
 
                 except (asyncio.CancelledError, GeneratorExit) as stop:
                     # OWUI ended this response: the Stop button, or Send now /
