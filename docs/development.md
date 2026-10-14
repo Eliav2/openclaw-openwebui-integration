@@ -28,12 +28,20 @@ as a single flat `.py` file, using the frontmatter docstring for metadata and
 introspecting a top-level `Pipe`/`Action` class directly, most bundlers
 break one or both of those.
 
+### When your change breaks streaming
+
+| Symptom | Likely cause |
+|---|---|
+| Text appears all at once instead of streaming | A code path in the Pipe uses `return` instead of `yield`. The Pipe is an async generator: Open WebUI streams each chunk only as it is yielded (see [Architecture](./architecture.md#how-it-works)). Check your code. |
+
+User-facing problems are in [Troubleshooting](./troubleshooting.md).
+
 ### Docs
 
 | Doc | What it covers |
 |-----|----------------|
 | [`docs/rehydration-persistence.md`](./rehydration-persistence.md) | How Open WebUI persists an assistant message, why `output` wins over `content`, and why the integration emits mid-run snapshots so a client reconnecting mid-turn isn't left staring at an empty message. Read this before changing anything about snapshots or streaming. |
-| [`docs/ask-user-modal.md`](./ask-user-modal.md) | Design spec for a tool-call-based ask-user flow. **Not implemented as written**: see the banner at the top; the shipped approach intercepts `OpenClaw needs input:` text. |
+| [`docs/design/ask-user-modal.md`](./design/ask-user-modal.md) | Design spec for a tool-call-based ask-user flow. **Not implemented as written**: see the banner at the top; the shipped approach intercepts `OpenClaw needs input:` text. |
 
 `scripts/verify_rehydration.py` is a live verifier for the behavior described in
 the first doc. It needs the integration deployed and a real streaming turn, it polls a

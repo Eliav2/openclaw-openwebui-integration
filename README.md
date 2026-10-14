@@ -22,7 +22,7 @@ Chat with your OpenClaw agents from Open WebUI, on your phone, and watch them wo
 - **Questions as dialogs,** not walls of text.
 - **Status:** context, rate limits, sub-agents.
 - **Every Gateway model** in the model picker.
-- **Cron and heartbeat replies** land in the chat.
+- **Cron jobs and sub-agent results** reply in the chat, live.
 - **Survives restarts** and reconnects.
 
 [Full feature list](./docs/features/index.md)
@@ -55,7 +55,14 @@ You should see the installer end with:
   ✓ Route smoke test passed (...)
 ```
 
-and the agent's reply streaming into the chat.
+and the agent's first reply in the chat:
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./docs/img/first-reply-dark.png">
+    <img src="./docs/img/first-reply-light.png" alt="The agent's first reply in Open WebUI: it says hello and what it can do" width="320">
+  </picture>
+</p>
 
 Something off? `uv run install.py healthcheck` re-checks the install and runs the smoke test again. See also [Troubleshooting](./docs/troubleshooting.md).
 
@@ -88,13 +95,13 @@ OpenClaw also ships an [OpenAI-compatible `/v1` endpoint](https://docs.openclaw.
 
 ## Versions
 
-| | Tested in CI |
-|---|---|
-| Open WebUI | 0.12.0 |
-| OpenClaw Gateway | 2026.9.3 |
-| Python (inside Open WebUI) | 3.10 to 3.13 |
+| | Minimum | Tested in CI |
+|---|---|---|
+| Open WebUI | 0.12.0 | 0.12.0 |
+| OpenClaw Gateway | 2026.9.3 | 2026.9.3 |
+| Python (inside Open WebUI) | 3.10 | 3.10 to 3.13 |
 
-Minimum versions, and what an older release loses: [Versions](./docs/versions.md).
+What an older release loses, and the test runs behind these numbers: [Versions](./docs/versions.md).
 
 ## More screenshots
 
