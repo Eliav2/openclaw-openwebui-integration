@@ -1082,6 +1082,16 @@ def _subagent_task_text(text):
     return task or None
 
 
+# A spawn's first message in any whitespace form: lastMessagePreview flattens
+# it to one line, so the header-on-its-own-line test above does not apply.
+_SUBAGENT_SPAWN_RE = re.compile(
+    r"^\s*(?:<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\s*)?\[Subagent Context\].*\[Subagent Task\]", re.S)
+
+
+def _is_spawn_message(text):
+    return isinstance(text, str) and bool(_SUBAGENT_SPAWN_RE.match(text))
+
+
 def _subagent_task_texts(previews_resp):
     """{child key: task text} from a sessions.preview answer. The preview
     holds a session's newest items, so a long-running child's first message
@@ -1101,6 +1111,9 @@ def _subagent_row(row, task_text=None):
     as the Tasks API had it, else the spawn label, else the key."""
     status = _subagent_status(row.get("status"))
     preview = row.get("lastMessagePreview")
+    if _is_spawn_message(preview):
+        # Just spawned: the newest message is still the task (ELI-119).
+        preview = None
     return {
         "id": row["key"],
         "title": task_text or row.get("label") or row["key"],
