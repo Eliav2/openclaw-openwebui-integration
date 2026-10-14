@@ -7179,6 +7179,127 @@ class HandoverRewriteTests(_RoutingCase):
         self.assertEqual(self.conn._turn_writers[(self.CHAT, self.STUB)].thinking, "high")
 
 
+class WriterQuestionCardTests(_RoutingCase):
+    """ELI-107 decision 1, option 1 (#21): a run the writer shows that ends
+    with a question asks it as Open WebUI's question card on the tab viewing
+    the chat, once, for as long as that card call lasts. The answer
+    continues the reply as an `input` run and the question becomes its Ask
+    User card, as in the inline reply. No tab on the chat, a cancel or a
+    timeout: the question stays as text and the reply ends."""
+
+    PROMPT = HandoverRewriteTests.PROMPT
+    closed_run = HandoverRewriteTests.closed_run
+    settle = HandoverRewriteTests.settle
+    ANSWERED = {"status": "answered", "answers": {"answer": {"type": "option", "label": "Blue"}}}
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        env = types.ModuleType("open_webui.env")
+        env.VERSION = "0.12.0"
+        p = mock.patch.dict(sys.modules, {"open_webui.env": env})
+        p.start()
+        self.addCleanup(p.stop)
+        self.history = {"messages": self.closed_run(self.RUN, "Before I go on:\n" + self.PROMPT)}
+        inner, test = self.conn.send_request, self
+
+        async def send_request(method, params, timeout=10):
+            if method == "chat.send":
+                test.sent.append((method, copy.deepcopy(params)))
+                return {"runId": params["idempotencyKey"], "status": "started"}
+            return await inner(method, params, timeout)
+        self.conn.send_request = send_request
+
+    def card_calls(self):
+        return [(to, d["data"]) for e, d, to in self.owui.calls
+                if e == "events" and d["data"].get("type") == "request:user_input"]
+
+    def sends(self):
+        return [p for m, p in self.sent if m == "chat.send"]
+
+    async def ask_run(self, text=None):
+        text = text or "Before I go on:\n" + self.PROMPT
+        await self.dispatch(self.RUN, _delta(text))
+        await self.dispatch(self.RUN, {"state": "final"})
+        await self.settle(self.RUN)
+
+    async def test_the_answer_continues_the_reply_under_its_card(self):
+        self.owui.session_pool["sid-tab"] = {"id": self.USER, "chat_ids": [self.CHAT]}
+        self.owui.page_intent["sid-tab"] = self.ANSWERED
+        await self.ask_run()
+        (to, _card), = self.card_calls()
+        self.assertEqual(to, "sid-tab")
+        (send,) = self.sends()
+        self.assertEqual(send["message"], "Blue")
+        (mid, m), = self.new_messages().items()
+        self.assertEqual(parse_pipe_run_id(send["idempotencyKey"]),
+                         {"chat": self.CHAT, "message": mid, "kind": "input"})
+        self.assertIs(m["done"], False, "the answer run continues this reply")
+        run2 = send["idempotencyKey"]
+        self.history = {"messages": self.closed_run(self.RUN, "Before I go on:\n" + self.PROMPT)
+                        + self.closed_run(run2, "Blue it is.", user="Blue")}
+        await self.dispatch(run2, _delta("Blue it is."))
+        await self.dispatch(run2, {"state": "final"})
+        await self.settle(run2)
+        m = self.new_messages()[mid]
+        self.assertIs(m["done"], True)
+        self.assertTrue(m["content"].startswith("Before I go on:\n"))
+        self.assertIn('name="Ask User"', m["content"])
+        self.assertIn('result="Blue"', m["content"])
+        self.assertTrue(m["content"].endswith("Blue it is."))
+        self.assertNotIn("needs input", m["content"])
+        self.assertEqual(len(self.card_calls()), 1, "the answer run asked nothing")
+
+    async def test_a_question_the_inline_reply_answered_is_not_asked_again(self):
+        """The inline reply asked and recorded its card, then handed the
+        answer run over: that run's end asks nothing."""
+        self.owui.session_pool["sid-tab"] = {"id": self.USER, "chat_ids": [self.CHAT]}
+        self.owui.page_intent["sid-tab"] = self.ANSWERED
+        card = HandoverRewriteTests.CARD
+        run1 = pipe_run_id(self.CHAT, self.STUB)
+        run2 = pipe_run_id(self.CHAT, self.STUB, "input")
+        self.add_stub(self.STUB, content="Let me ask.\n" + card)
+        self.conn.note_turn_rewrite(self.CHAT, self.STUB, self.PROMPT, card)
+        self.conn.register_run_target(self.key, run2, self.CHAT, self.STUB)
+        self.conn._run_renderers[f"{self.key}:{run2}"].feed(_delta("Let me ask.\n" + self.PROMPT))
+        self.history = {"messages": self.closed_run(run1, "Let me ask.\n" + self.PROMPT)
+                        + self.closed_run(run2, "Blue it is.", user="Blue")}
+        await self.dispatch(run2, _delta("Blue it is."))
+        await self.dispatch(run2, {"state": "final"})
+        await self.settle(run2)
+        self.assertEqual(self.card_calls(), [])
+        self.assertEqual(self.owui.msgs()[self.STUB]["content"], "Let me ask.\n" + card + "Blue it is.")
+
+    async def test_with_no_tab_on_the_chat_the_question_ends_the_reply_as_text(self):
+        self.owui.session_pool["sid-other"] = {"id": self.USER, "chat_ids": ["another-chat"]}
+        await self.ask_run()
+        self.assertEqual(self.card_calls(), [])
+        self.assertEqual(self.sends(), [])
+        (_mid, m), = self.new_messages().items()
+        self.assertIs(m["done"], True)
+        self.assertEqual(m["content"], "Before I go on:\nColor?\nPick one\n1. Red\n2. Blue")
+
+    async def test_a_cancelled_card_leaves_the_question_as_text(self):
+        self.owui.session_pool["sid-tab"] = {"id": self.USER, "chat_ids": [self.CHAT]}
+        self.owui.page_intent["sid-tab"] = {"status": "cancelled"}
+        await self.ask_run()
+        self.assertEqual(len(self.card_calls()), 1)
+        self.assertEqual(self.sends(), [])
+        (_mid, m), = self.new_messages().items()
+        self.assertIs(m["done"], True)
+        self.assertEqual(m["content"], "Before I go on:\nColor?\nPick one\n1. Red\n2. Blue")
+
+    async def test_a_quoted_question_in_a_code_fence_asks_nothing(self):
+        self.owui.session_pool["sid-tab"] = {"id": self.USER, "chat_ids": [self.CHAT]}
+        self.owui.page_intent["sid-tab"] = self.ANSWERED
+        quoted = "Report:\n```\n" + self.PROMPT + "\n```\nAll done."
+        self.history = {"messages": self.closed_run(self.RUN, quoted)}
+        await self.ask_run(quoted)
+        self.assertEqual(self.card_calls(), [])
+        (_mid, m), = self.new_messages().items()
+        self.assertIs(m["done"], True)
+        self.assertEqual(m["content"], quoted)
+
+
 class InlineRewriteWiringTests(unittest.TestCase):
     """The inline reply records each rewrite the writer must repeat, and moves
     its target to an answer run (R4, R9). Checked on the source: the inline

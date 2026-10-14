@@ -57,14 +57,22 @@ TURN_CUT_OFF_NOTE = ("_(This reply was cut off: the run was interrupted again af
 
 
 def _run_prompt_text(span: list | None) -> str:
-    """The needs-input prompt a run's text ends with, from its trigger line
-    on, as the renderer shows it; "" when there is none. A trigger line in
-    a code fence is a quote (ELI-107)."""
+    """The needs-input prompt a run's text ends with, as the renderer shows
+    it (`_prompt_tail`); "" when there is none."""
+    return _prompt_tail(_history_renderer(span).text) if span else ""
+
+
+def _prompt_tail(text: str, start: int = 0) -> str:
+    """`text` from its last needs-input trigger line at or after `start` on,
+    the prompt the inline reply would ask; "" when there is none. A trigger
+    line in a code fence is a quote (ELI-107). Always "" in the Status
+    Action's build."""
     find = globals().get("_marker_line_index")
     fenced = globals().get("_fence_open_after")
-    text = _history_renderer(span).text if span and find and fenced else ""
-    start, last = 0, None
-    while text:
+    if not (text and find and fenced):
+        return ""
+    last = None
+    while True:
         at = find(text[start:], fenced(text[:start]))
         if at is None:
             break
@@ -73,9 +81,6 @@ def _run_prompt_text(span: list | None) -> str:
         if not start:
             break
     return text[last:] if last is not None else ""
-
-
-RESUME_DIRECTIVE_PREFIX = "[system] Your previous "
 
 
 def _resume_directive(shown: str | None, request: str | None = None) -> str:
@@ -508,7 +513,67 @@ class _TurnWriter:
             note = TURN_CUT_OFF_NOTE
         elif (row or {}).get("status") in ("failed", "timeout") and row.get("lastRunError"):
             note = f"**Error:** {row['lastRunError']}"
+        if note is None and await self._ask_question():
+            return
         await self.finalize(note)
+
+    async def _ask_question(self) -> bool:
+        """A run that ends with a question asks it as the inline reply does:
+        Open WebUI's question card on the tab viewing the chat (ELI-107
+        decision 1, option 1). One card call, bounded by its own timeout, so
+        M waits for no tab. The answer is sent as an `input` run that this
+        writer adopts, and the question shows as its Ask User card. False
+        when nothing was sent: no question, no tab on the chat, a cancel, a
+        timeout, or a refused send; M then ends with the question as text.
+        Absent in the Status Action's build, which writes no turns."""
+        g = globals()
+        names = ("_call_native_card_on_live_session", "_native_ask_user_payload",
+                 "_owui_supports_native_ask_user", "_format_native_answers",
+                 "_ask_user_detail_block", "_is_user_input_prompt")
+        if self.closed or not self.opened or not all(n in g for n in names):
+            return False
+        # Only a question after the last one already answered in M: the text
+        # of an answer run follows its question's raw text.
+        text, start = self.renderer.text, 0
+        for raw, _ in self.conn.turn_rewrites(self.chat_id, self.message_id):
+            at = text.rfind(raw)
+            if at >= 0:
+                start = max(start, at + len(raw))
+        prompt = _prompt_tail(text, start)
+        if not prompt or not g["_is_user_input_prompt"](prompt):
+            return False
+        payload = g["_native_ask_user_payload"](prompt) if g["_owui_supports_native_ask_user"]() else None
+        if payload is None:
+            return False
+        try:
+            response = await g["_call_native_card_on_live_session"](
+                self.user_id, self.chat_id, self.message_id, payload)
+        except Exception as ex:
+            pipe_log(f"  turn writer: question card failed: {ex!r}")
+            return False
+        if response is None:
+            pipe_log(f"  turn writer: no tab views chat {self.chat_id[:8]}...; the question stays text")
+            return False
+        if self.closed or not (isinstance(response, dict) and response.get("status") == "answered"):
+            return False
+        answer = g["_format_native_answers"](payload["data"]["questions"], response.get("answers") or {})
+        if not answer:
+            return False
+        key = pipe_run_id(self.chat_id, self.message_id, "input")
+        try:
+            resp = await self.conn.send_request("chat.send", _owui_chat_send_params(
+                session_key=self.session_key, message=answer, idempotency_key=key,
+                owui_chat_id=self.chat_id, owui_user_id=self.user_id,
+                thinking=self.thinking), timeout=30)
+        except Exception as ex:
+            pipe_log(f"  turn writer: sending the answer failed ({ex}); the question stays text")
+            return False
+        self.conn.note_turn_rewrite(self.chat_id, self.message_id, prompt,
+                                    g["_ask_user_detail_block"](prompt, answer))
+        self.adopt(resp.get("runId") or key)
+        pipe_log(f"  turn writer: answer sent for {self.message_id[:8]}... as {self.run_id[:32]}...")
+        await self._stream()
+        return True
 
     async def on_hello(self) -> None:
         """A new socket: send a resume the closing Gateway refused."""
