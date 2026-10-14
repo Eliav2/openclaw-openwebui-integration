@@ -220,6 +220,34 @@ class SubagentDrawerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"endedAt": 1783790005000', overview)
         self.assertIn(f'"childSessionKey": "{CHILD_A}"', overview)
 
+    async def test_the_transcript_opens_with_the_task_not_the_spawn_wrapper(self):
+        """The child's first user message is the Gateway's spawn wrapper; the
+        Transcript shows the task in it, the way the Subagents row does
+        (ELI-119), on both versions and both content shapes."""
+        for wrapped, task in ((WRAPPED_93, "Research X and report."), (WRAPPED_103, "Summarise Y.")):
+            for content in (wrapped, [{"type": "text", "text": wrapped}]):
+                with self.subTest(task=task, shape=type(content).__name__):
+                    async def send_request(method, params, timeout=5, content=content):
+                        if method == "sessions.describe":
+                            return {"session": {"key": CHILD_A, "status": "done", "startedAt": 1, "endedAt": 2}}
+                        if method == "chat.history":
+                            return {"messages": [{"role": "user", "content": content},
+                                                 {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}]}
+                        raise AssertionError(f"unexpected RPC: {method}")
+
+                    _result, emitted, _conn = await self._drawer(CHILD_A, send_request)
+                    transcript = [c for c in _emitted_codes(emitted)
+                                  if "openclaw-drawer-section-transcript" in c][-1]
+                    self.assertIn(f'{{"role": "user", "text": "{task}"}}', transcript)
+                    self.assertNotIn("Subagent", transcript)
+                    self.assertNotIn("OPENCLAW_INTERNAL_CONTEXT", transcript)
+
+    def test_a_user_message_that_is_not_a_spawn_stays_as_written(self):
+        rows, _tools = openclaw_status_action._extract_transcript_and_tools(
+            [{"role": "user", "content": "Mention [Subagent Task] in passing."},
+             {"role": "assistant", "content": WRAPPED_93}])
+        self.assertEqual([r["text"] for r in rows], ["Mention [Subagent Task] in passing.", WRAPPED_93])
+
     async def test_a_failed_child_shows_its_error(self):
         async def send_request(method, params, timeout=5):
             if method == "sessions.describe":
