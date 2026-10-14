@@ -1237,11 +1237,13 @@ def _extract_transcript_and_tools(messages: list) -> tuple[list, list]:
         if role == "toolResult":
             # OpenClaw's own shape, outside claude-cli imports: the result is
             # a message of its own, paired by toolCallId with a `toolCall`
-            # block. It also stays in the Transcript, as before.
+            # block. It shows in that call's Tools card only, as a claude-cli
+            # `tool_result` does (ELI-128).
             call = pending_by_id.get(m.get("toolCallId"))
             if call is not None:
                 call["result"] = _tool_result_text(content)
                 call["isError"] = bool(m.get("isError"))
+            continue
         if isinstance(content, str):
             if content.strip():
                 add_text(role, content)

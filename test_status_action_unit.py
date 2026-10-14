@@ -394,6 +394,69 @@ class DrawerToolCardsStayOpenTests(unittest.TestCase):
         self.assertEqual(seen[2], [["🔧 exec", True], ["🔧 write", False]])
 
 
+_DRAWER_TRANSCRIPT_PAGE_JS = _FAKE_DOM_JS + r"""
+run(input.open);
+run(input.drawer);
+run(input.fill);
+const section = document.getElementById('openclaw-drawer-section-transcript');
+console.log(JSON.stringify(section.children.map((r) => r.children.map((c) => c.textContent))));
+"""
+
+
+class DrawerTranscriptWithoutToolResultsTests(unittest.TestCase):
+    """ELI-128: a tool's output shows once, in its Tools card. In OpenClaw's
+    own shape (any runtime but claude-cli) the result is a `toolResult`
+    message of its own, and the Transcript showed it again as a TOOLRESULT
+    row; claude-cli's `tool_result` items never reached the Transcript."""
+
+    TASK = DrawerToolCardsStayOpenTests.TASK
+
+    def _transcript(self, history):
+        import shutil
+        import subprocess
+        runtime = shutil.which("bun") or shutil.which("node")
+        if runtime is None:
+            self.skipTest("no bun or node")
+        rows, _calls = _extract_transcript_and_tools(history)
+        identity = {"chatId": "c", "messageId": "m", "sessionId": "s", "owuiModel": "x"}
+        payload = {"now": 1, "open": _render_modal_open_js(identity),
+                   "drawer": _render_drawer_open_js(self.TASK),
+                   "fill": _render_drawer_transcript_fill_js(
+                       {"childSessionKey": self.TASK["childSessionKey"], "messages": rows, "error": None})}
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
+            fh.write(_DRAWER_TRANSCRIPT_PAGE_JS)
+        try:
+            out = subprocess.run([runtime, fh.name], input=json.dumps(payload),
+                                 capture_output=True, text=True, timeout=60)
+        finally:
+            os.unlink(fh.name)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout)
+
+    def test_the_gateways_own_shape_shows_no_result_rows(self):
+        shown = self._transcript([
+            {"role": "user", "content": "Read the staging deploy log."},
+            {"role": "assistant", "content": [
+                {"type": "toolCall", "id": "call_1", "name": "read", "arguments": {"path": "README.md"}}]},
+            {"role": "toolResult", "toolCallId": "call_1", "toolName": "read",
+             "content": [{"type": "text", "text": "# Forecast"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "The staging log is clean."}]},
+        ])
+        self.assertEqual(shown, [["user", "Read the staging deploy log."],
+                                 ["assistant", "The staging log is clean."]])
+
+    def test_claude_cli_shape_is_unchanged(self):
+        shown = self._transcript([
+            {"role": "user", "content": "Read the staging deploy log."},
+            {"role": "assistant", "content": [
+                {"type": "toolcall", "id": "t1", "name": "read", "arguments": {"path": "README.md"}},
+                {"type": "tool_result", "tool_use_id": "t1", "content": "# Forecast"},
+                {"type": "text", "text": "The staging log is clean."}]},
+        ])
+        self.assertEqual(shown, [["user", "Read the staging deploy log."],
+                                 ["assistant", "The staging log is clean."]])
+
+
 class ElapsedTickTests(unittest.TestCase):
     """ELI-120: a running sub-agent's elapsed time counts up while the Status
     dialog stays open, instead of freezing at whatever it was when the
