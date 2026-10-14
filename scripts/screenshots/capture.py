@@ -660,13 +660,16 @@ class Scenes:
         wait_js(page, "() => document.body.innerText.includes('🎯')", "the goal row", 60_000)
         print("  status rows: " + json.dumps(page.evaluate(f"() => {LAST_ASSISTANT}.innerText")[:400]), flush=True)
         clip = f"""() => {{
-          // The last message, its top just under the chat's sticky header.
+          // From the first status row (the 🧠 line) to the end of the reply.
+          const a = {LAST_ASSISTANT};
+          const w = document.createTreeWalker(a, NodeFilter.SHOW_TEXT);
+          let row = null;
+          while (w.nextNode()) {{ if (w.currentNode.textContent.includes('🧠')) {{ row = w.currentNode.parentElement; break; }} }}
+          row.scrollIntoView({{block: 'center'}});
           const nav = document.querySelector('nav');
           const navBottom = nav ? nav.getBoundingClientRect().bottom : 0;
-          const c = document.getElementById('messages-container');
-          if (c) c.scrollTop += {LAST_ASSISTANT}.getBoundingClientRect().top - navBottom - 12;
-          const r = {LAST_ASSISTANT}.getBoundingClientRect();
-          const top = Math.max(r.top - 8, navBottom);
+          const r = a.getBoundingClientRect();
+          const top = Math.max(row.getBoundingClientRect().top - 10, navBottom);
           return {{x: 0, y: top, width: innerWidth, height: Math.min(r.bottom + 8, innerHeight) - top}};
         }}"""
         self.s.shot(page, "usage-goal", clip_js=clip, text_selector=".chat-assistant >> nth=-1")
