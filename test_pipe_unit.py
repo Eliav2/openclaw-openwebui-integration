@@ -6370,6 +6370,135 @@ class TurnWriterEndTests(_TurnWriterCase):
 
 
 
+class ResumeRequestReviewTests(_TurnWriterCase):
+    """Review 2af1 of #20 at bbbcc17 (projects/review-pr20/test_review_pr20.py):
+    the request a resume quotes (893bac8) must survive a re-created writer,
+    a long request, its own rule lines, a metadata block and attachments."""
+
+    RUN, KILLED = TurnWriterEndTests.RUN, TurnWriterEndTests.KILLED
+    opened_writer = TurnWriterEndTests.opened_writer
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.sent, test = [], self
+
+        async def send_request(method, params, timeout=10):
+            test.sent.append((method, copy.deepcopy(params)))
+            if method == "chat.history":
+                return copy.deepcopy(test.history)
+            if method == "chat.send":
+                return {"runId": params["idempotencyKey"], "status": "started"}
+            raise AssertionError(method)
+        self.conn.send_request = send_request
+    # Pipe run ids name UUIDs (2af1's test used "c1"/"m1", which
+    # parse_pipe_run_id rejects, as it rejects nothing the pipe makes).
+    CHAT = "24c342e4-50fa-442e-9b93-c215ed135f3a"
+    KEY = f"agent:main:openwebui-u1-{CHAT}"
+    MID = "8acdce95-1111-4222-8333-444455556666"
+    ORIGINAL_RUN = f"msg-{CHAT}-{MID}-1.0"                  # M's own run
+    RESUME_RUN = f"msg-{CHAT}-{MID}-resume-2.0"             # the first resume of M
+    REQUEST = "Run steps 1 to 5 of the migration and tell me which one failed."
+    BLOCK = 'Conversation info (untrusted metadata):\n```json\n{"chat_id": "c1"}\n```\n\n'
+
+    @staticmethod
+    def _user(run, content):
+        return {"role": "user", "content": content, "idempotencyKey": f"{run}:user"}
+
+    def sends(self):
+        return [p for m, p in self.sent if m == "chat.send"]
+
+    async def adopted_writer(self, run):
+        """A writer made for a run it did not start: `_adopt_turn_message`
+        after a redeploy, or `_turn_writer_for_locked` after an Open WebUI
+        restart. Its `runs` holds only that run."""
+        w = self.writer(run=run, message_id=self.MID)
+        await w.feed(_delta("Step 3 done."))
+        return w
+
+    async def test_F1_a_resume_of_a_resume_after_the_writer_is_recreated_keeps_the_request(self):
+        """M was resumed once, then the writer was re-created from the resume
+        run (redeploy or Open WebUI restart) and the run was cut again: the
+        second resume still quotes the user's request, from M's own first run."""
+        first = openclaw_pipe._resume_directive("Step 1 done.", self.REQUEST)
+        self.history = {"messages": [self._user(self.ORIGINAL_RUN, self.REQUEST),
+                                     self._user(self.RESUME_RUN, first)]}
+        w = await self.adopted_writer(self.RESUME_RUN)
+        await w.end(self.KILLED)
+        self.assertIn(self.REQUEST, self.sends()[0]["message"])
+
+    async def test_F1_an_agent_turns_request_survives_a_recreated_writer_too(self):
+        """M is an agent turn (a run the pipe did not start): its message id
+        is derived from its run id, and its resume names M."""
+        agent_run = "gate-agent-1234"
+        mid = openclaw_pipe.turn_message_id(self.KEY, agent_run, self.CHAT)
+        resume = f"msg-{self.CHAT}-{mid}-resume-2.0"
+        first = openclaw_pipe._resume_directive("Step 1 done.", self.REQUEST)
+        self.history = {"messages": [self._user("other-run", "an earlier turn"),
+                                     self._user(agent_run, self.REQUEST),
+                                     self._user(resume, first)]}
+        w = self.writer(run=resume, message_id=mid)
+        await w.feed(_delta("Step 3 done."))
+        await w.end(self.KILLED)
+        sent = self.sends()[0]["message"]
+        self.assertIn(self.REQUEST, sent)
+        self.assertNotIn("an earlier turn", sent)
+
+    async def test_F5_a_directive_behind_the_metadata_block_is_not_taken_for_the_request(self):
+        """With #22, a turn is stored with the conversation metadata block in
+        front of its text; a resume behind it is still a resume, not the request."""
+        first = openclaw_pipe._resume_directive("Step 1 done.", self.REQUEST)
+        self.history = {"messages": [self._user(self.RESUME_RUN, self.BLOCK + first)]}
+        w = await self.adopted_writer(self.RESUME_RUN)
+        await w.end(self.KILLED)
+        self.assertEqual(self.sends()[0]["message"].count("[system] Your previous"), 1,
+                         "a resume quotes no resume")
+
+    async def test_F5_the_quoted_request_has_no_metadata_block(self):
+        self.history = {"messages": [self._user(self.RUN, self.BLOCK + self.REQUEST)]}
+        w = await self.opened_writer()
+        await w.end(self.KILLED)
+        sent = self.sends()[0]["message"]
+        self.assertIn(self.REQUEST, sent)
+        self.assertNotIn("untrusted metadata", sent)
+
+    async def test_F3_a_request_with_an_image_says_so_in_the_resume(self):
+        """The resume runs in a new claude-cli session holding only the
+        directive; an image of the request is not carried, so the resume
+        must at least say it was there."""
+        content = [{"type": "text", "text": "What is wrong in this screenshot?"},
+                   {"type": "image", "mimeType": "image/png", "data": "iVBORw0KGgo="}]
+        self.history = {"messages": [self._user(self.RUN, content)]}
+        w = await self.opened_writer()
+        await w.end(self.KILLED)
+        sent = self.sends()[0]
+        self.assertIn("What is wrong in this screenshot?", sent["message"])
+        self.assertTrue(sent.get("attachments") or "image" in sent["message"].lower(),
+                        "the resume neither re-attaches the image nor says there was one")
+        self.assertIn("1 attachment", sent["message"])
+
+    def test_F2_a_long_request_keeps_its_question(self):
+        """A pasted log followed by the question: head and tail are kept,
+        with a line saying what was left out."""
+        request = "LOG LINE\n" * 800 + "Which step failed, and why?"
+        d = openclaw_pipe._resume_directive("Looking at the log.", request)
+        self.assertIn("Which step failed, and why?", d)
+        self.assertIn("LOG LINE\nLOG LINE", d)
+        self.assertIn("omitted", d)
+        self.assertLess(len(d), 9000)
+
+    def test_F2b_a_request_with_a_rule_line_stays_one_quote(self):
+        """2af1's test fixed the delimiter as `---`, which cannot both frame
+        the request and be absent from it; adapted to read the delimiter the
+        directive chose. The closing line never occurs in the request."""
+        for request in ("front matter:\n---\ntitle: x\n---\nRender this page.",
+                        "a\n------\nb", "plain request"):
+            with self.subTest(request=request):
+                d = openclaw_pipe._resume_directive("", request)
+                delim, rest = d.split("was:\n\n", 1)[1].split("\n", 1)
+                self.assertNotIn(delim, request.split("\n"))
+                self.assertEqual(rest.split("\n" + delim + "\n", 1)[0], request)
+
+
 class _RoutingCase(unittest.IsolatedAsyncioTestCase):
     """A connection wired to a fake Open WebUI chat, fed events and session
     pushes the way the receive loop feeds them."""
@@ -7367,6 +7496,16 @@ class WriterQuestionCardTests(_RoutingCase):
         self.assertIs(m["done"], True)
         self.assertEqual(m["content"], "Before I go on:\nColor?\nPick one\n1. Red\n2. Blue")
 
+    async def test_a_fence_left_open_before_a_tool_call_does_not_hide_the_question(self):
+        """Review 2af1 F4 on the writer: fences are tracked per message item."""
+        self.owui.session_pool["sid-tab"] = {"id": self.USER, "chat_ids": [self.CHAT]}
+        self.owui.page_intent["sid-tab"] = {"status": "cancelled"}
+        await self.dispatch(self.RUN, _delta("Checking:\n```python\nx = 1\n"))
+        await self.dispatch(self.RUN, _tool("start", tcid="toolu_1"))
+        await self.dispatch(self.RUN, _tool("result", tcid="toolu_1"))
+        await self.ask_run("Before I go on:\n" + self.PROMPT)
+        self.assertEqual(len(self.card_calls()), 1)
+
     async def test_a_quoted_question_in_a_code_fence_asks_nothing(self):
         self.owui.session_pool["sid-tab"] = {"id": self.USER, "chat_ids": [self.CHAT]}
         self.owui.page_intent["sid-tab"] = self.ANSWERED
@@ -8226,6 +8365,66 @@ class NeedsInputMarkerTests(unittest.IsolatedAsyncioTestCase):
                 # Inside an open fence a marker line is never held.
                 shown, held = self.ocp._advance_input_prompt_buffer("", f"{m}\n", True)
                 self.assertEqual(held, "")
+
+    # Review 2af1 F4: fences as CommonMark opens and closes them (4.5): a
+    # backtick fence's info string has no backtick, only the same character
+    # at least as long closes it, and a fence never spans message items.
+    Q = MARKER + " Which database should I migrate first?"
+
+    def test_F4_inline_triple_backticks_do_not_open_a_fence(self):
+        text = "```json``` is the format I used.\n" + self.Q
+        self.assertIsNotNone(self.ocp._marker_line_index(text))
+
+    def test_F4b_a_tilde_line_inside_a_backtick_block_does_not_close_it(self):
+        text = "```\n~~~\n```\n" + self.Q
+        self.assertIsNotNone(self.ocp._marker_line_index(text))
+        self.assertIsNone(self.ocp._marker_line_index("```\n~~~\n" + self.Q))
+
+    def test_F4_a_shorter_fence_does_not_close_a_longer_one(self):
+        self.assertIsNone(self.ocp._marker_line_index("````\n```\n" + self.Q))
+        self.assertIsNotNone(self.ocp._marker_line_index("````\n`````\n" + self.Q))
+        self.assertIsNone(self.ocp._marker_line_index("```\n``` not a close\n" + self.Q))
+
+    def test_F4c_the_live_buffer_holds_a_question_after_such_a_line(self):
+        shown = "```json``` is the format I used.\n"
+        flush, held = self.ocp._advance_input_prompt_buffer(
+            "", self.Q, self.ocp._fence_open_after(shown))
+        self.assertEqual((flush, held), ("", self.Q), "the question was not held for a card")
+
+    async def test_F4_a_fence_left_open_before_a_tool_call_does_not_hide_the_next_question(self):
+        """The text after a tool call is a new message item: a fence the
+        previous item left open (cut off) does not continue into it."""
+        calls = []
+
+        async def event_call(payload):
+            calls.append(payload)
+            return {"error": "Client session disconnected."}
+
+        async def emitter(event):
+            pass
+        body = {"model": "openclaw_gateway.default", "messages": [{"role": "user", "content": "go"}]}
+        meta = {"chat_id": "chat-1", "user_id": "u1", "message_id": "m1"}
+        gen = self.pipe._pipe_impl(body, emitter, __metadata__=meta, __event_call__=event_call)
+
+        async def drain():
+            out = ""
+            async for c in gen:
+                out += c if isinstance(c, str) else ""
+            return out
+        with mock.patch.object(self.ocp, "_owui_supports_native_ask_user", lambda: True):
+            task = asyncio.ensure_future(drain())
+            await self._until_registered("run-1")
+            q = self._queue("run-1")
+            q.put_nowait(self._delta("run-1", "Checking:\n```python\nx = 1\n"))
+            for phase in ("start", "result"):
+                q.put_nowait({"type": "event", "event": "agent", "payload": {
+                    "sessionKey": self.SK, "runId": "run-1", "stream": "tool",
+                    "data": {"phase": phase, "name": "Bash", "toolCallId": "t1", "args": {}}}})
+            q.put_nowait(self._delta("run-1", f"{self.MARKER}\nDB\nWhich one?\n1. a\n2. b\n"))
+            q.put_nowait(self._final("run-1"))
+            out = await asyncio.wait_for(task, 5)
+        self.assertEqual(len(calls), 1, "the question after the tool call was asked")
+        self.assertNotIn(self.MARKER, out)
 
     async def test_a_card_nobody_can_see_ends_the_reply_with_the_question(self):
         """A real prompt, but the turn's session is not a live socket (OWUI

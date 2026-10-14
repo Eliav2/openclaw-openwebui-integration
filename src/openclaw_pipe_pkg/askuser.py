@@ -34,20 +34,44 @@ def _could_be_user_input_prefix(normalized_text: str) -> bool:
     )
 
 
-_CODE_FENCE_RE = re.compile(r"^[ \t]{0,3}(```|~~~)")
+# CommonMark 4.5: a fence is 3+ backticks or tildes indented up to 3 spaces;
+# a backtick fence's info string has no backtick; only a run of the same
+# character, at least as long and followed by nothing but spaces, closes it.
+_FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+_FENCE_CLOSE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
 
 
-def _fence_open_after(text: str, in_fence: bool = False) -> bool:
-    """Whether a fenced code block is open at the end of `text`, which starts
-    with a fence open (`in_fence`) or not. A line that starts with ``` or
-    ~~~ opens or closes one."""
+def _fence_of(state) -> str:
+    """A fence state as the open fence's run ("" when none). `True` is an
+    open backtick fence of unknown length (older callers passed a bool)."""
+    if state is True:
+        return "```"
+    return state or ""
+
+
+def _fence_step(line: str, fence: str) -> str:
+    """The fence state after `line` when `fence` was open before it."""
+    if fence:
+        m = _FENCE_CLOSE_RE.match(line)
+        if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence):
+            return ""
+        return fence
+    m = _FENCE_OPEN_RE.match(line)
+    if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
+        return m.group(1)
+    return ""
+
+
+def _fence_open_after(text: str, in_fence=False) -> str:
+    """The fenced code block open at the end of `text` (its fence run, "" when
+    none), when `in_fence` was open where `text` starts. Truthy when open."""
+    fence = _fence_of(in_fence)
     for line in (text or "").split("\n"):
-        if _CODE_FENCE_RE.match(line):
-            in_fence = not in_fence
-    return in_fence
+        fence = _fence_step(line, fence)
+    return fence
 
 
-def _marker_line_index(text: str, in_fence: bool = False):
+def _marker_line_index(text: str, in_fence=False):
     """Index of the first line that opens a needs-input block, else None.
 
     The marker only counts at the start of a line, but it does NOT have to be
@@ -64,13 +88,12 @@ def _marker_line_index(text: str, in_fence: bool = False):
     report quoting the block in a fence was held as a live prompt and hung).
     `in_fence`: a fence is open where `text` starts.
     """
-    start = 0
+    start, fence = 0, _fence_of(in_fence)
     while True:
         nl = text.find("\n", start)
         line = text[start:] if nl == -1 else text[start:nl]
-        if _CODE_FENCE_RE.match(line):
-            in_fence = not in_fence
-        elif not in_fence and _is_user_input_prompt(line):
+        before, fence = fence, _fence_step(line, fence)
+        if not before and not fence and _is_user_input_prompt(line):
             return start
         if nl == -1:
             return None
@@ -78,7 +101,7 @@ def _marker_line_index(text: str, in_fence: bool = False):
 
 
 def _advance_input_prompt_buffer(pending: str, delta: str,
-                                 in_fence: bool = False) -> tuple[str, str]:
+                                 in_fence=False) -> tuple[str, str]:
     """Feed a new assistant-delta chunk into the needs-input buffering state.
 
     Returns `(text_to_yield_now, new_pending)`. `pending` is text already
@@ -146,11 +169,10 @@ def _strip_needs_input_lines(text: str) -> str:
     readable text, a quoted block in a fence stays as written (ELI-107)."""
     if not text:
         return text
-    out, in_fence, skip_blank = [], False, False
+    out, fence, skip_blank = [], "", False
     for line in text.split("\n"):
-        if _CODE_FENCE_RE.match(line):
-            in_fence = not in_fence
-        elif not in_fence and _is_user_input_prompt(line):
+        before, fence = fence, _fence_step(line, fence)
+        if not before and not fence and _is_user_input_prompt(line):
             skip_blank = True
             continue
         if skip_blank and not line.strip():
@@ -655,9 +677,12 @@ async def _ask_user_native_card(
 ) -> str | None:
     """Ask through OWUI's native question card until answered or cancelled.
 
-    The card is re-shown after each OWUI-side timeout, when the user comes
-    back from another chat, and on a fresh socket after a reconnect, all
-    within max_wait_s. Only an explicit Cancel ends it early (returns None).
+    The card is re-shown after each OWUI-side timeout while a tab views the
+    chat, and on a new socket viewing it after a reload, all within
+    max_wait_s. It is re-shown only if such a tab is back within
+    _NATIVE_CARD_TAB_GRACE_S (60 s); a first call no tab of the chat can
+    show ends at once. Those and an explicit Cancel return None: the reply
+    then ends with the question as text (ELI-107 decision 2).
     `owui_session_id`: the socket the turn started on; once it is gone the
     card moves to the tab viewing the chat without waiting out OWUI's call.
     """
