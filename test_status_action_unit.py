@@ -702,6 +702,30 @@ class ExtractTranscriptAndToolsTests(unittest.TestCase):
                 ])
                 self.assertEqual(tool_calls[0]["result"], shown)
 
+    def test_the_gateways_own_tool_shape_fills_the_tools_tab(self):
+        """Outside claude-cli imports, chat.history keeps OpenClaw's own shape
+        (seen in the screenshots stack, 2026-10-14): a `toolCall` block in the
+        assistant message and the result as a `toolResult` message with
+        `toolCallId`. The Tools tab only knew claude-cli's shape and said
+        "No tool calls yet." for every such child."""
+        history = [
+            {"role": "user", "content": "Price out Fly.io."},
+            {"role": "assistant", "content": [
+                {"type": "toolCall", "id": "call_1", "name": "read", "arguments": {"path": "README.md"}}]},
+            {"role": "toolResult", "toolCallId": "call_1", "toolName": "read",
+             "content": [{"type": "text", "text": "# Forecast"}, {"type": "text", "text": "A small weather app."}]},
+            {"role": "assistant", "content": [
+                {"type": "toolCall", "id": "call_2", "name": "exec", "arguments": {"command": "false"}}]},
+            {"role": "toolResult", "toolCallId": "call_2", "toolName": "exec", "isError": True,
+             "content": [{"type": "text", "text": "exit 1"}]},
+        ]
+        _rows, tool_calls = _extract_transcript_and_tools(history)
+        self.assertEqual([(c["name"], c["result"], c["isError"]) for c in tool_calls], [
+            ("read", "# Forecast\nA small weather app.", False),
+            ("exec", "exit 1", True),
+        ])
+        self.assertIn("README.md", tool_calls[0]["arguments"])
+
     def test_running_session_history_yields_no_tool_calls(self):
         """The regression this whole live-buffer path exists for.
 
