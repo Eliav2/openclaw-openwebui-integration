@@ -2,6 +2,15 @@
   "_comment": "Scripted model replies for the README screenshots (capture.py). A scene is picked by a phrase from the user's own message; step n answers the request that carries n tool results. Child scenes come first: a sub-agent's prompt can quote its parent's request.",
   "scenes": [
     {
+      "_comment": "The Gateway's compaction request quotes the whole conversation, so it comes first.",
+      "match": "<conversation>\n[User]:",
+      "steps": [
+        {
+          "say": "## Goal\nFind out what changed in the forecast app this week.\n\n## Progress\n- Read the commit log for the last seven days: the hourly strip, the ten-minute forecast cache, a wind units fix and a README setup section.\n- Read CHANGELOG.md: nothing marked as breaking.\n- Built the app: the build is clean.\n\n## Answer given\nA four-point summary of the week, with the build clean and nothing breaking.\n\n## Open items\nNone. The user may ask for release notes next."
+        }
+      ]
+    },
+    {
       "match": "Create a concise title",
       "steps": [
         {
@@ -230,10 +239,10 @@
       ]
     },
     {
-      "match": "Let's plan the hourly view release",
+      "match": "Help me plan the hourly view release",
       "steps": [
         {
-          "say": "Sure. What's left: the rain colours on the hourly strip, a cache test, and the release notes. The strip and the test are small; the notes depend on what you want to call out.",
+          "say": "Sure. What's left: the rain colours on the hourly strip, a check for the cache, and the release notes. The strip and the cache check are small; the notes depend on what you want to call out.",
           "delay": 0.03
         }
       ]
@@ -274,19 +283,19 @@
       ]
     },
     {
-      "match": "Run the full test suite for the forecast app",
+      "match": "Run all the checks for the forecast app",
       "steps": [
         {
-          "say": "Running the whole suite. It takes a couple of minutes.",
+          "say": "Running all the checks. It takes a couple of minutes.",
           "tool": "exec",
           "args": {
-            "command": "cd forecast && sleep 90 && python3 -m compileall -q src && echo all tests passed",
-            "title": "Run the full test suite",
+            "command": "cd forecast && sleep 90 && python3 -m compileall -q src && echo all checks passed",
+            "title": "Run all the checks",
             "yieldMs": 120000
           }
         },
         {
-          "say": "All tests passed."
+          "say": "All checks passed."
         }
       ]
     },

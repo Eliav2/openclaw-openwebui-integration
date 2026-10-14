@@ -347,9 +347,11 @@ def last_text_has(*needles: str, lacks: str | None = None) -> str:
 
 
 def visible_text(page: Page, selector: str | None = None) -> str:
-    if selector:
-        return page.locator(selector).first.inner_text()
-    return page.evaluate("() => document.body.innerText")
+    """The text a reader can see, field values included (an input's value is
+    not part of innerText, and a token in a valve field is still on screen)."""
+    root = page.locator(selector).first if selector else page.locator("body")
+    return root.evaluate("""el => el.innerText + '\\n' +
+        [...el.querySelectorAll('input, textarea')].map(f => f.value).join('\\n')""")
 
 
 class Shooter:
@@ -650,6 +652,7 @@ class Scenes:
         send(page, "Start with the build.")
         wait_js(page, last_text_has("Next is the staging deploy script"), "the reply")
         set_title(self.token, chat, "Hourly view to staging")
+        page.locator(".chat-assistant").last.get_by_text(re.compile("200k")).first.click()
         wait_js(page, "() => document.body.innerText.includes('🎯')", "the goal row", 60_000)
         print("  status rows: " + json.dumps(page.evaluate(f"() => {LAST_ASSISTANT}.innerText")[:400]), flush=True)
         clip = f"""() => {{
@@ -686,10 +689,6 @@ class Scenes:
         wait_js(page, last_text_has("running in the background"), "the parent's first reply")
         set_title(self.token, chat, "Forecast API uptime")
         wait_js(page, last_text_has("99.98%", "alert on the volume"), "the parent's reply to the result")
-        wait_js(page, f"() => {{ const m = {LAST_ASSISTANT}.closest('[id^=message-]'); return m && m.querySelector('button[aria-label=\"Copy\"]'); }}",
-                "that reply finished", 60_000)
-        page.goto(f"{BASE}/c/{chat}")  # the header shows the chat's title
-        wait_js(page, last_text_has("alert on the volume"), "the chat reopened")
         self.s.shot(page, "subagent-result")
 
     def error_message(self, page: Page) -> None:
@@ -710,7 +709,7 @@ class Scenes:
         old = pipe_valves(self.token, AUTO_TITLE=True)
         try:
             new_chat(page)
-            chat = send(page, "Let's plan the hourly view release.")
+            chat = send(page, "Help me plan the hourly view release.")
             wait_js(page, last_text_has("What's left"), "the first reply")
             send(page, "What should go in the release notes?")
             wait_js(page, last_text_has("Lead with the hourly strip"), "the second reply")
@@ -729,9 +728,9 @@ class Scenes:
         """Stop while a long tool is still running: the run ends and the
         running card is closed, not left spinning."""
         new_chat(page)
-        chat = send(page, "Run the full test suite for the forecast app.")
-        wait_js(page, f"() => {{ const s = ({CARDS_STATE})(); return s && s.active >= 1; }}", "the running test card")
-        set_title(self.token, chat, "Full test suite")
+        chat = send(page, "Run all the checks for the forecast app.")
+        wait_js(page, f"() => {{ const s = ({CARDS_STATE})(); return s && s.active >= 1; }}", "the running checks card")
+        set_title(self.token, chat, "All checks")
         page.wait_for_timeout(3000)  # a few seconds into the run, as a person would
         page.locator('button[aria-label="Stop"]').click()
         wait_js(page, f"""() => {{ const a = {LAST_ASSISTANT}; const s = ({CARDS_STATE})();
@@ -769,7 +768,8 @@ class Scenes:
         wait_js(page, """() => { const all = [...document.querySelectorAll('.chat-assistant')].map(a => a.innerText).join('\\n');
                  return all.includes('The cache is rebuilt') && all.includes("It's on main"); }""",
                 "the finished rebuild and the answer to the new message")
-        page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+        wait_js(page, f"() => {{ const m = {LAST_ASSISTANT}.closest('[id^=message-]'); return m && m.querySelector('button[aria-label=\"Copy\"]'); }}",
+                "the answer finished", 60_000)
         self.s.shot(page, "send-now")
 
     def image_input(self, page: Page) -> None:
@@ -813,23 +813,24 @@ class Scenes:
           const b = document.querySelector('.chat-control-valves');
           b.scrollIntoView({block: 'center'});
           const r = b.getBoundingClientRect();
-          return {x: 0, y: Math.max(0, r.top - 60), width: innerWidth, height: Math.min(r.height + 80, innerHeight)};
+          return {x: 0, y: Math.max(0, r.top - 60), width: innerWidth, height: Math.min(r.height + 120, innerHeight)};
         }"""
         self.s.shot(page, "thinking-level", clip_js=clip, text_selector=".chat-control-valves")
         page.locator('button[aria-label="Close"]').first.click()
 
     def admin_valves(self, page: Page) -> None:
-        """The Pipe's valves in the admin panel: the top of the list, and the
-        Owner Users field."""
+        """The Pipe's valves in the admin panel, from Owner Users down."""
         page.goto(f"{BASE}/admin/functions")
         row = page.locator('div[role="button"]', has_text="OpenClaw Gateway").first
         row.locator('button[aria-label="Valves"]').click()
         dialog = page.locator('div[role="dialog"][aria-modal="true"]').last
-        dialog.get_by_text("Gateway Url", exact=False).first.wait_for(timeout=30_000)
-        self.s.shot(page, "valves", text_selector='div[role="dialog"][aria-modal="true"] >> nth=-1')
-        dialog.get_by_text("Owner Users", exact=True).first.scroll_into_view_if_needed()
+        owner = dialog.get_by_text("Owner Users", exact=True).first
+        owner.wait_for(timeout=30_000)
+        # Owner Users at the top: the connection valves above it hold the
+        # Gateway token and the device key.
+        owner.evaluate("el => el.scrollIntoView({block: 'start'})")
         page.wait_for_timeout(300)
-        self.s.shot(page, "owner-users", text_selector='div[role="dialog"][aria-modal="true"] >> nth=-1')
+        self.s.shot(page, "valves", text_selector='div[role="dialog"][aria-modal="true"] >> nth=-1')
         page.keyboard.press("Escape")
 
     def toolbar(self, page: Page) -> None:
