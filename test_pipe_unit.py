@@ -6376,6 +6376,97 @@ class TurnWriterEndTests(_TurnWriterCase):
                 self.assertEqual(calls, ["toolu_1"], "the streamed card was dropped")
                 self.assertEqual(self.m()["content"].count("Reading them."), 1)
 
+    KILLED_RUN, NEXT_RUN = "killed-run", "next-run"
+
+    def _interrupted_transcript(self, next_items):
+        """The killed run left only its user turn (claude-cli never imported
+        its text or calls); the run that continues M is complete."""
+        self.history = {"messages": [
+            {"role": "user", "content": "check the logs", "idempotencyKey": f"{self.KILLED_RUN}:user"},
+            {"role": "user", "content": "[system] continue", "idempotencyKey": f"{self.NEXT_RUN}:user"},
+            *({"role": "assistant", "__openclaw": {"importedFrom": "claude-cli"}, "content": [b]}
+              for b in next_items),
+            {"role": "assistant", "idempotencyKey": f"cli-assistant:{self.NEXT_RUN}",
+             "content": [{"type": "text", "text": "\n\n".join(
+                 b["text"] for b in next_items if b["type"] == "text")}]},
+        ]}
+
+    @staticmethod
+    def _call(tcid, out="ok"):
+        return [{"type": "toolcall", "id": tcid, "name": "Bash", "arguments": {"command": "ls"}},
+                {"type": "tool_result", "tool_use_id": tcid, "name": "Bash",
+                 "content": [{"type": "text", "text": out}]}]
+
+    def _shape(self):
+        return [(o["type"], o.get("call_id") or o.get("id")) if o["type"] == "function_call"
+                else ("message", o["content"][0]["text"])
+                for o in self.m()["output"] if o["type"] in ("function_call", "message")]
+
+    async def test_a_resume_after_a_killed_run_keeps_what_the_killed_run_showed(self):
+        """Graceful window 2026-10-14 08:03Z (#21 7ee4488, case user, chat
+        1a5d9555): the killed run streamed its preamble and one card (Exit code
+        137), the pipe's resume ran the steps. Stored content was "...in the
+        foreground.USER-DONE-04f06c36": the resume's text glued on with no
+        break. The user keeps what the killed run showed, then the resume,
+        with the separator the live stream puts after a tool call."""
+        calls = [b for t in ("r1", "r2") for b in self._call(t)]
+        self._interrupted_transcript([calls[0]] + [calls[1]] + [calls[2]] + [calls[3]]
+                                     + [{"type": "text", "text": "USER-DONE"}])
+        self.history["messages"][2:6] = [
+            {"role": "assistant", "__openclaw": {"importedFrom": "claude-cli"}, "content": self._call(t)}
+            for t in ("r1", "r2")]
+        w = self.writer(run=self.KILLED_RUN)
+        await w.feed(_delta("I'll run the steps."))
+        await w.feed(_tool("start", tcid="toolu_k"))
+        await w.feed(_tool("result", tcid="toolu_k", result="Exit code 137"))
+        w.adopt(self.NEXT_RUN)
+        for t in ("r1", "r2"):
+            await w.feed(_tool("start", tcid=t))
+            await w.feed(_tool("result", tcid=t))
+        await w.feed(_delta("USER-DONE"))
+        await w.end({"status": "done", "hasActiveRun": False, "lastRunId": self.NEXT_RUN})
+        self.assertEqual(self.m()["content"], "I'll run the steps.\n\nUSER-DONE")
+        self.assertEqual(self._shape(), [("message", "I'll run the steps."), ("function_call", "toolu_k"),
+                                         ("function_call", "r1"), ("function_call", "r2"),
+                                         ("message", "\n\nUSER-DONE")])
+
+    async def test_a_killed_run_that_showed_only_text_keeps_it(self):
+        self._interrupted_transcript([*self._call("r1"), {"type": "text", "text": "USER-DONE"}])
+        self.history["messages"][2:4] = [
+            {"role": "assistant", "__openclaw": {"importedFrom": "claude-cli"}, "content": self._call("r1")}]
+        w = self.writer(run=self.KILLED_RUN)
+        await w.feed(_delta("I'll run the steps."))
+        w.adopt(self.NEXT_RUN)
+        await w.feed(_tool("start", tcid="r1"))
+        await w.feed(_delta("USER-DONE"))
+        await w.end({"status": "done", "hasActiveRun": False, "lastRunId": self.NEXT_RUN})
+        self.assertEqual(self.m()["content"], "I'll run the steps.\n\nUSER-DONE")
+
+    async def test_a_recovery_the_writer_joined_late_is_completed_from_its_transcript(self):
+        """Crash window 2026-10-14 08:22Z (#21 7ee4488, case user, chat
+        fbc93489): the Gateway's recovery started at boot before the pipe was
+        back, so the writer never saw its first text and card. Its transcript
+        has all of it; the killed run's card is in no transcript. Keeping the
+        whole stream (438428d) lost the recovery's start; replacing it all
+        (865f90f) lost the killed run's card."""
+        self._interrupted_transcript([{"type": "text", "text": "Checking the history."},
+                                      *self._call("r1"), {"type": "text", "text": "Ran again."}])
+        self.history["messages"][2:6] = [
+            {"role": "assistant", "__openclaw": {"importedFrom": "claude-cli"}, "content": [b]}
+            for b in ({"type": "text", "text": "Checking the history."},)] + [
+            {"role": "assistant", "__openclaw": {"importedFrom": "claude-cli"}, "content": self._call("r1")},
+            {"role": "assistant", "__openclaw": {"importedFrom": "claude-cli"},
+             "content": [{"type": "text", "text": "Ran again."}]}]
+        w = self.writer(run=self.KILLED_RUN)
+        await w.feed(_tool("start", tcid="toolu_k"))
+        w.adopt(self.NEXT_RUN)
+        await w.feed(_delta("\n\nRan again."))   # joined after r1: missed its start
+        await w.end({"status": "done", "hasActiveRun": False, "lastRunId": self.NEXT_RUN})
+        self.assertEqual(self._shape(), [("function_call", "toolu_k"),
+                                         ("message", "Checking the history."), ("function_call", "r1"),
+                                         ("message", "\n\nRan again.")])
+        self.assertEqual(self.m()["content"], "Checking the history.\n\nRan again.")
+
     async def test_send_now_keeps_writing_the_agent_turn(self):
         """DESIGN case 8: Send now cancels the task too, but the run keeps
         its message to the end; the queued message runs after (case 7)."""

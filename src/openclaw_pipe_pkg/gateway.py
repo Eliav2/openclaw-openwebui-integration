@@ -1145,6 +1145,11 @@ class _TurnRenderer:
         self._active_tool_args: dict[str, str] = {}
         self._tool_items: dict[str, dict] = {}
         self._tool_results: set[str] = set()
+        # A new run continues the message (resume, recovery, answer run): its
+        # first text gets the break the live stream puts between messages.
+        # The Gateway inserts it only inside one run (graceful window
+        # 2026-10-14: "...foreground.USER-DONE" across the resume).
+        self.run_boundary = False
 
     def _add(self, chunk: str) -> None:
         if chunk:
@@ -1153,6 +1158,9 @@ class _TurnRenderer:
     def _add_text(self, chunk: str) -> None:
         if not chunk:
             return
+        if self.run_boundary:
+            self.run_boundary = False
+            chunk = _message_boundary_separator(self.text, chunk) + chunk
         self._add(chunk)
         self.text += chunk
         last = self.output[-1] if self.output else None

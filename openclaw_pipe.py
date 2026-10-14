@@ -4274,6 +4274,11 @@ class _TurnRenderer:
         self._active_tool_args: dict[str, str] = {}
         self._tool_items: dict[str, dict] = {}
         self._tool_results: set[str] = set()
+        # A new run continues the message (resume, recovery, answer run): its
+        # first text gets the break the live stream puts between messages.
+        # The Gateway inserts it only inside one run (graceful window
+        # 2026-10-14: "...foreground.USER-DONE" across the resume).
+        self.run_boundary = False
 
     def _add(self, chunk: str) -> None:
         if chunk:
@@ -4282,6 +4287,9 @@ class _TurnRenderer:
     def _add_text(self, chunk: str) -> None:
         if not chunk:
             return
+        if self.run_boundary:
+            self.run_boundary = False
+            chunk = _message_boundary_separator(self.text, chunk) + chunk
         self._add(chunk)
         self.text += chunk
         last = self.output[-1] if self.output else None
@@ -7100,6 +7108,9 @@ class _TurnWriter:
         self.parent_id: str | None = None
         # every run written into M, in transcript order (_adopt_recoveries_from)
         self.runs = [run_id]
+        # Where each run's streamed part starts in the renderer, in adoption
+        # order: (run, output index, text length). See `_from_transcript`.
+        self.run_marks: list = [(run_id, 0, 0)]
         self.resumes = 0                # resume budget, counted on M (MAX_TURN_RESUMES)
         self.pending_resume = False     # a resume the Gateway refused; sent on the next hello-ok
         self.request: str | None = None  # the user's message M answers, quoted by a resume
@@ -7305,6 +7316,8 @@ class _TurnWriter:
         rule E maps here) is written into the same message."""
         if run_id not in self.runs:
             self.runs.append(run_id)
+            self.run_marks.append((run_id, len(self.renderer.output), len(self.renderer.text)))
+            self.renderer.run_boundary = True
         self.run_id = run_id
 
     def _adopt_recoveries_from(self, messages: list) -> None:
@@ -7497,11 +7510,9 @@ class _TurnWriter:
                     self._adopt_recoveries_from(hist.get("messages") or [])
                 if hist:
                     self._note_transcript_answers(hist.get("messages") or [])
-                per_run = [_history_span_messages(hist, r) for r in self.runs] if hist else [None]
-                if all(m is not None for m in per_run):
-                    rebuilt = _history_renderer([m for msgs in per_run for m in msgs])
-                    if rebuilt.output and self._holds_streamed_calls(rebuilt, "run's"):
-                        self.renderer = rebuilt
+                rebuilt = self._from_transcript(hist) if hist else None
+                if rebuilt is not None:
+                    self.renderer = rebuilt
                 if not (self._showable() or note):
                     await self._show_silent_announce(hist)
             if not self.opened:
@@ -7586,6 +7597,68 @@ class _TurnWriter:
                 and len(rebuilt.output) >= len(self.renderer.output)
                 and len(rebuilt.text) >= len(self.renderer.text) and rebuilt.output):
             self.renderer = rebuilt
+
+    def _from_transcript(self, hist: dict) -> "_TurnRenderer | None":
+        """M rebuilt from the transcript wherever the transcript holds it.
+
+        A run counts as covered when its span holds every call it streamed.
+        A killed or aborted claude-cli run is never covered: its calls and
+        text are never imported (graceful window 2026-10-14; run 64028b9f).
+        The transcript is used from the first run k after which every run is
+        covered; what streamed before run k's start is kept as it was, and
+        the rebuild follows it with the live stream's break. So a resume
+        after a killed run keeps the killed run's preamble and card, and a
+        recovery the writer joined late still gets its start back (crash
+        window 2026-10-14: its first text and card ran before the pipe was
+        back). None (keep what streamed) while a run has not closed, or when
+        the transcript covers nothing."""
+        spans = [_history_span_messages(hist, r) for r in self.runs]
+        if any(s is None for s in spans):
+            return None
+        out, text = self.renderer.output, self.renderer.text
+        starts = {run: (o, t) for run, o, t in self.run_marks}
+        order = sorted(self.run_marks, key=lambda m: m[1])
+
+        def streamed(run):
+            if run not in starts:
+                return []
+            o = starts[run][0]
+            end = min((m[1] for m in order if m[1] > o), default=len(out))
+            owner = [m for m in order if m[1] == o][-1][0]   # adopted last at this point
+            return out[o:end] if owner == run else []
+
+        def covered(run, span):
+            rebuilt = _history_renderer(span)
+            calls = {i.get("id") for i in rebuilt.output if i.get("type") == "function_call"}
+            seg = streamed(run)
+            return ({i.get("id") for i in seg if i.get("type") == "function_call"} <= calls
+                    and (bool(rebuilt.output) or not seg))
+        k = len(self.runs)
+        while k > 0 and covered(self.runs[k - 1], spans[k - 1]):
+            k -= 1
+        if k == len(self.runs):
+            pipe_log(f"  turn writer: the transcript covers none of {self.message_id[:8]}...'s "
+                     f"{len(self.runs)} run(s); keeping what streamed")
+            return None
+        rest = _history_renderer([m for s in spans[k:] for m in s])
+        if not rest.output:
+            return None
+        cut = min((starts[r] for r in self.runs[k:] if r in starts), default=(len(out), len(text)))
+        if k == 0 or cut == (0, 0):
+            return rest
+        prefix_out, prefix_text = copy.deepcopy(out[:cut[0]]), text[:cut[1]]
+        rest_out = rest.finished_output()
+        sep = _message_boundary_separator(prefix_text, rest.text) \
+            if prefix_text.strip() and rest.text else ""
+        if sep:
+            first = next(i for i in rest_out if i.get("type") == "message")
+            first["content"][0]["text"] = sep + first["content"][0]["text"]
+        composed = _TurnRenderer()
+        composed.output = prefix_out + rest_out
+        composed.text = composed.visible_text = prefix_text + sep + rest.text
+        pipe_log(f"  turn writer: {self.message_id[:8]}... keeps {len(prefix_out)} streamed item(s) of "
+                 f"{k} run(s) the transcript lacks, then {len(self.runs) - k} run(s) from it")
+        return composed
 
     def _holds_streamed_calls(self, rebuilt, whose: str) -> bool:
         """Whether a transcript rebuild holds every tool call that streamed
