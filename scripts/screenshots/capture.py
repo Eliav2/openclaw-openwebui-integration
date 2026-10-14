@@ -378,7 +378,7 @@ class Scenes:
         wait_js(page, f"""() => {{
           const r = document.querySelector('{root}'); if (!r) return false;
           const t = r.innerText;  // section headers are uppercased by CSS
-          return /subagents \(2\)/i.test(t) && t.includes('Fly.io') && t.includes('Render')
+          return /subagents \\(2\\)/i.test(t) && t.includes('Fly.io') && t.includes('Render')
             && /5h/.test(t) && /week/i.test(t);
         }}""", "the status dialog with two sub-agents and rate limits", 60_000)
         self.s.shot(page, "status-dialog", text_selector=root)
@@ -392,7 +392,7 @@ class Scenes:
             raise AssertionError(f"the sub-agent drawer opens behind the status dialog (computed z-index {z})")
         page.locator("#openclaw-drawer-root button", has_text="Transcript").first.click()
         wait_js(page, """() => { const d = document.querySelector('#openclaw-drawer-root');
-                 return d && d.innerText.includes('forecast/README.md'); }""",
+                 return d && /tool\\s*result/i.test(d.innerText) && d.innerText.includes('Forecast'); }""",
                 "the drawer transcript with the child's tool call", 60_000)
         self.s.shot(page, "subagent-drawer", text_selector="#openclaw-drawer-root")
 
