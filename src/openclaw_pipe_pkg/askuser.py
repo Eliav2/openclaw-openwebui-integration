@@ -426,6 +426,9 @@ _NATIVE_CARD_TIMEOUT_MS = 240_000
 # A card cancelled this fast was never seen: OWUI's frontend cancels
 # request:user_input at once when the user is viewing another chat.
 _NATIVE_CARD_UNSEEN_CANCEL_S = 1.5
+# How long a question card waits for a tab to view the chat again (a reload)
+# before the reply ends with the question as text (ELI-107 decision 2).
+_NATIVE_CARD_TAB_GRACE_S = 60
 
 
 def _owui_supports_native_ask_user() -> bool:
@@ -663,6 +666,7 @@ async def _ask_user_native_card(
     deadline = time.monotonic() + max_wait_s
     use_live_session = False
     waiting_shown = False
+    no_viewer_since = None
     while True:
         started = time.monotonic()
         if use_live_session:
@@ -691,8 +695,8 @@ async def _ask_user_native_card(
             if not use_live_session and not waiting_shown and not _user_has_live_session(
                     owui_user_id, owui_chat_id):
                 # The very first call found no live tab for this turn (an API
-                # caller, or a tab closed before the question) and the user has
-                # no other: nobody can see the card, so the reply ends now with
+                # caller, or a tab closed before the question) and no tab views
+                # the chat: nobody can see the card, so the reply ends now with
                 # the question as text rather than staying open for a
                 # reconnect (ELI-107: an hour).
                 pipe_log("  no live tab for this turn's question card; showing it as text")
@@ -700,6 +704,18 @@ async def _ask_user_native_card(
             # OWUI's __event_call__ is bound to the session that started the
             # turn; once that socket is gone, reach the user's new one.
             use_live_session = True
+        if use_live_session and response is None:
+            # No tab views the chat now. A reload brings one back within
+            # seconds; past the grace the reply ends with the question as
+            # text, so the stream does not outlive its run waiting for the
+            # user to come back (ELI-107 decision 2).
+            no_viewer_since = no_viewer_since or time.monotonic()
+            if time.monotonic() - no_viewer_since >= _NATIVE_CARD_TAB_GRACE_S:
+                pipe_log(f"  no tab came back to this chat within {_NATIVE_CARD_TAB_GRACE_S:g}s; "
+                         "showing the question as text")
+                return None
+        else:
+            no_viewer_since = None
         if time.monotonic() + poll_interval_s >= deadline:
             pipe_log(f"  gave up on the native question card after {int(max_wait_s)}s")
             return None
