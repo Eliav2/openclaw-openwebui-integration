@@ -1810,8 +1810,12 @@ class Pipe:
                                 # be checked reliably. Resolved once the run ends
                                 # (see the `else:` clause below) or as soon as the
                                 # buffered text diverges from every trigger.
+                                # A fence the shown text left open makes a marker a quote
+                                # (ELI-107); held text always starts outside one.
                                 flush_text, pending_prompt_text = (
-                                    _advance_input_prompt_buffer(pending_prompt_text, delta)
+                                    _advance_input_prompt_buffer(
+                                        pending_prompt_text, delta,
+                                        _fence_open_after(assistant_stream_text))
                                 )
                                 if not flush_text:
                                     continue

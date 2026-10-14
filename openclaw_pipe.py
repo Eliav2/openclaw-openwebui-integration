@@ -2056,7 +2056,20 @@ def _could_be_user_input_prefix(normalized_text: str) -> bool:
     )
 
 
-def _marker_line_index(text: str):
+_CODE_FENCE_RE = re.compile(r"^[ \t]{0,3}(```|~~~)")
+
+
+def _fence_open_after(text: str, in_fence: bool = False) -> bool:
+    """Whether a fenced code block is open at the end of `text`, which starts
+    with a fence open (`in_fence`) or not. A line that starts with ``` or
+    ~~~ opens or closes one."""
+    for line in (text or "").split("\n"):
+        if _CODE_FENCE_RE.match(line):
+            in_fence = not in_fence
+    return in_fence
+
+
+def _marker_line_index(text: str, in_fence: bool = False):
     """Index of the first line that opens a needs-input block, else None.
 
     The marker only counts at the start of a line, but it does NOT have to be
@@ -2068,19 +2081,26 @@ def _marker_line_index(text: str):
     leaked into the chat as raw text with no dialog (seen live 2026-08-01 on a
     claude-cli turn; token-streamed turns were unaffected, which is why this
     looked intermittent).
+
+    A line inside a fenced code block is a quote, not a prompt (ELI-107: a
+    report quoting the block in a fence was held as a live prompt and hung).
+    `in_fence`: a fence is open where `text` starts.
     """
     start = 0
     while True:
         nl = text.find("\n", start)
         line = text[start:] if nl == -1 else text[start:nl]
-        if _is_user_input_prompt(line):
+        if _CODE_FENCE_RE.match(line):
+            in_fence = not in_fence
+        elif not in_fence and _is_user_input_prompt(line):
             return start
         if nl == -1:
             return None
         start = nl + 1
 
 
-def _advance_input_prompt_buffer(pending: str, delta: str) -> tuple[str, str]:
+def _advance_input_prompt_buffer(pending: str, delta: str,
+                                 in_fence: bool = False) -> tuple[str, str]:
     """Feed a new assistant-delta chunk into the needs-input buffering state.
 
     Returns `(text_to_yield_now, new_pending)`. `pending` is text already
@@ -2096,20 +2116,23 @@ def _advance_input_prompt_buffer(pending: str, delta: str) -> tuple[str, str]:
     its own (P22 follow-up, 2026-07-08 -- caught live: a reply that talked
     normally first and only asked its question in the next paragraph never
     got buffered, because the newline landed mid-delta, not at its edge).
+
+    `in_fence`: a fenced code block is open where `pending + delta` starts
+    (the shown text left it open); nothing in a fence is held (ELI-107).
     """
     candidate = pending + delta
-    if _could_be_user_input_prefix(candidate.lstrip()):
+    if not in_fence and _could_be_user_input_prefix(candidate.lstrip()):
         return "", candidate
     # A complete marker may sit mid-candidate when the whole reply arrives at
     # once. Flush what precedes it and hold from the marker onward.
-    marker_at = _marker_line_index(candidate)
+    marker_at = _marker_line_index(candidate, in_fence)
     if marker_at is not None:
         return candidate[:marker_at], candidate[marker_at:]
     idx = candidate.rfind("\n")
     if idx == -1:
         return candidate, ""
     before, after = candidate[: idx + 1], candidate[idx + 1 :]
-    if after and _could_be_user_input_prefix(after.lstrip()):
+    if after and not _fence_open_after(before, in_fence) and _could_be_user_input_prefix(after.lstrip()):
         return before, after
     return before + after, ""
 
@@ -2557,6 +2580,15 @@ def _format_native_answers(questions: list[dict], answers: dict) -> str:
     return "\n".join(f"{header}: {text}" for header, text in lines)
 
 
+def _user_has_live_session(owui_user_id: str) -> bool:
+    """Whether the user has a connected Open WebUI socket now."""
+    try:
+        from open_webui.socket.main import SESSION_POOL
+    except Exception:
+        return False
+    return bool(_live_session_id_for_user(owui_user_id, SESSION_POOL))
+
+
 async def _call_native_card_on_live_session(
     owui_user_id: str, owui_chat_id: str | None, owui_message_id: str | None, payload: dict
 ):
@@ -2652,6 +2684,14 @@ async def _ask_user_native_card(
             return None
         if isinstance(response, dict) and "disconnected" in str(response.get("error", "")):
             if not owui_user_id:
+                return None
+            if not use_live_session and not waiting_shown and not _user_has_live_session(owui_user_id):
+                # The very first call found no live tab for this turn (an API
+                # caller, or a tab closed before the question) and the user has
+                # no other: nobody can see the card, so the reply ends now with
+                # the question as text rather than staying open for a
+                # reconnect (ELI-107: an hour).
+                pipe_log("  no live tab for this turn's question card; showing it as text")
                 return None
             # OWUI's __event_call__ is bound to the session that started the
             # turn; once that socket is gone, reach the user's new one.
@@ -9486,8 +9526,12 @@ class Pipe:
                                 # be checked reliably. Resolved once the run ends
                                 # (see the `else:` clause below) or as soon as the
                                 # buffered text diverges from every trigger.
+                                # A fence the shown text left open makes a marker a quote
+                                # (ELI-107); held text always starts outside one.
                                 flush_text, pending_prompt_text = (
-                                    _advance_input_prompt_buffer(pending_prompt_text, delta)
+                                    _advance_input_prompt_buffer(
+                                        pending_prompt_text, delta,
+                                        _fence_open_after(assistant_stream_text))
                                 )
                                 if not flush_text:
                                     continue
