@@ -1187,12 +1187,20 @@ def _extract_transcript_and_tools(messages: list) -> tuple[list, list]:
     text_rows: list = []
     tool_calls: list = []
     pending_by_id: dict = {}
+
+    def add_text(role, text):
+        if role == "user" and _is_spawn_message(text):
+            # A child's first message is the Gateway's spawn wrapper: show
+            # the task in it, as the Subagents row does.
+            text = _subagent_task_text(text) or text
+        text_rows.append({"role": role, "text": text})
+
     for m in messages or []:
         role = m.get("role")
         content = m.get("content")
         if isinstance(content, str):
             if content.strip():
-                text_rows.append({"role": role, "text": content})
+                add_text(role, content)
             continue
         if not isinstance(content, list):
             continue
@@ -1226,7 +1234,7 @@ def _extract_transcript_and_tools(messages: list) -> tuple[list, list]:
                     # chat tool cards already do.
                     call["isError"] = bool(item.get("is_error"))
         if text_parts:
-            text_rows.append({"role": role, "text": "\n".join(text_parts)})
+            add_text(role, "\n".join(text_parts))
     return text_rows, tool_calls
 
 
