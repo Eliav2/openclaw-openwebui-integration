@@ -2448,6 +2448,9 @@ _NATIVE_CARD_TIMEOUT_MS = 240_000
 # A card cancelled this fast was never seen: OWUI's frontend cancels
 # request:user_input at once when the user is viewing another chat.
 _NATIVE_CARD_UNSEEN_CANCEL_S = 1.5
+# How long a question card waits for a tab to view the chat again (a reload)
+# before the reply ends with the question as text (ELI-107 decision 2).
+_NATIVE_CARD_TAB_GRACE_S = 60
 
 
 def _owui_supports_native_ask_user() -> bool:
@@ -2600,13 +2603,14 @@ def _format_native_answers(questions: list[dict], answers: dict) -> str:
     return "\n".join(f"{header}: {text}" for header, text in lines)
 
 
-def _user_has_live_session(owui_user_id: str) -> bool:
-    """Whether the user has a connected Open WebUI socket now."""
+def _user_has_live_session(owui_user_id: str, owui_chat_id: str | None = None) -> bool:
+    """Whether the user has a connected Open WebUI socket now that a card
+    for `owui_chat_id` could be shown on (`_live_session_id_for_user`)."""
     try:
         from open_webui.socket.main import SESSION_POOL
     except Exception:
         return False
-    return bool(_live_session_id_for_user(owui_user_id, SESSION_POOL))
+    return bool(_live_session_id_for_user(owui_user_id, SESSION_POOL, owui_chat_id))
 
 
 async def _call_native_card_on_live_session(
@@ -2621,7 +2625,7 @@ async def _call_native_card_on_live_session(
     except Exception as ex:
         pipe_log(f"  native card retry unavailable (not running inside OWUI process?): {ex}")
         return None
-    sid = _live_session_id_for_user(owui_user_id, SESSION_POOL)
+    sid = _live_session_id_for_user(owui_user_id, SESSION_POOL, owui_chat_id)
     if not sid:
         return None
     interaction_id = str(uuid.uuid4())
@@ -2680,6 +2684,7 @@ async def _ask_user_native_card(
     deadline = time.monotonic() + max_wait_s
     use_live_session = False
     waiting_shown = False
+    no_viewer_since = None
     while True:
         started = time.monotonic()
         if use_live_session:
@@ -2705,10 +2710,11 @@ async def _ask_user_native_card(
         if isinstance(response, dict) and "disconnected" in str(response.get("error", "")):
             if not owui_user_id:
                 return None
-            if not use_live_session and not waiting_shown and not _user_has_live_session(owui_user_id):
+            if not use_live_session and not waiting_shown and not _user_has_live_session(
+                    owui_user_id, owui_chat_id):
                 # The very first call found no live tab for this turn (an API
-                # caller, or a tab closed before the question) and the user has
-                # no other: nobody can see the card, so the reply ends now with
+                # caller, or a tab closed before the question) and no tab views
+                # the chat: nobody can see the card, so the reply ends now with
                 # the question as text rather than staying open for a
                 # reconnect (ELI-107: an hour).
                 pipe_log("  no live tab for this turn's question card; showing it as text")
@@ -2716,6 +2722,18 @@ async def _ask_user_native_card(
             # OWUI's __event_call__ is bound to the session that started the
             # turn; once that socket is gone, reach the user's new one.
             use_live_session = True
+        if use_live_session and response is None:
+            # No tab views the chat now. A reload brings one back within
+            # seconds; past the grace the reply ends with the question as
+            # text, so the stream does not outlive its run waiting for the
+            # user to come back (ELI-107 decision 2).
+            no_viewer_since = no_viewer_since or time.monotonic()
+            if time.monotonic() - no_viewer_since >= _NATIVE_CARD_TAB_GRACE_S:
+                pipe_log(f"  no tab came back to this chat within {_NATIVE_CARD_TAB_GRACE_S:g}s; "
+                         "showing the question as text")
+                return None
+        else:
+            no_viewer_since = None
         if time.monotonic() + poll_interval_s >= deadline:
             pipe_log(f"  gave up on the native question card after {int(max_wait_s)}s")
             return None
@@ -2816,17 +2834,25 @@ def _normalize_event_call_response(response) -> str:
     return ""
 
 
-def _live_session_id_for_user(user_id: str, session_pool) -> str | None:
+def _live_session_id_for_user(user_id: str, session_pool, chat_id: str | None = None) -> str | None:
     """Find a currently-connected OWUI session_id belonging to user_id.
 
     session_pool is OWUI's own SESSION_POOL dict (sid -> user dict with an
     'id' field), imported live from the running process -- see
     _retry_modal_on_reconnect for why this only works inside OWUI itself.
+
+    With `chat_id`, only a socket viewing that chat: OWUI 0.12 records the
+    chats a socket has joined (`chat_ids`, events:chat join/leave). The
+    user's first socket can be another tab or another client, where the card
+    never shows (ELI-58 live repro). The newest such socket is the tab the
+    user opened last; with none, None, so the card waits for the user to
+    open the chat. An OWUI that records no `chat_ids` gets any socket.
     """
-    for sid, session in list(session_pool.items()):
-        if session and session.get("id") == user_id:
-            return sid
-    return None
+    mine = [(sid, s) for sid, s in list(session_pool.items()) if s and s.get("id") == user_id]
+    if chat_id and any("chat_ids" in s for _sid, s in mine):
+        viewing = [sid for sid, s in mine if chat_id in (s.get("chat_ids") or [])]
+        return viewing[-1] if viewing else None
+    return mine[0][0] if mine else None
 
 
 async def _retry_modal_on_reconnect(
