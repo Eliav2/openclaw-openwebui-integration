@@ -61,6 +61,9 @@ jobs:
 
       - uses: astral-sh/setup-uv@v10.3.0
 
+      # Runs the vendored Open WebUI frontend reducer for the live-order tests.
+      - uses: oven-sh/setup-bun@v2
+
       - name: Install dependencies
         run: uv pip install --system -r requirements-dev.txt
 
@@ -100,6 +103,7 @@ jobs:
         run: |
           set -a; . e2e/versions.env; set +a
           python3 scripts/check_owui_fixture.py --ref "$OWUI_REF"
+          python3 scripts/check_owui_frontend_fixture.py --ref "$OWUI_REF"
 
   secrets:
     name: Secret scan

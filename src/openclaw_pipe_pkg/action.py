@@ -140,8 +140,9 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
 
   function sectionHeader(text) {
     const h = document.createElement('div');
-    h.className = 'text-[10px] font-semibold tracking-wide uppercase '
+    h.className = 'font-semibold tracking-wide uppercase '
       + 'text-gray-400 dark:text-gray-500 mb-1.5';
+    h.style.fontSize = '10px';  // inline: see the panel's width below
     h.textContent = text;
     return h;
   }
@@ -274,7 +275,7 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
 
   const panel = document.createElement('div');
   panel.className = 'bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 '
-    + 'rounded-2xl shadow-2xl border border-gray-100 dark:border-gray-800 p-5';
+    + 'rounded-2xl shadow-xl border border-gray-100 dark:border-gray-800 p-5';
   // Inline, not a `w-[380px] max-w-[90vw]` utility class: same reasoning as
   // barColor() below -- an arbitrary-value class OWUI's own Tailwind build
   // never scanned out of its own source can silently carry zero CSS.
@@ -431,17 +432,19 @@ _CONTEXT_FILL_JS_TEMPLATE = r"""
   const headerRow = document.createElement('div');
   headerRow.className = 'flex items-center justify-between mb-1.5';
   const headerLabel = document.createElement('div');
-  headerLabel.className = 'text-[10px] font-semibold tracking-wide uppercase '
+  headerLabel.className = 'font-semibold tracking-wide uppercase '
     + 'text-gray-400 dark:text-gray-500';
+  headerLabel.style.fontSize = '10px';
   headerLabel.textContent = 'Context';
   headerRow.appendChild(headerLabel);
   if (S.identity.chatId && S.identity.messageId && S.identity.sessionId) {
     const compactBtn = document.createElement('button');
     compactBtn.type = 'button';
     compactBtn.textContent = 'Compact';
-    compactBtn.className = 'text-[10px] font-medium px-2 py-0.5 rounded-full '
+    compactBtn.className = 'font-medium px-2 py-0.5 rounded-full '
       + 'border border-gray-200 dark:border-gray-700 text-gray-500 dark:text-gray-400 '
-      + 'hover:text-gray-800 dark:hover:text-gray-100 hover:border-gray-300 dark:hover:border-gray-600';
+      + 'hover:text-gray-800 dark:hover:text-gray-100';
+    compactBtn.style.fontSize = '10px';
     compactBtn.onclick = S.triggerCompact;
     headerRow.appendChild(compactBtn);
   }
@@ -614,7 +617,8 @@ _SUBAGENTS_FILL_JS_TEMPLATE = r"""
     row.appendChild(body);
 
     const elapsed = document.createElement('span');
-    elapsed.className = 'text-[10px] text-gray-400 dark:text-gray-500 shrink-0 mt-1.5';
+    elapsed.className = 'text-gray-400 dark:text-gray-500 shrink-0 mt-1.5';
+    elapsed.style.fontSize = '10px';
     elapsed.textContent = S.elapsedTime(t.startedAt, t.endedAt);
     row.appendChild(elapsed);
 
@@ -647,7 +651,11 @@ _DRAWER_OPEN_JS_TEMPLATE = r"""
 
   const root = document.createElement('div');
   root.id = 'openclaw-drawer-root';
-  root.className = 'fixed inset-0 z-[10000]';
+  root.className = 'fixed inset-0';
+  // Inline: Open WebUI's CSS has no `z-[10000]` rule, so with the class the
+  // drawer had no z-index at all and opened behind the Status dialog
+  // (z-[9999]), which then swallowed every click on it (ELI-118).
+  root.style.zIndex = '10000';
 
   const backdrop = document.createElement('div');
   backdrop.className = 'absolute inset-0';
@@ -658,7 +666,7 @@ _DRAWER_OPEN_JS_TEMPLATE = r"""
   const panel = document.createElement('div');
   panel.className = 'absolute right-0 top-0 bottom-0 '
     + 'bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 '
-    + 'shadow-2xl border-l border-gray-100 dark:border-gray-800 flex flex-col';
+    + 'shadow-xl border-l border-gray-100 dark:border-gray-800 flex flex-col';
   // Inline, not a `w-[420px] max-w-[92vw]` utility class -- same reasoning
   // as the status modal's panel above. min() keeps this mobile-first: a
   // narrow viewport wins the 88vw side (leaves a visible margin so the
@@ -892,7 +900,8 @@ _DRAWER_TRANSCRIPT_FILL_JS_TEMPLATE = r"""
     const row = document.createElement('div');
     row.className = 'text-xs mb-2.5 ' + (ROLE_STYLE[m.role] || ROLE_STYLE.assistant);
     const roleLabel = document.createElement('div');
-    roleLabel.className = 'text-[10px] uppercase tracking-wide text-gray-400 dark:text-gray-500 mb-0.5';
+    roleLabel.className = 'uppercase tracking-wide text-gray-400 dark:text-gray-500 mb-0.5';
+    roleLabel.style.fontSize = '10px';
     roleLabel.textContent = m.role;
     row.appendChild(roleLabel);
     const text = document.createElement('div');
@@ -964,8 +973,9 @@ _DRAWER_TOOLS_FILL_JS_TEMPLATE = r"""
 
     if (c.result) {
       const resultLabel = document.createElement('div');
-      resultLabel.className = 'text-[10px] uppercase tracking-wide text-gray-400 '
+      resultLabel.className = 'uppercase tracking-wide text-gray-400 '
         + 'dark:text-gray-500 mt-1.5';
+      resultLabel.style.fontSize = '10px';
       resultLabel.textContent = 'Result';
       details.appendChild(resultLabel);
       const resultEl = document.createElement('pre');
@@ -1082,6 +1092,16 @@ def _subagent_task_text(text):
     return task or None
 
 
+# A spawn's first message in any whitespace form: lastMessagePreview flattens
+# it to one line, so the header-on-its-own-line test above does not apply.
+_SUBAGENT_SPAWN_RE = re.compile(
+    r"^\s*(?:<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\s*)?\[Subagent Context\].*\[Subagent Task\]", re.S)
+
+
+def _is_spawn_message(text):
+    return isinstance(text, str) and bool(_SUBAGENT_SPAWN_RE.match(text))
+
+
 def _subagent_task_texts(previews_resp):
     """{child key: task text} from a sessions.preview answer. The preview
     holds a session's newest items, so a long-running child's first message
@@ -1101,6 +1121,9 @@ def _subagent_row(row, task_text=None):
     as the Tasks API had it, else the spawn label, else the key."""
     status = _subagent_status(row.get("status"))
     preview = row.get("lastMessagePreview")
+    if _is_spawn_message(preview):
+        # Just spawned: the newest message is still the task (ELI-119).
+        preview = None
     return {
         "id": row["key"],
         "title": task_text or row.get("label") or row["key"],
@@ -1196,8 +1219,10 @@ def _extract_transcript_and_tools(messages: list) -> tuple[list, list]:
             elif item_type == "tool_result":
                 call = pending_by_id.get(item.get("tool_use_id"))
                 if call is not None:
-                    result = item.get("content")
-                    call["result"] = result if isinstance(result, str) else json.dumps(result)
+                    # The output, by the chat tool cards' rule (gateway.py):
+                    # not the block list or the {content, details} envelope
+                    # as JSON (ELI-125).
+                    call["result"] = _tool_result_text(item.get("content"))
                     # Real tool_result rows carry is_error; surfacing it here
                     # lets the card mark a failure the same way the inline
                     # chat tool cards already do.
