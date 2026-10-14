@@ -418,7 +418,19 @@ class Scenes:
         page.locator(".chat-assistant").last.locator("[role=button]").first.click()
         wait_js(page, f"() => {{ const a = {LAST_ASSISTANT}; return a && /output/i.test(a.innerText) && a.innerText.includes('git log'); }}",
                 "the opened card's input and output")
-        self.s.shot(page, "tool-card-expanded", selector=".chat-assistant >> nth=-1")
+        # Just the opened card, centred in the viewport and below the chat's
+        # sticky header (an element shot puts the header over its top).
+        clip = f"""() => {{
+          const btn = {LAST_ASSISTANT}.querySelector('[role=button]');
+          let card = btn;
+          while (card.parentElement && !/output/i.test(card.innerText)) card = card.parentElement;
+          card.scrollIntoView({{block: 'center'}});
+          const r = card.getBoundingClientRect();
+          const nav = document.querySelector('nav');
+          const top = Math.max(r.top - 12, nav ? nav.getBoundingClientRect().bottom : 0, 0);
+          return {{x: 0, y: top, width: innerWidth, height: Math.min(r.bottom + 12, innerHeight) - top}};
+        }}"""
+        self.s.shot(page, "tool-card-expanded", clip_js=clip, text_selector=".chat-assistant >> nth=-1")
 
     def composer_status(self, page: Page) -> None:
         page.goto(f"{BASE}/c/{self.hero_chat}")
