@@ -12,6 +12,7 @@ import copy
 import inspect
 import json
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -9764,6 +9765,407 @@ class MediaDirectiveCodeAwareTests(unittest.IsolatedAsyncioTestCase):
         card = next(i for i, c in enumerate(seen) if not isinstance(c, str))
         before = "".join(c for c in seen[:card] if isinstance(c, str))
         self.assertIn("A stray ` tick, ![x.png](https://x/x.png)\nand", before)
+
+
+def _owui_stream(chunks) -> tuple[str, list, list]:
+    """(content, output, live) for a pipe's yields as Open WebUI 0.12's
+    streaming loop (`middleware.py`) handles them. `content` joins the text
+    chunks (`content_parts`). `output` is the backend's list, which is saved:
+    a text chunk appends to the last message item, or opens one after any
+    other item; a dict goes through the vendored
+    `handle_responses_streaming_event`; the last message's text is stripped
+    when the stream ends. `live` is what the backend sends the chat tab
+    (`emit_response_completion_event`): a text chunk as an
+    `output_text.delta` on its target item's id and index, a dict as is."""
+    from test_fixture_owui_streaming_handler import handle_responses_streaming_event
+    output, parts, live = [], [], []
+    for c in chunks:
+        if isinstance(c, str):
+            if not c:
+                continue
+            parts.append(c)
+            if not output or output[-1].get("type") != "message":
+                output.append({"type": "message", "id": f"msg_{len(output)}", "role": "assistant",
+                               "content": [{"type": "output_text", "text": ""}]})
+            output[-1]["content"][-1]["text"] += c
+            live.append({"type": "response.output_text.delta", "item_id": output[-1]["id"],
+                         "output_index": len(output) - 1,
+                         "content_index": len(output[-1]["content"]) - 1, "delta": c})
+        elif isinstance(c, dict) and c.get("type", "").startswith("response."):
+            output, _ = handle_responses_streaming_event(c, output)
+            live.append(c)
+    if output and output[-1].get("type") == "message":
+        output[-1]["content"][-1]["text"] = output[-1]["content"][-1]["text"].strip()
+    return "".join(parts), output, live
+
+
+def _owui_saved(chunks) -> tuple[str, list]:
+    """(content, output) Open WebUI 0.12 saves for a pipe's yields."""
+    content, output, _live = _owui_stream(chunks)
+    return content, output
+
+
+def _owui_live_output(events: list) -> list:
+    """The output list an Open WebUI 0.12 chat tab renders while the reply
+    streams: `events` folded by the vendored frontend reducer
+    (`test_fixture_owui_structured_output.ts`), run with bun."""
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "owui_live_fold.ts")
+    done = subprocess.run(["bun", script], input=json.dumps(events), capture_output=True,
+                          text=True, check=True, timeout=60)
+    return json.loads(done.stdout)
+
+
+def _item_order(output: list) -> list:
+    """Each output item as (type, id or call_id, message text)."""
+    return [(i.get("type"), i.get("call_id") or i.get("id"),
+             "".join(str(p.get("text", "")) for p in i.get("content") or []).strip()
+             if i.get("type") == "message" else None) for i in output]
+
+
+class LiveToolCardOrderTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-122 (ELI-110 screenshots, run 38605371115): while a reply
+    streamed, the text written before a tool call showed under that call's
+    card; after a reload the order was right. The tab folds a tool card's
+    `output_item.added` with the frontend reducer, which splices an item with
+    no `output_index` in before the last one, while the backend (what is
+    saved) appends it. What the tab shows live must be what is saved."""
+
+    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
+    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
+    _queue = NoDroppedMessagesTests._queue
+    _delta = NoDroppedMessagesTests._delta
+    _final = NoDroppedMessagesTests._final
+    _until_registered = NoDroppedMessagesTests._until_registered
+
+    def _tool(self, phase, tcid, **data):
+        return {"type": "event", "event": "agent", "payload": {
+            "sessionKey": self.SK, "runId": "run-1", "stream": "tool",
+            "data": {"phase": phase, "toolCallId": tcid, "name": "Bash", "args": {"command": "ls"},
+                     **data}}}
+
+    async def _run(self, events):
+        """One run fed `events` (str = text delta); (saved, live) outputs."""
+        if shutil.which("bun") is None:
+            if os.environ.get("CI"):
+                self.fail("bun is missing: the live-order tests must run in CI")
+            self.skipTest("bun runs the vendored Open WebUI frontend reducer")
+
+        async def emitter(event):
+            pass
+        body = {"model": "openclaw_gateway.default", "messages": [{"role": "user", "content": "go"}]}
+        meta = {"chat_id": "chat-1", "user_id": "u1", "message_id": "m1"}
+        gen = self.pipe._pipe_impl(body, emitter, __metadata__=meta)
+
+        async def drain():
+            return [c async for c in gen]
+        task = asyncio.ensure_future(drain())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        for ev in events:
+            q.put_nowait(self._delta("run-1", ev) if isinstance(ev, str) else ev)
+        q.put_nowait(self._final("run-1"))
+        _content, saved, live = _owui_stream(await asyncio.wait_for(task, 5))   # bounds the test only
+        return saved, _owui_live_output(live)
+
+    async def test_text_before_a_tool_call_shows_above_its_card(self):
+        saved, live = await self._run([
+            "Let me look first.", self._tool("start", "t1"),
+            self._tool("result", "t1", result="a.txt"), "Found it."])
+        self.assertEqual([t for t, _id, _x in _item_order(saved)],
+                         ["message", "function_call", "function_call_output", "message"])
+        self.assertEqual(_item_order(live), _item_order(saved))
+
+    async def test_parallel_and_back_to_back_calls_keep_their_order_live(self):
+        saved, live = await self._run([
+            "Two at once.", self._tool("start", "t1"), self._tool("start", "t2"),
+            self._tool("result", "t2", result="b"), self._tool("result", "t1", result="a"),
+            "Then one more.", self._tool("start", "t3"), self._tool("result", "t3", result="c"),
+            "Done."])
+        self.assertEqual([t for t, _id, _x in _item_order(saved)],
+                         ["message", "function_call", "function_call", "function_call_output",
+                          "function_call_output", "message", "function_call",
+                          "function_call_output", "message"])
+        self.assertEqual(_item_order(live), _item_order(saved))
+
+    async def test_a_reply_that_starts_with_a_tool_call(self):
+        saved, live = await self._run([
+            self._tool("start", "t1"), self._tool("result", "t1", result="x"), "After."])
+        self.assertEqual(_item_order(live), _item_order(saved))
+
+
+class MediaDirectiveLineBreakTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-113 (found during ELI-111, 2026-10-14): the line break after a
+    streamed directive was dropped when the chunk ended right after it, so
+    the next line was glued onto the image: `Real: MEDIA:c.p` + `ng\\n` +
+    `Next line` was saved as `![c.png](...)Next line`. Where a stream is cut
+    must not change what Open WebUI saves."""
+
+    BASE = "https://x"
+    IMG = "![c.png](https://x/c.png)"
+
+    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
+    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
+    _queue = NoDroppedMessagesTests._queue
+    _delta = NoDroppedMessagesTests._delta
+    _final = NoDroppedMessagesTests._final
+    _until_registered = NoDroppedMessagesTests._until_registered
+
+    async def _saved(self, chunks):
+        """Stream `chunks` as one run's deltas; (content, message texts)
+        Open WebUI saves."""
+        self.pipe.valves.USE_OWUI_FILES = False
+        self.pipe.valves.FILE_SERVER_BASE_URL = self.BASE
+
+        async def emitter(event):
+            pass
+        body = {"model": "openclaw_gateway.default", "messages": [{"role": "user", "content": "go"}]}
+        meta = {"chat_id": "chat-1", "user_id": "u1", "message_id": "m1"}
+        gen = self.pipe._pipe_impl(body, emitter, __metadata__=meta)
+
+        async def drain():
+            return [c async for c in gen]
+        task = asyncio.ensure_future(drain())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        for c in chunks:
+            q.put_nowait(self._delta("run-1", c))
+        q.put_nowait(self._final("run-1"))
+        content, output = _owui_saved(await asyncio.wait_for(task, 5))   # bounds the test only
+        texts = [p["text"] for i in output if i.get("type") == "message" for p in i["content"]]
+        return content, texts
+
+    async def _fresh(self):
+        await self.asyncTearDown()
+        await self.asyncSetUp()
+
+    def test_a_stream_holds_the_break_until_the_next_line_starts(self):
+        self.assertEqual(_advance_media_buffer("", "Real: MEDIA:c.png\n"), ("Real: ", "MEDIA:c.png\n"))
+        self.assertEqual(_advance_media_buffer("MEDIA:c.png\n", "Next"), ("MEDIA:c.png\nNext", ""))
+        self.assertEqual(_resolve_media("MEDIA:c.png\n", base_url=self.BASE), (self.IMG, True))
+
+    async def test_the_reported_split_keeps_the_line_break(self):
+        content, texts = await self._saved(["Real: MEDIA:c.p", "ng\n", "Next line"])
+        self.assertEqual(content, f"Real: {self.IMG}\nNext line")
+        self.assertEqual(texts, [f"Real: {self.IMG}\nNext line"])
+
+    async def test_a_line_break_ending_a_chunk_after_a_directive_is_kept(self):
+        content, texts = await self._saved(["Real: MEDIA:c.png\nmore\n", "next"])
+        self.assertEqual(content, f"Real: {self.IMG}\nmore\nnext")
+        self.assertEqual(texts, [f"Real: {self.IMG}\nmore\nnext"])
+
+    async def test_every_split_saves_what_one_chunk_saves(self):
+        text = "Real: MEDIA:c.png\nNext line\nMEDIA:d.png  and more\nend\n"
+        whole = await self._saved([text])
+        self.assertEqual(whole[0], f"Real: {self.IMG}\nNext line\n![d.png](https://x/d.png)\nand more\nend\n")
+        for cut in range(1, len(text)):
+            with self.subTest(cut=cut):
+                await self._fresh()
+                self.assertEqual(await self._saved([text[:cut], text[cut:]]), whole)
+        with self.subTest(chunk=1):
+            await self._fresh()
+            self.assertEqual(await self._saved(list(text)), whole)
+
+
+def _card_output_text(output: list, call_id: str) -> str:
+    """The Output a tool card shows: Open WebUI 0.12's `getToolResultText`
+    (`structuredOutput.ts`), the text parts of the call's
+    `function_call_output`, images left out."""
+    item = next(i for i in output if i.get("type") == "function_call_output"
+                and i.get("call_id") == call_id)
+    return "".join(str(p.get("text", "")) for p in item.get("output") or []
+                   if p.get("type") != "input_image" and p.get("text") is not None)
+
+
+class ToolCardOutputTextTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-121 (ELI-110 screenshots, run 38605371115): a tool card's Output
+    showed the result envelope, `{"content": [...], "details": {..., "cwd":
+    ...}}`, instead of the command's output: the pipe and the turn renderer
+    json-dumped the whole result. OpenClaw sends a tool result as a string,
+    a list of content blocks, or the agent-tool envelope (`content` +
+    `details`, `sanitizeToolResult`); the card shows the content's text, and
+    `details` (status, exit code, cwd, ...) stays out of it."""
+
+    # The exec tool's result as OpenClaw sends it (`ExecToolDetails`,
+    # bash-tools.exec-types.ts; `sanitizeToolResult` keeps both keys).
+    ENVELOPE = {"content": [{"type": "text", "text": "README.md\nsrc"}],
+                "details": {"status": "completed", "exitCode": 0, "durationMs": 14,
+                            "aggregated": "README.md\nsrc", "cwd": "/home/runner/work"}}
+    CASES = (
+        (ENVELOPE, "README.md\nsrc"),
+        ({"content": [{"type": "text", "text": "line 1"}, {"type": "text", "text": "line 2"}],
+          "details": {"truncated": False}}, "line 1\nline 2"),
+        ({"content": [{"type": "text", "text": "Shot taken."},
+                      {"type": "image", "mimeType": "image/png", "bytes": 2048, "omitted": True}],
+          "details": {"path": "/tmp/s.png"}}, "Shot taken.\n[image/png image]"),
+        ([{"type": "text", "text": "from a CLI tool"}], "from a CLI tool"),
+        ("plain text", "plain text"),
+        ({"ok": True, "count": 2}, json.dumps({"ok": True, "count": 2})),
+    )
+
+    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
+    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
+    _queue = NoDroppedMessagesTests._queue
+    _final = NoDroppedMessagesTests._final
+    _until_registered = NoDroppedMessagesTests._until_registered
+
+    def _tool(self, phase, **data):
+        return {"type": "event", "event": "agent", "payload": {
+            "sessionKey": self.SK, "runId": "run-1", "stream": "tool",
+            "data": {"phase": phase, "toolCallId": "t1", "name": "exec",
+                     "args": {"command": "ls"}, **data}}}
+
+    async def _inline_card(self, result, is_error=False) -> str:
+        """What the card shows after a pipe run with one tool call."""
+        async def emitter(event):
+            pass
+        body = {"model": "openclaw_gateway.default", "messages": [{"role": "user", "content": "go"}]}
+        meta = {"chat_id": "chat-1", "user_id": "u1", "message_id": "m1"}
+        gen = self.pipe._pipe_impl(body, emitter, __metadata__=meta)
+
+        async def drain():
+            return [c async for c in gen]
+        task = asyncio.ensure_future(drain())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._tool("start"))
+        q.put_nowait(self._tool("result", result=result, isError=is_error))
+        q.put_nowait(self._final("run-1"))
+        _content, output = _owui_saved(await asyncio.wait_for(task, 5))   # bounds the test only
+        return _card_output_text(output, "t1")
+
+    @staticmethod
+    def _renderer_card(result, is_error=False) -> str:
+        r = _TurnRenderer()
+        r.feed({"stream": "tool", "data": {"phase": "start", "name": "exec", "toolCallId": "t1",
+                                           "args": {"command": "ls"}}})
+        r.feed({"stream": "tool", "data": {"phase": "result", "name": "exec", "toolCallId": "t1",
+                                           "result": result, "isError": is_error}})
+        return _card_output_text(r.output, "t1")
+
+    async def test_the_inline_card_shows_the_output(self):
+        for result, shown in self.CASES:
+            with self.subTest(result=result):
+                await self.asyncTearDown()
+                await self.asyncSetUp()
+                self.assertEqual(await self._inline_card(result), shown)
+
+    def test_a_handed_over_card_shows_the_output(self):
+        for result, shown in self.CASES:
+            with self.subTest(result=result):
+                self.assertEqual(self._renderer_card(result), shown)
+
+    async def test_details_never_reach_the_card(self):
+        inline = await self._inline_card(self.ENVELOPE)
+        for card in (inline, self._renderer_card(self.ENVELOPE)):
+            self.assertNotIn("cwd", card)
+            self.assertNotIn("details", card)
+            self.assertNotIn('"content"', card)
+
+    async def test_a_failed_call_explains_itself_with_the_output(self):
+        err = {"content": [{"type": "text", "text": "ls: cannot access 'x'"}],
+               "details": {"status": "failed", "exitCode": 2, "cwd": "/w"}}
+        for card in (await self._inline_card(err, is_error=True),
+                     self._renderer_card(err, is_error=True)):
+            self.assertEqual(card, f"{TOOL_ERROR_MARK} tool call failed\n\nls: cannot access 'x'")
+
+
+class _InlineReply:
+    """A pipe reply with a scripted Gateway (`NoDroppedMessagesTests`), for
+    a test that also needs another harness."""
+
+    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
+    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
+    _queue = NoDroppedMessagesTests._queue
+    _delta = NoDroppedMessagesTests._delta
+    _final = NoDroppedMessagesTests._final
+    _until_registered = NoDroppedMessagesTests._until_registered
+
+    def fail(self, msg):
+        raise AssertionError(msg)
+
+    async def saved(self, chunks, base_url) -> tuple[str, list]:
+        """(content, output) Open WebUI saves for one run streaming `chunks`,
+        a directive resolved through the file server at `base_url`."""
+        await self.asyncSetUp()
+        try:
+            self.pipe.valves.USE_OWUI_FILES = False
+            self.pipe.valves.FILE_SERVER_BASE_URL = base_url
+
+            async def emitter(event):
+                pass
+            body = {"model": "openclaw_gateway.default", "messages": [{"role": "user", "content": "go"}]}
+            meta = {"chat_id": "chat-1", "user_id": "u1", "message_id": "m1"}
+            gen = self.pipe._pipe_impl(body, emitter, __metadata__=meta)
+
+            async def drain():
+                return [c async for c in gen]
+            task = asyncio.ensure_future(drain())
+            await self._until_registered("run-1")
+            q = self._queue("run-1")
+            for c in chunks:
+                q.put_nowait(self._delta("run-1", c))
+            q.put_nowait(self._final("run-1"))
+            return _owui_saved(await asyncio.wait_for(task, 5))   # bounds the test only
+        finally:
+            await self.asyncTearDown()
+
+
+def _message_texts(output: list) -> list:
+    return ["".join(str(p.get("text", "")) for p in i.get("content") or [])
+            for i in output if i.get("type") == "message"]
+
+
+class WriterMediaLineTests(_RoutingCase):
+    """ELI-117 (found during ELI-113): the turn writer saved the text after a
+    `MEDIA:` directive on the directive's line as written, while the inline
+    reply puts it on a line of its own, so `MEDIA:a.png more` was saved
+    differently by the path that finalized the reply. One rule for both:
+    the same text, inline or handed over, saves the same content and output
+    items."""
+
+    closed_run = HandoverRewriteTests.closed_run
+    settle = HandoverRewriteTests.settle
+    BASE = "https://x"
+    TEXTS = (
+        "Here: MEDIA:x.png more",
+        "Shot MEDIA:x.png\nnext line",
+        "a MEDIA:x.png   \n\n  b",
+        "Two: MEDIA:x.png MEDIA:y.png end",
+        "Done: MEDIA:x.png\n",
+        "Quoted `MEDIA:x.png ` stays, real: MEDIA:y.png then",
+    )
+
+    async def _handed_over(self, text) -> tuple[str, list]:
+        """(content, output) the turn writer saves for a run the inline reply
+        never streamed, its directives resolved through the same server."""
+        run = pipe_run_id(self.CHAT, self.STUB)
+        self.add_stub(self.STUB, content="")
+        self.conn.register_run_target(self.key, run, self.CHAT, self.STUB)
+
+        async def resolve(directive, **kw):
+            fname = directive.split(":", 1)[1].strip()
+            return f"![{fname}]({self.BASE}/{fname})", True
+        with mock.patch.object(openclaw_pipe, "_resolve_media_text", resolve):
+            await self.dispatch(run, _delta(text))
+            await self.dispatch(run, {"state": "final"})
+            self.history = {"messages": self.closed_run(run, text)}
+            await self.settle(run)
+        m = self.owui.msgs()[self.STUB]
+        self.assertIs(m["done"], True)
+        return m["content"], m["output"]
+
+    async def test_inline_and_handed_over_replies_save_the_same(self):
+        for text in self.TEXTS:
+            with self.subTest(text=text):
+                await self.asyncSetUp()
+                inline_content, inline_output = await _InlineReply().saved([text], self.BASE)
+                content, output = await self._handed_over(text)
+                self.assertEqual(content, inline_content)
+                self.assertEqual(_message_texts(output), _message_texts(inline_output))
+
+    async def test_the_text_after_a_directive_is_on_its_own_line(self):
+        content, _output = await self._handed_over("Here: MEDIA:x.png more")
+        self.assertEqual(content, f"Here: ![x.png]({self.BASE}/x.png)\nmore")
 
 
 class HandoverMediaCodeAwareTests(_RoutingCase):

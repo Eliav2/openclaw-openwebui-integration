@@ -99,6 +99,26 @@ class SubagentListTests(unittest.IsolatedAsyncioTestCase):
                     if "getElementById('openclaw-status-section-subagents')" in c)
         self.assertIn("Research X and report.", code)
 
+    async def test_a_child_whose_last_message_is_its_spawn_shows_no_subtitle(self):
+        """Right after a spawn the child's newest message is the spawn itself,
+        so lastMessagePreview is the "[Subagent Context] ... Begin. Execute the
+        assigned task" wrapper, raw or flattened to one line. That is the task
+        again, not progress (ELI-119)."""
+        flat_93, flat_103 = " ".join(WRAPPED_93.split()), " ".join(WRAPPED_103.split())
+        for preview in (WRAPPED_93, WRAPPED_103, flat_93, flat_103):
+            with self.subTest(preview=preview[:40]):
+                rows = [{"key": CHILD_A, "status": "running", "startedAt": 1000, "lastMessagePreview": preview},
+                        {"key": CHILD_B, "status": "running", "lastMessagePreview": "Fly.io: about $3 a month"}]
+                previews = {CHILD_A: [{"role": "user", "text": WRAPPED_93}]}
+                _calls, emitted, data = await self._open(rows, previews)
+                a, b = data["tasks"]
+                self.assertEqual(a["title"], "Research X and report.")
+                self.assertIsNone(a["progressSummary"])
+                self.assertEqual(b["progressSummary"], "Fly.io: about $3 a month")
+                code = next(c for c in _emitted_codes(emitted)
+                            if "getElementById('openclaw-status-section-subagents')" in c)
+                self.assertNotIn("Subagent Context", code)
+
     async def test_no_preview_call_without_active_children(self):
         calls, _emitted, data = await self._open(
             [{"key": CHILD_DONE, "status": "done", "endedAt": 990}], {})
