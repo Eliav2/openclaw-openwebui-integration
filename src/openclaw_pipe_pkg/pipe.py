@@ -1642,6 +1642,8 @@ class Pipe:
         try:
             while adopt_new_run:
                 adopt_new_run = False
+                # A new run's text is a new message item (review 2af1 F4).
+                fence_item_start = len(assistant_stream_text)
                 try:
                     while not done:
                         # No silence timer: a quiet queue is a long tool call or
@@ -1810,12 +1812,13 @@ class Pipe:
                                 # be checked reliably. Resolved once the run ends
                                 # (see the `else:` clause below) or as soon as the
                                 # buffered text diverges from every trigger.
-                                # A fence the shown text left open makes a marker a quote
-                                # (ELI-107); held text always starts outside one.
+                                # A fence the shown text of this message item left open
+                                # makes a marker a quote (ELI-107); held text always
+                                # starts outside one. A fence never spans items.
                                 flush_text, pending_prompt_text = (
                                     _advance_input_prompt_buffer(
                                         pending_prompt_text, delta,
-                                        _fence_open_after(assistant_stream_text))
+                                        _fence_open_after(assistant_stream_text[fence_item_start:]))
                                 )
                                 if not flush_text:
                                     continue
@@ -1965,6 +1968,8 @@ class Pipe:
                                     # path must not duplicate it as markdown.
                                     pending_tool_calls.add(tool_call_id)
                                     yield _tool_call_started_event(name, tool_call_id, args)
+                                    # Text after a tool call is a new message item.
+                                    fence_item_start = len(assistant_stream_text)
                                     # Now the last item in OWUI's output list,
                                     # so a relabel on failure can target it
                                     # without an output_index. A second start

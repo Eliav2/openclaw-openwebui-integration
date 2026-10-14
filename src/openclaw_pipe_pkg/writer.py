@@ -59,7 +59,44 @@ TURN_CUT_OFF_NOTE = ("_(This reply was cut off: the run was interrupted again af
 RESUME_DIRECTIVE_PREFIX = "[system] Your previous "
 
 
-def _resume_directive(shown: str | None, request: str | None = None) -> str:
+# A request longer than this is quoted as its head and tail (review 2af1 F2).
+RESUME_REQUEST_MAX = 6000
+RESUME_REQUEST_HEAD = 2000
+# OpenClaw's inbound metadata blocks a stored user turn can start with
+# ("Conversation info (untrusted metadata):" and a fenced JSON body).
+_INBOUND_META_RE = re.compile(
+    r"\A\s*[A-Z][^\n]{0,80}\(untrusted metadata\):[ \t]*\n```[^\n]*\n.*?\n```[ \t]*(?:\n+|\Z)", re.S)
+
+
+def _strip_inbound_meta(text: str) -> str:
+    """`text` without the metadata blocks in front of it (review 2af1 F5)."""
+    while True:
+        m = _INBOUND_META_RE.match(text or "")
+        if not m:
+            return text
+        text = text[m.end():]
+
+
+def _quote_block(text: str) -> str:
+    """`text` between two delimiter lines that occur in it as no line: a run
+    of dashes longer than any dash-only line of its own (review 2af1 F2b)."""
+    dashes = [len(x.strip()) for x in text.split("\n") if x.strip() and set(x.strip()) == {"-"}]
+    delim = "-" * max([3] + [n + 1 for n in dashes])
+    return f"{delim}\n{text}\n{delim}"
+
+
+def _clip_middle(text: str, limit: int = RESUME_REQUEST_MAX, head: int = RESUME_REQUEST_HEAD) -> str:
+    """`text` within `limit` characters: its head and tail, the question a
+    long request usually ends with included, and a line for what is left
+    out (review 2af1 F2)."""
+    if len(text) <= limit:
+        return text
+    tail = limit - head
+    return f"{text[:head]}\n[... {len(text) - limit} characters omitted ...]\n{text[-tail:]}"
+
+
+def _resume_directive(shown: str | None, request: str | None = None,
+                      attachments: int = 0) -> str:
     """The message a resume sends: continue from what the user already sees.
 
     A resume follows an outside kill (the owner rule), which also kills any
@@ -70,7 +107,8 @@ def _resume_directive(shown: str | None, request: str | None = None) -> str:
     `request`: the user's message the run was answering. The killed run's
     claude-cli session is not continued: the resume runs in a new one that
     holds only this message (M3 window run 2, 2026-10-14: "I don't have the
-    rest of your sequence"), so the request travels in it."""
+    rest of your sequence"), so the request travels in it. `attachments`:
+    how many images or files it carried, which do not travel (F3)."""
     cause = (
         "The Gateway restarted or your process was killed from outside while you "
         "were working. A tool call that was still running was killed by that, so "
@@ -79,13 +117,17 @@ def _resume_directive(shown: str | None, request: str | None = None) -> str:
     request = (request or "").strip()
     if request:
         cause += (" The request you were answering, which this session may no longer "
-                  f"hold, was:\n\n---\n{request[:6000]}\n---\n")
+                  f"hold, was:\n\n{_quote_block(_clip_middle(request))}\n")
+    if attachments:
+        cause += (f" The request also carried {attachments} attachment"
+                  f"{'s' if attachments > 1 else ''} (an image or a file) that this session "
+                  "cannot see; if the request needs it, ask the user to send it again.")
     shown = (shown or "").strip()
     if shown:
         return (
             f"[system] Your previous reply was cut off partway through. {cause} The "
             "user can already see the following partial text, and it cannot be edited "
-            f"or retracted:\n\n---\n{shown[-1500:]}\n---\n\n"
+            f"or retracted:\n\n{_quote_block(shown[-1500:])}\n\n"
             "Continue that reply seamlessly from exactly where it stops and finish the "
             "request. Do not repeat any of it, do not restart the answer, and do not "
             "mention the interruption.")
@@ -245,6 +287,7 @@ class _TurnWriter:
         self.resumes = 0                # resume budget, counted on M (MAX_TURN_RESUMES)
         self.pending_resume = False     # a resume the Gateway refused; sent on the next hello-ok
         self.request: str | None = None  # the user's message M answers, quoted by a resume
+        self.request_attachments = 0    # its images or files, which a resume cannot carry
         self.awaiting_row = False       # kept open for a Gateway recovery (R2)
         self.closed = False             # nothing more to write (ended, or M is someone else's)
         self.sent_output: list = []     # the `output` open tabs hold
@@ -470,32 +513,43 @@ class _TurnWriter:
         if self.pending_resume and not self.closed:
             await self._send_resume()
 
-    async def _run_request(self) -> str | None:
-        """The user's message M answers: the user turn of the first run written
-        into M that is not itself a resume. None when the transcript cannot be
-        read (the resume then goes without it)."""
+    async def _run_request(self) -> tuple[str | None, int]:
+        """(text, attachments) of the user's message M answers: the user turn
+        of the first run written into M, in transcript order, that is not
+        itself a resume. Every run naming M counts, so M's own first run (a
+        pipe run or an agent turn) is found even when this writer was made
+        for a later run of M, a redeploy's or an Open WebUI restart's (review
+        2af1 F1). (None, 0) when the transcript cannot be read (the resume
+        then goes without it)."""
         try:
             hist = await self.conn.session_history(self.session_key, limit=RUN_HISTORY_LIMIT)
         except Exception as ex:
             pipe_log(f"  turn writer: chat.history for the resume failed: {ex!r}")
-            return None
-        turns = {_history_user_run_id(m): m for m in (hist or {}).get("messages") or []}
-        for run in self.runs:
-            m = turns.get(run)
-            if m is None:
+            return None, 0
+        messages = (hist or {}).get("messages") or []
+        for m in messages:
+            run = _history_user_run_id(m)
+            if not run or not (run in self.runs or run_message_id(
+                    self.session_key, self.chat_id, run, messages) == self.message_id):
                 continue
             content = m.get("content")
+            blocks = content if isinstance(content, list) else []
             text = content if isinstance(content, str) else "".join(
-                str(b.get("text") or "") for b in content or []
+                str(b.get("text") or "") for b in blocks
                 if isinstance(b, dict) and b.get("type") == "text")
-            if text.strip() and not text.lstrip().startswith(RESUME_DIRECTIVE_PREFIX):
-                return text
-        return None
+            text = _strip_inbound_meta(text)
+            attachments = sum(1 for b in blocks if isinstance(b, dict) and b.get("type") != "text")
+            if text.lstrip().startswith(RESUME_DIRECTIVE_PREFIX):
+                continue
+            if text.strip() or attachments:
+                return text, attachments
+        return None, 0
 
     async def _send_resume(self) -> None:
-        if not self.request:
-            self.request = await self._run_request()
-        directive = _resume_directive(self.renderer.visible_text, self.request)
+        if not self.request and not self.request_attachments:
+            self.request, self.request_attachments = await self._run_request()
+        directive = _resume_directive(self.renderer.visible_text, self.request,
+                                      self.request_attachments)
         key = pipe_run_id(self.chat_id, self.message_id, "resume")
         try:
             resp = await self.conn.send_request("chat.send", _owui_chat_send_params(
