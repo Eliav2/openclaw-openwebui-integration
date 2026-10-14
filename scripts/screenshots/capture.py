@@ -571,6 +571,24 @@ class Scenes:
         self.s.shot(page, "media-turn-source")
         page.keyboard.press("Escape")
 
+    def first_reply(self, page: Page) -> None:
+        """The first hello after install, done: what the Quick start's last
+        step should look like."""
+        new_chat(page)
+        chat = send(page, "Hello! Are you there?")
+        wait_js(page, f"""() => {{ const a = {LAST_ASSISTANT};
+                 return a && a.innerText.includes('What should we start with')
+                   && document.querySelectorAll('button[aria-label="Copy"]').length > 0; }}""",
+                "the finished first reply")
+        set_title(self.token, chat, "Hello")
+        # Down to the reply's toolbar: the empty chat under it says nothing.
+        clip = """() => {
+          const copy = [...document.querySelectorAll('button[aria-label="Copy"]')].pop();
+          const bottom = copy.getBoundingClientRect().bottom + 24;
+          return {x: 0, y: 0, width: innerWidth, height: Math.min(innerHeight, Math.ceil(bottom))};
+        }"""
+        self.s.shot(page, "first-reply", clip_js=clip)
+
     def failed_tool_live(self, page: Page) -> None:
         """A tool that failed, shown while the reply is still streaming: a
         `read` of a file that isn't there, then a long `exec` still running."""
@@ -630,6 +648,7 @@ def main(argv=None) -> int:
             shooter.run("agent-turn", scenes.agent_turn, page)
             shooter.run("media-turn", scenes.media_turn, page)
             shooter.run("failed-tool-live", scenes.failed_tool_live, page)
+            shooter.run("first-reply", scenes.first_reply, page)
             if scenes.hero_chat:
                 desk = browser.new_context(**DESKTOP, locale="en-US",
                                            timezone_id="America/New_York", color_scheme="light")
