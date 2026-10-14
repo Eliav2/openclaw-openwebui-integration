@@ -1,0 +1,34 @@
+# OpenClaw for Open WebUI
+
+> Connects a running OpenClaw Gateway to Open WebUI, so its agents' tool calls, questions and sub-agents show up as real UI in the chat. Three Open WebUI functions: a Pipe (the chat), a Status Action (context, rate limits, sub-agents) and a thinking filter. Every page below is plain Markdown in this repo; start at docs/index.md.
+
+## Start
+
+- [README](README.md): what it is, the install in three steps, where everything else is
+- [Docs index](docs/index.md): every page with a one-line description
+
+## Install
+
+- [Quick start](docs/install/quickstart.md): from nothing to the first reply, with a check at each step
+- [Installer](docs/install/installer.md): install.py, its wizard, flags, environment variables and commands
+- [Manual install](docs/install/manual.md): paste the function in the admin panel and set its valves
+- [Device pairing](docs/install/pairing.md): approving the device, where its identity lives
+- [Status Action](docs/install/status-action.md): the Status button and its rate-limit plugin
+- [Thinking filter](docs/install/thinking-filter.md): the per-chat thinking control
+- [Agent skills](docs/install/agent-skills.md): teaching the agent the questions and media conventions
+- [Update and uninstall](docs/install/update-uninstall.md)
+- [Two hosts](docs/install/two-hosts.md): Open WebUI and OpenClaw on different machines
+
+## Use
+
+- [Features](docs/features/index.md): the full list, each linked to its page
+- [Configuration](docs/configuration.md): every valve of the three functions, generated from the code
+- [Versions](docs/versions.md): tested versions, minimums, what an older release loses
+- [Troubleshooting](docs/troubleshooting.md): symptoms, logs, what to put in a bug report
+- [Security](docs/security.md): secrets, the media file server, the agent's privileges
+
+## Contribute
+
+- [Architecture](docs/architecture.md): message path and file layout
+- [Development](docs/development.md): building, testing, deploying a change
+- [Why](docs/why.md): this integration compared with OpenClaw's /v1 endpoint

@@ -4,7 +4,7 @@
 >
 > This document proposes a `request_user_input` function-calling tool. That tool
 > **does not exist**: the shipped implementation in
-> [`src/openclaw_pipe_pkg/askuser.py`](../src/openclaw_pipe_pkg/askuser.py) took
+> [`src/openclaw_pipe_pkg/askuser.py`](../../src/openclaw_pipe_pkg/askuser.py) took
 > the other path: it intercepts assistant text beginning with
 > `OpenClaw needs input:` or `Codex needs input:` and synthesizes the modal from
 > the prompt text. Notable divergences from this spec:
