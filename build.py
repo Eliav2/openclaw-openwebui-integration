@@ -215,6 +215,115 @@ def _check(out_path: Path, built: str, rebuild_flag: str) -> bool:
     return True
 
 
+CONFIG_DOC = ROOT / "docs" / "configuration.md"
+# (heading, fragment, file a user installs): the three functions' Valves, in
+# the order a user meets them.
+_VALVE_SOURCES = (
+    ("Pipe", "pipe", "openclaw_pipe.py"),
+    ("Status Action", "action", "openclaw_status_action.py"),
+    ("Thinking filter", "thinking_filter", "openclaw_thinking_filter.py"),
+)
+
+
+def _valves(fragment: str) -> list:
+    """[(name, type, default, description)] of the `Valves` class in a
+    fragment, read from its source: the docs cannot list a valve the code
+    doesn't have, or miss one it has."""
+    import ast
+    tree = ast.parse((PKG / f"{fragment}.py").read_text())
+    cls = next(n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == "Valves")
+    out = []
+    for node in cls.body:
+        if not (isinstance(node, ast.AnnAssign) and isinstance(node.value, ast.Call)):
+            continue
+        kw = {k.arg: k.value for k in node.value.keywords}
+        default = ast.literal_eval(kw["default"]) if "default" in kw else None
+        out.append((node.target.id, ast.unparse(node.annotation), default,
+                    ast.literal_eval(kw["description"]) if "description" in kw else ""))
+    return out
+
+
+def _user_valves(fragment: str) -> list:
+    """[(name, type, default, description)] of a `create_model("UserValves",
+    name=(type, Field(...)))` call in a fragment. Names in the default and the
+    description resolve against the package's module-level string constants."""
+    import ast
+    consts = {}
+    for path in PKG.glob("*.py"):
+        for node in ast.parse(path.read_text()).body:
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)):
+                consts[node.targets[0].id] = node.value.value
+
+    class _Inline(ast.NodeTransformer):
+        def visit_Name(self, node):
+            return ast.copy_location(ast.Constant(consts[node.id]), node) if node.id in consts else node
+
+        def visit_BinOp(self, node):  # "a" + NAME + "b": fold, literal_eval won't
+            node = self.generic_visit(node)
+            if (isinstance(node.op, ast.Add) and isinstance(node.left, ast.Constant)
+                    and isinstance(node.right, ast.Constant)
+                    and isinstance(node.left.value, str) and isinstance(node.right.value, str)):
+                return ast.copy_location(ast.Constant(node.left.value + node.right.value), node)
+            return node
+
+    def value(expr):
+        return ast.literal_eval(ast.fix_missing_locations(_Inline().visit(expr)))
+
+    out = []
+    for call in ast.walk(ast.parse((PKG / f"{fragment}.py").read_text())):
+        if not (isinstance(call, ast.Call) and getattr(call.func, "id", "") == "create_model"
+                and call.args and isinstance(call.args[0], ast.Constant)
+                and call.args[0].value == "UserValves"):
+            continue
+        for k in call.keywords:
+            if not isinstance(k.value, ast.Tuple):
+                continue
+            typ, field = k.value.elts
+            kw = {x.arg: x.value for x in field.keywords}
+            out.append((k.arg, ast.unparse(typ), value(kw["default"]) if "default" in kw else None,
+                        value(kw["description"]) if "description" in kw else ""))
+    return out
+
+
+def _valve_lines(valves: list, per_user: bool = False) -> list:
+    lines = []
+    for name, typ, default, desc in valves:
+        shown = "empty" if default == "" else f"`{default}`"
+        where = (" Per user: each user sets it in **Chat Controls > Valves**, from only the "
+                 "levels your models support ([Thinking control](./install/thinking-filter.md))."
+                 if per_user else "")
+        lines += ["", f"### {name}", "", f"Type: `{typ}`. Default: {shown}.{where}", "",
+                  " ".join(desc.split())]
+    return lines
+
+
+def render_configuration() -> str:
+    """docs/configuration.md, generated from the three Valves classes."""
+    lines = [
+        "Every setting (valve) of the three functions, with its type, default and what it does. "
+        "Generated from the code by `python3 build.py --all`; do not edit by hand.",
+        "",
+        "Applies to: Pipe, Action, Filter",
+        "",
+        "Set them in Open WebUI: **Admin Panel > Functions >** the function **> Valves** (the gear). "
+        "The installer rewrites the connection valves on every run "
+        "([which ones](./install/installer.md#valves-the-installer-sets)) and keeps the rest. "
+        "Changes apply on the next message, with no restart.",
+    ]
+    for heading, fragment, filename in _VALVE_SOURCES:
+        lines += ["", f"## {heading}", "", f"File: `{filename}`."]
+        if fragment == "action":
+            lines += ["", "The Action reuses the Pipe's Gateway connection when the Pipe has one. "
+                      "These valves are its own connection's settings, for when it has to open one: "
+                      "copy them from the Pipe's valves."]
+        lines += _valve_lines(_valves(fragment))
+        for line in _valve_lines(_user_valves(fragment), per_user=True):
+            lines.append(line)
+    return "\n".join(lines) + "\n"
+
+
 def main():
     do_all = "--all" in sys.argv or "--check-all" in sys.argv
     action = "--action" in sys.argv or "--check-action" in sys.argv
@@ -260,6 +369,15 @@ def main():
         else:
             out_path.write_text(built)
             print(f"built {out_path}  ({len(built.splitlines())} lines)")
+
+    if do_all:
+        # The docs page generated from the same sources.
+        doc = render_configuration()
+        if checking:
+            ok = _check(CONFIG_DOC, doc, "--all") and ok
+        else:
+            CONFIG_DOC.write_text(doc)
+            print(f"built {CONFIG_DOC}  ({len(doc.splitlines())} lines)")
 
     if checking and not ok:
         sys.exit(1)
