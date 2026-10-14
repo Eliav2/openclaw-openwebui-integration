@@ -13,7 +13,7 @@ import unittest
 from unittest import mock
 
 import test_status_action_unit  # noqa: F401  (installs the module stubs)
-from test_status_action_unit import _drawer_conn, _emitted_codes
+from test_status_action_unit import _drawer_conn, _emitted_codes, _open_dialog
 
 import openclaw_status_action
 from openclaw_status_action import Action
@@ -71,8 +71,8 @@ class SubagentListTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch("openclaw_status_action._get_action_connection",
                         new=mock.AsyncMock(return_value=(conn, "pipe"))), \
              mock.patch("openclaw_status_action._render_subagents_fill_js", side_effect=spy):
-            await Action().action({"chat_id": PARENT_CHAT}, __user__={"id": PARENT_USER},
-                                  __event_emitter__=emitter)
+            await _open_dialog(Action().action({"chat_id": PARENT_CHAT}, __user__={"id": PARENT_USER},
+                                               __event_emitter__=emitter), conn)
         return calls, emitted, seen[-1]
 
     async def test_lists_the_running_and_queued_children_with_their_task_as_title(self):
@@ -149,8 +149,8 @@ class SubagentListTests(unittest.IsolatedAsyncioTestCase):
                         new=mock.AsyncMock(return_value=(conn, "pipe"))), \
              mock.patch("openclaw_status_action._render_subagents_fill_js",
                         side_effect=lambda d: (seen.append(d), real(d))[1]):
-            await Action().action({"chat_id": PARENT_CHAT}, __user__={"id": PARENT_USER},
-                                  __event_emitter__=lambda e: emitted.append(e) or _noop())
+            await _open_dialog(Action().action({"chat_id": PARENT_CHAT}, __user__={"id": PARENT_USER},
+                                               __event_emitter__=lambda e: emitted.append(e) or _noop()), conn)
         self.assertEqual([t["title"] for t in seen[-1]["tasks"]], ["research-x"])
 
 
@@ -296,3 +296,69 @@ class NoTasksApiTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-127: the dialog's ticker counts a running child up (ELI-120), and
+    the dialog filled once, so a child that finished while it stayed open
+    kept its "running" dot and counted up until the dialog was reopened.
+    The section refills when a listed child's run state changes: the
+    Gateway's pushed `sessions.changed`, no polling."""
+
+    NOW = 1_783_790_100_000
+
+    async def test_a_child_that_finishes_leaves_the_open_dialog(self):
+        import asyncio
+        import json
+        import shutil
+        import subprocess
+        import tempfile
+        from test_status_action_unit import _DIALOG_PAGE_JS, _render_modal_open_js
+
+        runtime = shutil.which("bun") or shutil.which("node")
+        if runtime is None:
+            self.skipTest("no bun or node")
+        rows = [{"key": CHILD_A, "status": "running", "startedAt": self.NOW - 1000}]
+        previews = {CHILD_A: [{"role": "user", "text": WRAPPED_93}]}
+        waiters, emitted = {}, []
+
+        def session_change_event(key):
+            # As the connection does: one Event per session, popped and set
+            # by the next pushed change to its run state.
+            return waiters.setdefault(key, asyncio.Event())
+
+        async def emitter(evt):
+            emitted.append(evt)
+
+        conn = mock.Mock()
+        conn.send_request = mock.AsyncMock(side_effect=_list_rpc(rows, previews, []))
+        conn.session_change_event = session_change_event
+        with mock.patch("openclaw_status_action._get_action_connection",
+                        new=mock.AsyncMock(return_value=(conn, "pipe"))):
+            opened = asyncio.ensure_future(Action().action(
+                {"chat_id": PARENT_CHAT}, __user__={"id": PARENT_USER}, __event_emitter__=emitter))
+            # Until the dialog is filled and follows its child (or, without
+            # the follow, has returned).
+            while not opened.done() and CHILD_A not in waiters:
+                await asyncio.sleep(0)
+            rows[0] = {"key": CHILD_A, "status": "done", "startedAt": self.NOW - 1000, "endedAt": self.NOW}
+            ev = waiters.pop(CHILD_A, None)
+            if ev is not None:
+                ev.set()    # the Gateway pushes the child's settle
+            await asyncio.wait_for(opened, 5)   # bounds the test only
+
+        fills = [c for c in _emitted_codes(emitted)
+                 if "getElementById('openclaw-status-section-subagents')" in c]
+        identity = {"chatId": "c", "messageId": "m", "sessionId": "s", "owuiModel": "x"}
+        payload = {"now": self.NOW, "open": _render_modal_open_js(identity), "fills": fills,
+                   "steps": [{"advance": 60}]}
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
+            fh.write(_DIALOG_PAGE_JS)
+        try:
+            out = subprocess.run([runtime, fh.name], input=json.dumps(payload),
+                                 capture_output=True, text=True, timeout=60)
+        finally:
+            os.unlink(fh.name)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        # A minute later: no row still "running" and counting.
+        self.assertEqual(json.loads(out.stdout), [{"cells": [], "timers": 1}])

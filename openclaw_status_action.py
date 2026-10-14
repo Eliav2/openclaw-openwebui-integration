@@ -8318,9 +8318,11 @@ class Action:
         usage_task = asyncio.ensure_future(conn.send_request("usage.status", {}, timeout=5))
         # The parent's child sessions. The Gateway's spawnedBy filter keeps
         # the current ones (active, or ended in the last 30 minutes).
-        children_task = asyncio.ensure_future(conn.send_request(
-            "sessions.list", dict(spawnedBy=session_key, limit=50, includeLastMessage=True), timeout=5,
-        ))
+        def list_children():
+            return conn.send_request(
+                "sessions.list", dict(spawnedBy=session_key, limit=50, includeLastMessage=True), timeout=5,
+            )
+        children_task = asyncio.ensure_future(list_children())
 
         async def fill_context():
             """Also resolves provider/session_row for fill_limits to reuse
@@ -8404,7 +8406,7 @@ class Action:
                 "error": None,
             })}})
 
-        async def fill_subagents():
+        async def fill_subagents(children):
             """No dependency on sessions.describe/usage.status at all --
             session_key is already known synchronously, so this is the
             most genuinely independent of the three sections.
@@ -8415,15 +8417,16 @@ class Action:
             fields into the detail drawer's opening request (see
             S.openSubagentDrawer / Action._run_subagent_detail), so the
             drawer can paint its header instantly before its own RPCs
-            resolve. A row's id is the child session key."""
+            resolve. A row's id is the child session key. Returns the
+            listed children's keys."""
             try:
-                children_resp = await children_task
+                children_resp = await children
             except Exception as ex:
                 pipe_log(f"[status-action] sessions.list (children) failed: {ex}")
                 await __event_emitter__({"type": "execute", "data": {
                     "code": _render_subagents_fill_js({"error": f"Could not fetch subagents: {ex}"})
                 }})
-                return
+                return []
             active = [r for r in (children_resp or {}).get("sessions") or []
                       if r.get("key") and r.get("status") in ("running", "queued")]
             task_texts = {}
@@ -8441,16 +8444,41 @@ class Action:
             await __event_emitter__({"type": "execute", "data": {"code": _render_subagents_fill_js({
                 "tasks": subagent_tasks, "source": source, "fetchedAt": time.strftime("%H:%M:%S"), "error": None,
             })}})
+            return [r["key"] for r in active]
 
         context_ready = asyncio.ensure_future(fill_context())
         limits_ready = asyncio.ensure_future(fill_limits())
-        subagents_ready = asyncio.ensure_future(fill_subagents())
+        subagents_ready = asyncio.ensure_future(fill_subagents(children_task))
 
         provider, _session_row = await context_ready
         await limits_ready
-        await subagents_ready
+        listed = await subagents_ready
 
         pipe_log(f"[status-action] status dialog filled ({source}) provider={provider}")
+
+        # The ticker counts a listed child up while the dialog is open, so a
+        # child that ends meanwhile must leave the list (ELI-127). Hold this
+        # request open, as the drawer does, and refill the section on each
+        # pushed change to a listed child's run state, until none is listed
+        # or the drawer's bound passes. Each event is taken before the read
+        # it guards, so no change slips between them. A closed dialog makes
+        # every fill a no-op.
+        deadline = time.time() + _SUBAGENT_POLL_MAX_S
+        while listed:
+            changes = [conn.session_change_event(k) for k in listed]
+            following = listed
+            listed = await fill_subagents(list_children())
+            if not listed or set(listed) - set(following):
+                continue    # none left, or a new child: take its event first
+            waits = [asyncio.ensure_future(ev.wait()) for ev in changes]
+            try:
+                done, _pending = await asyncio.wait(
+                    waits, timeout=max(deadline - time.time(), 0), return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for w in waits:
+                    w.cancel()
+            if not done:
+                break
         return {"status": "ok"}
 
     async def _run_compact(self, body: dict, __user__, __event_emitter__):

@@ -1088,8 +1088,9 @@ under a running turn.
 <details>
 <summary><b>👥 Subagent drawer</b> <sub>(partial)</sub></summary>
 
-The status dialog lists the subagents a run spawned with their status and
-elapsed time. Click one to open a side drawer with Overview, Transcript and
+The status dialog lists the subagents a run spawned that are still running,
+with their elapsed time counting up. One that finishes while the dialog is open
+leaves the list, as soon as the Gateway pushes the change. Click one to open a side drawer with Overview, Transcript and
 Tools tabs, refreshed by a poll loop that holds open until the subagent
 terminates.
 

@@ -613,14 +613,17 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
             return fake_conn, "pipe"
 
         with mock.patch("openclaw_status_action._get_action_connection", new=fake_get_connection):
-            result = await action.action(
+            result = await _open_dialog(action.action(
                 {"chat_id": "chat-1", "id": "msg-1", "session_id": "sess-1", "model": "x.y"},
                 __user__={"id": "user-1"}, __event_emitter__=emitter,
-            )
+            ), fake_conn)
 
-        self.assertEqual(result["status"], "ok")
+        # Two children are running, so the dialog stays open to follow them.
+        self.assertEqual(result, "following")
         codes = _emitted_codes(emitted)
-        self.assertEqual(len(codes), 4)  # open + 3 independent fills
+        # open + 3 independent fills + the Subagents re-read that starts the
+        # follow (ELI-127)
+        self.assertEqual(len(codes), 5)
 
         context_code = next(c for c in codes if "getElementById('openclaw-status-section-context')" in c)
         self.assertIn("anthropic", context_code)
@@ -1006,6 +1009,34 @@ class ExtractTranscriptAndToolsTests(unittest.TestCase):
         text_rows, tool_calls = _extract_transcript_and_tools(running_history)
         self.assertEqual(tool_calls, [])
         self.assertEqual(len(text_rows), 2)
+
+
+async def _open_dialog(opening, conn):
+    """Run a status dialog Action until it returns, or until it holds open
+    to follow listed sub-agents that never change (ELI-127); then stop it,
+    as Open WebUI does when the request goes away. Returns the Action's
+    result, or "following"."""
+    import asyncio
+    followed = asyncio.Event()
+
+    class _Unchanged:
+        async def wait(self):
+            followed.set()
+            await asyncio.Future()
+
+    conn.session_change_event = lambda _key: _Unchanged()
+    task = asyncio.ensure_future(opening)
+    waiting = asyncio.ensure_future(followed.wait())
+    await asyncio.wait([task, waiting], return_when=asyncio.FIRST_COMPLETED)
+    waiting.cancel()
+    if task.done():
+        return task.result()
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    return "following"
 
 
 def _drawer_conn(send_request):
