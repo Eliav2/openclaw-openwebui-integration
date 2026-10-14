@@ -1,0 +1,44 @@
+{
+  "models": {
+    "providers": {
+      "fake": null,
+      "local": {
+        "baseUrl": "http://127.0.0.1:18999/v1",
+        "apiKey": "local",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "nova",
+            "name": "Nova"
+          },
+          {
+            "id": "nova-mini",
+            "name": "Nova Mini"
+          },
+          {
+            "id": "nova-pro",
+            "name": "Nova Pro"
+          },
+          {
+            "id": "nova-vision",
+            "name": "Nova Vision"
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "local/nova"
+      }
+    }
+  },
+  "plugins": {
+    "load": {
+      "paths": [
+        "@SCREENSHOTS_DIR@/sample-usage"
+      ]
+    }
+  }
+}
