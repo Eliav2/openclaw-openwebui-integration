@@ -677,8 +677,8 @@ def _run_action(token: str, call) -> list:
     return codes
 
 
-def _section_data(codes: list, element_id: str) -> dict:
-    code = [c for c in codes if f"getElementById('{element_id}')" in c][-1]
+def _section_data(codes: list, element_id: str, index: int = -1) -> dict:
+    code = [c for c in codes if f"getElementById('{element_id}')" in c][index]
     return json.loads(re.search(r"const DATA = (.*?);\n", code).group(1))
 
 
@@ -688,9 +688,11 @@ def test_the_status_action_lists_a_running_subagent_and_opens_its_drawer(token):
     status, me = _request("GET", "/api/v1/auths/", token=token)
     assert status == 200, me
 
+    # The dialog stays open while a listed child runs and refills on its
+    # pushed change (ELI-127), so this returns once the child is done.
     codes = _run_action(token, lambda a, emit: a.action(
         {"chat_id": chat_id}, __user__={"id": me["id"]}, __event_emitter__=emit))
-    data = _section_data(codes, "openclaw-status-section-subagents")
+    data = _section_data(codes, "openclaw-status-section-subagents", 0)
     assert data["error"] is None, data
     assert len(data["tasks"]) == 1, data
     row = data["tasks"][0]
@@ -698,6 +700,8 @@ def test_the_status_action_lists_a_running_subagent_and_opens_its_drawer(token):
     assert row["status"] == "running", row
     assert row["id"] == row["childSessionKey"] and row["id"].startswith("agent:main:subagent:"), row
     assert isinstance(row["startedAt"], int) and row["endedAt"] is None, row
+    # Its end left the open dialog's list.
+    assert _section_data(codes, "openclaw-status-section-subagents")["tasks"] == [], codes[-1]
 
     # The drawer, once the child is done: its status and its last reply.
     child = row["id"]
