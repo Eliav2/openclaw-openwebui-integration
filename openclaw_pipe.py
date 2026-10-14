@@ -6697,18 +6697,30 @@ def _run_prompt_text(span: list | None) -> str:
     return text[hits[-1]:] if hits else ""
 
 
-def _resume_directive(shown: str | None) -> str:
+RESUME_DIRECTIVE_PREFIX = "[system] Your previous "
+
+
+def _resume_directive(shown: str | None, request: str | None = None) -> str:
     """The message a resume sends: continue from what the user already sees.
 
     A resume follows an outside kill (the owner rule), which also kills any
     tool call still running. Its result then reads like the command failing
     (`Exit code 137`), and a resume that does not say why stopped there and
-    asked the user what to do (M3 window, 2026-10-13: 4 of 4)."""
+    asked the user what to do (M3 window, 2026-10-13: 4 of 4).
+
+    `request`: the user's message the run was answering. The killed run's
+    claude-cli session is not continued: the resume runs in a new one that
+    holds only this message (M3 window run 2, 2026-10-14: "I don't have the
+    rest of your sequence"), so the request travels in it."""
     cause = (
         "The Gateway restarted or your process was killed from outside while you "
         "were working. A tool call that was still running was killed by that, so "
         "its result (such as exit code 137 or 143) says nothing about the command "
         "itself: rerun it if the request still needs it.")
+    request = (request or "").strip()
+    if request:
+        cause += (" The request you were answering, which this session may no longer "
+                  f"hold, was:\n\n---\n{request[:6000]}\n---\n")
     shown = (shown or "").strip()
     if shown:
         return (
@@ -6873,6 +6885,7 @@ class _TurnWriter:
         self.runs = [run_id]
         self.resumes = 0                # resume budget, counted on M (MAX_TURN_RESUMES)
         self.pending_resume = False     # a resume the Gateway refused; sent on the next hello-ok
+        self.request: str | None = None  # the user's message M answers, quoted by a resume
         self.awaiting_row = False       # kept open for a Gateway recovery (R2)
         self.closed = False             # nothing more to write (ended, or M is someone else's)
         self.sent_output: list = []     # the `output` open tabs hold
@@ -7122,8 +7135,32 @@ class _TurnWriter:
         if self.pending_resume and not self.closed:
             await self._send_resume()
 
+    async def _run_request(self) -> str | None:
+        """The user's message M answers: the user turn of the first run written
+        into M that is not itself a resume. None when the transcript cannot be
+        read (the resume then goes without it)."""
+        try:
+            hist = await self.conn.session_history(self.session_key, limit=RUN_HISTORY_LIMIT)
+        except Exception as ex:
+            pipe_log(f"  turn writer: chat.history for the resume failed: {ex!r}")
+            return None
+        turns = {_history_user_run_id(m): m for m in (hist or {}).get("messages") or []}
+        for run in self.runs:
+            m = turns.get(run)
+            if m is None:
+                continue
+            content = m.get("content")
+            text = content if isinstance(content, str) else "".join(
+                str(b.get("text") or "") for b in content or []
+                if isinstance(b, dict) and b.get("type") == "text")
+            if text.strip() and not text.lstrip().startswith(RESUME_DIRECTIVE_PREFIX):
+                return text
+        return None
+
     async def _send_resume(self) -> None:
-        directive = _resume_directive(self.renderer.visible_text)
+        if not self.request:
+            self.request = await self._run_request()
+        directive = _resume_directive(self.renderer.visible_text, self.request)
         key = pipe_run_id(self.chat_id, self.message_id, "resume")
         try:
             resp = await self.conn.send_request("chat.send", _owui_chat_send_params(
@@ -9529,7 +9566,7 @@ class Pipe:
                 resume_queue = conn.register_consumer(session_key, key)
                 try:
                     resp = await conn.send_request("chat.send", _owui_chat_send_params(
-                        session_key=session_key, message=_resume_directive(visible_message_text),
+                        session_key=session_key, message=_resume_directive(visible_message_text, text),
                         idempotency_key=key, owui_chat_id=owui_origin_chat_id,
                         owui_user_id=owui_origin_user_id, thinking=resolved_thinking), timeout=30)
                 except Exception as ex:

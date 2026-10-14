@@ -1466,7 +1466,7 @@ class Pipe:
                 resume_queue = conn.register_consumer(session_key, key)
                 try:
                     resp = await conn.send_request("chat.send", _owui_chat_send_params(
-                        session_key=session_key, message=_resume_directive(visible_message_text),
+                        session_key=session_key, message=_resume_directive(visible_message_text, text),
                         idempotency_key=key, owui_chat_id=owui_origin_chat_id,
                         owui_user_id=owui_origin_user_id, thinking=resolved_thinking), timeout=30)
                 except Exception as ex:
