@@ -61,12 +61,10 @@ Something off? `uv run install.py healthcheck` re-checks the install and runs th
 
 ## Pick your path
 
-| I want... | Start here | Time |
-|---|---|---|
-| To try it | [Quick start](./docs/install/quickstart.md) | 5 min |
-| Everything: status, thinking control, agent skills | [Quick start](./docs/install/quickstart.md), then the [Status button](./docs/install/status-action.md), [thinking control](./docs/install/thinking-filter.md) and [agent skills](./docs/install/agent-skills.md) | 10 min |
-| No admin password given to a script | [Manual install](./docs/install/manual.md) | 10 min |
-| Open WebUI and OpenClaw on different machines | [Two hosts](./docs/install/two-hosts.md) | +5 min |
+- **Just try it** (5 min): the [Quick start](./docs/install/quickstart.md).
+- **Everything** (10 min): the Quick start, then the [Status button](./docs/install/status-action.md), [thinking control](./docs/install/thinking-filter.md) and [agent skills](./docs/install/agent-skills.md).
+- **No admin password given to a script** (10 min): the [manual install](./docs/install/manual.md).
+- **Open WebUI and OpenClaw on different machines** (+5 min): [two hosts](./docs/install/two-hosts.md).
 
 ## Why I built this
 
