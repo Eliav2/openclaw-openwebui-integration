@@ -6767,6 +6767,9 @@ def _prompt_tail(text: str, start: int = 0) -> str:
     return text[last:] if last is not None else ""
 
 
+RESUME_DIRECTIVE_PREFIX = "[system] Your previous "
+
+
 def _resume_directive(shown: str | None, request: str | None = None) -> str:
     """The message a resume sends: continue from what the user already sees.
 
