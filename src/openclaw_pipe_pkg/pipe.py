@@ -1718,6 +1718,21 @@ class Pipe:
             else:
                 conn.continue_run_target(session_key, our_run_id, answer_res.new_run_id)
 
+        async def settle_held_media(held: str) -> str:
+            """Text `_advance_media_buffer` held, once its message item ends:
+            resolved as a whole, a directive quoted in code left as text
+            (ELI-111), and recorded for a writer that takes the reply over."""
+            resolved, handled = await _resolve_media_text(
+                held,
+                valves=self.valves,
+                __request__=__request__,
+                __event_emitter__=__event_emitter__,
+                ctx=assistant_stream_text[fence_item_start:],
+            )
+            if handled:
+                conn.note_turn_rewrite(owui_origin_chat_id, owui_message_id, held, resolved)
+            return resolved
+
         adopt_new_run = True
         try:
             while adopt_new_run:
@@ -1939,8 +1954,11 @@ class Pipe:
                                 # real streaming provider can split "MEDIA:filename.png"
                                 # across multiple deltas at any point, including
                                 # mid-filename or mid-prefix. See _advance_media_buffer.
+                                # A directive quoted in code is text (ELI-111);
+                                # the shown text of this item sets the code state.
                                 delta, pending_media_text = _advance_media_buffer(
-                                    pending_media_text, delta
+                                    pending_media_text, delta,
+                                    assistant_stream_text[fence_item_start:]
                                 )
                                 if not delta:
                                     continue
@@ -1973,6 +1991,7 @@ class Pipe:
                                         valves=self.valves,
                                         __request__=__request__,
                                         __event_emitter__=__event_emitter__,
+                                        ctx=assistant_stream_text[fence_item_start:],
                                     )
                                     if handled:
                                         pipe_log("  resolved MEDIA: directive")
@@ -1980,6 +1999,9 @@ class Pipe:
                                         # shows the same image (review 2af1 R4).
                                         conn.note_turn_rewrite(owui_origin_chat_id, owui_message_id,
                                                                delta, resolved)
+                                        # The raw text was flushed: it sets the
+                                        # code state of what follows (ELI-111).
+                                        assistant_stream_text += delta
                                         record_visible_chunk(resolved)
                                         yield resolved
                                         await maybe_emit_snapshot()
@@ -2077,6 +2099,16 @@ class Pipe:
                                     # not part of the message text, and the snapshot
                                     # path must not duplicate it as markdown.
                                     pending_tool_calls.add(tool_call_id)
+                                    if pending_media_text:
+                                        # The message item ends here, and with it
+                                        # any code span a held directive waited on
+                                        # (ELI-111): it shows before the card.
+                                        held, pending_media_text = pending_media_text, ""
+                                        resolved = await settle_held_media(held)
+                                        assistant_stream_text += held
+                                        record_visible_chunk(resolved)
+                                        yield resolved
+                                        text_yielded = True
                                     yield _tool_call_started_event(name, tool_call_id, args)
                                     # Text after a tool call is a new message item.
                                     fence_item_start = len(assistant_stream_text)
@@ -2304,15 +2336,7 @@ class Pipe:
                         # resolve now; `_resolve_media_text` still falls back to
                         # showing it as plain text if resolution fails, so
                         # nothing is silently dropped.
-                        resolved, handled = await _resolve_media_text(
-                            pending_media_text,
-                            valves=self.valves,
-                            __request__=__request__,
-                            __event_emitter__=__event_emitter__,
-                        )
-                        if handled:
-                            conn.note_turn_rewrite(owui_origin_chat_id, owui_message_id,
-                                                   pending_media_text, resolved)
+                        resolved = await settle_held_media(pending_media_text)
                         record_visible_chunk(resolved)
                         yield resolved
                         text_yielded = True

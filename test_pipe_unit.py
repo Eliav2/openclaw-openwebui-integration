@@ -9587,3 +9587,209 @@ class GatewayOwnerNeverRecoversTests(_RoutingCase):
         (m,) = self.new_messages().values()
         self.assertIs(m["done"], True)
         self.assertFalse(self.conn._turn_pumps, "the interrupted run's pump leaked")
+
+
+class MediaDirectiveCodeAwareTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-111 (2026-10-14, chat 0abe9bde, message 442ecfa3): a report that
+    quoted media directives in inline code had one of them, inside a
+    double-backtick span, rendered as an image with a line break inserted.
+    The grammar matched the directive anywhere. Like the ask marker since
+    ELI-107, a directive is code-aware now (CommonMark): one inside an inline
+    code span (any backtick run length) or a fenced block is text; one in
+    prose, mid-line or not, is still a directive."""
+
+    FX = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "test_fixture_eli111_report.json")))
+    BASE = "https://x"
+    IN_CODE = (
+        "Use `MEDIA:x.png ` like this",
+        "Use `` MEDIA:x.png `` like this",
+        "Use ``a `MEDIA:x.png ` b`` like this",
+        "Use ```MEDIA:x.png ``` like this",
+        "Spans a line: `` see\nMEDIA:x.png `` there",
+        "```\nMEDIA:x.png\n```\nafter",
+        "~~~ text\nMEDIA:x.png\n~~~\nafter",
+        "````md\n```\nMEDIA:x.png\n```\n````\nafter",
+        "Unclosed fence:\n```\nMEDIA:x.png\n",
+    )
+
+    def test_the_report_is_shown_as_written(self):
+        raw, stored = self.FX["raw"], self.FX["stored"]
+        self.assertIn("![x.png](" + self.FX["base_url"] + "/x.png)\n` like this``", stored,
+                      "the fixture holds the live rewrite")
+        self.assertEqual(_resolve_media(raw, base_url=self.FX["base_url"]), (raw, False))
+        self.assertEqual(_advance_media_buffer("", raw), (raw, ""))
+
+    def test_a_directive_in_code_is_text(self):
+        for text in self.IN_CODE:
+            with self.subTest(text=text):
+                self.assertEqual(_resolve_media(text, base_url=self.BASE), (text, False))
+                self.assertEqual(openclaw_pipe._media_directives(text, True), [])
+
+    async def test_a_directive_in_code_is_never_uploaded(self):
+        for text in self.IN_CODE:
+            with self.subTest(text=text), \
+                 mock.patch("openclaw_pipe._upload_owui_file") as upload, \
+                 mock.patch("os.path.isfile", return_value=True):
+                got = await _resolve_media_via_owui(text, base_url="https://o", token="t",
+                                                    __event_emitter__=None)
+                self.assertEqual(got, (text, False))
+                upload.assert_not_called()
+
+    def test_a_directive_outside_code_still_resolves(self):
+        img = "![x.png](https://x/x.png)"
+        cases = {
+            "Done. MEDIA:x.png now": f"Done. {img}\nnow",
+            "`code` then MEDIA:x.png and `more`": f"`code` then {img}\nand `more`",
+            "```\nold\n```\nMEDIA:x.png\n": f"```\nold\n```\n{img}",
+            "A stray ` backtick, MEDIA:x.png end": f"A stray ` backtick, {img}\nend",
+            "Escaped \\`MEDIA:x.png \\` ticks": f"Escaped \\`{img}\n\\` ticks",
+            "Two paragraphs `a\n\nMEDIA:x.png b`": f"Two paragraphs `a\n\n{img}\nb`",
+            "    MEDIA:x.png indented": f"    {img}\nindented",
+        }
+        for text, want in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(_resolve_media(text, base_url=self.BASE), (want, True))
+                self.assertEqual(openclaw_pipe._media_directives(text, True), ["MEDIA:x.png"])
+
+    def test_code_and_prose_directives_in_one_text(self):
+        text = "Quote ``Use `MEDIA:a.png ` here``, real: MEDIA:b.png\nend"
+        self.assertEqual(_resolve_media(text, base_url=self.BASE),
+                         ("Quote ``Use `MEDIA:a.png ` here``, real: ![b.png](https://x/b.png)\nend",
+                          True))
+        self.assertEqual(openclaw_pipe._media_directives(text, True), ["MEDIA:b.png"])
+
+    def test_the_text_already_shown_sets_the_code_state(self):
+        """A streamed chunk starts where the shown text of its message item
+        left off: inside a fence, or inside an open code span."""
+        for ctx, chunk in (("```\n", "MEDIA:x.png\nmore"), ("~~~\nold\n", "MEDIA:x.png\nmore"),
+                           ("Use `` ", "MEDIA:x.png `` more")):
+            with self.subTest(ctx=ctx):
+                self.assertEqual(_resolve_media(chunk, base_url=self.BASE, ctx=ctx), (chunk, False))
+        for ctx in ("```\nold\n```\n", "`done` ", "A stray ` "):
+            with self.subTest(ctx=ctx):
+                self.assertTrue(_resolve_media("MEDIA:x.png\nmore", base_url=self.BASE, ctx=ctx)[1])
+
+    def test_a_directive_after_an_open_code_span_is_held_until_decided(self):
+        # Closed by a later run of the same length: code, released as text.
+        shown, held = _advance_media_buffer("", "MEDIA:x.png and", ctx="Use `` ")
+        self.assertEqual((shown, held), ("", "MEDIA:x.png and"))
+        shown, held = _advance_media_buffer(held, " more`` done", ctx="Use `` ")
+        self.assertEqual((shown, held), ("MEDIA:x.png and more`` done", ""))
+        self.assertFalse(_resolve_media(shown, base_url=self.BASE, ctx="Use `` ")[1])
+        # The paragraph ends first: the run was a literal backtick.
+        shown, held = _advance_media_buffer("", "MEDIA:x.png\n", ctx="a ` stray ")
+        self.assertEqual((shown, held), ("", "MEDIA:x.png\n"))
+        shown, held = _advance_media_buffer(held, "\nnext", ctx="a ` stray ")
+        self.assertEqual((shown, held), ("MEDIA:x.png\n\nnext", ""))
+        self.assertTrue(_resolve_media(shown, base_url=self.BASE, ctx="a ` stray ")[1])
+        # Inside a fence nothing is held.
+        self.assertEqual(_advance_media_buffer("", "MEDIA:x.pn", ctx="```\n"),
+                         ("MEDIA:x.pn", ""))
+
+    def test_the_writer_waits_for_an_open_span(self):
+        self.assertEqual(openclaw_pipe._media_directives("a `MEDIA:x.png b", False), [])
+        self.assertEqual(openclaw_pipe._media_directives("a `MEDIA:x.png b", True),
+                         ["MEDIA:x.png"])
+
+    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
+    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
+    _queue = NoDroppedMessagesTests._queue
+    _delta = NoDroppedMessagesTests._delta
+    _final = NoDroppedMessagesTests._final
+    _until_registered = NoDroppedMessagesTests._until_registered
+    _stream = NeedsInputMarkerTests._stream
+
+    async def test_the_report_streams_as_written(self):
+        self.pipe.valves.USE_OWUI_FILES = False
+        self.pipe.valves.FILE_SERVER_BASE_URL = self.BASE
+        for chunk in (40, 7):
+            with self.subTest(chunk=chunk):
+                out = await self._stream(self.FX["raw"], None, chunk=chunk)
+                self.assertNotIn("![", out)
+                self.assertEqual(out.strip(), self.FX["raw"].strip())
+                await self.asyncTearDown()
+                await self.asyncSetUp()
+                self.pipe.valves.USE_OWUI_FILES = False
+                self.pipe.valves.FILE_SERVER_BASE_URL = self.BASE
+
+    async def test_a_streamed_reply_resolves_only_its_prose_directive(self):
+        self.pipe.valves.USE_OWUI_FILES = False
+        self.pipe.valves.FILE_SERVER_BASE_URL = self.BASE
+        text = ("Quoted: ``Use `MEDIA:a.png ` here`` and\n```\nMEDIA:b.png\n```\n"
+                "Real: MEDIA:c.png and more.\n")
+        out = await self._stream(text, None, chunk=5)
+        self.assertIn("``Use `MEDIA:a.png ` here``", out)
+        self.assertIn("```\nMEDIA:b.png\n```", out)
+        self.assertIn("![c.png](https://x/c.png)", out)
+        self.assertEqual(out.count("!["), 1)
+
+
+    async def test_a_fence_opened_by_a_resolved_chunk_quotes_what_follows(self):
+        """The chunk that resolves a directive can open a fence; the next
+        chunk's code state needs that chunk's raw text."""
+        self.pipe.valves.USE_OWUI_FILES = False
+        self.pipe.valves.FILE_SERVER_BASE_URL = self.BASE
+        out = await self._stream("Real: MEDIA:a.png\n```\nMEDIA:b.png\n```\nend\n", None, chunk=5)
+        self.assertIn("![a.png](https://x/a.png)", out)
+        self.assertIn("MEDIA:b.png", out)
+        self.assertEqual(out.count("!["), 1)
+
+    async def test_a_held_directive_shows_before_the_next_tool_card(self):
+        """Held while a backtick run might still open a span; the item ends at
+        a tool call, so the run was literal and the image shows before it."""
+        self.pipe.valves.USE_OWUI_FILES = False
+        self.pipe.valves.FILE_SERVER_BASE_URL = self.BASE
+
+        async def emitter(event):
+            pass
+        body = {"model": "openclaw_gateway.default", "messages": [{"role": "user", "content": "go"}]}
+        meta = {"chat_id": "chat-1", "user_id": "u1", "message_id": "m1"}
+        gen = self.pipe._pipe_impl(body, emitter, __metadata__=meta)
+        seen = []
+
+        async def drain():
+            async for c in gen:
+                seen.append(c)
+        task = asyncio.ensure_future(drain())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "A stray ` tick, MEDIA:x.png and"))
+        q.put_nowait({"type": "event", "event": "agent", "payload": {
+            "sessionKey": self.SK, "runId": "run-1", "stream": "tool",
+            "data": {"phase": "start", "toolCallId": "t1", "name": "Bash", "args": {}}}})
+        q.put_nowait(self._delta("run-1", "after"))
+        q.put_nowait(self._final("run-1"))
+        await asyncio.wait_for(task, 5)   # bounds the test only
+        card = next(i for i, c in enumerate(seen) if not isinstance(c, str))
+        before = "".join(c for c in seen[:card] if isinstance(c, str))
+        self.assertIn("A stray ` tick, ![x.png](https://x/x.png)\nand", before)
+
+
+class HandoverMediaCodeAwareTests(_RoutingCase):
+    """ELI-111, the writer side: a handed-over reply resolves a directive the
+    way the inline reply does, and an image recorded for a prose directive is
+    not pasted over the same directive quoted in code."""
+
+    closed_run = HandoverRewriteTests.closed_run
+    settle = HandoverRewriteTests.settle
+
+    async def test_a_quoted_directive_stays_text_after_a_handover(self):
+        run = pipe_run_id(self.CHAT, self.STUB)
+        self.add_stub(self.STUB, content="")
+        self.conn.register_run_target(self.key, run, self.CHAT, self.STUB)
+        text = "Real: MEDIA:x.png\nQuoted: `` MEDIA:x.png `` and ```MEDIA:y.png ``` done."
+        calls = []
+
+        async def resolve(t, **kw):
+            calls.append(t)
+            return t.replace("MEDIA:", "IMG:"), True
+        with mock.patch.object(openclaw_pipe, "_resolve_media_text", resolve):
+            await self.dispatch(run, _delta(text))
+            await self.dispatch(run, {"state": "final"})
+            self.history = {"messages": self.closed_run(run, text)}
+            await self.settle(run)
+        m = self.owui.msgs()[self.STUB]
+        self.assertEqual(calls, ["MEDIA:x.png"])
+        self.assertEqual(m["content"],
+                         "Real: IMG:x.png\nQuoted: `` MEDIA:x.png `` and ```MEDIA:y.png ``` done.")

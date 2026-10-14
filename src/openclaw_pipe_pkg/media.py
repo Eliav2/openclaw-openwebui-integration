@@ -29,7 +29,7 @@ def _looks_like_media_filename(fname: str) -> bool:
     return bool(_MEDIA_FNAME_RE.search(fname))
 
 
-def _advance_media_buffer(pending: str, delta: str) -> tuple[str, str]:
+def _advance_media_buffer(pending: str, delta: str, ctx: str = "") -> tuple[str, str]:
     """Feed a new assistant-delta chunk into the MEDIA: buffering state.
 
     Returns (text_to_yield_now, new_pending), mirroring
@@ -43,18 +43,16 @@ def _advance_media_buffer(pending: str, delta: str) -> tuple[str, str]:
     modes in the same message). Hold back from the first "MEDIA:" (or a
     prefix of it that could still complete) until a whitespace char
     confirms the filename is done.
+
+    A directive in code is text and never held; one after a backtick run
+    that may still open a code span is held until that is decided (ELI-111).
+    `ctx`: the text already shown in this message item.
     """
     candidate = pending + delta
-    idx = candidate.find(_MEDIA_TRIGGER)
-    if idx == -1:
-        for i in range(min(len(_MEDIA_TRIGGER) - 1, len(candidate)), 0, -1):
-            if candidate.endswith(_MEDIA_TRIGGER[:i]):
-                return candidate[:-i], candidate[-i:]
+    _directives, hold = _media_scan(candidate, ctx, final=False)
+    if hold is None:
         return candidate, ""
-    after = candidate[idx + len(_MEDIA_TRIGGER):]
-    if not re.search(r"\s", after):
-        return candidate[:idx], candidate[idx:]
-    return candidate, ""
+    return candidate[:hold], candidate[hold:]
 
 
 def _take_media_fname(after_prefix: str) -> tuple[str, str]:
@@ -78,46 +76,159 @@ def _take_media_fname(after_prefix: str) -> tuple[str, str]:
     return fname, rest
 
 
-def _resolve_media(text, base_url=None):
+# ELI-111: a directive is code-aware, as the ask marker is (ELI-107). Code is
+# a fenced block (CommonMark 4.5) or an inline code span (6.1): a backtick run
+# closed by the next run of the same length within its paragraph. A run with
+# no closer is a literal backtick, which is only known once its paragraph
+# ends. Indented code blocks are not tracked: an indented line in a list is
+# prose. A report quoting a directive in a double-backtick span had it
+# rendered as an image (message 442ecfa3, 2026-10-14).
+_BLOCK_START_RE = re.compile(r"^ {0,3}(#{1,6}(\s|$)|[-+*](\s|$)|\d{1,9}[.)](\s|$))")
+
+
+def _media_code_ranges(text: str, ctx: str = "", final: bool = True):
+    """(ranges, open_at) for `text` as it continues `ctx`: the [start, end)
+    spans of `text` that are code, and the offset in `text` from which that
+    is not decided yet (a backtick run that may still be closed in the open
+    paragraph `text` ends in), else None. `final`: nothing follows `text`."""
+    full, base = ctx + text, len(ctx)
+    ranges, open_at = [], None
+    fence_step = globals().get("_fence_step")
+
+    def spans(start, end, last):
+        """Code spans of the paragraph full[start:end]; `last`: it may go on."""
+        nonlocal open_at
+        i = start
+        while i < end:
+            c = full[i]
+            if c == "\\" and i + 1 < end and full[i + 1] == "`":
+                i += 2
+                continue
+            if c != "`":
+                i += 1
+                continue
+            j = i
+            while j < end and full[j] == "`":
+                j += 1
+            k, close = j, None
+            while k < end and close is None:
+                if full[k] != "`":
+                    k += 1
+                    continue
+                r = k
+                while r < end and full[r] == "`":
+                    r += 1
+                if r - k == j - i and not (last and r == end):
+                    close = r
+                k = r
+            if close is not None:
+                ranges.append((i, close))
+                i = close
+                continue
+            if last and open_at is None:
+                open_at = i
+            i = j
+
+    fence, para, pos = "", None, 0
+    lines = full.split("\n")
+    for n, line in enumerate(lines):
+        end = pos + len(line)
+        complete = final or n < len(lines) - 1
+        if fence or (complete and fence_step and fence_step(line, "")):
+            if para is not None:
+                spans(para, pos, False)
+                para = None
+            ranges.append((pos, min(end + 1, len(full))))
+            if complete and fence_step:
+                fence = fence_step(line, fence)
+        elif complete and not line.strip():
+            if para is not None:
+                spans(para, pos, False)
+                para = None
+        else:
+            if para is not None and _BLOCK_START_RE.match(line):
+                spans(para, pos, False)
+                para = None
+            if para is None:
+                para = pos
+        pos = end + 1
+    if para is not None:
+        spans(para, len(full), not final)
+    shifted = [(max(a, base) - base, b - base) for a, b in ranges if b > base]
+    if open_at is not None:
+        open_at = max(open_at, base) - base
+    return shifted, open_at
+
+
+def _media_scan(text: str, ctx: str = "", final: bool = True):
+    """(directives, hold_at): each complete `MEDIA:<file>` directive of `text`
+    outside code, as (start, end, filename) by `_take_media_fname`, and the
+    offset a stream holds `text` back from (None when nothing): the first
+    occurrence, or prefix of one at the end, whose filename may still be
+    arriving or whose code state is not decided. `ctx`: the text shown
+    before `text` in its message item. `final`: nothing follows `text`."""
+    ranges, open_at = _media_code_ranges(text, ctx, final)
+
+    def in_code(i):
+        return any(a <= i < b for a, b in ranges)
+    directives, hold, i = [], None, 0
+    while True:
+        idx = text.find(_MEDIA_TRIGGER, i)
+        if idx < 0:
+            break
+        i = idx + len(_MEDIA_TRIGGER)
+        if in_code(idx):
+            continue
+        after = text[i:]
+        stripped = after.strip()
+        fname, rest = _take_media_fname(stripped)
+        end = i + (len(after) - len(after.lstrip())) + len(stripped) - len(rest)
+        complete = final or end < len(text)
+        if not complete or (open_at is not None and idx >= open_at
+                            and _looks_like_media_filename(fname)):
+            hold = idx
+            break
+        if fname and _looks_like_media_filename(fname):
+            directives.append((idx, end, fname))
+            i = end
+    if hold is None and not final:
+        for n in range(min(len(_MEDIA_TRIGGER) - 1, len(text)), 0, -1):
+            if text.endswith(_MEDIA_TRIGGER[:n]) and not in_code(len(text) - n):
+                hold = len(text) - n
+                break
+    return directives, hold
+
+
+def _replace_media(text: str, directives, replacement) -> str:
+    """`text` with each directive (from `_media_scan`) replaced by
+    `replacement(filename)`, and the text after it on a line of its own."""
+    out, pos = "", 0
+    for start, end, fname in directives:
+        rest = text[end:]
+        out += text[pos:start] + replacement(fname) + ("\n" if rest.strip() else "")
+        pos = end + len(rest) - len(rest.lstrip())
+    return out + text[pos:].rstrip()
+
+
+def _resolve_media(text, base_url=None, ctx=""):
     """Convert every MEDIA:filename directive in text to embedded media.
 
     A single reply can legitimately carry several images (confirmed live
     2026-07-10 sending a 4-screenshot bug repro) -- this must loop over every
     occurrence, not just the first, or later directives in the same chunk
-    silently pass through as literal "MEDIA:filename" text.
+    silently pass through as literal "MEDIA:filename" text. Prose using
+    "MEDIA:" as a term (no file extension) and a directive quoted in code
+    (ELI-111) stay text. `ctx`: the text shown before `text` in its message
+    item.
     """
     if base_url is None:
         base_url = MEDIA_BASE_URL
-    prefix = "MEDIA:"
-    if prefix not in text:
+    directives, _hold = _media_scan(text, ctx)
+    if not directives:
         return text, False
-    handled = False
-    out = ""
-    remaining = text
-    while prefix in remaining:
-        idx = remaining.index(prefix)
-        before = remaining[:idx]
-        after_prefix = remaining[idx + len(prefix):].strip()
-        fname, rest = _take_media_fname(after_prefix)
-        if not fname:
-            break
-        if not _looks_like_media_filename(fname):
-            # Not a real directive -- e.g. prose using "MEDIA:" as a term,
-            # not a file reference. Leave this occurrence as literal text
-            # and keep scanning past it for any genuine directive later on.
-            out += before + prefix
-            remaining = remaining[idx + len(prefix):]
-            continue
-        # Prefer HTTPS URL over base64 data URI (base64 breaks OWUI streaming parser).
-        url = f"{base_url.rstrip('/')}/{fname}"
-        rest = rest.strip()
-        out += before + f"![{fname}]({url})"
-        handled = True
-        if rest:
-            out += "\n"
-        remaining = rest
-    out += remaining
-    return (out, True) if handled else (text, False)
+    # Prefer HTTPS URL over base64 data URI (base64 breaks OWUI streaming parser).
+    return _replace_media(text, directives,
+                          lambda fname: f"![{fname}]({base_url.rstrip('/')}/{fname})"), True
 
 
 def _extract_request_bearer(__request__):
@@ -178,6 +289,7 @@ async def _resolve_media_via_owui(
     base_url,
     token,
     __event_emitter__,
+    ctx="",
 ):
     """Upload every MEDIA: file in text to OWUI, in order, and attach each to
     the current message.
@@ -192,31 +304,17 @@ async def _resolve_media_via_owui(
     URL instead of leaving a mix of native-upload and unresolved directives
     in one message.
     """
-    prefix = "MEDIA:"
-    if prefix not in text:
+    directives, _hold = _media_scan(text, ctx)
+    if not directives:
         return text, False
+    for _start, _end, fname in directives:
+        if ".." in fname or "/" in fname or not os.path.isfile(os.path.join(MEDIA_DIR, fname)):
+            return text, False
 
-    out = ""
-    remaining = text
-    uploaded_any = False
-    while prefix in remaining:
-        idx = remaining.index(prefix)
-        before = remaining[:idx]
-        after_prefix = remaining[idx + len(prefix):].strip()
-        fname, rest = _take_media_fname(after_prefix)
-        if not fname or not _looks_like_media_filename(fname):
-            # Not a real directive -- e.g. prose using "MEDIA:" as a term,
-            # not a file reference. Leave this occurrence as literal text
-            # and keep scanning past it for any genuine directive later on.
-            out += before + prefix
-            remaining = remaining[idx + len(prefix):]
+    shown = {}
+    for _start, _end, fname in directives:
+        if fname in shown:
             continue
-        if ".." in fname or "/" in fname:
-            return text, False
-        fpath = os.path.join(MEDIA_DIR, fname)
-        if not os.path.isfile(fpath):
-            return text, False
-
         # _upload_owui_file uses blocking urllib -- must run off the event loop.
         # This call goes to OWUI's own API (often 127.0.0.1:8080, i.e. OWUI
         # calling itself) from *inside* the async handler for the very request
@@ -225,6 +323,7 @@ async def _resolve_media_via_owui(
         # incoming HTTP request while its own loop is blocked waiting on it --
         # a guaranteed self-deadlock that only resolves via timeout. Running it
         # in a thread lets the event loop keep serving requests concurrently.
+        fpath = os.path.join(MEDIA_DIR, fname)
         file_obj = await asyncio.to_thread(_upload_owui_file, fpath, base_url, token)
         if __event_emitter__:
             await __event_emitter__(
@@ -238,24 +337,15 @@ async def _resolve_media_via_owui(
         mime = file_obj.get("meta", {}).get("content_type") or mimetypes.guess_type(fname)[0] or ""
         content_url = f"/api/v1/files/{file_id}/content" if file_id else ""
         if content_url and mime.startswith("image/"):
-            replacement = f"![{fname}]({content_url})"
+            shown[fname] = f"![{fname}]({content_url})"
         elif content_url:
-            replacement = f"[{fname}]({content_url})"
+            shown[fname] = f"[{fname}]({content_url})"
         else:
-            replacement = f"`{fname}`"
-
-        rest = rest.strip()
-        out += before + replacement
-        uploaded_any = True
-        if rest:
-            out += "\n"
-        remaining = rest
-
-    out += remaining
-    return (out, True) if uploaded_any else (text, False)
+            shown[fname] = f"`{fname}`"
+    return _replace_media(text, directives, shown.__getitem__), True
 
 
-async def _resolve_media_text(text, *, valves, __request__=None, __event_emitter__=None):
+async def _resolve_media_text(text, *, valves, __request__=None, __event_emitter__=None, ctx=""):
     """Resolve a MEDIA: directive, preferring the native OWUI Files API upload
     and falling back to the external file-server URL. Shared by the main
     per-delta resolution site and the end-of-stream final-flush site so both
@@ -272,11 +362,12 @@ async def _resolve_media_text(text, *, valves, __request__=None, __event_emitter
                 base_url=valves.OWUI_BASE_URL,
                 token=token,
                 __event_emitter__=__event_emitter__,
+                ctx=ctx,
             )
         except Exception as ex:
             pipe_log(f"  OWUI file upload failed; falling back: {ex}")
     if not handled:
-        resolved, handled = _resolve_media(text, base_url=valves.FILE_SERVER_BASE_URL)
+        resolved, handled = _resolve_media(text, base_url=valves.FILE_SERVER_BASE_URL, ctx=ctx)
     return resolved, handled
 
 

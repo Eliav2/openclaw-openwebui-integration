@@ -5038,7 +5038,13 @@ class _TurnWriter:
 
     def _rewrite(self, text: str) -> str:
         for raw, shown in self.conn.turn_rewrites(self.chat_id, self.message_id or ""):
-            if raw in text:
+            if raw not in text:
+                continue
+            # An image this writer recorded for one directive is not pasted
+            # over the same directive quoted in code (ELI-111).
+            if _media_directives(raw, True) == [raw]:
+                text = _replace_directive(text, raw, shown)
+            else:
                 text = text.replace(raw, shown)
         # A prompt nobody answered here shows as the inline reply's fallback
         # does: without its internal directive line (the writer side of
@@ -5527,22 +5533,26 @@ class _TurnWriter:
 
 def _media_directives(text: str, final: bool) -> list[str]:
     """Each complete `MEDIA:<file>` directive in `text`, as written, by the
-    inline reply's grammar (`_take_media_fname`). The last one is complete
-    once something follows its filename, or when the run is over."""
-    take, looks = globals().get("_take_media_fname"), globals().get("_looks_like_media_filename")
-    out, i = [], 0
-    while take and looks:
-        idx = text.find("MEDIA:", i)
-        if idx < 0:
-            break
-        after = text[idx + len("MEDIA:"):]
-        stripped = after.strip()
-        fname, rest = take(stripped)
-        end = idx + len("MEDIA:") + (len(after) - len(after.lstrip())) + len(stripped) - len(rest)
-        if fname and looks(fname) and (final or end < len(text)) and text[idx:end] not in out:
-            out.append(text[idx:end])
-        i = idx + len("MEDIA:")
+    inline reply's grammar (`_media_scan`): outside code (ELI-111), and the
+    last one complete once something follows its filename, or when the run
+    is over. Absent in the Status Action's build."""
+    scan = globals().get("_media_scan")
+    out = []
+    for start, end, _fname in (scan(text, final=final)[0] if scan else []):
+        if text[start:end] not in out:
+            out.append(text[start:end])
     return out
+
+
+def _replace_directive(text: str, raw: str, shown: str) -> str:
+    """`text` with `shown` for each occurrence of the directive `raw` that
+    the inline reply's grammar resolves, none quoted in code (ELI-111)."""
+    scan = globals().get("_media_scan")
+    out, pos = "", 0
+    for start, end, _fname in (scan(text)[0] if scan else []):
+        if text[start:end] == raw:
+            out, pos = out + text[pos:start] + shown, end
+    return out + text[pos:]
 
 
 async def _transcript_view(conn: "_GatewayConnection", *, session_key: str, chat_id: str,
