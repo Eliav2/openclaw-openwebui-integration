@@ -456,6 +456,7 @@ class Scenes:
         }}""", "the status dialog with two sub-agents and rate limits", 60_000)
         self.s.shot(page, "status-dialog", text_selector=root)
         opened_elapsed = page.evaluate(ELAPSED_CELLS)
+        opened_at = time.monotonic()
         page.locator(f"{root} button", has_text="Fly.io").first.click()
         page.wait_for_selector("#openclaw-drawer-root", timeout=30_000)
         wait_js(page, """() => { const d = document.querySelector('#openclaw-drawer-root');
@@ -489,6 +490,8 @@ class Scenes:
         # time has moved on from what the dialog first showed (ELI-120).
         page.mouse.click(12, 400)  # the drawer's backdrop, left of its panel
         page.wait_for_selector("#openclaw-drawer-root", state="detached", timeout=10_000)
+        # Ten seconds after it opened, so the change reads at a glance.
+        page.wait_for_timeout(max(0, 10_000 - (time.monotonic() - opened_at) * 1000))
         print(f"  elapsed at open {opened_elapsed}, now {page.evaluate(ELAPSED_CELLS)}", flush=True)
         self.s.shot(page, "status-dialog-later", text_selector=root)
 
