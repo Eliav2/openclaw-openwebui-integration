@@ -1100,16 +1100,57 @@ class ParkedCancelTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.15)
         self.assertEqual(calls, [("abort", "s", "run-1")])
 
+    @staticmethod
+    async def _spin():
+        for _ in range(50):
+            await asyncio.sleep(0)
+
+    def _park_asking(self, conn, run_id="run-1"):
+        """Park `run_id` with a settle whose page answer the test gives."""
+        answer = asyncio.get_running_loop().create_future()
+
+        async def settle():
+            conn.settle_parked_turn("s", run_id, await answer, hold_s=120)
+        conn.park_cancelled_turn("s", run_id, None, [], 30, send_stop=False, settle=settle)
+        return answer
+
     async def test_claim_waits_for_a_stop_answer_in_flight(self):
         # Stop, then OWUI auto-sends the next queued message: that message
         # must start fresh, not continue the run the user stopped.
         conn, calls = self._conn()
-        conn.park_cancelled_turn("s", "run-1", None, [], 30, send_stop=False)
+        answer = self._park_asking(conn)
         claim = asyncio.ensure_future(conn.claim_cancelled_turn("s"))
-        await asyncio.sleep(0.05)
-        conn.settle_parked_turn("s", "run-1", "stop", hold_s=120)
+        await self._spin()
+        self.assertFalse(claim.done(), "the claim waits for the page's answer, however long")
+        answer.set_result("stop")
         self.assertIsNone(await claim)
         self.assertEqual(calls, [("abort", "s", "run-1")])
+
+    async def test_claim_takes_the_run_on_a_send_now_answer(self):
+        conn, calls = self._conn()
+        answer = self._park_asking(conn)
+        claim = asyncio.ensure_future(conn.claim_cancelled_turn("s"))
+        await self._spin()
+        self.assertFalse(claim.done())
+        answer.set_result("send_now")
+        self.assertEqual((await claim)["run_id"], "run-1")
+        self.assertEqual(calls, [])
+
+    async def test_a_park_nobody_can_settle_is_resolved_at_once(self):
+        """No page to ask (API use): the fallback window decides, and the
+        next message claims without waiting."""
+        conn, _ = self._conn()
+        conn.park_cancelled_turn("s", "run-1", None, [], 30, send_stop=False)
+        self.assertTrue(conn._pending_cancel_aborts["s"]["resolved"].is_set())
+
+    async def test_a_settle_that_fails_still_resolves(self):
+        conn, _ = self._conn()
+
+        async def settle():
+            raise RuntimeError("page gone")
+        conn.park_cancelled_turn("s", "run-1", None, [], 30, send_stop=False, settle=settle)
+        claim = asyncio.ensure_future(conn.claim_cancelled_turn("s"))
+        self.assertEqual((await claim)["run_id"], "run-1")
 
     def test_intent_query_reads_and_clears(self):
         from openclaw_pipe import _intent_query_js
@@ -1559,6 +1600,73 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.05)
         self.assertIn("abort", self.rpc)
         self.assertEqual(self.conn._consumers, {})
+
+    async def _interrupted_during_settle(self):
+        """A reply cut while its run streams, and the closing of that reply
+        cancelled again while the page's Stop/Send-now answer is in flight.
+        Returns the future the page answers through."""
+        self.pipe.valves.INTERRUPT_GRACE_SECONDS = 30
+        answer = asyncio.get_running_loop().create_future()
+
+        async def event_call(event):
+            code = (event.get("data") or {}).get("code", "")
+            if "delete all[c]" in code:   # the intent query
+                return await answer
+            return True                  # the hook install at turn start
+        body = {"model": "openclaw_gateway.default", "messages": [{"role": "user", "content": "count"}]}
+        r1 = self.pipe._pipe_impl(body, lambda e: asyncio.sleep(0),
+                                  __metadata__={"chat_id": "chat-1", "user_id": "u1", "message_id": "m1"},
+                                  __event_call__=event_call)
+        first = asyncio.ensure_future(r1.__anext__())
+        await self._spin()
+        self.assertIn(f"{self.SK}:run-1", self.conn._consumers)
+        self.active = True
+        self._queue("run-1").put_nowait(self._delta("run-1", "1\n"))
+        await first
+        closing = asyncio.ensure_future(r1.aclose())
+        await self._spin()
+        closing.cancel()   # the cancelled reply is interrupted again, mid-settle
+        await asyncio.gather(closing, return_exceptions=True)
+        return answer
+
+    async def test_a_stop_answer_holds_when_the_cancelled_reply_is_interrupted(self):
+        """ELI-95: the page's answer was awaited on the cancelled reply's own
+        close path, so a second interruption there turned a Stop into
+        "unknown", and the next message continued the run the user stopped."""
+        answer = await self._interrupted_during_settle()
+        r2 = self._reply("next", "m2")
+        nxt = asyncio.ensure_future(r2.__anext__())
+        await self._spin()
+        self.assertIn(self.SK, self.conn._pending_cancel_aborts,
+                      "the next message waits for the page's answer")
+        answer.set_result("stop")
+        await self._spin()
+        self.assertIn("abort", self.rpc, "the stopped run is aborted")
+        self.assertNotIn(self.SK, self.conn._pending_cancel_aborts)
+        self._settled(False)   # the Gateway settles the aborted run
+        await self._spin()
+        self.assertIn(f"{self.SK}:run-2", self.conn._consumers)
+        self.assertEqual(self.sent[-1], "next", "the next message starts its own run")
+        nxt.cancel()
+        await asyncio.gather(nxt, return_exceptions=True)
+        await r2.aclose()
+
+    async def test_a_send_now_answer_is_adopted_when_the_cancelled_reply_is_interrupted(self):
+        answer = await self._interrupted_during_settle()
+        r2 = self._reply("next", "m2")
+        nxt = asyncio.ensure_future(r2.__anext__())
+        await self._spin()
+        self.assertIn(self.SK, self.conn._pending_cancel_aborts,
+                      "the next message waits for the page's answer")
+        self.assertFalse(nxt.done())
+        answer.set_result("send_now")
+        self._queue("run-1").put_nowait(self._delta("run-1", "2\n"))
+        out = await asyncio.wait_for(nxt, 2)   # bounds the test only
+        while "2" not in out:
+            out += await asyncio.wait_for(r2.__anext__(), 2)
+        self.assertIn("2", out)
+        self.assertNotIn("abort", self.rpc)
+        await r2.aclose()
 
     async def test_adopted_run_closing_text_is_not_appended_again(self):
         # Live 2026-10-12: the reply continuing a run showed 2327..4000 and

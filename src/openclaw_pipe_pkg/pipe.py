@@ -94,8 +94,12 @@ def _thinking_rejection_retry_body(body, recovered, resolved_thinking):
     return retry_body
 
 
-# A Send now's follow-up message is known to be coming; this only bounds a
-# browser that dies between the cancel and the send.
+# After a Send now the page sends its follow-up message, which claims the run
+# at once (`claim_cancelled_turn`). This bounds only a follow-up that never
+# comes: the tab was closed, crashed or reloaded in between. Nothing signals
+# that: the Gateway knows nothing of the browser, and Open WebUI's socket
+# disconnect is not it either, since a socket drop reconnects with a new sid
+# while the page and its queued message survive (ELI-95).
 _SEND_NOW_HOLD_S = 120.0
 
 
@@ -271,6 +275,8 @@ class Pipe:
                 "a /stop, so a tool it is running is actually killed -- aborting "
                 "the stream alone can leave the tool running."
         )
+        # A bound, not a wait: a client that cannot say Stop or Send now (no
+        # page hook, API use) sends no signal at all (ELI-95).
         INTERRUPT_GRACE_SECONDS: float = Field(
             default=10.0,
             description="Recommended: 10. Fallback only: the Pipe asks the "
@@ -782,10 +788,10 @@ class Pipe:
                     float(getattr(self.valves, "INTERRUPT_GRACE_SECONDS", 0) or 0),
                     send_stop=self.valves.SEND_STOP_ON_CANCEL,
                     run_text=turn.run_text,
+                    settle=functools.partial(
+                        _settle_cancel_intent, turn.conn, turn.session_key,
+                        turn.run_id, turn.chat_id, __event_call__),
                 )
-                await _settle_cancel_intent(
-                    turn.conn, turn.session_key, turn.run_id, turn.chat_id,
-                    __event_call__)
             raise
 
     async def _pipe_turn(self, body, __event_emitter__, __event_call__=None,
@@ -2223,6 +2229,9 @@ class Pipe:
                                   "item": last_item_text,
                                   "gaps": run_gaps,
                                   "segments": run_segments},
+                        settle=functools.partial(
+                            _settle_cancel_intent, conn, session_key, our_run_id,
+                            owui_origin_chat_id, __event_call__),
                     )
                     pipe_log(
                         f"Generator {type(stop).__name__}: run parked "
@@ -2232,9 +2241,6 @@ class Pipe:
                         f"Generator {type(stop).__name__}: sending chat.abort"
                     )
                     try:
-                        await _settle_cancel_intent(
-                            conn, session_key, our_run_id,
-                            owui_origin_chat_id, __event_call__)
                         await maybe_emit_snapshot(force=True)
                         await _emit_status(__event_emitter__, "Stopped", done=True)
                     except (Exception, asyncio.CancelledError) as ex:

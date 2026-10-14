@@ -93,6 +93,7 @@ import sys
 import hashlib
 import contextlib
 import copy
+import functools
 import re
 import signal
 import mimetypes
@@ -5468,7 +5469,7 @@ class _GatewayConnection:
     def park_cancelled_turn(self, session_key: str, run_id: str | None,
                             queue: asyncio.Queue | None, carried: list[str],
                             grace_s: float, send_stop: bool,
-                            run_text: dict | None = None) -> None:
+                            run_text: dict | None = None, settle=None) -> None:
         """Hand a cancelled reply's unfinished business to the next message.
 
         OWUI cancels a response the same way for Stop and for Send now /
@@ -5487,16 +5488,20 @@ class _GatewayConnection:
           of it for new and appends the entire reply again (seen live
           2026-10-12: 2327..4000 followed by 1..4000).
 
-        The caller then asks the browser which button was pressed and calls
-        `settle_parked_turn`: Stop releases it now, Send now holds it for the
-        follow-up message. `grace_s` is only the fallback for a client that
-        cannot say (no page hook, API use). `claim_cancelled_turn` takes all
-        of it over; if nothing claims it, the run is aborted, the queue
-        released and the carried messages dropped (the user stopped them).
+        `settle` (a coroutine function) asks the browser which button was
+        pressed and calls `settle_parked_turn`: Stop releases it now, Send now
+        holds it for the follow-up message. It runs as a background task
+        started here, so interrupting the cancelled reply cannot interrupt it
+        (ELI-95), and the entry is `resolved` when it returns, which the
+        intent query's own bound ensures. Without one, nobody can say (no page
+        hook, API use): it is resolved now, and `grace_s` decides.
+        `claim_cancelled_turn` takes all of it over; if nothing claims it, the
+        run is aborted, the queue released and the carried messages dropped
+        (the user stopped them).
 
         Synchronous on purpose: it runs on the generator's cancel/close path,
         where an await can itself be interrupted, so nothing here may depend
-        on one. The Gateway calls go to background tasks.
+        on one. The Gateway calls and the settle go to background tasks.
 
         Open WebUI shutting down cancels every open reply too, and that is no
         Stop: the run keeps going, nothing is aborted, and the next process's
@@ -5549,6 +5554,16 @@ class _GatewayConnection:
             return
         self._pending_cancel_aborts[session_key] = entry
         self._arm_parked_timer(session_key, entry, grace_s)
+        if settle is None:
+            entry["resolved"].set()
+            return
+
+        async def _settle() -> None:
+            try:
+                await settle()
+            finally:
+                entry["resolved"].set()
+        spawn_background(_settle())
 
     def _arm_parked_timer(self, session_key: str, entry: dict,
                           wait_s: float) -> None:
@@ -5599,14 +5614,15 @@ class _GatewayConnection:
                      "keeping the fallback window")
         entry["resolved"].set()
 
-    async def claim_cancelled_turn(self, session_key: str,
-                                   wait_s: float = 3.0) -> dict | None:
+    async def claim_cancelled_turn(self, session_key: str) -> dict | None:
         """Take over the turn `park_cancelled_turn` parked, if any.
 
-        Waits up to `wait_s` for `settle_parked_turn`, so a Stop whose answer
-        is still on its way is honored: OWUI follows a Stop with the next
-        queued message, which must start fresh rather than continue the run
-        the user just stopped.
+        Waits for the page's answer about the cancel (`resolved`), so a Stop
+        whose answer is still on its way is honored: OWUI follows a Stop with
+        the next queued message, which must start fresh rather than continue
+        the run the user just stopped. The answer's own query is bounded
+        (`_INTENT_QUERY_TIMEOUT_S`), and it always runs to its end in the
+        background, so this needs no bound of its own (ELI-95).
 
         Returns {"run_id", "queue", "carried"}; the caller now owns the run,
         its buffered queue and the carried messages.
@@ -5616,10 +5632,7 @@ class _GatewayConnection:
             return None
         if not entry["resolved"].is_set():
             entry["claiming"] = True
-            try:
-                await asyncio.wait_for(entry["resolved"].wait(), wait_s)
-            except asyncio.TimeoutError:
-                pass
+            await entry["resolved"].wait()
         entry = self._pending_cancel_aborts.pop(session_key, None)
         if entry is None:
             return None
@@ -7377,7 +7390,7 @@ def _intent_query_js(chat_id: str) -> str:
 
 
 # The page's answer to an intent query is an RPC reply; this bounds a tab that
-# never answers (it is not a wait for anything to happen).
+# never answers, as any RPC is bounded (not a wait for anything; ELI-95).
 _INTENT_QUERY_TIMEOUT_S = 3.0
 
 
@@ -8959,8 +8972,12 @@ def _thinking_rejection_retry_body(body, recovered, resolved_thinking):
     return retry_body
 
 
-# A Send now's follow-up message is known to be coming; this only bounds a
-# browser that dies between the cancel and the send.
+# After a Send now the page sends its follow-up message, which claims the run
+# at once (`claim_cancelled_turn`). This bounds only a follow-up that never
+# comes: the tab was closed, crashed or reloaded in between. Nothing signals
+# that: the Gateway knows nothing of the browser, and Open WebUI's socket
+# disconnect is not it either, since a socket drop reconnects with a new sid
+# while the page and its queued message survive (ELI-95).
 _SEND_NOW_HOLD_S = 120.0
 
 
@@ -9136,6 +9153,8 @@ class Pipe:
                 "a /stop, so a tool it is running is actually killed -- aborting "
                 "the stream alone can leave the tool running."
         )
+        # A bound, not a wait: a client that cannot say Stop or Send now (no
+        # page hook, API use) sends no signal at all (ELI-95).
         INTERRUPT_GRACE_SECONDS: float = Field(
             default=10.0,
             description="Recommended: 10. Fallback only: the Pipe asks the "
@@ -9630,10 +9649,10 @@ class Pipe:
                     float(getattr(self.valves, "INTERRUPT_GRACE_SECONDS", 0) or 0),
                     send_stop=self.valves.SEND_STOP_ON_CANCEL,
                     run_text=turn.run_text,
+                    settle=functools.partial(
+                        _settle_cancel_intent, turn.conn, turn.session_key,
+                        turn.run_id, turn.chat_id, __event_call__),
                 )
-                await _settle_cancel_intent(
-                    turn.conn, turn.session_key, turn.run_id, turn.chat_id,
-                    __event_call__)
             raise
 
     async def _pipe_turn(self, body, __event_emitter__, __event_call__=None,
@@ -11071,6 +11090,9 @@ class Pipe:
                                   "item": last_item_text,
                                   "gaps": run_gaps,
                                   "segments": run_segments},
+                        settle=functools.partial(
+                            _settle_cancel_intent, conn, session_key, our_run_id,
+                            owui_origin_chat_id, __event_call__),
                     )
                     pipe_log(
                         f"Generator {type(stop).__name__}: run parked "
@@ -11080,9 +11102,6 @@ class Pipe:
                         f"Generator {type(stop).__name__}: sending chat.abort"
                     )
                     try:
-                        await _settle_cancel_intent(
-                            conn, session_key, our_run_id,
-                            owui_origin_chat_id, __event_call__)
                         await maybe_emit_snapshot(force=True)
                         await _emit_status(__event_emitter__, "Stopped", done=True)
                     except (Exception, asyncio.CancelledError) as ex:

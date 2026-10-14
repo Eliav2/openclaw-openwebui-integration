@@ -17,6 +17,7 @@ import sys
 import hashlib
 import contextlib
 import copy
+import functools
 import re
 import signal
 import mimetypes

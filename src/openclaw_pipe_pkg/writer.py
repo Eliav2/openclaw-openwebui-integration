@@ -253,7 +253,7 @@ def _intent_query_js(chat_id: str) -> str:
 
 
 # The page's answer to an intent query is an RPC reply; this bounds a tab that
-# never answers (it is not a wait for anything to happen).
+# never answers, as any RPC is bounded (not a wait for anything; ELI-95).
 _INTENT_QUERY_TIMEOUT_S = 3.0
 
 
