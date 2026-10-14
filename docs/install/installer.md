@@ -34,6 +34,29 @@ The wizard prompts for everything it needs and says where to find the Gateway to
 uv run install.py install --wizard
 ```
 
+A real run, the Pipe part:
+
+```text
+──────────────────────────────────── Login ─────────────────────────────────────
+  ✓ Logged into OWUI as Sam
+─────────────────────────────────── Function ───────────────────────────────────
+  ✓ Created pipe function
+  ✓ Activated pipe function
+  ✓ Made pipe function global
+──────────────────────────────────── Valves ────────────────────────────────────
+  ! Generated new device identity: 133c1b884175ef2906a0...
+  ! This new identity must be approved once by OpenClaw.
+  ✓ Updated valves: AGENT_ID, DEVICE_IDENTITY, ENABLE_FILE_SERVER,
+GATEWAY_TOKEN, GATEWAY_URL, OWUI_BASE_URL, SEND_STOP_ON_CANCEL, STATE_DIR,
+USE_OWUI_FILES
+─────────────────────────────── Model discovery ────────────────────────────────
+  ✓ Model openclaw_gateway.default and at least one dynamic model are visible
+────────────────────────────────── Smoke test ──────────────────────────────────
+  ✓ Smoke test passed
+─────────────────────────────── Route smoke test ───────────────────────────────
+  ✓ Route smoke test passed (local/nova)
+```
+
 `uv run` resolves `cryptography`, `click` and `rich` into an ephemeral environment, so there is no venv or `pip install` step. `-w` is short for `--wizard`.
 
 The wizard asks for the Open WebUI base URL, admin email and password, the Gateway address (`host:port`), the Gateway token and the agent id. It only prompts for the email, password and token when they are not already set.

@@ -7,6 +7,9 @@ Valves: `AGENT_ID`, `DEFAULT_MODEL`, `MAX_MODELS`, `STATE_DIR`
 
 Each Open WebUI chat maps to a stable OpenClaw session key:
 
+![Two messages and two replies in one chat, one OpenClaw session](../img/chat-titles-light.png#gh-light-mode-only)
+![Two messages and two replies in one chat, one OpenClaw session](../img/chat-titles-dark.png#gh-dark-mode-only)
+
 ```text
 agent:{AGENT_ID}:openwebui-{user_id}-{chat_id}
 ```

@@ -40,12 +40,16 @@ More on these commands: [The installer](./install/installer.md).
 
 Failures name the thing that fixes them. When the cause is genuinely ambiguous, the message says so instead of guessing.
 
+![An error in the chat: the agent named in AGENT_ID does not exist on the Gateway](./img/error-message-light.png#gh-light-mode-only)
+![An error in the chat: the agent named in AGENT_ID does not exist on the Gateway](./img/error-message-dark.png#gh-dark-mode-only)
+
 | The chat shows | What to do |
 |---|---|
 | "This Open WebUI instance is not an approved device on the OpenClaw Gateway yet", with this device's id | On the Gateway host, run `openclaw devices list`, then `openclaw devices approve <request-id>` for the request with that id. Then send your message again. |
 | "The Gateway rejected the credentials" | [`GATEWAY_TOKEN`](./configuration.md#gateway_token) must match `gateway.auth.token` in your OpenClaw config. |
 | "The GATEWAY_URL valve is empty", or "GATEWAY_URL has an unsupported scheme" | Set [`GATEWAY_URL`](./configuration.md#gateway_url) to a bare `host:port`, for example `localhost:18789`. A pasted `http://`, `https://`, `ws://` or `wss://` prefix is accepted and stripped; any other prefix is not. |
 | "No response from the OpenClaw Gateway at `<host:port>` within 10s", or "Could not connect to the OpenClaw Gateway at `<host:port>`" | Check `GATEWAY_URL`, that the Gateway is running, and that the Open WebUI backend can reach that host. |
+| 'Error sending message: Agent "<id>" no longer exists in configuration' (the screenshot above) | [`AGENT_ID`](./configuration.md#agent_id) names an agent your Gateway does not define. Use `main` unless you configured others. |
 | "Could not start a session on agent `<id>`" | Fix [`AGENT_ID`](./configuration.md#agent_id). The model may be fine: applying the model is just the first thing the Pipe asks the agent to do. |
 | "Model selection error: could not apply `<model>`" | The Gateway refused that model. Pick another one, or check [`DEFAULT_MODEL`](./configuration.md#default_model). |
 | "Could not start this conversation's session" | The cause is unclear. Check that `AGENT_ID` names an agent your Gateway defines and that the model is one it offers. |
@@ -58,6 +62,27 @@ Failures name the thing that fixes them. When the cause is genuinely ambiguous, 
 ## Where the logs are
 
 Every turn logs to the Open WebUI backend log (its standard output), each line prefixed with `[openclaw-pipe]`. The Status Action logs with the same prefix. The thinking filter does not log.
+
+One reply in the Pipe's log (an excerpt):
+
+```text
+[openclaw-pipe] Messages: 1, last role: user
+[openclaw-pipe] Session key: agent:main:openwebui-<user id>-<chat id>
+[openclaw-pipe]   [diag] owui_msg_id=<message id> session_id=QHe3xkEulGUQ text_sha=94382a90 text_preview='What changed in this repo this week?'
+[openclaw-pipe] Cleared model override; using agent default
+[openclaw-pipe] Captured runId: msg-<chat id>-<message id>-1792018617.1007752
+[openclaw-pipe]   Tool start: exec
+[openclaw-pipe]   Item: kind=tool status=running title=exec Commits from the last week
+[openclaw-pipe]   Tool result: exec (200 chars)
+[openclaw-pipe]   Item: kind=tool status=completed title=exec Commits from the last week
+[openclaw-pipe]   Tool start: read
+[openclaw-pipe]   Item: kind=tool status=running title=read from forecast/CHANGELOG.md
+[openclaw-pipe]   Tool result: read (273 chars)
+[openclaw-pipe]   Item: kind=tool status=completed title=read from forecast/CHANGELOG.md
+[openclaw-pipe]   lifecycle end -> done
+[openclaw-pipe] DONE -- 129 events processed, text yielded: True
+[openclaw-pipe]   terminal: aborted=False text_yielded=True visible=606 snapshotted=0
+```
 
 On the Open WebUI host, with Docker (the container name depends on your deployment):
 

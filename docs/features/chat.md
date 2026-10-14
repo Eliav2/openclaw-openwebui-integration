@@ -7,6 +7,9 @@ Valves: `USE_OWUI_FILES`, `OWUI_BASE_URL`, `OWUI_API_KEY`, `ENABLE_FILE_SERVER`,
 
 Text appears token by token as the Gateway sends it, so a long answer starts showing at once instead of landing in one block at the end.
 
+![A reply part-way through: its first paragraph written, the rest still coming](../img/streaming-light.png#gh-light-mode-only)
+![A reply part-way through: its first paragraph written, the rest still coming](../img/streaming-dark.png#gh-dark-mode-only)
+
 Two provider quirks are handled so you never see them:
 
 - Some runtimes resend the whole reply as one final cumulative frame. The Pipe recognises text it has already shown and drops the repeat, so the answer is never printed twice.
@@ -46,6 +49,9 @@ Always on.
 ## Thinking level
 
 With the [thinking filter](../install/thinking-filter.md) installed, a toggle in the composer sets the reasoning level per chat: `default`, `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`.
+
+![The thinking level in Chat Controls > Valves, its choices listed: default, off, minimal, low, medium, high](../img/thinking-level-light.png#gh-light-mode-only)
+![The thinking level in Chat Controls > Valves, its choices listed: default, off, minimal, low, medium, high](../img/thinking-level-dark.png#gh-dark-mode-only)
 
 - `default` is not a level, it is the absence of one. No `thinking` field is sent, and the agent's own setting applies.
 - `off` is an explicit instruction not to think, and it does override the agent's setting.
@@ -87,6 +93,9 @@ Valves: [`USE_OWUI_FILES`](../configuration.md#use_owui_files) (on), [`OWUI_BASE
 
 An image you attach or paste reaches the Pipe as a list of content blocks, not the plain string Open WebUI sends for text. The Pipe takes each `image_url` block, parses the `data:<mime>;base64,<data>` URI Open WebUI sends, and forwards it to the agent as a `chat.send` attachment with its MIME type and a matching file extension. A vision-capable model gets the real image bytes, not a description.
 
+![A chart attached to a message, and the agent's reply about it](../img/image-input-light.png#gh-light-mode-only)
+![A chart attached to a message, and the agent's reply about it](../img/image-input-dark.png#gh-dark-mode-only)
+
 Only that inline base64 form is handled, because Open WebUI does not send plain HTTP(S) image URLs for attached or pasted images. An image the Pipe cannot forward produces a visible note that it could not be relayed, so you never get an answer confidently describing a picture the agent never received.
 
 Always on.
@@ -94,6 +103,9 @@ Always on.
 ## Usage and goal line
 
 After every reply, a status row shows where you stand:
+
+![The status rows under a reply, opened: the goal, both rate-limit windows with their resets, and the context used](../img/usage-goal-light.png#gh-light-mode-only)
+![The status rows under a reply, opened: the goal, both rate-limit windows with their resets, and the context used](../img/usage-goal-dark.png#gh-dark-mode-only)
 
 > 🧠 45k/200k (22.5%) · ⏱ 5h 18% left (resets in 22m)
 
@@ -108,6 +120,9 @@ Always on.
 ## Chat titles
 
 The chat names itself with a short title and an emoji. When you send your second message, the Pipe titles the chat from the first exchange (your first message and the first reply).
+
+![A chat titled by the Pipe after its second message, the title in the header](../img/chat-titles-light.png#gh-light-mode-only)
+![A chat titled by the Pipe after its second message, the title in the header](../img/chat-titles-dark.png#gh-dark-mode-only)
 
 Generation runs on a separate agent, `title-gen` by default, as a background task, so it never queues behind your conversation or adds to its context, and a failure never shows. The model's output is trimmed of quotes, extra lines and anything past 80 characters before it becomes the title. If that agent does not exist on your Gateway, titles are skipped silently: define a `title-gen` agent (a fast model is enough) or point `TITLE_GEN_AGENT_ID` at one you have.
 
