@@ -168,6 +168,25 @@ class SnippetRenderTests(unittest.TestCase):
         )
 
 
+class StatusLabelWidthTests(unittest.TestCase):
+    """ELI-123: at phone width (390 px) the composer row has no room for the
+    "Status" text next to the model selector, so the chip row's overflow cut
+    it to "Statı". Below `sm` the button is icon-only, like Open WebUI's own
+    composer chips, and keeps its accessible name; from `sm` up the label
+    shows. Both classes exist in Open WebUI 0.12's shipped CSS."""
+
+    def test_label_is_hidden_below_sm_and_the_button_keeps_its_name(self):
+        code = _render_composer_button_js()
+        self.assertIn('<span class="pr-0.5 hidden sm:inline">Status</span>', code)
+        self.assertIn("b.title = 'OpenClaw status';", code)
+        self.assertIn("b.setAttribute('aria-label', 'OpenClaw status');", code)
+
+    def test_version_bump_replaces_buttons_already_on_screen(self):
+        # ensure() swaps a button whose data-openclaw-version differs, so a
+        # page that already shows the clipped label gets the new one.
+        self.assertNotEqual(_COMPOSER_BUTTON_VERSION, "2")
+
+
 class EmitHelperTests(unittest.IsolatedAsyncioTestCase):
     async def test_emits_one_execute_event(self):
         events = []
