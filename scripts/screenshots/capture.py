@@ -173,6 +173,47 @@ def dump_children(session_key: str) -> None:
         print(f"  child row (now={now_ms}): {json.dumps(fields)}", flush=True)
 
 
+def forecast_chart_png(width: int = 600, height: int = 260) -> bytes:
+    """A small bar chart of hourly temperatures as a PNG, standard library
+    only: the image the media scene's reply shows."""
+    import struct
+    import zlib
+    temps = [11, 11, 10, 10, 11, 12, 14, 16, 18, 19, 21, 22, 22, 21, 19, 17, 16, 15, 14, 13, 12, 12, 11, 11]
+    rain = {15, 16, 17, 18}
+    bg, bar, wet, axis = (255, 255, 255), (59, 130, 246), (147, 197, 253), (209, 213, 219)
+    rows = []
+    slot = (width - 40) // len(temps)
+    for y in range(height):
+        row = bytearray(b"\x00")
+        for x in range(width):
+            px = bg
+            i = (x - 20) // slot
+            if y == height - 20 and 20 <= x < width - 20:
+                px = axis
+            elif 0 <= i < len(temps) and (x - 20) % slot < slot - 6 and y < height - 20:
+                top = height - 20 - temps[i] * 9
+                if y >= top:
+                    px = wet if i in rain else bar
+            row += bytes(px)
+        rows.append(bytes(row))
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"".join(rows), 9)) + chunk(b"IEND", b""))
+
+
+def upload_media(name: str, data: bytes) -> None:
+    """Put a file where a MEDIA:<name> directive finds it: the Pipe's media
+    file server (README, native media delivery)."""
+    req = urllib.request.Request(f"http://127.0.0.1:18791/{name}", data=data, method="PUT")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        body = resp.read().decode()
+    if not body.startswith("ok:"):
+        raise RuntimeError(f"media upload failed: {body}")
+
+
 def schedule_wake(session_key: str, message: str, in_s: float) -> None:
     at = (datetime.datetime.now(datetime.timezone.utc)
           + datetime.timedelta(seconds=in_s)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
@@ -384,6 +425,12 @@ class Scenes:
         self.s.shot(page, "status-dialog", text_selector=root)
         page.locator(f"{root} button", has_text="Fly.io").first.click()
         page.wait_for_selector("#openclaw-drawer-root", timeout=30_000)
+        wait_js(page, """() => { const d = document.querySelector('#openclaw-drawer-root');
+                 return d && d.innerText.includes('Fly.io') && /running/i.test(d.innerText); }""",
+                "the drawer's header", 30_000)
+        # As it opens, before anything else is clicked: where the drawer sits
+        # relative to the Status dialog is what this shot is for.
+        self.s.shot(page, "subagent-drawer-open")
         z = page.evaluate("""() => ({
           drawer: getComputedStyle(document.querySelector('#openclaw-drawer-root')).zIndex,
           dialog: getComputedStyle(document.querySelector('#openclaw-status-modal-root')).zIndex})""")
@@ -425,6 +472,25 @@ class Scenes:
         wait_js(page, f"() => {{ const a = {LAST_ASSISTANT}; return a && a.innerText.includes('nothing needs you today'); }}",
                 "the cron reply on screen")
         self.s.shot(page, "agent-turn")
+
+    def media_turn(self, page: Page) -> None:
+        """A cron reply with a MEDIA image followed by text. Replies the agent
+        starts are finalized by the Pipe's turn writer, not the inline path."""
+        new_chat(page)
+        chat = send(page, "Can you send me the hourly forecast chart every morning?")
+        wait_js(page, f"() => {{ const a = {LAST_ASSISTANT}; return a && a.innerText.includes('before you leave'); }}",
+                "the first reply")
+        set_title(self.token, chat, "Morning forecast chart")
+        upload_media("hourly-forecast.png", forecast_chart_png())
+        me = api("GET", "/api/v1/auths/", token=self.token)
+        schedule_wake(f"agent:main:openwebui-{me['id']}-{chat}", "Morning chart for the forecast app", 5)
+        wait_api(self.token, chat, "bike out this morning")
+        page.goto(f"{BASE}/c/{chat}")
+        wait_js(page, f"""() => {{ const a = {LAST_ASSISTANT};
+                 return a && a.innerText.includes('bike out this morning')
+                   && [...a.querySelectorAll('img')].some(i => i.complete && i.naturalWidth > 0); }}""",
+                "the cron reply with its chart loaded")
+        self.s.shot(page, "media-turn")
 
     def toolbar(self, page: Page) -> None:
         """#10: the Status button on the message toolbar, desktop width."""
@@ -471,6 +537,7 @@ def main(argv=None) -> int:
             shooter.run("status-dialog", scenes.status_and_drawer, page)
             shooter.run("model-picker", scenes.model_picker, page)
             shooter.run("agent-turn", scenes.agent_turn, page)
+            shooter.run("media-turn", scenes.media_turn, page)
             if scenes.hero_chat:
                 desk = browser.new_context(**DESKTOP, locale="en-US",
                                            timezone_id="America/New_York", color_scheme="light")
