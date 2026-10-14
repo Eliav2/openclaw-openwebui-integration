@@ -6,8 +6,11 @@ a real OWUI/pydantic/websockets/cryptography environment.
 """
 
 import asyncio
+import datetime
 import json
+import os
 import sys
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -242,6 +245,120 @@ class RenderJsTests(unittest.TestCase):
         js = _render_sections_error_js("boom")
         self.assertIn("openclaw-status-sections", js)
         self.assertIn('"boom"', js)
+
+
+# A page just big enough for the Status dialog's own JS: elements with
+# children, ids, dataset, `[data-*]` lookups, and a clock and timers the test
+# drives by hand. Reads {"open": js, "fills": [js, ...], "steps": [...]} on
+# stdin and prints what each step saw.
+_DIALOG_PAGE_JS = r"""
+const input = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+let now = input.now;
+Date.now = () => now;
+const timers = new Map();
+let nextTimer = 1;
+global.setInterval = (fn) => { const id = nextTimer++; timers.set(id, fn); return id; };
+global.clearInterval = (id) => { timers.delete(id); };
+const camel = (s) => s.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+class El {
+  constructor(tag) {
+    this.tagName = tag.toUpperCase(); this.children = []; this.parent = null;
+    this.style = {}; this.dataset = {}; this.className = ''; this.id = ''; this.text = '';
+  }
+  appendChild(c) { c.remove(); c.parent = this; this.children.push(c); return c; }
+  remove() {
+    if (this.parent) this.parent.children = this.parent.children.filter((x) => x !== this);
+    this.parent = null;
+  }
+  get isConnected() { let n = this; while (n.parent) n = n.parent; return n === document.body; }
+  set innerHTML(v) { this.children = []; this.text = ''; }
+  set textContent(v) { this.children = []; this.text = String(v); }
+  get textContent() { return this.text + this.children.map((c) => c.textContent).join(''); }
+  addEventListener() {}
+  walk(out = []) { for (const c of this.children) { out.push(c); c.walk(out); } return out; }
+  querySelectorAll(sel) {
+    const m = /^\[data-([a-z-]+)\]$/.exec(sel);
+    if (!m) throw new Error('unsupported selector ' + sel);
+    return this.walk().filter((e) => camel(m[1]) in e.dataset);
+  }
+}
+global.window = global;
+global.document = {
+  body: new El('body'),
+  documentElement: { classList: { contains: () => false } },
+  createElement: (t) => new El(t),
+  getElementById: (id) => document.body.walk().find((e) => e.id === id) || null,
+  addEventListener() {}, removeEventListener() {},
+};
+const run = (js) => new Function(js)();
+const elapsedCells = () => {
+  const section = document.getElementById('openclaw-status-section-subagents');
+  return section ? section.walk().filter((e) => e.tagName === 'SPAN' && e.style.fontSize === '10px')
+    .map((e) => e.textContent) : [];
+};
+const seen = [];
+run(input.open);
+input.fills.forEach(run);
+for (const step of input.steps) {
+  if (step.advance) {
+    for (let s = 0; s < step.advance; s++) { now += 1000; [...timers.values()].forEach((f) => f()); }
+  }
+  if (step.close) document.getElementById('openclaw-status-modal-root').remove();
+  if (step.reopen) { run(input.open); input.fills.forEach(run); }
+  seen.push({ cells: elapsedCells(), timers: timers.size });
+}
+console.log(JSON.stringify(seen));
+"""
+
+
+class ElapsedTickTests(unittest.TestCase):
+    """ELI-120: a running sub-agent's elapsed time counts up while the Status
+    dialog stays open, instead of freezing at whatever it was when the
+    dialog opened ("1s" for a child spawned a moment earlier)."""
+
+    NOW = 1_783_790_100_000
+
+    def _page(self, steps, tasks):
+        import shutil
+        import subprocess
+        runtime = shutil.which("bun") or shutil.which("node")
+        if runtime is None:
+            self.skipTest("no bun or node")
+        identity = {"chatId": "c", "messageId": "m", "sessionId": "s", "owuiModel": "x"}
+        fill = _render_subagents_fill_js({"tasks": tasks, "source": "pipe", "fetchedAt": "12:00:00", "error": None})
+        payload = {"now": self.NOW, "open": _render_modal_open_js(identity), "fills": [fill], "steps": steps}
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
+            fh.write(_DIALOG_PAGE_JS)
+        try:
+            out = subprocess.run([runtime, fh.name], input=json.dumps(payload),
+                                 capture_output=True, text=True, timeout=60)
+        finally:
+            os.unlink(fh.name)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout)
+
+    def _task(self, tid, status, started, ended=None):
+        return {"id": tid, "title": tid, "status": status, "progressSummary": None, "terminalSummary": None,
+                "error": None, "childSessionKey": tid, "startedAt": started, "endedAt": ended}
+
+    def test_running_rows_count_up_and_finished_rows_stay(self):
+        iso = datetime.datetime.fromtimestamp((self.NOW - 2000) / 1000, datetime.timezone.utc).isoformat()
+        tasks = [
+            self._task("running-ms", "running", self.NOW - 1000),
+            self._task("running-iso", "running", iso),
+            self._task("done", "completed", self.NOW - 60_000, self.NOW - 30_000),
+        ]
+        seen = self._page([{}, {"advance": 1}, {"advance": 64}], tasks)
+        self.assertEqual([s["cells"] for s in seen], [
+            ["1s", "2s", "30s"],
+            ["2s", "3s", "30s"],
+            ["1m", "1m", "30s"],
+        ])
+
+    def test_the_ticker_stops_with_the_dialog_and_a_reopen_keeps_one(self):
+        tasks = [self._task("running", "running", self.NOW - 1000)]
+        seen = self._page([{"reopen": True}, {"reopen": True}, {"close": True}, {"advance": 1}], tasks)
+        self.assertEqual([s["timers"] for s in seen], [1, 1, 1, 0])
 
 
 class GetActionConnectionTests(unittest.IsolatedAsyncioTestCase):
