@@ -1,0 +1,234 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "content": "This is a test. First use the Bash tool 2 times, one call at a time, waiting for each: `python3 -c 'import time; time.sleep(15); print(\"pre-1\")'`, `python3 -c 'import time; time.sleep(15); print(\"pre-2\")'`. Then ask me which colour I prefer: that reply must be exactly these lines and nothing else:\nOpenClaw needs input:\nColour 390661\nWhich colour do you prefer?\n1. Red\n2. Blue\n3. Green\nAfter I answer, use the Bash tool 4 times, one call at a time, waiting for each: `python3 -c 'import time; time.sleep(30); print(\"post-1\")'`, `python3 -c 'import time; time.sleep(30); print(\"post-2\")'`, `python3 -c 'import time; time.sleep(30); print(\"post-3\")'`, `python3 -c 'import time; time.sleep(30); print(\"post-4\")'`. Then reply with exactly: You chose <the colour> ASK-END-5f270568. Use no other tools.",
+   "idempotencyKey": "msg-d0f0c6ff-9968-40f6-bbd9-b3b4418c048e-a8351886-2ab5-4acf-8752-1ac1612d64c3-1791961562.4138143:user",
+   "timestamp": 1791961562417,
+   "__openclaw": {
+    "idempotencyKey": "msg-d0f0c6ff-9968-40f6-bbd9-b3b4418c048e-a8351886-2ab5-4acf-8752-1ac1612d64c3-1791961562.4138143:user"
+   }
+  },
+  {
+   "role": "user",
+   "content": "Conversation info (untrusted metadata):\n```json\n{\n  \"chat_id\": \"d0f0c6ff-9968-40f6-bbd9-b3b4418c048e\",\n  \"source\": \"openwebui\",\n  \"user_id\": \"2d206eab-acac-4945-bd2f-7e8b6365de8c\"\n}\n```\n\nThis is a test. First use the Bash tool 2 times, one call at a time, waiting for each: `python3 -c 'import time; time.sleep(15); print(\"pre-1\")'`, `python3 -c 'import time; time.sleep(15); print(\"pre-2\")'`. Then ask me which colour I prefer: that reply must be exactly these lines and nothing else:\nOpenClaw needs input:\nColour 390661\nWhich colour do you prefer?\n1. Red\n2. Blue\n3. Green\nAfter I answer, use the Bash tool 4 times, one call at a time, waiting for each: `python3 -c 'import time; time.sleep(30); print(\"post-1\")'`, `python3 -c 'import time; time.sleep(30); print(\"post-2\")'`, `python3 -c 'import time; time.sleep(30); print(\"post-3\")'`, `python3 -c 'import time; time.sleep(30); print(\"post-4\")'`. Then reply with exactly: You chose <the colour> ASK-END-5f270568. Use no other tools.",
+   "timestamp": 1791961564096,
+   "__openclaw": {
+    "importedFrom": "claude-cli"
+   }
+  },
+  {
+   "role": "assistant",
+   "content": [
+    {
+     "type": "toolcall",
+     "id": "toolu_01XXrWWrbGkPAP9yENsELwVf",
+     "name": "Bash",
+     "caller": {
+      "type": "direct"
+     },
+     "arguments": {
+      "command": "python3 -c 'import time; time.sleep(15); print(\"pre-1\")'",
+      "description": "Run first pre-question delay"
+     }
+    },
+    {
+     "tool_use_id": "toolu_01XXrWWrbGkPAP9yENsELwVf",
+     "type": "tool_result",
+     "content": "pre-1",
+     "is_error": false,
+     "name": "Bash"
+    }
+   ],
+   "timestamp": 1791961566005,
+   "__openclaw": {
+    "importedFrom": "claude-cli"
+   }
+  },
+  {
+   "role": "assistant",
+   "content": [
+    {
+     "type": "toolcall",
+     "id": "toolu_01VdqEvBG74cM6GQFytp546E",
+     "name": "Bash",
+     "caller": {
+      "type": "direct"
+     },
+     "arguments": {
+      "command": "python3 -c 'import time; time.sleep(15); print(\"pre-2\")'",
+      "description": "Run second pre-question delay"
+     }
+    },
+    {
+     "tool_use_id": "toolu_01VdqEvBG74cM6GQFytp546E",
+     "type": "tool_result",
+     "content": "pre-2",
+     "is_error": false,
+     "name": "Bash"
+    }
+   ],
+   "timestamp": 1791961582708,
+   "__openclaw": {
+    "importedFrom": "claude-cli"
+   }
+  },
+  {
+   "role": "assistant",
+   "content": [
+    {
+     "type": "text",
+     "text": "OpenClaw needs input:\nColour 390661\nWhich colour do you prefer?\n1. Red\n2. Blue\n3. Green"
+    }
+   ],
+   "idempotencyKey": "cli-assistant:msg-d0f0c6ff-9968-40f6-bbd9-b3b4418c048e-a8351886-2ab5-4acf-8752-1ac1612d64c3-1791961562.4138143",
+   "timestamp": 1791961599469,
+   "__openclaw": {
+    "idempotencyKey": "cli-assistant:msg-d0f0c6ff-9968-40f6-bbd9-b3b4418c048e-a8351886-2ab5-4acf-8752-1ac1612d64c3-1791961562.4138143"
+   }
+  },
+  {
+   "role": "user",
+   "content": "Blue",
+   "idempotencyKey": "msg-d0f0c6ff-9968-40f6-bbd9-b3b4418c048e-a8351886-2ab5-4acf-8752-1ac1612d64c3-input-1791961599.5217946:user",
+   "timestamp": 1791961599568,
+   "__openclaw": {
+    "idempotencyKey": "msg-d0f0c6ff-9968-40f6-bbd9-b3b4418c048e-a8351886-2ab5-4acf-8752-1ac1612d64c3-input-1791961599.5217946:user"
+   }
+  },
+  {
+   "role": "user",
+   "content": "Conversation info (untrusted metadata):\n```json\n{\n  \"chat_id\": \"d0f0c6ff-9968-40f6-bbd9-b3b4418c048e\",\n  \"source\": \"openwebui\",\n  \"user_id\": \"2d206eab-acac-4945-bd2f-7e8b6365de8c\"\n}\n```\n\nBlue",
+   "timestamp": 1791961599957,
+   "__openclaw": {
+    "importedFrom": "claude-cli"
+   }
+  },
+  {
+   "role": "assistant",
+   "content": [
+    {
+     "type": "toolcall",
+     "id": "toolu_01QpL8ddaeCAPSKFdHeNj3jt",
+     "name": "Bash",
+     "caller": {
+      "type": "direct"
+     },
+     "arguments": {
+      "command": "python3 -c 'import time; time.sleep(30); print(\"post-1\")'",
+      "description": "Run first post-answer delay"
+     }
+    },
+    {
+     "tool_use_id": "toolu_01QpL8ddaeCAPSKFdHeNj3jt",
+     "type": "tool_result",
+     "content": "post-1",
+     "is_error": false,
+     "name": "Bash"
+    }
+   ],
+   "timestamp": 1791961601581,
+   "__openclaw": {
+    "importedFrom": "claude-cli"
+   }
+  },
+  {
+   "role": "assistant",
+   "content": [
+    {
+     "type": "toolcall",
+     "id": "toolu_01MYadDVABxpUY82RPiAmEHd",
+     "name": "Bash",
+     "caller": {
+      "type": "direct"
+     },
+     "arguments": {
+      "command": "python3 -c 'import time; time.sleep(30); print(\"post-2\")'",
+      "description": "Run second post-answer delay"
+     }
+    },
+    {
+     "tool_use_id": "toolu_01MYadDVABxpUY82RPiAmEHd",
+     "type": "tool_result",
+     "content": "post-2",
+     "is_error": false,
+     "name": "Bash"
+    }
+   ],
+   "timestamp": 1791961633361,
+   "__openclaw": {
+    "importedFrom": "claude-cli"
+   }
+  },
+  {
+   "role": "assistant",
+   "content": [
+    {
+     "type": "toolcall",
+     "id": "toolu_01K2jztCPStNJL5JrJsUsKuZ",
+     "name": "Bash",
+     "caller": {
+      "type": "direct"
+     },
+     "arguments": {
+      "command": "python3 -c 'import time; time.sleep(30); print(\"post-3\")'",
+      "description": "Run third post-answer delay"
+     }
+    },
+    {
+     "tool_use_id": "toolu_01K2jztCPStNJL5JrJsUsKuZ",
+     "type": "tool_result",
+     "content": "post-3",
+     "is_error": false,
+     "name": "Bash"
+    }
+   ],
+   "timestamp": 1791961664911,
+   "__openclaw": {
+    "importedFrom": "claude-cli"
+   }
+  },
+  {
+   "role": "assistant",
+   "content": [
+    {
+     "type": "toolcall",
+     "id": "toolu_01LbkewJSU4YH55ekkjpp3qe",
+     "name": "Bash",
+     "caller": {
+      "type": "direct"
+     },
+     "arguments": {
+      "command": "python3 -c 'import time; time.sleep(30); print(\"post-4\")'",
+      "description": "Run fourth post-answer delay"
+     }
+    },
+    {
+     "tool_use_id": "toolu_01LbkewJSU4YH55ekkjpp3qe",
+     "type": "tool_result",
+     "content": "post-4",
+     "is_error": false,
+     "name": "Bash"
+    }
+   ],
+   "timestamp": 1791961697717,
+   "__openclaw": {
+    "importedFrom": "claude-cli"
+   }
+  },
+  {
+   "role": "assistant",
+   "content": [
+    {
+     "type": "text",
+     "text": "You chose Blue ASK-END-5f270568"
+    }
+   ],
+   "idempotencyKey": "cli-assistant:msg-d0f0c6ff-9968-40f6-bbd9-b3b4418c048e-a8351886-2ab5-4acf-8752-1ac1612d64c3-input-1791961599.5217946",
+   "timestamp": 1791961729693,
+   "__openclaw": {
+    "idempotencyKey": "cli-assistant:msg-d0f0c6ff-9968-40f6-bbd9-b3b4418c048e-a8351886-2ab5-4acf-8752-1ac1612d64c3-input-1791961599.5217946"
+   }
+  }
+ ]
+}

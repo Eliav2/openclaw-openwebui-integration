@@ -2865,7 +2865,11 @@ def _history_renderer(messages: list) -> "_TurnRenderer":
     messages whose blocks are `text`, `toolcall` {id, name, arguments} and
     `tool_result` {tool_use_id, content, is_error}, in order. The run's closing
     message (`cli-assistant:<runId>`) repeats all of its text, so it only
-    counts when nothing before it carried text (a plain, tool-free reply).
+    counts when nothing in its own run carried text (a plain, tool-free
+    reply, or imports that carry tool blocks only). It counts in place: an
+    asked question's run closes before its answer run starts, and the
+    question was lost when only the last closer was kept (ask-rebuild,
+    2026-10-14, chat d0f0c6ff).
 
     Text after a tool call is joined to the text before it with the separator
     the Gateway's live stream inserts there (`sawToolUseSinceText`), so the
@@ -2873,7 +2877,7 @@ def _history_renderer(messages: list) -> "_TurnRenderer":
     Plain concatenation glued a preamble to the answer ("...one at a time.
     USER-DONE" with no break, restart window 2026-10-13)."""
     r = _TurnRenderer()
-    closing = None
+    run_text = False          # this run carried text before its closer
     tool_since_text = False   # the Gateway's `sawToolUseSinceText`
     for message in messages:
         if not isinstance(message, dict) or message.get("role") != "assistant":
@@ -2881,7 +2885,12 @@ def _history_renderer(messages: list) -> "_TurnRenderer":
         meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
         keys = (str(message.get("idempotencyKey") or ""), str(meta.get("idempotencyKey") or ""))
         if any(k.startswith("cli-assistant:") for k in keys):
-            closing = message
+            text = ((_history_item(message) or {}).get("text") or "").strip()
+            if not run_text and text and text not in _SILENT_SENTINELS:
+                lead = _message_boundary_separator(r.text, text)
+                tool_since_text = False
+                r.feed({"stream": "assistant", "data": {"delta": lead + text}})
+            run_text = False
             continue
         content = message.get("content")
         if isinstance(content, str):
@@ -2893,6 +2902,7 @@ def _history_renderer(messages: list) -> "_TurnRenderer":
             if kind == "text" and block.get("text"):
                 lead = _message_boundary_separator(r.text, block["text"]) if tool_since_text else ""
                 tool_since_text = False
+                run_text = run_text or bool(block["text"].strip())
                 r.feed({"stream": "assistant", "data": {"delta": lead + block["text"]}})
             elif kind == "toolcall" and block.get("id"):
                 tool_since_text = True
@@ -2907,10 +2917,6 @@ def _history_renderer(messages: list) -> "_TurnRenderer":
                     "phase": "result", "name": block.get("name", ""),
                     "toolCallId": block["tool_use_id"], "result": result or "",
                     "isError": block.get("is_error") is True}})
-    if closing is not None and not r.text.strip():
-        text = ((_history_item(closing) or {}).get("text") or "").strip()
-        if text and text not in _SILENT_SENTINELS:
-            r.feed({"stream": "assistant", "data": {"delta": text}})
     return r
 
 
@@ -3463,8 +3469,10 @@ async def _reconcile_chat_ended_runs(conn: "_GatewayConnection", session_key: st
         if any(s is None for s in spans):
             continue  # a run written into it has not closed
         rendered = _history_renderer([m for s in spans for m in s])
-        output = rendered.finished_output()
-        text = rendered.text.strip()
+        output, text = await _transcript_view(
+            conn, session_key=session_key, chat_id=chat_id,
+            user_id=session_key.rsplit("openwebui-", 1)[-1][:36], message_id=mid,
+            runs=runs, messages=messages, rendered=rendered)
         if not output:
             continue
         async with conn._chat_write_lock(chat_id):

@@ -877,6 +877,25 @@ def _media_directives(text: str, final: bool) -> list[str]:
     return out
 
 
+async def _transcript_view(conn: "_GatewayConnection", *, session_key: str, chat_id: str,
+                           user_id: str, message_id: str, runs: list, messages: list,
+                           rendered: "_TurnRenderer") -> tuple[list, str]:
+    """(output, text) of M rebuilt from the transcript as the writer finalizes
+    it (`_TurnWriter._view`): an answered ask-user prompt as its card, one
+    nobody answered without its directive line, a `MEDIA:` directive as its
+    image. `content` is that text, so it always agrees with the items. The
+    ELI-94 reconcile wrote the bare rebuild and dropped an answered card
+    (ask-rebuild, 2026-10-14, chat d0f0c6ff)."""
+    view = _TurnWriter(conn, session_key=session_key, chat_id=chat_id, user_id=user_id,
+                       run_id=runs[-1], message_id=message_id, renderer=rendered)
+    view.runs = list(runs)
+    view._note_transcript_answers(messages)
+    output, text = await view._view(final=True)
+    output = [i for i in output if not _is_sentinel_message_item(i)]
+    text = text.strip()
+    return output, "" if text in _SILENT_SENTINELS else text
+
+
 def _history_span_messages(history: dict, run_id: str) -> list | None:
     """One run's messages in `chat.history`, or None while it may still be
     writing. A closed run ends at its `cli-assistant:<runId>`; a run cut off

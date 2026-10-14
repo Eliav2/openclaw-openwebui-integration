@@ -47,7 +47,7 @@ def _cards(output):
     return sum(1 for i in output or [] if i.get("type") == "function_call")
 
 
-class EndedWhileDownTests(unittest.IsolatedAsyncioTestCase):
+class _EndedWhileDownCase(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
         self.key = _owui_session_key("main", USER, CHAT)
@@ -134,6 +134,9 @@ class EndedWhileDownTests(unittest.IsolatedAsyncioTestCase):
 
     def msg(self):
         return self.chat["history"]["messages"][M]
+
+
+class EndedWhileDownTests(_EndedWhileDownCase):
 
     async def test_a_run_that_ended_while_down_completes_its_partial_reply(self):
         await self.startup()
@@ -263,6 +266,76 @@ class EndedWhileDownTests(unittest.IsolatedAsyncioTestCase):
         self.row["key"] = _owui_session_key("main", USER, "55555555-5555-5555-5555-555555555555")
         await self.startup()
         self.assertEqual(self.history_reads, 0)
+
+
+class AskReplyEndedWhileDownTests(_EndedWhileDownCase):
+    """#21 round, ask-rebuild (2026-10-14 07:06-07:08Z, chat d0f0c6ff, message
+    a8351886): the question was answered Blue from the card, then Open WebUI
+    restarted during the answer run's tools. The startup reconcile rewrote the
+    reply from the transcript as 6 Bash cards and "You chose Blue ...": the
+    question and its answered Ask User card, which the user had seen, were
+    gone from both `content` and the items. Real transcript, ids mapped:
+    test_fixture_eli94_ask_rebuild.json. Each run's text is only in its
+    closing message there (the imports carry tool blocks only)."""
+
+    REAL = {"d0f0c6ff-9968-40f6-bbd9-b3b4418c048e": CHAT,
+            "a8351886-2ab5-4acf-8752-1ac1612d64c3": M,
+            "2d206eab-acac-4945-bd2f-7e8b6365de8c": USER}
+    END = "You chose Blue ASK-END-5f270568"
+
+    def setUp(self):
+        super().setUp()
+        import json
+        import os
+        raw = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "test_fixture_eli94_ask_rebuild.json")).read()
+        for real, test_id in self.REAL.items():
+            raw = raw.replace(real, test_id)
+        self.history = json.loads(raw)
+        closed = max(m.get("timestamp") or 0 for m in self.history["messages"])
+        self.updated_at = closed // 1000 - 30          # the cut, during the answer run
+        self.row["updatedAt"] = closed + 40
+        self.row["lastRunId"] = next(
+            m["idempotencyKey"][len("cli-assistant:"):] for m in reversed(self.history["messages"])
+            if str(m.get("idempotencyKey", "")).startswith("cli-assistant:"))
+        card = openclaw_pipe._ask_user_detail_block(
+            "\n".join([openclaw_pipe._USER_INPUT_TRIGGER_PREFIXES[-1], "Colour 390661",
+                       "Which colour do you prefer?", "1. Red", "2. Blue", "3. Green"]), "Blue")
+        held = []
+        for n in range(4):
+            held += [{"type": "function_call", "id": f"h{n}", "call_id": f"h{n}", "name": "Bash",
+                      "arguments": "{}", "status": "completed"},
+                     {"type": "function_call_output", "call_id": f"h{n}", "output": [],
+                      "status": "completed"}]
+        held.insert(4, {"type": "message", "role": "assistant", "id": "o1", "status": "completed",
+                        "content": [{"type": "output_text", "text": card}]})
+        self.msg().update({"content": card, "output": held})
+
+    def _texts(self, output):
+        return "".join("".join(p.get("text", "") for p in o.get("content") or [])
+                       for o in output if o.get("type") == "message")
+
+    async def test_the_answered_question_survives_the_rebuild(self):
+        await self.startup()
+        m = self.msg()
+        self.assertEqual(_cards(m["output"]), 6)
+        for where, text in (("content", m["content"]), ("items", self._texts(m["output"]))):
+            with self.subTest(where=where):
+                self.assertIn("Ask User", text, "the answered card is gone")
+                self.assertIn('result="Blue"', text)
+                self.assertNotIn("needs input", text.lower(), "the raw prompt is shown")
+                self.assertTrue(text.rstrip().endswith(self.END))
+        self.assertEqual(m["content"].strip(), self._texts(m["output"]).strip(),
+                         "content and the items disagree")
+        self.assertLess(m["content"].index("Ask User"), m["content"].index(self.END))
+
+    def test_each_runs_closing_text_is_rendered_in_place(self):
+        r = openclaw_pipe._history_renderer(
+            [x for x in self.history["messages"] if x.get("role") == "assistant"])
+        self.assertIn("Which colour do you prefer?", r.text, "the question run's text is lost")
+        self.assertTrue(r.text.endswith(self.END))
+        kinds = [o["type"] for o in r.finished_output() if o["type"] != "function_call_output"]
+        self.assertEqual(kinds, ["function_call"] * 2 + ["message"] + ["function_call"] * 4 + ["message"])
 
 
 class _FakeUvicornServer:
