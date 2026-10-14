@@ -953,6 +953,15 @@ _DRAWER_TOOLS_FILL_JS_TEMPLATE = r"""
   const S = window.__openclawStatus;
   if (!section || !S) return;
 
+  // A live poll tick refills this tab every few seconds: keep each card open
+  // or closed as the user left it, keyed by its tool call id (the call stays
+  // the same while its place in the history window moves), as the Transcript
+  // keeps its scroll (ELI-133).
+  const wasOpen = {};
+  section.querySelectorAll('[data-call-id]').forEach(function(d) {
+    wasOpen[d.dataset.callId] = !!d.open;
+  });
+
   if (DATA.error) {
     section.innerHTML = '';
     section.appendChild(S.errorEl(DATA.error));
@@ -981,6 +990,10 @@ _DRAWER_TOOLS_FILL_JS_TEMPLATE = r"""
   calls.forEach(function(c) {
     const details = document.createElement('details');
     details.className = 'mb-2 rounded-lg border border-gray-100 dark:border-gray-800 px-2.5 py-1.5';
+    if (c.id) {
+      details.dataset.callId = c.id;
+      details.open = !!wasOpen[c.id];
+    }
     const summary = document.createElement('summary');
     summary.className = 'text-xs font-medium cursor-pointer text-gray-700 dark:text-gray-200';
     // Only ❌ vs 🔧 here: every card comes from chat.history, which only ever

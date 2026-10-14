@@ -251,7 +251,9 @@ class RenderJsTests(unittest.TestCase):
 # children, ids, dataset, `[data-*]` lookups, and a clock and timers the test
 # drives by hand. Reads {"open": js, "fills": [js, ...], "steps": [...]} on
 # stdin and prints what each step saw.
-_DIALOG_PAGE_JS = r"""
+# A page just big enough to run the dialog's JS under bun or node: the
+# elements, ids, data-* selectors and timers it uses.
+_FAKE_DOM_JS = r"""
 const input = JSON.parse(require('fs').readFileSync(0, 'utf8'));
 let now = input.now;
 Date.now = () => now;
@@ -291,6 +293,9 @@ global.document = {
   addEventListener() {}, removeEventListener() {},
 };
 const run = (js) => new Function(js)();
+"""
+
+_DIALOG_PAGE_JS = _FAKE_DOM_JS + r"""
 const elapsedCells = () => {
   const section = document.getElementById('openclaw-status-section-subagents');
   return section ? section.walk().filter((e) => e.tagName === 'SPAN' && e.style.fontSize === '10px')
@@ -309,6 +314,84 @@ for (const step of input.steps) {
 }
 console.log(JSON.stringify(seen));
 """
+
+
+_DRAWER_TOOLS_PAGE_JS = _FAKE_DOM_JS + r"""
+run(input.open);
+run(input.drawer);
+const cards = () => document.getElementById('openclaw-drawer-section-tools').walk()
+  .filter((e) => e.tagName === 'DETAILS');
+const seen = [];
+for (const step of input.steps) {
+  if (step.fill) run(step.fill);
+  if (step.toggle) {
+    // What a click on a card's summary does: flip that <details>.
+    const card = cards().find((d) => d.children[0].textContent.endsWith(' ' + step.toggle));
+    card.open = !card.open;
+  }
+  seen.push(cards().map((d) => [d.children[0].textContent, !!d.open]));
+}
+console.log(JSON.stringify(seen));
+"""
+
+
+class DrawerToolCardsStayOpenTests(unittest.TestCase):
+    """ELI-133 (ELI-110 screenshots, run 38636471099): while a sub-agent
+    runs, the drawer refills its Tools tab every 2.5 s, and each refill
+    rebuilt every card closed, so a card the user opened snapped shut. A
+    card keeps its open or closed state across refills, keyed by its tool
+    call id, as the Transcript keeps its scroll."""
+
+    TASK = {"id": "t1", "title": "Child", "status": "running", "childSessionKey": "agent:main:subagent:c",
+            "startedAt": 1, "endedAt": None, "progressSummary": None, "terminalSummary": None, "error": None}
+
+    @staticmethod
+    def _call(cid, name):
+        return {"id": cid, "name": name, "arguments": "{}", "result": "ok", "isError": False}
+
+    def _fill(self, calls):
+        return _render_drawer_tools_fill_js({"childSessionKey": self.TASK["childSessionKey"],
+                                             "toolCalls": calls, "error": None})
+
+    def _page(self, steps):
+        import shutil
+        import subprocess
+        runtime = shutil.which("bun") or shutil.which("node")
+        if runtime is None:
+            self.skipTest("no bun or node")
+        identity = {"chatId": "c", "messageId": "m", "sessionId": "s", "owuiModel": "x"}
+        payload = {"now": 1, "open": _render_modal_open_js(identity),
+                   "drawer": _render_drawer_open_js(self.TASK), "steps": steps}
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
+            fh.write(_DRAWER_TOOLS_PAGE_JS)
+        try:
+            out = subprocess.run([runtime, fh.name], input=json.dumps(payload),
+                                 capture_output=True, text=True, timeout=60)
+        finally:
+            os.unlink(fh.name)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout)
+
+    def test_an_opened_card_stays_open_across_a_refill(self):
+        a, b, c = self._call("call-a", "read"), self._call("call-b", "exec"), self._call("call-c", "write")
+        seen = self._page([{"fill": self._fill([a, b])}, {"toggle": "exec"},
+                           {"fill": self._fill([a, b, c])}])
+        self.assertEqual(seen[1], [["🔧 read", False], ["🔧 exec", True]])
+        self.assertEqual(seen[2], [["🔧 read", False], ["🔧 exec", True], ["🔧 write", False]])
+
+    def test_a_closed_card_stays_closed(self):
+        a, b = self._call("call-a", "read"), self._call("call-b", "exec")
+        seen = self._page([{"fill": self._fill([a, b])}, {"toggle": "read"}, {"toggle": "read"},
+                           {"fill": self._fill([a, b])}])
+        self.assertEqual(seen[3], [["🔧 read", False], ["🔧 exec", False]])
+
+    def test_the_state_follows_the_call_not_its_position(self):
+        """The history read is a window: when an older call drops out of it,
+        the open card is still the same call, now one place up."""
+        a, b, c = self._call("call-a", "read"), self._call("call-b", "exec"), self._call("call-c", "write")
+        seen = self._page([{"fill": self._fill([a, b])}, {"toggle": "exec"},
+                           {"fill": self._fill([b, c])}])
+        self.assertEqual(seen[2], [["🔧 exec", True], ["🔧 write", False]])
 
 
 class ElapsedTickTests(unittest.TestCase):
