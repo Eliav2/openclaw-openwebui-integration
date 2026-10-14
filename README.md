@@ -103,21 +103,19 @@ Minimum versions, and what an older release loses: [Versions](./docs/versions.md
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="./docs/img/question-card-dark.png">
-    <img src="./docs/img/question-card-light.png" alt="A question from the agent as a card with three options and a Recommended tag" width="48%">
+    <img src="./docs/img/question-card-light.png" alt="A question from the agent as a card with three options and a Recommended tag" width="300">
   </picture>
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="./docs/img/status-dialog-dark.png">
-    <img src="./docs/img/status-dialog-light.png" alt="The Status dialog: context used, 5-hour and weekly rate limits, two running sub-agents" width="48%">
+    <img src="./docs/img/status-dialog-light.png" alt="The Status dialog: context used, 5-hour and weekly rate limits, two running sub-agents" width="300">
   </picture>
-</p>
-<p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="./docs/img/subagent-drawer-dark.png">
-    <img src="./docs/img/subagent-drawer-light.png" alt="A running sub-agent's drawer, showing its task and what it has read so far" width="48%">
+    <img src="./docs/img/subagent-drawer-light.png" alt="A running sub-agent's drawer, showing its task and what it has read so far" width="300">
   </picture>
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="./docs/img/tool-card-expanded-dark.png">
-    <img src="./docs/img/tool-card-expanded-light.png" alt="A tool card opened to its command and its output" width="48%">
+    <img src="./docs/img/tool-card-expanded-light.png" alt="A tool card opened to its command and its output" width="300">
   </picture>
 </p>
 <p align="center"><sub>A question mid-reply, the Status dialog, a sub-agent's drawer, and a tool card opened. The rate limits are sample data.</sub></p>
