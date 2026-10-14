@@ -85,9 +85,12 @@ def main() -> int:
                     page.wait_for_function(IMAGES_LOADED, timeout=60_000)
                     marks = page.evaluate(LANDMARKS)
                     if marks:
+                        # Screens of the page, and of the README itself (from
+                        # its first line, past GitHub's header or file list).
                         for k in ("hero", "quickStart"):
                             if marks.get(k) is not None:
                                 marks[k + "Screen"] = marks[k] // SCREEN_H + 1
+                                marks[k + "ReadmeScreen"] = (marks[k] - marks["readmeTop"]) // SCREEN_H + 1
                     files = screens(page, a.out, f"{name}-{theme}", limit)
                     report[f"{name}-{theme}"] = {"url": url, "landmarks": marks, "screens": len(files)}
                     print(f"{name}-{theme}: {json.dumps(report[f'{name}-{theme}'])}", flush=True)
