@@ -796,8 +796,8 @@ def _is_owner_user(owners: frozenset, user_id, email) -> bool:
 RUN_SEND, RUN_ABORT, RUN_PATCH = "chat.send", "chat.abort", "sessions.patch"
 # chat.send fields the Gateway accepts only from an operator.admin connection
 # ("system provenance fields require admin scope"). A send over the restricted
-# connection leaves them out, so a non-owner turn carries no conversation
-# metadata block.
+# connection leaves them out; the conversation metadata block goes in the
+# message text instead (see `_non_owner_send_params`).
 ADMIN_ONLY_SEND_FIELDS = (
     "systemInputProvenance",
     "systemProvenanceReceipt",
@@ -4563,6 +4563,28 @@ async def _sender_is_owner(conn, session_key: str) -> bool:
     return _is_owner_user(owners, user_id, await _user_email(user_id))
 
 
+def _non_owner_send_params(params: dict) -> dict:
+    """A chat.send the restricted connection may make: without the admin-only
+    fields, and with the conversation metadata block at the head of the
+    message text, which is how the Gateway hands a receipt to the agent
+    (`receipt + "\\n\\n" + message`). The block keeps its "untrusted" label,
+    and ownership never comes from it: the Gateway decides that from the
+    sending connection. A command ("/stop") goes as typed, since the Gateway
+    reads commands from the raw text."""
+    dropped = [f for f in ADMIN_ONLY_SEND_FIELDS if f in params]
+    if not dropped:
+        return params
+    out = {k: v for k, v in params.items() if k not in dropped}
+    receipt = params.get("systemProvenanceReceipt")
+    message = out.get("message") or ""
+    moved = isinstance(receipt, str) and bool(receipt) and not message.lstrip().startswith("/")
+    if moved:
+        out["message"] = "\n\n".join(p for p in (receipt, message) if p)
+    pipe_log(f"  non-owner chat.send: left out admin-only fields {dropped}"
+             + ("; metadata block moved into the message" if moved else ""))
+    return out
+
+
 async def _run_request(conn, method: str, params: dict, *, timeout: float = 10,
                        owner: "bool | None" = None, wait: bool = True):
     """Send a request that starts, steers or ends a run (`RUN_SEND`,
@@ -4574,10 +4596,7 @@ async def _run_request(conn, method: str, params: dict, *, timeout: float = 10,
         owner = await _sender_is_owner(conn, params.get("sessionKey") or params.get("key") or "")
     target = conn if owner else await _get_restricted_connection(conn._valves)
     if not owner and method == RUN_SEND:
-        dropped = [f for f in ADMIN_ONLY_SEND_FIELDS if f in params]
-        if dropped:
-            params = {k: v for k, v in params.items() if k not in dropped}
-            pipe_log(f"  non-owner chat.send: left out admin-only fields {dropped}")
+        params = _non_owner_send_params(params)
     if not wait:
         await target._ws.send(json.dumps(dict(type="req", id="abort" if method == RUN_ABORT
                                               else f"run-{uuid.uuid4().hex[:8]}",

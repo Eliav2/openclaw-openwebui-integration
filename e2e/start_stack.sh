@@ -44,7 +44,8 @@ wait_for() {  # wait_for <description> <seconds> <command...>
 }
 
 echo "::group::Fake model server"
-FAKE_LLM_LOG="$LOG_DIR/fake-llm.jsonl" FAKE_LLM_PORT=$FAKE_LLM_PORT \
+FAKE_LLM_LOG="$LOG_DIR/fake-llm.jsonl"
+FAKE_LLM_LOG="$FAKE_LLM_LOG" FAKE_LLM_PORT=$FAKE_LLM_PORT \
   nohup python3 e2e/fake_llm.py >"$LOG_DIR/fake-llm.log" 2>&1 &
 wait_for "fake model" 30 curl -fsS "http://127.0.0.1:$FAKE_LLM_PORT/health"
 echo "::endgroup::"
@@ -119,8 +120,9 @@ if [[ -n "${GITHUB_ENV:-}" ]]; then
     echo "OWUI_PASSWORD=$OWUI_PASSWORD"
     echo "E2E_STACK=1"
     echo "E2E_GATEWAY_PID_FILE=$GATEWAY_PID_FILE"
+    echo "E2E_FAKE_LLM_LOG=$FAKE_LLM_LOG"
   } >>"$GITHUB_ENV"
 else
-  echo "export OWUI_URL=$OWUI_URL OWUI_EMAIL=$OWUI_EMAIL OWUI_PASSWORD=$OWUI_PASSWORD E2E_STACK=1 E2E_GATEWAY_PID_FILE=$GATEWAY_PID_FILE"
+  echo "export OWUI_URL=$OWUI_URL OWUI_EMAIL=$OWUI_EMAIL OWUI_PASSWORD=$OWUI_PASSWORD E2E_STACK=1 E2E_GATEWAY_PID_FILE=$GATEWAY_PID_FILE E2E_FAKE_LLM_LOG=$FAKE_LLM_LOG"
 fi
 echo "stack ready"

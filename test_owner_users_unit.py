@@ -282,7 +282,7 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         """The Gateway refuses a chat.send carrying system provenance or
         originating route fields from a connection without operator.admin
         ("system provenance fields require admin scope"). An owner's send keeps
-        the conversation metadata block; a guest's goes without it."""
+        them as they are; a guest's goes without them."""
         k_owner, k_guest = self.key(self.OWNER), self.key(self.GUEST)
         c = self.conn(self.OWNER)
         owner_params = openclaw_pipe._owui_chat_send_params(k_owner, "hi", "i1", "chat-1", self.OWNER)
@@ -292,12 +292,48 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         await openclaw_pipe._run_request(c, openclaw_pipe.RUN_SEND, guest_params)
         sent_owner = c.send_request.await_args.args[1]
         sent_guest = self.restricted.send_request.await_args.args[1]
-        self.assertIn("systemProvenanceReceipt", sent_owner)
+        self.assertEqual(sent_owner, owner_params)
         for f in openclaw_pipe.ADMIN_ONLY_SEND_FIELDS:
             self.assertNotIn(f, sent_guest)
-        self.assertEqual({k: sent_guest[k] for k in ("sessionKey", "message", "idempotencyKey")},
-                         {"sessionKey": k_guest, "message": "hi", "idempotencyKey": "i2"})
+        self.assertEqual({k: sent_guest[k] for k in ("sessionKey", "idempotencyKey")},
+                         {"sessionKey": k_guest, "idempotencyKey": "i2"})
         self.assertIn("systemProvenanceReceipt", guest_params)  # caller's dict untouched
+
+    async def test_a_guest_send_carries_the_metadata_block_in_its_text(self):
+        """The Gateway hands the agent `receipt + "\\n\\n" + message`
+        (chat-send-handler, messageForAgent). A guest's send puts the same
+        block in the message text the same way, so the agent sees the same
+        prompt; it stays labelled untrusted, and names the guest."""
+        k = self.key(self.GUEST)
+        c = self.conn(self.OWNER)
+        params = openclaw_pipe._owui_chat_send_params(k, "hi there", "i2", "chat-2", self.GUEST)
+        receipt = params["systemProvenanceReceipt"]
+        await openclaw_pipe._run_request(c, openclaw_pipe.RUN_SEND, params)
+        sent = self.restricted.send_request.await_args.args[1]
+        self.assertEqual(sent["message"], receipt + "\n\nhi there")
+        self.assertTrue(sent["message"].startswith("Conversation info (untrusted metadata):\n```json\n"))
+        block = json.loads(receipt.split("```json\n", 1)[1].split("\n```", 1)[0])
+        self.assertEqual(block, {"chat_id": "chat-2", "source": "openwebui", "user_id": self.GUEST})
+
+    async def test_a_guest_command_is_sent_as_typed(self):
+        """The Gateway reads a command from the raw message; a block in front
+        of "/stop" would turn it into a prompt."""
+        k = self.key(self.GUEST)
+        c = self.conn(self.OWNER)
+        params = openclaw_pipe._owui_chat_send_params(k, "/stop", "i3", "chat-2", self.GUEST)
+        await openclaw_pipe._run_request(c, openclaw_pipe.RUN_SEND, params)
+        sent = self.restricted.send_request.await_args.args[1]
+        self.assertEqual(sent["message"], "/stop")
+        self.assertNotIn("systemProvenanceReceipt", sent)
+
+    async def test_a_guest_send_without_a_block_is_unchanged(self):
+        """A send the pipe makes without chat metadata (a resume, the title)
+        gets none added."""
+        k = self.key(self.GUEST)
+        c = self.conn(self.OWNER)
+        params = {"sessionKey": k, "message": "continue", "idempotencyKey": "msg-x-resume"}
+        await openclaw_pipe._run_request(c, openclaw_pipe.RUN_SEND, dict(params))
+        self.assertEqual(self.restricted.send_request.await_args.args[1], params)
 
     async def test_a_key_without_a_user_is_not_the_owners(self):
         c = self.conn(self.OWNER)
