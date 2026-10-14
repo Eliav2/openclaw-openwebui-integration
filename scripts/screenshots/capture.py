@@ -498,13 +498,11 @@ class Scenes:
         self.s.shot(page, "media-turn")
         # The saved markdown, as the message editor shows it: where the text
         # after the directive ended up is easier to see here than rendered.
-        last = page.locator(".chat-assistant").last
-        last.hover()
-        last.locator('button[aria-label="Edit"]').first.click()
-        wait_js(page, f"""() => {{ const a = {LAST_ASSISTANT};
-                 return a && [...a.querySelectorAll('textarea')].some(t => t.value.includes('bike out')); }}""",
+        # The toolbar is a sibling of .chat-assistant, not inside it.
+        page.locator('button[aria-label="Edit"]').last.click()
+        wait_js(page, """() => [...document.querySelectorAll('textarea')].some(t => t.value.includes('bike out'))""",
                 "the reply's markdown in the editor", 30_000)
-        self.s.shot(page, "media-turn-source", selector=".chat-assistant >> nth=-1")
+        self.s.shot(page, "media-turn-source")
         page.keyboard.press("Escape")
 
     def toolbar(self, page: Page) -> None:
