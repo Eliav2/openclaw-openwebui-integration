@@ -412,6 +412,35 @@ for _name in [n for n in dir(test_pipe_unit.WriterQuestionCardTests)
     setattr(GuestQuestionCardAnswerTests, _name, None)
 
 
+class GuestAnswerFromTheTranscriptTests(test_pipe_unit.HandoverRewriteTests):
+    """A guest's turns are stored behind the conversation metadata block
+    (`_non_owner_send_params`), the answer to a question included. After an
+    Open WebUI restart, and in the ELI-94 reconcile (`_transcript_view`), the
+    writer rebuilds an answered question's card from that stored answer; the
+    card shows what the user answered, not the block."""
+
+    BLOCK = ('Conversation info (untrusted metadata):\n```json\n{\n  "chat_id": "c", '
+             '"source": "openwebui",\n  "user_id": "u"\n}\n```\n\n')
+
+    async def test_a_guests_answer_card_after_an_owui_restart_shows_the_answer(self):
+        run1 = test_pipe_unit.pipe_run_id(self.CHAT, self.STUB)
+        run2 = test_pipe_unit.pipe_run_id(self.CHAT, self.STUB, "input")
+        self.add_stub(self.STUB, content="Let me ask.\n")
+        self.history = {"messages": self.closed_run(run1, "Let me ask.\n" + self.PROMPT)
+                        + self.closed_run(run2, "Blue it is.", user=self.BLOCK + "2. Blue")}
+        await self.dispatch(run2, test_pipe_unit._delta("Blue it is."))
+        await self.dispatch(run2, {"state": "final"})
+        await self.settle(run2)
+        m = self.owui.msgs()[self.STUB]
+        self.assertEqual(self.card_answer(m["content"])[1], "2. Blue")
+        self.assertNotIn("untrusted metadata", m["content"])
+
+
+for _name in [n for n in dir(test_pipe_unit.HandoverRewriteTests)
+              if n.startswith("test_") and n not in GuestAnswerFromTheTranscriptTests.__dict__]:
+    setattr(GuestAnswerFromTheTranscriptTests, _name, None)
+
+
 class RestrictedConnectionTests(unittest.TestCase):
     """The restricted connection's own identity, scopes and connect frame."""
 

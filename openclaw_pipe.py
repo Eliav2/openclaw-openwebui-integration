@@ -7428,8 +7428,8 @@ class _TurnWriter:
             parsed = parse_pipe_run_id(run)
             if prev is not None and parsed and parsed["kind"] == "input":
                 prompt = _run_prompt_text(_history_span_messages(hist, prev))
-                answer = next((((_history_item(m) or {}).get("text") or "").strip() for m in messages
-                               if _history_user_run_id(m) == run), "")
+                answer = next((_strip_inbound_meta((_history_item(m) or {}).get("text") or "").strip()
+                               for m in messages if _history_user_run_id(m) == run), "")
                 if prompt and answer and prompt not in recorded:
                     self.conn.note_turn_rewrite(self.chat_id, self.message_id, prompt,
                                                 block(prompt, answer))
