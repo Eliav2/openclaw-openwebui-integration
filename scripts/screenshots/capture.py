@@ -427,7 +427,7 @@ class Scenes:
           card.scrollIntoView({{block: 'center'}});
           const r = card.getBoundingClientRect();
           const nav = document.querySelector('nav');
-          const top = Math.max(r.top - 12, nav ? nav.getBoundingClientRect().bottom : 0, 0);
+          const top = Math.max(r.top, nav ? nav.getBoundingClientRect().bottom : 0, 0);
           return {{x: 0, y: top, width: innerWidth, height: Math.min(r.bottom + 12, innerHeight) - top}};
         }}"""
         self.s.shot(page, "tool-card-expanded", clip_js=clip, text_selector=".chat-assistant >> nth=-1")
