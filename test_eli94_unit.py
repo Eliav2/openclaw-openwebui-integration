@@ -265,5 +265,89 @@ class EndedWhileDownTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.history_reads, 0)
 
 
+class _FakeUvicornServer:
+    """uvicorn.Server's shutdown surface (0.51): `handle_exit` is installed as
+    the SIGTERM/SIGINT handler while it serves and sets `should_exit`."""
+
+    def __init__(self):
+        self.should_exit = False
+
+    def handle_exit(self, sig, frame):
+        self.should_exit = True
+
+
+class ShutdownCancelTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-94 live, 2026-10-14 05:37 (round 21, eli94 r2): `ha apps stop`
+    cancelled both open replies at 05:37:15; the page could not answer the
+    cancel intent, and the 10 s fallback aborted both runs at 05:37:25 while
+    Open WebUI was still draining its cancelled tasks. The run then "ended
+    while down" with only its first step. A shutdown cancel is not a Stop: the
+    run keeps going and the next process's startup reconcile finishes it."""
+
+    def setUp(self):
+        openclaw_pipe._UVICORN_SERVER = None
+        self.addCleanup(setattr, openclaw_pipe, "_UVICORN_SERVER", None)
+
+    def _conn(self):
+        conn = _GatewayConnection(lambda: None)
+        calls = []
+
+        async def fake_abort(session_key, run_id):
+            calls.append(("abort", session_key, run_id))
+
+        async def fake_stop(session_key):
+            calls.append(("stop", session_key))
+
+        conn.abort = fake_abort
+        conn.send_stop = fake_stop
+        return conn, calls
+
+    def _serve(self):
+        """Install a server's handler the way uvicorn's capture_signals does;
+        returns the server and a callable that restores the old handler."""
+        import signal
+        server = _FakeUvicornServer()
+        old = signal.signal(signal.SIGTERM, server.handle_exit)
+        restore = lambda: signal.signal(signal.SIGTERM, old)  # noqa: E731
+        self.addCleanup(restore)
+        return server, restore
+
+    async def test_a_cancel_during_shutdown_leaves_the_run_running(self):
+        server, restore = self._serve()
+        openclaw_pipe.remember_owui_server()   # the pipe loaded while serving
+        conn, calls = self._conn()
+        q = conn.register_consumer("s", "run-1")
+        server.handle_exit(15, None)           # SIGTERM: ha apps stop
+        restore()                              # uvicorn restores it before cancelling tasks
+        conn.park_cancelled_turn("s", "run-1", q, [], 0.05, send_stop=True)
+        await asyncio.sleep(0.15)
+        self.assertEqual(calls, [], "a shutdown is not a Stop: no chat.abort, no /stop")
+        self.assertEqual(conn._consumers, {}, "the dying process releases its queue")
+        self.assertIsNone(await conn.claim_cancelled_turn("s"))
+
+    async def test_a_cancel_while_serving_still_stops_after_grace(self):
+        self._serve()
+        openclaw_pipe.remember_owui_server()
+        conn, calls = self._conn()
+        q = conn.register_consumer("s", "run-1")
+        conn.park_cancelled_turn("s", "run-1", q, [], 0.05, send_stop=True)
+        await asyncio.sleep(0.15)
+        self.assertEqual(calls, [("abort", "s", "run-1"), ("stop", "s")])
+
+    def test_the_server_is_kept_after_its_handler_is_restored(self):
+        server, restore = self._serve()
+        openclaw_pipe.remember_owui_server()
+        restore()
+        openclaw_pipe.remember_owui_server()   # a later call must not drop it
+        server.should_exit = True
+        self.assertTrue(openclaw_pipe.owui_shutting_down())
+
+    def test_no_uvicorn_handler_means_not_shutting_down(self):
+        import signal
+        old = signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        self.addCleanup(signal.signal, signal.SIGTERM, old)
+        self.assertFalse(openclaw_pipe.owui_shutting_down())
+
+
 if __name__ == "__main__":
     unittest.main()

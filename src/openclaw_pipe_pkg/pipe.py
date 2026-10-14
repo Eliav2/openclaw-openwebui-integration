@@ -680,6 +680,7 @@ class Pipe:
         Thin wrapper around _pipe_impl so dev-only deploy-coordination hooks
         (ELI-24) can bracket every turn without re-indenting the whole body.
         """
+        remember_owui_server()
         # DEV-ONLY-START
         async def _devcoord_report_wait(waited_s):
             await _emit_status(

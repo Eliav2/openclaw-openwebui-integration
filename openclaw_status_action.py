@@ -83,6 +83,7 @@ import hashlib
 import contextlib
 import copy
 import re
+import signal
 import mimetypes
 import urllib.error
 import urllib.request
@@ -2073,6 +2074,40 @@ class _RunQueue(asyncio.Queue):
             self._maxsize = bound
 
 
+# Open WebUI's uvicorn Server, kept while it serves (see `owui_shutting_down`).
+_UVICORN_SERVER = None
+
+
+def remember_owui_server() -> None:
+    """Keep a reference to the uvicorn Server that runs Open WebUI.
+
+    uvicorn installs `Server.handle_exit` as the SIGTERM/SIGINT handler while
+    it serves, and that sets `should_exit` when a signal arrives. It restores
+    the old handlers before asyncio cancels the tasks still running, which is
+    when Open WebUI's reply tasks reach the pipe, so the Server is taken from
+    the handler earlier: at import and at every request."""
+    global _UVICORN_SERVER
+    if _UVICORN_SERVER is not None:
+        return
+    try:
+        server = getattr(signal.getsignal(signal.SIGTERM), "__self__", None)
+    except (ValueError, TypeError):
+        return
+    if server is not None and hasattr(server, "should_exit"):
+        _UVICORN_SERVER = server
+
+
+def owui_shutting_down() -> bool:
+    """True once Open WebUI's server got SIGTERM or SIGINT (`ha apps stop`,
+    restart, update). Its shutdown cancels every open reply the way a Stop
+    does, and no page is left to say which it was (ELI-94)."""
+    remember_owui_server()
+    return bool(getattr(_UVICORN_SERVER, "should_exit", False))
+
+
+remember_owui_server()
+
+
 @dataclass
 class _Consumer:
     """An active run consumer -- its ``asyncio.Queue`` receives events."""
@@ -2916,7 +2951,18 @@ class _GatewayConnection:
         Synchronous on purpose: it runs on the generator's cancel/close path,
         where an await can itself be interrupted, so nothing here may depend
         on one. The Gateway calls go to background tasks.
+
+        Open WebUI shutting down cancels every open reply too, and that is no
+        Stop: the run keeps going, nothing is aborted, and the next process's
+        startup reconcile finishes the reply (ELI-90 if the run is still
+        active, ELI-94 if it ended while Open WebUI was down).
         """
+        if owui_shutting_down():
+            if queue is not None:
+                self.unregister_consumer(session_key, run_id, queue=queue)
+            pipe_log(f"  Open WebUI is shutting down: run {str(run_id)[:20]}... keeps going "
+                     f"({len(carried)} unsent message(s) dropped)")
+            return
         previous = self._pending_cancel_aborts.pop(session_key, None)
         if previous is not None:
             if previous["task"] is not None:

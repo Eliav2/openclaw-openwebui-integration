@@ -18,6 +18,7 @@ import hashlib
 import contextlib
 import copy
 import re
+import signal
 import mimetypes
 import urllib.error
 import urllib.request
