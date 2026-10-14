@@ -6010,6 +6010,34 @@ class TurnWriterEndTests(_TurnWriterCase):
         self.assertTrue((await self.task_done(w)).done(), "the Open WebUI task ends with the run")
         self.assertTrue(w.closed)
 
+    def _found_it_says(self, text):
+        for m in self.history["messages"]:
+            for b in m.get("content") if isinstance(m.get("content"), list) else []:
+                if b.get("text") == "Found it.":
+                    b["text"] = text
+
+    async def test_a_question_the_writer_shows_has_no_marker_line(self):
+        """M3 crash window run 2 (2026-10-14 01:16Z, ask case): a Gateway
+        recovery asked the window's question; the writer showed it with its
+        raw needs-input directive line. The writer has no card (#20): the
+        question shows as clean text, as the inline reply's fallback does."""
+        marker = openclaw_pipe._USER_INPUT_TRIGGER_PREFIXES[-1]
+        self._found_it_says(f"Found it.\n\n{marker}\nColour a1\nWhich colour do you prefer?\n1. Red")
+        w = await self.opened_writer()
+        await w.end({"status": "done", "hasActiveRun": False, "lastRunId": self.RUN})
+        content = self.m()["content"]
+        self.assertNotIn(marker, content)
+        self.assertIn("Found it.\n\nColour a1\nWhich colour do you prefer?\n1. Red", content)
+        self.assertNotIn(marker, json.dumps(self.m()["output"]))
+
+    async def test_a_quoted_marker_in_a_fence_stays_in_the_writers_text(self):
+        marker = openclaw_pipe._USER_INPUT_TRIGGER_PREFIXES[-1]
+        quote = f"Found it:\n```\n{marker}\nColour a1\n```\nDone."
+        self._found_it_says(quote)
+        w = await self.opened_writer()
+        await w.end({"status": "done", "hasActiveRun": False, "lastRunId": self.RUN})
+        self.assertIn(quote, self.m()["content"])
+
     async def test_without_a_transcript_what_streamed_is_kept(self):
         self.history = {"messages": []}
         w = await self.opened_writer()

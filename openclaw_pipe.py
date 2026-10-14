@@ -2162,6 +2162,26 @@ def _strip_input_marker_line(text: str) -> str:
     return text
 
 
+def _strip_needs_input_lines(text: str) -> str:
+    """Drop every needs-input directive line (and the blank lines after it)
+    that is outside a fenced code block: the question it opens stays as
+    readable text, a quoted block in a fence stays as written (ELI-107)."""
+    if not text:
+        return text
+    out, in_fence, skip_blank = [], False, False
+    for line in text.split("\n"):
+        if _CODE_FENCE_RE.match(line):
+            in_fence = not in_fence
+        elif not in_fence and _is_user_input_prompt(line):
+            skip_blank = True
+            continue
+        if skip_blank and not line.strip():
+            continue
+        skip_blank = False
+        out.append(line)
+    return "\n".join(out)
+
+
 def _truncate_at_repeated_marker(text: str) -> str:
     """Keep only the FIRST needs-input block.
 
@@ -6747,7 +6767,11 @@ class _TurnWriter:
         for raw, shown in self.conn.turn_rewrites(self.chat_id, self.message_id or ""):
             if raw in text:
                 text = text.replace(raw, shown)
-        return text
+        # The writer shows no question card: a question shows as the inline
+        # reply's fallback does, without its directive line. Absent in the
+        # Status Action's build.
+        strip = globals().get("_strip_needs_input_lines")
+        return strip(text) if strip else text
 
     async def _view(self, *, final: bool) -> tuple[list, str]:
         """(output, text) of M as the inline reply shows a run (review 2af1
@@ -6885,7 +6909,7 @@ class _TurnWriter:
         if not self.request:
             self.request = await self._run_request()
         directive = _resume_directive(self.renderer.visible_text, self.request)
-        key =pipe_run_id(self.chat_id, self.message_id, "resume")
+        key = pipe_run_id(self.chat_id, self.message_id, "resume")
         try:
             resp = await self.conn.send_request("chat.send", _owui_chat_send_params(
                 session_key=self.session_key, message=directive, idempotency_key=key,

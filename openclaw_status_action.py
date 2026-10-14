@@ -4485,7 +4485,11 @@ class _TurnWriter:
         for raw, shown in self.conn.turn_rewrites(self.chat_id, self.message_id or ""):
             if raw in text:
                 text = text.replace(raw, shown)
-        return text
+        # The writer shows no question card: a question shows as the inline
+        # reply's fallback does, without its directive line. Absent in the
+        # Status Action's build.
+        strip = globals().get("_strip_needs_input_lines")
+        return strip(text) if strip else text
 
     async def _view(self, *, final: bool) -> tuple[list, str]:
         """(output, text) of M as the inline reply shows a run (review 2af1
@@ -4623,7 +4627,7 @@ class _TurnWriter:
         if not self.request:
             self.request = await self._run_request()
         directive = _resume_directive(self.renderer.visible_text, self.request)
-        key =pipe_run_id(self.chat_id, self.message_id, "resume")
+        key = pipe_run_id(self.chat_id, self.message_id, "resume")
         try:
             resp = await self.conn.send_request("chat.send", _owui_chat_send_params(
                 session_key=self.session_key, message=directive, idempotency_key=key,
