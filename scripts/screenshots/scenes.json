@@ -162,6 +162,15 @@
           "delay": 0.03
         }
       ]
+    },
+    {
+      "match": "Hello! Are you there?",
+      "steps": [
+        {
+          "say": "Hi Sam, I'm here. I can run commands and read or edit files in your workspace, look things up, and run jobs on a schedule, like a check every morning. What should we start with?",
+          "delay": 0.03
+        }
+      ]
     }
   ]
 }
