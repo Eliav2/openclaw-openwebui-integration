@@ -1,0 +1,54 @@
+name: README on a phone
+
+# How the README renders on github.com in a phone viewport, light and dark,
+# screen by screen (scripts/readme_mobile.py). The review check for a README
+# change: the images render, and the hero and "Quick start" are within the
+# first two screens. Runs on a push to a docs/readme branch, or by hand.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["docs/readme**"]
+    paths:
+      - README.md
+      - docs/**
+      - scripts/readme_mobile.py
+      - .github/workflows/readme-mobile.yml
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - uses: astral-sh/setup-uv@v10.3.0
+
+      - name: Install Chromium for Playwright
+        run: uv run --with playwright==1.64.0 python -m playwright install --with-deps chromium
+
+      - name: Capture
+        run: |
+          uv run --with playwright==1.64.0 python scripts/readme_mobile.py \
+            --repo "${{ github.repository }}" --ref "${{ github.sha }}" --out "$RUNNER_TEMP/readme"
+
+      - name: Report
+        if: always()
+        run: |
+          { echo "### README on a phone"; echo; echo '```json'; cat "$RUNNER_TEMP/readme/report.json"; echo '```'; } \
+            >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Upload screens
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: readme-mobile
+          path: ${{ runner.temp }}/readme
+          retention-days: 14
