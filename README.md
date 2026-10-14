@@ -18,34 +18,14 @@ Chat with your OpenClaw agents from Open WebUI, on your phone, and watch them wo
 
 ## What you get
 
-- **Live tool cards.** Every command, file read and search shows up as it runs, and opens to its input and output.
-- **Questions as dialogs.** When the agent needs a decision, you pick an option instead of typing one.
-- **Status, one tap away.** Context, rate limits and running sub-agents, with a drawer per sub-agent.
-- **Every Gateway model** in Open WebUI's model picker, per chat.
-- **Replies you didn't ask for land in the chat:** cron jobs, heartbeats and finished sub-agents.
-- **Survives restarts and reconnects.** Reload mid-reply and the reply is still there.
+- **Live tool cards** for every command, read and search.
+- **Questions as dialogs,** not walls of text.
+- **Status:** context, rate limits, sub-agents.
+- **Every Gateway model** in the model picker.
+- **Cron and heartbeat replies** land in the chat.
+- **Survives restarts** and reconnects.
 
 [Full feature list](./docs/features/index.md)
-
-## Why I built this
-
-I built this because I wanted OpenClaw on my phone.
-
-OpenClaw's built-in chat UI was never somewhere I wanted to hold a long conversation, least of all on mobile. Open WebUI is polished and mobile-first. It feels like using ChatGPT or Claude, and I wanted that same experience for my own agents. So I built this, used it daily for a few months, and I'm now sharing it.
-
-## This or `/v1`?
-
-OpenClaw also ships an [OpenAI-compatible `/v1` endpoint](https://docs.openclaw.ai/gateway/openai-http-api#open-webui-quick-setup), and Open WebUI works with it out of the box. For many people that is the right answer. The difference is what each one carries:
-
-| | `/v1` endpoint | This integration |
-|---|---|---|
-| Setup | One config flag | One install command |
-| The agent's own tool calls | Not shown | Live tool cards |
-| Sub-agents | Not shown | Listed, with a drawer each |
-| Questions mid-run | No | Dialogs |
-| Images and files the agent sends | No | Attached in the chat |
-
-**`/v1` gives you the agent as a model. This gives you the agent as an agent.** [The full comparison](./docs/why.md)
 
 ## Quick start
 
@@ -87,6 +67,26 @@ Something off? `uv run install.py healthcheck` re-checks the install and runs th
 | Everything: status, thinking control, agent skills | [Quick start](./docs/install/quickstart.md), then the [Status button](./docs/install/status-action.md), [thinking control](./docs/install/thinking-filter.md) and [agent skills](./docs/install/agent-skills.md) | 10 min |
 | No admin password given to a script | [Manual install](./docs/install/manual.md) | 10 min |
 | Open WebUI and OpenClaw on different machines | [Two hosts](./docs/install/two-hosts.md) | +5 min |
+
+## Why I built this
+
+I built this because I wanted OpenClaw on my phone.
+
+OpenClaw's built-in chat UI was never somewhere I wanted to hold a long conversation, least of all on mobile. Open WebUI is polished and mobile-first. It feels like using ChatGPT or Claude, and I wanted that same experience for my own agents. So I built this, used it daily for a few months, and I'm now sharing it.
+
+## This or `/v1`?
+
+OpenClaw also ships an [OpenAI-compatible `/v1` endpoint](https://docs.openclaw.ai/gateway/openai-http-api#open-webui-quick-setup), and Open WebUI works with it out of the box. For many people that is the right answer. The difference is what each one carries:
+
+| | `/v1` endpoint | This integration |
+|---|---|---|
+| Setup | One config flag | One install command |
+| The agent's own tool calls | Not shown | Live tool cards |
+| Sub-agents | Not shown | Listed, with a drawer each |
+| Questions mid-run | No | Dialogs |
+| Images and files the agent sends | No | Attached in the chat |
+
+**`/v1` gives you the agent as a model. This gives you the agent as an agent.** [The full comparison](./docs/why.md)
 
 ## Versions
 
