@@ -155,6 +155,24 @@ def wait_children_answering(phrases: tuple, timeout_s: float = 120) -> None:
     raise TimeoutError(f"sub-agents not answering after {timeout_s:.0f}s: {phrases}")
 
 
+def dump_children(session_key: str) -> None:
+    """Print the timing fields of the parent's child rows as the Status
+    Action reads them (sessions.list spawnedBy), for the run log."""
+    out = subprocess.run(["openclaw", "gateway", "call", "sessions.list", "--json", "--params",
+                          json.dumps({"spawnedBy": session_key, "limit": 50, "includeLastMessage": True})],
+                         capture_output=True, text=True, timeout=90)
+    try:
+        rows = json.loads(out.stdout[out.stdout.find("{"):]).get("sessions") or []
+    except ValueError:
+        print(f"  sessions.list unreadable: {out.stderr[-500:]}")
+        return
+    now_ms = int(time.time() * 1000)
+    for r in rows:
+        fields = {k: r.get(k) for k in ("status", "startedAt", "endedAt", "updatedAt", "runtimeMs",
+                                         "hasActiveRun", "subagentRunState")}
+        print(f"  child row (now={now_ms}): {json.dumps(fields)}", flush=True)
+
+
 def schedule_wake(session_key: str, message: str, in_s: float) -> None:
     at = (datetime.datetime.now(datetime.timezone.utc)
           + datetime.timedelta(seconds=in_s)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
@@ -353,6 +371,8 @@ class Scenes:
         # Open the dialog once both sub-agents are mid-answer (each has had its
         # tool result back and is streaming prose), as the scripted model saw it.
         wait_children_answering(("Price out Fly.io", "Price out Render"))
+        me = api("GET", "/api/v1/auths/", token=self.token)
+        dump_children(f"agent:main:openwebui-{me['id']}-{chat}")
         page.locator('button[aria-label="OpenClaw status"]').click()
         root = "#openclaw-status-modal-root"
         wait_js(page, f"""() => {{
