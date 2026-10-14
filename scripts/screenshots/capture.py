@@ -288,6 +288,9 @@ def wait_js(page: Page, js: str, what: str, timeout_ms: int = TURN_TIMEOUT_MS) -
 
 
 LAST_ASSISTANT = "[...document.querySelectorAll('.chat-assistant')].pop()"
+# The Status dialog's sub-agent elapsed cells (the only 10 px spans in it).
+ELAPSED_CELLS = """() => [...document.querySelectorAll('#openclaw-status-section-subagents span')]
+  .filter(s => s.style.fontSize === '10px').map(s => s.textContent)"""
 CARDS_STATE = f"""() => {{
   const a = {LAST_ASSISTANT}; if (!a) return null;
   return {{done: a.querySelectorAll('[role=button] .text-emerald-500').length,
@@ -428,6 +431,7 @@ class Scenes:
             && /5h/.test(t) && /week/i.test(t);
         }}""", "the status dialog with two sub-agents and rate limits", 60_000)
         self.s.shot(page, "status-dialog", text_selector=root)
+        opened_elapsed = page.evaluate(ELAPSED_CELLS)
         page.locator(f"{root} button", has_text="Fly.io").first.click()
         page.wait_for_selector("#openclaw-drawer-root", timeout=30_000)
         wait_js(page, """() => { const d = document.querySelector('#openclaw-drawer-root');
@@ -447,6 +451,12 @@ class Scenes:
                  return d && /tool\\s*result/i.test(d.innerText) && d.innerText.includes('Forecast'); }""",
                 "the drawer transcript with the child's tool call", 60_000)
         self.s.shot(page, "subagent-drawer", text_selector="#openclaw-drawer-root")
+        # Back to the dialog, a while after it opened: a running row's elapsed
+        # time has moved on from what the dialog first showed (ELI-120).
+        page.mouse.click(12, 400)  # the drawer's backdrop, left of its panel
+        page.wait_for_selector("#openclaw-drawer-root", state="detached", timeout=10_000)
+        print(f"  elapsed at open {opened_elapsed}, now {page.evaluate(ELAPSED_CELLS)}", flush=True)
+        self.s.shot(page, "status-dialog-later", text_selector=root)
 
     def model_picker(self, page: Page) -> None:
         new_chat(page)
