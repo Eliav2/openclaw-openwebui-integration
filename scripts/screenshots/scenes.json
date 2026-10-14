@@ -121,6 +121,22 @@
           "say": "Will do. I'll check every morning at 7:00 and only write when something needs you."
         }
       ]
+    },
+    {
+      "match": "Morning chart for the forecast app",
+      "steps": [
+        {
+          "say": "Here's today's hourly forecast:\nMEDIA:hourly-forecast.png\nRain moves in after 3 PM, so take the bike out this morning."
+        }
+      ]
+    },
+    {
+      "match": "send me the hourly forecast chart",
+      "steps": [
+        {
+          "say": "Will do: every morning at 7:00, before you leave."
+        }
+      ]
     }
   ]
 }
