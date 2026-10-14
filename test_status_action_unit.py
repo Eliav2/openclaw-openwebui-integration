@@ -325,13 +325,15 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 return {"providers": [{"provider": "anthropic", "windows": [
                     {"label": "5h", "usedPercent": 72, "resetAt": 1783790000000},
                 ]}]}
-            if method == "tasks.list":
-                self.assertEqual(params["status"], ["running", "queued"])
-                return {"tasks": [
-                    {"kind": "subagent", "status": "running"},
-                    {"kind": "subagent", "status": "queued"},
-                    {"kind": "cron", "status": "running"},  # must be excluded from the count
+            if method == "sessions.list":
+                self.assertTrue(params["spawnedBy"].startswith("agent:main:openwebui-"))
+                return {"sessions": [
+                    {"key": "agent:main:subagent:a", "status": "running"},
+                    {"key": "agent:main:subagent:b", "status": "queued"},
+                    {"key": "agent:main:subagent:c", "status": "done"},  # must be excluded from the count
                 ]}
+            if method == "sessions.preview":
+                return {"previews": []}
             raise AssertionError(f"unexpected RPC: {method}")
 
         fake_conn = mock.AsyncMock()
@@ -366,9 +368,9 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1783790000000", limits_code)
 
         subagents_code = next(c for c in codes if "getElementById('openclaw-status-section-subagents')" in c)
-        # cron task excluded -- exactly the two "subagent"-kind rows come through
+        # the ended child excluded -- exactly the running and queued rows come through
         self.assertEqual(subagents_code.count('"status": "running"') + subagents_code.count('"status": "queued"'), 2)
-        self.assertNotIn('"kind": "cron"', subagents_code)
+        self.assertNotIn("agent:main:subagent:c", subagents_code)
 
     async def test_connect_failure_shows_dialog_wide_error(self):
         action = Action()
@@ -390,7 +392,7 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("gateway unreachable", codes[1])
 
     async def test_per_section_rpc_failure_only_errors_that_section(self):
-        """A failure fetching one section's data (here: tasks.list) must
+        """A failure fetching one section's data (here: the child sessions) must
         not prevent the other two, independently-loading sections from
         rendering their own real data."""
         action = Action()
@@ -404,8 +406,8 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 return {"session": {"modelProvider": "anthropic", "model": "claude-sonnet-5"}}
             if method == "usage.status":
                 return {"providers": []}
-            if method == "tasks.list":
-                raise RuntimeError("tasks unavailable")
+            if method == "sessions.list":
+                raise RuntimeError("children unavailable")
             raise AssertionError(f"unexpected RPC: {method}")
 
         fake_conn = mock.AsyncMock()
@@ -422,7 +424,7 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
         context_code = next(c for c in codes if "getElementById('openclaw-status-section-context')" in c)
         self.assertIn('"error": null', context_code)
         subagents_code = next(c for c in codes if "getElementById('openclaw-status-section-subagents')" in c)
-        self.assertIn("tasks unavailable", subagents_code)
+        self.assertIn("children unavailable", subagents_code)
 
 
 class ClaudeCliUsageFallbackTests(unittest.IsolatedAsyncioTestCase):
@@ -441,8 +443,8 @@ class ClaudeCliUsageFallbackTests(unittest.IsolatedAsyncioTestCase):
                 return {"session": {"modelProvider": "anthropic", "model": "claude-opus-5-5"}}
             if method == "usage.status":
                 return usage_status
-            if method == "tasks.list":
-                return {"tasks": []}
+            if method == "sessions.list":
+                return {"sessions": []}
             if method == "claudeCliUsage.status":
                 if isinstance(cli_usage, Exception):
                     raise cli_usage
@@ -560,8 +562,8 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
                                      "model": "claude-sonnet-5"}}
             if method == "usage.status":
                 return {"providers": []}
-            if method == "tasks.list":
-                return {"tasks": []}
+            if method == "sessions.list":
+                return {"sessions": []}
             raise AssertionError(f"unexpected RPC: {method}")
 
         fake_conn = mock.Mock()
@@ -707,10 +709,11 @@ class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
     synthetic mode="subagent-detail" marker (see openSubagentDrawer() in
     _MODAL_OPEN_JS_TEMPLATE) -- these cover the Python-side dispatch and the
     hold-the-request-open poll loop (same shape as CompactTests exercises
-    for _run_compact, just polling tasks.get instead of sessions.describe)."""
+    for _run_compact, polling the child session)."""
 
+    CHILD = "agent:main:subagent:child-sess-1"
     DETAIL_BODY = {"mode": "subagent-detail", "chat_id": "chat-1", "id": "msg-1", "session_id": "sess-1",
-                   "model": "x.y", "taskId": "task-1", "taskTitle": "Research X", "taskStatus": "running"}
+                   "model": "x.y", "taskId": CHILD, "taskTitle": "Research X", "taskStatus": "running"}
 
     async def test_mode_dispatch_routes_to_subagent_detail(self):
         action = Action()
@@ -741,18 +744,16 @@ class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
         get_calls = {"n": 0}
 
         async def fake_send_request(method, params, timeout=5):
-            if method == "tasks.get":
-                get_calls["n"] += 1
-                self.assertEqual(params["taskId"], "task-1")
-                status = "running" if get_calls["n"] == 1 else "completed"
-                return {"task": {"id": "task-1", "title": "Research X", "status": status,
-                                 "childSessionKey": "child-sess-1", "startedAt": 1783790000000,
-                                 "endedAt": None if status == "running" else 1783790005000}}
             if method == "sessions.describe":
+                get_calls["n"] += 1
+                self.assertEqual(params["key"], self.CHILD)
+                status = "running" if get_calls["n"] == 1 else "done"
                 return {"session": {"modelProvider": "anthropic", "model": "claude-sonnet-5",
-                                     "contextTokens": 1000000, "totalTokens": 5000}}
+                                     "contextTokens": 1000000, "totalTokens": 5000, "status": status,
+                                     "startedAt": 1783790000000,
+                                     "endedAt": None if status == "running" else 1783790005000}}
             if method == "chat.history":
-                self.assertEqual(params["sessionKey"], "child-sess-1")
+                self.assertEqual(params["sessionKey"], self.CHILD)
                 return {"messages": [{"role": "assistant", "content": [{"type": "text", "text": "working on it"}]}]}
             raise AssertionError(f"unexpected RPC: {method}")
 
@@ -764,7 +765,7 @@ class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
             result = await action._run_subagent_detail(self.DETAIL_BODY, {"id": "u1"}, emitter)
 
         self.assertEqual(result["status"], "ok")
-        # Looped (running -> completed), not a single-iteration happy path.
+        # Looped (running -> done), not a single-iteration happy path.
         self.assertEqual(get_calls["n"], 2)
         codes = _emitted_codes(emitted)
         self.assertIn("openclaw-drawer-root", codes[0])  # initial open
@@ -793,11 +794,9 @@ class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
             emitted.append(evt)
 
         async def fake_send_request(method, params, timeout=5):
-            if method == "tasks.get":
-                return {"task": {"id": "task-1", "title": "Research X", "status": "completed",
-                                 "childSessionKey": "child-sess-1", "startedAt": 1783790000000}}
             if method == "sessions.describe":
-                return {"session": {"modelProvider": "anthropic", "model": "claude-sonnet-5"}}
+                return {"session": {"modelProvider": "anthropic", "model": "claude-sonnet-5",
+                                     "status": "done", "startedAt": 1783790000000}}
             if method == "chat.history":
                 return {"messages": [
                     {"role": "user", "content": "[Subagent Context] running as a subagent"},
@@ -839,8 +838,10 @@ class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
             emitted.append(evt)
 
         async def fake_send_request(method, params, timeout=5):
-            if method == "tasks.get":
-                return {"task": {"id": "task-1", "status": "running", "childSessionKey": None}}
+            if method == "sessions.describe":
+                return {"session": {"status": "running"}}
+            if method == "chat.history":
+                return {"messages": []}
             raise AssertionError(f"unexpected RPC: {method}")
 
         fake_conn = _drawer_conn(fake_send_request)

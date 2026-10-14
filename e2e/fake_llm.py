@@ -54,6 +54,7 @@ PREFERRED_TOOLS = ("session_status", "sessions_list", "memory_search")
 _EXACTLY = re.compile(r"exactly:?\s+([A-Za-z0-9_]{3,})")
 _SLOW = re.compile(r"E2E_SLOW(?::(\d{1,3}))?\s+([A-Za-z0-9_]{3,})")
 SLOW_WORDS = 10
+SPAWN_TASK = "E2E_SLOW:20 E2E_CHILDTASK"   # the sub-agent's task for E2E_SPAWN
 
 
 def _text_of(content) -> str:
@@ -115,6 +116,18 @@ def plan_reply(body: dict) -> dict:
         call = _call(PREFERRED_TOOLS[0], offered)
         if call:
             return call
+        return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
+
+    if "E2E_SPAWN" in user_text:
+        # Spawn one sub-agent whose own run is slow, so it is still running
+        # while the test reads the Status Action's Subagents section.
+        if tool_results:
+            return {"text": "E2E_SPAWNED"}
+        args = {"task": SPAWN_TASK}
+        if "sessions_spawn" in offered:
+            return {"tool": "sessions_spawn", "args": args}
+        if "tool_call" in offered:
+            return {"tool": "tool_call", "args": {"id": "sessions_spawn", "args": args}}
         return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
 
     m = _SLOW.search(user_text)

@@ -577,6 +577,93 @@ def test_a_guest_run_continued_after_a_gateway_crash_stays_without_owner_rights(
     assert not any(o is True for _t, o in turns), f"an owner turn in a guest chat: {turns}"
 
 
+# ── The Status Action's Subagents section (ELI-106) ──────────────────────────
+# The section and its drawer read the chat's child sessions. The Action runs
+# here in the test process against the stack's Gateway, with the installed
+# Action's own Gateway settings; what it emits is the code Open WebUI hands
+# the browser, and the section's data is read out of that code.
+
+import asyncio  # noqa: E402
+import re  # noqa: E402
+import tempfile  # noqa: E402
+
+SPAWN_TASK = "E2E_SLOW:20 E2E_CHILDTASK"   # e2e/fake_llm.py's task for E2E_SPAWN
+_ACTION_STATE_DIR = tempfile.mkdtemp(prefix="e2e-action-")
+
+
+def _action_valves(token: str) -> dict:
+    status, fns = _request("GET", "/api/v1/functions/", token=token)
+    assert status == 200, fns
+    ids = [f["id"] for f in fns if f.get("type") == "action" and "status" in f["id"]]
+    assert len(ids) == 1, f"expected one Status Action, found {ids}"
+    status, valves = _request("GET", f"/api/v1/functions/id/{ids[0]}/valves", token=token)
+    assert status == 200, valves
+    return dict(valves or {})
+
+
+def _run_action(token: str, call) -> list:
+    """Every execute code the Status Action emits for `call(action, emit)`."""
+    import openclaw_status_action as sa
+    valves = _action_valves(token)
+    state_dir = _ACTION_STATE_DIR   # one device identity for every call
+    codes: list = []
+
+    async def emit(evt):
+        if evt.get("type") == "execute":
+            codes.append(evt["data"]["code"])
+
+    async def go():
+        # The Action keeps its own Gateway connection in a module global; it
+        # is bound to this event loop, so each call opens and closes its own.
+        sa._action_fallback_connection = None
+        action = sa.Action()
+        action.valves = action.Valves(**{**valves, "STATE_DIR": state_dir})
+        try:
+            await call(action, emit)
+        finally:
+            conn, sa._action_fallback_connection = sa._action_fallback_connection, None
+            if conn is not None:
+                await conn.disconnect()
+    asyncio.run(go())
+    return codes
+
+
+def _section_data(codes: list, element_id: str) -> dict:
+    code = [c for c in codes if f"getElementById('{element_id}')" in c][-1]
+    return json.loads(re.search(r"const DATA = (.*?);\n", code).group(1))
+
+
+def test_the_status_action_lists_a_running_subagent_and_opens_its_drawer(token):
+    chat_id, msg = _chat_turn(token, "E2E_SPAWN one helper")
+    assert msg.get("content", "").strip() == "E2E_SPAWNED", msg
+    status, me = _request("GET", "/api/v1/auths/", token=token)
+    assert status == 200, me
+
+    codes = _run_action(token, lambda a, emit: a.action(
+        {"chat_id": chat_id}, __user__={"id": me["id"]}, __event_emitter__=emit))
+    data = _section_data(codes, "openclaw-status-section-subagents")
+    assert data["error"] is None, data
+    assert len(data["tasks"]) == 1, data
+    row = data["tasks"][0]
+    assert row["title"] == SPAWN_TASK, row
+    assert row["status"] == "running", row
+    assert row["id"] == row["childSessionKey"] and row["id"].startswith("agent:main:subagent:"), row
+    assert isinstance(row["startedAt"], int) and row["endedAt"] is None, row
+
+    # The drawer, once the child is done: its status and its last reply.
+    child = row["id"]
+    _until("the sub-agent to finish", lambda: _gw("sessions.describe", {"key": child})
+           .get("session", {}).get("status") == "done", timeout_s=120, every_s=2)
+    codes = _run_action(token, lambda a, emit: a._run_subagent_detail(
+        {"mode": "subagent-detail", "taskId": child, "taskTitle": row["title"], "taskStatus": "running"},
+        {"id": me["id"]}, emit))
+    overview = _section_data(codes, "openclaw-drawer-section-overview")
+    assert overview["childSessionKey"] == child, overview
+    assert overview["task"]["status"] == "completed", overview
+    assert (overview["task"]["terminalSummary"] or "").startswith("E2E_CHILDTASK slow-1"), overview
+    assert overview["task"]["endedAt"], overview
+
+
 # ── A run that ends while Open WebUI is stopped (ELI-94) ─────────────────────
 # Keep this last: it stops and starts the Open WebUI container. A graceful stop
 # cancels the request streaming the reply and saves the message done:true with

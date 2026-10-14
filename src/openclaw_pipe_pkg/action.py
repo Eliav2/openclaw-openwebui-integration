@@ -1057,6 +1057,63 @@ async def _claude_cli_usage_windows(conn) -> list:
     return _limits_windows_for({"providers": [snapshot or {}]}, "anthropic")
 
 
+# A child session's run status, in the words the Subagents section and drawer
+# colour and print (they were written against the removed Tasks API).
+_SUBAGENT_STATUS_WORDS = {"done": "completed", "killed": "cancelled", "timeout": "timed_out"}
+_RUNTIME_CONTEXT_MARKER_RE = re.compile(r"^<<<(?:BEGIN|END)_OPENCLAW_INTERNAL_CONTEXT>>>$", re.M)
+# The header on a line of its own; 2026.10 also names it inside the context sentence.
+_SUBAGENT_TASK_HEADER_RE = re.compile(r"^\[Subagent Task\][ \t]*$", re.M)
+
+
+def _subagent_status(status):
+    return _SUBAGENT_STATUS_WORDS.get(status, status)
+
+
+def _subagent_task_text(text):
+    """The task out of a spawn's first message, which the Gateway wraps as
+    "[Subagent Context] ... [Subagent Task] <task> Begin. Execute ...".
+    2026.10 adds internal-context marker lines around the wrapper. None if
+    the text is not a spawn message."""
+    parts = _SUBAGENT_TASK_HEADER_RE.split(text) if isinstance(text, str) else []
+    if len(parts) < 2:
+        return None
+    task = _RUNTIME_CONTEXT_MARKER_RE.sub("", parts[-1])
+    task = task.split("Begin. Execute the assigned task", 1)[0].strip()
+    return task or None
+
+
+def _subagent_task_texts(previews_resp):
+    """{child key: task text} from a sessions.preview answer. The preview
+    holds a session's newest items, so a long-running child's first message
+    may be gone; that child has no entry."""
+    out = {}
+    for p in (previews_resp or {}).get("previews") or []:
+        for item in p.get("items") or []:
+            text = _subagent_task_text(item.get("text")) if item.get("role") == "user" else None
+            if text and p.get("key"):
+                out[p["key"]] = text
+                break
+    return out
+
+
+def _subagent_row(row, task_text=None):
+    """One Subagents row out of a child session row. The title is the task,
+    as the Tasks API had it, else the spawn label, else the key."""
+    status = _subagent_status(row.get("status"))
+    preview = row.get("lastMessagePreview")
+    return {
+        "id": row["key"],
+        "title": task_text or row.get("label") or row["key"],
+        "status": status,
+        "progressSummary": preview if status in ("running", "queued") else None,
+        "terminalSummary": preview if status not in ("running", "queued") else None,
+        "error": row.get("lastRunError"),
+        "childSessionKey": row["key"],
+        "startedAt": row.get("startedAt"),
+        "endedAt": row.get("endedAt"),
+    }
+
+
 def _render_subagents_fill_js(data: dict) -> str:
     return _SUBAGENTS_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
 
@@ -1294,8 +1351,10 @@ class Action:
             conn.send_request("sessions.describe", dict(key=session_key), timeout=5)
         )
         usage_task = asyncio.ensure_future(conn.send_request("usage.status", {}, timeout=5))
-        tasks_task = asyncio.ensure_future(conn.send_request(
-            "tasks.list", dict(sessionKey=session_key, status=["running", "queued"], limit=50), timeout=5,
+        # The parent's child sessions. The Gateway's spawnedBy filter keeps
+        # the current ones (active, or ended in the last 30 minutes).
+        children_task = asyncio.ensure_future(conn.send_request(
+            "sessions.list", dict(spawnedBy=session_key, limit=50, includeLastMessage=True), timeout=5,
         ))
 
         async def fill_context():
@@ -1385,34 +1444,35 @@ class Action:
             session_key is already known synchronously, so this is the
             most genuinely independent of the three sections.
 
-            Passes the raw TaskSummary fields through (not just a count) so
-            the fill template can render one clickable row per subagent --
-            each row's own click handler carries these same fields into the
-            detail drawer's opening request (see S.openSubagentDrawer /
-            Action._run_subagent_detail), so the drawer can paint its header
-            instantly before its own RPCs resolve."""
+            Passes one row per running or queued child session (not just a
+            count) so the fill template can render one clickable row per
+            subagent -- each row's own click handler carries these same
+            fields into the detail drawer's opening request (see
+            S.openSubagentDrawer / Action._run_subagent_detail), so the
+            drawer can paint its header instantly before its own RPCs
+            resolve. A row's id is the child session key."""
             try:
-                tasks_resp = await tasks_task
+                children_resp = await children_task
             except Exception as ex:
-                pipe_log(f"[status-action] tasks.list failed: {ex}")
+                pipe_log(f"[status-action] sessions.list (children) failed: {ex}")
                 await __event_emitter__({"type": "execute", "data": {
                     "code": _render_subagents_fill_js({"error": f"Could not fetch subagents: {ex}"})
                 }})
                 return
-            subagent_tasks = [
-                {
-                    "id": t.get("id"),
-                    "title": t.get("title"),
-                    "status": t.get("status"),
-                    "progressSummary": t.get("progressSummary"),
-                    "terminalSummary": t.get("terminalSummary"),
-                    "error": t.get("error"),
-                    "childSessionKey": t.get("childSessionKey"),
-                    "startedAt": t.get("startedAt"),
-                    "endedAt": t.get("endedAt"),
-                }
-                for t in (tasks_resp or {}).get("tasks", []) if t.get("kind") == "subagent"
-            ]
+            active = [r for r in (children_resp or {}).get("sessions") or []
+                      if r.get("key") and r.get("status") in ("running", "queued")]
+            task_texts = {}
+            if active:
+                try:
+                    previews = await conn.send_request(
+                        "sessions.preview", dict(keys=[r["key"] for r in active], limit=20, maxChars=2000),
+                        timeout=5,
+                    )
+                    task_texts = _subagent_task_texts(previews)
+                except Exception as ex:
+                    # Titles fall back to the spawn label; the rows still render.
+                    pipe_log(f"[status-action] sessions.preview (children) failed: {ex}")
+            subagent_tasks = [_subagent_row(r, task_texts.get(r["key"])) for r in active]
             await __event_emitter__({"type": "execute", "data": {"code": _render_subagents_fill_js({
                 "tasks": subagent_tasks, "source": source, "fetchedAt": time.strftime("%H:%M:%S"), "error": None,
             })}})
@@ -1578,6 +1638,14 @@ class Action:
             "id": task_id, "title": body.get("taskTitle"), "status": body.get("taskStatus"),
         })}})
 
+        if not task_id.startswith("agent:"):
+            # A Tasks API id from a message written before ELI-100; only the
+            # removed tasks.get could resolve it to a child session.
+            await __event_emitter__({"type": "execute", "data": {
+                "code": _render_drawer_error_js("This sub-agent's details are no longer available.")
+            }})
+            return {"status": "error", "detail": "legacy task id"}
+
         try:
             conn, source = await _get_action_connection(lambda: self.valves)
         except Exception as ex:
@@ -1593,72 +1661,68 @@ class Action:
 
     async def _subagent_detail_poll_loop(self, conn, source, task_id,
                                          __event_emitter__):
-        """The drawer's poll body: refresh task/session/history every
-        _SUBAGENT_POLL_INTERVAL_S until the subagent reaches a terminal status
-        or _SUBAGENT_POLL_MAX_S elapses.
+        """The drawer's poll body: refresh the child session and its history
+        every _SUBAGENT_POLL_INTERVAL_S until the subagent reaches a terminal
+        status or _SUBAGENT_POLL_MAX_S elapses. `task_id` is the child session
+        key.
         """
         deadline = time.time() + _SUBAGENT_POLL_MAX_S
         while True:
+            child_key = task_id
             try:
-                task_resp = await conn.send_request("tasks.get", dict(taskId=task_id), timeout=8)
-                task = (task_resp or {}).get("task") or {}
+                desc_resp, history_resp = await asyncio.gather(
+                    conn.send_request("sessions.describe", dict(key=child_key), timeout=8),
+                    conn.send_request(
+                        "chat.history", dict(sessionKey=child_key, limit=50, maxChars=4000), timeout=8,
+                    ),
+                )
             except Exception as ex:
-                pipe_log(f"[status-action] subagent tasks.get failed: {ex}")
+                pipe_log(f"[status-action] subagent detail fetch failed: {ex}")
                 await __event_emitter__({"type": "execute", "data": {
-                    "code": _render_drawer_error_js(f"Could not fetch task: {ex}")
+                    "code": _render_drawer_error_js(f"Could not fetch sub-agent: {ex}")
                 }})
                 return {"status": "error", "detail": str(ex)}
 
-            if not task:
+            session_row = (desc_resp or {}).get("session") or {}
+            if not session_row:
                 await __event_emitter__({"type": "execute", "data": {
-                    "code": _render_drawer_error_js("Task not found.")
+                    "code": _render_drawer_error_js("Sub-agent not found.")
                 }})
-                return {"status": "error", "detail": "task not found"}
+                return {"status": "error", "detail": "sub-agent not found"}
 
-            child_key = task.get("childSessionKey")
-            provider = model = None
-            context_data = goal_data = None
-            text_rows: list = []
-            tool_calls: list = []
-
-            if child_key:
-                try:
-                    desc_resp, history_resp = await asyncio.gather(
-                        conn.send_request("sessions.describe", dict(key=child_key), timeout=8),
-                        conn.send_request(
-                            "chat.history", dict(sessionKey=child_key, limit=50, maxChars=4000), timeout=8,
-                        ),
-                    )
-                except Exception as ex:
-                    pipe_log(f"[status-action] subagent detail fetch failed: {ex}")
-                    desc_resp, history_resp = None, None
-
-                session_row = (desc_resp or {}).get("session") or {}
-                provider = session_row.get("modelProvider")
-                model = session_row.get("model")
-                context_tokens = session_row.get("contextTokens")
-                total_tokens = session_row.get("totalTokens")
-                if context_tokens and total_tokens is not None:
-                    context_data = {
-                        "usedTokens": _fmt_tokens(total_tokens),
-                        "totalTokens": _fmt_tokens(context_tokens),
-                        "pct": round(total_tokens / context_tokens * 100, 1),
-                    }
-                goal = session_row.get("goal")
-                if goal:
-                    goal_line = _format_goal_line(goal)
-                    if goal_line:
-                        goal_data = {"line": goal_line}
-
-                # KNOWN GAP (ELI-26): chat.history is blind to the in-flight
-                # turn, so while the subagent is running this yields nothing and
-                # every tool call appears at once when the turn flushes. There
-                # is no pipe-side fix -- a running session's tool events reach
-                # only the connection that started the run. See the note in
-                # gateway.py's reader loop for the measurement.
-                text_rows, tool_calls = _extract_transcript_and_tools(
-                    (history_resp or {}).get("messages") or []
+            # KNOWN GAP (ELI-26): chat.history is blind to the in-flight
+            # turn, so while the subagent is running this yields nothing and
+            # every tool call appears at once when the turn flushes. There
+            # is no pipe-side fix -- a running session's tool events reach
+            # only the connection that started the run. See the note in
+            # gateway.py's reader loop for the measurement.
+            text_rows, tool_calls = _extract_transcript_and_tools(
+                (history_resp or {}).get("messages") or []
+            )
+            task = _subagent_row({"key": child_key, **session_row})
+            if task["status"] not in ("queued", "running") and not task["terminalSummary"]:
+                # The child's last reply, as the Tasks API's terminal summary had it.
+                task["terminalSummary"] = next(
+                    (r["text"] for r in reversed(text_rows) if r.get("role") == "assistant" and r.get("text")),
+                    None,
                 )
+
+            provider = session_row.get("modelProvider")
+            model = session_row.get("model")
+            context_data = goal_data = None
+            context_tokens = session_row.get("contextTokens")
+            total_tokens = session_row.get("totalTokens")
+            if context_tokens and total_tokens is not None:
+                context_data = {
+                    "usedTokens": _fmt_tokens(total_tokens),
+                    "totalTokens": _fmt_tokens(context_tokens),
+                    "pct": round(total_tokens / context_tokens * 100, 1),
+                }
+            goal = session_row.get("goal")
+            if goal:
+                goal_line = _format_goal_line(goal)
+                if goal_line:
+                    goal_data = {"line": goal_line}
 
             fetched_at = time.strftime("%H:%M:%S")
             await __event_emitter__({"type": "execute", "data": {"code": _render_drawer_overview_fill_js({
