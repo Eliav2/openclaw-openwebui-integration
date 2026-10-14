@@ -9793,3 +9793,86 @@ class HandoverMediaCodeAwareTests(_RoutingCase):
         self.assertEqual(calls, ["MEDIA:x.png"])
         self.assertEqual(m["content"],
                          "Real: IMG:x.png\nQuoted: `` MEDIA:x.png `` and ```MEDIA:y.png ``` done.")
+
+
+class ForwardedTurnHistoryTests(_RoutingCase):
+    """GH #24: since OpenClaw 2026.10.2, `chat.history` re-emits a forwarded
+    user turn (a cron run's prompt, a `sessions_send` message) as role
+    "assistant", "Forwarded from ..." (dist chat-display-projection.helpers-
+    pbUdgTgb.mjs `isForwardedUserMessage`, chat-display-projection.history
+    `projectForwardedMessages`). It is still the admitted turn `<id>:user`
+    that starts the run. The fixture is the e2e wake session's history as
+    each version returned it."""
+
+    FX = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "test_fixture_gh24_wake_history.json")))
+
+    def with_cli_closers(self, messages):
+        """The history a claude-cli runtime leaves: each run closes with
+        `cli-assistant:<runId>` repeating its text (cli-runner-C9KAAFBI.mjs:589,
+        2026.10.3). The fixture's fake model writes none."""
+        out = []
+        for n, m in enumerate(copy.deepcopy(messages)):
+            out.append(m)
+            run = (m.get("__openclaw") or {}).get("runId")
+            nxt = (messages[n + 1].get("__openclaw") or {}).get("runId") if n + 1 < len(messages) else None
+            if m["role"] == "assistant" and run and nxt != run:
+                out.append({"role": "assistant", "idempotencyKey": f"cli-assistant:{run}",
+                            "__openclaw": {"idempotencyKey": f"cli-assistant:{run}"},
+                            "content": copy.deepcopy(m["content"])})
+        return out
+
+    def wake_run(self, version, token):
+        msgs = self.FX[version]["messages"]
+        return next(m["__openclaw"]["runId"] for m in msgs if m["role"] == "assistant"
+                    and (openclaw_pipe._history_item(m) or {}).get("text", "").strip() == token)
+
+    async def test_a_forwarded_cron_turn_reads_as_the_user_turn_it_is(self):
+        self.history = {"messages": self.FX["2026.10.3"]["messages"]}
+        msgs = (await self.conn.session_history(self.key))["messages"]
+        prompts = [m for m in msgs if "Reply with exactly: WAKE_" in (openclaw_pipe._history_item(m) or {})["text"]]
+        self.assertEqual([m["role"] for m in prompts], ["user", "user"])
+        self.assertEqual(len(openclaw_pipe._history_user_turns(msgs)), 3, "the chat turn and both wakes")
+        replies = [(openclaw_pipe._history_item(m) or {})["text"] for m in msgs if m["role"] == "assistant"]
+        self.assertEqual(replies, ["E2E_WAKE_CHAT", "WAKE_ONE", "WAKE_TWO"])
+
+    async def test_a_claude_cli_wake_ends_with_its_reply_only(self):
+        """Read as a reply, the cron prompt and its scheduled-run preamble
+        became the wake message's text when the writer finalized it from the
+        transcript."""
+        run = self.wake_run("2026.10.3", "WAKE_ONE")
+        self.history = {"messages": self.with_cli_closers(self.FX["2026.10.3"]["messages"])}
+        self.conn._on_sessions_changed({"sessionKey": self.key, "phase": "start", "runId": run,
+                                        "hasActiveRun": True, "status": "running"})
+        for payload in (_delta("WAKE"), _delta("_ONE"), {"state": "final"}):
+            self.assertTrue(await _turn_route_event(self.conn, self.ev(run, payload)))
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "done", "lastRunId": run,
+                                        "reason": "chat.run.settled"})
+        await self.spin()
+        m = self.new_messages()[turn_message_id(self.key, run, self.CHAT)]
+        self.assertIs(m["done"], True)
+        self.assertNotIn("Reply with exactly", json.dumps(m))
+        self.assertEqual(m["content"], "WAKE_ONE")
+
+    async def test_a_forwarded_sessions_send_turn_is_a_user_turn_too(self):
+        turn = {"role": "assistant", "idempotencyKey": "t1:user", "senderLabel": "Forwarded from main",
+                "provenance": {"kind": "inter_session", "sourceTool": "sessions_send"},
+                "content": [{"type": "text", "text": "please check X"}]}
+        self.history = {"messages": [turn]}
+        (m,) = (await self.conn.session_history(self.key))["messages"]
+        self.assertEqual(m["role"], "user")
+        self.assertEqual(openclaw_pipe._history_user_turns([m]), [("t1", "sessions_send")])
+
+    async def test_any_other_message_is_kept(self):
+        for version in ("2026.9.3", "2026.10.3"):
+            with self.subTest(version=version):
+                msgs = self.FX[version]["messages"]
+                reply_like = [m for m in msgs if m["role"] == "assistant" and not str(
+                    m.get("idempotencyKey") or "").endswith(":user")]
+                self.history = {"messages": msgs}
+                got = (await self.conn.session_history(self.key))["messages"]
+                self.assertEqual([m for m in got if m["role"] == "assistant"], reply_like)
+        self.history = {"messages": self.FX["2026.9.3"]["messages"]}
+        self.assertEqual((await self.conn.session_history(self.key))["messages"],
+                         self.FX["2026.9.3"]["messages"], "9.3 history is unchanged")

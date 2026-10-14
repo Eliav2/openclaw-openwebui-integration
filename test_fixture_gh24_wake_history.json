@@ -1,0 +1,387 @@
+{
+ "source": "chat.history of the e2e wake session (test_two_cron_wakes_in_a_row_get_one_finished_message_each), dumped by a debug e2e lane per OpenClaw version (GH #24)",
+ "2026.10.3": {
+  "run": "https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/38580018681",
+  "sessionKey": "agent:main:openwebui-f4e85b74-30f8-42de-8518-f204017b33fe-c5393c7b-ca5d-4a63-b75b-36234e4189d9",
+  "sessionId": "befa3cf1-cc1e-4c97-989a-3779e0511ef1",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Respond with exactly: E2E_WAKE_CHAT",
+    "timestamp": 1791987927586,
+    "idempotencyKey": "msg-c5393c7b-ca5d-4a63-b75b-36234e4189d9-8a1e7411-d5f3-4bf5-8c32-35bd094811e7-1791987927.5850475:user",
+    "__openclaw": {
+     "senderIsOwner": true,
+     "transport": {
+      "clients": [
+       {
+        "id": "webchat",
+        "mode": "cli"
+       }
+      ]
+     },
+     "id": "4f355948-e406-4c33-ba7b-cbb43d521cef",
+     "idempotencyKey": "msg-c5393c7b-ca5d-4a63-b75b-36234e4189d9-8a1e7411-d5f3-4bf5-8c32-35bd094811e7-1791987927.5850475:user",
+     "recordTimestampMs": 1791987927704,
+     "transcriptPosition": {
+      "source": "ZjzIrTijriipHyNiecELGEIZMHOpjr47Mtnr46LybsY",
+      "rawSeq": 1
+     },
+     "seq": 1
+    }
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "text",
+      "text": "E2E_WAKE_CHAT"
+     }
+    ],
+    "api": "openai-completions",
+    "provider": "fake",
+    "model": "e2e-echo",
+    "usage": {
+     "input": 10,
+     "output": 5,
+     "totalTokens": 15,
+     "cacheRead": 0,
+     "cacheWrite": 0,
+     "cost": {
+      "input": 0,
+      "output": 0,
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "total": 0
+     }
+    },
+    "stopReason": "stop",
+    "timestamp": 1791987927924,
+    "responseId": "chatcmpl-c0c28584c0f9",
+    "__openclaw": {
+     "runId": "msg-c5393c7b-ca5d-4a63-b75b-36234e4189d9-8a1e7411-d5f3-4bf5-8c32-35bd094811e7-1791987927.5850475",
+     "id": "da80dc93-7572-4b34-b77c-5ece4833a681",
+     "recordTimestampMs": 1791987927965,
+     "transcriptPosition": {
+      "source": "ZjzIrTijriipHyNiecELGEIZMHOpjr47Mtnr46LybsY",
+      "rawSeq": 4
+     },
+     "seq": 2
+    }
+   },
+   {
+    "role": "assistant",
+    "content": "Reply with exactly: WAKE_ONE\nCurrent time: Wednesday, October 14th, 2026 - 2:25 PM (UTC)\nReference UTC: 2026-10-14 14:25 UTC\n\nThis is an unattended scheduled run. Nobody is present to clarify or approve, so complete the task with what you have. Your final reply is the deliverable \u2014 not a plan, an acknowledgement, or a request for input. If nothing needs doing, reply exactly NO_REPLY. If something failed, start with AUTOMATION_FAILED on its own line, then state what failed and what you tried \u2014 the scheduler owns retries and failure alerts. Where the job's own instructions conflict with this preamble, the job's instructions win (a question or plan the job explicitly requests is a valid deliverable). If this job is no longer needed, remove it if your available tools allow.",
+    "timestamp": 1791987932161,
+    "provenance": {
+     "kind": "internal_system",
+     "sourceTool": "cron",
+     "sourcePromptPrefix": "[cron:612e012e-7ed3-43dc-b056-d70c0d591f00 e2e-wake-fd9faa]",
+     "jobId": "612e012e-7ed3-43dc-b056-d70c0d591f00",
+     "runId": "befa3cf1-cc1e-4c97-989a-3779e0511ef1",
+     "sourceSessionKey": "agent:main:openwebui-f4e85b74-30f8-42de-8518-f204017b33fe-c5393c7b-ca5d-4a63-b75b-36234e4189d9"
+    },
+    "idempotencyKey": "90008378-f350-4099-a895-035c7386d5a0:user",
+    "__openclaw": {
+     "id": "83ed0232-ce37-42bb-9842-d44f00ddaf2c",
+     "idempotencyKey": "90008378-f350-4099-a895-035c7386d5a0:user",
+     "recordTimestampMs": 1791987932380,
+     "transcriptPosition": {
+      "source": "ZjzIrTijriipHyNiecELGEIZMHOpjr47Mtnr46LybsY",
+      "rawSeq": 6
+     },
+     "seq": 3,
+     "turnBoundary": true
+    },
+    "senderLabel": "Forwarded from Automation",
+    "senderSession": {
+     "sessionKey": "agent:main:openwebui-f4e85b74-30f8-42de-8518-f204017b33fe-c5393c7b-ca5d-4a63-b75b-36234e4189d9",
+     "agentId": "main",
+     "label": "Automation"
+    }
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "text",
+      "text": "WAKE_ONE"
+     }
+    ],
+    "api": "openai-completions",
+    "provider": "fake",
+    "model": "e2e-echo",
+    "usage": {
+     "input": 10,
+     "output": 5,
+     "totalTokens": 15,
+     "cacheRead": 0,
+     "cacheWrite": 0,
+     "cost": {
+      "input": 0,
+      "output": 0,
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "total": 0
+     }
+    },
+    "stopReason": "stop",
+    "timestamp": 1791987932403,
+    "responseId": "chatcmpl-f40c306d6af2",
+    "__openclaw": {
+     "runId": "a65c4729-f3af-4a7b-a1aa-294cc047cbcb",
+     "id": "6c2f9ea4-ac0d-4549-9729-cdb0aa04cd02",
+     "recordTimestampMs": 1791987932443,
+     "transcriptPosition": {
+      "source": "ZjzIrTijriipHyNiecELGEIZMHOpjr47Mtnr46LybsY",
+      "rawSeq": 7
+     },
+     "seq": 4
+    }
+   },
+   {
+    "role": "assistant",
+    "content": "Reply with exactly: WAKE_TWO\nCurrent time: Wednesday, October 14th, 2026 - 2:25 PM (UTC)\nReference UTC: 2026-10-14 14:25 UTC\n\nThis is an unattended scheduled run. Nobody is present to clarify or approve, so complete the task with what you have. Your final reply is the deliverable \u2014 not a plan, an acknowledgement, or a request for input. If nothing needs doing, reply exactly NO_REPLY. If something failed, start with AUTOMATION_FAILED on its own line, then state what failed and what you tried \u2014 the scheduler owns retries and failure alerts. Where the job's own instructions conflict with this preamble, the job's instructions win (a question or plan the job explicitly requests is a valid deliverable). If this job is no longer needed, remove it if your available tools allow.",
+    "timestamp": 1791987934320,
+    "provenance": {
+     "kind": "internal_system",
+     "sourceTool": "cron",
+     "sourcePromptPrefix": "[cron:9dc3695c-e10e-4225-8908-4e1135181301 e2e-wake-4220f7]",
+     "jobId": "9dc3695c-e10e-4225-8908-4e1135181301",
+     "runId": "befa3cf1-cc1e-4c97-989a-3779e0511ef1",
+     "sourceSessionKey": "agent:main:openwebui-f4e85b74-30f8-42de-8518-f204017b33fe-c5393c7b-ca5d-4a63-b75b-36234e4189d9"
+    },
+    "idempotencyKey": "1e41abb9-74a2-41f4-ad88-84691c612fa2:user",
+    "__openclaw": {
+     "id": "5d8f59fd-86e9-447c-b0f0-474ff02f91ce",
+     "idempotencyKey": "1e41abb9-74a2-41f4-ad88-84691c612fa2:user",
+     "recordTimestampMs": 1791987934489,
+     "transcriptPosition": {
+      "source": "ZjzIrTijriipHyNiecELGEIZMHOpjr47Mtnr46LybsY",
+      "rawSeq": 8
+     },
+     "seq": 5,
+     "turnBoundary": true
+    },
+    "senderLabel": "Forwarded from Automation",
+    "senderSession": {
+     "sessionKey": "agent:main:openwebui-f4e85b74-30f8-42de-8518-f204017b33fe-c5393c7b-ca5d-4a63-b75b-36234e4189d9",
+     "agentId": "main",
+     "label": "Automation"
+    }
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "text",
+      "text": "WAKE_TWO"
+     }
+    ],
+    "api": "openai-completions",
+    "provider": "fake",
+    "model": "e2e-echo",
+    "usage": {
+     "input": 10,
+     "output": 5,
+     "totalTokens": 15,
+     "cacheRead": 0,
+     "cacheWrite": 0,
+     "cost": {
+      "input": 0,
+      "output": 0,
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "total": 0
+     }
+    },
+    "stopReason": "stop",
+    "timestamp": 1791987934510,
+    "responseId": "chatcmpl-82b63263eb57",
+    "__openclaw": {
+     "runId": "14ec51d7-7730-40e2-bcf0-147ae742a8af",
+     "id": "d01a4d8b-dc67-4c9e-85ae-eba935a659c3",
+     "recordTimestampMs": 1791987934541,
+     "transcriptPosition": {
+      "source": "ZjzIrTijriipHyNiecELGEIZMHOpjr47Mtnr46LybsY",
+      "rawSeq": 9
+     },
+     "seq": 6
+    }
+   }
+  ]
+ },
+ "2026.9.3": {
+  "run": "https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/38580028904",
+  "sessionKey": "agent:main:openwebui-09456296-8b8a-40b0-883e-aca747e1e1e3-31a1ee10-2eb3-4f79-8171-a40bae25b6d3",
+  "sessionId": "196f3aca-3561-4138-ae15-004e43faa7d1",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Respond with exactly: E2E_WAKE_CHAT",
+    "timestamp": 1791987924077,
+    "idempotencyKey": "msg-31a1ee10-2eb3-4f79-8171-a40bae25b6d3-2febcab5-55ed-470b-9478-6337c133690a-1791987924.0758562:user",
+    "__openclaw": {
+     "senderIsOwner": true,
+     "id": "7f54c22b-f17a-4b5d-8d58-3d3a8ef9bf71",
+     "idempotencyKey": "msg-31a1ee10-2eb3-4f79-8171-a40bae25b6d3-2febcab5-55ed-470b-9478-6337c133690a-1791987924.0758562:user",
+     "recordTimestampMs": 1791987924109,
+     "transcriptPosition": {
+      "source": "bMixy5ejGd9ta6SMJXf-qpOvjAtx2Vkf5whGloWOCco",
+      "rawSeq": 1
+     },
+     "seq": 1
+    }
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "text",
+      "text": "E2E_WAKE_CHAT"
+     }
+    ],
+    "api": "openai-completions",
+    "provider": "fake",
+    "model": "e2e-echo",
+    "usage": {
+     "input": 10,
+     "output": 5,
+     "totalTokens": 15,
+     "cacheRead": 0,
+     "cacheWrite": 0,
+     "cost": {
+      "input": 0,
+      "output": 0,
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "total": 0
+     }
+    },
+    "stopReason": "stop",
+    "timestamp": 1791987924237,
+    "responseId": "chatcmpl-b0fb971a9af7",
+    "__openclaw": {
+     "runId": "msg-31a1ee10-2eb3-4f79-8171-a40bae25b6d3-2febcab5-55ed-470b-9478-6337c133690a-1791987924.0758562",
+     "id": "fbb07655-eb03-40b6-8a45-135188c8c38c",
+     "recordTimestampMs": 1791987924280,
+     "transcriptPosition": {
+      "source": "bMixy5ejGd9ta6SMJXf-qpOvjAtx2Vkf5whGloWOCco",
+      "rawSeq": 4
+     },
+     "seq": 2
+    }
+   },
+   {
+    "role": "user",
+    "content": "[cron:0740fb6d-d0e2-4df1-9784-dabb968652a3 e2e-wake-6fd372] Reply with exactly: WAKE_ONE\nCurrent time: Wednesday, October 14th, 2026 - 2:25 PM (UTC)\nReference UTC: 2026-10-14 14:25 UTC\n\nThis is an unattended scheduled run. Nobody is present to clarify or approve, so complete the task with what you have. Your final reply is the deliverable \u2014 not a plan, an acknowledgement, or a request for input. If nothing needs doing, reply exactly NO_REPLY. If something failed, state plainly what failed and what you tried \u2014 the scheduler owns retries and failure alerts. Where the job's own instructions conflict with this preamble, the job's instructions win (a question or plan the job explicitly requests is a valid deliverable). If this job is no longer needed, remove it if your available tools allow.",
+    "timestamp": 1791987928622,
+    "idempotencyKey": "03e28de1-ba70-444a-9bee-c6be21107ade:user",
+    "__openclaw": {
+     "id": "c56f1298-107a-497f-bc16-69a381e45d44",
+     "idempotencyKey": "03e28de1-ba70-444a-9bee-c6be21107ade:user",
+     "recordTimestampMs": 1791987928756,
+     "transcriptPosition": {
+      "source": "bMixy5ejGd9ta6SMJXf-qpOvjAtx2Vkf5whGloWOCco",
+      "rawSeq": 6
+     },
+     "seq": 3
+    }
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "text",
+      "text": "WAKE_ONE"
+     }
+    ],
+    "api": "openai-completions",
+    "provider": "fake",
+    "model": "e2e-echo",
+    "usage": {
+     "input": 10,
+     "output": 5,
+     "totalTokens": 15,
+     "cacheRead": 0,
+     "cacheWrite": 0,
+     "cost": {
+      "input": 0,
+      "output": 0,
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "total": 0
+     }
+    },
+    "stopReason": "stop",
+    "timestamp": 1791987928768,
+    "responseId": "chatcmpl-a13b6a146421",
+    "__openclaw": {
+     "runId": "196f3aca-3561-4138-ae15-004e43faa7d1",
+     "id": "c7af29b2-7825-4bac-9e82-b4bae8f8b268",
+     "recordTimestampMs": 1791987928809,
+     "transcriptPosition": {
+      "source": "bMixy5ejGd9ta6SMJXf-qpOvjAtx2Vkf5whGloWOCco",
+      "rawSeq": 7
+     },
+     "seq": 4
+    }
+   },
+   {
+    "role": "user",
+    "content": "[cron:fb8b08d8-dee2-4064-8188-2d687c324ebe e2e-wake-7bc230] Reply with exactly: WAKE_TWO\nCurrent time: Wednesday, October 14th, 2026 - 2:25 PM (UTC)\nReference UTC: 2026-10-14 14:25 UTC\n\nThis is an unattended scheduled run. Nobody is present to clarify or approve, so complete the task with what you have. Your final reply is the deliverable \u2014 not a plan, an acknowledgement, or a request for input. If nothing needs doing, reply exactly NO_REPLY. If something failed, state plainly what failed and what you tried \u2014 the scheduler owns retries and failure alerts. Where the job's own instructions conflict with this preamble, the job's instructions win (a question or plan the job explicitly requests is a valid deliverable). If this job is no longer needed, remove it if your available tools allow.",
+    "timestamp": 1791987930877,
+    "idempotencyKey": "297ab5c5-8987-4ae7-a0d6-2ef0e268527b:user",
+    "__openclaw": {
+     "id": "6c430ada-8e34-4492-a5d8-b8e0c14ca097",
+     "idempotencyKey": "297ab5c5-8987-4ae7-a0d6-2ef0e268527b:user",
+     "recordTimestampMs": 1791987930980,
+     "transcriptPosition": {
+      "source": "bMixy5ejGd9ta6SMJXf-qpOvjAtx2Vkf5whGloWOCco",
+      "rawSeq": 8
+     },
+     "seq": 5
+    }
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "text",
+      "text": "WAKE_TWO"
+     }
+    ],
+    "api": "openai-completions",
+    "provider": "fake",
+    "model": "e2e-echo",
+    "usage": {
+     "input": 10,
+     "output": 5,
+     "totalTokens": 15,
+     "cacheRead": 0,
+     "cacheWrite": 0,
+     "cost": {
+      "input": 0,
+      "output": 0,
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "total": 0
+     }
+    },
+    "stopReason": "stop",
+    "timestamp": 1791987930991,
+    "responseId": "chatcmpl-56b3ed5fafd8",
+    "__openclaw": {
+     "runId": "196f3aca-3561-4138-ae15-004e43faa7d1",
+     "id": "9a310e23-e5e5-45c8-83b1-f0541080b585",
+     "recordTimestampMs": 1791987931030,
+     "transcriptPosition": {
+      "source": "bMixy5ejGd9ta6SMJXf-qpOvjAtx2Vkf5whGloWOCco",
+      "rawSeq": 9
+     },
+     "seq": 6
+    }
+   }
+  ]
+ }
+}

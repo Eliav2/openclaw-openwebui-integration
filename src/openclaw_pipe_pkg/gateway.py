@@ -2179,12 +2179,16 @@ class _GatewayConnection:
                               limit: int = RECOVERY_HISTORY_LIMIT,
                               max_chars: int = RECOVERY_HISTORY_MAX_CHARS,
                               timeout: float = 10) -> dict:
-        """Fetch the session's recent messages unclipped, for timeout recovery."""
-        return await self.send_request(
+        """Fetch the session's recent messages unclipped, with each turn in
+        the role the transcript holds (`_transcript_roles`)."""
+        hist = await self.send_request(
             "chat.history",
             dict(sessionKey=session_key, limit=limit, maxChars=max_chars),
             timeout=timeout
         )
+        if isinstance(hist, dict) and isinstance(hist.get("messages"), list):
+            hist["messages"] = _transcript_roles(hist["messages"])
+        return hist
 
     async def abort(self, session_key: str, run_id: str):
         """Send chat.abort for an active run."""
@@ -3141,6 +3145,31 @@ ORPHAN_STUB_NOTE = (
     "Send the message again if you still need an answer.*"
 )
 ORPHAN_STUB_SILENT_NOTE = "*The run for this message stopped without leaving a reply in the transcript.*"
+
+
+def _is_forwarded_turn(message) -> bool:
+    """A forwarded user turn as `chat.history` shows it since OpenClaw
+    2026.10.2: role "assistant", "Forwarded from ...", keyed as the admitted
+    turn `<id>:user`, with the provenance the Gateway projects
+    (chat-display-projection.helpers-pbUdgTgb.mjs `hasForwardedMessageProvenance`:
+    a `sessions_send` message, or a cron run's prompt)."""
+    if not isinstance(message, dict) or message.get("role") != "assistant":
+        return False
+    meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
+    key = str(message.get("idempotencyKey") or meta.get("idempotencyKey") or "")
+    prov = message.get("provenance") if isinstance(message.get("provenance"), dict) else {}
+    forwarded = ((prov.get("kind"), prov.get("sourceTool")) == ("inter_session", "sessions_send")
+                 or (prov.get("kind"), prov.get("sourceTool")) == ("internal_system", "cron"))
+    return key.endswith(":user") and len(key) > 5 and forwarded
+
+
+def _transcript_roles(messages: list) -> list:
+    """`chat.history` messages with each forwarded user turn back in role
+    "user", as the transcript holds it. Read as a reply, a cron wake's prompt
+    and its scheduled-run preamble became the wake message's text when a
+    claude-cli run was rebuilt from the transcript, and the run it started
+    was not found (GH #24, OpenClaw 2026.10.2+). Other messages are kept."""
+    return [{**m, "role": "user"} if _is_forwarded_turn(m) else m for m in messages]
 
 
 def _history_user_run_id(message) -> str | None:

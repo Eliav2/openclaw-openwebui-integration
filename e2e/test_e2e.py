@@ -267,18 +267,30 @@ def _wait_for(token: str, chat_id: str, tokens: list[str]) -> dict:
                 f"{json.dumps({k: (m.get('role'), m.get('done'), (m.get('content') or '')[:80]) for k, m in msgs.items()})[:2500]}")
 
 
-def _wake_turns(key: str) -> dict:
-    """{prompt token: turn id} of the wake user turns in the transcript."""
+def _wake_messages(key: str) -> dict:
+    """{prompt token: the message id the pipe gives that wake}. Up to OpenClaw
+    2026.9, every wake into a session runs with runId = the sessionId, so a
+    wake is its own admitted turn's message (ELI-103). From 2026.10.2 each
+    wake has its own run id, an agent turn like any other: its message comes
+    from that run id, and `chat.history` shows the wake's prompt turn as a
+    forwarded "assistant" message with the cron prefix moved into its
+    provenance (GH #24)."""
     hist = _gw("chat.history", {"sessionKey": key, "limit": 100})
-    out = {}
+    session_id, turn, out = hist.get("sessionId"), None, {}
     for m in hist.get("messages") or []:
-        ikey = str(m.get("idempotencyKey") or (m.get("__openclaw") or {}).get("idempotencyKey") or "")
+        meta = m.get("__openclaw") or {}
+        ikey = str(m.get("idempotencyKey") or meta.get("idempotencyKey") or "")
         text = m.get("content") if isinstance(m.get("content"), str) else " ".join(
             b.get("text") or "" for b in m.get("content") or [] if isinstance(b, dict))
-        if m.get("role") == "user" and ikey.endswith(":user") and str(text).lstrip().startswith("[cron:"):
-            for tok in ("WAKE_ONE", "WAKE_TWO", "WAKE_SLOW"):
-                if tok in text:
-                    out[tok] = ikey[:-len(":user")]
+        if ikey.endswith(":user"):
+            cron = (str(text).lstrip().startswith("[cron:")
+                    or (m.get("provenance") or {}).get("sourceTool") == "cron")
+            turn = ikey[:-len(":user")] if cron else None
+            continue
+        run = meta.get("runId")
+        for tok in ("WAKE_ONE", "WAKE_TWO", "WAKE_SLOW"):
+            if m.get("role") == "assistant" and tok in str(text) and turn and run:
+                out[tok] = str(uuid.uuid5(TURN_NS, f"{key}:{turn if run == session_id else run}"))
     return out
 
 
@@ -297,12 +309,13 @@ def test_two_cron_wakes_in_a_row_get_one_finished_message_each(token):
     _schedule_wake(key, "Reply with exactly: WAKE_ONE", 3)
     _schedule_wake(key, "Reply with exactly: WAKE_TWO", 4)
     msgs = _wait_for(token, chat_id, ["WAKE_ONE", "WAKE_TWO"])
-    turns = _wake_turns(key)
+    wakes = _wake_messages(key)
     for tok in ("WAKE_ONE", "WAKE_TWO"):
         holders = [k for k, m in msgs.items() if tok in (m.get("content") or "")]
         assert len(holders) == 1, f"{tok} in {holders}"
-        assert holders[0] == str(uuid.uuid5(TURN_NS, f"{key}:{turns[tok]}")), (
-            f"{tok}: message {holders[0]} is not its wake turn's ({turns.get(tok)})")
+        assert tok in wakes, f"{tok}: no cron wake turn and run in chat.history"
+        assert holders[0] == wakes[tok], f"{tok}: message {holders[0]} is not its wake's ({wakes[tok]})"
+        assert msgs[holders[0]]["content"].strip() == tok, "the wake's message is its reply only"
         other = "WAKE_TWO" if tok == "WAKE_ONE" else "WAKE_ONE"
         assert other not in msgs[holders[0]]["content"], "one wake's text in the other's message"
     _assert_clean(token, chat_id, msgs)
