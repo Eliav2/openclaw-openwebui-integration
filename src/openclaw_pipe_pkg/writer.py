@@ -657,13 +657,21 @@ class _TurnWriter:
             if not run or not (run in self.runs or run_message_id(
                     self.session_key, self.chat_id, run, messages) == self.message_id):
                 continue
+            # The user's answer to M's question and a resume are no request
+            # (review 2af1 N2): only M's reply run or an agent turn is.
+            if (parse_pipe_run_id(run) or {}).get("kind") in ("input", "resume"):
+                continue
             content = m.get("content")
             blocks = content if isinstance(content, list) else []
             text = content if isinstance(content, str) else "".join(
                 str(b.get("text") or "") for b in blocks
                 if isinstance(b, dict) and b.get("type") == "text")
             text = _strip_inbound_meta(text)
-            attachments = sum(1 for b in blocks if isinstance(b, dict) and b.get("type") != "text")
+            # Content blocks, or (how the Gateway stores an Open WebUI image
+            # turn) string content with the images in `__openclaw.media` (N1).
+            media = (m.get("__openclaw") or {}).get("media")
+            attachments = max(sum(1 for b in blocks if isinstance(b, dict) and b.get("type") != "text"),
+                              len(media) if isinstance(media, list) else 0)
             if text.lstrip().startswith(RESUME_DIRECTIVE_PREFIX):
                 continue
             if text.strip() or attachments:

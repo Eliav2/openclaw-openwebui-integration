@@ -6443,6 +6443,43 @@ class ResumeRequestReviewTests(_TurnWriterCase):
         self.assertIn(self.REQUEST, sent)
         self.assertNotIn("an earlier turn", sent)
 
+    async def test_N1_an_image_turn_as_stored_says_it_had_an_attachment(self):
+        """How the 9.3 Gateway stores an Open WebUI image turn (live
+        transcript, 2026-10-14): string content with the <attached_files>
+        listing, the images in `__openclaw.media`, no non-text block."""
+        text = ('<attached_files>\n<file type="image" url="c653b2d2" content_type="image/png" '
+                'name="image.png"/>\n</attached_files>\n\nWhat is wrong in this screenshot?')
+        turn = self._user(self.RUN, text)
+        turn["__openclaw"] = {"media": [{"path": "/x/image.png", "contentType": "image/png"}],
+                              "mediaImageLayout": {"slots": [{"kind": "image", "factIndex": 0}]}}
+        self.history = {"messages": [turn]}
+        w = await self.opened_writer()
+        await w.end(self.KILLED)
+        self.assertIn("1 attachment ", self.sends()[0]["message"])
+
+    async def test_N2_an_answer_turn_is_not_quoted_as_the_request(self):
+        """M's own first turn is past the history limit: the first turn left
+        naming M is the user's answer to its question (an `input` run), which
+        is no request."""
+        answer_run = f"msg-{self.CHAT}-{self.MID}-input-1.5"
+        first = openclaw_pipe._resume_directive("Step 1 done.", None)
+        self.history = {"messages": [self._user(answer_run, "Postgres"),
+                                     self._user(self.RESUME_RUN, first)]}
+        w = await self.adopted_writer(self.RESUME_RUN)
+        await w.end(self.KILLED)
+        self.assertNotIn("Postgres", self.sends()[0]["message"])
+
+    async def test_N2_the_reply_run_is_the_request_even_after_an_answer(self):
+        answer_run = f"msg-{self.CHAT}-{self.MID}-input-1.5"
+        self.history = {"messages": [self._user(self.ORIGINAL_RUN, self.REQUEST),
+                                     self._user(answer_run, "Postgres"),
+                                     self._user(self.RESUME_RUN, "x")]}
+        w = await self.adopted_writer(answer_run)
+        await w.end(self.KILLED)
+        sent = self.sends()[0]["message"]
+        self.assertIn(self.REQUEST, sent)
+        self.assertNotIn("Postgres", sent)
+
     async def test_F5_a_directive_behind_the_metadata_block_is_not_taken_for_the_request(self):
         """With #22, a turn is stored with the conversation metadata block in
         front of its text; a resume behind it is still a resume, not the request."""
