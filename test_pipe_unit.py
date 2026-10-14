@@ -3838,24 +3838,22 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(answer, "a")
         self.assertEqual(sent, ["sid-tab"], "never another chat's tab")
 
-    async def test_with_no_tab_on_the_chat_the_card_waits_for_one(self):
+    async def test_with_no_tab_on_the_chat_the_reply_ends_with_the_question(self):
+        """A tab on another chat is no viewer: waiting for the user to open
+        this one kept the stream open past its run, up to an hour (ELI-107).
+        The question ends the reply as text."""
         pool = {"sid-other": {"id": "user-1", "chat_ids": ["chat-x"]}}
         sent = self.fake_socket(pool)
 
         async def event_call(event):
             return {"error": "Client session disconnected."}
 
-        async def user_opens_the_chat():
-            await asyncio.sleep(0.05)
-            pool["sid-tab"] = {"id": "user-1", "chat_ids": ["chat-1"]}
-        opener = asyncio.ensure_future(user_opens_the_chat())
-        answer = await _ask_user_input_modal(
+        answer = await asyncio.wait_for(_ask_user_input_modal(
             event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
             owui_user_id="user-1", owui_chat_id="chat-1", owui_message_id="msg-1",
-            max_wait_s=1, poll_interval_s=0.01)
-        await opener
-        self.assertEqual(answer, "a")
-        self.assertEqual(sent, ["sid-tab"])
+            max_wait_s=60, poll_interval_s=0.01), 2)
+        self.assertIsNone(answer)
+        self.assertEqual(sent, [], "never another chat's tab")
 
     async def test_a_reload_moves_the_card_without_waiting_out_owuis_timeout(self):
         """The first call is pending on the reloaded tab's old socket; OWUI
@@ -6134,6 +6132,34 @@ class TurnWriterEndTests(_TurnWriterCase):
         self.assertTrue((await self.task_done(w)).done(), "the Open WebUI task ends with the run")
         self.assertTrue(w.closed)
 
+    def _found_it_says(self, text):
+        for m in self.history["messages"]:
+            for b in m.get("content") if isinstance(m.get("content"), list) else []:
+                if b.get("text") == "Found it.":
+                    b["text"] = text
+
+    async def test_a_question_the_writer_shows_has_no_marker_line(self):
+        """M3 crash window run 2 (2026-10-14 01:16Z, ask case): a Gateway
+        recovery asked the window's question; the writer showed it with its
+        raw needs-input directive line. The writer has no card (#20): the
+        question shows as clean text, as the inline reply's fallback does."""
+        marker = openclaw_pipe._USER_INPUT_TRIGGER_PREFIXES[-1]
+        self._found_it_says(f"Found it.\n\n{marker}\nColour a1\nWhich colour do you prefer?\n1. Red")
+        w = await self.opened_writer()
+        await w.end({"status": "done", "hasActiveRun": False, "lastRunId": self.RUN})
+        content = self.m()["content"]
+        self.assertNotIn(marker, content)
+        self.assertIn("Found it.\n\nColour a1\nWhich colour do you prefer?\n1. Red", content)
+        self.assertNotIn(marker, json.dumps(self.m()["output"]))
+
+    async def test_a_quoted_marker_in_a_fence_stays_in_the_writers_text(self):
+        marker = openclaw_pipe._USER_INPUT_TRIGGER_PREFIXES[-1]
+        quote = f"Found it:\n```\n{marker}\nColour a1\n```\nDone."
+        self._found_it_says(quote)
+        w = await self.opened_writer()
+        await w.end({"status": "done", "hasActiveRun": False, "lastRunId": self.RUN})
+        self.assertIn(quote, self.m()["content"])
+
     async def test_without_a_transcript_what_streamed_is_kept(self):
         self.history = {"messages": []}
         w = await self.opened_writer()
@@ -7101,6 +7127,22 @@ class HandoverRewriteTests(_RoutingCase):
         self.assertTrue(m["content"].endswith("Blue it is."))
         self.assertNotIn("needs input", json.dumps(m["output"]))
 
+    async def test_a_quoted_prompt_in_a_code_fence_is_no_card_after_a_restart(self):
+        """A report that quotes a prompt in a code fence asked nothing
+        (ELI-107): the next run's text is no answer to rebuild a card from."""
+        run1 = pipe_run_id(self.CHAT, self.STUB)
+        run2 = pipe_run_id(self.CHAT, self.STUB, "input")
+        quoted = "Report:\n```\n" + self.PROMPT + "\n```\n"
+        self.add_stub(self.STUB, content=quoted)
+        self.history = {"messages": self.closed_run(run1, quoted)
+                        + self.closed_run(run2, "Noted.", user="go on")}
+        await self.dispatch(run2, _delta("Noted."))
+        await self.dispatch(run2, {"state": "final"})
+        await self.settle(run2)
+        m = self.owui.msgs()[self.STUB]
+        self.assertNotIn("Ask User", m["content"])
+        self.assertEqual(m["content"], quoted + "Noted.")
+
     async def test_a_card_the_reply_recorded_is_kept_as_it_was(self):
         """In the same process the inline reply's own card (its id) stays."""
         run1 = pipe_run_id(self.CHAT, self.STUB)
@@ -7912,6 +7954,100 @@ class EventGapTests(unittest.IsolatedAsyncioTestCase):
             await _GapRepairSink().handle_event(None, event)
         self.assertEqual(seen, ["lost"])
         self.assertEqual(ocp._take_gap_repairs("c", "m"), [])
+
+
+class NeedsInputMarkerTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-107 (2026-10-14 02:07Z, chat 0abe9bde): a report that QUOTED a
+    needs-input block in a fenced code block, after 48 tool calls, was held
+    as a live prompt from the fence on: nothing more streamed, the card's
+    first call failed (the turn came from an API session, no socket), and
+    the request polled for the user's "reconnect" for up to an hour. The
+    Gateway run had ended at 02:07Z; the stream ran until it was stopped by
+    hand at 02:16Z, the stored message empty and done:false."""
+
+    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
+    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
+    _queue = NoDroppedMessagesTests._queue
+    _delta = NoDroppedMessagesTests._delta
+    _final = NoDroppedMessagesTests._final
+    _until_registered = NoDroppedMessagesTests._until_registered
+    MARKER = openclaw_pipe._USER_INPUT_TRIGGER_PREFIXES[-1]
+    REPORT = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                         "test_fixture_eli107_report.json")))["text"]
+
+    async def _stream(self, text, event_call, chunk=40):
+        """One run streams `text` in `chunk`-sized deltas, then ends; returns
+        what the reply showed (its text chunks)."""
+        async def emitter(event):
+            pass
+        body = {"model": "openclaw_gateway.default", "messages": [{"role": "user", "content": "report"}]}
+        meta = {"chat_id": "chat-1", "user_id": "u1", "message_id": "m1"}
+        gen = self.pipe._pipe_impl(body, emitter, __metadata__=meta, __event_call__=event_call)
+
+        async def drain():
+            out = ""
+            async for c in gen:
+                out += c if isinstance(c, str) else ""
+            return out
+        task = asyncio.ensure_future(drain())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        for i in range(0, len(text), chunk):
+            q.put_nowait(self._delta("run-1", text[i:i + chunk]))
+        q.put_nowait(self._final("run-1"))
+        return await asyncio.wait_for(task, 5)   # bounds the test only
+
+    async def test_a_quoted_marker_in_a_code_fence_is_text_not_a_prompt(self):
+        self.assertIn("```\n  " + self.MARKER, self.REPORT, "the fixture quotes it in a fence")
+        calls = []
+
+        async def event_call(payload):
+            calls.append(payload)
+            return {"error": "Client session disconnected."}
+        with mock.patch.object(self.ocp, "_owui_supports_native_ask_user", lambda: True):
+            out = await self._stream(self.REPORT, event_call)
+        self.assertEqual(calls, [], "no card for a quote")
+        self.assertEqual(out.strip(), self.REPORT.strip(), "the whole report is shown as written")
+
+    def test_a_prompt_after_a_closed_fence_still_counts(self):
+        m = self.MARKER
+        for fence in ("```", "~~~"):
+            with self.subTest(fence=fence):
+                quoted = f"See:\n{fence}\n{m}\nold\n{fence}\n"
+                text = quoted + f"{m}\nTitle\nQ?\n"
+                self.assertEqual(self.ocp._marker_line_index(text), len(quoted))
+                self.assertIsNone(self.ocp._marker_line_index(quoted))
+                # Streamed: the quote is shown, the real prompt is held.
+                shown, held = self.ocp._advance_input_prompt_buffer("", quoted, False)
+                self.assertEqual((shown, held), (quoted, ""))
+                shown, held = self.ocp._advance_input_prompt_buffer(
+                    "", f"{m}\nTitle", self.ocp._fence_open_after(quoted))
+                self.assertEqual((shown, held), ("", f"{m}\nTitle"))
+                # Inside an open fence a marker line is never held.
+                shown, held = self.ocp._advance_input_prompt_buffer("", f"{m}\n", True)
+                self.assertEqual(held, "")
+
+    async def test_a_card_nobody_can_see_ends_the_reply_with_the_question(self):
+        """A real prompt, but the turn's session is not a live socket (OWUI
+        answers the first call `Client session disconnected.` at once): the
+        reply ends now with the question as text, it does not wait an hour
+        for a reconnect."""
+        prompt = f"Let me ask.\n{self.MARKER}\nColour a1\nWhich colour do you prefer?\n1. Red\n2. Blue\n"
+        calls = []
+        socket_main = types.ModuleType("open_webui.socket.main")
+        socket_main.SESSION_POOL = {}            # the user has no tab open at all
+        sys.modules.setdefault("open_webui.socket", types.ModuleType("open_webui.socket"))
+        sys.modules["open_webui.socket.main"] = socket_main
+        self.addCleanup(sys.modules.pop, "open_webui.socket.main", None)
+
+        async def event_call(payload):
+            calls.append(payload)
+            return {"error": "Client session disconnected."}
+        with mock.patch.object(self.ocp, "_owui_supports_native_ask_user", lambda: True):
+            out = await self._stream(prompt, event_call)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("Which colour do you prefer?", out)
+        self.assertNotIn(self.MARKER, out)
 
 
 class InlineOwnerRuleTests(unittest.IsolatedAsyncioTestCase):

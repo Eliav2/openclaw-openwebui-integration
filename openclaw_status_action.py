@@ -4418,23 +4418,23 @@ TURN_CUT_OFF_NOTE = ("_(This reply was cut off: the run was interrupted again af
                      f"{MAX_TURN_RESUMES} attempts to continue it.)_")
 
 
-def _needs_input_line_re() -> "re.Pattern | None":
-    """A needs-input directive line (`_USER_INPUT_TRIGGER_PREFIXES`) with the
-    blank lines after it, which the inline reply never shows
-    (`_strip_input_marker_line`). None in the Status Action's build."""
-    prefixes = globals().get("_USER_INPUT_TRIGGER_PREFIXES")
-    if not prefixes:
-        return None
-    return re.compile(r"(?m)^[ \t]*(?:%s)[^\n]*(?:\n+|$)" % "|".join(map(re.escape, prefixes)))
-
-
 def _run_prompt_text(span: list | None) -> str:
     """The needs-input prompt a run's text ends with, from its trigger line
-    on, as the renderer shows it; "" when there is none."""
-    line = _needs_input_line_re()
-    text = _history_renderer(span).text if span and line else ""
-    hits = [m.start() for m in line.finditer(text)] if text else []
-    return text[hits[-1]:] if hits else ""
+    on, as the renderer shows it; "" when there is none. A trigger line in
+    a code fence is a quote (ELI-107)."""
+    find = globals().get("_marker_line_index")
+    fenced = globals().get("_fence_open_after")
+    text = _history_renderer(span).text if span and find and fenced else ""
+    start, last = 0, None
+    while text:
+        at = find(text[start:], fenced(text[:start]))
+        if at is None:
+            break
+        last = start + at
+        start = text.find("\n", last) + 1
+        if not start:
+            break
+    return text[last:] if last is not None else ""
 
 
 RESUME_DIRECTIVE_PREFIX = "[system] Your previous "
@@ -4736,9 +4736,11 @@ class _TurnWriter:
             if raw in text:
                 text = text.replace(raw, shown)
         # A prompt nobody answered here shows as the inline reply's fallback
-        # does: without its internal directive line (the writer side of ELI-58).
-        line = _needs_input_line_re()
-        return line.sub("", text) if line else text
+        # does: without its internal directive line (the writer side of
+        # ELI-58), a quote in a code fence kept (ELI-107). Absent in the
+        # Status Action's build.
+        strip = globals().get("_strip_needs_input_lines")
+        return strip(text) if strip else text
 
     def _note_transcript_answers(self, messages: list) -> None:
         """An answered ask-user prompt is a card, rebuilt from the transcript

@@ -2104,7 +2104,20 @@ def _could_be_user_input_prefix(normalized_text: str) -> bool:
     )
 
 
-def _marker_line_index(text: str):
+_CODE_FENCE_RE = re.compile(r"^[ \t]{0,3}(```|~~~)")
+
+
+def _fence_open_after(text: str, in_fence: bool = False) -> bool:
+    """Whether a fenced code block is open at the end of `text`, which starts
+    with a fence open (`in_fence`) or not. A line that starts with ``` or
+    ~~~ opens or closes one."""
+    for line in (text or "").split("\n"):
+        if _CODE_FENCE_RE.match(line):
+            in_fence = not in_fence
+    return in_fence
+
+
+def _marker_line_index(text: str, in_fence: bool = False):
     """Index of the first line that opens a needs-input block, else None.
 
     The marker only counts at the start of a line, but it does NOT have to be
@@ -2116,19 +2129,26 @@ def _marker_line_index(text: str):
     leaked into the chat as raw text with no dialog (seen live 2026-08-01 on a
     claude-cli turn; token-streamed turns were unaffected, which is why this
     looked intermittent).
+
+    A line inside a fenced code block is a quote, not a prompt (ELI-107: a
+    report quoting the block in a fence was held as a live prompt and hung).
+    `in_fence`: a fence is open where `text` starts.
     """
     start = 0
     while True:
         nl = text.find("\n", start)
         line = text[start:] if nl == -1 else text[start:nl]
-        if _is_user_input_prompt(line):
+        if _CODE_FENCE_RE.match(line):
+            in_fence = not in_fence
+        elif not in_fence and _is_user_input_prompt(line):
             return start
         if nl == -1:
             return None
         start = nl + 1
 
 
-def _advance_input_prompt_buffer(pending: str, delta: str) -> tuple[str, str]:
+def _advance_input_prompt_buffer(pending: str, delta: str,
+                                 in_fence: bool = False) -> tuple[str, str]:
     """Feed a new assistant-delta chunk into the needs-input buffering state.
 
     Returns `(text_to_yield_now, new_pending)`. `pending` is text already
@@ -2144,20 +2164,23 @@ def _advance_input_prompt_buffer(pending: str, delta: str) -> tuple[str, str]:
     its own (P22 follow-up, 2026-07-08 -- caught live: a reply that talked
     normally first and only asked its question in the next paragraph never
     got buffered, because the newline landed mid-delta, not at its edge).
+
+    `in_fence`: a fenced code block is open where `pending + delta` starts
+    (the shown text left it open); nothing in a fence is held (ELI-107).
     """
     candidate = pending + delta
-    if _could_be_user_input_prefix(candidate.lstrip()):
+    if not in_fence and _could_be_user_input_prefix(candidate.lstrip()):
         return "", candidate
     # A complete marker may sit mid-candidate when the whole reply arrives at
     # once. Flush what precedes it and hold from the marker onward.
-    marker_at = _marker_line_index(candidate)
+    marker_at = _marker_line_index(candidate, in_fence)
     if marker_at is not None:
         return candidate[:marker_at], candidate[marker_at:]
     idx = candidate.rfind("\n")
     if idx == -1:
         return candidate, ""
     before, after = candidate[: idx + 1], candidate[idx + 1 :]
-    if after and _could_be_user_input_prefix(after.lstrip()):
+    if after and not _fence_open_after(before, in_fence) and _could_be_user_input_prefix(after.lstrip()):
         return before, after
     return before + after, ""
 
@@ -2185,6 +2208,26 @@ def _strip_input_marker_line(text: str) -> str:
             rest = rest[nl + 1:] if nl != -1 else ""
             return lead_ws + rest.lstrip("\n")
     return text
+
+
+def _strip_needs_input_lines(text: str) -> str:
+    """Drop every needs-input directive line (and the blank lines after it)
+    that is outside a fenced code block: the question it opens stays as
+    readable text, a quoted block in a fence stays as written (ELI-107)."""
+    if not text:
+        return text
+    out, in_fence, skip_blank = [], False, False
+    for line in text.split("\n"):
+        if _CODE_FENCE_RE.match(line):
+            in_fence = not in_fence
+        elif not in_fence and _is_user_input_prompt(line):
+            skip_blank = True
+            continue
+        if skip_blank and not line.strip():
+            continue
+        skip_blank = False
+        out.append(line)
+    return "\n".join(out)
 
 
 def _truncate_at_repeated_marker(text: str) -> str:
@@ -2605,6 +2648,16 @@ def _format_native_answers(questions: list[dict], answers: dict) -> str:
     return "\n".join(f"{header}: {text}" for header, text in lines)
 
 
+def _user_has_live_session(owui_user_id: str, owui_chat_id: str | None = None) -> bool:
+    """Whether the user has a connected Open WebUI socket now that a card
+    for `owui_chat_id` could be shown on (`_live_session_id_for_user`)."""
+    try:
+        from open_webui.socket.main import SESSION_POOL
+    except Exception:
+        return False
+    return bool(_live_session_id_for_user(owui_user_id, SESSION_POOL, owui_chat_id))
+
+
 async def _call_native_card_on_live_session(
     owui_user_id: str, owui_chat_id: str | None, owui_message_id: str | None, payload: dict
 ):
@@ -2704,6 +2757,15 @@ async def _ask_user_native_card(
             return None
         if isinstance(response, dict) and "disconnected" in str(response.get("error", "")):
             if not owui_user_id:
+                return None
+            if not use_live_session and not waiting_shown and not _user_has_live_session(
+                    owui_user_id, owui_chat_id):
+                # The very first call found no live tab for this turn (an API
+                # caller, or a tab closed before the question) and the user has
+                # no other: nobody can see the card, so the reply ends now with
+                # the question as text rather than staying open for a
+                # reconnect (ELI-107: an hour).
+                pipe_log("  no live tab for this turn's question card; showing it as text")
                 return None
             # OWUI's __event_call__ is bound to the session that started the
             # turn; once that socket is gone, reach the user's new one.
@@ -6678,23 +6740,23 @@ TURN_CUT_OFF_NOTE = ("_(This reply was cut off: the run was interrupted again af
                      f"{MAX_TURN_RESUMES} attempts to continue it.)_")
 
 
-def _needs_input_line_re() -> "re.Pattern | None":
-    """A needs-input directive line (`_USER_INPUT_TRIGGER_PREFIXES`) with the
-    blank lines after it, which the inline reply never shows
-    (`_strip_input_marker_line`). None in the Status Action's build."""
-    prefixes = globals().get("_USER_INPUT_TRIGGER_PREFIXES")
-    if not prefixes:
-        return None
-    return re.compile(r"(?m)^[ \t]*(?:%s)[^\n]*(?:\n+|$)" % "|".join(map(re.escape, prefixes)))
-
-
 def _run_prompt_text(span: list | None) -> str:
     """The needs-input prompt a run's text ends with, from its trigger line
-    on, as the renderer shows it; "" when there is none."""
-    line = _needs_input_line_re()
-    text = _history_renderer(span).text if span and line else ""
-    hits = [m.start() for m in line.finditer(text)] if text else []
-    return text[hits[-1]:] if hits else ""
+    on, as the renderer shows it; "" when there is none. A trigger line in
+    a code fence is a quote (ELI-107)."""
+    find = globals().get("_marker_line_index")
+    fenced = globals().get("_fence_open_after")
+    text = _history_renderer(span).text if span and find and fenced else ""
+    start, last = 0, None
+    while text:
+        at = find(text[start:], fenced(text[:start]))
+        if at is None:
+            break
+        last = start + at
+        start = text.find("\n", last) + 1
+        if not start:
+            break
+    return text[last:] if last is not None else ""
 
 
 RESUME_DIRECTIVE_PREFIX = "[system] Your previous "
@@ -6996,9 +7058,11 @@ class _TurnWriter:
             if raw in text:
                 text = text.replace(raw, shown)
         # A prompt nobody answered here shows as the inline reply's fallback
-        # does: without its internal directive line (the writer side of ELI-58).
-        line = _needs_input_line_re()
-        return line.sub("", text) if line else text
+        # does: without its internal directive line (the writer side of
+        # ELI-58), a quote in a code fence kept (ELI-107). Absent in the
+        # Status Action's build.
+        strip = globals().get("_strip_needs_input_lines")
+        return strip(text) if strip else text
 
     def _note_transcript_answers(self, messages: list) -> None:
         """An answered ask-user prompt is a card, rebuilt from the transcript
@@ -10005,8 +10069,12 @@ class Pipe:
                                 # be checked reliably. Resolved once the run ends
                                 # (see the `else:` clause below) or as soon as the
                                 # buffered text diverges from every trigger.
+                                # A fence the shown text left open makes a marker a quote
+                                # (ELI-107); held text always starts outside one.
                                 flush_text, pending_prompt_text = (
-                                    _advance_input_prompt_buffer(pending_prompt_text, delta)
+                                    _advance_input_prompt_buffer(
+                                        pending_prompt_text, delta,
+                                        _fence_open_after(assistant_stream_text))
                                 )
                                 if not flush_text:
                                     continue
