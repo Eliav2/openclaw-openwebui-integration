@@ -660,7 +660,7 @@ class Scenes:
         wait_js(page, "() => document.body.innerText.includes('🎯')", "the goal row", 60_000)
         print("  status rows: " + json.dumps(page.evaluate(f"() => {LAST_ASSISTANT}.innerText")[:400]), flush=True)
         clip = f"""() => {{
-          // From the first status row (the 🧠 line) to the end of the reply.
+          // From the model's name over the first status row (the 🧠 line) to the end of the reply.
           const a = {LAST_ASSISTANT};
           const w = document.createTreeWalker(a, NodeFilter.SHOW_TEXT);
           let row = null;
@@ -669,7 +669,7 @@ class Scenes:
           const nav = document.querySelector('nav');
           const navBottom = nav ? nav.getBoundingClientRect().bottom : 0;
           const r = a.getBoundingClientRect();
-          const top = Math.max(row.getBoundingClientRect().top - 10, navBottom);
+          const top = Math.max(row.getBoundingClientRect().top - 36, navBottom);  // with the model's name
           return {{x: 0, y: top, width: innerWidth, height: Math.min(r.bottom + 8, innerHeight) - top}};
         }}"""
         self.s.shot(page, "usage-goal", clip_js=clip, text_selector=".chat-assistant >> nth=-1")
