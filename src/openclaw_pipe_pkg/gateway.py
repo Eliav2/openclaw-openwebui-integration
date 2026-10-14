@@ -1126,8 +1126,8 @@ def _tool_result_text(result) -> str:
 TOOL_ERROR_MARK = "❌"
 
 
-def _tool_call_error_relabel_event(name: str) -> dict:
-    """Re-emit a failed call's `function_call` item with ❌ in its name.
+def _tool_call_error_relabel_event(name: str, tool_call_id: str, args_str: str) -> dict:
+    """Re-announce a failed call's `function_call` item with ❌ in its name.
 
     The card's collapsed row shows `attributes.name` and nothing else about
     outcome: its status icon is chosen by `isDone` alone, with no failure
@@ -1135,27 +1135,18 @@ def _tool_call_error_relabel_event(name: str) -> dict:
     without patching OWUI. The name is the only outcome-carrying field we
     control, and it renders through `Markdown`, so an emoji survives.
 
-    `response.output_item.done` looks like the natural event for this, but in
-    OWUI's `handle_responses_streaming_event` it is dead code: the broader
-    `elif event_type.startswith('response.') and event_type.endswith('.done')`
-    branch matches first and explicitly skips `output_item` ("handled
-    specifically below" -- it isn't reachable). So we instead use that
-    branch's own "Generic Field Done" arm, which for an unrecognized
-    `response.<field>.done` event does `item[<field>] = data[<field>]` on
-    `output[output_index]` (default: last item) and returns a non-None
-    metadata dict, which is what actually triggers the broadcast. No
-    `output_index` needed: the caller only uses this when the started item is
-    still last, which is exactly when the default is correct.
-
-    Unlike the old (dead) `output_item.done` shape, this mutates the existing
-    item in place rather than replacing it wholesale, so `arguments`/`status`
-    don't need to be repeated here -- they're already set on the item from the
-    start event and survive untouched.
+    The event is the start event again, same id and arguments: both of OWUI's
+    reducers replace an `output_item.added` item that has the id of one they
+    hold, the backend (`handle_responses_streaming_event`, what is saved) and
+    the chat tab (`structuredOutput.ts::applyResponseStreamEvent`, what shows
+    while the reply streams). So the mark shows live, on any card, last or
+    not. The `response.name.done` used before only reached the backend, and
+    only its last item: the tab ignores that event, so the ❌ appeared when
+    the reply finished (ELI-124), and a call followed by anything else got
+    the banner alone. (`response.output_item.done` replaces by position in
+    the backend, which the pipe cannot know.)
     """
-    return {
-        "type": "response.name.done",
-        "name": f"{name} {TOOL_ERROR_MARK}",
-    }
+    return _tool_call_started_event(f"{name} {TOOL_ERROR_MARK}", tool_call_id, args_str)
 
 
 def _tool_error_banner(result_str: str) -> str:

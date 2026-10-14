@@ -1832,31 +1832,23 @@ class ToolErrorIndicationTests(unittest.TestCase):
     extraction of that handler instead of asserting our belief about it.
     """
 
-    def test_relabel_uses_the_generic_field_done_shape(self):
-        """`response.output_item.done` is unreachable in OWUI's handler (a
-        broader `.done` branch matches first and explicitly skips it); the
-        generic `<field>.done` arm of that same broader branch is the one
-        that actually runs and broadcasts."""
-        ev = _tool_call_error_relabel_event("Bash")
-        self.assertEqual(ev["type"], "response.name.done")
+    def test_relabel_reannounces_the_call(self):
+        """The start event again, under the same id: both of OWUI's reducers
+        replace an added item whose id they already hold (ELI-124)."""
+        ev = _tool_call_error_relabel_event("Bash", "call-1", '{"command": "ls"}')
+        self.assertEqual(ev, _tool_call_started_event("Bash ❌", "call-1", '{"command": "ls"}'))
+        self.assertEqual(ev["type"], "response.output_item.added")
 
     def test_relabel_marks_the_name(self):
-        ev = _tool_call_error_relabel_event("Bash")
-        self.assertEqual(ev["name"], "Bash ❌")
-
-    def test_relabel_sends_no_output_index(self):
-        """Deliberate: OWUI defaults to the last item, and the caller only
-        relabels when the started item IS last. A wrong explicit index would
-        overwrite a text item and eat visible message content."""
-        ev = _tool_call_error_relabel_event("Bash")
-        self.assertNotIn("output_index", ev)
+        ev = _tool_call_error_relabel_event("Bash", "call-1", "{}")
+        self.assertEqual(ev["item"]["name"], "Bash ❌")
 
     def test_relabel_is_json_serializable(self):
-        json.dumps(_tool_call_error_relabel_event("Bash"))
+        json.dumps(_tool_call_error_relabel_event("Bash", "call-1", "{}"))
 
     def test_banner_precedes_the_original_output(self):
-        """The banner is the fallback when the card can't be relabeled, so it
-        must never cost the actual error text."""
+        """The banner explains the failure inside the card, so it must never
+        cost the actual error text."""
         banner = _tool_error_banner("ls: cannot access '/nope'")
         self.assertTrue(banner.startswith("❌"))
         self.assertIn("ls: cannot access '/nope'", banner)
@@ -1933,22 +1925,19 @@ class RealHandlerReplayTests(unittest.TestCase):
         )
 
     def test_relabel_lands_on_the_real_handler(self):
-        started = _tool_call_started_event("Read", "call-1", "{}")
-        relabel = _tool_call_error_relabel_event("Read")
+        started = _tool_call_started_event("Read", "call-1", '{"p": 1}')
+        relabel = _tool_call_error_relabel_event("Read", "call-1", '{"p": 1}')
         result = _tool_call_result_event("call-1", "BANNER")
 
-        output, metadata_seq = self._replay([started, relabel, result])
+        output, _ = self._replay([started, relabel, result])
 
-        function_call = next(item for item in output if item["type"] == "function_call")
-        self.assertEqual(function_call["name"], "Read ❌")
-        # The relabel step must itself trigger a broadcast (non-None
-        # metadata), not just silently mutate an output list nobody sees.
-        self.assertIsNotNone(metadata_seq[1])
+        self.assertEqual([i["type"] for i in output], ["function_call", "function_call_output"])
+        self.assertEqual(output[0]["name"], "Read ❌")
+        self.assertEqual(output[0]["arguments"], '{"p": 1}')
 
-    def test_relabel_lands_with_preceding_text(self):
-        """Same replay, but with a streamed text item ahead of the tool call
-        -- the generic field-done arm targets by output_index (default: last
-        item), so a leading item must not shift what gets relabeled."""
+    def test_relabel_lands_on_a_card_that_is_not_last(self):
+        """Matched by id, not position: text or a parallel call after the
+        card does not move the mark onto them."""
         preceding_text = {
             "type": "message",
             "id": "msg_1",
@@ -1956,16 +1945,18 @@ class RealHandlerReplayTests(unittest.TestCase):
             "role": "assistant",
             "content": [{"type": "output_text", "text": "hi"}],
         }
-        started = _tool_call_started_event("Read", "call-1", "{}")
-        relabel = _tool_call_error_relabel_event("Read")
-        result = _tool_call_result_event("call-1", "BANNER")
+        events = [
+            _tool_call_started_event("Read", "call-1", "{}"),
+            _tool_call_started_event("Bash", "call-2", "{}"),
+            _tool_call_error_relabel_event("Read", "call-1", "{}"),
+            _tool_call_result_event("call-1", "BANNER"),
+        ]
 
-        output, _ = self._replay(
-            [started, relabel, result], initial_output=[preceding_text]
-        )
+        output, _ = self._replay(events, initial_output=[preceding_text])
 
-        function_call = next(item for item in output if item["type"] == "function_call")
-        self.assertEqual(function_call["name"], "Read ❌")
+        self.assertEqual([(i["type"], i.get("name")) for i in output],
+                         [("message", None), ("function_call", "Read ❌"),
+                          ("function_call", "Bash"), ("function_call_output", None)])
 
     def test_output_item_done_is_no_longer_dead_code(self):
         """`response.output_item.done` used to be unreachable on 0.11.0 (the
@@ -9891,6 +9882,58 @@ class LiveToolCardOrderTests(unittest.IsolatedAsyncioTestCase):
         saved, live = await self._run([
             self._tool("start", "t1"), self._tool("result", "t1", result="x"), "After."])
         self.assertEqual(_item_order(live), _item_order(saved))
+
+
+def _card_names(output: list) -> dict:
+    """Each tool card's name (the collapsed row), by call id."""
+    return {i.get("call_id") or i.get("id"): i.get("name")
+            for i in output if i.get("type") == "function_call"}
+
+
+class LiveToolErrorMarkTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-124 (found during ELI-122): a failed call's card got its ❌ only
+    when the reply finished. The mark was a `response.name.done`, which the
+    backend applies to its last item but the chat tab's reducer ignores. The
+    tab must show the mark while the reply streams, as it is saved."""
+
+    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
+    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
+    _queue = NoDroppedMessagesTests._queue
+    _delta = NoDroppedMessagesTests._delta
+    _final = NoDroppedMessagesTests._final
+    _until_registered = NoDroppedMessagesTests._until_registered
+    _tool = LiveToolCardOrderTests._tool
+    _run = LiveToolCardOrderTests._run
+
+    def _failed(self, tcid):
+        return self._tool("result", tcid, result="ls: cannot access 'x'", isError=True)
+
+    async def test_a_failed_call_is_marked_live(self):
+        saved, live = await self._run([
+            "Trying.", self._tool("start", "t1"), self._failed("t1"), "It failed."])
+        self.assertEqual(_card_names(saved), {"t1": f"Bash {TOOL_ERROR_MARK}"})
+        self.assertEqual(_card_names(live), _card_names(saved))
+        self.assertEqual(_item_order(live), _item_order(saved))
+
+    async def test_parallel_failed_calls_are_each_marked(self):
+        """The mark used to need its card to be the last item; a parallel call
+        or text in between only got the banner."""
+        saved, live = await self._run([
+            self._tool("start", "t1"), self._tool("start", "t2"),
+            self._failed("t1"), self._tool("result", "t2", result="ok"),
+            "Then.", self._tool("start", "t3"), "Text before its result.", self._failed("t3")])
+        want = {"t1": f"Bash {TOOL_ERROR_MARK}", "t2": "Bash", "t3": f"Bash {TOOL_ERROR_MARK}"}
+        self.assertEqual(_card_names(saved), want)
+        self.assertEqual(_card_names(live), want)
+        self.assertEqual(_item_order(live), _item_order(saved))
+
+    async def test_the_mark_keeps_the_card_whole(self):
+        saved, live = await self._run([self._tool("start", "t1"), self._failed("t1")])
+        for output in (saved, live):
+            call = next(i for i in output if i.get("type") == "function_call")
+            self.assertEqual(call["arguments"], json.dumps({"command": "ls"}))
+            out = next(i for i in output if i.get("type") == "function_call_output")
+            self.assertTrue(out["output"][0]["text"].startswith(f"{TOOL_ERROR_MARK} tool call failed"))
 
 
 class MediaDirectiveLineBreakTests(unittest.IsolatedAsyncioTestCase):

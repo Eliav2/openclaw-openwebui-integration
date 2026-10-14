@@ -1405,12 +1405,6 @@ class Pipe:
         # not been completed by a matching result item yet. Anything left
         # here when the run ends would render as a spinner forever.
         pending_tool_calls: set[str] = set()
-        # toolCallId of the `function_call` item yielded most recently, held
-        # only while it is still the LAST item in OWUI's output list; anything
-        # else we yield clears it. A failed call can only be relabeled (❌ in
-        # the card name) while it is last, because the relabel event replaces
-        # by index and we send none -- see `_tool_call_error_relabel_event`.
-        relabelable_tool_call: str | None = None
         pending_prompt_text = ""
         pending_media_text = ""
         last_snapshot_text = ""
@@ -1550,14 +1544,9 @@ class Pipe:
             return await recover_from_transcript() or ""
 
         def record_visible_chunk(chunk: str):
-            nonlocal visible_message_text, relabelable_tool_call
+            nonlocal visible_message_text
             if chunk:
                 visible_message_text += chunk
-                # Text either extends OWUI's last output item or appends a new
-                # `message` one (`middleware.py:4452`); either way the
-                # `function_call` we were holding is no longer last, so an
-                # index-less relabel would now overwrite this text instead.
-                relabelable_tool_call = None
 
         async def maybe_emit_snapshot(*, force: bool = False):
             nonlocal last_snapshot_text, last_snapshot_time
@@ -2112,12 +2101,6 @@ class Pipe:
                                     yield _tool_call_started_event(name, tool_call_id, args)
                                     # Text after a tool call is a new message item.
                                     fence_item_start = len(assistant_stream_text)
-                                    # Now the last item in OWUI's output list,
-                                    # so a relabel on failure can target it
-                                    # without an output_index. A second start
-                                    # (parallel calls) displaces the first,
-                                    # which then falls back to the banner.
-                                    relabelable_tool_call = tool_call_id
                                 await _emit_status(
                                     __event_emitter__,
                                     f"Running {name}...",
@@ -2143,37 +2126,25 @@ class Pipe:
                                     # for the result to complete: open one.
                                     pending_tool_calls.add(tool_call_id)
                                     yield _tool_call_started_event(name, tool_call_id, args_str)
-                                    relabelable_tool_call = tool_call_id
                                 pipe_log(
                                     f"  Tool result: {name} ({len(result_str)} chars)"
                                     f"{' [error]' if is_error else ''}"
                                 )
                                 if is_error:
-                                    # Log the gate decision, always. Without it a
-                                    # skipped relabel is invisible, which is
-                                    # indistinguishable from the error branch never
-                                    # running at all. That ambiguity is exactly why
-                                    # ELI-75 read as a missing feature for months
-                                    # while the branch was in fact running and only
-                                    # the relabel was being skipped.
-                                    pipe_log(
-                                        f"  relabel gate: call={tool_call_id!r} "
-                                        f"held={relabelable_tool_call!r} "
-                                        + ("FIRE" if tool_call_id
-                                           and relabelable_tool_call == tool_call_id
-                                           else "SKIP")
-                                    )
-                                    if tool_call_id and relabelable_tool_call == tool_call_id:
-                                        # Mutates the started item's `name`
-                                        # field in place via OWUI's generic
-                                        # "<field>.done" handler: the
-                                        # collapsed row becomes "View Result
-                                        # from **<name> ❌**", and OWUI
-                                        # persists it, so the mark survives a
-                                        # reload.
-                                        yield _tool_call_error_relabel_event(name)
+                                    # Log the decision, always: a skipped
+                                    # relabel is otherwise indistinguishable
+                                    # from the error branch never running
+                                    # (why ELI-75 read as a missing feature).
+                                    marked = tool_call_id in pending_tool_calls
+                                    pipe_log(f"  relabel: call={tool_call_id!r} "
+                                             + ("FIRE" if marked else "SKIP (no card)"))
+                                    if marked:
+                                        # Replaces the started item by its id,
+                                        # in what is saved and in the open tab
+                                        # (ELI-124): the collapsed row becomes
+                                        # "View Result from **<name> ❌**".
+                                        yield _tool_call_error_relabel_event(name, tool_call_id, args_str)
                                     result_str = _tool_error_banner(result_str)
-                                relabelable_tool_call = None
                                 if tool_call_id:
                                     # Completes the item yielded at start: the shared
                                     # call_id is what flips that card to done and

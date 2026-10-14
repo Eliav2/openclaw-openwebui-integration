@@ -4354,8 +4354,8 @@ def _tool_result_text(result) -> str:
 TOOL_ERROR_MARK = "❌"
 
 
-def _tool_call_error_relabel_event(name: str) -> dict:
-    """Re-emit a failed call's `function_call` item with ❌ in its name.
+def _tool_call_error_relabel_event(name: str, tool_call_id: str, args_str: str) -> dict:
+    """Re-announce a failed call's `function_call` item with ❌ in its name.
 
     The card's collapsed row shows `attributes.name` and nothing else about
     outcome: its status icon is chosen by `isDone` alone, with no failure
@@ -4363,27 +4363,18 @@ def _tool_call_error_relabel_event(name: str) -> dict:
     without patching OWUI. The name is the only outcome-carrying field we
     control, and it renders through `Markdown`, so an emoji survives.
 
-    `response.output_item.done` looks like the natural event for this, but in
-    OWUI's `handle_responses_streaming_event` it is dead code: the broader
-    `elif event_type.startswith('response.') and event_type.endswith('.done')`
-    branch matches first and explicitly skips `output_item` ("handled
-    specifically below" -- it isn't reachable). So we instead use that
-    branch's own "Generic Field Done" arm, which for an unrecognized
-    `response.<field>.done` event does `item[<field>] = data[<field>]` on
-    `output[output_index]` (default: last item) and returns a non-None
-    metadata dict, which is what actually triggers the broadcast. No
-    `output_index` needed: the caller only uses this when the started item is
-    still last, which is exactly when the default is correct.
-
-    Unlike the old (dead) `output_item.done` shape, this mutates the existing
-    item in place rather than replacing it wholesale, so `arguments`/`status`
-    don't need to be repeated here -- they're already set on the item from the
-    start event and survive untouched.
+    The event is the start event again, same id and arguments: both of OWUI's
+    reducers replace an `output_item.added` item that has the id of one they
+    hold, the backend (`handle_responses_streaming_event`, what is saved) and
+    the chat tab (`structuredOutput.ts::applyResponseStreamEvent`, what shows
+    while the reply streams). So the mark shows live, on any card, last or
+    not. The `response.name.done` used before only reached the backend, and
+    only its last item: the tab ignores that event, so the ❌ appeared when
+    the reply finished (ELI-124), and a call followed by anything else got
+    the banner alone. (`response.output_item.done` replaces by position in
+    the backend, which the pipe cannot know.)
     """
-    return {
-        "type": "response.name.done",
-        "name": f"{name} {TOOL_ERROR_MARK}",
-    }
+    return _tool_call_started_event(f"{name} {TOOL_ERROR_MARK}", tool_call_id, args_str)
 
 
 def _tool_error_banner(result_str: str) -> str:
@@ -10262,12 +10253,6 @@ class Pipe:
         # not been completed by a matching result item yet. Anything left
         # here when the run ends would render as a spinner forever.
         pending_tool_calls: set[str] = set()
-        # toolCallId of the `function_call` item yielded most recently, held
-        # only while it is still the LAST item in OWUI's output list; anything
-        # else we yield clears it. A failed call can only be relabeled (❌ in
-        # the card name) while it is last, because the relabel event replaces
-        # by index and we send none -- see `_tool_call_error_relabel_event`.
-        relabelable_tool_call: str | None = None
         pending_prompt_text = ""
         pending_media_text = ""
         last_snapshot_text = ""
@@ -10407,14 +10392,9 @@ class Pipe:
             return await recover_from_transcript() or ""
 
         def record_visible_chunk(chunk: str):
-            nonlocal visible_message_text, relabelable_tool_call
+            nonlocal visible_message_text
             if chunk:
                 visible_message_text += chunk
-                # Text either extends OWUI's last output item or appends a new
-                # `message` one (`middleware.py:4452`); either way the
-                # `function_call` we were holding is no longer last, so an
-                # index-less relabel would now overwrite this text instead.
-                relabelable_tool_call = None
 
         async def maybe_emit_snapshot(*, force: bool = False):
             nonlocal last_snapshot_text, last_snapshot_time
@@ -10969,12 +10949,6 @@ class Pipe:
                                     yield _tool_call_started_event(name, tool_call_id, args)
                                     # Text after a tool call is a new message item.
                                     fence_item_start = len(assistant_stream_text)
-                                    # Now the last item in OWUI's output list,
-                                    # so a relabel on failure can target it
-                                    # without an output_index. A second start
-                                    # (parallel calls) displaces the first,
-                                    # which then falls back to the banner.
-                                    relabelable_tool_call = tool_call_id
                                 await _emit_status(
                                     __event_emitter__,
                                     f"Running {name}...",
@@ -11000,37 +10974,25 @@ class Pipe:
                                     # for the result to complete: open one.
                                     pending_tool_calls.add(tool_call_id)
                                     yield _tool_call_started_event(name, tool_call_id, args_str)
-                                    relabelable_tool_call = tool_call_id
                                 pipe_log(
                                     f"  Tool result: {name} ({len(result_str)} chars)"
                                     f"{' [error]' if is_error else ''}"
                                 )
                                 if is_error:
-                                    # Log the gate decision, always. Without it a
-                                    # skipped relabel is invisible, which is
-                                    # indistinguishable from the error branch never
-                                    # running at all. That ambiguity is exactly why
-                                    # ELI-75 read as a missing feature for months
-                                    # while the branch was in fact running and only
-                                    # the relabel was being skipped.
-                                    pipe_log(
-                                        f"  relabel gate: call={tool_call_id!r} "
-                                        f"held={relabelable_tool_call!r} "
-                                        + ("FIRE" if tool_call_id
-                                           and relabelable_tool_call == tool_call_id
-                                           else "SKIP")
-                                    )
-                                    if tool_call_id and relabelable_tool_call == tool_call_id:
-                                        # Mutates the started item's `name`
-                                        # field in place via OWUI's generic
-                                        # "<field>.done" handler: the
-                                        # collapsed row becomes "View Result
-                                        # from **<name> ❌**", and OWUI
-                                        # persists it, so the mark survives a
-                                        # reload.
-                                        yield _tool_call_error_relabel_event(name)
+                                    # Log the decision, always: a skipped
+                                    # relabel is otherwise indistinguishable
+                                    # from the error branch never running
+                                    # (why ELI-75 read as a missing feature).
+                                    marked = tool_call_id in pending_tool_calls
+                                    pipe_log(f"  relabel: call={tool_call_id!r} "
+                                             + ("FIRE" if marked else "SKIP (no card)"))
+                                    if marked:
+                                        # Replaces the started item by its id,
+                                        # in what is saved and in the open tab
+                                        # (ELI-124): the collapsed row becomes
+                                        # "View Result from **<name> ❌**".
+                                        yield _tool_call_error_relabel_event(name, tool_call_id, args_str)
                                     result_str = _tool_error_banner(result_str)
-                                relabelable_tool_call = None
                                 if tool_call_id:
                                     # Completes the item yielded at start: the shared
                                     # call_id is what flips that card to done and
