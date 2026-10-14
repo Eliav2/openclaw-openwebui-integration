@@ -400,7 +400,14 @@ class Scenes:
         self.hero_chat = send(page, "What changed in this repo this week?")
         wait_js(page, f"() => {{ const s = ({CARDS_STATE})(); return s && s.done >= 2 && s.active >= 1; }}",
                 "two finished tool cards and one running")
-        self.s.shot(page, "hero-tool-cards")
+        # Down to just below the running card: the empty chat and the composer
+        # under it would take half the README's first screen on a phone.
+        clip = f"""() => {{
+          const cards = [...{LAST_ASSISTANT}.querySelectorAll('[role=button]')];
+          const bottom = cards[cards.length - 1].getBoundingClientRect().bottom + 56;
+          return {{x: 0, y: 0, width: innerWidth, height: Math.min(innerHeight, Math.ceil(bottom))}};
+        }}"""
+        self.s.shot(page, "hero-tool-cards", clip_js=clip)
         wait_js(page, f"() => {{ const a = {LAST_ASSISTANT}; return a && a.innerText.includes('The build is clean'); }}",
                 "the final answer")
         set_title(self.token, self.hero_chat, "Repo changes this week")
