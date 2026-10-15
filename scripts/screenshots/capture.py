@@ -521,9 +521,12 @@ class Scenes:
         if z["drawer"] == "auto" or (z["dialog"] != "auto" and int(z["drawer"]) <= int(z["dialog"])):
             raise AssertionError(f"the sub-agent drawer opens behind the status dialog (computed z-index {z})")
         page.locator("#openclaw-drawer-root button", has_text="Transcript").first.click()
+        # The child's reply reaches its transcript when its run ends, and tool
+        # results show only in the Tools tab (ELI-128), so while it runs the
+        # Transcript holds its task.
         wait_js(page, """() => { const d = document.querySelector('#openclaw-drawer-root');
-                 return d && /tool\\s*result/i.test(d.innerText) && d.innerText.includes('Forecast'); }""",
-                "the drawer transcript with the child's tool call", 60_000)
+                 return d && /\\buser\\b/i.test(d.innerText); }""",
+                "the drawer transcript's task row", 60_000)
         self.s.shot(page, "subagent-drawer", text_selector="#openclaw-drawer-root")
         # The Tools tab, its first card opened: what a tool's result looks like there.
         dump_child_history_shapes(f"agent:main:openwebui-{me['id']}-{chat}")
