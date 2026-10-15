@@ -143,7 +143,6 @@ from openclaw_pipe import (
     _modal_payload_from_user_input_prompt,
     _native_ask_user_payload,
     _format_native_answers,
-    _owui_supports_native_ask_user,
     _model_patch_matches,
     _normalize_event_call_response,
     _normalize_model_entry,
@@ -3672,7 +3671,7 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
 
         answer = await _ask_user_input_modal(
             event_call,
-            "Codex needs input:\n\nPackage\nChoose\n1. curl\n2. pipx",
+            "Codex needs input:\n\nPackage\nChoose (multi)\n1. curl\n2. pipx",
         )
 
         self.assertEqual(answer, "pipx")
@@ -3702,7 +3701,7 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.TimeoutError):
             await _ask_user_input_modal(
                 event_call,
-                "Codex needs input:\n\nPackage\nChoose",
+                "Codex needs input:\n\nPackage\nYour API key",
                 timeout_s=0.01,
             )
 
@@ -3758,7 +3757,7 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
         try:
             answer = await _ask_user_input_modal(
                 event_call,
-                "OpenClaw needs input:\n\nQ\nAnswer?\n1. a\n2. b",
+                "OpenClaw needs input:\n\nQ\nAnswer? (multi)\n1. a\n2. b",
                 timeout_s=0.01,
                 owui_user_id="user-1",
                 owui_chat_id="chat-1",
@@ -3800,7 +3799,7 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
 
         answer = await _ask_user_input_modal(
             event_call,
-            "OpenClaw needs input:\n\nQ\nAnswer?\n1. a\n2. b",
+            "OpenClaw needs input:\n\nQ\nAnswer? (multi)\n1. a\n2. b",
             timeout_s=0.01,
             owui_user_id="user-1",
             owui_chat_id="chat-1",
@@ -3832,7 +3831,7 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
 
         await _ask_user_input_modal(
             event_call,
-            "OpenClaw needs input:\n\nQ\nAnswer?\n1. a\n2. b",
+            "OpenClaw needs input:\n\nQ\nAnswer? (multi)\n1. a\n2. b",
             timeout_s=0.01,
             owui_user_id="user-1",
             max_wait_s=1,
@@ -3856,7 +3855,7 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
 
         answer = await _ask_user_input_modal(
             event_call,
-            "OpenClaw needs input:\n\nQ\nAnswer?\n1. a\n2. b",
+            "OpenClaw needs input:\n\nQ\nAnswer? (multi)\n1. a\n2. b",
             timeout_s=0.01,
             owui_user_id="user-1",
             max_wait_s=0.05,
@@ -3875,13 +3874,6 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
         env.VERSION = "0.12.0"
         sys.modules["open_webui.env"] = env
         self.addCleanup(sys.modules.pop, "open_webui.env", None)
-
-    def test_version_gate(self):
-        self.assertTrue(_owui_supports_native_ask_user())
-        sys.modules["open_webui.env"].VERSION = "0.11.0"
-        self.assertFalse(_owui_supports_native_ask_user())
-        sys.modules.pop("open_webui.env")
-        self.assertFalse(_owui_supports_native_ask_user())
 
     def test_numbered_options_become_card_options_with_descriptions(self):
         payload = _native_ask_user_payload(
@@ -8769,8 +8761,7 @@ class NeedsInputMarkerTests(unittest.IsolatedAsyncioTestCase):
         async def event_call(payload):
             calls.append(payload)
             return {"error": "Client session disconnected."}
-        with mock.patch.object(self.ocp, "_owui_supports_native_ask_user", lambda: True):
-            out = await self._stream(self.REPORT, event_call)
+        out = await self._stream(self.REPORT, event_call)
         self.assertEqual(calls, [], "no card for a quote")
         self.assertEqual(out.strip(), self.REPORT.strip(), "the whole report is shown as written")
 
@@ -8833,8 +8824,7 @@ class NeedsInputMarkerTests(unittest.IsolatedAsyncioTestCase):
             return {"error": "Event call timed out. The browser tab may be inactive or closed."}
         prompt = (f"{self.MARKER}\n```json\n"
                   + json.dumps(self.HEBREW_FORM, ensure_ascii=False, indent=2) + "\n```\n")
-        with mock.patch.object(self.ocp, "_owui_supports_native_ask_user", lambda: True):
-            out = await self._stream("Two things first.\n" + prompt, event_call)
+        out = await self._stream("Two things first.\n" + prompt, event_call)
         self.assertEqual(out, (
             "Two things first.\n"
             "1. **טווח**: לאיזה טווח השקעה?\n"
@@ -8881,18 +8871,17 @@ class NeedsInputMarkerTests(unittest.IsolatedAsyncioTestCase):
             async for c in gen:
                 out += c if isinstance(c, str) else ""
             return out
-        with mock.patch.object(self.ocp, "_owui_supports_native_ask_user", lambda: True):
-            task = asyncio.ensure_future(drain())
-            await self._until_registered("run-1")
-            q = self._queue("run-1")
-            q.put_nowait(self._delta("run-1", "Checking:\n```python\nx = 1\n"))
-            for phase in ("start", "result"):
-                q.put_nowait({"type": "event", "event": "agent", "payload": {
-                    "sessionKey": self.SK, "runId": "run-1", "stream": "tool",
-                    "data": {"phase": phase, "name": "Bash", "toolCallId": "t1", "args": {}}}})
-            q.put_nowait(self._delta("run-1", f"{self.MARKER}\nDB\nWhich one?\n1. a\n2. b\n"))
-            q.put_nowait(self._final("run-1"))
-            out = await asyncio.wait_for(task, 5)
+        task = asyncio.ensure_future(drain())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "Checking:\n```python\nx = 1\n"))
+        for phase in ("start", "result"):
+            q.put_nowait({"type": "event", "event": "agent", "payload": {
+                "sessionKey": self.SK, "runId": "run-1", "stream": "tool",
+                "data": {"phase": phase, "name": "Bash", "toolCallId": "t1", "args": {}}}})
+        q.put_nowait(self._delta("run-1", f"{self.MARKER}\nDB\nWhich one?\n1. a\n2. b\n"))
+        q.put_nowait(self._final("run-1"))
+        out = await asyncio.wait_for(task, 5)
         self.assertEqual(len(calls), 1, "the question after the tool call was asked")
         self.assertNotIn(self.MARKER, out)
 
@@ -8912,8 +8901,7 @@ class NeedsInputMarkerTests(unittest.IsolatedAsyncioTestCase):
         async def event_call(payload):
             calls.append(payload)
             return {"error": "Client session disconnected."}
-        with mock.patch.object(self.ocp, "_owui_supports_native_ask_user", lambda: True):
-            out = await self._stream(prompt, event_call)
+        out = await self._stream(prompt, event_call)
         self.assertEqual(len(calls), 1)
         self.assertIn("Which colour do you prefer?", out)
         self.assertNotIn(self.MARKER, out)

@@ -615,7 +615,7 @@ class _TurnWriter:
     async def _ask_card(self, prompt: str) -> bool:
         """The card for `prompt` on the tab viewing the chat, and its answer
         sent; False when nothing was sent."""
-        payload = _native_ask_user_payload(prompt) if _owui_supports_native_ask_user() else None
+        payload = _native_ask_user_payload(prompt)
         if payload is None:
             return False
         try:

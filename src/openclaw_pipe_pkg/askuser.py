@@ -462,19 +462,6 @@ _OPTION_DESCRIPTION_SEPARATORS = (" - ", " – ", " — ")
 _NATIVE_CARD_TIMEOUT_MS = 240_000
 
 
-def _owui_supports_native_ask_user() -> bool:
-    """True when the running OWUI renders `request:user_input` as its native
-    question card (the ask_user builtin, shipped in 0.11.1)."""
-    try:
-        from open_webui.env import VERSION
-    except Exception:
-        return False
-    parts = re.findall(r"\d+", str(VERSION))[:3]
-    if len(parts) < 3:
-        return False
-    return tuple(int(p) for p in parts) >= (0, 11, 1)
-
-
 def _split_option_description(text: str) -> tuple[str, str]:
     """"Postgres - robust, needs a server" -> ("Postgres", "robust, needs a server")."""
     for sep in _OPTION_DESCRIPTION_SEPARATORS:
@@ -972,9 +959,7 @@ async def _ask_user_input_modal(
     """
     if not __event_call__ or not _is_user_input_prompt(prompt_text):
         return None
-    native_payload = (
-        _native_ask_user_payload(prompt_text) if _owui_supports_native_ask_user() else None
-    )
+    native_payload = _native_ask_user_payload(prompt_text)
     if native_payload is not None:
         return await _ask_user_native_card(
             __event_call__,
