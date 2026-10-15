@@ -19,10 +19,10 @@
       ]
     },
     {
-      "match": "came back with 99.98%",
+      "match": "keeps each forecast in memory for 600 seconds",
       "steps": [
         {
-          "say": "The uptime check is back: 99.98% over the last 30 days, with one 9-minute outage on Tuesday night while the cache volume was resized. Nothing to fix; I'd only add an alert on the volume filling up.",
+          "say": "The helper is back. The cache came in four days ago, in \"Cache forecasts for ten minutes\". It keeps each forecast in memory for ten minutes, so reopening the app within that window doesn't refetch; a restart starts it cold.",
           "delay": 0.03
         }
       ]
@@ -31,7 +31,7 @@
       "match": "Price out Fly.io",
       "steps": [
         {
-          "say": "",
+          "say": "I'll start from the app's README, for its size and how it runs.",
           "tool": "read",
           "args": {
             "path": "forecast/README.md"
@@ -47,7 +47,7 @@
       "match": "Price out Render",
       "steps": [
         {
-          "say": "",
+          "say": "I'll start from the app's README, for its size and how it runs.",
           "tool": "read",
           "args": {
             "path": "forecast/README.md"
@@ -60,7 +60,7 @@
       ]
     },
     {
-      "match": "Morning build check",
+      "match": "Nightly build check",
       "steps": [
         {
           "say": "",
@@ -71,7 +71,7 @@
           }
         },
         {
-          "say": "Morning! Last night's build passed. The two commits after it only touch the docs, so nothing needs you today."
+          "say": "Checked last night's build: it passed. The two commits after it only touch the docs, so nothing needs you today."
         }
       ]
     },
@@ -141,10 +141,10 @@
       ]
     },
     {
-      "match": "check the overnight build",
+      "match": "keep an eye on the nightly build",
       "steps": [
         {
-          "say": "Will do. I'll check every morning at 7:00 and only write when something needs you."
+          "say": "Will do. I'll check after each nightly build and only write when something needs you."
         }
       ]
     },
@@ -199,33 +199,41 @@
       ]
     },
     {
-      "match": "Check the uptime of the forecast API",
+      "match": "Find the commit that added src/forecast/cache.py",
       "steps": [
+        {
+          "say": "",
+          "tool": "exec",
+          "args": {
+            "command": "cd forecast && git log --format='%h %ad %s' --date=short -- src/forecast/cache.py",
+            "title": "Commits that touched the cache"
+          }
+        },
         {
           "say": "",
           "tool": "read",
           "args": {
-            "path": "forecast/README.md"
+            "path": "forecast/src/forecast/cache.py"
           }
         },
         {
-          "say": "Uptime came back with 99.98% over the last 30 days. One outage: 9 minutes on Tuesday night, during the cache volume resize."
+          "say": "Added four days ago in \"Cache forecasts for ten minutes\", the only commit that touched it. src/forecast/cache.py keeps each forecast in memory for 600 seconds (_TTL), then fetches again."
         }
       ]
     },
     {
-      "match": "how reliable the forecast API has been",
+      "match": "when the forecast cache came in",
       "steps": [
         {
-          "say": "I'll have a helper go through the uptime history while we keep talking.",
+          "say": "I'll have a helper dig through the history while we keep talking.",
           "tool": "sessions_spawn",
           "args": {
-            "task": "Check the uptime of the forecast API over the last 30 days and list any outages.",
-            "label": "Uptime check"
+            "task": "Find the commit that added src/forecast/cache.py and explain what the cache does.",
+            "label": "Cache history"
           }
         },
         {
-          "say": "The uptime check is running in the background. I'll tell you what it finds."
+          "say": "The helper is reading the history in the background. I'll tell you what it finds."
         }
       ]
     },
@@ -277,7 +285,7 @@
       "match": "What does this chart say about the afternoon?",
       "steps": [
         {
-          "say": "Rain from about 3 PM to 6 PM, the lighter bars, while the temperature drops from 22 to 17 degrees. A dry morning and a wet commute home: take a jacket.",
+          "say": "Rain from 3 PM, the lighter bars, while the temperature drops from 22 at noon to 17 by 3 PM. A dry morning and a wet commute home: take a jacket.",
           "delay": 0.03
         }
       ]
