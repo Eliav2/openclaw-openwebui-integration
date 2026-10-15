@@ -199,5 +199,32 @@ class FetchPipeArtifactTests(unittest.TestCase):
         self.assertIn("openclaw_pipe.py", inst.ARTIFACT_URL)
 
 
+class MirrorPipeValvesTests(unittest.TestCase):
+    """install_action.py copies the five shared valves from the Pipe. Open WebUI
+    stores exactly the posted valve set (`Valves(**form).model_dump(exclude_unset
+    =True)`), so a post of only the shared five would reset the Action's own
+    CONTROL_UI_URL on every re-install (ELI-141)."""
+
+    def test_the_actions_own_valves_survive_a_mirror(self):
+        import install_action
+
+        pipe = {"GATEWAY_URL": "localhost:18789", "GATEWAY_TOKEN": "new-token", "DEVICE_IDENTITY": "",
+                "STATE_DIR": "/data/openclaw", "AGENT_ID": "main", "PIPE_ONLY": "x"}
+        action = {"GATEWAY_URL": "localhost:18789", "GATEWAY_TOKEN": "old-token", "DEVICE_IDENTITY": "",
+                  "STATE_DIR": "/data/openclaw", "AGENT_ID": "main",
+                  "CONTROL_UI_URL": "https://claw.example.com"}
+        posted = []
+
+        class _Client:
+            def request(self, method, path, body=None):
+                if method == "GET":
+                    return 200, dict(pipe if install_action.PIPE_FUNCTION_ID in path else action)
+                posted.append(body)
+                return 200, body
+
+        install_action.mirror_pipe_valves(_Client())
+        self.assertEqual(posted, [{**action, "GATEWAY_TOKEN": "new-token"}])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -74,6 +74,7 @@ if "pydantic" not in sys.modules:
 from openclaw_status_action import (  # noqa: E402
     Action,
     _extract_transcript_and_tools,
+    _control_ui_session_url,
     _get_action_connection,
     _owui_session_key,
     _render_context_fill_js,
@@ -1338,3 +1339,97 @@ process.stdout.write(JSON.stringify(f ? f.textContent : null));
         self.assertEqual(out.returncode, 0, out.stderr)
         footer = json.loads(out.stdout)
         self.assertTrue(footer.startswith("Updated 12:00:00"), footer)
+
+
+class ControlUiLinkTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-141 (Eliav, 2026-10-15): the Status dialog links to this session in
+    the OpenClaw Control UI, and the sub-agent drawer to the child's. The
+    route is the Control UI's short-id form, `/chat/<agent>/<hex of the key's
+    trailing UUID>`, which its `sessions.resolve {shortId}` maps back to the
+    key (checked live on 9.3 for chat 56b98d09)."""
+
+    BASE = "https://claw.example.com/"
+    CHAT = "56b98d09-f3b7-4e4f-b2bb-688ce63bfa53"
+    USER = "2d206eab-acac-4945-bd2f-7e8b6365de8c"
+
+    def test_the_session_url(self):
+        key = _owui_session_key("main", self.USER, self.CHAT)
+        self.assertEqual(_control_ui_session_url(self.BASE, key),
+                         "https://claw.example.com/chat/main/56b98d09f3b74e4fb2bb688ce63bfa53")
+        self.assertEqual(
+            _control_ui_session_url("https://x.example/openclaw",
+                                    "agent:research:subagent:0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0"),
+            "https://x.example/openclaw/chat/research/0f1e2d3c4b5a69788796a5b4c3d2e1f0")
+
+    def test_no_url_without_a_web_base_or_a_uuid_key(self):
+        key = _owui_session_key("main", self.USER, self.CHAT)
+        for base in ("", "   ", "javascript:alert(1)//", "claw.example.com"):
+            self.assertIsNone(_control_ui_session_url(base, key), base)
+        for key in ("agent:main:main", "agent:main:telegram:12345", "not-a-key", ""):
+            self.assertIsNone(_control_ui_session_url(self.BASE, key), key)
+
+    async def _open_code(self, control_ui_url):
+        emitted = []
+
+        async def emitter(evt):
+            emitted.append(evt)
+
+        fake_conn = mock.AsyncMock()
+        fake_conn.send_request = mock.AsyncMock(side_effect=lambda method, params, timeout=5: {
+            "sessions.describe": {"session": {}}, "usage.status": {"providers": []},
+            "sessions.list": {"sessions": []}}.get(method, {}))
+
+        async def fake_get_connection(_valves_getter):
+            return fake_conn, "pipe"
+
+        action = Action()
+        action.valves.CONTROL_UI_URL = control_ui_url
+        with mock.patch("openclaw_status_action._get_action_connection", new=fake_get_connection):
+            await _open_dialog(action.action(
+                {"chat_id": self.CHAT, "id": "msg-1", "session_id": "sess-1", "model": "x.y"},
+                __user__={"id": self.USER}, __event_emitter__=emitter,
+            ), fake_conn)
+        return _emitted_codes(emitted)[0]
+
+    def _links(self, opening, drawer=None):
+        import shutil
+        import subprocess
+        runtime = shutil.which("bun") or shutil.which("node")
+        if runtime is None:
+            self.skipTest("no bun or node")
+        page = _FAKE_DOM_JS + r"""
+run(input.open);
+if (input.drawer) run(input.drawer);
+const links = (id) => {
+  const root = document.getElementById(id);
+  return root ? root.walk().filter((e) => e.tagName === 'A')
+    .map((a) => [a.textContent, a.href, a.target, a.rel]) : null;
+};
+process.stdout.write(JSON.stringify({dialog: links('openclaw-status-modal-root'),
+                                     drawer: links('openclaw-drawer-root')}));
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
+            fh.write(page)
+        try:
+            out = subprocess.run([runtime, fh.name], input=json.dumps({"now": 1, "open": opening, "drawer": drawer}),
+                                 capture_output=True, text=True, timeout=60)
+        finally:
+            os.unlink(fh.name)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout)
+
+    async def test_the_dialog_and_drawer_link_to_their_sessions(self):
+        url = "https://claw.example.com/chat/main/56b98d09f3b74e4fb2bb688ce63bfa53"
+        child = "https://claw.example.com/chat/main/0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+        seen = self._links(await self._open_code(self.BASE),
+                           _render_drawer_open_js({"id": "agent:main:subagent:x", "title": "Child",
+                                                   "status": "running", "controlUiUrl": child}))
+        self.assertEqual(seen["dialog"][0], ["Open in OpenClaw ↗", url, "_blank", "noopener noreferrer"])
+        self.assertEqual(seen["drawer"], [["Open in OpenClaw ↗", child, "_blank", "noopener noreferrer"]])
+
+    async def test_no_link_while_the_valve_is_empty(self):
+        seen = self._links(await self._open_code(""),
+                           _render_drawer_open_js({"id": "agent:main:subagent:x", "title": "Child",
+                                                   "status": "running", "controlUiUrl": None}))
+        self.assertEqual(seen["dialog"], [])
+        self.assertEqual(seen["drawer"], [])

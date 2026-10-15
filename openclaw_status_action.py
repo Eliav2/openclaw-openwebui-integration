@@ -7080,6 +7080,18 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     });
   }
 
+  // "Open in OpenClaw": this session's page in the Control UI, in a new tab
+  // (CONTROL_UI_URL valve, ELI-141).
+  function controlUiLink(url) {
+    const a = document.createElement('a');
+    a.href = url;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    a.className = 'text-xs text-blue-600 dark:text-blue-400 hover:underline whitespace-nowrap';
+    a.textContent = 'Open in OpenClaw ↗';
+    return a;
+  }
+
   function touchFooter(fetchedAt, source) {
     const f = document.getElementById('openclaw-status-footer');
     if (f) f.textContent = 'Updated ' + clockTime(fetchedAt) + ' · via ' + source;
@@ -7177,7 +7189,7 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
   window.__openclawStatus = {
     identity: IDENTITY, isDark: isDark, barColor: barColor, makeBar: makeBar,
     sectionHeader: sectionHeader, errorEl: errorEl,
-    skeletonSection: skeletonSection, touchFooter: touchFooter, clockTime: clockTime,
+    skeletonSection: skeletonSection, touchFooter: touchFooter, clockTime: clockTime, controlUiLink: controlUiLink,
     triggerCompact: triggerCompact, elapsedTime: elapsedTime, toMs: toMs,
     openSubagentDrawer: openSubagentDrawer,
   };
@@ -7204,13 +7216,17 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
   title.className = 'text-sm font-semibold';
   title.textContent = 'OpenClaw Status';
   header.appendChild(title);
+  const headerEnd = document.createElement('div');
+  headerEnd.className = 'flex items-center gap-3';
+  if (IDENTITY.controlUiUrl) headerEnd.appendChild(controlUiLink(IDENTITY.controlUiUrl));
+  header.appendChild(headerEnd);
   const closeBtn = document.createElement('button');
   closeBtn.type = 'button';
   closeBtn.textContent = '×';
   closeBtn.className = 'text-xl leading-none text-gray-400 hover:text-gray-700 '
     + 'dark:hover:text-gray-200 px-1';
   closeBtn.onclick = function() { root.remove(); };
-  header.appendChild(closeBtn);
+  headerEnd.appendChild(closeBtn);
   panel.appendChild(header);
 
   const sections = document.createElement('div');
@@ -7627,6 +7643,11 @@ _DRAWER_OPEN_JS_TEMPLATE = r"""
   statusEl.className = 'text-xs text-gray-400 dark:text-gray-500 mt-0.5';
   statusEl.textContent = TASK.status || '';
   headerText.appendChild(statusEl);
+  if (TASK.controlUiUrl) {
+    const link = S.controlUiLink(TASK.controlUiUrl);
+    link.className += ' inline-block mt-1';
+    headerText.appendChild(link);
+  }
   header.appendChild(headerText);
   const closeBtn = document.createElement('button');
   closeBtn.type = 'button';
@@ -8091,6 +8112,28 @@ def _render_subagents_fill_js(data: dict) -> str:
     return _SUBAGENTS_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
 
 
+_TRAILING_UUID_RE = re.compile(
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$", re.IGNORECASE)
+
+
+def _control_ui_session_url(base: str, session_key: str) -> str | None:
+    """The session's page in the OpenClaw Control UI (ELI-141).
+
+    The UI's short-id route, `<base>/chat/<agentId>/<id>`, where `<id>` is the
+    hex of the UUID the session key ends in (OpenClaw docs/web/urls.md; the UI
+    resolves it with `sessions.resolve {shortId}`). Every key the dialog shows
+    ends in one: `agent:<id>:openwebui-<user>-<chat>` and `agent:<id>:subagent:<uuid>`.
+    None without an http(s) base or for any other key."""
+    base = (base or "").strip().rstrip("/")
+    parts = (session_key or "").split(":", 2)
+    if not base.lower().startswith(("http://", "https://")) or len(parts) != 3 or parts[0] != "agent":
+        return None
+    m = _TRAILING_UUID_RE.search(parts[2])
+    if not m or not parts[1]:
+        return None
+    return f"{base}/chat/{parts[1]}/{m.group(1).lower().replace('-', '')}"
+
+
 def _render_drawer_open_js(task: dict) -> str:
     return _DRAWER_OPEN_JS_TEMPLATE.replace("__OPENCLAW_TASK__", _json_for_js(task))
 
@@ -8233,6 +8276,13 @@ class Action:
             description="Copy this exactly from the Pipe's valves -- the same "
                         "OpenClaw agent the Pipe routes chats to."
         )
+        CONTROL_UI_URL: str = Field(
+            default="",
+            description="The address you open the OpenClaw Control UI at, e.g. "
+                        "https://openclaw.example.com. When set, the Status "
+                        "dialog and the sub-agent drawer link to the session in "
+                        "it. Empty: no link."
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -8316,6 +8366,9 @@ class Action:
                 "messageId": body.get("id"),
                 "sessionId": body.get("session_id"),
                 "owuiModel": body.get("model"),
+                "controlUiUrl": _control_ui_session_url(
+                    self.valves.CONTROL_UI_URL,
+                    _owui_session_key(self.valves.AGENT_ID, user_id, chat_id)),
             }
             await __event_emitter__({"type": "execute", "data": {"code": _render_modal_open_js(identity)}})
         else:
@@ -8657,6 +8710,7 @@ class Action:
 
         await __event_emitter__({"type": "execute", "data": {"code": _render_drawer_open_js({
             "id": task_id, "title": body.get("taskTitle"), "status": body.get("taskStatus"),
+            "controlUiUrl": _control_ui_session_url(self.valves.CONTROL_UI_URL, task_id),
         })}})
 
         if not task_id.startswith("agent:"):

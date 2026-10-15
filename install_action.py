@@ -203,8 +203,10 @@ def mirror_pipe_valves(client: OwuiClient) -> dict:
         info("Valves already mirror the Pipe's")
         return desired
 
+    # Open WebUI replaces the whole valve set with what is posted, so the
+    # Action's own valves (CONTROL_UI_URL) go along unchanged or they reset.
     status, payload = client.request(
-        "POST", f"/api/v1/functions/id/{FUNCTION_ID}/valves/update", desired,
+        "POST", f"/api/v1/functions/id/{FUNCTION_ID}/valves/update", {**current, **desired},
     )
     if status != 200 or not isinstance(payload, dict):
         raise SystemExit(f"Valve update failed: {payload}")
