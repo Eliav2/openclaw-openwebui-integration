@@ -1271,3 +1271,70 @@ class SubagentProactiveMessageClickTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UpdatedTimeIsTheBrowsersClockTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-140 (2026-10-15): the footer's "Updated HH:MM:SS" came from the
+    Open WebUI server's clock (`time.strftime`), while the rate-limit resets
+    beside it are formatted in the browser. With the container on UTC and
+    the reader in Asia/Jerusalem, "Updated" was 3 hours off. The dialog's
+    own fill, rendered in the reader's timezone, must show the reader's
+    time."""
+
+    FETCHED = 1792054800  # 2026-10-15 09:00:00 UTC, 12:00:00 in Jerusalem
+
+    async def _context_fill(self):
+        emitted = []
+
+        async def emitter(evt):
+            emitted.append(evt)
+
+        async def fake_send_request(method, params, timeout=5):
+            if method == "sessions.describe":
+                return {"session": {"modelProvider": "anthropic", "model": "m",
+                                    "contextTokens": 1000, "totalTokens": 100}}
+            if method == "usage.status":
+                return {"providers": []}
+            if method == "sessions.list":
+                return {"sessions": []}
+            return {}
+
+        fake_conn = mock.AsyncMock()
+        fake_conn.send_request = mock.AsyncMock(side_effect=fake_send_request)
+
+        async def fake_get_connection(_valves_getter):
+            return fake_conn, "pipe"
+
+        with mock.patch("openclaw_status_action._get_action_connection", new=fake_get_connection), \
+                mock.patch("openclaw_status_action.time.time", return_value=self.FETCHED):
+            await _open_dialog(Action().action(
+                {"chat_id": "chat-1", "id": "msg-1", "session_id": "sess-1", "model": "x.y"},
+                __user__={"id": "user-1"}, __event_emitter__=emitter,
+            ), fake_conn)
+        codes = _emitted_codes(emitted)
+        return codes[0], next(c for c in codes if "openclaw-status-section-context" in c and c != codes[0])
+
+    async def test_updated_is_on_the_readers_clock(self):
+        import shutil
+        import subprocess
+        runtime = shutil.which("bun") or shutil.which("node")
+        if runtime is None:
+            self.skipTest("no bun or node")
+        opening, fill = await self._context_fill()
+        page = _FAKE_DOM_JS + r"""
+run(input.open);
+run(input.fill);
+const f = document.getElementById('openclaw-status-footer');
+process.stdout.write(JSON.stringify(f ? f.textContent : null));
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
+            fh.write(page)
+        try:
+            out = subprocess.run([runtime, fh.name], input=json.dumps({"now": 1, "open": opening, "fill": fill}),
+                                 capture_output=True, text=True, timeout=60,
+                                 env={**os.environ, "TZ": "Asia/Jerusalem"})
+        finally:
+            os.unlink(fh.name)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        footer = json.loads(out.stdout)
+        self.assertTrue(footer.startswith("Updated 12:00:00"), footer)

@@ -7071,9 +7071,18 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     return el;
   }
 
+  // When the data was fetched (epoch ms), on the browser's clock like the
+  // rate-limit resets: the Open WebUI server's timezone is not the reader's
+  // (ELI-140).
+  function clockTime(ms) {
+    return new Date(ms).toLocaleTimeString([], {
+      hour: '2-digit', minute: '2-digit', second: '2-digit'
+    });
+  }
+
   function touchFooter(fetchedAt, source) {
     const f = document.getElementById('openclaw-status-footer');
-    if (f) f.textContent = 'Updated ' + fetchedAt + ' · via ' + source;
+    if (f) f.textContent = 'Updated ' + clockTime(fetchedAt) + ' · via ' + source;
   }
 
   // Fetches back to this same Action (same-origin, unsandboxed execute
@@ -7168,7 +7177,7 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
   window.__openclawStatus = {
     identity: IDENTITY, isDark: isDark, barColor: barColor, makeBar: makeBar,
     sectionHeader: sectionHeader, errorEl: errorEl,
-    skeletonSection: skeletonSection, touchFooter: touchFooter,
+    skeletonSection: skeletonSection, touchFooter: touchFooter, clockTime: clockTime,
     triggerCompact: triggerCompact, elapsedTime: elapsedTime, toMs: toMs,
     openSubagentDrawer: openSubagentDrawer,
   };
@@ -7768,7 +7777,7 @@ _DRAWER_OVERVIEW_FILL_JS_TEMPLATE = r"""
   }
 
   const df = document.getElementById('openclaw-drawer-footer');
-  if (df) df.textContent = 'Updated ' + DATA.fetchedAt + ' · via ' + DATA.source;
+  if (df) df.textContent = 'Updated ' + S.clockTime(DATA.fetchedAt) + ' · via ' + DATA.source;
 })();
 """
 
@@ -8389,7 +8398,7 @@ class Action:
                 "context": context_data,
                 "goal": goal_data,
                 "source": source,
-                "fetchedAt": time.strftime("%H:%M:%S"),
+                "fetchedAt": int(time.time() * 1000),
                 "error": None,
             })}})
             return provider, session_row
@@ -8421,7 +8430,7 @@ class Action:
                 # refreshes from that run's own API response headers.
                 "sessionActive": session_row.get("status") == "running",
                 "source": source,
-                "fetchedAt": time.strftime("%H:%M:%S"),
+                "fetchedAt": int(time.time() * 1000),
                 "error": None,
             })}})
 
@@ -8461,7 +8470,7 @@ class Action:
                     pipe_log(f"[status-action] sessions.preview (children) failed: {ex}")
             subagent_tasks = [_subagent_row(r, task_texts.get(r["key"])) for r in active]
             await __event_emitter__({"type": "execute", "data": {"code": _render_subagents_fill_js({
-                "tasks": subagent_tasks, "source": source, "fetchedAt": time.strftime("%H:%M:%S"), "error": None,
+                "tasks": subagent_tasks, "source": source, "fetchedAt": int(time.time() * 1000), "error": None,
             })}})
             return [r["key"] for r in active]
 
@@ -8736,7 +8745,7 @@ class Action:
                 if goal_line:
                     goal_data = {"line": goal_line}
 
-            fetched_at = time.strftime("%H:%M:%S")
+            fetched_at = int(time.time() * 1000)
             await __event_emitter__({"type": "execute", "data": {"code": _render_drawer_overview_fill_js({
                 "task": task, "childSessionKey": child_key, "provider": provider, "model": model,
                 "context": context_data, "goal": goal_data, "source": source,
