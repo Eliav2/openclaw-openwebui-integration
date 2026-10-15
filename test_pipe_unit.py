@@ -6136,6 +6136,37 @@ class RecoveryLinkTests(unittest.TestCase):
 
 
 
+def _owui_output_text(output) -> str:
+    """Open WebUI 0.12's `get_output_text` (utils/misc.py): the text of each
+    message item, one per line."""
+    texts = []
+    for item in output if isinstance(output, list) else []:
+        if isinstance(item, dict) and item.get("type") == "message":
+            text = "".join(str(p.get("text")) for p in item.get("content") or []
+                           if isinstance(p, dict) and p.get("text") is not None)
+            if text and not text.isspace():
+                texts.append(text)
+    return "\n".join(texts)
+
+
+def _owui_fold_chunk(output: list, chunk) -> list:
+    """A reply's output as Open WebUI folds its stream: Responses events
+    through its own handler, text onto the last message item (a new one
+    after any other item). A simplification of middleware.py's text path,
+    which also splits out reasoning and code blocks."""
+    from test_fixture_owui_streaming_handler import handle_responses_streaming_event
+    if isinstance(chunk, dict) and str(chunk.get("type", "")).startswith("response."):
+        return handle_responses_streaming_event(chunk, output)[0]
+    if not isinstance(chunk, str) or not chunk:
+        return output
+    output = copy.deepcopy(output)
+    if not output or output[-1].get("type") != "message":
+        output.append({"type": "message", "id": f"msg-{len(output)}", "role": "assistant",
+                       "content": [{"type": "output_text", "text": ""}]})
+    output[-1]["content"][0]["text"] += chunk
+    return output
+
+
 class _FakeOwuiChat:
     """A one-chat Open WebUI for the turn writer: the chat row behind a real
     lock (Chats._chat_transaction), chat_message rows, the socket server and
@@ -6164,9 +6195,14 @@ class _FakeOwuiChat:
 
             @staticmethod
             async def upsert_message_to_chat_by_id_and_message_id(chat_id, message_id, message):
+                if not message.get("content"):        # as Open WebUI does (models/chats.py)
+                    text = _owui_output_text(message.get("output"))
+                    if text:
+                        message = {**message, "content": text}
                 msgs = fake.chat.chat["history"]["messages"]
                 msgs[message_id] = {**msgs.get(message_id, {}), **message}
                 return fake.chat
+        self._chats = Chats
 
         class ChatMessages:
             @staticmethod
@@ -6228,6 +6264,13 @@ class _FakeOwuiChat:
 
     def msgs(self):
         return self.chat.chat["history"]["messages"]
+
+    async def end_request(self, message_id, output):
+        """What Open WebUI 0.12 saves when a reply's response stream ends or is
+        cancelled: `done` and the output it folded from that stream, over
+        whatever the message held (utils/middleware.py:6599, :6667)."""
+        await self._chats.upsert_message_to_chat_by_id_and_message_id(
+            self.chat_id, message_id, {"done": True, "output": copy.deepcopy(output)})
 
     def events(self, kind):
         return [d["data"] for e, d, room in self.emits if e == "events" and d["data"].get("type") == kind]
@@ -9163,14 +9206,18 @@ class GapHandoverReplayTests(_RoutingCase):
         meta = {"chat_id": self.CHAT, "user_id": self.USER, "message_id": message_id}
         gen = self.pipe._pipe_impl(body, emitter, __metadata__=meta,
                                    __event_call__=event_call if intent else None)
-        reply = {"gen": gen, "text": "", "items": [], "emitted": emitted}
+        reply = {"gen": gen, "text": "", "items": [], "emitted": emitted, "output": []}
 
         async def drain():
-            async for chunk in gen:
-                if isinstance(chunk, str):
-                    reply["text"] += chunk
-                elif isinstance(chunk, dict) and chunk.get("type") == "response.output_item.added":
-                    reply["items"].append(chunk["item"])
+            try:
+                async for chunk in gen:
+                    reply["output"] = _owui_fold_chunk(reply["output"], chunk)
+                    if isinstance(chunk, str):
+                        reply["text"] += chunk
+                    elif isinstance(chunk, dict) and chunk.get("type") == "response.output_item.added":
+                        reply["items"].append(chunk["item"])
+            finally:
+                await self.owui.end_request(message_id, reply["output"])
         sent_before = len(self.chat_sends)
         reply["task"] = asyncio.ensure_future(drain())
         for _ in range(400 if sends else 0):
@@ -9306,9 +9353,96 @@ class GapHandoverReplayTests(_RoutingCase):
         self.settle()
         await self.ended(second)
         self.assertEqual(self.conn._turn_pumps, {}, "nothing was handed over")
-        self.assertIs(self.owui.msgs()["m2"]["done"], False, "the writer never wrote m2")
-        self.assertEqual(self._count(second["text"]), [11, 12, 13, 16, 17, 18, 19, 20])
-        self.assertIn("ANSWER", second["text"])
+        self.assertEqual(self.owui.tasks, {}, "no turn writer opened a message")
+        self.assertEqual(self.owui.msgs()["m2"]["content"],
+                         self._nums(11, 13) + self._nums(16, 20) + "\n\n---\n\nANSWER")
+
+    async def _send_now_takeover(self):
+        """Reply 1 streams 1..10 of a run; Send now hands the run to reply 2,
+        which holds MSG2 and streams 11..13."""
+        first = await self.start_reply("count to 20", "m1", intent="send_now")
+        self.frame(_delta(self._nums(1, 10)))
+        for _ in range(400):
+            if "10\n" in first["text"]:
+                break
+            await asyncio.sleep(0.005)
+        first["task"].cancel()                         # Send now
+        await asyncio.gather(first["task"], return_exceptions=True)
+        second = await self.start_reply("MSG2", "m2", intent="send_now", sends=False)
+        self.frame(_delta(self._nums(11, 13)))
+        for _ in range(400):
+            if "13\n" in second["text"]:
+                break
+            await asyncio.sleep(0.005)
+        return second
+
+    def _reconnect_to_a_restarted_gateway(self):
+        """The next reconnect's hello names a new Gateway process."""
+        self.conn.gateway_boot_id, self.conn.connection_epoch = "boot-a", 1
+        reconnect = self.conn._reconnect
+
+        async def restarted():
+            await reconnect()
+            self.conn.connection_epoch += 1
+            self.conn._note_gateway_boot("boot-b")
+        self.conn._reconnect = restarted
+
+    async def _answer_msg2(self, second):
+        for _ in range(400):
+            if len(self.chat_sends) == 2:
+                break
+            await asyncio.sleep(0.005)
+        self.assertEqual([p["message"] for p in self.chat_sends], ["count to 20", "MSG2"])
+        self.run, self.active = self.chat_sends[1]["idempotencyKey"], True
+        for _ in range(400):
+            if self.conn.consumers_for_event({"sessionKey": self.key, "runId": self.run}):
+                break
+            await asyncio.sleep(0.005)
+        self.frame(_delta("ANSWER"))
+        self.frame({"state": "final"}, event="chat")
+        self.settle()
+        await self.ended(second)
+
+    async def test_a_takeover_reply_keeps_a_run_the_restarted_gateway_recovered(self):
+        """ELI-153: a Send now reply holds MSG2 for the run it took over. The
+        Gateway restarts mid-run and its new process carries the run on. The
+        reply keeps streaming it and sends MSG2 after it. Handed to the turn
+        writer, the run's tail (14..20) went into m2 from the writer while the
+        reply went on into m2 with "---" and the answer, and Open WebUI's save
+        at the reply's end left m2 without the tail."""
+        self._reconnect_to_a_restarted_gateway()
+        second = await self._send_now_takeover()
+        self.socket.frames.put_nowait("drop")
+        for _ in range(400):
+            if self.conn.gateway_boot_id == "boot-b":
+                break
+            await asyncio.sleep(0.005)
+        self.frame(_delta(self._nums(14, 20)))          # the new socket's frames
+        self.frame({"state": "final"}, event="chat")
+        self.settle()
+        await self._answer_msg2(second)
+        self.assertEqual(self.owui.msgs()["m2"]["content"],
+                         self._nums(11, 20) + "\n\n---\n\nANSWER")
+        self.assertEqual(self.owui.tasks, {}, "no turn writer opened a message")
+
+    async def test_a_takeover_reply_ends_a_run_the_restart_killed(self):
+        """ELI-153: the restart killed the run the Send now reply took over:
+        its row is idle and the transcript holds what it wrote (1..13). The
+        reply ends it there and sends MSG2, with no resume of the dead run
+        racing it."""
+        self._reconnect_to_a_restarted_gateway()
+        second = await self._send_now_takeover()
+        run1 = self.run
+        self.history = {"messages": [
+            {"role": "user", "content": "count to 20", "idempotencyKey": f"{run1}:user"},
+            {"role": "assistant", "idempotencyKey": f"cli-assistant:{run1}",
+             "content": [{"type": "text", "text": self._nums(1, 13)}]}]}
+        self.active = False
+        self.socket.frames.put_nowait("drop")
+        await self._answer_msg2(second)
+        self.assertEqual(self.owui.msgs()["m2"]["content"],
+                         self._nums(11, 13) + "\n\n---\n\nANSWER")
+        self.assertEqual(self.owui.tasks, {}, "no turn writer opened a message")
 
     @staticmethod
     def _count(text):
