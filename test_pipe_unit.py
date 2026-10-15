@@ -9466,6 +9466,39 @@ class GapHandoverReplayTests(_RoutingCase):
                          self._nums(11, 13) + f"\n\n**Error:** {kill}\n\n---\n\nANSWER")
         self.assertEqual(self.owui.tasks, {}, "no turn writer opened a message")
 
+    async def test_a_gap_in_the_held_message_s_own_run_keeps_the_takeover(self):
+        """ELI-153: the run a Send now reply took over ends, MSG2 goes out in
+        the same message, and a frame of MSG2's own run is lost. The reply
+        keeps streaming. Handed to the turn writer, m2 was rebuilt from MSG2's
+        run alone: everything the reply showed before it (11..20, "---") was
+        gone."""
+        second = await self._send_now_takeover()
+        self.frame(_delta(self._nums(14, 20)))
+        self.frame({"state": "final"}, event="chat")
+        self.settle()
+        for _ in range(400):
+            if len(self.chat_sends) == 2:
+                break
+            await asyncio.sleep(0.005)
+        self.run, self.active = self.chat_sends[1]["idempotencyKey"], True
+        self.history = {"messages": [
+            {"role": "user", "content": "MSG2", "idempotencyKey": f"{self.run}:user"},
+            {"role": "assistant", "idempotencyKey": f"cli-assistant:{self.run}",
+             "content": [{"type": "text", "text": "ANSWER FULL"}]}]}
+        for _ in range(400):
+            if self.conn.consumers_for_event({"sessionKey": self.key, "runId": self.run}):
+                break
+            await asyncio.sleep(0.005)
+        self.frame(_delta("ANSWER"))
+        self.lost(1)                                   # a dropped frame: only its seq shows
+        self.frame(_delta(" FULL"))
+        self.frame({"state": "final"}, event="chat")
+        self.settle()
+        await self.ended(second)
+        self.assertEqual(self.owui.msgs()["m2"]["content"],
+                         self._nums(11, 20) + "\n\n---\n\nANSWER FULL")
+        self.assertEqual(self.owui.tasks, {}, "no turn writer opened a message")
+
     @staticmethod
     def _count(text):
         return [int(t) for t in text.split() if t.isdigit()]
