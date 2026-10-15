@@ -4375,6 +4375,30 @@ class _TurnRenderer:
             self._assistant_stream_text = run_text.get("received", "")
             self._last_item_text = run_text.get("item", "")
 
+    def drop_shown(self, shown: str) -> bool:
+        """Drop the start of the run that `shown` is, which another message
+        already holds (an adopted run, ELI-147): its text and the cards
+        inside it. False, changing nothing, when the text does not start
+        with it."""
+        if not self.text.startswith(shown):
+            return False
+        cut, pos, kept = len(shown), 0, []
+        for item in self.output:
+            if item.get("type") == "message":
+                text = item["content"][0]["text"]
+                start, pos = pos, pos + len(text)
+                if pos <= cut:
+                    continue
+                if start < cut:
+                    item = copy.deepcopy(item)
+                    item["content"][0]["text"] = text[cut - start:]
+            elif pos < cut:
+                continue
+            kept.append(item)
+        self.output, self.text = kept, self.text[cut:]
+        self.visible_text = self.text
+        return True
+
     def _add(self, chunk: str) -> None:
         if chunk:
             self.visible_text += chunk
@@ -4955,9 +4979,7 @@ class _GatewayConnection:
                 or (session_key, run_id) in self._turn_pumps):
             return False
         pump = self._turn_pumps[(session_key, run_id)] = _RunPump()
-        pump.handover = {"message_id": target["message_id"],
-                         "renderer": self._run_renderers.get(key),
-                         "thinking": thinking or target.get("thinking")}
+        pump.handover = self.handover_of(session_key, run_id, thinking)
         pump.stop_notice_before = self._stop_notice_seen
         self.unregister_run_target(session_key, run_id)
         spawn_background(_turn_pump_loop(self, session_key, run_id, parsed, pump))
@@ -5062,6 +5084,15 @@ class _GatewayConnection:
             for stale in list(self._run_targets)[:50]:
                 self._run_targets.pop(stale, None)
                 self._run_renderers.pop(stale, None)
+
+    def handover_of(self, session_key: str, run_id: str, thinking: str | None = None) -> dict:
+        """What a turn writer takes over from a run's request (DESIGN 2.6):
+        its message, its shadow renderer, its thinking level, and `shown`,
+        what earlier replies already showed of an adopted run."""
+        key = f"{session_key}:{run_id}"
+        target = self._run_targets[key]
+        return {"message_id": target["message_id"], "renderer": self._run_renderers.get(key),
+                "thinking": thinking or target.get("thinking"), "shown": target.get("shown", "")}
 
     def unregister_run_target(self, session_key: str, run_id: str) -> None:
         key = f"{session_key}:{run_id}"
@@ -5626,10 +5657,14 @@ class _GatewayConnection:
         in `queue`, which were dispatched before this reply registered its
         own target. Without this a handover to a turn writer would miss the
         buffered text and duplicate the rest."""
-        renderer = self._run_renderers.get(f"{session_key}:{run_id}")
+        key = f"{session_key}:{run_id}"
+        renderer = self._run_renderers.get(key)
         if renderer is None:
             return
         renderer.seed(run_text)
+        # What the earlier replies showed of the run is theirs: a writer that
+        # takes this one over rebuilds from after it (ELI-147).
+        self._run_targets[key]["shown"] = (run_text or {}).get("stream", "")
         for msg in list(getattr(queue, "_queue", ())):
             try:
                 renderer.feed(msg.get("payload", {}))
@@ -6169,35 +6204,55 @@ def _history_text_for_run(history: dict, run_id: str) -> tuple[bool, str | None]
 def _history_renderer(messages: list) -> "_TurnRenderer":
     """A `_TurnRenderer` fed one run's `chat.history` messages instead of its
     live events, so a run whose events were lost still ends as the same
-    `text` + `output` items (ELI-88/90/92).
+    `text` + `output` items (ELI-88/90/92)."""
+    r = _TurnRenderer()
+    for payload in _history_events(messages):
+        r.feed(payload)
+    return r
+
+
+def _history_events(messages: list):
+    """`chat.history` messages as the live events that wrote them: the one
+    transcript parser, for the chat's rebuild and the dialog's Tools tab
+    (ELI-147).
 
     claude-cli imports its transcript into the session as it goes: assistant
     messages whose blocks are `text`, `toolcall` {id, name, arguments} and
-    `tool_result` {tool_use_id, content, is_error}, in order. The run's closing
-    message (`cli-assistant:<runId>`) repeats all of its text, so it only
-    counts when nothing in its own run carried text (a plain, tool-free
+    `tool_result` {tool_use_id, name, content, is_error}, in order. The run's
+    closing message (`cli-assistant:<runId>`) repeats all of its text, so it
+    only counts when nothing in its own run carried text (a plain, tool-free
     reply, or imports that carry tool blocks only). It counts in place: an
     asked question's run closes before its answer run starts, and the
     question was lost when only the last closer was kept (ask-rebuild,
     2026-10-14, chat d0f0c6ff).
+
+    A run on the Gateway's own runtime (GPT, Gemini, DeepSeek) keeps
+    OpenClaw's shape: `toolCall` blocks, and each result a `toolResult`
+    message {toolCallId, toolName, content, isError} of its own (recorded,
+    test_fixture_native_history.json).
 
     Text after a tool call is joined to the text before it with the separator
     the Gateway's live stream inserts there (`sawToolUseSinceText`), so the
     rebuild equals what streamed (it streams as "\n\n<text>").
     Plain concatenation glued a preamble to the answer ("...one at a time.
     USER-DONE" with no break, restart window 2026-10-13)."""
-    r = _TurnRenderer()
+    text = ""                 # what the events so far said
     run_text = False          # this run carried text before its closer
     tool_since_text = False   # the Gateway's `sawToolUseSinceText`
     for message in messages:
-        if not isinstance(message, dict) or message.get("role") != "assistant":
+        if not isinstance(message, dict):
             continue
-        if any(k.startswith("cli-assistant:") for k in _idempotency_keys(message)):
-            text = ((_history_item(message) or {}).get("text") or "").strip()
-            if not run_text and text and text not in _SILENT_SENTINELS:
-                lead = _message_boundary_separator(r.text, text)
-                tool_since_text = False
-                r.feed({"stream": "assistant", "data": {"delta": lead + text}})
+        role = message.get("role")
+        if role == "toolResult" and message.get("toolCallId"):
+            yield _history_tool_result(message["toolCallId"], message.get("toolName"),
+                                       message.get("content"), message.get("isError"))
+            continue
+        if _is_closing_message(message):
+            closing = ((_history_item(message) or {}).get("text") or "").strip()
+            if not run_text and closing and closing not in _SILENT_SENTINELS:
+                delta = _message_boundary_separator(text, closing) + closing
+                text, tool_since_text = text + delta, False
+                yield {"stream": "assistant", "data": {"delta": delta}}
             run_text = False
             continue
         content = message.get("content")
@@ -6207,25 +6262,25 @@ def _history_renderer(messages: list) -> "_TurnRenderer":
             if not isinstance(block, dict):
                 continue
             kind = block.get("type")
-            if kind == "text" and block.get("text"):
-                lead = _message_boundary_separator(r.text, block["text"]) if tool_since_text else ""
-                tool_since_text = False
+            if kind == "text" and block.get("text") and role == "assistant":
+                lead = _message_boundary_separator(text, block["text"]) if tool_since_text else ""
+                text, tool_since_text = text + lead + block["text"], False
                 run_text = run_text or bool(block["text"].strip())
-                r.feed({"stream": "assistant", "data": {"delta": lead + block["text"]}})
-            elif kind == "toolcall" and block.get("id"):
+                yield {"stream": "assistant", "data": {"delta": lead + block["text"]}}
+            elif kind in ("toolcall", "toolCall") and block.get("id") and role == "assistant":
                 tool_since_text = True
-                r.feed({"stream": "tool", "data": {
+                yield {"stream": "tool", "data": {
                     "phase": "start", "name": block.get("name", ""),
-                    "toolCallId": block["id"], "args": block.get("arguments") or {}}})
+                    "toolCallId": block["id"], "args": block.get("arguments") or {}}}
             elif kind == "tool_result" and block.get("tool_use_id"):
-                result = block.get("content")
-                if isinstance(result, list):
-                    result = "".join(str(b.get("text") or "") for b in result if isinstance(b, dict))
-                r.feed({"stream": "tool", "data": {
-                    "phase": "result", "name": block.get("name", ""),
-                    "toolCallId": block["tool_use_id"], "result": result or "",
-                    "isError": block.get("is_error") is True}})
-    return r
+                yield _history_tool_result(block["tool_use_id"], block.get("name"),
+                                           block.get("content"), block.get("is_error"))
+
+
+def _history_tool_result(tool_call_id: str, name, content, is_error) -> dict:
+    return {"stream": "tool", "data": {
+        "phase": "result", "name": name or "", "toolCallId": tool_call_id,
+        "result": "" if content is None else content, "isError": is_error is True}}
 
 
 def _message_boundary_separator(previous: str, nxt: str) -> str:
@@ -7409,7 +7464,7 @@ class _TurnWriter:
     def __init__(self, conn: "_GatewayConnection", *, session_key: str, chat_id: str,
                  user_id: str, run_id: str, message_id: str | None,
                  takeover: bool = False, renderer: "_TurnRenderer | None" = None,
-                 thinking: str | None = None, wake: dict | None = None):
+                 thinking: str | None = None, wake: dict | None = None, shown: str = ""):
         self.conn = conn
         self.session_key, self.chat_id, self.user_id = session_key, chat_id, user_id
         self.run_id, self.message_id = run_id, message_id
@@ -7422,6 +7477,9 @@ class _TurnWriter:
         # A cron wake (ELI-103): {key, at, job} of its turn, and `end` once its
         # terminal arrived. Its transcript span is a time window, not a run id.
         self.wake = wake
+        # What earlier replies showed of a run M continues (an adopted run,
+        # ELI-147): the transcript rebuild of M starts after it.
+        self.shown = {run_id: shown} if shown else {}
         self.opened = False
         self.task_id: str | None = None
         # every run written into M, in transcript order (_adopt_recoveries_from)
@@ -7984,6 +8042,11 @@ class _TurnWriter:
                      f"{len(self.runs)} run(s); keeping what streamed")
             return None
         rest = _history_renderer([m for s in spans[k:] for m in s])
+        shown = self.shown.get(self.runs[k], "")
+        if shown and not rest.drop_shown(shown):
+            pipe_log(f"  turn writer: run {self.runs[k][:24]}... does not start with what earlier "
+                     f"replies showed; keeping what streamed in {self.message_id[:8]}...")
+            return None
         if not rest.output:
             return None
         cut = min((starts[r] for r in self.runs[k:] if r in starts), default=(len(out), len(text)))
@@ -8174,9 +8237,7 @@ def _turn_queue(conn: "_GatewayConnection", sess: str, run: str, parsed: tuple,
             # DESIGN 2.6: the request streaming this run ended before it. The
             # writer continues in the same message from the shadow renderer,
             # which already holds this event.
-            pump.handover = {"message_id": target["message_id"],
-                             "renderer": conn._run_renderers.get(f"{sess}:{run}"),
-                             "thinking": target.get("thinking")}
+            pump.handover = conn.handover_of(sess, run)
             conn.unregister_run_target(sess, run)
         spawn_background(_turn_pump_loop(conn, sess, run, parsed, pump))
         spawn_background(conn.ensure_message_subscription(sess))
@@ -8356,7 +8417,8 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
         elif handed is not None:
             pump.writer = _TurnWriter(conn, session_key=sess, chat_id=chat_id, user_id=user_id,
                                       run_id=run, message_id=handed["message_id"], takeover=True,
-                                      renderer=handed["renderer"], thinking=handed.get("thinking"))
+                                      renderer=handed["renderer"], thinking=handed.get("thinking"),
+                                      shown=handed.get("shown", ""))
             conn._turn_writers[(chat_id, handed["message_id"])] = pump.writer
             await pump.writer.feed(None)
         elif re.fullmatch(_UUID_RE, run) and run == await conn.session_id_for(sess):

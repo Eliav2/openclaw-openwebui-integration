@@ -440,6 +440,27 @@ class HistoryRunRebuildTests(unittest.TestCase):
         r = _history_renderer(self._two_text_blocks(closer=False))
         self.assertEqual(r.text, "Running the five sleep steps one at a time.\n\nUSER-DONE-9e127db9")
 
+    def test_a_native_runs_transcript_rebuilds_its_cards(self):
+        """A run on the Gateway's own runtime (GPT, Gemini, DeepSeek in the
+        picker) keeps OpenClaw's shape, not claude-cli's: `toolCall` blocks,
+        and each result is a `toolResult` message of its own. Recorded from a
+        DeepSeek session; the rebuild came back with no cards at all."""
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_fixture_native_history.json")
+        with open(path) as f:
+            messages = json.load(f)["messages"]
+        messages = messages + [{"role": "assistant", "stopReason": "stop",
+                                "content": [{"type": "text", "text": "The workshop is empty."}]}]
+        r = _history_renderer(messages)
+        cards = [i for i in r.output if i["type"] == "function_call"]
+        self.assertEqual([c["name"] for c in cards],
+                         ["ls", f"ls {TOOL_ERROR_MARK}", "exec", f"ls {TOOL_ERROR_MARK}", "exec"])
+        outputs = {i["call_id"]: i["output"][0]["text"] for i in r.output if i["type"] == "function_call_output"}
+        self.assertEqual(outputs["call_00_bLXMsmgz1pJc5IL1J0Rx1971"], "(empty directory)")
+        self.assertTrue(outputs["call_00_QFthybdFqQt4QEdyJoAu2999"].startswith(f"{TOOL_ERROR_MARK} tool call failed"))
+        self.assertEqual(len(r.finished_output()), len(r.output))  # every call answered
+        self.assertEqual(r.output[-1]["type"], "message")
+        self.assertTrue(r.text.endswith("The workshop is empty."))
+
 
 def _turn_history(stub_id="stub-1", *, run="msg-c-stub-1-1.0", closed=True,
                   text="check the logs", later=False):
@@ -737,6 +758,22 @@ class TurnRendererOutputTests(unittest.TestCase):
                                            "isError": True}})
         self.assertEqual(r.output[0]["name"], f"Bash {TOOL_ERROR_MARK}")
         self.assertIn("tool call failed", r.output[1]["output"][0]["text"])
+
+    def test_drop_shown_cuts_the_text_and_the_cards_another_message_holds(self):
+        r = _TurnRenderer()
+        r.feed({"stream": "assistant", "data": {"delta": "One."}})
+        r.feed({"stream": "tool", "data": {"phase": "start", "name": "Read", "toolCallId": "t1", "args": {}}})
+        r.feed({"stream": "tool", "data": {"phase": "result", "name": "Read", "toolCallId": "t1", "result": "x"}})
+        r.feed({"stream": "assistant", "data": {"delta": "Two. Three."}})
+        r.feed({"stream": "tool", "data": {"phase": "start", "name": "Bash", "toolCallId": "t2", "args": {}}})
+        r.feed({"stream": "tool", "data": {"phase": "result", "name": "Bash", "toolCallId": "t2", "result": "y"}})
+        self.assertFalse(r.drop_shown("One!"), "a start that does not line up changes nothing")
+        self.assertEqual(len(r.output), 6)
+        self.assertTrue(r.drop_shown("One.Two. "))
+        self.assertEqual(r.text, "Three.")
+        self.assertEqual([(i["type"], i.get("id") or i.get("call_id")) for i in r.output[1:]],
+                         [("function_call", "t2"), ("function_call_output", "fco_t2")])
+        self.assertEqual(r.output[0]["content"][0]["text"], "Three.")
 
     def test_finished_output_completes_open_items_without_touching_the_live_copy(self):
         r = _TurnRenderer()
@@ -7118,6 +7155,35 @@ class AgentTurnRoutingTests(_RoutingCase):
         self.assertEqual(sum(1 for i in m["output"] if i["type"] == "function_call"), 1)
         self.assertEqual(m["meta"]["openclaw_writer"], self.conn.writer_id)
         self.assertNotIn(f"{self.key}:{run}", self.conn._run_targets, "the shadow is retired")
+
+    async def test_a_handed_over_adopted_run_does_not_repeat_what_the_first_reply_showed(self):
+        """ELI-147: a Send now reply adopted a run whose start reply 1 already
+        showed (lines 1-10), streamed lines 11-20 into its own message, and
+        was handed over (a Gateway restart, a socket gap). The run's closing
+        transcript holds lines 1-30; the rebuild of reply 2's message must
+        start where reply 1 left off."""
+        def lines(a, b):
+            return "".join(f"{i}\n" for i in range(a, b + 1))
+        run = pipe_run_id(self.CHAT, "m-first")       # named by reply 1's message
+        self.add_stub(self.STUB, content=lines(11, 20))
+        self.conn.register_run_target(self.key, run, self.CHAT, self.STUB)
+        self.conn.seed_run_renderer(self.key, run, asyncio.Queue(),
+                                    run_text={"received": lines(1, 10), "stream": lines(1, 10),
+                                              "item": ""})
+        self.conn._run_renderers[f"{self.key}:{run}"].feed(_delta(lines(11, 20)))
+        self.assertTrue(await self.dispatch(run, _delta(lines(21, 25))))
+        await self.dispatch(run, {"state": "final"})
+        self.history = {"messages": [
+            {"role": "user", "content": "count to 30", "idempotencyKey": f"{run}:user"},
+            {"role": "assistant", "idempotencyKey": f"cli-assistant:{run}",
+             "content": [{"type": "text", "text": lines(1, 30)}]}]}
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "done", "lastRunId": run})
+        await self.spin()
+        m = self.owui.msgs()[self.STUB]
+        self.assertIs(m["done"], True)
+        self.assertEqual(m["content"].strip(), lines(11, 30).strip(),
+                         "lines 1-10 are reply 1's; 26-30 are what the transcript adds")
 
     async def test_handover_after_an_owui_restart_takes_the_stub_its_run_id_names(self):
         """2026-10-12 23:29Z, chat 0abe9bde (fails on main 787a471, where it
