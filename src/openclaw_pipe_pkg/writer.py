@@ -318,7 +318,6 @@ class _TurnWriter:
         self.wake = wake
         self.opened = False
         self.task_id: str | None = None
-        self.parent_id: str | None = None
         # every run written into M, in transcript order (_adopt_recoveries_from)
         self.runs = [run_id]
         # Where each run's streamed part starts in the renderer, in adoption
@@ -356,7 +355,6 @@ class _TurnWriter:
         if not claim["claimed"]:
             pipe_log(f"  turn writer: message {self.message_id[:8]}... is held by another writer")
             return False
-        self.parent_id = claim["parent"]
         if claim["how"] == "new":
             await _introduce_turn_message(self.chat_id, self.user_id, claim["messages"],
                                           self.message_id)
