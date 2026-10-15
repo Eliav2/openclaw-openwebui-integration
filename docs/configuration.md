@@ -155,6 +155,12 @@ Type: `str`. Default: `main`.
 
 Copy this exactly from the Pipe's valves -- the same OpenClaw agent the Pipe routes chats to.
 
+### CONTROL_UI_URL
+
+Type: `str`. Default: empty.
+
+The address you open the OpenClaw Control UI at, e.g. https://openclaw.example.com. When set, the Status dialog and the sub-agent drawer link to the session in it. Empty: no link.
+
 ## Thinking filter
 
 File: `openclaw_thinking_filter.py`.

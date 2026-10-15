@@ -83,14 +83,13 @@ This needs the Open WebUI message id, which a normal chat always has. It is alwa
 
 ## Lost events
 
-If events are lost on the way (a dropped frame, a socket gap), the reply is filled in from the Gateway's own transcript (`chat.history`), which holds each message whole. Text lost in the middle is put back where it belongs, and a run that ended while its final event was lost is closed from its settled session row. `sessions.preview` is used only when a Gateway refuses `chat.history`, because it clips long messages.
+If events are lost on the way (a dropped frame, a socket gap), the reply is rebuilt from the Gateway's own transcript (`chat.history`), which holds each message whole: text and tool cards lost in the middle are put back where they belong, and a run that ended while its final event was lost is closed from its settled session row. A reply with no Open WebUI message (an API request) keeps streaming instead, and what the gap lost there stays lost.
 
 What the Pipe logs when the Gateway socket drops mid-reply (an excerpt):
 
 ```text
 [openclaw-pipe] WS disconnected -- reconnecting... (code 1006, reason '')
 [openclaw-pipe]   marked an event gap in 1 run queue(s)
-[openclaw-pipe]   event gap at offset 19 (Gateway socket dropped)
 ```
 
 Silence is never treated as the end of a reply. A long tool call or a long stretch of silent reasoning is waited on; the reply ends only on the run's own end, its settled session row, or a restart.

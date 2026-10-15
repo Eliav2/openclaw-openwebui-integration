@@ -1,7 +1,7 @@
 The Status dialog shows a chat's context use, your rate limits and the sub-agents its runs spawned, fetched live when you open it. From there you can compact the session, or open any sub-agent's drawer to see its task, transcript and tool calls.
 
 Applies to: Action (the composer Status button also needs the Pipe)
-Valves: `GATEWAY_URL`, `GATEWAY_TOKEN`, `DEVICE_IDENTITY`, `STATE_DIR`, `AGENT_ID` (Action); `COMPOSER_STATUS_BUTTON` (Pipe)
+Valves: `GATEWAY_URL`, `GATEWAY_TOKEN`, `DEVICE_IDENTITY`, `STATE_DIR`, `AGENT_ID`, `CONTROL_UI_URL` (Action); `COMPOSER_STATUS_BUTTON` (Pipe)
 
 ## The Status dialog
 
@@ -21,7 +21,7 @@ Each section has its own skeleton and fills the moment its own request returns, 
 
 The footer says when the dialog last refreshed and whether it used the Pipe's live connection (`via pipe`) or opened its own (`via action-own`). It reuses the Pipe's connection when one is open, and otherwise connects with the Pipe's saved device identity from `STATE_DIR`, so there is never a second device to approve. The Action's own connection only reads: it never writes a reply into a chat.
 
-The Action's valves mirror the Pipe's (`install_action.py` copies them over): [`GATEWAY_URL`](../configuration.md#gateway_url-1), [`GATEWAY_TOKEN`](../configuration.md#gateway_token-1), [`DEVICE_IDENTITY`](../configuration.md#device_identity-1), [`STATE_DIR`](../configuration.md#state_dir-1), [`AGENT_ID`](../configuration.md#agent_id-1), under [Status Action](../configuration.md#status-action) in Configuration.
+The Action's valves mirror the Pipe's (`install_action.py` copies them over): [`GATEWAY_URL`](../configuration.md#gateway_url-1), [`GATEWAY_TOKEN`](../configuration.md#gateway_token-1), [`DEVICE_IDENTITY`](../configuration.md#device_identity-1), [`STATE_DIR`](../configuration.md#state_dir-1), [`AGENT_ID`](../configuration.md#agent_id-1), under [Status Action](../configuration.md#status-action) in Configuration. Its own [`CONTROL_UI_URL`](../configuration.md#control_ui_url) is kept across re-installs: set it to the address you open the OpenClaw Control UI at (including any `gateway.controlUi.basePath`), and the dialog header links to this chat's session there, and the sub-agent drawer to the child's, each in a new tab, through the Control UI's short-id route `/chat/<agent>/<id>`. Empty (the default): no link.
 
 ## Rate limits
 
@@ -46,9 +46,9 @@ Typing `/compact` in the message box does not compact the session: Open WebUI 0.
 
 ## Sub-agents
 
-The Subagents section lists the child sessions this chat's runs spawned that are still running or queued, with their elapsed time counting up while the dialog is open. One that finishes while the dialog is open leaves the list as soon as the Gateway pushes the change.
+The Subagents section lists every child session this chat's runs spawned, ended ones included, newest first, up to 20 ("20 of N" when there are more). A running one's elapsed time counts up while the dialog is open; one that finishes meanwhile shows its end as soon as the Gateway pushes the change. Below them, **In-process agents** lists the chat's Claude Code Agent calls, which are not Gateway sessions, as their tool cards show them: running, launched in the background, returned, cut off or failed, with no drawer.
 
-Each row is titled with the sub-agent's task, else its spawn label. While a sub-agent has just started, the row shows its task rather than the Gateway's spawn wrapper.
+Each row is titled with the sub-agent's task, read from the head of its transcript (`sessions.preview`), else its spawn label. While a sub-agent has just started, the row shows its task rather than the Gateway's spawn wrapper.
 
 ## Sub-agent drawer
 

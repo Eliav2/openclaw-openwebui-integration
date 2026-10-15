@@ -1,4 +1,4 @@
-The Status Action adds an **OpenClaw Status** button that opens a dialog with the session's context, your rate limits and the running sub-agents, fetched live. It is a separate function that reuses the Pipe's connection and device, so there is no second pairing; install the Pipe first.
+The Status Action adds an **OpenClaw Status** button that opens a dialog with the session's context, your rate limits and its sub-agents, fetched live. It is a separate function that reuses the Pipe's connection and device, so there is no second pairing; install the Pipe first.
 
 Applies to: Action, Pipe
 
@@ -53,7 +53,7 @@ Repeat the [manual install](./manual.md) steps, creating an **Action** function 
 2. Set the ID to `openclaw_status_action` (the type is detected as an Action).
 3. Paste the contents of [`openclaw_status_action.py`](../../openclaw_status_action.py).
 4. Save and enable it, then turn on **Global** so the button appears on every model's messages.
-5. Set all five of its valves, `GATEWAY_URL`, `GATEWAY_TOKEN`, `DEVICE_IDENTITY`, `STATE_DIR`, `AGENT_ID`, to exactly the same values as the Pipe's.
+5. Set its five connection valves, `GATEWAY_URL`, `GATEWAY_TOKEN`, `DEVICE_IDENTITY`, `STATE_DIR`, `AGENT_ID`, to exactly the same values as the Pipe's. Its sixth, `CONTROL_UI_URL`, is its own and optional.
 
 Do not skip `DEVICE_IDENTITY` here. Without it, a fallback connection from the Action registers as a _new_ device and the Gateway raises a second pairing request. If the Pipe's own `DEVICE_IDENTITY` is empty, leave this one empty too: a matching `STATE_DIR` is what lets the Action find the Pipe's identity on disk. `uv run install_action.py install` mirrors all five for you.
 

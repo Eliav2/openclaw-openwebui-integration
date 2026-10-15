@@ -40,10 +40,10 @@ Answer the card and the run continues in the same reply. The exchange stays in t
 
 While it waits, the status line reads "Waiting for your reply -- the question is pending in this chat". You can reload or switch away and come back:
 
-- **Question card:** the card is shown again on the tab that views the chat, for up to an hour. If no tab comes back to the chat within about a minute, or no tab could show it in the first place (for example a client calling the API), the reply ends with the question as plain text.
+- **Question card:** the card is shown once, on the tab that views the chat; a reload moves it to the reloaded tab. If it is not answered by Open WebUI's card timeout (4 minutes), or no tab views the chat (for example a client calling the API), the reply ends with the question as plain text.
 - **Older dialogs:** the dialog pops again on your new session each time you reconnect, for up to an hour, with the status "Waiting for your reply -- question is pending, reconnect anytime".
 
-If you cancel the question, or it ends as text, the question stays in the reply as ordinary text with the trigger line removed, so nothing is lost. Answer it with a normal message.
+If you cancel the question, or it ends as text, the question stays in the reply as ordinary text with the trigger removed (a JSON form as its numbered questions with their options), so nothing is lost. Answer it with a normal message.
 
 ## Questions in replies the agent starts
 
