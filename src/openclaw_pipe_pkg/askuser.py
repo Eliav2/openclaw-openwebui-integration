@@ -150,16 +150,18 @@ def _advance_input_prompt_buffer(pending: str, delta: str,
 
 
 def _strip_input_marker_line(text: str) -> str:
-    """Remove a leading needs-input trigger line ("OpenClaw needs input:" /
-    "Codex needs input:") from text about to be shown as visible content.
+    """Remove a leading needs-input marker ("OpenClaw needs input:" /
+    "Codex needs input:") and keep the prompt after it. The one place a
+    prompt is split from its marker: the card, the modal and the text
+    fallback all read the prompt through it.
 
     A needs-input prompt is normally intercepted into a modal and never
     rendered raw. But the fallback paths -- a cancelled/dismissed modal, a run
     that ended before the modal could fire -- can still reach a raw ``yield``
     with the marker intact, leaking the literal directive line into the chat.
-    The marker is only ever meaningful as the FIRST line, so drop exactly the
-    marker and keep the rest (the actual question) as a readable fallback,
-    including a question written on the marker line itself (ELI-151).
+    The marker is only ever meaningful at the start, so drop exactly the
+    marker and keep the rest (the actual question), including a question
+    written on the marker line itself (ELI-151).
     """
     if not text:
         return text
@@ -362,10 +364,9 @@ def _modal_payload_from_user_input_prompt(prompt_text: str) -> tuple[dict, bool]
     caller converts to an "execute" event just before firing it.
     """
     prompt_text = _truncate_at_repeated_marker(prompt_text or "")
-    lines = [line.strip() for line in prompt_text.splitlines()]
+    # The marker goes as in the text fallback: a question on its line stays (ELI-151).
+    lines = [line.strip() for line in _strip_input_marker_line(prompt_text).splitlines()]
     lines = [line for line in lines if line]
-    if lines and lines[0].endswith("needs input:"):
-        lines = lines[1:]
 
     title = "OpenClaw needs input"
     if lines and len(lines[0]) <= 80 and not re.match(r"^\d+\.", lines[0]):
