@@ -3842,6 +3842,21 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(q["allow_other"])
 
+    def test_a_question_on_the_marker_line_is_the_cards_question(self):
+        """ELI-151: the card for the inline form showed the raw marker as its
+        header and question. It is the card of the marker on its own line."""
+        inline = _native_ask_user_payload("OpenClaw needs input: Which branch?\n1. main\n2. dev")
+        (q,) = inline["data"]["questions"]
+        self.assertEqual((q["header"], q["question"]), ("Which branch?", "Which branch?"))
+        self.assertEqual([o["label"] for o in q["options"]], ["main", "dev"])
+        self.assertEqual(inline, _native_ask_user_payload("OpenClaw needs input:\nWhich branch?\n1. main\n2. dev"))
+        # A free-text question and a yes/no question on the marker line, too.
+        for marker, prompt in (("Codex needs input:", "Package\nName the package you want"),
+                               ("OpenClaw needs input:", "Deploy now? (y/n)")):
+            inline = _native_ask_user_payload(f"{marker} {prompt}")
+            self.assertNotIn("needs input", json.dumps(inline))
+            self.assertEqual(inline, _native_ask_user_payload(f"{marker}\n{prompt}"))
+
     def test_confirmation_becomes_yes_no_without_free_text(self):
         payload = _native_ask_user_payload(
             "OpenClaw needs input:\n\nDeploy\nDeploy now? (y/n)"
