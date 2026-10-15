@@ -122,6 +122,7 @@ from openclaw_pipe import (
     _reconcile_stub,
     ORPHAN_STUB_NOTE,
     TOOL_ERROR_MARK,
+    TOOL_NO_RESULT_NOTE,
     _FALLBACK_MODELS,
     _advance_input_prompt_buffer,
     _advance_media_buffer,
@@ -745,7 +746,10 @@ class TurnRendererOutputTests(unittest.TestCase):
                                            "toolCallId": "t3", "args": {}}})
         done = r.finished_output()
         self.assertEqual({i["status"] for i in done}, {"completed"})
+        self.assertEqual(done[-1]["call_id"], "t3", "the call the run never answered is closed")
+        self.assertEqual(done[-1]["output"][0]["text"], TOOL_NO_RESULT_NOTE)
         self.assertEqual(r.output[1]["status"], "in_progress")
+        self.assertEqual(len(r.output), 2)
 
 
 class ThinkingNoteAnnouncementTests(unittest.TestCase):
@@ -9111,7 +9115,7 @@ class ToolCardParityTests(unittest.IsolatedAsyncioTestCase):
                       writer)
         self.assertIn(("call", "t3", "Grep", json.dumps({"q": "x"})), writer,
                       "a result whose start was missed still gets its card")
-        self.assertIn(("output", "t4", "(no result -- the run ended first)"), writer,
+        self.assertIn(("output", "t4", TOOL_NO_RESULT_NOTE), writer,
                       "a call the run never answered is closed, not left spinning")
 
 

@@ -330,7 +330,6 @@ class Pipe:
 
     def __init__(self):
         self.valves = self.Valves()
-        self._active_tool_args: dict[str, str] = {}
 
     async def pipes(self):
         """Expose multiple OWUI model-selector entries from one pipe.
@@ -1343,11 +1342,9 @@ class _PipeTurn:
                                  "start": len(self.assistant_received_text)})
 
         self.visible_message_text = self._initial_visible_text + self.pending_clamp_note
-        had_tool_block = False
-        # toolCallIds announced to OWUI as `function_call` items that have
-        # not been completed by a matching result item yet. Anything left
-        # here when the run ends would render as a spinner forever.
-        pending_tool_calls: set[str] = set()
+        # The tool cards this reply streamed (ELI-147); a call still open
+        # when the run ends would render as a spinner forever.
+        self.tool_cards = _TurnRenderer()
         pending_prompt_text = ""
         pending_media_text = ""
         self.last_snapshot_text = ""
@@ -1744,33 +1741,28 @@ class _PipeTurn:
                                     yield item_delta
 
                         # --- Tool call events ---
+                        # The cards come from `_TurnRenderer`, the same code a
+                        # turn writer shows them with (ELI-147): each event is
+                        # a Responses item Open WebUI folds into its own output
+                        # list, so a card is mutable and is never part of the
+                        # message text.
                         if stream == "tool":
+                            events = self.tool_cards.feed(payload)
                             if phase == "start":
-                                tool_call_id = data.get("toolCallId", "")
-                                args = json.dumps(data.get("args", {}))
-                                if tool_call_id:
-                                    self.pipe._active_tool_args[tool_call_id] = args
                                 pipe_log(f"  Tool start: {name}")
-                                if tool_call_id:
-                                    # Protocol switch, not text: this dict becomes a
-                                    # `function_call` item in OWUI's own output list,
-                                    # which renders as a live spinner until its
-                                    # matching result item arrives. Deliberately NOT
-                                    # recorded into `visible_message_text` -- it is
-                                    # not part of the message text, and the snapshot
-                                    # path must not duplicate it as markdown.
-                                    pending_tool_calls.add(tool_call_id)
-                                    if pending_media_text:
-                                        # The message item ends here, and with it
-                                        # any code span a held directive waited on
-                                        # (ELI-111): it shows before the card.
-                                        held, pending_media_text = pending_media_text, ""
-                                        resolved = await self.settle_held_media(held)
-                                        self.assistant_stream_text += held
-                                        self.record_visible_chunk(resolved)
-                                        yield resolved
-                                        self.text_yielded = True
-                                    yield _tool_call_started_event(name, tool_call_id, args)
+                                if events and pending_media_text:
+                                    # The message item ends here, and with it
+                                    # any code span a held directive waited on
+                                    # (ELI-111): it shows before the card.
+                                    held, pending_media_text = pending_media_text, ""
+                                    resolved = await self.settle_held_media(held)
+                                    self.assistant_stream_text += held
+                                    self.record_visible_chunk(resolved)
+                                    yield resolved
+                                    self.text_yielded = True
+                                for event in events:
+                                    yield event
+                                if events:
                                     # Text after a tool call is a new message item.
                                     self.fence_item_start = len(self.assistant_stream_text)
                                 await _emit_status(
@@ -1780,63 +1772,13 @@ class _PipeTurn:
                                 )
 
                             elif phase == "result":
-                                result = data.get("result", {})
-                                result_str = _tool_result_text(result)
-                                tool_call_id = data.get("toolCallId", "")
-                                # The Gateway already tells us the outcome
-                                # (`execute.runtime`'s emitCliToolResult); the
-                                # card just never showed it.
-                                is_error = data.get("isError") is True
-                                stored_args = self.pipe._active_tool_args.pop(tool_call_id, None)
-                                args_str = stored_args or json.dumps(data.get("args", {}))
-                                if (
-                                    self.adopted_run_id and tool_call_id
-                                    and tool_call_id not in pending_tool_calls
-                                ):
-                                    # Started under the reply that was
-                                    # interrupted, so this reply has no card
-                                    # for the result to complete: open one.
-                                    pending_tool_calls.add(tool_call_id)
-                                    yield _tool_call_started_event(name, tool_call_id, args_str)
                                 pipe_log(
-                                    f"  Tool result: {name} ({len(result_str)} chars)"
-                                    f"{' [error]' if is_error else ''}"
+                                    f"  Tool result: {name} "
+                                    f"({len(_tool_result_text(data.get('result', {})))} chars)"
+                                    f"{' [error]' if data.get('isError') is True else ''}"
                                 )
-                                if is_error:
-                                    # Log the decision, always: a skipped
-                                    # relabel is otherwise indistinguishable
-                                    # from the error branch never running
-                                    # (why ELI-75 read as a missing feature).
-                                    marked = tool_call_id in pending_tool_calls
-                                    pipe_log(f"  relabel: call={tool_call_id!r} "
-                                             + ("FIRE" if marked else "SKIP (no card)"))
-                                    if marked:
-                                        # Replaces the started item by its id,
-                                        # in what is saved and in the open tab
-                                        # (ELI-124): the collapsed row becomes
-                                        # "View Result from **<name> ❌**".
-                                        yield _tool_call_error_relabel_event(name, tool_call_id, args_str)
-                                    result_str = _tool_error_banner(result_str)
-                                if tool_call_id:
-                                    # Completes the item yielded at start: the shared
-                                    # call_id is what flips that card to done and
-                                    # reveals its Output. No snapshot needed -- the
-                                    # backend folds this into the output list it
-                                    # already persists and re-emits.
-                                    pending_tool_calls.discard(tool_call_id)
-                                    yield _tool_call_result_event(tool_call_id, result_str)
-                                else:
-                                    # No toolCallId means there is nothing to pair a
-                                    # result item to, so fall back to the markdown
-                                    # card -- the same one the shadow renderer emits.
-                                    tool_block = _render_tool_result_block(
-                                        name, tool_call_id, args_str, result_str,
-                                        data.get("meta", ""),
-                                    )
-                                    had_tool_block = True
-                                    self.record_visible_chunk(tool_block)
-                                    yield tool_block
-                                    await self.maybe_emit_snapshot(force=True)
+                                for event in events:
+                                    yield event
                                 await _emit_status(
                                     self.__event_emitter__,
                                     f"{name} done",
@@ -1964,39 +1906,6 @@ class _PipeTurn:
                         self.text_yielded = True
                         pending_media_text = ""
 
-                    # For pure-text turns, do NOT force a snapshot here: OWUI's own
-                    # accumulation of the streamed yields already lands the full
-                    # text in `content`, and an extra forced `replace` at this
-                    # point double-writes it (P23/P25 -- exact duplicate, no
-                    # separator).
-                    #
-                    # Turns that included a tool-call block are different (P27,
-                    # 2026-07-08): once a `<details type="tool_calls">` block has
-                    # been yielded, OWUI's own end-of-stream save no longer reliably
-                    # lands the plain-text tail in `content` at all -- it only shows
-                    # up in `output` instead. So for tool-block turns only, force
-                    # one last `content` snapshot here.
-                    #
-                    # This was briefly reverted the same day after what looked like
-                    # a live duplicate regression, but that turned out to be a false
-                    # alarm caused by redeploying the pipe mid-message in the same
-                    # live chat used to test it (a self-inflicted artifact of the
-                    # testing method, not this code) -- confirmed by reproducing the
-                    # duplicate-free "output has it once, content misses it"
-                    # signature again on an unrelated turn where nothing was
-                    # redeployed mid-stream. Restored. Lesson for future sessions:
-                    # never redeploy this pipe function while a message in the same
-                    # live chat being used to verify it is still streaming.
-                    #
-                    # Skip while re-entering for a modal follow-up: the snapshot must
-                    # only land once the run is truly finished, not between turns.
-                    # Not for an adopted run either: this reply keeps streaming
-                    # the queued message's answer, and a `replace` now would
-                    # freeze those deltas (P23/P25).
-                    if (not adopt_new_run and had_tool_block and not self.adopted_run_id
-                            and not handed_over):
-                        await self.maybe_emit_snapshot(force=True)
-
                     # Resolve any tool call that was announced but never got a
                     # result (run cancelled, gateway dropped it, tool crashed).
                     # Its card is a spinner until something completes it, and
@@ -2016,13 +1925,12 @@ class _PipeTurn:
                     # turn, whose stream then overwrites the writer's reply
                     # (M3 crash window, 2026-10-13). Only the yielded items are
                     # closed; the handed renderer keeps the call open.
-                    if not adopt_new_run and pending_tool_calls:
+                    if not adopt_new_run:
                         note = ("(interrupted -- the reply continues when the run resumes)"
-                                if handed_over else "(no result -- the run ended first)")
-                        for orphan_id in list(pending_tool_calls):
-                            pipe_log(f"  closing orphaned tool call {orphan_id}")
-                            yield _tool_call_result_event(orphan_id, note)
-                        pending_tool_calls.clear()
+                                if handed_over else TOOL_NO_RESULT_NOTE)
+                        for event in self.tool_cards.close_open_calls(note):
+                            pipe_log(f"  closing orphaned tool call {event['item']['call_id']}")
+                            yield event
 
         finally:
             if self.awaiting_owner:
