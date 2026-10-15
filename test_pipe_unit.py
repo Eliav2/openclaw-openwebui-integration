@@ -1352,6 +1352,43 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(f"{self.SK}:run-1", self.conn._run_targets)
         self.assertTrue(self.conn.was_delivered_live(self.SK, "run-1"))
 
+    async def test_one_owui_message_invoked_twice_is_sent_once(self):
+        """ELI-82 (2026-10-14 11:02Z, chat 56b98d09, message 5819edee): Open
+        WebUI called the pipe twice for the same reply, same messages. The
+        second call queued behind the first call's own run, then sent the
+        user's text again as a new run once it settled. The agent answered
+        twice ("I've already done this...") and the second answer, written
+        last, replaced the real final in the same message."""
+        gen1 = self._reply("hello", "m1")
+        first1 = asyncio.ensure_future(gen1.__anext__())
+        await self._until_registered("run-1")
+        self.active = True
+
+        gen2 = self._reply("hello", "m1")
+        first2 = asyncio.ensure_future(gen2.__anext__())
+        await self._spin()
+
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "the real final"))
+        q.put_nowait(self._final("run-1"))
+        out1 = await asyncio.wait_for(first1, 2)
+        async for chunk in gen1:
+            out1 += chunk if isinstance(chunk, str) else ""
+        self.assertIn("the real final", out1)
+
+        self._settled(False)
+        await self._spin()
+        try:
+            self.assertEqual(self.sent, ["hello"], "the same message ran twice")
+            out2 = await asyncio.wait_for(first2, 2)
+            async for chunk in gen2:
+                out2 += chunk if isinstance(chunk, str) else ""
+            self.assertIn("the real final", out2)
+        finally:
+            first2.cancel()
+            with contextlib.suppress(BaseException):
+                await gen2.aclose()
+
     async def test_a_socket_gap_makes_the_waiter_read_again(self):
         """The settle can be among the events lost while the socket was down,
         so a gap wakes every waiter to re-read the state."""
