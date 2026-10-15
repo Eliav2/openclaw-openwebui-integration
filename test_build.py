@@ -230,6 +230,26 @@ class StatusActionBuildTests(unittest.TestCase):
         for args in calls:
             self.assertIn("writes_turns=False", args)
 
+    def test_carries_no_turn_writer(self):
+        """ELI-149: the Action writes no turns, so it ships none of writer.py:
+        no definition from it and no reference to one. A reference left in a
+        shared fragment would be a NameError the first time that path ran in
+        the Action's own connection (CI's ruff F821 lints the built file too)."""
+        writer = ast.parse((PKG / "writer.py").read_text())
+        names = set()
+        for node in writer.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(node.name)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                names |= {t.id for t in targets if isinstance(t, ast.Name)}
+        self.assertIn("_TurnWriter", names)
+        action = ast.parse(ACTION_BUILT.read_text())
+        defined = {n.name for n in action.body
+                   if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+        used = {n.id for n in ast.walk(action) if isinstance(n, ast.Name)}
+        self.assertEqual(sorted(names & (defined | used)), [])
+
     def test_does_not_reuse_pipe_stale_conn_write_path(self):
         """The Action fragment must never call _remember_gateway_connection
         or assign the module-level `_gateway_connection` singleton itself

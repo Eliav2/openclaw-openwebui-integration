@@ -541,6 +541,166 @@ class GetActionConnectionTests(unittest.IsolatedAsyncioTestCase):
         mod._action_fallback_connection = None  # reset for other tests
 
 
+class _RecordingOwuiModule(types.ModuleType):
+    """An Open WebUI module that records every name read from it. Nothing is
+    stashed on it (`_openclaw_*`): no Pipe connection is in the process."""
+
+    def __init__(self, name, touched):
+        super().__init__(name)
+        self._touched = touched
+
+    def __getattr__(self, attr):
+        if attr.startswith("__"):
+            raise AttributeError(attr)
+        self._touched.append((self.__name__, attr))
+        if attr.startswith("_openclaw_"):
+            raise AttributeError(attr)
+        return mock.MagicMock(name=f"{self.__name__}.{attr}")
+
+
+class _ScriptedSocket:
+    """A Gateway socket that plays a list of frames. A request is answered at
+    once (from `answers`, by method); `None` in the script drops the socket.
+    When the script of the last socket is done, `on_end` runs and the
+    connection stops."""
+
+    def __init__(self, conn, frames, answers, sent, on_end=None):
+        self.conn, self.frames, self.answers, self.sent = conn, list(frames), answers, sent
+        self.on_end = on_end
+
+    async def send(self, text):
+        req = json.loads(text)
+        self.sent.append(req["method"])
+        self.conn._pending_reqs[req["id"]].set_result(self.answers.get(req["method"], {}))
+
+    async def recv(self):
+        import openclaw_status_action as mod
+
+        if self.frames:
+            frame = self.frames.pop(0)
+            if frame is None:
+                raise mod.websockets.exceptions.ConnectionClosed(None, None)
+            return json.dumps(frame)
+        await self.on_end()
+        self.conn._stopped = True
+        return json.dumps({"type": "event", "event": "tick", "payload": {}})
+
+
+class ActionOwnConnectionWritesNothingTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-149: the Action's fallback connection is the only place the Action
+    runs gateway.py's receive loop. Fed every kind of frame a Gateway sends it,
+    with no Pipe connection in the process, it raises nothing and writes
+    nothing: no turn, no chat.send, no Open WebUI write."""
+
+    USER = "2d206eab-acac-4945-bd2f-7e8b6365de8c"
+    CHAT = "0abe9bde-9b86-4ef3-8a46-a3a98ed9410a"
+    READ_ONLY = {"sessions.subscribe", "sessions.messages.subscribe", "sessions.list",
+                 "cron.list", "chat.history"}
+
+    async def test_frames_it_can_meet(self):
+        import openclaw_status_action as mod
+
+        key = _owui_session_key("main", self.USER, self.CHAT)
+
+        def agent(seq, run, **payload):
+            return {"type": "event", "event": "agent", "seq": seq,
+                    "payload": {"runId": run, "sessionKey": key, **payload}}
+
+        def event(seq, name, **payload):
+            return {"type": "event", "event": name, "seq": seq, "payload": payload}
+
+        first = [
+            event(1, "tick"),
+            agent(2, "hb-run", isHeartbeat=True, stream="lifecycle", data={"phase": "start"}),
+            agent(3, "run-1", stream="assistant", data={"text": "hi", "delta": "hi"}),
+            event(4, "session.tool", runId="run-1", sessionKey=key, stream="tool",
+                  data={"phase": "start", "name": "Read", "toolCallId": "t1", "args": {}}),
+            # seq 5 dropped: a frame gap, resynced
+            event(6, "chat", runId="run-1", sessionKey=key, state="final",
+                  message={"role": "assistant", "content": [{"type": "text", "text": "hi"}]}),
+            event(7, "sessions.changed", sessionKey=key, hasActiveRun=False),
+            event(8, "shutdown", restartExpectedMs=5000),
+            None,  # the socket drops; the Gateway comes back restarted
+        ]
+        second = [
+            event(1, "sessions.changed", sessionKey=key, hasActiveRun=True),
+            agent(2, "run-2", stream="lifecycle", data={"phase": "start"}),
+            event(3, "chat", runId="run-2", sessionKey=key, state="final",
+                  message={"role": "assistant", "content": [{"type": "text", "text": "ok"}]}),
+            event(4, "sessions.changed", sessionKey=key, hasActiveRun=False),
+        ]
+        answers = {
+            "sessions.subscribe": {"list": {"sessions": [
+                {"key": key, "hasActiveRun": True, "activeRunIds": ["run-1"]}]}},
+            "sessions.list": {"sessions": [{"key": key, "hasActiveRun": False}]},
+            "cron.list": {"jobs": []},
+        }
+        sent, logs, tasks, touched = [], [], [], []
+        sockets = [first, second]
+        boots = iter(["boot-a", "boot-b"])
+
+        async def settle_background():
+            while not all(t.done() for t in tasks):
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        async def fake_connect(conn):
+            # What a handshake leaves behind (`_connect_and_start`).
+            frames = sockets.pop(0)
+            conn._ws = _ScriptedSocket(conn, frames, answers, sent,
+                                       on_end=None if sockets else settle_background)
+            conn._frame_seq = None
+            conn.connection_epoch += 1
+            conn._note_gateway_boot(next(boots))
+            conn._subscriptions_stale = not conn.requests_only
+
+        def spawn(coro):
+            task = asyncio.ensure_future(coro)
+            tasks.append(task)
+            return task
+
+        owui = {name: _RecordingOwuiModule(name, touched) for name in (
+            "open_webui", "open_webui.socket", "open_webui.socket.main", "open_webui.main",
+            "open_webui.tasks", "open_webui.models", "open_webui.models.chats",
+            "open_webui.models.chat_messages", "open_webui.models.users",
+            "open_webui.models.functions", "open_webui.internal", "open_webui.internal.db")}
+        for name, module in owui.items():
+            parent, _, leaf = name.rpartition(".")
+            if parent:
+                owui[parent].__dict__[leaf] = module
+        mod._action_fallback_connection = None
+        try:
+            with mock.patch.dict(sys.modules, owui), \
+                 mock.patch.object(mod._GatewayConnection, "_connect_and_start", fake_connect), \
+                 mock.patch.object(mod._GatewayConnection, "_reconnect", fake_connect), \
+                 mock.patch.object(mod, "spawn_background", spawn), \
+                 mock.patch.object(mod, "pipe_log", logs.append):
+                conn, source = await _get_action_connection(
+                    lambda: types.SimpleNamespace(AGENT_ID="main"))
+                await conn._event_loop_task
+                await settle_background()
+        finally:
+            mod._action_fallback_connection = None
+
+        self.assertEqual(source, "action-own")
+        self.assertFalse(sockets, "both sockets played")
+        self.assertEqual(conn.gateway_restarts, 1)
+        self.assertEqual([t.exception() for t in tasks if t.exception()], [])
+        self.assertEqual([line for line in logs
+                          if "error" in line.lower() or "failed" in line.lower()], [])
+        # Each path was reached: both hellos, the frame gap, the restart, the
+        # settle's subscription.
+        self.assertEqual(sent.count("sessions.subscribe"), 2)
+        self.assertIn("sessions.messages.subscribe", sent)
+        for reached in ("frame seq gap", "WS disconnected", "Gateway restarted"):
+            self.assertTrue(any(reached in line for line in logs), (reached, logs))
+        self.assertEqual(sorted(set(sent) - self.READ_ONLY), [])
+        # Only this function's own stash was looked up: no Open WebUI API.
+        self.assertEqual([t for t in touched if not (
+            t[0] == "open_webui.socket.main" and t[1].startswith("_openclaw_"))], [])
+        self.assertEqual(dict(getattr(conn, "_turn_pumps", {})), {})
+        self.assertEqual(dict(getattr(conn, "_turn_writers", {})), {})
+
+
 class SessionKeyTests(unittest.TestCase):
     def test_matches_pipe_format(self):
         """Must stay byte-identical to gateway.py's _owui_session_key (same
