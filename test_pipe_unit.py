@@ -1316,10 +1316,26 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.005)
         self.fail(f"{run_id} never registered")
 
+    def _hold_parked_timers(self):
+        """The fallback window of a parked run (`INTERRUPT_GRACE_SECONDS`) is
+        a wall-clock timer. A test of the next reply claiming the run drives
+        that claim itself, so the window must not close on its own: a single
+        debug-mode loop step of this harness takes 0.3 s idle and seconds on
+        a loaded host (ELI-154). The timer is recorded here and never runs;
+        returns the windows armed."""
+        armed = []
+        patch = mock.patch.object(self.conn, "_arm_parked_timer",
+                                  lambda session_key, entry, wait_s: armed.append(wait_s))
+        patch.start()
+        self.addCleanup(patch.stop)
+        return armed
+
     async def _read(self, gen, want):
         out = ""
         while want not in out:
-            out += await asyncio.wait_for(gen.__anext__(), 2)
+            # Bounds a hang only: one loop step of this harness can take
+            # seconds on a loaded host (ELI-154).
+            out += await asyncio.wait_for(gen.__anext__(), 30)
         return out
 
     @staticmethod
@@ -1631,6 +1647,7 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         3, where the catch-all arrived. With no message to hand over, the
         lost lines stay lost, and the catch-all repeats none of the others
         (a reply with a message hands over: GapHandoverReplayTests)."""
+        armed = self._hold_parked_timers()
         r1 = self._reply("count to 30", "m1", intent="send_now")
         first = asyncio.ensure_future(r1.__anext__())
         await self._until_registered("run-1")
@@ -1665,8 +1682,10 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(nums), len(set(nums)), "no line may be shown twice")
         self.assertEqual(sorted(nums), list(range(4, 31)))
         self.assertNotIn("abort", self.rpc)
+        self.assertGreaterEqual(armed.count(0.3), 2, "each Send now parked the run for the next reply")
 
     async def test_send_now_twice_loses_nothing(self):
+        armed = self._hold_parked_timers()
         r1 = self._reply("count to 1500", "m1")
         first = asyncio.ensure_future(r1.__anext__())
         await self._until_registered("run-1")
@@ -1703,6 +1722,7 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sent, ["count to 1500", "test\n\nanother test"],
                          "the interrupted reply's own message must still be sent")
         self.assertNotIn("abort", self.rpc, "an interrupt must not stop the run")
+        self.assertEqual(armed[:2], [0.3, 0.3], "each Send now parked the run for the next reply")
 
     async def test_send_now_answer_survives_a_slow_follow_up(self):
         # The live failure after the first deploy: the follow-up came 3.4s
