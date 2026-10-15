@@ -9200,6 +9200,13 @@ class TextParityTests(unittest.IsolatedAsyncioTestCase):
             "media before a tool card (inline)": ([A("See MEDIA:chart.png"), *tool, A("Next.")],
                                                   f"See {self.IMG}Next."),
             "prompt mid-line, two deltas (writer)": ([A("Checking. "), A(P)], "Checking. " + P),
+            "media in an item (writer)": ([I("message", "Look: MEDIA:chart.png done.")],
+                                          f"Look: {self.IMG}\ndone."),
+            "media ending an item (writer)": ([I("message", "Look: MEDIA:chart.png")], f"Look: {self.IMG}"),
+            "prompt after text in an item (writer)": ([I("message", "Some context.\n\n" + P)],
+                                                      "Some context.\n\n1. main\n2. dev"),
+            "prompt mid-line after an item (writer)": ([I("preamble", "Checking."), A(" " + P)],
+                                                       "Checking. " + P),
         }
 
     async def inline(self, steps):
