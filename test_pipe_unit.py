@@ -8759,6 +8759,50 @@ class NeedsInputMarkerTests(unittest.IsolatedAsyncioTestCase):
             "", self.Q, self.ocp._fence_open_after(shown))
         self.assertEqual((flush, held), ("", self.Q), "the question was not held for a card")
 
+    # ELI-142: an unanswered card ends the reply with its question as text.
+    # The incident's form was JSON with three Hebrew questions, which showed
+    # as the raw JSON body.
+    HEBREW_FORM = {"questions": [
+        {"header": "טווח", "question": "לאיזה טווח השקעה?",
+         "options": ["קצר - עד שנה", "ארוך - 5 שנים ומעלה"]},
+        {"header": "סיכון", "question": "כמה סיכון אתה מוכן לקחת?",
+         "options": [{"label": "נמוך", "description": "אג\"ח ומדדים"}, {"label": "גבוה"}]},
+        {"header": "סכום", "question": "כמה להשקיע בחודש?"},
+    ]}
+
+    async def test_an_unanswered_json_form_ends_the_reply_as_readable_text(self):
+        async def event_call(payload):
+            return {"error": "Event call timed out. The browser tab may be inactive or closed."}
+        prompt = (f"{self.MARKER}\n```json\n"
+                  + json.dumps(self.HEBREW_FORM, ensure_ascii=False, indent=2) + "\n```\n")
+        with mock.patch.object(self.ocp, "_owui_supports_native_ask_user", lambda: True):
+            out = await self._stream("Two things first.\n" + prompt, event_call)
+        self.assertEqual(out, (
+            "Two things first.\n"
+            "1. **טווח**: לאיזה טווח השקעה?\n"
+            "   - קצר - עד שנה\n"
+            "   - ארוך - 5 שנים ומעלה\n"
+            "2. **סיכון**: כמה סיכון אתה מוכן לקחת?\n"
+            "   - נמוך - אג\"ח ומדדים\n"
+            "   - גבוה\n"
+            "3. **סכום**: כמה להשקיע בחודש?\n"
+            "\n"
+            "_Answer in your next message._"))
+
+    def test_a_single_json_question_is_not_numbered(self):
+        prompt = self.MARKER + "\n" + json.dumps({"questions": [
+            {"question": "Where should the checks run?",
+             "options": [{"label": "GitHub Actions", "description": "Free here"}, "GitLab CI"]}]})
+        self.assertEqual(self.ocp._ask_user_fallback_text(prompt), (
+            "Where should the checks run?\n"
+            "- GitHub Actions - Free here\n"
+            "- GitLab CI\n"
+            "\n"
+            "_Answer in your next message._"))
+        # The text form keeps its own text, marker line stripped, as before.
+        self.assertEqual(self.ocp._ask_user_fallback_text(self.MARKER + "\nColor?\n1. Red\n2. Blue"),
+                         "Color?\n1. Red\n2. Blue")
+
     async def test_F4_a_fence_left_open_before_a_tool_call_does_not_hide_the_next_question(self):
         """The text after a tool call is a new message item: a fence the
         previous item left open (cut off) does not continue into it."""
