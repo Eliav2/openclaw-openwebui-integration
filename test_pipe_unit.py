@@ -738,6 +738,22 @@ class TurnRendererOutputTests(unittest.TestCase):
         self.assertEqual(r.output[0]["name"], f"Bash {TOOL_ERROR_MARK}")
         self.assertIn("tool call failed", r.output[1]["output"][0]["text"])
 
+    def test_drop_shown_cuts_the_text_and_the_cards_another_message_holds(self):
+        r = _TurnRenderer()
+        r.feed({"stream": "assistant", "data": {"delta": "One."}})
+        r.feed({"stream": "tool", "data": {"phase": "start", "name": "Read", "toolCallId": "t1", "args": {}}})
+        r.feed({"stream": "tool", "data": {"phase": "result", "name": "Read", "toolCallId": "t1", "result": "x"}})
+        r.feed({"stream": "assistant", "data": {"delta": "Two. Three."}})
+        r.feed({"stream": "tool", "data": {"phase": "start", "name": "Bash", "toolCallId": "t2", "args": {}}})
+        r.feed({"stream": "tool", "data": {"phase": "result", "name": "Bash", "toolCallId": "t2", "result": "y"}})
+        self.assertFalse(r.drop_shown("One!"), "a start that does not line up changes nothing")
+        self.assertEqual(len(r.output), 6)
+        self.assertTrue(r.drop_shown("One.Two. "))
+        self.assertEqual(r.text, "Three.")
+        self.assertEqual([(i["type"], i.get("id") or i.get("call_id")) for i in r.output[1:]],
+                         [("function_call", "t2"), ("function_call_output", "fco_t2")])
+        self.assertEqual(r.output[0]["content"][0]["text"], "Three.")
+
     def test_finished_output_completes_open_items_without_touching_the_live_copy(self):
         r = _TurnRenderer()
         r.feed({"stream": "assistant", "data": {"delta": "Hi"}})
@@ -7110,7 +7126,8 @@ class AgentTurnRoutingTests(_RoutingCase):
         self.add_stub(self.STUB, content=lines(11, 20))
         self.conn.register_run_target(self.key, run, self.CHAT, self.STUB)
         self.conn.seed_run_renderer(self.key, run, asyncio.Queue(),
-                                    run_text={"received": lines(1, 10), "item": ""})
+                                    run_text={"received": lines(1, 10), "stream": lines(1, 10),
+                                              "item": ""})
         self.conn._run_renderers[f"{self.key}:{run}"].feed(_delta(lines(11, 20)))
         self.assertTrue(await self.dispatch(run, _delta(lines(21, 25))))
         await self.dispatch(run, {"state": "final"})

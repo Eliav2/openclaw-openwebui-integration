@@ -1177,6 +1177,30 @@ class _TurnRenderer:
             self._assistant_stream_text = run_text.get("received", "")
             self._last_item_text = run_text.get("item", "")
 
+    def drop_shown(self, shown: str) -> bool:
+        """Drop the start of the run that `shown` is, which another message
+        already holds (an adopted run, ELI-147): its text and the cards
+        inside it. False, changing nothing, when the text does not start
+        with it."""
+        if not self.text.startswith(shown):
+            return False
+        cut, pos, kept = len(shown), 0, []
+        for item in self.output:
+            if item.get("type") == "message":
+                text = item["content"][0]["text"]
+                start, pos = pos, pos + len(text)
+                if pos <= cut:
+                    continue
+                if start < cut:
+                    item = copy.deepcopy(item)
+                    item["content"][0]["text"] = text[cut - start:]
+            elif pos < cut:
+                continue
+            kept.append(item)
+        self.output, self.text = kept, self.text[cut:]
+        self.visible_text = self.text
+        return True
+
     def _add(self, chunk: str) -> None:
         if chunk:
             self.visible_text += chunk
@@ -1757,9 +1781,7 @@ class _GatewayConnection:
                 or (session_key, run_id) in self._turn_pumps):
             return False
         pump = self._turn_pumps[(session_key, run_id)] = _RunPump()
-        pump.handover = {"message_id": target["message_id"],
-                         "renderer": self._run_renderers.get(key),
-                         "thinking": thinking or target.get("thinking")}
+        pump.handover = self.handover_of(session_key, run_id, thinking)
         pump.stop_notice_before = self._stop_notice_seen
         self.unregister_run_target(session_key, run_id)
         spawn_background(_turn_pump_loop(self, session_key, run_id, parsed, pump))
@@ -1864,6 +1886,15 @@ class _GatewayConnection:
             for stale in list(self._run_targets)[:50]:
                 self._run_targets.pop(stale, None)
                 self._run_renderers.pop(stale, None)
+
+    def handover_of(self, session_key: str, run_id: str, thinking: str | None = None) -> dict:
+        """What a turn writer takes over from a run's request (DESIGN 2.6):
+        its message, its shadow renderer, its thinking level, and `shown`,
+        what earlier replies already showed of an adopted run."""
+        key = f"{session_key}:{run_id}"
+        target = self._run_targets[key]
+        return {"message_id": target["message_id"], "renderer": self._run_renderers.get(key),
+                "thinking": thinking or target.get("thinking"), "shown": target.get("shown", "")}
 
     def unregister_run_target(self, session_key: str, run_id: str) -> None:
         key = f"{session_key}:{run_id}"
@@ -2428,10 +2459,14 @@ class _GatewayConnection:
         in `queue`, which were dispatched before this reply registered its
         own target. Without this a handover to a turn writer would miss the
         buffered text and duplicate the rest."""
-        renderer = self._run_renderers.get(f"{session_key}:{run_id}")
+        key = f"{session_key}:{run_id}"
+        renderer = self._run_renderers.get(key)
         if renderer is None:
             return
         renderer.seed(run_text)
+        # What the earlier replies showed of the run is theirs: a writer that
+        # takes this one over rebuilds from after it (ELI-147).
+        self._run_targets[key]["shown"] = (run_text or {}).get("stream", "")
         for msg in list(getattr(queue, "_queue", ())):
             try:
                 renderer.feed(msg.get("payload", {}))

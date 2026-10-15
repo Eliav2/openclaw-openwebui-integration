@@ -303,7 +303,7 @@ class _TurnWriter:
     def __init__(self, conn: "_GatewayConnection", *, session_key: str, chat_id: str,
                  user_id: str, run_id: str, message_id: str | None,
                  takeover: bool = False, renderer: "_TurnRenderer | None" = None,
-                 thinking: str | None = None, wake: dict | None = None):
+                 thinking: str | None = None, wake: dict | None = None, shown: str = ""):
         self.conn = conn
         self.session_key, self.chat_id, self.user_id = session_key, chat_id, user_id
         self.run_id, self.message_id = run_id, message_id
@@ -316,6 +316,9 @@ class _TurnWriter:
         # A cron wake (ELI-103): {key, at, job} of its turn, and `end` once its
         # terminal arrived. Its transcript span is a time window, not a run id.
         self.wake = wake
+        # What earlier replies showed of a run M continues (an adopted run,
+        # ELI-147): the transcript rebuild of M starts after it.
+        self.shown = {run_id: shown} if shown else {}
         self.opened = False
         self.task_id: str | None = None
         # every run written into M, in transcript order (_adopt_recoveries_from)
@@ -878,6 +881,11 @@ class _TurnWriter:
                      f"{len(self.runs)} run(s); keeping what streamed")
             return None
         rest = _history_renderer([m for s in spans[k:] for m in s])
+        shown = self.shown.get(self.runs[k], "")
+        if shown and not rest.drop_shown(shown):
+            pipe_log(f"  turn writer: run {self.runs[k][:24]}... does not start with what earlier "
+                     f"replies showed; keeping what streamed in {self.message_id[:8]}...")
+            return None
         if not rest.output:
             return None
         cut = min((starts[r] for r in self.runs[k:] if r in starts), default=(len(out), len(text)))
@@ -1068,9 +1076,7 @@ def _turn_queue(conn: "_GatewayConnection", sess: str, run: str, parsed: tuple,
             # DESIGN 2.6: the request streaming this run ended before it. The
             # writer continues in the same message from the shadow renderer,
             # which already holds this event.
-            pump.handover = {"message_id": target["message_id"],
-                             "renderer": conn._run_renderers.get(f"{sess}:{run}"),
-                             "thinking": target.get("thinking")}
+            pump.handover = conn.handover_of(sess, run)
             conn.unregister_run_target(sess, run)
         spawn_background(_turn_pump_loop(conn, sess, run, parsed, pump))
         spawn_background(conn.ensure_message_subscription(sess))
@@ -1250,7 +1256,8 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
         elif handed is not None:
             pump.writer = _TurnWriter(conn, session_key=sess, chat_id=chat_id, user_id=user_id,
                                       run_id=run, message_id=handed["message_id"], takeover=True,
-                                      renderer=handed["renderer"], thinking=handed.get("thinking"))
+                                      renderer=handed["renderer"], thinking=handed.get("thinking"),
+                                      shown=handed.get("shown", ""))
             conn._turn_writers[(chat_id, handed["message_id"])] = pump.writer
             await pump.writer.feed(None)
         elif re.fullmatch(_UUID_RE, run) and run == await conn.session_id_for(sess):
