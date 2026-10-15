@@ -106,11 +106,6 @@
       "paths": [
         "@SCREENSHOTS_DIR@/sample-usage"
       ]
-    },
-    "entries": {
-      "anthropic": {
-        "enabled": false
-      }
     }
   }
 }

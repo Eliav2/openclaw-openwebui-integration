@@ -1,9 +1,10 @@
 // Test-only Gateway plugin for the README screenshots (scripts/screenshots).
-// The screenshot stack's default provider ("anthropic", served by e2e/fake_llm.py)
-// has no real quota, so `usage.status` would report no windows and the Status
-// dialog would show "no rate limits". This serves fixed sample numbers through
-// OpenClaw's provider usage hooks instead. The docs caption says they are
-// sample data. Never load this on a real Gateway.
+// The screenshot stack's "anthropic" provider is served by e2e/fake_llm.py and
+// has no real quota, so the Status dialog would show "no rate limits". The pipe
+// falls back to `claudeCliUsage.status` (gateway-plugins/claude-cli-usage) when
+// usage.status has no anthropic windows; this answers that method with fixed
+// sample numbers, so the bundled anthropic provider stays untouched. The docs
+// caption says they are sample data. Never load this on a real Gateway.
 const HOUR = 3_600_000;
 
 export function sampleSnapshot(now = Date.now()) {
@@ -21,14 +22,14 @@ export function sampleSnapshot(now = Date.now()) {
 export default {
   id: "screenshot-sample-usage",
   name: "Screenshot sample usage",
-  description: "Test-only: fixed rate-limit windows for the screenshot stack's \"anthropic\" provider.",
+  description: "Test-only: claudeCliUsage.status with fixed sample rate-limit windows.",
   register(api) {
-    api.registerProvider({
-      id: "anthropic",
-      label: "Anthropic",
-      auth: [],
-      resolveUsageAuth: async () => ({ token: "sample" }),
-      fetchUsageSnapshot: async () => sampleSnapshot(),
-    });
+    api.registerGatewayMethod(
+      "claudeCliUsage.status",
+      async ({ respond }) => {
+        respond(true, sampleSnapshot());
+      },
+      { scope: "operator.read" },
+    );
   },
 };
