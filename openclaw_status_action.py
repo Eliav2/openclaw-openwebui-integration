@@ -6369,8 +6369,10 @@ async def _build_usage_status_lines(conn, session_key, timeout: float = 5) -> li
         pass
 
     context_and_primary = " · ".join(bit for bit in (context_bit, primary_bit) if bit) or None
+    # Which provider answered, as its own row under every reply.
+    provider_line = f"🤖 Answered by {provider}" if provider else None
 
-    return [line for line in (goal_line, *reset_lines, context_and_primary) if line]
+    return [line for line in (goal_line, *reset_lines, provider_line, context_and_primary) if line]
 
 
 async def _emit_message_snapshot(__event_emitter__, content):
