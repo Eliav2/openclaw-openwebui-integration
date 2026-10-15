@@ -342,12 +342,11 @@ def send(page: Page, text: str) -> str:
     return page.evaluate("() => location.pathname").split("/c/", 1)[1].strip("/")
 
 
-def settle_title(page: Page) -> None:
-    """The chat header cross-fades from the first message to the chat's title
-    as it loads: wait until nothing in the header animates."""
-    wait_js(page, """() => !document.getAnimations().some(a => a.playState === 'running'
-                 && a.effect && a.effect.target && a.effect.target.closest && a.effect.target.closest('nav'))""",
-            "the chat title to settle", 30_000)
+def scroll_chat_to_top(page: Page) -> None:
+    """Scroll the conversation to its start. Scrolled down, the first user
+    message sits under the translucent chat header and shows through its title."""
+    page.evaluate("() => { const m = document.getElementById('messages-container'); if (m) m.scrollTop = 0; }")
+    page.wait_for_timeout(200)  # one frame for the scroll to paint
 
 
 def park_mouse(page: Page) -> None:
@@ -594,7 +593,7 @@ class Scenes:
         attach_filter(self.token, MODEL, "openclaw_thinking")
         page.goto(f"{BASE}/c/{self.hero_chat}")
         page.wait_for_selector("#chat-input")
-        settle_title(page)
+        scroll_chat_to_top(page)
         page.locator("button[aria-label='Integrations']").first.click()
         wait_js(page, "() => /thinking/i.test(document.body.innerText)", "the thinking toggle in the menu", 30_000)
         self.s.shot(page, "thinking-toggle")
