@@ -918,9 +918,12 @@ class _Page:
         for t, e in rows:
             d = (e.get("data") or {}).get("data")
             d = d if isinstance(d, dict) else {}
-            shown = d.get("delta") or (d.get("item") or {}).get("type") or _shown(d)[-60:]
-            out.append(f"  {t - since:7.2f}s {(e.get('data') or {}).get('type')} {d.get('type', '')} {shown!r}")
-        return f"{len(rows)} event(s) for {message_id[:8]}:\n" + "\n".join(out[-60:])
+            item = d.get("item") or {}
+            shown = d.get("delta") or item.get("type") or _shown(d)[-60:]
+            ident = d.get("item_id") or item.get("id") or ""
+            out.append(f"  {t - since:7.2f}s {(e.get('data') or {}).get('type')} {d.get('type', '')} "
+                       f"{str(ident)[-12:]} {shown!r}")
+        return f"{len(rows)} event(s) for {message_id[:8]}:\n" + "\n".join(out)
 
     def close(self) -> None:
         self.ws.close()
@@ -1042,7 +1045,10 @@ def _redeploy_plain() -> tuple[subprocess.Popen, threading.Event, list]:
 
 
 @pytest.mark.skipif(not os.environ.get("GATEWAY_TOKEN"), reason="install.py repair needs GATEWAY_TOKEN")
-def test_a_plain_redeploy_mid_reply_leaves_the_reply_whole(token):
+@pytest.mark.parametrize("redeploy", [False, True], ids=["control", "redeploy"])
+def test_a_plain_redeploy_mid_reply_leaves_the_reply_whole(token, redeploy):
+    """`control` streams the same reply with no redeploy: every check below
+    must hold there, so a failure with the redeploy is the redeploy's."""
     page = _Page(token)
     try:
         sent_at = time.monotonic()
@@ -1051,19 +1057,23 @@ def test_a_plain_redeploy_mid_reply_leaves_the_reply_whole(token):
         # Redeploy once the first tool card is done and the text after it streams.
         page.wait("the reply to stream past its first tool card",
                   lambda: "mid-3" in _output_text(page.streamed(aid)))
-        proc, deployed, lines = _redeploy_plain()
-        assert deployed.wait(120), "install.py repair never updated the Pipe:\n" + "\n".join(
-            line for _t, line in lines[-40:])
-        deployed_at = next(t for t, line in lines if DEPLOY_LINE in line)
-        assert proc.wait(300) == 0, "install.py repair failed after the deploy:\n" + "\n".join(
-            line for _t, line in lines[-60:])
+        if redeploy:
+            proc, deployed, lines = _redeploy_plain()
+            assert deployed.wait(120), "install.py repair never updated the Pipe:\n" + "\n".join(
+                line for _t, line in lines[-40:])
+            deployed_at = next(t for t, line in lines if DEPLOY_LINE in line)
+            assert proc.wait(300) == 0, "install.py repair failed after the deploy:\n" + "\n".join(
+                line for _t, line in lines[-60:])
+        else:
+            deployed_at = time.monotonic()   # the point the redeploy would have been
 
         page.wait("the reply to finish on the page", lambda: any(
             d.get("done") for _t, d in page.completions(aid)), timeout_s=180)
         events = page.completions(aid)
 
         # Precondition: the new code went in while the reply was streaming.
-        print(page.summary(aid, sent_at), f"\nredeploy at {deployed_at - sent_at:.2f}s")
+        print(page.summary(aid, sent_at), f"\n{'redeploy' if redeploy else 'no redeploy'} "
+              f"at {deployed_at - sent_at:.2f}s")
         done_at = next(t for t, d in events if d.get("done"))
         assert deployed_at < done_at, "the reply finished before the redeploy; nothing was tested"
         shown_then = _output_text(page.streamed(aid, until=deployed_at))
@@ -1071,39 +1081,45 @@ def test_a_plain_redeploy_mid_reply_leaves_the_reply_whole(token):
 
         # The page kept streaming after the redeploy: the rest of the reply
         # arrived live, not only in the final save.
-        assert page.last_stream_event_at(aid) > deployed_at, "no live event after the redeploy"
+        problems = []
+        if page.last_stream_event_at(aid) <= deployed_at:
+            problems.append("no live event after the redeploy")
         streamed = page.streamed(aid)
         live_words = re.findall(r"E2E_DEPLOY_\w+|mid-\d+|end-\d+", _output_text(streamed))
-        assert live_words == DEPLOY_WORDS, f"what streamed live is not whole: {_output_text(streamed)!r}"
+        if live_words != DEPLOY_WORDS:
+            problems.append(f"what the page streamed is not the reply once: {_output_text(streamed)!r}")
 
         # The saved reply is whole: every word once, in order, both tool cards closed.
         msgs = _chat_messages(token, chat_id)
         saved = msgs[aid]
-        assert saved.get("done") is True, json.dumps(saved)[:1500]
+        if saved.get("done") is not True:
+            problems.append(f"the saved reply is not done: {json.dumps(saved)[:1500]}")
         text = _shown(saved)
         words = re.findall(r"E2E_DEPLOY_\w+|mid-\d+|end-\d+", text)
-        assert words == DEPLOY_WORDS, f"the saved reply is not whole: {text!r}"
+        if words != DEPLOY_WORDS:
+            problems.append(f"the saved reply is not the reply once: {text!r}")
         calls = _output_calls(saved.get("output"))
         started = [c for kind, c in calls if kind == "function_call"]
         finished = [c for kind, c in calls if kind == "function_call_output"]
-        assert len(started) == 2 and sorted(started) == sorted(finished), f"tool cards: {calls}"
+        if not (len(started) == 2 and sorted(started) == sorted(finished)):
+            problems.append(f"saved tool cards: {calls}")
 
         # The saved copy is what streamed, and what the page shows at the end.
-        assert _output_text(streamed) == _output_text(saved.get("output")), (
-            f"streamed and saved differ:\nstreamed: {_output_text(streamed)!r}\n"
-            f"saved:    {_output_text(saved.get('output'))!r}")
-        assert _output_calls(streamed) == calls, (_output_calls(streamed), calls)
+        if _output_text(streamed) != _output_text(saved.get("output")):
+            problems.append("what streamed and what was saved differ")
+        if _output_calls(streamed) != calls:
+            problems.append(f"streamed cards {_output_calls(streamed)} != saved {calls}")
         final = next(d for _t, d in events if d.get("done"))
-        if final.get("output"):
-            assert _output_text(final["output"]) == _output_text(saved.get("output")), (
-                f"the page's final event and the saved reply differ:\n"
-                f"page:  {_output_text(final['output'])!r}\nsaved: {_output_text(saved.get('output'))!r}")
+        if final.get("output") and _output_text(final["output"]) != _output_text(saved.get("output")):
+            problems.append(f"the page's final event shows {_output_text(final['output'])!r}")
 
         # The next message in the chat runs.
         _, next_id = _send_in_chat(token, page, chat_id, "Respond with exactly: E2E_AFTER_DEPLOY")
         msgs = _wait_for(token, chat_id, ["E2E_AFTER_DEPLOY"])
-        assert (msgs[next_id].get("content") or "").strip() == "E2E_AFTER_DEPLOY", (
-            json.dumps(msgs[next_id])[:1500])
+        if (msgs[next_id].get("content") or "").strip() != "E2E_AFTER_DEPLOY":
+            problems.append(f"the next message: {json.dumps(msgs[next_id])[:1500]}")
         _assert_clean(token, chat_id, msgs)
+        print(page.summary(next_id, sent_at))
+        assert not problems, "\n".join(problems)
     finally:
         page.close()
