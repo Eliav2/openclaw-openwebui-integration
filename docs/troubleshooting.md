@@ -34,6 +34,7 @@ More on these commands: [The installer](./install/installer.md).
 | An image link points at port 18791 instead of being attached | The upload to Open WebUI's Files API failed and the Pipe fell back to its own file server. The log says `OWUI file upload failed; falling back`. Check [`OWUI_BASE_URL`](./configuration.md#owui_base_url), the request's login or [`OWUI_API_KEY`](./configuration.md#owui_api_key), and the Open WebUI log. See also [Security](./security.md#the-media-file-server). |
 | A reply goes quiet for a long time | The Pipe has no silence timeout: a quiet reply is usually a long tool call or the model thinking. The reply ends when the run ends, fails or is stopped. If the page stopped updating, reload: the partial answer is kept. Check the backend log for the turn. See [Reliability](./features/reliability.md). |
 | The answer stops after a Gateway restart | The Pipe resumes a reply cut off by a Gateway restart, up to 3 times per reply. After that the reply ends with a "cut off" note: the Gateway was down too long or kept restarting. Send the message again. |
+| A typed `/compact`, `/status`, `/fork` or `/model` does nothing in OpenClaw | Open WebUI 0.12 handles these commands itself, so they never reach OpenClaw. To compact the session, use the Compact button in the [Status dialog](./features/status.md#compact). |
 | Chats never get a title | [`TITLE_GEN_AGENT_ID`](./configuration.md#title_gen_agent_id) (default `title-gen`) must name an agent your Gateway defines. If it does not, titles are skipped without an error. |
 
 ## Errors in the chat

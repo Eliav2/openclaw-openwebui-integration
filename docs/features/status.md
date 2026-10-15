@@ -43,6 +43,8 @@ While a reply is running, Compact refuses with "A response is currently in progr
 
 The `/compact` command becomes a turn in the session's stored transcript, so other tools that read that history see it, but it never appears as a message in the Open WebUI chat.
 
+Typing `/compact` in the message box does not compact the session: Open WebUI 0.12 handles `/compact`, `/status`, `/fork` and `/model` itself, so they never reach OpenClaw. Use the Compact button in this dialog instead.
+
 ## Sub-agents
 
 The Subagents section lists the child sessions this chat's runs spawned: the ones still active and the ones that ended in the last 30 minutes, with their status and elapsed time. A running sub-agent's elapsed time counts up while the dialog is open.
