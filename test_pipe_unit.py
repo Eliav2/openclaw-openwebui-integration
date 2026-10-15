@@ -9175,6 +9175,158 @@ class InlineOwnerRuleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("sessions.list", self.rpc)
 
 
+class GapHandoverReplayTests(_RoutingCase):
+    """ELI-147 slice 4: events lost on the Gateway socket (a dropped frame, a
+    drop and reconnect) end the user's reply and hand its message to the
+    turn writer, whose transcript rebuild puts back what was lost, tool cards
+    included. Replayed through the real request, the real receive loop on a
+    scripted socket, and the writer writing into Open WebUI. Gap repair put
+    back lost text only, and a lost card stayed lost."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        test = self
+        self.active = False                          # busy from its chat.send to its settle
+        self.run = None
+        self.chat_sends = []
+
+        def row():
+            return {"key": test.key, "hasActiveRun": test.active,
+                    "status": "running" if test.active else "done", "lastRunId": test.run}
+
+        async def send_request(method, params, timeout=10):
+            test.sent.append((method, copy.deepcopy(params)))
+            if method == "chat.send":
+                test.chat_sends.append(params)
+                test.active = True
+                return {"runId": params["idempotencyKey"], "status": "started"}
+            if method == "chat.history":
+                return copy.deepcopy(test.history)
+            if method == "sessions.list":
+                return {"sessions": [row()]}
+            if method == "sessions.subscribe":
+                return {"list": {"sessions": [row()] if test.active else []}}
+            if method == "sessions.describe":
+                return {"session": {"status": "running" if test.active else "done"}}
+            return {}
+        self.conn.send_request = send_request
+        self.conn.model_patch_cached = lambda *a, **k: True
+
+        class Socket:
+            def __init__(self_):
+                self_.frames = asyncio.Queue()
+
+            async def recv(self_):
+                frame = await self_.frames.get()
+                if frame == "drop":
+                    raise websockets.exceptions.ConnectionClosed(None, None)
+                return json.dumps(frame)
+        self.socket = Socket()
+        self.conn._ws = self.socket
+        self.seq = 0
+
+        async def reconnect():
+            # A new socket after the hello: its frame seq starts again, and
+            # the loop renews the subscriptions (`_subscribe_all`).
+            test.conn._ws, test.conn._frame_seq, test.seq = test.socket, None, 0
+            test.conn._subscriptions_stale = True
+        self.conn._reconnect = reconnect
+        loop = asyncio.ensure_future(self.conn._event_loop())
+
+        async def stop_loop():
+            self.conn._stopped = True
+            loop.cancel()
+            await asyncio.gather(loop, return_exceptions=True)
+        self.addAsyncCleanup(stop_loop)
+
+        import openclaw_pipe as ocp
+
+        async def get_conn(_valves):
+            return self.conn
+        for patch in (mock.patch.object(ocp, "_get_gateway_connection", get_conn),
+                      mock.patch.object(ocp, "_build_usage_status_lines",
+                                        mock.AsyncMock(return_value=[]))):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.pipe = Pipe()
+        self.pipe.valves.AGENT_ID = "main"
+        self.pipe.valves.AUTO_TITLE = False
+        self.pipe.valves.INTERRUPT_GRACE_SECONDS = 0.3
+
+    async def start_reply(self, text="count", message_id=None, intent=None):
+        """A user turn's request, running until its run is sent."""
+        message_id = message_id or self.STUB
+        self.add_stub(message_id)
+
+        async def emitter(event):
+            pass
+
+        async def event_call(event):
+            return intent
+        body = {"model": "openclaw_gateway.main", "messages": [{"role": "user", "content": text}]}
+        meta = {"chat_id": self.CHAT, "user_id": self.USER, "message_id": message_id}
+        gen = self.pipe._pipe_impl(body, emitter, __metadata__=meta,
+                                   __event_call__=event_call if intent else None)
+        reply = {"gen": gen, "text": "", "items": []}
+
+        async def drain():
+            async for chunk in gen:
+                if isinstance(chunk, str):
+                    reply["text"] += chunk
+                elif isinstance(chunk, dict) and chunk.get("type") == "response.output_item.added":
+                    reply["items"].append(chunk["item"])
+        sends = len(self.chat_sends)
+        reply["task"] = asyncio.ensure_future(drain())
+        for _ in range(400):
+            if len(self.chat_sends) > sends:
+                break
+            await asyncio.sleep(0.005)
+        if self.run is None:
+            self.run = self.chat_sends[-1]["idempotencyKey"]
+        for _ in range(400):
+            if self.conn.consumers_for_event({"sessionKey": self.key, "runId": self.run}):
+                break
+            await asyncio.sleep(0.005)
+        return reply
+
+    def frame(self, payload, event="agent"):
+        self.seq += 1
+        body = payload if event == "sessions.changed" else self.ev(self.run, payload)
+        self.socket.frames.put_nowait({"type": "event", "event": event, "seq": self.seq, "payload": body})
+
+    def lost(self, n=1):
+        """Frames the Gateway sent while this client was slow, or the
+        socket was down: their seq numbers pass, nothing arrives."""
+        self.seq += n
+
+    def settle(self):
+        self.active = False
+        self.frame({"sessionKey": self.key, "hasActiveRun": False, "status": "done",
+                    "lastRunId": self.run, "reason": "chat.run.settled"}, event="sessions.changed")
+
+    async def ended(self, reply):
+        await asyncio.wait_for(reply["task"], 5)   # bounds the test only
+        await self.spin(600)
+
+    def stored(self, message_id=None):
+        m = self.owui.msgs()[message_id or self.STUB]
+        return (m.get("done"), m.get("content"),
+                sum(1 for i in m.get("output") or [] if i.get("type") == "function_call"))
+
+    async def test_case_1_frames_lost_mid_run(self):
+        """A slow client: the Gateway dropped the frames of a whole tool call
+        (only the frame seq shows it). The text around it all arrived."""
+        reply = await self.start_reply()
+        self.history = _turn_history(run=self.run)
+        self.frame(_delta("Reading them."))
+        self.lost(2)                                   # the call's start and result
+        self.frame(_delta("\n\nFound it."))
+        self.frame({"state": "final"}, event="chat")
+        self.settle()
+        await self.ended(reply)
+        self.assertEqual(self.stored(), (True, "Reading them.\n\nFound it.", 1))
+
+
 class ToolCardParityTests(unittest.IsolatedAsyncioTestCase):
     """ELI-147 slice 2: the inline reply and the turn writer show a run's tool
     calls as the same cards. Both are fed one recorded run: a call that
