@@ -901,6 +901,8 @@ class Scenes:
         # button is laid out at its full size and nothing in its row moves.
         wait_js(page, """() => { const b = [...document.querySelectorAll('button[aria-label="OpenClaw Status"]')].pop();
                  if (!b || b.getBoundingClientRect().width < 16) return false;
+                 // Its icon is an image: the button only has its full width once it loaded.
+                 if ([...b.querySelectorAll('img')].some(i => !i.complete || !i.naturalWidth)) return false;
                  let row = b.parentElement;
                  while (row && !row.querySelector('button[aria-label="Copy"]')) row = row.parentElement;
                  return !(row || b).getAnimations({subtree: true}).some(a => a.playState === 'running'); }""",
@@ -914,6 +916,9 @@ class Scenes:
           const right = Math.min(innerWidth, q.right + 12);
           return {x: Math.max(0, right - 300), y: Math.max(0, r.top - 8), width: 300, height: r.height + 16};
         }"""
+        print("  status button: " + json.dumps(page.evaluate("""() => {
+          const b = [...document.querySelectorAll('button[aria-label="OpenClaw Status"]')].pop();
+          const r = b.getBoundingClientRect(); return {left: r.left, right: r.right, width: r.width, vw: innerWidth}; }""")), flush=True)
         self.s.shot(page, "toolbar-button", clip_js=clip, text_selector=".chat-assistant >> nth=-1")
 
 

@@ -80,6 +80,14 @@
     "defaults": {
       "model": {
         "primary": "anthropic/claude-opus-5-5"
+      },
+      "models": {
+        "anthropic/claude-opus-5-5": {},
+        "anthropic/claude-sonnet-5-5": {},
+        "anthropic/claude-haiku-5-5": {},
+        "openai/gpt-5.5": {},
+        "google/gemini-3.1-pro-preview": {},
+        "deepseek/deepseek-v4-flash": {}
       }
     },
     "list": [
