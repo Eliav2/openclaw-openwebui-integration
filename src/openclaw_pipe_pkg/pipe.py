@@ -1321,11 +1321,9 @@ class _PipeTurn:
         # `park_cancelled_turn`), while what THIS reply shows,
         # `visible_message_text`, starts empty.
         self.assistant_stream_text = ""
-        last_item_text = ""
         if self.adopted_run_text:
             self.renderer.seed(self.adopted_run_text)
             self.assistant_stream_text = self.adopted_run_text.get("stream", "")
-            last_item_text = self.adopted_run_text.get("item", "")
         # Offsets in the renderer's `received` text where events were lost (a
         # Gateway socket drop, see `_mark_event_gap`), and which OWUI reply
         # showed the run from which offset, so a lost chunk can be put back
@@ -1556,68 +1554,9 @@ class _PipeTurn:
                                 whole = _item_assistant_text(data) if stream == "item" else ""
                             gap_tail = self.reconcile_whole_text(whole) if whole else None
                             added = self.renderer.feed(payload, gap_tail=gap_tail)
-                        if stream == "assistant":
                             for text in (a for a in added if isinstance(a, str)):
                                 async for chunk in self.show_text(text):
                                     yield chunk
-
-                        # --- Assistant text carried by item/preamble events ---
-                        if stream == "item":
-                            item_text = _item_assistant_text(data)
-                            if item_text:
-                                answer_res = await self.maybe_answer_user_input(item_text)
-                                if answer_res.handled:
-                                    detail_block = ""
-                                    if answer_res.answer:
-                                        detail_block = _ask_user_detail_block(
-                                            answer_res.prompt_text or item_text, answer_res.answer
-                                        )
-                                        self.record_visible_chunk(detail_block)
-                                        yield detail_block
-                                        await self.maybe_emit_snapshot(force=True)
-                                    self.conn.note_turn_rewrite(self.owui_origin_chat_id, self.owui_message_id,
-                                                           answer_res.prompt_text or item_text,
-                                                           detail_block)
-                                    if answer_res.new_run_id and answer_res.new_run_id != self.our_run_id:
-                                        pipe_log(f"  needs-input handled, switching to run {answer_res.new_run_id[:20]}...")
-                                        # The answer run continues this reply (R9).
-                                        self.switch_to_answer_run(answer_res)
-                                        self.conn.unregister_consumer(self.session_key, self.our_run_id, queue=self.queue)
-                                        self.queue = answer_res.queue or self.conn.register_consumer(
-                                            self.session_key, answer_res.new_run_id)
-                                        self.our_run_id = answer_res.new_run_id
-                                    self.done = False
-                                    last_item_text = item_text
-                                    continue
-                                # `gap_tail`: this event's, worked out above.
-                                item_delta = gap_tail if gap_tail is not None else _item_delta_text(
-                                    item_text, last_item_text, self.assistant_stream_text
-                                )
-                                last_item_text = item_text
-                                # Same safety net as the assistant-stream catch-all
-                                # above, and for the same reason: `last_item_text`/
-                                # `assistant_stream_text` can drift from
-                                # `visible_message_text`, and this call site has the
-                                # exact same `_item_delta_text` fallback that
-                                # re-yields the entire text when the prefix check
-                                # fails (P27).
-                                item_delta = _suppress_already_shown(item_delta, self.visible_message_text)
-                                # Unlike the assistant-stream path, item events
-                                # carry no `_advance_input_prompt_buffer` guard,
-                                # so a needs-input prompt that arrives here (and
-                                # wasn't handled into a modal above) would leak
-                                # its raw "OpenClaw needs input:" marker line.
-                                # Strip it defensively.
-                                if _is_user_input_prompt(item_delta):
-                                    stripped = _ask_user_fallback_text(item_delta)
-                                    self.conn.note_turn_rewrite(self.owui_origin_chat_id, self.owui_message_id,
-                                                           item_delta, stripped)
-                                    item_delta = stripped
-                                if item_delta:
-                                    self.text_yielded = True
-                                    pipe_log("  yielded text from item event")
-                                    self.record_visible_chunk(item_delta)
-                                    yield item_delta
 
                         # --- Tool call events ---
                         # The cards come from `_TurnRenderer`, the same code a

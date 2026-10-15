@@ -7919,16 +7919,18 @@ class InlineRewriteWiringTests(unittest.TestCase):
 
     def test_the_inline_reply_records_its_rewrites_and_answer_runs(self):
         src = inspect.getsource(openclaw_pipe._PipeTurn)
-        self.assertEqual(src.count("switch_to_answer_run(answer_res)"), 2, "both answer switches")
-        self.assertEqual(src.count("answer_res.queue or self.conn.register_consumer("), 2)
+        # One answer switch: a prompt in an item event is held and asked
+        # when the run ends, as one in the assistant stream is (ELI-147).
+        self.assertEqual(src.count("switch_to_answer_run(answer_res)"), 1, "the answer switch")
+        self.assertEqual(src.count("answer_res.queue or self.conn.register_consumer("), 1)
         # Review 2af1 N6: the answer run is listened for, and its target moved,
         # before its chat.send.
         ask = src.split("async def maybe_answer_user_input", 1)[1]
         send = ask.index("RUN_SEND")
         self.assertLess(ask.index("conn.register_consumer(self.session_key, idempotency_key)"), send)
         self.assertLess(ask.index("conn.continue_run_target(self.session_key, self.our_run_id, idempotency_key"), send)
-        self.assertGreaterEqual(src.count("conn.note_turn_rewrite("), 5,
-                                "2 MEDIA sites, 2 answered cards, 1 fallback prompt")
+        self.assertGreaterEqual(src.count("conn.note_turn_rewrite("), 4,
+                                "2 MEDIA sites, 1 answered card, 1 fallback prompt")
         self.assertIn("thinking=self.resolved_thinking", src.split("conn.register_run_target(")[1][:200])
 
 

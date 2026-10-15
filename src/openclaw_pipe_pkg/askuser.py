@@ -155,11 +155,10 @@ def _strip_input_marker_line(text: str) -> str:
 
     A needs-input prompt is normally intercepted into a modal and never
     rendered raw. But the fallback paths -- a cancelled/dismissed modal, a run
-    that ended before the modal could fire, or the item-event path which lacks
-    the streaming buffer guard -- can still reach a raw ``yield`` with the marker
-    intact, leaking the literal directive line into the chat. The marker is only
-    ever meaningful as the FIRST line, so drop exactly that line and keep the
-    rest (the actual question) as a readable fallback.
+    that ended before the modal could fire -- can still reach a raw ``yield``
+    with the marker intact, leaking the literal directive line into the chat.
+    The marker is only ever meaningful as the FIRST line, so drop exactly that
+    line and keep the rest (the actual question) as a readable fallback.
     """
     if not text:
         return text
