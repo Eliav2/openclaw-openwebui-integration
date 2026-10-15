@@ -3104,25 +3104,41 @@ def _is_closing_message(message) -> bool:
     return any(k.startswith("cli-assistant:") for k in _idempotency_keys(message))
 
 
+def _run_closed_by(message) -> str | None:
+    """The run a `chat.history` message closes, or None. A claude-cli run
+    closes with its `cli-assistant:<runId>` message. A run on the Gateway's
+    own runtime has no such message: every message it writes carries
+    `__openclaw.runId` (the `chat.send` run id, probed live 2026-10-15), and
+    its last is an assistant message that did not stop for a tool call."""
+    if not isinstance(message, dict) or message.get("role") != "assistant":
+        return None
+    key = next((k for k in _idempotency_keys(message) if k.startswith("cli-assistant:")), "")
+    if key:
+        return key[len("cli-assistant:"):]
+    meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
+    if meta.get("runId") and message.get("stopReason") not in (None, "toolUse"):
+        return str(meta["runId"])
+    return None
+
+
 def _history_run_messages(history: dict, run_id: str) -> list | None:
     """One run's messages in `chat.history`: everything after the user
     message that started it, or after the previous run's closing message
     (a run with no user turn, e.g. a sub-agent announce), through its own
-    closing message (`cli-assistant:<runId>`). None when the run has not
-    closed yet."""
+    closing message (`_run_closed_by`). None when the run has not closed
+    yet."""
     messages = (history or {}).get("messages")
     if not isinstance(messages, list) or not run_id:
         return None
-    wanted = {run_id, f"cli-assistant:{run_id}"}
     for end in range(len(messages) - 1, -1, -1):
         message = messages[end]
         if not isinstance(message, dict) or message.get("role") != "assistant":
             continue
-        if not set(_idempotency_keys(message)) & wanted:
+        if run_id not in _idempotency_keys(message) and _run_closed_by(message) != run_id:
             continue
         start = end
         while start > 0 and (messages[start - 1] or {}).get("role") != "user" \
-                and not _is_closing_message(messages[start - 1]):
+                and not _run_closed_by(messages[start - 1]):
             start -= 1
         return messages[start:end + 1]
     return None
