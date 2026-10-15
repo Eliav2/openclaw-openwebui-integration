@@ -639,6 +639,10 @@ class Scenes:
         page.wait_for_timeout(500)
         print(f"  dialog: {json.dumps(visible_text(page, root), ensure_ascii=False)[:1200]}", flush=True)
         self.s.shot(page, "eli152-dialog", text_selector=root)
+        # The panel scrolls when its lists outgrow the screen: its end.
+        page.evaluate(f"() => {{ const p = document.querySelector('{root}').firstElementChild; p.scrollTop = p.scrollHeight; }}")
+        page.wait_for_timeout(300)
+        self.s.shot(page, "eli152-dialog-end", text_selector=root)
 
     def model_picker(self, page: Page) -> None:
         new_chat(page)
