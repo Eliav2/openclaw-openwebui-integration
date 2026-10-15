@@ -1444,6 +1444,44 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         await self._collect(first2, gen2)
         self.assertEqual(self.sent, ["check the logs", "and now the other log"])
 
+    _NOT_ALLOWED = ('Model "anthropic/are" is not allowed. Use /models to list providers, '
+                    'or /models <provider> to list models.')
+
+    def _chat_error(self, run_id, message):
+        return {"type": "event", "event": "chat", "payload": {
+            "sessionKey": self.SK, "runId": run_id, "state": "error",
+            "errorMessage": message}}
+
+    async def _reply_text(self, events):
+        gen = self._reply("these /model are fine", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        for ev in events:
+            self._queue("run-1").put_nowait(ev)
+        out = await asyncio.wait_for(first, 2)
+        async for chunk in gen:
+            out += chunk if isinstance(chunk, str) else ""
+        return out
+
+    async def test_a_run_refused_before_it_starts_shows_its_error(self):
+        """ELI-139 (2026-10-15, chat 2af17834): a message with "/model are"
+        in its text made the Gateway refuse the run as an inline model
+        directive. Its only event was a chat `state: "error"` carrying the
+        reason, and the reply said "(This turn produced no reply text.)"."""
+        out = await self._reply_text([self._chat_error("run-1", self._NOT_ALLOWED)])
+        self.assertIn(f"**Error:** {self._NOT_ALLOWED}", out)
+        self.assertNotIn("no reply text", out)
+
+    async def test_a_lifecycle_error_is_not_shown_twice(self):
+        out = await self._reply_text([
+            {"type": "event", "event": "agent", "payload": {
+                "sessionKey": self.SK, "runId": "run-1", "stream": "lifecycle",
+                "data": {"phase": "error", "error": "provider overloaded"}}},
+            self._chat_error("run-1", "provider overloaded"),
+        ])
+        self.assertEqual(out.count("**Error:**"), 1)
+        self.assertIn("**Error:** provider overloaded", out)
+
     async def test_a_socket_gap_makes_the_waiter_read_again(self):
         """The settle can be among the events lost while the socket was down,
         so a gap wakes every waiter to re-read the state."""
