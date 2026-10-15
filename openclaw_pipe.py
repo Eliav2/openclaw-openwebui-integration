@@ -10017,9 +10017,9 @@ class _PipeTurn:
                         if msg.get("type") == _RESTART_MARKER_TYPE:
                             # A new Gateway process: the run may be recovered
                             # by it (a crash leaves its row `running`) or need
-                            # a resume. Its row decides, in the turn writer. A
-                            # Send now takeover keeps it, as at a gap (ELI-153).
-                            if not self.adopted_run_id and _hand_over_run(self.conn, self.session_key,
+                            # a resume. Its row decides, in the turn writer,
+                            # unless the reply `keeps_its_run`.
+                            if not self.keeps_its_run and _hand_over_run(self.conn, self.session_key,
                                     self.our_run_id, thinking=self.resolved_thinking, read_row=True):
                                 self.handed_over = self.done = True
                             elif self.awaiting_owner:
@@ -10038,13 +10038,12 @@ class _PipeTurn:
                             # (it closes its own open cards next) and the
                             # events queued behind the gap. Its consumer goes
                             # before any await, so nothing later lands here.
-                            # A reply that took over a run after Send now
-                            # keeps streaming: it still owes the user's message
-                            # (ELI-153). So does a reply with no message (an
-                            # API request). What a gap lost there stays lost.
+                            # A reply that `keeps_its_run` keeps streaming, as
+                            # does one with no message (an API request). What a
+                            # gap lost there stays lost.
                             self.signals_lost = True
                             queued = []
-                            if not self.adopted_run_id and self.owui_message_id:
+                            if not self.keeps_its_run and self.owui_message_id:
                                 queued = self.queue.take_all()
                                 if _hand_over_run(
                                         self.conn, self.session_key, self.our_run_id,
@@ -10094,10 +10093,10 @@ class _PipeTurn:
                         # Gateway (a `running` row) or by a resume. The reply
                         # decides neither: the turn writer takes the message
                         # and the settled row picks the owner. Without a
-                        # message to hand over, or in a Send now takeover
-                        # (ELI-153), it ends here like any error.
+                        # message to hand over, or in a reply that
+                        # `keeps_its_run`, it ends here like any error.
                         if _EXTERNAL_KILL_RE.search(err) or (aborted_run and self.conn._shutdown_seen):
-                            if not self.adopted_run_id and _hand_over_run(self.conn, self.session_key,
+                            if not self.keeps_its_run and _hand_over_run(self.conn, self.session_key,
                                     self.our_run_id, thinking=self.resolved_thinking):
                                 self.handed_over = self.done = True
                                 continue
@@ -10365,6 +10364,13 @@ class _PipeTurn:
                     await _emit_status(self.__event_emitter__, line, done=True)
             else:
                 await _emit_status(self.__event_emitter__, "", done=True)
+
+    @property
+    def keeps_its_run(self) -> bool:
+        """The message holds more than this run: a Send now takeover (it owes
+        the user's message) or a continuation of an earlier reply's message.
+        The turn writer rebuilds from the run alone, so no handover (ELI-153)."""
+        return bool(self.adopted_run_id or self._initial_visible_text)
 
     async def finish(self):
         """After the run: the messages an adopted run held back, a queued message
