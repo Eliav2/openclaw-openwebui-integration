@@ -68,10 +68,10 @@ Something off? `uv run install.py healthcheck` re-checks the install and runs th
 
 ## Pick your path
 
-- **Just try it** (5 min): the [Quick start](./docs/install/quickstart.md).
-- **Everything** (10 min): the Quick start, then the [Status button](./docs/install/status-action.md), [thinking control](./docs/install/thinking-filter.md) and [agent skills](./docs/install/agent-skills.md).
-- **No admin password given to a script** (10 min): the [manual install](./docs/install/manual.md).
-- **Open WebUI and OpenClaw on different machines** (+5 min): [two hosts](./docs/install/two-hosts.md).
+- **Just try it:** the [Quick start](./docs/install/quickstart.md).
+- **Everything:** the Quick start, then the [Status button](./docs/install/status-action.md), [thinking control](./docs/install/thinking-filter.md) and [agent skills](./docs/install/agent-skills.md).
+- **No admin password given to a script:** the [manual install](./docs/install/manual.md).
+- **Open WebUI and OpenClaw on different machines:** [two hosts](./docs/install/two-hosts.md).
 
 ## Why I built this
 
@@ -120,7 +120,7 @@ What an older release loses, and the test runs behind these numbers: [Versions](
   </picture>
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="./docs/img/model-picker-dark.png">
-    <img src="./docs/img/model-picker-light.png" alt="Every Gateway model: the model picker open, listing the models the Gateway knows" width="300">
+    <img src="./docs/img/model-picker-light.png" alt="Every Gateway model: the model picker open, listing the models the Gateway allows" width="300">
   </picture>
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="./docs/img/agent-turn-dark.png">

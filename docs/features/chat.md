@@ -104,12 +104,14 @@ Always on.
 
 After every reply, a status row shows where you stand:
 
-![The status rows under a reply, opened: the goal, both rate-limit windows with their resets, and the context used](../img/usage-goal-light.png#gh-light-mode-only)
-![The status rows under a reply, opened: the goal, both rate-limit windows with their resets, and the context used](../img/usage-goal-dark.png#gh-dark-mode-only)
+![The status rows under a reply, opened: the goal and the context used](../img/usage-goal-light.png#gh-light-mode-only)
+![The status rows under a reply, opened: the goal and the context used](../img/usage-goal-dark.png#gh-dark-mode-only)
 
-> 🧠 45k/200k (22.5%) · ⏱ 5h 18% left (resets in 22m)
+> 🧠 34k/1.0m (3.5%) · ⏱ 5h 62% left
 
-You get one row per rate-limit window that reports a reset, and a goal line when the session has one (`🎯 Pursuing goal (12k/50k)`, with paused, blocked, usage-limited, unmet and achieved variants).
+You get one row per rate-limit window that reports a reset (`⏱ 5h 62% left (resets in 2h13m)`), and a goal line when the session has one (`🎯 Pursuing goal (204/50k)`, with paused, blocked, usage-limited, unmet and achieved variants).
+
+The rate-limit rows come from the Gateway's `usage.status` only. On a Gateway whose only Anthropic credential is a Claude CLI login (OpenClaw 2026.9.1 and later), it reports no windows, so the rows show the context and goal without limits; the [Status dialog](./status.md#rate-limits) still shows them. The screenshot's Gateway reports no windows either.
 
 Each fact is its own status event, because Open WebUI clamps a status row to one line and a combined string loses its numbers off the right edge.
 

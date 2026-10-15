@@ -29,13 +29,12 @@ Rate limits come from the Gateway's `usage.status`. On a Gateway whose only Anth
 
 ## Compact
 
-A Compact pill in the dialog header runs `/compact` on the session. While it works, the dialog shows a distinct "Compacting..." state, then refreshes with the numbers after compaction, so you can see what it bought you.
+A Compact pill in the dialog header runs `/compact` on the session. While it works, the dialog shows a distinct "Compacting..." state, then refreshes with the numbers after compaction.
 
-![The Context section before compacting](../img/compact-before-light.png#gh-light-mode-only)
-![The Context section before compacting](../img/compact-before-dark.png#gh-dark-mode-only)
+![The Context section with its Compact pill](../img/compact-before-light.png#gh-light-mode-only)
+![The Context section with its Compact pill](../img/compact-before-dark.png#gh-dark-mode-only)
 
-![The same section after Compact](../img/compact-after-light.png#gh-light-mode-only)
-![The same section after Compact](../img/compact-after-dark.png#gh-dark-mode-only)
+Right after a compact, the context number can read far lower than what the next request carries: it counts the kept conversation, without the system prompt and tools. The next reply brings it up to date.
 
 It waits up to 180 seconds, the same as the default timeout of `openclaw sessions compact`. If it takes longer, the dialog says so; compaction may still finish in the background.
 

@@ -54,7 +54,7 @@ USE_OWUI_FILES
 ────────────────────────────────── Smoke test ──────────────────────────────────
   ✓ Smoke test passed
 ─────────────────────────────── Route smoke test ───────────────────────────────
-  ✓ Route smoke test passed (local/nova)
+  ✓ Route smoke test passed (anthropic/claude-haiku-5-5)
 ```
 
 `uv run` resolves `cryptography`, `click` and `rich` into an ephemeral environment, so there is no venv or `pip install` step. `-w` is short for `--wizard`.
