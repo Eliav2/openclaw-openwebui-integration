@@ -29,6 +29,10 @@ that is offered: from OpenClaw 2026.10 most tools are deferred behind
   word a second, so a turn can be queued behind a run that is still going.
   `E2E_SLOW:<n> TOKEN` sends n words instead of 10 (a run that outlasts an
   Open WebUI stop).
+* `E2E_DEPLOY_SCENE`                   -> a long reply with two tool calls:
+  `E2E_DEPLOY_START` and a call, then `E2E_DEPLOY_MID mid-1 ... mid-20` one
+  word a second and a second call, then `E2E_DEPLOY_END end-1 ... end-10` one
+  word a second. Long enough for the Pipe to be redeployed while it streams.
 * anything else                        -> `E2E fake model reply.`
 
 Replies stream word by word so the streaming path sees several deltas.
@@ -55,6 +59,8 @@ _EXACTLY = re.compile(r"exactly:?\s+([A-Za-z0-9_]{3,})")
 _SLOW = re.compile(r"E2E_SLOW(?::(\d{1,3}))?\s+([A-Za-z0-9_]{3,})")
 SLOW_WORDS = 10
 SPAWN_TASK = "E2E_SLOW:20 E2E_CHILDTASK"   # the sub-agent's task for E2E_SPAWN
+DEPLOY_MID = "E2E_DEPLOY_MID " + " ".join(f"mid-{i}" for i in range(1, 21))
+DEPLOY_END = "E2E_DEPLOY_END " + " ".join(f"end-{i}" for i in range(1, 11))
 
 
 def _text_of(content) -> str:
@@ -77,8 +83,16 @@ def _call(name: str, offered: list) -> dict | None:
     return None
 
 
+def _harmless_call(offered: list) -> dict | None:
+    for name in PREFERRED_TOOLS:
+        if name in offered:
+            return {"tool": name}
+    return _call(PREFERRED_TOOLS[0], offered)
+
+
 def plan_reply(body: dict) -> dict:
-    """Return {"text": str} or {"tool": name, "args"?: dict} for one request."""
+    """Return {"text": str}, {"tool": name, "args"?: dict}, or both (text, then
+    the call) for one request."""
     messages = body.get("messages") or []
     # The current turn is the run of user messages after the last assistant
     # reply: the Gateway appends its own context block as a separate user
@@ -117,6 +131,16 @@ def plan_reply(body: dict) -> dict:
         if call:
             return call
         return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
+
+    if "E2E_DEPLOY_SCENE" in user_text:
+        call = _harmless_call(offered)
+        if not call:
+            return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
+        if not tool_results:
+            return {"text": "E2E_DEPLOY_START", **call}
+        if len(tool_results) == 1:
+            return {"text": DEPLOY_MID, "delay": 1.0, **call}
+        return {"text": DEPLOY_END, "delay": 1.0}
 
     if "E2E_SPAWN" in user_text:
         # Spawn one sub-agent whose own run is slow, so it is still running
@@ -196,7 +220,7 @@ class Handler(BaseHTTPRequestHandler):
             call = {"id": f"call_{uuid.uuid4().hex[:12]}", "type": "function",
                     "function": {"name": plan["tool"],
                                  "arguments": json.dumps(plan.get("args") or {})}}
-            message = {"role": "assistant", "content": None, "tool_calls": [call]}
+            message = {"role": "assistant", "content": plan.get("text"), "tool_calls": [call]}
             finish = "tool_calls"
         else:
             message = {"role": "assistant", "content": plan["text"]}
@@ -226,13 +250,12 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
 
         emit({"role": "assistant", "content": ""})
+        for piece in _chunks(plan["text"]) if plan.get("text") else []:
+            emit({"content": piece})
+            time.sleep(plan.get("delay", 0.02))
         if "tool" in plan:
             call = message["tool_calls"][0]
             emit({"tool_calls": [{"index": 0, **call}]})
-        else:
-            for piece in _chunks(plan["text"]):
-                emit({"content": piece})
-                time.sleep(plan.get("delay", 0.02))
         emit({}, finish_reason=finish)
         if (body.get("stream_options") or {}).get("include_usage"):
             chunk = {"id": cid, "object": "chat.completion.chunk", "created": created,
