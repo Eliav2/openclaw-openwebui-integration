@@ -920,6 +920,12 @@ class StripInputMarkerLineTests(unittest.TestCase):
     def test_marker_only_becomes_empty(self):
         self.assertEqual(_strip_input_marker_line("OpenClaw needs input:"), "")
 
+    def test_a_question_on_the_marker_line_is_kept(self):
+        """ELI-151: the question written on the marker line is the question."""
+        self.assertEqual(_strip_input_marker_line("OpenClaw needs input: Which branch?\n1. main\n2. dev"),
+                         "Which branch?\n1. main\n2. dev")
+        self.assertEqual(_strip_input_marker_line("Codex needs input:  Proceed?"), "Proceed?")
+
     def test_empty_input(self):
         self.assertEqual(_strip_input_marker_line(""), "")
 
@@ -9148,6 +9154,8 @@ class TextParityTests(unittest.IsolatedAsyncioTestCase):
     USER, CHAT = InlineOwnerRuleTests.USER, InlineOwnerRuleTests.CHAT
 
     PROMPT = "OpenClaw needs input: Which branch?\n1. main\n2. dev"
+    # The documented form: the marker on its own line (ELI-151).
+    PROMPT_OWN_LINE = "OpenClaw needs input:\nWhich branch?\n1. main\n2. dev"
     IMG = "![chart.png](http://localhost:18791/chart.png)"
 
     async def asyncSetUp(self):
@@ -9171,8 +9179,11 @@ class TextParityTests(unittest.IsolatedAsyncioTestCase):
         return ("tool", {"phase": phase, "name": "Bash", "toolCallId": tcid, **data})
 
     def cases(self):
-        A, W, I, T, P = self.A, self.W, self.I, self.T, self.PROMPT
+        A, W, I, T, P, P2 = self.A, self.W, self.I, self.T, self.PROMPT, self.PROMPT_OWN_LINE
         tool = [T("start", "t1", args={}), T("result", "t1", result="ok")]
+        # ELI-151: a question written on the marker line is kept, as the line
+        # after a marker on its own line is; only the marker itself goes.
+        q = "Which branch?\n1. main\n2. dev"
         return {
             "catch-all equal": ([A("Hello "), A("world."), W("Hello world.")], "Hello world."),
             "catch-all with more": ([A("Hello "), W("Hello world.")], "Hello world."),
@@ -9185,15 +9196,19 @@ class TextParityTests(unittest.IsolatedAsyncioTestCase):
             "item grows": ([I("preamble", "Let"), I("preamble", "Let me check."), A(" More.")],
                            "Let me check. More."),
             "two items": ([I("message", "First."), *tool, I("message", "Second.")], "First.Second."),
-            "prompt in deltas": ([A("Before.\n\n"), A(P)], "Before.\n\n1. main\n2. dev"),
-            "prompt in an item": ([A("Before.\n\n"), I("message", "Before.\n\n" + P)],
-                                  "Before.\n\n1. main\n2. dev"),
+            "prompt in deltas": ([A("Before.\n\n"), A(P)], "Before.\n\n" + q),
+            "prompt in an item": ([A("Before.\n\n"), I("message", "Before.\n\n" + P)], "Before.\n\n" + q),
             "prompt, then catch-all": ([A("Before.\n\n"), A(P[:25]), A(P[25:]), W("Before.\n\n" + P)],
-                                       "Before.\n\n1. main\n2. dev"),
+                                       "Before.\n\n" + q),
             "prompt in a fence": ([A("Example:\n```\n" + P + "\n```\nThat's it.")],
                                   "Example:\n```\n" + P + "\n```\nThat's it."),
             "prompt, tool, text": ([A("Q:\n\n" + P + "\n\n"), *tool, A("After the tool.")],
-                                   "Q:\n\n1. main\n2. dev\n\nAfter the tool."),
+                                   "Q:\n\n" + q + "\n\nAfter the tool."),
+            "own-line prompt in deltas": ([A("Before.\n\n"), A(P2)], "Before.\n\n" + q),
+            "own-line prompt in an item": ([A("Before.\n\n"), I("message", "Before.\n\n" + P2)],
+                                           "Before.\n\n" + q),
+            "own-line prompt, tool, text": ([A("Q:\n\n" + P2 + "\n\n"), *tool, A("After the tool.")],
+                                            "Q:\n\n" + q + "\n\nAfter the tool."),
             "prompt mid-line, one delta": ([A("Checking. " + P)], "Checking. " + P),
             "media": ([A("Here: MEDIA:chart.png "), A("done.")], f"Here: {self.IMG}\ndone."),
             "media at the end": ([A("Here: MEDIA:chart.png")], f"Here: {self.IMG}"),
@@ -9206,7 +9221,7 @@ class TextParityTests(unittest.IsolatedAsyncioTestCase):
                                           f"Look: {self.IMG}\ndone."),
             "media ending an item (writer)": ([I("message", "Look: MEDIA:chart.png")], f"Look: {self.IMG}"),
             "prompt after text in an item (writer)": ([I("message", "Some context.\n\n" + P)],
-                                                      "Some context.\n\n1. main\n2. dev"),
+                                                      "Some context.\n\n" + q),
             "prompt mid-line after an item (writer)": ([I("preamble", "Checking."), A(" " + P)],
                                                        "Checking. " + P),
         }
