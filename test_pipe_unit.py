@@ -9444,6 +9444,28 @@ class GapHandoverReplayTests(_RoutingCase):
                          self._nums(11, 13) + "\n\n---\n\nANSWER")
         self.assertEqual(self.owui.tasks, {}, "no turn writer opened a message")
 
+    async def test_a_takeover_reply_whose_run_is_killed_from_outside(self):
+        """ELI-153: the run a Send now reply took over is killed from outside
+        (exit 143). The reply shows the error and sends MSG2 in the same
+        message. Handed to the turn writer, the writer finalized m2 after the
+        reply's own save and the answer to MSG2 was gone."""
+        second = await self._send_now_takeover()
+        run1 = self.run
+        self.history = {"messages": [
+            {"role": "user", "content": "count to 20", "idempotencyKey": f"{run1}:user"},
+            {"role": "assistant", "idempotencyKey": f"cli-assistant:{run1}",
+             "content": [{"type": "text", "text": self._nums(1, 13)}]}]}
+        kill = "Claude Code process exited with code 143"
+        self.frame({"stream": "lifecycle", "data": {"phase": "error", "error": kill}})
+        self.active = False
+        self.frame({"sessionKey": self.key, "hasActiveRun": False, "status": "failed",
+                    "lastRunId": run1, "lastRunError": kill, "reason": "chat.run.settled"},
+                   event="sessions.changed")
+        await self._answer_msg2(second)
+        self.assertEqual(self.owui.msgs()["m2"]["content"],
+                         self._nums(11, 13) + f"\n\n**Error:** {kill}\n\n---\n\nANSWER")
+        self.assertEqual(self.owui.tasks, {}, "no turn writer opened a message")
+
     @staticmethod
     def _count(text):
         return [int(t) for t in text.split() if t.isdigit()]

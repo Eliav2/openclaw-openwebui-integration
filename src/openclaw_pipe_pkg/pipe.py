@@ -1302,9 +1302,10 @@ class _PipeTurn:
                         if msg.get("type") == _RESTART_MARKER_TYPE:
                             # A new Gateway process: the run may be recovered
                             # by it (a crash leaves its row `running`) or need
-                            # a resume. Its row decides, in the turn writer.
-                            if _hand_over_run(self.conn, self.session_key, self.our_run_id,
-                                              thinking=self.resolved_thinking, read_row=True):
+                            # a resume. Its row decides, in the turn writer. A
+                            # Send now takeover keeps it, as at a gap (ELI-153).
+                            if not self.adopted_run_id and _hand_over_run(self.conn, self.session_key,
+                                    self.our_run_id, thinking=self.resolved_thinking, read_row=True):
                                 self.handed_over = self.done = True
                             elif self.awaiting_owner:
                                 spawn_background(self.conn.push_row(self.session_key))
@@ -1378,9 +1379,11 @@ class _PipeTurn:
                         # Gateway (a `running` row) or by a resume. The reply
                         # decides neither: the turn writer takes the message
                         # and the settled row picks the owner. Without a
-                        # message to hand over, it ends here like any error.
+                        # message to hand over, or in a Send now takeover
+                        # (ELI-153), it ends here like any error.
                         if _EXTERNAL_KILL_RE.search(err) or (aborted_run and self.conn._shutdown_seen):
-                            if _hand_over_run(self.conn, self.session_key, self.our_run_id, thinking=self.resolved_thinking):
+                            if not self.adopted_run_id and _hand_over_run(self.conn, self.session_key,
+                                    self.our_run_id, thinking=self.resolved_thinking):
                                 self.handed_over = self.done = True
                                 continue
                             if not self.owui_message_id:
