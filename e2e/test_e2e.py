@@ -834,6 +834,7 @@ from websockets.sync.client import connect as _ws_connect  # noqa: E402
 
 DEPLOY_WORDS = (["E2E_DEPLOY_START", "E2E_DEPLOY_MID"] + [f"mid-{i}" for i in range(1, 21)]
                 + ["E2E_DEPLOY_END"] + [f"end-{i}" for i in range(1, 11)])
+DEPLOY_WORD_RE = r"E2E_DEPLOY_(?:START|MID|END)|mid-\d+|end-\d+"
 DEPLOY_LINE = "Updated Pipe function in place"   # install.py, once the new code is in
 
 
@@ -972,11 +973,11 @@ def _apply_stream_event(output: list, ev: dict) -> list:
 
 
 def _output_text(output) -> str:
-    """The reply's text as the page draws it from `output` (message items)."""
-    return "".join(part.get("text") or ""
-                   for item in output or [] if isinstance(item, dict) and item.get("type") == "message"
-                   for part in item.get("content") or []
-                   if isinstance(part, dict) and part.get("type") == "output_text")
+    """The reply's text as the page draws it from `output`: each message item
+    is its own block."""
+    return "\n".join("".join(part.get("text") or "" for part in item.get("content") or []
+                             if isinstance(part, dict) and part.get("type") == "output_text")
+                     for item in output or [] if isinstance(item, dict) and item.get("type") == "message")
 
 
 def _shown(data: dict) -> str:
@@ -1085,7 +1086,7 @@ def test_a_plain_redeploy_mid_reply_leaves_the_reply_whole(token, redeploy):
         if page.last_stream_event_at(aid) <= deployed_at:
             problems.append("no live event after the redeploy")
         streamed = page.streamed(aid)
-        live_words = re.findall(r"E2E_DEPLOY_\w+|mid-\d+|end-\d+", _output_text(streamed))
+        live_words = re.findall(DEPLOY_WORD_RE, _output_text(streamed))
         if live_words != DEPLOY_WORDS:
             problems.append(f"what the page streamed is not the reply once: {_output_text(streamed)!r}")
 
@@ -1095,7 +1096,7 @@ def test_a_plain_redeploy_mid_reply_leaves_the_reply_whole(token, redeploy):
         if saved.get("done") is not True:
             problems.append(f"the saved reply is not done: {json.dumps(saved)[:1500]}")
         text = _shown(saved)
-        words = re.findall(r"E2E_DEPLOY_\w+|mid-\d+|end-\d+", text)
+        words = re.findall(DEPLOY_WORD_RE, text)
         if words != DEPLOY_WORDS:
             problems.append(f"the saved reply is not the reply once: {text!r}")
         calls = _output_calls(saved.get("output"))
@@ -1118,8 +1119,14 @@ def test_a_plain_redeploy_mid_reply_leaves_the_reply_whole(token, redeploy):
         msgs = _wait_for(token, chat_id, ["E2E_AFTER_DEPLOY"])
         if (msgs[next_id].get("content") or "").strip() != "E2E_AFTER_DEPLOY":
             problems.append(f"the next message: {json.dumps(msgs[next_id])[:1500]}")
-        _assert_clean(token, chat_id, msgs)
+        try:
+            _assert_clean(token, chat_id, msgs)
+        except AssertionError as ex:
+            problems.append(f"the chat is not clean: {ex}")
+        replies = [m for m in msgs.values() if m.get("role") == "assistant"]
         print(page.summary(next_id, sent_at))
-        assert not problems, "\n".join(problems)
+        assert not problems, "\n".join(problems) + "\nsaved replies:\n" + "\n".join(
+            f"  {m['id'][:8]} done={m.get('done')} items={[i.get('type') for i in m.get('output') or []]} "
+            f"text={_shown(m)!r}" for m in replies)
     finally:
         page.close()
