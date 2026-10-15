@@ -34,6 +34,10 @@ on:
         description: Lane name
         type: string
         default: manual
+      tests:
+        description: pytest -k expression for the end-to-end suite (empty = all; for repeating one test)
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -81,9 +85,11 @@ jobs:
         run: bash e2e/start_stack.sh
 
       - name: End-to-end suite
+        env:
+          TESTS: ${{ inputs.tests }}
         run: |
           uv run --with-requirements requirements-dev.txt \
-            pytest -v --junitxml="$RUNNER_TEMP/e2e-logs/junit.xml" e2e/test_e2e.py
+            pytest -v --junitxml="$RUNNER_TEMP/e2e-logs/junit.xml" e2e/test_e2e.py ${TESTS:+-k "$TESTS"}
 
       - name: Integration suite (test_pipe.py) against the stack
         # test_route_model_override asks a real model to call session_status and
