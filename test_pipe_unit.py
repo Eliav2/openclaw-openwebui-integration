@@ -7098,6 +7098,34 @@ class AgentTurnRoutingTests(_RoutingCase):
         self.assertEqual(m["meta"]["openclaw_writer"], self.conn.writer_id)
         self.assertNotIn(f"{self.key}:{run}", self.conn._run_targets, "the shadow is retired")
 
+    async def test_a_handed_over_adopted_run_does_not_repeat_what_the_first_reply_showed(self):
+        """ELI-147: a Send now reply adopted a run whose start reply 1 already
+        showed (lines 1-10), streamed lines 11-20 into its own message, and
+        was handed over (a Gateway restart, a socket gap). The run's closing
+        transcript holds lines 1-30; the rebuild of reply 2's message must
+        start where reply 1 left off."""
+        def lines(a, b):
+            return "".join(f"{i}\n" for i in range(a, b + 1))
+        run = pipe_run_id(self.CHAT, "m-first")       # named by reply 1's message
+        self.add_stub(self.STUB, content=lines(11, 20))
+        self.conn.register_run_target(self.key, run, self.CHAT, self.STUB)
+        self.conn.seed_run_renderer(self.key, run, asyncio.Queue(),
+                                    run_text={"received": lines(1, 10), "item": ""})
+        self.conn._run_renderers[f"{self.key}:{run}"].feed(_delta(lines(11, 20)))
+        self.assertTrue(await self.dispatch(run, _delta(lines(21, 25))))
+        await self.dispatch(run, {"state": "final"})
+        self.history = {"messages": [
+            {"role": "user", "content": "count to 30", "idempotencyKey": f"{run}:user"},
+            {"role": "assistant", "idempotencyKey": f"cli-assistant:{run}",
+             "content": [{"type": "text", "text": lines(1, 30)}]}]}
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "done", "lastRunId": run})
+        await self.spin()
+        m = self.owui.msgs()[self.STUB]
+        self.assertIs(m["done"], True)
+        self.assertEqual(m["content"].strip(), lines(11, 30).strip(),
+                         "lines 1-10 are reply 1's; 26-30 are what the transcript adds")
+
     async def test_handover_after_an_owui_restart_takes_the_stub_its_run_id_names(self):
         """2026-10-12 23:29Z, chat 0abe9bde (fails on main 787a471, where it
         was `test_relay_writes_into_the_stub_its_run_id_names_when_history_fails`):
