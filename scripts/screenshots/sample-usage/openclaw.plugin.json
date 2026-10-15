@@ -1,13 +1,13 @@
 {
   "id": "screenshot-sample-usage",
   "name": "Screenshot sample usage",
-  "description": "Test-only: fixed rate-limit windows for the screenshot stack's \"local\" provider, so the Status dialog has bars to show. Never install this on a real Gateway.",
+  "description": "Test-only: fixed rate-limit windows for the screenshot stack's \"anthropic\" provider, so the Status dialog has bars to show. Never install this on a real Gateway.",
   "activation": {
     "onStartup": true
   },
-  "providers": ["local"],
+  "providers": ["anthropic"],
   "contracts": {
-    "usageProviders": ["local"]
+    "usageProviders": ["anthropic"]
   },
   "configSchema": {
     "type": "object",

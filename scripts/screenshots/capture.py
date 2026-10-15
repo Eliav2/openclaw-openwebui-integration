@@ -696,7 +696,7 @@ class Scenes:
         send(page, "Start with the build.")
         wait_js(page, last_text_has("Next is the staging deploy script"), "the reply")
         set_title(self.token, chat, "Hourly view to staging")
-        page.locator(".chat-assistant").last.get_by_text(re.compile("200k")).first.click()
+        page.locator(".chat-assistant").last.get_by_text(re.compile(r"\d+(\.\d+)?[km]/\d+(\.\d+)?[km]")).first.click()
         wait_js(page, "() => document.body.innerText.includes('🎯')", "the goal row", 60_000)
         print("  status rows: " + json.dumps(page.evaluate(f"() => {LAST_ASSISTANT}.innerText")[:400]), flush=True)
         clip = f"""() => {{
