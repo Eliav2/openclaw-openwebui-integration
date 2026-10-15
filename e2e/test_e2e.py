@@ -700,8 +700,16 @@ def test_the_status_action_lists_a_running_subagent_and_opens_its_drawer(token):
     assert row["status"] == "running", row
     assert row["id"] == row["childSessionKey"] and row["id"].startswith("agent:main:subagent:"), row
     assert isinstance(row["startedAt"], int) and row["endedAt"] is None, row
-    # Its end left the open dialog's list.
-    assert _section_data(codes, "openclaw-status-section-subagents")["tasks"] == [], codes[-1]
+    # Its end shows in the open dialog, and it stays listed (ELI-152).
+    last = _section_data(codes, "openclaw-status-section-subagents")
+    assert [(t["id"], t["status"]) for t in last["tasks"]] == [(row["id"], "completed")], last
+    assert last["tasks"][0]["endedAt"], last
+    # Reopened, the ended child is still there: the open reads every session.
+    codes = _run_action(token, lambda a, emit: a.action(
+        {"chat_id": chat_id}, __user__={"id": me["id"]}, __event_emitter__=emit))
+    reopened = _section_data(codes, "openclaw-status-section-subagents")
+    assert [(t["id"], t["status"]) for t in reopened["tasks"]] == [(row["id"], "completed")], reopened
+    assert reopened["total"] == 1 and reopened["agents"] == [], reopened
 
     # The drawer, once the child is done: its status and its last reply.
     child = row["id"]

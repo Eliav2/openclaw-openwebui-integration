@@ -617,20 +617,27 @@ _SUBAGENTS_FILL_JS_TEMPLATE = r"""
     return;
   }
 
-  if (!DATA.tasks || !DATA.tasks.length) {
+  const tasks = DATA.tasks || [];
+  const agents = DATA.agents || [];
+  if (!tasks.length && !agents.length) {
     section.className = '';
     return;
   }
 
   section.className = 'mb-4';
-  section.appendChild(S.sectionHeader('Subagents (' + DATA.tasks.length + ')'));
+
+  // "Subagents (3)", or "(20 of 31)" when the list is capped.
+  function countLabel(name, shown, total) {
+    return name + ' (' + (total > shown ? shown + ' of ' + total : shown) + ')';
+  }
 
   const STATUS_COLOR = {
     queued: '#9ca3af', running: '#3b82f6', completed: '#10b981',
     failed: '#f43f5e', cancelled: '#f59e0b', timed_out: '#f59e0b',
   };
 
-  DATA.tasks.forEach(function(t) {
+  if (tasks.length) section.appendChild(S.sectionHeader(countLabel('Subagents', tasks.length, DATA.total || 0)));
+  tasks.forEach(function(t) {
     const row = document.createElement('button');
     row.type = 'button';
     row.className = 'w-full flex items-start gap-2 text-left py-1.5 px-1.5 -mx-1.5 '
@@ -670,6 +677,58 @@ _SUBAGENTS_FILL_JS_TEMPLATE = r"""
     }
     row.appendChild(elapsed);
 
+    section.appendChild(row);
+  });
+
+  // Claude Code's in-process Agent calls (ELI-152): not Gateway sessions,
+  // so no drawer and no duration, only what the chat's tool cards tell.
+  const AGENT_STATE = {
+    running: ['running', '#3b82f6'], launched: ['launched in the background', '#9ca3af'],
+    returned: ['returned', '#10b981'], 'cut off': ['cut off', '#f59e0b'], failed: ['failed', '#f43f5e'],
+  };
+  if (agents.length) {
+    const head = S.sectionHeader(countLabel('In-process agents', agents.length, DATA.agentsTotal || 0));
+    if (tasks.length) head.style.marginTop = '10px';
+    section.appendChild(head);
+    const note = document.createElement('div');
+    note.className = 'text-xs text-gray-400 dark:text-gray-500 mb-1';
+    note.textContent = 'Claude Code Agent calls in this chat, as their tool cards show them.';
+    section.appendChild(note);
+  }
+  agents.forEach(function(a) {
+    const state = AGENT_STATE[a.state] || [a.state, '#9ca3af'];
+    const row = document.createElement('div');
+    row.className = 'w-full flex items-start gap-2 py-1.5';
+
+    const dot = document.createElement('span');
+    dot.className = 'mt-1.5 h-1.5 w-1.5 rounded-full shrink-0' + (a.state === 'running' ? ' animate-pulse' : '');
+    dot.style.backgroundColor = state[1];
+    row.appendChild(dot);
+
+    const body = document.createElement('div');
+    body.className = 'min-w-0 flex-1';
+    const titleLine = document.createElement('div');
+    titleLine.className = 'text-sm text-gray-700 dark:text-gray-200 break-words';
+    titleLine.textContent = a.title;
+    body.appendChild(titleLine);
+    const subLine = document.createElement('div');
+    subLine.className = 'text-xs text-gray-400 dark:text-gray-500 break-words';
+    subLine.textContent = state[0];
+    body.appendChild(subLine);
+    row.appendChild(body);
+
+    // When its reply started, on the reader's clock.
+    const started = S.toMs(a.startedAt);
+    if (started != null) {
+      const when = document.createElement('span');
+      when.className = 'text-gray-400 dark:text-gray-500 shrink-0 mt-1.5';
+      when.style.fontSize = '10px';
+      when.textContent = new Date(started).toLocaleString([], {
+        month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
+      });
+      when.title = 'Started';
+      row.appendChild(when);
+    }
     section.appendChild(row);
   });
 
@@ -1186,6 +1245,9 @@ def _subagent_row(row, task_text=None):
     """One Subagents row out of a child session row. The title is the task,
     as the Tasks API had it, else the spawn label, else the key."""
     status = _subagent_status(row.get("status"))
+    if status is None and row.get("endedAt"):
+        status = "ended"    # a visible spawn's session carries no run status
+    live = status in _LIVE_SUBAGENT_STATUSES
     preview = row.get("lastMessagePreview")
     if _is_spawn_message(preview):
         # Just spawned: the newest message is still the task (ELI-119).
@@ -1194,13 +1256,116 @@ def _subagent_row(row, task_text=None):
         "id": row["key"],
         "title": task_text or row.get("label") or row["key"],
         "status": status,
-        "progressSummary": preview if status in ("running", "queued") else None,
-        "terminalSummary": preview if status not in ("running", "queued") else None,
+        "progressSummary": preview if live else None,
+        "terminalSummary": preview if not live else None,
         "error": row.get("lastRunError"),
         "childSessionKey": row["key"],
         "startedAt": row.get("startedAt"),
-        "endedAt": row.get("endedAt"),
+        # An ended child's duration stops at its last update when the
+        # Gateway kept no end time.
+        "endedAt": row.get("endedAt") or (None if live else row.get("updatedAt")),
     }
+
+
+_LIVE_SUBAGENT_STATUSES = ("running", "queued")
+# How many sub-agents of each kind the section lists, newest first (ELI-152).
+_SUBAGENT_LIST_CAP = 20
+
+
+def _is_child_of(row, parent_key):
+    """A session the parent spawned. `sessions.list {spawnedBy}` keeps an
+    ended child for 30 minutes only, so the dialog's open reads the whole
+    list and picks the children itself (ELI-152)."""
+    return row.get("key") not in (None, parent_key) and parent_key in (
+        row.get("spawnedBy"), row.get("parentSessionKey"))
+
+
+def _subagent_started(row):
+    return row.get("startedAt") or row.get("createdAt") or row.get("updatedAt") or 0
+
+
+# Claude Code's in-process sub-agent tool, and what its card's result says
+# for a sub-agent started in the background (its report comes later, as a
+# turn of its own).
+_AGENT_TOOL_NAME = "Agent"
+_AGENT_LAUNCHED_PREFIX = "Async agent launched"
+
+
+def _owui_branch(chat):
+    """The messages of a stored chat's current branch, oldest first."""
+    history = (chat or {}).get("history") or {}
+    messages = history.get("messages") or {}
+    branch, seen, mid = [], set(), history.get("currentId")
+    while mid and mid not in seen and mid in messages:
+        seen.add(mid)
+        branch.append(messages[mid])
+        mid = messages[mid].get("parentId")
+    return branch[::-1]
+
+
+def _card_text(item):
+    out = (item or {}).get("output")
+    if isinstance(out, list):
+        return "".join(p.get("text") or "" for p in out if isinstance(p, dict))
+    return out if isinstance(out, str) else ""
+
+
+def _agent_call_rows(chat):
+    """The chat's in-process Agent calls (Claude Code sub-agents), newest
+    first, out of its replies' own tool cards (ELI-152). The Gateway never
+    lists them as child sessions, so a card is all there is: the call's
+    description, its reply's start time, and a state its result tells.
+    "launched" is a background agent whose report comes later on its own."""
+    rows = []
+    for msg in _owui_branch(chat):
+        output = msg.get("output") or []
+        results = {o.get("call_id"): o for o in output if o.get("type") == "function_call_output"}
+        for item in output:
+            name = item.get("name") or ""
+            if item.get("type") != "function_call" or name.replace(TOOL_ERROR_MARK, "").strip() != _AGENT_TOOL_NAME:
+                continue
+            try:
+                args = json.loads(item.get("arguments") or "{}")
+            except ValueError:
+                args = {}
+            args = args if isinstance(args, dict) else {}
+            result = results.get(item.get("call_id") or item.get("id"))
+            text = _card_text(result).strip()
+            if TOOL_ERROR_MARK in name:
+                state = "failed"
+            elif result is None:
+                state = "cut off" if msg.get("done") else "running"
+            elif text.startswith(TOOL_NO_RESULT_NOTE):
+                state = "cut off"
+            elif text.startswith(_AGENT_LAUNCHED_PREFIX):
+                state = "launched"
+            else:
+                state = "returned"
+            ts = msg.get("timestamp")
+            rows.append({
+                "id": item.get("call_id") or item.get("id"),
+                "title": str(args.get("description") or args.get("subagent_type") or _AGENT_TOOL_NAME),
+                "subagentType": args.get("subagent_type"),
+                "state": state,
+                "startedAt": int(ts * 1000) if isinstance(ts, (int, float)) else None,
+            })
+    return rows[::-1]
+
+
+async def _load_owui_chat(chat_id, user_id):
+    """The chat as Open WebUI stores it, when it is this user's; None outside
+    Open WebUI or on any failure (the section then lists no Agent calls)."""
+    try:
+        from open_webui.models.chats import Chats
+        row = Chats.get_chat_by_id(chat_id)
+        if asyncio.iscoroutine(row):
+            row = await row
+    except Exception as ex:
+        pipe_log(f"[status-action] could not read the chat for its Agent calls: {ex}")
+        return None
+    if row is None or getattr(row, "user_id", None) != user_id:
+        return None
+    return getattr(row, "chat", None)
 
 
 def _render_subagents_fill_js(data: dict) -> str:
@@ -1462,12 +1627,16 @@ class Action:
         )
         usage_task = asyncio.ensure_future(conn.send_request("usage.status", {}, timeout=5))
         # The parent's child sessions. The Gateway's spawnedBy filter keeps
-        # the current ones (active, or ended in the last 30 minutes).
+        # the current ones only (active, or ended in the last 30 minutes),
+        # so the open reads every session and picks the children itself
+        # (ELI-152); a refill follows the current ones with the filter.
         def list_children():
             return conn.send_request(
                 "sessions.list", dict(spawnedBy=session_key, limit=50, includeLastMessage=True), timeout=5,
             )
-        children_task = asyncio.ensure_future(list_children())
+        children_task = asyncio.ensure_future(conn.send_request(
+            "sessions.list", dict(limit=1000, includeLastMessage=True), timeout=10))
+        chat_task = asyncio.ensure_future(_load_owui_chat(chat_id, user_id))
 
         async def fill_context():
             """Also resolves provider/session_row for fill_limits to reuse
@@ -1551,19 +1720,23 @@ class Action:
                 "error": None,
             })}})
 
+        # Every child seen so far by key, and the tasks read off their
+        # transcript heads: a refill updates the rows it lists again.
+        children_seen, task_texts, agents = {}, {}, []
+
         async def fill_subagents(children):
             """No dependency on sessions.describe/usage.status at all --
             session_key is already known synchronously, so this is the
             most genuinely independent of the three sections.
 
-            Passes one row per running or queued child session (not just a
-            count) so the fill template can render one clickable row per
-            subagent -- each row's own click handler carries these same
-            fields into the detail drawer's opening request (see
+            Lists every child session of this chat (ELI-152), ended ones
+            included, newest first, capped, with the chat's in-process
+            Agent calls as a second group. Each child row carries the
+            fields its click hands the detail drawer (see
             S.openSubagentDrawer / Action._run_subagent_detail), so the
             drawer can paint its header instantly before its own RPCs
-            resolve. A row's id is the child session key. Returns the
-            listed children's keys."""
+            resolve. A row's id is the child session key. Returns the keys
+            of the listed children still running."""
             try:
                 children_resp = await children
             except Exception as ex:
@@ -1572,28 +1745,36 @@ class Action:
                     "code": _render_subagents_fill_js({"error": f"Could not fetch subagents: {ex}"})
                 }})
                 return []
-            active = [r for r in (children_resp or {}).get("sessions") or []
-                      if r.get("key") and r.get("status") in ("running", "queued")]
-            task_texts = {}
-            if active:
+            for r in (children_resp or {}).get("sessions") or []:
+                if _is_child_of(r, session_key):
+                    children_seen[r["key"]] = r
+            shown = sorted(children_seen.values(), key=_subagent_started, reverse=True)[:_SUBAGENT_LIST_CAP]
+            untitled = [r["key"] for r in shown if r["key"] not in task_texts]
+            if untitled:
                 try:
                     previews = await conn.send_request(
-                        "sessions.preview", dict(keys=[r["key"] for r in active], limit=20, maxChars=2000),
-                        timeout=5,
+                        "sessions.preview", dict(keys=untitled, limit=20, maxChars=2000), timeout=5,
                     )
-                    task_texts = _subagent_task_texts(previews)
+                    task_texts.update({k: None for k in untitled})
+                    task_texts.update(_subagent_task_texts(previews))
                 except Exception as ex:
                     # Titles fall back to the spawn label; the rows still render.
                     pipe_log(f"[status-action] sessions.preview (children) failed: {ex}")
-            subagent_tasks = [_subagent_row(r, task_texts.get(r["key"])) for r in active]
             await __event_emitter__({"type": "execute", "data": {"code": _render_subagents_fill_js({
-                "tasks": subagent_tasks, "source": source, "fetchedAt": int(time.time() * 1000), "error": None,
+                "tasks": [_subagent_row(r, task_texts.get(r["key"])) for r in shown],
+                "total": len(children_seen),
+                "agents": agents[:_SUBAGENT_LIST_CAP], "agentsTotal": len(agents),
+                "source": source, "fetchedAt": int(time.time() * 1000), "error": None,
             })}})
-            return [r["key"] for r in active]
+            return [r["key"] for r in shown if r.get("status") in _LIVE_SUBAGENT_STATUSES]
+
+        async def fill_subagents_at_open():
+            agents.extend(_agent_call_rows(await chat_task))
+            return await fill_subagents(children_task)
 
         context_ready = asyncio.ensure_future(fill_context())
         limits_ready = asyncio.ensure_future(fill_limits())
-        subagents_ready = asyncio.ensure_future(fill_subagents(children_task))
+        subagents_ready = asyncio.ensure_future(fill_subagents_at_open())
 
         provider, _session_row = await context_ready
         await limits_ready
@@ -1601,8 +1782,8 @@ class Action:
 
         pipe_log(f"[status-action] status dialog filled ({source}) provider={provider}")
 
-        # The ticker counts a listed child up while the dialog is open, so a
-        # child that ends meanwhile must leave the list (ELI-127). Hold this
+        # The ticker counts a running child up while the dialog is open, so a
+        # child that ends meanwhile must show its end (ELI-127). Hold this
         # request open, as the drawer does, and refill the section on each
         # pushed change to a listed child's run state, until none is listed
         # or the drawer's bound passes. Each event is taken before the read

@@ -223,8 +223,8 @@ class RenderJsTests(unittest.TestCase):
         clutter than signal -- gated in source, not just data-dependent
         text, so it truly renders nothing (not an empty header)."""
         js = _render_subagents_fill_js({"tasks": [], "source": "pipe", "fetchedAt": "12:00:00", "error": None})
-        gate_idx = js.index("if (!DATA.tasks || !DATA.tasks.length)")
-        header_idx = js.index("sectionHeader('Subagents")
+        gate_idx = js.index("if (!tasks.length && !agents.length)")
+        header_idx = js.index("countLabel('Subagents'")
         self.assertLess(gate_idx, header_idx)
 
     def test_subagents_shows_clickable_rows_when_nonempty(self):
@@ -572,6 +572,7 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
         rate-limit windows, and a nonzero subagent count all end to end."""
         action = Action()
         emitted = []
+        parent = "agent:main:openwebui-user-1-chat-1"
 
         async def emitter(evt):
             emitted.append(evt)
@@ -590,11 +591,15 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
                     {"label": "5h", "usedPercent": 72, "resetAt": 1783790000000},
                 ]}]}
             if method == "sessions.list":
-                self.assertTrue(params["spawnedBy"].startswith("agent:main:openwebui-"))
+                # The open reads every session (ELI-152); a refill follows
+                # the chat's current children.
+                if "spawnedBy" in params:
+                    self.assertEqual(params["spawnedBy"], parent)
                 return {"sessions": [
-                    {"key": "agent:main:subagent:a", "status": "running"},
-                    {"key": "agent:main:subagent:b", "status": "queued"},
-                    {"key": "agent:main:subagent:c", "status": "done"},  # must be excluded from the count
+                    {"key": "agent:main:subagent:a", "status": "running", "spawnedBy": parent},
+                    {"key": "agent:main:subagent:b", "status": "queued", "spawnedBy": parent},
+                    {"key": "agent:main:subagent:c", "status": "done", "spawnedBy": parent},
+                    {"key": "agent:main:subagent:d", "status": "running", "spawnedBy": "another-session"},
                 ]}
             if method == "sessions.preview":
                 return {"previews": []}
@@ -635,9 +640,10 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1783790000000", limits_code)
 
         subagents_code = next(c for c in codes if "getElementById('openclaw-status-section-subagents')" in c)
-        # the ended child excluded -- exactly the running and queued rows come through
+        # Every child of this chat, the ended one included; another chat's not.
         self.assertEqual(subagents_code.count('"status": "running"') + subagents_code.count('"status": "queued"'), 2)
-        self.assertNotIn("agent:main:subagent:c", subagents_code)
+        self.assertIn('"status": "completed"', subagents_code)
+        self.assertNotIn("agent:main:subagent:d", subagents_code)
 
     async def test_connect_failure_shows_dialog_wide_error(self):
         action = Action()

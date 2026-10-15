@@ -8,7 +8,10 @@ head (`sessions.preview`), and the child session itself (`sessions.describe`,
 `chat.history`): RPCs both 2026.9.3 and 2026.10.3 serve.
 """
 
+import json
 import os
+import sys
+import types
 import unittest
 from unittest import mock
 
@@ -52,6 +55,11 @@ def _list_rpc(rows, previews, calls):
     return send_request
 
 
+def _child(key, status, **kw):
+    """A child session row as the Gateway's full `sessions.list` has it."""
+    return {"key": key, "status": status, "spawnedBy": PARENT_KEY, **kw}
+
+
 class SubagentListTests(unittest.IsolatedAsyncioTestCase):
 
     async def _open(self, rows, previews):
@@ -75,29 +83,68 @@ class SubagentListTests(unittest.IsolatedAsyncioTestCase):
                                                __event_emitter__=emitter), conn)
         return calls, emitted, seen[-1]
 
-    async def test_lists_the_running_and_queued_children_with_their_task_as_title(self):
+    async def test_lists_every_child_with_its_task_as_title_newest_first(self):
         rows = [
-            {"key": CHILD_A, "status": "running", "startedAt": 1000, "lastMessagePreview": "halfway"},
-            {"key": CHILD_B, "status": "queued", "label": "y-summary"},
-            {"key": CHILD_DONE, "status": "done", "startedAt": 900, "endedAt": 990},
+            _child(CHILD_DONE, "done", startedAt=900, endedAt=990),
+            _child(CHILD_A, "running", startedAt=1000, lastMessagePreview="halfway"),
+            _child(CHILD_B, "queued", label="y-summary", createdAt=1100),
         ]
         previews = {CHILD_A: [{"role": "user", "text": WRAPPED_93}, {"role": "assistant", "text": "halfway"}],
                     CHILD_B: [{"role": "user", "text": WRAPPED_103}]}
         calls, emitted, data = await self._open(rows, previews)
         methods = [m for m, _p in calls]
         self.assertNotIn("tasks.list", methods)
-        listed = next(p for m, p in calls if m == "sessions.list")
-        self.assertEqual(listed["spawnedBy"], PARENT_KEY)
         self.assertIsNone(data["error"])
-        self.assertEqual([t["id"] for t in data["tasks"]], [CHILD_A, CHILD_B])
-        a, b = data["tasks"]
+        self.assertEqual([t["id"] for t in data["tasks"]], [CHILD_B, CHILD_A, CHILD_DONE])
+        b, a, done = data["tasks"]
         self.assertEqual((a["title"], a["status"], a["childSessionKey"], a["startedAt"], a["progressSummary"]),
                          ("Research X and report.", "running", CHILD_A, 1000, "halfway"))
         self.assertEqual((b["title"], b["status"]), ("Summarise Y.", "queued"))
-        # Rendered: the section's own fill carries both rows.
+        self.assertEqual((done["status"], done["startedAt"], done["endedAt"]), ("completed", 900, 990))
+        # Rendered: the section's own fill carries the rows.
         code = next(c for c in _emitted_codes(emitted)
                     if "getElementById('openclaw-status-section-subagents')" in c)
         self.assertIn("Research X and report.", code)
+
+    async def test_the_open_reads_every_session_not_the_30_minute_child_window(self):
+        """ELI-152: `sessions.list {spawnedBy}` keeps an ended child for 30
+        minutes only (the Gateway's shouldKeepStoreOnlyChildLink), so the
+        dialog's open reads the whole list and picks the chat's children by
+        `spawnedBy` or `parentSessionKey` itself."""
+        other = "agent:main:openwebui-user-1-other-chat"
+        rows = [
+            _child(CHILD_A, "done", startedAt=1000, endedAt=1050),
+            {"key": CHILD_B, "status": "failed", "parentSessionKey": PARENT_KEY, "startedAt": 2000,
+             "endedAt": 2100, "lastRunError": "provider 529"},
+            {"key": CHILD_DONE, "status": "done", "spawnedBy": other, "startedAt": 3000},
+            {"key": PARENT_KEY, "status": "running"},
+            # A visible spawn (`visible: true`): no run status, but ended.
+            _child("agent:main:dashboard:dddddddd-0000-0000-0000-000000000004", None,
+                   label="W1: engine", startedAt=1500, endedAt=1800),
+        ]
+        calls, _emitted, data = await self._open(rows, {})
+        opened = next(p for m, p in calls if m == "sessions.list")
+        self.assertNotIn("spawnedBy", opened)
+        self.assertEqual([(t["id"][-4:], t["status"]) for t in data["tasks"]],
+                         [("0002", "failed"), ("0004", "ended"), ("0001", "completed")])
+        self.assertEqual(data["tasks"][0]["error"], "provider 529")
+        self.assertEqual(data["tasks"][1]["title"], "W1: engine")
+        self.assertEqual(data["total"], 3)
+
+    async def test_the_newest_twenty_are_listed(self):
+        rows = [_child(f"agent:main:subagent:{n:08d}-0000-0000-0000-000000000000", "done",
+                       startedAt=n * 1000, endedAt=n * 1000 + 5) for n in range(1, 26)]
+        _calls, _emitted, data = await self._open(rows, {})
+        self.assertEqual(len(data["tasks"]), 20)
+        self.assertEqual(data["tasks"][0]["startedAt"], 25000)
+        self.assertEqual(data["tasks"][-1]["startedAt"], 6000)
+        self.assertEqual(data["total"], 25)
+
+    async def test_an_ended_child_without_an_end_time_ends_at_its_last_update(self):
+        """Its duration must not count up to now."""
+        _calls, _emitted, data = await self._open(
+            [_child(CHILD_A, "done", startedAt=1000, updatedAt=4000)], {})
+        self.assertEqual(data["tasks"][0]["endedAt"], 4000)
 
     async def test_a_child_whose_last_message_is_its_spawn_shows_no_subtitle(self):
         """Right after a spawn the child's newest message is the spawn itself,
@@ -107,8 +154,8 @@ class SubagentListTests(unittest.IsolatedAsyncioTestCase):
         flat_93, flat_103 = " ".join(WRAPPED_93.split()), " ".join(WRAPPED_103.split())
         for preview in (WRAPPED_93, WRAPPED_103, flat_93, flat_103):
             with self.subTest(preview=preview[:40]):
-                rows = [{"key": CHILD_A, "status": "running", "startedAt": 1000, "lastMessagePreview": preview},
-                        {"key": CHILD_B, "status": "running", "lastMessagePreview": "Fly.io: about $3 a month"}]
+                rows = [_child(CHILD_A, "running", startedAt=1000, lastMessagePreview=preview),
+                        _child(CHILD_B, "running", lastMessagePreview="Fly.io: about $3 a month")]
                 previews = {CHILD_A: [{"role": "user", "text": WRAPPED_93}]}
                 _calls, emitted, data = await self._open(rows, previews)
                 a, b = data["tasks"]
@@ -119,22 +166,28 @@ class SubagentListTests(unittest.IsolatedAsyncioTestCase):
                             if "getElementById('openclaw-status-section-subagents')" in c)
                 self.assertNotIn("Subagent Context", code)
 
-    async def test_no_preview_call_without_active_children(self):
-        calls, _emitted, data = await self._open(
-            [{"key": CHILD_DONE, "status": "done", "endedAt": 990}], {})
+    async def test_no_preview_call_without_children(self):
+        calls, _emitted, data = await self._open([], {})
         self.assertEqual(data["tasks"], [])
         self.assertNotIn("sessions.preview", [m for m, _p in calls])
 
+    async def test_an_ended_child_has_its_task_as_title_and_its_last_reply_as_summary(self):
+        _calls, _emitted, data = await self._open(
+            [_child(CHILD_DONE, "done", startedAt=900, endedAt=990, lastMessagePreview="Y is fine")],
+            {CHILD_DONE: [{"role": "user", "text": WRAPPED_103}, {"role": "assistant", "text": "Y is fine"}]})
+        (t,) = data["tasks"]
+        self.assertEqual((t["title"], t["terminalSummary"]), ("Summarise Y.", "Y is fine"))
+
     async def test_title_falls_back_to_label_then_key(self):
-        rows = [{"key": CHILD_A, "status": "running", "label": "research-x"},
-                {"key": CHILD_B, "status": "running"}]
+        rows = [_child(CHILD_A, "running", label="research-x", startedAt=2),
+                _child(CHILD_B, "running", startedAt=1)]
         # A long-running child's preview no longer reaches its first message.
         previews = {CHILD_A: [{"role": "assistant", "text": "step 9"}], CHILD_B: []}
         _calls, _emitted, data = await self._open(rows, previews)
         self.assertEqual([t["title"] for t in data["tasks"]], ["research-x", CHILD_B])
 
     async def test_a_preview_failure_keeps_the_rows(self):
-        rows = [{"key": CHILD_A, "status": "running", "label": "research-x"}]
+        rows = [_child(CHILD_A, "running", label="research-x")]
 
         async def send_request(method, params, timeout=5):
             if method == "sessions.preview":
@@ -307,7 +360,7 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
 
     NOW = 1_783_790_100_000
 
-    async def test_a_child_that_finishes_leaves_the_open_dialog(self):
+    async def test_a_child_that_finishes_stops_counting_in_the_open_dialog(self):
         import asyncio
         import json
         import shutil
@@ -318,7 +371,7 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
         runtime = shutil.which("bun") or shutil.which("node")
         if runtime is None:
             self.skipTest("no bun or node")
-        rows = [{"key": CHILD_A, "status": "running", "startedAt": self.NOW - 1000}]
+        rows = [_child(CHILD_A, "running", startedAt=self.NOW - 1000)]
         previews = {CHILD_A: [{"role": "user", "text": WRAPPED_93}]}
         waiters, emitted = {}, []
 
@@ -341,7 +394,7 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
             # the follow, has returned).
             while not opened.done() and CHILD_A not in waiters:
                 await asyncio.sleep(0)
-            rows[0] = {"key": CHILD_A, "status": "done", "startedAt": self.NOW - 1000, "endedAt": self.NOW}
+            rows[0] = _child(CHILD_A, "done", startedAt=self.NOW - 1000, endedAt=self.NOW)
             ev = waiters.pop(CHILD_A, None)
             if ev is not None:
                 ev.set()    # the Gateway pushes the child's settle
@@ -360,5 +413,161 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
         finally:
             os.unlink(fh.name)
         self.assertEqual(out.returncode, 0, out.stderr)
-        # A minute later: no row still "running" and counting.
-        self.assertEqual(json.loads(out.stdout), [{"cells": [], "timers": 1}])
+        # A minute later the ended child is still listed (ELI-152), with
+        # its own duration, not counting up.
+        self.assertEqual(json.loads(out.stdout), [{"cells": ["1s"], "timers": 1}])
+
+
+def _card(call_id, name, args, result=None):
+    """An Agent (or other) tool card as the Pipe stores it in a reply's output."""
+    items = [{"type": "function_call", "id": call_id, "call_id": call_id, "name": name,
+              "arguments": json.dumps(args), "status": "completed"}]
+    if result is not None:
+        items.append({"type": "function_call_output", "id": f"fco_{call_id}", "call_id": call_id,
+                      "output": [{"type": "output_text", "text": result}], "status": "completed"})
+    return items
+
+
+def _agents_chat():
+    """A chat with Agent calls on its current branch and one off it."""
+    no_result = openclaw_status_action.TOOL_NO_RESULT_NOTE
+    failed = "Agent " + openclaw_status_action.TOOL_ERROR_MARK
+    msgs = {
+        "u1": {"id": "u1", "parentId": None, "role": "user", "content": "research", "timestamp": 1000},
+        "a1": {"id": "a1", "parentId": "u1", "role": "assistant", "timestamp": 1001, "done": True, "output":
+               _card("t1", "Agent", {"description": "Tax research", "run_in_background": True},
+                     "Async agent launched successfully. (internal metadata)")
+               + _card("t2", "Agent", {"description": "Broker research", "subagent_type": "general-purpose"},
+                       "[Subagent hand-back] Brokers: IBKR")
+               + _card("t3", "Bash", {"command": "ls"}, "a b")},
+        "u2": {"id": "u2", "parentId": "a1", "role": "user", "content": "more", "timestamp": 2000},
+        # Off the current branch: a regenerated sibling.
+        "a2x": {"id": "a2x", "parentId": "u2", "role": "assistant", "timestamp": 2001, "done": True,
+                "output": _card("t9", "Agent", {"description": "Discarded branch"}, "x")},
+        "a2": {"id": "a2", "parentId": "u2", "role": "assistant", "timestamp": 2002, "done": True,
+               "output": _card("t4", "Agent", {"description": "Strategy research"}, no_result)
+               + _card("t5", failed, {"description": "Venue research"}, "Agent crashed")},
+        "u3": {"id": "u3", "parentId": "a2", "role": "user", "content": "go", "timestamp": 3000},
+        "a3": {"id": "a3", "parentId": "u3", "role": "assistant", "timestamp": 3001, "done": False,
+               "output": _card("t6", "Agent", {"description": "Benchmark run"})},
+    }
+    return {"history": {"currentId": "a3", "messages": msgs}}
+
+
+class InProcessAgentTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-152: most sub-agents are Claude Code's in-process Agent calls,
+    which the Gateway never lists as child sessions. The section lists them
+    from the chat's own Agent tool cards: what the card can tell."""
+
+    def test_agent_cards_on_the_current_branch_newest_first(self):
+        rows = openclaw_status_action._agent_call_rows(_agents_chat())
+        self.assertEqual([(r["title"], r["state"]) for r in rows], [
+            ("Benchmark run", "running"),
+            ("Venue research", "failed"),
+            ("Strategy research", "cut off"),
+            ("Broker research", "returned"),
+            ("Tax research", "launched"),
+        ])
+        self.assertEqual(rows[0]["startedAt"], 3001000)
+        self.assertEqual(rows[3]["subagentType"], "general-purpose")
+
+    def test_a_call_with_no_result_in_a_finished_reply_was_cut_off(self):
+        chat = _agents_chat()
+        chat["history"]["messages"]["a3"]["done"] = True
+        self.assertEqual(openclaw_status_action._agent_call_rows(chat)[0]["state"], "cut off")
+
+    def test_the_newest_twenty(self):
+        msgs = {"a": {"id": "a", "parentId": None, "role": "assistant", "timestamp": 5, "done": True,
+                      "output": [i for n in range(25) for i in _card(f"t{n}", "Agent", {"description": f"job {n}"}, "ok")]}}
+        rows = openclaw_status_action._agent_call_rows({"history": {"currentId": "a", "messages": msgs}})
+        self.assertEqual([r["title"] for r in rows[:2]], ["job 24", "job 23"])
+        self.assertEqual(len(rows), 25)   # the caller caps what it shows
+
+    def test_no_chat_no_rows(self):
+        self.assertEqual(openclaw_status_action._agent_call_rows(None), [])
+        self.assertEqual(openclaw_status_action._agent_call_rows({"history": {}}), [])
+
+    async def test_the_dialog_lists_them_beside_the_gateway_children(self):
+        chats = types.ModuleType("open_webui.models.chats")
+
+        class Chats:
+            @staticmethod
+            def get_chat_by_id(chat_id):
+                assert chat_id == PARENT_CHAT
+                return types.SimpleNamespace(user_id=PARENT_USER, chat=_agents_chat())
+        chats.Chats = Chats
+        mods = {"open_webui": types.ModuleType("open_webui"),
+                "open_webui.models": types.ModuleType("open_webui.models"),
+                "open_webui.models.chats": chats}
+        with mock.patch.dict(sys.modules, mods):
+            _calls, emitted, data = await SubagentListTests._open(
+                self, [_child(CHILD_DONE, "done", startedAt=900, endedAt=990)], {})
+        self.assertEqual([t["id"] for t in data["tasks"]], [CHILD_DONE])
+        self.assertEqual([a["title"] for a in data["agents"]],
+                         ["Benchmark run", "Venue research", "Strategy research", "Broker research", "Tax research"])
+        self.assertEqual(data["agentsTotal"], 5)
+
+    async def test_another_users_chat_lists_no_agents(self):
+        chats = types.ModuleType("open_webui.models.chats")
+        chats.Chats = types.SimpleNamespace(
+            get_chat_by_id=lambda chat_id: types.SimpleNamespace(user_id="someone-else", chat=_agents_chat()))
+        mods = {"open_webui": types.ModuleType("open_webui"),
+                "open_webui.models": types.ModuleType("open_webui.models"),
+                "open_webui.models.chats": chats}
+        with mock.patch.dict(sys.modules, mods):
+            _calls, _emitted, data = await SubagentListTests._open(self, [], {})
+        self.assertEqual(data["agents"], [])
+
+
+class SubagentSectionRenderTests(unittest.TestCase):
+    """What the section shows for both groups, run in a fake page."""
+
+    NOW = 1_783_790_100_000
+
+    def _page(self, data):
+        import shutil
+        import subprocess
+        import tempfile
+        from test_status_action_unit import _FAKE_DOM_JS, _render_modal_open_js
+
+        runtime = shutil.which("bun") or shutil.which("node")
+        if runtime is None:
+            self.skipTest("no bun or node")
+        page = _FAKE_DOM_JS + r"""
+run(input.open);
+run(input.fill);
+const section = document.getElementById('openclaw-status-section-subagents');
+console.log(JSON.stringify(section.walk().filter((e) => e.children.length === 0 && e.text)
+  .map((e) => e.text)));
+"""
+        identity = {"chatId": "c", "messageId": "m", "sessionId": "s", "owuiModel": "x"}
+        payload = {"now": self.NOW, "open": _render_modal_open_js(identity),
+                   "fill": openclaw_status_action._render_subagents_fill_js(data)}
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
+            fh.write(page)
+        try:
+            out = subprocess.run([runtime, fh.name], input=json.dumps(payload),
+                                 capture_output=True, text=True, timeout=60)
+        finally:
+            os.unlink(fh.name)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout)
+
+    def test_both_groups_with_their_counts_and_states(self):
+        task = {"id": CHILD_A, "title": "Research X", "status": "completed", "childSessionKey": CHILD_A,
+                "startedAt": self.NOW - 65_000, "endedAt": self.NOW - 5_000, "terminalSummary": "X is fine"}
+        agents = [{"id": "t6", "title": "Benchmark run", "state": "running", "startedAt": self.NOW - 30_000},
+                  {"id": "t1", "title": "Tax research", "state": "launched", "startedAt": self.NOW - 600_000}]
+        texts = self._page({"tasks": [task], "total": 21, "agents": agents, "agentsTotal": 2,
+                            "source": "pipe", "fetchedAt": self.NOW, "error": None})
+        self.assertEqual(texts[:4], ["Subagents (1 of 21)", "Research X", "X is fine", "1m"])
+        self.assertIn("In-process agents (2)", texts)
+        rest = texts[texts.index("In-process agents (2)") + 1:]
+        self.assertEqual(rest[:2], ["Claude Code Agent calls in this chat, as their tool cards show them.",
+                                    "Benchmark run"])
+        self.assertIn("running", rest)
+        self.assertIn("launched in the background", rest)
+
+    def test_nothing_to_show_hides_the_section(self):
+        self.assertEqual(self._page({"tasks": [], "total": 0, "agents": [], "agentsTotal": 0,
+                                     "source": "pipe", "fetchedAt": self.NOW, "error": None}), [])
