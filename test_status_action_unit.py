@@ -1011,6 +1011,33 @@ class ExtractTranscriptAndToolsTests(unittest.TestCase):
         self.assertEqual(tool_calls, [])
         self.assertEqual(len(text_rows), 2)
 
+    def test_the_tools_tab_and_the_chat_rebuild_read_the_same_calls(self):
+        """One transcript parser (ELI-147): the drawer's Tools tab lists the
+        calls the chat's rebuild makes cards of, in both transcript shapes.
+        A recorded DeepSeek run (the Gateway's own runtime) and a claude-cli
+        run with a failed call."""
+        from openclaw_status_action import _history_renderer, TOOL_ERROR_MARK
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_fixture_native_history.json")
+        with open(path) as f:
+            native = json.load(f)["messages"]
+        cli = [
+            {"role": "user", "content": "check the logs", "idempotencyKey": "run-1:user"},
+            {"role": "assistant", "content": [
+                {"type": "toolcall", "id": "toolu_1", "name": "Bash", "arguments": {"command": "tail log"}},
+                {"type": "tool_result", "tool_use_id": "toolu_1", "name": "Bash", "content": "boom",
+                 "is_error": True}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "Found it."}]},
+        ]
+        for label, history in (("native", native), ("claude-cli", cli)):
+            with self.subTest(label):
+                _rows, tool_calls = _extract_transcript_and_tools(history)
+                cards = [i for i in _history_renderer(history).output if i["type"] == "function_call"]
+                self.assertTrue(cards)
+                self.assertEqual(
+                    [(c["id"], c["name"], c["isError"]) for c in tool_calls],
+                    [(c["id"], c["name"].removesuffix(f" {TOOL_ERROR_MARK}"), c["name"].endswith(TOOL_ERROR_MARK))
+                     for c in cards])
+
 
 async def _open_dialog(opening, conn):
     """Run a status dialog Action until it returns, or until it holds open

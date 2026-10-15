@@ -440,6 +440,27 @@ class HistoryRunRebuildTests(unittest.TestCase):
         r = _history_renderer(self._two_text_blocks(closer=False))
         self.assertEqual(r.text, "Running the five sleep steps one at a time.\n\nUSER-DONE-9e127db9")
 
+    def test_a_native_runs_transcript_rebuilds_its_cards(self):
+        """A run on the Gateway's own runtime (GPT, Gemini, DeepSeek in the
+        picker) keeps OpenClaw's shape, not claude-cli's: `toolCall` blocks,
+        and each result is a `toolResult` message of its own. Recorded from a
+        DeepSeek session; the rebuild came back with no cards at all."""
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_fixture_native_history.json")
+        with open(path) as f:
+            messages = json.load(f)["messages"]
+        messages = messages + [{"role": "assistant", "stopReason": "stop",
+                                "content": [{"type": "text", "text": "The workshop is empty."}]}]
+        r = _history_renderer(messages)
+        cards = [i for i in r.output if i["type"] == "function_call"]
+        self.assertEqual([c["name"] for c in cards],
+                         ["ls", f"ls {TOOL_ERROR_MARK}", "exec", f"ls {TOOL_ERROR_MARK}", "exec"])
+        outputs = {i["call_id"]: i["output"][0]["text"] for i in r.output if i["type"] == "function_call_output"}
+        self.assertEqual(outputs["call_00_bLXMsmgz1pJc5IL1J0Rx1971"], "(empty directory)")
+        self.assertTrue(outputs["call_00_QFthybdFqQt4QEdyJoAu2999"].startswith(f"{TOOL_ERROR_MARK} tool call failed"))
+        self.assertEqual(r.finished_output(), r.output)  # every call answered
+        self.assertEqual(r.output[-1]["type"], "message")
+        self.assertTrue(r.text.endswith("The workshop is empty."))
+
 
 def _turn_history(stub_id="stub-1", *, run="msg-c-stub-1-1.0", closed=True,
                   text="check the logs", later=False):
