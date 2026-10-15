@@ -7269,6 +7269,10 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
   // min() keeps this mobile-first: a narrow viewport wins the 88vw side (a
   // visible margin, not edge-to-edge), a wide one wins the 380px cap.
   panel.style.width = 'min(380px, 88vw)';
+  // Up to 20 sub-agents of each kind (ELI-152) outgrow a phone screen: the
+  // panel scrolls instead of running off both edges of the centered overlay.
+  panel.style.maxHeight = '88vh';
+  panel.style.overflowY = 'auto';
   panel.addEventListener('click', function(e) { e.stopPropagation(); });
 
   const header = document.createElement('div');
