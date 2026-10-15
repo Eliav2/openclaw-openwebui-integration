@@ -560,7 +560,7 @@ console.log(JSON.stringify(section.walk().filter((e) => e.children.length === 0 
                   {"id": "t1", "title": "Tax research", "state": "launched", "startedAt": self.NOW - 600_000}]
         texts = self._page({"tasks": [task], "total": 21, "agents": agents, "agentsTotal": 2,
                             "source": "pipe", "fetchedAt": self.NOW, "error": None})
-        self.assertEqual(texts[:4], ["Subagents (20 of 21)", "Research X", "X is fine", "1m"])
+        self.assertEqual(texts[:4], ["Subagents (1 of 21)", "Research X", "X is fine", "1m"])
         self.assertIn("In-process agents (2)", texts)
         rest = texts[texts.index("In-process agents (2)") + 1:]
         self.assertEqual(rest[:2], ["Claude Code Agent calls in this chat, as their tool cards show them.",
