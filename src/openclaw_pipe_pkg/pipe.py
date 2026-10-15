@@ -30,39 +30,6 @@ def _session_active_from_signals(describe_status, list_has_active_run) -> bool:
     return bool(list_has_active_run)
 
 
-def _owui_owns_inflight_message() -> bool:
-    """True when the running Open WebUI (0.12+) owns the in-flight assistant
-    message, which makes the pipe's REST mid-run snapshot a no-op.
-
-    Two 0.12 changes, measured live on 2026-10-11 against 0.12.0:
-      * `Chats.update_chat_by_id` keeps the STORED copy of any assistant
-        message whose stored or incoming `done` is False
-        (`models/chats.py::update_chat_by_id`), so the snapshot's
-        `history.messages[id]` patch is dropped. The live probe saw every
-        snapshot POST return 200 while the DB row stayed at content=0 until
-        `done`.
-      * The streaming handler keeps in-progress content/output in
-        `response_streams` (`middleware.py::save_current_response_stream`)
-        and `GET /api/v1/chats/{id}` overlays it onto the message
-        (`routers/chats.py::overlay_response_streams`). The same probe read
-        the growing text back from that GET every poll, so a client that
-        reloads mid-turn is rehydrated by OWUI itself.
-
-    `insert_chat_turn` (the 0.12 server-side turn insertion that came with
-    the `done` rule) is the feature marker. Outside OWUI, or on an older
-    OWUI, this is False and the snapshot keeps running.
-    """
-    mod = sys.modules.get("open_webui.models.chats")
-    if mod is None:
-        try:
-            import importlib
-            mod = importlib.import_module("open_webui.models.chats")
-        except Exception:
-            return False
-    chats = getattr(mod, "Chats", None)
-    return callable(getattr(chats, "insert_chat_turn", None))
-
-
 def _thinking_rejection_retry_body(body, recovered, resolved_thinking):
     """Decide whether a textless ("PHANTOM") turn's preview-recovered text is
     the Gateway's permanent-brick thinking-level rejection, and build the
@@ -567,100 +534,6 @@ class Pipe:
             method="POST",
         )
         await asyncio.to_thread(urllib.request.urlopen, req, timeout=10)
-
-    async def _rest_snapshot_message(self, chat_id: str, message_id: str,
-                                      content: str, bearer_token: str | None):
-        """Persist the in-flight assistant message via OWUI's REST API.
-
-        Deliberately NOT the __event_emitter__ `replace` event, and
-        deliberately NOT `POST /api/v1/chats/{id}/messages/{message_id}`
-        either -- that dedicated endpoint calls an `event_emitter` with a
-        `chat:message` socket event, which races the live HTTP delta stream
-        exactly like `replace` does (P17/P19/P23/P25/P27, 6e5f372). This
-        uses the same whole-chat update endpoint `_set_owui_chat_title`
-        already calls mid-conversation (`POST /api/v1/chats/{id}` with no
-        `message_id` in the path), which was confirmed by reading the live
-        OWUI 0.11.0 source (`bridge-rehydration-rest-snapshot-verify`,
-        2026-08-26) to never emit any Socket.IO frame -- it writes the DB
-        row directly with nothing for the frontend's live-stream handlers
-        to even receive.
-
-        Read-modify-write is required because `chat.messages[]` (the flat,
-        active-branch array) has no server-side merge -- sending it fully
-        replaces the old array, per `routers/chats.py::update_chat_by_id`
-        (`updated_chat = {**chat.chat, **form_data.chat}`). `chat.history
-        .messages{}` (keyed by message id) merges whole-object-per-id
-        server-side (`Chats.merge_history`), so only the one patched
-        message needs to be sent there.
-
-        Skipped on OWUI 0.12+ (`_owui_owns_inflight_message`): there the
-        write is discarded for an unfinished message and OWUI serves the
-        in-flight text to reloading clients on its own.
-        """
-        token = bearer_token or self.valves.OWUI_API_KEY
-        if not token or not chat_id or not message_id:
-            return
-        if _owui_owns_inflight_message():
-            return
-        base = self.valves.OWUI_BASE_URL.rstrip('/')
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        }
-
-        def _get_chat():
-            req = urllib.request.Request(
-                f"{base}/api/v1/chats/{chat_id}", headers=headers, method="GET",
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                return json.loads(resp.read().decode("utf-8", "replace"))
-
-        try:
-            current = await asyncio.to_thread(_get_chat)
-        except Exception as ex:
-            pipe_log(f"  rest_snapshot: GET failed: {ex}")
-            return
-
-        chat_obj = (current or {}).get("chat") or {}
-        messages = chat_obj.get("messages")
-        history_messages = ((chat_obj.get("history") or {}).get("messages")) or {}
-
-        target = history_messages.get(message_id)
-        if target is None and isinstance(messages, list):
-            target = next(
-                (m for m in messages if isinstance(m, dict) and m.get("id") == message_id),
-                None,
-            )
-        if target is None:
-            # Message doesn't exist yet on the OWUI side (e.g. very first
-            # chunk of a brand-new chat, before OWUI's own request handler
-            # has created the row) -- nothing to patch onto.
-            return
-
-        patched = dict(target)
-        patched["content"] = content
-
-        patch: dict = {"history": {"messages": {message_id: patched}}}
-        if isinstance(messages, list):
-            patched_messages = [
-                (patched if isinstance(m, dict) and m.get("id") == message_id else m)
-                for m in messages
-            ]
-            patch["messages"] = patched_messages
-
-        data = json.dumps({"chat": patch}).encode()
-
-        def _post_chat():
-            req = urllib.request.Request(
-                f"{base}/api/v1/chats/{chat_id}",
-                data=data, headers=headers, method="POST",
-            )
-            urllib.request.urlopen(req, timeout=10)
-
-        try:
-            await asyncio.to_thread(_post_chat)
-        except Exception as ex:
-            pipe_log(f"  rest_snapshot: POST failed: {ex}")
 
     async def pipe(self, body, __event_emitter__, __event_call__=None,
                    __user__=None, __metadata__=None, __request__=None,
@@ -1333,21 +1206,6 @@ class _PipeTurn:
         self.last_snapshot_time = 0.0
         self.snapshot_interval_s = 1.0
         self.snapshot_min_delta_chars = 250
-        # REST-API mid-run snapshot (bridge-rehydration-rest-snapshot-verify,
-        # confirmed safe 2026-08-26): a parallel, throttled persistence path
-        # for the plain assistant-text stream, which lost the `replace`-based
-        # snapshot in 6e5f372 and cannot regain it that way -- see
-        # REHYDRATION-PLAINTEXT-FIX-PROPOSAL.md for why every replace-based
-        # variant of this (P17/P19/P23/P25/P27) is unsafe at any throttle.
-        # This instead POSTs straight to the chat's DB row, which never
-        # broadcasts to the live client, so it cannot race the delta stream.
-        self.last_rest_snapshot_text = ""
-        self.last_rest_snapshot_time = 0.0
-        self.rest_snapshot_interval_s = 2.5
-        self.rest_snapshot_task: asyncio.Task | None = None
-        # OWUI 0.12+ discards this write and rehydrates reloads itself
-        # (`_owui_owns_inflight_message`), so don't schedule it at all there.
-        self.rest_snapshot_enabled = not _owui_owns_inflight_message()
         queued_shown = False
         # An interrupted run is not continued here: its message goes to the
         # turn writer, whose settled row decides who continues it (DESIGN 2.7).
@@ -2154,40 +2012,6 @@ class _PipeTurn:
         self.last_snapshot_text = self.visible_message_text
         self.last_snapshot_time = now
 
-    def maybe_start_rest_snapshot(self):
-        """Throttled gate for the REST-API mid-run snapshot.
-
-        Fire-and-forget (background task): a GET+POST round trip inline
-        in the streaming path would stall the live delta yield every
-        time the throttle opens. Guarded so at most one is in flight at
-        once, and stops firing once the turn hits terminal flush (`done`
-        True) -- matching this project's established convention
-        (19e9fd7/2092e19) of never doing anything new right at the
-        natural end of a message, even though this path is confirmed
-        safe from the replace-vs-delta race that motivated that
-        convention (bridge-rehydration-rest-snapshot-verify, 2026-08-26).
-        """
-        if self.done or not self.owui_message_id or not self.rest_snapshot_enabled:
-            return
-        if not self.visible_message_text or self.visible_message_text == self.last_rest_snapshot_text:
-            return
-        now = time.time()
-        if (
-            self.last_rest_snapshot_text
-            and now - self.last_rest_snapshot_time < self.rest_snapshot_interval_s
-        ):
-            return
-        if self.rest_snapshot_task is not None and not self.rest_snapshot_task.done():
-            return
-        snapshot_text = self.visible_message_text
-        self.last_rest_snapshot_text = snapshot_text
-        self.last_rest_snapshot_time = now
-        self.rest_snapshot_task = asyncio.create_task(
-            self.pipe._rest_snapshot_message(
-                self.owui_origin_chat_id, self.owui_message_id, snapshot_text, self.bearer_token,
-            )
-        )
-
     async def maybe_answer_user_input(self, prompt_text: str) -> UserInputResult:
         """Ask the user via an OWUI modal and deliver their answer.
 
@@ -2317,12 +2141,9 @@ class _PipeTurn:
         self.assistant_stream_text += text
         self.record_visible_chunk(shown_as)
         yield shown_as
-        if shown_as is text:
-            # No `replace` snapshot per delta: a mid-stream one freezes the
-            # visible stream (P23/P25). The REST snapshot writes the DB row
-            # without a broadcast instead.
-            self.maybe_start_rest_snapshot()
-        else:
+        # No `replace` snapshot per plain delta: a mid-stream one freezes the
+        # visible stream (P23/P25). Open WebUI keeps the in-flight text itself.
+        if shown_as is not text:
             await self.maybe_emit_snapshot()
 
     async def settle_held_media(self, held: str) -> str:

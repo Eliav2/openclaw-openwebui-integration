@@ -82,8 +82,7 @@ redeploying the pipe mid-stream in the same live chat used to verify it.**
 ### The one thing left to confirm on live (deploy-gated)
 
 Whether the active-client transport-race transient is (a) actually observable and
-(b) truly transient / self-healing. Run `scripts/verify_rehydration.py` (see its
-header) against a real streaming turn:
+(b) truly transient / self-healing, against a real streaming turn:
 1. reconnect-mid-turn → DB `content` grows before `done` (rehydration works);
 2. after `done` → no byte-identical duplication in `output` text or `content`.
 
@@ -92,20 +91,18 @@ is still streaming**: that reintroduces the false-alarm duplicate.
 
 ## Open WebUI 0.12 (2026-10-11)
 
-0.12 changes both halves of this picture, so the pipe's REST mid-run snapshot
-(`Pipe._rest_snapshot_message`) is skipped there (`_owui_owns_inflight_message`):
+0.12 (the minimum) owns the in-flight assistant message, so the pipe saves
+no mid-run copy of its own (its REST snapshot is gone since ELI-144):
 
 - `Chats.update_chat_by_id` (`models/chats.py`) keeps the STORED copy of any
-  assistant message whose stored or incoming `done` is False. The snapshot's
-  `history.messages[id]` patch is dropped. Measured live on 0.12.0: every
-  snapshot POST returned 200 while the DB row stayed at `content=""` until
-  `done`.
+  assistant message whose stored or incoming `done` is False, so a mid-run
+  write to it is dropped.
 - The streaming handler keeps in-progress `content`/`output` in
   `response_streams` (`middleware.py::save_current_response_stream`), and
   `GET /api/v1/chats/{id}` overlays it onto the message
-  (`routers/chats.py::overlay_response_streams`). The same probe read the
-  growing text back from that GET every ~2s, so a client reloading mid-turn is
-  rehydrated by OWUI itself.
+  (`routers/chats.py::overlay_response_streams`). Measured live on 0.12.0,
+  that GET returned the growing text every ~2s, so a client reloading mid-turn
+  is rehydrated by OWUI itself.
 
 The proactive-variant heal (`_heal_proactive_variants`) is hit by the same
 `done` rule: it now leaves a variant group alone while re-linking it would move

@@ -43,11 +43,6 @@ User-facing problems are in [Troubleshooting](./troubleshooting.md).
 | [`docs/rehydration-persistence.md`](./rehydration-persistence.md) | How Open WebUI persists an assistant message, why `output` wins over `content`, and why the integration emits mid-run snapshots so a client reconnecting mid-turn isn't left staring at an empty message. Read this before changing anything about snapshots or streaming. |
 | [`docs/design/ask-user-modal.md`](./design/ask-user-modal.md) | Design spec for a tool-call-based ask-user flow. **Not implemented as written**: see the banner at the top; the shipped approach intercepts `OpenClaw needs input:` text. |
 
-`scripts/verify_rehydration.py` is a live verifier for the behavior described in
-the first doc. It needs the integration deployed and a real streaming turn, it polls a
-chat until the turn is done and reports whether mid-run snapshots landed and
-whether the final message duplicated itself.
-
 `scripts/migrate_stale_chat_models.py` repoints chats whose saved model the
 Gateway no longer offers. Open WebUI drops an unlisted model id before the
 Pipe runs (the browser swaps in the default model, the API answers "Model not

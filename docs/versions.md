@@ -19,9 +19,7 @@ Below the minimums the chat itself still works, but some features break (the tab
 | Feature | Needs | On an older release |
 | --- | --- | --- |
 | Tool cards (live, native) | Open WebUI 0.11.1 | 0.10.2 and 0.11.0: a card keeps spinning after its tool has finished, because 0.11.1 changed how Open WebUI pairs a call with its result and the Pipe follows 0.11.1 |
-| Question card | Open WebUI 0.11.1 (its built-in question card) | Older dialogs: a text input, a confirm, or choice buttons |
 | Replies the agent starts (cron jobs, sub-agent results, restart recovery) | Open WebUI 0.12.0 | 0.11.1 and older: the reply is never written to the chat. The writer needs the chat row lock 0.12 added |
-| Reload mid-reply shows the answer so far | Any | 0.11.1 and older: the Pipe saves the reply every 2.5 s instead of Open WebUI keeping it |
 | Status dialog styling | Open WebUI 0.12.0 | Older releases lack a few of its CSS classes: slightly different spacing and text size, nothing missing |
 | Status button in the composer on chat open | Open WebUI 0.12.0 | Appears after the next reply instead |
 | Cron replies, and finishing a reply a Gateway restart cut off | OpenClaw 2026.9.3 | 2026.9.1 and older: a cron run in the chat's session is not recognised, so its reply is never shown; and in the restart test, a reply cut by a Gateway restart did not finish |

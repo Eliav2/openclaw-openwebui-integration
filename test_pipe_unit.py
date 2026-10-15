@@ -2259,46 +2259,6 @@ class RealHandlerReplayTests(unittest.TestCase):
         self.assertEqual(output[0]["name"], "Read ❌")
 
 
-class RestSnapshotOwui012Tests(unittest.TestCase):
-    """The REST mid-run snapshot is a no-op on OWUI 0.12 (its
-    `update_chat_by_id` keeps the stored copy of an unfinished assistant
-    message) and redundant there (GET /api/v1/chats/{id} overlays the live
-    stream). Measured live on 0.12.0: snapshot POSTs returned 200 while the
-    DB content stayed empty until `done`."""
-
-    @staticmethod
-    def _owui_modules(with_turn_insert: bool):
-        class FakeChats:
-            pass
-        if with_turn_insert:
-            async def insert_chat_turn(chat_id, user, user_message, message_ids):
-                return {}
-            FakeChats.insert_chat_turn = staticmethod(insert_chat_turn)
-        mod = types.ModuleType("open_webui.models.chats")
-        mod.Chats = FakeChats
-        return {
-            "open_webui": types.ModuleType("open_webui"),
-            "open_webui.models": types.ModuleType("open_webui.models"),
-            "open_webui.models.chats": mod,
-        }
-
-    def _run_snapshot(self, modules):
-        pipe = Pipe()
-        with mock.patch.dict(sys.modules, modules), \
-                mock.patch("urllib.request.urlopen",
-                           side_effect=OSError("no network in tests")) as urlopen:
-            asyncio.run(pipe._rest_snapshot_message("chat-1", "msg-1", "partial", "tok"))
-        return urlopen
-
-    def test_skipped_on_owui_012(self):
-        urlopen = self._run_snapshot(self._owui_modules(with_turn_insert=True))
-        urlopen.assert_not_called()
-
-    def test_still_runs_on_older_owui(self):
-        urlopen = self._run_snapshot(self._owui_modules(with_turn_insert=False))
-        urlopen.assert_called()
-
-
 class GatewayReconnectStormTests(unittest.IsolatedAsyncioTestCase):
     """Regression tests for the 2026-07-10 reconnect-storm incident (P36):
     `_reconnect()` used to call `_connect_and_start()`, which spawned a
