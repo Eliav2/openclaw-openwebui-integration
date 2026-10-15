@@ -1195,6 +1195,8 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.aborts = []
         self.active = False
         self.runtime = None
+        self.keys = []
+        self.history = {}
         n = {"run": 0}
 
         async def send_request(method, params, timeout=10):
@@ -1202,7 +1204,10 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
             if method == "chat.send":
                 n["run"] += 1
                 self.sent.append(params.get("message"))
+                self.keys.append(params.get("idempotencyKey"))
                 return {"runId": f"run-{n['run']}"}
+            if method == "chat.history":
+                return copy.deepcopy(self.history)
             if method == "chat.abort":
                 self.aborts.append(params)
                 return {"aborted": True}
@@ -1352,42 +1357,92 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(f"{self.SK}:run-1", self.conn._run_targets)
         self.assertTrue(self.conn.was_delivered_live(self.SK, "run-1"))
 
+    def _sent_history(self, key):
+        """The transcript once run `key` (a reply's chat.send) has ended."""
+        hist = _cli_history(key)
+        hist["messages"][2]["idempotencyKey"] = f"{key}:user"
+        return hist
+
+    @staticmethod
+    async def _collect(first, gen):
+        out, items = "", []
+        for chunk in [await asyncio.wait_for(first, 2)] + [c async for c in gen]:
+            if isinstance(chunk, str):
+                out += chunk
+            else:
+                items.append(chunk)
+        return out, items
+
     async def test_one_owui_message_invoked_twice_is_sent_once(self):
         """ELI-82 (2026-10-14 11:02Z, chat 56b98d09, message 5819edee): Open
         WebUI called the pipe twice for the same reply, same messages. The
         second call queued behind the first call's own run, then sent the
         user's text again as a new run once it settled. The agent answered
         twice ("I've already done this...") and the second answer, written
-        last, replaced the real final in the same message."""
-        gen1 = self._reply("hello", "m1")
+        last, replaced the real final in the same message. The second call
+        must follow the first run and end with its reply."""
+        gen1 = self._reply("check the logs", "m1")
         first1 = asyncio.ensure_future(gen1.__anext__())
         await self._until_registered("run-1")
         self.active = True
+        # The Gateway writes the user turn when it admits the send.
+        self.history = {"messages": self._sent_history(self.keys[0])["messages"][:3]}
 
-        gen2 = self._reply("hello", "m1")
+        gen2 = self._reply("check the logs", "m1")
         first2 = asyncio.ensure_future(gen2.__anext__())
         await self._spin()
+        self.assertFalse(first2.done(), "the second call waits for the run")
 
         q = self._queue("run-1")
-        q.put_nowait(self._delta("run-1", "the real final"))
+        q.put_nowait(self._delta("run-1", "Reading them.\n\nFound it."))
         q.put_nowait(self._final("run-1"))
-        out1 = await asyncio.wait_for(first1, 2)
-        async for chunk in gen1:
-            out1 += chunk if isinstance(chunk, str) else ""
-        self.assertIn("the real final", out1)
-
+        out1, _ = await self._collect(first1, gen1)
+        self.assertIn("Found it.", out1)
+        self.history = self._sent_history(self.keys[0])
         self._settled(False)
-        await self._spin()
-        try:
-            self.assertEqual(self.sent, ["hello"], "the same message ran twice")
-            out2 = await asyncio.wait_for(first2, 2)
-            async for chunk in gen2:
-                out2 += chunk if isinstance(chunk, str) else ""
-            self.assertIn("the real final", out2)
-        finally:
-            first2.cancel()
-            with contextlib.suppress(BaseException):
-                await gen2.aclose()
+
+        out2, items2 = await self._collect(first2, gen2)
+        self.assertEqual(self.sent, ["check the logs"], "the same message ran twice")
+        self.assertEqual(out2, "Reading them.\n\nFound it.")
+        self.assertEqual([i["item"]["type"] for i in items2 if i.get("type") == "response.output_item.added"],
+                         ["function_call", "function_call_output"])
+
+    async def test_a_second_call_after_the_run_ended_is_not_sent_again(self):
+        """Most of the 31 second calls came after the first run had ended
+        (up to 588 s later): the reply is rebuilt without waiting."""
+        gen1 = self._reply("check the logs", "m1")
+        first1 = asyncio.ensure_future(gen1.__anext__())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "Reading them.\n\nFound it."))
+        q.put_nowait(self._final("run-1"))
+        await self._collect(first1, gen1)
+        self.history = self._sent_history(self.keys[0])
+
+        gen2 = self._reply("check the logs", "m1")
+        out2, _ = await self._collect(asyncio.ensure_future(gen2.__anext__()), gen2)
+        self.assertEqual(self.sent, ["check the logs"])
+        self.assertIn("Found it.", out2)
+
+    async def test_a_second_call_with_new_text_is_sent(self):
+        """A second call for the same reply with different input is not a
+        repeat (two such calls in the logs continue a reply after a tool)."""
+        gen1 = self._reply("check the logs", "m1")
+        first1 = asyncio.ensure_future(gen1.__anext__())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "done"))
+        q.put_nowait(self._final("run-1"))
+        await self._collect(first1, gen1)
+
+        gen2 = self._reply("and now the other log", "m1")
+        first2 = asyncio.ensure_future(gen2.__anext__())
+        await self._until_registered("run-2")
+        q = self._queue("run-2")
+        q.put_nowait(self._delta("run-2", "other"))
+        q.put_nowait(self._final("run-2"))
+        await self._collect(first2, gen2)
+        self.assertEqual(self.sent, ["check the logs", "and now the other log"])
 
     async def test_a_socket_gap_makes_the_waiter_read_again(self):
         """The settle can be among the events lost while the socket was down,

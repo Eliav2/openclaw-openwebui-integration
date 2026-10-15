@@ -1158,11 +1158,15 @@ is what the naive implementation produces.
 Liveness is read from `sessions.describe` plus `sessions.list`'s
 `hasActiveRun`, which is authoritative across multiple Open WebUI worker
 processes. It also correctly handles the gap where a parent is suspended waiting
-on a sub-agent: that session is busy, not finished, and a 2 second
-settle-confirm keeps it from being misread. A per-session send lock means two
-messages released at the same moment cannot both merge into one run.
+on a sub-agent: that session is busy, not finished. The wait ends when the
+Gateway pushes that the run settled, with no timer and no ceiling. A
+per-session send lock means two messages released at the same moment cannot
+both merge into one run.
 
-Safety ceiling of 1800 seconds. Always on.
+Open WebUI sometimes calls the Pipe twice for the same reply. The second call
+does not send your message again: it follows the run the first call started
+and ends with that run's answer, so the agent never answers the same message
+twice and the real answer is never replaced. Always on.
 
 </details>
 

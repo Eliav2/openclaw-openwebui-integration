@@ -4839,6 +4839,9 @@ class _GatewayConnection:
         # its own events; a zombie connection never registers a target.
         self._run_targets: dict[str, dict] = {}
         self._run_renderers: dict[str, "_TurnRenderer"] = {}
+        # What each reply's message went out as, by "session_key:message_id"
+        # (`note_reply_sent`, ELI-82).
+        self._sent_replies: dict[str, dict] = {}
         # What the inline reply showed in place of raw run text, by
         # "chat_id:message_id": [(raw, shown)] for each resolved `MEDIA:`
         # directive and each ask-user prompt (its card, or its fallback text).
@@ -5097,6 +5100,22 @@ class _GatewayConnection:
         key = f"{session_key}:{run_id}"
         self._run_targets.pop(key, None)
         self._run_renderers.pop(key, None)
+
+    def note_reply_sent(self, session_key: str, message_id: str | None,
+                        run_id: str, text: str) -> None:
+        """Remember that OWUI reply `message_id` sent `text` as `run_id`, so
+        a second call for the same reply follows that run instead of
+        sending the message again (ELI-82)."""
+        if not (message_id and run_id):
+            return
+        self._sent_replies[f"{session_key}:{message_id}"] = {"run_id": run_id, "text": text}
+        if len(self._sent_replies) > 100:
+            for stale in list(self._sent_replies)[:50]:
+                self._sent_replies.pop(stale, None)
+
+    def reply_sent(self, session_key: str, message_id: str | None) -> dict | None:
+        """{run_id, text} that `note_reply_sent` recorded for this reply."""
+        return self._sent_replies.get(f"{session_key}:{message_id}") if message_id else None
 
     def continue_run_target(self, session_key: str, run_id: str, next_run_id: str,
                             shown: bool = True) -> None:
@@ -9996,6 +10015,43 @@ class Pipe:
                 return active
             return conn.active_run_id_for_session(session_key) is not None
 
+        # Open WebUI can call the pipe twice for one reply (ELI-82: 31 of
+        # 1150 replies from 2026-09-26 to 2026-10-14, the second call up to
+        # ten minutes later). Sending the message again runs it twice, and
+        # the second answer, written last, replaces the first in the same
+        # message. So a second call with the same text follows the run the
+        # first one started and ends with that run's reply, rebuilt from the
+        # transcript once the run is over.
+        reply_id = (__metadata__ or {}).get("message_id")
+        prior = (conn.reply_sent(session_key, reply_id)
+                 if _send_texts is None and not adopted_run_id else None)
+        if prior and prior["text"] == "\n\n".join(t for t in turn.unsent if t):
+            pipe_log(f"  this reply already sent its message as run "
+                     f"{prior['run_id'][:20]}... (a second call from Open WebUI); "
+                     "following that run instead of sending it again")
+            found = None
+            while True:
+                changed = conn.session_change_event(session_key)
+                try:
+                    hist = await conn.session_history(session_key, limit=RUN_HISTORY_LIMIT)
+                except Exception as ex:
+                    pipe_log(f"  chat.history for the sent run failed: {ex!r}")
+                    break
+                found = _stub_turn(hist, reply_id, "")
+                if found is None or found["closed"] or not await _session_run_active():
+                    break
+                await changed.wait()
+            if found is not None:
+                for item in _history_renderer(found["messages"]).finished_output():
+                    if item.get("type") == "message":
+                        yield (item.get("content") or [{}])[0].get("text", "")
+                    else:
+                        yield {"type": "response.output_item.added",
+                               "output_index": _OUTPUT_APPEND_INDEX, "item": item}
+                await _emit_status(__event_emitter__, "", done=True)
+                return
+            pipe_log("  the sent run is not in the transcript; sending the message")
+
         if (adopted_run_id and adopted_queue is None
                 and not await _session_run_active()):
             # It finished during the cancel/re-send gap and nothing buffered
@@ -10073,7 +10129,6 @@ class Pipe:
                 # The OWUI message id in the run id ties the run to the reply
                 # it streams into, so a reply orphaned by an Open WebUI restart
                 # is matched to its run by identity (ELI-90, `_stub_turn`).
-                reply_id = (__metadata__ or {}).get("message_id")
                 idempotency_key = (pipe_run_id(chat_id, reply_id) if reply_id
                                    else f"msg-{chat_id}-{time.time()}")
                 # Fit the requested level to what this session's model actually
@@ -10153,6 +10208,8 @@ class Pipe:
                     conn.unregister_consumer(session_key, idempotency_key, queue=queue)
                     queue = conn.register_consumer(session_key, our_run_id)
                 sent_texts = list(turn.unsent)
+                conn.note_reply_sent(session_key, reply_id, our_run_id,
+                                     "\n\n".join(t for t in sent_texts if t))
                 turn.unsent = []
                 turn.run_id = our_run_id
                 turn.queue = queue

@@ -2378,6 +2378,9 @@ class _GatewayConnection:
         # its own events; a zombie connection never registers a target.
         self._run_targets: dict[str, dict] = {}
         self._run_renderers: dict[str, "_TurnRenderer"] = {}
+        # What each reply's message went out as, by "session_key:message_id"
+        # (`note_reply_sent`, ELI-82).
+        self._sent_replies: dict[str, dict] = {}
         # What the inline reply showed in place of raw run text, by
         # "chat_id:message_id": [(raw, shown)] for each resolved `MEDIA:`
         # directive and each ask-user prompt (its card, or its fallback text).
@@ -2636,6 +2639,22 @@ class _GatewayConnection:
         key = f"{session_key}:{run_id}"
         self._run_targets.pop(key, None)
         self._run_renderers.pop(key, None)
+
+    def note_reply_sent(self, session_key: str, message_id: str | None,
+                        run_id: str, text: str) -> None:
+        """Remember that OWUI reply `message_id` sent `text` as `run_id`, so
+        a second call for the same reply follows that run instead of
+        sending the message again (ELI-82)."""
+        if not (message_id and run_id):
+            return
+        self._sent_replies[f"{session_key}:{message_id}"] = {"run_id": run_id, "text": text}
+        if len(self._sent_replies) > 100:
+            for stale in list(self._sent_replies)[:50]:
+                self._sent_replies.pop(stale, None)
+
+    def reply_sent(self, session_key: str, message_id: str | None) -> dict | None:
+        """{run_id, text} that `note_reply_sent` recorded for this reply."""
+        return self._sent_replies.get(f"{session_key}:{message_id}") if message_id else None
 
     def continue_run_target(self, session_key: str, run_id: str, next_run_id: str,
                             shown: bool = True) -> None:
