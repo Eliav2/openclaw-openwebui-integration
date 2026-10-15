@@ -817,3 +817,77 @@ def test_a_reply_whose_run_ends_while_owui_is_stopped_is_completed_on_start(toke
     assert msgs[aid]["content"].strip().startswith("E2E_DOWN slow-1"), msgs[aid]["content"][:300]
     assert [k for k, m in msgs.items() if m.get("role") == "assistant"] == [aid], "a second reply"
     _assert_clean(token, chat_id, msgs)
+
+
+# ── DEBUG ELI-98 (throwaway branch, never merged) ──────────────────────────
+# Does the Gateway emit a compaction signal that a connection of our own
+# class (_GatewayConnection, client id "webchat", the one the Pipe uses)
+# receives for a run it started? A: a manual /compact. B: a turn whose first
+# model call overflows, so the agent compacts and retries.
+
+def _eli98_capture(token: str, chat_id: str, key: str, message: str, wait_s: float = 150) -> list:
+    import openclaw_status_action as sa
+    user_id = key.split("openwebui-", 1)[1][:36]
+    run_id = f"e2e-eli98-{uuid.uuid4().hex[:10]}"
+    frames: list = []
+
+    async def call(action, emit):
+        conn, _ = await sa._get_action_connection(lambda: action.valves)
+        q = conn.register_consumer(key, run_id)
+        params = sa._owui_chat_send_params(session_key=key, message=message,
+                                           idempotency_key=run_id,
+                                           owui_chat_id=chat_id, owui_user_id=user_id)
+        params["deliver"] = False
+        resp = await sa._run_request(conn, sa.RUN_SEND, params, timeout=30)
+        frames.append({"send_resp": resp})
+        q2 = None
+        if isinstance(resp, dict) and resp.get("runId") and resp["runId"] != run_id:
+            q2 = conn.register_consumer(key, resp["runId"])
+        deadline = time.time() + wait_s
+        while time.time() < deadline:
+            got = None
+            for qq in (q, q2):
+                if qq is not None and not qq.empty():
+                    got = qq.get_nowait()
+                    break
+            if got is None:
+                await asyncio.sleep(0.2)
+                continue
+            frames.append(got)
+            p = (got.get("payload") or {}) if isinstance(got, dict) else {}
+            if got.get("event") == "chat" and p.get("state") in ("final", "error", "aborted"):
+                break
+    _run_action(token, call)
+    for f in frames:
+        print("[eli98] " + json.dumps(f)[:1500], flush=True)
+    log_dir = os.environ.get("E2E_LOG_DIR") or os.path.join(os.environ.get("RUNNER_TEMP", "/tmp"), "e2e-logs")
+    os.makedirs(log_dir, exist_ok=True)
+    with open(os.path.join(log_dir, "eli98-frames.jsonl"), "a") as fh:
+        fh.write(json.dumps({"message": message, "frames": frames}) + "\n")
+    return frames
+
+
+def _eli98_streams(frames: list) -> list:
+    return [((f.get("payload") or {}).get("stream"), ((f.get("payload") or {}).get("data") or {}).get("phase"))
+            for f in frames if isinstance(f, dict) and f.get("event") == "agent"]
+
+
+def test_debug_eli98_manual_compact_events(token):
+    chat_id, _ = _chat_turn(token, "Reply with exactly: ELI98_ONE")
+    key = _session_key(token, chat_id)
+    _eli98_capture(token, chat_id, key, "Reply with exactly: ELI98_TWO", wait_s=60)
+    frames = _eli98_capture(token, chat_id, key, "/compact")
+    print("[eli98] manual streams:", _eli98_streams(frames), flush=True)
+    finals = [((f.get("payload") or {}).get("message")) for f in frames
+              if isinstance(f, dict) and f.get("event") == "chat"
+              and (f.get("payload") or {}).get("state") == "final"]
+    print("[eli98] manual final:", json.dumps(finals)[:1500], flush=True)
+
+
+def test_debug_eli98_overflow_compaction_events(token):
+    chat_id, _ = _chat_turn(token, "Reply with exactly: ELI98_A")
+    key = _session_key(token, chat_id)
+    _eli98_capture(token, chat_id, key, "Reply with exactly: ELI98_B", wait_s=60)
+    frames = _eli98_capture(token, chat_id, key,
+                            f"E2E_OVERFLOW_{uuid.uuid4().hex[:8]} Reply with exactly: ELI98_C")
+    print("[eli98] overflow streams:", _eli98_streams(frames), flush=True)

@@ -83,7 +83,7 @@ jobs:
       - name: End-to-end suite
         run: |
           uv run --with-requirements requirements-dev.txt \
-            pytest -v --junitxml="$RUNNER_TEMP/e2e-logs/junit.xml" e2e/test_e2e.py
+            pytest -v -s --junitxml="$RUNNER_TEMP/e2e-logs/junit.xml" e2e/test_e2e.py -k eli98
 
       - name: Integration suite (test_pipe.py) against the stack
         # test_route_model_override asks a real model to call session_status and

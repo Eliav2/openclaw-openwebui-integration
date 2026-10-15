@@ -77,6 +77,10 @@ def _call(name: str, offered: list) -> dict | None:
     return None
 
 
+_OVERFLOWED: set = set()
+_OVERFLOW = re.compile(r"E2E_OVERFLOW_([A-Za-z0-9]{4,})")
+
+
 def plan_reply(body: dict) -> dict:
     """Return {"text": str} or {"tool": name, "args"?: dict} for one request."""
     messages = body.get("messages") or []
@@ -96,6 +100,13 @@ def plan_reply(body: dict) -> dict:
         (t.get("function") or {}).get("name")
         for t in body.get("tools") or []
     ]
+
+    # DEBUG ELI-98: the first request carrying E2E_OVERFLOW_<id> fails with a
+    # context overflow, so the agent compacts and retries.
+    m = _OVERFLOW.search(user_text)
+    if m and m.group(1) not in _OVERFLOWED:
+        _OVERFLOWED.add(m.group(1))
+        return {"overflow": True}
 
     if "session_status" in user_text and "model line" in user_text:
         if tool_results:
@@ -186,6 +197,15 @@ class Handler(BaseHTTPRequestHandler):
             with open(LOG_PATH, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps({"ts": time.time(), "path": self.path,
                                      "request": body, "reply": plan}) + "\n")
+
+        if plan.get("overflow"):
+            self._json(400, {"error": {
+                "message": "This model's maximum context length is 8192 tokens. However, "
+                           "your messages resulted in 9100 tokens. Please reduce the length "
+                           "of the messages.",
+                "type": "invalid_request_error", "param": "messages",
+                "code": "context_length_exceeded"}})
+            return
 
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         created = int(time.time())
