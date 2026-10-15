@@ -1,0 +1,62 @@
+{
+ "_source": "chat.history of a native-runtime chat.send (DeepSeek V4 Flash) on an openwebui- session key, recorded 2026-10-15 from the live Gateway 2026.9.3 (ELI-147 slice 4 probe). Ids as recorded; the tool's output is trimmed.",
+ "messages": [
+  {
+   "role": "user",
+   "content": "Call the session_status tool exactly once, then reply with the single word DONE.",
+   "idempotencyKey": "msg-probe-c728e4bb-d318-493d-b247-86cd4fd666ca-1792083843.485596:user",
+   "__openclaw": {
+    "idempotencyKey": "msg-probe-c728e4bb-d318-493d-b247-86cd4fd666ca-1792083843.485596:user"
+   }
+  },
+  {
+   "role": "assistant",
+   "content": [
+    {
+     "type": "toolCall",
+     "id": "call_00_ET_Mm8we4k60XbdiKNcNe143153",
+     "name": "session_status",
+     "arguments": {
+      "sessionKey": "current"
+     }
+    }
+   ],
+   "provider": "deepseek",
+   "model": "deepseek-v4-flash",
+   "stopReason": "toolUse",
+   "__openclaw": {
+    "runId": "msg-probe-c728e4bb-d318-493d-b247-86cd4fd666ca-1792083843.485596"
+   }
+  },
+  {
+   "role": "toolResult",
+   "toolCallId": "call_00_ET_Mm8we4k60XbdiKNcNe143153",
+   "toolName": "session_status",
+   "content": [
+    {
+     "type": "text",
+     "text": "OpenClaw 2026.9.3 (1391f7c)\nModel: deepseek/deepseek-v4-flash"
+    }
+   ],
+   "isError": false,
+   "__openclaw": {
+    "runId": "msg-probe-c728e4bb-d318-493d-b247-86cd4fd666ca-1792083843.485596"
+   }
+  },
+  {
+   "role": "assistant",
+   "content": [
+    {
+     "type": "text",
+     "text": "DONE"
+    }
+   ],
+   "provider": "deepseek",
+   "model": "deepseek-v4-flash",
+   "stopReason": "stop",
+   "__openclaw": {
+    "runId": "msg-probe-c728e4bb-d318-493d-b247-86cd4fd666ca-1792083843.485596"
+   }
+  }
+ ]
+}

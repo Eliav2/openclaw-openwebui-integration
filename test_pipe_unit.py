@@ -461,6 +461,34 @@ class HistoryRunRebuildTests(unittest.TestCase):
         self.assertEqual(r.output[-1]["type"], "message")
         self.assertTrue(r.text.endswith("The workshop is empty."))
 
+    @staticmethod
+    def _native_chat_send():
+        """A `chat.send` on the Gateway's own runtime, as the Pipe sends it
+        (recorded on an openwebui- session, DeepSeek V4 Flash): no closing
+        `cli-assistant:` message; each message the run wrote carries its run
+        id in `__openclaw.runId`, the last one with `stopReason` "stop"."""
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_fixture_native_chat_send.json")
+        with open(path) as f:
+            messages = json.load(f)["messages"]
+        return messages, messages[0]["idempotencyKey"].removesuffix(":user")
+
+    def test_a_native_run_is_found_by_its_run_id_once_it_stopped(self):
+        messages, run = self._native_chat_send()
+        later = [{"role": "user", "content": "next", "idempotencyKey": "msg-c-x-9.0:user"}]
+        for label, hist in (("newest turn", messages), ("a later turn follows", messages + later)):
+            with self.subTest(label):
+                span = _history_span_messages({"messages": hist}, run)
+                self.assertEqual([m["role"] for m in span], ["assistant", "toolResult", "assistant"])
+                r = _history_renderer(span)
+                self.assertEqual([i["type"] for i in r.output],
+                                 ["function_call", "function_call_output", "message"])
+                self.assertEqual(r.text, "DONE")
+
+    def test_a_native_run_still_calling_tools_is_not_closed(self):
+        messages, run = self._native_chat_send()
+        self.assertIsNone(_history_run_messages({"messages": messages[:3]}, run))
+        self.assertIsNone(_history_span_messages({"messages": messages[:3]}, run))
+
 
 def _turn_history(stub_id="stub-1", *, run="msg-c-stub-1-1.0", closed=True,
                   text="check the logs", later=False):
