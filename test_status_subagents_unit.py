@@ -571,3 +571,31 @@ console.log(JSON.stringify(section.walk().filter((e) => e.children.length === 0 
     def test_nothing_to_show_hides_the_section(self):
         self.assertEqual(self._page({"tasks": [], "total": 0, "agents": [], "agentsTotal": 0,
                                      "source": "pipe", "fetchedAt": self.NOW, "error": None}), [])
+
+    def test_a_long_dialog_scrolls_instead_of_running_off_the_screen(self):
+        """Up to 20 rows of each kind outgrow a phone screen: seen on the
+        runner, the dialog's top and bottom were cut off with no scroll."""
+        import shutil
+        import subprocess
+        import tempfile
+        from test_status_action_unit import _FAKE_DOM_JS, _render_modal_open_js
+
+        runtime = shutil.which("bun") or shutil.which("node")
+        if runtime is None:
+            self.skipTest("no bun or node")
+        page = _FAKE_DOM_JS + r"""
+run(input.open);
+const panel = document.getElementById('openclaw-status-modal-root').children[0];
+console.log(JSON.stringify({maxHeight: panel.style.maxHeight, overflowY: panel.style.overflowY}));
+"""
+        identity = {"chatId": "c", "messageId": "m", "sessionId": "s", "owuiModel": "x"}
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
+            fh.write(page)
+        try:
+            out = subprocess.run([runtime, fh.name], input=json.dumps(
+                {"now": self.NOW, "open": _render_modal_open_js(identity)}),
+                capture_output=True, text=True, timeout=60)
+        finally:
+            os.unlink(fh.name)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(out.stdout), {"maxHeight": "88vh", "overflowY": "auto"})
