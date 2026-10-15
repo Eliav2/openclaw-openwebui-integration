@@ -2093,7 +2093,7 @@ class Pipe:
                                 # its raw "OpenClaw needs input:" marker line.
                                 # Strip it defensively.
                                 if _is_user_input_prompt(item_delta):
-                                    stripped = _strip_input_marker_line(item_delta)
+                                    stripped = _ask_user_fallback_text(item_delta)
                                     conn.note_turn_rewrite(owui_origin_chat_id, owui_message_id,
                                                            item_delta, stripped)
                                     item_delta = stripped
@@ -2301,7 +2301,7 @@ class Pipe:
                             # on reconnect). Show the prompt as a fallback, but
                             # never leak the literal "OpenClaw needs input:"
                             # directive line as visible text.
-                            fallback = _strip_input_marker_line(pending_prompt_text)
+                            fallback = _ask_user_fallback_text(pending_prompt_text)
                             conn.note_turn_rewrite(owui_origin_chat_id, owui_message_id,
                                                    pending_prompt_text, fallback)
                             if fallback:

@@ -2695,6 +2695,28 @@ def _parse_ask_user_json(prompt_text: str) -> list[dict] | None:
     return questions or None
 
 
+def _ask_user_fallback_text(prompt_text: str) -> str:
+    """A prompt nobody answered in a card, as the text that ends the reply.
+
+    The JSON form reads as its questions, numbered when there are several,
+    each with its options listed under it, then one line on how to answer
+    (ELI-142: it showed as the raw JSON). Any other prompt is its own text
+    without the marker line."""
+    questions = _parse_ask_user_json(prompt_text)
+    if not questions:
+        return _strip_input_marker_line(prompt_text)
+    numbered = len(questions) > 1
+    lines = []
+    for n, q in enumerate(questions, 1):
+        auto_header = re.fullmatch(r"Question \d+", q["header"])
+        line = q["question"] if auto_header else f"**{q['header']}**: {q['question']}"
+        lines.append(f"{n}. {line}" if numbered else line)
+        for opt in q["options"]:
+            label = f"{opt['label']} - {opt['description']}" if opt["description"] else opt["label"]
+            lines.append(("   - " if numbered else "- ") + label)
+    return "\n".join(lines) + "\n\n_Answer in your next message._"
+
+
 def _native_ask_user_payload(prompt_text: str) -> dict | None:
     """Build OWUI's native `request:user_input` question card for a prompt.
 
@@ -7684,7 +7706,7 @@ class _TurnWriter:
         g = globals()
         names = ("_call_native_card_on_live_session", "_native_ask_user_payload",
                  "_owui_supports_native_ask_user", "_format_native_answers",
-                 "_ask_user_detail_block", "_is_user_input_prompt")
+                 "_ask_user_detail_block", "_is_user_input_prompt", "_ask_user_fallback_text")
         if self.closed or not self.opened or not all(n in g for n in names):
             return False
         # Only a question in the run's last message item (fences are per
@@ -7699,6 +7721,18 @@ class _TurnWriter:
         prompt = _prompt_tail(text, start)
         if not prompt or not g["_is_user_input_prompt"](prompt):
             return False
+        if await self._ask_card(prompt):
+            return True
+        # Not answered here: M ends with the question as the inline reply's
+        # fallback shows it (a JSON form as readable text, ELI-142).
+        self.conn.note_turn_rewrite(self.chat_id, self.message_id, prompt,
+                                    g["_ask_user_fallback_text"](prompt))
+        return False
+
+    async def _ask_card(self, prompt: str) -> bool:
+        """The card for `prompt` on the tab viewing the chat, and its answer
+        sent; False when nothing was sent."""
+        g = globals()
         payload = g["_native_ask_user_payload"](prompt) if g["_owui_supports_native_ask_user"]() else None
         if payload is None:
             return False
@@ -10905,7 +10939,7 @@ class Pipe:
                                 # its raw "OpenClaw needs input:" marker line.
                                 # Strip it defensively.
                                 if _is_user_input_prompt(item_delta):
-                                    stripped = _strip_input_marker_line(item_delta)
+                                    stripped = _ask_user_fallback_text(item_delta)
                                     conn.note_turn_rewrite(owui_origin_chat_id, owui_message_id,
                                                            item_delta, stripped)
                                     item_delta = stripped
@@ -11113,7 +11147,7 @@ class Pipe:
                             # on reconnect). Show the prompt as a fallback, but
                             # never leak the literal "OpenClaw needs input:"
                             # directive line as visible text.
-                            fallback = _strip_input_marker_line(pending_prompt_text)
+                            fallback = _ask_user_fallback_text(pending_prompt_text)
                             conn.note_turn_rewrite(owui_origin_chat_id, owui_message_id,
                                                    pending_prompt_text, fallback)
                             if fallback:

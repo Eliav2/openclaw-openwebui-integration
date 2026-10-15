@@ -7864,6 +7864,20 @@ class WriterQuestionCardTests(_RoutingCase):
         self.assertIs(m["done"], True)
         self.assertEqual(m["content"], "Before I go on:\nColor?\nPick one\n1. Red\n2. Blue")
 
+    async def test_an_unanswered_json_form_ends_the_reply_as_readable_text(self):
+        """ELI-142: the writer's fallback reads as the inline reply's does."""
+        self.owui.session_pool["sid-tab"] = {"id": self.USER, "chat_ids": [self.CHAT]}
+        self.owui.page_intent["sid-tab"] = {"status": "cancelled"}
+        text = "Before I go on:\n" + openclaw_pipe._USER_INPUT_TRIGGER_PREFIXES[0] + "\n" + json.dumps(
+            NeedsInputMarkerTests.HEBREW_FORM, ensure_ascii=False)
+        self.history = {"messages": self.closed_run(self.RUN, text)}
+        await self.ask_run(text)
+        self.assertEqual(len(self.card_calls()), 1)
+        (_mid, m), = self.new_messages().items()
+        self.assertIs(m["done"], True)
+        self.assertEqual(m["content"], "Before I go on:\n" + openclaw_pipe._ask_user_fallback_text(text[16:]))
+        self.assertIn("1. **טווח**: לאיזה טווח השקעה?\n   - קצר - עד שנה", m["content"])
+
     async def test_a_fence_left_open_before_a_tool_call_does_not_hide_the_question(self):
         """Review 2af1 F4 on the writer: fences are tracked per message item."""
         self.owui.session_pool["sid-tab"] = {"id": self.USER, "chat_ids": [self.CHAT]}

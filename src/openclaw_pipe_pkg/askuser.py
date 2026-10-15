@@ -524,6 +524,28 @@ def _parse_ask_user_json(prompt_text: str) -> list[dict] | None:
     return questions or None
 
 
+def _ask_user_fallback_text(prompt_text: str) -> str:
+    """A prompt nobody answered in a card, as the text that ends the reply.
+
+    The JSON form reads as its questions, numbered when there are several,
+    each with its options listed under it, then one line on how to answer
+    (ELI-142: it showed as the raw JSON). Any other prompt is its own text
+    without the marker line."""
+    questions = _parse_ask_user_json(prompt_text)
+    if not questions:
+        return _strip_input_marker_line(prompt_text)
+    numbered = len(questions) > 1
+    lines = []
+    for n, q in enumerate(questions, 1):
+        auto_header = re.fullmatch(r"Question \d+", q["header"])
+        line = q["question"] if auto_header else f"**{q['header']}**: {q['question']}"
+        lines.append(f"{n}. {line}" if numbered else line)
+        for opt in q["options"]:
+            label = f"{opt['label']} - {opt['description']}" if opt["description"] else opt["label"]
+            lines.append(("   - " if numbered else "- ") + label)
+    return "\n".join(lines) + "\n\n_Answer in your next message._"
+
+
 def _native_ask_user_payload(prompt_text: str) -> dict | None:
     """Build OWUI's native `request:user_input` question card for a prompt.
 

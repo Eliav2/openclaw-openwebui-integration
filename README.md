@@ -791,8 +791,8 @@ options are collapsed.
 The question card is shown once, on the tab viewing the chat; a reload moves it
 to the reloaded tab. If it is not answered by Open WebUI's card timeout (4
 minutes), or you dismiss it, or no tab views the chat, the reply ends with the
-question as ordinary text, marker line stripped, and you answer it in your next
-message. The older modals survive a reconnect instead: close the tab, come back
+question as ordinary text, marker line stripped (a JSON form as its numbered
+questions with their options), and you answer it in your next message. The older modals survive a reconnect instead: close the tab, come back
 later, and the modal re-pops on your new session for up to an hour while the
 status line reads "Waiting for your reply, question is pending, reconnect
 anytime". Once answered, the exchange is kept
