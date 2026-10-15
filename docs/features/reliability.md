@@ -38,6 +38,8 @@ In the tab where the reply is running, Open WebUI holds the new message itself, 
 
 Whether a run is active comes from the Gateway: `sessions.describe`, confirmed against `sessions.list`'s `hasActiveRun`, which holds across several Open WebUI processes. A parent that is paused waiting on a sub-agent counts as busy, not finished. The wait ends when the Gateway pushes that the run settled, with no polling and no time limit. A per-session send lock means two messages released at the same moment cannot merge into one run.
 
+Open WebUI sometimes calls the Pipe twice for the same reply. The second call does not send your message again: it follows the run the first call started and ends with that run's answer, so the agent never answers the same message twice and the real answer is never replaced.
+
 Always on.
 
 ## Reload mid-reply
@@ -93,7 +95,7 @@ What the Pipe logs when the Gateway socket drops mid-reply (an excerpt):
 
 Silence is never treated as the end of a reply. A long tool call or a long stretch of silent reasoning is waited on; the reply ends only on the run's own end, its settled session row, or a restart.
 
-There is one bound: a run that sends 5000 events with no text at all is recovered from the transcript, or ends with a timeout note. When a run ends without text, the reason comes from its real final state, so you see **Stopped.**, the run's error, or **Failed:** the run did not complete, rather than a generic timeout. With no reason at all, the reply says "_(This turn produced no reply text.)_".
+There is no timer and no event count: thousands of tool calls before the first word keep the reply open too. When a run ends without text, the reason comes from its real final state, so you see **Stopped.**, the run's error, or **Failed:** the run did not complete, rather than a generic timeout. With no reason at all, the reply says "_(This turn produced no reply text.)_".
 
 Always on.
 

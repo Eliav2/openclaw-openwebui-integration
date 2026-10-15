@@ -47,7 +47,7 @@ Typing `/compact` in the message box does not compact the session: Open WebUI 0.
 
 ## Sub-agents
 
-The Subagents section lists the child sessions this chat's runs spawned: the ones still active and the ones that ended in the last 30 minutes, with their status and elapsed time. A running sub-agent's elapsed time counts up while the dialog is open.
+The Subagents section lists the child sessions this chat's runs spawned that are still running or queued, with their elapsed time counting up while the dialog is open. One that finishes while the dialog is open leaves the list as soon as the Gateway pushes the change.
 
 Each row is titled with the sub-agent's task, else its spawn label. While a sub-agent has just started, the row shows its task rather than the Gateway's spawn wrapper.
 
