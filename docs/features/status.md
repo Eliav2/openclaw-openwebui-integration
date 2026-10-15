@@ -29,19 +29,15 @@ Rate limits come from the Gateway's `usage.status`. On a Gateway whose only Anth
 
 ## Compact
 
-A Compact pill in the dialog header runs `/compact` on the session. While it works, the dialog shows a distinct "Compacting..." state, then refreshes with the numbers after compaction, so you can see what it bought you.
+A Compact pill in the dialog's Context section sends `/compact` from the chat's message box, the same as typing it. It shows in the chat as your message, Open WebUI keeps the box busy while it runs, and the reply under it is the Gateway's own line with the size before and after, for example "⚙️ Compacted (31k → 4k) • Context 4k/200k (2%)".
 
-![The Context section before compacting](../img/compact-before-light.png#gh-light-mode-only)
-![The Context section before compacting](../img/compact-before-dark.png#gh-dark-mode-only)
+![The Context section with its Compact pill](../img/compact-before-light.png#gh-light-mode-only)
+![The Context section with its Compact pill](../img/compact-before-dark.png#gh-dark-mode-only)
 
-![The same section after Compact](../img/compact-after-light.png#gh-light-mode-only)
-![The same section after Compact](../img/compact-after-dark.png#gh-dark-mode-only)
+![The chat after Compact: the /compact message and the Gateway's reply](../img/compact-after-light.png#gh-light-mode-only)
+![The chat after Compact: the /compact message and the Gateway's reply](../img/compact-after-dark.png#gh-dark-mode-only)
 
-It waits up to 180 seconds, the same as the default timeout of `openclaw sessions compact`. If it takes longer, the dialog says so; compaction may still finish in the background.
-
-While a reply is running, Compact refuses with "A response is currently in progress", rather than compacting the session under a running turn.
-
-The `/compact` command becomes a turn in the session's stored transcript, so other tools that read that history see it, but it never appears as a message in the Open WebUI chat.
+If the message box holds a draft, Compact leaves it alone and asks you to send or clear it first.
 
 ## Sub-agents
 

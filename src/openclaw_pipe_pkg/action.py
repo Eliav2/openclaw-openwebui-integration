@@ -171,39 +171,57 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     if (f) f.textContent = 'Updated ' + fetchedAt + ' · via ' + source;
   }
 
-  // Fetches back to this same Action (same-origin, unsandboxed execute
-  // context -- no iframe/postMessage plumbing needed) with a synthetic
-  // mode="compact" marker. Reads OWUI's own stored auth token directly
-  // (confirmed against OWUI's frontend source: it keeps its bearer token
-  // at localStorage['token']) rather than assuming cookie auth. The
-  // chat/message/session identity is the *original* click's (captured at
-  // open time, in IDENTITY -- these never change over the dialog's
-  // lifetime and never need an RPC, unlike everything else here), so the
-  // Python side's __event_emitter__ calls for this follow-up route back
-  // to this same open tab. The fetch response itself is ignored -- all UI
-  // updates arrive as separate execute events pushed from the Python side
-  // as the compact operation progresses.
+  // Sends /compact the way a person would: through this chat's own
+  // composer, so it is a real message in the chat, Open WebUI blocks the
+  // composer while it runs, and the Gateway's reply ("Compacted (52k ->
+  // 8k)") lands under it. A draft in the composer is never overwritten.
+  function composerText(box) {
+    return (box.tagName === 'TEXTAREA' ? box.value : box.innerText).trim();
+  }
+  function compactError(message) {
+    const wrap = document.getElementById('openclaw-status-sections');
+    if (!wrap) return;
+    wrap.innerHTML = '';
+    wrap.appendChild(errorEl(message));
+  }
   function triggerCompact() {
-    const token = localStorage.getItem('token');
-    fetch('/api/chat/actions/openclaw_status_action', {
-      method: 'POST',
-      headers: {
-        'Authorization': 'Bearer ' + token,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: IDENTITY.owuiModel,
-        chat_id: IDENTITY.chatId,
-        id: IDENTITY.messageId,
-        session_id: IDENTITY.sessionId,
-        mode: 'compact',
-      }),
-    }).catch(function(err) {
-      const wrap = document.getElementById('openclaw-status-sections');
-      if (!wrap) return;
-      wrap.innerHTML = '';
-      wrap.appendChild(errorEl('Could not start compact: ' + err));
-    });
+    const box = document.getElementById('chat-input');
+    if (!box || location.pathname.indexOf('/c/' + IDENTITY.chatId) !== 0) {
+      compactError('Open this chat to compact it.');
+      return;
+    }
+    if (composerText(box)) {
+      compactError('The message box has a draft. Send or clear it, then Compact.');
+      return;
+    }
+    box.focus();
+    setComposer(box, '/compact');
+    // Open WebUI shows and enables its send button once it has seen the text
+    // (during a reply, it queues the message behind it).
+    let tries = 0;
+    (function send() {
+      const btn = document.getElementById('send-message-button');
+      if (btn && !btn.disabled) {
+        btn.click();
+        const root = document.getElementById('openclaw-status-modal-root');
+        if (root) root.remove();
+        return;
+      }
+      if (++tries < 40) { setTimeout(send, 50); return; }
+      setComposer(box, '');
+      compactError('Could not send /compact from the message box.');
+    })();
+  }
+  function setComposer(box, text) {
+    if (box.tagName === 'TEXTAREA') {
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+      setter.call(box, text);
+      box.dispatchEvent(new Event('input', { bubbles: true }));
+    } else {
+      document.execCommand('selectAll', false);
+      if (text) document.execCommand('insertText', false, text);
+      else document.execCommand('delete', false);
+    }
   }
 
   // TaskSummary timestamps can arrive as either an ISO string or an epoch-ms
@@ -233,8 +251,10 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     return deltaS + 's';
   }
 
-  // Same same-origin/synthetic-mode trick as triggerCompact() above, just a
-  // different mode + extra taskId/title/status payload so the drawer
+  // Fetches back to this same Action (same-origin, unsandboxed execute
+  // context) with a synthetic mode="subagent-detail" marker and OWUI's own
+  // bearer token from localStorage['token'], plus the taskId/title/status
+  // payload so the drawer
   // (_DRAWER_OPEN_JS_TEMPLATE) can paint its header instantly from data the
   // row already had, before Action._run_subagent_detail's own RPCs resolve.
   function openSubagentDrawer(task) {
@@ -345,66 +365,8 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
 })();
 """
 
-# Fired only on a post-compact refresh (_run_status(show_loading=False)),
-# never on the initial open. _MODAL_COMPACTING_JS (below) replaces
-# #openclaw-status-sections' entire contents with its spinner, which
-# destroys the three individual section ids each fill function targets --
-# this recreates fresh skeletons in their place before the refreshed RPCs
-# are fired, without touching the overlay/header/window.__openclawStatus
-# (already correctly set up from the original open).
-_RESET_SECTIONS_JS = r"""
-(function() {
-  const wrap = document.getElementById('openclaw-status-sections');
-  const S = window.__openclawStatus;
-  if (!wrap || !S) return;
-  wrap.innerHTML = '';
-  wrap.appendChild(S.skeletonSection('openclaw-status-section-context'));
-  wrap.appendChild(S.skeletonSection('openclaw-status-section-limits'));
-  wrap.appendChild(S.skeletonSection('openclaw-status-section-subagents'));
-})();
-"""
-
-# Static (no data), fired the moment a compact is triggered -- see
-# Action._run_compact. Deliberately a distinct, prominent "Compacting..."
-# state rather than reusing the generic loading skeleton: compaction is an
-# LLM call that can take a while, so the dialog should look like it's
-# doing something specific and ongoing, not like a normal fetch that's
-# about to finish in a second. Replaces the whole sections wrapper (not a
-# specific section) since this is a dialog-wide state, not a per-query one.
-_MODAL_COMPACTING_JS = r"""
-(function() {
-  const wrap = document.getElementById('openclaw-status-sections');
-  if (!wrap) return;
-  wrap.innerHTML = '';
-
-  const isDark = document.documentElement.classList.contains('dark');
-
-  const box = document.createElement('div');
-  box.className = 'flex flex-col items-center justify-center py-6 text-center';
-
-  const spinner = document.createElement('div');
-  spinner.className = 'animate-spin rounded-full h-6 w-6 border-2 mb-3';
-  spinner.style.borderColor = isDark ? '#4b5563' : '#d1d5db';
-  spinner.style.borderTopColor = 'transparent';
-  box.appendChild(spinner);
-
-  const title = document.createElement('div');
-  title.className = 'text-sm font-medium text-gray-700 dark:text-gray-200';
-  title.textContent = 'Compacting…';
-  box.appendChild(title);
-
-  const sub = document.createElement('div');
-  sub.className = 'text-xs text-gray-400 dark:text-gray-500 mt-1';
-  sub.textContent = 'This can take a moment for long conversations.';
-  box.appendChild(sub);
-
-  wrap.appendChild(box);
-})();
-"""
-
-# Dialog-wide error (connection failures, "busy" guard, compact timeout) --
-# also replaces the whole sections wrapper rather than one section, same
-# reasoning as _MODAL_COMPACTING_JS.
+# Dialog-wide error (connection failures): replaces the whole sections
+# wrapper rather than one section, since it is a dialog-wide state.
 _SECTIONS_ERROR_JS_TEMPLATE = r"""
 (function() {
   const MESSAGE = __OPENCLAW_ERROR_MESSAGE__;
@@ -455,7 +417,7 @@ _CONTEXT_FILL_JS_TEMPLATE = r"""
   headerLabel.style.fontSize = '10px';
   headerLabel.textContent = 'Context';
   headerRow.appendChild(headerLabel);
-  if (S.identity.chatId && S.identity.messageId && S.identity.sessionId) {
+  if (S.identity.chatId) {
     const compactBtn = document.createElement('button');
     compactBtn.type = 'button';
     compactBtn.textContent = 'Compact';
@@ -658,7 +620,7 @@ _SUBAGENTS_FILL_JS_TEMPLATE = r"""
 # positioned to the side rather than centered) so the full subagent list
 # stays visible and glanceable behind it. Opened by S.openSubagentDrawer()
 # (defined in _MODAL_OPEN_JS_TEMPLATE) via a synthetic mode="subagent-detail"
-# call -- same self-call convention triggerCompact() already uses. All three
+# call back to this same Action. All three
 # tab panes are created up front with skeletons; Action._run_subagent_detail
 # fills all three on every poll tick regardless of which tab is visible
 # (cheap: it's just a DOM update), so switching tabs is a pure visibility
@@ -1184,10 +1146,9 @@ def _render_drawer_tools_fill_js(data: dict) -> str:
     return _DRAWER_TOOLS_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
 
 
-# Bounds for Action._run_subagent_detail's hold-open poll loop -- same
-# "hold the request, sleep, poll, keep emitting" shape _run_compact already
-# proves works (there, bounded to 180s). A subagent can legitimately run much
-# longer than a compact call, so this gets its own, longer ceiling; it exists
+# Bounds for Action._run_subagent_detail's hold-open poll loop ("hold the
+# request, sleep, poll, keep emitting"). A subagent can legitimately run for a
+# long time, so the ceiling is generous; it exists
 # purely so a forgotten-open drawer (or a subagent stuck non-terminal) can't
 # pin the coroutine/connection open forever, not because 15 minutes is a
 # meaningful product limit.
@@ -1311,11 +1272,10 @@ class Action:
     async def action(self, body: dict, __user__=None, __event_emitter__=None):
         """Dispatches on body["mode"]: the default ("status", or absent --
         this is what OWUI sends for the actual message-toolbar click) opens
-        the dialog and shows live usage; "compact" and "subagent-detail" are
-        never sent by OWUI itself -- both are synthetic markers the dialog's
-        own in-page buttons fetch back with (see triggerCompact() and
-        openSubagentDrawer() in _MODAL_OPEN_JS_TEMPLATE), reusing this same
-        endpoint rather than registering a second Action.
+        the dialog and shows live usage; "subagent-detail" is never sent by
+        OWUI itself -- it is a synthetic marker the dialog's drawer buttons
+        fetch back with (see openSubagentDrawer() in _MODAL_OPEN_JS_TEMPLATE),
+        reusing this same endpoint rather than registering a second Action.
 
         A real toolbar click on an old sub-agent-finished message (written
         by bridge versions before ELI-100) is also mode-less (OWUI itself
@@ -1327,8 +1287,6 @@ class Action:
         straight into the same subagent-detail drawer instead of the
         general status dialog, keyed off content rather than mode."""
         mode = body.get("mode")
-        if mode == "compact":
-            return await self._run_compact(body, __user__, __event_emitter__)
         if mode == "subagent-detail":
             return await self._run_subagent_detail(body, __user__, __event_emitter__)
         if mode is None:
@@ -1343,7 +1301,7 @@ class Action:
             # Every status run (re)delivers the composer Status button, so one
             # spark click is enough to install it in this tab. Sent last so it
             # never delays the dialog; idempotent and best effort (never
-            # raises). Not on compact/drawer runs: the dialog that sends those
+            # raises). Not on drawer runs: the dialog that sends those
             # was opened by a status run, which already delivered it. The
             # Action is global (its spark shows under every model's replies),
             # so the chat is only vouched for when its model is the Pipe's.
@@ -1355,7 +1313,7 @@ class Action:
                 chat_id=body.get("chat_id") if ours else None,
             )
 
-    async def _run_status(self, body: dict, __user__, __event_emitter__, *, show_loading=True):
+    async def _run_status(self, body: dict, __user__, __event_emitter__):
         """Fetches and renders the dialog's three sections -- Context, Rate
         Limits, Subagents -- each independently: its own skeleton at open,
         its own fill event as soon as its own data is ready, not one
@@ -1381,20 +1339,13 @@ class Action:
         # they're already in `body` -- so they're embedded once at open
         # time (IDENTITY in _MODAL_OPEN_JS_TEMPLATE) rather than threaded
         # through every section's own fill payload.
-        if show_loading:
-            identity = {
-                "chatId": chat_id,
-                "messageId": body.get("id"),
-                "sessionId": body.get("session_id"),
-                "owuiModel": body.get("model"),
-            }
-            await __event_emitter__({"type": "execute", "data": {"code": _render_modal_open_js(identity)}})
-        else:
-            # Post-compact refresh: the dialog is already open, but
-            # _MODAL_COMPACTING_JS replaced the sections wrapper with its
-            # spinner, destroying the three section ids -- recreate fresh
-            # skeletons in their place before firing the refreshed RPCs.
-            await __event_emitter__({"type": "execute", "data": {"code": _RESET_SECTIONS_JS}})
+        identity = {
+            "chatId": chat_id,
+            "messageId": body.get("id"),
+            "sessionId": body.get("session_id"),
+            "owuiModel": body.get("model"),
+        }
+        await __event_emitter__({"type": "execute", "data": {"code": _render_modal_open_js(identity)}})
 
         session_key = _owui_session_key(self.valves.AGENT_ID, user_id, chat_id)
 
@@ -1552,133 +1503,11 @@ class Action:
         pipe_log(f"[status-action] status dialog filled ({source}) provider={provider}")
         return {"status": "ok"}
 
-    async def _run_compact(self, body: dict, __user__, __event_emitter__):
-        """Triggers /compact on the same session and waits for it to
-        finish, then refreshes the dialog with post-compaction numbers.
-
-        Uses chat.send(message="/compact") rather than the gateway's
-        sessions.compact RPC: traced sessions.compact's handler and it
-        explicitly rejects webchat-classified connections
-        (rejectWebchatSessionMutation / isWebchatClient in the installed
-        gateway bundle) -- and the Pipe's own connect params identify as
-        client.id="webchat", so any connection this Action reuses from the
-        Pipe is classified the same way. The RPC's own error message
-        confirms the intended alternative: "use chat.send for
-        session-scoped updates". This does mean the literal "/compact" text
-        becomes a real turn in the session's stored transcript (visible to
-        other surfaces that inspect that history), even though it never
-        appears in OWUI's own chat bubble UI (a separate HTTP path this
-        call never touches) -- a known, accepted trade-off, not an oversight.
-
-        Polls sessions.describe for completion rather than registering a
-        run consumer and reading the Pipe's event queue -- see the
-        Milestone 4 plan notes for why: this only needs a boolean "still
-        running" signal, not live text streaming, so the Pipe's much larger
-        consumption loop (idle probes, steering, preview recovery) would be
-        a lot of machinery for a narrow need.
-        """
-        chat_id = body.get("chat_id")
-        user_id = (__user__ or {}).get("id") or "unknown"
-
-        if not chat_id:
-            await __event_emitter__({
-                "type": "execute",
-                "data": {"code": _render_sections_error_js("Missing chat_id")},
-            })
-            return {"status": "error", "detail": "missing chat_id"}
-
-        session_key = _owui_session_key(self.valves.AGENT_ID, user_id, chat_id)
-
-        try:
-            conn, source = await _get_action_connection(lambda: self.valves)
-        except Exception as ex:
-            await __event_emitter__({
-                "type": "execute",
-                "data": {"code": _render_sections_error_js(f"Could not connect: {ex}")},
-            })
-            return {"status": "error", "detail": str(ex)}
-
-        if conn.active_run_id_for_session(session_key):
-            await __event_emitter__({
-                "type": "execute",
-                "data": {"code": _render_sections_error_js(
-                    "A response is currently in progress -- wait for it to "
-                    "finish before compacting."
-                )},
-            })
-            return {"status": "error", "detail": "session busy"}
-
-        # Immediate, unambiguous visual feedback -- compaction can take a
-        # while (it's an LLM summarization call), so the dialog needs a
-        # definitive "in progress" state, not a skeleton that looks like
-        # it's about to finish in a second.
-        await __event_emitter__({"type": "execute", "data": {"code": _MODAL_COMPACTING_JS}})
-
-        try:
-            compact_params = _owui_chat_send_params(
-                session_key=session_key,
-                message="/compact",
-                # ACTION_RUN_PREFIX: the turn path never gives this run a message.
-                idempotency_key=f"{ACTION_RUN_PREFIX}compact-{chat_id}-{time.time()}",
-                owui_chat_id=chat_id,
-                owui_user_id=user_id,
-            )
-            # Explicit, not relying on the gateway's own default for an
-            # omitted field: this compact run should never trigger outbound
-            # delivery to other configured channels (Slack/Discord/etc.) --
-            # same reasoning gateway.py's existing send_stop already applies
-            # to its own chat.send("/stop") call.
-            compact_params["deliver"] = False
-            send_resp = await _run_request(conn, RUN_SEND, compact_params, timeout=30)
-        except Exception as ex:
-            pipe_log(f"[status-action] compact chat.send failed: {ex}")
-            await __event_emitter__({
-                "type": "execute",
-                "data": {"code": _render_sections_error_js(f"Could not start compact: {ex}")},
-            })
-            return {"status": "error", "detail": str(ex)}
-
-        pipe_log(f"[status-action] compact started, runId={send_resp.get('runId')}")
-
-        deadline = time.time() + 180  # matches `openclaw sessions compact`'s own default RPC timeout
-        status = None
-        while time.time() < deadline:
-            await asyncio.sleep(1.5)
-            try:
-                desc = await conn.send_request("sessions.describe", dict(key=session_key), timeout=8)
-            except Exception as ex:
-                pipe_log(f"[status-action] compact poll failed: {ex}")
-                continue
-            status = ((desc or {}).get("session") or {}).get("status")
-            if status in ("done", "failed", "cancelled"):
-                break
-
-        if status not in ("done", "failed", "cancelled"):
-            await __event_emitter__({
-                "type": "execute",
-                "data": {"code": _render_sections_error_js(
-                    "Compact timed out -- it may still finish in the background."
-                )},
-            })
-            return {"status": "error", "detail": "timeout"}
-
-        if status != "done":
-            await __event_emitter__({
-                "type": "execute",
-                "data": {"code": _render_sections_error_js(f"Compact {status}.")},
-            })
-            return {"status": "error", "detail": status}
-
-        pipe_log("[status-action] compact done, refreshing status")
-        return await self._run_status(body, __user__, __event_emitter__, show_loading=False)
-
     async def _run_subagent_detail(self, body: dict, __user__, __event_emitter__):
         """Opens the per-subagent drawer and holds this same request open for
         the life of the subagent's run, polling and pushing fresh execute
-        fills roughly every _SUBAGENT_POLL_INTERVAL_S seconds -- the same
-        "hold the request open, sleep-poll, keep emitting" shape
-        _run_compact already uses and has proven works (there, bounded to
-        180s). Bounded here to _SUBAGENT_POLL_MAX_S so a forgotten-open
+        fills roughly every _SUBAGENT_POLL_INTERVAL_S seconds. Bounded to
+        _SUBAGENT_POLL_MAX_S so a forgotten-open
         drawer, or a subagent that never reaches a terminal status, can't
         pin this coroutine/connection open forever.
 
@@ -1686,10 +1515,9 @@ class Action:
         the user closes the drawer (or reopens it for a different task,
         which removes and recreates '#openclaw-drawer-root'), every fill
         template's own `if (!section) return;` guard makes further
-        execute() pushes targeting the now-missing ids silent no-ops. Same
-        trade-off _run_compact already accepts (no cancel path there either)
-        -- wasted polling until the next terminal status or the deadline,
-        never a visible glitch.
+        execute() pushes targeting the now-missing ids silent no-ops: wasted
+        polling until the next terminal status or the deadline, never a
+        visible glitch.
         """
         task_id = body.get("taskId")
         if not task_id:

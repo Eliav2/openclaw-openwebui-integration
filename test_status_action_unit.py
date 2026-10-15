@@ -197,24 +197,20 @@ class RenderJsTests(unittest.TestCase):
         self.assertIn("toLocaleTimeString", js)
         self.assertIn("'resets in ' + w.resetIn", js)
 
-    def test_compact_button_gated_on_identity_fields_present(self):
-        """The Compact button's click handler needs chatId/messageId/
-        sessionId (embedded in IDENTITY at open time, read via
-        S.identity.*) to build a working callback -- the context fill must
-        gate the button's creation on all three being present."""
+    def test_compact_button_gated_on_the_chat_id(self):
+        """The Compact button sends /compact through the chat's own composer,
+        so it only needs to know which chat the dialog belongs to."""
         js = _render_context_fill_js({
             "provider": "x", "model": "", "context": {"usedTokens": "1k", "totalTokens": "10k", "pct": 10.0},
             "goal": None, "source": "pipe", "fetchedAt": "12:00:00", "error": None,
         })
-        self.assertIn("S.identity.chatId && S.identity.messageId && S.identity.sessionId", js)
+        self.assertIn("if (S.identity.chatId) {", js)
         self.assertIn("compactBtn", js)
         self.assertIn("S.triggerCompact", js)
 
-    def test_compact_fetch_targets_this_same_action_with_mode_marker(self):
+    def test_no_compact_mode_is_sent_back_to_the_action(self):
         js = _render_modal_open_js({"chatId": "c1", "messageId": "m1", "sessionId": "s1", "owuiModel": "x.y"})
-        self.assertIn("/api/chat/actions/openclaw_status_action", js)
-        self.assertIn("mode: 'compact'", js)
-        self.assertIn("localStorage.getItem('token')", js)
+        self.assertNotIn("mode: 'compact'", js)
 
     def test_subagents_hidden_entirely_when_tasks_empty(self):
         """General tracking, no detail: a permanently
@@ -359,6 +355,148 @@ class ElapsedTickTests(unittest.TestCase):
         tasks = [self._task("running", "running", self.NOW - 1000)]
         seen = self._page([{"reopen": True}, {"reopen": True}, {"close": True}, {"advance": 1}], tasks)
         self.assertEqual([s["timers"] for s in seen], [1, 1, 1, 0])
+
+
+# A page with Open WebUI's composer: `#chat-input` (the rich editor, or a
+# textarea) and `#send-message-button`, which Open WebUI enables once it has
+# seen input and which sends and clears the box when clicked.
+_COMPACT_PAGE_JS = r"""
+const input = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+const timers = [];
+global.setTimeout = (fn) => { timers.push(fn); return timers.length; };
+global.setInterval = () => 0;
+global.clearInterval = () => {};
+class El {
+  constructor(tag) {
+    this.tagName = tag.toUpperCase(); this.children = []; this.parent = null;
+    this.style = {}; this.dataset = {}; this.className = ''; this.id = ''; this.text = '';
+  }
+  appendChild(c) { if (c.remove) c.remove(); c.parent = this; this.children.push(c); return c; }
+  remove() {
+    if (this.parent) this.parent.children = this.parent.children.filter((x) => x !== this);
+    this.parent = null;
+  }
+  set innerHTML(v) { this.children = []; this.text = ''; }
+  set textContent(v) { this.children = []; this.text = String(v); }
+  get textContent() { return this.text + this.children.map((c) => c.textContent).join(''); }
+  get innerText() { return this.textContent; }
+  addEventListener() {}
+  focus() { focused = this; }
+  click() { if (this.onclick) this.onclick(); }
+  walk(out = []) { for (const c of this.children) { out.push(c); c.walk(out); } return out; }
+}
+class TextArea extends El {
+  get value() { return this.text; }
+  set value(v) { this.text = String(v); }
+  dispatchEvent(e) { if (e.type === 'input') send.disabled = !this.text; }
+}
+global.HTMLTextAreaElement = TextArea;
+global.Event = class { constructor(type) { this.type = type; } };
+let focused = null;
+let selected = false;
+global.window = global;
+global.location = { pathname: input.path };
+const fetches = [];
+global.fetch = (...args) => { fetches.push(args[0]); return { catch() {} }; };
+global.localStorage = { getItem: () => 't' };
+global.document = {
+  body: new El('body'),
+  documentElement: { classList: { contains: () => false } },
+  createElement: (t) => new El(t),
+  getElementById: (id) => document.body.walk().find((e) => e.id === id) || null,
+  addEventListener() {}, removeEventListener() {},
+  execCommand: (cmd, ui, text) => {
+    if (!focused) return false;
+    if (cmd === 'selectAll') selected = true;
+    else if (cmd === 'insertText') focused.text = (selected ? '' : focused.text) + text;
+    else if (cmd === 'delete' && selected) focused.text = '';
+    else return false;
+    if (cmd !== 'selectAll') selected = false;
+    send.disabled = !focused.text;
+    return true;
+  },
+};
+const box = input.composer.kind === 'textarea' ? new TextArea('textarea') : new El('div');
+box.id = 'chat-input';
+box.text = input.composer.text;
+document.body.appendChild(box);
+const sent = [];
+const send = new El('button');
+send.id = 'send-message-button';
+send.disabled = !box.text;
+send.onclick = () => { if (send.disabled) return; sent.push(box.text); box.text = ''; send.disabled = true; };
+if (input.composer.sendButton !== false) document.body.appendChild(send);
+const run = (js) => new Function(js)();
+run(input.open);
+input.fills.forEach(run);
+const btn = document.body.walk().find((e) => e.tagName === 'BUTTON' && e.text === 'Compact');
+btn.onclick();
+for (let i = 0; i < 100 && timers.length; i++) timers.shift()();
+const wrap = document.getElementById('openclaw-status-sections');
+console.log(JSON.stringify({
+  sent, fetches: fetches.length, composer: box.text,
+  dialogOpen: !!document.getElementById('openclaw-status-modal-root'),
+  sections: wrap ? wrap.textContent : null,
+}));
+"""
+
+
+class CompactButtonTests(unittest.TestCase):
+    """ELI-81: Compact sends /compact through the chat's own composer, so it
+    is a real message in the chat and Open WebUI runs it like any other,
+    instead of calling the Action on the side where the chat shows nothing."""
+
+    def _click(self, composer: dict, path: str = "/c/c1") -> dict:
+        import shutil
+        import subprocess
+        runtime = shutil.which("bun") or shutil.which("node")
+        if runtime is None:
+            self.skipTest("no bun or node")
+        identity = {"chatId": "c1", "messageId": "m1", "sessionId": "s1", "owuiModel": "x"}
+        fill = _render_context_fill_js({
+            "provider": "x", "model": "", "context": {"usedTokens": "1k", "totalTokens": "10k", "pct": 10.0},
+            "goal": None, "source": "pipe", "fetchedAt": "12:00:00", "error": None,
+        })
+        payload = {"open": _render_modal_open_js(identity), "fills": [fill],
+                   "composer": composer, "path": path}
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
+            fh.write(_COMPACT_PAGE_JS)
+        try:
+            out = subprocess.run([runtime, fh.name], input=json.dumps(payload),
+                                 capture_output=True, text=True, timeout=60)
+        finally:
+            os.unlink(fh.name)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout)
+
+    def test_sends_compact_from_the_composer_and_closes_the_dialog(self):
+        page = self._click({"kind": "div", "text": ""})
+        self.assertEqual(page["sent"], ["/compact"])
+        self.assertEqual(page["fetches"], 0, "no side call to the Action")
+        self.assertFalse(page["dialogOpen"])
+
+    def test_a_textarea_composer_sends_it_too(self):
+        page = self._click({"kind": "textarea", "text": ""})
+        self.assertEqual(page["sent"], ["/compact"])
+        self.assertFalse(page["dialogOpen"])
+
+    def test_a_draft_is_kept_and_nothing_is_sent(self):
+        page = self._click({"kind": "div", "text": "half a thought"})
+        self.assertEqual(page["sent"], [])
+        self.assertEqual(page["composer"], "half a thought")
+        self.assertTrue(page["dialogOpen"])
+        self.assertIn("has a draft", page["sections"])
+
+    def test_no_send_button_leaves_the_box_as_it_was(self):
+        page = self._click({"kind": "div", "text": "", "sendButton": False})
+        self.assertEqual(page["sent"], [])
+        self.assertTrue(page["dialogOpen"])
+        self.assertIn("Could not send /compact", page["sections"])
+
+    def test_another_chat_is_never_compacted(self):
+        page = self._click({"kind": "div", "text": ""}, path="/c/other-chat")
+        self.assertEqual(page["sent"], [])
+        self.assertIn("Open this chat", page["sections"])
 
 
 class GetActionConnectionTests(unittest.IsolatedAsyncioTestCase):
@@ -608,143 +746,6 @@ class ClaudeCliUsageFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"error": null', limits_code)
 
 
-class CompactTests(unittest.IsolatedAsyncioTestCase):
-    """The dialog's Compact button fetches back to this same Action with a
-    synthetic mode="compact" marker (see triggerCompact() in
-    _MODAL_OPEN_JS_TEMPLATE) -- these cover the Python-side dispatch and
-    the poll-for-completion flow (chat.send + sessions.describe polling,
-    not the Pipe's full event-consumer loop -- see action.py's
-    _run_compact docstring for why)."""
-
-    COMPACT_BODY = {"mode": "compact", "chat_id": "chat-1", "id": "msg-1", "session_id": "sess-1",
-                     "model": "openclaw_gateway.anthropic/claude-sonnet-5"}
-
-    async def test_mode_dispatch_routes_to_run_compact(self):
-        action = Action()
-        with mock.patch.object(action, "_run_compact", new=mock.AsyncMock(return_value={"status": "ok"})) as m:
-            result = await action.action(self.COMPACT_BODY, __user__={"id": "u1"}, __event_emitter__=mock.AsyncMock())
-        m.assert_awaited_once()
-        self.assertEqual(result["status"], "ok")
-
-    async def test_default_mode_does_not_route_to_compact(self):
-        action = Action()
-        with mock.patch.object(action, "_run_compact", new=mock.AsyncMock()) as m, \
-             mock.patch.object(action, "_run_status", new=mock.AsyncMock(return_value={"status": "ok"})):
-            await action.action({"chat_id": "chat-1"}, __user__={"id": "u1"}, __event_emitter__=mock.AsyncMock())
-        m.assert_not_awaited()
-
-    async def test_blocked_when_a_run_is_already_active(self):
-        action = Action()
-        emitted = []
-
-        async def emitter(evt):
-            emitted.append(evt)
-
-        fake_conn = mock.Mock()
-        fake_conn.active_run_id_for_session = mock.Mock(return_value="some-active-run")
-        fake_conn.send_request = mock.AsyncMock()  # must never be called
-
-        with mock.patch("openclaw_status_action._get_action_connection",
-                         new=mock.AsyncMock(return_value=(fake_conn, "pipe"))):
-            result = await action._run_compact(self.COMPACT_BODY, {"id": "u1"}, emitter)
-
-        self.assertEqual(result["status"], "error")
-        self.assertEqual(result["detail"], "session busy")
-        fake_conn.send_request.assert_not_awaited()
-        self.assertEqual(len(emitted), 1)
-        self.assertIn("currently in progress", emitted[0]["data"]["code"])
-
-    async def test_success_shows_compacting_then_refreshes_all_sections(self):
-        action = Action()
-        emitted = []
-
-        async def emitter(evt):
-            emitted.append(evt)
-
-        describe_calls = {"n": 0}
-
-        async def fake_send_request(method, params, timeout=5):
-            if method == "chat.send":
-                self.assertEqual(params["message"], "/compact")
-                self.assertEqual(params["deliver"], False)
-                return {"runId": "compact-run-1"}
-            if method == "sessions.describe":
-                describe_calls["n"] += 1
-                # Still running on the first poll, done on the second --
-                # exercises the loop actually looping, not just the
-                # single-iteration happy path. Calls after that (the
-                # _run_status refresh's own sessions.describe) report done.
-                status = "running" if describe_calls["n"] == 1 else "done"
-                return {"session": {"status": status, "modelProvider": "anthropic",
-                                     "model": "claude-sonnet-5"}}
-            if method == "usage.status":
-                return {"providers": []}
-            if method == "sessions.list":
-                return {"sessions": []}
-            raise AssertionError(f"unexpected RPC: {method}")
-
-        fake_conn = mock.Mock()
-        fake_conn.active_run_id_for_session = mock.Mock(return_value=None)
-        fake_conn.send_request = mock.AsyncMock(side_effect=fake_send_request)
-
-        with mock.patch("openclaw_status_action._get_action_connection",
-                         new=mock.AsyncMock(return_value=(fake_conn, "pipe"))), \
-             mock.patch("openclaw_status_action.asyncio.sleep", new=mock.AsyncMock()):
-            result = await action._run_compact(self.COMPACT_BODY, {"id": "u1"}, emitter)
-
-        self.assertEqual(result["status"], "ok")
-        self.assertGreaterEqual(describe_calls["n"], 2)
-        codes = _emitted_codes(emitted)
-        self.assertIn("Compacting", codes[0])
-        self.assertIn("openclaw-status-sections", codes[1])  # skeleton reset, not full re-open
-        # The refresh must reach all three sections again, not just Context.
-        self.assertTrue(any("getElementById('openclaw-status-section-context')" in c for c in codes))
-        self.assertTrue(any("getElementById('openclaw-status-section-limits')" in c for c in codes))
-        self.assertTrue(any("getElementById('openclaw-status-section-subagents')" in c for c in codes))
-        context_code = next(c for c in codes if "getElementById('openclaw-status-section-context')" in c)
-        self.assertIn("anthropic", context_code)
-
-    async def test_timeout_shows_clear_message_not_infinite_spin(self):
-        action = Action()
-        emitted = []
-
-        async def emitter(evt):
-            emitted.append(evt)
-
-        async def fake_send_request(method, params, timeout=5):
-            if method == "chat.send":
-                return {"runId": "compact-run-1"}
-            if method == "sessions.describe":
-                return {"session": {"status": "running"}}  # never finishes
-            raise AssertionError(f"unexpected RPC: {method}")
-
-        fake_conn = mock.Mock()
-        fake_conn.active_run_id_for_session = mock.Mock(return_value=None)
-        fake_conn.send_request = mock.AsyncMock(side_effect=fake_send_request)
-
-        # Simulate 180s+ elapsing without a real wait: each asyncio.sleep
-        # call jumps the fake clock forward past the deadline immediately.
-        clock = {"t": 0.0}
-
-        def fake_time():
-            return clock["t"]
-
-        async def fake_sleep(_seconds):
-            clock["t"] += 200
-
-        with mock.patch("openclaw_status_action._get_action_connection",
-                         new=mock.AsyncMock(return_value=(fake_conn, "pipe"))), \
-             mock.patch("openclaw_status_action.time.time", side_effect=fake_time), \
-             mock.patch("openclaw_status_action.asyncio.sleep", new=fake_sleep):
-            result = await action._run_compact(self.COMPACT_BODY, {"id": "u1"}, emitter)
-
-        self.assertEqual(result["status"], "error")
-        self.assertEqual(result["detail"], "timeout")
-        codes = _emitted_codes(emitted)
-        self.assertIn("timed out", codes[-1])
-        self.assertIn("openclaw-status-sections", codes[-1])
-
-
 class ExtractTranscriptAndToolsTests(unittest.TestCase):
     """Message shape here mirrors what sessions_history returns for a real
     session (confirmed live, 2026-07-12): content is a list of typed parts
@@ -873,8 +874,7 @@ class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
     """The Subagents section's rows fetch back to this same Action with a
     synthetic mode="subagent-detail" marker (see openSubagentDrawer() in
     _MODAL_OPEN_JS_TEMPLATE) -- these cover the Python-side dispatch and the
-    hold-the-request-open poll loop (same shape as CompactTests exercises
-    for _run_compact, polling the child session)."""
+    hold-the-request-open poll loop, polling the child session."""
 
     CHILD = "agent:main:subagent:child-sess-1"
     DETAIL_BODY = {"mode": "subagent-detail", "chat_id": "chat-1", "id": "msg-1", "session_id": "sess-1",
@@ -1079,17 +1079,16 @@ class SubagentProactiveMessageClickTests(unittest.IsolatedAsyncioTestCase):
         detail_m.assert_not_awaited()
 
     async def test_explicit_mode_still_takes_priority_over_marker_sniffing(self):
-        """A synthetic mode="compact"/"subagent-detail" click (the dialog's
-        own in-page buttons) must never be reinterpreted by content
-        sniffing, even if its body coincidentally carries old marker text."""
+        """A synthetic mode="subagent-detail" click (the dialog's drawer
+        buttons) must never be reinterpreted by content sniffing, even if
+        its body coincidentally carries old marker text."""
         action = Action()
-        body = {"mode": "compact", "chat_id": "chat-1",
+        body = {"mode": "subagent-detail", "chat_id": "chat-1", "taskId": "task-2",
                 "content": "<!-- openclaw:taskId=task-1 -->"}
-        with mock.patch.object(action, "_run_compact", new=mock.AsyncMock(return_value={"status": "ok"})) as compact_m, \
-             mock.patch.object(action, "_run_subagent_detail", new=mock.AsyncMock()) as detail_m:
+        with mock.patch.object(action, "_run_subagent_detail", new=mock.AsyncMock()) as detail_m:
             await action.action(body, __user__={"id": "u1"}, __event_emitter__=mock.AsyncMock())
-        compact_m.assert_awaited_once()
-        detail_m.assert_not_awaited()
+        detail_m.assert_awaited_once()
+        self.assertEqual(detail_m.await_args.args[0]["taskId"], "task-2")
 
 
 if __name__ == "__main__":

@@ -813,3 +813,52 @@ def test_a_reply_whose_run_ends_while_owui_is_stopped_is_completed_on_start(toke
     assert msgs[aid]["content"].strip().startswith("E2E_DOWN slow-1"), msgs[aid]["content"][:300]
     assert [k for k, m in msgs.items() if m.get("role") == "assistant"] == [aid], "a second reply"
     _assert_clean(token, chat_id, msgs)
+
+
+def _next_turn(token: str, chat_id: str, prompt: str, model: str = DEFAULT_MODEL) -> dict:
+    """One more turn in an existing chat, sent the way the composer sends it;
+    returns the saved assistant message."""
+    status, got = _request("GET", f"/api/v1/chats/{chat_id}", token=token)
+    assert status == 200, got
+    chat = got["chat"]
+    prev = chat["history"]["currentId"]
+    now = int(time.time())
+    uid, aid = str(uuid.uuid4()), str(uuid.uuid4())
+    user = {"id": uid, "parentId": prev, "childrenIds": [aid], "role": "user",
+            "content": prompt, "timestamp": now, "models": [model]}
+    assistant = {"id": aid, "parentId": uid, "childrenIds": [], "role": "assistant",
+                 "content": "", "model": model, "timestamp": now, "done": False}
+    msgs = chat["history"]["messages"]
+    msgs[prev]["childrenIds"] = msgs[prev].get("childrenIds", []) + [uid]
+    msgs[uid], msgs[aid] = user, assistant
+    chat["history"]["currentId"] = aid
+    chat["messages"] = chat.get("messages", []) + [user, assistant]
+    status, saved = _request("POST", f"/api/v1/chats/{chat_id}", {"chat": chat}, token)
+    assert status == 200, saved
+    convo = [{"role": m["role"], "content": m.get("content") or ""} for m in chat["messages"][:-1]]
+    status, ack = _request("POST", "/api/chat/completions", {
+        "model": model, "messages": convo, "stream": True, "chat_id": chat_id, "id": aid,
+        "session_id": f"e2e-{uuid.uuid4().hex[:8]}", "parent_id": uid, "user_message": user,
+    }, token)
+    assert status == 200, f"completion request failed: {status} {ack}"
+    deadline = time.time() + TURN_TIMEOUT_S
+    msg: dict = {}
+    while time.time() < deadline:
+        msg = _chat_messages(token, chat_id).get(aid, {})
+        if msg.get("done"):
+            return msg
+        time.sleep(1.5)
+    pytest.fail(f"turn did not finish within {TURN_TIMEOUT_S:.0f}s: {json.dumps(msg)[:1500]}")
+
+
+def test_compact_sent_as_a_message_gets_the_gateways_line(token):
+    """The Status dialog's Compact button sends /compact from the composer
+    (ELI-81): the chat keeps the message and the Gateway's own compaction
+    line as a finished reply."""
+    chat_id, _ = _chat_turn(token, "Reply with exactly: COMPACT_ONE")
+    _next_turn(token, chat_id, "Reply with exactly: COMPACT_TWO")
+    msg = _next_turn(token, chat_id, "/compact")
+    assert msg.get("done") is True and not msg.get("error"), json.dumps(msg)[:1500]
+    assert msg["content"].startswith("⚙️ Compact"), msg["content"]
+    users = [m["content"] for m in _chat_messages(token, chat_id).values() if m.get("role") == "user"]
+    assert "/compact" in users, users

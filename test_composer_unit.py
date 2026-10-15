@@ -338,7 +338,7 @@ class ActionDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(cfg["chatId"])
         self.assertEqual(cfg["modelPrefixes"], ["openclaw_gateway."])
 
-    async def test_compact_and_drawer_runs_do_not_emit(self):
+    async def test_drawer_runs_do_not_emit(self):
         events = []
 
         async def emitter(e):
@@ -349,9 +349,7 @@ class ActionDeliveryTests(unittest.IsolatedAsyncioTestCase):
         async def fake(*args, **kwargs):
             return {"status": "ok"}
 
-        with mock.patch.object(action, "_run_compact", fake), \
-                mock.patch.object(action, "_run_subagent_detail", fake):
-            await action.action({"mode": "compact"}, __user__={"id": "u"}, __event_emitter__=emitter)
+        with mock.patch.object(action, "_run_subagent_detail", fake):
             await action.action({"mode": "subagent-detail"}, __user__={"id": "u"},
                                 __event_emitter__=emitter)
         self.assertFalse(any(_is_composer_event(e) for e in events))

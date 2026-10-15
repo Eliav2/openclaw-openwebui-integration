@@ -81,7 +81,7 @@ if "pydantic" not in sys.modules:
 
 import openclaw_pipe  # noqa: E402
 from openclaw_pipe import (
-    ACTION_RUN_PREFIX, TURN_NS, _run_id_sent_at, parse_pipe_run_id, pipe_run_id, turn_message_id,
+    TURN_NS, _run_id_sent_at, parse_pipe_run_id, pipe_run_id, turn_message_id,
     _claim_turn_message, _register_turn_writer, _retire_turn_writer,
     MAX_TURN_RESUMES, next_continuation, turn_owner,
     recovery_source_run, run_message_id, _TurnWriter, _INTENT_HOOK_JS,
@@ -5508,12 +5508,8 @@ class TurnIdentityTests(unittest.TestCase):
             self.assertEqual(turn_message_id(self.KEY, run, self.CHAT),
                              str(uuid.uuid5(TURN_NS, f"{self.KEY}:{run}")))
 
-    def test_the_status_actions_runs_get_no_message(self):
-        self.assertIsNone(turn_message_id(self.KEY, f"{ACTION_RUN_PREFIX}compact-{self.CHAT}-1.0"))
+    def test_no_run_id_gets_no_message(self):
         self.assertIsNone(turn_message_id(self.KEY, ""))
-        src = open(os.path.join(os.path.dirname(__file__), "src", "openclaw_pipe_pkg",
-                                "action.py")).read()
-        self.assertIn('idempotency_key=f"{ACTION_RUN_PREFIX}compact-', src)
 
 
 
@@ -6138,10 +6134,6 @@ class TurnWriterOpenTests(_TurnWriterCase):
         self.assertEqual(len(self.owui.emits), emits_before, "nothing introduced")
         self.assertEqual(self.owui.tasks, {}, "no second task")
 
-    async def test_the_status_actions_runs_never_open(self):
-        w = self.writer(run=f"{ACTION_RUN_PREFIX}compact-c1-1.0", message_id=None)
-        self.assertFalse(await w.open())
-        self.assertEqual(set(self.owui.msgs()), {"q1", "a1"})
 
 
 
@@ -7147,11 +7139,6 @@ class AgentTurnRoutingTests(_RoutingCase):
         self.assertIsNone(_history_span_messages(
             {"messages": hist["messages"][:2]}, self.RUN), "still the newest turn: not over")
 
-    async def test_the_status_actions_runs_are_swallowed(self):
-        self.assertTrue(await _turn_route_event(
-            self.conn, self.ev(f"{ACTION_RUN_PREFIX}compact-x-1.0", _delta("Compacted."))))
-        await self.spin()
-        self.assertEqual(self.new_messages(), {})
 
 
 class RegressionPlanTests(_RoutingCase):

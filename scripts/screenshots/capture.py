@@ -675,33 +675,19 @@ class Scenes:
         self.s.shot(page, "usage-goal", clip_js=clip, text_selector=".chat-assistant >> nth=-1")
 
     def compact(self, page: Page) -> None:
-        """The Status dialog's context section before and after its Compact
-        button, on the hero chat (three tool calls of history)."""
+        """The Status dialog's Context section with its Compact button, then
+        the hero chat (three tool calls of history) after the click: the
+        /compact message and the Gateway's reply under it."""
         page.goto(f"{BASE}/c/{self.hero_chat}")
         page.locator('button[aria-label="OpenClaw status"]').click()
         sec = "#openclaw-status-section-context"
         wait_js(page, f"() => {{ const s = document.querySelector('{sec}'); return s && /\\d+(\\.\\d+)?k?\\s*\\/\\s*200k/i.test(s.innerText); }}",
                 "the context numbers", 60_000)
-        before = page.locator(sec).inner_text()
-        print("  before: " + json.dumps(before), flush=True)
         self.s.shot(page, "compact-before", selector=sec)
         page.locator("#openclaw-status-modal-root button", has_text="Compact").first.click()
-        wait_js(page, f"() => {{ const s = document.querySelector('{sec}'); return s && /200k/.test(s.innerText); }}",
-                "the dialog back from compacting", 150_000)
-        # The dialog refreshes once, as compacting ends; the Gateway can report
-        # the new size a moment later, so look again the way a person would.
-        deadline = time.time() + 90
-        while page.locator(sec).inner_text() == before:
-            if time.time() > deadline:
-                raise TimeoutError(f"context unchanged after compacting: {before!r}")
-            page.keyboard.press("Escape")
-            page.wait_for_timeout(5000)
-            page.locator('button[aria-label="OpenClaw status"]').click()
-            wait_js(page, f"() => {{ const s = document.querySelector('{sec}'); return s && /200k/.test(s.innerText); }}",
-                    "the dialog reopened", 60_000)
-        print("  after: " + json.dumps(page.locator(sec).inner_text()), flush=True)
-        self.s.shot(page, "compact-after", selector=sec)
-        page.keyboard.press("Escape")
+        wait_js(page, last_text_has("Compacted ("), "the Gateway's compaction reply", 150_000)
+        print("  reply: " + json.dumps(page.evaluate(f"() => {LAST_ASSISTANT}.innerText")), flush=True)
+        self.s.shot(page, "compact-after")
 
     def subagent_result(self, page: Page) -> None:
         """A sub-agent finishes while its parent is idle: the parent's reply

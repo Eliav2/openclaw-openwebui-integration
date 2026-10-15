@@ -1021,8 +1021,6 @@ def _turn_route_now(conn: "_GatewayConnection", payload: dict) -> bool:
         return False
     if conn.consumers_for_event(payload):
         return False
-    if run.startswith(ACTION_RUN_PREFIX):
-        return True  # the Status Action's own runs render nothing
     if (sess, run) in conn._held_for_live:
         conn.drain_held(sess, run)  # the earlier ones first (review 2af1 N7)
     if conn.live_reply_owns(sess, run):
