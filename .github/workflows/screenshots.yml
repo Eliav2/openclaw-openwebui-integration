@@ -79,7 +79,7 @@ jobs:
 
       - name: Capture
         env:
-          ONLY: ${{ inputs.only }}
+          ONLY: ${{ inputs.only || 'eli152-dialog' }}
         run: |
           uv run --with playwright==1.64.0 python scripts/screenshots/capture.py \
             --out "$RUNNER_TEMP/img" ${ONLY:+--only "$ONLY"}

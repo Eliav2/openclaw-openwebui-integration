@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import uuid
 import os
 import re
 import socket
@@ -575,6 +576,70 @@ class Scenes:
         print(f"  elapsed at open {opened_elapsed}, now {page.evaluate(ELAPSED_CELLS)}", flush=True)
         self.s.shot(page, "status-dialog-later", text_selector=root)
 
+    def eli152_dialog(self, page: Page) -> None:
+        """ELI-152: the Status dialog of a chat whose sub-agents have all
+        ended: two Gateway children (the hosting scene's spawns) and three
+        in-process Agent calls an earlier reply's tool cards carry (seeded:
+        the scripted model has no Agent tool)."""
+        now = int(time.time())
+        uid, aid = str(uuid.uuid4()), str(uuid.uuid4())
+
+        def card(cid, desc, result, bg=False):
+            args = {"description": desc, "subagent_type": "general-purpose", "prompt": desc + "."}
+            if bg:
+                args["run_in_background"] = True
+            return [{"type": "function_call", "id": cid, "call_id": cid, "name": "Agent",
+                     "arguments": json.dumps(args), "status": "completed"},
+                    {"type": "function_call_output", "id": "fco_" + cid, "call_id": cid, "status": "completed",
+                     "output": [{"type": "output_text", "text": result}]}]
+        output = (card("toolu_eli152_1", "Compare CI providers", "Async agent launched successfully.", bg=True)
+                  + card("toolu_eli152_2", "Time the full build", "The full build takes 4m10s; the cache saves 3m.")
+                  + card("toolu_eli152_3", "Profile the app's startup", "(no result -- the run ended first)")
+                  + [{"type": "message", "id": "msg_eli152", "status": "completed", "role": "assistant",
+                      "content": [{"type": "output_text", "text": "Three researchers looked into the build."}]}])
+        user = {"id": uid, "parentId": None, "childrenIds": [aid], "role": "user",
+                "content": "Look into the forecast app's build.", "timestamp": now - 900, "models": [MODEL]}
+        reply = {"id": aid, "parentId": uid, "childrenIds": [], "role": "assistant",
+                 "content": "Three researchers looked into the build.", "output": output, "done": True,
+                 "model": MODEL, "modelName": "OpenClaw · Default", "timestamp": now - 899}
+        chat = api("POST", "/api/v1/chats/new", {"chat": {
+            "title": "Forecast app: build and hosting", "models": [MODEL],
+            "history": {"messages": {uid: user, aid: reply}, "currentId": aid},
+            "messages": [user, reply]}}, self.token)["id"]
+        page.goto(f"{BASE}/c/{chat}")
+        page.wait_for_selector("#chat-input", timeout=60_000)
+        send(page, "Compare hosting for the forecast app: Fly.io or Render?")
+        wait_js(page, f"() => {{ const a = {LAST_ASSISTANT}; return a && a.innerText.includes('side by side'); }}",
+                "the parent's reply")
+        me = api("GET", "/api/v1/auths/", token=self.token)
+        key = f"agent:main:openwebui-{me['id']}-{chat}"
+        deadline = time.time() + 240
+        while True:
+            out = subprocess.run(["openclaw", "gateway", "call", "sessions.list", "--json", "--params",
+                                  json.dumps({"spawnedBy": key, "limit": 50})],
+                                 capture_output=True, text=True, timeout=90)
+            try:
+                rows = json.loads(out.stdout[out.stdout.find("{"):]).get("sessions") or []
+            except ValueError:
+                rows = []
+            print(f"  children: {[r.get('status') for r in rows]}", flush=True)
+            if len(rows) == 2 and all(r.get("status") == "done" for r in rows):
+                break
+            if time.time() > deadline:
+                raise TimeoutError(f"the two sub-agents did not both end: {rows}")
+            time.sleep(3)
+        page.wait_for_timeout(3000)   # the parent's own follow-up, if any, lands
+        page.locator('button[aria-label="OpenClaw status"]').last.click()
+        root = "#openclaw-status-modal-root"
+        wait_js(page, f"""() => {{
+          const r = document.querySelector('{root}'); if (!r) return false;
+          const s = document.querySelector('#openclaw-status-section-subagents');
+          return /5h/.test(r.innerText) && s && !s.querySelector('.animate-pulse');
+        }}""", "the status dialog, filled", 60_000)
+        page.wait_for_timeout(500)
+        print(f"  dialog: {json.dumps(visible_text(page, root), ensure_ascii=False)[:1200]}", flush=True)
+        self.s.shot(page, "eli152-dialog", text_selector=root)
+
     def model_picker(self, page: Page) -> None:
         new_chat(page)
         page.locator("button[id^=model-selector-][id$=-button], button[aria-label*='model' i]").first.click()
@@ -939,6 +1004,7 @@ def main(argv=None) -> int:
                 shooter.run("thinking-toggle", scenes.thinking, page)
             shooter.run("question-card", scenes.question, page)
             shooter.run("status-dialog", scenes.status_and_drawer, page)
+            shooter.run("eli152-dialog", scenes.eli152_dialog, page)
             shooter.run("model-picker", scenes.model_picker, page)
             shooter.run("agent-turn", scenes.agent_turn, page)
             shooter.run("media-turn", scenes.media_turn, page)
