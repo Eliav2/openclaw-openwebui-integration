@@ -1056,10 +1056,7 @@ def _redeploy_plain() -> tuple[subprocess.Popen, threading.Event, list]:
 @pytest.mark.skipif(not os.environ.get("GATEWAY_TOKEN"), reason="install.py repair needs GATEWAY_TOKEN")
 @pytest.mark.parametrize("redeploy", [
     pytest.param(False, id="control"),
-    pytest.param(True, id="redeploy", marks=pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-        "ELI-150: after a plain redeploy the new load's turn writer takes over the reply the "
-        "retired connection still serves; the live page gets every delta twice and the saved "
-        "reply stays done:false"))),
+    pytest.param(True, id="redeploy"),
 ])
 def test_a_plain_redeploy_mid_reply_leaves_the_reply_whole(token, redeploy):
     """`control` streams the same reply with no redeploy: every check below
