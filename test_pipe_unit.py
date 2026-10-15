@@ -785,8 +785,8 @@ class ThinkingNoteAnnouncementTests(unittest.TestCase):
     def test_the_pipe_gates_the_yield_on_it(self):
         # The note is still logged unconditionally: suppressing it in the chat
         # must not make a clamp invisible when diagnosing one from the logs.
-        source = inspect.getsource(Pipe._pipe_turn)
-        self.assertIn("should_announce_thinking_note(session_key, thinking_note)", source)
+        source = inspect.getsource(openclaw_pipe._PipeTurn)
+        self.assertIn("should_announce_thinking_note(self.session_key, thinking_note)", source)
         self.assertIn('pipe_log(f"thinking: {thinking_note}")', source)
 
 
@@ -795,9 +795,9 @@ class OwuiTaskNoopTests(unittest.TestCase):
     join the background-task no-op set; moa_response_generation must not."""
 
     def _noop_task_values(self):
-        source = inspect.getsource(Pipe._pipe_turn)
+        source = inspect.getsource(openclaw_pipe._PipeTurn)
         m = re.search(
-            r"if __task__ and __task__ in \(\s*((?:\"[a-z_]+\",?\s*)+)\)",
+            r"if self\.__task__ and self\.__task__ in \(\s*((?:\"[a-z_]+\",?\s*)+)\)",
             source,
         )
         self.assertIsNotNone(m, "could not find the __task__ no-op tuple")
@@ -1121,12 +1121,12 @@ class ParkedCancelTests(unittest.IsolatedAsyncioTestCase):
         # The grace window is seconds; sessions.patch alone can take 10s+ with
         # its retry, so the claim must come before it. And the cancel handler
         # must park, never abort directly.
-        src = inspect.getsource(Pipe._pipe_turn)
-        claim = src.index("await conn.claim_cancelled_turn(session_key)")
+        src = inspect.getsource(openclaw_pipe._PipeTurn)
+        claim = src.index("await self.conn.claim_cancelled_turn(self.session_key)")
         patch = src.index("RUN_PATCH")
         self.assertLess(claim, patch)
         self.assertIn("conn.park_cancelled_turn(", src)
-        self.assertNotIn("await conn.abort(", src)
+        self.assertNotIn("await self.conn.abort(", src)
 
     def test_grace_valve_defaults_on(self):
         self.assertGreater(Pipe.Valves().INTERRUPT_GRACE_SECONDS, 0)
@@ -7903,18 +7903,18 @@ class InlineRewriteWiringTests(unittest.TestCase):
     loop has no unit harness (e2e drives it)."""
 
     def test_the_inline_reply_records_its_rewrites_and_answer_runs(self):
-        src = inspect.getsource(openclaw_pipe.Pipe._pipe_turn)
+        src = inspect.getsource(openclaw_pipe._PipeTurn)
         self.assertEqual(src.count("switch_to_answer_run(answer_res)"), 2, "both answer switches")
-        self.assertEqual(src.count("answer_res.queue or conn.register_consumer("), 2)
+        self.assertEqual(src.count("answer_res.queue or self.conn.register_consumer("), 2)
         # Review 2af1 N6: the answer run is listened for, and its target moved,
         # before its chat.send.
         ask = src.split("async def maybe_answer_user_input", 1)[1]
         send = ask.index("RUN_SEND")
-        self.assertLess(ask.index("conn.register_consumer(session_key, idempotency_key)"), send)
-        self.assertLess(ask.index("conn.continue_run_target(session_key, our_run_id, idempotency_key"), send)
+        self.assertLess(ask.index("conn.register_consumer(self.session_key, idempotency_key)"), send)
+        self.assertLess(ask.index("conn.continue_run_target(self.session_key, self.our_run_id, idempotency_key"), send)
         self.assertGreaterEqual(src.count("conn.note_turn_rewrite("), 5,
                                 "2 MEDIA sites, 2 answered cards, 1 fallback prompt")
-        self.assertIn("thinking=resolved_thinking", src.split("conn.register_run_target(")[1][:200])
+        self.assertIn("thinking=self.resolved_thinking", src.split("conn.register_run_target(")[1][:200])
 
 
 
@@ -8235,7 +8235,7 @@ class InlineEndSignalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.consumers_at_send, [f"{self.sk}:{self.run}"])
 
     def test_no_silence_timer_is_left_in_the_inline_loop(self):
-        src = inspect.getsource(openclaw_pipe.Pipe._pipe_turn)
+        src = inspect.getsource(openclaw_pipe._PipeTurn)
         for timer in ("idle_probe_s", "no_text_deadman_s", "describe_check_interval",
                       "recv_timeout"):
             self.assertNotIn(timer, src)

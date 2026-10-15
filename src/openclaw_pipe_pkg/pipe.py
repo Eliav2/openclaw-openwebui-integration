@@ -779,10 +779,52 @@ class Pipe:
         snapshot persists -- a note recorded only on the caller's copy would
         show while streaming and vanish on reload.
         """
-        if self.valves.ENABLE_FILE_SERVER:
+        state = _PipeTurn(
+            self, body, __event_emitter__, __event_call__, __user__, __metadata__,
+            __request__, __task__, __task_body__, _initial_visible_text, _send_texts, turn)
+        async with contextlib.aclosing(state.run()) as items:
+            async for item in items:
+                yield item
+
+
+class _PipeTurn:
+    """One reply of `Pipe._pipe_turn`, in four phases run in order (ELI-147):
+    `prepare`, `admit`, `consume` and `finish`. A phase that ends the reply
+    early sets `ended`. The closures the single function had are methods,
+    and the locals they or two phases shared are attributes."""
+
+    def __init__(self, pipe, body, __event_emitter__, __event_call__, __user__,
+                 __metadata__, __request__, __task__, __task_body__,
+                 _initial_visible_text, _send_texts, turn):
+        self.pipe = pipe
+        self.body = body
+        self.__event_emitter__ = __event_emitter__
+        self.__event_call__ = __event_call__
+        self.__user__ = __user__
+        self.__metadata__ = __metadata__
+        self.__request__ = __request__
+        self.__task__ = __task__
+        self.__task_body__ = __task_body__
+        self._initial_visible_text = _initial_visible_text
+        self._send_texts = _send_texts
+        self.turn = turn
+        self.ended = False
+
+    async def run(self):
+        for phase in (self.prepare, self.admit, self.consume, self.finish):
+            async with contextlib.aclosing(phase()) as items:
+                async for item in items:
+                    yield item
+            if self.ended:
+                return
+
+    async def prepare(self):
+        """The message, the connection, the session key, a cancelled reply's
+        run to take over, and the model patch."""
+        if self.pipe.valves.ENABLE_FILE_SERVER:
             _start_file_server()
-        preset = self._selected_preset(body)
-        model_override = self._model_override_for_preset(preset)
+        preset = self.pipe._selected_preset(self.body)
+        self.model_override = self.pipe._model_override_for_preset(preset)
 
         # Per-chat thinking level (ELI-85). `reasoning_effort` is the single
         # source of truth: Open WebUI's own Advanced Params control writes it,
@@ -792,12 +834,12 @@ class Pipe:
         # Absent means absent: no `thinking` is sent and the agent's configured
         # level applies. Validation against the model's real ladder happens
         # below, once describe has told us what this session resolves to.
-        requested_thinking = body.get("reasoning_effort") or None
-        if requested_thinking is not None:
-            requested_thinking = str(requested_thinking).strip().lower() or None
-        session_thinking_ladder = None
-        session_model_key = None
-        session_runtime = None
+        self.requested_thinking = self.body.get("reasoning_effort") or None
+        if self.requested_thinking is not None:
+            self.requested_thinking = str(self.requested_thinking).strip().lower() or None
+        self.session_thinking_ladder = None
+        self.session_model_key = None
+        self.session_runtime = None
 
         # --- P15: Short-circuit OWUI background tasks ---
         # O10 addendum: image_prompt_generation and function_calling also get
@@ -809,7 +851,7 @@ class Pipe:
         # request whose only output path is the streamed content itself, so
         # a no-op here would show as a visibly empty result rather than a
         # graceful fallback.
-        if __task__ and __task__ in (
+        if self.__task__ and self.__task__ in (
             "title_generation",
             "tags_generation",
             "follow_up_generation",
@@ -819,7 +861,8 @@ class Pipe:
             "image_prompt_generation",
             "function_calling",
         ):
-            pipe_log(f"Skipping OWUI background task: {__task__}")
+            pipe_log(f"Skipping OWUI background task: {self.__task__}")
+            self.ended = True
             return
 
         # --- Extract user message ---
@@ -829,12 +872,12 @@ class Pipe:
         # Coercing through _coerce_text (already used elsewhere for gateway
         # event payloads with the same block shape) extracts and joins any
         # text blocks and safely no-ops on plain strings.
-        messages = body.get("messages", [])
+        messages = self.body.get("messages", [])
         raw_content = messages[-1]["content"] if messages else ""
-        text = _coerce_text(raw_content)
+        self.text = _coerce_text(raw_content)
         has_image = _content_has_image(raw_content)
-        image_attachments = _extract_image_attachments(raw_content) if has_image else []
-        if not text and not image_attachments:
+        self.image_attachments = _extract_image_attachments(raw_content) if has_image else []
+        if not self.text and not self.image_attachments:
             if has_image:
                 yield (
                     "**Couldn't read that image** -- only base64-embedded "
@@ -843,9 +886,10 @@ class Pipe:
                 )
             else:
                 yield "No message"
+            self.ended = True
             return
 
-        if has_image and not image_attachments:
+        if has_image and not self.image_attachments:
             # An image block was present but couldn't be turned into an
             # attachment (e.g. not a base64 data URL) -- text still goes
             # through, but say so rather than silently dropping the image.
@@ -854,70 +898,71 @@ class Pipe:
                 "only the text below was sent.)_\n\n"
             )
 
-        _ensure_orphan_reconcile(lambda: self.valves)
-        await _emit_status(__event_emitter__, "Thinking...", done=False)
-        if self.valves.COMPOSER_STATUS_BUTTON and not _initial_visible_text:
+        _ensure_orphan_reconcile(lambda: self.pipe.valves)
+        await _emit_status(self.__event_emitter__, "Thinking...", done=False)
+        if self.pipe.valves.COMPOSER_STATUS_BUTTON and not self._initial_visible_text:
             # Cheap and idempotent: installs the composer Status button in the
             # tabs showing this chat (a no-op where it is already there). Once
             # per turn: the thinking-retry recursion skips it.
-            _ensure_composer_watcher(lambda: self.valves)
+            _ensure_composer_watcher(lambda: self.pipe.valves)
             await _emit_composer_button(
-                __event_emitter__,
-                session_id=(__metadata__ or {}).get("session_id"),
-                chat_id=(__metadata__ or {}).get("chat_id"),
-                model_prefixes=_composer_note_model(body.get("model")),
+                self.__event_emitter__,
+                session_id=(self.__metadata__ or {}).get("session_id"),
+                chat_id=(self.__metadata__ or {}).get("chat_id"),
+                model_prefixes=_composer_note_model(self.body.get("model")),
             )
         pipe_log(f"Messages: {len(messages)}, last role: "
                  f"{messages[-1]['role'] if messages else 'NONE'}")
 
         # --- Get the persistent connection ---
         try:
-            conn = await _get_gateway_connection(lambda: self.valves)
+            self.conn = await _get_gateway_connection(lambda: self.pipe.valves)
         except GatewayError as e:
-            await _emit_status(__event_emitter__, "", done=True)
+            await _emit_status(self.__event_emitter__, "", done=True)
             yield f"**Gateway connection error:** {e}"
+            self.ended = True
             return
 
 
         # --- Derive stable session key ---
-        if __metadata__:
-            chat_id = (
-                __metadata__.get("chat_id")
-                or __metadata__.get("session_id")
-                or __metadata__.get("conversation_id")
+        if self.__metadata__:
+            self.chat_id = (
+                self.__metadata__.get("chat_id")
+                or self.__metadata__.get("session_id")
+                or self.__metadata__.get("conversation_id")
             )
-            user_id = __metadata__.get("user_id", "unknown")
+            user_id = self.__metadata__.get("user_id", "unknown")
         else:
-            chat_id = None
+            self.chat_id = None
             user_id = "unknown"
 
-        owui_origin_chat_id = chat_id
-        owui_origin_user_id = user_id
+        self.owui_origin_chat_id = self.chat_id
+        self.owui_origin_user_id = user_id
 
-        if not chat_id:
-            chat_id = f"owui-{uuid.uuid4().hex[:12]}"
-            pipe_log("WARNING: no chat_id in metadata, generated random:", chat_id)
+        if not self.chat_id:
+            self.chat_id = f"owui-{uuid.uuid4().hex[:12]}"
+            pipe_log("WARNING: no chat_id in metadata, generated random:", self.chat_id)
 
-        session_key = _owui_session_key(self.valves.AGENT_ID, user_id, chat_id)
-        pipe_log(f"Session key: {session_key}")
+        self.session_key = _owui_session_key(self.pipe.valves.AGENT_ID, user_id, self.chat_id)
+        pipe_log(f"Session key: {self.session_key}")
 
-        if turn is None:
-            turn = _TurnState()
-        turn.conn = conn
-        turn.session_key = session_key
-        turn.chat_id = owui_origin_chat_id
-        turn.unsent = list(_send_texts) if _send_texts else [text]
-        if owui_origin_chat_id and __event_emitter__:
+        if self.turn is None:
+            self.turn = _TurnState()
+        self.turn.conn = self.conn
+        self.turn.session_key = self.session_key
+        self.turn.chat_id = self.owui_origin_chat_id
+        self.turn.unsent = list(self._send_texts) if self._send_texts else [self.text]
+        if self.owui_origin_chat_id and self.__event_emitter__:
             # Lets a later cancel ask the page whether it was Stop or Send
             # now. Idempotent in the page; fire-and-forget.
             try:
-                await __event_emitter__(
+                await self.__event_emitter__(
                     {"type": "execute", "data": {"code": _INTENT_HOOK_JS}})
             except Exception as ex:
                 pipe_log(f"  intent hook install failed: {ex!r}")
         # What actually went out in this turn's chat.send, for the
         # thinking-rejection retry to send again.
-        sent_texts = list(turn.unsent)
+        self.sent_texts = list(self.turn.unsent)
 
         # A cancel of this session's previous response that arrived just
         # before this message is OWUI's "Send now" / interrupt, not a Stop:
@@ -925,27 +970,27 @@ class Pipe:
         # running with its events buffered, and any message it had not sent
         # yet. Claimed this early because the model patch below can take
         # seconds and the grace window is short.
-        adopted_run_id = None
-        adopted_queue = None
-        adopted_run_text = None
-        claimed = await conn.claim_cancelled_turn(session_key)
+        self.adopted_run_id = None
+        self.adopted_queue = None
+        self.adopted_run_text = None
+        claimed = await self.conn.claim_cancelled_turn(self.session_key)
         if claimed:
             if claimed["carried"]:
-                turn.unsent = claimed["carried"] + turn.unsent
+                self.turn.unsent = claimed["carried"] + self.turn.unsent
                 pipe_log(
                     f"  carrying {len(claimed['carried'])} unsent message(s) "
                     "from the cancelled reply"
                 )
-            adopted_run_id = claimed["run_id"]
-            adopted_queue = claimed["queue"]
-            if adopted_run_id:
-                adopted_run_text = claimed.get("run_text")
-                turn.run_id = adopted_run_id
-                turn.queue = adopted_queue
-                turn.run_text = adopted_run_text
+            self.adopted_run_id = claimed["run_id"]
+            self.adopted_queue = claimed["queue"]
+            if self.adopted_run_id:
+                self.adopted_run_text = claimed.get("run_text")
+                self.turn.run_id = self.adopted_run_id
+                self.turn.queue = self.adopted_queue
+                self.turn.run_text = self.adopted_run_text
                 pipe_log(
                     f"  new message right after a cancel: keeping run "
-                    f"{adopted_run_id[:20]}... alive and continuing it in this "
+                    f"{self.adopted_run_id[:20]}... alive and continuing it in this "
                     "reply before sending the message"
                 )
 
@@ -958,49 +1003,54 @@ class Pipe:
         # failure since, a model not allowed or a Gateway timeout, failed
         # twice; ELI-131).
         patch_err = None
-        async with conn.model_patch_lock(session_key):
-            if conn.model_patch_cached(session_key, model_override):
+        async with self.conn.model_patch_lock(self.session_key):
+            if self.conn.model_patch_cached(self.session_key, self.model_override):
                 pipe_log(
                     f"  model patch skipped (cached: "
-                    f"{model_override or 'agent default'})"
+                    f"{self.model_override or 'agent default'})"
                 )
             else:
                 try:
                     patch_resp = await _run_request(
-                        conn, RUN_PATCH,
-                        dict(key=session_key, model=model_override),
+                        self.conn, RUN_PATCH,
+                        dict(key=self.session_key, model=self.model_override),
                         timeout=10
                     )
-                    if not _model_patch_matches(model_override, patch_resp):
+                    if not _model_patch_matches(self.model_override, patch_resp):
                         resolved_model = _resolved_model_key(patch_resp)
                         raise GatewayError(
                             "model override did not apply "
-                            f"(wanted {model_override or 'agent default'}, "
+                            f"(wanted {self.model_override or 'agent default'}, "
                             f"got {resolved_model or 'agent default'})"
                         )
-                    if model_override:
-                        pipe_log(f"Applied model override: {model_override}")
+                    if self.model_override:
+                        pipe_log(f"Applied model override: {self.model_override}")
                     else:
                         pipe_log("Cleared model override; using agent default")
-                    conn.record_model_patched(session_key, model_override)
+                    self.conn.record_model_patched(self.session_key, self.model_override)
                 except Exception as e:
                     patch_err = e
                     pipe_log(f"  [diag] model patch failed: {type(e).__name__}: {e!r}")
                 if patch_err is not None:
-                    conn.invalidate_model_patch(session_key)
+                    self.conn.invalidate_model_patch(self.session_key)
         if patch_err is not None:
-            await _emit_status(__event_emitter__, "", done=True)
+            await _emit_status(self.__event_emitter__, "", done=True)
             yield _explain_session_patch_failure(
                 patch_err,
-                model_override=model_override,
-                agent_id=self.valves.AGENT_ID,
+                model_override=self.model_override,
+                agent_id=self.pipe.valves.AGENT_ID,
             )
+            self.ended = True
             return
 
         # Tool cards for this session's runs whoever started them, including
         # this reply's own run after a reconnect (see `ensure_message_subscription`).
-        await conn.ensure_message_subscription(session_key)
+        await self.conn.ensure_message_subscription(self.session_key)
 
+    async def admit(self):
+        """The run this reply streams: a second Open WebUI call follows the one
+        it already sent (ELI-82), a taken-over run continues, else the message
+        waits for the session to be idle and is sent."""
         # --- Concurrency: queue behind an active run, never steer-merge ---
         # A message that arrives while a run is active must become its OWN run,
         # not a steer-merge into the active run. Steer-merging (the gateway's
@@ -1022,59 +1072,6 @@ class Pipe:
         # returned a runId that instantly emits a single 'final' with no text,
         # so the bubble rendered nothing and the real answer leaked out as a
         # separate message. (Verified from live pipe logs 2026-07-18.)
-        async def _session_run_active() -> bool:
-            # Fast path: describe exposes a persisted `status`. When it names a
-            # live run state we're done. But describe.status flips to 'done'
-            # during a subagent-yield gap (the run is only suspended and will
-            # resume -- ELI-56), so a non-active status is NOT conclusive:
-            # confirm against sessions.list's authoritative hasActiveRun before
-            # treating the session as free to send into.
-            nonlocal session_thinking_ladder, session_model_key, session_runtime
-            try:
-                desc = await conn.send_request(
-                    "sessions.describe", dict(key=session_key), timeout=8
-                )
-                row = desc.get("session") or {}
-                status = row.get("status")
-                session_runtime = (row.get("agentRuntime") or {}).get("id") or session_runtime
-                # Harvest the thinking ladder from the describe we are already
-                # making. This probe runs before every send, so the per-model
-                # validation below costs no extra round trip, and piggybacking
-                # rather than adding a describe of its own means the ladder can
-                # never be fresher or staler than the run state it was read
-                # alongside.
-                #
-                # Describe is a WEAK source and is treated as one. It resolves
-                # the ladder with no model catalog in scope, so for a
-                # catalog-gated model it reports the generic base profile
-                # rather than the truth -- live, it advertised all 8 levels for
-                # claude-cli/claude-opus-5, whose real ladder is ["off"]. Good
-                # enough to seed the dropdown; not good enough to clamp a send
-                # against once the Gateway itself has ruled.
-                session_model_key = _session_model_key(row)
-                ladder = _session_thinking_ladder(desc)
-                if ladder:
-                    session_thinking_ladder = ladder
-                    _record_thinking_ladder(
-                        ladder, model_key=session_model_key,
-                        state_dir=getattr(self.valves, "STATE_DIR", ""))
-                if row.get("activeRunId") or status in _ACTIVE_RUN_STATES:
-                    return True
-            except Exception as ex:
-                # Describe failed: fall back to the list probe below, and if
-                # that also fails, to the (per-worker, possibly-blind) registry.
-                pipe_log(f"  active-check describe failed: {ex}")
-                status = None
-            list_active = await _session_list_active(conn, session_key, missing=None)
-            if list_active is not None:
-                active = _session_active_from_signals(status, list_active)
-                if active and status not in _ACTIVE_RUN_STATES:
-                    pipe_log(
-                        f"  active-check: describe.status={status!r} but "
-                        "list.hasActiveRun=True (subagent-yield gap; queueing)"
-                    )
-                return active
-            return conn.active_run_id_for_session(session_key) is not None
 
         # Open WebUI can call the pipe twice for one reply (ELI-82: 31 of
         # 1150 replies from 2026-09-26 to 2026-10-14, the second call up to
@@ -1083,23 +1080,23 @@ class Pipe:
         # message. So a second call with the same text follows the run the
         # first one started and ends with that run's reply, rebuilt from the
         # transcript once the run is over.
-        reply_id = (__metadata__ or {}).get("message_id")
-        prior = (conn.reply_sent(session_key, reply_id)
-                 if _send_texts is None and not adopted_run_id else None)
-        if prior and prior["text"] == "\n\n".join(t for t in turn.unsent if t):
+        reply_id = (self.__metadata__ or {}).get("message_id")
+        prior = (self.conn.reply_sent(self.session_key, reply_id)
+                 if self._send_texts is None and not self.adopted_run_id else None)
+        if prior and prior["text"] == "\n\n".join(t for t in self.turn.unsent if t):
             pipe_log(f"  this reply already sent its message as run "
                      f"{prior['run_id'][:20]}... (a second call from Open WebUI); "
                      "following that run instead of sending it again")
             found = None
             while True:
-                changed = conn.session_change_event(session_key)
+                changed = self.conn.session_change_event(self.session_key)
                 try:
-                    hist = await conn.session_history(session_key, limit=RUN_HISTORY_LIMIT)
+                    hist = await self.conn.session_history(self.session_key, limit=RUN_HISTORY_LIMIT)
                 except Exception as ex:
                     pipe_log(f"  chat.history for the sent run failed: {ex!r}")
                     break
                 found = _stub_turn(hist, reply_id, "")
-                if found is None or found["closed"] or not await _session_run_active():
+                if found is None or found["closed"] or not await self._session_run_active():
                     break
                 await changed.wait()
             if found is not None:
@@ -1109,37 +1106,38 @@ class Pipe:
                     else:
                         yield {"type": "response.output_item.added",
                                "output_index": _OUTPUT_APPEND_INDEX, "item": item}
-                await _emit_status(__event_emitter__, "", done=True)
+                await _emit_status(self.__event_emitter__, "", done=True)
+                self.ended = True
                 return
             pipe_log("  the sent run is not in the transcript; sending the message")
 
-        if (adopted_run_id and adopted_queue is None
-                and not await _session_run_active()):
+        if (self.adopted_run_id and self.adopted_queue is None
+                and not await self._session_run_active()):
             # It finished during the cancel/re-send gap and nothing buffered
             # its events: nothing to continue. (With a parked queue the run's
             # tail and final are waiting in it, so it is always adopted.)
             pipe_log("  adopted run already ended; sending the message normally")
-            adopted_run_id = None
-            adopted_run_text = None
-            turn.run_id = None
-            turn.run_text = None
-        if adopted_run_id:
+            self.adopted_run_id = None
+            self.adopted_run_text = None
+            self.turn.run_id = None
+            self.turn.run_text = None
+        if self.adopted_run_id:
             # Stream the rest of the adopted run into THIS reply. The message
             # itself is sent afterwards, as its own run, by the recursive call
             # at the end of this turn: sending it now would steer into the
             # live run, and the claude-cli runtime has no steering hook (the
             # gateway acks "started", then drops the message once the run
             # ends -- measured 2026-10-11).
-            our_run_id = adopted_run_id
-            resolved_thinking = None
-            pending_clamp_note = ""
-            if adopted_queue is not None:
-                queue = adopted_queue
+            self.our_run_id = self.adopted_run_id
+            self.resolved_thinking = None
+            self.pending_clamp_note = ""
+            if self.adopted_queue is not None:
+                self.queue = self.adopted_queue
             else:
-                queue = conn.register_consumer(session_key, our_run_id)
-            turn.queue = queue
+                self.queue = self.conn.register_consumer(self.session_key, self.our_run_id)
+            self.turn.queue = self.queue
             await _emit_status(
-                __event_emitter__,
+                self.__event_emitter__,
                 "Continuing the current task; your message is next…",
                 done=False,
             )
@@ -1156,7 +1154,7 @@ class Pipe:
             # NOTE: do NOT prepend a `/queue followup` directive here. On the
             # 2026.7.1 gateway that directive is NOT stripped from a device
             # chat.send -- it leaked verbatim into the delivered message.
-            async with conn.session_send_lock(session_key):
+            async with self.conn.session_send_lock(self.session_key):
                 # Wait for the Gateway to push that the run settled
                 # (`sessions.changed`, see `session_change_event`), re-reading
                 # the authoritative state after each change. No poll, no
@@ -1168,15 +1166,15 @@ class Pipe:
                 # wait like any other.
                 ever_active = False
                 while True:
-                    changed = conn.session_change_event(session_key)
-                    if not await _session_run_active():
+                    changed = self.conn.session_change_event(self.session_key)
+                    if not await self._session_run_active():
                         break
                     if not ever_active:
                         ever_active = True
                         pipe_log("Session has an active run (gateway-authoritative); "
                                  "queueing behind it")
                         await _emit_status(
-                            __event_emitter__,
+                            self.__event_emitter__,
                             "Queued: waiting for the current run to finish…",
                             done=False,
                         )
@@ -1189,8 +1187,8 @@ class Pipe:
                 # The OWUI message id in the run id ties the run to the reply
                 # it streams into, so a reply orphaned by an Open WebUI restart
                 # is matched to its run by identity (ELI-90, `_stub_turn`).
-                idempotency_key = (pipe_run_id(chat_id, reply_id) if reply_id
-                                   else f"msg-{chat_id}-{time.time()}")
+                idempotency_key = (pipe_run_id(self.chat_id, reply_id) if reply_id
+                                   else f"msg-{self.chat_id}-{time.time()}")
                 # Fit the requested level to what this session's model actually
                 # supports. The dropdown is a union across models, so a level that
                 # is real for one model can be unavailable here. Clamping is
@@ -1212,167 +1210,139 @@ class Pipe:
                 # `_record_thinking_ladder` files the authoritative entry; reading
                 # back under the vendor key alone missed it every time and repeated
                 # the same round-trip rejection (and its note) on every turn.
-                _state_dir_valve = getattr(self.valves, "STATE_DIR", "")
-                effective_ladder = (_read_model_thinking_ladder(model_override, _state_dir_valve)
-                                    or _read_model_thinking_ladder(session_model_key, _state_dir_valve)
-                                    or session_thinking_ladder)
-                resolved_thinking, thinking_note = clamp_to_ladder(
-                    requested_thinking, effective_ladder)
+                _state_dir_valve = getattr(self.pipe.valves, "STATE_DIR", "")
+                effective_ladder = (_read_model_thinking_ladder(self.model_override, _state_dir_valve)
+                                    or _read_model_thinking_ladder(self.session_model_key, _state_dir_valve)
+                                    or self.session_thinking_ladder)
+                self.resolved_thinking, thinking_note = clamp_to_ladder(
+                    self.requested_thinking, effective_ladder)
                 # Held until `visible_message_text` exists below (it isn't defined
                 # yet at this point in the turn) so the note that streams here also
                 # ends up in the forced terminal snapshot -- otherwise it shows
                 # while streaming and is gone after a reload.
-                pending_clamp_note = ""
+                self.pending_clamp_note = ""
                 if thinking_note:
                     pipe_log(f"thinking: {thinking_note}")
                     # Logged every time, shown once: the dropdown keeps the level
                     # selected, so an unchanged mismatch would otherwise stamp the
                     # same italic line above every answer in the chat.
-                    if conn.should_announce_thinking_note(session_key, thinking_note):
-                        pending_clamp_note = f"_{thinking_note}_\n\n"
-                        yield pending_clamp_note
+                    if self.conn.should_announce_thinking_note(self.session_key, thinking_note):
+                        self.pending_clamp_note = f"_{thinking_note}_\n\n"
+                        yield self.pending_clamp_note
                 # Listen before sending: the run's first events can arrive
                 # before chat.send returns, and with no consumer they would go
                 # to the turn writer, which takes this reply's message over
                 # while the reply still streams (review 2af1 R12). The run id
                 # is the idempotency key.
-                queue = conn.register_consumer(session_key, idempotency_key)
+                self.queue = self.conn.register_consumer(self.session_key, idempotency_key)
                 try:
                     send_resp = await _run_request(
-                        conn, RUN_SEND,
+                        self.conn, RUN_SEND,
                         _owui_chat_send_params(
-                            session_key=session_key,
-                            message="\n\n".join(t for t in turn.unsent if t),
+                            session_key=self.session_key,
+                            message="\n\n".join(t for t in self.turn.unsent if t),
                             idempotency_key=idempotency_key,
-                            owui_chat_id=owui_origin_chat_id,
-                            owui_user_id=owui_origin_user_id,
-                            attachments=image_attachments,
-                            thinking=resolved_thinking,
+                            owui_chat_id=self.owui_origin_chat_id,
+                            owui_user_id=self.owui_origin_user_id,
+                            attachments=self.image_attachments,
+                            thinking=self.resolved_thinking,
                         ),
                         timeout=30
                     )
                 except asyncio.TimeoutError:
-                    conn.unregister_consumer(session_key, idempotency_key, queue=queue)
-                    await _emit_status(__event_emitter__, "", done=True)
+                    self.conn.unregister_consumer(self.session_key, idempotency_key, queue=self.queue)
+                    await _emit_status(self.__event_emitter__, "", done=True)
                     yield "**Timeout:** Gateway did not respond to chat.send"
+                    self.ended = True
                     return
                 except Exception as e:
-                    conn.unregister_consumer(session_key, idempotency_key, queue=queue)
-                    await _emit_status(__event_emitter__, "", done=True)
+                    self.conn.unregister_consumer(self.session_key, idempotency_key, queue=self.queue)
+                    await _emit_status(self.__event_emitter__, "", done=True)
                     yield f"**Error sending message:** {e}"
+                    self.ended = True
                     return
-                our_run_id = send_resp.get("runId") or idempotency_key
-                pipe_log(f"Captured runId: {our_run_id}")
-                if our_run_id != idempotency_key:
-                    conn.unregister_consumer(session_key, idempotency_key, queue=queue)
-                    queue = conn.register_consumer(session_key, our_run_id)
-                sent_texts = list(turn.unsent)
-                conn.note_reply_sent(session_key, reply_id, our_run_id,
-                                     "\n\n".join(t for t in sent_texts if t))
-                turn.unsent = []
-                turn.run_id = our_run_id
-                turn.queue = queue
-                turn.run_text = None
+                self.our_run_id = send_resp.get("runId") or idempotency_key
+                pipe_log(f"Captured runId: {self.our_run_id}")
+                if self.our_run_id != idempotency_key:
+                    self.conn.unregister_consumer(self.session_key, idempotency_key, queue=self.queue)
+                    self.queue = self.conn.register_consumer(self.session_key, self.our_run_id)
+                self.sent_texts = list(self.turn.unsent)
+                self.conn.note_reply_sent(self.session_key, reply_id, self.our_run_id,
+                                     "\n\n".join(t for t in self.sent_texts if t))
+                self.turn.unsent = []
+                self.turn.run_id = self.our_run_id
+                self.turn.queue = self.queue
+                self.turn.run_text = None
         # Tell the persistent connection which OWUI message this run streams
         # into, so a turn writer continues that message from a shadow renderer
         # if this inline turn ends before the run does (cancel, close, a
         # torn-down request). No-op without a stable message id. See
         # _turn_route_event (writer.py) and _TurnRenderer (gateway.py).
-        owui_message_id = (__metadata__ or {}).get("message_id")
-        conn.register_run_target(
-            session_key, our_run_id, owui_origin_chat_id, owui_message_id,
-            thinking=resolved_thinking,
+        self.owui_message_id = (self.__metadata__ or {}).get("message_id")
+        self.conn.register_run_target(
+            self.session_key, self.our_run_id, self.owui_origin_chat_id, self.owui_message_id,
+            thinking=self.resolved_thinking,
         )
         # When the Gateway had admitted this reply's run (chat.send returned;
         # an adopted run already ran). An idle row read after it means the
         # run is over; one read before may show the previous run's settle
         # (review 2af1 N4).
-        admitted_at = float("-inf") if adopted_run_id else time.monotonic()
+        self.admitted_at = float("-inf") if self.adopted_run_id else time.monotonic()
         # A gap or a resync since: this run's own final and settle may be
         # lost, so another run's settle row may be the first sign it ended.
-        signals_lost = False
-        if adopted_run_id and adopted_queue is not None:
-            conn.seed_run_renderer(session_key, our_run_id, queue,
-                                   run_text=adopted_run_text)
+        self.signals_lost = False
+        if self.adopted_run_id and self.adopted_queue is not None:
+            self.conn.seed_run_renderer(self.session_key, self.our_run_id, self.queue,
+                                   run_text=self.adopted_run_text)
         # Extracted once up front (not just at the terminal snapshot/auto-title
         # step further below) so the mid-run REST snapshot gate has a token to
         # use throughout the streaming loop, not only after it ends.
-        bearer_token = _extract_request_bearer(__request__)
+        self.bearer_token = _extract_request_bearer(self.__request__)
 
+    async def consume(self):
+        """The run's events, until its end, a handover or a cancel."""
         # --- Consume events ---
-        done = False
-        event_count = 0
-        text_yielded = False
-        error_shown = ""  # the run's "**Error:**" line, once shown
-        aborted = False
-        first_event_arrived = False
+        self.done = False
+        self.event_count = 0
+        self.text_yielded = False
+        self.error_shown = ""  # the run's "**Error:**" line, once shown
+        self.aborted = False
+        self.first_event_arrived = False
         # The Gateway acks every chat.send with "started"; one that it queued
         # behind a run (or steered into one) instead gets a lone `chat` final
         # with no message as its first and only event.
-        enqueued_not_started = False
+        self.enqueued_not_started = False
         last_item_text = ""
-        assistant_stream_text = ""
+        self.assistant_stream_text = ""
         # Everything the gateway has sent for this turn, including text the
         # ask-user buffer withheld. assistant_stream_text only tracks what was
         # FLUSHED, so it cannot be used to dedup a cumulative catch-all event
         # while a needs-input block is being held back (ELI-80).
-        assistant_received_text = ""
-        if adopted_run_text:
+        self.assistant_received_text = ""
+        if self.adopted_run_text:
             # Continuing a run another reply started: its text baselines carry
             # over (see `park_cancelled_turn`), while what THIS reply shows,
             # `visible_message_text`, starts empty.
-            assistant_received_text = adopted_run_text.get("received", "")
-            assistant_stream_text = adopted_run_text.get("stream", "")
-            last_item_text = adopted_run_text.get("item", "")
+            self.assistant_received_text = self.adopted_run_text.get("received", "")
+            self.assistant_stream_text = self.adopted_run_text.get("stream", "")
+            last_item_text = self.adopted_run_text.get("item", "")
         # Offsets in `assistant_received_text` where events were lost (a
         # Gateway socket drop, see `_mark_event_gap`), and which OWUI reply
         # showed the run from which offset, so a lost chunk can be put back
         # into the reply it belongs to. Both are run-level and travel with an
         # adopted run.
-        run_gaps: list[int] = list((adopted_run_text or {}).get("gaps", []))
-        run_segments: list[dict] = list((adopted_run_text or {}).get("segments", []))
-        if chat_id and owui_message_id:
+        self.run_gaps: list[int] = list((self.adopted_run_text or {}).get("gaps", []))
+        self.run_segments: list[dict] = list((self.adopted_run_text or {}).get("segments", []))
+        if self.chat_id and self.owui_message_id:
             # The reply that showed the run until now has stopped streaming,
             # so OWUI has saved it; repairs that waited for it can go in.
-            for seg in run_segments:
-                for repair in _take_gap_repairs(chat_id, seg["message_id"]):
-                    _schedule_gap_repair(conn, repair, streaming=False)
-            run_segments.append({"message_id": owui_message_id,
-                                 "start": len(assistant_received_text)})
+            for seg in self.run_segments:
+                for repair in _take_gap_repairs(self.chat_id, seg["message_id"]):
+                    _schedule_gap_repair(self.conn, repair, streaming=False)
+            self.run_segments.append({"message_id": self.owui_message_id,
+                                 "start": len(self.assistant_received_text)})
 
-        def reconcile_whole_text(whole: str) -> str | None:
-            """After a gap, line the run's whole text up with what arrived
-            and put each lost chunk back into the reply that showed it.
-            Returns the text after the last received piece (the only new
-            text), or None when there is no gap or `whole` does not line up
-            (an item carrying one segment, not the whole run), which leaves
-            the gaps pending for the next whole text."""
-            if not run_gaps or not chat_id:
-                return None
-            aligned = _align_whole_text(whole, assistant_received_text, run_gaps)
-            if aligned is None:
-                return None
-            tail, missing = aligned
-            run_gaps.clear()
-            for offset, chunk in missing:
-                seg = next((sg for sg in reversed(run_segments) if sg["start"] <= offset),
-                           run_segments[0] if run_segments else None)
-                if seg is None:
-                    continue
-                nxt = next((sg["start"] for sg in run_segments if sg["start"] > seg["start"]),
-                           len(assistant_received_text))
-                repair = {
-                    "user_id": owui_origin_user_id, "chat_id": chat_id,
-                    "message_id": seg["message_id"], "chunk": chunk,
-                    "before": assistant_received_text[offset:min(offset + _GAP_ANCHOR_CHARS, nxt)],
-                    "after": assistant_received_text[max(seg["start"], offset - _GAP_ANCHOR_CHARS):offset],
-                }
-                pipe_log(f"  event gap: {len(chunk)} chars lost at offset {offset}; "
-                         f"repairing message {seg['message_id'][:8]}...")
-                _schedule_gap_repair(conn, repair,
-                                     streaming=seg["message_id"] == owui_message_id)
-            return tail
-        visible_message_text = _initial_visible_text + pending_clamp_note
+        self.visible_message_text = self._initial_visible_text + self.pending_clamp_note
         had_tool_block = False
         # toolCallIds announced to OWUI as `function_call` items that have
         # not been completed by a matching result item yet. Anything left
@@ -1380,10 +1350,10 @@ class Pipe:
         pending_tool_calls: set[str] = set()
         pending_prompt_text = ""
         pending_media_text = ""
-        last_snapshot_text = ""
-        last_snapshot_time = 0.0
-        snapshot_interval_s = 1.0
-        snapshot_min_delta_chars = 250
+        self.last_snapshot_text = ""
+        self.last_snapshot_time = 0.0
+        self.snapshot_interval_s = 1.0
+        self.snapshot_min_delta_chars = 250
         # REST-API mid-run snapshot (bridge-rehydration-rest-snapshot-verify,
         # confirmed safe 2026-08-26): a parallel, throttled persistence path
         # for the plain assistant-text stream, which lost the `replace`-based
@@ -1392,13 +1362,13 @@ class Pipe:
         # variant of this (P17/P19/P23/P25/P27) is unsafe at any throttle.
         # This instead POSTs straight to the chat's DB row, which never
         # broadcasts to the live client, so it cannot race the delta stream.
-        last_rest_snapshot_text = ""
-        last_rest_snapshot_time = 0.0
-        rest_snapshot_interval_s = 2.5
-        rest_snapshot_task: asyncio.Task | None = None
+        self.last_rest_snapshot_text = ""
+        self.last_rest_snapshot_time = 0.0
+        self.rest_snapshot_interval_s = 2.5
+        self.rest_snapshot_task: asyncio.Task | None = None
         # OWUI 0.12+ discards this write and rehydrates reloads itself
         # (`_owui_owns_inflight_message`), so don't schedule it at all there.
-        rest_snapshot_enabled = not _owui_owns_inflight_message()
+        self.rest_snapshot_enabled = not _owui_owns_inflight_message()
         queued_shown = False
         # An interrupted run is not continued here: its message goes to the
         # turn writer, whose settled row decides who continues it (DESIGN 2.7).
@@ -1406,318 +1376,55 @@ class Pipe:
         # A reply with no Open WebUI message (an API request) has nothing to
         # hand over: it applies the owner rule itself, in its own stream
         # (review 2af1 R14). Set while it waits for the interrupted run's row.
-        awaiting_owner = False
-        owner_notice_before = False
-        owner_resumes = 0
-        owner_run = None
-
-        def await_owner() -> None:
-            nonlocal awaiting_owner, owner_notice_before, owner_run
-            awaiting_owner, owner_notice_before = True, conn._stop_notice_seen
-            owner_run = conn._awaiting_owner[session_key] = our_run_id
-            pipe_log(f"  run {our_run_id[:24]}... interrupted, no message to hand over: "
-                     "its row decides here")
-            spawn_background(conn.push_row(session_key))
-
-        async def owner_step(row: dict):
-            """One row while the reply waits for its run's owner (DESIGN 2.7):
-            ("switch", run, queue) to continue in the Gateway's recovery run
-            or a resume sent here, ("end", note) to finish, None to wait."""
-            nonlocal owner_resumes
-            decision = next_continuation(row, owner_notice_before, owner_resumes)
-            if decision == "gateway":
-                # The Gateway recovers it as a run whose turn names this one
-                # (rule E); until that turn is committed, the next row looks again.
-                try:
-                    messages = (await conn.session_history(session_key, limit=50,
-                                                           max_chars=200)).get("messages") or []
-                except Exception as ex:
-                    pipe_log(f"  chat.history for the recovery failed: {ex!r}")
-                    return None
-                rec = next((r for r, _t in _history_user_turns(messages)
-                            if recovery_source_run(messages, r) == our_run_id), None)
-                if rec is None:
-                    return None
-                pipe_log(f"  following the Gateway's recovery run {rec[:24]}...")
-                return ("switch", rec, conn.register_consumer(session_key, rec))
-            if decision == "wait":
-                return None
-            if decision == "resume":
-                key = f"msg-{chat_id}-resume-{time.time()}"
-                resume_queue = conn.register_consumer(session_key, key)
-                try:
-                    resp = await _run_request(conn, RUN_SEND, _owui_chat_send_params(
-                        session_key=session_key, message=_resume_directive(visible_message_text, text),
-                        idempotency_key=key, owui_chat_id=owui_origin_chat_id,
-                        owui_user_id=owui_origin_user_id, thinking=resolved_thinking), timeout=30)
-                except Exception as ex:
-                    # The Gateway is closing: its next hello reads the row again.
-                    conn.unregister_consumer(session_key, key, queue=resume_queue)
-                    pipe_log(f"  resume refused ({ex}); trying again on the next row")
-                    return None
-                owner_resumes += 1
-                new_run = resp.get("runId") or key
-                if new_run != key:
-                    conn.unregister_consumer(session_key, key, queue=resume_queue)
-                    resume_queue = conn.register_consumer(session_key, new_run)
-                pipe_log(f"  resumed as {new_run[:32]}... ({owner_resumes}/{MAX_TURN_RESUMES})")
-                return ("switch", new_run, resume_queue)
-            if turn_owner(row, owner_notice_before) == "pipe":
-                return ("end", TURN_CUT_OFF_NOTE)
-            if (row or {}).get("status") in ("failed", "timeout") and row.get("lastRunError"):
-                return ("end", f"**Error:** {row['lastRunError']}")
-            return ("end", None)
-
-        async def recover_from_transcript() -> str | None:
-            """The run's text read back: by its run id, else by its user text,
-            which only a run seen here may use. With nothing of it seen, the
-            session's last reply may be another run's (review 2af1 N4)."""
-            try:
-                hist = await conn.session_history(session_key, limit=RUN_TEXT_HISTORY_LIMIT)
-                found, whole = _history_text_for_run(hist, our_run_id)
-                if found and whole:
-                    return whole
-            except Exception as ex:
-                pipe_log(f"  recovery by run id: chat.history failed: {ex!r}")
-            if not first_event_arrived:
-                pipe_log("  recovery: nothing of this run seen, no text by its id")
-                return None
-            return await _recover_turn_text(conn, session_key, text)
-
-        async def settled_tail(row: dict, closer_only: bool = False) -> str | None:
-            """What this reply still owes once its run settled with no final
-            event here: the run's text after what arrived (its closing message
-            in the transcript), or, for a run that showed nothing, why.
-            `closer_only`: the session is busy, maybe with a later run, so
-            only this run's own closer says it ended; None without one."""
-            try:
-                hist = await conn.session_history(session_key, limit=RUN_TEXT_HISTORY_LIMIT)
-            except Exception as ex:
-                pipe_log(f"  settled run: chat.history failed: {ex!r}")
-                hist = None
-            found, whole = _history_text_for_run(hist, our_run_id) if hist else (False, None)
-            if found and whole:
-                gap_tail = reconcile_whole_text(whole)
-                if gap_tail is not None:
-                    return gap_tail
-                if whole.startswith(assistant_received_text):
-                    return whole[len(assistant_received_text):]
-                return "" if text_yielded else whole
-            if closer_only:
-                return "" if found else None
-            if text_yielded:
-                return ""
-            status = row.get("status")
-            if status in ("cancelled", "killed"):
-                return "**Stopped.**"
-            if status in ("failed", "timeout"):
-                err = row.get("lastRunError")
-                return f"**Error:** {err}" if err else "**Failed:** the run did not complete."
-            return await recover_from_transcript() or ""
-
-        def record_visible_chunk(chunk: str):
-            nonlocal visible_message_text
-            if chunk:
-                visible_message_text += chunk
-
-        async def maybe_emit_snapshot(*, force: bool = False):
-            nonlocal last_snapshot_text, last_snapshot_time
-            if not visible_message_text or visible_message_text == last_snapshot_text:
-                return
-            now = time.time()
-            if (
-                not force
-                and last_snapshot_text
-                and now - last_snapshot_time < snapshot_interval_s
-                and len(visible_message_text) - len(last_snapshot_text) < snapshot_min_delta_chars
-            ):
-                return
-            await _emit_message_snapshot(__event_emitter__, visible_message_text)
-            last_snapshot_text = visible_message_text
-            last_snapshot_time = now
-
-        def maybe_start_rest_snapshot():
-            """Throttled gate for the REST-API mid-run snapshot.
-
-            Fire-and-forget (background task): a GET+POST round trip inline
-            in the streaming path would stall the live delta yield every
-            time the throttle opens. Guarded so at most one is in flight at
-            once, and stops firing once the turn hits terminal flush (`done`
-            True) -- matching this project's established convention
-            (19e9fd7/2092e19) of never doing anything new right at the
-            natural end of a message, even though this path is confirmed
-            safe from the replace-vs-delta race that motivated that
-            convention (bridge-rehydration-rest-snapshot-verify, 2026-08-26).
-            """
-            nonlocal last_rest_snapshot_text, last_rest_snapshot_time, rest_snapshot_task
-            if done or not owui_message_id or not rest_snapshot_enabled:
-                return
-            if not visible_message_text or visible_message_text == last_rest_snapshot_text:
-                return
-            now = time.time()
-            if (
-                last_rest_snapshot_text
-                and now - last_rest_snapshot_time < rest_snapshot_interval_s
-            ):
-                return
-            if rest_snapshot_task is not None and not rest_snapshot_task.done():
-                return
-            snapshot_text = visible_message_text
-            last_rest_snapshot_text = snapshot_text
-            last_rest_snapshot_time = now
-            rest_snapshot_task = asyncio.create_task(
-                self._rest_snapshot_message(
-                    owui_origin_chat_id, owui_message_id, snapshot_text, bearer_token,
-                )
-            )
-
-        async def maybe_answer_user_input(prompt_text: str) -> UserInputResult:
-            """Ask the user via an OWUI modal and deliver their answer.
-
-            See UserInputResult for the meaning of the return value. Crucially,
-            a delivered answer that steers the *same* run (no new runId) still
-            returns handled=True, so the caller suppresses the raw prompt text
-            instead of leaking it into the chat.
-            """
-            if not _is_user_input_prompt(prompt_text):
-                return UserInputResult(False, None)
-            reconnect_user_id = (
-                owui_origin_user_id
-                if owui_origin_user_id and owui_origin_user_id != "unknown"
-                else None
-            )
-            try:
-                answer = await _ask_user_input_modal(
-                    __event_call__,
-                    prompt_text,
-                    owui_user_id=reconnect_user_id,
-                    owui_chat_id=owui_origin_chat_id,
-                    owui_message_id=(__metadata__ or {}).get("message_id"),
-                    owui_session_id=(__metadata__ or {}).get("session_id"),
-                    __event_emitter__=__event_emitter__,
-                )
-            except Exception as ex:
-                pipe_log(f"  user input modal failed; falling back to chat prompt: {ex}")
-                answer = None
-            if answer is None:
-                pipe_log("  user input modal cancelled or empty answer")
-                return UserInputResult(False, None)
-            pipe_log("  user input answered via OWUI modal")
-            await _emit_status(__event_emitter__, "Sending answer...", done=False)
-            # The answer continues this reply: its run id names it (ELI-100 2.2).
-            idempotency_key = (pipe_run_id(chat_id, owui_message_id, "input") if owui_message_id
-                               else f"user-input-{chat_id}-{time.time()}")
-            # Listen before sending, as for the first send (R12): the answer
-            # run's first events can arrive before chat.send returns, and with
-            # no consumer and no target they would open a second writer on
-            # this reply's message (review 2af1 N6).
-            answer_queue = conn.register_consumer(session_key, idempotency_key)
-            conn.continue_run_target(session_key, our_run_id, idempotency_key, shown=False)
-
-            def unlisten():
-                conn.unregister_consumer(session_key, idempotency_key, queue=answer_queue)
-                conn.continue_run_target(session_key, idempotency_key, our_run_id, shown=False)
-            try:
-                send_resp = await _run_request(
-                    conn, RUN_SEND,
-                    _owui_chat_send_params(
-                        session_key=session_key,
-                        message=answer,
-                        idempotency_key=idempotency_key,
-                        owui_chat_id=owui_origin_chat_id,
-                        owui_user_id=owui_origin_user_id,
-                    ),
-                    timeout=30,
-                )
-            except Exception as ex:
-                # Delivery failed: report not-handled so the caller falls back
-                # to showing the prompt text (better than a silent stall).
-                pipe_log(f"  sending answer back failed: {ex}")
-                unlisten()
-                return UserInputResult(False, None)
-            new_run_id = send_resp.get("runId") or None
-            if new_run_id != idempotency_key:
-                unlisten()  # steered into the live run, or renamed: as before
-                answer_queue = None
-            else:
-                nonlocal admitted_at, signals_lost
-                admitted_at, signals_lost = time.monotonic(), False
-            await _emit_status(__event_emitter__, "Answer sent; continuing...", done=False)
-            if new_run_id:
-                pipe_log(f"  answer sent, new runId: {new_run_id[:20]}...")
-            else:
-                pipe_log("  answer sent, steering into active run (no new runId)")
-            return UserInputResult(True, new_run_id, prompt_text=prompt_text, answer=answer,
-                                   queue=answer_queue)
-
-        def switch_to_answer_run(answer_res: UserInputResult) -> None:
-            """The reply continues in the answer run (R9). Its target moved
-            before the send when its consumer was registered then (N6); the
-            question run was shown to its end either way."""
-            if answer_res.queue is not None:
-                conn.mark_delivered_live(session_key, our_run_id)
-            else:
-                conn.continue_run_target(session_key, our_run_id, answer_res.new_run_id)
-
-        async def settle_held_media(held: str) -> str:
-            """Text `_advance_media_buffer` held, once its message item ends:
-            resolved as a whole, a directive quoted in code left as text
-            (ELI-111), and recorded for a writer that takes the reply over."""
-            resolved, handled = await _resolve_media_text(
-                held,
-                valves=self.valves,
-                __request__=__request__,
-                __event_emitter__=__event_emitter__,
-                ctx=assistant_stream_text[fence_item_start:],
-            )
-            if handled:
-                conn.note_turn_rewrite(owui_origin_chat_id, owui_message_id, held, resolved)
-            return resolved
+        self.awaiting_owner = False
+        self.owner_notice_before = False
+        self.owner_resumes = 0
+        self.owner_run = None
 
         adopt_new_run = True
         try:
             while adopt_new_run:
                 adopt_new_run = False
                 # A new run's text is a new message item (review 2af1 F4).
-                fence_item_start = len(assistant_stream_text)
+                self.fence_item_start = len(self.assistant_stream_text)
                 try:
-                    while not done:
+                    while not self.done:
                         # No silence timer: a quiet queue is a long tool call or
                         # model thinking as often as a dead run. The run's own
                         # signals end the reply: its terminal event, its settle
                         # row (below), a Gateway restart (handed over).
-                        msg = await queue.get()
+                        msg = await self.queue.get()
 
-                        if msg.get("type") == _ROW_MARKER_TYPE and awaiting_owner:
-                            step = await owner_step(msg.get("row") or {})
+                        if msg.get("type") == _ROW_MARKER_TYPE and self.awaiting_owner:
+                            step = await self.owner_step(msg.get("row") or {})
                             if step is None:
                                 continue
                             if step[0] == "end":
                                 if step[1]:
-                                    note = f"\n\n{step[1]}" if visible_message_text.strip() else step[1]
-                                    record_visible_chunk(note)
+                                    note = f"\n\n{step[1]}" if self.visible_message_text.strip() else step[1]
+                                    self.record_visible_chunk(note)
                                     yield note
-                                    text_yielded = True
-                                done = True
+                                    self.text_yielded = True
+                                self.done = True
                             else:
                                 # The reply continues in the run that continues
                                 # this one: its events (held until now) and its end.
                                 _kind, new_run, new_queue = step
-                                conn.unregister_consumer(session_key, our_run_id, queue=queue)
-                                queue, our_run_id = new_queue, new_run
-                                turn.run_id, turn.queue = our_run_id, queue
-                                admitted_at, signals_lost = time.monotonic(), False
-                            awaiting_owner = False
-                            conn.stop_awaiting_owner(session_key, owner_run)
+                                self.conn.unregister_consumer(self.session_key, self.our_run_id, queue=self.queue)
+                                self.queue, self.our_run_id = new_queue, new_run
+                                self.turn.run_id, self.turn.queue = self.our_run_id, self.queue
+                                self.admitted_at, self.signals_lost = time.monotonic(), False
+                            self.awaiting_owner = False
+                            self.conn.stop_awaiting_owner(self.session_key, self.owner_run)
                             continue
 
                         if msg.get("type") == _ROW_MARKER_TYPE:
                             row = msg.get("row") or {}
-                            if row.get("status") == "queued" and not first_event_arrived \
+                            if row.get("status") == "queued" and not self.first_event_arrived \
                                     and not queued_shown:
                                 queued_shown = True
                                 await _emit_status(
-                                    __event_emitter__,
+                                    self.__event_emitter__,
                                     "Waiting -- your message is queued behind an "
                                     "active response...",
                                     done=False,
@@ -1727,75 +1434,75 @@ class Pipe:
                             # is the end signal once its own may have been lost
                             # in a gap (review 2af1 N3). A row read before the
                             # admission shows nothing about it (N4).
-                            admitted = msg.get("read_at", time.monotonic()) >= admitted_at
+                            admitted = msg.get("read_at", time.monotonic()) >= self.admitted_at
                             if admitted and msg.get("resync"):
-                                signals_lost = True
+                                self.signals_lost = True
                             tail = None
                             if row.get("hasActiveRun") is False and (
-                                    row.get("lastRunId") == our_run_id
-                                    or (admitted and signals_lost)):
+                                    row.get("lastRunId") == self.our_run_id
+                                    or (admitted and self.signals_lost)):
                                 # The run settled while its terminal event never
                                 # reached this reply (dropped frame, socket gap).
                                 # Its transcript has what was lost.
                                 pipe_log(f"  run settled (row status {row.get('status')}, "
                                          f"last run {str(row.get('lastRunId'))[:24]}) without its final")
-                                tail = await settled_tail(row)
+                                tail = await self.settled_tail(row)
                             elif row.get("hasActiveRun") and msg.get("resync") and admitted:
                                 # After a gap the session is busy, maybe with a
                                 # later run: this run's closer says it ended.
-                                tail = await settled_tail(row, closer_only=True)
+                                tail = await self.settled_tail(row, closer_only=True)
                                 if tail is not None:
                                     pipe_log("  run closed in the transcript during a gap")
                             if tail is not None:
                                 if tail:
-                                    record_visible_chunk(tail)
+                                    self.record_visible_chunk(tail)
                                     yield tail
-                                    text_yielded = True
-                                    await maybe_emit_snapshot(force=True)
-                                done = True
+                                    self.text_yielded = True
+                                    await self.maybe_emit_snapshot(force=True)
+                                self.done = True
                             continue
 
                         if msg.get("type") == _RESTART_MARKER_TYPE:
                             # A new Gateway process: the run may be recovered
                             # by it (a crash leaves its row `running`) or need
                             # a resume. Its row decides, in the turn writer.
-                            if conn.hand_over_run(session_key, our_run_id,
-                                                  thinking=resolved_thinking, read_row=True):
-                                handed_over = done = True
-                            elif awaiting_owner:
-                                spawn_background(conn.push_row(session_key))
-                            elif not owui_message_id:
-                                await_owner()
+                            if self.conn.hand_over_run(self.session_key, self.our_run_id,
+                                                  thinking=self.resolved_thinking, read_row=True):
+                                handed_over = self.done = True
+                            elif self.awaiting_owner:
+                                spawn_background(self.conn.push_row(self.session_key))
+                            elif not self.owui_message_id:
+                                self.await_owner()
                             else:
                                 pipe_log("  Gateway restarted; no message to hand over, waiting")
                             continue
 
                         if msg.get("type") == _GAP_MARKER_TYPE:
-                            signals_lost = True
-                            run_gaps.append(len(assistant_received_text))
-                            pipe_log(f"  event gap at offset {len(assistant_received_text)} "
+                            self.signals_lost = True
+                            self.run_gaps.append(len(self.assistant_received_text))
+                            pipe_log(f"  event gap at offset {len(self.assistant_received_text)} "
                                      "(Gateway socket dropped)")
                             continue
 
-                        event_count += 1
-                        first_event_arrived = True
+                        self.event_count += 1
+                        self.first_event_arrived = True
                         payload = msg.get("payload", {})
                         stream = payload.get("stream")
                         data = payload.get("data", {})
                         name = data.get("name", "")
                         phase = data.get("phase", "")
                         state = payload.get("state", "")
-                        if (event_count == 1 and state == "final" and msg.get("event") == "chat"
+                        if (self.event_count == 1 and state == "final" and msg.get("event") == "chat"
                                 and not payload.get("message")):
-                            enqueued_not_started = True
+                            self.enqueued_not_started = True
 
                         # --- P16: Double-check session/run match ---
                         evt_session = payload.get("sessionKey", "")
                         evt_run_id = payload.get("runId", "")
-                        if evt_session and evt_session != session_key:
+                        if evt_session and evt_session != self.session_key:
                             pipe_log(f"  queue delivered wrong session: {evt_session[:40]}...")
                             continue
-                        if evt_run_id and evt_run_id != our_run_id:
+                        if evt_run_id and evt_run_id != self.our_run_id:
                             pipe_log(f"  queue delivered wrong run: {evt_run_id[:20]}...")
                             continue
 
@@ -1809,24 +1516,24 @@ class Pipe:
                         # decides neither: the turn writer takes the message
                         # and the settled row picks the owner. Without a
                         # message to hand over, it ends here like any error.
-                        if _EXTERNAL_KILL_RE.search(err) or (aborted_run and conn._shutdown_seen):
-                            if conn.hand_over_run(session_key, our_run_id, thinking=resolved_thinking):
-                                handed_over = done = True
+                        if _EXTERNAL_KILL_RE.search(err) or (aborted_run and self.conn._shutdown_seen):
+                            if self.conn.hand_over_run(self.session_key, self.our_run_id, thinking=self.resolved_thinking):
+                                handed_over = self.done = True
                                 continue
-                            if not owui_message_id:
-                                await_owner()
+                            if not self.owui_message_id:
+                                self.await_owner()
                                 continue
                         if stream == "lifecycle" and phase == "end":
-                            done = True
+                            self.done = True
                             pipe_log("  lifecycle end -> done")
                         elif err:
-                            error_shown = f"\n\n**Error:** {err}"
-                            record_visible_chunk(error_shown)
-                            yield error_shown
-                            done = True
+                            self.error_shown = f"\n\n**Error:** {err}"
+                            self.record_visible_chunk(self.error_shown)
+                            yield self.error_shown
+                            self.done = True
                             pipe_log("  lifecycle error -> done")
                         if state in ("final", "cancelled", "error", "aborted") or aborted_run:
-                            done = True
+                            self.done = True
                             pipe_log(f"  payload state='{state}' aborted={aborted_run} -> done")
                         # A run the Gateway refused before it started (an
                         # inline `/model` naming a model that is not allowed)
@@ -1834,19 +1541,19 @@ class Pipe:
                         # rejection is left to the retry below.
                         run_error = str(payload.get("errorMessage") or "").strip() \
                             if state == "error" else ""
-                        if (run_error and not error_shown
+                        if (run_error and not self.error_shown
                                 and _thinking_rejection_retry_body(
-                                    body, run_error, resolved_thinking) is None):
-                            error_shown = f"\n\n**Error:** {run_error}"
-                            record_visible_chunk(error_shown)
-                            yield error_shown
+                                    self.body, run_error, self.resolved_thinking) is None):
+                            self.error_shown = f"\n\n**Error:** {run_error}"
+                            self.record_visible_chunk(self.error_shown)
+                            yield self.error_shown
 
                         # --- Assistant text stream ---
                         if stream == "assistant":
                             raw_delta = data.get("delta")
                             if raw_delta:
                                 delta = raw_delta
-                                assistant_received_text += raw_delta
+                                self.assistant_received_text += raw_delta
                             else:
                                 # Some providers (observed with claude-cli-backed
                                 # Opus/Sonnet overrides) send a final catch-all event
@@ -1856,15 +1563,15 @@ class Pipe:
                                 # time. Diff it against what's already been streamed,
                                 # same as the item-event dedup below.
                                 raw_text = data.get("text") or ""
-                                gap_tail = reconcile_whole_text(raw_text) if raw_text else None
+                                gap_tail = self.reconcile_whole_text(raw_text) if raw_text else None
                                 before = _item_delta_text(
-                                    raw_text, "", assistant_received_text
+                                    raw_text, "", self.assistant_received_text
                                 ) if raw_text else ""
                                 delta = (
-                                    _suppress_already_shown(gap_tail, visible_message_text)
+                                    _suppress_already_shown(gap_tail, self.visible_message_text)
                                     if gap_tail is not None
                                     else _catch_all_delta(
-                                        raw_text, assistant_received_text, visible_message_text
+                                        raw_text, self.assistant_received_text, self.visible_message_text
                                     )
                                 )
                                 if before and not delta:
@@ -1872,7 +1579,7 @@ class Pipe:
                                         "  suppressed duplicate catch-all assistant "
                                         f"text ({len(before)} chars already received)"
                                     )
-                                assistant_received_text += delta
+                                self.assistant_received_text += delta
                             if delta:
                                 # Filter Sender metadata
                                 if (
@@ -1897,7 +1604,7 @@ class Pipe:
                                 flush_text, pending_prompt_text = (
                                     _advance_input_prompt_buffer(
                                         pending_prompt_text, delta,
-                                        _fence_open_after(assistant_stream_text[fence_item_start:]))
+                                        _fence_open_after(self.assistant_stream_text[self.fence_item_start:]))
                                 )
                                 if not flush_text:
                                     continue
@@ -1912,12 +1619,12 @@ class Pipe:
                                 # the shown text of this item sets the code state.
                                 delta, pending_media_text = _advance_media_buffer(
                                     pending_media_text, delta,
-                                    assistant_stream_text[fence_item_start:]
+                                    self.assistant_stream_text[self.fence_item_start:]
                                 )
                                 if not delta:
                                     continue
 
-                                text_yielded = True
+                                self.text_yielded = True
                                 # No snapshot here, regardless of whether tool blocks
                                 # exist earlier in the message. A `replace` event sets
                                 # the full message content; if it lands on (or near)
@@ -1942,26 +1649,26 @@ class Pipe:
                                 if "MEDIA:" in delta:
                                     resolved, handled = await _resolve_media_text(
                                         delta,
-                                        valves=self.valves,
-                                        __request__=__request__,
-                                        __event_emitter__=__event_emitter__,
-                                        ctx=assistant_stream_text[fence_item_start:],
+                                        valves=self.pipe.valves,
+                                        __request__=self.__request__,
+                                        __event_emitter__=self.__event_emitter__,
+                                        ctx=self.assistant_stream_text[self.fence_item_start:],
                                     )
                                     if handled:
                                         pipe_log("  resolved MEDIA: directive")
                                         # A writer that takes this reply over
                                         # shows the same image (review 2af1 R4).
-                                        conn.note_turn_rewrite(owui_origin_chat_id, owui_message_id,
+                                        self.conn.note_turn_rewrite(self.owui_origin_chat_id, self.owui_message_id,
                                                                delta, resolved)
                                         # The raw text was flushed: it sets the
                                         # code state of what follows (ELI-111).
-                                        assistant_stream_text += delta
-                                        record_visible_chunk(resolved)
+                                        self.assistant_stream_text += delta
+                                        self.record_visible_chunk(resolved)
                                         yield resolved
-                                        await maybe_emit_snapshot()
+                                        await self.maybe_emit_snapshot()
                                         continue
-                                assistant_stream_text += delta
-                                record_visible_chunk(delta)
+                                self.assistant_stream_text += delta
+                                self.record_visible_chunk(delta)
                                 yield delta
                                 # NOTE: do NOT emit a `replace` snapshot per text
                                 # delta here. A mid-stream `replace` carrying the
@@ -1976,39 +1683,39 @@ class Pipe:
                                 # writes the chat row directly and never broadcasts
                                 # to the live client, so it cannot trigger that
                                 # suppression.
-                                maybe_start_rest_snapshot()
+                                self.maybe_start_rest_snapshot()
 
                         # --- Assistant text carried by item/preamble events ---
                         if stream == "item":
                             item_text = _item_assistant_text(data)
                             if item_text:
-                                answer_res = await maybe_answer_user_input(item_text)
+                                answer_res = await self.maybe_answer_user_input(item_text)
                                 if answer_res.handled:
                                     detail_block = ""
                                     if answer_res.answer:
                                         detail_block = _ask_user_detail_block(
                                             answer_res.prompt_text or item_text, answer_res.answer
                                         )
-                                        record_visible_chunk(detail_block)
+                                        self.record_visible_chunk(detail_block)
                                         yield detail_block
-                                        await maybe_emit_snapshot(force=True)
-                                    conn.note_turn_rewrite(owui_origin_chat_id, owui_message_id,
+                                        await self.maybe_emit_snapshot(force=True)
+                                    self.conn.note_turn_rewrite(self.owui_origin_chat_id, self.owui_message_id,
                                                            answer_res.prompt_text or item_text,
                                                            detail_block)
-                                    if answer_res.new_run_id and answer_res.new_run_id != our_run_id:
+                                    if answer_res.new_run_id and answer_res.new_run_id != self.our_run_id:
                                         pipe_log(f"  needs-input handled, switching to run {answer_res.new_run_id[:20]}...")
                                         # The answer run continues this reply (R9).
-                                        switch_to_answer_run(answer_res)
-                                        conn.unregister_consumer(session_key, our_run_id, queue=queue)
-                                        queue = answer_res.queue or conn.register_consumer(
-                                            session_key, answer_res.new_run_id)
-                                        our_run_id = answer_res.new_run_id
-                                    done = False
+                                        self.switch_to_answer_run(answer_res)
+                                        self.conn.unregister_consumer(self.session_key, self.our_run_id, queue=self.queue)
+                                        self.queue = answer_res.queue or self.conn.register_consumer(
+                                            self.session_key, answer_res.new_run_id)
+                                        self.our_run_id = answer_res.new_run_id
+                                    self.done = False
                                     last_item_text = item_text
                                     continue
-                                gap_tail = reconcile_whole_text(item_text)
+                                gap_tail = self.reconcile_whole_text(item_text)
                                 item_delta = gap_tail if gap_tail is not None else _item_delta_text(
-                                    item_text, last_item_text, assistant_stream_text
+                                    item_text, last_item_text, self.assistant_stream_text
                                 )
                                 last_item_text = item_text
                                 # Same safety net as the assistant-stream catch-all
@@ -2018,7 +1725,7 @@ class Pipe:
                                 # exact same `_item_delta_text` fallback that
                                 # re-yields the entire text when the prefix check
                                 # fails (P27).
-                                item_delta = _suppress_already_shown(item_delta, visible_message_text)
+                                item_delta = _suppress_already_shown(item_delta, self.visible_message_text)
                                 # Unlike the assistant-stream path, item events
                                 # carry no `_advance_input_prompt_buffer` guard,
                                 # so a needs-input prompt that arrives here (and
@@ -2027,13 +1734,13 @@ class Pipe:
                                 # Strip it defensively.
                                 if _is_user_input_prompt(item_delta):
                                     stripped = _ask_user_fallback_text(item_delta)
-                                    conn.note_turn_rewrite(owui_origin_chat_id, owui_message_id,
+                                    self.conn.note_turn_rewrite(self.owui_origin_chat_id, self.owui_message_id,
                                                            item_delta, stripped)
                                     item_delta = stripped
                                 if item_delta:
-                                    text_yielded = True
+                                    self.text_yielded = True
                                     pipe_log("  yielded text from item event")
-                                    record_visible_chunk(item_delta)
+                                    self.record_visible_chunk(item_delta)
                                     yield item_delta
 
                         # --- Tool call events ---
@@ -2042,7 +1749,7 @@ class Pipe:
                                 tool_call_id = data.get("toolCallId", "")
                                 args = json.dumps(data.get("args", {}))
                                 if tool_call_id:
-                                    self._active_tool_args[tool_call_id] = args
+                                    self.pipe._active_tool_args[tool_call_id] = args
                                 pipe_log(f"  Tool start: {name}")
                                 if tool_call_id:
                                     # Protocol switch, not text: this dict becomes a
@@ -2058,16 +1765,16 @@ class Pipe:
                                         # any code span a held directive waited on
                                         # (ELI-111): it shows before the card.
                                         held, pending_media_text = pending_media_text, ""
-                                        resolved = await settle_held_media(held)
-                                        assistant_stream_text += held
-                                        record_visible_chunk(resolved)
+                                        resolved = await self.settle_held_media(held)
+                                        self.assistant_stream_text += held
+                                        self.record_visible_chunk(resolved)
                                         yield resolved
-                                        text_yielded = True
+                                        self.text_yielded = True
                                     yield _tool_call_started_event(name, tool_call_id, args)
                                     # Text after a tool call is a new message item.
-                                    fence_item_start = len(assistant_stream_text)
+                                    self.fence_item_start = len(self.assistant_stream_text)
                                 await _emit_status(
-                                    __event_emitter__,
+                                    self.__event_emitter__,
                                     f"Running {name}...",
                                     done=False,
                                 )
@@ -2080,10 +1787,10 @@ class Pipe:
                                 # (`execute.runtime`'s emitCliToolResult); the
                                 # card just never showed it.
                                 is_error = data.get("isError") is True
-                                stored_args = self._active_tool_args.pop(tool_call_id, None)
+                                stored_args = self.pipe._active_tool_args.pop(tool_call_id, None)
                                 args_str = stored_args or json.dumps(data.get("args", {}))
                                 if (
-                                    adopted_run_id and tool_call_id
+                                    self.adopted_run_id and tool_call_id
                                     and tool_call_id not in pending_tool_calls
                                 ):
                                     # Started under the reply that was
@@ -2127,11 +1834,11 @@ class Pipe:
                                         data.get("meta", ""),
                                     )
                                     had_tool_block = True
-                                    record_visible_chunk(tool_block)
+                                    self.record_visible_chunk(tool_block)
                                     yield tool_block
-                                    await maybe_emit_snapshot(force=True)
+                                    await self.maybe_emit_snapshot(force=True)
                                 await _emit_status(
-                                    __event_emitter__,
+                                    self.__event_emitter__,
                                     f"{name} done",
                                     done=True,
                                 )
@@ -2156,31 +1863,31 @@ class Pipe:
                     # events buffered, and the next message takes it over
                     # (see `park_cancelled_turn`). The awaits after it may be
                     # interrupted themselves; nothing depends on them.
-                    aborted = True
-                    grace_s = float(getattr(self.valves, "INTERRUPT_GRACE_SECONDS", 0) or 0)
-                    turn.parked = True
-                    conn.park_cancelled_turn(
-                        session_key, our_run_id, queue, turn.unsent, grace_s,
-                        send_stop=self.valves.SEND_STOP_ON_CANCEL,
-                        run_text={"received": assistant_received_text,
-                                  "stream": assistant_stream_text,
+                    self.aborted = True
+                    grace_s = float(getattr(self.pipe.valves, "INTERRUPT_GRACE_SECONDS", 0) or 0)
+                    self.turn.parked = True
+                    self.conn.park_cancelled_turn(
+                        self.session_key, self.our_run_id, self.queue, self.turn.unsent, grace_s,
+                        send_stop=self.pipe.valves.SEND_STOP_ON_CANCEL,
+                        run_text={"received": self.assistant_received_text,
+                                  "stream": self.assistant_stream_text,
                                   "item": last_item_text,
-                                  "gaps": run_gaps,
-                                  "segments": run_segments},
+                                  "gaps": self.run_gaps,
+                                  "segments": self.run_segments},
                         settle=functools.partial(
-                            _settle_cancel_intent, conn, session_key, our_run_id,
-                            owui_origin_chat_id, __event_call__),
+                            _settle_cancel_intent, self.conn, self.session_key, self.our_run_id,
+                            self.owui_origin_chat_id, self.__event_call__),
                     )
                     pipe_log(
                         f"Generator {type(stop).__name__}: run parked "
-                        f"{grace_s:g}s with {len(turn.unsent)} unsent "
+                        f"{grace_s:g}s with {len(self.turn.unsent)} unsent "
                         "message(s), in case a new message follows"
                         if grace_s > 0 else
                         f"Generator {type(stop).__name__}: sending chat.abort"
                     )
                     try:
-                        await maybe_emit_snapshot(force=True)
-                        await _emit_status(__event_emitter__, "Stopped", done=True)
+                        await self.maybe_emit_snapshot(force=True)
+                        await _emit_status(self.__event_emitter__, "Stopped", done=True)
                     except (Exception, asyncio.CancelledError) as ex:
                         pipe_log(f"  stop snapshot/status skipped: {ex!r}")
                     raise
@@ -2197,7 +1904,7 @@ class Pipe:
                         # re-checks the trigger itself and returns False for a
                         # partial/non-match, in which case fall back to showing it
                         # as plain text so nothing is silently dropped.
-                        answer_res = await maybe_answer_user_input(pending_prompt_text)
+                        answer_res = await self.maybe_answer_user_input(pending_prompt_text)
                         if answer_res.handled:
                             # Answer delivered. Re-enter the main loop (via the outer
                             # `while adopt_new_run`) to consume the follow-up -- whether
@@ -2205,29 +1912,29 @@ class Pipe:
                             # -- so the continuation reuses the same needs-input
                             # re-detection, dedup and snapshot handling as any other
                             # run instead of a separate, drift-prone copy of the loop.
-                            text_yielded = True
+                            self.text_yielded = True
                             detail_block = ""
                             if answer_res.answer:
                                 detail_block = _ask_user_detail_block(
                                     answer_res.prompt_text or pending_prompt_text, answer_res.answer
                                 )
-                                record_visible_chunk(detail_block)
+                                self.record_visible_chunk(detail_block)
                                 yield detail_block
-                                await maybe_emit_snapshot(force=True)
-                            conn.note_turn_rewrite(owui_origin_chat_id, owui_message_id,
+                                await self.maybe_emit_snapshot(force=True)
+                            self.conn.note_turn_rewrite(self.owui_origin_chat_id, self.owui_message_id,
                                                    pending_prompt_text, detail_block)
                             pending_prompt_text = ""
-                            if answer_res.new_run_id and answer_res.new_run_id != our_run_id:
+                            if answer_res.new_run_id and answer_res.new_run_id != self.our_run_id:
                                 pipe_log(f"  continuing into new run: {answer_res.new_run_id[:20]}...")
                                 # The answer run continues this reply (R9).
-                                switch_to_answer_run(answer_res)
-                                conn.unregister_consumer(session_key, our_run_id, queue=queue)
-                                queue = answer_res.queue or conn.register_consumer(
-                                    session_key, answer_res.new_run_id)
-                                our_run_id = answer_res.new_run_id
+                                self.switch_to_answer_run(answer_res)
+                                self.conn.unregister_consumer(self.session_key, self.our_run_id, queue=self.queue)
+                                self.queue = answer_res.queue or self.conn.register_consumer(
+                                    self.session_key, answer_res.new_run_id)
+                                self.our_run_id = answer_res.new_run_id
                             else:
                                 pipe_log("  continuing in the same run after modal answer")
-                            done = False
+                            self.done = False
                             adopt_new_run = True
                         else:
                             # Modal not handled (cancelled / dismissed / gave up
@@ -2235,12 +1942,12 @@ class Pipe:
                             # never leak the literal "OpenClaw needs input:"
                             # directive line as visible text.
                             fallback = _ask_user_fallback_text(pending_prompt_text)
-                            conn.note_turn_rewrite(owui_origin_chat_id, owui_message_id,
+                            self.conn.note_turn_rewrite(self.owui_origin_chat_id, self.owui_message_id,
                                                    pending_prompt_text, fallback)
                             if fallback:
-                                record_visible_chunk(fallback)
+                                self.record_visible_chunk(fallback)
                                 yield fallback
-                                text_yielded = True
+                                self.text_yielded = True
                             pending_prompt_text = ""
 
                     if pending_media_text:
@@ -2251,10 +1958,10 @@ class Pipe:
                         # resolve now; `_resolve_media_text` still falls back to
                         # showing it as plain text if resolution fails, so
                         # nothing is silently dropped.
-                        resolved = await settle_held_media(pending_media_text)
-                        record_visible_chunk(resolved)
+                        resolved = await self.settle_held_media(pending_media_text)
+                        self.record_visible_chunk(resolved)
                         yield resolved
-                        text_yielded = True
+                        self.text_yielded = True
                         pending_media_text = ""
 
                     # For pure-text turns, do NOT force a snapshot here: OWUI's own
@@ -2286,9 +1993,9 @@ class Pipe:
                     # Not for an adopted run either: this reply keeps streaming
                     # the queued message's answer, and a `replace` now would
                     # freeze those deltas (P23/P25).
-                    if (not adopt_new_run and had_tool_block and not adopted_run_id
+                    if (not adopt_new_run and had_tool_block and not self.adopted_run_id
                             and not handed_over):
-                        await maybe_emit_snapshot(force=True)
+                        await self.maybe_emit_snapshot(force=True)
 
                     # Resolve any tool call that was announced but never got a
                     # result (run cancelled, gateway dropped it, tool crashed).
@@ -2318,28 +2025,28 @@ class Pipe:
                         pending_tool_calls.clear()
 
         finally:
-            if awaiting_owner:
-                conn.stop_awaiting_owner(session_key, owner_run)
+            if self.awaiting_owner:
+                self.conn.stop_awaiting_owner(self.session_key, self.owner_run)
             # A parked queue now belongs to whoever claims the run; releasing
             # it here would drop the events it is buffering.
-            if not turn.parked:
-                if done and not aborted and our_run_id and not handed_over:
+            if not self.turn.parked:
+                if self.done and not self.aborted and self.our_run_id and not handed_over:
                     # The run ended in this reply. Its trailing `chat` final
                     # lands after this consumer is gone and must not read as
                     # "the reply ended before its run" (a handover would
                     # rewrite the message OWUI is about to save) or as a run
                     # nobody showed.
-                    conn.mark_delivered_live(session_key, our_run_id)
-                    conn.unregister_run_target(session_key, our_run_id)
-                conn.unregister_consumer(session_key, our_run_id, queue=queue)
-                turn.run_id = None
-                turn.queue = None
+                    self.conn.mark_delivered_live(self.session_key, self.our_run_id)
+                    self.conn.unregister_run_target(self.session_key, self.our_run_id)
+                self.conn.unregister_consumer(self.session_key, self.our_run_id, queue=self.queue)
+                self.turn.run_id = None
+                self.turn.queue = None
             status_lines = []
-            if not aborted and text_yielded and not adopted_run_id and not handed_over:
-                status_lines = await _build_usage_status_lines(conn, session_key)
-            if adopted_run_id and not aborted:
+            if not self.aborted and self.text_yielded and not self.adopted_run_id and not handed_over:
+                status_lines = await _build_usage_status_lines(self.conn, self.session_key)
+            if self.adopted_run_id and not self.aborted:
                 await _emit_status(
-                    __event_emitter__, "Sending your message…", done=False)
+                    self.__event_emitter__, "Sending your message…", done=False)
             elif status_lines:
                 # One `status` event per fact (context / rate-limit / goal) so
                 # each row stays inside OWUI's per-line clamp instead of one
@@ -2351,45 +2058,49 @@ class Pipe:
                 # shimmer for an instant before getting replaced by the last
                 # line, a visible flash for no reason.
                 for line in status_lines:
-                    await _emit_status(__event_emitter__, line, done=True)
+                    await _emit_status(self.__event_emitter__, line, done=True)
             else:
-                await _emit_status(__event_emitter__, "", done=True)
+                await _emit_status(self.__event_emitter__, "", done=True)
 
-        pipe_log(f"DONE -- {event_count} events processed, "
-                 f"text yielded: {text_yielded}")
-        if adopted_run_id and not aborted:
+    async def finish(self):
+        """After the run: the messages an adopted run held back, a queued message
+        taken back, a lost tail, the terminal snapshot, the title, and the
+        recovery or thinking retry of a reply with no text."""
+        pipe_log(f"DONE -- {self.event_count} events processed, "
+                 f"text yielded: {self.text_yielded}")
+        if self.adopted_run_id and not self.aborted:
             # The adopted run is over; now send the messages this reply owes
             # (its own, plus any carried over from cancelled replies), in the
             # same reply. The recursive call does the normal queue + send (it
             # also waits out a subagent-yield gap if the run resumes), and
             # owns the terminal snapshot, usage lines and auto-title. Seeding
             # it with what streamed so far keeps that snapshot complete.
-            send_texts = list(turn.unsent)
+            send_texts = list(self.turn.unsent)
             pipe_log(
-                f"  adopted run {adopted_run_id[:20]}... finished; sending "
+                f"  adopted run {self.adopted_run_id[:20]}... finished; sending "
                 f"{len(send_texts)} queued message(s)"
             )
-            separator = "\n\n---\n\n" if visible_message_text.strip() else ""
+            separator = "\n\n---\n\n" if self.visible_message_text.strip() else ""
             if separator:
-                record_visible_chunk(separator)
+                self.record_visible_chunk(separator)
                 yield separator
             # From here the recursive reply owns them, and parks them itself
             # if it is cancelled.
-            turn.unsent = []
-            async with contextlib.aclosing(self._pipe_impl(
-                body, __event_emitter__,
-                __event_call__=__event_call__, __user__=__user__,
-                __metadata__=__metadata__, __request__=__request__,
-                __task__=__task__, __task_body__=__task_body__,
-                _initial_visible_text=visible_message_text,
+            self.turn.unsent = []
+            async with contextlib.aclosing(self.pipe._pipe_impl(
+                self.body, self.__event_emitter__,
+                __event_call__=self.__event_call__, __user__=self.__user__,
+                __metadata__=self.__metadata__, __request__=self.__request__,
+                __task__=self.__task__, __task_body__=self.__task_body__,
+                _initial_visible_text=self.visible_message_text,
                 _send_texts=send_texts,
             )) as continuation:
                 async for item in continuation:
                     yield item
             return
-        if (enqueued_not_started and not text_yielded and not aborted
-                and not adopted_run_id and session_runtime == "claude-cli"
-                and our_run_id and sent_texts):
+        if (self.enqueued_not_started and not self.text_yielded and not self.aborted
+                and not self.adopted_run_id and self.session_runtime == "claude-cli"
+                and self.our_run_id and self.sent_texts):
             # A run started between the idle read and the send (a sub-agent's
             # parent resuming, a wake), and the Gateway queued this message
             # behind it. claude-cli cannot run a queued turn: it fails with
@@ -2399,7 +2110,7 @@ class Pipe:
             # queued, wait for that run to settle, and send it again.
             try:
                 await _run_request(
-                    conn, RUN_ABORT, {"sessionKey": session_key, "runId": our_run_id},
+                    self.conn, RUN_ABORT, {"sessionKey": self.session_key, "runId": self.our_run_id},
                     timeout=15,
                 )
                 took_back = True
@@ -2409,48 +2120,48 @@ class Pipe:
             if took_back:
                 pipe_log(
                     f"  message was queued behind a run that started first "
-                    f"(run {str(our_run_id)[:20]}...); took it back, resending once idle"
+                    f"(run {str(self.our_run_id)[:20]}...); took it back, resending once idle"
                 )
-                conn.unregister_run_target(session_key, our_run_id)
-                async with contextlib.aclosing(self._pipe_impl(
-                    body, __event_emitter__,
-                    __event_call__=__event_call__, __user__=__user__,
-                    __metadata__=__metadata__, __request__=__request__,
-                    __task__=__task__, __task_body__=__task_body__,
-                    _initial_visible_text=visible_message_text,
-                    _send_texts=sent_texts,
+                self.conn.unregister_run_target(self.session_key, self.our_run_id)
+                async with contextlib.aclosing(self.pipe._pipe_impl(
+                    self.body, self.__event_emitter__,
+                    __event_call__=self.__event_call__, __user__=self.__user__,
+                    __metadata__=self.__metadata__, __request__=self.__request__,
+                    __task__=self.__task__, __task_body__=self.__task_body__,
+                    _initial_visible_text=self.visible_message_text,
+                    _send_texts=self.sent_texts,
                 )) as again:
                     async for item in again:
                         yield item
                 return
 
-        if not text_yielded:
+        if not self.text_yielded:
             pipe_log(
-                f"  [diag] PHANTOM (no text): our_run_id={str(our_run_id)[:40]} "
-                f"first_event_arrived={first_event_arrived} aborted={aborted}"
+                f"  [diag] PHANTOM (no text): our_run_id={str(self.our_run_id)[:40]} "
+                f"first_event_arrived={self.first_event_arrived} aborted={self.aborted}"
             )
 
-        if run_gaps and not aborted and our_run_id:
+        if self.run_gaps and not self.aborted and self.our_run_id:
             # Events were lost and no whole-text event lined up with them
             # during the run: the run's own closing message in the transcript
             # (`cli-assistant:<runId>`, see `_history_text_for_run`) is the
             # whole text. Its tail, if the lost events were the last ones,
             # belongs at the end of this reply.
             try:
-                hist = await conn.session_history(session_key, limit=RUN_TEXT_HISTORY_LIMIT)
+                hist = await self.conn.session_history(self.session_key, limit=RUN_TEXT_HISTORY_LIMIT)
             except Exception as ex:
                 hist = None
                 pipe_log(f"  event gap: chat.history failed: {ex}")
-            found, whole = _history_text_for_run(hist, our_run_id)
-            tail = (reconcile_whole_text(whole) if found and whole else None) or ""
-            if run_gaps:
-                pipe_log(f"  {len(run_gaps)} event gap(s) and no whole text lines up for run "
-                         f"{str(our_run_id)[:20]}...; the lost text cannot be put back")
-            elif tail and not visible_message_text.endswith(tail):
+            found, whole = _history_text_for_run(hist, self.our_run_id)
+            tail = (self.reconcile_whole_text(whole) if found and whole else None) or ""
+            if self.run_gaps:
+                pipe_log(f"  {len(self.run_gaps)} event gap(s) and no whole text lines up for run "
+                         f"{str(self.our_run_id)[:20]}...; the lost text cannot be put back")
+            elif tail and not self.visible_message_text.endswith(tail):
                 pipe_log(f"  event gap: {len(tail)} chars lost at the end of the run, appended")
-                record_visible_chunk(tail)
+                self.record_visible_chunk(tail)
                 yield tail
-                text_yielded = True
+                self.text_yielded = True
 
         # Terminal back-sync (ELI-57): persist the completed turn's visible text
         # to the OWUI DB with one final `replace` snapshot. OWUI only saves
@@ -2464,26 +2175,26 @@ class Pipe:
         # so a single force snapshot is freeze-safe, and OWUI's `replace`
         # handler writes the DB unconditionally (sio.emit to an empty room is a
         # no-op, not an error), so it persists even with everything dead.
-        if not aborted and text_yielded:
-            await maybe_emit_snapshot(force=True)
+        if not self.aborted and self.text_yielded:
+            await self.maybe_emit_snapshot(force=True)
 
         # Auto-title: generate title after first exchange (best-effort, non-blocking)
-        if not aborted and text_yielded:
+        if not self.aborted and self.text_yielded:
             spawn_background(
-                self._auto_title(
-                    body, conn, visible_message_text,
-                    owui_origin_chat_id, bearer_token, session_key=session_key,
+                self.pipe._auto_title(
+                    self.body, self.conn, self.visible_message_text,
+                    self.owui_origin_chat_id, self.bearer_token, session_key=self.session_key,
                 )
             )
 
-        if not aborted and not text_yielded and error_shown:
+        if not self.aborted and not self.text_yielded and self.error_shown:
             # The error is the reply: nothing to recover, and no
             # "no reply text" note under it.
-            await maybe_emit_snapshot(force=True)
-        elif not aborted and not text_yielded:
-            recovered = await recover_from_transcript()
+            await self.maybe_emit_snapshot(force=True)
+        elif not self.aborted and not self.text_yielded:
+            recovered = await self.recover_from_transcript()
             retry_body = _thinking_rejection_retry_body(
-                body, recovered, resolved_thinking)
+                self.body, recovered, self.resolved_thinking)
             if retry_body is not None:
                 # Learn from the rejection before retrying. The Gateway just
                 # named this model's real ladder, and it is the only place that
@@ -2495,12 +2206,12 @@ class Pipe:
                     learned = rejection["levels"]
                     _record_thinking_ladder(
                         learned,
-                        model_key=rejection["model"] or session_model_key,
+                        model_key=rejection["model"] or self.session_model_key,
                         authoritative=True,
-                        state_dir=getattr(self.valves, "STATE_DIR", ""),
+                        state_dir=getattr(self.pipe.valves, "STATE_DIR", ""),
                     )
                 pipe_log(
-                    f"thinking: Gateway rejected level {resolved_thinking!r} "
+                    f"thinking: Gateway rejected level {self.resolved_thinking!r} "
                     f"({recovered!r}); retrying once without an explicit level"
                 )
                 # Say only what was actually observed. The previous wording
@@ -2511,41 +2222,41 @@ class Pipe:
                     supported = ", ".join(repr(lv) for lv in learned)
                     retry_note = (
                         f"_This model only supports thinking level "
-                        f"{supported}, so {resolved_thinking!r} was dropped "
+                        f"{supported}, so {self.resolved_thinking!r} was dropped "
                         f"for this message. Remembered for next time._\n\n"
                     )
                 else:
                     retry_note = (
                         f"_This model does not support thinking level "
-                        f"{resolved_thinking!r}; sending without it instead._"
+                        f"{self.resolved_thinking!r}; sending without it instead._"
                         f"\n\n"
                     )
-                record_visible_chunk(retry_note)
+                self.record_visible_chunk(retry_note)
                 yield retry_note
-                async with contextlib.aclosing(self._pipe_impl(
-                    retry_body, __event_emitter__,
-                    __event_call__=__event_call__, __user__=__user__,
-                    __metadata__=__metadata__, __request__=__request__,
-                    __task__=__task__, __task_body__=__task_body__,
-                    _initial_visible_text=visible_message_text,
-                    _send_texts=sent_texts,
+                async with contextlib.aclosing(self.pipe._pipe_impl(
+                    retry_body, self.__event_emitter__,
+                    __event_call__=self.__event_call__, __user__=self.__user__,
+                    __metadata__=self.__metadata__, __request__=self.__request__,
+                    __task__=self.__task__, __task_body__=self.__task_body__,
+                    _initial_visible_text=self.visible_message_text,
+                    _send_texts=self.sent_texts,
                 )) as retry:
                     async for item in retry:
                         yield item
                 return
             if recovered:
                 pipe_log("  recovered assistant text at final fallback")
-                record_visible_chunk(recovered)
+                self.record_visible_chunk(recovered)
                 yield recovered
-                await maybe_emit_snapshot(force=True)
+                await self.maybe_emit_snapshot(force=True)
             else:
                 # No assistant text and preview recovery came up empty. Surface
                 # the run's REAL terminal state (from the gateway) instead of a
                 # scary generic "missing output event" placeholder.
                 reason = None
                 try:
-                    desc = await conn.send_request(
-                        "sessions.describe", dict(key=session_key), timeout=8)
+                    desc = await self.conn.send_request(
+                        "sessions.describe", dict(key=self.session_key), timeout=8)
                     row = desc.get("session") or {}
                     status = row.get("status")
                     if status == "failed":
@@ -2557,6 +2268,349 @@ class Pipe:
                 no_response_text = "\n\n" + (
                     reason or "_(This turn produced no reply text.)_"
                 )
-                record_visible_chunk(no_response_text)
+                self.record_visible_chunk(no_response_text)
                 yield no_response_text
-                await maybe_emit_snapshot(force=True)
+                await self.maybe_emit_snapshot(force=True)
+
+    async def _session_run_active(self) -> bool:
+        # Fast path: describe exposes a persisted `status`. When it names a
+        # live run state we're done. But describe.status flips to 'done'
+        # during a subagent-yield gap (the run is only suspended and will
+        # resume -- ELI-56), so a non-active status is NOT conclusive:
+        # confirm against sessions.list's authoritative hasActiveRun before
+        # treating the session as free to send into.
+        try:
+            desc = await self.conn.send_request(
+                "sessions.describe", dict(key=self.session_key), timeout=8
+            )
+            row = desc.get("session") or {}
+            status = row.get("status")
+            self.session_runtime = (row.get("agentRuntime") or {}).get("id") or self.session_runtime
+            # Harvest the thinking ladder from the describe we are already
+            # making. This probe runs before every send, so the per-model
+            # validation below costs no extra round trip, and piggybacking
+            # rather than adding a describe of its own means the ladder can
+            # never be fresher or staler than the run state it was read
+            # alongside.
+            #
+            # Describe is a WEAK source and is treated as one. It resolves
+            # the ladder with no model catalog in scope, so for a
+            # catalog-gated model it reports the generic base profile
+            # rather than the truth -- live, it advertised all 8 levels for
+            # claude-cli/claude-opus-5, whose real ladder is ["off"]. Good
+            # enough to seed the dropdown; not good enough to clamp a send
+            # against once the Gateway itself has ruled.
+            self.session_model_key = _session_model_key(row)
+            ladder = _session_thinking_ladder(desc)
+            if ladder:
+                self.session_thinking_ladder = ladder
+                _record_thinking_ladder(
+                    ladder, model_key=self.session_model_key,
+                    state_dir=getattr(self.pipe.valves, "STATE_DIR", ""))
+            if row.get("activeRunId") or status in _ACTIVE_RUN_STATES:
+                return True
+        except Exception as ex:
+            # Describe failed: fall back to the list probe below, and if
+            # that also fails, to the (per-worker, possibly-blind) registry.
+            pipe_log(f"  active-check describe failed: {ex}")
+            status = None
+        list_active = await _session_list_active(self.conn, self.session_key, missing=None)
+        if list_active is not None:
+            active = _session_active_from_signals(status, list_active)
+            if active and status not in _ACTIVE_RUN_STATES:
+                pipe_log(
+                    f"  active-check: describe.status={status!r} but "
+                    "list.hasActiveRun=True (subagent-yield gap; queueing)"
+                )
+            return active
+        return self.conn.active_run_id_for_session(self.session_key) is not None
+
+    def reconcile_whole_text(self, whole: str) -> str | None:
+        """After a gap, line the run's whole text up with what arrived
+        and put each lost chunk back into the reply that showed it.
+        Returns the text after the last received piece (the only new
+        text), or None when there is no gap or `whole` does not line up
+        (an item carrying one segment, not the whole run), which leaves
+        the gaps pending for the next whole text."""
+        if not self.run_gaps or not self.chat_id:
+            return None
+        aligned = _align_whole_text(whole, self.assistant_received_text, self.run_gaps)
+        if aligned is None:
+            return None
+        tail, missing = aligned
+        self.run_gaps.clear()
+        for offset, chunk in missing:
+            seg = next((sg for sg in reversed(self.run_segments) if sg["start"] <= offset),
+                       self.run_segments[0] if self.run_segments else None)
+            if seg is None:
+                continue
+            nxt = next((sg["start"] for sg in self.run_segments if sg["start"] > seg["start"]),
+                       len(self.assistant_received_text))
+            repair = {
+                "user_id": self.owui_origin_user_id, "chat_id": self.chat_id,
+                "message_id": seg["message_id"], "chunk": chunk,
+                "before": self.assistant_received_text[offset:min(offset + _GAP_ANCHOR_CHARS, nxt)],
+                "after": self.assistant_received_text[max(seg["start"], offset - _GAP_ANCHOR_CHARS):offset],
+            }
+            pipe_log(f"  event gap: {len(chunk)} chars lost at offset {offset}; "
+                     f"repairing message {seg['message_id'][:8]}...")
+            _schedule_gap_repair(self.conn, repair,
+                                 streaming=seg["message_id"] == self.owui_message_id)
+        return tail
+
+    def await_owner(self) -> None:
+        self.awaiting_owner, self.owner_notice_before = True, self.conn._stop_notice_seen
+        self.owner_run = self.conn._awaiting_owner[self.session_key] = self.our_run_id
+        pipe_log(f"  run {self.our_run_id[:24]}... interrupted, no message to hand over: "
+                 "its row decides here")
+        spawn_background(self.conn.push_row(self.session_key))
+
+    async def owner_step(self, row: dict):
+        """One row while the reply waits for its run's owner (DESIGN 2.7):
+        ("switch", run, queue) to continue in the Gateway's recovery run
+        or a resume sent here, ("end", note) to finish, None to wait."""
+        decision = next_continuation(row, self.owner_notice_before, self.owner_resumes)
+        if decision == "gateway":
+            # The Gateway recovers it as a run whose turn names this one
+            # (rule E); until that turn is committed, the next row looks again.
+            try:
+                messages = (await self.conn.session_history(self.session_key, limit=50,
+                                                       max_chars=200)).get("messages") or []
+            except Exception as ex:
+                pipe_log(f"  chat.history for the recovery failed: {ex!r}")
+                return None
+            rec = next((r for r, _t in _history_user_turns(messages)
+                        if recovery_source_run(messages, r) == self.our_run_id), None)
+            if rec is None:
+                return None
+            pipe_log(f"  following the Gateway's recovery run {rec[:24]}...")
+            return ("switch", rec, self.conn.register_consumer(self.session_key, rec))
+        if decision == "wait":
+            return None
+        if decision == "resume":
+            key = f"msg-{self.chat_id}-resume-{time.time()}"
+            resume_queue = self.conn.register_consumer(self.session_key, key)
+            try:
+                resp = await _run_request(self.conn, RUN_SEND, _owui_chat_send_params(
+                    session_key=self.session_key, message=_resume_directive(self.visible_message_text, self.text),
+                    idempotency_key=key, owui_chat_id=self.owui_origin_chat_id,
+                    owui_user_id=self.owui_origin_user_id, thinking=self.resolved_thinking), timeout=30)
+            except Exception as ex:
+                # The Gateway is closing: its next hello reads the row again.
+                self.conn.unregister_consumer(self.session_key, key, queue=resume_queue)
+                pipe_log(f"  resume refused ({ex}); trying again on the next row")
+                return None
+            self.owner_resumes += 1
+            new_run = resp.get("runId") or key
+            if new_run != key:
+                self.conn.unregister_consumer(self.session_key, key, queue=resume_queue)
+                resume_queue = self.conn.register_consumer(self.session_key, new_run)
+            pipe_log(f"  resumed as {new_run[:32]}... ({self.owner_resumes}/{MAX_TURN_RESUMES})")
+            return ("switch", new_run, resume_queue)
+        if turn_owner(row, self.owner_notice_before) == "pipe":
+            return ("end", TURN_CUT_OFF_NOTE)
+        if (row or {}).get("status") in ("failed", "timeout") and row.get("lastRunError"):
+            return ("end", f"**Error:** {row['lastRunError']}")
+        return ("end", None)
+
+    async def recover_from_transcript(self) -> str | None:
+        """The run's text read back: by its run id, else by its user text,
+        which only a run seen here may use. With nothing of it seen, the
+        session's last reply may be another run's (review 2af1 N4)."""
+        try:
+            hist = await self.conn.session_history(self.session_key, limit=RUN_TEXT_HISTORY_LIMIT)
+            found, whole = _history_text_for_run(hist, self.our_run_id)
+            if found and whole:
+                return whole
+        except Exception as ex:
+            pipe_log(f"  recovery by run id: chat.history failed: {ex!r}")
+        if not self.first_event_arrived:
+            pipe_log("  recovery: nothing of this run seen, no text by its id")
+            return None
+        return await _recover_turn_text(self.conn, self.session_key, self.text)
+
+    async def settled_tail(self, row: dict, closer_only: bool = False) -> str | None:
+        """What this reply still owes once its run settled with no final
+        event here: the run's text after what arrived (its closing message
+        in the transcript), or, for a run that showed nothing, why.
+        `closer_only`: the session is busy, maybe with a later run, so
+        only this run's own closer says it ended; None without one."""
+        try:
+            hist = await self.conn.session_history(self.session_key, limit=RUN_TEXT_HISTORY_LIMIT)
+        except Exception as ex:
+            pipe_log(f"  settled run: chat.history failed: {ex!r}")
+            hist = None
+        found, whole = _history_text_for_run(hist, self.our_run_id) if hist else (False, None)
+        if found and whole:
+            gap_tail = self.reconcile_whole_text(whole)
+            if gap_tail is not None:
+                return gap_tail
+            if whole.startswith(self.assistant_received_text):
+                return whole[len(self.assistant_received_text):]
+            return "" if self.text_yielded else whole
+        if closer_only:
+            return "" if found else None
+        if self.text_yielded:
+            return ""
+        status = row.get("status")
+        if status in ("cancelled", "killed"):
+            return "**Stopped.**"
+        if status in ("failed", "timeout"):
+            err = row.get("lastRunError")
+            return f"**Error:** {err}" if err else "**Failed:** the run did not complete."
+        return await self.recover_from_transcript() or ""
+
+    def record_visible_chunk(self, chunk: str):
+        if chunk:
+            self.visible_message_text += chunk
+
+    async def maybe_emit_snapshot(self, *, force: bool = False):
+        if not self.visible_message_text or self.visible_message_text == self.last_snapshot_text:
+            return
+        now = time.time()
+        if (
+            not force
+            and self.last_snapshot_text
+            and now - self.last_snapshot_time < self.snapshot_interval_s
+            and len(self.visible_message_text) - len(self.last_snapshot_text) < self.snapshot_min_delta_chars
+        ):
+            return
+        await _emit_message_snapshot(self.__event_emitter__, self.visible_message_text)
+        self.last_snapshot_text = self.visible_message_text
+        self.last_snapshot_time = now
+
+    def maybe_start_rest_snapshot(self):
+        """Throttled gate for the REST-API mid-run snapshot.
+
+        Fire-and-forget (background task): a GET+POST round trip inline
+        in the streaming path would stall the live delta yield every
+        time the throttle opens. Guarded so at most one is in flight at
+        once, and stops firing once the turn hits terminal flush (`done`
+        True) -- matching this project's established convention
+        (19e9fd7/2092e19) of never doing anything new right at the
+        natural end of a message, even though this path is confirmed
+        safe from the replace-vs-delta race that motivated that
+        convention (bridge-rehydration-rest-snapshot-verify, 2026-08-26).
+        """
+        if self.done or not self.owui_message_id or not self.rest_snapshot_enabled:
+            return
+        if not self.visible_message_text or self.visible_message_text == self.last_rest_snapshot_text:
+            return
+        now = time.time()
+        if (
+            self.last_rest_snapshot_text
+            and now - self.last_rest_snapshot_time < self.rest_snapshot_interval_s
+        ):
+            return
+        if self.rest_snapshot_task is not None and not self.rest_snapshot_task.done():
+            return
+        snapshot_text = self.visible_message_text
+        self.last_rest_snapshot_text = snapshot_text
+        self.last_rest_snapshot_time = now
+        self.rest_snapshot_task = asyncio.create_task(
+            self.pipe._rest_snapshot_message(
+                self.owui_origin_chat_id, self.owui_message_id, snapshot_text, self.bearer_token,
+            )
+        )
+
+    async def maybe_answer_user_input(self, prompt_text: str) -> UserInputResult:
+        """Ask the user via an OWUI modal and deliver their answer.
+
+        See UserInputResult for the meaning of the return value. Crucially,
+        a delivered answer that steers the *same* run (no new runId) still
+        returns handled=True, so the caller suppresses the raw prompt text
+        instead of leaking it into the chat.
+        """
+        if not _is_user_input_prompt(prompt_text):
+            return UserInputResult(False, None)
+        reconnect_user_id = (
+            self.owui_origin_user_id
+            if self.owui_origin_user_id and self.owui_origin_user_id != "unknown"
+            else None
+        )
+        try:
+            answer = await _ask_user_input_modal(
+                self.__event_call__,
+                prompt_text,
+                owui_user_id=reconnect_user_id,
+                owui_chat_id=self.owui_origin_chat_id,
+                owui_message_id=(self.__metadata__ or {}).get("message_id"),
+                owui_session_id=(self.__metadata__ or {}).get("session_id"),
+                __event_emitter__=self.__event_emitter__,
+            )
+        except Exception as ex:
+            pipe_log(f"  user input modal failed; falling back to chat prompt: {ex}")
+            answer = None
+        if answer is None:
+            pipe_log("  user input modal cancelled or empty answer")
+            return UserInputResult(False, None)
+        pipe_log("  user input answered via OWUI modal")
+        await _emit_status(self.__event_emitter__, "Sending answer...", done=False)
+        # The answer continues this reply: its run id names it (ELI-100 2.2).
+        idempotency_key = (pipe_run_id(self.chat_id, self.owui_message_id, "input") if self.owui_message_id
+                           else f"user-input-{self.chat_id}-{time.time()}")
+        # Listen before sending, as for the first send (R12): the answer
+        # run's first events can arrive before chat.send returns, and with
+        # no consumer and no target they would open a second writer on
+        # this reply's message (review 2af1 N6).
+        answer_queue = self.conn.register_consumer(self.session_key, idempotency_key)
+        self.conn.continue_run_target(self.session_key, self.our_run_id, idempotency_key, shown=False)
+
+        def unlisten():
+            self.conn.unregister_consumer(self.session_key, idempotency_key, queue=answer_queue)
+            self.conn.continue_run_target(self.session_key, idempotency_key, self.our_run_id, shown=False)
+        try:
+            send_resp = await _run_request(
+                self.conn, RUN_SEND,
+                _owui_chat_send_params(
+                    session_key=self.session_key,
+                    message=answer,
+                    idempotency_key=idempotency_key,
+                    owui_chat_id=self.owui_origin_chat_id,
+                    owui_user_id=self.owui_origin_user_id,
+                ),
+                timeout=30,
+            )
+        except Exception as ex:
+            # Delivery failed: report not-handled so the caller falls back
+            # to showing the prompt text (better than a silent stall).
+            pipe_log(f"  sending answer back failed: {ex}")
+            unlisten()
+            return UserInputResult(False, None)
+        new_run_id = send_resp.get("runId") or None
+        if new_run_id != idempotency_key:
+            unlisten()  # steered into the live run, or renamed: as before
+            answer_queue = None
+        else:
+            self.admitted_at, self.signals_lost = time.monotonic(), False
+        await _emit_status(self.__event_emitter__, "Answer sent; continuing...", done=False)
+        if new_run_id:
+            pipe_log(f"  answer sent, new runId: {new_run_id[:20]}...")
+        else:
+            pipe_log("  answer sent, steering into active run (no new runId)")
+        return UserInputResult(True, new_run_id, prompt_text=prompt_text, answer=answer,
+                               queue=answer_queue)
+
+    def switch_to_answer_run(self, answer_res: UserInputResult) -> None:
+        """The reply continues in the answer run (R9). Its target moved
+        before the send when its consumer was registered then (N6); the
+        question run was shown to its end either way."""
+        if answer_res.queue is not None:
+            self.conn.mark_delivered_live(self.session_key, self.our_run_id)
+        else:
+            self.conn.continue_run_target(self.session_key, self.our_run_id, answer_res.new_run_id)
+
+    async def settle_held_media(self, held: str) -> str:
+        """Text `_advance_media_buffer` held, once its message item ends:
+        resolved as a whole, a directive quoted in code left as text
+        (ELI-111), and recorded for a writer that takes the reply over."""
+        resolved, handled = await _resolve_media_text(
+            held,
+            valves=self.pipe.valves,
+            __request__=self.__request__,
+            __event_emitter__=self.__event_emitter__,
+            ctx=self.assistant_stream_text[self.fence_item_start:],
+        )
+        if handled:
+            self.conn.note_turn_rewrite(self.owui_origin_chat_id, self.owui_message_id, held, resolved)
+        return resolved
