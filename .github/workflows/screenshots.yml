@@ -8,9 +8,11 @@ name: Screenshots
 # to review, and the ones that are kept get committed under docs/img/.
 #
 # The stack differs from the E2E one only in what shows up on screen: the
-# scripted model is served as "Nova" models of a "local" provider, the admin
-# is "Sam", and a test-only plugin (scripts/screenshots/sample-usage) serves
-# sample rate limits for the Status dialog.
+# scripted model is served under real model ids and names (Claude Opus 5.5 as
+# the default, and a few others for the model picker), the admin is "Sam", and
+# a test-only plugin (scripts/screenshots/sample-usage) serves sample rate
+# limits for the Status dialog. The browser runs in UTC, the runner's timezone,
+# so times the server formats and times the page formats agree.
 
 on:
   workflow_dispatch:

@@ -2,42 +2,75 @@
   "models": {
     "providers": {
       "fake": null,
-      "local": {
+      "anthropic": {
         "baseUrl": "http://127.0.0.1:18999/v1",
         "apiKey": "local",
         "api": "openai-completions",
         "models": [
           {
-            "id": "nova",
-            "name": "Nova",
-            "contextWindow": 200000,
-            "maxTokens": 8192,
+            "id": "claude-opus-5-5",
+            "name": "Claude Opus 5.5",
             "input": [
               "text",
               "image"
             ]
           },
           {
-            "id": "nova-mini",
-            "name": "Nova Mini",
-            "contextWindow": 200000,
-            "maxTokens": 8192
-          },
-          {
-            "id": "nova-pro",
-            "name": "Nova Pro",
-            "contextWindow": 200000,
-            "maxTokens": 8192
-          },
-          {
-            "id": "nova-vision",
-            "name": "Nova Vision",
-            "contextWindow": 200000,
-            "maxTokens": 8192,
+            "id": "claude-sonnet-5-5",
+            "name": "Claude Sonnet 5.5",
             "input": [
               "text",
               "image"
             ]
+          },
+          {
+            "id": "claude-haiku-5-5",
+            "name": "Claude Haiku 5.5",
+            "input": [
+              "text",
+              "image"
+            ]
+          }
+        ]
+      },
+      "openai": {
+        "baseUrl": "http://127.0.0.1:18999/v1",
+        "apiKey": "local",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "gpt-5.5",
+            "name": "GPT-5.5",
+            "input": [
+              "text",
+              "image"
+            ]
+          }
+        ]
+      },
+      "google": {
+        "baseUrl": "http://127.0.0.1:18999/v1",
+        "apiKey": "local",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "gemini-3.1-pro-preview",
+            "name": "Gemini 3.1 Pro",
+            "input": [
+              "text",
+              "image"
+            ]
+          }
+        ]
+      },
+      "deepseek": {
+        "baseUrl": "http://127.0.0.1:18999/v1",
+        "apiKey": "local",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "deepseek-v4-flash",
+            "name": "DeepSeek V4 Flash"
           }
         ]
       }
@@ -46,7 +79,7 @@
   "agents": {
     "defaults": {
       "model": {
-        "primary": "local/nova"
+        "primary": "anthropic/claude-opus-5-5"
       }
     },
     "list": [

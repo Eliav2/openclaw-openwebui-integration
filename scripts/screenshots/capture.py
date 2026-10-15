@@ -213,29 +213,51 @@ def dump_child_history_shapes(session_key: str) -> None:
         print(f"  child history {row['key'][-12:]}: {json.dumps(shapes)}", flush=True)
 
 
-def forecast_chart_png(width: int = 600, height: int = 260) -> bytes:
+_DIGITS = {  # 3x5 bitmap digits for the chart's labels
+    "0": "111101101101111", "1": "010110010010111", "2": "111001111100111",
+    "3": "111001111001111", "4": "101101111001001", "5": "111100111001111",
+    "6": "111100111101111", "7": "111001010010010", "8": "111101111101111",
+    "9": "111101111001111",
+}
+
+
+def forecast_chart_png(width: int = 600, height: int = 300) -> bytes:
     """A small bar chart of hourly temperatures as a PNG, standard library
-    only: the image the media scene's reply shows."""
+    only: the image the media and image-input scenes show. Every third hour
+    carries its hour (24 h) under the bar and its temperature above it, so a
+    reply that quotes the chart can be checked against it."""
     import struct
     import zlib
     temps = [11, 11, 10, 10, 11, 12, 14, 16, 18, 19, 21, 22, 22, 21, 19, 17, 16, 15, 14, 13, 12, 12, 11, 11]
     rain = {15, 16, 17, 18}
-    bg, bar, wet, axis = (255, 255, 255), (59, 130, 246), (147, 197, 253), (209, 213, 219)
-    rows = []
+    bg, bar, wet, axis, ink = (255, 255, 255), (59, 130, 246), (147, 197, 253), (209, 213, 219), (75, 85, 99)
+    base = height - 40  # the axis line; hour labels sit below it
     slot = (width - 40) // len(temps)
-    for y in range(height):
-        row = bytearray(b"\x00")
-        for x in range(width):
-            px = bg
-            i = (x - 20) // slot
-            if y == height - 20 and 20 <= x < width - 20:
-                px = axis
-            elif 0 <= i < len(temps) and (x - 20) % slot < slot - 6 and y < height - 20:
-                top = height - 20 - temps[i] * 9
-                if y >= top:
-                    px = wet if i in rain else bar
-            row += bytes(px)
-        rows.append(bytes(row))
+    px = [[bg] * width for _ in range(height)]
+    for x in range(20, width - 20):
+        px[base][x] = axis
+    for i, t in enumerate(temps):
+        top = base - t * 9
+        for x in range(20 + i * slot, 20 + i * slot + slot - 6):
+            for y in range(top, base):
+                px[y][x] = wet if i in rain else bar
+
+    def text(label: str, cx: int, y0: int, scale: int = 3) -> None:
+        w = (len(label) * 4 - 1) * scale
+        x0 = cx - w // 2
+        for k, ch in enumerate(label):
+            bits = _DIGITS[ch]
+            for r in range(5):
+                for c in range(3):
+                    if bits[r * 3 + c] == "1":
+                        for dy in range(scale):
+                            for dx in range(scale):
+                                px[y0 + r * scale + dy][x0 + (k * 4 + c) * scale + dx] = ink
+    for i in range(0, len(temps), 3):
+        cx = 20 + i * slot + (slot - 6) // 2
+        text(str(i), cx, base + 10)
+        text(str(temps[i]), cx, base - temps[i] * 9 - 22)
+    rows = [b"\x00" + b"".join(bytes(c) for c in row) for row in px]
 
     def chunk(kind: bytes, data: bytes) -> bytes:
         return (struct.pack(">I", len(data)) + kind + data
@@ -257,7 +279,7 @@ def upload_media(name: str, data: bytes) -> None:
 def schedule_wake(session_key: str, message: str, in_s: float) -> None:
     at = (datetime.datetime.now(datetime.timezone.utc)
           + datetime.timedelta(seconds=in_s)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-    params = {"name": "morning-build-check", "schedule": {"kind": "at", "at": at},
+    params = {"name": "nightly-build-check", "schedule": {"kind": "at", "at": at},
               "sessionTarget": f"session:{session_key}",
               "payload": {"kind": "agentTurn", "message": message},
               "delivery": {"mode": "none"}, "deleteAfterRun": True}
@@ -318,6 +340,20 @@ def send(page: Page, text: str) -> str:
     # Open WebUI moves to /c/<id> with history.replaceState: no navigation event.
     wait_js(page, "() => /^\\/c\\/[0-9a-f-]+/.test(location.pathname)", "the new chat's URL", 60_000)
     return page.evaluate("() => location.pathname").split("/c/", 1)[1].strip("/")
+
+
+def settle_title(page: Page) -> None:
+    """The chat header cross-fades from the first message to the chat's title
+    as it loads: wait until nothing in the header animates."""
+    wait_js(page, """() => !document.getAnimations().some(a => a.playState === 'running'
+                 && a.effect && a.effect.target && a.effect.target.closest && a.effect.target.closest('nav'))""",
+            "the chat title to settle", 30_000)
+
+
+def park_mouse(page: Page) -> None:
+    """Move the pointer to empty chat space, so no tooltip covers the shot."""
+    page.mouse.move(PHONE["viewport"]["width"] // 2, 700)
+    page.wait_for_timeout(300)  # a tooltip fades out
 
 
 def wait_js(page: Page, js: str, what: str, timeout_ms: int = TURN_TIMEOUT_MS) -> None:
@@ -521,12 +557,12 @@ class Scenes:
         if z["drawer"] == "auto" or (z["dialog"] != "auto" and int(z["drawer"]) <= int(z["dialog"])):
             raise AssertionError(f"the sub-agent drawer opens behind the status dialog (computed z-index {z})")
         page.locator("#openclaw-drawer-root button", has_text="Transcript").first.click()
-        # The child's reply reaches its transcript when its run ends, and tool
-        # results show only in the Tools tab (ELI-128), so while it runs the
-        # Transcript holds its task.
+        # Tool results show only in the Tools tab (ELI-128); the child's first
+        # turn carries a line of prose with its tool call, so the Transcript
+        # shows the task and the child's own words.
         wait_js(page, """() => { const d = document.querySelector('#openclaw-drawer-root');
-                 return d && /\\buser\\b/i.test(d.innerText); }""",
-                "the drawer transcript's task row", 60_000)
+                 return d && /\\buser\\b/i.test(d.innerText) && d.innerText.includes("start from the app's README"); }""",
+                "the drawer transcript's task and the child's prose", 60_000)
         self.s.shot(page, "subagent-drawer", text_selector="#openclaw-drawer-root")
         # The Tools tab, its first card opened: what a tool's result looks like there.
         dump_child_history_shapes(f"agent:main:openwebui-{me['id']}-{chat}")
@@ -550,7 +586,7 @@ class Scenes:
     def model_picker(self, page: Page) -> None:
         new_chat(page)
         page.locator("button[id^=model-selector-][id$=-button], button[aria-label*='model' i]").first.click()
-        wait_js(page, "() => document.body.innerText.includes('Nova Mini')", "the open model list", 30_000)
+        wait_js(page, "() => document.body.innerText.includes('Claude Sonnet 5.5')", "the open model list", 30_000)
         self.s.shot(page, "model-picker")
         page.keyboard.press("Escape")
 
@@ -558,6 +594,7 @@ class Scenes:
         attach_filter(self.token, MODEL, "openclaw_thinking")
         page.goto(f"{BASE}/c/{self.hero_chat}")
         page.wait_for_selector("#chat-input")
+        settle_title(page)
         page.locator("button[aria-label='Integrations']").first.click()
         wait_js(page, "() => /thinking/i.test(document.body.innerText)", "the thinking toggle in the menu", 30_000)
         self.s.shot(page, "thinking-toggle")
@@ -565,12 +602,12 @@ class Scenes:
 
     def agent_turn(self, page: Page) -> None:
         new_chat(page)
-        chat = send(page, "Can you check the overnight build every morning?")
+        chat = send(page, "Can you keep an eye on the nightly build?")
         wait_js(page, f"() => {{ const a = {LAST_ASSISTANT}; return a && a.innerText.includes('only write when'); }}",
                 "the first reply")
         set_title(self.token, chat, "Overnight build check")
         me = api("GET", "/api/v1/auths/", token=self.token)
-        schedule_wake(f"agent:main:openwebui-{me['id']}-{chat}", "Morning build check for the forecast app", 5)
+        schedule_wake(f"agent:main:openwebui-{me['id']}-{chat}", "Nightly build check for the forecast app", 5)
         # The tab stays open on the chat: the cron reply has to arrive in it
         # live, with no reload (agent turns, "open tabs update live").
         wait_js(page, f"() => {{ const a = {LAST_ASSISTANT}; return a && a.innerText.includes('nothing needs you today'); }}",
@@ -678,42 +715,27 @@ class Scenes:
         self.s.shot(page, "usage-goal", clip_js=clip, text_selector=".chat-assistant >> nth=-1")
 
     def compact(self, page: Page) -> None:
-        """The Status dialog's context section before and after its Compact
-        button, on the hero chat (three tool calls of history)."""
+        """The Status dialog's context section with its Compact pill, on the
+        hero chat (three tool calls of history). No "after" shot: right after
+        a compact the Gateway's number counts the kept transcript only, so it
+        reads far lower than what the next request really carries."""
         page.goto(f"{BASE}/c/{self.hero_chat}")
         page.locator('button[aria-label="OpenClaw status"]').click()
         sec = "#openclaw-status-section-context"
-        wait_js(page, f"() => {{ const s = document.querySelector('{sec}'); return s && /\\d+(\\.\\d+)?k?\\s*\\/\\s*200k/i.test(s.innerText); }}",
+        wait_js(page, f"() => {{ const s = document.querySelector('{sec}'); return s && /\\d+(\\.\\d+)?[km]?\\s*\\/\\s*\\d+(\\.\\d+)?[km]\\b/i.test(s.innerText); }}",
                 "the context numbers", 60_000)
-        before = page.locator(sec).inner_text()
-        print("  before: " + json.dumps(before), flush=True)
+        print("  context: " + json.dumps(page.locator(sec).inner_text()), flush=True)
         self.s.shot(page, "compact-before", selector=sec)
-        page.locator("#openclaw-status-modal-root button", has_text="Compact").first.click()
-        wait_js(page, f"() => {{ const s = document.querySelector('{sec}'); return s && /200k/.test(s.innerText); }}",
-                "the dialog back from compacting", 150_000)
-        # The dialog refreshes once, as compacting ends; the Gateway can report
-        # the new size a moment later, so look again the way a person would.
-        deadline = time.time() + 90
-        while page.locator(sec).inner_text() == before:
-            if time.time() > deadline:
-                raise TimeoutError(f"context unchanged after compacting: {before!r}")
-            page.keyboard.press("Escape")
-            page.wait_for_timeout(5000)
-            page.locator('button[aria-label="OpenClaw status"]').click()
-            wait_js(page, f"() => {{ const s = document.querySelector('{sec}'); return s && /200k/.test(s.innerText); }}",
-                    "the dialog reopened", 60_000)
-        print("  after: " + json.dumps(page.locator(sec).inner_text()), flush=True)
-        self.s.shot(page, "compact-after", selector=sec)
         page.keyboard.press("Escape")
 
     def subagent_result(self, page: Page) -> None:
         """A sub-agent finishes while its parent is idle: the parent's reply
         to the result lands in the chat as a normal reply."""
         new_chat(page)
-        chat = send(page, "Can you find out how reliable the forecast API has been lately?")
-        wait_js(page, last_text_has("running in the background"), "the parent's first reply")
-        set_title(self.token, chat, "Forecast API uptime")
-        wait_js(page, last_text_has("99.98%", "alert on the volume"), "the parent's reply to the result")
+        chat = send(page, "Can you find out when the forecast cache came in and how it works?")
+        wait_js(page, last_text_has("in the background"), "the parent's first reply")
+        set_title(self.token, chat, "Forecast cache history")
+        wait_js(page, last_text_has("helper is back", "starts it cold"), "the parent's reply to the result")
         clip = """() => {
           const box = document.getElementById('message-input-container');
           const bottom = box ? box.getBoundingClientRect().top - 8 : innerHeight;
@@ -772,6 +794,7 @@ class Scenes:
                 "the stopped reply", 60_000)
         rows = page.evaluate(f"() => [...{LAST_ASSISTANT}.querySelectorAll('[role=button]')].map(b => b.innerText)")
         print(f"  card rows after stop: {json.dumps(rows)}", flush=True)
+        park_mouse(page)
         self.s.shot(page, "stop")
 
     def _busy_then_queue(self, page: Page, title: str) -> str:
@@ -790,6 +813,7 @@ class Scenes:
     def queued(self, page: Page) -> None:
         """A message sent while the agent works: queued, then answered for real."""
         self._busy_then_queue(page, "Cache rebuild")
+        park_mouse(page)
         self.s.shot(page, "message-queued")
         wait_js(page, last_text_has("It's on main"), "the queued message's own reply", TURN_TIMEOUT_MS)
 
@@ -873,13 +897,21 @@ class Scenes:
         last.wait_for(timeout=60_000)
         last.hover()
         page.locator('button[aria-label="OpenClaw Status"]').last.wait_for(timeout=30_000)
+        # The toolbar fades and slides in on hover: measure once the Status
+        # button is laid out at its full size and nothing in its row moves.
+        wait_js(page, """() => { const b = [...document.querySelectorAll('button[aria-label="OpenClaw Status"]')].pop();
+                 if (!b || b.getBoundingClientRect().width < 16) return false;
+                 let row = b.parentElement;
+                 while (row && !row.querySelector('button[aria-label="Copy"]')) row = row.parentElement;
+                 return !(row || b).getAnimations({subtree: true}).some(a => a.playState === 'running'); }""",
+                "the Status button laid out", 30_000)
         # A 300 px strip of the message toolbar that ends at the Status button.
         clip = """() => {
           const b = [...document.querySelectorAll('button[aria-label="OpenClaw Status"]')].pop();
           let row = b.parentElement;
           while (row && !row.querySelector('button[aria-label="Copy"]')) row = row.parentElement;
           const r = (row || b).getBoundingClientRect(), q = b.getBoundingClientRect();
-          const right = q.right + 6;
+          const right = Math.min(innerWidth, q.right + 12);
           return {x: Math.max(0, right - 300), y: Math.max(0, r.top - 8), width: 300, height: r.height + 16};
         }"""
         self.s.shot(page, "toolbar-button", clip_js=clip, text_selector=".chat-assistant >> nth=-1")
@@ -898,7 +930,7 @@ def main(argv=None) -> int:
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
         try:
-            ctx = browser.new_context(**PHONE, locale="en-US", timezone_id="America/New_York",
+            ctx = browser.new_context(**PHONE, locale="en-US", timezone_id="UTC",
                                       color_scheme="light")
             page = ctx.new_page()
             login(page, token)
@@ -929,7 +961,7 @@ def main(argv=None) -> int:
                 shooter.run("compact-before", scenes.compact, page)
             if scenes.hero_chat:
                 desk = browser.new_context(**DESKTOP, locale="en-US",
-                                           timezone_id="America/New_York", color_scheme="light")
+                                           timezone_id="UTC", color_scheme="light")
                 dpage = desk.new_page()
                 login(dpage, token)
                 shooter.run("toolbar-button", scenes.toolbar, dpage)
