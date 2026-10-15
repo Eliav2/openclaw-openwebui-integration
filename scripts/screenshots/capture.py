@@ -342,13 +342,6 @@ def send(page: Page, text: str) -> str:
     return page.evaluate("() => location.pathname").split("/c/", 1)[1].strip("/")
 
 
-def scroll_chat_to_top(page: Page) -> None:
-    """Scroll the conversation to its start. Scrolled down, the first user
-    message sits under the translucent chat header and shows through its title."""
-    page.evaluate("() => { const m = document.getElementById('messages-container'); if (m) m.scrollTop = 0; }")
-    page.wait_for_timeout(200)  # one frame for the scroll to paint
-
-
 def park_mouse(page: Page) -> None:
     """Move the pointer to empty chat space, so no tooltip covers the shot."""
     page.mouse.move(PHONE["viewport"]["width"] // 2, 700)
@@ -591,9 +584,10 @@ class Scenes:
 
     def thinking(self, page: Page) -> None:
         attach_filter(self.token, MODEL, "openclaw_thinking")
-        page.goto(f"{BASE}/c/{self.hero_chat}")
-        page.wait_for_selector("#chat-input")
-        scroll_chat_to_top(page)
+        # A new chat: over a long one the menu shares the screen with either
+        # the first message under the translucent header (scrolled down) or
+        # the jump-to-bottom arrow on the reply's toolbar (scrolled up).
+        new_chat(page)
         page.locator("button[aria-label='Integrations']").first.click()
         wait_js(page, "() => /thinking/i.test(document.body.innerText)", "the thinking toggle in the menu", 30_000)
         self.s.shot(page, "thinking-toggle")
@@ -735,6 +729,9 @@ class Scenes:
         wait_js(page, last_text_has("in the background"), "the parent's first reply")
         set_title(self.token, chat, "Forecast cache history")
         wait_js(page, last_text_has("helper is back", "starts it cold"), "the parent's reply to the result")
+        # Finished, not mid-stream: the reply's toolbar shows only once it is done.
+        wait_js(page, f"() => {{ const a = {LAST_ASSISTANT}; return !!(a && a.querySelector('button[aria-label=\"Copy\"]')); }}",
+                "the parent's reply finished", 30_000)
         clip = """() => {
           const box = document.getElementById('message-input-container');
           const bottom = box ? box.getBoundingClientRect().top - 8 : innerHeight;
@@ -900,7 +897,7 @@ class Scenes:
         # button is laid out at its full size and nothing in its row moves.
         wait_js(page, """() => { const b = [...document.querySelectorAll('button[aria-label="OpenClaw Status"]')].pop();
                  if (!b || b.getBoundingClientRect().width < 16) return false;
-                 // Its icon is an image: the button only has its full width once it loaded.
+                 // An action with an icon_url shows an image; wait for it if there is one.
                  if ([...b.querySelectorAll('img')].some(i => !i.complete || !i.naturalWidth)) return false;
                  let row = b.parentElement;
                  while (row && !row.querySelector('button[aria-label="Copy"]')) row = row.parentElement;
@@ -912,7 +909,7 @@ class Scenes:
           let row = b.parentElement;
           while (row && !row.querySelector('button[aria-label="Copy"]')) row = row.parentElement;
           const r = (row || b).getBoundingClientRect(), q = b.getBoundingClientRect();
-          const right = Math.min(innerWidth, q.right + 12);
+          const right = Math.min(innerWidth, q.right + 4);  // the reply's timestamp follows
           return {x: Math.max(0, right - 300), y: Math.max(0, r.top - 8), width: 300, height: r.height + 16};
         }"""
         print("  status button: " + json.dumps(page.evaluate("""() => {
