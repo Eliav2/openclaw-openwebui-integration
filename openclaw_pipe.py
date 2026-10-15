@@ -3383,28 +3383,6 @@ def _parse_gateway_url(raw: str) -> tuple[str, int]:
     return host, port
 
 
-def _preview_recovery_text(preview: dict, session_key: str, user_text: str) -> str | None:
-    """Return assistant text saved after this user message, if preview has it.
-
-    Lossy: the Gateway clips every `sessions.preview` item server-side (800
-    chars on 2026.9.x, 2000 before) whatever `maxChars` asks for. Only the
-    fallback for when `_history_recovery_text` finds nothing (ELI-74).
-    """
-    previews = preview.get("previews")
-    if not isinstance(previews, list):
-        return None
-
-    entry = None
-    for candidate in previews:
-        if isinstance(candidate, dict) and candidate.get("key") == session_key:
-            entry = candidate
-            break
-    if not entry:
-        return None
-
-    return _recovery_text_from_items(entry.get("items"), user_text)
-
-
 # Budget for reading back an interrupted turn's tail. `chat.history` honors
 # maxChars per message (schema max 500000) up to a 128 KiB per-message byte
 # cap; 50000 chars stays under that cap even for 2-byte scripts like Hebrew.
@@ -3421,9 +3399,9 @@ def _event_frame(payload: dict) -> dict:
 
 
 def _history_item(message) -> dict | None:
-    """Flatten one `chat.history` message to the {role, text} shape of a
-    `sessions.preview` item. Only `text` blocks count: tool calls, tool results
-    and thinking blocks are not part of the visible answer."""
+    """Flatten one `chat.history` message to {role, text}. Only `text` blocks
+    count: tool calls, tool results and thinking blocks are not part of the
+    visible answer."""
     if not isinstance(message, dict):
         return None
     content = message.get("content")
@@ -3442,13 +3420,7 @@ def _history_item(message) -> dict | None:
 
 def _history_recovery_text(history: dict, user_text: str) -> str | None:
     """Return the full assistant text saved after this user message, read from
-    a `chat.history` response.
-
-    This replaces `sessions.preview` as the recovery source (ELI-74): the
-    preview is clipped server-side, so a long reply recovered from it landed
-    in OWUI cut mid-sentence with a trailing "...". `chat.history` returns the
-    message whole.
-    """
+    a `chat.history` response."""
     messages = (history or {}).get("messages")
     if not isinstance(messages, list):
         return None
@@ -3460,8 +3432,7 @@ def _recovery_user_text_matches(item_text: str, user_text: str) -> bool:
 
     The transcript can hold it verbatim or behind the Gateway's metadata
     envelope ("Conversation info (untrusted metadata): ...", then a blank
-    line, then the text). `sessions.preview` strips that envelope;
-    `chat.history` does not.
+    line, then the text).
     """
     return item_text == user_text or item_text.endswith("\n" + user_text)
 
@@ -3510,28 +3481,17 @@ def _recovery_text_from_items(items, user_text: str) -> str | None:
 
 
 async def _recover_turn_text(conn, session_key: str, user_text: str) -> str | None:
-    """Read back the assistant text of a turn whose live stream was lost.
-
-    `chat.history` first, because it returns the message whole. The old
-    `sessions.preview`-only path persisted long replies clipped mid-sentence
-    with a trailing "..." (ELI-74): the Gateway caps each preview item
-    server-side, so no `maxChars` value fixes it. The preview stays as a
-    fallback for a Gateway that refuses `chat.history`.
-    """
+    """Read back the assistant text of a turn whose live stream was lost,
+    from `chat.history`, which returns the message whole (ELI-74)."""
     try:
         history = await conn.session_history(session_key)
-        text = _history_recovery_text(history, user_text)
-        if text:
-            return text
-        pipe_log("  history recovery found no reply; trying sessions.preview")
     except Exception as ex:
-        pipe_log(f"  history recovery failed: {ex}; trying sessions.preview")
-    try:
-        preview = await conn.session_preview(session_key)
-        return _preview_recovery_text(preview, session_key, user_text)
-    except Exception as ex:
-        pipe_log(f"  preview recovery failed: {ex}")
+        pipe_log(f"  history recovery failed: {ex}")
         return None
+    text = _history_recovery_text(history, user_text)
+    if not text:
+        pipe_log("  history recovery found no reply")
+    return text
 
 
 def _owui_session_key(agent_id: str, user_id: str, chat_id: str) -> str:
@@ -4740,9 +4700,6 @@ class _GatewayConnection:
         # Next request id
         self._next_req_id = 1
 
-        # Counter for the event loop
-        self._event_count = 0
-
         # Delivery bookkeeping. When running inside OWUI these dicts are the
         # *same objects* for every `_GatewayConnection` in the process (see
         # `_shared_gateway_state`), so a turn shown live by one connection is
@@ -5397,17 +5354,6 @@ class _GatewayConnection:
             return matches if len(matches) == 1 else []
         return []
 
-    async def session_preview(self, session_key: str, limit: int = 8,
-                              max_chars: int = 4000) -> dict:
-        """Fetch a bounded transcript preview. Every item comes back clipped
-        server-side (see `_preview_recovery_text`), so do not use this where
-        the whole message matters."""
-        return await self.send_request(
-            "sessions.preview",
-            dict(keys=[session_key], limit=limit, maxChars=max_chars),
-            timeout=10
-        )
-
     async def session_history(self, session_key: str,
                               limit: int = RECOVERY_HISTORY_LIMIT,
                               max_chars: int = RECOVERY_HISTORY_MAX_CHARS,
@@ -6041,7 +5987,6 @@ class _GatewayConnection:
                     continue
 
                 if consumers:
-                    self._event_count += 1
                     if not payload.get("runId"):
                         pipe_log("  dispatched session-only event to sole consumer")
                     if payload.get("state") == "final" and payload.get("sessionKey") and payload.get("runId"):
@@ -6132,6 +6077,15 @@ RUN_TEXT_HISTORY_LIMIT = 60
 RUN_HISTORY_LIMIT = 600
 
 
+def _idempotency_keys(message) -> tuple[str, str]:
+    """A transcript message's `idempotencyKey`, top level and under
+    `__openclaw`, as strings ("" when absent)."""
+    if not isinstance(message, dict):
+        return "", ""
+    meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
+    return str(message.get("idempotencyKey") or ""), str(meta.get("idempotencyKey") or "")
+
+
 def _history_text_for_run(history: dict, run_id: str) -> tuple[bool, str | None]:
     """The closing assistant text one specific run saved, found by its id.
 
@@ -6147,10 +6101,7 @@ def _history_text_for_run(history: dict, run_id: str) -> tuple[bool, str | None]
     for message in reversed(messages):
         if not isinstance(message, dict) or message.get("role") != "assistant":
             continue
-        meta = message.get("__openclaw")
-        keys = {message.get("idempotencyKey"),
-                meta.get("idempotencyKey") if isinstance(meta, dict) else None}
-        if not keys & wanted:
+        if not set(_idempotency_keys(message)) & wanted:
             continue
         text = ((_history_item(message) or {}).get("text") or "").strip()
         if not text:
@@ -6187,9 +6138,7 @@ def _history_renderer(messages: list) -> "_TurnRenderer":
     for message in messages:
         if not isinstance(message, dict) or message.get("role") != "assistant":
             continue
-        meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
-        keys = (str(message.get("idempotencyKey") or ""), str(meta.get("idempotencyKey") or ""))
-        if any(k.startswith("cli-assistant:") for k in keys):
+        if any(k.startswith("cli-assistant:") for k in _idempotency_keys(message)):
             text = ((_history_item(message) or {}).get("text") or "").strip()
             if not run_text and text and text not in _SILENT_SENTINELS:
                 lead = _message_boundary_separator(r.text, text)
@@ -6241,9 +6190,7 @@ def _is_closing_message(message) -> bool:
     """A run's closing assistant message (`cli-assistant:<runId>`)."""
     if not isinstance(message, dict) or message.get("role") != "assistant":
         return False
-    meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
-    return any(str(k or "").startswith("cli-assistant:")
-               for k in (message.get("idempotencyKey"), meta.get("idempotencyKey")))
+    return any(k.startswith("cli-assistant:") for k in _idempotency_keys(message))
 
 
 def _history_run_messages(history: dict, run_id: str) -> list | None:
@@ -6260,8 +6207,7 @@ def _history_run_messages(history: dict, run_id: str) -> list | None:
         message = messages[end]
         if not isinstance(message, dict) or message.get("role") != "assistant":
             continue
-        meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
-        if not {message.get("idempotencyKey"), meta.get("idempotencyKey")} & wanted:
+        if not set(_idempotency_keys(message)) & wanted:
             continue
         start = end
         while start > 0 and (messages[start - 1] or {}).get("role") != "user" \
@@ -6400,8 +6346,7 @@ def _is_forwarded_turn(message) -> bool:
     a `sessions_send` message, or a cron run's prompt)."""
     if not isinstance(message, dict) or message.get("role") != "assistant":
         return False
-    meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
-    key = str(message.get("idempotencyKey") or meta.get("idempotencyKey") or "")
+    key = next((k for k in _idempotency_keys(message) if k), "")
     prov = message.get("provenance") if isinstance(message.get("provenance"), dict) else {}
     forwarded = ((prov.get("kind"), prov.get("sourceTool")) == ("inter_session", "sessions_send")
                  or (prov.get("kind"), prov.get("sourceTool")) == ("internal_system", "cron"))
@@ -6424,8 +6369,7 @@ def _history_user_run_id(message) -> str | None:
     runtime imports next to it."""
     if not isinstance(message, dict) or message.get("role") != "user":
         return None
-    meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
-    key = str(message.get("idempotencyKey") or meta.get("idempotencyKey") or "")
+    key = next((k for k in _idempotency_keys(message) if k), "")
     return key[:-len(":user")] if key.endswith(":user") and len(key) > 5 else None
 
 
@@ -6478,8 +6422,7 @@ def _stub_turn(history: dict, stub_id: str, user_text: str,
     turn = messages[pick + 1:end]
     closing = f"cli-assistant:{run_id}"
     for j, m in enumerate(turn):
-        meta = m.get("__openclaw") if isinstance(m, dict) and isinstance(m.get("__openclaw"), dict) else {}
-        if isinstance(m, dict) and closing in (m.get("idempotencyKey"), meta.get("idempotencyKey")):
+        if closing in _idempotency_keys(m):
             return {"run_id": run_id, "messages": turn[:j + 1], "closed": True, "by": by}
     return {"run_id": run_id, "messages": turn, "closed": end < len(messages), "by": by}
 
@@ -6504,17 +6447,18 @@ async def _owui_chat_has_live_task(chat_id: str) -> bool:
         return True
 
 
-async def _session_list_active(conn: "_GatewayConnection", session_key: str) -> bool | None:
+async def _session_list_active(conn: "_GatewayConnection", session_key: str,
+                               *, missing: bool | None = False) -> bool | None:
     """`sessions.list` `hasActiveRun` for one session (counts a sub-agent
-    yield gap as active, unlike `sessions.describe`). False when the Gateway
-    lists no such session, None when it can't be asked."""
+    yield gap as active, unlike `sessions.describe`). `missing` when the
+    Gateway lists no such session, None when it can't be asked."""
     try:
         lst = await conn.send_request("sessions.list", {}, timeout=15)
     except Exception as ex:
         pipe_log(f"  sessions.list for {session_key[-36:][:8]}... failed: {ex}")
         return None
     row = next((r for r in (lst.get("sessions") or []) if r.get("key") == session_key), None)
-    return bool(row and row.get("hasActiveRun"))
+    return bool(row.get("hasActiveRun")) if row else missing
 
 
 # A long session's whole transcript (952 messages for 0abe9bde) takes the
@@ -6701,9 +6645,7 @@ def _history_closed_runs(messages: list) -> list:
     for m in messages or []:
         if not isinstance(m, dict) or m.get("role") != "assistant":
             continue
-        meta = m.get("__openclaw") if isinstance(m.get("__openclaw"), dict) else {}
-        for k in (m.get("idempotencyKey"), meta.get("idempotencyKey")):
-            k = str(k or "")
+        for k in _idempotency_keys(m):
             run = k[len("cli-assistant:"):] if k.startswith("cli-assistant:") else (k if k in started else "")
             if run and isinstance(m.get("timestamp"), (int, float)):
                 out.append((run, m["timestamp"]))
@@ -7428,7 +7370,6 @@ class _TurnWriter:
         self.wake = wake
         self.opened = False
         self.task_id: str | None = None
-        self.parent_id: str | None = None
         # every run written into M, in transcript order (_adopt_recoveries_from)
         self.runs = [run_id]
         # Where each run's streamed part starts in the renderer, in adoption
@@ -7466,7 +7407,6 @@ class _TurnWriter:
         if not claim["claimed"]:
             pipe_log(f"  turn writer: message {self.message_id[:8]}... is held by another writer")
             return False
-        self.parent_id = claim["parent"]
         if claim["how"] == "new":
             await _introduce_turn_message(self.chat_id, self.user_id, claim["messages"],
                                           self.message_id)
@@ -9010,31 +8950,6 @@ async def _settle_cancel_intent(conn, session_key, run_id, chat_id, event_call):
     conn.settle_parked_turn(session_key, run_id, intent, hold_s=_SEND_NOW_HOLD_S)
 
 
-async def _gateway_run_status(conn, session_key: str) -> str | None:
-    """The Gateway's own run status (P26), for a reply that has been quiet.
-
-    A quiet queue does not mean the run ended: it may be queued behind
-    another run, in a long tool call, or in a sub-agent yield gap. Returns
-    the `sessions.describe` status ("running", "done", "failed",
-    "cancelled", ...), so callers can tell a user stop from a dead run. A
-    terminal status is checked against `sessions.list` `hasActiveRun`, which
-    counts a yield gap as active where describe already says "done"
-    (ELI-56); then it is "running". None when the probe failed or the
-    session is unknown."""
-    try:
-        desc = await conn.send_request("sessions.describe", dict(key=session_key), timeout=8)
-    except Exception as ex:
-        pipe_log(f"  initial describe probe failed: {ex}")
-        return None
-    session_row = desc.get("session")
-    if session_row is None:
-        return None
-    status = session_row.get("status")
-    if status in ("done", "failed", "cancelled") and await _session_list_active(conn, session_key):
-        return "running"
-    return status
-
-
 @dataclass
 class _TurnState:
     """What one reply still owes the user if it is cancelled or closed now.
@@ -9219,10 +9134,6 @@ class Pipe:
     def __init__(self):
         self.valves = self.Valves()
         self._active_tool_args: dict[str, str] = {}
-        # Will be set per pipe() call
-        self._current_session_key: str | None = None
-        self._current_run_id: str | None = None
-        self._connection: _GatewayConnection | None = None
 
     async def pipes(self):
         """Expose multiple OWUI model-selector entries from one pipe.
@@ -9753,7 +9664,6 @@ class Pipe:
             yield f"**Gateway connection error:** {e}"
             return
 
-        self._connection = conn
 
         # --- Derive stable session key ---
         if __metadata__:
@@ -9776,22 +9686,6 @@ class Pipe:
 
         session_key = _owui_session_key(self.valves.AGENT_ID, user_id, chat_id)
         pipe_log(f"Session key: {session_key}")
-        self._current_session_key = session_key
-
-        # DIAG (2026-07-18, ELI-56): log the OWUI message_id + a short content
-        # hash of the user text so a *re-fired / duplicate* completion for the
-        # same message -- the suspected cause of the phantom "1-event, no-text"
-        # turns (e.g. on a socket reconnect behind a reverse proxy) -- becomes
-        # visible: two pipe() invocations with the SAME owui_msg_id / text_sha
-        # close together is a smoking gun. Pure logging, no behavior change.
-        _diag_md = __metadata__ or {}
-        _diag_sha = hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()[:8]
-        self._diag_text_sha = _diag_sha
-        pipe_log(
-            f"  [diag] owui_msg_id={_diag_md.get('message_id')} "
-            f"session_id={str(_diag_md.get('session_id'))[:12]} "
-            f"text_sha={_diag_sha} text_preview={text[:48]!r}"
-        )
 
         if turn is None:
             turn = _TurnState()
@@ -9914,19 +9808,6 @@ class Pipe:
         # returned a runId that instantly emits a single 'final' with no text,
         # so the bubble rendered nothing and the real answer leaked out as a
         # separate message. (Verified from live pipe logs 2026-07-18.)
-        async def _list_has_active_run() -> bool | None:
-            """Authoritative live run signal from sessions.list (hasActiveRun).
-            Returns None if the probe fails or our session isn't in the list."""
-            try:
-                lst = await conn.send_request("sessions.list", dict(), timeout=8)
-            except Exception as ex:
-                pipe_log(f"  active-check sessions.list failed: {ex}")
-                return None
-            for s in (lst.get("sessions") or []):
-                if s.get("key") == session_key:
-                    return bool(s.get("hasActiveRun"))
-            return None
-
         async def _session_run_active() -> bool:
             # Fast path: describe exposes a persisted `status`. When it names a
             # live run state we're done. But describe.status flips to 'done'
@@ -9970,7 +9851,7 @@ class Pipe:
                 # that also fails, to the (per-worker, possibly-blind) registry.
                 pipe_log(f"  active-check describe failed: {ex}")
                 status = None
-            list_active = await _list_has_active_run()
+            list_active = await _session_list_active(conn, session_key, missing=None)
             if list_active is not None:
                 active = _session_active_from_signals(status, list_active)
                 if active and status not in _ACTIVE_RUN_STATES:
@@ -10036,7 +9917,6 @@ class Pipe:
             # gateway acks "started", then drops the message once the run
             # ends -- measured 2026-10-11).
             our_run_id = adopted_run_id
-            self._current_run_id = our_run_id
             resolved_thinking = None
             pending_clamp_note = ""
             if adopted_queue is not None:
@@ -10168,7 +10048,6 @@ class Pipe:
                     yield f"**Error sending message:** {e}"
                     return
                 our_run_id = send_resp.get("runId") or idempotency_key
-                self._current_run_id = our_run_id
                 pipe_log(f"Captured runId: {our_run_id}")
                 if our_run_id != idempotency_key:
                     conn.unregister_consumer(session_key, idempotency_key, queue=queue)
@@ -10429,25 +10308,7 @@ class Pipe:
 
         async def maybe_emit_snapshot(*, force: bool = False):
             nonlocal last_snapshot_text, last_snapshot_time
-            # ELI-82 instrumentation. A forced snapshot is the pipe's last
-            # chance to persist trailing text, and it used to be completely
-            # silent: on the 2026-08-01 incident the final 3417-char block
-            # vanished and there was no way to tell whether this ever ran, let
-            # alone with what. Only `force` calls are logged, so the mid-stream
-            # cadence stays quiet. Log-only, no behaviour change.
-            if force:
-                pipe_log(
-                    f"  snapshot(force): visible={len(visible_message_text)} "
-                    f"last={len(last_snapshot_text)} "
-                    f"delta={len(visible_message_text) - len(last_snapshot_text)}"
-                )
             if not visible_message_text or visible_message_text == last_snapshot_text:
-                if force:
-                    pipe_log(
-                        "  snapshot(force): SKIPPED "
-                        + ("visible_message_text empty" if not visible_message_text
-                           else "identical to last snapshot")
-                    )
                 return
             now = time.time()
             if (
@@ -10460,8 +10321,6 @@ class Pipe:
             await _emit_message_snapshot(__event_emitter__, visible_message_text)
             last_snapshot_text = visible_message_text
             last_snapshot_time = now
-            if force:
-                pipe_log(f"  snapshot(force): EMITTED {len(visible_message_text)} chars")
 
         def maybe_start_rest_snapshot():
             """Throttled gate for the REST-API mid-run snapshot.
@@ -10632,7 +10491,6 @@ class Pipe:
                                 _kind, new_run, new_queue = step
                                 conn.unregister_consumer(session_key, our_run_id, queue=queue)
                                 queue, our_run_id = new_queue, new_run
-                                self._current_run_id = our_run_id
                                 turn.run_id, turn.queue = our_run_id, queue
                                 admitted_at, signals_lost = time.monotonic(), False
                             awaiting_owner = False
@@ -11282,8 +11140,6 @@ class Pipe:
                     await _emit_status(__event_emitter__, line, done=True)
             else:
                 await _emit_status(__event_emitter__, "", done=True)
-            self._current_session_key = None
-            self._current_run_id = None
 
         pipe_log(f"DONE -- {event_count} events processed, "
                  f"text yielded: {text_yielded}")
@@ -11355,13 +11211,8 @@ class Pipe:
                 return
 
         if not text_yielded:
-            # DIAG (ELI-56): a no-text turn is the phantom. Emit the correlation
-            # keys so it can be matched to a duplicate/re-fired completion above
-            # (same text_sha / owui_msg_id) and to the run that actually carried
-            # the answer (which then leaks out as a separate message).
             pipe_log(
                 f"  [diag] PHANTOM (no text): our_run_id={str(our_run_id)[:40]} "
-                f"text_sha={getattr(self, '_diag_text_sha', None)} "
                 f"first_event_arrived={first_event_arrived} aborted={aborted}"
             )
 
@@ -11399,15 +11250,6 @@ class Pipe:
         # so a single force snapshot is freeze-safe, and OWUI's `replace`
         # handler writes the DB unconditionally (sio.emit to an empty room is a
         # no-op, not an error), so it persists even with everything dead.
-        # ELI-82 instrumentation: record the terminal decision inputs, not just
-        # its effect. `text_yielded` gating this call means a turn can end with
-        # a populated visible_message_text and still never snapshot, which is
-        # indistinguishable from "snapshotted but OWUI dropped it" unless the
-        # inputs are on the record.
-        pipe_log(
-            f"  terminal: aborted={aborted} text_yielded={text_yielded} "
-            f"visible={len(visible_message_text)} snapshotted={len(last_snapshot_text)}"
-        )
         if not aborted and text_yielded:
             await maybe_emit_snapshot(force=True)
 

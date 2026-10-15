@@ -200,28 +200,6 @@ def _parse_gateway_url(raw: str) -> tuple[str, int]:
     return host, port
 
 
-def _preview_recovery_text(preview: dict, session_key: str, user_text: str) -> str | None:
-    """Return assistant text saved after this user message, if preview has it.
-
-    Lossy: the Gateway clips every `sessions.preview` item server-side (800
-    chars on 2026.9.x, 2000 before) whatever `maxChars` asks for. Only the
-    fallback for when `_history_recovery_text` finds nothing (ELI-74).
-    """
-    previews = preview.get("previews")
-    if not isinstance(previews, list):
-        return None
-
-    entry = None
-    for candidate in previews:
-        if isinstance(candidate, dict) and candidate.get("key") == session_key:
-            entry = candidate
-            break
-    if not entry:
-        return None
-
-    return _recovery_text_from_items(entry.get("items"), user_text)
-
-
 # Budget for reading back an interrupted turn's tail. `chat.history` honors
 # maxChars per message (schema max 500000) up to a 128 KiB per-message byte
 # cap; 50000 chars stays under that cap even for 2-byte scripts like Hebrew.
@@ -238,9 +216,9 @@ def _event_frame(payload: dict) -> dict:
 
 
 def _history_item(message) -> dict | None:
-    """Flatten one `chat.history` message to the {role, text} shape of a
-    `sessions.preview` item. Only `text` blocks count: tool calls, tool results
-    and thinking blocks are not part of the visible answer."""
+    """Flatten one `chat.history` message to {role, text}. Only `text` blocks
+    count: tool calls, tool results and thinking blocks are not part of the
+    visible answer."""
     if not isinstance(message, dict):
         return None
     content = message.get("content")
@@ -259,13 +237,7 @@ def _history_item(message) -> dict | None:
 
 def _history_recovery_text(history: dict, user_text: str) -> str | None:
     """Return the full assistant text saved after this user message, read from
-    a `chat.history` response.
-
-    This replaces `sessions.preview` as the recovery source (ELI-74): the
-    preview is clipped server-side, so a long reply recovered from it landed
-    in OWUI cut mid-sentence with a trailing "...". `chat.history` returns the
-    message whole.
-    """
+    a `chat.history` response."""
     messages = (history or {}).get("messages")
     if not isinstance(messages, list):
         return None
@@ -277,8 +249,7 @@ def _recovery_user_text_matches(item_text: str, user_text: str) -> bool:
 
     The transcript can hold it verbatim or behind the Gateway's metadata
     envelope ("Conversation info (untrusted metadata): ...", then a blank
-    line, then the text). `sessions.preview` strips that envelope;
-    `chat.history` does not.
+    line, then the text).
     """
     return item_text == user_text or item_text.endswith("\n" + user_text)
 
@@ -327,28 +298,17 @@ def _recovery_text_from_items(items, user_text: str) -> str | None:
 
 
 async def _recover_turn_text(conn, session_key: str, user_text: str) -> str | None:
-    """Read back the assistant text of a turn whose live stream was lost.
-
-    `chat.history` first, because it returns the message whole. The old
-    `sessions.preview`-only path persisted long replies clipped mid-sentence
-    with a trailing "..." (ELI-74): the Gateway caps each preview item
-    server-side, so no `maxChars` value fixes it. The preview stays as a
-    fallback for a Gateway that refuses `chat.history`.
-    """
+    """Read back the assistant text of a turn whose live stream was lost,
+    from `chat.history`, which returns the message whole (ELI-74)."""
     try:
         history = await conn.session_history(session_key)
-        text = _history_recovery_text(history, user_text)
-        if text:
-            return text
-        pipe_log("  history recovery found no reply; trying sessions.preview")
     except Exception as ex:
-        pipe_log(f"  history recovery failed: {ex}; trying sessions.preview")
-    try:
-        preview = await conn.session_preview(session_key)
-        return _preview_recovery_text(preview, session_key, user_text)
-    except Exception as ex:
-        pipe_log(f"  preview recovery failed: {ex}")
+        pipe_log(f"  history recovery failed: {ex}")
         return None
+    text = _history_recovery_text(history, user_text)
+    if not text:
+        pipe_log("  history recovery found no reply")
+    return text
 
 
 def _owui_session_key(agent_id: str, user_id: str, chat_id: str) -> str:
@@ -1557,9 +1517,6 @@ class _GatewayConnection:
         # Next request id
         self._next_req_id = 1
 
-        # Counter for the event loop
-        self._event_count = 0
-
         # Delivery bookkeeping. When running inside OWUI these dicts are the
         # *same objects* for every `_GatewayConnection` in the process (see
         # `_shared_gateway_state`), so a turn shown live by one connection is
@@ -2214,17 +2171,6 @@ class _GatewayConnection:
             return matches if len(matches) == 1 else []
         return []
 
-    async def session_preview(self, session_key: str, limit: int = 8,
-                              max_chars: int = 4000) -> dict:
-        """Fetch a bounded transcript preview. Every item comes back clipped
-        server-side (see `_preview_recovery_text`), so do not use this where
-        the whole message matters."""
-        return await self.send_request(
-            "sessions.preview",
-            dict(keys=[session_key], limit=limit, maxChars=max_chars),
-            timeout=10
-        )
-
     async def session_history(self, session_key: str,
                               limit: int = RECOVERY_HISTORY_LIMIT,
                               max_chars: int = RECOVERY_HISTORY_MAX_CHARS,
@@ -2858,7 +2804,6 @@ class _GatewayConnection:
                     continue
 
                 if consumers:
-                    self._event_count += 1
                     if not payload.get("runId"):
                         pipe_log("  dispatched session-only event to sole consumer")
                     if payload.get("state") == "final" and payload.get("sessionKey") and payload.get("runId"):
@@ -2949,6 +2894,15 @@ RUN_TEXT_HISTORY_LIMIT = 60
 RUN_HISTORY_LIMIT = 600
 
 
+def _idempotency_keys(message) -> tuple[str, str]:
+    """A transcript message's `idempotencyKey`, top level and under
+    `__openclaw`, as strings ("" when absent)."""
+    if not isinstance(message, dict):
+        return "", ""
+    meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
+    return str(message.get("idempotencyKey") or ""), str(meta.get("idempotencyKey") or "")
+
+
 def _history_text_for_run(history: dict, run_id: str) -> tuple[bool, str | None]:
     """The closing assistant text one specific run saved, found by its id.
 
@@ -2964,10 +2918,7 @@ def _history_text_for_run(history: dict, run_id: str) -> tuple[bool, str | None]
     for message in reversed(messages):
         if not isinstance(message, dict) or message.get("role") != "assistant":
             continue
-        meta = message.get("__openclaw")
-        keys = {message.get("idempotencyKey"),
-                meta.get("idempotencyKey") if isinstance(meta, dict) else None}
-        if not keys & wanted:
+        if not set(_idempotency_keys(message)) & wanted:
             continue
         text = ((_history_item(message) or {}).get("text") or "").strip()
         if not text:
@@ -3004,9 +2955,7 @@ def _history_renderer(messages: list) -> "_TurnRenderer":
     for message in messages:
         if not isinstance(message, dict) or message.get("role") != "assistant":
             continue
-        meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
-        keys = (str(message.get("idempotencyKey") or ""), str(meta.get("idempotencyKey") or ""))
-        if any(k.startswith("cli-assistant:") for k in keys):
+        if any(k.startswith("cli-assistant:") for k in _idempotency_keys(message)):
             text = ((_history_item(message) or {}).get("text") or "").strip()
             if not run_text and text and text not in _SILENT_SENTINELS:
                 lead = _message_boundary_separator(r.text, text)
@@ -3058,9 +3007,7 @@ def _is_closing_message(message) -> bool:
     """A run's closing assistant message (`cli-assistant:<runId>`)."""
     if not isinstance(message, dict) or message.get("role") != "assistant":
         return False
-    meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
-    return any(str(k or "").startswith("cli-assistant:")
-               for k in (message.get("idempotencyKey"), meta.get("idempotencyKey")))
+    return any(k.startswith("cli-assistant:") for k in _idempotency_keys(message))
 
 
 def _history_run_messages(history: dict, run_id: str) -> list | None:
@@ -3077,8 +3024,7 @@ def _history_run_messages(history: dict, run_id: str) -> list | None:
         message = messages[end]
         if not isinstance(message, dict) or message.get("role") != "assistant":
             continue
-        meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
-        if not {message.get("idempotencyKey"), meta.get("idempotencyKey")} & wanted:
+        if not set(_idempotency_keys(message)) & wanted:
             continue
         start = end
         while start > 0 and (messages[start - 1] or {}).get("role") != "user" \
@@ -3217,8 +3163,7 @@ def _is_forwarded_turn(message) -> bool:
     a `sessions_send` message, or a cron run's prompt)."""
     if not isinstance(message, dict) or message.get("role") != "assistant":
         return False
-    meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
-    key = str(message.get("idempotencyKey") or meta.get("idempotencyKey") or "")
+    key = next((k for k in _idempotency_keys(message) if k), "")
     prov = message.get("provenance") if isinstance(message.get("provenance"), dict) else {}
     forwarded = ((prov.get("kind"), prov.get("sourceTool")) == ("inter_session", "sessions_send")
                  or (prov.get("kind"), prov.get("sourceTool")) == ("internal_system", "cron"))
@@ -3241,8 +3186,7 @@ def _history_user_run_id(message) -> str | None:
     runtime imports next to it."""
     if not isinstance(message, dict) or message.get("role") != "user":
         return None
-    meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
-    key = str(message.get("idempotencyKey") or meta.get("idempotencyKey") or "")
+    key = next((k for k in _idempotency_keys(message) if k), "")
     return key[:-len(":user")] if key.endswith(":user") and len(key) > 5 else None
 
 
@@ -3295,8 +3239,7 @@ def _stub_turn(history: dict, stub_id: str, user_text: str,
     turn = messages[pick + 1:end]
     closing = f"cli-assistant:{run_id}"
     for j, m in enumerate(turn):
-        meta = m.get("__openclaw") if isinstance(m, dict) and isinstance(m.get("__openclaw"), dict) else {}
-        if isinstance(m, dict) and closing in (m.get("idempotencyKey"), meta.get("idempotencyKey")):
+        if closing in _idempotency_keys(m):
             return {"run_id": run_id, "messages": turn[:j + 1], "closed": True, "by": by}
     return {"run_id": run_id, "messages": turn, "closed": end < len(messages), "by": by}
 
@@ -3321,17 +3264,18 @@ async def _owui_chat_has_live_task(chat_id: str) -> bool:
         return True
 
 
-async def _session_list_active(conn: "_GatewayConnection", session_key: str) -> bool | None:
+async def _session_list_active(conn: "_GatewayConnection", session_key: str,
+                               *, missing: bool | None = False) -> bool | None:
     """`sessions.list` `hasActiveRun` for one session (counts a sub-agent
-    yield gap as active, unlike `sessions.describe`). False when the Gateway
-    lists no such session, None when it can't be asked."""
+    yield gap as active, unlike `sessions.describe`). `missing` when the
+    Gateway lists no such session, None when it can't be asked."""
     try:
         lst = await conn.send_request("sessions.list", {}, timeout=15)
     except Exception as ex:
         pipe_log(f"  sessions.list for {session_key[-36:][:8]}... failed: {ex}")
         return None
     row = next((r for r in (lst.get("sessions") or []) if r.get("key") == session_key), None)
-    return bool(row and row.get("hasActiveRun"))
+    return bool(row.get("hasActiveRun")) if row else missing
 
 
 # A long session's whole transcript (952 messages for 0abe9bde) takes the
@@ -3518,9 +3462,7 @@ def _history_closed_runs(messages: list) -> list:
     for m in messages or []:
         if not isinstance(m, dict) or m.get("role") != "assistant":
             continue
-        meta = m.get("__openclaw") if isinstance(m.get("__openclaw"), dict) else {}
-        for k in (m.get("idempotencyKey"), meta.get("idempotencyKey")):
-            k = str(k or "")
+        for k in _idempotency_keys(m):
             run = k[len("cli-assistant:"):] if k.startswith("cli-assistant:") else (k if k in started else "")
             if run and isinstance(m.get("timestamp"), (int, float)):
                 out.append((run, m["timestamp"]))

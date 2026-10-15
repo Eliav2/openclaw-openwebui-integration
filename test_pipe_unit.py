@@ -87,7 +87,6 @@ from openclaw_pipe import (
     recovery_source_run, run_message_id, _TurnWriter, _INTENT_HOOK_JS,
     _turn_route_event, _turn_after_hello, _turn_resync, _history_span_messages,
     wake_turns, wake_turn_at, wake_span, _wake_resync, _adopt_turn_message,
-    _gateway_run_status,
     _GatewayConnection,
     GatewayError,
     _parse_gateway_url,
@@ -154,9 +153,9 @@ from openclaw_pipe import (
     _normalize_model_entry,
     _owui_chat_send_params,
     _owui_session_key,
-    _preview_recovery_text,
     _history_recovery_text,
     _recover_turn_text,
+    _recovery_text_from_items,
     _provider_from_key,
     _reap_stale_gateway_connection,
     _relative_time,
@@ -183,42 +182,25 @@ from openclaw_pipe import (
 )
 
 
-class PreviewRecoveryTests(unittest.TestCase):
+class RecoveryItemsTests(unittest.TestCase):
     def test_recovers_assistant_after_matching_user_message(self):
-        preview = {
-            "previews": [{
-                "key": "agent:main:test",
-                "items": [
-                    {"role": "user", "text": "old"},
-                    {"role": "assistant", "text": "old answer"},
-                    {"role": "user", "text": "current question"},
-                    {"role": "assistant", "text": "current answer"},
-                ],
-            }]
-        }
-        self.assertEqual(
-            _preview_recovery_text(preview, "agent:main:test", "current question"),
-            "current answer",
-        )
+        items = [
+            {"role": "user", "text": "old"},
+            {"role": "assistant", "text": "old answer"},
+            {"role": "user", "text": "current question"},
+            {"role": "assistant", "text": "current answer"},
+        ]
+        self.assertEqual(_recovery_text_from_items(items, "current question"), "current answer")
 
     def test_does_not_recover_without_matching_user_message(self):
-        preview = {
-            "previews": [{
-                "key": "agent:main:test",
-                "items": [{"role": "assistant", "text": "answer"}],
-            }]
-        }
-        self.assertIsNone(
-            _preview_recovery_text(preview, "agent:main:test", "current question")
-        )
+        items = [{"role": "assistant", "text": "answer"}]
+        self.assertIsNone(_recovery_text_from_items(items, "current question"))
 
 
 class InterruptedTurnTailRecoveryTests(unittest.TestCase):
-    """ELI-74: a turn whose live stream was lost is read back from the session
-    transcript. It used to come from `sessions.preview`, which the Gateway
-    clips per item server-side (2000 chars then, 800 on 2026.9.x) whatever
-    `maxChars` asks for, so long replies landed cut mid-sentence with "...".
-    """
+    """ELI-74: a turn whose live stream was lost is read back whole from the
+    session transcript (`chat.history`), never from the clipped
+    `sessions.preview`."""
 
     KEY = "agent:main:openwebui-u-c"
     QUESTION = "what changed?"
@@ -249,26 +231,12 @@ class InterruptedTurnTailRecoveryTests(unittest.TestCase):
                 {"type": "text", "text": self.LONG}]},
         ]}
 
-    @staticmethod
-    def _clipping_preview(full_text, cap=800):
-        """What the Gateway's sessions.preview returns: every item clipped."""
-        def clip(t):
-            return t if len(t) <= cap else t[:cap - 3] + "..."
-
-        async def session_preview(session_key, limit=8, max_chars=4000):
-            return {"previews": [{"key": session_key, "items": [
-                {"role": "user", "text": InterruptedTurnTailRecoveryTests.QUESTION},
-                {"role": "assistant", "text": clip(full_text)},
-            ]}]}
-        return session_preview
-
     def _conn(self, history=None, history_error=None):
         conn = types.SimpleNamespace()
         if history_error is not None:
             conn.session_history = mock.AsyncMock(side_effect=history_error)
         else:
             conn.session_history = mock.AsyncMock(return_value=history)
-        conn.session_preview = mock.AsyncMock(side_effect=self._clipping_preview(self.LONG))
         return conn
 
     def test_long_tail_survives_intact(self):
@@ -277,7 +245,6 @@ class InterruptedTurnTailRecoveryTests(unittest.TestCase):
         recovered = asyncio.run(_recover_turn_text(conn, self.KEY, self.QUESTION))
         self.assertEqual(recovered, self.LONG)
         self.assertFalse(recovered.endswith("..."))
-        conn.session_preview.assert_not_awaited()
 
     def test_history_is_requested_with_a_budget_above_the_old_clip(self):
         conn = self._conn(self._history())
@@ -301,16 +268,9 @@ class InterruptedTurnTailRecoveryTests(unittest.TestCase):
         ]
         self.assertEqual(_history_recovery_text(history, self.QUESTION), self.LONG)
 
-    def test_falls_back_to_the_preview_when_history_fails(self):
-        conn = self._conn(history_error=GatewayError("unknown method chat.history"))
-        recovered = asyncio.run(_recover_turn_text(conn, self.KEY, self.QUESTION))
-        self.assertTrue(recovered.endswith("..."))  # clipped, but not nothing
-        conn.session_preview.assert_awaited_once()
-
-    def test_falls_back_to_the_preview_when_history_has_no_match(self):
-        conn = self._conn({"messages": []})
-        self.assertIsNotNone(asyncio.run(_recover_turn_text(conn, self.KEY, self.QUESTION)))
-        conn.session_preview.assert_awaited_once()
+    def test_a_history_failure_recovers_nothing(self):
+        conn = self._conn(history_error=GatewayError("chat.history timed out"))
+        self.assertIsNone(asyncio.run(_recover_turn_text(conn, self.KEY, self.QUESTION)))
 
     def test_no_match_anywhere_is_none(self):
         conn = self._conn({"messages": []})
@@ -8594,37 +8554,6 @@ class RunSpanTests(unittest.TestCase):
         self.assertEqual((r.text.strip(), r.output and sum(
             1 for i in r.finished_output() if i["type"] == "function_call")), ("The check finished.", 0))
         self.assertEqual(len(_history_span_messages(hist, parent)), 2, "the parent keeps its own")
-
-
-class NoMidRunCloseTests(unittest.IsolatedAsyncioTestCase):
-    """NoMidRunCloseTest: `sessions.describe` says "done" during a sub-agent
-    yield gap while `sessions.list` still has the run active (ELI-56). The
-    inline reply's idle probe must not read that as the end of the run; on
-    main it closed the reply after 30 s of silence."""
-
-    SK = _owui_session_key("main", "11111111-1111-1111-1111-111111111111",
-                           "22222222-2222-2222-2222-222222222222")
-
-    def conn(self, describe, active):
-        conn = _GatewayConnection(lambda: None)
-
-        async def send_request(method, params, timeout=10):
-            if method == "sessions.describe":
-                return {"session": {"status": describe}}
-            if method == "sessions.list":
-                return {"sessions": [{"key": self.SK, "hasActiveRun": active}]}
-            raise AssertionError(method)
-        conn.send_request = send_request
-        return conn
-
-    async def test_done_while_the_run_is_active_is_running(self):
-        self.assertEqual(await _gateway_run_status(self.conn("done", True), self.SK), "running")
-
-    async def test_done_and_idle_is_done(self):
-        self.assertEqual(await _gateway_run_status(self.conn("done", False), self.SK), "done")
-
-    async def test_an_active_describe_needs_no_list(self):
-        self.assertEqual(await _gateway_run_status(self.conn("running", False), self.SK), "running")
 
 
 if __name__ == "__main__":
