@@ -8813,12 +8813,6 @@ MODELS_SOURCE_FALLBACK = "fallback"
 UNVERIFIED_MODEL_SUFFIX = " -- example, Gateway not reached"
 
 
-async def _discover_models(valves) -> list[dict]:
-    """Back-compat wrapper for callers that don't care where the list came from."""
-    models, _source = await _discover_models_with_source(valves)
-    return models
-
-
 async def _discover_models_with_source(valves) -> tuple[list[dict], str]:
     """Discover models, and report where the list came from.
 

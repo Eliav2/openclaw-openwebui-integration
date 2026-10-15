@@ -39,6 +39,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -333,9 +334,9 @@ def choose_identity(existing_valves: dict) -> dict:
 # Function / valve management
 # --------------------------------------------------------------------------
 
-def get_function(client: OwuiClient) -> dict | None:
-    status, payload = client.request("GET", f"/api/v1/functions/id/{FUNCTION_ID}")
-    if status == 200 and isinstance(payload, dict) and payload.get("id") == FUNCTION_ID:
+def get_function(client: OwuiClient, function_id: str = FUNCTION_ID) -> dict | None:
+    status, payload = client.request("GET", f"/api/v1/functions/id/{function_id}")
+    if status == 200 and isinstance(payload, dict) and payload.get("id") == function_id:
         return payload
     return None
 
@@ -347,15 +348,15 @@ def get_functions(client: OwuiClient) -> list[dict]:
     return []
 
 
-def get_function_summary(client: OwuiClient) -> dict | None:
+def get_function_summary(client: OwuiClient, function_id: str = FUNCTION_ID) -> dict | None:
     for item in get_functions(client):
-        if item.get("id") == FUNCTION_ID:
+        if item.get("id") == function_id:
             return item
     return None
 
 
-def get_valves(client: OwuiClient) -> dict:
-    status, payload = client.request("GET", f"/api/v1/functions/id/{FUNCTION_ID}/valves")
+def get_valves(client: OwuiClient, function_id: str = FUNCTION_ID) -> dict:
+    status, payload = client.request("GET", f"/api/v1/functions/id/{function_id}/valves")
     if status == 200 and isinstance(payload, dict):
         return payload
     return {}
@@ -377,12 +378,12 @@ def model_exists(client: OwuiClient) -> bool:
 def backup_function(fn: dict, valves: dict | None = None) -> None:
     BACKUP_DIR.mkdir(exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    path = BACKUP_DIR / f"{FUNCTION_ID}-{stamp}.json"
+    path = BACKUP_DIR / f"{fn.get('id') or FUNCTION_ID}-{stamp}.json"
     path.write_text(json.dumps(fn, indent=2, ensure_ascii=False))
     os.chmod(path, 0o600)
     info(f"Backed up existing function to {path}")
     if valves is not None:
-        valves_path = BACKUP_DIR / f"{FUNCTION_ID}-{stamp}-valves.json"
+        valves_path = BACKUP_DIR / f"{fn.get('id') or FUNCTION_ID}-{stamp}-valves.json"
         valves_path.write_text(json.dumps(valves, indent=2, ensure_ascii=False))
         os.chmod(valves_path, 0o600)
         info(f"Backed up existing valves to {valves_path}")
@@ -507,85 +508,196 @@ def update_or_create_function(client: OwuiClient, cfg: Config) -> dict:
         # or someone who deleted the artifact) would otherwise silently deploy
         # HEAD-of-main from the internet instead of failing loudly.
         # Never for --dev-bundle, which is internal-only and never published.
-        return _deploy_pipe_code(client, _fetch_pipe_file())
+        return deploy_function_code(client, PIPE_SPEC, _fetch_pipe_file())
     if not pipe_file.exists():
         raise SystemExit(
             f"Pipe file not found: {pipe_file}\n"
             "Run `python3 build.py --dev` first, or drop --dev-bundle."
         )
-    return _deploy_pipe_code(client, pipe_file.read_text())
+    return deploy_function_code(client, PIPE_SPEC, pipe_file.read_text())
 
 
-def _deploy_pipe_code(client: OwuiClient, pipe_code: str) -> dict:
-    """Create or update the OWUI function from already-resolved pipe source.
+# --------------------------------------------------------------------------
+# One installer core for the three Functions (ELI-146)
+# --------------------------------------------------------------------------
 
-    Split out so the no-clone path (fetched artifact, never written into the
-    working directory) and the normal path share one deploy implementation.
-    """
-    existing = get_function(client)
-    preserved_valves = get_valves(client) if existing else {}
+@dataclass(frozen=True)
+class FunctionSpec:
+    """One Open WebUI Function this repo installs. The Pipe's installer is the
+    rest of this file; install_action.py and install_filter.py are a spec each
+    plus their own steps, run by `function_cli`."""
+    id: str
+    name: str
+    type: str                      # "pipe", "action" or "filter"
+    label: str                     # "Pipe", "Action", "Filter" in messages
+    description: str
+    artifact: Path | None = None   # the Pipe resolves its own (dev bundle, no clone)
+    build_artifact: str = ""       # build.py's artifact object ("ACTION", "FILTER")
+    global_: bool = True           # made global; False: left per-model, warned if global
+    global_warning: str = ""
+    valves: Callable | None = None         # (client): after create/update
+    smoke: Callable | None = None          # (client) -> bool, after the content check
+    status_checks: Callable | None = None  # (client) -> {field: must-be-true}
 
+
+PIPE_SPEC = FunctionSpec(FUNCTION_ID, "OpenClaw Gateway", "pipe", "Pipe",
+                         "OpenClaw Gateway Pipe - restart-safe persistent WS bridge")
+
+
+def deploy_function_code(client: OwuiClient, spec: FunctionSpec, code: str) -> dict:
+    """Update the Function in place (after a backup of it and its valves), or
+    create it. Never deletes and recreates: valves survive. Returns the valves
+    it had before."""
+    meta = {"description": spec.description, "manifest": {}}
+    existing = get_function(client, spec.id)
+    preserved_valves = get_valves(client, spec.id) if existing else {}
     if existing:
         backup_function(existing, preserved_valves)
         status, payload = client.request(
-            "POST",
-            f"/api/v1/functions/id/{FUNCTION_ID}/update",
-            {
-                "id": FUNCTION_ID,
-                "name": "OpenClaw Gateway",
-                "content": pipe_code,
-                "meta": {
-                    "description": "OpenClaw Gateway Pipe - restart-safe persistent WS bridge",
-                    "manifest": {},
-                },
-            },
+            "POST", f"/api/v1/functions/id/{spec.id}/update",
+            {"id": spec.id, "name": spec.name, "content": code, "meta": meta},
         )
-        if status != 200 or not isinstance(payload, dict) or payload.get("id") != FUNCTION_ID:
+        if status != 200 or not isinstance(payload, dict) or payload.get("id") != spec.id:
             raise SystemExit(f"Function update failed: {payload}")
-        info("Updated pipe function in place")
+        info(f"Updated {spec.label} function in place")
         return preserved_valves
-
     status, payload = client.request(
-        "POST",
-        "/api/v1/functions/create",
-        {
-            "id": FUNCTION_ID,
-            "name": "OpenClaw Gateway",
-            "content": pipe_code,
-            "type": "pipe",
-            "meta": {
-                "description": "OpenClaw Gateway Pipe - restart-safe persistent WS bridge",
-                "manifest": {},
-            },
-        },
+        "POST", "/api/v1/functions/create",
+        {"id": spec.id, "name": spec.name, "content": code, "type": spec.type, "meta": meta},
     )
-    if status != 200 or not isinstance(payload, dict) or payload.get("id") != FUNCTION_ID:
+    if status != 200 or not isinstance(payload, dict) or payload.get("id") != spec.id:
         raise SystemExit(f"Function create failed: {payload}")
-    info("Created pipe function")
+    info(f"Created {spec.label} function")
     return preserved_valves
 
 
-def ensure_active_global(client: OwuiClient) -> None:
-    summary = get_function_summary(client)
+def ensure_active(client: OwuiClient, spec: FunctionSpec) -> None:
+    """Activate the Function if it is not; make it global only when the spec
+    says so (a filter stays attached per model)."""
+    summary = get_function_summary(client, spec.id)
     if not summary:
         raise SystemExit("Function summary not found after create/update")
 
     if not summary.get("is_active"):
-        status, payload = client.request("POST", f"/api/v1/functions/id/{FUNCTION_ID}/toggle")
+        status, payload = client.request("POST", f"/api/v1/functions/id/{spec.id}/toggle")
         if status != 200:
             raise SystemExit(f"Failed to activate function: {payload}")
-        info("Activated pipe function")
+        info(f"Activated {spec.label} function")
     else:
-        info("Pipe function already active")
+        info(f"{spec.label} function already active")
 
-    summary = get_function_summary(client) or {}
-    if not summary.get("is_global"):
-        status, payload = client.request("POST", f"/api/v1/functions/id/{FUNCTION_ID}/toggle/global")
+    summary = get_function_summary(client, spec.id) or {}
+    if not spec.global_:
+        if summary.get("is_global") and spec.global_warning:
+            warn(spec.global_warning)
+    elif not summary.get("is_global"):
+        status, payload = client.request("POST", f"/api/v1/functions/id/{spec.id}/toggle/global")
         if status != 200:
             raise SystemExit(f"Failed to make function global: {payload}")
-        info("Made pipe function global")
+        info(f"Made {spec.label} function global")
     else:
-        info("Pipe function already global")
+        info(f"{spec.label} function already global")
+
+
+def rebuild_artifact(spec: FunctionSpec) -> None:
+    """Regenerate the spec's artifact from src/ before deploying, as
+    _rebuild_pipe_file does for the Pipe, so a forgotten build step can never
+    cause a stale deploy."""
+    build_script = ROOT / "build.py"
+    if not build_script.exists():
+        return
+    import importlib.util
+
+    module = importlib.util.spec_from_file_location(f"_{spec.type}_build", build_script)
+    mod = importlib.util.module_from_spec(module)
+    module.loader.exec_module(mod)
+    built = mod.build(strip_dev_only=True, artifact=getattr(mod, spec.build_artifact))
+    if not spec.artifact.exists() or spec.artifact.read_text() != built:
+        spec.artifact.write_text(built)
+        info(f"Rebuilt {spec.artifact.name} from src/")
+
+
+def install_function(client: OwuiClient, spec: FunctionSpec) -> bool:
+    """install/repair for a spec'd Function: deploy, activate, its valves,
+    then confirm the server holds exactly the uploaded code, then its own
+    smoke test."""
+    section("Function")
+    rebuild_artifact(spec)
+    if not spec.artifact.exists():
+        raise SystemExit(f"Artifact not found: {spec.artifact}")
+    code = spec.artifact.read_text()
+    deploy_function_code(client, spec, code)
+    ensure_active(client, spec)
+    if spec.valves:
+        section("Valves")
+        spec.valves(client)
+
+    section("Smoke test")
+    fn = get_function(client, spec.id)
+    if not fn or fn.get("type") != spec.type or fn.get("content") != code:
+        fail(f"{spec.label} function on the server is missing, of another type, or not the uploaded code")
+        return False
+    info(f"{spec.label} function type and content verified")
+    return spec.smoke(client) if spec.smoke else True
+
+
+def function_status(client: OwuiClient, spec: FunctionSpec) -> bool:
+    summary = get_function_summary(client, spec.id)
+    fn = get_function(client, spec.id) if summary else None
+    state = {
+        "function_exists": bool(summary),
+        "is_active": bool(summary and summary.get("is_active")),
+        "is_global": bool(summary and summary.get("is_global")),
+        "content_current": bool(fn and spec.artifact.exists() and fn.get("content") == spec.artifact.read_text()),
+    }
+    if spec.status_checks and summary:
+        state.update(spec.status_checks(client))
+    console.print_json(json.dumps(state))
+    return all(v for k, v in state.items() if k != "is_global" or spec.global_)
+
+
+def owui_options(f):
+    for option in reversed([
+        click.option("--owui-url", envvar="OWUI_URL", default="http://localhost:8080",
+                     show_default=True, help="Open WebUI base URL"),
+        click.option("--owui-email", envvar="OWUI_EMAIL", default="", help="Open WebUI admin email"),
+        click.option("--owui-password", envvar="OWUI_PASSWORD", default="", help="Open WebUI admin password"),
+    ]):
+        f = option(f)
+    return f
+
+
+def function_cli(spec: FunctionSpec):
+    """install / repair / status for a spec'd Function, logged in with the
+    same OWUI credentials install.py uses."""
+    @click.group(help=f"Install, repair, and health-check the {spec.name} {spec.label}.")
+    def cli() -> None:
+        pass
+
+    def run(command: str, owui_url: str, owui_email: str, owui_password: str) -> None:
+        if not owui_email or not owui_password:
+            raise SystemExit("Missing required env/args: OWUI_EMAIL, OWUI_PASSWORD "
+                             "(the same Open WebUI login install.py uses).")
+        client = OwuiClient(owui_url.rstrip("/"), owui_email, owui_password)
+        section("Login")
+        client.login()
+        if command == "status":
+            section("Status")
+            ok = function_status(client, spec)
+        else:
+            ok = install_function(client, spec)
+        raise SystemExit(0 if ok else 1)
+
+    def add(command: str, help_text: str) -> None:
+        @cli.command(name=command, help=help_text)
+        @owui_options
+        def _command(owui_url: str, owui_email: str, owui_password: str) -> None:
+            run(command, owui_url, owui_email, owui_password)
+
+    add("install", f"Create or update the {spec.label} function, then smoke test.")
+    add("repair", "Same as install; use after a broken/partial setup.")
+    add("status", "Print current state without changing anything.")
+    return cli
 
 
 def update_valves(client: OwuiClient, cfg: Config, preserved_valves: dict | None = None) -> dict:
@@ -932,7 +1044,7 @@ def install_or_repair(client: OwuiClient, cfg: Config) -> dict:
     section("Function")
     with devcoord_deploy_guard(cfg):
         preserved_valves = update_or_create_function(client, cfg)
-    ensure_active_global(client)
+    ensure_active(client, PIPE_SPEC)
 
     section("Valves")
     valves = update_valves(client, cfg, preserved_valves=preserved_valves)

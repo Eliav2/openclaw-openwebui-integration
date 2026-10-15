@@ -135,7 +135,6 @@ from openclaw_pipe import (
     _content_has_image,
     _could_be_user_input_prefix,
     _deepest_leaf_id,
-    _discover_models,
     _emit_message_snapshot,
     _emit_status,
     _extract_image_attachments,
@@ -4306,7 +4305,7 @@ class DiscoverModelsTests(unittest.IsolatedAsyncioTestCase):
             # Use a minimal valves-like object with STATE_DIR
             class FakeValves:
                 STATE_DIR = "/tmp/openclaw-test-discover"
-            models = await _discover_models(FakeValves())
+            models, _source = await _discover_models_with_source(FakeValves())
             self.assertEqual(len(models), 5)
             keys = {m["key"] for m in models}
             self.assertIn("deepseek/deepseek-v4-flash", keys)
@@ -4316,7 +4315,7 @@ class DiscoverModelsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_discover_models_normalizes_live_gateway_response(self):
         """Live gateway responses use id/name/provider/alias, not key/tags --
-        _discover_models must normalize them before returning/caching."""
+        _discover_models_with_source must normalize them before returning/caching."""
         import openclaw_pipe as ocp
 
         class FakeConn:
@@ -4346,7 +4345,7 @@ class DiscoverModelsTests(unittest.IsolatedAsyncioTestCase):
         orig_conn = ocp._gateway_connection
         try:
             ocp._gateway_connection = FakeConn()
-            models = await _discover_models(FakeValves())
+            models, _source = await _discover_models_with_source(FakeValves())
         finally:
             ocp._gateway_connection = orig_conn
 
@@ -4397,7 +4396,7 @@ class DiscoverModelsTests(unittest.IsolatedAsyncioTestCase):
         orig_conn = ocp._gateway_connection
         try:
             ocp._gateway_connection = FakeConn()
-            models = await _discover_models(FakeValves())
+            models, _source = await _discover_models_with_source(FakeValves())
         finally:
             ocp._gateway_connection = orig_conn
 
