@@ -872,10 +872,18 @@ def _eli98_streams(frames: list) -> list:
             for f in frames if isinstance(f, dict) and f.get("event") == "agent"]
 
 
+def _eli98_fill(token: str, chat_id: str, key: str, turns: int = 3) -> None:
+    # Compaction keeps the newest 20k tokens (keepRecentTokens), so a session
+    # needs more than that before there is anything to compact.
+    filler = " ".join(f"filler{i}" for i in range(5000))   # ~45k chars, ~11k tokens
+    for i in range(turns):
+        _eli98_capture(token, chat_id, key, f"Reply with exactly: ELI98_FILL{i} {filler}", wait_s=60)
+
+
 def test_debug_eli98_manual_compact_events(token):
     chat_id, _ = _chat_turn(token, "Reply with exactly: ELI98_ONE")
     key = _session_key(token, chat_id)
-    _eli98_capture(token, chat_id, key, "Reply with exactly: ELI98_TWO", wait_s=60)
+    _eli98_fill(token, chat_id, key)
     frames = _eli98_capture(token, chat_id, key, "/compact")
     print("[eli98] manual streams:", _eli98_streams(frames), flush=True)
     finals = [((f.get("payload") or {}).get("message")) for f in frames
@@ -887,7 +895,7 @@ def test_debug_eli98_manual_compact_events(token):
 def test_debug_eli98_overflow_compaction_events(token):
     chat_id, _ = _chat_turn(token, "Reply with exactly: ELI98_A")
     key = _session_key(token, chat_id)
-    _eli98_capture(token, chat_id, key, "Reply with exactly: ELI98_B", wait_s=60)
+    _eli98_fill(token, chat_id, key)
     frames = _eli98_capture(token, chat_id, key,
                             f"E2E_OVERFLOW_{uuid.uuid4().hex[:8]} Reply with exactly: ELI98_C")
     print("[eli98] overflow streams:", _eli98_streams(frames), flush=True)
