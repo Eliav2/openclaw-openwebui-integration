@@ -9119,6 +9119,114 @@ class ToolCardParityTests(unittest.IsolatedAsyncioTestCase):
                       "a call the run never answered is closed, not left spinning")
 
 
+class TextParityTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-147 slice 3: the inline reply and the turn writer show a run's
+    text the same way: dedup of whole-text and item events, the metadata
+    filter, `MEDIA:` directives and needs-input prompts. Each case is one
+    recorded run, fed to an inline reply and to a writer that saw the run
+    alone (no tab answers the question on either side)."""
+
+    asyncSetUp_inline = InlineOwnerRuleTests.asyncSetUp
+    asyncTearDown = InlineOwnerRuleTests.asyncTearDown
+    _queue = InlineOwnerRuleTests._queue
+    _until_registered = InlineOwnerRuleTests._until_registered
+    _reply = InlineOwnerRuleTests._reply
+    _event = InlineOwnerRuleTests._event
+    USER, CHAT = InlineOwnerRuleTests.USER, InlineOwnerRuleTests.CHAT
+
+    PROMPT = "OpenClaw needs input: Which branch?\n1. main\n2. dev"
+    IMG = "![chart.png](http://localhost:18791/chart.png)"
+
+    async def asyncSetUp(self):
+        await self.asyncSetUp_inline()
+        self.owui = _FakeOwuiChat(self, self.CHAT)
+
+    @staticmethod
+    def A(text):
+        return ("assistant", {"delta": text})
+
+    @staticmethod
+    def W(text):
+        return ("assistant", {"text": text})
+
+    @staticmethod
+    def I(kind, text):
+        return ("item", {"kind": kind, "text": text})
+
+    @staticmethod
+    def T(phase, tcid, **data):
+        return ("tool", {"phase": phase, "name": "Bash", "toolCallId": tcid, **data})
+
+    def cases(self):
+        A, W, I, T, P = self.A, self.W, self.I, self.T, self.PROMPT
+        tool = [T("start", "t1", args={}), T("result", "t1", result="ok")]
+        return {
+            "catch-all equal": ([A("Hello "), A("world."), W("Hello world.")], "Hello world."),
+            "catch-all with more": ([A("Hello "), W("Hello world.")], "Hello world."),
+            "item echo": ([A("Hello world."), I("message", "Hello world.")], "Hello world."),
+            "preamble, tool, text": ([I("preamble", "Let me check."), *tool, A("All good.")],
+                                     "Let me check.All good."),
+            "text, tool, text, catch-all": ([A("Checking."), *tool, A("Done."), W("Checking.Done.")],
+                                            "Checking.Done."),
+            "metadata block": ([A("Hi. "), A("Sender (untrusted metadata): x"), A("Bye.")], "Hi. Bye."),
+            "item grows": ([I("preamble", "Let"), I("preamble", "Let me check."), A(" More.")],
+                           "Let me check. More."),
+            "two items": ([I("message", "First."), *tool, I("message", "Second.")], "First.Second."),
+            "prompt in deltas": ([A("Before.\n\n"), A(P)], "Before.\n\n1. main\n2. dev"),
+            "prompt in an item": ([A("Before.\n\n"), I("message", "Before.\n\n" + P)],
+                                  "Before.\n\n1. main\n2. dev"),
+            "prompt, then catch-all": ([A("Before.\n\n"), A(P[:25]), A(P[25:]), W("Before.\n\n" + P)],
+                                       "Before.\n\n1. main\n2. dev"),
+            "prompt in a fence": ([A("Example:\n```\n" + P + "\n```\nThat's it.")],
+                                  "Example:\n```\n" + P + "\n```\nThat's it."),
+            "prompt, tool, text": ([A("Q:\n\n" + P + "\n\n"), *tool, A("After the tool.")],
+                                   "Q:\n\n1. main\n2. dev\n\nAfter the tool."),
+            "prompt mid-line, one delta": ([A("Checking. " + P)], "Checking. " + P),
+            "media": ([A("Here: MEDIA:chart.png "), A("done.")], f"Here: {self.IMG}\ndone."),
+            "media at the end": ([A("Here: MEDIA:chart.png")], f"Here: {self.IMG}"),
+            "media in code": ([A("Use `MEDIA:chart.png` to show it.")], "Use `MEDIA:chart.png` to show it."),
+            # Differed on main; the expected text names the side that was right.
+            "media before a tool card (inline)": ([A("See MEDIA:chart.png"), *tool, A("Next.")],
+                                                  f"See {self.IMG}Next."),
+            "prompt mid-line, two deltas (writer)": ([A("Checking. "), A(P)], "Checking. " + P),
+        }
+
+    async def inline(self, steps):
+        gen = self._reply("hello", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        for stream, data in steps:
+            q.put_nowait(self._event("agent", stream=stream, data=data))
+        q.put_nowait(NoDroppedMessagesTests._final(self, "run-1"))
+        got = [await asyncio.wait_for(first, 5)]
+        async for chunk in gen:
+            got.append(chunk)
+        return "".join(c for c in got if isinstance(c, str))
+
+    async def writer(self, steps, message_id):
+        w = _TurnWriter(self.conn, session_key=self.SK, chat_id=self.CHAT, user_id=self.USER,
+                        run_id="run-w", message_id=message_id)
+        for stream, data in steps:
+            w.renderer.feed({"stream": stream, "data": data})
+        w.opened = True
+        self.conn._valves = lambda: self.pipe.valves
+        # What `end` does when no tab answers the question, then `finalize`'s view.
+        with mock.patch.object(_TurnWriter, "_ask_card", new=mock.AsyncMock(return_value=False)):
+            await w._ask_question()
+        return (await w._view(final=True))[1]
+
+    async def test_the_inline_reply_and_the_writer_show_the_same_text(self):
+        for n, (name, (steps, expected)) in enumerate(self.cases().items()):
+            with self.subTest(name):
+                if n:
+                    await self.asyncTearDown()
+                    await self.asyncSetUp()
+                inline = await self.inline(steps)
+                writer = await self.writer(steps, f"w{n}")
+                self.assertEqual((inline, writer), (expected, expected))
+
+
 class ApiCallerOwnerRuleTests(unittest.IsolatedAsyncioTestCase):
     """Review 2af1 R14: an interrupted reply hands its Open WebUI message to
     the turn writer, which applies the owner rule. A request through the API
