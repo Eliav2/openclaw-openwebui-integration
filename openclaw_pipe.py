@@ -2328,8 +2328,9 @@ def _strip_input_marker_line(text: str) -> str:
     rendered raw. But the fallback paths -- a cancelled/dismissed modal, a run
     that ended before the modal could fire -- can still reach a raw ``yield``
     with the marker intact, leaking the literal directive line into the chat.
-    The marker is only ever meaningful as the FIRST line, so drop exactly that
-    line and keep the rest (the actual question) as a readable fallback.
+    The marker is only ever meaningful as the FIRST line, so drop exactly the
+    marker and keep the rest (the actual question) as a readable fallback,
+    including a question written on the marker line itself (ELI-151).
     """
     if not text:
         return text
@@ -2337,25 +2338,28 @@ def _strip_input_marker_line(text: str) -> str:
     lead_ws = text[: len(text) - len(stripped)]
     for prefix in _USER_INPUT_TRIGGER_PREFIXES:
         if stripped.startswith(prefix):
-            rest = stripped[len(prefix):]
-            nl = rest.find("\n")
-            rest = rest[nl + 1:] if nl != -1 else ""
-            return lead_ws + rest.lstrip("\n")
+            rest = stripped[len(prefix):].lstrip(" \t\r")
+            if rest.startswith("\n"):
+                rest = rest.lstrip("\n")
+            return lead_ws + rest
     return text
 
 
 def _strip_needs_input_lines(text: str) -> str:
-    """Drop every needs-input directive line (and the blank lines after it)
-    that is outside a fenced code block: the question it opens stays as
-    readable text, a quoted block in a fence stays as written (ELI-107)."""
+    """Drop every needs-input directive (and the blank lines after a lone
+    one) that is outside a fenced code block: the question it opens stays as
+    readable text, a question on the marker line included (ELI-151), and a
+    quoted block in a fence stays as written (ELI-107)."""
     if not text:
         return text
     out, fence, skip_blank = [], "", False
     for line in text.split("\n"):
         before, fence = fence, _fence_step(line, fence)
         if not before and not fence and _is_user_input_prompt(line):
-            skip_blank = True
-            continue
+            line = _strip_input_marker_line(line)
+            skip_blank = not line.strip()
+            if skip_blank:
+                continue
         if skip_blank and not line.strip():
             continue
         skip_blank = False
