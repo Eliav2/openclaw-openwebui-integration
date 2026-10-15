@@ -4150,6 +4150,47 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(answer, "a")
         self.assertEqual(sent, ["sid-new"])
 
+    # ELI-142 live (2026-10-15, chat ed98cbd2): after an Open WebUI restart the
+    # tab's socket stayed in SESSION_POOL while the page, in a reconnect storm,
+    # never showed the card. Each call ended in OWUI's 240 s timeout and the
+    # pipe re-showed the card: four timeouts, about 20 minutes of an open
+    # reply with nothing on screen and no text fallback.
+
+    async def test_a_socket_that_never_answers_ends_with_the_question_as_text(self):
+        pool = {"sid-tab": {"id": "user-1", "chat_ids": ["chat-1"]}}
+        self.fake_socket(pool)
+        calls = []
+
+        async def event_call(event):
+            calls.append(event)
+            return {"error": "Event call timed out. The browser tab may be inactive or closed."}
+
+        answer = await asyncio.wait_for(_ask_user_input_modal(
+            event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
+            owui_user_id="user-1", owui_chat_id="chat-1", owui_message_id="msg-1",
+            owui_session_id="sid-tab", max_wait_s=60, poll_interval_s=0.01), 2)
+        self.assertIsNone(answer)
+        self.assertEqual(len(calls), 1, "one card, never re-shown")
+
+    async def test_a_moved_card_that_is_never_answered_ends_with_the_question_as_text(self):
+        """The turn's socket is gone and the tab viewing the chat takes the
+        card, but that socket never answers either."""
+        sent = []
+
+        async def call(data, to):
+            sent.append(to)
+            return {"error": "Event call timed out: TimeoutError()"}
+        self._socket({"sid-tab": {"id": "user-1", "chat_ids": ["chat-1"]}}, call)
+
+        async def event_call(event):
+            return {"error": "Client session disconnected."}
+        answer = await asyncio.wait_for(_ask_user_input_modal(
+            event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
+            owui_user_id="user-1", owui_chat_id="chat-1", owui_message_id="msg-1",
+            max_wait_s=60, poll_interval_s=0.01), 2)
+        self.assertIsNone(answer)
+        self.assertEqual(sent, ["sid-tab"])
+
 
 class DynamicModelSelectorTests(unittest.TestCase):
     """Tests for ELI-11: dynamic model discovery."""
