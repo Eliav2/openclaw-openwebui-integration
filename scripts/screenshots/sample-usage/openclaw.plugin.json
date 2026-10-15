@@ -1,13 +1,9 @@
 {
   "id": "screenshot-sample-usage",
   "name": "Screenshot sample usage",
-  "description": "Test-only: fixed rate-limit windows for the screenshot stack's \"anthropic\" provider, so the Status dialog has bars to show. Never install this on a real Gateway.",
+  "description": "Test-only: answers claudeCliUsage.status with fixed sample rate-limit windows, so the screenshot stack's Status dialog has bars to show. Never install this on a real Gateway.",
   "activation": {
     "onStartup": true
-  },
-  "providers": ["anthropic"],
-  "contracts": {
-    "usageProviders": ["anthropic"]
   },
   "configSchema": {
     "type": "object",
