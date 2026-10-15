@@ -85,7 +85,7 @@ from openclaw_pipe import (
     _claim_turn_message, _register_turn_writer, _retire_turn_writer,
     MAX_TURN_RESUMES, next_continuation, turn_owner,
     recovery_source_run, run_message_id, _TurnWriter, _INTENT_HOOK_JS,
-    _turn_route_event, _turn_after_hello, _turn_resync, _history_span_messages,
+    _turn_route_now, _turn_after_hello, _turn_resync, _history_span_messages,
     wake_turns, wake_turn_at, wake_span, _wake_resync, _adopt_turn_message,
     _GatewayConnection,
     GatewayError,
@@ -6977,11 +6977,11 @@ class _RoutingCase(unittest.IsolatedAsyncioTestCase):
     async def run_turn(self, run, *, text=("Reading them.", "\n\nFound it."), settle=None):
         self.conn._on_sessions_changed({"sessionKey": self.key, "phase": "start", "runId": run,
                                         "hasActiveRun": True, "status": "running"})
-        handled = [await _turn_route_event(self.conn, self.ev(run, _delta(text[0])))]
-        handled.append(await _turn_route_event(self.conn, self.ev(run, _tool("start", tcid="toolu_1"))))
-        handled.append(await _turn_route_event(self.conn, self.ev(run, _tool("result", tcid="toolu_1"))))
-        handled.append(await _turn_route_event(self.conn, self.ev(run, _delta(text[1]))))
-        handled.append(await _turn_route_event(self.conn, self.ev(run, {"state": "final"})))
+        handled = [_turn_route_now(self.conn, self.ev(run, _delta(text[0])))]
+        handled.append(_turn_route_now(self.conn, self.ev(run, _tool("start", tcid="toolu_1"))))
+        handled.append(_turn_route_now(self.conn, self.ev(run, _tool("result", tcid="toolu_1"))))
+        handled.append(_turn_route_now(self.conn, self.ev(run, _delta(text[1]))))
+        handled.append(_turn_route_now(self.conn, self.ev(run, {"state": "final"})))
         self.conn._on_sessions_changed(settle or {"sessionKey": self.key, "hasActiveRun": False,
                                                   "status": "done", "lastRunId": run,
                                                   "reason": "chat.run.settled"})
@@ -7008,7 +7008,7 @@ class _RoutingCase(unittest.IsolatedAsyncioTestCase):
         shadow = self.conn._run_renderers.get(f"{self.key}:{run}")
         if shadow is not None:
             shadow.feed(payload)
-        return await _turn_route_event(self.conn, self.ev(run, payload))
+        return _turn_route_now(self.conn, self.ev(run, payload))
 
     def crashed_then_recovered_history(self):
         """RUN streamed, the Gateway died (no closing turn for RUN), and boot
@@ -7051,7 +7051,7 @@ class AgentTurnRoutingTests(_RoutingCase):
             {"role": "user", "content": "x", "idempotencyKey": f"{self.RUN}:user"},
             {"role": "user", "content": "[System] continue", "idempotencyKey": f"{self.REC}:user",
              "provenance": {"kind": "internal_system", "sourceTool": "main_session_restart_recovery"}}]}
-        await _turn_route_event(self.conn, self.ev(self.RUN, _delta("Reading them.")))
+        _turn_route_now(self.conn, self.ev(self.RUN, _delta("Reading them.")))
         self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": True,
                                         "status": "running"})
         await self.spin()
@@ -7069,7 +7069,7 @@ class AgentTurnRoutingTests(_RoutingCase):
         none of its events arrived. Its settle (or the row read after hello)
         ends RUN's writer, and the finalize takes the recovery from the
         transcript by rule E."""
-        await _turn_route_event(self.conn, self.ev(self.RUN, _delta("Reading them.")))
+        _turn_route_now(self.conn, self.ev(self.RUN, _delta("Reading them.")))
         await self.spin()
         self.history = self.crashed_then_recovered_history()
         self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
@@ -7086,7 +7086,7 @@ class AgentTurnRoutingTests(_RoutingCase):
         """No settle reached this socket (it was down). The first hello's
         snapshot does not list the session as active, so its row is read and
         ends the writer: no wait for a push that already happened."""
-        await _turn_route_event(self.conn, self.ev(self.RUN, _delta("Reading them.")))
+        _turn_route_now(self.conn, self.ev(self.RUN, _delta("Reading them.")))
         await self.spin()
         self.history = self.crashed_then_recovered_history()
         row = {"key": self.key, "hasActiveRun": False, "status": "done", "lastRunId": self.REC}
@@ -7106,7 +7106,7 @@ class AgentTurnRoutingTests(_RoutingCase):
         self.assertEqual(m["content"], "Reading them.\n\nFound it.")
 
     async def test_after_hello_an_active_session_waits_for_its_settle(self):
-        await _turn_route_event(self.conn, self.ev(self.RUN, _delta("Reading them.")))
+        _turn_route_now(self.conn, self.ev(self.RUN, _delta("Reading them.")))
         await self.spin()
         self.conn.active_run_snapshot = {self.key: []}
         await _turn_after_hello(self.conn)
@@ -7238,8 +7238,8 @@ class AgentTurnRoutingTests(_RoutingCase):
         (server-chat-CbnqM5f6.mjs:791, 823-826) renders nothing, including
         its later events that come without the flag (session.tool)."""
         hb = {**_delta("HEARTBEAT check"), "isHeartbeat": True}
-        self.assertTrue(await _turn_route_event(self.conn, self.ev(self.RUN, hb)))
-        self.assertTrue(await _turn_route_event(self.conn, self.ev(self.RUN, _tool("start", tcid="t"))))
+        self.assertTrue(_turn_route_now(self.conn, self.ev(self.RUN, hb)))
+        self.assertTrue(_turn_route_now(self.conn, self.ev(self.RUN, _tool("start", tcid="t"))))
         self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
                                         "status": "done", "lastRunId": self.RUN})
         await self.spin()
@@ -7249,7 +7249,7 @@ class AgentTurnRoutingTests(_RoutingCase):
     async def test_a_run_a_live_request_consumes_is_not_routed(self):
         q = self.conn.register_consumer(self.key, "msg-run")
         self.addCleanup(self.conn.unregister_consumer, self.key, "msg-run", queue=q)
-        self.assertFalse(await _turn_route_event(self.conn, self.ev("msg-run", _delta("hi"))))
+        self.assertFalse(_turn_route_now(self.conn, self.ev("msg-run", _delta("hi"))))
 
     async def test_an_answer_run_waits_for_the_reply_streaming_its_message(self):
         """Review 2af1 N6: an answer run's early event, before its reply
@@ -7259,7 +7259,7 @@ class AgentTurnRoutingTests(_RoutingCase):
         live = self.conn.register_consumer(self.key, q_run)
         self.addCleanup(self.conn.unregister_consumer, self.key, q_run, queue=live)
         a_run = pipe_run_id(self.CHAT, self.STUB, "input")
-        self.assertTrue(await _turn_route_event(self.conn, self.ev(a_run, _delta("Reading a.py."))))
+        self.assertTrue(_turn_route_now(self.conn, self.ev(a_run, _delta("Reading a.py."))))
         self.assertEqual(self.conn._turn_pumps, {})
         q = self.conn.register_consumer(self.key, a_run)
         self.addCleanup(self.conn.unregister_consumer, self.key, a_run, queue=q)
@@ -7274,7 +7274,7 @@ class AgentTurnRoutingTests(_RoutingCase):
         q_run = pipe_run_id(self.CHAT, self.STUB)
         live = self.conn.register_consumer(self.key, q_run)
         a_run = pipe_run_id(self.CHAT, self.STUB, "input")
-        await _turn_route_event(self.conn, self.ev(a_run, _delta("Reading a.py.")))
+        _turn_route_now(self.conn, self.ev(a_run, _delta("Reading a.py.")))
         self.conn.unregister_consumer(self.key, q_run, queue=live)
         await self.spin()
         self.assertIn((self.key, a_run), self.conn._turn_pumps)
@@ -7288,9 +7288,9 @@ class AgentTurnRoutingTests(_RoutingCase):
         self.conn.register_consumer(self.key, q_run)
         r_run = pipe_run_id(self.CHAT, self.STUB, "resume")
         for text in ("One.", " Two."):
-            await _turn_route_event(self.conn, self.ev(r_run, _delta(text)))
+            _turn_route_now(self.conn, self.ev(r_run, _delta(text)))
         self.conn.unregister_consumer(self.key, q_run)
-        await _turn_route_event(self.conn, self.ev(r_run, _delta(" Three.")))
+        _turn_route_now(self.conn, self.ev(r_run, _delta(" Three.")))
         pump = self.conn._turn_pumps[(self.key, r_run)]
         queued = []
         while not pump.queue.empty():
@@ -7306,7 +7306,7 @@ class AgentTurnRoutingTests(_RoutingCase):
         self.conn.register_consumer(self.key, q_run)
         a_run = pipe_run_id(self.CHAT, self.STUB, "input")
         for text in ("Reading", " a.py."):
-            await _turn_route_event(self.conn, self.ev(a_run, _delta(text)))
+            _turn_route_now(self.conn, self.ev(a_run, _delta(text)))
         self.conn.unregister_consumer(self.key, q_run)
         q = self.conn.register_consumer(self.key, a_run)
         self.addCleanup(self.conn.unregister_consumer, self.key, a_run, queue=q)
@@ -7336,11 +7336,11 @@ class AgentTurnRoutingTests(_RoutingCase):
 
     async def test_the_action_connection_never_writes_turns(self):
         conn = _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"), writes_turns=False)
-        self.assertFalse(await _turn_route_event(conn, self.ev(self.RUN, _delta("hi"))))
+        self.assertFalse(_turn_route_now(conn, self.ev(self.RUN, _delta("hi"))))
 
     async def test_a_retired_connection_writes_no_turns(self):
         self.conn._retired = True
-        self.assertFalse(await _turn_route_event(self.conn, self.ev(self.RUN, _delta("hi"))))
+        self.assertFalse(_turn_route_now(self.conn, self.ev(self.RUN, _delta("hi"))))
         self.assertEqual(self.conn._turn_pumps, {})
 
     def test_an_interrupted_runs_span_ends_at_the_next_admitted_turn(self):
@@ -7353,7 +7353,7 @@ class AgentTurnRoutingTests(_RoutingCase):
             {"messages": hist["messages"][:2]}, self.RUN), "still the newest turn: not over")
 
     async def test_the_status_actions_runs_are_swallowed(self):
-        self.assertTrue(await _turn_route_event(
+        self.assertTrue(_turn_route_now(
             self.conn, self.ev(f"{ACTION_RUN_PREFIX}compact-x-1.0", _delta("Compacted."))))
         await self.spin()
         self.assertEqual(self.new_messages(), {})
@@ -7409,7 +7409,7 @@ class RegressionPlanTests(_RoutingCase):
         for payload in (_delta("Reading them."), _tool("start", tcid="toolu_1"),
                         _tool("result", tcid="toolu_1"), _delta("\n\nFound it."), {"state": "final"}):
             for conn in (self.conn, other):
-                self.assertTrue(await _turn_route_event(conn, self.ev(self.RUN, payload)))
+                self.assertTrue(_turn_route_now(conn, self.ev(self.RUN, payload)))
         await self.spin()
         # The deterministic uuid5 gives one message even if both wrote it:
         # count the writers' own effects (review 2af1, Strong2).
@@ -7428,7 +7428,7 @@ class RegressionPlanTests(_RoutingCase):
     async def test_tool_cards_from_the_transcript(self):
         """ToolCardsFromTranscriptTest: events after the first tool call were
         lost; M ends with the transcript's cards."""
-        await _turn_route_event(self.conn, self.ev(self.RUN, _tool("start", tcid="toolu_0")))
+        _turn_route_now(self.conn, self.ev(self.RUN, _tool("start", tcid="toolu_0")))
         self.history = self.tool_history(self.RUN, 3)
         self.settled(self.RUN, status="done")
         await self.spin()
@@ -7461,9 +7461,9 @@ class RegressionPlanTests(_RoutingCase):
                 return {"runId": params["idempotencyKey"], "status": "started"}
             return await inner(method, params, timeout)
         self.conn.send_request = send_request
-        await _turn_route_event(self.conn, self.ev(self.RUN, _delta("Reading them.")))
+        _turn_route_now(self.conn, self.ev(self.RUN, _delta("Reading them.")))
         self.conn._stop_notice_seen = stop_notice
-        await _turn_route_event(self.conn, self.ev(self.RUN, {"state": terminal}))
+        _turn_route_now(self.conn, self.ev(self.RUN, {"state": terminal}))
         self.conn._on_sessions_changed({"sessionKey": self.key, "phase": "end", "runId": self.RUN,
                                         "status": "running", "hasActiveRun": True})
         self.history = {"messages": []}
@@ -7519,7 +7519,7 @@ class RegressionPlanTests(_RoutingCase):
                 return {"runId": params["idempotencyKey"], "status": "started"}
             return await inner(method, params, timeout)
         self.conn.send_request = send_request
-        await _turn_route_event(self.conn, self.ev(self.RUN, _delta("Reading them.")))
+        _turn_route_now(self.conn, self.ev(self.RUN, _delta("Reading them.")))
         self.conn.active_run_snapshot = {self.key: []}
         await _turn_after_hello(self.conn)
         await self.spin()
@@ -7533,13 +7533,13 @@ class RegressionPlanTests(_RoutingCase):
         also sent resume-..., queued behind recovery f2445aa8, and the reply
         closed on its immediate empty final. Here: no pipe resume, and M gets
         the recovery's card and text."""
-        await _turn_route_event(self.conn, self.ev(self.RUN, _delta("Reading them.")))
+        _turn_route_now(self.conn, self.ev(self.RUN, _delta("Reading them.")))
         self.conn.active_run_snapshot = {self.key: []}
         await _turn_after_hello(self.conn)
         self.history = self.crashed_then_recovered_history()
         for payload in (_tool("start", tcid="toolu_9"), _tool("result", tcid="toolu_9"),
                         _delta("\n\nFound it."), {"state": "final"}):
-            await _turn_route_event(self.conn, self.ev(self.REC, payload))
+            _turn_route_now(self.conn, self.ev(self.REC, payload))
         self.settled(self.REC, status="done")
         await self.spin()
         self.assertNotIn("chat.send", [m for m, _ in self.sent])
@@ -7846,8 +7846,8 @@ class HandoverRewriteTests(_RoutingCase):
         self.assertEqual(m["content"], "Before I go on:\nColor?\nPick one\n1. Red\n2. Blue")
 
     async def test_a_routed_handover_keeps_the_turns_thinking_level(self):
-        """R6: the handover that `_turn_route_event` makes (the request ended
-        first) carries the level like `hand_over_run` does, so a resume keeps it."""
+        """R6: the handover that `_turn_route_now` makes (the request ended
+        first) carries the level like `_hand_over_run` does, so a resume keeps it."""
         run = pipe_run_id(self.CHAT, self.STUB)
         self.add_stub(self.STUB)
         self.conn.register_run_target(self.key, run, self.CHAT, self.STUB, thinking="high")
@@ -8490,8 +8490,8 @@ class SilentAnnounceTests(_RoutingCase):
 
     async def announce_run(self, reply):
         self.history = self.parent_history(reply)
-        await _turn_route_event(self.conn, self.ev(self.announce, _delta(reply)))
-        await _turn_route_event(self.conn, self.ev(self.announce, {"state": "final"}))
+        _turn_route_now(self.conn, self.ev(self.announce, _delta(reply)))
+        _turn_route_now(self.conn, self.ev(self.announce, {"state": "final"}))
         self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
                                         "status": "done", "lastRunId": self.announce})
         await self.spin()
@@ -8539,7 +8539,7 @@ class SilentAnnounceTests(_RoutingCase):
         return json.dumps([i for i in m["output"] if i["type"] == "function_call_output"])
 
     async def test_a_deleted_childs_result_seen_in_its_final_still_shows(self):
-        await _turn_route_event(self.conn, self.child_final())
+        _turn_route_now(self.conn, self.child_final())
         self.child_history = None            # cleanup: "delete"
         await self.announce_run("NO_REPLY")
         self.assertIn("SUB-DONE-R10", self.card_result())
@@ -8548,12 +8548,12 @@ class SilentAnnounceTests(_RoutingCase):
         """No child final reached this connection (a socket gap): the
         transcript is read as the announce run starts, before the delete."""
         self.history = self.parent_history("NO_REPLY")
-        await _turn_route_event(self.conn, self.ev(self.announce, {"stream": "lifecycle",
+        _turn_route_now(self.conn, self.ev(self.announce, {"stream": "lifecycle",
                                                                    "data": {"phase": "start"}}))
         await self.spin()
         self.child_history = None            # deleted once the announcement is delivered
-        await _turn_route_event(self.conn, self.ev(self.announce, _delta("NO_REPLY")))
-        await _turn_route_event(self.conn, self.ev(self.announce, {"state": "final"}))
+        _turn_route_now(self.conn, self.ev(self.announce, _delta("NO_REPLY")))
+        _turn_route_now(self.conn, self.ev(self.announce, {"state": "final"}))
         self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
                                         "status": "done", "lastRunId": self.announce})
         await self.spin()
@@ -8561,7 +8561,7 @@ class SilentAnnounceTests(_RoutingCase):
 
     async def test_another_sessions_child_final_is_not_kept(self):
         other = {**self.child_final(), "spawnedBy": "agent:main:main"}
-        await _turn_route_event(self.conn, other)
+        _turn_route_now(self.conn, other)
         self.child_history = None
         await self.announce_run("NO_REPLY")
         self.assertEqual(self.new_messages(), {})
@@ -9628,8 +9628,8 @@ class ApiCallerOwnerRuleTests(unittest.IsolatedAsyncioTestCase):
         # The recovery's first events come before the reply knows it is the
         # recovery of its run: held, not given to a turn writer.
         rec = lambda payload: {"sessionKey": self.SK, "runId": self.REC, **payload}
-        await _turn_route_event(self.conn, rec({"stream": "lifecycle", "data": {"phase": "start"}}))
-        await _turn_route_event(self.conn, rec({"stream": "assistant", "data": {"delta": " Found it."}}))
+        _turn_route_now(self.conn, rec({"stream": "lifecycle", "data": {"phase": "start"}}))
+        _turn_route_now(self.conn, rec({"stream": "assistant", "data": {"delta": " Found it."}}))
         self.history = {"messages": [
             {"role": "user", "content": "hello", "idempotencyKey": "run-1:user"},
             {"role": "user", "content": "[System] continue", "idempotencyKey": f"{self.REC}:user",
@@ -9756,10 +9756,10 @@ class SessionIdRunTests(_RoutingCase):
     async def wake(self, key, *texts):
         self.wake_turn(key)
         for text in texts:
-            await _turn_route_event(self.conn, self.sid_ev(_delta(text)))
+            _turn_route_now(self.conn, self.sid_ev(_delta(text)))
         self.imported("".join(texts))
         self.closing("".join(texts))
-        await _turn_route_event(self.conn, self.sid_ev({"state": "final"}))
+        _turn_route_now(self.conn, self.sid_ev({"state": "final"}))
         self.job_finished()
         self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
                                         "status": "done", "lastRunId": self.SID})
@@ -9780,7 +9780,7 @@ class SessionIdRunTests(_RoutingCase):
         the reconnect time, and the queued run's reply written since landed in
         the wake's message. The end is the job run's finish (cron.runs ts)."""
         self.wake_turn(self.W1)
-        await _turn_route_event(self.conn, self.sid_ev(_delta("Working.")))
+        _turn_route_now(self.conn, self.sid_ev(_delta("Working.")))
         await self.spin()
         self.queued_turn()
         self.imported("Working. Done.")
@@ -9797,7 +9797,7 @@ class SessionIdRunTests(_RoutingCase):
 
     async def test_with_no_finish_time_the_wake_keeps_what_it_streamed(self):
         self.wake_turn(self.W1)
-        await _turn_route_event(self.conn, self.sid_ev(_delta("Working.")))
+        _turn_route_now(self.conn, self.sid_ev(_delta("Working.")))
         await self.spin()
         self.jobs = []  # gone, and cron.runs has no entry for it
         self.imported("Working. Done.")
@@ -9812,7 +9812,7 @@ class SessionIdRunTests(_RoutingCase):
         """Review 2af1 N2: a stray (runId = sessionId, no running wake) was held
         by a pump that lived on, and the next wake flushed it as its own."""
         await self.wake(self.W1, "First wake.")
-        await _turn_route_event(self.conn, self.sid_ev(_tool("start", tcid="toolu_stray")))
+        _turn_route_now(self.conn, self.sid_ev(_tool("start", tcid="toolu_stray")))
         await self.spin()
         self.assertNotIn((self.key, self.SID), self.conn._turn_pumps, "the stray pump is closed")
         await self.wake(self.W2, "Second wake.")
@@ -9823,11 +9823,11 @@ class SessionIdRunTests(_RoutingCase):
     async def test_held_events_older_than_the_wakes_job_run_are_dropped(self):
         early = self.sid_ev(_tool("start", tcid="toolu_early"))  # emitted before the job started
         self.start_job()
-        await _turn_route_event(self.conn, early)
+        _turn_route_now(self.conn, early)
         await self.spin()
         self.wake_turn(self.W1, started=True)
-        await _turn_route_event(self.conn, self.sid_ev(_delta("Own text.")))
-        await _turn_route_event(self.conn, self.sid_ev({"state": "final"}))
+        _turn_route_now(self.conn, self.sid_ev(_delta("Own text.")))
+        _turn_route_now(self.conn, self.sid_ev({"state": "final"}))
         await self.spin()
         (m,) = self.new_messages().values()
         self.assertEqual(m["content"], "Own text.")
@@ -9850,7 +9850,7 @@ class SessionIdRunTests(_RoutingCase):
         self.wake_turn(self.W1)
         for i in range(120):
             self.imported(f"step {i}")
-        await _turn_route_event(self.conn, self.sid_ev(_delta("Still going.")))
+        _turn_route_now(self.conn, self.sid_ev(_delta("Still going.")))
         await self.spin()
         self.assertEqual(list(self.new_messages()), [turn_message_id(self.key, self.W1, self.CHAT)])
         self.assertEqual(limits[:2], [50, 200])
@@ -9871,7 +9871,7 @@ class SessionIdRunTests(_RoutingCase):
         for i in range(300):
             self.imported(f"old {i}")
         self.start_job()
-        await _turn_route_event(self.conn, self.sid_ev(_delta("Early.")))
+        _turn_route_now(self.conn, self.sid_ev(_delta("Early.")))
         await self.spin()
         self.assertEqual(limits, [50])
         self.assertEqual(self.new_messages(), {})
@@ -9881,9 +9881,9 @@ class SessionIdRunTests(_RoutingCase):
         runId = sessionId. With no cron wake of its own it is a stray."""
         await self.wake(self.W1, "First wake.")
         first = copy.deepcopy(self.new_messages())
-        await _turn_route_event(self.conn, self.sid_ev(_tool("start", tcid="toolu_9")))
-        await _turn_route_event(self.conn, self.sid_ev(_delta("compaction note")))
-        await _turn_route_event(self.conn, self.sid_ev({"state": "final"}))
+        _turn_route_now(self.conn, self.sid_ev(_tool("start", tcid="toolu_9")))
+        _turn_route_now(self.conn, self.sid_ev(_delta("compaction note")))
+        _turn_route_now(self.conn, self.sid_ev({"state": "final"}))
         await self.spin()
         self.assertEqual(self.new_messages(), first, "a stray reopened or added a message")
         self.assertFalse(self.conn._turn_pumps)
@@ -9892,8 +9892,8 @@ class SessionIdRunTests(_RoutingCase):
         await self.wake(self.W1, "First wake.")
         first = copy.deepcopy(self.new_messages())
         self.conn._wake_turns_bound.clear()  # a new deploy's connection knows no wake
-        await _turn_route_event(self.conn, self.sid_ev(_delta("late stray")))
-        await _turn_route_event(self.conn, self.sid_ev({"state": "final"}))
+        _turn_route_now(self.conn, self.sid_ev(_delta("late stray")))
+        _turn_route_now(self.conn, self.sid_ev({"state": "final"}))
         await self.spin()
         self.assertEqual(self.new_messages(), first)
 
@@ -9903,8 +9903,8 @@ class SessionIdRunTests(_RoutingCase):
         sessionId event is not that wake's."""
         self.wake_turn(self.W1)
         self.job_finished()
-        await _turn_route_event(self.conn, self.sid_ev(_delta("compaction note")))
-        await _turn_route_event(self.conn, self.sid_ev({"state": "final"}))
+        _turn_route_now(self.conn, self.sid_ev(_delta("compaction note")))
+        _turn_route_now(self.conn, self.sid_ev({"state": "final"}))
         await self.spin()
         self.assertEqual(self.new_messages(), {}, "a stray opened a message for a finished wake")
 
@@ -9916,8 +9916,8 @@ class SessionIdRunTests(_RoutingCase):
             "role": "user", "content": "[cron:other x] forwarded", "idempotencyKey": "cb27292c:user",
             "provenance": {"kind": "inter_session", "sourceTool": "sessions_send"},
             "__openclaw": {"idempotencyKey": "cb27292c:user", "recordTimestampMs": at}})
-        await _turn_route_event(self.conn, self.sid_ev(_delta("Wake text.")))
-        await _turn_route_event(self.conn, self.sid_ev({"state": "final"}))
+        _turn_route_now(self.conn, self.sid_ev(_delta("Wake text.")))
+        _turn_route_now(self.conn, self.sid_ev({"state": "final"}))
         await self.spin()
         self.assertEqual(list(self.new_messages()), [turn_message_id(self.key, self.W1, self.CHAT)])
 
@@ -9925,8 +9925,8 @@ class SessionIdRunTests(_RoutingCase):
         """Review (f): skipped by its resolved identity, not by the run id
         every wake shares."""
         self.wake_turn(self.W1)
-        await _turn_route_event(self.conn, self.sid_ev({**_delta("HEARTBEAT_OK"), "isHeartbeat": True}))
-        await _turn_route_event(self.conn, self.sid_ev({"state": "final", "isHeartbeat": True}))
+        _turn_route_now(self.conn, self.sid_ev({**_delta("HEARTBEAT_OK"), "isHeartbeat": True}))
+        _turn_route_now(self.conn, self.sid_ev({"state": "final", "isHeartbeat": True}))
         self.job_finished()
         await self.spin()
         self.assertEqual(self.new_messages(), {})
@@ -9939,27 +9939,27 @@ class SessionIdRunTests(_RoutingCase):
         transcript: a seq gap or a reconnect reads the idle row."""
         from openclaw_pipe import _turn_resync
         self.wake_turn(self.W1)
-        await _turn_route_event(self.conn, self.sid_ev(_delta("Reruns all passed.")))
+        _turn_route_now(self.conn, self.sid_ev(_delta("Reruns all passed.")))
         await self.spin()
         await _turn_resync(self.conn)
         await self.spin()
-        await _turn_route_event(self.conn, self.sid_ev(_delta(" Tests written.")))
-        await _turn_route_event(self.conn, self.sid_ev({"state": "final"}))
+        _turn_route_now(self.conn, self.sid_ev(_delta(" Tests written.")))
+        _turn_route_now(self.conn, self.sid_ev({"state": "final"}))
         await self.spin()
         self.assertEqual([m["content"] for m in self.new_messages().values()],
                          ["Reruns all passed. Tests written."])
 
     async def test_another_runs_settle_row_does_not_end_the_wake(self):
         self.wake_turn(self.W1)
-        await _turn_route_event(self.conn, self.sid_ev(_delta("Reruns all passed.")))
+        _turn_route_now(self.conn, self.sid_ev(_delta("Reruns all passed.")))
         await self.spin()
         # The queued user message's row: idle, and naming another run.
         self.queued_turn()
         self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
                                         "status": "done", "lastRunId": self.R})
         await self.spin()
-        await _turn_route_event(self.conn, self.sid_ev(_delta(" Tests written.")))
-        await _turn_route_event(self.conn, self.sid_ev({"state": "final"}))
+        _turn_route_now(self.conn, self.sid_ev(_delta(" Tests written.")))
+        _turn_route_now(self.conn, self.sid_ev({"state": "final"}))
         await self.spin()
         (mid, m), = self.new_messages().items()
         self.assertEqual(mid, turn_message_id(self.key, self.W1, self.CHAT))
@@ -9987,10 +9987,10 @@ class SessionIdRunTests(_RoutingCase):
     async def test_lost_deltas_are_repaired_from_the_wakes_own_window(self):
         await self.wake(self.W1, "First wake.")
         self.wake_turn(self.W2)
-        await _turn_route_event(self.conn, self.sid_ev(_delta("Second wake.")))
+        _turn_route_now(self.conn, self.sid_ev(_delta("Second wake.")))
         # " All done." never reached the socket; the import has it.
         self.imported("Second wake. All done.")
-        await _turn_route_event(self.conn, self.sid_ev({"state": "final"}))
+        _turn_route_now(self.conn, self.sid_ev({"state": "final"}))
         await self.spin()
         second = self.new_messages()[turn_message_id(self.key, self.W2, self.CHAT)]
         self.assertEqual(second["content"], "Second wake. All done.")
@@ -10002,12 +10002,12 @@ class SessionIdRunTests(_RoutingCase):
         rebuild from that window must keep the cards that streamed, whatever
         the item count says."""
         self.wake_turn(self.W1)
-        await _turn_route_event(self.conn, self.sid_ev(_tool("start", tcid="toolu_a")))
+        _turn_route_now(self.conn, self.sid_ev(_tool("start", tcid="toolu_a")))
         # The call's result and the wake's text never reached the socket (a
         # gap): one streamed item. The transcript renders one too, its text,
         # with no tool call: an item count calls that "at least as much".
         self.imported("WQ-DONE")
-        await _turn_route_event(self.conn, self.sid_ev({"state": "final"}))
+        _turn_route_now(self.conn, self.sid_ev({"state": "final"}))
         await self.spin()
         (m,) = self.new_messages().values()
         self.assertIs(m["done"], True)
@@ -10016,14 +10016,14 @@ class SessionIdRunTests(_RoutingCase):
 
     async def test_a_transcript_with_the_wakes_calls_still_repairs_what_the_gap_lost(self):
         self.wake_turn(self.W1)
-        await _turn_route_event(self.conn, self.sid_ev(_tool("start", tcid="toolu_a")))
+        _turn_route_now(self.conn, self.sid_ev(_tool("start", tcid="toolu_a")))
         self.history["messages"].append({
             "role": "assistant", "timestamp": self.tick(), "__openclaw": {"importedFrom": "claude-cli"},
             "content": [{"type": "toolcall", "id": "toolu_a", "name": "Bash", "arguments": {"command": "ls"}},
                         {"type": "tool_result", "tool_use_id": "toolu_a", "name": "Bash",
                          "content": [{"type": "text", "text": "WQ-step-1"}]}]})
         self.imported("WQ-DONE")
-        await _turn_route_event(self.conn, self.sid_ev({"state": "final"}))
+        _turn_route_now(self.conn, self.sid_ev({"state": "final"}))
         await self.spin()
         (m,) = self.new_messages().values()
         self.assertEqual([o["type"] for o in m["output"]], ["function_call", "function_call_output", "message"])
@@ -10040,18 +10040,18 @@ class SessionIdRunTests(_RoutingCase):
         ran 30 s later."""
         job_b, w_b = "3277885d-d0e5-4059-87c1-0432adafdba5", "c4b6f7a2-0d1e-4f5a-9b8c-7d6e5f4a3b2c"
         self.wake_turn(self.W1)
-        await _turn_route_event(self.conn, self.sid_ev(_delta("First ")))
+        _turn_route_now(self.conn, self.sid_ev(_delta("First ")))
         b_start = self.tick()  # b's failed attempt: running for 143 ms
         self.jobs.append({"id": job_b, "sessionTarget": f"session:{self.key}",
                           "state": {"runningAtMs": b_start}})
-        await _turn_route_event(self.conn, self.sid_ev(_delta("wake.")))
+        _turn_route_now(self.conn, self.sid_ev(_delta("wake.")))
         self.jobs = [j for j in self.jobs if j["id"] != job_b]
         self.cron_runs.append({"jobId": job_b, "action": "finished", "status": "error", "runAtMs": b_start,
                                "ts": self.tick(), "sessionId": None,
                                "error": f'Session "{self.key}" changed while starting work. Retry.'})
         self.imported("First wake.")
         self.closing("First wake.")
-        await _turn_route_event(self.conn, self.sid_ev({"state": "final"}))
+        _turn_route_now(self.conn, self.sid_ev({"state": "final"}))
         self.job_finished()
         self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
                                         "status": "done", "lastRunId": self.SID})
@@ -10065,9 +10065,9 @@ class SessionIdRunTests(_RoutingCase):
             "role": "user", "content": f"[cron:{job_b} eli103-gate-b] Second.", "timestamp": at - 150,
             "idempotencyKey": f"{w_b}:user", "__openclaw": {"idempotencyKey": f"{w_b}:user",
                                                            "recordTimestampMs": at}})
-        await _turn_route_event(self.conn, self.sid_ev(_delta("Second wake.")))
+        _turn_route_now(self.conn, self.sid_ev(_delta("Second wake.")))
         self.imported("Second wake.")
-        await _turn_route_event(self.conn, self.sid_ev({"state": "final"}))
+        _turn_route_now(self.conn, self.sid_ev({"state": "final"}))
         self.job_finished()
         self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
                                         "status": "done", "lastRunId": self.SID})
@@ -10079,8 +10079,8 @@ class SessionIdRunTests(_RoutingCase):
     async def test_a_turn_queued_behind_the_wake_is_not_the_wakes(self):
         self.wake_turn(self.W1)
         self.queued_turn()  # committed between the wake's turn and its first event
-        await _turn_route_event(self.conn, self.sid_ev(_delta("Reruns all passed.")))
-        await _turn_route_event(self.conn, self.sid_ev({"state": "final"}))
+        _turn_route_now(self.conn, self.sid_ev(_delta("Reruns all passed.")))
+        _turn_route_now(self.conn, self.sid_ev({"state": "final"}))
         await self.spin()
         self.assertEqual(list(self.new_messages()), [turn_message_id(self.key, self.W1, self.CHAT)])
 
@@ -10089,12 +10089,12 @@ class SessionIdRunTests(_RoutingCase):
         (embedded-agent-DNQn_PMM.mjs:5891): the first event can come first."""
         await self.wake(self.W1, "First wake.")
         self.start_job()
-        await _turn_route_event(self.conn, self.sid_ev(_delta("Second ")))
+        _turn_route_now(self.conn, self.sid_ev(_delta("Second ")))
         await self.spin()
         self.assertEqual(len(self.new_messages()), 1, "bound to the previous wake's turn")
         self.wake_turn(self.W2, started=True)
-        await _turn_route_event(self.conn, self.sid_ev(_delta("wake.")))
-        await _turn_route_event(self.conn, self.sid_ev({"state": "final"}))
+        _turn_route_now(self.conn, self.sid_ev(_delta("wake.")))
+        _turn_route_now(self.conn, self.sid_ev({"state": "final"}))
         await self.spin()
         second = self.new_messages()[turn_message_id(self.key, self.W2, self.CHAT)]
         self.assertEqual(second["content"], "Second wake.")
@@ -10107,7 +10107,7 @@ class SessionIdRunTests(_RoutingCase):
 
     async def test_after_a_reconnect_the_cron_job_says_whether_the_wake_ended(self):
         self.wake_turn(self.W1)
-        await _turn_route_event(self.conn, self.sid_ev(_delta("Working.")))
+        _turn_route_now(self.conn, self.sid_ev(_delta("Working.")))
         await self.spin()
         await _wake_resync(self.conn)  # the job is still running (wake_turn)
         await self.spin()
@@ -10184,7 +10184,7 @@ class RetiredWriterTests(_RoutingCase):
     async def start_turn_then_retire(self):
         """A's writer streamed half a turn, then a deploy retired A."""
         self.active = True
-        await _turn_route_event(self.conn, self.ev(self.RUN, _delta("Reading them.")))
+        _turn_route_now(self.conn, self.ev(self.RUN, _delta("Reading them.")))
         await self.spin()
         (mid, m), = self.new_messages().items()
         (task_id, (_chat, task)), = self.owui.tasks.items()
@@ -10220,8 +10220,8 @@ class RetiredWriterTests(_RoutingCase):
         b = self.successor()
         await self.adopt(b, mid)
         self.assertIs(self.owui.msgs()[mid]["done"], False, "a running run was finished")
-        await _turn_route_event(b, self.ev(self.RUN, _delta("\n\nFound it.")))
-        await _turn_route_event(b, self.ev(self.RUN, {"state": "final"}))
+        _turn_route_now(b, self.ev(self.RUN, _delta("\n\nFound it.")))
+        _turn_route_now(b, self.ev(self.RUN, {"state": "final"}))
         self.active = False
         b._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False, "status": "done",
                                 "lastRunId": self.RUN, "reason": "chat.run.settled"})
@@ -10238,7 +10238,7 @@ class RetiredWriterTests(_RoutingCase):
             {"role": "user", "content": "[cron:job-9 wake] go", "idempotencyKey": f"{w}:user",
              "__openclaw": {"recordTimestampMs": 1000}}]}
         self.jobs = [{"id": "job-9", "state": {"runningAtMs": 900}}]
-        await _turn_route_event(self.conn, {"sessionKey": self.key, "runId": sid, "ts": 2000,
+        _turn_route_now(self.conn, {"sessionKey": self.key, "runId": sid, "ts": 2000,
                                             **_delta("Smoke ")})
         await self.spin()
         (mid, m), = self.new_messages().items()
@@ -10262,7 +10262,7 @@ class RetiredWriterTests(_RoutingCase):
     async def test_a_message_another_pump_already_writes_is_left_to_it(self):
         mid, _ = await self.start_turn_then_retire()
         b = self.successor()
-        await _turn_route_event(b, self.ev(self.RUN, _delta("\n\nFound it.")))
+        _turn_route_now(b, self.ev(self.RUN, _delta("\n\nFound it.")))
         self.assertEqual(await self.adopt(b, mid), "skip")
 
 
@@ -10274,7 +10274,7 @@ class GatewayOwnerNeverRecoversTests(_RoutingCase):
     (main-session-restart-recovery-CPJjd8da.mjs:1150): that row closes M."""
 
     async def keep_open(self):
-        await _turn_route_event(self.conn, self.ev(self.RUN, _delta("Working on it.")))
+        _turn_route_now(self.conn, self.ev(self.RUN, _delta("Working on it.")))
         await self.spin()
         self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
                                         "status": "running", "lastRunId": self.RUN})
@@ -11096,7 +11096,7 @@ class ForwardedTurnHistoryTests(_RoutingCase):
         self.conn._on_sessions_changed({"sessionKey": self.key, "phase": "start", "runId": run,
                                         "hasActiveRun": True, "status": "running"})
         for payload in (_delta("WAKE"), _delta("_ONE"), {"state": "final"}):
-            self.assertTrue(await _turn_route_event(self.conn, self.ev(run, payload)))
+            self.assertTrue(_turn_route_now(self.conn, self.ev(run, payload)))
         self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
                                         "status": "done", "lastRunId": run,
                                         "reason": "chat.run.settled"})

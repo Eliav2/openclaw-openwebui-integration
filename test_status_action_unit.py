@@ -682,6 +682,7 @@ class ActionOwnConnectionWritesNothingTests(unittest.IsolatedAsyncioTestCase):
             mod._action_fallback_connection = None
 
         self.assertEqual(source, "action-own")
+        self.assertFalse(conn.writes_turns)
         self.assertFalse(sockets, "both sockets played")
         self.assertEqual(conn.gateway_restarts, 1)
         self.assertEqual([t.exception() for t in tasks if t.exception()], [])

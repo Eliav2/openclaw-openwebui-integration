@@ -1158,7 +1158,7 @@ class _TurnRenderer:
 # second time (P33, root-caused 2026-07-11). Stashing the bookkeeping on
 # `open_webui.socket.main` (OWUI's own stable module, never reloaded by our
 # function) makes all connections read and write the *same* dicts. Since
-# ELI-100 a retired connection writes no turns at all (`_turn_route_event`).
+# ELI-100 a retired connection writes no turns at all (`_turn_route_now`).
 _SHARED_STATE_ATTR = "_openclaw_gateway_shared_state_v1"
 
 
@@ -1254,6 +1254,12 @@ class _Consumer:
     queues: list[asyncio.Queue] = field(default_factory=list)
 
 
+# The turn writer's entry points (writer.py's `_TurnHooks`), which the Pipe
+# build registers. None in the Status Action's build: it carries no turn
+# writer, and its own connection only makes requests (ELI-149).
+_TURNS = None
+
+
 class _GatewayConnection:
     """Singleton persistent WebSocket connection to the Gateway.
 
@@ -1336,7 +1342,7 @@ class _GatewayConnection:
         self._stopped = False
         # Set once a newer deploy of this function has taken over (see
         # `retire()`). A retired connection still serves runs it already
-        # has consumers for, but never writes turns (`_turn_route_event`) and
+        # has consumers for, but never writes turns (`_turn_route_now`) and
         # never reconnects once those runs are gone.
         self._retired = False
         # ELI-100: this connection's identity as a turn writer. A message whose
@@ -1344,8 +1350,8 @@ class _GatewayConnection:
         # worker process exited) can be taken over (DESIGN 2.3); retire()
         # removes it.
         self.writer_id = turn_writer_id()
-        # The Status Action's own connection only makes RPCs: it never writes turns.
-        self.writes_turns = writes_turns
+        # Only a build with the turn writer writes turns (not the Status Action's).
+        self.writes_turns = writes_turns and _TURNS is not None
         self._turn_pumps: dict = {}     # (session_key, run_id) -> _RunPump
         self._turn_writers: dict = {}   # (chat_id, message_id) -> _TurnWriter
         self._turn_skip_runs: dict = {}  # (session_key, run_id) of heartbeat runs
@@ -1430,7 +1436,7 @@ class _GatewayConnection:
         # accumulating the full content from this run's event stream -- so if
         # the inline turn ends before the run does (cancel, close, a torn-down
         # request), a turn writer continues the SAME message from it
-        # (`_turn_route_event`, DESIGN 2.6). Instance-local
+        # (`_turn_route_now`, DESIGN 2.6). Instance-local
         # (not shared): only the singleton connection runs pipe() and dispatches
         # its own events; a zombie connection never registers a target.
         self._run_targets: dict[str, dict] = {}
@@ -1480,7 +1486,8 @@ class _GatewayConnection:
             self._note_active_snapshot(((resp or {}).get("list") or {}).get("sessions") or [])
             self._stop_notice_seen = False
             self._shutdown_seen = False
-            spawn_background(_turn_after_hello(self))
+            if _TURNS:
+                spawn_background(_TURNS.after_hello(self))
         for key in list(self._message_subscriptions):
             await self._subscribe_messages(key)
         # A waiter that read run state before the subscription existed would
@@ -1569,43 +1576,6 @@ class _GatewayConnection:
         if payload.get("restartExpectedMs") is None:
             self._stop_notice_seen = True
 
-    def hand_over_run(self, session_key: str, run_id: str, *,
-                      thinking: str | None = None, read_row: bool = False,
-                      reply: dict | None = None) -> bool:
-        """An interrupted run's request ends without continuing it: the turn
-        writer takes its message over (DESIGN 2.6) and the run's settled row
-        decides who continues it (2.7), so a reply never resumes a run the
-        Gateway recovers. `read_row`: the row is read now, for a handover
-        that can come after the post-hello resync. `reply`: a request that
-        hands over at an event gap gives its own state, {message_id,
-        renderer, events}: what it showed, and the events queued behind the
-        gap, which the writer takes next. The run's target is then not
-        needed (the run's final reaching the request drops it). False when
-        there is no message to hand over."""
-        key = f"{session_key}:{run_id}"
-        target = self._run_targets.get(key)
-        parsed = self.parse_owui_session_key(session_key)
-        if ((target is None and reply is None) or not parsed or not self.writes_turns
-                or self._retired or (session_key, run_id) in self._turn_pumps):
-            return False
-        pump = self._turn_pumps[(session_key, run_id)] = _RunPump()
-        if reply is None:
-            pump.handover = self.handover_of(session_key, run_id, thinking)
-        else:
-            pump.handover = {"message_id": reply["message_id"], "renderer": reply["renderer"],
-                             "thinking": thinking or (target or {}).get("thinking"), "shown": ""}
-            for payload in reply["events"]:
-                pump.queue.put_nowait(("event", payload))
-        pump.stop_notice_before = self._stop_notice_seen
-        self.unregister_run_target(session_key, run_id)
-        spawn_background(_turn_pump_loop(self, session_key, run_id, parsed, pump))
-        spawn_background(self.ensure_message_subscription(session_key))
-        if read_row:
-            spawn_background(_turn_resync(self, skip=set(self.active_run_snapshot)))
-        pipe_log(f"  handed run {run_id[:24]}... over to the turn writer "
-                 f"(message {pump.handover['message_id'][:8]}...)")
-        return True
-
     def _on_sessions_changed(self, payload: dict) -> None:
         """A session row changed. Waiters on its run state re-read it, and an
         OWUI session whose run just started gets a transcript subscription
@@ -1616,8 +1586,8 @@ class _GatewayConnection:
         if key and "hasActiveRun" in payload:
             self._wake_session_waiters(key)
             self.row_to_consumers(key, payload)
-        if key and payload.get("hasActiveRun") is False:
-            _turn_settled(self, key, payload)
+        if _TURNS and key and payload.get("hasActiveRun") is False:
+            _TURNS.settled(self, key, payload)
         if (payload.get("hasActiveRun") and key
                 and key not in self._message_subscriptions
                 and self.parse_owui_session_key(key)):
@@ -1995,14 +1965,14 @@ class _GatewayConnection:
             return
         pipe_log(f"  {len(held)} held event(s) of {run_id[:24]}... released to the turn writer")
         for ev in held:
-            _turn_route_now(self, ev)
+            _TURNS.route_now(self, ev)  # only the turn writer holds events
 
     def mark_delivered_live(self, session_key: str, run_id: str):
         """Record that this run's final event was just dispatched to a live
         consumer queue -- i.e. genuinely shown to an open browser tab, which
         persists it itself via OWUI's own client-side flow. See
         `_delivered_live`'s docstring: a late event of such a run never
-        reopens its message (`_turn_route_event`)."""
+        reopens its message (`_turn_route_now`)."""
         key = f"{session_key}:{run_id}"
         self._delivered_live[key] = time.time()
         if len(self._delivered_live) > 500:
@@ -2607,7 +2577,8 @@ class _GatewayConnection:
                     if self._frame_seq is not None and _seq != self._frame_seq + 1:
                         pipe_log(f"  frame seq gap: expected {self._frame_seq + 1}, got {_seq}")
                         self._mark_event_gap()
-                        spawn_background(_turn_resync(self))
+                        if _TURNS:
+                            spawn_background(_TURNS.resync(self))
                     self._frame_seq = _seq
 
                 # ── Request-response matching ──
@@ -2630,7 +2601,8 @@ class _GatewayConnection:
 
                 # ── Tick keepalive (silently consume) ──
                 if msg.get("event") == "tick" or msg.get("payload", {}).get("isHeartbeat"):
-                    _note_heartbeat_run(self, msg.get("payload") or {})
+                    if _TURNS:
+                        _TURNS.note_heartbeat(self, msg.get("payload") or {})
                     continue
 
                 # ── Event dispatch ──
@@ -2687,7 +2659,7 @@ class _GatewayConnection:
                 consumers = self.consumers_for_event(payload)
 
                 # ── ELI-100: a run no live request consumes is a turn ──
-                if not consumers and await _turn_route_event(self, payload):
+                if not consumers and _TURNS and _TURNS.route_now(self, payload):
                     continue
 
                 if consumers:
@@ -2934,29 +2906,6 @@ def _run_closed_by(message) -> str | None:
     return None
 
 
-def _history_run_messages(history: dict, run_id: str) -> list | None:
-    """One run's messages in `chat.history`: everything after the user
-    message that started it, or after the previous run's closing message
-    (a run with no user turn, e.g. a sub-agent announce), through its own
-    closing message (`_run_closed_by`). None when the run has not closed
-    yet."""
-    messages = (history or {}).get("messages")
-    if not isinstance(messages, list) or not run_id:
-        return None
-    for end in range(len(messages) - 1, -1, -1):
-        message = messages[end]
-        if not isinstance(message, dict) or message.get("role") != "assistant":
-            continue
-        if run_id not in _idempotency_keys(message) and _run_closed_by(message) != run_id:
-            continue
-        start = end
-        while start > 0 and (messages[start - 1] or {}).get("role") != "user" \
-                and not _run_closed_by(messages[start - 1]):
-            start -= 1
-        return messages[start:end + 1]
-    return None
-
-
 def _deepest_leaf_id(messages: dict, start_id: str | None) -> str | None:
     """Walk down `childrenIds` from `start_id` to the deepest childless node.
 
@@ -2983,99 +2932,6 @@ def _deepest_leaf_id(messages: dict, start_id: str | None) -> str | None:
             break
         node_id = children[-1]
     return node_id
-
-
-def _relay_output_events(sent: list[dict], current: list[dict]) -> list[dict]:
-    """Responses stream events that take a tab's `message.output` from
-    `sent` to `current`, in the shapes OWUI's `applyResponseStreamEvent`
-    (structuredOutput.ts) folds: a new item is `output_item.added` with an
-    explicit `output_index` (without one it is spliced in BEFORE the last
-    item), grown message text is an `output_text.delta` on the item's id
-    (which also extends `message.content`), and any other change to an
-    existing item is `output_item.done`, which replaces it."""
-    events: list[dict] = []
-    for i, item in enumerate(current):
-        old = sent[i] if i < len(sent) else None
-        is_message = item.get("type") == "message"
-        text = (item.get("content") or [{}])[0].get("text", "") if is_message else ""
-        if old is None:
-            added = copy.deepcopy(item)
-            if is_message:
-                added["content"] = [{"type": "output_text", "text": ""}]
-            events.append({"type": "response.output_item.added",
-                           "output_index": i, "item": added})
-            if text:
-                events.append({"type": "response.output_text.delta", "item_id": item["id"],
-                               "output_index": i, "content_index": 0, "delta": text})
-            continue
-        if is_message and old.get("id") == item.get("id"):
-            old_text = (old.get("content") or [{}])[0].get("text", "")
-            if text != old_text and text.startswith(old_text):
-                events.append({"type": "response.output_text.delta", "item_id": item["id"],
-                               "output_index": i, "content_index": 0,
-                               "delta": text[len(old_text):]})
-                continue
-        if item != old:
-            events.append({"type": "response.output_item.done",
-                           "output_index": i, "item": copy.deepcopy(item)})
-    return events
-
-
-def _relay_content_is_showable(text: str) -> bool:
-    """True once the accumulated visible content is safe to surface as a real
-    bubble: non-empty, not a silent sentinel, and not still a prefix that could
-    grow into a sentinel-only run. Delaying introduce until this holds means a
-    sentinel-only wake (`NO_REPLY`/`ANNOUNCE_SKIP`) never flashes an empty
-    bubble -- the same suppression the post-hoc path gets from
-    `_last_assistant_text_from_preview`, applied to a stream we watch grow.
-    """
-    t = text.strip()
-    if not t or t in _SILENT_SENTINELS:
-        return False
-    if any(s.startswith(t) for s in _SILENT_SENTINELS):
-        return False
-    return True
-
-
-async def _relay_emit_event(user_id: str, chat_id: str, message_id: str | None,
-                            data: dict) -> bool:
-    """Fire one OWUI socket `events` envelope to the user room (same transport
-    as `_emit_live_bootstrap_reload`). Returns False on any failure so callers
-    can log context; a failed emit never raises into the event loop."""
-    if not message_id:
-        return False
-    try:
-        from open_webui.socket.main import sio
-    except Exception as ex:
-        pipe_log(f"  socket emit unavailable (not inside OWUI process?): {ex}")
-        return False
-    try:
-        await sio.emit(
-            "events",
-            {"chat_id": chat_id, "message_id": message_id, "data": data},
-            room=f"user:{user_id}",
-        )
-        return True
-    except Exception as ex:
-        pipe_log(f"  socket emit failed: {ex}")
-        return False
-
-
-# ── Orphaned reply stubs (ELI-90) ──
-# Open WebUI writes a reply's assistant message (`done: False`) before the
-# pipe sends anything, and only the request that streams the reply ever sets
-# `done: True`. When Open WebUI restarts mid-turn (three OOM kills on
-# 2026-10-12 16:21-16:25 UTC), that request is gone: the run finishes in the
-# Gateway, but the chat keeps an empty bubble that looks like it is still
-# running, forever. On the first load after the restart these stubs are
-# matched to their runs in the Gateway transcript and finished from it.
-
-ORPHAN_STUB_NOTE = (
-    "*This reply was cut off before it finished (Open WebUI restarted or "
-    "lost the run), and no reply for it could be recovered from OpenClaw. "
-    "Send the message again if you still need an answer.*"
-)
-ORPHAN_STUB_SILENT_NOTE = "*The run for this message stopped without leaving a reply in the transcript.*"
 
 
 def _is_forwarded_turn(message) -> bool:
@@ -3111,428 +2967,6 @@ def _history_user_run_id(message) -> str | None:
         return None
     key = next((k for k in _idempotency_keys(message) if k), "")
     return key[:-len(":user")] if key.endswith(":user") and len(key) > 5 else None
-
-
-def _run_id_sent_at(run_id: str) -> float | None:
-    """The send time the pipe writes at the end of its run ids
-    (`msg-<chat>-[<message>-]<time.time()>`)."""
-    try:
-        return float(run_id.rsplit("-", 1)[1]) if run_id.startswith("msg-") else None
-    except (IndexError, ValueError):
-        return None
-
-
-def _stub_turn(history: dict, stub_id: str, user_text: str,
-               stub_ts: float | None = None) -> dict | None:
-    """The transcript turn an OWUI reply stub was waiting for:
-    {"run_id", "messages", "closed", "by"}, or None when the transcript has
-    none.
-
-    The pipe puts the OWUI message id into the run id (`msg-<chat>-<message>-
-    <time>`), so the turn is found by identity (`by` "id"). A run sent
-    before that is found by its user text (`by` "text"): with `stub_ts` (the
-    stub's creation time) the first matching run sent at or after it, since
-    the pipe sends after Open WebUI creates the stub and the same short text
-    ("works?") recurs; without it the newest match. `messages` runs to the
-    run's closing message (`cli-assistant:<runId>`) or the next turn;
-    `closed` says whether the run is over by the transcript alone."""
-    messages = (history or {}).get("messages")
-    if not isinstance(messages, list):
-        return None
-    starts = [i for i, m in enumerate(messages) if _history_user_run_id(m)]
-    pick, by = None, "id"
-    if stub_id:
-        by_id = [i for i in starts if f"-{stub_id}-" in _history_user_run_id(messages[i])]
-        pick = by_id[-1] if by_id else None
-    text = (user_text or "").strip()
-    if pick is None and text:
-        by, by_text = "text", [i for i in starts if _recovery_user_text_matches(
-            ((_history_item(messages[i]) or {}).get("text") or "").strip(), text)]
-        if stub_ts is not None:
-            # 2s of slack: Open WebUI stamps whole seconds.
-            by_text = [i for i in by_text
-                       if (_run_id_sent_at(_history_user_run_id(messages[i])) or 0) >= stub_ts - 2]
-            pick = by_text[0] if by_text else None
-        else:
-            pick = by_text[-1] if by_text else None
-    if pick is None:
-        return None
-    run_id = _history_user_run_id(messages[pick])
-    end = next((i for i in starts if i > pick), len(messages))
-    turn = messages[pick + 1:end]
-    closing = f"cli-assistant:{run_id}"
-    for j, m in enumerate(turn):
-        if closing in _idempotency_keys(m):
-            return {"run_id": run_id, "messages": turn[:j + 1], "closed": True, "by": by}
-    return {"run_id": run_id, "messages": turn, "closed": end < len(messages), "by": by}
-
-
-def _owui_message_ts(message: dict) -> float | None:
-    ts = message.get("timestamp")
-    if isinstance(ts, (int, float)) and ts > 0:
-        return ts / 1000 if ts > 1e11 else float(ts)  # ms or s
-    return None
-
-
-async def _owui_chat_has_live_task(chat_id: str) -> bool:
-    """True while Open WebUI runs a task for `chat_id` (a reply being
-    generated by this process). Answers True when it cannot tell, so a
-    reply that is still streaming is never overwritten."""
-    try:
-        from open_webui.main import app
-        from open_webui.tasks import list_task_ids_by_item_id
-        return bool(await list_task_ids_by_item_id(getattr(app.state, "redis", None), chat_id))
-    except Exception as ex:
-        pipe_log(f"  orphan stub: cannot read Open WebUI tasks ({ex}); leaving chat {chat_id[:8]}... alone")
-        return True
-
-
-async def _session_list_active(conn: "_GatewayConnection", session_key: str,
-                               *, missing: bool | None = False) -> bool | None:
-    """`sessions.list` `hasActiveRun` for one session (counts a sub-agent
-    yield gap as active, unlike `sessions.describe`). `missing` when the
-    Gateway lists no such session, None when it can't be asked."""
-    try:
-        lst = await conn.send_request("sessions.list", {}, timeout=15)
-    except Exception as ex:
-        pipe_log(f"  sessions.list for {session_key[-36:][:8]}... failed: {ex}")
-        return None
-    row = next((r for r in (lst.get("sessions") or []) if r.get("key") == session_key), None)
-    return bool(row.get("hasActiveRun")) if row else missing
-
-
-# A long session's whole transcript (952 messages for 0abe9bde) takes the
-# Gateway well over the default 10s RPC bound to serialize.
-ORPHAN_HISTORY_TIMEOUT_S = 60
-
-
-async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
-                          chat_id: str, stub_id: str, *, wait: bool = True) -> str:
-    """Finish one orphaned reply stub from its run in the transcript. A run
-    still going is waited for on the pushed settle (`sessions.changed`), not
-    on a timer, or with `wait=False` reported as "wait"; a stub a live turn
-    writer takes over meanwhile is the writer's (DESIGN 2.6). Returns
-    "done", "wait" or "skip"."""
-    from open_webui.models.chats import Chats
-    waiting = False
-    while True:
-        chat = await Chats.get_chat_by_id(chat_id)
-        msgs = ((chat.chat or {}).get("history") or {}).get("messages") or {} if chat else {}
-        stub = msgs.get(stub_id) or {}
-        if stub.get("role") != "assistant" or stub.get("done") is not False:
-            return "skip"  # gone or finished meanwhile
-        writer = (stub.get("meta") or {}).get("openclaw_writer")
-        if writer:
-            # A turn writer's message: its own writer finishes it, or, once
-            # that writer is gone (a retired deploy, a dead process), this
-            # connection adopts it. Another request's task in the chat is no
-            # reason to leave it.
-            if _turn_writer_alive(writer):
-                return "skip"
-            return await _adopt_turn_message(
-                conn, chat_id=chat_id, user_id=chat.user_id, message_id=stub_id,
-                session_key=_owui_session_key(agent_id, chat.user_id, chat_id),
-                meta=stub.get("meta") or {})
-        if await _owui_chat_has_live_task(chat_id):
-            return "skip"  # a live request owns it
-        session_key = _owui_session_key(agent_id, chat.user_id, chat_id)
-        changed = conn.session_change_event(session_key)
-        try:
-            hist = await conn.session_history(session_key, limit=RUN_HISTORY_LIMIT,
-                                              timeout=ORPHAN_HISTORY_TIMEOUT_S)
-        except Exception as ex:
-            pipe_log(f"  orphan stub {stub_id[:8]}...: chat.history failed: {ex!r}")
-            return "skip"
-        parent = msgs.get(stub.get("parentId")) or {}
-        user_text = _coerce_text(parent.get("content")) if parent.get("role") == "user" else ""
-        turn = _stub_turn(hist, stub_id, user_text, _owui_message_ts(stub))
-        if turn is None or turn["closed"]:
-            break  # no run to wait for, or it is over
-        active = await _session_list_active(conn, session_key)
-        if active is None:
-            return "skip"
-        if not active:
-            break
-        if not wait:
-            return "wait"
-        if not waiting:
-            waiting = True
-            pipe_log(f"  orphan stub {stub_id[:8]}... in chat {chat_id[:8]}...: "
-                     "its run is still going; finishing it when the run settles")
-        await changed.wait()
-
-    run_id = (turn or {}).get("run_id")
-    # What the stub already shows is never replaced on a guess: a stub with
-    # content (older pipes streamed into it, a writer persisted into it) is
-    # rebuilt only from a run matched by identity, else just closed.
-    has_content = bool(_coerce_text(stub.get("content")).strip() or stub.get("output"))
-    fields: dict = {"done": True}
-    output: list | None = None
-    text = ""
-    if turn and (turn["by"] == "id" or not has_content):
-        rendered = _history_renderer(turn["messages"])
-        if not rendered.text.strip() and not rendered.output and not has_content:
-            rendered._add_text(ORPHAN_STUB_SILENT_NOTE)
-        if rendered.output:
-            output = rendered.finished_output()
-            text = rendered.text.strip()
-            fields.update(content=text, output=output)
-    elif not has_content:
-        rendered = _TurnRenderer()
-        rendered._add_text(ORPHAN_STUB_NOTE)
-        output, text = rendered.finished_output(), rendered.text
-        fields.update(content=text, output=output)
-    async with conn._chat_write_lock(chat_id):
-        chat = await Chats.get_chat_by_id(chat_id)
-        msgs = ((chat.chat or {}).get("history") or {}).get("messages") or {} if chat else {}
-        current = msgs.get(stub_id) or {}
-        if current.get("done") is not False:
-            return "skip"
-        if _turn_writer_alive((current.get("meta") or {}).get("openclaw_writer")):
-            return "skip"  # a turn writer took it over (DESIGN 2.6) and finishes it
-        claim = f"{session_key}:{run_id}" if run_id else None
-        if claim:
-            if claim in conn._claimed_runs:
-                return "skip"  # another connection finished this run's stub
-            conn._claimed_runs[claim] = True
-        # Open WebUI answers None, logging nothing, when the write fails (its
-        # transaction raised and was rolled back).
-        if await Chats.upsert_message_to_chat_by_id_and_message_id(
-                chat_id, stub_id, fields) is None:
-            if claim:
-                conn._claimed_runs.pop(claim, None)
-            pipe_log(f"  orphan stub {stub_id[:8]}... in chat {chat_id[:8]}...: "
-                     "Open WebUI did not save the write (ELI-90)")
-            return "skip"
-        if run_id:
-            conn.mark_delivered_live(session_key, run_id)
-    if output is not None:
-        await _relay_emit_event(chat.user_id, chat_id, stub_id,
-                                {"type": "chat:completion", "data": {"output": output}})
-    await _relay_emit_event(chat.user_id, chat_id, stub_id,
-                            {"type": "chat:active", "data": {"active": False}})
-    cards = sum(1 for i in output or [] if i.get("type") == "function_call")
-    if output is None:
-        how = "closed, content kept"
-    elif run_id:
-        how = f"filled from run {run_id[:48]} by {turn['by']}"
-    else:
-        how = "no run in the transcript, note written"
-    pipe_log(f"  orphan stub {stub_id[:8]}... in chat {chat_id[:8]}...: {how} "
-             f"({len(text)} chars, {cards} tool card(s)) (ELI-90)")
-    return "done"
-
-
-async def _orphan_stub_ids(prefixes: list[str]) -> list[tuple[str, str]]:
-    """(chat_id, message_id) of every unfinished assistant message a model of
-    this pipe wrote. Open WebUI keeps a row per message in `chat_message`
-    whose id is `<chat_id>-<message_id>`."""
-    from sqlalchemy import or_, select
-    from open_webui.internal.db import get_async_db_context
-    from open_webui.models.chat_messages import ChatMessage
-    async with get_async_db_context() as db:
-        rows = (await db.execute(
-            select(ChatMessage.chat_id, ChatMessage.id)
-            .where(ChatMessage.role == "assistant")
-            .where(ChatMessage.done.is_(False))
-            .where(or_(*[ChatMessage.model_id.startswith(p) for p in prefixes]))
-        )).all()
-    out = []
-    for chat_id, composite in rows:
-        prefix = f"{chat_id}-"
-        out.append((chat_id, composite[len(prefix):] if composite.startswith(prefix) else composite))
-    return out
-
-
-_orphan_reconcile_task: "asyncio.Task | None" = None
-
-
-async def _reconcile_orphan_stubs(valves_getter) -> None:
-    try:
-        conn = await _get_gateway_connection(valves_getter)
-        agent_id = getattr(valves_getter(), "AGENT_ID", "") or "main"
-        stubs = await _orphan_stub_ids(
-            _composer_model_prefixes(own_id=_composer_own_function_id()))
-    except Exception as ex:
-        pipe_log(f"  orphan stub reconcile could not start: {ex}")
-        return
-    if stubs:
-        pipe_log(f"  orphan stub reconcile: {len(stubs)} unfinished OpenClaw "
-                 "repl(y/ies) in Open WebUI")
-    # One at a time: Open WebUI's SQLite rejected most of 45 concurrent chat
-    # writes (2026-10-12). Only a stub whose run is still going gets its own
-    # task, to wait for that run's settle.
-    counts: dict = {}
-    for chat_id, stub_id in stubs:
-        status = await _reconcile_stub_logged(conn, agent_id, chat_id, stub_id, wait=False)
-        counts[status] = counts.get(status, 0) + 1
-        if status == "wait":
-            spawn_background(_reconcile_stub_logged(conn, agent_id, chat_id, stub_id))
-    if stubs:
-        pipe_log(f"  orphan stub reconcile: {counts}")
-    try:
-        await _reconcile_ended_while_down(conn, agent_id)
-    except Exception as ex:
-        pipe_log(f"  ended-while-down reconcile failed: {ex!r}")
-
-
-def _history_closed_runs(messages: list) -> list:
-    """[(run_id, closing timestamp ms)] of the runs `chat.history` shows as
-    closed: a claude-cli run by its `cli-assistant:<runId>` message, an
-    embedded run by an assistant message keyed with the run id itself."""
-    started = {run for run, _tool in _history_user_turns(messages)}
-    out = []
-    for m in messages or []:
-        if not isinstance(m, dict) or m.get("role") != "assistant":
-            continue
-        for k in _idempotency_keys(m):
-            run = k[len("cli-assistant:"):] if k.startswith("cli-assistant:") else (k if k in started else "")
-            if run and isinstance(m.get("timestamp"), (int, float)):
-                out.append((run, m["timestamp"]))
-                break
-    return out
-
-
-def _settled_run_span(history: dict, run_id: str) -> list | None:
-    """The messages of a run the session row reports settled (no active run,
-    `lastRunId`): its span up to its closer or the next admitted turn, else,
-    as the newest turn, everything after its user turn."""
-    span = _history_span_messages(history, run_id)
-    if span is not None:
-        return span
-    messages = (history or {}).get("messages")
-    for i, m in enumerate(messages if isinstance(messages, list) else []):
-        if _history_user_run_id(m) == run_id:
-            return messages[i + 1:]
-    return None
-
-
-async def _reconcile_ended_while_down(conn: "_GatewayConnection", agent_id: str) -> None:
-    """ELI-94, DESIGN-agent-turns.md case 4. A graceful Open WebUI stop saves
-    the reply it cancels `done: true` with what it had; the run goes on and
-    closes while Open WebUI is down, so no event reaches this process and
-    the ELI-90 pass (done:false only) skips it. Two recorded timestamps say
-    which chats missed something: the session row's `updatedAt` (bumped when
-    a run ends) newer than the chat's `updated_at`. In those, a run that
-    closed in a later second than the chat's last write is rebuilt from the
-    transcript into its message (identity rule, rule E for recoveries)."""
-    from open_webui.models.chats import Chats
-    lst = await conn.send_request("sessions.list", {}, timeout=15)
-    prefix = f"agent:{agent_id}:openwebui-"
-    fixed = 0
-    for row in lst.get("sessions") or []:
-        key = row.get("key") or ""
-        if not key.startswith(prefix) or row.get("hasActiveRun"):
-            continue  # not ours, or a run still going: the handover (2.6) owns it
-        after = key[len(prefix):]
-        if len(after) != 73 or after[36] != "-":
-            continue
-        user_id, chat_id = after[:36], after[37:]
-        updated = row.get("updatedAt")
-        if not isinstance(updated, (int, float)):
-            continue
-        chat = await Chats.get_chat_by_id(chat_id)
-        if chat is None or chat.user_id != user_id:
-            continue
-        written = int(getattr(chat, "updated_at", 0) or 0)
-        if int(updated // 1000) <= written:
-            continue
-        fixed += await _reconcile_chat_ended_runs(conn, key, chat_id, written,
-                                                  session_id=row.get("sessionId"),
-                                                  last_run=row.get("lastRunId"), settled_ms=updated)
-    if fixed:
-        pipe_log(f"  ended-while-down reconcile: completed {fixed} repl(y/ies) (ELI-94)")
-
-
-async def _reconcile_chat_ended_runs(conn: "_GatewayConnection", session_key: str,
-                                     chat_id: str, written: int, *,
-                                     session_id: str | None, last_run: str | None = None,
-                                     settled_ms: float | None = None) -> int:
-    """Rebuild every finished reply in `chat_id` whose run closed after the
-    chat was last written (`written`, whole seconds) and that holds less than
-    the transcript. A run closed by its transcript closer, or the session
-    row's `lastRunId`, settled at the row's `updatedAt` (`settled_ms`; the
-    embedded runtime writes no closer). Returns how many were written."""
-    from open_webui.models.chats import Chats
-    if await _owui_chat_has_live_task(chat_id):
-        return 0  # a reply is streaming: its own request finishes it
-    hist = await conn.session_history(session_key, limit=RUN_HISTORY_LIMIT,
-                                      timeout=ORPHAN_HISTORY_TIMEOUT_S)
-    messages = (hist or {}).get("messages") or []
-    closed = _history_closed_runs(messages)
-    if last_run and settled_ms and last_run not in {r for r, _ms in closed}:
-        closed.append((last_run, settled_ms))
-    targets: dict = {}
-    for run, closed_ms in closed:
-        # A wake's closer is keyed by the sessionId and deduplicated (ELI-103).
-        if run == session_id or int(closed_ms // 1000) <= written:
-            continue
-        mid = run_message_id(session_key, chat_id, run, messages)
-        if mid:
-            targets.setdefault(mid, run)
-    fixed = 0
-    for mid, run in targets.items():
-        runs = [r for r, _tool in _history_user_turns(messages)
-                if r != session_id and run_message_id(session_key, chat_id, r, messages) == mid]
-        if run not in runs:
-            runs.append(run)
-        spans = [_settled_run_span(hist, r) if r == last_run else _history_span_messages(hist, r)
-                 for r in runs]
-        if any(s is None for s in spans):
-            continue  # a run written into it has not closed
-        rendered = _history_renderer([m for s in spans for m in s])
-        output, text = await _transcript_view(
-            conn, session_key=session_key, chat_id=chat_id,
-            user_id=session_key.rsplit("openwebui-", 1)[-1][:36], message_id=mid,
-            runs=runs, messages=messages, rendered=rendered)
-        if not output:
-            continue
-        async with conn._chat_write_lock(chat_id):
-            chat = await Chats.get_chat_by_id(chat_id)
-            msgs = ((chat.chat or {}).get("history") or {}).get("messages") or {} if chat else {}
-            current = msgs.get(mid) or {}
-            if current.get("role") != "assistant" or current.get("done") is not True:
-                continue  # missing, or still generating: the ELI-90 pass owns done:false
-            held_cards = sum(1 for i in current.get("output") or [] if i.get("type") == "function_call")
-            cards = sum(1 for i in output if i.get("type") == "function_call")
-            held_text = _coerce_text(current.get("content")).strip()
-            if cards < held_cards or (cards == held_cards and len(text) <= len(held_text)):
-                continue  # holds as much as the transcript: never rewritten
-            if await Chats.upsert_message_to_chat_by_id_and_message_id(
-                    chat_id, mid, {"content": text, "output": output, "done": True}) is None:
-                pipe_log(f"  ended-while-down {mid[:8]}... in chat {chat_id[:8]}...: "
-                         "Open WebUI did not save the write (ELI-94)")
-                continue
-            conn.mark_delivered_live(session_key, run)
-        await _relay_emit_event(chat.user_id, chat_id, mid,
-                                {"type": "chat:completion", "data": {"output": output}})
-        pipe_log(f"  ended-while-down {mid[:8]}... in chat {chat_id[:8]}...: completed from "
-                 f"{len(runs)} run(s) ({len(text)} chars, {cards} tool card(s), "
-                 f"held {held_cards}) (ELI-94)")
-        fixed += 1
-    return fixed
-
-
-async def _reconcile_stub_logged(conn, agent_id, chat_id, stub_id, *, wait=True) -> str:
-    try:
-        return await _reconcile_stub(conn, agent_id, chat_id, stub_id, wait=wait)
-    except Exception as ex:
-        pipe_log(f"  orphan stub {stub_id[:8]}... in chat {chat_id[:8]}...: reconcile failed: {ex!r}")
-        return "failed"
-
-
-def _ensure_orphan_reconcile(valves_getter) -> None:
-    """Once per load of this Function inside Open WebUI (a restart reloads
-    it; so does a deploy, which is harmless: a reply still streaming has a
-    live task and is skipped)."""
-    global _orphan_reconcile_task
-    if _orphan_reconcile_task is not None:
-        return
-    try:
-        import open_webui.models.chat_messages  # noqa: F401  (inside Open WebUI only)
-    except Exception:
-        return
-    _orphan_reconcile_task = spawn_background(_reconcile_orphan_stubs(valves_getter))
 
 
 # Read-only shim (ELI-100): bridge versions before ELI-100 embedded this in

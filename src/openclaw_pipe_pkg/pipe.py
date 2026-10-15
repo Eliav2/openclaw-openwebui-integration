@@ -1276,7 +1276,7 @@ class _PipeTurn:
         # into, so a turn writer continues that message from a shadow renderer
         # if this inline turn ends before the run does (cancel, close, a
         # torn-down request). No-op without a stable message id. See
-        # _turn_route_event (writer.py) and _TurnRenderer (gateway.py).
+        # _turn_route_now (writer.py) and _TurnRenderer (gateway.py).
         self.owui_message_id = (self.__metadata__ or {}).get("message_id")
         self.conn.register_run_target(
             self.session_key, self.our_run_id, self.owui_origin_chat_id, self.owui_message_id,
@@ -1445,8 +1445,8 @@ class _PipeTurn:
                             # A new Gateway process: the run may be recovered
                             # by it (a crash leaves its row `running`) or need
                             # a resume. Its row decides, in the turn writer.
-                            if self.conn.hand_over_run(self.session_key, self.our_run_id,
-                                                  thinking=self.resolved_thinking, read_row=True):
+                            if _hand_over_run(self.conn, self.session_key, self.our_run_id,
+                                              thinking=self.resolved_thinking, read_row=True):
                                 self.handed_over = self.done = True
                             elif self.awaiting_owner:
                                 spawn_background(self.conn.push_row(self.session_key))
@@ -1472,8 +1472,8 @@ class _PipeTurn:
                             queued = []
                             if not self.adopted_run_id and self.owui_message_id:
                                 queued = self.queue.take_all()
-                                if self.conn.hand_over_run(
-                                        self.session_key, self.our_run_id,
+                                if _hand_over_run(
+                                        self.conn, self.session_key, self.our_run_id,
                                         thinking=self.resolved_thinking, read_row=True,
                                         reply={"message_id": self.owui_message_id,
                                                "renderer": copy.deepcopy(self.renderer),
@@ -1522,7 +1522,7 @@ class _PipeTurn:
                         # and the settled row picks the owner. Without a
                         # message to hand over, it ends here like any error.
                         if _EXTERNAL_KILL_RE.search(err) or (aborted_run and self.conn._shutdown_seen):
-                            if self.conn.hand_over_run(self.session_key, self.our_run_id, thinking=self.resolved_thinking):
+                            if _hand_over_run(self.conn, self.session_key, self.our_run_id, thinking=self.resolved_thinking):
                                 self.handed_over = self.done = True
                                 continue
                             if not self.owui_message_id:

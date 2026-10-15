@@ -85,13 +85,14 @@ PIPE = Artifact(
 # "action" fragment. "emit" is included so the modal's numbers come from
 # the exact same _build_usage_status_lines/_fmt_tokens logic the status
 # line itself uses -- one source of truth, no risk of the two drifting
-# apart. No dev/internal-tooling variant yet -- add a dev_out here if this
-# artifact ever grows a devcoord-style need for one.
+# apart. It writes no turns, so it leaves out "writer" (ELI-149). No
+# dev/internal-tooling variant yet -- add a dev_out here if this artifact
+# ever grows a devcoord-style need for one.
 ACTION = Artifact(
     frontmatter=ROOT / "src" / "frontmatter-action.txt",
     out=ROOT / "openclaw_status_action.py",
     dev_out=None,
-    module_order=("_prelude", "identity", "state", "turns", "thinking", "gateway", "writer",
+    module_order=("_prelude", "identity", "state", "turns", "thinking", "gateway",
                   "emit", "composer", "action"),
 )
 # "composer" is in both: the Action and the Pipe each deliver the composer

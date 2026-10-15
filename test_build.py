@@ -220,16 +220,6 @@ class StatusActionBuildTests(unittest.TestCase):
         self.assertNotIn(build_mod.DEV_ONLY_END, built)
         self.assertNotIn("DEV-ONLY", built)
 
-    def test_fallback_connection_writes_no_turns(self):
-        """The Action's own fallback connection only makes RPCs, so every run
-        looks unconsumed to it: it must never write turns next to the Pipe's
-        connection. Every connection the Action builds says so."""
-        action_src = (PKG / "action.py").read_text()
-        calls = re.findall(r"_GatewayConnection\(([^)]*)\)", action_src)
-        self.assertTrue(calls)
-        for args in calls:
-            self.assertIn("writes_turns=False", args)
-
     def test_carries_no_turn_writer(self):
         """ELI-149: the Action writes no turns, so it ships none of writer.py:
         no definition from it and no reference to one. A reference left in a
@@ -244,11 +234,16 @@ class StatusActionBuildTests(unittest.TestCase):
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target]
                 names |= {t.id for t in targets if isinstance(t, ast.Name)}
         self.assertIn("_TurnWriter", names)
+        # The one name both share: gateway.py's hook, which writer.py sets.
+        names.discard("_TURNS")
         action = ast.parse(ACTION_BUILT.read_text())
         defined = {n.name for n in action.body
                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
         used = {n.id for n in ast.walk(action) if isinstance(n, ast.Name)}
         self.assertEqual(sorted(names & (defined | used)), [])
+        hooks = [n for n in action.body if isinstance(n, ast.Assign)
+                 and any(isinstance(t, ast.Name) and t.id == "_TURNS" for t in n.targets)]
+        self.assertEqual([ast.unparse(n.value) for n in hooks], ["None"])
 
     def test_does_not_reuse_pipe_stale_conn_write_path(self):
         """The Action fragment must never call _remember_gateway_connection

@@ -346,7 +346,7 @@ request died with the process.
 
 An interrupted run is one more such path. The inline turn never resumes a run itself. On an
 outside kill of the CLI (the 2.7 exit text), an abort after a `shutdown` notice, or a new
-`bootId` after a reconnect, it hands M to the writer (`hand_over_run`) and ends its request.
+`bootId` after a reconnect, it hands M to the writer (`_hand_over_run`) and ends its request.
 R's settled row then picks the owner by 2.7, read from the next push, or read at once when
 the handover comes after the post-hello resync. `resume_after_restart`, the epoch-bump probe
 and `_is_restart_signature` are gone.

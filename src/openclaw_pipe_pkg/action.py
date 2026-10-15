@@ -32,10 +32,8 @@
 #      shared attribute) so it can never collide with the Pipe's bookkeeping
 #      either.
 #
-# This fragment reuses gateway.py verbatim (see build.py's ACTION artifact).
-# Its fallback connection is built with `writes_turns=False`: it only makes
-# request/response RPCs, so every run would look unconsumed to it, and it
-# must never write turns next to the Pipe's own connection.
+# This fragment reuses gateway.py verbatim (see build.py's ACTION artifact),
+# without the turn writer: its fallback connection only makes requests.
 
 _action_fallback_connection: "_GatewayConnection | None" = None
 _action_fallback_lock = asyncio.Lock()
@@ -56,7 +54,7 @@ async def _get_action_connection(valves_getter):
     if _action_fallback_connection is None:
         async with _action_fallback_lock:
             if _action_fallback_connection is None:
-                conn = _GatewayConnection(valves_getter, writes_turns=False)
+                conn = _GatewayConnection(valves_getter)
                 await conn.ensure_connected()
                 _action_fallback_connection = conn
                 return conn, "action-own"
