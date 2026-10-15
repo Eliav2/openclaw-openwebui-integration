@@ -891,3 +891,44 @@ def test_debug_eli98_overflow_compaction_events(token):
     frames = _eli98_capture(token, chat_id, key,
                             f"E2E_OVERFLOW_{uuid.uuid4().hex[:8]} Reply with exactly: ELI98_C")
     print("[eli98] overflow streams:", _eli98_streams(frames), flush=True)
+
+
+def _eli98_followup_turn(token: str, chat_id: str, prompt: str, model: str = DEFAULT_MODEL) -> dict:
+    status, got = _request("GET", f"/api/v1/chats/{chat_id}", token=token)
+    assert status == 200, got
+    chat = got["chat"]
+    prev_id = chat["history"]["currentId"]
+    msgs = chat["history"]["messages"]
+    now = int(time.time())
+    uid, aid = str(uuid.uuid4()), str(uuid.uuid4())
+    user = {"id": uid, "parentId": prev_id, "childrenIds": [aid], "role": "user",
+            "content": prompt, "timestamp": now, "models": [model]}
+    assistant = {"id": aid, "parentId": uid, "childrenIds": [], "role": "assistant",
+                 "content": "", "model": model, "timestamp": now, "done": False}
+    msgs[prev_id]["childrenIds"] = msgs[prev_id].get("childrenIds", []) + [uid]
+    msgs[uid], msgs[aid] = user, assistant
+    chat["history"]["currentId"] = aid
+    chat["messages"] = chat.get("messages", []) + [user, assistant]
+    status, upd = _request("POST", f"/api/v1/chats/{chat_id}", {"chat": chat}, token)
+    assert status == 200, upd
+    convo = [{"role": m["role"], "content": m.get("content") or ""} for m in chat["messages"][:-1]]
+    status, ack = _request("POST", "/api/chat/completions", {
+        "model": model, "messages": convo, "stream": True, "chat_id": chat_id, "id": aid,
+        "session_id": f"e2e-{uuid.uuid4().hex[:8]}", "parent_id": uid, "user_message": user,
+    }, token)
+    assert status == 200, ack
+    deadline = time.time() + TURN_TIMEOUT_S
+    while time.time() < deadline:
+        msg = _chat_messages(token, chat_id).get(aid, {})
+        if msg.get("done"):
+            return msg
+        time.sleep(1.5)
+    pytest.fail(f"follow-up turn did not finish: {json.dumps(msg)[:1500]}")
+
+
+def test_debug_eli98_compact_typed_in_owui(token):
+    chat_id, _ = _chat_turn(token, "Reply with exactly: ELI98_X")
+    _eli98_followup_turn(token, chat_id, "Reply with exactly: ELI98_Y")
+    msg = _eli98_followup_turn(token, chat_id, "/compact")
+    print("[eli98] owui /compact persisted:", json.dumps(
+        {k: msg.get(k) for k in ("content", "output", "statusHistory", "done", "error")})[:3000], flush=True)
