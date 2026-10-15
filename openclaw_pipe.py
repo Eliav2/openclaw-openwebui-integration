@@ -2272,7 +2272,7 @@ def _marker_line_index(text: str, in_fence=False):
 
 
 def _advance_input_prompt_buffer(pending: str, delta: str,
-                                 in_fence=False) -> tuple[str, str]:
+                                 in_fence=False, at_line_start=True) -> tuple[str, str]:
     """Feed a new assistant-delta chunk into the needs-input buffering state.
 
     Returns `(text_to_yield_now, new_pending)`. `pending` is text already
@@ -2291,8 +2291,19 @@ def _advance_input_prompt_buffer(pending: str, delta: str,
 
     `in_fence`: a fenced code block is open where `pending + delta` starts
     (the shown text left it open); nothing in a fence is held (ELI-107).
+    `at_line_start`: the shown text ends at the start of a line. When it
+    does not, the first line of `delta` continues a line and opens no
+    prompt, wherever the deltas happen to split (ELI-147).
     """
     candidate = pending + delta
+    if not (pending or at_line_start):
+        nl = candidate.find("\n")
+        if nl == -1:
+            return candidate, ""
+        head = candidate[:nl + 1]
+        flush, held = _advance_input_prompt_buffer("", candidate[nl + 1:],
+                                                   _fence_open_after(head, in_fence))
+        return head + flush, held
     if not in_fence and _could_be_user_input_prefix(candidate.lstrip()):
         return "", candidate
     # A complete marker may sit mid-candidate when the whole reply arrives at
@@ -4072,27 +4083,6 @@ def _item_delta_text(item_text: str, last_item_text: str, assistant_stream_text:
     return item_text
 
 
-def _catch_all_delta(raw_text: str, received_text: str, visible_text: str) -> str:
-    """New text carried by a cumulative catch-all assistant event.
-
-    Some providers end a turn with an event that has no `delta` but a `text`
-    field holding the WHOLE reply. It has to be diffed against what already
-    arrived, or the entire message is treated as new.
-
-    The diff is against `received_text`, everything the gateway sent us, and
-    not only against what was shown. Those two differ: text held back by the
-    ask-user buffer was received but never yielded. Diffing against shown text
-    alone made the final catch-all look entirely new, so the whole needs-input
-    block was appended to that buffer a second time and the dialog rendered the
-    prompt twice with double the options (ELI-80). The visible-text pass stays
-    as a second net for the drift case it was originally written for (P27).
-    """
-    if not raw_text:
-        return ""
-    delta = _item_delta_text(raw_text, "", received_text)
-    return _suppress_already_shown(delta, visible_text)
-
-
 def _suppress_already_shown(delta: str, visible_message_text: str) -> str:
     """Final safety net against re-yielding text that's already been shown.
 
@@ -4364,13 +4354,31 @@ class _TurnRenderer:
         # 2026-10-14: "...foreground.USER-DONE" across the resume).
         self.run_boundary = False
 
+    @property
+    def received(self) -> str:
+        """All the run text that arrived, shown or not: the dedup baseline."""
+        return self._assistant_stream_text
+
+    @property
+    def last_item(self) -> str:
+        """The last item event's text, the baseline for the next one."""
+        return self._last_item_text
+
+    def seed(self, run_text: dict | None) -> None:
+        """Continue a run another reply showed: take its dedup baselines, so
+        its closing whole-text events are not shown again."""
+        if run_text:
+            self._assistant_stream_text = run_text.get("received", "")
+            self._last_item_text = run_text.get("item", "")
+
     def _add(self, chunk: str) -> None:
         if chunk:
             self.visible_text += chunk
 
-    def _add_text(self, chunk: str) -> None:
+    def _add_text(self, chunk: str) -> str:
+        """Append `chunk` to the run's text; returns it as added."""
         if not chunk:
-            return
+            return ""
         if self.run_boundary:
             self.run_boundary = False
             chunk = _message_boundary_separator(self.text, chunk) + chunk
@@ -4387,6 +4395,7 @@ class _TurnRenderer:
             }
             self.output.append(last)
         last["content"][0]["text"] += chunk
+        return chunk
 
     def _tool_item(self, name: str, tcid: str, args_str: str, events: list) -> dict:
         """The call's card, opened (and its start event added to `events`)
@@ -4428,12 +4437,14 @@ class _TurnRenderer:
                 item["status"] = "completed"
         return out
 
-    def feed(self, payload: dict) -> list[dict]:
-        """Grow the run's content by one event. Returns the Responses events
-        it caused for a live stream: a tool card opened, relabelled as failed,
-        or answered. The inline reply yields them, so it and a turn writer
-        show the same cards (ELI-147)."""
-        events: list[dict] = []
+    def feed(self, payload: dict, gap_tail: str | None = None) -> list:
+        """Grow the run's content by one event. Returns what it added for a
+        live stream: the new text (a str) and the Responses events of a tool
+        card opened, relabelled as failed, or answered. The inline reply
+        shows them, so it and a turn writer show the same text and cards
+        (ELI-147). `gap_tail`: the new part of a whole-text event after a
+        gap, which the inline reply's gap repair worked out."""
+        events: list = []
         data = payload.get("data", {}) or {}
         stream = payload.get("stream")
         name = data.get("name", "")
@@ -4445,29 +4456,36 @@ class _TurnRenderer:
                 delta = raw_delta
             else:
                 raw_text = data.get("text") or ""
-                delta = (
-                    _item_delta_text(raw_text, "", self._assistant_stream_text)
-                    if raw_text else ""
-                )
+                if gap_tail is not None:
+                    delta = gap_tail
+                else:
+                    delta = (
+                        _item_delta_text(raw_text, "", self._assistant_stream_text)
+                        if raw_text else ""
+                    )
+                    if raw_text and not delta:
+                        pipe_log("  suppressed duplicate catch-all assistant text")
                 delta = _suppress_already_shown(delta, self.visible_text)
             if delta:
                 if (
                     "Sender (untrusted metadata)" in delta
                     or "UnTrustedMetadata" in delta
                 ):
+                    pipe_log("  filtered metadata block")
                     return events
                 self._assistant_stream_text += delta
-                self._add_text(delta)
+                events.append(self._add_text(delta))
 
         if stream == "item":
             item_text = _item_assistant_text(data)
             if item_text:
-                item_delta = _item_delta_text(
+                item_delta = gap_tail if gap_tail is not None else _item_delta_text(
                     item_text, self._last_item_text, self._assistant_stream_text
                 )
                 self._last_item_text = item_text
                 item_delta = _suppress_already_shown(item_delta, self.visible_text)
-                self._add_text(item_delta)
+                if item_delta:
+                    events.append(self._add_text(item_delta))
 
         if stream == "tool":
             tcid = data.get("toolCallId", "")
@@ -5607,9 +5625,7 @@ class _GatewayConnection:
         renderer = self._run_renderers.get(f"{session_key}:{run_id}")
         if renderer is None:
             return
-        if run_text:
-            renderer._assistant_stream_text = run_text.get("received", "")
-            renderer._last_item_text = run_text.get("item", "")
+        renderer.seed(run_text)
         for msg in list(getattr(queue, "_queue", ())):
             try:
                 renderer.feed(msg.get("payload", {}))
@@ -7566,18 +7582,26 @@ class _TurnWriter:
         directive that first came after the handover resolved here, and,
         while the run streams, a directive whose filename is still arriving
         held back, as the inline reply holds it."""
-        await self._resolve_media(self._rewrite(self.renderer.text), final)
         output = self.renderer.finished_output() if final else copy.deepcopy(self.renderer.output)
+        items = [i for i in output if i.get("type") == "message" and i.get("content")]
+        # Each message item is read on its own, as the inline reply reads
+        # it: an item ends a directive, so the text after a tool card does
+        # not run into the filename before it (ELI-147).
+        for item in items:
+            await self._resolve_media(self._rewrite(item["content"][0].get("text") or ""),
+                                      final or item is not output[-1])
         hold = None if final else globals().get("_advance_media_buffer")
 
         def show(text: str, tail: bool) -> str:
             text = self._rewrite(text)
             return hold("", text)[0] if hold and tail else text
         for n, item in enumerate(output):
-            if item.get("type") == "message" and item.get("content"):
+            if item in items:
                 part = item["content"][0]
                 part["text"] = show(part.get("text") or "", n == len(output) - 1)
-        return output, show(self.renderer.text, True)
+        if not items:
+            return output, show(self.renderer.text, True)
+        return output, "".join(i["content"][0]["text"] for i in items)
 
     async def _resolve_media(self, text: str, final: bool) -> None:
         """Upload each complete `MEDIA:` directive the inline reply never saw,
@@ -10125,21 +10149,22 @@ class _PipeTurn:
         # behind a run (or steered into one) instead gets a lone `chat` final
         # with no message as its first and only event.
         self.enqueued_not_started = False
-        last_item_text = ""
+        # The run's text and tool cards, read by the renderer a turn writer
+        # uses (ELI-147). Its `received` text is everything the run sent,
+        # including what the text hooks still hold, so it is the baseline a
+        # cumulative event is diffed against (ELI-80).
+        self.renderer = _TurnRenderer()
+        # The text this reply has shown, raw: the code state the text hooks
+        # read. Continuing a run another reply started, both carry over (see
+        # `park_cancelled_turn`), while what THIS reply shows,
+        # `visible_message_text`, starts empty.
         self.assistant_stream_text = ""
-        # Everything the gateway has sent for this turn, including text the
-        # ask-user buffer withheld. assistant_stream_text only tracks what was
-        # FLUSHED, so it cannot be used to dedup a cumulative catch-all event
-        # while a needs-input block is being held back (ELI-80).
-        self.assistant_received_text = ""
+        last_item_text = ""
         if self.adopted_run_text:
-            # Continuing a run another reply started: its text baselines carry
-            # over (see `park_cancelled_turn`), while what THIS reply shows,
-            # `visible_message_text`, starts empty.
-            self.assistant_received_text = self.adopted_run_text.get("received", "")
+            self.renderer.seed(self.adopted_run_text)
             self.assistant_stream_text = self.adopted_run_text.get("stream", "")
             last_item_text = self.adopted_run_text.get("item", "")
-        # Offsets in `assistant_received_text` where events were lost (a
+        # Offsets in the renderer's `received` text where events were lost (a
         # Gateway socket drop, see `_mark_event_gap`), and which OWUI reply
         # showed the run from which offset, so a lost chunk can be put back
         # into the reply it belongs to. Both are run-level and travel with an
@@ -10153,14 +10178,13 @@ class _PipeTurn:
                 for repair in _take_gap_repairs(self.chat_id, seg["message_id"]):
                     _schedule_gap_repair(self.conn, repair, streaming=False)
             self.run_segments.append({"message_id": self.owui_message_id,
-                                 "start": len(self.assistant_received_text)})
+                                 "start": len(self.renderer.received)})
 
         self.visible_message_text = self._initial_visible_text + self.pending_clamp_note
-        # The tool cards this reply streamed (ELI-147); a call still open
-        # when the run ends would render as a spinner forever.
-        self.tool_cards = _TurnRenderer()
-        pending_prompt_text = ""
-        pending_media_text = ""
+        # Text the hooks hold back: a possible needs-input prompt, a MEDIA:
+        # directive whose filename is still arriving.
+        self.pending_prompt_text = ""
+        self.pending_media_text = ""
         self.last_snapshot_text = ""
         self.last_snapshot_time = 0.0
         self.snapshot_interval_s = 1.0
@@ -10290,8 +10314,8 @@ class _PipeTurn:
 
                         if msg.get("type") == _GAP_MARKER_TYPE:
                             self.signals_lost = True
-                            self.run_gaps.append(len(self.assistant_received_text))
-                            pipe_log(f"  event gap at offset {len(self.assistant_received_text)} "
+                            self.run_gaps.append(len(self.renderer.received))
+                            pipe_log(f"  event gap at offset {len(self.renderer.received)} "
                                      "(Gateway socket dropped)")
                             continue
 
@@ -10359,142 +10383,21 @@ class _PipeTurn:
                             self.record_visible_chunk(self.error_shown)
                             yield self.error_shown
 
-                        # --- Assistant text stream ---
-                        if stream == "assistant":
-                            raw_delta = data.get("delta")
-                            if raw_delta:
-                                delta = raw_delta
-                                self.assistant_received_text += raw_delta
+                        # --- Run text and tool cards ---
+                        # One renderer reads them, the one a turn writer uses
+                        # (ELI-147). After a gap, a whole-text event's new part
+                        # is what the gap repair lines up.
+                        if stream in ("assistant", "item", "tool"):
+                            if stream == "assistant" and not data.get("delta"):
+                                whole = data.get("text") or ""
                             else:
-                                # Some providers (observed with claude-cli-backed
-                                # Opus/Sonnet overrides) send a final catch-all event
-                                # with no `delta` but a `text` field holding the full
-                                # cumulative reply rather than a fresh chunk. Treating
-                                # it as always-new re-sent the whole message a second
-                                # time. Diff it against what's already been streamed,
-                                # same as the item-event dedup below.
-                                raw_text = data.get("text") or ""
-                                gap_tail = self.reconcile_whole_text(raw_text) if raw_text else None
-                                before = _item_delta_text(
-                                    raw_text, "", self.assistant_received_text
-                                ) if raw_text else ""
-                                delta = (
-                                    _suppress_already_shown(gap_tail, self.visible_message_text)
-                                    if gap_tail is not None
-                                    else _catch_all_delta(
-                                        raw_text, self.assistant_received_text, self.visible_message_text
-                                    )
-                                )
-                                if before and not delta:
-                                    pipe_log(
-                                        "  suppressed duplicate catch-all assistant "
-                                        f"text ({len(before)} chars already received)"
-                                    )
-                                self.assistant_received_text += delta
-                            if delta:
-                                # Filter Sender metadata
-                                if (
-                                    "Sender (untrusted metadata)" in delta
-                                    or "UnTrustedMetadata" in delta
-                                ):
-                                    pipe_log("  filtered metadata block")
-                                    continue
-                                # Hold back text while it (or a fresh line within
-                                # it) is still ambiguous whether it opens with a
-                                # needs-input trigger phrase. Real token-by-token
-                                # streaming delivers that phrase a few characters at
-                                # a time, so checking each raw delta in isolation
-                                # (as used to happen here) essentially never
-                                # matches -- only the buffered, accumulated text can
-                                # be checked reliably. Resolved once the run ends
-                                # (see the `else:` clause below) or as soon as the
-                                # buffered text diverges from every trigger.
-                                # A fence the shown text of this message item left open
-                                # makes a marker a quote (ELI-107); held text always
-                                # starts outside one. A fence never spans items.
-                                flush_text, pending_prompt_text = (
-                                    _advance_input_prompt_buffer(
-                                        pending_prompt_text, delta,
-                                        _fence_open_after(self.assistant_stream_text[self.fence_item_start:]))
-                                )
-                                if not flush_text:
-                                    continue
-                                delta = flush_text
-
-                                # Hold back a MEDIA: directive until its filename is
-                                # confirmed complete (terminated by whitespace) -- a
-                                # real streaming provider can split "MEDIA:filename.png"
-                                # across multiple deltas at any point, including
-                                # mid-filename or mid-prefix. See _advance_media_buffer.
-                                # A directive quoted in code is text (ELI-111);
-                                # the shown text of this item sets the code state.
-                                delta, pending_media_text = _advance_media_buffer(
-                                    pending_media_text, delta,
-                                    self.assistant_stream_text[self.fence_item_start:]
-                                )
-                                if not delta:
-                                    continue
-
-                                self.text_yielded = True
-                                # No snapshot here, regardless of whether tool blocks
-                                # exist earlier in the message. A `replace` event sets
-                                # the full message content; if it lands on (or near)
-                                # the complete final text right before the generator
-                                # naturally finishes, OWUI double-saves -- the
-                                # `replace` writes it once, then the generator's own
-                                # accumulated streamed yields write the same content
-                                # again on top. This isn't only a risk for the literal
-                                # last chunk: since these snapshots are throttled by
-                                # time/char thresholds rather than tied to "a tool
-                                # block was just added", they keep firing throughout
-                                # any plain-text tail after a tool call and will
-                                # eventually land close enough to the end to trigger
-                                # the same duplicate. The one snapshot that's actually
-                                # safe is the forced one taken right when a tool
-                                # block itself is yielded (still partial content by
-                                # definition, since the block was just added) -- see
-                                # the `stream == "tool"` / phase == "result" handler.
-                                # See P17 / P19 / P23 / P24 / ELI-9 for the history of
-                                # this recurring bug.
-                                # MEDIA: resolution
-                                if "MEDIA:" in delta:
-                                    resolved, handled = await _resolve_media_text(
-                                        delta,
-                                        valves=self.pipe.valves,
-                                        __request__=self.__request__,
-                                        __event_emitter__=self.__event_emitter__,
-                                        ctx=self.assistant_stream_text[self.fence_item_start:],
-                                    )
-                                    if handled:
-                                        pipe_log("  resolved MEDIA: directive")
-                                        # A writer that takes this reply over
-                                        # shows the same image (review 2af1 R4).
-                                        self.conn.note_turn_rewrite(self.owui_origin_chat_id, self.owui_message_id,
-                                                               delta, resolved)
-                                        # The raw text was flushed: it sets the
-                                        # code state of what follows (ELI-111).
-                                        self.assistant_stream_text += delta
-                                        self.record_visible_chunk(resolved)
-                                        yield resolved
-                                        await self.maybe_emit_snapshot()
-                                        continue
-                                self.assistant_stream_text += delta
-                                self.record_visible_chunk(delta)
-                                yield delta
-                                # NOTE: do NOT emit a `replace` snapshot per text
-                                # delta here. A mid-stream `replace` carrying the
-                                # full accumulated text makes OWUI's own
-                                # `_suppress_already_shown` treat the *continuing*
-                                # delta stream as already-shown and suppress it --
-                                # the visible stream freezes mid-message (regression
-                                # 2026-07-18, exactly the P23/P25 hazard). Mid-run
-                                # DB back-sync for this path goes through the REST
-                                # snapshot gate instead (`maybe_start_rest_snapshot`,
-                                # bridge-rehydration-rest-snapshot-verify), which
-                                # writes the chat row directly and never broadcasts
-                                # to the live client, so it cannot trigger that
-                                # suppression.
-                                self.maybe_start_rest_snapshot()
+                                whole = _item_assistant_text(data) if stream == "item" else ""
+                            gap_tail = self.reconcile_whole_text(whole) if whole else None
+                            added = self.renderer.feed(payload, gap_tail=gap_tail)
+                        if stream == "assistant":
+                            for text in (a for a in added if isinstance(a, str)):
+                                async for chunk in self.show_text(text):
+                                    yield chunk
 
                         # --- Assistant text carried by item/preamble events ---
                         if stream == "item":
@@ -10524,7 +10427,7 @@ class _PipeTurn:
                                     self.done = False
                                     last_item_text = item_text
                                     continue
-                                gap_tail = self.reconcile_whole_text(item_text)
+                                # `gap_tail`: this event's, worked out above.
                                 item_delta = gap_tail if gap_tail is not None else _item_delta_text(
                                     item_text, last_item_text, self.assistant_stream_text
                                 )
@@ -10561,14 +10464,14 @@ class _PipeTurn:
                         # list, so a card is mutable and is never part of the
                         # message text.
                         if stream == "tool":
-                            events = self.tool_cards.feed(payload)
+                            events = [a for a in added if isinstance(a, dict)]
                             if phase == "start":
                                 pipe_log(f"  Tool start: {name}")
-                                if events and pending_media_text:
+                                if events and self.pending_media_text:
                                     # The message item ends here, and with it
                                     # any code span a held directive waited on
                                     # (ELI-111): it shows before the card.
-                                    held, pending_media_text = pending_media_text, ""
+                                    held, self.pending_media_text = self.pending_media_text, ""
                                     resolved = await self.settle_held_media(held)
                                     self.assistant_stream_text += held
                                     self.record_visible_chunk(resolved)
@@ -10625,9 +10528,9 @@ class _PipeTurn:
                     self.conn.park_cancelled_turn(
                         self.session_key, self.our_run_id, self.queue, self.turn.unsent, grace_s,
                         send_stop=self.pipe.valves.SEND_STOP_ON_CANCEL,
-                        run_text={"received": self.assistant_received_text,
+                        run_text={"received": self.renderer.received,
                                   "stream": self.assistant_stream_text,
-                                  "item": last_item_text,
+                                  "item": self.renderer.last_item,
                                   "gaps": self.run_gaps,
                                   "segments": self.run_segments},
                         settle=functools.partial(
@@ -10650,7 +10553,7 @@ class _PipeTurn:
 
                 else:
                     # Normal completion (no cancellation).
-                    if pending_prompt_text:
+                    if self.pending_prompt_text:
                         # The buffered plain-text tail either fully resolved into a
                         # needs-input trigger (see `_could_be_user_input_prefix`
                         # above -- buffering only continues past the ambiguous
@@ -10660,7 +10563,7 @@ class _PipeTurn:
                         # re-checks the trigger itself and returns False for a
                         # partial/non-match, in which case fall back to showing it
                         # as plain text so nothing is silently dropped.
-                        answer_res = await self.maybe_answer_user_input(pending_prompt_text)
+                        answer_res = await self.maybe_answer_user_input(self.pending_prompt_text)
                         if answer_res.handled:
                             # Answer delivered. Re-enter the main loop (via the outer
                             # `while adopt_new_run`) to consume the follow-up -- whether
@@ -10672,14 +10575,14 @@ class _PipeTurn:
                             detail_block = ""
                             if answer_res.answer:
                                 detail_block = _ask_user_detail_block(
-                                    answer_res.prompt_text or pending_prompt_text, answer_res.answer
+                                    answer_res.prompt_text or self.pending_prompt_text, answer_res.answer
                                 )
                                 self.record_visible_chunk(detail_block)
                                 yield detail_block
                                 await self.maybe_emit_snapshot(force=True)
                             self.conn.note_turn_rewrite(self.owui_origin_chat_id, self.owui_message_id,
-                                                   pending_prompt_text, detail_block)
-                            pending_prompt_text = ""
+                                                   self.pending_prompt_text, detail_block)
+                            self.pending_prompt_text = ""
                             if answer_res.new_run_id and answer_res.new_run_id != self.our_run_id:
                                 pipe_log(f"  continuing into new run: {answer_res.new_run_id[:20]}...")
                                 # The answer run continues this reply (R9).
@@ -10697,16 +10600,16 @@ class _PipeTurn:
                             # on reconnect). Show the prompt as a fallback, but
                             # never leak the literal "OpenClaw needs input:"
                             # directive line as visible text.
-                            fallback = _ask_user_fallback_text(pending_prompt_text)
+                            fallback = _ask_user_fallback_text(self.pending_prompt_text)
                             self.conn.note_turn_rewrite(self.owui_origin_chat_id, self.owui_message_id,
-                                                   pending_prompt_text, fallback)
+                                                   self.pending_prompt_text, fallback)
                             if fallback:
                                 self.record_visible_chunk(fallback)
                                 yield fallback
                                 self.text_yielded = True
-                            pending_prompt_text = ""
+                            self.pending_prompt_text = ""
 
-                    if pending_media_text:
+                    if self.pending_media_text:
                         # The run ended with a MEDIA: directive still buffered --
                         # either its filename never got a trailing whitespace
                         # before the stream closed, or "MEDIA:" itself was still
@@ -10714,11 +10617,11 @@ class _PipeTurn:
                         # resolve now; `_resolve_media_text` still falls back to
                         # showing it as plain text if resolution fails, so
                         # nothing is silently dropped.
-                        resolved = await self.settle_held_media(pending_media_text)
+                        resolved = await self.settle_held_media(self.pending_media_text)
                         self.record_visible_chunk(resolved)
                         yield resolved
                         self.text_yielded = True
-                        pending_media_text = ""
+                        self.pending_media_text = ""
 
                     # Resolve any tool call that was announced but never got a
                     # result (run cancelled, gateway dropped it, tool crashed).
@@ -10742,7 +10645,7 @@ class _PipeTurn:
                     if not adopt_new_run:
                         note = ("(interrupted -- the reply continues when the run resumes)"
                                 if handed_over else TOOL_NO_RESULT_NOTE)
-                        for event in self.tool_cards.close_open_calls(note):
+                        for event in self.renderer.close_open_calls(note):
                             pipe_log(f"  closing orphaned tool call {event['item']['call_id']}")
                             yield event
 
@@ -11056,7 +10959,7 @@ class _PipeTurn:
         the gaps pending for the next whole text."""
         if not self.run_gaps or not self.chat_id:
             return None
-        aligned = _align_whole_text(whole, self.assistant_received_text, self.run_gaps)
+        aligned = _align_whole_text(whole, self.renderer.received, self.run_gaps)
         if aligned is None:
             return None
         tail, missing = aligned
@@ -11067,12 +10970,12 @@ class _PipeTurn:
             if seg is None:
                 continue
             nxt = next((sg["start"] for sg in self.run_segments if sg["start"] > seg["start"]),
-                       len(self.assistant_received_text))
+                       len(self.renderer.received))
             repair = {
                 "user_id": self.owui_origin_user_id, "chat_id": self.chat_id,
                 "message_id": seg["message_id"], "chunk": chunk,
-                "before": self.assistant_received_text[offset:min(offset + _GAP_ANCHOR_CHARS, nxt)],
-                "after": self.assistant_received_text[max(seg["start"], offset - _GAP_ANCHOR_CHARS):offset],
+                "before": self.renderer.received[offset:min(offset + _GAP_ANCHOR_CHARS, nxt)],
+                "after": self.renderer.received[max(seg["start"], offset - _GAP_ANCHOR_CHARS):offset],
             }
             pipe_log(f"  event gap: {len(chunk)} chars lost at offset {offset}; "
                      f"repairing message {seg['message_id'][:8]}...")
@@ -11167,8 +11070,8 @@ class _PipeTurn:
             gap_tail = self.reconcile_whole_text(whole)
             if gap_tail is not None:
                 return gap_tail
-            if whole.startswith(self.assistant_received_text):
-                return whole[len(self.assistant_received_text):]
+            if whole.startswith(self.renderer.received):
+                return whole[len(self.renderer.received):]
             return "" if self.text_yielded else whole
         if closer_only:
             return "" if found else None
@@ -11321,6 +11224,56 @@ class _PipeTurn:
             self.conn.mark_delivered_live(self.session_key, self.our_run_id)
         else:
             self.conn.continue_run_target(self.session_key, self.our_run_id, answer_res.new_run_id)
+
+    async def show_text(self, text: str):
+        """New run text from the renderer, assistant or item alike, through
+        the reply's text hooks: held while it may open a needs-input prompt
+        (resolved when the run ends), held while a `MEDIA:` filename is still
+        arriving, and a complete directive shown as its image."""
+        # A fence the shown text of this message item left open makes a
+        # marker a quote (ELI-107), and a marker only opens a line; held text
+        # always starts outside a fence. A fence never spans items.
+        shown = self.assistant_stream_text[self.fence_item_start:] + self.pending_media_text
+        text, self.pending_prompt_text = _advance_input_prompt_buffer(
+            self.pending_prompt_text, text, _fence_open_after(shown),
+            at_line_start=not shown or shown.endswith("\n"))
+        if not text:
+            return
+        # A directive split across deltas is held until its filename is
+        # complete (`_advance_media_buffer`); one quoted in code is text
+        # (ELI-111), by the shown text of this item.
+        text, self.pending_media_text = _advance_media_buffer(
+            self.pending_media_text, text, self.assistant_stream_text[self.fence_item_start:])
+        if not text:
+            return
+        self.text_yielded = True
+        shown_as = text
+        if "MEDIA:" in text:
+            resolved, handled = await _resolve_media_text(
+                text,
+                valves=self.pipe.valves,
+                __request__=self.__request__,
+                __event_emitter__=self.__event_emitter__,
+                ctx=self.assistant_stream_text[self.fence_item_start:],
+            )
+            if handled:
+                pipe_log("  resolved MEDIA: directive")
+                # A writer that takes this reply over shows the same image
+                # (review 2af1 R4).
+                self.conn.note_turn_rewrite(self.owui_origin_chat_id, self.owui_message_id,
+                                            text, resolved)
+                shown_as = resolved
+        # The raw text sets the code state of what follows (ELI-111).
+        self.assistant_stream_text += text
+        self.record_visible_chunk(shown_as)
+        yield shown_as
+        if shown_as is text:
+            # No `replace` snapshot per delta: a mid-stream one freezes the
+            # visible stream (P23/P25). The REST snapshot writes the DB row
+            # without a broadcast instead.
+            self.maybe_start_rest_snapshot()
+        else:
+            await self.maybe_emit_snapshot()
 
     async def settle_held_media(self, held: str) -> str:
         """Text `_advance_media_buffer` held, once its message item ends:

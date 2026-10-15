@@ -480,18 +480,26 @@ class _TurnWriter:
         directive that first came after the handover resolved here, and,
         while the run streams, a directive whose filename is still arriving
         held back, as the inline reply holds it."""
-        await self._resolve_media(self._rewrite(self.renderer.text), final)
         output = self.renderer.finished_output() if final else copy.deepcopy(self.renderer.output)
+        items = [i for i in output if i.get("type") == "message" and i.get("content")]
+        # Each message item is read on its own, as the inline reply reads
+        # it: an item ends a directive, so the text after a tool card does
+        # not run into the filename before it (ELI-147).
+        for item in items:
+            await self._resolve_media(self._rewrite(item["content"][0].get("text") or ""),
+                                      final or item is not output[-1])
         hold = None if final else globals().get("_advance_media_buffer")
 
         def show(text: str, tail: bool) -> str:
             text = self._rewrite(text)
             return hold("", text)[0] if hold and tail else text
         for n, item in enumerate(output):
-            if item.get("type") == "message" and item.get("content"):
+            if item in items:
                 part = item["content"][0]
                 part["text"] = show(part.get("text") or "", n == len(output) - 1)
-        return output, show(self.renderer.text, True)
+        if not items:
+            return output, show(self.renderer.text, True)
+        return output, "".join(i["content"][0]["text"] for i in items)
 
     async def _resolve_media(self, text: str, final: bool) -> None:
         """Upload each complete `MEDIA:` directive the inline reply never saw,

@@ -92,7 +92,6 @@ from openclaw_pipe import (
     _parse_gateway_url,
     _explain_connect_rejection,
     _explain_session_patch_failure,
-    _catch_all_delta,
     _align_whole_text,
     _gap_repair_fields,
     _GapRepairSink,
@@ -4851,6 +4850,18 @@ class RepeatedAskUserMarkerTests(unittest.TestCase):
 
     def test_dedupe_drops_blanks(self):
         self.assertEqual(_dedupe_options(["a", "  ", "", "a"]), ["a"])
+
+
+def _catch_all_delta(raw_text: str, received: str, visible: str) -> str:
+    """The text the renderer adds for a cumulative catch-all event (no
+    `delta`, the whole reply in `text`) after `received` arrived and
+    `visible` showed. The inline reply's own copy of this diff went in
+    ELI-147; the renderer's is the one both sides use."""
+    r = _TurnRenderer()
+    r.seed({"received": received})
+    r.visible_text = visible
+    added = r.feed({"stream": "assistant", "data": {"text": raw_text}})
+    return "".join(a for a in added if isinstance(a, str))
 
 
 class MediaDirectiveDoubledFilenameTests(unittest.IsolatedAsyncioTestCase):

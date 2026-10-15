@@ -101,7 +101,7 @@ def _marker_line_index(text: str, in_fence=False):
 
 
 def _advance_input_prompt_buffer(pending: str, delta: str,
-                                 in_fence=False) -> tuple[str, str]:
+                                 in_fence=False, at_line_start=True) -> tuple[str, str]:
     """Feed a new assistant-delta chunk into the needs-input buffering state.
 
     Returns `(text_to_yield_now, new_pending)`. `pending` is text already
@@ -120,8 +120,19 @@ def _advance_input_prompt_buffer(pending: str, delta: str,
 
     `in_fence`: a fenced code block is open where `pending + delta` starts
     (the shown text left it open); nothing in a fence is held (ELI-107).
+    `at_line_start`: the shown text ends at the start of a line. When it
+    does not, the first line of `delta` continues a line and opens no
+    prompt, wherever the deltas happen to split (ELI-147).
     """
     candidate = pending + delta
+    if not (pending or at_line_start):
+        nl = candidate.find("\n")
+        if nl == -1:
+            return candidate, ""
+        head = candidate[:nl + 1]
+        flush, held = _advance_input_prompt_buffer("", candidate[nl + 1:],
+                                                   _fence_open_after(head, in_fence))
+        return head + flush, held
     if not in_fence and _could_be_user_input_prefix(candidate.lstrip()):
         return "", candidate
     # A complete marker may sit mid-candidate when the whole reply arrives at

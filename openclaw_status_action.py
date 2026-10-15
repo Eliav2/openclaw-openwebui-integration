@@ -1657,27 +1657,6 @@ def _item_delta_text(item_text: str, last_item_text: str, assistant_stream_text:
     return item_text
 
 
-def _catch_all_delta(raw_text: str, received_text: str, visible_text: str) -> str:
-    """New text carried by a cumulative catch-all assistant event.
-
-    Some providers end a turn with an event that has no `delta` but a `text`
-    field holding the WHOLE reply. It has to be diffed against what already
-    arrived, or the entire message is treated as new.
-
-    The diff is against `received_text`, everything the gateway sent us, and
-    not only against what was shown. Those two differ: text held back by the
-    ask-user buffer was received but never yielded. Diffing against shown text
-    alone made the final catch-all look entirely new, so the whole needs-input
-    block was appended to that buffer a second time and the dialog rendered the
-    prompt twice with double the options (ELI-80). The visible-text pass stays
-    as a second net for the drift case it was originally written for (P27).
-    """
-    if not raw_text:
-        return ""
-    delta = _item_delta_text(raw_text, "", received_text)
-    return _suppress_already_shown(delta, visible_text)
-
-
 def _suppress_already_shown(delta: str, visible_message_text: str) -> str:
     """Final safety net against re-yielding text that's already been shown.
 
@@ -1949,13 +1928,31 @@ class _TurnRenderer:
         # 2026-10-14: "...foreground.USER-DONE" across the resume).
         self.run_boundary = False
 
+    @property
+    def received(self) -> str:
+        """All the run text that arrived, shown or not: the dedup baseline."""
+        return self._assistant_stream_text
+
+    @property
+    def last_item(self) -> str:
+        """The last item event's text, the baseline for the next one."""
+        return self._last_item_text
+
+    def seed(self, run_text: dict | None) -> None:
+        """Continue a run another reply showed: take its dedup baselines, so
+        its closing whole-text events are not shown again."""
+        if run_text:
+            self._assistant_stream_text = run_text.get("received", "")
+            self._last_item_text = run_text.get("item", "")
+
     def _add(self, chunk: str) -> None:
         if chunk:
             self.visible_text += chunk
 
-    def _add_text(self, chunk: str) -> None:
+    def _add_text(self, chunk: str) -> str:
+        """Append `chunk` to the run's text; returns it as added."""
         if not chunk:
-            return
+            return ""
         if self.run_boundary:
             self.run_boundary = False
             chunk = _message_boundary_separator(self.text, chunk) + chunk
@@ -1972,6 +1969,7 @@ class _TurnRenderer:
             }
             self.output.append(last)
         last["content"][0]["text"] += chunk
+        return chunk
 
     def _tool_item(self, name: str, tcid: str, args_str: str, events: list) -> dict:
         """The call's card, opened (and its start event added to `events`)
@@ -2013,12 +2011,14 @@ class _TurnRenderer:
                 item["status"] = "completed"
         return out
 
-    def feed(self, payload: dict) -> list[dict]:
-        """Grow the run's content by one event. Returns the Responses events
-        it caused for a live stream: a tool card opened, relabelled as failed,
-        or answered. The inline reply yields them, so it and a turn writer
-        show the same cards (ELI-147)."""
-        events: list[dict] = []
+    def feed(self, payload: dict, gap_tail: str | None = None) -> list:
+        """Grow the run's content by one event. Returns what it added for a
+        live stream: the new text (a str) and the Responses events of a tool
+        card opened, relabelled as failed, or answered. The inline reply
+        shows them, so it and a turn writer show the same text and cards
+        (ELI-147). `gap_tail`: the new part of a whole-text event after a
+        gap, which the inline reply's gap repair worked out."""
+        events: list = []
         data = payload.get("data", {}) or {}
         stream = payload.get("stream")
         name = data.get("name", "")
@@ -2030,29 +2030,36 @@ class _TurnRenderer:
                 delta = raw_delta
             else:
                 raw_text = data.get("text") or ""
-                delta = (
-                    _item_delta_text(raw_text, "", self._assistant_stream_text)
-                    if raw_text else ""
-                )
+                if gap_tail is not None:
+                    delta = gap_tail
+                else:
+                    delta = (
+                        _item_delta_text(raw_text, "", self._assistant_stream_text)
+                        if raw_text else ""
+                    )
+                    if raw_text and not delta:
+                        pipe_log("  suppressed duplicate catch-all assistant text")
                 delta = _suppress_already_shown(delta, self.visible_text)
             if delta:
                 if (
                     "Sender (untrusted metadata)" in delta
                     or "UnTrustedMetadata" in delta
                 ):
+                    pipe_log("  filtered metadata block")
                     return events
                 self._assistant_stream_text += delta
-                self._add_text(delta)
+                events.append(self._add_text(delta))
 
         if stream == "item":
             item_text = _item_assistant_text(data)
             if item_text:
-                item_delta = _item_delta_text(
+                item_delta = gap_tail if gap_tail is not None else _item_delta_text(
                     item_text, self._last_item_text, self._assistant_stream_text
                 )
                 self._last_item_text = item_text
                 item_delta = _suppress_already_shown(item_delta, self.visible_text)
-                self._add_text(item_delta)
+                if item_delta:
+                    events.append(self._add_text(item_delta))
 
         if stream == "tool":
             tcid = data.get("toolCallId", "")
@@ -3192,9 +3199,7 @@ class _GatewayConnection:
         renderer = self._run_renderers.get(f"{session_key}:{run_id}")
         if renderer is None:
             return
-        if run_text:
-            renderer._assistant_stream_text = run_text.get("received", "")
-            renderer._last_item_text = run_text.get("item", "")
+        renderer.seed(run_text)
         for msg in list(getattr(queue, "_queue", ())):
             try:
                 renderer.feed(msg.get("payload", {}))
@@ -5151,18 +5156,26 @@ class _TurnWriter:
         directive that first came after the handover resolved here, and,
         while the run streams, a directive whose filename is still arriving
         held back, as the inline reply holds it."""
-        await self._resolve_media(self._rewrite(self.renderer.text), final)
         output = self.renderer.finished_output() if final else copy.deepcopy(self.renderer.output)
+        items = [i for i in output if i.get("type") == "message" and i.get("content")]
+        # Each message item is read on its own, as the inline reply reads
+        # it: an item ends a directive, so the text after a tool card does
+        # not run into the filename before it (ELI-147).
+        for item in items:
+            await self._resolve_media(self._rewrite(item["content"][0].get("text") or ""),
+                                      final or item is not output[-1])
         hold = None if final else globals().get("_advance_media_buffer")
 
         def show(text: str, tail: bool) -> str:
             text = self._rewrite(text)
             return hold("", text)[0] if hold and tail else text
         for n, item in enumerate(output):
-            if item.get("type") == "message" and item.get("content"):
+            if item in items:
                 part = item["content"][0]
                 part["text"] = show(part.get("text") or "", n == len(output) - 1)
-        return output, show(self.renderer.text, True)
+        if not items:
+            return output, show(self.renderer.text, True)
+        return output, "".join(i["content"][0]["text"] for i in items)
 
     async def _resolve_media(self, text: str, final: bool) -> None:
         """Upload each complete `MEDIA:` directive the inline reply never saw,
