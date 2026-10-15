@@ -9253,13 +9253,15 @@ class GapHandoverReplayTests(_RoutingCase):
         self.pipe.valves.AUTO_TITLE = False
         self.pipe.valves.INTERRUPT_GRACE_SECONDS = 0.3
 
-    async def start_reply(self, text="count", message_id=None, intent=None):
-        """A user turn's request, running until its run is sent."""
+    async def start_reply(self, text="count", message_id=None, intent=None, sends=True):
+        """A user turn's request, running until its run is sent (or, for a
+        reply that takes over a parked run, until it consumes it)."""
         message_id = message_id or self.STUB
         self.add_stub(message_id)
+        emitted = []
 
         async def emitter(event):
-            pass
+            emitted.append(event)
 
         async def event_call(event):
             return intent
@@ -9267,7 +9269,7 @@ class GapHandoverReplayTests(_RoutingCase):
         meta = {"chat_id": self.CHAT, "user_id": self.USER, "message_id": message_id}
         gen = self.pipe._pipe_impl(body, emitter, __metadata__=meta,
                                    __event_call__=event_call if intent else None)
-        reply = {"gen": gen, "text": "", "items": []}
+        reply = {"gen": gen, "text": "", "items": [], "emitted": emitted}
 
         async def drain():
             async for chunk in gen:
@@ -9275,10 +9277,10 @@ class GapHandoverReplayTests(_RoutingCase):
                     reply["text"] += chunk
                 elif isinstance(chunk, dict) and chunk.get("type") == "response.output_item.added":
                     reply["items"].append(chunk["item"])
-        sends = len(self.chat_sends)
+        sent_before = len(self.chat_sends)
         reply["task"] = asyncio.ensure_future(drain())
-        for _ in range(400):
-            if len(self.chat_sends) > sends:
+        for _ in range(400 if sends else 0):
+            if len(self.chat_sends) > sent_before:
                 break
             await asyncio.sleep(0.005)
         if self.run is None:
@@ -9325,6 +9327,98 @@ class GapHandoverReplayTests(_RoutingCase):
         self.settle()
         await self.ended(reply)
         self.assertEqual(self.stored(), (True, "Reading them.\n\nFound it.", 1))
+
+    async def test_case_2_the_socket_drops_mid_tool_and_the_run_ends_while_down(self):
+        """The call's result, the closing text, the final and the settle were
+        all sent while the socket was down. The row read after the reconnect
+        is idle."""
+        reply = await self.start_reply()
+        self.history = _turn_history(run=self.run)
+        self.frame(_delta("Reading them."))
+        self.frame(_tool("start", tcid="toolu_1"))
+        self.active = False
+        self.socket.frames.put_nowait("drop")
+        await self.ended(reply)
+        self.assertEqual(self.stored(), (True, "Reading them.\n\nFound it.", 1))
+
+    async def test_case_3_only_the_final_and_the_settle_are_lost(self):
+        reply = await self.start_reply()
+        self.history = _turn_history(run=self.run)
+        for payload in (_delta("Reading them."), _tool("start", tcid="toolu_1"),
+                        _tool("result", tcid="toolu_1"), _delta("\n\nFound it.")):
+            self.frame(payload)
+        self.active = False
+        self.socket.frames.put_nowait("drop")
+        await self.ended(reply)
+        self.assertEqual(self.stored(), (True, "Reading them.\n\nFound it.", 1))
+
+    @staticmethod
+    def _nums(a, b):
+        return "".join(f"{i}\n" for i in range(a, b + 1))
+
+    async def test_the_98891cbb_shape_a_drop_right_after_the_send(self):
+        """2026-10-12, chat 98891cbb: the socket dropped right after the reply
+        registered, so lines 1-3 never arrived. The message gets the whole
+        run once, from the writer. The request, which showed nothing, leaves
+        it alone: no partial save into the writer's message, no transcript
+        recovery and no thinking retry (those are for a reply with no text)."""
+        reply = await self.start_reply("count to 30")
+        self.history = {"messages": [
+            {"role": "user", "content": "count to 30", "idempotencyKey": f"{self.run}:user"},
+            {"role": "assistant", "idempotencyKey": f"cli-assistant:{self.run}",
+             "content": [{"type": "text", "text": self._nums(1, 30)}]}]}
+        self.socket.frames.put_nowait("drop")          # 1-3 are sent while it is down
+        self.frame(_delta(self._nums(4, 30)))
+        self.frame({"state": "final"}, event="chat")
+        self.settle()
+        await self.ended(reply)
+        self.assertEqual(self.stored(), (True, self._nums(1, 30), 0))
+        self.assertEqual(reply["text"], "")
+        self.assertEqual([e for e in reply["emitted"] if e.get("type") == "replace"], [])
+        self.assertEqual(len(self.chat_sends), 1, "no retry or resend")
+
+    async def test_a_reply_that_took_over_a_run_keeps_streaming_through_a_gap(self):
+        """Known, accepted gap: a Send now reply holds the user's new message
+        and sends it once the run it took over ends, in the same message. It
+        does not hand over (the writer would own its message while it sends,
+        ELI-153); text lost in a gap there stays lost."""
+        first = await self.start_reply("count to 20", "m1", intent="send_now")
+        run1 = self.run
+        self.history = {"messages": [
+            {"role": "user", "content": "count to 20", "idempotencyKey": f"{run1}:user"},
+            {"role": "assistant", "idempotencyKey": f"cli-assistant:{run1}",
+             "content": [{"type": "text", "text": self._nums(1, 20)}]}]}
+        self.frame(_delta(self._nums(1, 10)))
+        for _ in range(400):
+            if "10\n" in first["text"]:
+                break
+            await asyncio.sleep(0.005)
+        first["task"].cancel()                         # Send now
+        await asyncio.gather(first["task"], return_exceptions=True)
+        second = await self.start_reply("MSG2", "m2", intent="send_now", sends=False)
+        self.frame(_delta(self._nums(11, 13)))
+        self.lost(1)                                   # 14-15
+        self.frame(_delta(self._nums(16, 20)))
+        self.frame({"state": "final"}, event="chat")
+        self.settle()
+        for _ in range(400):
+            if len(self.chat_sends) == 2:
+                break
+            await asyncio.sleep(0.005)
+        self.assertEqual(self.chat_sends[1]["message"], "MSG2")
+        self.run, self.active = self.chat_sends[1]["idempotencyKey"], True
+        self.frame(_delta("ANSWER"))
+        self.frame({"state": "final"}, event="chat")
+        self.settle()
+        await self.ended(second)
+        self.assertEqual(self.conn._turn_pumps, {}, "nothing was handed over")
+        self.assertIs(self.owui.msgs()["m2"]["done"], False, "the writer never wrote m2")
+        self.assertEqual(self._count(second["text"]), [11, 12, 13, 16, 17, 18, 19, 20])
+        self.assertIn("ANSWER", second["text"])
+
+    @staticmethod
+    def _count(text):
+        return [int(t) for t in text.split() if t.isdigit()]
 
 
 class ToolCardParityTests(unittest.IsolatedAsyncioTestCase):
