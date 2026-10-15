@@ -1264,77 +1264,46 @@ def _extract_transcript_and_tools(messages: list) -> tuple[list, list]:
     """Splits chat.history's message rows into plain-text transcript rows and
     tool-call cards for the drawer's Transcript/Tools tabs.
 
-    Assumes the same {role, content: [...]} shape confirmed live via
-    sessions_history (content items typed "text" / "toolcall" /
-    "tool_result" / "thinking") -- chat.history is a display-normalized
-    projection of the same underlying transcript store, not a separate
-    schema, so this is expected to match; a plain string `content` (some
-    transports may still use that) is treated as a single text row so this
-    degrades instead of silently dropping messages if the shape differs.
+    The tool calls are the ones the chat's own rebuild makes cards of, read
+    by the same parser (`_history_events`, gateway.py), in both transcript
+    shapes (claude-cli's and the Gateway's own runtime's). Each card's result
+    is its output by the chat tool cards' rule, not the block list or the
+    {content, details} envelope as JSON (ELI-125). Text rows are every
+    message's text blocks; a plain string `content` is a single row.
     """
     text_rows: list = []
-    tool_calls: list = []
-    pending_by_id: dict = {}
-
-    def add_text(role, text):
-        if role == "user" and _is_spawn_message(text):
+    for m in messages or []:
+        role, content = m.get("role"), m.get("content")
+        if role == "toolResult":
+            continue  # shows in its call's Tools card only (ELI-128)
+        if isinstance(content, str):
+            text = content if content.strip() else ""
+        elif isinstance(content, list):
+            text = "\n".join(i["text"] for i in content
+                             if isinstance(i, dict) and i.get("type") == "text" and i.get("text"))
+        else:
+            continue
+        if text and role == "user" and _is_spawn_message(text):
             # A child's first message is the Gateway's spawn wrapper: show
             # the task in it, as the Subagents row does.
             text = _subagent_task_text(text) or text
-        text_rows.append({"role": role, "text": text})
+        if text:
+            text_rows.append({"role": role, "text": text})
 
-    for m in messages or []:
-        role = m.get("role")
-        content = m.get("content")
-        if role == "toolResult":
-            # OpenClaw's own shape, outside claude-cli imports: the result is
-            # a message of its own, paired by toolCallId with a `toolCall`
-            # block. It shows in that call's Tools card only, as a claude-cli
-            # `tool_result` does (ELI-128).
-            call = pending_by_id.get(m.get("toolCallId"))
-            if call is not None:
-                call["result"] = _tool_result_text(content)
-                call["isError"] = bool(m.get("isError"))
+    tool_calls: list = []
+    by_id: dict = {}
+    for event in _history_events(messages or []):
+        data = event["data"]
+        if event["stream"] != "tool":
             continue
-        if isinstance(content, str):
-            if content.strip():
-                add_text(role, content)
-            continue
-        if not isinstance(content, list):
-            continue
-        text_parts = []
-        for item in content:
-            if not isinstance(item, dict):
-                continue
-            item_type = item.get("type")
-            if item_type == "text" and item.get("text"):
-                text_parts.append(item["text"])
-            elif item_type in ("toolcall", "toolCall"):
-                call = {
-                    "id": item.get("id"),
-                    "name": item.get("name") or "tool",
-                    "arguments": (
-                        json.dumps(item.get("arguments"), indent=2)
-                        if item.get("arguments") is not None else ""
-                    ),
-                    "result": None,
-                    "isError": False,
-                }
-                pending_by_id[call["id"]] = call
-                tool_calls.append(call)
-            elif item_type == "tool_result":
-                call = pending_by_id.get(item.get("tool_use_id"))
-                if call is not None:
-                    # The output, by the chat tool cards' rule (gateway.py):
-                    # not the block list or the {content, details} envelope
-                    # as JSON (ELI-125).
-                    call["result"] = _tool_result_text(item.get("content"))
-                    # Real tool_result rows carry is_error; surfacing it here
-                    # lets the card mark a failure the same way the inline
-                    # chat tool cards already do.
-                    call["isError"] = bool(item.get("is_error"))
-        if text_parts:
-            add_text(role, "\n".join(text_parts))
+        if data["phase"] == "start":
+            by_id[data["toolCallId"]] = call = {
+                "id": data["toolCallId"], "name": data["name"] or "tool",
+                "arguments": json.dumps(data["args"], indent=2), "result": None, "isError": False}
+            tool_calls.append(call)
+        elif (call := by_id.get(data["toolCallId"])) is not None:
+            call["result"] = _tool_result_text(data["result"])
+            call["isError"] = data["isError"]
     return text_rows, tool_calls
 
 

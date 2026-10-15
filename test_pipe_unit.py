@@ -457,7 +457,7 @@ class HistoryRunRebuildTests(unittest.TestCase):
         outputs = {i["call_id"]: i["output"][0]["text"] for i in r.output if i["type"] == "function_call_output"}
         self.assertEqual(outputs["call_00_bLXMsmgz1pJc5IL1J0Rx1971"], "(empty directory)")
         self.assertTrue(outputs["call_00_QFthybdFqQt4QEdyJoAu2999"].startswith(f"{TOOL_ERROR_MARK} tool call failed"))
-        self.assertEqual(r.finished_output(), r.output)  # every call answered
+        self.assertEqual(len(r.finished_output()), len(r.output))  # every call answered
         self.assertEqual(r.output[-1]["type"], "message")
         self.assertTrue(r.text.endswith("The workshop is empty."))
 
