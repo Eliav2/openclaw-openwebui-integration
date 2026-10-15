@@ -940,3 +940,14 @@ def test_debug_eli98_compact_typed_in_owui(token):
     msg = _eli98_followup_turn(token, chat_id, "/compact")
     print("[eli98] owui /compact persisted:", json.dumps(
         {k: msg.get(k) for k in ("content", "output", "statusHistory", "done", "error")})[:3000], flush=True)
+
+
+def test_debug_eli98_threshold_compaction_events(token):
+    chat_id, _ = _chat_turn(token, "Reply with exactly: ELI98_T1")
+    key = _session_key(token, chat_id)
+    _eli98_fill(token, chat_id, key)
+    frames = _eli98_capture(token, chat_id, key, "E2E_BIGUSAGE Reply with exactly: ELI98_T2")
+    print("[eli98] threshold streams:", _eli98_streams(frames), flush=True)
+    comp = [f for f in frames if isinstance(f, dict) and f.get("event") == "agent"
+            and (f.get("payload") or {}).get("stream") == "compaction"]
+    print("[eli98] threshold compaction frames:", json.dumps(comp)[:3000], flush=True)

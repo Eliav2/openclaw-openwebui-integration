@@ -141,6 +141,10 @@ def plan_reply(body: dict) -> dict:
             return {"tool": "tool_call", "args": {"id": "sessions_spawn", "args": args}}
         return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
 
+    if "E2E_BIGUSAGE" in user_text:   # DEBUG ELI-98: report a nearly full context
+        m = _EXACTLY.search(user_text)
+        return {"text": m.group(1) if m else "E2E fake model reply.", "prompt_tokens": 190000}
+
     m = _SLOW.search(user_text)
     if m:
         count = int(m.group(1) or SLOW_WORDS)
@@ -210,7 +214,8 @@ class Handler(BaseHTTPRequestHandler):
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         created = int(time.time())
         model = body.get("model") or MODEL_ID
-        usage = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        pt = plan.get("prompt_tokens", 10)
+        usage = {"prompt_tokens": pt, "completion_tokens": 5, "total_tokens": pt + 5}
 
         if "tool" in plan:
             call = {"id": f"call_{uuid.uuid4().hex[:12]}", "type": "function",
