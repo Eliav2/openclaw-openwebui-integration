@@ -87,13 +87,11 @@ from openclaw_pipe import (
     recovery_source_run, run_message_id, _TurnWriter, _INTENT_HOOK_JS,
     _turn_route_event, _turn_after_hello, _turn_resync, _history_span_messages,
     wake_turns, wake_turn_at, wake_span, _wake_resync, _adopt_turn_message,
-    _gateway_run_status,
     _GatewayConnection,
     GatewayError,
     _parse_gateway_url,
     _explain_connect_rejection,
     _explain_session_patch_failure,
-    _catch_all_delta,
     _align_whole_text,
     _gap_repair_fields,
     _GapRepairSink,
@@ -123,6 +121,7 @@ from openclaw_pipe import (
     _reconcile_stub,
     ORPHAN_STUB_NOTE,
     TOOL_ERROR_MARK,
+    TOOL_NO_RESULT_NOTE,
     _FALLBACK_MODELS,
     _advance_input_prompt_buffer,
     _advance_media_buffer,
@@ -135,7 +134,6 @@ from openclaw_pipe import (
     _content_has_image,
     _could_be_user_input_prefix,
     _deepest_leaf_id,
-    _discover_models,
     _emit_message_snapshot,
     _emit_status,
     _extract_image_attachments,
@@ -154,9 +152,9 @@ from openclaw_pipe import (
     _normalize_model_entry,
     _owui_chat_send_params,
     _owui_session_key,
-    _preview_recovery_text,
     _history_recovery_text,
     _recover_turn_text,
+    _recovery_text_from_items,
     _provider_from_key,
     _reap_stale_gateway_connection,
     _relative_time,
@@ -183,42 +181,25 @@ from openclaw_pipe import (
 )
 
 
-class PreviewRecoveryTests(unittest.TestCase):
+class RecoveryItemsTests(unittest.TestCase):
     def test_recovers_assistant_after_matching_user_message(self):
-        preview = {
-            "previews": [{
-                "key": "agent:main:test",
-                "items": [
-                    {"role": "user", "text": "old"},
-                    {"role": "assistant", "text": "old answer"},
-                    {"role": "user", "text": "current question"},
-                    {"role": "assistant", "text": "current answer"},
-                ],
-            }]
-        }
-        self.assertEqual(
-            _preview_recovery_text(preview, "agent:main:test", "current question"),
-            "current answer",
-        )
+        items = [
+            {"role": "user", "text": "old"},
+            {"role": "assistant", "text": "old answer"},
+            {"role": "user", "text": "current question"},
+            {"role": "assistant", "text": "current answer"},
+        ]
+        self.assertEqual(_recovery_text_from_items(items, "current question"), "current answer")
 
     def test_does_not_recover_without_matching_user_message(self):
-        preview = {
-            "previews": [{
-                "key": "agent:main:test",
-                "items": [{"role": "assistant", "text": "answer"}],
-            }]
-        }
-        self.assertIsNone(
-            _preview_recovery_text(preview, "agent:main:test", "current question")
-        )
+        items = [{"role": "assistant", "text": "answer"}]
+        self.assertIsNone(_recovery_text_from_items(items, "current question"))
 
 
 class InterruptedTurnTailRecoveryTests(unittest.TestCase):
-    """ELI-74: a turn whose live stream was lost is read back from the session
-    transcript. It used to come from `sessions.preview`, which the Gateway
-    clips per item server-side (2000 chars then, 800 on 2026.9.x) whatever
-    `maxChars` asks for, so long replies landed cut mid-sentence with "...".
-    """
+    """ELI-74: a turn whose live stream was lost is read back whole from the
+    session transcript (`chat.history`), never from the clipped
+    `sessions.preview`."""
 
     KEY = "agent:main:openwebui-u-c"
     QUESTION = "what changed?"
@@ -249,26 +230,12 @@ class InterruptedTurnTailRecoveryTests(unittest.TestCase):
                 {"type": "text", "text": self.LONG}]},
         ]}
 
-    @staticmethod
-    def _clipping_preview(full_text, cap=800):
-        """What the Gateway's sessions.preview returns: every item clipped."""
-        def clip(t):
-            return t if len(t) <= cap else t[:cap - 3] + "..."
-
-        async def session_preview(session_key, limit=8, max_chars=4000):
-            return {"previews": [{"key": session_key, "items": [
-                {"role": "user", "text": InterruptedTurnTailRecoveryTests.QUESTION},
-                {"role": "assistant", "text": clip(full_text)},
-            ]}]}
-        return session_preview
-
     def _conn(self, history=None, history_error=None):
         conn = types.SimpleNamespace()
         if history_error is not None:
             conn.session_history = mock.AsyncMock(side_effect=history_error)
         else:
             conn.session_history = mock.AsyncMock(return_value=history)
-        conn.session_preview = mock.AsyncMock(side_effect=self._clipping_preview(self.LONG))
         return conn
 
     def test_long_tail_survives_intact(self):
@@ -277,7 +244,6 @@ class InterruptedTurnTailRecoveryTests(unittest.TestCase):
         recovered = asyncio.run(_recover_turn_text(conn, self.KEY, self.QUESTION))
         self.assertEqual(recovered, self.LONG)
         self.assertFalse(recovered.endswith("..."))
-        conn.session_preview.assert_not_awaited()
 
     def test_history_is_requested_with_a_budget_above_the_old_clip(self):
         conn = self._conn(self._history())
@@ -301,16 +267,9 @@ class InterruptedTurnTailRecoveryTests(unittest.TestCase):
         ]
         self.assertEqual(_history_recovery_text(history, self.QUESTION), self.LONG)
 
-    def test_falls_back_to_the_preview_when_history_fails(self):
-        conn = self._conn(history_error=GatewayError("unknown method chat.history"))
-        recovered = asyncio.run(_recover_turn_text(conn, self.KEY, self.QUESTION))
-        self.assertTrue(recovered.endswith("..."))  # clipped, but not nothing
-        conn.session_preview.assert_awaited_once()
-
-    def test_falls_back_to_the_preview_when_history_has_no_match(self):
-        conn = self._conn({"messages": []})
-        self.assertIsNotNone(asyncio.run(_recover_turn_text(conn, self.KEY, self.QUESTION)))
-        conn.session_preview.assert_awaited_once()
+    def test_a_history_failure_recovers_nothing(self):
+        conn = self._conn(history_error=GatewayError("chat.history timed out"))
+        self.assertIsNone(asyncio.run(_recover_turn_text(conn, self.KEY, self.QUESTION)))
 
     def test_no_match_anywhere_is_none(self):
         conn = self._conn({"messages": []})
@@ -480,6 +439,27 @@ class HistoryRunRebuildTests(unittest.TestCase):
         """An aborted run has no closer: the join does not depend on one."""
         r = _history_renderer(self._two_text_blocks(closer=False))
         self.assertEqual(r.text, "Running the five sleep steps one at a time.\n\nUSER-DONE-9e127db9")
+
+    def test_a_native_runs_transcript_rebuilds_its_cards(self):
+        """A run on the Gateway's own runtime (GPT, Gemini, DeepSeek in the
+        picker) keeps OpenClaw's shape, not claude-cli's: `toolCall` blocks,
+        and each result is a `toolResult` message of its own. Recorded from a
+        DeepSeek session; the rebuild came back with no cards at all."""
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_fixture_native_history.json")
+        with open(path) as f:
+            messages = json.load(f)["messages"]
+        messages = messages + [{"role": "assistant", "stopReason": "stop",
+                                "content": [{"type": "text", "text": "The workshop is empty."}]}]
+        r = _history_renderer(messages)
+        cards = [i for i in r.output if i["type"] == "function_call"]
+        self.assertEqual([c["name"] for c in cards],
+                         ["ls", f"ls {TOOL_ERROR_MARK}", "exec", f"ls {TOOL_ERROR_MARK}", "exec"])
+        outputs = {i["call_id"]: i["output"][0]["text"] for i in r.output if i["type"] == "function_call_output"}
+        self.assertEqual(outputs["call_00_bLXMsmgz1pJc5IL1J0Rx1971"], "(empty directory)")
+        self.assertTrue(outputs["call_00_QFthybdFqQt4QEdyJoAu2999"].startswith(f"{TOOL_ERROR_MARK} tool call failed"))
+        self.assertEqual(len(r.finished_output()), len(r.output))  # every call answered
+        self.assertEqual(r.output[-1]["type"], "message")
+        self.assertTrue(r.text.endswith("The workshop is empty."))
 
 
 def _turn_history(stub_id="stub-1", *, run="msg-c-stub-1-1.0", closed=True,
@@ -779,6 +759,22 @@ class TurnRendererOutputTests(unittest.TestCase):
         self.assertEqual(r.output[0]["name"], f"Bash {TOOL_ERROR_MARK}")
         self.assertIn("tool call failed", r.output[1]["output"][0]["text"])
 
+    def test_drop_shown_cuts_the_text_and_the_cards_another_message_holds(self):
+        r = _TurnRenderer()
+        r.feed({"stream": "assistant", "data": {"delta": "One."}})
+        r.feed({"stream": "tool", "data": {"phase": "start", "name": "Read", "toolCallId": "t1", "args": {}}})
+        r.feed({"stream": "tool", "data": {"phase": "result", "name": "Read", "toolCallId": "t1", "result": "x"}})
+        r.feed({"stream": "assistant", "data": {"delta": "Two. Three."}})
+        r.feed({"stream": "tool", "data": {"phase": "start", "name": "Bash", "toolCallId": "t2", "args": {}}})
+        r.feed({"stream": "tool", "data": {"phase": "result", "name": "Bash", "toolCallId": "t2", "result": "y"}})
+        self.assertFalse(r.drop_shown("One!"), "a start that does not line up changes nothing")
+        self.assertEqual(len(r.output), 6)
+        self.assertTrue(r.drop_shown("One.Two. "))
+        self.assertEqual(r.text, "Three.")
+        self.assertEqual([(i["type"], i.get("id") or i.get("call_id")) for i in r.output[1:]],
+                         [("function_call", "t2"), ("function_call_output", "fco_t2")])
+        self.assertEqual(r.output[0]["content"][0]["text"], "Three.")
+
     def test_finished_output_completes_open_items_without_touching_the_live_copy(self):
         r = _TurnRenderer()
         r.feed({"stream": "assistant", "data": {"delta": "Hi"}})
@@ -786,7 +782,10 @@ class TurnRendererOutputTests(unittest.TestCase):
                                            "toolCallId": "t3", "args": {}}})
         done = r.finished_output()
         self.assertEqual({i["status"] for i in done}, {"completed"})
+        self.assertEqual(done[-1]["call_id"], "t3", "the call the run never answered is closed")
+        self.assertEqual(done[-1]["output"][0]["text"], TOOL_NO_RESULT_NOTE)
         self.assertEqual(r.output[1]["status"], "in_progress")
+        self.assertEqual(len(r.output), 2)
 
 
 class ThinkingNoteAnnouncementTests(unittest.TestCase):
@@ -826,8 +825,8 @@ class ThinkingNoteAnnouncementTests(unittest.TestCase):
     def test_the_pipe_gates_the_yield_on_it(self):
         # The note is still logged unconditionally: suppressing it in the chat
         # must not make a clamp invisible when diagnosing one from the logs.
-        source = inspect.getsource(Pipe._pipe_turn)
-        self.assertIn("should_announce_thinking_note(session_key, thinking_note)", source)
+        source = inspect.getsource(openclaw_pipe._PipeTurn)
+        self.assertIn("should_announce_thinking_note(self.session_key, thinking_note)", source)
         self.assertIn('pipe_log(f"thinking: {thinking_note}")', source)
 
 
@@ -836,9 +835,9 @@ class OwuiTaskNoopTests(unittest.TestCase):
     join the background-task no-op set; moa_response_generation must not."""
 
     def _noop_task_values(self):
-        source = inspect.getsource(Pipe._pipe_turn)
+        source = inspect.getsource(openclaw_pipe._PipeTurn)
         m = re.search(
-            r"if __task__ and __task__ in \(\s*((?:\"[a-z_]+\",?\s*)+)\)",
+            r"if self\.__task__ and self\.__task__ in \(\s*((?:\"[a-z_]+\",?\s*)+)\)",
             source,
         )
         self.assertIsNotNone(m, "could not find the __task__ no-op tuple")
@@ -957,6 +956,12 @@ class StripInputMarkerLineTests(unittest.TestCase):
 
     def test_marker_only_becomes_empty(self):
         self.assertEqual(_strip_input_marker_line("OpenClaw needs input:"), "")
+
+    def test_a_question_on_the_marker_line_is_kept(self):
+        """ELI-151: the question written on the marker line is the question."""
+        self.assertEqual(_strip_input_marker_line("OpenClaw needs input: Which branch?\n1. main\n2. dev"),
+                         "Which branch?\n1. main\n2. dev")
+        self.assertEqual(_strip_input_marker_line("Codex needs input:  Proceed?"), "Proceed?")
 
     def test_empty_input(self):
         self.assertEqual(_strip_input_marker_line(""), "")
@@ -1162,12 +1167,12 @@ class ParkedCancelTests(unittest.IsolatedAsyncioTestCase):
         # The grace window is seconds; sessions.patch alone can take 10s+ with
         # its retry, so the claim must come before it. And the cancel handler
         # must park, never abort directly.
-        src = inspect.getsource(Pipe._pipe_turn)
-        claim = src.index("await conn.claim_cancelled_turn(session_key)")
+        src = inspect.getsource(openclaw_pipe._PipeTurn)
+        claim = src.index("await self.conn.claim_cancelled_turn(self.session_key)")
         patch = src.index("RUN_PATCH")
         self.assertLess(claim, patch)
         self.assertIn("conn.park_cancelled_turn(", src)
-        self.assertNotIn("await conn.abort(", src)
+        self.assertNotIn("await self.conn.abort(", src)
 
     def test_grace_valve_defaults_on(self):
         self.assertGreater(Pipe.Valves().INTERRUPT_GRACE_SECONDS, 0)
@@ -1443,6 +1448,44 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         q.put_nowait(self._final("run-2"))
         await self._collect(first2, gen2)
         self.assertEqual(self.sent, ["check the logs", "and now the other log"])
+
+    _NOT_ALLOWED = ('Model "anthropic/are" is not allowed. Use /models to list providers, '
+                    'or /models <provider> to list models.')
+
+    def _chat_error(self, run_id, message):
+        return {"type": "event", "event": "chat", "payload": {
+            "sessionKey": self.SK, "runId": run_id, "state": "error",
+            "errorMessage": message}}
+
+    async def _reply_text(self, events):
+        gen = self._reply("these /model are fine", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        for ev in events:
+            self._queue("run-1").put_nowait(ev)
+        out = await asyncio.wait_for(first, 2)
+        async for chunk in gen:
+            out += chunk if isinstance(chunk, str) else ""
+        return out
+
+    async def test_a_run_refused_before_it_starts_shows_its_error(self):
+        """ELI-139 (2026-10-15, chat 2af17834): a message with "/model are"
+        in its text made the Gateway refuse the run as an inline model
+        directive. Its only event was a chat `state: "error"` carrying the
+        reason, and the reply said "(This turn produced no reply text.)"."""
+        out = await self._reply_text([self._chat_error("run-1", self._NOT_ALLOWED)])
+        self.assertIn(f"**Error:** {self._NOT_ALLOWED}", out)
+        self.assertNotIn("no reply text", out)
+
+    async def test_a_lifecycle_error_is_not_shown_twice(self):
+        out = await self._reply_text([
+            {"type": "event", "event": "agent", "payload": {
+                "sessionKey": self.SK, "runId": "run-1", "stream": "lifecycle",
+                "data": {"phase": "error", "error": "provider overloaded"}}},
+            self._chat_error("run-1", "provider overloaded"),
+        ])
+        self.assertEqual(out.count("**Error:**"), 1)
+        self.assertIn("**Error:** provider overloaded", out)
 
     async def test_a_socket_gap_makes_the_waiter_read_again(self):
         """The settle can be among the events lost while the socket was down,
@@ -3809,11 +3852,6 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
         env.VERSION = "0.12.0"
         sys.modules["open_webui.env"] = env
         self.addCleanup(sys.modules.pop, "open_webui.env", None)
-        # Treat every cancel as seen and every call as fast, so a test decides
-        # the outcome through the response alone.
-        patcher = mock.patch.object(openclaw_pipe, "_NATIVE_CARD_UNSEEN_CANCEL_S", -1)
-        patcher.start()
-        self.addCleanup(patcher.stop)
 
     def test_version_gate(self):
         self.assertTrue(_owui_supports_native_ask_user())
@@ -3840,6 +3878,21 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         self.assertTrue(q["allow_other"])
+
+    def test_a_question_on_the_marker_line_is_the_cards_question(self):
+        """ELI-151: the card for the inline form showed the raw marker as its
+        header and question. It is the card of the marker on its own line."""
+        inline = _native_ask_user_payload("OpenClaw needs input: Which branch?\n1. main\n2. dev")
+        (q,) = inline["data"]["questions"]
+        self.assertEqual((q["header"], q["question"]), ("Which branch?", "Which branch?"))
+        self.assertEqual([o["label"] for o in q["options"]], ["main", "dev"])
+        self.assertEqual(inline, _native_ask_user_payload("OpenClaw needs input:\nWhich branch?\n1. main\n2. dev"))
+        # A free-text question and a yes/no question on the marker line, too.
+        for marker, prompt in (("Codex needs input:", "Package\nName the package you want"),
+                               ("OpenClaw needs input:", "Deploy now? (y/n)")):
+            inline = _native_ask_user_payload(f"{marker} {prompt}")
+            self.assertNotIn("needs input", json.dumps(inline))
+            self.assertEqual(inline, _native_ask_user_payload(f"{marker}\n{prompt}"))
 
     def test_confirmation_becomes_yes_no_without_free_text(self):
         payload = _native_ask_user_payload(
@@ -3928,31 +3981,30 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
             calls.append(event)
             return {"status": "cancelled", "answers": {}}
 
-        with mock.patch.object(openclaw_pipe, "_NATIVE_CARD_UNSEEN_CANCEL_S", 0):
-            answer = await _ask_user_input_modal(
-                event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
-                owui_user_id="user-1", max_wait_s=1, poll_interval_s=0.01,
-            )
+        answer = await _ask_user_input_modal(
+            event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
+            owui_user_id="user-1", max_wait_s=1, poll_interval_s=0.01,
+        )
         self.assertIsNone(answer)
         self.assertEqual(len(calls), 1)
 
-    async def test_timeout_and_unseen_cancel_reask(self):
-        responses = [
-            {"error": "Event call timed out. The browser tab may be inactive or closed."},
-            {"status": "cancelled", "answers": {}},  # instant: viewing another chat
-            {"status": "answered", "answers": {"answer": {"type": "option", "label": "b"}}},
-        ]
+    async def test_a_timeout_or_an_unseen_cancel_ends_with_the_question_as_text(self):
+        """OWUI's timeout, and a cancel the moment the card reaches a tab on
+        another chat, do not show the card was seen: no re-show (ELI-142)."""
+        for response in ({"error": "Event call timed out. The browser tab may be inactive or closed."},
+                         {"status": "cancelled", "answers": {}}):
+            calls = []
 
-        async def event_call(event):
-            return responses.pop(0)
+            async def event_call(event):
+                calls.append(event)
+                return response
 
-        with mock.patch.object(openclaw_pipe, "_NATIVE_CARD_UNSEEN_CANCEL_S", 10):
             answer = await _ask_user_input_modal(
                 event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
-                owui_user_id="user-1", max_wait_s=1, poll_interval_s=0.01,
+                owui_user_id="user-1", max_wait_s=60, poll_interval_s=0.01,
             )
-        self.assertEqual(answer, "b")
-        self.assertEqual(responses, [])
+            self.assertIsNone(answer, response)
+            self.assertEqual(len(calls), 1, response)
 
     # ELI-107 decision 2: a wait for the card's answer ends with the run, so
     # a tab that cannot show it is no reason to keep the reply open.
@@ -3991,9 +4043,9 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent, [], "never another chat's tab")
 
     async def test_a_tab_that_does_not_come_back_ends_the_wait(self):
-        """The tab viewing the chat went away (a reload, a closed tab) and no
-        tab views the chat again within the grace: the reply ends with the
-        question as text instead of waiting out max_wait_s."""
+        """The tab viewing the chat went away (a reload, a closed tab) while
+        it held the card: the reply ends with the question as text instead
+        of waiting out max_wait_s."""
         pool = {"sid-tab": {"id": "user-1", "chat_ids": ["chat-1"]}}
 
         async def call(data, to):
@@ -4003,35 +4055,11 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
 
         async def event_call(event):
             return {"error": "Client session disconnected."}
-        with mock.patch.object(openclaw_pipe, "_NATIVE_CARD_TAB_GRACE_S", 0.05, create=True):
-            answer = await asyncio.wait_for(_ask_user_input_modal(
-                event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
-                owui_user_id="user-1", owui_chat_id="chat-1", owui_message_id="msg-1",
-                max_wait_s=60, poll_interval_s=0.01), 2)
-        self.assertIsNone(answer)
-
-    async def test_a_reloaded_tab_within_the_grace_still_gets_the_card(self):
-        pool = {"sid-old": {"id": "user-1", "chat_ids": ["chat-1"]}}
-        sent = []
-
-        async def call(data, to):
-            sent.append(to)
-            if to == "sid-old":
-                del pool["sid-old"]                     # reloaded: a new socket comes later
-                asyncio.get_running_loop().call_later(
-                    0.05, pool.__setitem__, "sid-new", {"id": "user-1", "chat_ids": ["chat-1"]})
-                return {"error": "Event call timed out"}
-            return {"status": "answered", "answers": {"answer": {"type": "option", "label": "b"}}}
-        self._socket(pool, call)
-
-        async def event_call(event):
-            return {"error": "Client session disconnected."}
         answer = await asyncio.wait_for(_ask_user_input_modal(
             event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
             owui_user_id="user-1", owui_chat_id="chat-1", owui_message_id="msg-1",
             max_wait_s=60, poll_interval_s=0.01), 2)
-        self.assertEqual(answer, "b")
-        self.assertEqual(sent, ["sid-old", "sid-new"])
+        self.assertIsNone(answer)
 
     async def test_disconnected_session_moves_to_the_users_new_socket(self):
         sent = {"calls": [], "emits": []}
@@ -4150,6 +4178,47 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(answer, "a")
         self.assertEqual(sent, ["sid-new"])
 
+    # ELI-142 live (2026-10-15, chat ed98cbd2): after an Open WebUI restart the
+    # tab's socket stayed in SESSION_POOL while the page, in a reconnect storm,
+    # never showed the card. Each call ended in OWUI's 240 s timeout and the
+    # pipe re-showed the card: four timeouts, about 20 minutes of an open
+    # reply with nothing on screen and no text fallback.
+
+    async def test_a_socket_that_never_answers_ends_with_the_question_as_text(self):
+        pool = {"sid-tab": {"id": "user-1", "chat_ids": ["chat-1"]}}
+        self.fake_socket(pool)
+        calls = []
+
+        async def event_call(event):
+            calls.append(event)
+            return {"error": "Event call timed out. The browser tab may be inactive or closed."}
+
+        answer = await asyncio.wait_for(_ask_user_input_modal(
+            event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
+            owui_user_id="user-1", owui_chat_id="chat-1", owui_message_id="msg-1",
+            owui_session_id="sid-tab", max_wait_s=60, poll_interval_s=0.01), 2)
+        self.assertIsNone(answer)
+        self.assertEqual(len(calls), 1, "one card, never re-shown")
+
+    async def test_a_moved_card_that_is_never_answered_ends_with_the_question_as_text(self):
+        """The turn's socket is gone and the tab viewing the chat takes the
+        card, but that socket never answers either."""
+        sent = []
+
+        async def call(data, to):
+            sent.append(to)
+            return {"error": "Event call timed out: TimeoutError()"}
+        self._socket({"sid-tab": {"id": "user-1", "chat_ids": ["chat-1"]}}, call)
+
+        async def event_call(event):
+            return {"error": "Client session disconnected."}
+        answer = await asyncio.wait_for(_ask_user_input_modal(
+            event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
+            owui_user_id="user-1", owui_chat_id="chat-1", owui_message_id="msg-1",
+            max_wait_s=60, poll_interval_s=0.01), 2)
+        self.assertIsNone(answer)
+        self.assertEqual(sent, ["sid-tab"])
+
 
 class DynamicModelSelectorTests(unittest.TestCase):
     """Tests for ELI-11: dynamic model discovery."""
@@ -4257,7 +4326,7 @@ class DiscoverModelsTests(unittest.IsolatedAsyncioTestCase):
             # Use a minimal valves-like object with STATE_DIR
             class FakeValves:
                 STATE_DIR = "/tmp/openclaw-test-discover"
-            models = await _discover_models(FakeValves())
+            models, _source = await _discover_models_with_source(FakeValves())
             self.assertEqual(len(models), 5)
             keys = {m["key"] for m in models}
             self.assertIn("deepseek/deepseek-v4-flash", keys)
@@ -4267,7 +4336,7 @@ class DiscoverModelsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_discover_models_normalizes_live_gateway_response(self):
         """Live gateway responses use id/name/provider/alias, not key/tags --
-        _discover_models must normalize them before returning/caching."""
+        _discover_models_with_source must normalize them before returning/caching."""
         import openclaw_pipe as ocp
 
         class FakeConn:
@@ -4297,7 +4366,7 @@ class DiscoverModelsTests(unittest.IsolatedAsyncioTestCase):
         orig_conn = ocp._gateway_connection
         try:
             ocp._gateway_connection = FakeConn()
-            models = await _discover_models(FakeValves())
+            models, _source = await _discover_models_with_source(FakeValves())
         finally:
             ocp._gateway_connection = orig_conn
 
@@ -4348,7 +4417,7 @@ class DiscoverModelsTests(unittest.IsolatedAsyncioTestCase):
         orig_conn = ocp._gateway_connection
         try:
             ocp._gateway_connection = FakeConn()
-            models = await _discover_models(FakeValves())
+            models, _source = await _discover_models_with_source(FakeValves())
         finally:
             ocp._gateway_connection = orig_conn
 
@@ -4839,6 +4908,18 @@ class RepeatedAskUserMarkerTests(unittest.TestCase):
 
     def test_dedupe_drops_blanks(self):
         self.assertEqual(_dedupe_options(["a", "  ", "", "a"]), ["a"])
+
+
+def _catch_all_delta(raw_text: str, received: str, visible: str) -> str:
+    """The text the renderer adds for a cumulative catch-all event (no
+    `delta`, the whole reply in `text`) after `received` arrived and
+    `visible` showed. The inline reply's own copy of this diff went in
+    ELI-147; the renderer's is the one both sides use."""
+    r = _TurnRenderer()
+    r.seed({"received": received})
+    r.visible_text = visible
+    added = r.feed({"stream": "assistant", "data": {"text": raw_text}})
+    return "".join(a for a in added if isinstance(a, str))
 
 
 class MediaDirectiveDoubledFilenameTests(unittest.IsolatedAsyncioTestCase):
@@ -7075,6 +7156,35 @@ class AgentTurnRoutingTests(_RoutingCase):
         self.assertEqual(m["meta"]["openclaw_writer"], self.conn.writer_id)
         self.assertNotIn(f"{self.key}:{run}", self.conn._run_targets, "the shadow is retired")
 
+    async def test_a_handed_over_adopted_run_does_not_repeat_what_the_first_reply_showed(self):
+        """ELI-147: a Send now reply adopted a run whose start reply 1 already
+        showed (lines 1-10), streamed lines 11-20 into its own message, and
+        was handed over (a Gateway restart, a socket gap). The run's closing
+        transcript holds lines 1-30; the rebuild of reply 2's message must
+        start where reply 1 left off."""
+        def lines(a, b):
+            return "".join(f"{i}\n" for i in range(a, b + 1))
+        run = pipe_run_id(self.CHAT, "m-first")       # named by reply 1's message
+        self.add_stub(self.STUB, content=lines(11, 20))
+        self.conn.register_run_target(self.key, run, self.CHAT, self.STUB)
+        self.conn.seed_run_renderer(self.key, run, asyncio.Queue(),
+                                    run_text={"received": lines(1, 10), "stream": lines(1, 10),
+                                              "item": ""})
+        self.conn._run_renderers[f"{self.key}:{run}"].feed(_delta(lines(11, 20)))
+        self.assertTrue(await self.dispatch(run, _delta(lines(21, 25))))
+        await self.dispatch(run, {"state": "final"})
+        self.history = {"messages": [
+            {"role": "user", "content": "count to 30", "idempotencyKey": f"{run}:user"},
+            {"role": "assistant", "idempotencyKey": f"cli-assistant:{run}",
+             "content": [{"type": "text", "text": lines(1, 30)}]}]}
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "done", "lastRunId": run})
+        await self.spin()
+        m = self.owui.msgs()[self.STUB]
+        self.assertIs(m["done"], True)
+        self.assertEqual(m["content"].strip(), lines(11, 30).strip(),
+                         "lines 1-10 are reply 1's; 26-30 are what the transcript adds")
+
     async def test_handover_after_an_owui_restart_takes_the_stub_its_run_id_names(self):
         """2026-10-12 23:29Z, chat 0abe9bde (fails on main 787a471, where it
         was `test_relay_writes_into_the_stub_its_run_id_names_when_history_fails`):
@@ -7853,6 +7963,20 @@ class WriterQuestionCardTests(_RoutingCase):
         self.assertIs(m["done"], True)
         self.assertEqual(m["content"], "Before I go on:\nColor?\nPick one\n1. Red\n2. Blue")
 
+    async def test_an_unanswered_json_form_ends_the_reply_as_readable_text(self):
+        """ELI-142: the writer's fallback reads as the inline reply's does."""
+        self.owui.session_pool["sid-tab"] = {"id": self.USER, "chat_ids": [self.CHAT]}
+        self.owui.page_intent["sid-tab"] = {"status": "cancelled"}
+        text = "Before I go on:\n" + openclaw_pipe._USER_INPUT_TRIGGER_PREFIXES[0] + "\n" + json.dumps(
+            NeedsInputMarkerTests.HEBREW_FORM, ensure_ascii=False)
+        self.history = {"messages": self.closed_run(self.RUN, text)}
+        await self.ask_run(text)
+        self.assertEqual(len(self.card_calls()), 1)
+        (_mid, m), = self.new_messages().items()
+        self.assertIs(m["done"], True)
+        self.assertEqual(m["content"], "Before I go on:\n" + openclaw_pipe._ask_user_fallback_text(text[16:]))
+        self.assertIn("1. **טווח**: לאיזה טווח השקעה?\n   - קצר - עד שנה", m["content"])
+
     async def test_a_fence_left_open_before_a_tool_call_does_not_hide_the_question(self):
         """Review 2af1 F4 on the writer: fences are tracked per message item."""
         self.owui.session_pool["sid-tab"] = {"id": self.USER, "chat_ids": [self.CHAT]}
@@ -7881,18 +8005,20 @@ class InlineRewriteWiringTests(unittest.TestCase):
     loop has no unit harness (e2e drives it)."""
 
     def test_the_inline_reply_records_its_rewrites_and_answer_runs(self):
-        src = inspect.getsource(openclaw_pipe.Pipe._pipe_turn)
-        self.assertEqual(src.count("switch_to_answer_run(answer_res)"), 2, "both answer switches")
-        self.assertEqual(src.count("answer_res.queue or conn.register_consumer("), 2)
+        src = inspect.getsource(openclaw_pipe._PipeTurn)
+        # One answer switch: a prompt in an item event is held and asked
+        # when the run ends, as one in the assistant stream is (ELI-147).
+        self.assertEqual(src.count("switch_to_answer_run(answer_res)"), 1, "the answer switch")
+        self.assertEqual(src.count("answer_res.queue or self.conn.register_consumer("), 1)
         # Review 2af1 N6: the answer run is listened for, and its target moved,
         # before its chat.send.
         ask = src.split("async def maybe_answer_user_input", 1)[1]
         send = ask.index("RUN_SEND")
-        self.assertLess(ask.index("conn.register_consumer(session_key, idempotency_key)"), send)
-        self.assertLess(ask.index("conn.continue_run_target(session_key, our_run_id, idempotency_key"), send)
-        self.assertGreaterEqual(src.count("conn.note_turn_rewrite("), 5,
-                                "2 MEDIA sites, 2 answered cards, 1 fallback prompt")
-        self.assertIn("thinking=resolved_thinking", src.split("conn.register_run_target(")[1][:200])
+        self.assertLess(ask.index("conn.register_consumer(self.session_key, idempotency_key)"), send)
+        self.assertLess(ask.index("conn.continue_run_target(self.session_key, self.our_run_id, idempotency_key"), send)
+        self.assertGreaterEqual(src.count("conn.note_turn_rewrite("), 4,
+                                "2 MEDIA sites, 1 answered card, 1 fallback prompt")
+        self.assertIn("thinking=self.resolved_thinking", src.split("conn.register_run_target(")[1][:200])
 
 
 
@@ -8213,7 +8339,7 @@ class InlineEndSignalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.consumers_at_send, [f"{self.sk}:{self.run}"])
 
     def test_no_silence_timer_is_left_in_the_inline_loop(self):
-        src = inspect.getsource(openclaw_pipe.Pipe._pipe_turn)
+        src = inspect.getsource(openclaw_pipe._PipeTurn)
         for timer in ("idle_probe_s", "no_text_deadman_s", "describe_check_interval",
                       "recv_timeout"):
             self.assertNotIn(timer, src)
@@ -8533,37 +8659,6 @@ class RunSpanTests(unittest.TestCase):
         self.assertEqual(len(_history_span_messages(hist, parent)), 2, "the parent keeps its own")
 
 
-class NoMidRunCloseTests(unittest.IsolatedAsyncioTestCase):
-    """NoMidRunCloseTest: `sessions.describe` says "done" during a sub-agent
-    yield gap while `sessions.list` still has the run active (ELI-56). The
-    inline reply's idle probe must not read that as the end of the run; on
-    main it closed the reply after 30 s of silence."""
-
-    SK = _owui_session_key("main", "11111111-1111-1111-1111-111111111111",
-                           "22222222-2222-2222-2222-222222222222")
-
-    def conn(self, describe, active):
-        conn = _GatewayConnection(lambda: None)
-
-        async def send_request(method, params, timeout=10):
-            if method == "sessions.describe":
-                return {"session": {"status": describe}}
-            if method == "sessions.list":
-                return {"sessions": [{"key": self.SK, "hasActiveRun": active}]}
-            raise AssertionError(method)
-        conn.send_request = send_request
-        return conn
-
-    async def test_done_while_the_run_is_active_is_running(self):
-        self.assertEqual(await _gateway_run_status(self.conn("done", True), self.SK), "running")
-
-    async def test_done_and_idle_is_done(self):
-        self.assertEqual(await _gateway_run_status(self.conn("done", False), self.SK), "done")
-
-    async def test_an_active_describe_needs_no_list(self):
-        self.assertEqual(await _gateway_run_status(self.conn("running", False), self.SK), "running")
-
-
 if __name__ == "__main__":
     unittest.main()
 
@@ -8747,6 +8842,50 @@ class NeedsInputMarkerTests(unittest.IsolatedAsyncioTestCase):
         flush, held = self.ocp._advance_input_prompt_buffer(
             "", self.Q, self.ocp._fence_open_after(shown))
         self.assertEqual((flush, held), ("", self.Q), "the question was not held for a card")
+
+    # ELI-142: an unanswered card ends the reply with its question as text.
+    # The incident's form was JSON with three Hebrew questions, which showed
+    # as the raw JSON body.
+    HEBREW_FORM = {"questions": [
+        {"header": "טווח", "question": "לאיזה טווח השקעה?",
+         "options": ["קצר - עד שנה", "ארוך - 5 שנים ומעלה"]},
+        {"header": "סיכון", "question": "כמה סיכון אתה מוכן לקחת?",
+         "options": [{"label": "נמוך", "description": "אג\"ח ומדדים"}, {"label": "גבוה"}]},
+        {"header": "סכום", "question": "כמה להשקיע בחודש?"},
+    ]}
+
+    async def test_an_unanswered_json_form_ends_the_reply_as_readable_text(self):
+        async def event_call(payload):
+            return {"error": "Event call timed out. The browser tab may be inactive or closed."}
+        prompt = (f"{self.MARKER}\n```json\n"
+                  + json.dumps(self.HEBREW_FORM, ensure_ascii=False, indent=2) + "\n```\n")
+        with mock.patch.object(self.ocp, "_owui_supports_native_ask_user", lambda: True):
+            out = await self._stream("Two things first.\n" + prompt, event_call)
+        self.assertEqual(out, (
+            "Two things first.\n"
+            "1. **טווח**: לאיזה טווח השקעה?\n"
+            "   - קצר - עד שנה\n"
+            "   - ארוך - 5 שנים ומעלה\n"
+            "2. **סיכון**: כמה סיכון אתה מוכן לקחת?\n"
+            "   - נמוך - אג\"ח ומדדים\n"
+            "   - גבוה\n"
+            "3. **סכום**: כמה להשקיע בחודש?\n"
+            "\n"
+            "_Answer in your next message._"))
+
+    def test_a_single_json_question_is_not_numbered(self):
+        prompt = self.MARKER + "\n" + json.dumps({"questions": [
+            {"question": "Where should the checks run?",
+             "options": [{"label": "GitHub Actions", "description": "Free here"}, "GitLab CI"]}]})
+        self.assertEqual(self.ocp._ask_user_fallback_text(prompt), (
+            "Where should the checks run?\n"
+            "- GitHub Actions - Free here\n"
+            "- GitLab CI\n"
+            "\n"
+            "_Answer in your next message._"))
+        # The text form keeps its own text, marker line stripped, as before.
+        self.assertEqual(self.ocp._ask_user_fallback_text(self.MARKER + "\nColor?\n1. Red\n2. Blue"),
+                         "Color?\n1. Red\n2. Blue")
 
     async def test_F4_a_fence_left_open_before_a_tool_call_does_not_hide_the_next_question(self):
         """The text after a tool call is a new message item: a fence the
@@ -9006,6 +9145,202 @@ class InlineOwnerRuleTests(unittest.IsolatedAsyncioTestCase):
         resync already ran; the handover then reads the row itself."""
         await self._turn(self._restart)
         self.assertIn("sessions.list", self.rpc)
+
+
+class ToolCardParityTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-147 slice 2: the inline reply and the turn writer show a run's tool
+    calls as the same cards. Both are fed one recorded run: a call that
+    succeeds, one that fails, a result whose start was never seen, and a call
+    the run ended without answering."""
+
+    asyncSetUp = InlineOwnerRuleTests.asyncSetUp
+    asyncTearDown = InlineOwnerRuleTests.asyncTearDown
+    _queue = InlineOwnerRuleTests._queue
+    _delta = InlineOwnerRuleTests._delta
+    _until_registered = InlineOwnerRuleTests._until_registered
+    _reply = InlineOwnerRuleTests._reply
+    _event = InlineOwnerRuleTests._event
+    _turn_items = InlineOwnerRuleTests._turn_items
+    USER, CHAT = InlineOwnerRuleTests.USER, InlineOwnerRuleTests.CHAT
+
+    def _tool(self, phase, tcid, name, **data):
+        return self._event("agent", stream="tool", data={
+            "phase": phase, "name": name, "toolCallId": tcid, **data})
+
+    def _run(self):
+        return [
+            self._tool("start", "t1", "Read", args={"path": "a"}),
+            self._tool("result", "t1", "Read", result="contents"),
+            self._tool("start", "t2", "Bash", args={"command": "false"}),
+            self._tool("result", "t2", "Bash", result="exit 1", isError=True),
+            self._tool("result", "t3", "Grep", args={"q": "x"}, result="hit"),
+            self._tool("start", "t4", "Bash", args={"command": "sleep 99"}),
+            NoDroppedMessagesTests._final(self, "run-1"),
+        ]
+
+    @staticmethod
+    def _fold(items):
+        """The output list Open WebUI keeps from `output_item.added` events:
+        an item with the id of one it holds replaces it, else it is appended
+        (`handle_responses_streaming_event`)."""
+        out = []
+        for item in items:
+            at = next((i for i, o in enumerate(out) if o.get("id") == item.get("id")), None)
+            if at is None:
+                out.append(item)
+            else:
+                out[at] = item
+        return out
+
+    @staticmethod
+    def _cards(items):
+        """What a card shows: the call's name and arguments, its output."""
+        cards = []
+        for i in items:
+            if i["type"] == "function_call":
+                cards.append(("call", i["id"], i["name"], i["arguments"]))
+            elif i["type"] == "function_call_output":
+                cards.append(("output", i["call_id"], i["output"][0]["text"]))
+        return cards
+
+    async def test_the_inline_reply_and_the_writer_show_the_same_cards(self):
+        run = self._run()
+        inline = self._cards(self._fold(await self._turn_items(*run)))
+        renderer = _TurnRenderer()
+        for frame in run:
+            renderer.feed(frame["payload"])
+        writer = self._cards(renderer.finished_output())
+        self.assertEqual(inline, writer)
+        self.assertIn(("call", "t2", f"Bash {TOOL_ERROR_MARK}", json.dumps({"command": "false"})),
+                      writer)
+        self.assertIn(("call", "t3", "Grep", json.dumps({"q": "x"})), writer,
+                      "a result whose start was missed still gets its card")
+        self.assertIn(("output", "t4", TOOL_NO_RESULT_NOTE), writer,
+                      "a call the run never answered is closed, not left spinning")
+
+
+class TextParityTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-147 slice 3: the inline reply and the turn writer show a run's
+    text the same way: dedup of whole-text and item events, the metadata
+    filter, `MEDIA:` directives and needs-input prompts. Each case is one
+    recorded run, fed to an inline reply and to a writer that saw the run
+    alone (no tab answers the question on either side)."""
+
+    asyncSetUp_inline = InlineOwnerRuleTests.asyncSetUp
+    asyncTearDown = InlineOwnerRuleTests.asyncTearDown
+    _queue = InlineOwnerRuleTests._queue
+    _until_registered = InlineOwnerRuleTests._until_registered
+    _reply = InlineOwnerRuleTests._reply
+    _event = InlineOwnerRuleTests._event
+    USER, CHAT = InlineOwnerRuleTests.USER, InlineOwnerRuleTests.CHAT
+
+    PROMPT = "OpenClaw needs input: Which branch?\n1. main\n2. dev"
+    # The documented form: the marker on its own line (ELI-151).
+    PROMPT_OWN_LINE = "OpenClaw needs input:\nWhich branch?\n1. main\n2. dev"
+    IMG = "![chart.png](http://localhost:18791/chart.png)"
+
+    async def asyncSetUp(self):
+        await self.asyncSetUp_inline()
+        self.owui = _FakeOwuiChat(self, self.CHAT)
+
+    @staticmethod
+    def A(text):
+        return ("assistant", {"delta": text})
+
+    @staticmethod
+    def W(text):
+        return ("assistant", {"text": text})
+
+    @staticmethod
+    def I(kind, text):
+        return ("item", {"kind": kind, "text": text})
+
+    @staticmethod
+    def T(phase, tcid, **data):
+        return ("tool", {"phase": phase, "name": "Bash", "toolCallId": tcid, **data})
+
+    def cases(self):
+        A, W, I, T, P, P2 = self.A, self.W, self.I, self.T, self.PROMPT, self.PROMPT_OWN_LINE
+        tool = [T("start", "t1", args={}), T("result", "t1", result="ok")]
+        # ELI-151: a question written on the marker line is kept, as the line
+        # after a marker on its own line is; only the marker itself goes.
+        q = "Which branch?\n1. main\n2. dev"
+        return {
+            "catch-all equal": ([A("Hello "), A("world."), W("Hello world.")], "Hello world."),
+            "catch-all with more": ([A("Hello "), W("Hello world.")], "Hello world."),
+            "item echo": ([A("Hello world."), I("message", "Hello world.")], "Hello world."),
+            "preamble, tool, text": ([I("preamble", "Let me check."), *tool, A("All good.")],
+                                     "Let me check.All good."),
+            "text, tool, text, catch-all": ([A("Checking."), *tool, A("Done."), W("Checking.Done.")],
+                                            "Checking.Done."),
+            "metadata block": ([A("Hi. "), A("Sender (untrusted metadata): x"), A("Bye.")], "Hi. Bye."),
+            "item grows": ([I("preamble", "Let"), I("preamble", "Let me check."), A(" More.")],
+                           "Let me check. More."),
+            "two items": ([I("message", "First."), *tool, I("message", "Second.")], "First.Second."),
+            "prompt in deltas": ([A("Before.\n\n"), A(P)], "Before.\n\n" + q),
+            "prompt in an item": ([A("Before.\n\n"), I("message", "Before.\n\n" + P)], "Before.\n\n" + q),
+            "prompt, then catch-all": ([A("Before.\n\n"), A(P[:25]), A(P[25:]), W("Before.\n\n" + P)],
+                                       "Before.\n\n" + q),
+            "prompt in a fence": ([A("Example:\n```\n" + P + "\n```\nThat's it.")],
+                                  "Example:\n```\n" + P + "\n```\nThat's it."),
+            "prompt, tool, text": ([A("Q:\n\n" + P + "\n\n"), *tool, A("After the tool.")],
+                                   "Q:\n\n" + q + "\n\nAfter the tool."),
+            "own-line prompt in deltas": ([A("Before.\n\n"), A(P2)], "Before.\n\n" + q),
+            "own-line prompt in an item": ([A("Before.\n\n"), I("message", "Before.\n\n" + P2)],
+                                           "Before.\n\n" + q),
+            "own-line prompt, tool, text": ([A("Q:\n\n" + P2 + "\n\n"), *tool, A("After the tool.")],
+                                            "Q:\n\n" + q + "\n\nAfter the tool."),
+            "prompt mid-line, one delta": ([A("Checking. " + P)], "Checking. " + P),
+            "media": ([A("Here: MEDIA:chart.png "), A("done.")], f"Here: {self.IMG}\ndone."),
+            "media at the end": ([A("Here: MEDIA:chart.png")], f"Here: {self.IMG}"),
+            "media in code": ([A("Use `MEDIA:chart.png` to show it.")], "Use `MEDIA:chart.png` to show it."),
+            # Differed on main; the expected text names the side that was right.
+            "media before a tool card (inline)": ([A("See MEDIA:chart.png"), *tool, A("Next.")],
+                                                  f"See {self.IMG}Next."),
+            "prompt mid-line, two deltas (writer)": ([A("Checking. "), A(P)], "Checking. " + P),
+            "media in an item (writer)": ([I("message", "Look: MEDIA:chart.png done.")],
+                                          f"Look: {self.IMG}\ndone."),
+            "media ending an item (writer)": ([I("message", "Look: MEDIA:chart.png")], f"Look: {self.IMG}"),
+            "prompt after text in an item (writer)": ([I("message", "Some context.\n\n" + P)],
+                                                      "Some context.\n\n" + q),
+            "prompt mid-line after an item (writer)": ([I("preamble", "Checking."), A(" " + P)],
+                                                       "Checking. " + P),
+        }
+
+    async def inline(self, steps):
+        gen = self._reply("hello", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        for stream, data in steps:
+            q.put_nowait(self._event("agent", stream=stream, data=data))
+        q.put_nowait(NoDroppedMessagesTests._final(self, "run-1"))
+        got = [await asyncio.wait_for(first, 5)]
+        async for chunk in gen:
+            got.append(chunk)
+        return "".join(c for c in got if isinstance(c, str))
+
+    async def writer(self, steps, message_id):
+        w = _TurnWriter(self.conn, session_key=self.SK, chat_id=self.CHAT, user_id=self.USER,
+                        run_id="run-w", message_id=message_id)
+        for stream, data in steps:
+            w.renderer.feed({"stream": stream, "data": data})
+        w.opened = True
+        self.conn._valves = lambda: self.pipe.valves
+        # What `end` does when no tab answers the question, then `finalize`'s view.
+        with mock.patch.object(_TurnWriter, "_ask_card", new=mock.AsyncMock(return_value=False)):
+            await w._ask_question()
+        return (await w._view(final=True))[1]
+
+    async def test_the_inline_reply_and_the_writer_show_the_same_text(self):
+        for n, (name, (steps, expected)) in enumerate(self.cases().items()):
+            with self.subTest(name):
+                if n:
+                    await self.asyncTearDown()
+                    await self.asyncSetUp()
+                inline = await self.inline(steps)
+                writer = await self.writer(steps, f"w{n}")
+                self.assertEqual((inline, writer), (expected, expected))
 
 
 class ApiCallerOwnerRuleTests(unittest.IsolatedAsyncioTestCase):

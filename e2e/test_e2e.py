@@ -817,3 +817,322 @@ def test_a_reply_whose_run_ends_while_owui_is_stopped_is_completed_on_start(toke
     assert msgs[aid]["content"].strip().startswith("E2E_DOWN slow-1"), msgs[aid]["content"][:300]
     assert [k for k, m in msgs.items() if m.get("role") == "assistant"] == [aid], "a second reply"
     _assert_clean(token, chat_id, msgs)
+
+
+# ── A plain redeploy of the Pipe mid-reply (ELI-145) ─────────────────────────
+# The dev bundle's deploy coordination exists because a hot reload once cut the
+# reply that was streaming (ELI-23/ELI-24). This deploys the plain artifact the
+# way a user upgrades (`install.py repair`, no --dev-bundle) while a long reply
+# with tool calls streams, and checks what the user sees: the page's live
+# events and the saved message.
+
+import re  # noqa: E402
+import threading  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from websockets.sync.client import connect as _ws_connect  # noqa: E402
+
+DEPLOY_WORDS = (["E2E_DEPLOY_START", "E2E_DEPLOY_MID"] + [f"mid-{i}" for i in range(1, 21)]
+                + ["E2E_DEPLOY_END"] + [f"end-{i}" for i in range(1, 11)])
+DEPLOY_WORD_RE = r"E2E_DEPLOY_(?:START|MID|END)|mid-\d+|end-\d+"
+DEPLOY_LINE = "Updated Pipe function in place"   # install.py, once the new code is in
+
+
+class _Page:
+    """What an open chat tab receives: Open WebUI's socket.io `events` for the
+    user, recorded with the time each arrived."""
+
+    def __init__(self, token: str):
+        url = BASE.replace("http", "ws", 1) + "/ws/socket.io/?EIO=4&transport=websocket"
+        self.ws = _ws_connect(url, additional_headers={"Authorization": f"Bearer {token}"})
+        self.token = token
+        self.socket_id = None
+        self.events: list = []          # (time.monotonic(), event payload)
+        self.cond = threading.Condition()
+        threading.Thread(target=self._read, daemon=True).start()
+        self.wait("the socket.io connect", lambda: self.socket_id, 30)
+        self._emit("user-join", {"auth": {"token": token}})
+
+    def _emit(self, name: str, data) -> None:
+        self.ws.send("42" + json.dumps([name, data]))
+
+    def _read(self) -> None:
+        for raw in self.ws:
+            if raw.startswith("0"):                # engine.io open
+                self.ws.send("40" + json.dumps({"token": self.token}))
+            elif raw == "2":                       # engine.io ping
+                self.ws.send("3")
+            elif raw.startswith("40"):             # socket.io connect ack
+                with self.cond:
+                    self.socket_id = json.loads(raw[2:] or "{}").get("sid")
+                    self.cond.notify_all()
+            elif raw.startswith("42"):
+                body = raw[2:].lstrip("0123456789")
+                try:
+                    name, *args = json.loads(body)
+                except ValueError:
+                    continue
+                if name == "events" and args and isinstance(args[0], dict):
+                    with self.cond:
+                        self.events.append((time.monotonic(), args[0]))
+                        self.cond.notify_all()
+
+    def wait(self, what: str, check, timeout_s: float = TURN_TIMEOUT_S):
+        with self.cond:
+            got = self.cond.wait_for(check, timeout=timeout_s)
+        if not got:
+            pytest.fail(f"timed out after {timeout_s:.0f}s waiting for {what}")
+        return got
+
+    def completions(self, message_id: str) -> list:
+        """(time, data) of each chat:completion event for one message."""
+        with self.cond:
+            return [(t, e["data"]["data"]) for t, e in self.events
+                    if e.get("message_id") == message_id
+                    and (e.get("data") or {}).get("type") == "chat:completion"
+                    and isinstance(e["data"].get("data"), dict)]
+
+    def streamed(self, message_id: str, until: float | None = None) -> list:
+        """The reply's `output` as the page builds it from the live
+        `response:completion` stream events received up to `until`."""
+        with self.cond:
+            evs = [e["data"]["data"] for t, e in self.events
+                   if e.get("message_id") == message_id and (until is None or t <= until)
+                   and (e.get("data") or {}).get("type") == "response:completion"
+                   and isinstance(e["data"].get("data"), dict)]
+        output: list = []
+        for ev in evs:
+            output = _apply_stream_event(output, ev)
+        return output
+
+    def last_stream_event_at(self, message_id: str) -> float:
+        with self.cond:
+            return max((t for t, e in self.events if e.get("message_id") == message_id
+                        and (e.get("data") or {}).get("type") == "response:completion"), default=0.0)
+
+    def summary(self, message_id: str, since: float = 0.0) -> str:
+        """Every event for one message, for a failure message: when, its
+        type, the keys of its data and the text it shows."""
+        with self.cond:
+            rows = [(t, e) for t, e in self.events if e.get("message_id") == message_id]
+        out = []
+        for t, e in rows:
+            d = (e.get("data") or {}).get("data")
+            d = d if isinstance(d, dict) else {}
+            item = d.get("item") or {}
+            shown = d.get("delta") or item.get("type") or _shown(d)[-60:]
+            ident = d.get("item_id") or item.get("id") or ""
+            out.append(f"  {t - since:7.2f}s {(e.get('data') or {}).get('type')} {d.get('type', '')} "
+                       f"{str(ident)[-12:]} {shown!r}")
+        return f"{len(rows)} event(s) for {message_id[:8]}:\n" + "\n".join(out)
+
+    def close(self) -> None:
+        self.ws.close()
+
+
+def _apply_stream_event(output: list, ev: dict) -> list:
+    """One Responses stream event applied to a message's `output`, the way
+    Open WebUI's chat tab does (`structuredOutput.ts::applyResponseStreamEvent`,
+    vendored in test_fixture_owui_structured_output.ts), for the event types
+    the Pipe sends: items added or done, text deltas and text done."""
+    kind = ev.get("type") or ""
+    out = [dict(i) for i in output]
+    at = next((n for n, i in enumerate(out) if ev.get("item_id")
+               and ev["item_id"] in (i.get("id"), i.get("call_id"))), -1)
+    index = at if at >= 0 else ev.get("output_index", max(len(out) - 1, 0))
+    if kind in ("response.output_item.added", "response.output_item.done"):
+        item = dict(ev.get("item") or {})
+        same = next((n for n, i in enumerate(out) if (item.get("id") and i.get("id") == item["id"])
+                     or (item.get("call_id") and i.get("type") == item.get("type")
+                         and i.get("call_id") == item["call_id"])), -1)
+        if same >= 0:
+            out[same] = item
+        elif index < len(out):
+            if kind.endswith("added"):
+                out.insert(index, item)
+            else:
+                out[index] = item
+        else:
+            out.append(item)
+        return out
+    if kind.endswith(".delta") or kind == "response.output_text.done":
+        while len(out) <= index:   # filler slots up to the addressed one, as the tab does
+            out.append({"type": "message", "role": "assistant", "content": [],
+                        **({"id": ev.get("item_id")} if len(out) == index else {})})
+        item = out[index]
+        parts = [dict(p) for p in item.get("content") or []]
+        ci = ev.get("content_index") or 0
+        while len(parts) <= ci:
+            parts.append({"type": "output_text", "text": ""})
+        if kind.endswith(".delta"):
+            parts[ci]["text"] = (parts[ci].get("text") or "") + (ev.get("delta") or "")
+        else:
+            parts[ci]["text"] = ev.get("text", parts[ci].get("text"))
+        item["content"] = parts
+    return out
+
+
+def _output_text(output) -> str:
+    """The reply's text as the page draws it from `output`: each message item
+    is its own block."""
+    return "\n".join("".join(part.get("text") or "" for part in item.get("content") or []
+                             if isinstance(part, dict) and part.get("type") == "output_text")
+                     for item in output or [] if isinstance(item, dict) and item.get("type") == "message")
+
+
+def _shown(data: dict) -> str:
+    """The text a chat:completion event or a saved message shows: its `output`
+    items when it has them, else its `content`."""
+    return _output_text(data.get("output")) if data.get("output") else (data.get("content") or "")
+
+
+def _output_calls(output) -> list:
+    """(type, call id) of each tool card item, in order."""
+    return [(item["type"], item.get("call_id") or item.get("id"))
+            for item in output or []
+            if isinstance(item, dict) and item.get("type") in ("function_call", "function_call_output")]
+
+
+def _send_in_chat(token: str, page: _Page, chat_id: str | None, prompt: str) -> tuple[str, str]:
+    """Send `prompt` the way the page does, as a new chat or under the chat's
+    current leaf. Returns (chat id, assistant message id)."""
+    now = int(time.time())
+    uid, aid = str(uuid.uuid4()), str(uuid.uuid4())
+    user = {"id": uid, "parentId": None, "childrenIds": [aid], "role": "user",
+            "content": prompt, "timestamp": now, "models": [DEFAULT_MODEL]}
+    assistant = {"id": aid, "parentId": uid, "childrenIds": [], "role": "assistant",
+                 "content": "", "model": DEFAULT_MODEL, "timestamp": now, "done": False}
+    if chat_id is None:
+        chat = {"title": "E2E plain deploy", "models": [DEFAULT_MODEL],
+                "history": {"messages": {uid: user, aid: assistant}, "currentId": aid},
+                "messages": [user, assistant], "files": [], "tags": [], "timestamp": now * 1000}
+        status, created = _request("POST", "/api/v1/chats/new", {"chat": chat}, token)
+        assert status == 200, created
+        chat_id = created["id"]
+    else:
+        status, got = _request("GET", f"/api/v1/chats/{chat_id}", token=token)
+        assert status == 200, got
+        chat = got["chat"]
+        msgs, leaf = chat["history"]["messages"], chat["history"]["currentId"]
+        user["parentId"] = leaf
+        msgs[leaf]["childrenIds"] = [*(msgs[leaf].get("childrenIds") or []), uid]
+        msgs[uid], msgs[aid] = user, assistant
+        chat["history"]["currentId"] = aid
+        status, saved = _request("POST", f"/api/v1/chats/{chat_id}", {"chat": chat}, token)
+        assert status == 200, saved
+    status, ack = _request("POST", "/api/chat/completions", {
+        "model": DEFAULT_MODEL, "messages": [{"role": "user", "content": prompt}],
+        "stream": True, "chat_id": chat_id, "id": aid, "session_id": page.socket_id,
+        "parent_id": uid, "user_message": user}, token)
+    assert status == 200, ack
+    return chat_id, aid
+
+
+def _redeploy_plain() -> tuple[subprocess.Popen, threading.Event, list]:
+    """Start `install.py repair` (the plain artifact). Returns the process, an
+    event set once the new code is in Open WebUI, and its output lines."""
+    root = Path(__file__).resolve().parent.parent
+    proc = subprocess.Popen(["uv", "run", "install.py", "repair"], cwd=root, env=os.environ.copy(),
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    deployed, lines = threading.Event(), []
+
+    def read():
+        for line in proc.stdout:
+            lines.append((time.monotonic(), line.rstrip()))
+            if DEPLOY_LINE in line:
+                deployed.set()
+    threading.Thread(target=read, daemon=True).start()
+    return proc, deployed, lines
+
+
+@pytest.mark.skipif(not os.environ.get("GATEWAY_TOKEN"), reason="install.py repair needs GATEWAY_TOKEN")
+@pytest.mark.parametrize("redeploy", [
+    pytest.param(False, id="control"),
+    pytest.param(True, id="redeploy", marks=pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
+        "ELI-150: after a plain redeploy the new load's turn writer takes over the reply the "
+        "retired connection still serves; the live page gets every delta twice and the saved "
+        "reply stays done:false"))),
+])
+def test_a_plain_redeploy_mid_reply_leaves_the_reply_whole(token, redeploy):
+    """`control` streams the same reply with no redeploy: every check below
+    must hold there, so a failure with the redeploy is the redeploy's."""
+    page = _Page(token)
+    try:
+        sent_at = time.monotonic()
+        chat_id, aid = _send_in_chat(token, page, None, "E2E_DEPLOY_SCENE")
+
+        # Redeploy once the first tool card is done and the text after it streams.
+        page.wait("the reply to stream past its first tool card",
+                  lambda: "mid-3" in _output_text(page.streamed(aid)))
+        if redeploy:
+            proc, deployed, lines = _redeploy_plain()
+            assert deployed.wait(120), "install.py repair never updated the Pipe:\n" + "\n".join(
+                line for _t, line in lines[-40:])
+            deployed_at = next(t for t, line in lines if DEPLOY_LINE in line)
+            assert proc.wait(300) == 0, "install.py repair failed after the deploy:\n" + "\n".join(
+                line for _t, line in lines[-60:])
+        else:
+            deployed_at = time.monotonic()   # the point the redeploy would have been
+
+        page.wait("the reply to finish on the page", lambda: any(
+            d.get("done") for _t, d in page.completions(aid)), timeout_s=180)
+        events = page.completions(aid)
+
+        # Precondition: the new code went in while the reply was streaming.
+        print(page.summary(aid, sent_at), f"\n{'redeploy' if redeploy else 'no redeploy'} "
+              f"at {deployed_at - sent_at:.2f}s")
+        done_at = next(t for t, d in events if d.get("done"))
+        assert deployed_at < done_at, "the reply finished before the redeploy; nothing was tested"
+        shown_then = _output_text(page.streamed(aid, until=deployed_at))
+        assert "end-1" not in shown_then, f"the redeploy came too late: {shown_then[-200:]!r}"
+
+        # The page kept streaming after the redeploy: the rest of the reply
+        # arrived live, not only in the final save.
+        problems = []
+        if page.last_stream_event_at(aid) <= deployed_at:
+            problems.append("no live event after the redeploy")
+        streamed = page.streamed(aid)
+        live_words = re.findall(DEPLOY_WORD_RE, _output_text(streamed))
+        if live_words != DEPLOY_WORDS:
+            problems.append(f"what the page streamed is not the reply once: {_output_text(streamed)!r}")
+
+        # The saved reply is whole: every word once, in order, both tool cards closed.
+        msgs = _chat_messages(token, chat_id)
+        saved = msgs[aid]
+        if saved.get("done") is not True:
+            problems.append(f"the saved reply is not done: {json.dumps(saved)[:1500]}")
+        text = _shown(saved)
+        words = re.findall(DEPLOY_WORD_RE, text)
+        if words != DEPLOY_WORDS:
+            problems.append(f"the saved reply is not the reply once: {text!r}")
+        calls = _output_calls(saved.get("output"))
+        started = [c for kind, c in calls if kind == "function_call"]
+        finished = [c for kind, c in calls if kind == "function_call_output"]
+        if not (len(started) == 2 and sorted(started) == sorted(finished)):
+            problems.append(f"saved tool cards: {calls}")
+
+        # The saved copy is what streamed, and what the page shows at the end.
+        if _output_text(streamed) != _output_text(saved.get("output")):
+            problems.append("what streamed and what was saved differ")
+        if _output_calls(streamed) != calls:
+            problems.append(f"streamed cards {_output_calls(streamed)} != saved {calls}")
+        final = next(d for _t, d in events if d.get("done"))
+        if final.get("output") and _output_text(final["output"]) != _output_text(saved.get("output")):
+            problems.append(f"the page's final event shows {_output_text(final['output'])!r}")
+
+        # The next message in the chat runs.
+        _, next_id = _send_in_chat(token, page, chat_id, "Respond with exactly: E2E_AFTER_DEPLOY")
+        msgs = _wait_for(token, chat_id, ["E2E_AFTER_DEPLOY"])
+        if (msgs[next_id].get("content") or "").strip() != "E2E_AFTER_DEPLOY":
+            problems.append(f"the next message: {json.dumps(msgs[next_id])[:1500]}")
+        try:
+            _assert_clean(token, chat_id, msgs)
+        except AssertionError as ex:
+            problems.append(f"the chat is not clean: {ex}")
+        replies = [m for m in msgs.values() if m.get("role") == "assistant"]
+        print(page.summary(next_id, sent_at))
+        assert not problems, "\n".join(problems) + "\nsaved replies:\n" + "\n".join(
+            f"  {m['id'][:8]} done={m.get('done')} items={[i.get('type') for i in m.get('output') or []]} "
+            f"text={_shown(m)!r}" for m in replies)
+    finally:
+        page.close()

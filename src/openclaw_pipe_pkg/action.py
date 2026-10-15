@@ -166,9 +166,30 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     return el;
   }
 
+  // When the data was fetched (epoch ms), on the browser's clock like the
+  // rate-limit resets: the Open WebUI server's timezone is not the reader's
+  // (ELI-140).
+  function clockTime(ms) {
+    return new Date(ms).toLocaleTimeString([], {
+      hour: '2-digit', minute: '2-digit', second: '2-digit'
+    });
+  }
+
+  // "Open in OpenClaw": this session's page in the Control UI, in a new tab
+  // (CONTROL_UI_URL valve, ELI-141).
+  function controlUiLink(url) {
+    const a = document.createElement('a');
+    a.href = url;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    a.className = 'text-xs text-blue-600 dark:text-blue-400 hover:underline whitespace-nowrap';
+    a.textContent = 'Open in OpenClaw ↗';
+    return a;
+  }
+
   function touchFooter(fetchedAt, source) {
     const f = document.getElementById('openclaw-status-footer');
-    if (f) f.textContent = 'Updated ' + fetchedAt + ' · via ' + source;
+    if (f) f.textContent = 'Updated ' + clockTime(fetchedAt) + ' · via ' + source;
   }
 
   // Fetches back to this same Action (same-origin, unsandboxed execute
@@ -263,7 +284,7 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
   window.__openclawStatus = {
     identity: IDENTITY, isDark: isDark, barColor: barColor, makeBar: makeBar,
     sectionHeader: sectionHeader, errorEl: errorEl,
-    skeletonSection: skeletonSection, touchFooter: touchFooter,
+    skeletonSection: skeletonSection, touchFooter: touchFooter, clockTime: clockTime, controlUiLink: controlUiLink,
     triggerCompact: triggerCompact, elapsedTime: elapsedTime, toMs: toMs,
     openSubagentDrawer: openSubagentDrawer,
   };
@@ -290,13 +311,17 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
   title.className = 'text-sm font-semibold';
   title.textContent = 'OpenClaw Status';
   header.appendChild(title);
+  const headerEnd = document.createElement('div');
+  headerEnd.className = 'flex items-center gap-3';
+  if (IDENTITY.controlUiUrl) headerEnd.appendChild(controlUiLink(IDENTITY.controlUiUrl));
+  header.appendChild(headerEnd);
   const closeBtn = document.createElement('button');
   closeBtn.type = 'button';
   closeBtn.textContent = '×';
   closeBtn.className = 'text-xl leading-none text-gray-400 hover:text-gray-700 '
     + 'dark:hover:text-gray-200 px-1';
   closeBtn.onclick = function() { root.remove(); };
-  header.appendChild(closeBtn);
+  headerEnd.appendChild(closeBtn);
   panel.appendChild(header);
 
   const sections = document.createElement('div');
@@ -713,6 +738,11 @@ _DRAWER_OPEN_JS_TEMPLATE = r"""
   statusEl.className = 'text-xs text-gray-400 dark:text-gray-500 mt-0.5';
   statusEl.textContent = TASK.status || '';
   headerText.appendChild(statusEl);
+  if (TASK.controlUiUrl) {
+    const link = S.controlUiLink(TASK.controlUiUrl);
+    link.className += ' inline-block mt-1';
+    headerText.appendChild(link);
+  }
   header.appendChild(headerText);
   const closeBtn = document.createElement('button');
   closeBtn.type = 'button';
@@ -863,7 +893,7 @@ _DRAWER_OVERVIEW_FILL_JS_TEMPLATE = r"""
   }
 
   const df = document.getElementById('openclaw-drawer-footer');
-  if (df) df.textContent = 'Updated ' + DATA.fetchedAt + ' · via ' + DATA.source;
+  if (df) df.textContent = 'Updated ' + S.clockTime(DATA.fetchedAt) + ' · via ' + DATA.source;
 })();
 """
 
@@ -1177,6 +1207,28 @@ def _render_subagents_fill_js(data: dict) -> str:
     return _SUBAGENTS_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
 
 
+_TRAILING_UUID_RE = re.compile(
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$", re.IGNORECASE)
+
+
+def _control_ui_session_url(base: str, session_key: str) -> str | None:
+    """The session's page in the OpenClaw Control UI (ELI-141).
+
+    The UI's short-id route, `<base>/chat/<agentId>/<id>`, where `<id>` is the
+    hex of the UUID the session key ends in (OpenClaw docs/web/urls.md; the UI
+    resolves it with `sessions.resolve {shortId}`). Every key the dialog shows
+    ends in one: `agent:<id>:openwebui-<user>-<chat>` and `agent:<id>:subagent:<uuid>`.
+    None without an http(s) base or for any other key."""
+    base = (base or "").strip().rstrip("/")
+    parts = (session_key or "").split(":", 2)
+    if not base.lower().startswith(("http://", "https://")) or len(parts) != 3 or parts[0] != "agent":
+        return None
+    m = _TRAILING_UUID_RE.search(parts[2])
+    if not m or not parts[1]:
+        return None
+    return f"{base}/chat/{parts[1]}/{m.group(1).lower().replace('-', '')}"
+
+
 def _render_drawer_open_js(task: dict) -> str:
     return _DRAWER_OPEN_JS_TEMPLATE.replace("__OPENCLAW_TASK__", _json_for_js(task))
 
@@ -1212,77 +1264,46 @@ def _extract_transcript_and_tools(messages: list) -> tuple[list, list]:
     """Splits chat.history's message rows into plain-text transcript rows and
     tool-call cards for the drawer's Transcript/Tools tabs.
 
-    Assumes the same {role, content: [...]} shape confirmed live via
-    sessions_history (content items typed "text" / "toolcall" /
-    "tool_result" / "thinking") -- chat.history is a display-normalized
-    projection of the same underlying transcript store, not a separate
-    schema, so this is expected to match; a plain string `content` (some
-    transports may still use that) is treated as a single text row so this
-    degrades instead of silently dropping messages if the shape differs.
+    The tool calls are the ones the chat's own rebuild makes cards of, read
+    by the same parser (`_history_events`, gateway.py), in both transcript
+    shapes (claude-cli's and the Gateway's own runtime's). Each card's result
+    is its output by the chat tool cards' rule, not the block list or the
+    {content, details} envelope as JSON (ELI-125). Text rows are every
+    message's text blocks; a plain string `content` is a single row.
     """
     text_rows: list = []
-    tool_calls: list = []
-    pending_by_id: dict = {}
-
-    def add_text(role, text):
-        if role == "user" and _is_spawn_message(text):
+    for m in messages or []:
+        role, content = m.get("role"), m.get("content")
+        if role == "toolResult":
+            continue  # shows in its call's Tools card only (ELI-128)
+        if isinstance(content, str):
+            text = content if content.strip() else ""
+        elif isinstance(content, list):
+            text = "\n".join(i["text"] for i in content
+                             if isinstance(i, dict) and i.get("type") == "text" and i.get("text"))
+        else:
+            continue
+        if text and role == "user" and _is_spawn_message(text):
             # A child's first message is the Gateway's spawn wrapper: show
             # the task in it, as the Subagents row does.
             text = _subagent_task_text(text) or text
-        text_rows.append({"role": role, "text": text})
+        if text:
+            text_rows.append({"role": role, "text": text})
 
-    for m in messages or []:
-        role = m.get("role")
-        content = m.get("content")
-        if role == "toolResult":
-            # OpenClaw's own shape, outside claude-cli imports: the result is
-            # a message of its own, paired by toolCallId with a `toolCall`
-            # block. It shows in that call's Tools card only, as a claude-cli
-            # `tool_result` does (ELI-128).
-            call = pending_by_id.get(m.get("toolCallId"))
-            if call is not None:
-                call["result"] = _tool_result_text(content)
-                call["isError"] = bool(m.get("isError"))
+    tool_calls: list = []
+    by_id: dict = {}
+    for event in _history_events(messages or []):
+        data = event["data"]
+        if event["stream"] != "tool":
             continue
-        if isinstance(content, str):
-            if content.strip():
-                add_text(role, content)
-            continue
-        if not isinstance(content, list):
-            continue
-        text_parts = []
-        for item in content:
-            if not isinstance(item, dict):
-                continue
-            item_type = item.get("type")
-            if item_type == "text" and item.get("text"):
-                text_parts.append(item["text"])
-            elif item_type in ("toolcall", "toolCall"):
-                call = {
-                    "id": item.get("id"),
-                    "name": item.get("name") or "tool",
-                    "arguments": (
-                        json.dumps(item.get("arguments"), indent=2)
-                        if item.get("arguments") is not None else ""
-                    ),
-                    "result": None,
-                    "isError": False,
-                }
-                pending_by_id[call["id"]] = call
-                tool_calls.append(call)
-            elif item_type == "tool_result":
-                call = pending_by_id.get(item.get("tool_use_id"))
-                if call is not None:
-                    # The output, by the chat tool cards' rule (gateway.py):
-                    # not the block list or the {content, details} envelope
-                    # as JSON (ELI-125).
-                    call["result"] = _tool_result_text(item.get("content"))
-                    # Real tool_result rows carry is_error; surfacing it here
-                    # lets the card mark a failure the same way the inline
-                    # chat tool cards already do.
-                    call["isError"] = bool(item.get("is_error"))
-        if text_parts:
-            add_text(role, "\n".join(text_parts))
+        if data["phase"] == "start":
+            by_id[data["toolCallId"]] = call = {
+                "id": data["toolCallId"], "name": data["name"] or "tool",
+                "arguments": json.dumps(data["args"], indent=2), "result": None, "isError": False}
+            tool_calls.append(call)
+        elif (call := by_id.get(data["toolCallId"])) is not None:
+            call["result"] = _tool_result_text(data["result"])
+            call["isError"] = data["isError"]
     return text_rows, tool_calls
 
 
@@ -1318,6 +1339,13 @@ class Action:
             default="main",
             description="Copy this exactly from the Pipe's valves -- the same "
                         "OpenClaw agent the Pipe routes chats to."
+        )
+        CONTROL_UI_URL: str = Field(
+            default="",
+            description="The address you open the OpenClaw Control UI at, e.g. "
+                        "https://openclaw.example.com. When set, the Status "
+                        "dialog and the sub-agent drawer link to the session in "
+                        "it. Empty: no link."
         )
 
     def __init__(self):
@@ -1402,6 +1430,9 @@ class Action:
                 "messageId": body.get("id"),
                 "sessionId": body.get("session_id"),
                 "owuiModel": body.get("model"),
+                "controlUiUrl": _control_ui_session_url(
+                    self.valves.CONTROL_UI_URL,
+                    _owui_session_key(self.valves.AGENT_ID, user_id, chat_id)),
             }
             await __event_emitter__({"type": "execute", "data": {"code": _render_modal_open_js(identity)}})
         else:
@@ -1484,7 +1515,7 @@ class Action:
                 "context": context_data,
                 "goal": goal_data,
                 "source": source,
-                "fetchedAt": time.strftime("%H:%M:%S"),
+                "fetchedAt": int(time.time() * 1000),
                 "error": None,
             })}})
             return provider, session_row
@@ -1516,7 +1547,7 @@ class Action:
                 # refreshes from that run's own API response headers.
                 "sessionActive": session_row.get("status") == "running",
                 "source": source,
-                "fetchedAt": time.strftime("%H:%M:%S"),
+                "fetchedAt": int(time.time() * 1000),
                 "error": None,
             })}})
 
@@ -1556,7 +1587,7 @@ class Action:
                     pipe_log(f"[status-action] sessions.preview (children) failed: {ex}")
             subagent_tasks = [_subagent_row(r, task_texts.get(r["key"])) for r in active]
             await __event_emitter__({"type": "execute", "data": {"code": _render_subagents_fill_js({
-                "tasks": subagent_tasks, "source": source, "fetchedAt": time.strftime("%H:%M:%S"), "error": None,
+                "tasks": subagent_tasks, "source": source, "fetchedAt": int(time.time() * 1000), "error": None,
             })}})
             return [r["key"] for r in active]
 
@@ -1743,6 +1774,7 @@ class Action:
 
         await __event_emitter__({"type": "execute", "data": {"code": _render_drawer_open_js({
             "id": task_id, "title": body.get("taskTitle"), "status": body.get("taskStatus"),
+            "controlUiUrl": _control_ui_session_url(self.valves.CONTROL_UI_URL, task_id),
         })}})
 
         if not task_id.startswith("agent:"):
@@ -1831,7 +1863,7 @@ class Action:
                 if goal_line:
                     goal_data = {"line": goal_line}
 
-            fetched_at = time.strftime("%H:%M:%S")
+            fetched_at = int(time.time() * 1000)
             await __event_emitter__({"type": "execute", "data": {"code": _render_drawer_overview_fill_js({
                 "task": task, "childSessionKey": child_key, "provider": provider, "model": model,
                 "context": context_data, "goal": goal_data, "source": source,

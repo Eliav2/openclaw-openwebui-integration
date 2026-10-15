@@ -303,7 +303,7 @@ class _TurnWriter:
     def __init__(self, conn: "_GatewayConnection", *, session_key: str, chat_id: str,
                  user_id: str, run_id: str, message_id: str | None,
                  takeover: bool = False, renderer: "_TurnRenderer | None" = None,
-                 thinking: str | None = None, wake: dict | None = None):
+                 thinking: str | None = None, wake: dict | None = None, shown: str = ""):
         self.conn = conn
         self.session_key, self.chat_id, self.user_id = session_key, chat_id, user_id
         self.run_id, self.message_id = run_id, message_id
@@ -316,9 +316,11 @@ class _TurnWriter:
         # A cron wake (ELI-103): {key, at, job} of its turn, and `end` once its
         # terminal arrived. Its transcript span is a time window, not a run id.
         self.wake = wake
+        # What earlier replies showed of a run M continues (an adopted run,
+        # ELI-147): the transcript rebuild of M starts after it.
+        self.shown = {run_id: shown} if shown else {}
         self.opened = False
         self.task_id: str | None = None
-        self.parent_id: str | None = None
         # every run written into M, in transcript order (_adopt_recoveries_from)
         self.runs = [run_id]
         # Where each run's streamed part starts in the renderer, in adoption
@@ -356,7 +358,6 @@ class _TurnWriter:
         if not claim["claimed"]:
             pipe_log(f"  turn writer: message {self.message_id[:8]}... is held by another writer")
             return False
-        self.parent_id = claim["parent"]
         if claim["how"] == "new":
             await _introduce_turn_message(self.chat_id, self.user_id, claim["messages"],
                                           self.message_id)
@@ -482,18 +483,26 @@ class _TurnWriter:
         directive that first came after the handover resolved here, and,
         while the run streams, a directive whose filename is still arriving
         held back, as the inline reply holds it."""
-        await self._resolve_media(self._rewrite(self.renderer.text), final)
         output = self.renderer.finished_output() if final else copy.deepcopy(self.renderer.output)
+        items = [i for i in output if i.get("type") == "message" and i.get("content")]
+        # Each message item is read on its own, as the inline reply reads
+        # it: an item ends a directive, so the text after a tool card does
+        # not run into the filename before it (ELI-147).
+        for item in items:
+            await self._resolve_media(self._rewrite(item["content"][0].get("text") or ""),
+                                      final or item is not output[-1])
         hold = None if final else globals().get("_advance_media_buffer")
 
         def show(text: str, tail: bool) -> str:
             text = self._rewrite(text)
             return hold("", text)[0] if hold and tail else text
         for n, item in enumerate(output):
-            if item.get("type") == "message" and item.get("content"):
+            if item in items:
                 part = item["content"][0]
                 part["text"] = show(part.get("text") or "", n == len(output) - 1)
-        return output, show(self.renderer.text, True)
+        if not items:
+            return output, show(self.renderer.text, True)
+        return output, "".join(i["content"][0]["text"] for i in items)
 
     async def _resolve_media(self, text: str, final: bool) -> None:
         """Upload each complete `MEDIA:` directive the inline reply never saw,
@@ -596,7 +605,7 @@ class _TurnWriter:
         g = globals()
         names = ("_call_native_card_on_live_session", "_native_ask_user_payload",
                  "_owui_supports_native_ask_user", "_format_native_answers",
-                 "_ask_user_detail_block", "_is_user_input_prompt")
+                 "_ask_user_detail_block", "_is_user_input_prompt", "_ask_user_fallback_text")
         if self.closed or not self.opened or not all(n in g for n in names):
             return False
         # Only a question in the run's last message item (fences are per
@@ -611,6 +620,18 @@ class _TurnWriter:
         prompt = _prompt_tail(text, start)
         if not prompt or not g["_is_user_input_prompt"](prompt):
             return False
+        if await self._ask_card(prompt):
+            return True
+        # Not answered here: M ends with the question as the inline reply's
+        # fallback shows it (a JSON form as readable text, ELI-142).
+        self.conn.note_turn_rewrite(self.chat_id, self.message_id, prompt,
+                                    g["_ask_user_fallback_text"](prompt))
+        return False
+
+    async def _ask_card(self, prompt: str) -> bool:
+        """The card for `prompt` on the tab viewing the chat, and its answer
+        sent; False when nothing was sent."""
+        g = globals()
         payload = g["_native_ask_user_payload"](prompt) if g["_owui_supports_native_ask_user"]() else None
         if payload is None:
             return False
@@ -860,6 +881,11 @@ class _TurnWriter:
                      f"{len(self.runs)} run(s); keeping what streamed")
             return None
         rest = _history_renderer([m for s in spans[k:] for m in s])
+        shown = self.shown.get(self.runs[k], "")
+        if shown and not rest.drop_shown(shown):
+            pipe_log(f"  turn writer: run {self.runs[k][:24]}... does not start with what earlier "
+                     f"replies showed; keeping what streamed in {self.message_id[:8]}...")
+            return None
         if not rest.output:
             return None
         cut = min((starts[r] for r in self.runs[k:] if r in starts), default=(len(out), len(text)))
@@ -1050,9 +1076,7 @@ def _turn_queue(conn: "_GatewayConnection", sess: str, run: str, parsed: tuple,
             # DESIGN 2.6: the request streaming this run ended before it. The
             # writer continues in the same message from the shadow renderer,
             # which already holds this event.
-            pump.handover = {"message_id": target["message_id"],
-                             "renderer": conn._run_renderers.get(f"{sess}:{run}"),
-                             "thinking": target.get("thinking")}
+            pump.handover = conn.handover_of(sess, run)
             conn.unregister_run_target(sess, run)
         spawn_background(_turn_pump_loop(conn, sess, run, parsed, pump))
         spawn_background(conn.ensure_message_subscription(sess))
@@ -1232,7 +1256,8 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
         elif handed is not None:
             pump.writer = _TurnWriter(conn, session_key=sess, chat_id=chat_id, user_id=user_id,
                                       run_id=run, message_id=handed["message_id"], takeover=True,
-                                      renderer=handed["renderer"], thinking=handed.get("thinking"))
+                                      renderer=handed["renderer"], thinking=handed.get("thinking"),
+                                      shown=handed.get("shown", ""))
             conn._turn_writers[(chat_id, handed["message_id"])] = pump.writer
             await pump.writer.feed(None)
         elif re.fullmatch(_UUID_RE, run) and run == await conn.session_id_for(sess):

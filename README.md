@@ -438,7 +438,9 @@ It reads only `OWUI_URL`, `OWUI_EMAIL`, and `OWUI_PASSWORD`. The five shared
 valves, `GATEWAY_URL`, `GATEWAY_TOKEN`, `DEVICE_IDENTITY`, `STATE_DIR`,
 `AGENT_ID`: are copied verbatim from the Pipe's valves, so the Action reuses
 the Pipe's already-approved device identity and never triggers a second pairing.
-It fails fast if the Pipe isn't installed yet.
+It fails fast if the Pipe isn't installed yet. The Action's one valve of its
+own, `CONTROL_UI_URL` (optional, see [Status Action button](#f-status-action)),
+is set in Open WebUI and left as is by the installer.
 
 Two differences from `install.py`: it must be run from a clone (it imports from
 `install.py`, so the `uv run <raw-github-url>` form doesn't work), and it has no
@@ -788,11 +790,14 @@ one character at a time, or when it shows up mid-reply inside one cumulative
 chunk. A prompt emitted twice does not become a doubled dialog, and duplicate
 options are collapsed.
 
-The question survives a reconnect. Close the tab or switch chats, come back
-later, and it re-pops on your new session for up to an hour, re-firing on each reconnect while
-the status line reads "Waiting for your reply, question is pending, reconnect
-anytime". If you dismiss it, the question appears as ordinary text with the
-marker line stripped, so nothing is lost. Once answered, the exchange is kept
+The question card is shown once, on the tab viewing the chat; a reload moves it
+to the reloaded tab. If it is not answered by Open WebUI's card timeout (4
+minutes), or you dismiss it, or no tab views the chat, the reply ends with the
+question as ordinary text, marker line stripped (a JSON form as its numbered
+questions with their options), and you answer it in your next message. The older modals survive a reconnect instead: close the tab, come back
+later, and the modal re-pops on your new session for up to an hour while the
+status line reads "Waiting for your reply, question is pending, reconnect
+anytime". Once answered, the exchange is kept
 inline as a collapsible ❓ Ask User card showing both the question and your
 answer, and the run continues in the same bubble.
 
@@ -1052,8 +1057,17 @@ second pairing to approve. The Action can never deliver proactive messages: that
 path is compiled out of this artifact, so its fallback connection cannot write
 stray text into a chat.
 
+**Open in OpenClaw.** Set the Action's `CONTROL_UI_URL` valve to the address
+you open the OpenClaw Control UI at (for example `https://openclaw.example.com`,
+including any `gateway.controlUi.basePath`). The dialog header then links to this
+chat's session in the Control UI, and the sub-agent drawer links to the child's
+session, each in a new tab. The link uses the Control UI's
+[short-id session route](https://docs.openclaw.ai/web/urls), `/chat/<agent>/<id>`.
+Empty (the default): no link.
+
 Valves (mirrored from the Pipe by `install_action.py`): `GATEWAY_URL`,
-`GATEWAY_TOKEN`, `DEVICE_IDENTITY`, `STATE_DIR`, `AGENT_ID`. Install steps in
+`GATEWAY_TOKEN`, `DEVICE_IDENTITY`, `STATE_DIR`, `AGENT_ID`. The Action's own
+`CONTROL_UI_URL` is kept across re-installs. Install steps in
 [Installing the companion Status Action](#installing-the-companion-status-action).
 
 **Composer Status button (experiment).** The Pipe also adds a **Status** button

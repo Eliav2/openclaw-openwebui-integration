@@ -101,7 +101,7 @@ def _marker_line_index(text: str, in_fence=False):
 
 
 def _advance_input_prompt_buffer(pending: str, delta: str,
-                                 in_fence=False) -> tuple[str, str]:
+                                 in_fence=False, at_line_start=True) -> tuple[str, str]:
     """Feed a new assistant-delta chunk into the needs-input buffering state.
 
     Returns `(text_to_yield_now, new_pending)`. `pending` is text already
@@ -120,8 +120,19 @@ def _advance_input_prompt_buffer(pending: str, delta: str,
 
     `in_fence`: a fenced code block is open where `pending + delta` starts
     (the shown text left it open); nothing in a fence is held (ELI-107).
+    `at_line_start`: the shown text ends at the start of a line. When it
+    does not, the first line of `delta` continues a line and opens no
+    prompt, wherever the deltas happen to split (ELI-147).
     """
     candidate = pending + delta
+    if not (pending or at_line_start):
+        nl = candidate.find("\n")
+        if nl == -1:
+            return candidate, ""
+        head = candidate[:nl + 1]
+        flush, held = _advance_input_prompt_buffer("", candidate[nl + 1:],
+                                                   _fence_open_after(head, in_fence))
+        return head + flush, held
     if not in_fence and _could_be_user_input_prefix(candidate.lstrip()):
         return "", candidate
     # A complete marker may sit mid-candidate when the whole reply arrives at
@@ -139,16 +150,18 @@ def _advance_input_prompt_buffer(pending: str, delta: str,
 
 
 def _strip_input_marker_line(text: str) -> str:
-    """Remove a leading needs-input trigger line ("OpenClaw needs input:" /
-    "Codex needs input:") from text about to be shown as visible content.
+    """Remove a leading needs-input marker ("OpenClaw needs input:" /
+    "Codex needs input:") and keep the prompt after it. The one place a
+    prompt is split from its marker: the card, the modal and the text
+    fallback all read the prompt through it.
 
     A needs-input prompt is normally intercepted into a modal and never
     rendered raw. But the fallback paths -- a cancelled/dismissed modal, a run
-    that ended before the modal could fire, or the item-event path which lacks
-    the streaming buffer guard -- can still reach a raw ``yield`` with the marker
-    intact, leaking the literal directive line into the chat. The marker is only
-    ever meaningful as the FIRST line, so drop exactly that line and keep the
-    rest (the actual question) as a readable fallback.
+    that ended before the modal could fire -- can still reach a raw ``yield``
+    with the marker intact, leaking the literal directive line into the chat.
+    The marker is only ever meaningful at the start, so drop exactly the
+    marker and keep the rest (the actual question), including a question
+    written on the marker line itself (ELI-151).
     """
     if not text:
         return text
@@ -156,25 +169,28 @@ def _strip_input_marker_line(text: str) -> str:
     lead_ws = text[: len(text) - len(stripped)]
     for prefix in _USER_INPUT_TRIGGER_PREFIXES:
         if stripped.startswith(prefix):
-            rest = stripped[len(prefix):]
-            nl = rest.find("\n")
-            rest = rest[nl + 1:] if nl != -1 else ""
-            return lead_ws + rest.lstrip("\n")
+            rest = stripped[len(prefix):].lstrip(" \t\r")
+            if rest.startswith("\n"):
+                rest = rest.lstrip("\n")
+            return lead_ws + rest
     return text
 
 
 def _strip_needs_input_lines(text: str) -> str:
-    """Drop every needs-input directive line (and the blank lines after it)
-    that is outside a fenced code block: the question it opens stays as
-    readable text, a quoted block in a fence stays as written (ELI-107)."""
+    """Drop every needs-input directive (and the blank lines after a lone
+    one) that is outside a fenced code block: the question it opens stays as
+    readable text, a question on the marker line included (ELI-151), and a
+    quoted block in a fence stays as written (ELI-107)."""
     if not text:
         return text
     out, fence, skip_blank = [], "", False
     for line in text.split("\n"):
         before, fence = fence, _fence_step(line, fence)
         if not before and not fence and _is_user_input_prompt(line):
-            skip_blank = True
-            continue
+            line = _strip_input_marker_line(line)
+            skip_blank = not line.strip()
+            if skip_blank:
+                continue
         if skip_blank and not line.strip():
             continue
         skip_blank = False
@@ -348,10 +364,9 @@ def _modal_payload_from_user_input_prompt(prompt_text: str) -> tuple[dict, bool]
     caller converts to an "execute" event just before firing it.
     """
     prompt_text = _truncate_at_repeated_marker(prompt_text or "")
-    lines = [line.strip() for line in prompt_text.splitlines()]
+    # The marker goes as in the text fallback: a question on its line stays (ELI-151).
+    lines = [line.strip() for line in _strip_input_marker_line(prompt_text).splitlines()]
     lines = [line for line in lines if line]
-    if lines and lines[0].endswith("needs input:"):
-        lines = lines[1:]
 
     title = "OpenClaw needs input"
     if lines and len(lines[0]) <= 80 and not re.match(r"^\d+\.", lines[0]):
@@ -442,15 +457,9 @@ def _modal_payload_from_user_input_prompt(prompt_text: str) -> tuple[dict, bool]
 _OPTION_DESCRIPTION_SEPARATORS = (" - ", " – ", " — ")
 
 # OWUI clamps a request:user_input event call to 60..240s and, when it times
-# out, removes the card itself. We ask for the maximum and re-show the card
-# after each timeout, so a question waits for as long as max_wait_s allows.
+# out, removes the card itself. We ask for the maximum; a card not answered
+# by then ends the reply with the question as text (ELI-142).
 _NATIVE_CARD_TIMEOUT_MS = 240_000
-# A card cancelled this fast was never seen: OWUI's frontend cancels
-# request:user_input at once when the user is viewing another chat.
-_NATIVE_CARD_UNSEEN_CANCEL_S = 1.5
-# How long a question card waits for a tab to view the chat again (a reload)
-# before the reply ends with the question as text (ELI-107 decision 2).
-_NATIVE_CARD_TAB_GRACE_S = 60
 
 
 def _owui_supports_native_ask_user() -> bool:
@@ -530,6 +539,28 @@ def _parse_ask_user_json(prompt_text: str) -> list[dict] | None:
     return questions or None
 
 
+def _ask_user_fallback_text(prompt_text: str) -> str:
+    """A prompt nobody answered in a card, as the text that ends the reply.
+
+    The JSON form reads as its questions, numbered when there are several,
+    each with its options listed under it, then one line on how to answer
+    (ELI-142: it showed as the raw JSON). Any other prompt is its own text
+    without the marker line."""
+    questions = _parse_ask_user_json(prompt_text)
+    if not questions:
+        return _strip_input_marker_line(prompt_text)
+    numbered = len(questions) > 1
+    lines = []
+    for n, q in enumerate(questions, 1):
+        auto_header = re.fullmatch(r"Question \d+", q["header"])
+        line = q["question"] if auto_header else f"**{q['header']}**: {q['question']}"
+        lines.append(f"{n}. {line}" if numbered else line)
+        for opt in q["options"]:
+            label = f"{opt['label']} - {opt['description']}" if opt["description"] else opt["label"]
+            lines.append(("   - " if numbered else "- ") + label)
+    return "\n".join(lines) + "\n\n_Answer in your next message._"
+
+
 def _native_ask_user_payload(prompt_text: str) -> dict | None:
     """Build OWUI's native `request:user_input` question card for a prompt.
 
@@ -603,16 +634,6 @@ def _format_native_answers(questions: list[dict], answers: dict) -> str:
     return "\n".join(f"{header}: {text}" for header, text in lines)
 
 
-def _user_has_live_session(owui_user_id: str, owui_chat_id: str | None = None) -> bool:
-    """Whether the user has a connected Open WebUI socket now that a card
-    for `owui_chat_id` could be shown on (`_live_session_id_for_user`)."""
-    try:
-        from open_webui.socket.main import SESSION_POOL
-    except Exception:
-        return False
-    return bool(_live_session_id_for_user(owui_user_id, SESSION_POOL, owui_chat_id))
-
-
 async def _call_native_card_on_live_session(
     owui_user_id: str, owui_chat_id: str | None, owui_message_id: str | None, payload: dict
 ):
@@ -670,88 +691,38 @@ async def _ask_user_native_card(
     owui_user_id: str | None,
     owui_chat_id: str | None,
     owui_message_id: str | None,
-    max_wait_s: float,
     poll_interval_s: float,
     owui_session_id: str | None = None,
-    __event_emitter__=None,
 ) -> str | None:
-    """Ask through OWUI's native question card until answered or cancelled.
+    """Ask once through OWUI's native question card.
 
-    The card is re-shown after each OWUI-side timeout while a tab views the
-    chat, and on a new socket viewing it after a reload, all within
-    max_wait_s. It is re-shown only if such a tab is back within
-    _NATIVE_CARD_TAB_GRACE_S (60 s); a first call no tab of the chat can
-    show ends at once. Those and an explicit Cancel return None: the reply
-    then ends with the question as text (ELI-107 decision 2).
-    `owui_session_id`: the socket the turn started on; once it is gone the
-    card moves to the tab viewing the chat without waiting out OWUI's call.
+    Only an answer or a cancel shows the card was seen. Anything else (OWUI's
+    timeout, a cancel the moment it arrives on a tab viewing another chat, a
+    socket that never answers) returns None, as a cancel does: the reply then
+    ends with the question as text (ELI-107 decision 2). Re-showing the card
+    after a timeout kept a reply open with nothing on screen, about 20 minutes
+    on a socket that never answered (ELI-142).
+    `owui_session_id`: the socket the turn started on. Once it is gone (a
+    reload; no socket for an API caller) the card moves once to the tab
+    viewing the chat, as the turn writer's card does.
     """
-    questions = payload["data"]["questions"]
-    card_timeout_s = payload["data"]["timeout_ms"] / 1000
-    deadline = time.monotonic() + max_wait_s
-    use_live_session = False
-    waiting_shown = False
-    no_viewer_since = None
-    while True:
-        started = time.monotonic()
-        if use_live_session:
-            response = await _call_native_card_on_live_session(
-                owui_user_id, owui_chat_id, owui_message_id, payload
-            )
-        else:
-            response = await _event_call_while_session_lives(
-                __event_call__, payload, owui_session_id, card_timeout_s + 15, poll_interval_s
-            )
-        elapsed = time.monotonic() - started
-
-        if isinstance(response, dict) and response.get("status") == "answered":
-            return _format_native_answers(questions, response.get("answers") or {}) or None
-        unseen = response is None or (isinstance(response, dict) and (
-            "error" in response
-            or elapsed < _NATIVE_CARD_UNSEEN_CANCEL_S
-            or elapsed >= card_timeout_s - 5
-        ))
-        if not unseen:
-            pipe_log("  native question card cancelled by the user")
-            return None
-        if isinstance(response, dict) and "disconnected" in str(response.get("error", "")):
-            if not owui_user_id:
-                return None
-            if not use_live_session and not waiting_shown and not _user_has_live_session(
-                    owui_user_id, owui_chat_id):
-                # The very first call found no live tab for this turn (an API
-                # caller, or a tab closed before the question) and no tab views
-                # the chat: nobody can see the card, so the reply ends now with
-                # the question as text rather than staying open for a
-                # reconnect (ELI-107: an hour).
-                pipe_log("  no live tab for this turn's question card; showing it as text")
-                return None
-            # OWUI's __event_call__ is bound to the session that started the
-            # turn; once that socket is gone, reach the user's new one.
-            use_live_session = True
-        if use_live_session and response is None:
-            # No tab views the chat now. A reload brings one back within
-            # seconds; past the grace the reply ends with the question as
-            # text, so the stream does not outlive its run waiting for the
-            # user to come back (ELI-107 decision 2).
-            no_viewer_since = no_viewer_since or time.monotonic()
-            if time.monotonic() - no_viewer_since >= _NATIVE_CARD_TAB_GRACE_S:
-                pipe_log(f"  no tab came back to this chat within {_NATIVE_CARD_TAB_GRACE_S:g}s; "
-                         "showing the question as text")
-                return None
-        else:
-            no_viewer_since = None
-        if time.monotonic() + poll_interval_s >= deadline:
-            pipe_log(f"  gave up on the native question card after {int(max_wait_s)}s")
-            return None
-        if not waiting_shown:
-            waiting_shown = True
-            await _emit_status(
-                __event_emitter__,
-                "Waiting for your reply -- the question is pending in this chat",
-                done=False,
-            )
-        await asyncio.sleep(poll_interval_s)
+    response = await _event_call_while_session_lives(
+        __event_call__, payload, owui_session_id, payload["data"]["timeout_ms"] / 1000 + 15, poll_interval_s
+    )
+    if owui_user_id and isinstance(response, dict) and "disconnected" in str(response.get("error", "")):
+        response = await _call_native_card_on_live_session(
+            owui_user_id, owui_chat_id, owui_message_id, payload
+        )
+    if isinstance(response, dict) and response.get("status") == "answered":
+        return _format_native_answers(payload["data"]["questions"], response.get("answers") or {}) or None
+    if response is None:
+        outcome = "no tab views the chat"
+    elif isinstance(response, dict):
+        outcome = str(response.get("error") or response.get("status"))
+    else:
+        outcome = repr(response)
+    pipe_log(f"  question card not answered ({outcome[:80]}); the question ends the reply as text")
+    return None
 
 
 def _ask_user_detail_block(prompt_text: str, answer: str) -> str:
@@ -1011,10 +982,8 @@ async def _ask_user_input_modal(
             owui_user_id=owui_user_id,
             owui_chat_id=owui_chat_id,
             owui_message_id=owui_message_id,
-            max_wait_s=max_wait_s,
             poll_interval_s=poll_interval_s,
             owui_session_id=owui_session_id,
-            __event_emitter__=__event_emitter__,
         )
     payload, _ = _modal_payload_from_user_input_prompt(prompt_text)
     # A clickable-choice prompt is delivered as an "execute" event that renders
