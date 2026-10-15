@@ -729,9 +729,6 @@ class Scenes:
         wait_js(page, last_text_has("in the background"), "the parent's first reply")
         set_title(self.token, chat, "Forecast cache history")
         wait_js(page, last_text_has("helper is back", "starts it cold"), "the parent's reply to the result")
-        # Finished, not mid-stream: the reply's toolbar shows only once it is done.
-        wait_js(page, f"() => {{ const a = {LAST_ASSISTANT}; return !!(a && a.querySelector('button[aria-label=\"Copy\"]')); }}",
-                "the parent's reply finished", 30_000)
         clip = """() => {
           const box = document.getElementById('message-input-container');
           const bottom = box ? box.getBoundingClientRect().top - 8 : innerHeight;
