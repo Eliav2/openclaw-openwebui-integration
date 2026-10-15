@@ -53,8 +53,8 @@ Each row is titled with the sub-agent's task, else its spawn label. While a sub-
 
 ## Sub-agent drawer
 
-![A running sub-agent's drawer, Transcript tab: its task and what it has read so far](../img/subagent-drawer-light.png#gh-light-mode-only)
-![A running sub-agent's drawer, Transcript tab: its task and what it has read so far](../img/subagent-drawer-dark.png#gh-dark-mode-only)
+![A running sub-agent's drawer, Transcript tab: its task, while it works](../img/subagent-drawer-light.png#gh-light-mode-only)
+![A running sub-agent's drawer, Transcript tab: its task, while it works](../img/subagent-drawer-dark.png#gh-dark-mode-only)
 
 Click a sub-agent to open a side drawer with three tabs:
 
