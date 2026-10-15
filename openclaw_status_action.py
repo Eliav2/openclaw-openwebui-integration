@@ -5291,7 +5291,7 @@ class _TurnWriter:
         g = globals()
         names = ("_call_native_card_on_live_session", "_native_ask_user_payload",
                  "_owui_supports_native_ask_user", "_format_native_answers",
-                 "_ask_user_detail_block", "_is_user_input_prompt")
+                 "_ask_user_detail_block", "_is_user_input_prompt", "_ask_user_fallback_text")
         if self.closed or not self.opened or not all(n in g for n in names):
             return False
         # Only a question in the run's last message item (fences are per
@@ -5306,6 +5306,18 @@ class _TurnWriter:
         prompt = _prompt_tail(text, start)
         if not prompt or not g["_is_user_input_prompt"](prompt):
             return False
+        if await self._ask_card(prompt):
+            return True
+        # Not answered here: M ends with the question as the inline reply's
+        # fallback shows it (a JSON form as readable text, ELI-142).
+        self.conn.note_turn_rewrite(self.chat_id, self.message_id, prompt,
+                                    g["_ask_user_fallback_text"](prompt))
+        return False
+
+    async def _ask_card(self, prompt: str) -> bool:
+        """The card for `prompt` on the tab viewing the chat, and its answer
+        sent; False when nothing was sent."""
+        g = globals()
         payload = g["_native_ask_user_payload"](prompt) if g["_owui_supports_native_ask_user"]() else None
         if payload is None:
             return False

@@ -2613,15 +2613,9 @@ def _modal_payload_from_user_input_prompt(prompt_text: str) -> tuple[dict, bool]
 _OPTION_DESCRIPTION_SEPARATORS = (" - ", " – ", " — ")
 
 # OWUI clamps a request:user_input event call to 60..240s and, when it times
-# out, removes the card itself. We ask for the maximum and re-show the card
-# after each timeout, so a question waits for as long as max_wait_s allows.
+# out, removes the card itself. We ask for the maximum; a card not answered
+# by then ends the reply with the question as text (ELI-142).
 _NATIVE_CARD_TIMEOUT_MS = 240_000
-# A card cancelled this fast was never seen: OWUI's frontend cancels
-# request:user_input at once when the user is viewing another chat.
-_NATIVE_CARD_UNSEEN_CANCEL_S = 1.5
-# How long a question card waits for a tab to view the chat again (a reload)
-# before the reply ends with the question as text (ELI-107 decision 2).
-_NATIVE_CARD_TAB_GRACE_S = 60
 
 
 def _owui_supports_native_ask_user() -> bool:
@@ -2701,6 +2695,28 @@ def _parse_ask_user_json(prompt_text: str) -> list[dict] | None:
     return questions or None
 
 
+def _ask_user_fallback_text(prompt_text: str) -> str:
+    """A prompt nobody answered in a card, as the text that ends the reply.
+
+    The JSON form reads as its questions, numbered when there are several,
+    each with its options listed under it, then one line on how to answer
+    (ELI-142: it showed as the raw JSON). Any other prompt is its own text
+    without the marker line."""
+    questions = _parse_ask_user_json(prompt_text)
+    if not questions:
+        return _strip_input_marker_line(prompt_text)
+    numbered = len(questions) > 1
+    lines = []
+    for n, q in enumerate(questions, 1):
+        auto_header = re.fullmatch(r"Question \d+", q["header"])
+        line = q["question"] if auto_header else f"**{q['header']}**: {q['question']}"
+        lines.append(f"{n}. {line}" if numbered else line)
+        for opt in q["options"]:
+            label = f"{opt['label']} - {opt['description']}" if opt["description"] else opt["label"]
+            lines.append(("   - " if numbered else "- ") + label)
+    return "\n".join(lines) + "\n\n_Answer in your next message._"
+
+
 def _native_ask_user_payload(prompt_text: str) -> dict | None:
     """Build OWUI's native `request:user_input` question card for a prompt.
 
@@ -2774,16 +2790,6 @@ def _format_native_answers(questions: list[dict], answers: dict) -> str:
     return "\n".join(f"{header}: {text}" for header, text in lines)
 
 
-def _user_has_live_session(owui_user_id: str, owui_chat_id: str | None = None) -> bool:
-    """Whether the user has a connected Open WebUI socket now that a card
-    for `owui_chat_id` could be shown on (`_live_session_id_for_user`)."""
-    try:
-        from open_webui.socket.main import SESSION_POOL
-    except Exception:
-        return False
-    return bool(_live_session_id_for_user(owui_user_id, SESSION_POOL, owui_chat_id))
-
-
 async def _call_native_card_on_live_session(
     owui_user_id: str, owui_chat_id: str | None, owui_message_id: str | None, payload: dict
 ):
@@ -2841,88 +2847,38 @@ async def _ask_user_native_card(
     owui_user_id: str | None,
     owui_chat_id: str | None,
     owui_message_id: str | None,
-    max_wait_s: float,
     poll_interval_s: float,
     owui_session_id: str | None = None,
-    __event_emitter__=None,
 ) -> str | None:
-    """Ask through OWUI's native question card until answered or cancelled.
+    """Ask once through OWUI's native question card.
 
-    The card is re-shown after each OWUI-side timeout while a tab views the
-    chat, and on a new socket viewing it after a reload, all within
-    max_wait_s. It is re-shown only if such a tab is back within
-    _NATIVE_CARD_TAB_GRACE_S (60 s); a first call no tab of the chat can
-    show ends at once. Those and an explicit Cancel return None: the reply
-    then ends with the question as text (ELI-107 decision 2).
-    `owui_session_id`: the socket the turn started on; once it is gone the
-    card moves to the tab viewing the chat without waiting out OWUI's call.
+    Only an answer or a cancel shows the card was seen. Anything else (OWUI's
+    timeout, a cancel the moment it arrives on a tab viewing another chat, a
+    socket that never answers) returns None, as a cancel does: the reply then
+    ends with the question as text (ELI-107 decision 2). Re-showing the card
+    after a timeout kept a reply open with nothing on screen, about 20 minutes
+    on a socket that never answered (ELI-142).
+    `owui_session_id`: the socket the turn started on. Once it is gone (a
+    reload; no socket for an API caller) the card moves once to the tab
+    viewing the chat, as the turn writer's card does.
     """
-    questions = payload["data"]["questions"]
-    card_timeout_s = payload["data"]["timeout_ms"] / 1000
-    deadline = time.monotonic() + max_wait_s
-    use_live_session = False
-    waiting_shown = False
-    no_viewer_since = None
-    while True:
-        started = time.monotonic()
-        if use_live_session:
-            response = await _call_native_card_on_live_session(
-                owui_user_id, owui_chat_id, owui_message_id, payload
-            )
-        else:
-            response = await _event_call_while_session_lives(
-                __event_call__, payload, owui_session_id, card_timeout_s + 15, poll_interval_s
-            )
-        elapsed = time.monotonic() - started
-
-        if isinstance(response, dict) and response.get("status") == "answered":
-            return _format_native_answers(questions, response.get("answers") or {}) or None
-        unseen = response is None or (isinstance(response, dict) and (
-            "error" in response
-            or elapsed < _NATIVE_CARD_UNSEEN_CANCEL_S
-            or elapsed >= card_timeout_s - 5
-        ))
-        if not unseen:
-            pipe_log("  native question card cancelled by the user")
-            return None
-        if isinstance(response, dict) and "disconnected" in str(response.get("error", "")):
-            if not owui_user_id:
-                return None
-            if not use_live_session and not waiting_shown and not _user_has_live_session(
-                    owui_user_id, owui_chat_id):
-                # The very first call found no live tab for this turn (an API
-                # caller, or a tab closed before the question) and no tab views
-                # the chat: nobody can see the card, so the reply ends now with
-                # the question as text rather than staying open for a
-                # reconnect (ELI-107: an hour).
-                pipe_log("  no live tab for this turn's question card; showing it as text")
-                return None
-            # OWUI's __event_call__ is bound to the session that started the
-            # turn; once that socket is gone, reach the user's new one.
-            use_live_session = True
-        if use_live_session and response is None:
-            # No tab views the chat now. A reload brings one back within
-            # seconds; past the grace the reply ends with the question as
-            # text, so the stream does not outlive its run waiting for the
-            # user to come back (ELI-107 decision 2).
-            no_viewer_since = no_viewer_since or time.monotonic()
-            if time.monotonic() - no_viewer_since >= _NATIVE_CARD_TAB_GRACE_S:
-                pipe_log(f"  no tab came back to this chat within {_NATIVE_CARD_TAB_GRACE_S:g}s; "
-                         "showing the question as text")
-                return None
-        else:
-            no_viewer_since = None
-        if time.monotonic() + poll_interval_s >= deadline:
-            pipe_log(f"  gave up on the native question card after {int(max_wait_s)}s")
-            return None
-        if not waiting_shown:
-            waiting_shown = True
-            await _emit_status(
-                __event_emitter__,
-                "Waiting for your reply -- the question is pending in this chat",
-                done=False,
-            )
-        await asyncio.sleep(poll_interval_s)
+    response = await _event_call_while_session_lives(
+        __event_call__, payload, owui_session_id, payload["data"]["timeout_ms"] / 1000 + 15, poll_interval_s
+    )
+    if owui_user_id and isinstance(response, dict) and "disconnected" in str(response.get("error", "")):
+        response = await _call_native_card_on_live_session(
+            owui_user_id, owui_chat_id, owui_message_id, payload
+        )
+    if isinstance(response, dict) and response.get("status") == "answered":
+        return _format_native_answers(payload["data"]["questions"], response.get("answers") or {}) or None
+    if response is None:
+        outcome = "no tab views the chat"
+    elif isinstance(response, dict):
+        outcome = str(response.get("error") or response.get("status"))
+    else:
+        outcome = repr(response)
+    pipe_log(f"  question card not answered ({outcome[:80]}); the question ends the reply as text")
+    return None
 
 
 def _ask_user_detail_block(prompt_text: str, answer: str) -> str:
@@ -3182,10 +3138,8 @@ async def _ask_user_input_modal(
             owui_user_id=owui_user_id,
             owui_chat_id=owui_chat_id,
             owui_message_id=owui_message_id,
-            max_wait_s=max_wait_s,
             poll_interval_s=poll_interval_s,
             owui_session_id=owui_session_id,
-            __event_emitter__=__event_emitter__,
         )
     payload, _ = _modal_payload_from_user_input_prompt(prompt_text)
     # A clickable-choice prompt is delivered as an "execute" event that renders
@@ -7752,7 +7706,7 @@ class _TurnWriter:
         g = globals()
         names = ("_call_native_card_on_live_session", "_native_ask_user_payload",
                  "_owui_supports_native_ask_user", "_format_native_answers",
-                 "_ask_user_detail_block", "_is_user_input_prompt")
+                 "_ask_user_detail_block", "_is_user_input_prompt", "_ask_user_fallback_text")
         if self.closed or not self.opened or not all(n in g for n in names):
             return False
         # Only a question in the run's last message item (fences are per
@@ -7767,6 +7721,18 @@ class _TurnWriter:
         prompt = _prompt_tail(text, start)
         if not prompt or not g["_is_user_input_prompt"](prompt):
             return False
+        if await self._ask_card(prompt):
+            return True
+        # Not answered here: M ends with the question as the inline reply's
+        # fallback shows it (a JSON form as readable text, ELI-142).
+        self.conn.note_turn_rewrite(self.chat_id, self.message_id, prompt,
+                                    g["_ask_user_fallback_text"](prompt))
+        return False
+
+    async def _ask_card(self, prompt: str) -> bool:
+        """The card for `prompt` on the tab viewing the chat, and its answer
+        sent; False when nothing was sent."""
+        g = globals()
         payload = g["_native_ask_user_payload"](prompt) if g["_owui_supports_native_ask_user"]() else None
         if payload is None:
             return False
@@ -10244,6 +10210,7 @@ class Pipe:
         done = False
         event_count = 0
         text_yielded = False
+        error_shown = ""  # the run's "**Error:**" line, once shown
         aborted = False
         first_event_arrived = False
         # The Gateway acks every chat.send with "started"; one that it queued
@@ -10781,12 +10748,26 @@ class Pipe:
                             done = True
                             pipe_log("  lifecycle end -> done")
                         elif err:
-                            yield f"\n\n**Error:** {err}"
+                            error_shown = f"\n\n**Error:** {err}"
+                            record_visible_chunk(error_shown)
+                            yield error_shown
                             done = True
                             pipe_log("  lifecycle error -> done")
                         if state in ("final", "cancelled", "error", "aborted") or aborted_run:
                             done = True
                             pipe_log(f"  payload state='{state}' aborted={aborted_run} -> done")
+                        # A run the Gateway refused before it started (an
+                        # inline `/model` naming a model that is not allowed)
+                        # says why only here (ELI-139). A thinking-level
+                        # rejection is left to the retry below.
+                        run_error = str(payload.get("errorMessage") or "").strip() \
+                            if state == "error" else ""
+                        if (run_error and not error_shown
+                                and _thinking_rejection_retry_body(
+                                    body, run_error, resolved_thinking) is None):
+                            error_shown = f"\n\n**Error:** {run_error}"
+                            record_visible_chunk(error_shown)
+                            yield error_shown
 
                         # --- Assistant text stream ---
                         if stream == "assistant":
@@ -10973,7 +10954,7 @@ class Pipe:
                                 # its raw "OpenClaw needs input:" marker line.
                                 # Strip it defensively.
                                 if _is_user_input_prompt(item_delta):
-                                    stripped = _strip_input_marker_line(item_delta)
+                                    stripped = _ask_user_fallback_text(item_delta)
                                     conn.note_turn_rewrite(owui_origin_chat_id, owui_message_id,
                                                            item_delta, stripped)
                                     item_delta = stripped
@@ -11181,7 +11162,7 @@ class Pipe:
                             # on reconnect). Show the prompt as a fallback, but
                             # never leak the literal "OpenClaw needs input:"
                             # directive line as visible text.
-                            fallback = _strip_input_marker_line(pending_prompt_text)
+                            fallback = _ask_user_fallback_text(pending_prompt_text)
                             conn.note_turn_rewrite(owui_origin_chat_id, owui_message_id,
                                                    pending_prompt_text, fallback)
                             if fallback:
@@ -11439,7 +11420,11 @@ class Pipe:
                 )
             )
 
-        if not aborted and not text_yielded:
+        if not aborted and not text_yielded and error_shown:
+            # The error is the reply: nothing to recover, and no
+            # "no reply text" note under it.
+            await maybe_emit_snapshot(force=True)
+        elif not aborted and not text_yielded:
             recovered = await recover_from_transcript()
             retry_body = _thinking_rejection_retry_body(
                 body, recovered, resolved_thinking)

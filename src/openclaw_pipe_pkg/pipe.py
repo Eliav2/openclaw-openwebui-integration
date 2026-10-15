@@ -1364,6 +1364,7 @@ class Pipe:
         done = False
         event_count = 0
         text_yielded = False
+        error_shown = ""  # the run's "**Error:**" line, once shown
         aborted = False
         first_event_arrived = False
         # The Gateway acks every chat.send with "started"; one that it queued
@@ -1901,12 +1902,26 @@ class Pipe:
                             done = True
                             pipe_log("  lifecycle end -> done")
                         elif err:
-                            yield f"\n\n**Error:** {err}"
+                            error_shown = f"\n\n**Error:** {err}"
+                            record_visible_chunk(error_shown)
+                            yield error_shown
                             done = True
                             pipe_log("  lifecycle error -> done")
                         if state in ("final", "cancelled", "error", "aborted") or aborted_run:
                             done = True
                             pipe_log(f"  payload state='{state}' aborted={aborted_run} -> done")
+                        # A run the Gateway refused before it started (an
+                        # inline `/model` naming a model that is not allowed)
+                        # says why only here (ELI-139). A thinking-level
+                        # rejection is left to the retry below.
+                        run_error = str(payload.get("errorMessage") or "").strip() \
+                            if state == "error" else ""
+                        if (run_error and not error_shown
+                                and _thinking_rejection_retry_body(
+                                    body, run_error, resolved_thinking) is None):
+                            error_shown = f"\n\n**Error:** {run_error}"
+                            record_visible_chunk(error_shown)
+                            yield error_shown
 
                         # --- Assistant text stream ---
                         if stream == "assistant":
@@ -2093,7 +2108,7 @@ class Pipe:
                                 # its raw "OpenClaw needs input:" marker line.
                                 # Strip it defensively.
                                 if _is_user_input_prompt(item_delta):
-                                    stripped = _strip_input_marker_line(item_delta)
+                                    stripped = _ask_user_fallback_text(item_delta)
                                     conn.note_turn_rewrite(owui_origin_chat_id, owui_message_id,
                                                            item_delta, stripped)
                                     item_delta = stripped
@@ -2301,7 +2316,7 @@ class Pipe:
                             # on reconnect). Show the prompt as a fallback, but
                             # never leak the literal "OpenClaw needs input:"
                             # directive line as visible text.
-                            fallback = _strip_input_marker_line(pending_prompt_text)
+                            fallback = _ask_user_fallback_text(pending_prompt_text)
                             conn.note_turn_rewrite(owui_origin_chat_id, owui_message_id,
                                                    pending_prompt_text, fallback)
                             if fallback:
@@ -2559,7 +2574,11 @@ class Pipe:
                 )
             )
 
-        if not aborted and not text_yielded:
+        if not aborted and not text_yielded and error_shown:
+            # The error is the reply: nothing to recover, and no
+            # "no reply text" note under it.
+            await maybe_emit_snapshot(force=True)
+        elif not aborted and not text_yielded:
             recovered = await recover_from_transcript()
             retry_body = _thinking_rejection_retry_body(
                 body, recovered, resolved_thinking)

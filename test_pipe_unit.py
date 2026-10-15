@@ -1444,6 +1444,44 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         await self._collect(first2, gen2)
         self.assertEqual(self.sent, ["check the logs", "and now the other log"])
 
+    _NOT_ALLOWED = ('Model "anthropic/are" is not allowed. Use /models to list providers, '
+                    'or /models <provider> to list models.')
+
+    def _chat_error(self, run_id, message):
+        return {"type": "event", "event": "chat", "payload": {
+            "sessionKey": self.SK, "runId": run_id, "state": "error",
+            "errorMessage": message}}
+
+    async def _reply_text(self, events):
+        gen = self._reply("these /model are fine", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        for ev in events:
+            self._queue("run-1").put_nowait(ev)
+        out = await asyncio.wait_for(first, 2)
+        async for chunk in gen:
+            out += chunk if isinstance(chunk, str) else ""
+        return out
+
+    async def test_a_run_refused_before_it_starts_shows_its_error(self):
+        """ELI-139 (2026-10-15, chat 2af17834): a message with "/model are"
+        in its text made the Gateway refuse the run as an inline model
+        directive. Its only event was a chat `state: "error"` carrying the
+        reason, and the reply said "(This turn produced no reply text.)"."""
+        out = await self._reply_text([self._chat_error("run-1", self._NOT_ALLOWED)])
+        self.assertIn(f"**Error:** {self._NOT_ALLOWED}", out)
+        self.assertNotIn("no reply text", out)
+
+    async def test_a_lifecycle_error_is_not_shown_twice(self):
+        out = await self._reply_text([
+            {"type": "event", "event": "agent", "payload": {
+                "sessionKey": self.SK, "runId": "run-1", "stream": "lifecycle",
+                "data": {"phase": "error", "error": "provider overloaded"}}},
+            self._chat_error("run-1", "provider overloaded"),
+        ])
+        self.assertEqual(out.count("**Error:**"), 1)
+        self.assertIn("**Error:** provider overloaded", out)
+
     async def test_a_socket_gap_makes_the_waiter_read_again(self):
         """The settle can be among the events lost while the socket was down,
         so a gap wakes every waiter to re-read the state."""
@@ -3809,11 +3847,6 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
         env.VERSION = "0.12.0"
         sys.modules["open_webui.env"] = env
         self.addCleanup(sys.modules.pop, "open_webui.env", None)
-        # Treat every cancel as seen and every call as fast, so a test decides
-        # the outcome through the response alone.
-        patcher = mock.patch.object(openclaw_pipe, "_NATIVE_CARD_UNSEEN_CANCEL_S", -1)
-        patcher.start()
-        self.addCleanup(patcher.stop)
 
     def test_version_gate(self):
         self.assertTrue(_owui_supports_native_ask_user())
@@ -3928,31 +3961,30 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
             calls.append(event)
             return {"status": "cancelled", "answers": {}}
 
-        with mock.patch.object(openclaw_pipe, "_NATIVE_CARD_UNSEEN_CANCEL_S", 0):
-            answer = await _ask_user_input_modal(
-                event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
-                owui_user_id="user-1", max_wait_s=1, poll_interval_s=0.01,
-            )
+        answer = await _ask_user_input_modal(
+            event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
+            owui_user_id="user-1", max_wait_s=1, poll_interval_s=0.01,
+        )
         self.assertIsNone(answer)
         self.assertEqual(len(calls), 1)
 
-    async def test_timeout_and_unseen_cancel_reask(self):
-        responses = [
-            {"error": "Event call timed out. The browser tab may be inactive or closed."},
-            {"status": "cancelled", "answers": {}},  # instant: viewing another chat
-            {"status": "answered", "answers": {"answer": {"type": "option", "label": "b"}}},
-        ]
+    async def test_a_timeout_or_an_unseen_cancel_ends_with_the_question_as_text(self):
+        """OWUI's timeout, and a cancel the moment the card reaches a tab on
+        another chat, do not show the card was seen: no re-show (ELI-142)."""
+        for response in ({"error": "Event call timed out. The browser tab may be inactive or closed."},
+                         {"status": "cancelled", "answers": {}}):
+            calls = []
 
-        async def event_call(event):
-            return responses.pop(0)
+            async def event_call(event):
+                calls.append(event)
+                return response
 
-        with mock.patch.object(openclaw_pipe, "_NATIVE_CARD_UNSEEN_CANCEL_S", 10):
             answer = await _ask_user_input_modal(
                 event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
-                owui_user_id="user-1", max_wait_s=1, poll_interval_s=0.01,
+                owui_user_id="user-1", max_wait_s=60, poll_interval_s=0.01,
             )
-        self.assertEqual(answer, "b")
-        self.assertEqual(responses, [])
+            self.assertIsNone(answer, response)
+            self.assertEqual(len(calls), 1, response)
 
     # ELI-107 decision 2: a wait for the card's answer ends with the run, so
     # a tab that cannot show it is no reason to keep the reply open.
@@ -3991,9 +4023,9 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent, [], "never another chat's tab")
 
     async def test_a_tab_that_does_not_come_back_ends_the_wait(self):
-        """The tab viewing the chat went away (a reload, a closed tab) and no
-        tab views the chat again within the grace: the reply ends with the
-        question as text instead of waiting out max_wait_s."""
+        """The tab viewing the chat went away (a reload, a closed tab) while
+        it held the card: the reply ends with the question as text instead
+        of waiting out max_wait_s."""
         pool = {"sid-tab": {"id": "user-1", "chat_ids": ["chat-1"]}}
 
         async def call(data, to):
@@ -4003,35 +4035,11 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
 
         async def event_call(event):
             return {"error": "Client session disconnected."}
-        with mock.patch.object(openclaw_pipe, "_NATIVE_CARD_TAB_GRACE_S", 0.05, create=True):
-            answer = await asyncio.wait_for(_ask_user_input_modal(
-                event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
-                owui_user_id="user-1", owui_chat_id="chat-1", owui_message_id="msg-1",
-                max_wait_s=60, poll_interval_s=0.01), 2)
-        self.assertIsNone(answer)
-
-    async def test_a_reloaded_tab_within_the_grace_still_gets_the_card(self):
-        pool = {"sid-old": {"id": "user-1", "chat_ids": ["chat-1"]}}
-        sent = []
-
-        async def call(data, to):
-            sent.append(to)
-            if to == "sid-old":
-                del pool["sid-old"]                     # reloaded: a new socket comes later
-                asyncio.get_running_loop().call_later(
-                    0.05, pool.__setitem__, "sid-new", {"id": "user-1", "chat_ids": ["chat-1"]})
-                return {"error": "Event call timed out"}
-            return {"status": "answered", "answers": {"answer": {"type": "option", "label": "b"}}}
-        self._socket(pool, call)
-
-        async def event_call(event):
-            return {"error": "Client session disconnected."}
         answer = await asyncio.wait_for(_ask_user_input_modal(
             event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
             owui_user_id="user-1", owui_chat_id="chat-1", owui_message_id="msg-1",
             max_wait_s=60, poll_interval_s=0.01), 2)
-        self.assertEqual(answer, "b")
-        self.assertEqual(sent, ["sid-old", "sid-new"])
+        self.assertIsNone(answer)
 
     async def test_disconnected_session_moves_to_the_users_new_socket(self):
         sent = {"calls": [], "emits": []}
@@ -4149,6 +4157,47 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
         await reloader
         self.assertEqual(answer, "a")
         self.assertEqual(sent, ["sid-new"])
+
+    # ELI-142 live (2026-10-15, chat ed98cbd2): after an Open WebUI restart the
+    # tab's socket stayed in SESSION_POOL while the page, in a reconnect storm,
+    # never showed the card. Each call ended in OWUI's 240 s timeout and the
+    # pipe re-showed the card: four timeouts, about 20 minutes of an open
+    # reply with nothing on screen and no text fallback.
+
+    async def test_a_socket_that_never_answers_ends_with_the_question_as_text(self):
+        pool = {"sid-tab": {"id": "user-1", "chat_ids": ["chat-1"]}}
+        self.fake_socket(pool)
+        calls = []
+
+        async def event_call(event):
+            calls.append(event)
+            return {"error": "Event call timed out. The browser tab may be inactive or closed."}
+
+        answer = await asyncio.wait_for(_ask_user_input_modal(
+            event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
+            owui_user_id="user-1", owui_chat_id="chat-1", owui_message_id="msg-1",
+            owui_session_id="sid-tab", max_wait_s=60, poll_interval_s=0.01), 2)
+        self.assertIsNone(answer)
+        self.assertEqual(len(calls), 1, "one card, never re-shown")
+
+    async def test_a_moved_card_that_is_never_answered_ends_with_the_question_as_text(self):
+        """The turn's socket is gone and the tab viewing the chat takes the
+        card, but that socket never answers either."""
+        sent = []
+
+        async def call(data, to):
+            sent.append(to)
+            return {"error": "Event call timed out: TimeoutError()"}
+        self._socket({"sid-tab": {"id": "user-1", "chat_ids": ["chat-1"]}}, call)
+
+        async def event_call(event):
+            return {"error": "Client session disconnected."}
+        answer = await asyncio.wait_for(_ask_user_input_modal(
+            event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
+            owui_user_id="user-1", owui_chat_id="chat-1", owui_message_id="msg-1",
+            max_wait_s=60, poll_interval_s=0.01), 2)
+        self.assertIsNone(answer)
+        self.assertEqual(sent, ["sid-tab"])
 
 
 class DynamicModelSelectorTests(unittest.TestCase):
@@ -7853,6 +7902,20 @@ class WriterQuestionCardTests(_RoutingCase):
         self.assertIs(m["done"], True)
         self.assertEqual(m["content"], "Before I go on:\nColor?\nPick one\n1. Red\n2. Blue")
 
+    async def test_an_unanswered_json_form_ends_the_reply_as_readable_text(self):
+        """ELI-142: the writer's fallback reads as the inline reply's does."""
+        self.owui.session_pool["sid-tab"] = {"id": self.USER, "chat_ids": [self.CHAT]}
+        self.owui.page_intent["sid-tab"] = {"status": "cancelled"}
+        text = "Before I go on:\n" + openclaw_pipe._USER_INPUT_TRIGGER_PREFIXES[0] + "\n" + json.dumps(
+            NeedsInputMarkerTests.HEBREW_FORM, ensure_ascii=False)
+        self.history = {"messages": self.closed_run(self.RUN, text)}
+        await self.ask_run(text)
+        self.assertEqual(len(self.card_calls()), 1)
+        (_mid, m), = self.new_messages().items()
+        self.assertIs(m["done"], True)
+        self.assertEqual(m["content"], "Before I go on:\n" + openclaw_pipe._ask_user_fallback_text(text[16:]))
+        self.assertIn("1. **טווח**: לאיזה טווח השקעה?\n   - קצר - עד שנה", m["content"])
+
     async def test_a_fence_left_open_before_a_tool_call_does_not_hide_the_question(self):
         """Review 2af1 F4 on the writer: fences are tracked per message item."""
         self.owui.session_pool["sid-tab"] = {"id": self.USER, "chat_ids": [self.CHAT]}
@@ -8747,6 +8810,50 @@ class NeedsInputMarkerTests(unittest.IsolatedAsyncioTestCase):
         flush, held = self.ocp._advance_input_prompt_buffer(
             "", self.Q, self.ocp._fence_open_after(shown))
         self.assertEqual((flush, held), ("", self.Q), "the question was not held for a card")
+
+    # ELI-142: an unanswered card ends the reply with its question as text.
+    # The incident's form was JSON with three Hebrew questions, which showed
+    # as the raw JSON body.
+    HEBREW_FORM = {"questions": [
+        {"header": "טווח", "question": "לאיזה טווח השקעה?",
+         "options": ["קצר - עד שנה", "ארוך - 5 שנים ומעלה"]},
+        {"header": "סיכון", "question": "כמה סיכון אתה מוכן לקחת?",
+         "options": [{"label": "נמוך", "description": "אג\"ח ומדדים"}, {"label": "גבוה"}]},
+        {"header": "סכום", "question": "כמה להשקיע בחודש?"},
+    ]}
+
+    async def test_an_unanswered_json_form_ends_the_reply_as_readable_text(self):
+        async def event_call(payload):
+            return {"error": "Event call timed out. The browser tab may be inactive or closed."}
+        prompt = (f"{self.MARKER}\n```json\n"
+                  + json.dumps(self.HEBREW_FORM, ensure_ascii=False, indent=2) + "\n```\n")
+        with mock.patch.object(self.ocp, "_owui_supports_native_ask_user", lambda: True):
+            out = await self._stream("Two things first.\n" + prompt, event_call)
+        self.assertEqual(out, (
+            "Two things first.\n"
+            "1. **טווח**: לאיזה טווח השקעה?\n"
+            "   - קצר - עד שנה\n"
+            "   - ארוך - 5 שנים ומעלה\n"
+            "2. **סיכון**: כמה סיכון אתה מוכן לקחת?\n"
+            "   - נמוך - אג\"ח ומדדים\n"
+            "   - גבוה\n"
+            "3. **סכום**: כמה להשקיע בחודש?\n"
+            "\n"
+            "_Answer in your next message._"))
+
+    def test_a_single_json_question_is_not_numbered(self):
+        prompt = self.MARKER + "\n" + json.dumps({"questions": [
+            {"question": "Where should the checks run?",
+             "options": [{"label": "GitHub Actions", "description": "Free here"}, "GitLab CI"]}]})
+        self.assertEqual(self.ocp._ask_user_fallback_text(prompt), (
+            "Where should the checks run?\n"
+            "- GitHub Actions - Free here\n"
+            "- GitLab CI\n"
+            "\n"
+            "_Answer in your next message._"))
+        # The text form keeps its own text, marker line stripped, as before.
+        self.assertEqual(self.ocp._ask_user_fallback_text(self.MARKER + "\nColor?\n1. Red\n2. Blue"),
+                         "Color?\n1. Red\n2. Blue")
 
     async def test_F4_a_fence_left_open_before_a_tool_call_does_not_hide_the_next_question(self):
         """The text after a tool call is a new message item: a fence the
