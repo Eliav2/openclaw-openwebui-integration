@@ -122,6 +122,7 @@ from openclaw_pipe import (
     _reconcile_stub,
     ORPHAN_STUB_NOTE,
     TOOL_ERROR_MARK,
+    TOOL_NO_RESULT_NOTE,
     _FALLBACK_MODELS,
     _advance_input_prompt_buffer,
     _advance_media_buffer,
@@ -745,7 +746,10 @@ class TurnRendererOutputTests(unittest.TestCase):
                                            "toolCallId": "t3", "args": {}}})
         done = r.finished_output()
         self.assertEqual({i["status"] for i in done}, {"completed"})
+        self.assertEqual(done[-1]["call_id"], "t3", "the call the run never answered is closed")
+        self.assertEqual(done[-1]["output"][0]["text"], TOOL_NO_RESULT_NOTE)
         self.assertEqual(r.output[1]["status"], "in_progress")
+        self.assertEqual(len(r.output), 2)
 
 
 class ThinkingNoteAnnouncementTests(unittest.TestCase):
@@ -9041,6 +9045,78 @@ class InlineOwnerRuleTests(unittest.IsolatedAsyncioTestCase):
         resync already ran; the handover then reads the row itself."""
         await self._turn(self._restart)
         self.assertIn("sessions.list", self.rpc)
+
+
+class ToolCardParityTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-147 slice 2: the inline reply and the turn writer show a run's tool
+    calls as the same cards. Both are fed one recorded run: a call that
+    succeeds, one that fails, a result whose start was never seen, and a call
+    the run ended without answering."""
+
+    asyncSetUp = InlineOwnerRuleTests.asyncSetUp
+    asyncTearDown = InlineOwnerRuleTests.asyncTearDown
+    _queue = InlineOwnerRuleTests._queue
+    _delta = InlineOwnerRuleTests._delta
+    _until_registered = InlineOwnerRuleTests._until_registered
+    _reply = InlineOwnerRuleTests._reply
+    _event = InlineOwnerRuleTests._event
+    _turn_items = InlineOwnerRuleTests._turn_items
+    USER, CHAT = InlineOwnerRuleTests.USER, InlineOwnerRuleTests.CHAT
+
+    def _tool(self, phase, tcid, name, **data):
+        return self._event("agent", stream="tool", data={
+            "phase": phase, "name": name, "toolCallId": tcid, **data})
+
+    def _run(self):
+        return [
+            self._tool("start", "t1", "Read", args={"path": "a"}),
+            self._tool("result", "t1", "Read", result="contents"),
+            self._tool("start", "t2", "Bash", args={"command": "false"}),
+            self._tool("result", "t2", "Bash", result="exit 1", isError=True),
+            self._tool("result", "t3", "Grep", args={"q": "x"}, result="hit"),
+            self._tool("start", "t4", "Bash", args={"command": "sleep 99"}),
+            NoDroppedMessagesTests._final(self, "run-1"),
+        ]
+
+    @staticmethod
+    def _fold(items):
+        """The output list Open WebUI keeps from `output_item.added` events:
+        an item with the id of one it holds replaces it, else it is appended
+        (`handle_responses_streaming_event`)."""
+        out = []
+        for item in items:
+            at = next((i for i, o in enumerate(out) if o.get("id") == item.get("id")), None)
+            if at is None:
+                out.append(item)
+            else:
+                out[at] = item
+        return out
+
+    @staticmethod
+    def _cards(items):
+        """What a card shows: the call's name and arguments, its output."""
+        cards = []
+        for i in items:
+            if i["type"] == "function_call":
+                cards.append(("call", i["id"], i["name"], i["arguments"]))
+            elif i["type"] == "function_call_output":
+                cards.append(("output", i["call_id"], i["output"][0]["text"]))
+        return cards
+
+    async def test_the_inline_reply_and_the_writer_show_the_same_cards(self):
+        run = self._run()
+        inline = self._cards(self._fold(await self._turn_items(*run)))
+        renderer = _TurnRenderer()
+        for frame in run:
+            renderer.feed(frame["payload"])
+        writer = self._cards(renderer.finished_output())
+        self.assertEqual(inline, writer)
+        self.assertIn(("call", "t2", f"Bash {TOOL_ERROR_MARK}", json.dumps({"command": "false"})),
+                      writer)
+        self.assertIn(("call", "t3", "Grep", json.dumps({"q": "x"})), writer,
+                      "a result whose start was missed still gets its card")
+        self.assertIn(("output", "t4", TOOL_NO_RESULT_NOTE), writer,
+                      "a call the run never answered is closed, not left spinning")
 
 
 class ApiCallerOwnerRuleTests(unittest.IsolatedAsyncioTestCase):

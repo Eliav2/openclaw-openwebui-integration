@@ -1852,6 +1852,8 @@ def _tool_result_text(result) -> str:
 
 
 TOOL_ERROR_MARK = "❌"
+# What a call the run ended without answering shows as its output.
+TOOL_NO_RESULT_NOTE = "(no result -- the run ended first)"
 
 
 def _tool_call_error_relabel_event(name: str, tool_call_id: str, args_str: str) -> dict:
@@ -1971,24 +1973,52 @@ class _TurnRenderer:
             self.output.append(last)
         last["content"][0]["text"] += chunk
 
-    def _tool_item(self, name: str, tcid: str, args_str: str) -> dict:
+    def _tool_item(self, name: str, tcid: str, args_str: str, events: list) -> dict:
+        """The call's card, opened (and its start event added to `events`)
+        the first time the call is seen, by its start or, when that was
+        missed, by its result."""
         item = self._tool_items.get(tcid)
         if item is None:
-            item = _tool_call_started_event(name, tcid, args_str)["item"]
+            event = _tool_call_started_event(name, tcid, args_str)
+            item = copy.deepcopy(event["item"])
             self._tool_items[tcid] = item
             self.output.append(item)
+            events.append(event)
         return item
 
+    def _unanswered(self, note: str) -> list[dict]:
+        """A result event for every call with no result yet, saying `note`."""
+        return [_tool_call_result_event(tcid, note) for tcid in self._tool_items
+                if tcid not in self._tool_results]
+
+    def close_open_calls(self, note: str) -> list[dict]:
+        """Answer every call still open with `note` and return those events.
+        Open WebUI runs a streamed `function_call` that has no output when
+        the stream ends and sends the result back as a new turn (M3 crash
+        window, 2026-10-13); stored, it is a spinner forever."""
+        events = self._unanswered(note)
+        for event in events:
+            self._tool_results.add(event["item"]["call_id"])
+            self.output.append(copy.deepcopy(event["item"]))
+        return events
+
     def finished_output(self) -> list[dict]:
-        """`output` as stored once the run is over: OWUI marks every item
-        still in progress completed before its final write, and so do we."""
+        """`output` as stored once the run is over: a call the run never
+        answered is closed, and every item still in progress is completed,
+        as OWUI does before its final write."""
         out = copy.deepcopy(self.output)
+        out += [e["item"] for e in self._unanswered(TOOL_NO_RESULT_NOTE)]
         for item in out:
             if item.get("status") == "in_progress":
                 item["status"] = "completed"
         return out
 
-    def feed(self, payload: dict) -> None:
+    def feed(self, payload: dict) -> list[dict]:
+        """Grow the run's content by one event. Returns the Responses events
+        it caused for a live stream: a tool card opened, relabelled as failed,
+        or answered. The inline reply yields them, so it and a turn writer
+        show the same cards (ELI-147)."""
+        events: list[dict] = []
         data = payload.get("data", {}) or {}
         stream = payload.get("stream")
         name = data.get("name", "")
@@ -2010,7 +2040,7 @@ class _TurnRenderer:
                     "Sender (untrusted metadata)" in delta
                     or "UnTrustedMetadata" in delta
                 ):
-                    return
+                    return events
                 self._assistant_stream_text += delta
                 self._add_text(delta)
 
@@ -2030,10 +2060,10 @@ class _TurnRenderer:
                 if tcid:
                     args_str = json.dumps(data.get("args", {}))
                     self._active_tool_args[tcid] = args_str
-                    self._tool_item(name, tcid, args_str)
+                    self._tool_item(name, tcid, args_str, events)
             elif phase == "result":
                 if tcid and tcid in self._tool_results:
-                    return
+                    return events
                 result = data.get("result", {})
                 result_str = _tool_result_text(result)
                 args_str = self._active_tool_args.pop(tcid, None) or json.dumps(
@@ -2044,12 +2074,16 @@ class _TurnRenderer:
                 ))
                 if tcid:
                     self._tool_results.add(tcid)
-                    item = self._tool_item(name, tcid, args_str)
+                    item = self._tool_item(name, tcid, args_str, events)
                     item["status"] = "completed"
                     if data.get("isError") is True:
                         item["name"] = f"{name} {TOOL_ERROR_MARK}"
+                        events.append(_tool_call_error_relabel_event(name, tcid, args_str))
                         result_str = _tool_error_banner(result_str)
-                    self.output.append(_tool_call_result_event(tcid, result_str)["item"])
+                    event = _tool_call_result_event(tcid, result_str)
+                    self.output.append(copy.deepcopy(event["item"]))
+                    events.append(event)
+        return events
 
 
 # ---------------------------------------------------------------------------
