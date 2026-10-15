@@ -92,9 +92,6 @@ from openclaw_pipe import (
     _parse_gateway_url,
     _explain_connect_rejection,
     _explain_session_patch_failure,
-    _align_whole_text,
-    _gap_repair_fields,
-    _GapRepairSink,
     _marker_line_index,
     _discover_models_with_source,
     _modal_payload_from_user_input_prompt,
@@ -1606,16 +1603,10 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         """2026-10-12, chat 98891cbb: the pipe's Gateway socket dropped for 1s
         mid-count. The closing catch-all (the WHOLE reply) no longer started
         with what had arrived, so all of it was appended again: 3816
-        duplicates. Now only what follows the received text is new, and the
-        lost lines go back into the reply once OWUI has saved it."""
-        applied = []
-
-        async def fake_apply(conn, repair):
-            applied.append(repair)
-            return True
-
-        with mock.patch.object(self.ocp, "_apply_gap_repair", fake_apply), \
-                mock.patch.object(self.ocp, "_gateway_connection", self.conn):
+        duplicates. Now only what follows the received text is new. This
+        reply has no message to hand over (the session key names no Open
+        WebUI chat), so the lost lines stay lost (ELI-147 slice 4)."""
+        with mock.patch.object(self.ocp, "_gateway_connection", self.conn):
             r1 = self._reply("count to 100", "m1")
             first = asyncio.ensure_future(r1.__anext__())
             await self._until_registered("run-1")
@@ -1633,62 +1624,46 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
             nums = self._count(out)
             self.assertEqual(len(nums), len(set(nums)), "no line may be shown twice")
             self.assertEqual(sorted(nums), list(range(1, 51)) + list(range(61, 101)))
-            # The reply was still streaming: its repair waits for the save.
-            self.assertEqual(applied, [])
-            await self.ocp._on_chat_finished({"chat_id": "chat-1", "message_id": "m1"})
-        self.assertEqual(len(applied), 1)
-        self.assertEqual(applied[0]["message_id"], "m1")
-        self.assertEqual(applied[0]["chunk"], self._nums(51, 60))
-        self.assertTrue(applied[0]["before"].startswith("61\n"))
 
-    async def test_socket_drop_before_a_send_now_repairs_the_first_reply(self):
+    async def test_socket_drop_before_a_send_now_shows_no_line_twice(self):
         """The 98891cbb shape: the drop hit right after reply 1 registered
         (lines 1..3 lost), then two Send nows moved the run to replies 2 and
-        3, where the catch-all arrived. The lost lines belong to reply 1,
-        which OWUI has already saved, so they go back in at once."""
-        applied = []
+        3, where the catch-all arrived. With no message to hand over, the
+        lost lines stay lost, and the catch-all repeats none of the others
+        (a reply with a message hands over: GapHandoverReplayTests)."""
+        r1 = self._reply("count to 30", "m1", intent="send_now")
+        first = asyncio.ensure_future(r1.__anext__())
+        await self._until_registered("run-1")
+        self.active = True
+        q = self._queue("run-1")
+        self.conn._mark_event_gap()
+        q.put_nowait(self._delta("run-1", self._nums(4, 10)))
+        out1 = await first
+        out1 += await self._read(r1, "10\n") if "10\n" not in out1 else ""
+        await r1.aclose()
 
-        async def fake_apply(conn, repair):
-            applied.append(repair)
-            return True
+        r2 = self._reply("MSG2", "m2", intent="send_now")
+        q.put_nowait(self._delta("run-1", self._nums(11, 20)))
+        out2 = await self._read(r2, "20\n")
+        await r2.aclose()
 
-        with mock.patch.object(self.ocp, "_apply_gap_repair", fake_apply):
-            r1 = self._reply("count to 30", "m1", intent="send_now")
-            first = asyncio.ensure_future(r1.__anext__())
-            await self._until_registered("run-1")
-            self.active = True
-            q = self._queue("run-1")
-            self.conn._mark_event_gap()
-            q.put_nowait(self._delta("run-1", self._nums(4, 10)))
-            out1 = await first
-            out1 += await self._read(r1, "10\n") if "10\n" not in out1 else ""
-            await r1.aclose()
-
-            r2 = self._reply("MSG2", "m2", intent="send_now")
-            q.put_nowait(self._delta("run-1", self._nums(11, 20)))
-            out2 = await self._read(r2, "20\n")
-            await r2.aclose()
-
-            r3 = self._reply("MSG3", "m3")
-            q.put_nowait(self._delta("run-1", self._nums(21, 30)))
-            q.put_nowait(self._whole("run-1", self._nums(1, 30)))
-            q.put_nowait(self._final("run-1"))
-            out3 = await self._read(r3, "30\n")
-            self.active = False
-            rest = asyncio.ensure_future(self._read(r3, "ANSWER"))
-            await self._until_registered("run-2")
-            self._queue("run-2").put_nowait(self._delta("run-2", "ANSWER"))
-            self._queue("run-2").put_nowait(self._final("run-2"))
-            out3 += await rest
-            await r3.aclose()
-            await asyncio.sleep(0)
+        r3 = self._reply("MSG3", "m3")
+        q.put_nowait(self._delta("run-1", self._nums(21, 30)))
+        q.put_nowait(self._whole("run-1", self._nums(1, 30)))
+        q.put_nowait(self._final("run-1"))
+        out3 = await self._read(r3, "30\n")
+        self.active = False
+        rest = asyncio.ensure_future(self._read(r3, "ANSWER"))
+        await self._until_registered("run-2")
+        self._queue("run-2").put_nowait(self._delta("run-2", "ANSWER"))
+        self._queue("run-2").put_nowait(self._final("run-2"))
+        out3 += await rest
+        await r3.aclose()
+        await asyncio.sleep(0)
 
         nums = self._count(out1 + out2 + out3)
         self.assertEqual(len(nums), len(set(nums)), "no line may be shown twice")
         self.assertEqual(sorted(nums), list(range(4, 31)))
-        self.assertEqual([(r["message_id"], r["chunk"]) for r in applied],
-                         [("m1", self._nums(1, 3))])
-        self.assertTrue(applied[0]["before"].startswith("4\n5\n"))
         self.assertNotIn("abort", self.rpc)
 
     async def test_send_now_twice_loses_nothing(self):
@@ -8695,20 +8670,6 @@ class EventGapTests(unittest.IsolatedAsyncioTestCase):
     """Events lost while the Gateway socket reconnects (no replay exists:
     sequence numbers are per connection)."""
 
-    def test_align_finds_the_lost_chunks_and_the_tail(self):
-        whole = "a" * 30 + "LOST1" + "b" * 30 + "LOST2" + "c" * 30 + "TAIL"
-        received = "a" * 30 + "b" * 30 + "c" * 30
-        tail, missing = _align_whole_text(whole, received, [30, 60])
-        self.assertEqual(tail, "TAIL")
-        self.assertEqual(missing, [(30, "LOST1"), (60, "LOST2")])
-
-    def test_align_gap_at_the_start(self):
-        tail, missing = _align_whole_text("123456", "456", [0])
-        self.assertEqual((tail, missing), ("", [(0, "123")]))
-
-    def test_align_refuses_a_different_text(self):
-        self.assertIsNone(_align_whole_text("something else", "hello there", [5]))
-
     def test_whole_text_with_a_hole_yields_only_what_follows(self):
         whole = "".join(f"{i}\n" for i in range(1, 400))
         received = "".join(f"{i}\n" for i in range(184, 400))
@@ -8719,21 +8680,6 @@ class EventGapTests(unittest.IsolatedAsyncioTestCase):
         # "OK." in a later, different text must not swallow it.
         self.assertEqual(_item_delta_text("Fine. Then more text. OK.", "", "OK."),
                          "Fine. Then more text. OK.")
-
-    def test_repair_fields_put_the_chunk_into_output_and_content(self):
-        msg = {"content": "4\n5\n6\n",
-               "output": [{"type": "message", "content": [
-                   {"type": "output_text", "text": "4\n5\n6\n"}]}]}
-        fields = _gap_repair_fields(msg, "1\n2\n3\n", "4\n5\n", "")
-        self.assertEqual(fields["content"], "1\n2\n3\n4\n5\n6\n")
-        self.assertEqual(fields["output"][0]["content"][0]["text"], "1\n2\n3\n4\n5\n6\n")
-        self.assertEqual(msg["output"][0]["content"][0]["text"], "4\n5\n6\n", "input untouched")
-
-    def test_repair_fields_after_anchor_and_no_anchor(self):
-        msg = {"content": "x\ny\n", "output": [{"type": "message", "content": [
-            {"type": "output_text", "text": "x\ny\n"}]}]}
-        self.assertEqual(_gap_repair_fields(msg, "z\n", "", "x\ny\n")["content"], "x\ny\nz\n")
-        self.assertIsNone(_gap_repair_fields(msg, "z\n", "nope", "nope"))
 
     async def test_disconnect_marks_a_gap_after_what_was_queued(self):
         conn = _GatewayConnection(lambda: None)
@@ -8754,26 +8700,6 @@ class EventGapTests(unittest.IsolatedAsyncioTestCase):
             await conn._event_loop()
         self.assertEqual(q.get_nowait(), {"type": "event", "n": 1})
         self.assertEqual(q.get_nowait()["type"], "_pipe_gap")
-
-    async def test_sink_applies_waiting_repairs_on_chat_finished(self):
-        import openclaw_pipe as ocp
-        seen = []
-
-        async def fake_apply(conn, repair):
-            seen.append(repair["chunk"])
-            return True
-
-        ocp._take_gap_repairs("c", "m")
-        ocp._gap_repair_registry()["c:m"] = [{"chunk": "lost", "chat_id": "c", "message_id": "m"}]
-        event = types.SimpleNamespace(event="chat.finished", data={"chat_id": "c", "message_id": "m"})
-        with mock.patch.object(ocp, "_apply_gap_repair", fake_apply), \
-                mock.patch.object(ocp, "_gateway_connection", _GatewayConnection(lambda: None)):
-            await _GapRepairSink().handle_event(None, types.SimpleNamespace(event="chat.started", data={}))
-            self.assertEqual(seen, [])
-            await _GapRepairSink().handle_event(None, event)
-        self.assertEqual(seen, ["lost"])
-        self.assertEqual(ocp._take_gap_repairs("c", "m"), [])
-
 
 class NeedsInputMarkerTests(unittest.IsolatedAsyncioTestCase):
     """ELI-107 (2026-10-14 02:07Z, chat 0abe9bde): a report that QUOTED a
@@ -9372,7 +9298,7 @@ class GapHandoverReplayTests(_RoutingCase):
         self.frame({"state": "final"}, event="chat")
         self.settle()
         await self.ended(reply)
-        self.assertEqual(self.stored(), (True, self._nums(1, 30), 0))
+        self.assertEqual(self.stored(), (True, self._nums(1, 30).strip(), 0))
         self.assertEqual(reply["text"], "")
         self.assertEqual([e for e in reply["emitted"] if e.get("type") == "replace"], [])
         self.assertEqual(len(self.chat_sends), 1, "no retry or resend")

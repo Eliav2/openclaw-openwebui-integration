@@ -1324,22 +1324,6 @@ class _PipeTurn:
         if self.adopted_run_text:
             self.renderer.seed(self.adopted_run_text)
             self.assistant_stream_text = self.adopted_run_text.get("stream", "")
-        # Offsets in the renderer's `received` text where events were lost (a
-        # Gateway socket drop, see `_mark_event_gap`), and which OWUI reply
-        # showed the run from which offset, so a lost chunk can be put back
-        # into the reply it belongs to. Both are run-level and travel with an
-        # adopted run.
-        self.run_gaps: list[int] = list((self.adopted_run_text or {}).get("gaps", []))
-        self.run_segments: list[dict] = list((self.adopted_run_text or {}).get("segments", []))
-        if self.chat_id and self.owui_message_id:
-            # The reply that showed the run until now has stopped streaming,
-            # so OWUI has saved it; repairs that waited for it can go in.
-            for seg in self.run_segments:
-                for repair in _take_gap_repairs(self.chat_id, seg["message_id"]):
-                    _schedule_gap_repair(self.conn, repair, streaming=False)
-            self.run_segments.append({"message_id": self.owui_message_id,
-                                 "start": len(self.renderer.received)})
-
         self.visible_message_text = self._initial_visible_text + self.pending_clamp_note
         # Text the hooks hold back: a possible needs-input prompt, a MEDIA:
         # directive whose filename is still arriving.
@@ -1367,7 +1351,7 @@ class _PipeTurn:
         queued_shown = False
         # An interrupted run is not continued here: its message goes to the
         # turn writer, whose settled row decides who continues it (DESIGN 2.7).
-        handed_over = False
+        self.handed_over = False
         # A reply with no Open WebUI message (an API request) has nothing to
         # hand over: it applies the owner rule itself, in its own stream
         # (review 2af1 R14). Set while it waits for the interrupted run's row.
@@ -1463,7 +1447,7 @@ class _PipeTurn:
                             # a resume. Its row decides, in the turn writer.
                             if self.conn.hand_over_run(self.session_key, self.our_run_id,
                                                   thinking=self.resolved_thinking, read_row=True):
-                                handed_over = self.done = True
+                                self.handed_over = self.done = True
                             elif self.awaiting_owner:
                                 spawn_background(self.conn.push_row(self.session_key))
                             elif not self.owui_message_id:
@@ -1473,10 +1457,36 @@ class _PipeTurn:
                             continue
 
                         if msg.get("type") == _GAP_MARKER_TYPE:
+                            # Events were lost on the Gateway socket. The turn
+                            # writer rebuilds the message from the run's
+                            # transcript, cards included, so the reply hands
+                            # it over (ELI-147), with a copy of what it showed
+                            # (it closes its own open cards next) and the
+                            # events queued behind the gap. Its consumer goes
+                            # before any await, so nothing later lands here.
+                            # A reply that took over a run after Send now
+                            # keeps streaming: it still owes the user's message
+                            # (ELI-153). So does a reply with no message (an
+                            # API request). What a gap lost there stays lost.
                             self.signals_lost = True
-                            self.run_gaps.append(len(self.renderer.received))
-                            pipe_log(f"  event gap at offset {len(self.renderer.received)} "
-                                     "(Gateway socket dropped)")
+                            queued = []
+                            if not self.adopted_run_id and self.owui_message_id:
+                                queued = self.queue.take_all()
+                                if self.conn.hand_over_run(
+                                        self.session_key, self.our_run_id,
+                                        thinking=self.resolved_thinking, read_row=True,
+                                        reply={"message_id": self.owui_message_id,
+                                               "renderer": copy.deepcopy(self.renderer),
+                                               "events": [m.get("payload") or {} for m in queued
+                                                          if m.get("type") == "event"]}):
+                                    self.conn.unregister_consumer(self.session_key, self.our_run_id,
+                                                                  queue=self.queue)
+                                    self.handed_over = self.done = True
+                                    continue
+                            for m in queued:
+                                self.queue.put_control(m)
+                            pipe_log("  event gap (Gateway socket dropped): "
+                                     "what it lost stays lost in this reply")
                             continue
 
                         self.event_count += 1
@@ -1513,7 +1523,7 @@ class _PipeTurn:
                         # message to hand over, it ends here like any error.
                         if _EXTERNAL_KILL_RE.search(err) or (aborted_run and self.conn._shutdown_seen):
                             if self.conn.hand_over_run(self.session_key, self.our_run_id, thinking=self.resolved_thinking):
-                                handed_over = self.done = True
+                                self.handed_over = self.done = True
                                 continue
                             if not self.owui_message_id:
                                 self.await_owner()
@@ -1545,15 +1555,9 @@ class _PipeTurn:
 
                         # --- Run text and tool cards ---
                         # One renderer reads them, the one a turn writer uses
-                        # (ELI-147). After a gap, a whole-text event's new part
-                        # is what the gap repair lines up.
+                        # (ELI-147).
                         if stream in ("assistant", "item", "tool"):
-                            if stream == "assistant" and not data.get("delta"):
-                                whole = data.get("text") or ""
-                            else:
-                                whole = _item_assistant_text(data) if stream == "item" else ""
-                            gap_tail = self.reconcile_whole_text(whole) if whole else None
-                            added = self.renderer.feed(payload, gap_tail=gap_tail)
+                            added = self.renderer.feed(payload)
                             for text in (a for a in added if isinstance(a, str)):
                                 async for chunk in self.show_text(text):
                                     yield chunk
@@ -1631,9 +1635,7 @@ class _PipeTurn:
                         send_stop=self.pipe.valves.SEND_STOP_ON_CANCEL,
                         run_text={"received": self.renderer.received,
                                   "stream": self.assistant_stream_text,
-                                  "item": self.renderer.last_item,
-                                  "gaps": self.run_gaps,
-                                  "segments": self.run_segments},
+                                  "item": self.renderer.last_item},
                         settle=functools.partial(
                             _settle_cancel_intent, self.conn, self.session_key, self.our_run_id,
                             self.owui_origin_chat_id, self.__event_call__),
@@ -1745,7 +1747,7 @@ class _PipeTurn:
                     # closed; the handed renderer keeps the call open.
                     if not adopt_new_run:
                         note = ("(interrupted -- the reply continues when the run resumes)"
-                                if handed_over else TOOL_NO_RESULT_NOTE)
+                                if self.handed_over else TOOL_NO_RESULT_NOTE)
                         for event in self.renderer.close_open_calls(note):
                             pipe_log(f"  closing orphaned tool call {event['item']['call_id']}")
                             yield event
@@ -1756,7 +1758,7 @@ class _PipeTurn:
             # A parked queue now belongs to whoever claims the run; releasing
             # it here would drop the events it is buffering.
             if not self.turn.parked:
-                if self.done and not self.aborted and self.our_run_id and not handed_over:
+                if self.done and not self.aborted and self.our_run_id and not self.handed_over:
                     # The run ended in this reply. Its trailing `chat` final
                     # lands after this consumer is gone and must not read as
                     # "the reply ended before its run" (a handover would
@@ -1768,7 +1770,7 @@ class _PipeTurn:
                 self.turn.run_id = None
                 self.turn.queue = None
             status_lines = []
-            if not self.aborted and self.text_yielded and not self.adopted_run_id and not handed_over:
+            if not self.aborted and self.text_yielded and not self.adopted_run_id and not self.handed_over:
                 status_lines = await _build_usage_status_lines(self.conn, self.session_key)
             if self.adopted_run_id and not self.aborted:
                 await _emit_status(
@@ -1824,6 +1826,11 @@ class _PipeTurn:
                 async for item in continuation:
                     yield item
             return
+        if self.handed_over:
+            # The turn writer owns the message now (DESIGN 2.6): no save of
+            # this request's part into it, and no recovery or retry of a
+            # reply that showed nothing (the 98891cbb shape, ELI-147).
+            return
         if (self.enqueued_not_started and not self.text_yielded and not self.aborted
                 and not self.adopted_run_id and self.session_runtime == "claude-cli"
                 and self.our_run_id and self.sent_texts):
@@ -1866,28 +1873,6 @@ class _PipeTurn:
                 f"  [diag] PHANTOM (no text): our_run_id={str(self.our_run_id)[:40]} "
                 f"first_event_arrived={self.first_event_arrived} aborted={self.aborted}"
             )
-
-        if self.run_gaps and not self.aborted and self.our_run_id:
-            # Events were lost and no whole-text event lined up with them
-            # during the run: the run's own closing message in the transcript
-            # (`cli-assistant:<runId>`, see `_history_text_for_run`) is the
-            # whole text. Its tail, if the lost events were the last ones,
-            # belongs at the end of this reply.
-            try:
-                hist = await self.conn.session_history(self.session_key, limit=RUN_TEXT_HISTORY_LIMIT)
-            except Exception as ex:
-                hist = None
-                pipe_log(f"  event gap: chat.history failed: {ex}")
-            found, whole = _history_text_for_run(hist, self.our_run_id)
-            tail = (self.reconcile_whole_text(whole) if found and whole else None) or ""
-            if self.run_gaps:
-                pipe_log(f"  {len(self.run_gaps)} event gap(s) and no whole text lines up for run "
-                         f"{str(self.our_run_id)[:20]}...; the lost text cannot be put back")
-            elif tail and not self.visible_message_text.endswith(tail):
-                pipe_log(f"  event gap: {len(tail)} chars lost at the end of the run, appended")
-                self.record_visible_chunk(tail)
-                yield tail
-                self.text_yielded = True
 
         # Terminal back-sync (ELI-57): persist the completed turn's visible text
         # to the OWUI DB with one final `replace` snapshot. OWUI only saves
@@ -2051,39 +2036,6 @@ class _PipeTurn:
             return active
         return self.conn.active_run_id_for_session(self.session_key) is not None
 
-    def reconcile_whole_text(self, whole: str) -> str | None:
-        """After a gap, line the run's whole text up with what arrived
-        and put each lost chunk back into the reply that showed it.
-        Returns the text after the last received piece (the only new
-        text), or None when there is no gap or `whole` does not line up
-        (an item carrying one segment, not the whole run), which leaves
-        the gaps pending for the next whole text."""
-        if not self.run_gaps or not self.chat_id:
-            return None
-        aligned = _align_whole_text(whole, self.renderer.received, self.run_gaps)
-        if aligned is None:
-            return None
-        tail, missing = aligned
-        self.run_gaps.clear()
-        for offset, chunk in missing:
-            seg = next((sg for sg in reversed(self.run_segments) if sg["start"] <= offset),
-                       self.run_segments[0] if self.run_segments else None)
-            if seg is None:
-                continue
-            nxt = next((sg["start"] for sg in self.run_segments if sg["start"] > seg["start"]),
-                       len(self.renderer.received))
-            repair = {
-                "user_id": self.owui_origin_user_id, "chat_id": self.chat_id,
-                "message_id": seg["message_id"], "chunk": chunk,
-                "before": self.renderer.received[offset:min(offset + _GAP_ANCHOR_CHARS, nxt)],
-                "after": self.renderer.received[max(seg["start"], offset - _GAP_ANCHOR_CHARS):offset],
-            }
-            pipe_log(f"  event gap: {len(chunk)} chars lost at offset {offset}; "
-                     f"repairing message {seg['message_id'][:8]}...")
-            _schedule_gap_repair(self.conn, repair,
-                                 streaming=seg["message_id"] == self.owui_message_id)
-        return tail
-
     def await_owner(self) -> None:
         self.awaiting_owner, self.owner_notice_before = True, self.conn._stop_notice_seen
         self.owner_run = self.conn._awaiting_owner[self.session_key] = self.our_run_id
@@ -2168,9 +2120,6 @@ class _PipeTurn:
             hist = None
         found, whole = _history_text_for_run(hist, self.our_run_id) if hist else (False, None)
         if found and whole:
-            gap_tail = self.reconcile_whole_text(whole)
-            if gap_tail is not None:
-                return gap_tail
             if whole.startswith(self.renderer.received):
                 return whole[len(self.renderer.received):]
             return "" if self.text_yielded else whole

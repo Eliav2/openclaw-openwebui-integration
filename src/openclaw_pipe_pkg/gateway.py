@@ -645,207 +645,6 @@ _RESTART_MARKER_TYPE = "_pipe_restart"
 # `read_at` (time.monotonic) is when the row was read: a reply trusts an idle
 # row only when it was read after its run was admitted (review 2af1 N4).
 _ROW_MARKER_TYPE = "_pipe_row"
-# Text on each side of a gap used to find where a repaired chunk goes.
-_GAP_ANCHOR_CHARS = 120
-
-
-def _align_whole_text(whole: str, received: str, gaps) -> tuple[str, list] | None:
-    """Line up what a run actually sent (`whole`) with what reached us.
-
-    `received` is the run's text as it arrived, `gaps` the offsets in it
-    where a gap marker sat (events lost on a socket drop). Between gaps the
-    received text is contiguous, so each piece is found in `whole` in order;
-    whatever `whole` has between pieces is what was lost there. Returns
-    (tail, missing): `tail` is what follows the last received piece (new
-    text), `missing` a list of (offset in `received`, lost text). None when
-    a piece is not in `whole`: then it is not the same text and nothing is
-    repaired.
-    """
-    if not whole or not received:
-        return None
-    cuts = sorted({g for g in gaps or () if 0 <= g <= len(received)})
-    bounds = [0, *cuts, len(received)]
-    j = 0
-    missing = []
-    for a, b in zip(bounds, bounds[1:]):
-        piece = received[a:b]
-        if not piece:
-            continue
-        pos = whole.find(piece, j)
-        if pos < 0:
-            return None
-        if pos > j:
-            missing.append((a, whole[j:pos]))
-        j = pos + len(piece)
-    return whole[j:], missing
-
-
-def _insert_at_anchor(text: str, chunk: str, before: str, after: str) -> str | None:
-    """`text` with `chunk` put in front of `before`, or right after `after`."""
-    if before:
-        i = text.find(before)
-        if i >= 0:
-            return text[:i] + chunk + text[i:]
-    if after:
-        i = text.rfind(after)
-        if i >= 0:
-            i += len(after)
-            return text[:i] + chunk + text[i:]
-    return None
-
-
-def _gap_repair_fields(message: dict, chunk: str, before: str, after: str) -> dict | None:
-    """The DB fields that put `chunk` back into an OWUI message, or None.
-
-    OWUI 0.12 renders and saves a reply from its `output` items (the content
-    string is derived), so the chunk goes into the text part that holds the
-    anchor; `content` is kept in step when present.
-    """
-    fields: dict = {}
-    output = copy.deepcopy(message.get("output") or [])
-    placed = False
-    for item in output:
-        if not isinstance(item, dict) or item.get("type") != "message":
-            continue
-        for part in item.get("content") or []:
-            if isinstance(part, dict) and part.get("type") == "output_text":
-                new = _insert_at_anchor(part.get("text") or "", chunk, before, after)
-                if new is not None:
-                    part["text"] = new
-                    placed = True
-                    break
-        if placed:
-            break
-    if placed:
-        fields["output"] = output
-    content = message.get("content")
-    if isinstance(content, str) and content:
-        new_content = _insert_at_anchor(content, chunk, before, after)
-        if new_content is not None:
-            fields["content"] = new_content
-    if output and not placed:
-        return None  # the screen renders `output`; a content-only fix would not show
-    return fields or None
-
-
-def _gap_repair_registry() -> dict:
-    """Repairs waiting for a reply that is still streaming, by
-    "<chat_id>:<message_id>". Shared across redeploys like the other
-    bookkeeping, so a repair registered by one module instance is applied by
-    the sink whichever instance is current."""
-    state = _shared_gateway_state()
-    if state is None:
-        return _LOCAL_GAP_REPAIRS
-    return state.setdefault("pending_gap_repairs", {})
-
-
-_LOCAL_GAP_REPAIRS: dict = {}
-
-
-async def _apply_gap_repair(conn, repair: dict) -> bool:
-    """Put a lost chunk back into a reply OWUI has finished saving, in the DB
-    and in every open tab (a `chat:completion` carrying only `output` replaces
-    that one message's items, without a reload and without marking it done).
-    """
-    chat_id, message_id = repair["chat_id"], repair["message_id"]
-    try:
-        from open_webui.models.chats import Chats
-    except Exception as ex:
-        pipe_log(f"  gap repair unavailable (not inside OWUI process?): {ex}")
-        return False
-    try:
-        async with conn._chat_write_lock(chat_id):
-            chat = await Chats.get_chat_by_id(chat_id)
-            messages = ((chat.chat.get("history") or {}).get("messages") or {}) if chat else {}
-            message = messages.get(message_id)
-            if not message:
-                pipe_log(f"  gap repair: message {message_id[:8]}... not found; "
-                         f"{len(repair['chunk'])} chars stay missing")
-                return False
-            fields = _gap_repair_fields(message, repair["chunk"],
-                                        repair.get("before", ""), repair.get("after", ""))
-            if not fields:
-                pipe_log(f"  gap repair: no anchor in message {message_id[:8]}...; "
-                         f"{len(repair['chunk'])} chars stay missing")
-                return False
-            await Chats.upsert_message_to_chat_by_id_and_message_id(chat_id, message_id, fields)
-        live = {"output": fields["output"]} if "output" in fields else {"content": fields["content"]}
-        await _relay_emit_event(repair["user_id"], chat_id, message_id,
-                                {"type": "chat:completion", "data": live})
-        pipe_log(f"  gap repair: put {len(repair['chunk'])} lost chars back into "
-                 f"message {message_id[:8]}...")
-        return True
-    except Exception as ex:
-        pipe_log(f"  gap repair failed: {ex}")
-        return False
-
-
-def _schedule_gap_repair(conn, repair: dict, *, streaming: bool) -> None:
-    """Apply now, or once OWUI has saved the reply that is still streaming.
-
-    A reply that stopped streaming is already saved: a finished one before
-    `chat.finished`, a stopped one before OWUI's stop endpoint returns (it
-    awaits the cancelled task), which is before the next reply could start.
-    The one still streaming is saved from its `output` when the stream ends,
-    which would overwrite a repair made now, so that repair waits for
-    `chat.finished` (`_GapRepairSink`) or for the reply that adopts its run.
-    """
-    if not streaming:
-        spawn_background(_apply_gap_repair(conn, repair))
-        return
-    key = f"{repair['chat_id']}:{repair['message_id']}"
-    _gap_repair_registry().setdefault(key, []).append(repair)
-    _ensure_gap_repair_sink()
-    pipe_log(f"  gap repair for message {repair['message_id'][:8]}... waits for its final save")
-
-
-def _take_gap_repairs(chat_id: str, message_id: str) -> list:
-    return _gap_repair_registry().pop(f"{chat_id}:{message_id}", [])
-
-
-async def _on_chat_finished(data: dict) -> None:
-    repairs = _take_gap_repairs(str(data.get("chat_id")), str(data.get("message_id")))
-    if not repairs:
-        return
-    conn = _gateway_connection
-    if conn is None:
-        return
-    for repair in repairs:
-        await _apply_gap_repair(conn, repair)
-
-
-class _GapRepairSink:
-    """OWUI event sink: `chat.finished` fires after the reply's final save
-    (`publish_chat_finished_event`, after the upsert in middleware.py). It
-    stays registered across redeploys, so it calls whichever handler the
-    current module instance stored, never its own (stale) code."""
-
-    openclaw_gap_repair_sink = True
-
-    async def handle_event(self, app, event, request=None) -> None:
-        if getattr(event, "event", None) != "chat.finished":
-            return
-        state = _shared_gateway_state() or {}
-        handler = state.get("gap_repair_on_finished") or _on_chat_finished
-        try:
-            await handler(getattr(event, "data", None) or {})
-        except Exception as ex:
-            pipe_log(f"  gap repair sink failed: {ex}")
-
-
-def _ensure_gap_repair_sink() -> None:
-    try:
-        import open_webui.events as owui_events
-    except Exception:
-        return
-    state = _shared_gateway_state()
-    if state is not None:
-        state["gap_repair_on_finished"] = _on_chat_finished
-    sinks = getattr(owui_events, "EVENT_SINKS", None)
-    if isinstance(sinks, list) and not any(
-        getattr(s, "openclaw_gap_repair_sink", False) for s in sinks
-    ):
-        sinks.append(_GapRepairSink())
 
 
 # How much of the already-received text anchors a cumulative text that does not
@@ -877,7 +676,8 @@ def _item_delta_text(item_text: str, last_item_text: str, assistant_stream_text:
     # from the middle or the start (events lost while the Gateway socket was
     # reconnecting): only what follows that tail is new. Returning the whole
     # item here posted a second full copy of a 4000-line reply (2026-10-12).
-    # The missing piece is put back by the gap repair, not appended here.
+    # The missing piece comes back with the turn writer's transcript rebuild
+    # (ELI-147), never appended here.
     # Shorter anchors too: the hole may sit inside the longest one.
     for n in (_WHOLE_TEXT_ANCHOR_CHARS, 128, _MIN_WHOLE_TEXT_ANCHOR_CHARS):
         anchor = baseline[-n:]
@@ -1267,13 +1067,12 @@ class _TurnRenderer:
                 item["status"] = "completed"
         return out
 
-    def feed(self, payload: dict, gap_tail: str | None = None) -> list:
+    def feed(self, payload: dict) -> list:
         """Grow the run's content by one event. Returns what it added for a
         live stream: the new text (a str) and the Responses events of a tool
         card opened, relabelled as failed, or answered. The inline reply
         shows them, so it and a turn writer show the same text and cards
-        (ELI-147). `gap_tail`: the new part of a whole-text event after a
-        gap, which the inline reply's gap repair worked out."""
+        (ELI-147)."""
         events: list = []
         data = payload.get("data", {}) or {}
         stream = payload.get("stream")
@@ -1286,15 +1085,12 @@ class _TurnRenderer:
                 delta = raw_delta
             else:
                 raw_text = data.get("text") or ""
-                if gap_tail is not None:
-                    delta = gap_tail
-                else:
-                    delta = (
-                        _item_delta_text(raw_text, "", self._assistant_stream_text)
-                        if raw_text else ""
-                    )
-                    if raw_text and not delta:
-                        pipe_log("  suppressed duplicate catch-all assistant text")
+                delta = (
+                    _item_delta_text(raw_text, "", self._assistant_stream_text)
+                    if raw_text else ""
+                )
+                if raw_text and not delta:
+                    pipe_log("  suppressed duplicate catch-all assistant text")
                 delta = _suppress_already_shown(delta, self.visible_text)
             if delta:
                 if (
@@ -1309,7 +1105,7 @@ class _TurnRenderer:
         if stream == "item":
             item_text = _item_assistant_text(data)
             if item_text:
-                item_delta = gap_tail if gap_tail is not None else _item_delta_text(
+                item_delta = _item_delta_text(
                     item_text, self._last_item_text, self._assistant_stream_text
                 )
                 self._last_item_text = item_text
@@ -1407,6 +1203,13 @@ class _RunQueue(asyncio.Queue):
             self.put_nowait(item)
         finally:
             self._maxsize = bound
+
+    def take_all(self) -> list:
+        """Everything queued now, in order, without waiting."""
+        items = []
+        while not self.empty():
+            items.append(self.get_nowait())
+        return items
 
 
 # Open WebUI's uvicorn Server, kept while it serves (see `owui_shutting_down`).
@@ -1615,7 +1418,7 @@ class _GatewayConnection:
         )
 
         # Per-chat write locks for the read-modify-write paths that are not
-        # turn writers (gap repair, stub reconcile). Shared across connections.
+        # turn writers (stub reconcile). Shared across connections.
         # Keyed by chat_id.
         self._chat_write_locks: dict[str, asyncio.Lock] = (
             _shared["chat_write_locks"] if _shared is not None else {}
@@ -1767,21 +1570,32 @@ class _GatewayConnection:
             self._stop_notice_seen = True
 
     def hand_over_run(self, session_key: str, run_id: str, *,
-                      thinking: str | None = None, read_row: bool = False) -> bool:
+                      thinking: str | None = None, read_row: bool = False,
+                      reply: dict | None = None) -> bool:
         """An interrupted run's request ends without continuing it: the turn
         writer takes its message over (DESIGN 2.6) and the run's settled row
         decides who continues it (2.7), so a reply never resumes a run the
         Gateway recovers. `read_row`: the row is read now, for a handover
-        that can come after the post-hello resync. False when there is no
-        message to hand over."""
+        that can come after the post-hello resync. `reply`: a request that
+        hands over at an event gap gives its own state, {message_id,
+        renderer, events}: what it showed, and the events queued behind the
+        gap, which the writer takes next. The run's target is then not
+        needed (the run's final reaching the request drops it). False when
+        there is no message to hand over."""
         key = f"{session_key}:{run_id}"
         target = self._run_targets.get(key)
         parsed = self.parse_owui_session_key(session_key)
-        if (target is None or not parsed or not self.writes_turns or self._retired
-                or (session_key, run_id) in self._turn_pumps):
+        if ((target is None and reply is None) or not parsed or not self.writes_turns
+                or self._retired or (session_key, run_id) in self._turn_pumps):
             return False
         pump = self._turn_pumps[(session_key, run_id)] = _RunPump()
-        pump.handover = self.handover_of(session_key, run_id, thinking)
+        if reply is None:
+            pump.handover = self.handover_of(session_key, run_id, thinking)
+        else:
+            pump.handover = {"message_id": reply["message_id"], "renderer": reply["renderer"],
+                             "thinking": thinking or (target or {}).get("thinking"), "shown": ""}
+            for payload in reply["events"]:
+                pump.queue.put_nowait(("event", payload))
         pump.stop_notice_before = self._stop_notice_seen
         self.unregister_run_target(session_key, run_id)
         spawn_background(_turn_pump_loop(self, session_key, run_id, parsed, pump))
@@ -1789,7 +1603,7 @@ class _GatewayConnection:
         if read_row:
             spawn_background(_turn_resync(self, skip=set(self.active_run_snapshot)))
         pipe_log(f"  handed run {run_id[:24]}... over to the turn writer "
-                 f"(message {target['message_id'][:8]}...)")
+                 f"(message {pump.handover['message_id'][:8]}...)")
         return True
 
     def _on_sessions_changed(self, payload: dict) -> None:
@@ -1958,7 +1772,7 @@ class _GatewayConnection:
 
     def _chat_write_lock(self, chat_id: str) -> asyncio.Lock:
         """Return the process-wide `asyncio.Lock` for serializing the
-        read-modify-write paths into `chat_id` (gap repair, stub reconcile),
+        read-modify-write paths into `chat_id` (stub reconcile),
         creating it on first use."""
         lock = self._chat_write_locks.get(chat_id)
         if lock is None:
@@ -2539,9 +2353,8 @@ class _GatewayConnection:
         The Gateway has no event replay (sequence numbers are per connection),
         so whatever it sent while this socket was down is gone. The marker
         sits exactly between the last event before the drop and the first one
-        after, which is where the run's text has a hole; the consumer turns
-        it into an offset and `_align_whole_text` puts the text back once the
-        run's whole text is known.
+        after. A reply that reads it hands its message to the turn writer,
+        whose transcript rebuild has what was lost (ELI-147).
         """
         n = 0
         for consumer in list(self._consumers.values()):
