@@ -442,15 +442,9 @@ def _modal_payload_from_user_input_prompt(prompt_text: str) -> tuple[dict, bool]
 _OPTION_DESCRIPTION_SEPARATORS = (" - ", " – ", " — ")
 
 # OWUI clamps a request:user_input event call to 60..240s and, when it times
-# out, removes the card itself. We ask for the maximum and re-show the card
-# after each timeout, so a question waits for as long as max_wait_s allows.
+# out, removes the card itself. We ask for the maximum; a card not answered
+# by then ends the reply with the question as text (ELI-142).
 _NATIVE_CARD_TIMEOUT_MS = 240_000
-# A card cancelled this fast was never seen: OWUI's frontend cancels
-# request:user_input at once when the user is viewing another chat.
-_NATIVE_CARD_UNSEEN_CANCEL_S = 1.5
-# How long a question card waits for a tab to view the chat again (a reload)
-# before the reply ends with the question as text (ELI-107 decision 2).
-_NATIVE_CARD_TAB_GRACE_S = 60
 
 
 def _owui_supports_native_ask_user() -> bool:
@@ -603,16 +597,6 @@ def _format_native_answers(questions: list[dict], answers: dict) -> str:
     return "\n".join(f"{header}: {text}" for header, text in lines)
 
 
-def _user_has_live_session(owui_user_id: str, owui_chat_id: str | None = None) -> bool:
-    """Whether the user has a connected Open WebUI socket now that a card
-    for `owui_chat_id` could be shown on (`_live_session_id_for_user`)."""
-    try:
-        from open_webui.socket.main import SESSION_POOL
-    except Exception:
-        return False
-    return bool(_live_session_id_for_user(owui_user_id, SESSION_POOL, owui_chat_id))
-
-
 async def _call_native_card_on_live_session(
     owui_user_id: str, owui_chat_id: str | None, owui_message_id: str | None, payload: dict
 ):
@@ -670,88 +654,38 @@ async def _ask_user_native_card(
     owui_user_id: str | None,
     owui_chat_id: str | None,
     owui_message_id: str | None,
-    max_wait_s: float,
     poll_interval_s: float,
     owui_session_id: str | None = None,
-    __event_emitter__=None,
 ) -> str | None:
-    """Ask through OWUI's native question card until answered or cancelled.
+    """Ask once through OWUI's native question card.
 
-    The card is re-shown after each OWUI-side timeout while a tab views the
-    chat, and on a new socket viewing it after a reload, all within
-    max_wait_s. It is re-shown only if such a tab is back within
-    _NATIVE_CARD_TAB_GRACE_S (60 s); a first call no tab of the chat can
-    show ends at once. Those and an explicit Cancel return None: the reply
-    then ends with the question as text (ELI-107 decision 2).
-    `owui_session_id`: the socket the turn started on; once it is gone the
-    card moves to the tab viewing the chat without waiting out OWUI's call.
+    Only an answer or a cancel shows the card was seen. Anything else (OWUI's
+    timeout, a cancel the moment it arrives on a tab viewing another chat, a
+    socket that never answers) returns None, as a cancel does: the reply then
+    ends with the question as text (ELI-107 decision 2). Re-showing the card
+    after a timeout kept a reply open with nothing on screen, about 20 minutes
+    on a socket that never answered (ELI-142).
+    `owui_session_id`: the socket the turn started on. Once it is gone (a
+    reload; no socket for an API caller) the card moves once to the tab
+    viewing the chat, as the turn writer's card does.
     """
-    questions = payload["data"]["questions"]
-    card_timeout_s = payload["data"]["timeout_ms"] / 1000
-    deadline = time.monotonic() + max_wait_s
-    use_live_session = False
-    waiting_shown = False
-    no_viewer_since = None
-    while True:
-        started = time.monotonic()
-        if use_live_session:
-            response = await _call_native_card_on_live_session(
-                owui_user_id, owui_chat_id, owui_message_id, payload
-            )
-        else:
-            response = await _event_call_while_session_lives(
-                __event_call__, payload, owui_session_id, card_timeout_s + 15, poll_interval_s
-            )
-        elapsed = time.monotonic() - started
-
-        if isinstance(response, dict) and response.get("status") == "answered":
-            return _format_native_answers(questions, response.get("answers") or {}) or None
-        unseen = response is None or (isinstance(response, dict) and (
-            "error" in response
-            or elapsed < _NATIVE_CARD_UNSEEN_CANCEL_S
-            or elapsed >= card_timeout_s - 5
-        ))
-        if not unseen:
-            pipe_log("  native question card cancelled by the user")
-            return None
-        if isinstance(response, dict) and "disconnected" in str(response.get("error", "")):
-            if not owui_user_id:
-                return None
-            if not use_live_session and not waiting_shown and not _user_has_live_session(
-                    owui_user_id, owui_chat_id):
-                # The very first call found no live tab for this turn (an API
-                # caller, or a tab closed before the question) and no tab views
-                # the chat: nobody can see the card, so the reply ends now with
-                # the question as text rather than staying open for a
-                # reconnect (ELI-107: an hour).
-                pipe_log("  no live tab for this turn's question card; showing it as text")
-                return None
-            # OWUI's __event_call__ is bound to the session that started the
-            # turn; once that socket is gone, reach the user's new one.
-            use_live_session = True
-        if use_live_session and response is None:
-            # No tab views the chat now. A reload brings one back within
-            # seconds; past the grace the reply ends with the question as
-            # text, so the stream does not outlive its run waiting for the
-            # user to come back (ELI-107 decision 2).
-            no_viewer_since = no_viewer_since or time.monotonic()
-            if time.monotonic() - no_viewer_since >= _NATIVE_CARD_TAB_GRACE_S:
-                pipe_log(f"  no tab came back to this chat within {_NATIVE_CARD_TAB_GRACE_S:g}s; "
-                         "showing the question as text")
-                return None
-        else:
-            no_viewer_since = None
-        if time.monotonic() + poll_interval_s >= deadline:
-            pipe_log(f"  gave up on the native question card after {int(max_wait_s)}s")
-            return None
-        if not waiting_shown:
-            waiting_shown = True
-            await _emit_status(
-                __event_emitter__,
-                "Waiting for your reply -- the question is pending in this chat",
-                done=False,
-            )
-        await asyncio.sleep(poll_interval_s)
+    response = await _event_call_while_session_lives(
+        __event_call__, payload, owui_session_id, payload["data"]["timeout_ms"] / 1000 + 15, poll_interval_s
+    )
+    if owui_user_id and isinstance(response, dict) and "disconnected" in str(response.get("error", "")):
+        response = await _call_native_card_on_live_session(
+            owui_user_id, owui_chat_id, owui_message_id, payload
+        )
+    if isinstance(response, dict) and response.get("status") == "answered":
+        return _format_native_answers(payload["data"]["questions"], response.get("answers") or {}) or None
+    if response is None:
+        outcome = "no tab views the chat"
+    elif isinstance(response, dict):
+        outcome = str(response.get("error") or response.get("status"))
+    else:
+        outcome = repr(response)
+    pipe_log(f"  question card not answered ({outcome[:80]}); the question ends the reply as text")
+    return None
 
 
 def _ask_user_detail_block(prompt_text: str, answer: str) -> str:
@@ -1011,10 +945,8 @@ async def _ask_user_input_modal(
             owui_user_id=owui_user_id,
             owui_chat_id=owui_chat_id,
             owui_message_id=owui_message_id,
-            max_wait_s=max_wait_s,
             poll_interval_s=poll_interval_s,
             owui_session_id=owui_session_id,
-            __event_emitter__=__event_emitter__,
         )
     payload, _ = _modal_payload_from_user_input_prompt(prompt_text)
     # A clickable-choice prompt is delivered as an "execute" event that renders

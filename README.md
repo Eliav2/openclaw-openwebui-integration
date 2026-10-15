@@ -788,11 +788,14 @@ one character at a time, or when it shows up mid-reply inside one cumulative
 chunk. A prompt emitted twice does not become a doubled dialog, and duplicate
 options are collapsed.
 
-The question survives a reconnect. Close the tab or switch chats, come back
-later, and it re-pops on your new session for up to an hour, re-firing on each reconnect while
-the status line reads "Waiting for your reply, question is pending, reconnect
-anytime". If you dismiss it, the question appears as ordinary text with the
-marker line stripped, so nothing is lost. Once answered, the exchange is kept
+The question card is shown once, on the tab viewing the chat; a reload moves it
+to the reloaded tab. If it is not answered by Open WebUI's card timeout (4
+minutes), or you dismiss it, or no tab views the chat, the reply ends with the
+question as ordinary text, marker line stripped, and you answer it in your next
+message. The older modals survive a reconnect instead: close the tab, come back
+later, and the modal re-pops on your new session for up to an hour while the
+status line reads "Waiting for your reply, question is pending, reconnect
+anytime". Once answered, the exchange is kept
 inline as a collapsible ❓ Ask User card showing both the question and your
 answer, and the run continues in the same bubble.
 

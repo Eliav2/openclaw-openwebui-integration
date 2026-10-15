@@ -3809,11 +3809,6 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
         env.VERSION = "0.12.0"
         sys.modules["open_webui.env"] = env
         self.addCleanup(sys.modules.pop, "open_webui.env", None)
-        # Treat every cancel as seen and every call as fast, so a test decides
-        # the outcome through the response alone.
-        patcher = mock.patch.object(openclaw_pipe, "_NATIVE_CARD_UNSEEN_CANCEL_S", -1)
-        patcher.start()
-        self.addCleanup(patcher.stop)
 
     def test_version_gate(self):
         self.assertTrue(_owui_supports_native_ask_user())
@@ -3928,31 +3923,30 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
             calls.append(event)
             return {"status": "cancelled", "answers": {}}
 
-        with mock.patch.object(openclaw_pipe, "_NATIVE_CARD_UNSEEN_CANCEL_S", 0):
-            answer = await _ask_user_input_modal(
-                event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
-                owui_user_id="user-1", max_wait_s=1, poll_interval_s=0.01,
-            )
+        answer = await _ask_user_input_modal(
+            event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
+            owui_user_id="user-1", max_wait_s=1, poll_interval_s=0.01,
+        )
         self.assertIsNone(answer)
         self.assertEqual(len(calls), 1)
 
-    async def test_timeout_and_unseen_cancel_reask(self):
-        responses = [
-            {"error": "Event call timed out. The browser tab may be inactive or closed."},
-            {"status": "cancelled", "answers": {}},  # instant: viewing another chat
-            {"status": "answered", "answers": {"answer": {"type": "option", "label": "b"}}},
-        ]
+    async def test_a_timeout_or_an_unseen_cancel_ends_with_the_question_as_text(self):
+        """OWUI's timeout, and a cancel the moment the card reaches a tab on
+        another chat, do not show the card was seen: no re-show (ELI-142)."""
+        for response in ({"error": "Event call timed out. The browser tab may be inactive or closed."},
+                         {"status": "cancelled", "answers": {}}):
+            calls = []
 
-        async def event_call(event):
-            return responses.pop(0)
+            async def event_call(event):
+                calls.append(event)
+                return response
 
-        with mock.patch.object(openclaw_pipe, "_NATIVE_CARD_UNSEEN_CANCEL_S", 10):
             answer = await _ask_user_input_modal(
                 event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
-                owui_user_id="user-1", max_wait_s=1, poll_interval_s=0.01,
+                owui_user_id="user-1", max_wait_s=60, poll_interval_s=0.01,
             )
-        self.assertEqual(answer, "b")
-        self.assertEqual(responses, [])
+            self.assertIsNone(answer, response)
+            self.assertEqual(len(calls), 1, response)
 
     # ELI-107 decision 2: a wait for the card's answer ends with the run, so
     # a tab that cannot show it is no reason to keep the reply open.
@@ -3991,9 +3985,9 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent, [], "never another chat's tab")
 
     async def test_a_tab_that_does_not_come_back_ends_the_wait(self):
-        """The tab viewing the chat went away (a reload, a closed tab) and no
-        tab views the chat again within the grace: the reply ends with the
-        question as text instead of waiting out max_wait_s."""
+        """The tab viewing the chat went away (a reload, a closed tab) while
+        it held the card: the reply ends with the question as text instead
+        of waiting out max_wait_s."""
         pool = {"sid-tab": {"id": "user-1", "chat_ids": ["chat-1"]}}
 
         async def call(data, to):
@@ -4003,35 +3997,11 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
 
         async def event_call(event):
             return {"error": "Client session disconnected."}
-        with mock.patch.object(openclaw_pipe, "_NATIVE_CARD_TAB_GRACE_S", 0.05, create=True):
-            answer = await asyncio.wait_for(_ask_user_input_modal(
-                event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
-                owui_user_id="user-1", owui_chat_id="chat-1", owui_message_id="msg-1",
-                max_wait_s=60, poll_interval_s=0.01), 2)
-        self.assertIsNone(answer)
-
-    async def test_a_reloaded_tab_within_the_grace_still_gets_the_card(self):
-        pool = {"sid-old": {"id": "user-1", "chat_ids": ["chat-1"]}}
-        sent = []
-
-        async def call(data, to):
-            sent.append(to)
-            if to == "sid-old":
-                del pool["sid-old"]                     # reloaded: a new socket comes later
-                asyncio.get_running_loop().call_later(
-                    0.05, pool.__setitem__, "sid-new", {"id": "user-1", "chat_ids": ["chat-1"]})
-                return {"error": "Event call timed out"}
-            return {"status": "answered", "answers": {"answer": {"type": "option", "label": "b"}}}
-        self._socket(pool, call)
-
-        async def event_call(event):
-            return {"error": "Client session disconnected."}
         answer = await asyncio.wait_for(_ask_user_input_modal(
             event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
             owui_user_id="user-1", owui_chat_id="chat-1", owui_message_id="msg-1",
             max_wait_s=60, poll_interval_s=0.01), 2)
-        self.assertEqual(answer, "b")
-        self.assertEqual(sent, ["sid-old", "sid-new"])
+        self.assertIsNone(answer)
 
     async def test_disconnected_session_moves_to_the_users_new_socket(self):
         sent = {"calls": [], "emits": []}
