@@ -6229,6 +6229,16 @@ async def _retire_stale_connection(stale) -> None:
     await asyncio.wait_for(stale.disconnect(), timeout=5)
 
 
+# Earlier loads' connections this load retired. One may still stream a reply
+# (`retire`); its run's events reach this load's connection too (ELI-150).
+_retired_connections: list = []
+
+
+def _served_by_retired(payload: dict) -> bool:
+    _retired_connections[:] = [c for c in _retired_connections if getattr(c, "_consumers", None)]
+    return any(c.consumers_for_event(payload) for c in _retired_connections)
+
+
 async def _reap_stale_gateway_connection() -> None:
     try:
         import open_webui.socket.main as _owui_socket_main
@@ -6247,6 +6257,7 @@ async def _reap_stale_gateway_connection() -> None:
     for conn in stale_conns:
         try:
             await _retire_stale_connection(conn)
+            _retired_connections.append(conn)
             pipe_log(
                 "  reaped stale gateway connection from a previous deploy "
                 f"({type(conn).__module__})"
@@ -7429,8 +7440,8 @@ def _turn_route_now(conn: "_GatewayConnection", payload: dict) -> bool:
     if not parsed:
         _note_child_result(conn, payload)
         return False
-    if conn.consumers_for_event(payload):
-        return False
+    if conn.consumers_for_event(payload) or _served_by_retired(payload):
+        return False  # a live reply, here or on an earlier load's connection, writes it
     if run.startswith(ACTION_RUN_PREFIX):
         return True  # the Status Action's own runs render nothing
     if (sess, run) in conn._held_for_live:

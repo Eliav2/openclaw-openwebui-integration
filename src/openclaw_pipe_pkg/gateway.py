@@ -3046,6 +3046,16 @@ async def _retire_stale_connection(stale) -> None:
     await asyncio.wait_for(stale.disconnect(), timeout=5)
 
 
+# Earlier loads' connections this load retired. One may still stream a reply
+# (`retire`); its run's events reach this load's connection too (ELI-150).
+_retired_connections: list = []
+
+
+def _served_by_retired(payload: dict) -> bool:
+    _retired_connections[:] = [c for c in _retired_connections if getattr(c, "_consumers", None)]
+    return any(c.consumers_for_event(payload) for c in _retired_connections)
+
+
 async def _reap_stale_gateway_connection() -> None:
     try:
         import open_webui.socket.main as _owui_socket_main
@@ -3064,6 +3074,7 @@ async def _reap_stale_gateway_connection() -> None:
     for conn in stale_conns:
         try:
             await _retire_stale_connection(conn)
+            _retired_connections.append(conn)
             pipe_log(
                 "  reaped stale gateway connection from a previous deploy "
                 f"({type(conn).__module__})"
