@@ -891,6 +891,19 @@ class _Page:
                     and (e.get("data") or {}).get("type") == "chat:completion"
                     and isinstance(e["data"].get("data"), dict)]
 
+    def summary(self, message_id: str, since: float = 0.0) -> str:
+        """Every event for one message, for a failure message: when, its
+        type, the keys of its data and the text it shows."""
+        with self.cond:
+            rows = [(t, e) for t, e in self.events if e.get("message_id") == message_id]
+        out = []
+        for t, e in rows:
+            d = (e.get("data") or {}).get("data")
+            keys = sorted(d) if isinstance(d, dict) else type(d).__name__
+            shown = _shown(d)[-60:] if isinstance(d, dict) else ""
+            out.append(f"  {t - since:7.2f}s {(e.get('data') or {}).get('type')} {keys} {shown!r}")
+        return f"{len(rows)} event(s) for {message_id[:8]}:\n" + "\n".join(out[-60:])
+
     def close(self) -> None:
         self.ws.close()
 
@@ -972,6 +985,7 @@ def _redeploy_plain() -> tuple[subprocess.Popen, threading.Event, list]:
 def test_a_plain_redeploy_mid_reply_leaves_the_reply_whole(token):
     page = _Page(token)
     try:
+        sent_at = time.monotonic()
         chat_id, aid = _send_in_chat(token, page, None, "E2E_DEPLOY_SCENE")
 
         # Redeploy once the first tool card is done and the text after it streams.
@@ -990,6 +1004,7 @@ def test_a_plain_redeploy_mid_reply_leaves_the_reply_whole(token):
 
         # Precondition: the new code went in while the reply was streaming.
         done_at = next(t for t, d in events if d.get("done"))
+        print(page.summary(aid, sent_at), f"\nredeploy at {deployed_at - sent_at:.2f}s")
         assert deployed_at < done_at, "the reply finished before the redeploy; nothing was tested"
         shown_then = max((_shown(d) for t, d in events if t <= deployed_at), key=len, default="")
         assert "end-1" not in shown_then, f"the redeploy came too late: {shown_then[-200:]!r}"
