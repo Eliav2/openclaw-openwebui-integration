@@ -111,17 +111,6 @@ class RenderJsTests(unittest.TestCase):
         self.assertTrue(js.strip().startswith("(function()"))
         self.assertTrue(js.strip().endswith("})();"))
 
-    def test_open_js_creates_three_independent_section_skeletons(self):
-        """Each query gets its own loading state. Structural guard that the three sections exist as
-        distinct, independently-targetable containers from the start."""
-        js = _render_modal_open_js({"chatId": None, "messageId": None, "sessionId": None, "owuiModel": None})
-        for section_id in (
-            "openclaw-status-section-context",
-            "openclaw-status-section-limits",
-            "openclaw-status-section-subagents",
-        ):
-            self.assertIn(section_id, js)
-
     def test_adversarial_strings_stay_inside_the_json_blob(self):
         """Quotes, backslashes, and a fake </script> tag must not be able to
         terminate the JS string/close the <script> the execute event runs
@@ -137,113 +126,14 @@ class RenderJsTests(unittest.TestCase):
         self.assertEqual(parsed["provider"], nasty)
         self.assertNotIn("</script>", js.replace("<\\/script>", ""))
 
-    def test_bar_and_error_colors_are_inline_not_tailwind_classes(self):
-        """Regression guard: 'bg-rose-500' (and friends) rendered as an
-        invisible bar in production because Tailwind only ships utility
-        classes it finds referenced in ITS OWN build's source -- OWUI's
-        frontend never uses "rose" anywhere, so that class had zero CSS
-        behind it despite looking like a normal Tailwind color utility.
-        Every dynamic traffic-light color must be an inline style."""
+    def test_traffic_light_colours_are_inline_not_tailwind_classes(self):
+        """'bg-rose-500' rendered as an invisible bar: OWUI's Tailwind build
+        ships only the utilities its own source uses. The colours are
+        inline styles (DialogSectionTests checks the values)."""
         js = _render_modal_open_js({"chatId": None, "messageId": None, "sessionId": None, "owuiModel": None})
+        executable = "\n".join(l for l in js.splitlines() if not l.strip().startswith("//"))
         for leftover in ("bg-rose", "bg-amber", "bg-emerald", "text-rose"):
-            executable = "\n".join(l for l in js.splitlines() if not l.strip().startswith("//"))
             self.assertNotIn(leftover, executable)
-        self.assertIn("style.backgroundColor = barColor", js)
-        self.assertIn("#f43f5e", js)  # rose-500 equivalent, as a literal hex now
-        self.assertIn("#f59e0b", js)  # amber-500 equivalent
-        self.assertIn("#10b981", js)  # emerald-500 equivalent
-
-    def test_limits_shows_explicit_note_when_windows_empty(self):
-        """Regression guard for a reported confusion: "why does it sometimes
-        show only Context and no Rate Limits?". Root cause was a
-        real gateway-side gap (usage.status can transiently report zero
-        windows for the active provider while a run is in flight), not a
-        bug here -- the section must always show its header (given a real
-        provider) with either the data or an explicit note, never nothing."""
-        js = _render_limits_fill_js({
-            "provider": "anthropic", "windows": [], "sessionActive": True,
-            "source": "pipe", "fetchedAt": "12:00:00", "error": None,
-        })
-        self.assertIn("Rate Limits", js)
-        self.assertIn("No rate-limit data available", js)
-        self.assertIn("a response is in progress", js)
-
-    def test_limits_note_is_gated_on_empty_windows_not_always_shown(self):
-        """_render_limits_fill_js returns JS *source*, not a rendered
-        result -- both the note branch and the per-window render loop are
-        always present as code regardless of data, so the only thing
-        checkable from Python is that the note is correctly gated behind
-        `DATA.windows.length === 0` rather than unconditional."""
-        js = _render_limits_fill_js({
-            "provider": "anthropic",
-            "windows": [{"label": "5h", "usedPercent": 50, "resetIn": None, "resetAtMs": None}],
-            "sessionActive": False, "source": "pipe", "fetchedAt": "12:00:00", "error": None,
-        })
-        gate_idx = js.index("if (DATA.windows.length === 0)")
-        note_idx = js.index("No rate-limit data available")
-        loop_idx = js.index("DATA.windows.forEach")
-        self.assertTrue(gate_idx < note_idx < loop_idx)
-
-    def test_limits_reset_shows_both_relative_and_absolute(self):
-        """Relative countdown from the server, absolute clock time computed
-        client-side (browser's own timezone, not the gateway container's)."""
-        js = _render_limits_fill_js({
-            "provider": "anthropic",
-            "windows": [{"label": "5h", "usedPercent": 50, "resetIn": "1h21m", "resetAtMs": 1783790000000}],
-            "sessionActive": False, "source": "pipe", "fetchedAt": "12:00:00", "error": None,
-        })
-        self.assertIn("resetAtMs", js)
-        self.assertIn("toLocaleTimeString", js)
-        self.assertIn("'resets in ' + w.resetIn", js)
-
-    def test_compact_button_gated_on_identity_fields_present(self):
-        """The Compact button's click handler needs chatId/messageId/
-        sessionId (embedded in IDENTITY at open time, read via
-        S.identity.*) to build a working callback -- the context fill must
-        gate the button's creation on all three being present."""
-        js = _render_context_fill_js({
-            "provider": "x", "model": "", "context": {"usedTokens": "1k", "totalTokens": "10k", "pct": 10.0},
-            "goal": None, "source": "pipe", "fetchedAt": "12:00:00", "error": None,
-        })
-        self.assertIn("S.identity.chatId && S.identity.messageId && S.identity.sessionId", js)
-        self.assertIn("compactBtn", js)
-        self.assertIn("S.triggerCompact", js)
-
-    def test_compact_fetch_targets_this_same_action_with_mode_marker(self):
-        js = _render_modal_open_js({"chatId": "c1", "messageId": "m1", "sessionId": "s1", "owuiModel": "x.y"})
-        self.assertIn("/api/chat/actions/openclaw_status_action", js)
-        self.assertIn("mode: 'compact'", js)
-        self.assertIn("localStorage.getItem('token')", js)
-
-    def test_subagents_hidden_entirely_when_tasks_empty(self):
-        """General tracking, no detail: a permanently
-        visible empty section for the common idle case would be more
-        clutter than signal -- gated in source, not just data-dependent
-        text, so it truly renders nothing (not an empty header)."""
-        js = _render_subagents_fill_js({"tasks": [], "source": "pipe", "fetchedAt": "12:00:00", "error": None})
-        gate_idx = js.index("if (!tasks.length && !agents.length)")
-        header_idx = js.index("countLabel('Subagents'")
-        self.assertLess(gate_idx, header_idx)
-
-    def test_subagents_shows_clickable_rows_when_nonempty(self):
-        # _render_subagents_fill_js returns JS *source*: task fields are
-        # runtime values substituted into the DOM-building code, not
-        # literal rendered text, so check the JSON payload plus the
-        # row-building/click-handler expressions rather than rendered text.
-        tasks = [
-            {"id": "t1", "title": "Research X", "status": "running", "progressSummary": "reading docs",
-             "terminalSummary": None, "error": None, "childSessionKey": "sess-1",
-             "startedAt": 1783790000000, "endedAt": None},
-        ]
-        js = _render_subagents_fill_js({"tasks": tasks, "source": "pipe", "fetchedAt": "12:00:00", "error": None})
-        self.assertIn('"title": "Research X"', js)
-        self.assertIn("S.openSubagentDrawer(t)", js)
-        self.assertIn("S.elapsedTime(t.startedAt, t.endedAt)", js)
-
-    def test_sections_error_js_uses_shared_error_helper(self):
-        js = _render_sections_error_js("boom")
-        self.assertIn("openclaw-status-sections", js)
-        self.assertIn('"boom"', js)
 
 
 # A page just big enough for the Status dialog's own JS: elements with
@@ -335,6 +225,114 @@ for (const step of input.steps) {
 }
 console.log(JSON.stringify(seen));
 """
+
+
+_SECTIONS_PAGE_JS = _FAKE_DOM_JS + r"""
+const fetches = [];
+global.localStorage = { getItem: (k) => (k === 'token' ? 'tok-1' : null) };
+global.fetch = (url, opts) => {
+  fetches.push({ url, auth: opts.headers.Authorization, body: JSON.parse(opts.body) });
+  return Promise.resolve({});
+};
+run(input.open);
+input.fills.forEach(run);
+const el = (id) => document.getElementById(id);
+const text = (id) => (el(id) ? el(id).textContent : null);
+const ctx = el('openclaw-status-section-context');
+const compact = ctx ? ctx.walk().find((e) => e.tagName === 'BUTTON' && e.textContent === 'Compact') : null;
+if (input.click && compact) compact.onclick();
+console.log(JSON.stringify({
+  sections: ['context', 'limits', 'subagents'].map((n) => !!el('openclaw-status-section-' + n)),
+  context: text('openclaw-status-section-context'),
+  limits: text('openclaw-status-section-limits'),
+  wrap: text('openclaw-status-sections'),
+  bars: ctx ? ctx.walk().filter((e) => e.style.width).map((e) => e.style.backgroundColor) : [],
+  compact: !!compact,
+  fetches,
+}));
+"""
+
+FULL_IDENTITY = {"chatId": "c1", "messageId": "m1", "sessionId": "s1", "owuiModel": "x.y"}
+
+
+class DialogSectionTests(unittest.TestCase):
+    """The Status dialog's Context, Rate Limits and error fills, run on a
+    fake page: what a reader sees, not what the JS source contains."""
+
+    def _page(self, fills, identity=FULL_IDENTITY, click=False, tz="UTC"):
+        import shutil
+        import subprocess
+        runtime = shutil.which("bun") or shutil.which("node")
+        if runtime is None:
+            self.skipTest("no bun or node")
+        payload = {"now": 1, "open": _render_modal_open_js(identity), "fills": fills, "click": click}
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
+            fh.write(_SECTIONS_PAGE_JS)
+        try:
+            out = subprocess.run([runtime, fh.name], input=json.dumps(payload), capture_output=True,
+                                 text=True, timeout=60, env={**os.environ, "TZ": tz})
+        finally:
+            os.unlink(fh.name)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout)
+
+    @staticmethod
+    def _context(pct):
+        return _render_context_fill_js({
+            "provider": "anthropic", "model": "claude-opus-5-5",
+            "context": {"usedTokens": "34k", "totalTokens": "1.0m", "pct": pct},
+            "goal": None, "source": "pipe", "fetchedAt": 1, "error": None})
+
+    @staticmethod
+    def _limits(windows, session_active=False):
+        return _render_limits_fill_js({"provider": "anthropic", "windows": windows,
+                                       "sessionActive": session_active, "source": "pipe",
+                                       "fetchedAt": 1, "error": None})
+
+    def test_the_dialog_opens_with_three_sections(self):
+        self.assertEqual(self._page([])["sections"], [True, True, True])
+
+    def test_the_context_bar_colour_follows_usage(self):
+        for pct, colour in ((95, "#f43f5e"), (70, "#f59e0b"), (10, "#10b981")):
+            with self.subTest(pct=pct):
+                seen = self._page([self._context(pct)])
+                self.assertEqual(seen["bars"], [colour])
+                self.assertIn("34k / 1.0m tokens", seen["context"])
+
+    def test_no_windows_shows_a_note_and_why(self):
+        seen = self._page([self._limits([], session_active=True)])
+        self.assertIn("Rate Limits", seen["limits"])
+        self.assertIn("No rate-limit data available right now (a response is in progress).", seen["limits"])
+
+    def test_windows_show_without_the_note(self):
+        seen = self._page([self._limits([{"label": "5h", "usedPercent": 50, "resetIn": None,
+                                           "resetAtMs": None}])])
+        self.assertIn("5h50% used", seen["limits"])
+        self.assertNotIn("No rate-limit data", seen["limits"])
+
+    def test_a_reset_shows_relative_and_the_readers_clock(self):
+        reset_at = int(datetime.datetime(2026, 10, 16, 9, 30, tzinfo=datetime.timezone.utc).timestamp() * 1000)
+        window = {"label": "5h", "usedPercent": 50, "resetIn": "1h21m", "resetAtMs": reset_at}
+        self.assertIn("resets in 1h21m · 09:30", self._page([self._limits([window])])["limits"])
+        self.assertIn("resets in 1h21m · 12:30",
+                      self._page([self._limits([window])], tz="Asia/Jerusalem")["limits"])
+
+    def test_compact_needs_the_whole_identity(self):
+        self.assertTrue(self._page([self._context(10)])["compact"])
+        for missing in ("chatId", "messageId", "sessionId"):
+            with self.subTest(missing=missing):
+                self.assertFalse(self._page([self._context(10)], {**FULL_IDENTITY, missing: None})["compact"])
+
+    def test_compact_posts_back_to_this_action(self):
+        seen = self._page([self._context(10)], click=True)
+        self.assertEqual(seen["fetches"], [{
+            "url": "/api/chat/actions/openclaw_status_action", "auth": "Bearer tok-1",
+            "body": {"model": "x.y", "chat_id": "c1", "id": "m1", "session_id": "s1", "mode": "compact"}}])
+
+    def test_a_dialog_error_replaces_every_section(self):
+        seen = self._page([self._context(10), _render_sections_error_js("Gateway unreachable")])
+        self.assertEqual(seen["wrap"], "Gateway unreachable")
+        self.assertEqual(seen["sections"], [False, False, False])
 
 
 class DrawerToolCardsStayOpenTests(unittest.TestCase):
@@ -1324,10 +1322,6 @@ class SubagentProactiveMessageClickTests(unittest.IsolatedAsyncioTestCase):
         detail_m.assert_not_awaited()
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class UpdatedTimeIsTheBrowsersClockTests(unittest.IsolatedAsyncioTestCase):
     """ELI-140 (2026-10-15): the footer's "Updated HH:MM:SS" came from the
     Open WebUI server's clock (`time.strftime`), while the rate-limit resets
@@ -1487,3 +1481,7 @@ process.stdout.write(JSON.stringify({dialog: links('openclaw-status-modal-root')
                                                    "status": "running", "controlUiUrl": None}))
         self.assertEqual(seen["dialog"], [])
         self.assertEqual(seen["drawer"], [])
+
+
+if __name__ == "__main__":
+    unittest.main()
