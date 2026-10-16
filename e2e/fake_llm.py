@@ -28,6 +28,8 @@ whole):
 A tool the agent does not offer directly is called through `tool_call` when
 that is offered: from OpenClaw 2026.10 most tools are deferred behind
 `tool_search` / `tool_call` and only a core set is sent as real schemas.
+* `E2E_BG_EXEC`                        -> starts `sleep 25` with `exec` in the
+  background, then replies `E2E_BG_STARTED`.
 * `E2E_SLOW TOKEN`                     -> replies `TOKEN slow-1 ... slow-10`, one
   word a second, so a turn can be queued behind a run that is still going.
   `E2E_SLOW:<n> TOKEN` sends n words instead of 10 (a run that outlasts an
@@ -192,6 +194,18 @@ def plan_reply(body: dict) -> dict:
         if len(tool_results) == 1:
             return {"text": DEPLOY_MID, "delay": 1.0, **call}
         return {"text": DEPLOY_END, "delay": 1.0}
+
+    if "E2E_BG_EXEC" in user_text:
+        # One shell command left running in the background, for the Status
+        # Action's Background section (ELI-163).
+        if tool_results:
+            return {"text": "E2E_BG_STARTED"}
+        args = {"command": "sleep 25; echo e2e-bg-done", "background": True}
+        if "exec" in offered:
+            return {"tool": "exec", "args": args}
+        if "tool_call" in offered:
+            return {"tool": "tool_call", "args": {"id": "exec", "args": args}}
+        return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
 
     if "E2E_SPAWN" in user_text:
         # Spawn one sub-agent whose own run is slow, so it is still running

@@ -820,7 +820,17 @@ def test_the_status_action_lists_a_running_subagent_and_opens_its_drawer(token):
         {"chat_id": chat_id}, __user__={"id": me["id"]}, __event_emitter__=emit))
     reopened = _section_data(codes, "openclaw-status-section-subagents")
     assert [(t["id"], t["status"]) for t in reopened["tasks"]] == [(row["id"], "completed")], reopened
-    assert reopened["total"] == 1 and reopened["agents"] == [], reopened
+    assert reopened["total"] == 1, reopened
+    # Nothing runs, so the section opens folded and its transcripts wait for
+    # the reader's tap (ELI-163); the tap reads them and titles the row.
+    assert reopened["pending"] is True, reopened
+    assert _section_data(codes, "openclaw-status-section-agents")["agents"] == []
+    dialog_id = json.loads(re.search(r"const IDENTITY = (.*?);\n", codes[0]).group(1))["dialogId"]
+    codes = _run_action(token, lambda a, emit: a.action(
+        {"chat_id": chat_id, "mode": "subagent-rows", "dialogId": dialog_id},
+        __user__={"id": me["id"]}, __event_emitter__=emit))
+    tapped = _section_data(codes, "openclaw-status-section-subagents")
+    assert tapped["pending"] is False and tapped["tasks"][0]["title"] == SPAWN_TASK, tapped
 
     # The drawer, once the child is done: its status, its task in the
     # header, and its run ending with its reply.
@@ -849,6 +859,80 @@ def test_the_status_action_lists_a_running_subagent_and_opens_its_drawer(token):
 import shutil  # noqa: E402
 
 DOWN_RUN_WORDS = 40
+
+
+# ── The Status Action's Background section (ELI-163) ─────────────────────────
+
+import types  # noqa: E402
+from unittest import mock  # noqa: E402
+
+
+def _background(tok: str, chat_id: str) -> tuple[dict, list]:
+    me = _me(tok)
+    codes = _run_action(tok, lambda a, emit: a.action(
+        {"chat_id": chat_id}, __user__={"id": me["id"]}, __event_emitter__=emit))
+    return _section_data(codes, "openclaw-status-section-background"), codes
+
+
+def test_the_status_action_lists_a_background_command(token):
+    chat_id, msg = _chat_turn(token, "E2E_BG_EXEC")
+    assert msg.get("content", "").strip() == "E2E_BG_STARTED", msg
+    data, _codes = _background(token, chat_id)
+    assert data["error"] is None and data["errors"] == [], data
+    assert data["tasksAvailable"] is True, data
+    commands = [r for r in data["rows"] if r["kind"] == "Command"]
+    # Titled by the command its tool card ran, not the Gateway's "CLI command".
+    assert [(r["title"], r["status"]) for r in commands] == [("sleep 25; echo e2e-bg-done", "running")], data
+
+
+class _LiveFunctions:
+    """`open_webui.models.functions` for the Action run in this process: the
+    live Open WebUI's saved Pipe valves, over its REST API. Inside Open WebUI
+    the Action reads them from its own models; that is where OWNER_USERS is."""
+
+    def __init__(self, token: str):
+        self.token = token
+
+    def get_functions_by_type(self, kind):
+        status, fns = _request("GET", "/api/v1/functions/", token=self.token)
+        assert status == 200, fns
+        return [types.SimpleNamespace(id=f["id"]) for f in fns if f.get("type") == kind]
+
+    def get_function_valves_by_id(self, fid):
+        status, valves = _request("GET", f"/api/v1/functions/id/{fid}/valves", token=self.token)
+        assert status == 200, valves
+        return valves
+
+
+def test_a_user_not_in_owner_users_never_sees_the_gateways_automations(token, guest_token):
+    """Red team, through the real path: the guest's own Status dialog, read
+    from the stack's Gateway with the installed Action's settings and the
+    Pipe's saved OWNER_USERS (the owner's user id)."""
+    me = _me(token)
+    _set_owner_users(token, me["id"])
+    functions = types.ModuleType("open_webui.models.functions")
+    functions.Functions = _LiveFunctions(token)
+    owui = {"open_webui": types.ModuleType("open_webui"), "open_webui.models": types.ModuleType("open_webui.models"),
+            "open_webui.models.functions": functions}
+    job = _gw("cron.add", {"name": "e2e-owner-only-automation", "schedule": {"kind": "cron", "expr": "0 4 1 1 *"},
+                           "sessionTarget": "isolated", "payload": {"kind": "agentTurn", "message": "noop"},
+                           "delivery": {"mode": "none"}, "agentId": "main"})
+    try:
+        o_chat, _ = _chat_turn(token, "Respond with exactly: E2E_OWNER_BG")
+        with mock.patch.dict(sys.modules, owui):
+            owner_view, _ = _background(token, o_chat)
+        # Precondition: the owner does see it, so the guest's empty list is the filter.
+        assert owner_view["owner"] is True, owner_view
+        assert "e2e-owner-only-automation" in [r["title"] for r in owner_view["automations"]], owner_view
+        g_chat, _ = _chat_turn(guest_token, "Respond with exactly: E2E_GUEST_BG")
+        with mock.patch.dict(sys.modules, owui):
+            guest_view, codes = _background(guest_token, g_chat)
+        assert guest_view["owner"] is False, guest_view
+        assert guest_view["automations"] == [] and guest_view["automationsTotal"] == 0, guest_view
+        assert not any("e2e-owner-only-automation" in c for c in codes), "an owner automation reached the guest's page"
+    finally:
+        _gw("cron.remove", {"id": job.get("id")})
+        _set_owner_users(token, "")
 
 
 def _session_row(key: str) -> dict:
