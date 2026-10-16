@@ -36,6 +36,7 @@ REJOIN_S = 5
 SCENE = "ELI115_REPLAY_TOOLS"      # replay-scene.json
 DONE = "ELI115_REPLAY_DONE"
 TURN_TIMEOUT_S = 900
+PAGE_SAVES = os.environ.get("PAGE_SAVES", "1") == "1"
 
 
 def owui_pid():
@@ -293,7 +294,9 @@ async def main():
     t0 = time.monotonic()
     with Peak() as p:
         background = [asyncio.ensure_future(rejoining_tab(token, cid, stop, joins)) for cid, _ in chats]
-        background += [asyncio.ensure_future(page_saves(c, h, cid, chat, stop, save_lat)) for cid, chat in chats]
+        if PAGE_SAVES:
+            background += [asyncio.ensure_future(page_saves(c, h, cid, chat, stop, save_lat))
+                           for cid, chat in chats]
         turns = await asyncio.gather(*(chat_turns(c, h, user_id, cid, chat, tab)
                                        for (cid, chat), tab in zip(chats, tabs)))
         took = time.monotonic() - t0
@@ -309,7 +312,7 @@ async def main():
                 for cid, ch in chats}
     pushes = [j for j in joins if j.get("pushed")]
     row = {"kind": "pipe-replay", "variant": os.environ.get("VARIANT"), "ref": os.environ.get("REF"),
-           "rep": os.environ.get("REP"), "tools": TOOLS, "chats_mb": SIZES,
+           "rep": os.environ.get("REP"), "page_saves_on": PAGE_SAVES, "tools": TOOLS, "chats_mb": SIZES,
            "before": before, "peak": p.peak, "anon_peak": p.anon_peak, "after": anon + swap,
            "swap_after": swap, "s": round(took, 1),
            "page_saves": len(save_lat), "page_save_avg_s": round(sum(save_lat) / max(1, len(save_lat)), 2),
