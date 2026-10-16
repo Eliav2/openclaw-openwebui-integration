@@ -107,8 +107,7 @@ The installer (or `healthcheck`) ends with:
 
 and the agent's reply streaming into the chat:
 
-![The agent's first reply in Open WebUI after install](../img/first-reply-light.png#gh-light-mode-only)
-![The agent's first reply in Open WebUI after install](../img/first-reply-dark.png#gh-dark-mode-only)
+![The agent's first reply in Open WebUI after install](../img/first-reply-light.png)
 
 ## Something off?
 

@@ -5,8 +5,7 @@ Valves: `OWUI_API_KEY`
 
 ## What you see
 
-![A reply a cron job wrote into the chat, with no user message above it](../img/agent-turn-light.png#gh-light-mode-only)
-![A reply a cron job wrote into the chat, with no user message above it](../img/agent-turn-dark.png#gh-dark-mode-only)
+![A reply a cron job wrote into the chat, with no user message above it](../img/agent-turn-light.png)
 
 When a run starts on a chat's session that you did not start from Open WebUI, the Pipe adds an assistant message at the end of that chat and streams the run into it, exactly as it streams your own replies: text token by token, tool cards that spin and complete, failed tools marked.
 
@@ -37,8 +36,7 @@ Heartbeats never get a message: the Gateway hides heartbeat output itself, and h
 
 A sub-agent's own session is not a chat, so nothing is written for it directly. Its result reaches the chat through the parent:
 
-![The parent's first reply, then its reply to the sub-agent's result, with no message from you in between](../img/subagent-result-light.png#gh-light-mode-only)
-![The parent's first reply, then its reply to the sub-agent's result, with no message from you in between](../img/subagent-result-dark.png#gh-dark-mode-only)
+![The parent's first reply, then its reply to the sub-agent's result, with no message from you in between](../img/subagent-result-light.png)
 
 - **Parent idle:** the Gateway hands the result to the parent as a new run. That run is an ordinary reply in the chat, and it usually quotes or summarises the result.
 - **Parent still running:** the result is steered into the running parent run, and shows up in the reply you are already watching.

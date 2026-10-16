@@ -3,8 +3,8 @@ name: Screenshots
 # The README and docs screenshots, taken from the real stack on a GitHub
 # runner: Open WebUI, this integration as installed by its own installers, a
 # real OpenClaw Gateway running real tools, and a scripted model
-# (scripts/screenshots/scenes.json). Chromium in a phone viewport, light and
-# dark. Run it by hand after a UI change; the images come back as an artifact
+# (scripts/screenshots/scenes.json). Chromium in a phone viewport, light
+# theme only. Run it by hand after a UI change; the images come back as an artifact
 # to review, and the ones that are kept get committed under docs/img/.
 #
 # The stack differs from the E2E one only in what shows up on screen: the

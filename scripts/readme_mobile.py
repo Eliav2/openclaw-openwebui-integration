@@ -2,7 +2,7 @@
 """Photograph a README the way a phone shows it on github.com.
 
 Opens the rendered README (the blob page) and the repository's front page in
-a 390 px phone viewport, light and dark, and writes one PNG per screen
+a 390 px phone viewport, light theme, and writes one PNG per screen
 (844 px tall), top to bottom. Also prints where the hero image and the Quick
 start heading land, counted in screens, which is the README's scan test: both
 should be on screen one or two.
@@ -66,35 +66,34 @@ def main() -> int:
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
         try:
-            for theme in ("light", "dark"):
-                ctx = browser.new_context(viewport={"width": SCREEN_W, "height": SCREEN_H},
-                                          device_scale_factor=2, is_mobile=True, has_touch=True,
-                                          user_agent=UA, color_scheme=theme, locale="en-US")
-                page = ctx.new_page()
-                for name, url, limit in (("readme", readme_url, README_SCREENS),
-                                         ("home", home_url, HOME_SCREENS)):
-                    page.goto(url, wait_until="domcontentloaded")
-                    page.wait_for_selector("article.markdown-body", timeout=60_000)
-                    # Lazy images load as they scroll into view: walk down once.
-                    page.evaluate("""async () => {
-                      for (let y = 0; y < document.documentElement.scrollHeight; y += 600) {
-                        scrollTo(0, y); await new Promise((r) => setTimeout(r, 150));
-                      }
-                      scrollTo(0, 0);
-                    }""")
-                    page.wait_for_function(IMAGES_LOADED, timeout=60_000)
-                    marks = page.evaluate(LANDMARKS)
-                    if marks:
-                        # Screens of the page, and of the README itself (from
-                        # its first line, past GitHub's header or file list).
-                        for k in ("hero", "quickStart"):
-                            if marks.get(k) is not None:
-                                marks[k + "Screen"] = marks[k] // SCREEN_H + 1
-                                marks[k + "ReadmeScreen"] = (marks[k] - marks["readmeTop"]) // SCREEN_H + 1
-                    files = screens(page, a.out, f"{name}-{theme}", limit)
-                    report[f"{name}-{theme}"] = {"url": url, "landmarks": marks, "screens": len(files)}
-                    print(f"{name}-{theme}: {json.dumps(report[f'{name}-{theme}'])}", flush=True)
-                ctx.close()
+            ctx = browser.new_context(viewport={"width": SCREEN_W, "height": SCREEN_H},
+                                      device_scale_factor=2, is_mobile=True, has_touch=True,
+                                      user_agent=UA, color_scheme="light", locale="en-US")
+            page = ctx.new_page()
+            for name, url, limit in (("readme", readme_url, README_SCREENS),
+                                     ("home", home_url, HOME_SCREENS)):
+                page.goto(url, wait_until="domcontentloaded")
+                page.wait_for_selector("article.markdown-body", timeout=60_000)
+                # Lazy images load as they scroll into view: walk down once.
+                page.evaluate("""async () => {
+                  for (let y = 0; y < document.documentElement.scrollHeight; y += 600) {
+                    scrollTo(0, y); await new Promise((r) => setTimeout(r, 150));
+                  }
+                  scrollTo(0, 0);
+                }""")
+                page.wait_for_function(IMAGES_LOADED, timeout=60_000)
+                marks = page.evaluate(LANDMARKS)
+                if marks:
+                    # Screens of the page, and of the README itself (from
+                    # its first line, past GitHub's header or file list).
+                    for k in ("hero", "quickStart"):
+                        if marks.get(k) is not None:
+                            marks[k + "Screen"] = marks[k] // SCREEN_H + 1
+                            marks[k + "ReadmeScreen"] = (marks[k] - marks["readmeTop"]) // SCREEN_H + 1
+                files = screens(page, a.out, name, limit)
+                report[name] = {"url": url, "landmarks": marks, "screens": len(files)}
+                print(f"{name}: {json.dumps(report[name])}", flush=True)
+            ctx.close()
         finally:
             browser.close()
     with open(os.path.join(a.out, "report.json"), "w") as fh:

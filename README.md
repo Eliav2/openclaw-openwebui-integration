@@ -10,10 +10,7 @@ Chat with your OpenClaw agents from Open WebUI, on your phone, and watch them wo
 > You need a running [OpenClaw Gateway](https://github.com/openclaw/openclaw). This connects it to Open WebUI; it is not an agent itself. No OpenClaw yet? [Install it first](https://docs.openclaw.ai).
 
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./docs/img/hero-tool-cards-dark.png">
-    <img src="./docs/img/hero-tool-cards-light.png" alt="An agent at work in Open WebUI on a phone: two finished tool cards and one still running, with the agent's notes between them" width="320">
-  </picture>
+  <img src="./docs/img/hero-tool-cards-light.png" alt="An agent at work in Open WebUI on a phone: two finished tool cards and one still running, with the agent's notes between them" width="320">
 </p>
 
 ## What you get
@@ -58,10 +55,7 @@ You should see the installer end with:
 and the agent's first reply in the chat:
 
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./docs/img/first-reply-dark.png">
-    <img src="./docs/img/first-reply-light.png" alt="The agent's first reply in Open WebUI: it says hello and what it can do" width="320">
-  </picture>
+  <img src="./docs/img/first-reply-light.png" alt="The agent's first reply in Open WebUI: it says hello and what it can do" width="320">
 </p>
 
 Something off? `uv run install.py healthcheck` re-checks the install and runs the smoke test again. See also [Troubleshooting](./docs/troubleshooting.md).
@@ -106,30 +100,12 @@ What an older release loses, and the test runs behind these numbers: [Versions](
 ## In pictures
 
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./docs/img/tool-card-expanded-dark.png">
-    <img src="./docs/img/tool-card-expanded-light.png" alt="Live tool cards: a tool card opened to its command and its output" width="300">
-  </picture>
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./docs/img/question-card-dark.png">
-    <img src="./docs/img/question-card-light.png" alt="Questions as dialogs: a question from the agent as a card with three options and a Recommended tag" width="300">
-  </picture>
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./docs/img/status-dialog-dark.png">
-    <img src="./docs/img/status-dialog-light.png" alt="Status: context used, 5-hour and weekly rate limits, two running sub-agents" width="300">
-  </picture>
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./docs/img/model-picker-dark.png">
-    <img src="./docs/img/model-picker-light.png" alt="Every Gateway model: the model picker open, listing the models the Gateway allows" width="300">
-  </picture>
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./docs/img/agent-turn-dark.png">
-    <img src="./docs/img/agent-turn-light.png" alt="Cron jobs: a reply a cron job wrote into the open chat, with no message from you" width="300">
-  </picture>
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./docs/img/reload-mid-reply-dark.png">
-    <img src="./docs/img/reload-mid-reply-light.png" alt="Survives restarts: a reply right after a page reload, the answer so far still there and growing" width="300">
-  </picture>
+  <img src="./docs/img/tool-card-expanded-light.png" alt="Live tool cards: a tool card opened to its command and its output" width="300">
+  <img src="./docs/img/question-card-light.png" alt="Questions as dialogs: a question from the agent as a card with three options and a Recommended tag" width="300">
+  <img src="./docs/img/status-dialog-light.png" alt="Status: context used, 5-hour and weekly rate limits, two running sub-agents" width="300">
+  <img src="./docs/img/model-picker-light.png" alt="Every Gateway model: the model picker open, listing the models the Gateway allows" width="300">
+  <img src="./docs/img/agent-turn-light.png" alt="Cron jobs: a reply a cron job wrote into the open chat, with no message from you" width="300">
+  <img src="./docs/img/reload-mid-reply-light.png" alt="Survives restarts: a reply right after a page reload, the answer so far still there and growing" width="300">
 </p>
 <p align="center"><sub>The list under "What you get", in order: a tool card opened, a question mid-reply, the Status dialog, the model picker, a cron reply in an open chat, and a reply after a page reload. The rate limits are sample data. Every feature's own screenshot is on its page in the <a href="./docs/features/index.md">feature list</a>.</sub></p>
 

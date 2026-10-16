@@ -7,8 +7,7 @@ Valves: `USE_OWUI_FILES`, `OWUI_BASE_URL`, `OWUI_API_KEY`, `ENABLE_FILE_SERVER`,
 
 Text appears token by token as the Gateway sends it, so a long answer starts showing at once instead of landing in one block at the end.
 
-![A reply part-way through: its first paragraph written, the rest still coming](../img/streaming-light.png#gh-light-mode-only)
-![A reply part-way through: its first paragraph written, the rest still coming](../img/streaming-dark.png#gh-dark-mode-only)
+![A reply part-way through: its first paragraph written, the rest still coming](../img/streaming-light.png)
 
 Two provider quirks are handled so you never see them:
 
@@ -21,15 +20,13 @@ Always on.
 
 ## Tool cards
 
-![A reply mid-run: two finished tool cards and one still running](../img/hero-tool-cards-light.png#gh-light-mode-only)
-![A reply mid-run: two finished tool cards and one still running](../img/hero-tool-cards-dark.png#gh-dark-mode-only)
+![A reply mid-run: two finished tool cards and one still running](../img/hero-tool-cards-light.png)
 
 Tool calls are sent as Responses-API output items, so Open WebUI draws them with its own two-phase tool card: a spinner while the tool runs, the result when it finishes. Nothing is hand-rolled HTML, so the cards match the rest of the UI and survive a reload.
 
 Expand a card to see the arguments the agent passed and the result it got back. Arguments are capped at 3000 characters and results at 8000, so one huge tool result cannot bury the conversation.
 
-![A tool card opened: the command it ran and its output](../img/tool-card-expanded-light.png#gh-light-mode-only)
-![A tool card opened: the command it ran and its output](../img/tool-card-expanded-dark.png#gh-dark-mode-only)
+![A tool card opened: the command it ran and its output](../img/tool-card-expanded-light.png)
 
 A call that arrives without a tool-call id still shows: it falls back to a Markdown `<details type="tool_calls">` card rather than disappearing. The status row under the message tracks the same events in words: "Running \<tool\>..." then "\<tool\> done".
 
@@ -37,8 +34,7 @@ Always on. Native cards need a recent Open WebUI; on older releases they fall ba
 
 ## Sub-agent cards
 
-![A sub-agent's card opened: named after the sub-agent, the first lines of its task, and one line saying it started](../img/spawn-card-light.png#gh-light-mode-only)
-![A sub-agent's card opened: named after the sub-agent, the first lines of its task, and one line saying it started](../img/spawn-card-dark.png#gh-dark-mode-only)
+![A sub-agent's card opened: named after the sub-agent, the first lines of its task, and one line saying it started](../img/spawn-card-light.png)
 
 When the agent starts a sub-agent (`sessions_spawn`), its card is named after the sub-agent: 🤖 and the name the agent gave it, or the first sentence of its task, cut to 60 characters, when it gave none. Several sub-agents started in a row group as "Explored 🤖 Fly.io pricing, 🤖 Render pricing".
 
@@ -50,8 +46,7 @@ Always on.
 
 ## Failed tools
 
-![A reply streaming: a read card marked with a cross because the file is missing, and an exec card still running](../img/failed-tool-live-light.png#gh-light-mode-only)
-![A reply streaming: a read card marked with a cross because the file is missing, and an exec card still running](../img/failed-tool-live-dark.png#gh-dark-mode-only)
+![A reply streaming: a read card marked with a cross because the file is missing, and an exec card still running](../img/failed-tool-live-light.png)
 
 A tool call that fails gets its card renamed to `<name> ❌` the moment the result arrives, on any card, not only the last one. The mark is part of the saved message, so it is still there after a reload. The expanded output opens with a `❌ tool call failed` line, so the reason is visible once you open the card.
 
@@ -63,8 +58,7 @@ Always on.
 
 With the [thinking filter](../install/thinking-filter.md) installed, a toggle in the composer sets the reasoning level per chat: `default`, `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`.
 
-![The thinking level in Chat Controls > Valves, its choices listed: default, off, minimal, low, medium, high](../img/thinking-level-light.png#gh-light-mode-only)
-![The thinking level in Chat Controls > Valves, its choices listed: default, off, minimal, low, medium, high](../img/thinking-level-dark.png#gh-dark-mode-only)
+![The thinking level in Chat Controls > Valves, its choices listed: default, off, minimal, low, medium, high](../img/thinking-level-light.png)
 
 - `default` is not a level, it is the absence of one. No `thinking` field is sent, and the agent's own setting applies.
 - `off` is an explicit instruction not to think, and it does override the agent's setting.
@@ -83,8 +77,7 @@ The filter and Open WebUI's own Advanced Params reasoning-effort control write t
 
 _Needs agent setup: the agent must emit `MEDIA:<bare-filename>`, see [agent skills](../install/agent-skills.md)._
 
-![A reply from a cron job: a chart image, then text under it](../img/media-turn-light.png#gh-light-mode-only)
-![A reply from a cron job: a chart image, then text under it](../img/media-turn-dark.png#gh-dark-mode-only)
+![A reply from a cron job: a chart image, then text under it](../img/media-turn-light.png)
 
 When the agent emits a `MEDIA:<filename>` line and the file exists in the Pipe's media directory (`/tmp/openclaw-pipe-media`), the Pipe:
 
@@ -106,8 +99,7 @@ Valves: [`USE_OWUI_FILES`](../configuration.md#use_owui_files) (on), [`OWUI_BASE
 
 An image you attach or paste reaches the Pipe as a list of content blocks, not the plain string Open WebUI sends for text. The Pipe takes each `image_url` block, parses the `data:<mime>;base64,<data>` URI Open WebUI sends, and forwards it to the agent as a `chat.send` attachment with its MIME type and a matching file extension. A vision-capable model gets the real image bytes, not a description.
 
-![A chart attached to a message, and the agent's reply about it](../img/image-input-light.png#gh-light-mode-only)
-![A chart attached to a message, and the agent's reply about it](../img/image-input-dark.png#gh-dark-mode-only)
+![A chart attached to a message, and the agent's reply about it](../img/image-input-light.png)
 
 Only that inline base64 form is handled, because Open WebUI does not send plain HTTP(S) image URLs for attached or pasted images. An image the Pipe cannot forward produces a visible note that it could not be relayed, so you never get an answer confidently describing a picture the agent never received.
 
@@ -117,8 +109,7 @@ Always on.
 
 After every reply, a status row shows where you stand:
 
-![The status rows under a reply, opened: the goal and the context used](../img/usage-goal-light.png#gh-light-mode-only)
-![The status rows under a reply, opened: the goal and the context used](../img/usage-goal-dark.png#gh-dark-mode-only)
+![The status rows under a reply, opened: the goal and the context used](../img/usage-goal-light.png)
 
 > 🧠 34k/1.0m (3.5%) · ⏱ 5h 62% left
 
@@ -136,8 +127,7 @@ Always on.
 
 The chat names itself with a short title and an emoji. When you send your second message, the Pipe titles the chat from the first exchange (your first message and the first reply).
 
-![A chat titled by the Pipe after its second message, the title in the header](../img/chat-titles-light.png#gh-light-mode-only)
-![A chat titled by the Pipe after its second message, the title in the header](../img/chat-titles-dark.png#gh-dark-mode-only)
+![A chat titled by the Pipe after its second message, the title in the header](../img/chat-titles-light.png)
 
 Generation runs on a separate agent, `title-gen` by default, as a background task, so it never queues behind your conversation or adds to its context, and a failure never shows. The model's output is trimmed of quotes, extra lines and anything past 80 characters before it becomes the title. If that agent does not exist on your Gateway, titles are skipped silently: define a `title-gen` agent (a fast model is enough) or point `TITLE_GEN_AGENT_ID` at one you have.
 

@@ -17,12 +17,14 @@ A user-visible feature is anything a user sees, sets or runs: something in the c
 1. **`docs/features/index.md`:** its bullet, linking to its section.
 2. **Its page:** the section in `docs/features/` (or `docs/install/` for setup) that describes it, with its valves linked to `docs/configuration.md#<valve>`. `docs/configuration.md` is generated from the Valves classes: run `python3 build.py --all` after changing a valve.
 3. **The README's "What you get":** only when the feature is headline-level. Its image then also goes in the README's "In pictures".
-4. **Its screenshot:** a scene in `scripts/screenshots/scenes.json` and `capture.py`, taken by the Screenshots workflow in light and dark, committed to `docs/img/` and shown next to its description. A feature with nothing on screen shows real log or command output as a code block instead.
+4. **Its screenshot:** a scene in `scripts/screenshots/scenes.json` and `capture.py`, taken by the Screenshots workflow, committed to `docs/img/` and shown next to its description. A feature with nothing on screen shows real log or command output as a code block instead.
 5. **`docs/versions.md`:** when the feature needs a newer Open WebUI or OpenClaw than the minimums.
 
 A PR that changes how something already documented behaves (a fix included) corrects the text and images that no longer hold, in the same PR. A stale doc is a bug in that PR, not a follow-up.
 
-A PR with a visual change shows Before and After images in its description, from the Screenshots workflow.
+One screenshot per scene, in the light theme: no dark copies, in the docs or anywhere else.
+
+A PR with a visual change shows one Before and After pair in its description, light theme, from the Screenshots workflow.
 
 Every PR description has a `Docs:` line: what it updated, or "no change needed" and why, so the reviewer can check the claim.
 

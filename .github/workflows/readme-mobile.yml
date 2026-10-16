@@ -1,6 +1,6 @@
 name: README on a phone
 
-# How the README renders on github.com in a phone viewport, light and dark,
+# How the README renders on github.com in a phone viewport, light theme,
 # screen by screen (scripts/readme_mobile.py). The review check for a README
 # change: the images render, and the hero and "Quick start" are within the
 # first two screens. Runs on a push to a docs/readme branch, or by hand.

@@ -6,8 +6,8 @@ up Open WebUI, the Gateway and the scripted model (scenes.json). Every shot is
 a real page in a phone-sized Chromium: real Open WebUI, the installed Pipe and
 Action, a real Gateway running real tools against a small sample project.
 
-Each shot waits for its own DOM state (never a fixed sleep), is taken in light
-and dark, and fails if its visible text matches the deny-list (words that give
+Each shot waits for its own DOM state (never a fixed sleep), is taken in the
+light theme, and fails if its visible text matches the deny-list (words that give
 away a test stack, anything with "@", the host name, token-shaped strings).
 A failed shot leaves a full-page screenshot and the page HTML under
 <out>/debug/ and the run exits non-zero; the other shots still run.
@@ -38,7 +38,6 @@ MODEL = "openclaw_gateway.default"
 PHONE = {"viewport": {"width": 390, "height": 844}, "device_scale_factor": 2,
          "is_mobile": True, "has_touch": True}
 DESKTOP = {"viewport": {"width": 1280, "height": 800}, "device_scale_factor": 2}
-THEMES = ("light", "dark")
 TURN_TIMEOUT_MS = 150_000
 
 DENY = [re.compile(p, re.I) for p in (
@@ -292,18 +291,10 @@ def schedule_wake(session_key: str, message: str, in_s: float) -> None:
 
 # ── Page helpers ────────────────────────────────────────────────────
 
-def set_theme(page: Page, theme: str) -> None:
-    page.emulate_media(color_scheme=theme)
-    page.evaluate("""t => {
-        try { localStorage.setItem('theme', t); } catch (e) {}
-        document.documentElement.classList.toggle('dark', t === 'dark');
-        document.documentElement.classList.toggle('light', t === 'light');
-    }""", theme)
-
-
 def login(page: Page, token: str) -> None:
     page.goto(BASE + "/auth")
-    page.evaluate("t => localStorage.setItem('token', t)", token)
+    # One screenshot per scene, in the light theme.
+    page.evaluate("t => { localStorage.setItem('token', t); localStorage.setItem('theme', 'light'); }", token)
     page.goto(BASE + "/")
     page.wait_for_selector("#chat-input", timeout=60_000)
     dismiss_popups(page)
@@ -443,26 +434,22 @@ class Shooter:
 
     def shot(self, page: Page, name: str, *, selector: str | None = None,
              clip_js: str | None = None, text_selector: str | None = None) -> None:
-        """Light and dark: the viewport, one element, or a JS-computed clip."""
+        """The viewport, one element, or a JS-computed clip, as <name>-light.png."""
         # A toast from another chat's reply is never the subject of a shot.
         page.evaluate("""() => { if (document.getElementById('shot-no-toasts')) return;
           const s = document.createElement('style'); s.id = 'shot-no-toasts';
           s.textContent = '[data-sonner-toaster], section[aria-label^="Notifications"] { display: none !important; }';
           document.head.appendChild(s); }""")
-        for theme in THEMES:
-            set_theme(page, theme)
-            page.wait_for_timeout(150)  # one frame for the class swap to paint
-            self.check_text(page, name, text_selector or selector)
-            path = os.path.join(self.out, f"{name}-{theme}.png")
-            if selector:
-                page.locator(selector).first.screenshot(path=path, animations="disabled")
-            elif clip_js:
-                page.screenshot(path=path, clip=page.evaluate(clip_js), animations="disabled")
-            else:
-                page.screenshot(path=path, animations="disabled")
-            self.written.append(path)
-            print(f"  wrote {path}", flush=True)
-        set_theme(page, "light")
+        self.check_text(page, name, text_selector or selector)
+        path = os.path.join(self.out, f"{name}-light.png")
+        if selector:
+            page.locator(selector).first.screenshot(path=path, animations="disabled")
+        elif clip_js:
+            page.screenshot(path=path, clip=page.evaluate(clip_js), animations="disabled")
+        else:
+            page.screenshot(path=path, animations="disabled")
+        self.written.append(path)
+        print(f"  wrote {path}", flush=True)
 
     def run(self, name: str, fn, *args) -> None:
         if not self.wanted(name):
