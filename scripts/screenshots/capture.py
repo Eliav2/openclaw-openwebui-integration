@@ -722,6 +722,9 @@ class Scenes:
                     "Background with the imports and the automation, every section open", 30_000)
             print("  background: " + json.dumps(page.locator("#openclaw-status-section-background").inner_text()[:600]),
                   flush=True)
+            # Opening the last section scrolled the dialog down; back to Background.
+            page.evaluate("() => document.getElementById('openclaw-status-section-background').scrollIntoView({block: 'start'})")
+            page.wait_for_timeout(300)
             self.s.shot(page, "status-dialog-background", text_selector=root)
             page.keyboard.press("Escape")
         finally:
@@ -755,7 +758,9 @@ class Scenes:
         row (the sample Agent tool answers as Claude Code's does)."""
         new_chat(page)
         chat = send(page, "Look into the station vendors for me.")
-        wait_js(page, f"() => {{ const a = {LAST_ASSISTANT}; return a && a.innerText.includes('Waiting on 1 background agent'); }}",
+        # A few words into the reply's text, the background agent still out.
+        wait_js(page, f"""() => {{ const a = {LAST_ASSISTANT}; if (!a) return false; const t = a.innerText;
+                  return t.includes('Waiting on 1 background agent') && t.includes('the same sensor'); }}""",
                 "the waiting line", 90_000)
         set_title(self.token, chat, "Station vendors")
         print("  reply: " + json.dumps(page.evaluate(f"() => {LAST_ASSISTANT}.innerText")[:300]), flush=True)
