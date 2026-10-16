@@ -286,10 +286,10 @@ start (gateway.py:1630-1633). The renderer's output diff becomes
 shapes Open WebUI folds for its own turns. They are emitted through
 `get_event_emitter({chat_id, message_id:M, user_id})` (`socket/main.py:1314`), so they reach
 the user's room and, throttled by Open WebUI itself (0.15 s, `:1366-1371`), the shared chat
-room. The DB gets `content`/`output` once at a handover, then a checkpoint each time 10 more
-tool calls have finished, and at the end: every write rewrites the whole chat, so the live
-state is carried by the response stream (2.3) and the DB only by what a crash needs
-(ELI-115, [Rehydration](../rehydration-persistence.md#the-turn-writer)).
+room. Between the claim and the end, the DB gets `content`/`output` only once, after a
+handover's request has saved: every write rewrites the whole chat, so the live state is
+carried by the response stream (2.3) and the DB only by what a crash needs (ELI-115,
+[Rehydration](../rehydration-persistence.md#the-turn-writer)).
 
 ### 2.5 End: the run's own terminal, nothing else
 
@@ -627,7 +627,7 @@ Turn path, pipe.py and gateway.py:
 | Proactive debounce 120 s idle / 5 s poll / 600 s give-up | gateway.py:3036-3068 | remove (2.1 start push + DB claim) |
 | Sub-agent debounce, same values | gateway.py:4334-4375 | remove |
 | `_RELAY_MIN_IDLE_S = 120` via `session_idle_for` | gateway.py:3432, 1866-1891, 2585 | remove |
-| `_RELAY_SNAPSHOT_MIN_INTERVAL_S = 1.0` | gateway.py:3439, 3704-3723 | remove. Keep the live state in the response stream and persist only checkpoints and the end (2.3, 2.4). |
+| `_RELAY_SNAPSHOT_MIN_INTERVAL_S = 1.0` | gateway.py:3439, 3704-3723 | remove. Keep the live state in the response stream and persist only the handover and the end (2.3, 2.4). |
 | Inline idle close, `idle_probe_s = 30` + describe | pipe.py:1407, 2235-2269 | remove (P27; end only on terminal, 2.5) |
 | Restart resume trigger: the same 30 s idle probe plus the epoch bump, after a deferred `_is_restart_signature` error | pipe.py:1696-1720, 1885-1891 | remove. The resume fires on the owner rule (2.7): R's terminal push or the first `sessions.list` after `hello-ok`. |
 | First-event wait 60 s + describe probe | pipe.py:1684-1719 | remove. A quiet queue before the first event is answered by run state (`sessions.changed` / `sessions.list`), which the queue wait already uses. |
