@@ -193,6 +193,17 @@ def plan_reply(body: dict) -> dict:
             return {"text": DEPLOY_MID, "delay": 1.0, **call}
         return {"text": DEPLOY_END, "delay": 1.0}
 
+    if "E2E_BG_EXEC" in user_text:
+        # ELI-163 probe: one shell command started in the background.
+        if tool_results:
+            return {"text": "E2E_BG_STARTED"}
+        args = {"command": "sleep 25; echo eli163-bg-done", "background": True}
+        if "exec" in offered:
+            return {"tool": "exec", "args": args}
+        if "tool_call" in offered:
+            return {"tool": "tool_call", "args": {"id": "exec", "args": args}}
+        return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
+
     if "E2E_SPAWN" in user_text:
         # Spawn one sub-agent whose own run is slow, so it is still running
         # while the test reads the Status Action's Subagents section.

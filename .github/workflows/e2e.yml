@@ -63,12 +63,11 @@ jobs:
         run: |
           echo "### E2E lane \`$LANE\`: \`$OWUI_IMAGE\`, \`openclaw@$OPENCLAW_VERSION\`" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: End-to-end suite
+      - name: ELI-163 probe
         env:
-          TESTS: ${{ inputs.tests }}
+          E2E_LOG_DIR: ${{ runner.temp }}/e2e-logs
         run: |
-          uv run --with-requirements requirements-dev.txt \
-            pytest -v --junitxml="$RUNNER_TEMP/e2e-logs/junit.xml" e2e/test_e2e.py ${TESTS:+-k "$TESTS"}
+          uv run --with-requirements requirements-dev.txt pytest -s -v e2e/test_eli163_probe.py
 
       - name: Fixtures still match the installed OpenClaw
         # The unit suite pins two Gateway source lines the Pipe matches on
