@@ -28,6 +28,9 @@ on:
     paths:
       - scripts/screenshots/**
       - .github/workflows/screenshots.yml
+      - .github/actions/stack/**
+      - e2e/start_stack.sh
+      - requirements-browser.txt
 
 permissions:
   contents: read
@@ -39,49 +42,34 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Resolve versions
-        run: |
-          set -a; . e2e/versions.env; set +a
-          echo "OWUI_IMAGE=$OWUI_IMAGE" >> "$GITHUB_ENV"
-          echo "OPENCLAW_VERSION=$OPENCLAW_VERSION" >> "$GITHUB_ENV"
-
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 24
-
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.11"
-
-      - uses: astral-sh/setup-uv@v10.3.0
-
-      - name: Pull Open WebUI image
-        run: docker pull --quiet "$OWUI_IMAGE"
-
       - name: Sample project for the scenes
         run: bash scripts/screenshots/sample_project.sh "$HOME/.openclaw/workspace"
 
-      - name: Start the stack and install the integration
-        env:
-          E2E_LOG_DIR: ${{ runner.temp }}/logs
-          STACK_ADMIN_NAME: Sam
-          STACK_ADMIN_EMAIL: sam@example.com
-          FAKE_LLM_SCENES: ${{ github.workspace }}/scripts/screenshots/scenes.json
-          FAKE_LLM_DEFAULT: Sure.
-          FAKE_LLM_USAGE: estimate
+      - name: Gateway config patch
         run: |
           sed "s|@SCREENSHOTS_DIR@|$PWD/scripts/screenshots|" scripts/screenshots/stack-patch.json \
             > "$RUNNER_TEMP/stack-patch.json"
-          STACK_CONFIG_PATCH="$RUNNER_TEMP/stack-patch.json" bash e2e/start_stack.sh
+
+      - name: Start the stack and install the integration
+        uses: ./.github/actions/stack
+        env:
+          STACK_ADMIN_NAME: Sam
+          STACK_ADMIN_EMAIL: sam@example.com
+          STACK_CONFIG_PATCH: ${{ runner.temp }}/stack-patch.json
+          FAKE_LLM_SCENES: ${{ github.workspace }}/scripts/screenshots/scenes.json
+          FAKE_LLM_DEFAULT: Sure.
+          FAKE_LLM_USAGE: estimate
+        with:
+          log_dir: ${{ runner.temp }}/logs
 
       - name: Install Chromium for Playwright
-        run: uv run --with playwright==1.64.0 python -m playwright install --with-deps chromium
+        run: uv run --with-requirements requirements-browser.txt python -m playwright install --with-deps chromium
 
       - name: Capture
         env:
           ONLY: ${{ inputs.only }}
         run: |
-          uv run --with playwright==1.64.0 python scripts/screenshots/capture.py \
+          uv run --with-requirements requirements-browser.txt python scripts/screenshots/capture.py \
             --out "$RUNNER_TEMP/img" ${ONLY:+--only "$ONLY"}
 
       - name: Optimize and report sizes

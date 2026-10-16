@@ -25,6 +25,12 @@ cd "$(dirname "$0")/.."
 LOG_DIR="${E2E_LOG_DIR:-$PWD/e2e-logs}"
 mkdir -p "$LOG_DIR"
 
+# The Open WebUI image is the stack's largest download. It is pulled while the
+# fake model, the npm install and the Gateway come up; `docker run` waits for it.
+PULL_START=$SECONDS
+docker pull --quiet "$OWUI_IMAGE" >"$LOG_DIR/docker-pull.log" 2>&1 &
+PULL_PID=$!
+
 OWUI_URL="http://localhost:8080"
 OWUI_EMAIL="${STACK_ADMIN_EMAIL:-e2e-admin@example.com}"
 OWUI_ADMIN_NAME="${STACK_ADMIN_NAME:-E2E Admin}"
@@ -93,6 +99,9 @@ wait_for "OpenClaw Gateway" 120 grep -q "\[gateway\] ready" "$LOG_DIR/gateway.lo
 echo "::endgroup::"
 
 echo "::group::Open WebUI ($OWUI_IMAGE)"
+WAIT_START=$SECONDS
+wait "$PULL_PID" || { cat "$LOG_DIR/docker-pull.log"; echo "::error::docker pull $OWUI_IMAGE failed"; exit 1; }
+echo "image pulled after $(( SECONDS - PULL_START ))s, $(( SECONDS - WAIT_START ))s of it waited for here"
 # Host networking so "localhost:18789" means the same Gateway from inside the
 # container as from the installer, which is the single-host layout the README's
 # defaults assume.

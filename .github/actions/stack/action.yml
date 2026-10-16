@@ -1,0 +1,47 @@
+name: Start the stack
+description: >-
+  Open WebUI in Docker, a real OpenClaw Gateway and the fake model, with this
+  integration installed by its own installers (e2e/start_stack.sh). Used by the
+  E2E and Screenshots workflows. STACK_* and FAKE_LLM_* variables reach the
+  stack from the calling step's env.
+
+inputs:
+  owui_image:
+    description: Open WebUI image (empty = the pinned one in e2e/versions.env)
+    default: ""
+  openclaw_version:
+    description: npm spec for openclaw (empty = the pinned one in e2e/versions.env)
+    default: ""
+  log_dir:
+    description: Where the stack writes its logs
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve versions
+      shell: bash
+      env:
+        IN_OWUI_IMAGE: ${{ inputs.owui_image }}
+        IN_OPENCLAW_VERSION: ${{ inputs.openclaw_version }}
+      run: |
+        set -a; . e2e/versions.env; set +a
+        echo "OWUI_IMAGE=${IN_OWUI_IMAGE:-$OWUI_IMAGE}" >> "$GITHUB_ENV"
+        echo "OPENCLAW_VERSION=${IN_OPENCLAW_VERSION:-$OPENCLAW_VERSION}" >> "$GITHUB_ENV"
+        echo "Open WebUI: ${IN_OWUI_IMAGE:-$OWUI_IMAGE} / OpenClaw: openclaw@${IN_OPENCLAW_VERSION:-$OPENCLAW_VERSION}"
+
+    - uses: actions/setup-node@v7
+      with:
+        node-version: 24
+
+    - uses: actions/setup-python@v7
+      with:
+        python-version: "3.11"
+
+    - uses: astral-sh/setup-uv@v10.3.0
+
+    - name: Start the stack and install the integration
+      shell: bash
+      env:
+        E2E_LOG_DIR: ${{ inputs.log_dir }}
+      run: bash e2e/start_stack.sh

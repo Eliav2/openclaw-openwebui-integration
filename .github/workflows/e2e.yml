@@ -50,39 +50,18 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Resolve versions
+      - name: Start the stack and install the integration
+        uses: ./.github/actions/stack
+        with:
+          owui_image: ${{ inputs.owui_image }}
+          openclaw_version: ${{ inputs.openclaw_version }}
+          log_dir: ${{ runner.temp }}/e2e-logs
+
+      - name: Lane summary
         env:
-          IN_OWUI_IMAGE: ${{ inputs.owui_image }}
-          IN_OPENCLAW_VERSION: ${{ inputs.openclaw_version }}
           LANE: ${{ inputs.lane }}
         run: |
-          set -a; . e2e/versions.env; set +a
-          OWUI_IMAGE="${IN_OWUI_IMAGE:-$OWUI_IMAGE}"
-          OPENCLAW_VERSION="${IN_OPENCLAW_VERSION:-$OPENCLAW_VERSION}"
-          echo "OWUI_IMAGE=$OWUI_IMAGE" >> "$GITHUB_ENV"
-          echo "OPENCLAW_VERSION=$OPENCLAW_VERSION" >> "$GITHUB_ENV"
-          echo "Open WebUI: $OWUI_IMAGE / OpenClaw: openclaw@$OPENCLAW_VERSION"
           echo "### E2E lane \`$LANE\`: \`$OWUI_IMAGE\`, \`openclaw@$OPENCLAW_VERSION\`" >> "$GITHUB_STEP_SUMMARY"
-
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 24
-
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.11"
-
-      - uses: astral-sh/setup-uv@v10.3.0
-
-      - name: Pull Open WebUI image
-        # Separate step so image download time is visible on its own and a
-        # registry hiccup reads as one, not as a stack failure.
-        run: docker pull --quiet "$OWUI_IMAGE"
-
-      - name: Start the stack and install the integration
-        env:
-          E2E_LOG_DIR: ${{ runner.temp }}/e2e-logs
-        run: bash e2e/start_stack.sh
 
       - name: End-to-end suite
         env:
