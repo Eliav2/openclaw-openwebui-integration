@@ -16,7 +16,7 @@ import unittest
 from unittest import mock
 
 import test_status_action_unit  # noqa: F401  (installs the module stubs)
-from _test_helpers import RecordingEmitter, run_page
+from _test_helpers import action_gateway, RecordingEmitter, run_page
 from test_status_action_unit import _FAKE_DOM_JS, _drawer_conn, _emitted_codes
 
 import openclaw_status_action
@@ -348,8 +348,7 @@ class FinalReplyTests(unittest.IsolatedAsyncioTestCase):
         emitted = []
         emitter = RecordingEmitter(emitted)
 
-        with mock.patch("openclaw_status_action._get_action_connection",
-                        new=mock.AsyncMock(return_value=(_drawer_conn(send_request), "pipe"))):
+        with action_gateway(_drawer_conn(send_request)):
             await Action()._run_subagent_detail({"mode": "subagent-detail", "taskId": CHILD}, {"id": "u"}, emitter)
         code = [c for c in _emitted_codes(emitted) if "S.fillDrawer(DATA)" in c][-1]
         return json.loads(code.split("const DATA = ", 1)[1].split(";\n", 1)[0])["items"]
@@ -399,8 +398,7 @@ class PollTests(unittest.IsolatedAsyncioTestCase):
         async def emitter(_evt):
             return None
 
-        with mock.patch("openclaw_status_action._get_action_connection",
-                        new=mock.AsyncMock(return_value=(_drawer_conn(send_request), "pipe"))):
+        with action_gateway(_drawer_conn(send_request)):
             result = await asyncio.wait_for(Action()._run_subagent_detail(
                 {"mode": "subagent-detail", "taskId": CHILD}, {"id": "u"}, emitter), 5)  # bounds the test only
         self.assertEqual(result["status"], "ok")
@@ -467,8 +465,7 @@ async def _drawer_fill(send_request, body=None, user=None):
     emitter = RecordingEmitter(emitted)
 
     conn = _drawer_conn(send_request)
-    with mock.patch("openclaw_status_action._get_action_connection",
-                    new=mock.AsyncMock(return_value=(conn, "pipe"))):
+    with action_gateway(conn):
         await Action()._run_subagent_detail({"mode": "subagent-detail", "taskId": CHILD, "opened": True,
                                              **(body or {})}, user or {"id": "u"}, emitter)
     code = [c for c in _emitted_codes(emitted) if "S.fillDrawer(DATA)" in c][-1]

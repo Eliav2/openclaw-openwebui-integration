@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 
 def run_page(js: str, payload, tz: str | None = None):
@@ -39,3 +40,10 @@ class RecordingEmitter:
 
     async def __call__(self, event):
         self.events.append(event)
+
+
+def action_gateway(conn, source: str = "pipe"):
+    """Patch the Status Action's Gateway lookup to hand out `conn`, as if it
+    came from `source` (the Pipe's stashed connection by default)."""
+    return mock.patch("openclaw_status_action._get_action_connection",
+                      new=mock.AsyncMock(return_value=(conn, source)))

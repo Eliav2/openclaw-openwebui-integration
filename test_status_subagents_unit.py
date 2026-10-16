@@ -16,7 +16,7 @@ import unittest
 from unittest import mock
 
 import test_status_action_unit  # noqa: F401  (installs the module stubs)
-from _test_helpers import RecordingEmitter, run_page
+from _test_helpers import action_gateway, RecordingEmitter, run_page
 from test_status_action_unit import _drawer_conn, _emitted_codes, _open_dialog
 
 import openclaw_status_action
@@ -76,8 +76,7 @@ class SubagentListTests(unittest.IsolatedAsyncioTestCase):
             seen.append(data)
             return real(data)
 
-        with mock.patch("openclaw_status_action._get_action_connection",
-                        new=mock.AsyncMock(return_value=(conn, "pipe"))), \
+        with action_gateway(conn), \
              mock.patch("openclaw_status_action._render_subagents_fill_js", side_effect=spy):
             await _open_dialog(Action().action({"chat_id": PARENT_CHAT}, __user__={"id": PARENT_USER},
                                                __event_emitter__=emitter), conn)
@@ -199,8 +198,7 @@ class SubagentListTests(unittest.IsolatedAsyncioTestCase):
         conn = mock.AsyncMock()
         conn.send_request = mock.AsyncMock(side_effect=send_request)
         real = openclaw_status_action._render_subagents_fill_js
-        with mock.patch("openclaw_status_action._get_action_connection",
-                        new=mock.AsyncMock(return_value=(conn, "pipe"))), \
+        with action_gateway(conn), \
              mock.patch("openclaw_status_action._render_subagents_fill_js",
                         side_effect=lambda d: (seen.append(d), real(d))[1]):
             await _open_dialog(Action().action({"chat_id": PARENT_CHAT}, __user__={"id": PARENT_USER},
@@ -235,8 +233,7 @@ class SubagentDrawerTests(unittest.IsolatedAsyncioTestCase):
         emitter = RecordingEmitter(emitted)
 
         conn = _drawer_conn(send_request)
-        with mock.patch("openclaw_status_action._get_action_connection",
-                        new=mock.AsyncMock(return_value=(conn, "pipe"))), \
+        with action_gateway(conn), \
              mock.patch("openclaw_status_action.asyncio.sleep", new=mock.AsyncMock()):
             result = await Action()._run_subagent_detail(
                 {"mode": "subagent-detail", "taskId": task_id, "taskTitle": "Research X", "taskStatus": "running"},
@@ -375,8 +372,7 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
         conn = mock.Mock()
         conn.send_request = mock.AsyncMock(side_effect=_list_rpc(rows, previews, []))
         conn.session_change_event = session_change_event
-        with mock.patch("openclaw_status_action._get_action_connection",
-                        new=mock.AsyncMock(return_value=(conn, "pipe"))):
+        with action_gateway(conn):
             opened = asyncio.ensure_future(Action().action(
                 {"chat_id": PARENT_CHAT}, __user__={"id": PARENT_USER}, __event_emitter__=emitter))
             # Until the dialog is filled and follows its child (or, without

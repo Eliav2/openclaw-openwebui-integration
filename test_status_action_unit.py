@@ -16,7 +16,7 @@ from unittest import mock
 
 import conftest  # noqa: F401  (imports real pydantic before the stubs can shadow it)
 
-from _test_helpers import RecordingEmitter, run_page  # noqa: E402
+from _test_helpers import action_gateway, RecordingEmitter, run_page  # noqa: E402
 from _test_stubs import install_stubs  # noqa: E402
 
 install_stubs()
@@ -718,8 +718,7 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
         fake_conn = mock.AsyncMock()
         fake_conn.send_request = mock.AsyncMock(side_effect=fake_send_request)
 
-        with mock.patch("openclaw_status_action._get_action_connection",
-                         new=mock.AsyncMock(return_value=(fake_conn, "pipe"))):
+        with action_gateway(fake_conn):
             result = await action.action(
                 {"chat_id": "chat-1"}, __user__={"id": "user-1"}, __event_emitter__=emitter,
             )
@@ -756,8 +755,7 @@ class ClaudeCliUsageFallbackTests(unittest.IsolatedAsyncioTestCase):
 
         fake_conn = mock.AsyncMock()
         fake_conn.send_request = mock.AsyncMock(side_effect=fake_send_request)
-        with mock.patch("openclaw_status_action._get_action_connection",
-                         new=mock.AsyncMock(return_value=(fake_conn, "pipe"))):
+        with action_gateway(fake_conn):
             await Action().action({"chat_id": "chat-1"}, __user__={"id": "user-1"}, __event_emitter__=emitter)
         methods = [c.args[0] for c in fake_conn.send_request.call_args_list]
         limits_code = next(c for c in _emitted_codes(emitted)
@@ -828,8 +826,7 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
         fake_conn.active_run_id_for_session = mock.Mock(return_value="some-active-run")
         fake_conn.send_request = mock.AsyncMock()  # must never be called
 
-        with mock.patch("openclaw_status_action._get_action_connection",
-                         new=mock.AsyncMock(return_value=(fake_conn, "pipe"))):
+        with action_gateway(fake_conn):
             result = await action._run_compact(self.COMPACT_BODY, {"id": "u1"}, emitter)
 
         self.assertEqual(result["status"], "error")
@@ -869,8 +866,7 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
         fake_conn.active_run_id_for_session = mock.Mock(return_value=None)
         fake_conn.send_request = mock.AsyncMock(side_effect=fake_send_request)
 
-        with mock.patch("openclaw_status_action._get_action_connection",
-                         new=mock.AsyncMock(return_value=(fake_conn, "pipe"))), \
+        with action_gateway(fake_conn), \
              mock.patch("openclaw_status_action.asyncio.sleep", new=mock.AsyncMock()):
             result = await action._run_compact(self.COMPACT_BODY, {"id": "u1"}, emitter)
 
@@ -912,8 +908,7 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
         async def fake_sleep(_seconds):
             clock["t"] += 200
 
-        with mock.patch("openclaw_status_action._get_action_connection",
-                         new=mock.AsyncMock(return_value=(fake_conn, "pipe"))), \
+        with action_gateway(fake_conn), \
              mock.patch("openclaw_status_action.time.time", side_effect=fake_time), \
              mock.patch("openclaw_status_action.asyncio.sleep", new=fake_sleep):
             result = await action._run_compact(self.COMPACT_BODY, {"id": "u1"}, emitter)
@@ -1134,8 +1129,7 @@ class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
 
         fake_conn = _drawer_conn(fake_send_request)
 
-        with mock.patch("openclaw_status_action._get_action_connection",
-                         new=mock.AsyncMock(return_value=(fake_conn, "pipe"))):
+        with action_gateway(fake_conn):
             result = await action._run_subagent_detail(self.DETAIL_BODY, {"id": "u1"}, emitter)
 
         self.assertEqual(result["status"], "ok")
@@ -1148,8 +1142,7 @@ class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('{"kind": "text", "text": "working on it"}', fills[0])
 
         emitted.clear()
-        with mock.patch("openclaw_status_action._get_action_connection",
-                         new=mock.AsyncMock(return_value=(fake_conn, "pipe"))):
+        with action_gateway(fake_conn):
             await action._run_subagent_detail({**self.DETAIL_BODY, "opened": True}, {"id": "u1"}, emitter)
         self.assertFalse(any("openDrawer" in c for c in _emitted_codes(emitted)))   # a page refresh
 
@@ -1241,10 +1234,7 @@ class UpdatedTimeIsTheBrowsersClockTests(unittest.IsolatedAsyncioTestCase):
         fake_conn = mock.AsyncMock()
         fake_conn.send_request = mock.AsyncMock(side_effect=fake_send_request)
 
-        async def fake_get_connection(_valves_getter):
-            return fake_conn, "pipe"
-
-        with mock.patch("openclaw_status_action._get_action_connection", new=fake_get_connection), \
+        with action_gateway(fake_conn), \
                 mock.patch("openclaw_status_action.time.time", return_value=self.FETCHED):
             await _open_dialog(Action().action(
                 {"chat_id": "chat-1", "id": "msg-1", "session_id": "sess-1", "model": "x.y"},
@@ -1301,12 +1291,9 @@ class ControlUiLinkTests(unittest.IsolatedAsyncioTestCase):
             "sessions.describe": {"session": {}}, "usage.status": {"providers": []},
             "sessions.list": {"sessions": []}}.get(method, {}))
 
-        async def fake_get_connection(_valves_getter):
-            return fake_conn, "pipe"
-
         action = Action()
         action.valves.CONTROL_UI_URL = control_ui_url
-        with mock.patch("openclaw_status_action._get_action_connection", new=fake_get_connection):
+        with action_gateway(fake_conn):
             await _open_dialog(action.action(
                 {"chat_id": self.CHAT, "id": "msg-1", "session_id": "sess-1", "model": "x.y"},
                 __user__={"id": self.USER}, __event_emitter__=emitter,
