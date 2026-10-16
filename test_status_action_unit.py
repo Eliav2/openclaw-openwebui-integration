@@ -706,8 +706,9 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["status"], "error")
         codes = _emitted_codes(emitted)
-        errors = [c for c in codes if "S.sectionError(" in c and "gateway unreachable" in c]
-        self.assertEqual(sorted(json.loads(c.split("S.sectionError(", 1)[1].split(",", 1)[0]) for c in errors),
+        marker = "if (S && S.sectionError) S.sectionError("
+        errors = [c for c in codes if marker in c and "gateway unreachable" in c]
+        self.assertEqual(sorted(json.loads(c.split(marker, 1)[1].split(",", 1)[0]) for c in errors),
                          ["background", "context", "limits", "subagents"])
         self.assertTrue(any("getElementById('openclaw-status-section-agents')" in c for c in codes))
 
