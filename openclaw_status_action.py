@@ -4241,12 +4241,12 @@ async def _build_usage_status_lines(conn, session_key, timeout: float = 5) -> li
 
 
 async def _emit_message_snapshot(__event_emitter__, content):
-    """Persist the in-flight assistant message content for OWUI reloads.
+    """Write `content` to the reply's stored message with a `replace` event.
 
-    Pipe yielded content is still the final source of truth, but OWUI only saves
-    that content when the pipe completes. A short-name `replace` event updates
-    the message content in the DB while the run is still active, so navigating
-    away and back can rehydrate the partial response.
+    Open WebUI 0.12 writes it even while the message is `done: false` (the
+    message upsert has no done guard), and its end-of-reply save then sets
+    `content` from `output`, over it. So it shows only when a reply never
+    reaches that save. Probed on 0.12.0 (ELI-160 slice 8).
     """
     if not __event_emitter__ or not content:
         return

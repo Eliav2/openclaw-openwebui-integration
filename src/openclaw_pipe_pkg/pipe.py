@@ -1709,18 +1709,14 @@ class _PipeTurn:
                 f"first_event_arrived={self.first_event_arrived} aborted={self.aborted}"
             )
 
-        # Terminal back-sync (ELI-57): persist the completed turn's visible text
-        # to the OWUI DB with one final `replace` snapshot. OWUI only saves
-        # yielded content when the BROWSER writes it back after completion -- if
-        # the tab/socket died mid-stream, the SSE yields land nowhere, raise
-        # nothing, and the message stays empty in the DB forever (reload shows
-        # nothing). Tool turns already snapshot along the way; pure-text turns
-        # snapshot nowhere since the per-delta back-sync was reverted (ffd2fdd --
-        # a mid-stream `replace` makes the frontend suppress the CONTINUING
-        # delta stream, P23/P25). At terminal there are no continuing deltas,
-        # so a single force snapshot is freeze-safe, and OWUI's `replace`
-        # handler writes the DB unconditionally (sio.emit to an empty room is a
-        # no-op, not an error), so it persists even with everything dead.
+        # Terminal snapshot (ELI-57): the turn's visible text, written to the
+        # message with one `replace`. Open WebUI's own end-of-reply save
+        # overwrites it (`content` from `output`); it shows only when the
+        # reply never reaches that save (Open WebUI stopped mid-reply), until
+        # the orphan reconcile finishes the message. A mid-stream `replace`
+        # freezes the visible stream, so this is sent only at the end, when
+        # no deltas follow. Open WebUI writes it even for a `done: false`
+        # message and with no tab open.
         if not self.aborted and self.text_yielded:
             await self.maybe_emit_snapshot(force=True)
 

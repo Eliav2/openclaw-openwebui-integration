@@ -14,7 +14,7 @@ How Open WebUI 0.12 (the minimum) keeps an assistant message while its reply is 
 
 ## What the Pipe still sends
 
-The Pipe still sends a forced `replace` event when a reply ends or is stopped (`emit.py`, `_emit_message_snapshot`). Whether that persists anything on 0.12, given the rule above, is still to be probed; until then it stays.
+The Pipe sends a forced `replace` event when a reply ends or is stopped (`emit.py`, `_emit_message_snapshot`). It goes through `Chats.upsert_message_to_chat_by_id_and_message_id`, which has no `done` guard, so it is written even while the message is `done: false`. Open WebUI's end-of-reply save then sets `content` from `output` over it. So the snapshot shows only when a reply never reaches that save (Open WebUI stopped mid-reply), until the orphan reconcile finishes the message. Probed on 0.12.0 in CI: after the event the stored message read `done: false`, `content` = the snapshot; after the end-of-reply save, `done: true`, `content` = the `output` text.
 
 ## Redeploying mid-reply
 

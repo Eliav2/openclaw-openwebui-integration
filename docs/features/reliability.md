@@ -51,7 +51,7 @@ Reload the page mid-reply, or open the chat on another device, and you see the a
 
 ![The same reply right after a page reload: the answer so far is there and still growing](../img/reload-mid-reply-light.png)
 
-If your tab or socket dies mid-stream, a forced final save means the finished text is in the database when you come back.
+If your tab or socket dies mid-stream, the reply still finishes and is saved: Open WebUI runs and saves it on the server, not in the tab.
 
 The device identity and token persist in `STATE_DIR`, so restarting Open WebUI or reloading the function never asks you to pair again. If `STATE_DIR` is not writable, the Pipe falls back to `/tmp/openclaw-bridge` and logs `STATE_DIR unavailable` loudly rather than failing. Details and the fix: [Device pairing](../install/pairing.md).
 
