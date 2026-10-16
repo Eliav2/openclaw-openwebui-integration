@@ -30,7 +30,14 @@
           }
         },
         {
-          "say": "Now rewriting run.sh (per-model runs, 2021-06/2024-07 in-sample/out-of-sample split, 1x and 2x noise, time-budgeted sharded tuning) and the workflow into a two-phase matrix. While the smoke run goes, rewriting report.py for the new label scheme. Prophet's warm-up looks fine for backtests. Checking the smoke eval phase now. Meanwhile, making the smoke run exercise the time-budget stop (5000 trials, 60 s budget) so the full run doesn't depend on an untested path. Full run dispatched: https://github.com/example/forecast-bench/actions/runs/38767910637. Phase 1 takes about 20 minutes (tuning budget 19 min), then phase 2. Polling. ARIMA is fast here (16 s per year). Waiting on the tuning shards. Still waiting on the 7 shards; the baseline and all 4 ARIMA jobs are done. Polling. The shards all stopped cleanly on the time budget. Done: the baseline holds out-of-sample; ARIMA beats it in-sample by 4% but loses by 2% out-of-sample (flagged as overfit). PR #12 has the report and the CSVs.",
+          "say": "Now rewriting run.sh (per-model runs, 2021-06/2024-07 in-sample/out-of-sample split, 1x and 2x noise, time-budgeted sharded tuning) and the workflow into a two-phase matrix. While the smoke run goes, rewriting report.py for the new label scheme. Prophet's warm-up looks fine for backtests. Checking the smoke eval phase now. Meanwhile, making the smoke run exercise the time-budget stop (5000 trials, 60 s budget) so the full run doesn't depend on an untested path. Full run dispatched: https://github.com/example/forecast-bench/actions/runs/38767910637. Phase 1 takes about 20 minutes (tuning budget 19 min), then phase 2. Polling. ARIMA is fast here (16 s per year). Waiting on the tuning shards. Still waiting on the 7 shards; the baseline and all 4 ARIMA jobs are done. Polling. The shards all stopped cleanly on the time budget.",
+          "tool": "read",
+          "args": {
+            "path": "forecast/README.md"
+          }
+        },
+        {
+          "say": "Done: the baseline holds out-of-sample; ARIMA beats it in-sample by 4% but loses by 2% out-of-sample (flagged as overfit). PR #12 has the report and the CSVs.",
           "delay": 0.03
         }
       ]
