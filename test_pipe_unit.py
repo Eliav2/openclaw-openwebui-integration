@@ -5858,16 +5858,25 @@ class TestSpawnBackground(unittest.TestCase):
             await asyncio.sleep(0)
             ran.append(True)
 
+        held = {}
+
         async def main():
-            openclaw_pipe.spawn_background(work())
+            # The set is module-wide: another task held in it at the same time
+            # (here, one that outlives this test's) must not matter.
+            other = openclaw_pipe.spawn_background(asyncio.sleep(60))
+            task = openclaw_pipe.spawn_background(work())
             gc.collect()
-            self.assertEqual(len(openclaw_pipe._BACKGROUND_TASKS), 1)
+            held["while running"] = task in openclaw_pipe._BACKGROUND_TASKS
             for _ in range(5):
                 await asyncio.sleep(0)
+            held["after"] = task in openclaw_pipe._BACKGROUND_TASKS
+            held["other"] = other in openclaw_pipe._BACKGROUND_TASKS
+            other.cancel()
+            await asyncio.sleep(0)
 
         asyncio.run(main())
         self.assertEqual(ran, [True])
-        self.assertEqual(openclaw_pipe._BACKGROUND_TASKS, set())
+        self.assertEqual(held, {"while running": True, "after": False, "other": True})
 
     def test_no_bare_create_task_left_in_sources(self):
         # A create_task whose result is discarded is exactly the bug; ruff's
@@ -5885,6 +5894,92 @@ class TestSpawnBackground(unittest.TestCase):
                         and node.value.func.attr == "create_task"):
                     offenders.append(f"{name}:{node.lineno}")
         self.assertEqual(offenders, [], "use spawn_background() instead")
+
+
+class OrphanStubLoopTests(unittest.IsolatedAsyncioTestCase):
+    """The startup pass over every unfinished OpenClaw reply (ELI-90/156):
+    one stub at a time, a stub whose run still goes gets its own waiter, a
+    failing stub does not stop the others, and the ended-while-down pass
+    runs after it."""
+
+    async def _run(self, stubs, statuses):
+        import openclaw_pipe
+        calls, order = [], []
+
+        async def reconcile(conn, agent_id, chat_id, stub_id, *, wait=True):
+            calls.append((stub_id, wait))
+            if not wait:  # the pass itself; a waiter runs beside it
+                order.append(f"start {stub_id}")
+            await asyncio.sleep(0)
+            if not wait:
+                order.append(f"end {stub_id}")
+            status = statuses[stub_id] if not wait else "finished"
+            if isinstance(status, Exception):
+                raise status
+            return status
+
+        async def stub_ids(prefixes):
+            return [("chat-1", s) for s in stubs]
+
+        async def get_conn(valves_getter):
+            return object()
+
+        ended = mock.AsyncMock(side_effect=RuntimeError("history down"))
+        with mock.patch("openclaw_pipe._orphan_stub_ids", stub_ids), \
+                mock.patch("openclaw_pipe._reconcile_stub", reconcile), \
+                mock.patch("openclaw_pipe._reconcile_ended_while_down", ended), \
+                mock.patch("openclaw_pipe._get_gateway_connection", get_conn), \
+                mock.patch("openclaw_pipe._composer_model_prefixes", lambda **kw: ["openclaw_gateway."]), \
+                mock.patch("openclaw_pipe._composer_own_function_id", lambda: "openclaw_gateway"):
+            await openclaw_pipe._reconcile_orphan_stubs(lambda: types.SimpleNamespace(AGENT_ID="main"))
+            for _ in range(10):
+                await asyncio.sleep(0)
+        return calls, order, ended
+
+    async def test_each_stub_in_turn_and_a_waiter_only_for_a_running_one(self):
+        calls, order, ended = await self._run(
+            ["a", "b", "c"], {"a": "finished", "b": "wait", "c": RuntimeError("chat gone")})
+        self.assertEqual(order, ["start a", "end a", "start b", "end b", "start c", "end c"])
+        self.assertEqual(calls, [("a", False), ("b", False), ("c", False), ("b", True)])
+        ended.assert_awaited_once()
+
+    async def test_no_stubs_still_runs_the_ended_while_down_pass(self):
+        calls, _order, ended = await self._run([], {})
+        self.assertEqual(calls, [])
+        ended.assert_awaited_once()
+
+
+class SettledTailTests(unittest.IsolatedAsyncioTestCase):
+    """What a reply still shows once its run settled with no final event
+    here: the rest of the run's text, or why it shows nothing."""
+
+    def _turn(self, *, history=None, text_yielded=False, received=""):
+        import openclaw_pipe
+        turn = openclaw_pipe._PipeTurn(None, {}, None, None, None, None, None, None, None, "", [], None)
+        turn.conn = types.SimpleNamespace(session_history=mock.AsyncMock(return_value=history))
+        turn.session_key, turn.our_run_id = "agent:main:x", "run-1"
+        turn.renderer = openclaw_pipe._TurnRenderer()
+        turn.renderer.seed({"received": received})
+        turn.text_yielded, turn.first_event_arrived, turn.text = text_yielded, False, "hi"
+        return turn
+
+    async def test_the_rest_of_the_runs_text(self):
+        turn = self._turn(history={"messages": []}, received="Hello ")
+        with mock.patch("openclaw_pipe._history_text_for_run", return_value=(True, "Hello world")):
+            self.assertEqual(await turn.settled_tail({"status": "done"}), "world")
+
+    async def test_a_stopped_run_that_showed_nothing(self):
+        for status in ("cancelled", "killed"):
+            self.assertEqual(await self._turn().settled_tail({"status": status}), "**Stopped.**")
+
+    async def test_a_failed_run_that_showed_nothing(self):
+        self.assertEqual(await self._turn().settled_tail({"status": "failed", "lastRunError": "quota"}),
+                         "**Error:** quota")
+        self.assertEqual(await self._turn().settled_tail({"status": "timeout"}),
+                         "**Failed:** the run did not complete.")
+
+    async def test_a_run_that_showed_text_owes_nothing_more(self):
+        self.assertEqual(await self._turn(text_yielded=True).settled_tail({"status": "failed"}), "")
 
 
 
