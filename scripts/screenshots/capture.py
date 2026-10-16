@@ -477,15 +477,21 @@ MOCK_BACKGROUND_SECTION = r"""() => {
 }"""
 
 MOCK_COMPOSER_CHIP = r"""() => {
-  const b = document.querySelector('button[aria-label="OpenClaw status"]');
+  document.activeElement && document.activeElement.blur();
+  const box = document.getElementById('message-input-container');
+  const form = box.querySelector('form');
+  const row = document.createElement('div');
+  row.className = 'flex justify-center';
+  row.style.marginBottom = '8px';
   const chip = document.createElement('button');
   chip.type = 'button';
   chip.id = 'openclaw-mock-chip';
-  chip.title = '3 background jobs running';
-  chip.className = 'flex gap-1 items-center text-xs rounded-full shrink-0 font-semibold';
-  chip.style.cssText = 'padding:3px 9px;color:#3b82f6;background:#3b82f622;';
-  chip.innerHTML = '<span style="width:6px;height:6px;border-radius:9999px;background:#3b82f6;display:inline-block"></span>3 running';
-  b.parentElement.insertBefore(chip, b.nextSibling);
+  chip.className = 'flex gap-1.5 items-center text-xs rounded-full font-semibold';
+  chip.style.cssText = 'padding:4px 12px;color:#3b82f6;background:#eff6ff;border:1px solid #3b82f633;';
+  chip.innerHTML = '<span style="width:7px;height:7px;border-radius:9999px;background:#3b82f6;display:inline-block"></span>'
+    + '3 running in the background<span style="color:#9ca3af;font-weight:500">· npm run build, 2 more</span>';
+  row.appendChild(chip);
+  form.parentElement.insertBefore(row, form);
 }"""
 
 
@@ -841,7 +847,7 @@ class Scenes:
         page.wait_for_selector(root, state="detached", timeout=10_000)
         page.evaluate(MOCK_COMPOSER_CHIP)
         clip = """() => {
-          const f = document.getElementById('openclaw-mock-chip').closest('form');
+          const f = document.getElementById('message-input-container');
           const r = f.getBoundingClientRect();
           const top = Math.max(0, r.top - 260);
           return {x: 0, y: top, width: innerWidth, height: Math.min(innerHeight, r.bottom + 8) - top};
