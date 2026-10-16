@@ -63,6 +63,13 @@ def mem():
     return got.get("RssAnon", 0), got.get("VmSwap", 0)
 
 
+def cpu():
+    """CPU seconds the Open WebUI process has used (utime + stime)."""
+    with open(f"/proc/{PID}/stat") as f:
+        fields = f.read().rsplit(")", 1)[1].split()
+    return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+
+
 class Peak:
     def __enter__(self):
         a, s = mem()
@@ -296,6 +303,7 @@ async def main():
     stop = asyncio.Event()
     joins, save_lat = [], []
     t0 = time.monotonic()
+    cpu0 = cpu()
     if JOINS_ONLY:
         with Peak() as p:
             background = [asyncio.ensure_future(rejoining_tab(token, cid, stop, joins)) for cid, _ in chats]
@@ -308,7 +316,7 @@ async def main():
         row = {"kind": "joins-only", "variant": os.environ.get("VARIANT"), "ref": os.environ.get("REF"),
                "rep": os.environ.get("REP"), "rejoin_s": REJOIN_S, "chats_mb": SIZES,
                "before": before, "peak": p.peak, "anon_peak": p.anon_peak, "after": anon + swap,
-               "joins": len(joins), "pushes": len(pushes),
+               "cpu_s": round(cpu() - cpu0, 1), "joins": len(joins), "pushes": len(pushes),
                "push_s_avg": round(sum(j["s"] for j in pushes) / max(1, len(pushes)), 2),
                "push_last_user": all(j["pushed"] == ch["history"]["messages"][ch["history"]["currentId"]]["parentId"]
                                      for j in pushes for cid, ch in chats if cid == j["chat"])}
@@ -340,7 +348,7 @@ async def main():
     row = {"kind": "pipe-replay", "variant": os.environ.get("VARIANT"), "ref": os.environ.get("REF"),
            "rep": os.environ.get("REP"), "page_saves_on": PAGE_SAVES, "tools": TOOLS, "chats_mb": SIZES,
            "before": before, "peak": p.peak, "anon_peak": p.anon_peak, "after": anon + swap,
-           "swap_after": swap, "s": round(took, 1),
+           "swap_after": swap, "s": round(took, 1), "cpu_s": round(cpu() - cpu0, 1),
            "page_saves": len(save_lat), "page_save_avg_s": round(sum(save_lat) / max(1, len(save_lat)), 2),
            "page_save_max_s": max(save_lat or [0]),
            "joins": len(joins), "pushes": len(pushes),
