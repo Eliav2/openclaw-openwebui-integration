@@ -14,6 +14,7 @@ on:
       - docs/**
       - scripts/readme_mobile.py
       - .github/workflows/readme-mobile.yml
+      - requirements-browser.txt
 
 permissions:
   contents: read
@@ -32,11 +33,11 @@ jobs:
       - uses: astral-sh/setup-uv@v10.3.0
 
       - name: Install Chromium for Playwright
-        run: uv run --with playwright==1.64.0 python -m playwright install --with-deps chromium
+        run: uv run --with-requirements requirements-browser.txt python -m playwright install --with-deps chromium
 
       - name: Capture
         run: |
-          uv run --with playwright==1.64.0 python scripts/readme_mobile.py \
+          uv run --with-requirements requirements-browser.txt python scripts/readme_mobile.py \
             --repo "${{ github.repository }}" --ref "${{ github.sha }}" --out "$RUNNER_TEMP/readme"
 
       - name: Report

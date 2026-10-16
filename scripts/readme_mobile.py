@@ -7,7 +7,7 @@ a 390 px phone viewport, light theme, and writes one PNG per screen
 start heading land, counted in screens, which is the README's scan test: both
 should be on screen one or two.
 
-    uv run --with playwright==1.64.0 python scripts/readme_mobile.py \\
+    uv run --with-requirements requirements-browser.txt python scripts/readme_mobile.py \\
         --repo OWNER/NAME --ref <sha or branch> --out DIR
 
 Runs on a GitHub runner (.github/workflows/readme-mobile.yml), never on a

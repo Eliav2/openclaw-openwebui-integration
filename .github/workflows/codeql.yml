@@ -28,11 +28,13 @@ jobs:
         with:
           languages: ${{ matrix.language }}
           # src/ fragments are analysed through the built artifacts, which are
-          # the code Open WebUI actually runs.
+          # the code Open WebUI actually runs. The test_fixture_owui_* files are
+          # verbatim Open WebUI source, not ours.
           config: |
             paths-ignore:
               - src/openclaw_pipe_pkg
               - test_fixture_owui_streaming_handler.py
+              - test_fixture_owui_structured_output.ts
       - uses: github/codeql-action/analyze@v4
         with:
           category: /language:${{ matrix.language }}

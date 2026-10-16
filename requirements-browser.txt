@@ -1,0 +1,4 @@
+# The browser automation pin, in one place (and where Dependabot sees it):
+#   uv run --with-requirements requirements-browser.txt python -m playwright install --with-deps chromium
+# Used by the Screenshots and README-on-a-phone workflows, not by the unit suite.
+playwright==1.64.0
