@@ -10,66 +10,16 @@ import datetime
 import json
 import os
 import sys
-import tempfile
 import types
 import unittest
 from unittest import mock
 
-import conftest  # noqa: F401  (imports real pydantic before this file's stub can shadow it)
+import conftest  # noqa: F401  (imports real pydantic before the stubs can shadow it)
 
-if "websockets" not in sys.modules:
-    websockets_stub = types.SimpleNamespace(
-        WebSocketClientProtocol=object,
-        exceptions=types.SimpleNamespace(ConnectionClosed=Exception),
-    )
-    sys.modules["websockets"] = websockets_stub
+from _test_helpers import action_gateway, RecordingEmitter, run_page  # noqa: E402
+from _test_stubs import install_stubs  # noqa: E402
 
-if "cryptography" not in sys.modules:
-    crypto = types.ModuleType("cryptography")
-    hazmat = types.ModuleType("cryptography.hazmat")
-    primitives = types.ModuleType("cryptography.hazmat.primitives")
-    asymmetric = types.ModuleType("cryptography.hazmat.primitives.asymmetric")
-    ed25519 = types.ModuleType("cryptography.hazmat.primitives.asymmetric.ed25519")
-    serialization = types.ModuleType("cryptography.hazmat.primitives.serialization")
-    backends = types.ModuleType("cryptography.hazmat.backends")
-
-    class _DummyPrivateKey:
-        @staticmethod
-        def generate():
-            raise RuntimeError("cryptography stub cannot generate keys")
-
-    ed25519.Ed25519PrivateKey = _DummyPrivateKey
-    serialization.Encoding = types.SimpleNamespace(Raw="Raw", PEM="PEM")
-    serialization.PublicFormat = types.SimpleNamespace(Raw="Raw")
-    serialization.PrivateFormat = types.SimpleNamespace(PKCS8="PKCS8")
-    serialization.NoEncryption = lambda: None
-    serialization.load_pem_private_key = lambda *args, **kwargs: None
-    backends.default_backend = lambda: None
-
-    sys.modules["cryptography"] = crypto
-    sys.modules["cryptography.hazmat"] = hazmat
-    sys.modules["cryptography.hazmat.primitives"] = primitives
-    sys.modules["cryptography.hazmat.primitives.asymmetric"] = asymmetric
-    sys.modules["cryptography.hazmat.primitives.asymmetric.ed25519"] = ed25519
-    sys.modules["cryptography.hazmat.primitives.serialization"] = serialization
-    sys.modules["cryptography.hazmat.backends"] = backends
-
-if "pydantic" not in sys.modules:
-    pydantic = types.ModuleType("pydantic")
-
-    class _BaseModel:
-        def __init__(self, **kwargs):
-            for name, value in self.__class__.__dict__.items():
-                if name.startswith("_") or callable(value):
-                    continue
-                setattr(self, name, kwargs.get(name, value))
-
-    def _field(*, default=None, **kwargs):
-        return default
-
-    pydantic.BaseModel = _BaseModel
-    pydantic.Field = _field
-    sys.modules["pydantic"] = pydantic
+install_stubs()
 
 from openclaw_status_action import (  # noqa: E402
     Action,
@@ -260,21 +210,8 @@ class DialogSectionTests(unittest.TestCase):
     fake page: what a reader sees, not what the JS source contains."""
 
     def _page(self, fills, identity=FULL_IDENTITY, click=False, tz="UTC"):
-        import shutil
-        import subprocess
-        runtime = shutil.which("bun") or shutil.which("node")
-        if runtime is None:
-            self.skipTest("no bun or node")
         payload = {"now": 1, "open": _render_modal_open_js(identity), "fills": fills, "click": click}
-        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
-            fh.write(_SECTIONS_PAGE_JS)
-        try:
-            out = subprocess.run([runtime, fh.name], input=json.dumps(payload), capture_output=True,
-                                 text=True, timeout=60, env={**os.environ, "TZ": tz})
-        finally:
-            os.unlink(fh.name)
-        self.assertEqual(out.returncode, 0, out.stderr)
-        return json.loads(out.stdout)
+        return run_page(_SECTIONS_PAGE_JS, payload, tz=tz)
 
     @staticmethod
     def _context(pct):
@@ -354,23 +291,10 @@ class DrawerToolCardsStayOpenTests(unittest.TestCase):
                                        "error": None})
 
     def _page(self, steps):
-        import shutil
-        import subprocess
-        runtime = shutil.which("bun") or shutil.which("node")
-        if runtime is None:
-            self.skipTest("no bun or node")
         identity = {"chatId": "c", "messageId": "m", "sessionId": "s", "owuiModel": "x"}
         payload = {"now": 1, "open": _render_modal_open_js(identity),
                    "drawer": _render_drawer_open_js(self.TASK), "steps": steps}
-        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
-            fh.write(_DRAWER_CARDS_PAGE_JS)
-        try:
-            out = subprocess.run([runtime, fh.name], input=json.dumps(payload),
-                                 capture_output=True, text=True, timeout=60)
-        finally:
-            os.unlink(fh.name)
-        self.assertEqual(out.returncode, 0, out.stderr)
-        return json.loads(out.stdout)
+        return run_page(_DRAWER_CARDS_PAGE_JS, payload)
 
     def test_an_opened_card_stays_open_across_a_refill(self):
         a, b, c = self._call("call-a", "read"), self._call("call-b", "exec"), self._call("call-c", "write")
@@ -433,23 +357,10 @@ class ElapsedTickTests(unittest.TestCase):
     NOW = 1_783_790_100_000
 
     def _page(self, steps, tasks):
-        import shutil
-        import subprocess
-        runtime = shutil.which("bun") or shutil.which("node")
-        if runtime is None:
-            self.skipTest("no bun or node")
         identity = {"chatId": "c", "messageId": "m", "sessionId": "s", "owuiModel": "x"}
         fill = _render_subagents_fill_js({"tasks": tasks, "source": "pipe", "fetchedAt": "12:00:00", "error": None})
         payload = {"now": self.NOW, "open": _render_modal_open_js(identity), "fills": [fill], "steps": steps}
-        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
-            fh.write(_DIALOG_PAGE_JS)
-        try:
-            out = subprocess.run([runtime, fh.name], input=json.dumps(payload),
-                                 capture_output=True, text=True, timeout=60)
-        finally:
-            os.unlink(fh.name)
-        self.assertEqual(out.returncode, 0, out.stderr)
-        return json.loads(out.stdout)
+        return run_page(_DIALOG_PAGE_JS, payload)
 
     def _task(self, tid, status, started, ended=None):
         return {"id": tid, "title": tid, "status": status, "progressSummary": None, "terminalSummary": None,
@@ -684,9 +595,7 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
     async def test_missing_chat_id_notifies_and_returns_error(self):
         action = Action()
         emitted = []
-
-        async def emitter(evt):
-            emitted.append(evt)
+        emitter = RecordingEmitter(emitted)
 
         result = await action.action({}, __user__={"id": "u1"}, __event_emitter__=emitter)
         self.assertEqual(result["status"], "error")
@@ -702,8 +611,7 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
         emitted = []
         parent = "agent:main:openwebui-user-1-chat-1"
 
-        async def emitter(evt):
-            emitted.append(evt)
+        emitter = RecordingEmitter(emitted)
 
         async def fake_send_request(method, params, timeout=5):
             if method == "sessions.describe":
@@ -776,9 +684,7 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
     async def test_connect_failure_shows_dialog_wide_error(self):
         action = Action()
         emitted = []
-
-        async def emitter(evt):
-            emitted.append(evt)
+        emitter = RecordingEmitter(emitted)
 
         with mock.patch("openclaw_status_action._get_action_connection",
                          new=mock.AsyncMock(side_effect=RuntimeError("gateway unreachable"))):
@@ -798,9 +704,7 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
         rendering their own real data."""
         action = Action()
         emitted = []
-
-        async def emitter(evt):
-            emitted.append(evt)
+        emitter = RecordingEmitter(emitted)
 
         async def fake_send_request(method, params, timeout=5):
             if method == "sessions.describe":
@@ -814,8 +718,7 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
         fake_conn = mock.AsyncMock()
         fake_conn.send_request = mock.AsyncMock(side_effect=fake_send_request)
 
-        with mock.patch("openclaw_status_action._get_action_connection",
-                         new=mock.AsyncMock(return_value=(fake_conn, "pipe"))):
+        with action_gateway(fake_conn):
             result = await action.action(
                 {"chat_id": "chat-1"}, __user__={"id": "user-1"}, __event_emitter__=emitter,
             )
@@ -835,9 +738,7 @@ class ClaudeCliUsageFallbackTests(unittest.IsolatedAsyncioTestCase):
 
     async def _run(self, usage_status, cli_usage):
         emitted = []
-
-        async def emitter(evt):
-            emitted.append(evt)
+        emitter = RecordingEmitter(emitted)
 
         async def fake_send_request(method, params, timeout=5):
             if method == "sessions.describe":
@@ -854,8 +755,7 @@ class ClaudeCliUsageFallbackTests(unittest.IsolatedAsyncioTestCase):
 
         fake_conn = mock.AsyncMock()
         fake_conn.send_request = mock.AsyncMock(side_effect=fake_send_request)
-        with mock.patch("openclaw_status_action._get_action_connection",
-                         new=mock.AsyncMock(return_value=(fake_conn, "pipe"))):
+        with action_gateway(fake_conn):
             await Action().action({"chat_id": "chat-1"}, __user__={"id": "user-1"}, __event_emitter__=emitter)
         methods = [c.args[0] for c in fake_conn.send_request.call_args_list]
         limits_code = next(c for c in _emitted_codes(emitted)
@@ -920,16 +820,13 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
     async def test_blocked_when_a_run_is_already_active(self):
         action = Action()
         emitted = []
-
-        async def emitter(evt):
-            emitted.append(evt)
+        emitter = RecordingEmitter(emitted)
 
         fake_conn = mock.Mock()
         fake_conn.active_run_id_for_session = mock.Mock(return_value="some-active-run")
         fake_conn.send_request = mock.AsyncMock()  # must never be called
 
-        with mock.patch("openclaw_status_action._get_action_connection",
-                         new=mock.AsyncMock(return_value=(fake_conn, "pipe"))):
+        with action_gateway(fake_conn):
             result = await action._run_compact(self.COMPACT_BODY, {"id": "u1"}, emitter)
 
         self.assertEqual(result["status"], "error")
@@ -941,9 +838,7 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
     async def test_success_shows_compacting_then_refreshes_all_sections(self):
         action = Action()
         emitted = []
-
-        async def emitter(evt):
-            emitted.append(evt)
+        emitter = RecordingEmitter(emitted)
 
         describe_calls = {"n": 0}
 
@@ -971,8 +866,7 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
         fake_conn.active_run_id_for_session = mock.Mock(return_value=None)
         fake_conn.send_request = mock.AsyncMock(side_effect=fake_send_request)
 
-        with mock.patch("openclaw_status_action._get_action_connection",
-                         new=mock.AsyncMock(return_value=(fake_conn, "pipe"))), \
+        with action_gateway(fake_conn), \
              mock.patch("openclaw_status_action.asyncio.sleep", new=mock.AsyncMock()):
             result = await action._run_compact(self.COMPACT_BODY, {"id": "u1"}, emitter)
 
@@ -991,9 +885,7 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
     async def test_timeout_shows_clear_message_not_infinite_spin(self):
         action = Action()
         emitted = []
-
-        async def emitter(evt):
-            emitted.append(evt)
+        emitter = RecordingEmitter(emitted)
 
         async def fake_send_request(method, params, timeout=5):
             if method == "chat.send":
@@ -1016,8 +908,7 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
         async def fake_sleep(_seconds):
             clock["t"] += 200
 
-        with mock.patch("openclaw_status_action._get_action_connection",
-                         new=mock.AsyncMock(return_value=(fake_conn, "pipe"))), \
+        with action_gateway(fake_conn), \
              mock.patch("openclaw_status_action.time.time", side_effect=fake_time), \
              mock.patch("openclaw_status_action.asyncio.sleep", new=fake_sleep):
             result = await action._run_compact(self.COMPACT_BODY, {"id": "u1"}, emitter)
@@ -1209,9 +1100,7 @@ class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
     async def test_missing_task_id_returns_error(self):
         action = Action()
         emitted = []
-
-        async def emitter(evt):
-            emitted.append(evt)
+        emitter = RecordingEmitter(emitted)
 
         result = await action._run_subagent_detail({"mode": "subagent-detail"}, {"id": "u1"}, emitter)
         self.assertEqual(result["status"], "error")
@@ -1222,9 +1111,7 @@ class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
         header and run. The page asks again while the child runs (ELI-155)."""
         action = Action()
         emitted = []
-
-        async def emitter(evt):
-            emitted.append(evt)
+        emitter = RecordingEmitter(emitted)
 
         get_calls = {"n": 0}
 
@@ -1242,8 +1129,7 @@ class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
 
         fake_conn = _drawer_conn(fake_send_request)
 
-        with mock.patch("openclaw_status_action._get_action_connection",
-                         new=mock.AsyncMock(return_value=(fake_conn, "pipe"))):
+        with action_gateway(fake_conn):
             result = await action._run_subagent_detail(self.DETAIL_BODY, {"id": "u1"}, emitter)
 
         self.assertEqual(result["status"], "ok")
@@ -1256,8 +1142,7 @@ class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('{"kind": "text", "text": "working on it"}', fills[0])
 
         emitted.clear()
-        with mock.patch("openclaw_status_action._get_action_connection",
-                         new=mock.AsyncMock(return_value=(fake_conn, "pipe"))):
+        with action_gateway(fake_conn):
             await action._run_subagent_detail({**self.DETAIL_BODY, "opened": True}, {"id": "u1"}, emitter)
         self.assertFalse(any("openDrawer" in c for c in _emitted_codes(emitted)))   # a page refresh
 
@@ -1334,9 +1219,7 @@ class UpdatedTimeIsTheBrowsersClockTests(unittest.IsolatedAsyncioTestCase):
 
     async def _context_fill(self):
         emitted = []
-
-        async def emitter(evt):
-            emitted.append(evt)
+        emitter = RecordingEmitter(emitted)
 
         async def fake_send_request(method, params, timeout=5):
             if method == "sessions.describe":
@@ -1351,10 +1234,7 @@ class UpdatedTimeIsTheBrowsersClockTests(unittest.IsolatedAsyncioTestCase):
         fake_conn = mock.AsyncMock()
         fake_conn.send_request = mock.AsyncMock(side_effect=fake_send_request)
 
-        async def fake_get_connection(_valves_getter):
-            return fake_conn, "pipe"
-
-        with mock.patch("openclaw_status_action._get_action_connection", new=fake_get_connection), \
+        with action_gateway(fake_conn), \
                 mock.patch("openclaw_status_action.time.time", return_value=self.FETCHED):
             await _open_dialog(Action().action(
                 {"chat_id": "chat-1", "id": "msg-1", "session_id": "sess-1", "model": "x.y"},
@@ -1364,11 +1244,6 @@ class UpdatedTimeIsTheBrowsersClockTests(unittest.IsolatedAsyncioTestCase):
         return codes[0], next(c for c in codes if "openclaw-status-section-context" in c and c != codes[0])
 
     async def test_updated_is_on_the_readers_clock(self):
-        import shutil
-        import subprocess
-        runtime = shutil.which("bun") or shutil.which("node")
-        if runtime is None:
-            self.skipTest("no bun or node")
         opening, fill = await self._context_fill()
         page = _FAKE_DOM_JS + r"""
 run(input.open);
@@ -1376,16 +1251,7 @@ run(input.fill);
 const f = document.getElementById('openclaw-status-footer');
 process.stdout.write(JSON.stringify(f ? f.textContent : null));
 """
-        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
-            fh.write(page)
-        try:
-            out = subprocess.run([runtime, fh.name], input=json.dumps({"now": 1, "open": opening, "fill": fill}),
-                                 capture_output=True, text=True, timeout=60,
-                                 env={**os.environ, "TZ": "Asia/Jerusalem"})
-        finally:
-            os.unlink(fh.name)
-        self.assertEqual(out.returncode, 0, out.stderr)
-        footer = json.loads(out.stdout)
+        footer = run_page(page, {"now": 1, "open": opening, "fill": fill}, tz="Asia/Jerusalem")
         self.assertTrue(footer.startswith("Updated 12:00:00"), footer)
 
 
@@ -1418,21 +1284,16 @@ class ControlUiLinkTests(unittest.IsolatedAsyncioTestCase):
 
     async def _open_code(self, control_ui_url):
         emitted = []
-
-        async def emitter(evt):
-            emitted.append(evt)
+        emitter = RecordingEmitter(emitted)
 
         fake_conn = mock.AsyncMock()
         fake_conn.send_request = mock.AsyncMock(side_effect=lambda method, params, timeout=5: {
             "sessions.describe": {"session": {}}, "usage.status": {"providers": []},
             "sessions.list": {"sessions": []}}.get(method, {}))
 
-        async def fake_get_connection(_valves_getter):
-            return fake_conn, "pipe"
-
         action = Action()
         action.valves.CONTROL_UI_URL = control_ui_url
-        with mock.patch("openclaw_status_action._get_action_connection", new=fake_get_connection):
+        with action_gateway(fake_conn):
             await _open_dialog(action.action(
                 {"chat_id": self.CHAT, "id": "msg-1", "session_id": "sess-1", "model": "x.y"},
                 __user__={"id": self.USER}, __event_emitter__=emitter,
@@ -1440,11 +1301,6 @@ class ControlUiLinkTests(unittest.IsolatedAsyncioTestCase):
         return _emitted_codes(emitted)[0]
 
     def _links(self, opening, drawer=None):
-        import shutil
-        import subprocess
-        runtime = shutil.which("bun") or shutil.which("node")
-        if runtime is None:
-            self.skipTest("no bun or node")
         page = _FAKE_DOM_JS + r"""
 run(input.open);
 if (input.drawer) run(input.drawer);
@@ -1456,15 +1312,7 @@ const links = (id) => {
 process.stdout.write(JSON.stringify({dialog: links('openclaw-status-modal-root'),
                                      drawer: links('openclaw-drawer-root')}));
 """
-        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
-            fh.write(page)
-        try:
-            out = subprocess.run([runtime, fh.name], input=json.dumps({"now": 1, "open": opening, "drawer": drawer}),
-                                 capture_output=True, text=True, timeout=60)
-        finally:
-            os.unlink(fh.name)
-        self.assertEqual(out.returncode, 0, out.stderr)
-        return json.loads(out.stdout)
+        return run_page(page, {"now": 1, "open": opening, "drawer": drawer})
 
     async def test_the_dialog_and_drawer_link_to_their_sessions(self):
         url = "https://claw.example.com/chat/main/56b98d09f3b74e4fb2bb688ce63bfa53"

@@ -21,63 +21,14 @@ import asyncio
 import uuid
 from unittest import mock
 
-import conftest  # noqa: F401  (imports real pydantic before this file's stub can shadow it)
+import conftest  # noqa: F401  (imports real pydantic before the stubs can shadow it)
 
-if "websockets" not in sys.modules:
-    websockets_stub = types.SimpleNamespace(
-        WebSocketClientProtocol=object,
-        exceptions=types.SimpleNamespace(ConnectionClosed=Exception),
-    )
-    sys.modules["websockets"] = websockets_stub
+from _test_helpers import FakeSio, RecordingEmitter, fake_owui, owui_modules  # noqa: E402
+from _test_stubs import install_stubs  # noqa: E402
 
-import websockets  # noqa: E402  (must come after the stub is installed above)
+install_stubs()
 
-if "cryptography" not in sys.modules:
-    crypto = types.ModuleType("cryptography")
-    hazmat = types.ModuleType("cryptography.hazmat")
-    primitives = types.ModuleType("cryptography.hazmat.primitives")
-    asymmetric = types.ModuleType("cryptography.hazmat.primitives.asymmetric")
-    ed25519 = types.ModuleType("cryptography.hazmat.primitives.asymmetric.ed25519")
-    serialization = types.ModuleType("cryptography.hazmat.primitives.serialization")
-    backends = types.ModuleType("cryptography.hazmat.backends")
-
-    class _DummyPrivateKey:
-        @staticmethod
-        def generate():
-            raise RuntimeError("cryptography stub cannot generate keys")
-
-    ed25519.Ed25519PrivateKey = _DummyPrivateKey
-    serialization.Encoding = types.SimpleNamespace(Raw="Raw", PEM="PEM")
-    serialization.PublicFormat = types.SimpleNamespace(Raw="Raw")
-    serialization.PrivateFormat = types.SimpleNamespace(PKCS8="PKCS8")
-    serialization.NoEncryption = lambda: None
-    serialization.load_pem_private_key = lambda *args, **kwargs: None
-    backends.default_backend = lambda: None
-
-    sys.modules["cryptography"] = crypto
-    sys.modules["cryptography.hazmat"] = hazmat
-    sys.modules["cryptography.hazmat.primitives"] = primitives
-    sys.modules["cryptography.hazmat.primitives.asymmetric"] = asymmetric
-    sys.modules["cryptography.hazmat.primitives.asymmetric.ed25519"] = ed25519
-    sys.modules["cryptography.hazmat.primitives.serialization"] = serialization
-    sys.modules["cryptography.hazmat.backends"] = backends
-
-if "pydantic" not in sys.modules:
-    pydantic = types.ModuleType("pydantic")
-
-    class _BaseModel:
-        def __init__(self, **kwargs):
-            for name, value in self.__class__.__dict__.items():
-                if name.startswith("_") or callable(value):
-                    continue
-                setattr(self, name, kwargs.get(name, value))
-
-    def _field(*, default=None, **kwargs):
-        return default
-
-    pydantic.BaseModel = _BaseModel
-    pydantic.Field = _field
-    sys.modules["pydantic"] = pydantic
+import websockets  # noqa: E402  (after the stubs)
 
 import openclaw_pipe  # noqa: E402
 from openclaw_pipe import (
@@ -272,6 +223,22 @@ class InterruptedTurnTailRecoveryTests(unittest.TestCase):
         self.assertIsNone(asyncio.run(_recover_turn_text(conn, self.KEY, "never asked")))
 
 
+async def _play_frames(conn, frames):
+    """Run `conn`'s event loop over `frames` (Gateway frames, in order), then
+    stop it the way a shutdown does, not as a tick timeout (which marks a gap)."""
+    frames = list(frames)
+
+    class ScriptedWS:
+        async def recv(self_):
+            if frames:
+                return json.dumps(frames.pop(0))
+            conn._stopped = True
+            raise asyncio.CancelledError
+
+    conn._ws = ScriptedWS()
+    await conn._event_loop()
+
+
 class SessionToolEventTests(unittest.IsolatedAsyncioTestCase):
     """ELI-92: tool activity of a run this connection did not start.
 
@@ -288,17 +255,7 @@ class SessionToolEventTests(unittest.IsolatedAsyncioTestCase):
                            "22222222-2222-2222-2222-222222222222")
 
     async def _run_loop(self, conn, frames):
-        frames = list(frames)
-
-        class ScriptedWS:
-            async def recv(self_):
-                if frames:
-                    return json.dumps(frames.pop(0))
-                conn._stopped = True
-                raise asyncio.CancelledError  # stop, not a tick timeout (which marks a gap)
-
-        conn._ws = ScriptedWS()
-        await conn._event_loop()
+        await _play_frames(conn, frames)
         for _ in range(5):
             await asyncio.sleep(0)
 
@@ -604,14 +561,10 @@ class OrphanStubReconcileTests(unittest.IsolatedAsyncioTestCase):
 
         chats_mod = types.ModuleType("open_webui.models.chats")
         chats_mod.Chats = FakeChats
-        socket_main = types.ModuleType("open_webui.socket.main")
         self.sio = mock.AsyncMock()
-        socket_main.sio = self.sio
-        self.modules = {"open_webui": types.ModuleType("open_webui"),
+        self.modules = {**owui_modules(sio=self.sio),
                         "open_webui.models": types.ModuleType("open_webui.models"),
-                        "open_webui.models.chats": chats_mod,
-                        "open_webui.socket": types.ModuleType("open_webui.socket"),
-                        "open_webui.socket.main": socket_main}
+                        "open_webui.models.chats": chats_mod}
         self.conn = _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"))
 
         async def send_request(method, params, timeout=10):
@@ -2679,10 +2632,8 @@ class RetiredConnectionServesItsReplyTests(unittest.IsolatedAsyncioTestCase):
     USER, CHAT, MSG = (str(uuid.UUID(int=1)), str(uuid.UUID(int=2)), str(uuid.UUID(int=3)))
 
     async def test_no_takeover_while_the_retired_connection_serves_the_reply(self):
-        socket_main = types.ModuleType("open_webui.socket.main")
-        modules = {"open_webui": types.ModuleType("open_webui"),
-                   "open_webui.socket": types.ModuleType("open_webui.socket"),
-                   "open_webui.socket.main": socket_main}
+        modules = owui_modules()
+        socket_main = modules["open_webui.socket.main"]
         valves = lambda: types.SimpleNamespace(AGENT_ID="main")   # noqa: E731
         key = _owui_session_key("main", self.USER, self.CHAT)
         run = f"msg-{self.CHAT}-{self.MSG}-1792100000.5"
@@ -2726,16 +2677,8 @@ class GatewayReloadReapTests(unittest.IsolatedAsyncioTestCase):
     next deploy can tear down the previous one's connection before opening
     its own -- self-healing without a container restart."""
 
-    def _install_fake_owui_socket_module(self):
-        fake_module = types.ModuleType("open_webui.socket.main")
-        sys.modules.setdefault("open_webui", types.ModuleType("open_webui"))
-        sys.modules.setdefault("open_webui.socket", types.ModuleType("open_webui.socket"))
-        sys.modules["open_webui.socket.main"] = fake_module
-        self.addCleanup(sys.modules.pop, "open_webui.socket.main", None)
-        return fake_module
-
     async def test_reaps_and_disconnects_a_stale_connection_from_a_prior_deploy(self):
-        fake_socket_module = self._install_fake_owui_socket_module()
+        fake_socket_module = fake_owui(self)
 
         disconnect_calls = {"n": 0}
 
@@ -2752,7 +2695,7 @@ class GatewayReloadReapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(disconnect_calls["n"], 1)
 
     async def test_does_not_reap_when_stale_is_the_current_connection(self):
-        fake_socket_module = self._install_fake_owui_socket_module()
+        fake_socket_module = fake_owui(self)
         conn = _GatewayConnection(lambda: None)
 
         disconnect_calls = {"n": 0}
@@ -2765,7 +2708,7 @@ class GatewayReloadReapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(disconnect_calls["n"], 0)
 
     async def test_reap_is_a_noop_when_no_anchor_present(self):
-        self._install_fake_owui_socket_module()
+        fake_owui(self)
         with mock.patch("openclaw_pipe._gateway_connection", None):
             await _reap_stale_gateway_connection()  # must not raise
 
@@ -2777,7 +2720,7 @@ class GatewayReloadReapTests(unittest.IsolatedAsyncioTestCase):
             await _reap_stale_gateway_connection()  # must not raise
 
     async def test_disconnect_failure_is_swallowed_not_fatal(self):
-        fake_socket_module = self._install_fake_owui_socket_module()
+        fake_socket_module = fake_owui(self)
 
         class _FakeStaleConn:
             async def disconnect(self):
@@ -2791,7 +2734,7 @@ class GatewayReloadReapTests(unittest.IsolatedAsyncioTestCase):
     async def test_old_code_stale_connection_cannot_be_revived_after_reap(self):
         # Connections built before `retire()` existed get pinned shut on the
         # instance, so an in-flight run of the old module can't reconnect it.
-        fake_socket_module = self._install_fake_owui_socket_module()
+        fake_socket_module = fake_owui(self)
 
         class _FakeStaleConn:
             _stopped = False
@@ -2812,7 +2755,7 @@ class GatewayReloadReapTests(unittest.IsolatedAsyncioTestCase):
             await stale.ensure_connected()
 
     async def test_reap_retires_new_code_connection_and_it_stays_down(self):
-        fake_socket_module = self._install_fake_owui_socket_module()
+        fake_socket_module = fake_owui(self)
         stale = _GatewayConnection(lambda: None)
         stale._connect_and_start = mock.AsyncMock()
         fake_socket_module._openclaw_gateway_connection_v1 = stale
@@ -2852,7 +2795,7 @@ class GatewayReloadReapTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reap_finds_orphans_from_older_loads_but_not_other_functions(self):
         import openclaw_pipe
-        self._install_fake_owui_socket_module()
+        fake_owui(self)
         me = "function_openclaw_gateway_" + "a" * 32
 
         def make(module_name):
@@ -2888,7 +2831,7 @@ class GatewayReloadReapTests(unittest.IsolatedAsyncioTestCase):
         )
 
     def test_remember_stores_connection_on_owui_socket_module(self):
-        fake_socket_module = self._install_fake_owui_socket_module()
+        fake_socket_module = fake_owui(self)
         conn = _GatewayConnection(lambda: None)
 
         _remember_gateway_connection(conn)
@@ -3358,9 +3301,7 @@ class MediaBufferTests(unittest.TestCase):
 class StatusEmitterTests(unittest.IsolatedAsyncioTestCase):
     async def test_emits_owui_status_event(self):
         events = []
-
-        async def emitter(event):
-            events.append(event)
+        emitter = RecordingEmitter(events)
 
         await _emit_status(emitter, "Thinking...", done=False)
 
@@ -3635,9 +3576,7 @@ class UsageStatusLineTests(unittest.IsolatedAsyncioTestCase):
 class MessageSnapshotEmitterTests(unittest.IsolatedAsyncioTestCase):
     async def test_emits_persisted_replace_event(self):
         events = []
-
-        async def emitter(event):
-            events.append(event)
+        emitter = RecordingEmitter(events)
 
         await _emit_message_snapshot(emitter, "partial answer")
 
@@ -3651,9 +3590,7 @@ class MessageSnapshotEmitterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_emitter_or_empty_content_is_noop(self):
         events = []
-
-        async def emitter(event):
-            events.append(event)
+        emitter = RecordingEmitter(events)
 
         await _emit_message_snapshot(None, "partial answer")
         await _emit_message_snapshot(emitter, "")
@@ -3958,28 +3895,11 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(_live_session_id_for_user("u3", pool))
         self.assertIsNone(_live_session_id_for_user("u1", {}))
 
-    def _install_fake_owui_socket_module(self, fake_sio, session_pool):
-        fake_module = types.ModuleType("open_webui.socket.main")
-        fake_module.sio = fake_sio
-        fake_module.SESSION_POOL = session_pool
-        sys.modules.setdefault("open_webui", types.ModuleType("open_webui"))
-        sys.modules.setdefault("open_webui.socket", types.ModuleType("open_webui.socket"))
-        sys.modules["open_webui.socket.main"] = fake_module
-
     async def test_ask_user_input_modal_retries_after_reconnect(self):
         session_pool = {}
 
-        class _FakeSio:
-            def __init__(self):
-                self.calls = []
-
-            async def call(self, event, data, to=None, timeout=None):
-                self.calls.append((event, data, to, timeout))
-                return {"value": "42"}
-
-        fake_sio = _FakeSio()
-        self._install_fake_owui_socket_module(fake_sio, session_pool)
-        self.addCleanup(sys.modules.pop, "open_webui.socket.main", None)
+        fake_sio = FakeSio(lambda *call: {"value": "42"})
+        fake_owui(self, sio=fake_sio, SESSION_POOL=session_pool)
 
         async def event_call(payload):
             raise asyncio.TimeoutError()
@@ -4015,19 +3935,13 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
         # retried to the same live session on a later poll.
         session_pool = {"sid-123": {"id": "user-1"}}
 
-        class _FakeSio:
-            def __init__(self):
-                self.calls = 0
+        def reply(*call):
+            if len(fake_sio.calls) == 1:
+                raise asyncio.TimeoutError()  # away / didn't click in time
+            return {"value": "clicked"}
 
-            async def call(self, event, data, to=None, timeout=None):
-                self.calls += 1
-                if self.calls == 1:
-                    raise asyncio.TimeoutError()  # away / didn't click in time
-                return {"value": "clicked"}
-
-        fake_sio = _FakeSio()
-        self._install_fake_owui_socket_module(fake_sio, session_pool)
-        self.addCleanup(sys.modules.pop, "open_webui.socket.main", None)
+        fake_sio = FakeSio(reply)
+        fake_owui(self, sio=fake_sio, SESSION_POOL=session_pool)
 
         async def event_call(payload):
             raise asyncio.TimeoutError()
@@ -4044,22 +3958,15 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(answer, "clicked")
-        self.assertGreaterEqual(fake_sio.calls, 2)  # re-fired after the timeout
+        self.assertGreaterEqual(len(fake_sio.calls), 2)  # re-fired after the timeout
 
     async def test_reconnect_gives_modal_a_human_interaction_timeout(self):
         # The re-fired sio.call must wait a real human-interaction budget for a
         # click (OWUI's WEBSOCKET_EVENT_CALLER_TIMEOUT, default 300s), not the
         # old 30s that made modals vanish before they could be answered.
         session_pool = {"sid-123": {"id": "user-1"}}
-        captured = {}
-
-        class _FakeSio:
-            async def call(self, event, data, to=None, timeout=None):
-                captured["timeout"] = timeout
-                return {"value": "ok"}
-
-        self._install_fake_owui_socket_module(_FakeSio(), session_pool)
-        self.addCleanup(sys.modules.pop, "open_webui.socket.main", None)
+        fake_sio = FakeSio(lambda *call: {"value": "ok"})
+        fake_owui(self, sio=fake_sio, SESSION_POOL=session_pool)
 
         async def event_call(payload):
             raise asyncio.TimeoutError()
@@ -4073,17 +3980,11 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
             poll_interval_s=0.01,
         )
 
-        self.assertGreaterEqual(captured.get("timeout", 0), 300)
+        self.assertGreaterEqual(fake_sio.calls[-1][3], 300)
 
     async def test_ask_user_input_modal_gives_up_if_never_reconnects(self):
-        session_pool = {}
-
-        class _FakeSio:
-            async def call(self, *args, **kwargs):
-                raise AssertionError("should never be called if user never reconnects")
-
-        self._install_fake_owui_socket_module(_FakeSio(), session_pool)
-        self.addCleanup(sys.modules.pop, "open_webui.socket.main", None)
+        fake_sio = FakeSio()
+        fake_owui(self, sio=fake_sio, SESSION_POOL={})
 
         async def event_call(payload):
             raise asyncio.TimeoutError()
@@ -4098,6 +3999,7 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIsNone(answer)
+        self.assertEqual(fake_sio.calls, [], "no live session, so no modal is fired")
 
 
 class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
@@ -4260,18 +4162,7 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
     # a tab that cannot show it is no reason to keep the reply open.
 
     def _socket(self, pool, call):
-        class _FakeSio:
-            async def call(self, event, data, to=None, timeout=None):
-                return await call(data, to)
-
-            async def emit(self, event, data, to=None):
-                pass
-        socket_main = types.ModuleType("open_webui.socket.main")
-        socket_main.sio = _FakeSio()
-        socket_main.SESSION_POOL = pool
-        sys.modules.setdefault("open_webui.socket", types.ModuleType("open_webui.socket"))
-        sys.modules["open_webui.socket.main"] = socket_main
-        self.addCleanup(sys.modules.pop, "open_webui.socket.main", None)
+        fake_owui(self, sio=FakeSio(lambda event, data, to, timeout: call(data, to)), SESSION_POOL=pool)
 
     async def test_a_tab_on_another_chat_is_no_viewer(self):
         """OWUI 0.12 records the chats each socket views; the user's tab on
@@ -4312,22 +4203,8 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(answer)
 
     async def test_disconnected_session_moves_to_the_users_new_socket(self):
-        sent = {"calls": [], "emits": []}
-
-        class _FakeSio:
-            async def call(self, event, data, to=None, timeout=None):
-                sent["calls"].append((data, to, timeout))
-                return {"status": "answered", "answers": {"answer": {"type": "option", "label": "a"}}}
-
-            async def emit(self, event, data, to=None):
-                sent["emits"].append(data)
-
-        socket_main = types.ModuleType("open_webui.socket.main")
-        socket_main.sio = _FakeSio()
-        socket_main.SESSION_POOL = {"sid-new": {"id": "user-1"}}
-        sys.modules.setdefault("open_webui.socket", types.ModuleType("open_webui.socket"))
-        sys.modules["open_webui.socket.main"] = socket_main
-        self.addCleanup(sys.modules.pop, "open_webui.socket.main", None)
+        sio = FakeSio(lambda *call: {"status": "answered", "answers": {"answer": {"type": "option", "label": "a"}}})
+        fake_owui(self, sio=sio, SESSION_POOL={"sid-new": {"id": "user-1"}})
 
         async def event_call(event):
             return {"error": "Client session disconnected."}
@@ -4338,13 +4215,13 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
             max_wait_s=1, poll_interval_s=0.01,
         )
         self.assertEqual(answer, "a")
-        data, to, timeout = sent["calls"][0]
+        _event, data, to, timeout = sio.calls[0]
         self.assertEqual(to, "sid-new")
         self.assertEqual(timeout, 240)
         self.assertEqual(data["chat_id"], "chat-1")
         interaction_id = data["data"]["data"]["interaction_id"]
         # The card is removed from the screen once the call settles.
-        self.assertEqual(sent["emits"][0]["data"], {
+        self.assertEqual(sio.emits[0][1]["data"], {
             "type": "request:interaction:done", "data": {"interaction_id": interaction_id}})
 
     # ELI-58 live repro (2026-10-13, chat c83d7eb7, pipe cb5a7cb): the card was
@@ -4355,21 +4232,13 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
     # each socket views (`SESSION_POOL[sid]["chat_ids"]`, events:chat join).
 
     def fake_socket(self, pool, answer="a"):
+        """The sids the card was sent to, in order (filled as it is sent)."""
         sent = []
 
-        class _FakeSio:
-            async def call(self, event, data, to=None, timeout=None):
-                sent.append(to)
-                return {"status": "answered", "answers": {"answer": {"type": "option", "label": answer}}}
-
-            async def emit(self, event, data, to=None):
-                pass
-        socket_main = types.ModuleType("open_webui.socket.main")
-        socket_main.sio = _FakeSio()
-        socket_main.SESSION_POOL = pool
-        sys.modules.setdefault("open_webui.socket", types.ModuleType("open_webui.socket"))
-        sys.modules["open_webui.socket.main"] = socket_main
-        self.addCleanup(sys.modules.pop, "open_webui.socket.main", None)
+        def reply(event, data, to, timeout):
+            sent.append(to)
+            return {"status": "answered", "answers": {"answer": {"type": "option", "label": answer}}}
+        fake_owui(self, sio=FakeSio(reply), SESSION_POOL=pool)
         return sent
 
     async def test_the_card_comes_back_on_the_tab_viewing_the_chat(self):
@@ -4710,21 +4579,7 @@ class SharedProactiveStateAcrossConnectionsTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self._fake_owui = types.ModuleType("open_webui.socket.main")
-        self._saved = {
-            k: sys.modules.get(k)
-            for k in ("open_webui", "open_webui.socket", "open_webui.socket.main")
-        }
-        sys.modules["open_webui"] = types.ModuleType("open_webui")
-        sys.modules["open_webui.socket"] = types.ModuleType("open_webui.socket")
-        sys.modules["open_webui.socket.main"] = self._fake_owui
-
-    def tearDown(self):
-        for k, v in self._saved.items():
-            if v is None:
-                sys.modules.pop(k, None)
-            else:
-                sys.modules[k] = v
+        self._fake_owui = fake_owui(self)
 
     def _conn(self):
         return _GatewayConnection(lambda: None)
@@ -6064,16 +5919,14 @@ class ClaimTurnMessageTests(unittest.IsolatedAsyncioTestCase):
         cm_mod.ChatMessages = ChatMessages
         attrs = types.ModuleType("sqlalchemy.orm.attributes")
         attrs.flag_modified = lambda obj, name: None
-        self.socket_main = types.ModuleType("open_webui.socket.main")
-        mods = {"open_webui": types.ModuleType("open_webui"),
+        mods = {**owui_modules(),
                 "open_webui.models": types.ModuleType("open_webui.models"),
                 "open_webui.models.chats": chats_mod,
                 "open_webui.models.chat_messages": cm_mod,
-                "open_webui.socket": types.ModuleType("open_webui.socket"),
-                "open_webui.socket.main": self.socket_main,
                 "sqlalchemy": types.ModuleType("sqlalchemy"),
                 "sqlalchemy.orm": types.ModuleType("sqlalchemy.orm"),
                 "sqlalchemy.orm.attributes": attrs}
+        self.socket_main = mods["open_webui.socket.main"]
         p = mock.patch.dict(sys.modules, mods)
         p.start()
         self.addCleanup(p.stop)
@@ -7777,17 +7630,7 @@ class RegressionPlanTests(_RoutingCase):
                                         "lastRunId": run, **row})
 
     async def scripted_loop(self, conn, frames):
-        frames = list(frames)
-
-        class ScriptedWS:
-            async def recv(self_):
-                if frames:
-                    return json.dumps(frames.pop(0))
-                conn._stopped = True
-                raise asyncio.CancelledError  # stop, not a tick timeout (which marks a gap)
-
-        conn._ws = ScriptedWS()
-        await conn._event_loop()
+        await _play_frames(conn, frames)
         await self.spin()
 
     async def test_two_connections_one_message(self):
@@ -9372,11 +9215,7 @@ class NeedsInputMarkerTests(unittest.IsolatedAsyncioTestCase):
         for a reconnect."""
         prompt = f"Let me ask.\n{self.MARKER}\nColour a1\nWhich colour do you prefer?\n1. Red\n2. Blue\n"
         calls = []
-        socket_main = types.ModuleType("open_webui.socket.main")
-        socket_main.SESSION_POOL = {}            # the user has no tab open at all
-        sys.modules.setdefault("open_webui.socket", types.ModuleType("open_webui.socket"))
-        sys.modules["open_webui.socket.main"] = socket_main
-        self.addCleanup(sys.modules.pop, "open_webui.socket.main", None)
+        fake_owui(self, SESSION_POOL={})         # the user has no tab open at all
 
         async def event_call(payload):
             calls.append(payload)
@@ -9686,9 +9525,7 @@ class GapHandoverReplayTests(_RoutingCase):
         message_id = message_id or self.STUB
         self.add_stub(message_id)
         emitted = []
-
-        async def emitter(event):
-            emitted.append(event)
+        emitter = RecordingEmitter(emitted)
 
         async def event_call(event):
             return intent

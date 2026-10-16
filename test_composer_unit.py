@@ -20,60 +20,12 @@ import types
 import unittest
 from unittest import mock
 
-import conftest  # noqa: F401  (imports real pydantic before this file's stub can shadow it)
+import conftest  # noqa: F401  (imports real pydantic before the stubs can shadow it)
 
-if "websockets" not in sys.modules:
-    sys.modules["websockets"] = types.SimpleNamespace(
-        WebSocketClientProtocol=object,
-        exceptions=types.SimpleNamespace(ConnectionClosed=Exception),
-    )
+from _test_helpers import RecordingEmitter, fake_owui  # noqa: E402
+from _test_stubs import install_stubs  # noqa: E402
 
-if "cryptography" not in sys.modules:
-    crypto = types.ModuleType("cryptography")
-    hazmat = types.ModuleType("cryptography.hazmat")
-    primitives = types.ModuleType("cryptography.hazmat.primitives")
-    asymmetric = types.ModuleType("cryptography.hazmat.primitives.asymmetric")
-    ed25519 = types.ModuleType("cryptography.hazmat.primitives.asymmetric.ed25519")
-    serialization = types.ModuleType("cryptography.hazmat.primitives.serialization")
-    backends = types.ModuleType("cryptography.hazmat.backends")
-
-    class _DummyPrivateKey:
-        @staticmethod
-        def generate():
-            raise RuntimeError("cryptography stub cannot generate keys")
-
-    ed25519.Ed25519PrivateKey = _DummyPrivateKey
-    serialization.Encoding = types.SimpleNamespace(Raw="Raw", PEM="PEM")
-    serialization.PublicFormat = types.SimpleNamespace(Raw="Raw")
-    serialization.PrivateFormat = types.SimpleNamespace(PKCS8="PKCS8")
-    serialization.NoEncryption = lambda: None
-    serialization.load_pem_private_key = lambda *args, **kwargs: None
-    backends.default_backend = lambda: None
-
-    sys.modules["cryptography"] = crypto
-    sys.modules["cryptography.hazmat"] = hazmat
-    sys.modules["cryptography.hazmat.primitives"] = primitives
-    sys.modules["cryptography.hazmat.primitives.asymmetric"] = asymmetric
-    sys.modules["cryptography.hazmat.primitives.asymmetric.ed25519"] = ed25519
-    sys.modules["cryptography.hazmat.primitives.serialization"] = serialization
-    sys.modules["cryptography.hazmat.backends"] = backends
-
-if "pydantic" not in sys.modules:
-    pydantic = types.ModuleType("pydantic")
-
-    class _BaseModel:
-        def __init__(self, **kwargs):
-            for name, value in self.__class__.__dict__.items():
-                if name.startswith("_") or callable(value):
-                    continue
-                setattr(self, name, kwargs.get(name, value))
-
-    def _field(*, default=None, **kwargs):
-        return default
-
-    pydantic.BaseModel = _BaseModel
-    pydantic.Field = _field
-    sys.modules["pydantic"] = pydantic
+install_stubs()
 
 import openclaw_pipe  # noqa: E402
 import openclaw_status_action  # noqa: E402
@@ -185,9 +137,7 @@ class StatusLabelWidthTests(unittest.TestCase):
 class EmitHelperTests(unittest.IsolatedAsyncioTestCase):
     async def test_emits_one_execute_event(self):
         events = []
-
-        async def emitter(e):
-            events.append(e)
+        emitter = RecordingEmitter(events)
 
         ok = await _emit_composer_button(emitter, session_id="sid1", model_id="mine.x")
         self.assertTrue(ok)
@@ -293,9 +243,7 @@ class ActionDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_status_run_emits_snippet_last(self):
         events = []
-
-        async def emitter(e):
-            events.append(e)
+        emitter = RecordingEmitter(events)
 
         action = openclaw_status_action.Action()
         result = await action.action({"session_id": "sockA"}, __user__={"id": "u"},
@@ -310,9 +258,7 @@ class ActionDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def _status_cfg(self, model):
         events = []
-
-        async def emitter(e):
-            events.append(e)
+        emitter = RecordingEmitter(events)
 
         action = openclaw_status_action.Action()
 
@@ -335,9 +281,7 @@ class ActionDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_compact_and_drawer_runs_do_not_emit(self):
         events = []
-
-        async def emitter(e):
-            events.append(e)
+        emitter = RecordingEmitter(events)
 
         action = openclaw_status_action.Action()
 
@@ -353,9 +297,7 @@ class ActionDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_emitted_even_when_the_run_raises(self):
         events = []
-
-        async def emitter(e):
-            events.append(e)
+        emitter = RecordingEmitter(events)
 
         action = openclaw_status_action.Action()
 
@@ -575,19 +517,6 @@ class EnsureWatcherTests(unittest.IsolatedAsyncioTestCase):
         if task is not None:
             task.cancel()
         openclaw_pipe._composer_watcher_task = None
-        for name in ("open_webui.socket.main", "open_webui.socket", "open_webui"):
-            sys.modules.pop(name, None)
-
-    def _install_fake_owui(self):
-        owui = types.ModuleType("open_webui")
-        sock = types.ModuleType("open_webui.socket")
-        main = types.ModuleType("open_webui.socket.main")
-        main.SESSION_POOL = {}
-        owui.socket = sock
-        sock.main = main
-        sys.modules.update({"open_webui": owui, "open_webui.socket": sock,
-                            "open_webui.socket.main": main})
-        return main
 
     async def test_outside_owui_does_nothing(self):
         sys.modules.pop("open_webui", None)
@@ -595,7 +524,7 @@ class EnsureWatcherTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(_ensure_composer_watcher(lambda: Pipe.Valves()))
 
     async def test_starts_once_and_cancels_a_previous_deploys_task(self):
-        main = self._install_fake_owui()
+        main = fake_owui(self, SESSION_POOL={})
         stale = asyncio.get_running_loop().create_task(asyncio.sleep(60))
         setattr(main, openclaw_pipe._COMPOSER_WATCH_ATTR, stale)
         task = _ensure_composer_watcher(lambda: Pipe.Valves())
@@ -606,7 +535,7 @@ class EnsureWatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(stale.cancelled())
 
     async def test_disabled_valve_does_not_start(self):
-        self._install_fake_owui()
+        fake_owui(self, SESSION_POOL={})
         valves = Pipe.Valves()
         valves.COMPOSER_STATUS_BUTTON = False
         self.assertIsNone(_ensure_composer_watcher(lambda: valves))

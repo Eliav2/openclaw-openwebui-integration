@@ -12,14 +12,11 @@ in-process agents had no detail at all (B10).
 
 import asyncio
 import json
-import os
-import shutil
-import subprocess
-import tempfile
 import unittest
 from unittest import mock
 
 import test_status_action_unit  # noqa: F401  (installs the module stubs)
+from _test_helpers import action_gateway, RecordingEmitter, run_page
 from test_status_action_unit import _FAKE_DOM_JS, _drawer_conn, _emitted_codes
 
 import openclaw_status_action
@@ -65,19 +62,7 @@ run(input.open);
 
 
 def _page(body: str, payload: dict) -> dict:
-    runtime = shutil.which("bun") or shutil.which("node")
-    if runtime is None:
-        raise unittest.SkipTest("no bun or node")
-    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
-        fh.write(_PAGE_JS + body)
-    try:
-        out = subprocess.run([runtime, fh.name], input=json.dumps({"now": NOW, **payload}),
-                             capture_output=True, text=True, timeout=60)
-    finally:
-        os.unlink(fh.name)
-    if out.returncode != 0:
-        raise AssertionError(out.stderr)
-    return json.loads(out.stdout)
+    return run_page(_PAGE_JS + body, {"now": NOW, **payload})
 
 
 def _rows():
@@ -361,12 +346,9 @@ class FinalReplyTests(unittest.IsolatedAsyncioTestCase):
             raise AssertionError(f"unexpected RPC: {method}")
 
         emitted = []
+        emitter = RecordingEmitter(emitted)
 
-        async def emitter(evt):
-            emitted.append(evt)
-
-        with mock.patch("openclaw_status_action._get_action_connection",
-                        new=mock.AsyncMock(return_value=(_drawer_conn(send_request), "pipe"))):
+        with action_gateway(_drawer_conn(send_request)):
             await Action()._run_subagent_detail({"mode": "subagent-detail", "taskId": CHILD}, {"id": "u"}, emitter)
         code = [c for c in _emitted_codes(emitted) if "S.fillDrawer(DATA)" in c][-1]
         return json.loads(code.split("const DATA = ", 1)[1].split(";\n", 1)[0])["items"]
@@ -416,8 +398,7 @@ class PollTests(unittest.IsolatedAsyncioTestCase):
         async def emitter(_evt):
             return None
 
-        with mock.patch("openclaw_status_action._get_action_connection",
-                        new=mock.AsyncMock(return_value=(_drawer_conn(send_request), "pipe"))):
+        with action_gateway(_drawer_conn(send_request)):
             result = await asyncio.wait_for(Action()._run_subagent_detail(
                 {"mode": "subagent-detail", "taskId": CHILD}, {"id": "u"}, emitter), 5)  # bounds the test only
         self.assertEqual(result["status"], "ok")
@@ -481,13 +462,10 @@ async def _drawer_fill(send_request, body=None, user=None):
     """Run one drawer request against a fake Gateway; returns its fill's DATA
     and the RPCs it made."""
     emitted = []
-
-    async def emitter(evt):
-        emitted.append(evt)
+    emitter = RecordingEmitter(emitted)
 
     conn = _drawer_conn(send_request)
-    with mock.patch("openclaw_status_action._get_action_connection",
-                    new=mock.AsyncMock(return_value=(conn, "pipe"))):
+    with action_gateway(conn):
         await Action()._run_subagent_detail({"mode": "subagent-detail", "taskId": CHILD, "opened": True,
                                              **(body or {})}, user or {"id": "u"}, emitter)
     code = [c for c in _emitted_codes(emitted) if "S.fillDrawer(DATA)" in c][-1]

@@ -66,7 +66,10 @@ pydantic, cryptography and websockets to the versions Open WebUI itself locks,
 because the artifacts run inside Open WebUI's interpreter.
 
 Most of the suite (`test_build.py` and every `test_*_unit.py`) is pure unit
-tests with no external dependencies. `test_fixture_owui_streaming_handler.py`
+tests with no external dependencies. What the suites share lives in two modules pytest
+does not collect: `_test_stubs.py` (stand-ins for websockets, cryptography and
+pydantic) and `_test_helpers.py` (`run_page` for the fake-DOM page scripts,
+`RecordingEmitter`, `action_gateway`, `fake_owui`/`owui_modules`, `FakeSio`). `test_fixture_owui_streaming_handler.py`
 is not a suite, it's a verbatim copy of Open WebUI's streaming handler, used
 as a fixture to pin tool-card rendering against the real thing.
 
