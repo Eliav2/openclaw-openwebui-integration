@@ -384,6 +384,12 @@ class _TurnWriter:
         self.awaiting_row = False       # kept open for a Gateway recovery (R2)
         self.closed = False             # nothing more to write (ended, or M is someone else's)
         self.sent_output: list = []     # the `output` open tabs hold
+        if renderer is not None:
+            # A handed renderer is what the request showed: open tabs hold
+            # those items, but under Open WebUI's ids, so an `added` would
+            # splice in a second copy. Unknown items make the first diff
+            # replace each one in place, by index (ELI-158).
+            self.sent_output = [{"type": "_shown_by_request"} for _ in renderer.output]
         self._media_failed: set = set()  # MEDIA directives that did not resolve
         self._emit = None
         self._done = asyncio.Event()
