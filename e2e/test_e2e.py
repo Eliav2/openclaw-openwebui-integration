@@ -711,18 +711,22 @@ def test_the_status_action_lists_a_running_subagent_and_opens_its_drawer(token):
     assert [(t["id"], t["status"]) for t in reopened["tasks"]] == [(row["id"], "completed")], reopened
     assert reopened["total"] == 1 and reopened["agents"] == [], reopened
 
-    # The drawer, once the child is done: its status and its last reply.
+    # The drawer, once the child is done: its status, its task in the
+    # header, and its run ending with its reply.
     child = row["id"]
     _until("the sub-agent to finish", lambda: _gw("sessions.describe", {"key": child})
            .get("session", {}).get("status") == "done", timeout_s=120, every_s=2)
     codes = _run_action(token, lambda a, emit: a._run_subagent_detail(
         {"mode": "subagent-detail", "taskId": child, "taskTitle": row["title"], "taskStatus": "running"},
         {"id": me["id"]}, emit))
-    overview = _section_data(codes, "openclaw-drawer-section-overview")
-    assert overview["childSessionKey"] == child, overview
-    assert overview["task"]["status"] == "completed", overview
-    assert (overview["task"]["terminalSummary"] or "").startswith("E2E_CHILDTASK slow-1"), overview
-    assert overview["task"]["endedAt"], overview
+    drawer = _section_data(codes, "openclaw-drawer-stream")
+    assert drawer["childSessionKey"] == child, drawer
+    assert drawer["task"]["status"] == "completed", drawer
+    assert drawer["task"]["task"] == SPAWN_TASK, drawer
+    assert drawer["task"]["endedAt"], drawer
+    assert drawer["items"] and drawer["items"][-1]["kind"] == "text", drawer
+    assert drawer["items"][-1]["text"].startswith("E2E_CHILDTASK slow-1"), drawer
+    assert drawer["parent"]["chatId"] == chat_id, drawer
 
 
 # ── A run that ends while Open WebUI is stopped (ELI-94) ─────────────────────

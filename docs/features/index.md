@@ -33,7 +33,7 @@ Everything here works as soon as the Pipe is installed, except entries marked:
 
 - [**Status dialog**](./status.md#the-status-dialog) _(separate function)_: context, rate limits and sub-agents, fetched live on demand, from the message toolbar or the composer
 - [**Compact from the dialog**](./status.md#compact): run `/compact` on the session and watch the numbers change
-- [**Sub-agent drawer**](./status.md#sub-agent-drawer): each sub-agent's overview, transcript and tool calls, refreshed while it runs
+- [**Sub-agent drawer**](./status.md#sub-agent-drawer): each sub-agent's run as a read-only chat, its tool calls as cards, growing while it runs
 - [**Backend diagnostics**](../troubleshooting.md): prefixed logs for every reply, save decision and tool call
 
 ## Replies the agent starts

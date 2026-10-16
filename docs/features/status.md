@@ -1,4 +1,4 @@
-The Status dialog shows a chat's context use, your rate limits and the sub-agents its runs spawned, fetched live when you open it. From there you can compact the session, or open any sub-agent's drawer to see its task, transcript and tool calls.
+The Status dialog shows a chat's context use, your rate limits and the sub-agents its runs spawned, fetched live when you open it. From there you can compact the session, or open any sub-agent's drawer to read its run like a chat.
 
 Applies to: Action (the composer Status button also needs the Pipe)
 Valves: `GATEWAY_URL`, `GATEWAY_TOKEN`, `DEVICE_IDENTITY`, `STATE_DIR`, `AGENT_ID`, `CONTROL_UI_URL` (Action); `COMPOSER_STATUS_BUTTON` (Pipe)
@@ -49,22 +49,18 @@ Each row is one line: the sub-agent's spawn label (else the first sentence of it
 
 ## Sub-agent drawer
 
-![A running sub-agent's drawer on a phone: a one-line header, its reply so far as Latest, and its Task](../img/subagent-drawer-light.png)
+![A running sub-agent's drawer on a phone: its name, status and time, its model and the chat it came from, the head of its task, then its run so far with a tool card opened and the step it is on](../img/subagent-drawer-light.png)
 
-Click a sub-agent to open its drawer: a side panel, or on a phone a full-screen sheet with a **‹ Back** button. Its header is the title, the status, the time and the link to the sub-agent in the Control UI, with three tabs below:
+Click a sub-agent to open its drawer: a side panel, or on a phone a full-screen sheet with a **‹ Back** button. The top is a short header: the sub-agent's name, its status and its time; its model and the chat it came from (a link; for a sub-agent spawned by another sub-agent, its parent's drawer); and the first two lines of its task, with "Show all".
 
-- **Overview:** its **Result** (the last block of its final reply, six lines, "Show all" for the rest; while it runs, its reply so far, as **Latest**) and its **Task** (three lines, "Show all"), then when it started and how long it ran, its own context fill, its goal line, and its provider and model, which are often not the parent's.
-- **Transcript:** the sub-agent's messages. Its first message shows the task it was given, not the spawn wrapper around it.
-- **Tools:** each tool call with its arguments and result, failed ones marked.
+Below the header is the sub-agent's run as a read-only chat, oldest first: what it said, every tool call as a collapsed card (tap it for the input and the output; a failed one is marked ❌, as in the chat), any message it was sent after its task, and its reply last. The cards are the same ones the chat shows for a run, drawn from the same transcript the same way. There is no composer.
 
-An in-process agent opens the same sheet with its task and result from its tool card, and no tabs.
+An in-process agent opens the same sheet: its task as the message that started it, and its result as the reply.
 
-The drawer reads the sub-agent's own transcript (`chat.history`) and refreshes about every 2.5 seconds for as long as it is open and the sub-agent runs; closing it stops the refresh. For a claude-cli sub-agent the Result is its last turn, not the run's closing message, which repeats every message of the run. When tool calls show up depends on the runtime the sub-agent runs on:
+The drawer reads the sub-agent's whole transcript (`chat.history`). A very long run shows its newest steps and says how many earlier ones are left out, with **Show earlier steps** to read them too. While the sub-agent runs, the drawer refreshes about every 2.5 seconds, adds each new step and shows which step it is on ("Working… (step 3)"); if you scrolled up to read, it leaves you there. Closing it stops the refresh. When the steps show up depends on the runtime the sub-agent runs on:
 
-- **OpenClaw's own runtime:** tool calls show as they happen.
-- **claude-cli runtime:** its tool calls reach the transcript when its run ends, so the Tools tab fills at the end.
-
-The Tools tab reads both transcript shapes, so it works the same for either runtime.
+- **OpenClaw's own runtime:** each step shows as it happens.
+- **claude-cli runtime:** its messages and tool calls reach the transcript when its run ends, so while it runs the drawer says so and shows its latest line. A claude-cli sub-agent that is stopped before it ends keeps none of its tool calls, and the drawer says that too.
 
 ## Status button in the composer
 

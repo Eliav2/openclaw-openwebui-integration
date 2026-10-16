@@ -567,30 +567,19 @@ class Scenes:
         print(f"  computed z-index: {z}", flush=True)
         if z["drawer"] == "auto" or (z["dialog"] != "auto" and int(z["drawer"]) <= int(z["dialog"])):
             raise AssertionError(f"the sub-agent drawer opens behind the status dialog (computed z-index {z})")
-        # The Overview: the reply so far as its Result, and its Task.
-        wait_js(page, """() => { const b = document.getElementById('openclaw-drawer-blocks');
-                 return b && b.querySelector('[data-openclaw-block=result]') && b.querySelector('[data-openclaw-block=task]'); }""",
-                "the drawer's Result and Task", 60_000)
-        print("  drawer layout: " + json.dumps(page.evaluate(DRAWER_LAYOUT)), flush=True)
-        self.s.shot(page, "subagent-drawer", text_selector="#openclaw-drawer-root")
-        page.locator("#openclaw-drawer-root button", has_text="Transcript").first.click()
-        # Tool results show only in the Tools tab (ELI-128); the child's first
-        # turn carries a line of prose with its tool call, so the Transcript
-        # shows the task and the child's own words.
-        wait_js(page, """() => { const d = document.querySelector('#openclaw-drawer-root');
-                 return d && /\\buser\\b/i.test(d.innerText) && d.innerText.includes("start from the app's README"); }""",
-                "the drawer transcript's task and the child's prose", 60_000)
-        self.s.shot(page, "subagent-drawer-transcript", text_selector="#openclaw-drawer-root")
-        # The Tools tab, its first card opened: what a tool's result looks like there.
+        # Its run as a read-only chat: the child's own words, its read call
+        # with its result back, and the step it is on now.
+        wait_js(page, """() => { const s = document.getElementById('openclaw-drawer-stream');
+                 return s && s.querySelector('[data-openclaw-card]') && s.querySelector('[data-openclaw-note=working]')
+                   && s.innerText.includes("start from the app's README"); }""",
+                "the drawer's run so far", 60_000)
         dump_child_history_shapes(f"agent:main:openwebui-{me['id']}-{chat}")
-        page.locator("#openclaw-drawer-root button", has_text="Tools").first.click()
-        wait_js(page, """() => { const s = document.querySelector('#openclaw-drawer-section-tools');
-                 return s && !s.querySelector('.animate-pulse') && s.innerText.trim().length > 0; }""",
-                "the drawer's Tools tab", 30_000)
-        if page.locator("#openclaw-drawer-section-tools summary").count():
-            page.locator("#openclaw-drawer-section-tools summary").first.click()
-        print("  tools tab: " + json.dumps(page.locator("#openclaw-drawer-section-tools").inner_text()[:600]), flush=True)
-        self.s.shot(page, "subagent-drawer-tools", text_selector="#openclaw-drawer-root")
+        page.locator("#openclaw-drawer-stream [data-openclaw-card-button]").first.click()
+        wait_js(page, """() => /output/i.test(document.getElementById('openclaw-drawer-stream').innerText)""",
+                "the opened card's output", 10_000)
+        print("  drawer layout: " + json.dumps(page.evaluate(DRAWER_LAYOUT)), flush=True)
+        print("  drawer run: " + json.dumps(page.locator("#openclaw-drawer-stream").inner_text()[:600]), flush=True)
+        self.s.shot(page, "subagent-drawer", text_selector="#openclaw-drawer-root")
         # Back to the dialog, a while after it opened: a running row's elapsed
         # time has moved on from what the dialog first showed (ELI-120).
         back_to_dialog(page)
