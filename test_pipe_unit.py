@@ -9591,11 +9591,13 @@ class GapHandoverReplayTests(_RoutingCase):
         meta = {"chat_id": self.CHAT, "user_id": self.USER, "message_id": message_id}
         gen = self.pipe._pipe_impl(body, emitter, __metadata__=meta,
                                    __event_call__=event_call if intent else None)
-        reply = {"gen": gen, "text": "", "items": [], "emitted": emitted, "output": []}
+        reply = {"gen": gen, "text": "", "items": [], "emitted": emitted, "output": [],
+                 "chunks": []}
 
         async def drain():
             try:
                 async for chunk in gen:
+                    reply["chunks"].append(chunk)
                     reply["output"] = _owui_fold_chunk(reply["output"], chunk)
                     if isinstance(chunk, str):
                         reply["text"] += chunk
@@ -9721,6 +9723,7 @@ class GapHandoverReplayTests(_RoutingCase):
             await asyncio.sleep(0.005)
         first["task"].cancel()                         # Send now
         await asyncio.gather(first["task"], return_exceptions=True)
+        self.first = first
         second = await self.start_reply("MSG2", self.M2, intent="send_now", sends=False)
         for _ in range(400):
             if (self.M1 in [k[1] for k in self.conn._turn_writers]
@@ -9794,6 +9797,33 @@ class GapHandoverReplayTests(_RoutingCase):
         self.assertIn(self._nums(11, 20).strip(), m1.get("content"))
         self.assertEqual(m2.get("content"), "ANSWER")
         self.assertEqual(self._calls(self.M2), ([], []), "the run's card is not repeated")
+
+    async def test_the_tab_shows_the_kept_run_once(self):
+        """ELI-158 screenshots (run 38880792397): after Send now the tab
+        showed the reply's text twice. Its message items carry Open WebUI's
+        ids, so the writer's first `output_item.added` spliced in a second
+        copy. The tab folds what the reply streamed, then the writer's events
+        (the vendored frontend reducer): each part shows once."""
+        if shutil.which("bun") is None:
+            if os.environ.get("CI"):
+                self.fail("bun is missing: the live-order tests must run in CI")
+            self.skipTest("bun runs the vendored Open WebUI frontend reducer")
+        await self._send_now_mid_tool()
+        self.frame(_tool("result", tcid="toolu_1"))
+        self.frame(_delta(self._nums(11, 13)))
+        for _ in range(400):
+            if any(m == self.M1 and "13" in c for _t, m, c, _o in self.owui.streams):
+                break
+            await asyncio.sleep(0.005)
+        writer = [d["data"]["data"] for e, d, _room in self.owui.emits
+                  if e == "events" and d["message_id"] == self.M1
+                  and d["data"].get("type") == "response:completion"]
+        live = _owui_live_output(_owui_stream(self.first["chunks"])[2] + writer)
+        order = _item_order(live)
+        self.assertEqual([t for t, _id, _x in order],
+                         ["message", "function_call", "function_call_output", "message"], order)
+        self.assertEqual(self._count(" ".join(x for _t, _id, x in order if x)),
+                         list(range(1, 14)), order)
 
     async def test_a_gap_in_the_kept_run_is_repaired_in_its_own_message(self):
         """The run kept in its own message loses frames: the turn writer
