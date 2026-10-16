@@ -1238,7 +1238,8 @@ def _hand_over_run(conn: "_GatewayConnection", session_key: str, run_id: str, *,
     that can come after the post-hello resync. `reply`: a request that
     hands over at an event gap gives its own state, {message_id,
     renderer, events}: what it showed, and the events queued behind the
-    gap, which the writer takes next. The run's target is then not
+    gap, which the writer takes next; with `no_resume` the writer never
+    resumes the run (a run Send now kept, ELI-158). The run's target is then not
     needed (the run's final reaching the request drops it). False when
     there is no message to hand over."""
     key = f"{session_key}:{run_id}"
@@ -1252,7 +1253,8 @@ def _hand_over_run(conn: "_GatewayConnection", session_key: str, run_id: str, *,
         pump.handover = conn.handover_of(session_key, run_id, thinking)
     else:
         pump.handover = {"message_id": reply["message_id"], "renderer": reply["renderer"],
-                         "thinking": thinking or (target or {}).get("thinking"), "shown": ""}
+                         "thinking": thinking or (target or {}).get("thinking"), "shown": "",
+                         "no_resume": bool(reply.get("no_resume"))}
         for payload in reply["events"]:
             pump.queue.put_nowait(("event", payload))
     pump.stop_notice_before = conn._stop_notice_seen
@@ -1326,6 +1328,11 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
                                       renderer=handed["renderer"], thinking=handed.get("thinking"),
                                       shown=handed.get("shown", ""))
             conn._turn_writers[(chat_id, handed["message_id"])] = pump.writer
+            if handed.get("no_resume"):
+                # Kept by Send now (ELI-158): the user's new message is next
+                # and goes out when the run settles. A resume would race it
+                # into the same session (ELI-159), so an outside kill ends M.
+                pump.writer.resumes = MAX_TURN_RESUMES
             await pump.writer.feed(None)
         elif re.fullmatch(_UUID_RE, run) and run == await conn.session_id_for(sess):
             pump.wake = True
@@ -2204,6 +2211,7 @@ class _TurnHooks:
     resync = staticmethod(_turn_resync)
     settled = staticmethod(_turn_settled)
     note_heartbeat = staticmethod(_note_heartbeat_run)
+    hand_over = staticmethod(_hand_over_run)
 
 
 _TURNS = _TurnHooks

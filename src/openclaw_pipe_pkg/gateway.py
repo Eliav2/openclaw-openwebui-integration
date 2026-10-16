@@ -2150,7 +2150,8 @@ class _GatewayConnection:
     def park_cancelled_turn(self, session_key: str, run_id: str | None,
                             queue: asyncio.Queue | None, carried: list[str],
                             grace_s: float, send_stop: bool,
-                            run_text: dict | None = None, settle=None) -> None:
+                            run_text: dict | None = None, settle=None,
+                            reply: dict | None = None) -> None:
         """Hand a cancelled reply's unfinished business to the next message.
 
         OWUI cancels a response the same way for Stop and for Send now /
@@ -2169,9 +2170,13 @@ class _GatewayConnection:
           of it for new and appends the entire reply again (seen live
           2026-10-12: 2327..4000 followed by 1..4000).
 
+        * `reply` is the cancelled reply's own state, {message_id, renderer}:
+          the message it showed the run in, and what it showed there.
+
         `settle` (a coroutine function) asks the browser which button was
         pressed and calls `settle_parked_turn`: Stop releases it now, Send now
-        holds it for the follow-up message. It runs as a background task
+        keeps the run in its own message (`_keep_in_own_message`) and holds
+        what the reply had not sent for the follow-up message. It runs as a background task
         started here, so interrupting the cancelled reply cannot interrupt it
         (ELI-95), and the entry is `resolved` when it returns, which the
         intent query's own bound ensures. Without one, nobody can say (no page
@@ -2217,17 +2222,19 @@ class _GatewayConnection:
 
         entry = {"run_id": run_id, "queue": queue, "carried": list(carried),
                  "send_stop": send_stop, "task": None,
-                 "resolved": asyncio.Event(), "run_text": run_text}
+                 "resolved": asyncio.Event(), "run_text": run_text, "reply": reply}
 
         def _release() -> None:
+            # Read from the entry: a run kept in its own message is no longer
+            # the entry's to stop.
             if entry["queue"] is not None:
-                self.unregister_consumer(session_key, run_id, queue=entry["queue"])
+                self.unregister_consumer(session_key, entry["run_id"], queue=entry["queue"])
             if entry["carried"]:
                 pipe_log(f"  stopped: dropping {len(entry['carried'])} unsent "
                          "message(s)")
-            if run_id:
+            if entry["run_id"]:
                 spawn_background(
-                    self._abort_cancelled_run(session_key, run_id, send_stop))
+                    self._abort_cancelled_run(session_key, entry["run_id"], send_stop))
 
         entry["release"] = _release
         if grace_s <= 0:
@@ -2287,13 +2294,51 @@ class _GatewayConnection:
             pipe_log(f"  cancel was a Stop: stopping run {str(run_id)[:20]}... now")
             entry["release"]()
         elif intent == "send_now":
-            pipe_log(f"  cancel was a Send now: holding run {str(run_id)[:20]}... "
-                     f"for the follow-up message (up to {hold_s:g}s)")
-            self._arm_parked_timer(session_key, entry, hold_s)
+            if self._keep_in_own_message(session_key, entry):
+                pipe_log(f"  cancel was a Send now: run {str(run_id)[:20]}... goes on in "
+                         "its own message; the follow-up message waits for it")
+                if not entry["carried"]:
+                    self._pending_cancel_aborts.pop(session_key, None)
+                    if entry["task"] is not None:
+                        entry["task"].cancel()
+                else:
+                    self._arm_parked_timer(session_key, entry, hold_s)
+            else:
+                pipe_log(f"  cancel was a Send now: holding run {str(run_id)[:20]}... "
+                         f"for the follow-up message (up to {hold_s:g}s)")
+                self._arm_parked_timer(session_key, entry, hold_s)
         else:
             pipe_log("  cancel intent unknown (no page hook or no answer): "
                      "keeping the fallback window")
         entry["resolved"].set()
+
+    def _keep_in_own_message(self, session_key: str, entry: dict) -> bool:
+        """Keep a parked run in the message it was cancelled in (ELI-158):
+        the turn writer takes that message over with what the reply showed
+        and the run's events buffered since the cancel, and finishes it when
+        the run really ends. A running tool card stays running there instead
+        of being shown done while the run goes on in the next reply. The
+        entry keeps only the messages the reply had not sent. False when
+        there is no message to keep it in (an API request) or no run."""
+        reply, run_id, queue = entry.get("reply"), entry["run_id"], entry["queue"]
+        if not reply or not run_id or not _TURNS:
+            return False
+        taken = queue.take_all() if queue is not None else []
+        events = [m.get("payload") or {} for m in taken if m.get("type") == "event"]
+        # Parking marked the run delivered so a late event reopens nothing;
+        # its message is open again now, so its events must reach the writer.
+        delivered = self._delivered_live.pop(f"{session_key}:{run_id}", None)
+        if not _TURNS.hand_over(self, session_key, run_id,
+                                reply={**reply, "events": events, "no_resume": True}):
+            for m in taken:
+                queue.put_control(m)
+            if delivered is not None:
+                self._delivered_live[f"{session_key}:{run_id}"] = delivered
+            return False
+        if queue is not None:
+            self.unregister_consumer(session_key, run_id, queue=queue)
+        entry.update(run_id=None, queue=None, reply=None, run_text=None)
+        return True
 
     async def claim_cancelled_turn(self, session_key: str) -> dict | None:
         """Take over the turn `park_cancelled_turn` parked, if any.
@@ -2319,6 +2364,9 @@ class _GatewayConnection:
             return None
         if entry["task"] is not None:
             entry["task"].cancel()
+        # A new message inside the fallback window keeps the run, in its own
+        # message as Send now does; the new reply takes only the messages.
+        self._keep_in_own_message(session_key, entry)
         return {"run_id": entry["run_id"], "queue": entry["queue"],
                 "carried": list(entry["carried"]),
                 "run_text": entry.get("run_text")}

@@ -1497,8 +1497,9 @@ class _PipeTurn:
                     # and the reply's own unsent message lost (2026-10-11).
                     #
                     # Park first, synchronously: the run keeps going with its
-                    # events buffered, and the next message takes it over
-                    # (see `park_cancelled_turn`). The awaits after it may be
+                    # events buffered. On Send now it goes on in this reply's
+                    # own message, through the turn writer (ELI-158); see
+                    # `park_cancelled_turn`. The awaits after it may be
                     # interrupted themselves; nothing depends on them.
                     self.aborted = True
                     grace_s = float(getattr(self.pipe.valves, "INTERRUPT_GRACE_SECONDS", 0) or 0)
@@ -1512,6 +1513,9 @@ class _PipeTurn:
                         settle=functools.partial(
                             _settle_cancel_intent, self.conn, self.session_key, self.our_run_id,
                             self.owui_origin_chat_id, self.__event_call__),
+                        reply=({"message_id": self.owui_message_id,
+                                "renderer": copy.deepcopy(self.renderer)}
+                               if self.owui_message_id and not self.keeps_its_run else None),
                     )
                     pipe_log(
                         f"Generator {type(stop).__name__}: run parked "

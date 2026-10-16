@@ -1359,7 +1359,7 @@ class ParkedCancelTests(unittest.IsolatedAsyncioTestCase):
         buffered since the cancel, and the next reply gets no run."""
         conn, calls = self._conn()
         reply = self._park_with_reply(conn)
-        with mock.patch("openclaw_pipe._hand_over_run", return_value=True) as hand:
+        with mock.patch.object(openclaw_pipe._TurnHooks, "hand_over", return_value=True) as hand:
             conn.settle_parked_turn("s", "run-1", "send_now", hold_s=5)
         hand.assert_called_once()
         args, kwargs = hand.call_args
@@ -1375,7 +1375,7 @@ class ParkedCancelTests(unittest.IsolatedAsyncioTestCase):
     async def test_messages_the_cancelled_reply_had_not_sent_still_reach_the_next(self):
         conn, _ = self._conn()
         self._park_with_reply(conn, carried=["first"])
-        with mock.patch("openclaw_pipe._hand_over_run", return_value=True):
+        with mock.patch.object(openclaw_pipe._TurnHooks, "hand_over", return_value=True):
             conn.settle_parked_turn("s", "run-1", "send_now", hold_s=5)
         claimed = await conn.claim_cancelled_turn("s")
         self.assertIsNone(claimed["run_id"])
@@ -1386,7 +1386,7 @@ class ParkedCancelTests(unittest.IsolatedAsyncioTestCase):
         the window keeps the run, in its own message, as Send now does."""
         conn, calls = self._conn()
         self._park_with_reply(conn)
-        with mock.patch("openclaw_pipe._hand_over_run", return_value=True) as hand:
+        with mock.patch.object(openclaw_pipe._TurnHooks, "hand_over", return_value=True) as hand:
             claimed = await conn.claim_cancelled_turn("s")
         hand.assert_called_once()
         self.assertIsNone(claimed["run_id"])
@@ -9690,74 +9690,49 @@ class GapHandoverReplayTests(_RoutingCase):
         self.assertEqual([e for e in reply["emitted"] if e.get("type") == "replace"], [])
         self.assertEqual(len(self.chat_sends), 1, "no retry or resend")
 
-    async def test_a_reply_that_took_over_a_run_keeps_streaming_through_a_gap(self):
-        """Known, accepted gap: a Send now reply holds the user's new message
-        and sends it once the run it took over ends, in the same message. It
-        does not hand over (the writer would own its message while it sends,
-        ELI-153); text lost in a gap there stays lost."""
-        first = await self.start_reply("count to 20", "m1", intent="send_now")
+    # Real Open WebUI message ids: a pipe run id names its message, and only
+    # a uuid there makes the run the Pipe's own (`parse_pipe_run_id`).
+    M1 = "11111111-1111-4111-8111-111111111111"
+    M2 = "22222222-2222-4222-8222-222222222222"
+
+    async def _send_now_mid_tool(self):
+        """Reply 1 streams 1..10 and starts a tool call; Send now; reply 2
+        brings MSG2. Returns reply 2 and the first run's id."""
+        first = await self.start_reply("count to 20", self.M1, intent="send_now")
         run1 = self.run
-        self.history = {"messages": [
-            {"role": "user", "content": "count to 20", "idempotencyKey": f"{run1}:user"},
-            {"role": "assistant", "idempotencyKey": f"cli-assistant:{run1}",
-             "content": [{"type": "text", "text": self._nums(1, 20)}]}]}
         self.frame(_delta(self._nums(1, 10)))
+        self.frame(_tool("start", tcid="toolu_1"))
         for _ in range(400):
-            if "10\n" in first["text"]:
+            if first["items"]:
                 break
             await asyncio.sleep(0.005)
         first["task"].cancel()                         # Send now
         await asyncio.gather(first["task"], return_exceptions=True)
-        second = await self.start_reply("MSG2", "m2", intent="send_now", sends=False)
-        self.frame(_delta(self._nums(11, 13)))
-        self.lost(1)                                   # 14-15
-        self.frame(_delta(self._nums(16, 20)))
-        self.frame({"state": "final"}, event="chat")
-        self.settle()
+        second = await self.start_reply("MSG2", self.M2, intent="send_now", sends=False)
         for _ in range(400):
-            if len(self.chat_sends) == 2:
+            if (self.M1 in [k[1] for k in self.conn._turn_writers]
+                    and self.owui.msgs()[self.M1].get("done") is False):
                 break
             await asyncio.sleep(0.005)
-        self.assertEqual(self.chat_sends[1]["message"], "MSG2")
-        self.run, self.active = self.chat_sends[1]["idempotencyKey"], True
-        self.frame(_delta("ANSWER"))
-        self.frame({"state": "final"}, event="chat")
-        self.settle()
-        await self.ended(second)
-        self.assertEqual(self.conn._turn_pumps, {}, "nothing was handed over")
-        self.assertEqual(self.owui.tasks, {}, "no turn writer opened a message")
-        self.assertEqual(self.owui.msgs()["m2"]["content"],
-                         self._nums(11, 13) + self._nums(16, 20) + "\n\n---\n\nANSWER")
+        return second, run1
 
-    async def _send_now_takeover(self):
-        """Reply 1 streams 1..10 of a run; Send now hands the run to reply 2,
-        which holds MSG2 and streams 11..13."""
-        first = await self.start_reply("count to 20", "m1", intent="send_now")
-        self.frame(_delta(self._nums(1, 10)))
-        for _ in range(400):
-            if "10\n" in first["text"]:
-                break
-            await asyncio.sleep(0.005)
-        first["task"].cancel()                         # Send now
-        await asyncio.gather(first["task"], return_exceptions=True)
-        second = await self.start_reply("MSG2", "m2", intent="send_now", sends=False)
-        self.frame(_delta(self._nums(11, 13)))
-        for _ in range(400):
-            if "13\n" in second["text"]:
-                break
-            await asyncio.sleep(0.005)
-        return second
+    @staticmethod
+    def _history(run, *parts, text=None):
+        """run's turn as the Gateway stores it on claude-cli: the user
+        message, the imported assistant content, the closing message."""
+        imported = {"importedFrom": "claude-cli"}
+        closing = text if text is not None else "".join(
+            p.get("text", "") for p in parts if p.get("type") == "text")
+        return {"messages": [
+            {"role": "user", "content": "count to 20", "idempotencyKey": f"{run}:user"},
+            {"role": "assistant", "__openclaw": imported, "content": list(parts)},
+            {"role": "assistant", "idempotencyKey": f"cli-assistant:{run}",
+             "content": [{"type": "text", "text": closing}]}]}
 
-    def _reconnect_to_a_restarted_gateway(self):
-        """The next reconnect's hello names a new Gateway process."""
-        self.conn.gateway_boot_id, self.conn.connection_epoch = "boot-a", 1
-        reconnect = self.conn._reconnect
-
-        async def restarted():
-            await reconnect()
-            self.conn.connection_epoch += 1
-            self.conn._note_gateway_boot("boot-b")
-        self.conn._reconnect = restarted
+    def _calls(self, message_id):
+        out = self.owui.msgs()[message_id].get("output") or []
+        return ([i.get("call_id") or i.get("id") for i in out if i.get("type") == "function_call"],
+                [i.get("call_id") or i.get("id") for i in out if i.get("type") == "function_call_output"])
 
     async def _answer_msg2(self, second):
         for _ in range(400):
@@ -9775,58 +9750,68 @@ class GapHandoverReplayTests(_RoutingCase):
         self.settle()
         await self.ended(second)
 
-    async def test_a_takeover_reply_keeps_a_run_the_restarted_gateway_recovered(self):
-        """ELI-153: a Send now reply holds MSG2 for the run it took over. The
-        Gateway restarts mid-run and its new process carries the run on. The
-        reply keeps streaming it and sends MSG2 after it. Handed to the turn
-        writer, the run's tail (14..20) went into m2 from the writer while the
-        reply went on into m2 with "---" and the answer, and Open WebUI's save
-        at the reply's end left m2 without the tail."""
-        self._reconnect_to_a_restarted_gateway()
-        second = await self._send_now_takeover()
-        self.socket.frames.put_nowait("drop")
+    async def test_send_now_keeps_a_running_tool_card_running_in_its_own_message(self):
+        """ELI-158: Send now while a tool runs. The run stays in its own
+        message, its card running until the tool really ends there; the new
+        message waits for the run and gets only its own answer. Before, the
+        cancelled message showed the card done and the run went on in the
+        next reply."""
+        second, run1 = await self._send_now_mid_tool()
+        self.assertEqual(self._calls(self.M1), (["toolu_1"], []), "the card is still running")
+        self.assertEqual(len(self.chat_sends), 1, "MSG2 waits for the run")
+        self.history = self._history(
+            run1, {"type": "text", "text": self._nums(1, 10)},
+            {"type": "toolcall", "id": "toolu_1", "name": "Bash", "arguments": {"command": "ls"}},
+            {"type": "tool_result", "tool_use_id": "toolu_1", "name": "Bash",
+             "content": [{"type": "text", "text": "ok"}]},
+            {"type": "text", "text": self._nums(11, 20)})
+        self.frame(_tool("result", tcid="toolu_1"))
         for _ in range(400):
-            if self.conn.gateway_boot_id == "boot-b":
+            if self._calls(self.M1)[1]:
                 break
             await asyncio.sleep(0.005)
-        self.frame(_delta(self._nums(14, 20)))          # the new socket's frames
+        self.assertEqual(self._calls(self.M1), (["toolu_1"], ["toolu_1"]), "done when the tool ends")
+        self.frame(_delta(self._nums(11, 20)))
         self.frame({"state": "final"}, event="chat")
+        self.active = False
         self.settle()
         await self._answer_msg2(second)
-        self.assertEqual(self.owui.msgs()["m2"]["content"],
-                         self._nums(11, 20) + "\n\n---\n\nANSWER")
-        self.assertEqual(self.owui.tasks, {}, "no turn writer opened a message")
+        m1, m2 = self.owui.msgs()[self.M1], self.owui.msgs()[self.M2]
+        self.assertIs(m1.get("done"), True)
+        self.assertIn(self._nums(11, 20).strip(), m1.get("content"))
+        self.assertEqual(m2.get("content"), "ANSWER")
+        self.assertEqual(self._calls(self.M2), ([], []), "the run's card is not repeated")
 
-    async def test_a_takeover_reply_ends_a_run_the_restart_killed(self):
-        """ELI-153: the restart killed the run the Send now reply took over:
-        its row is idle and the transcript holds what it wrote (1..13). The
-        reply ends it there and sends MSG2, with no resume of the dead run
-        racing it."""
-        self._reconnect_to_a_restarted_gateway()
-        second = await self._send_now_takeover()
-        run1 = self.run
-        self.history = {"messages": [
-            {"role": "user", "content": "count to 20", "idempotencyKey": f"{run1}:user"},
-            {"role": "assistant", "idempotencyKey": f"cli-assistant:{run1}",
-             "content": [{"type": "text", "text": self._nums(1, 13)}]}]}
+    async def test_a_gap_in_the_kept_run_is_repaired_in_its_own_message(self):
+        """The run kept in its own message loses frames: the turn writer
+        rebuilds that message from the transcript (before ELI-158 the reply
+        that took the run over kept what it lost lost)."""
+        second, run1 = await self._send_now_mid_tool()
+        self.history = self._history(
+            run1, {"type": "text", "text": self._nums(1, 10)},
+            {"type": "toolcall", "id": "toolu_1", "name": "Bash", "arguments": {"command": "ls"}},
+            {"type": "tool_result", "tool_use_id": "toolu_1", "name": "Bash",
+             "content": [{"type": "text", "text": "ok"}]},
+            {"type": "text", "text": self._nums(11, 20)})
+        self.frame(_tool("result", tcid="toolu_1"))
+        self.frame(_delta(self._nums(11, 13)))
+        self.lost(1)                                   # 14-15
+        self.frame(_delta(self._nums(16, 20)))
+        self.frame({"state": "final"}, event="chat")
         self.active = False
-        self.socket.frames.put_nowait("drop")
+        self.settle()
         await self._answer_msg2(second)
-        self.assertEqual(self.owui.msgs()["m2"]["content"],
-                         self._nums(11, 13) + "\n\n---\n\nANSWER")
-        self.assertEqual(self.owui.tasks, {}, "no turn writer opened a message")
+        m1 = self.owui.msgs()[self.M1].get("content")
+        self.assertEqual(self._count(m1), list(range(1, 21)), m1)
+        self.assertEqual(self.owui.msgs()[self.M2].get("content"), "ANSWER")
 
-    async def test_a_takeover_reply_whose_run_is_killed_from_outside(self):
-        """ELI-153: the run a Send now reply took over is killed from outside
-        (exit 143). The reply shows the error and sends MSG2 in the same
-        message. Handed to the turn writer, the writer finalized m2 after the
-        reply's own save and the answer to MSG2 was gone."""
-        second = await self._send_now_takeover()
-        run1 = self.run
-        self.history = {"messages": [
-            {"role": "user", "content": "count to 20", "idempotencyKey": f"{run1}:user"},
-            {"role": "assistant", "idempotencyKey": f"cli-assistant:{run1}",
-             "content": [{"type": "text", "text": self._nums(1, 13)}]}]}
+    async def test_a_kept_run_killed_from_outside_ends_in_its_own_message(self):
+        """The kept run is killed from outside (exit 143): its own message
+        ends with the cut-off note and is not resumed, since a resume would
+        race MSG2 into the session (ELI-159); MSG2 goes out after it, alone,
+        in its own message."""
+        second, run1 = await self._send_now_mid_tool()
+        self.history = self._history(run1, {"type": "text", "text": self._nums(1, 10)})
         kill = "Claude Code process exited with code 143"
         self.frame({"stream": "lifecycle", "data": {"phase": "error", "error": kill}})
         self.active = False
@@ -9834,42 +9819,9 @@ class GapHandoverReplayTests(_RoutingCase):
                     "lastRunId": run1, "lastRunError": kill, "reason": "chat.run.settled"},
                    event="sessions.changed")
         await self._answer_msg2(second)
-        self.assertEqual(self.owui.msgs()["m2"]["content"],
-                         self._nums(11, 13) + f"\n\n**Error:** {kill}\n\n---\n\nANSWER")
-        self.assertEqual(self.owui.tasks, {}, "no turn writer opened a message")
-
-    async def test_a_gap_in_the_held_message_s_own_run_keeps_the_takeover(self):
-        """ELI-153: the run a Send now reply took over ends, MSG2 goes out in
-        the same message, and a frame of MSG2's own run is lost. The reply
-        keeps streaming. Handed to the turn writer, m2 was rebuilt from MSG2's
-        run alone: everything the reply showed before it (11..20, "---") was
-        gone."""
-        second = await self._send_now_takeover()
-        self.frame(_delta(self._nums(14, 20)))
-        self.frame({"state": "final"}, event="chat")
-        self.settle()
-        for _ in range(400):
-            if len(self.chat_sends) == 2:
-                break
-            await asyncio.sleep(0.005)
-        self.run, self.active = self.chat_sends[1]["idempotencyKey"], True
-        self.history = {"messages": [
-            {"role": "user", "content": "MSG2", "idempotencyKey": f"{self.run}:user"},
-            {"role": "assistant", "idempotencyKey": f"cli-assistant:{self.run}",
-             "content": [{"type": "text", "text": "ANSWER FULL"}]}]}
-        for _ in range(400):
-            if self.conn.consumers_for_event({"sessionKey": self.key, "runId": self.run}):
-                break
-            await asyncio.sleep(0.005)
-        self.frame(_delta("ANSWER"))
-        self.lost(1)                                   # a dropped frame: only its seq shows
-        self.frame(_delta(" FULL"))
-        self.frame({"state": "final"}, event="chat")
-        self.settle()
-        await self.ended(second)
-        self.assertEqual(self.owui.msgs()["m2"]["content"],
-                         self._nums(11, 20) + "\n\n---\n\nANSWER FULL")
-        self.assertEqual(self.owui.tasks, {}, "no turn writer opened a message")
+        self.assertIs(self.owui.msgs()[self.M1].get("done"), True)
+        self.assertIn("cut off", self.owui.msgs()[self.M1].get("content"))
+        self.assertEqual(self.owui.msgs()[self.M2].get("content"), "ANSWER")
 
     @staticmethod
     def _count(text):
