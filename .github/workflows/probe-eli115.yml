@@ -1,7 +1,7 @@
 name: Probe ELI-115 memory
 
-# Throwaway probe (branch probe/eli115-memory only): Open WebUI 0.12's
-# anonymous memory under the requests a 30 MB chat gets.
+# Throwaway probe (branch probe/eli115-memory only): a replay of
+# 2026-10-16 07:12Z (status writes on and off) and the socket storm.
 
 on:
   push:
@@ -11,48 +11,65 @@ permissions:
   contents: read
 
 jobs:
-  probe:
-    name: probe (${{ matrix.variant }})
+  replay:
+    name: replay (${{ matrix.mode }})
     runs-on: ubuntu-latest
     timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - variant: default
-            env: ""
-            trace: "0"
-          - variant: arena2
-            env: "-e MALLOC_ARENA_MAX=2"
-            trace: "0"
-          - variant: trace
-            env: ""
-            trace: "1"
+        mode: [today, fixed]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0
+      - name: Open WebUI (one CPU, nearer the Pi)
+        run: |
+          source e2e/versions.env
+          docker run -d --name owui --network host --cpus=1 \
+            -e WEBUI_SECRET_KEY=probe-$(openssl rand -hex 8) -e ENABLE_OLLAMA_API=false \
+            -e ENABLE_OPENAI_API=false -e OFFLINE_MODE=true "$OWUI_IMAGE"
+          for i in $(seq 150); do curl -fsS localhost:8080/health && break; sleep 2; done
+          curl -fsS -X POST localhost:8080/api/v1/auths/signup -H 'Content-Type: application/json' \
+            -d '{"name":"probe","email":"probe@example.com","password":"probe-pass-1"}' >/dev/null
+      - name: Replay
+        env:
+          OWUI_EMAIL: probe@example.com
+          OWUI_PASSWORD: probe-pass-1
+          MODE: ${{ matrix.mode }}
+          OUT: ${{ runner.temp }}/replay-${{ matrix.mode }}.jsonl
+        run: uv run --with httpx python probe115/replay.py
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: replay-${{ matrix.mode }}
+          path: ${{ runner.temp }}/replay-${{ matrix.mode }}.jsonl
+
+  storm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.3.0
       - name: Open WebUI
         run: |
           source e2e/versions.env
-          docker run -d --name owui --network host ${{ matrix.env }} \
+          docker run -d --name owui --network host \
             -e WEBUI_SECRET_KEY=probe-$(openssl rand -hex 8) -e ENABLE_OLLAMA_API=false \
             -e ENABLE_OPENAI_API=false -e OFFLINE_MODE=true "$OWUI_IMAGE"
           for i in $(seq 150); do curl -fsS localhost:8080/health && break; sleep 2; done
           curl -fsS -X POST localhost:8080/api/v1/auths/signup -H 'Content-Type: application/json' \
             -d '{"name":"probe","email":"probe@example.com","password":"probe-pass-1"}' >/dev/null
-          free -m; nproc
-      - name: Probe
+      - name: Storm
         env:
           OWUI_EMAIL: probe@example.com
           OWUI_PASSWORD: probe-pass-1
-          TRACE: ${{ matrix.trace }}
-          OUT: ${{ runner.temp }}/probe-${{ matrix.variant }}.jsonl
-        run: uv run --with httpx python probe115/driver.py
-      - name: Logs
+          OUT: ${{ runner.temp }}/storm.jsonl
+        run: uv run --with httpx --with "python-socketio[asyncio_client]" python probe115/storm.py
+      - name: Session-not-found lines
         if: always()
-        run: docker logs owui 2>&1 | tail -80
+        run: docker logs owui 2>&1 | grep -c "Session not found" || true
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: probe-${{ matrix.variant }}
-          path: ${{ runner.temp }}/probe-${{ matrix.variant }}.jsonl
+          name: storm
+          path: ${{ runner.temp }}/storm.jsonl
