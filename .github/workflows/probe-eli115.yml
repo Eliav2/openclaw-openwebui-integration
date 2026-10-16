@@ -12,6 +12,7 @@ permissions:
 
 jobs:
   probe:
+    if: false
     name: probe (${{ matrix.variant }})
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -48,22 +49,23 @@ jobs:
           name: probe-${{ matrix.variant }}
           path: ${{ runner.temp }}/probe-${{ matrix.variant }}.jsonl
 
-  replay-off:
-    if: false
-    name: replay (${{ matrix.mode }})
+  replay:
+    name: replay (${{ matrix.mode }} ${{ matrix.malloc }})
     runs-on: ubuntu-latest
     timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
-        mode: [today, fixed]
+        mode: [today]
+        malloc: [default, mmap128k]
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.3.0
       - name: Open WebUI (one CPU, nearer the Pi)
         run: |
           source e2e/versions.env
-          docker run -d --name owui --network host --cpus=1 \
+          [ "${{ matrix.malloc }}" = mmap128k ] && M="-e MALLOC_MMAP_THRESHOLD_=131072" || M=""
+          docker run -d --name owui --network host --cpus=1 $M \
             -e WEBUI_SECRET_KEY=probe-$(openssl rand -hex 8) -e ENABLE_OLLAMA_API=false \
             -e ENABLE_OPENAI_API=false -e OFFLINE_MODE=true "$OWUI_IMAGE"
           for i in $(seq 150); do curl -fsS localhost:8080/health && break; sleep 2; done
@@ -74,13 +76,13 @@ jobs:
           OWUI_EMAIL: probe@example.com
           OWUI_PASSWORD: probe-pass-1
           MODE: ${{ matrix.mode }}
-          OUT: ${{ runner.temp }}/replay-${{ matrix.mode }}.jsonl
+          OUT: ${{ runner.temp }}/replay-${{ matrix.mode }}-${{ matrix.malloc }}.jsonl
         run: uv run --with httpx python probe115/replay.py
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: replay-${{ matrix.mode }}
-          path: ${{ runner.temp }}/replay-${{ matrix.mode }}.jsonl
+          name: replay-${{ matrix.mode }}-${{ matrix.malloc }}
+          path: ${{ runner.temp }}/replay-${{ matrix.mode }}-${{ matrix.malloc }}.jsonl
 
   storm:
     if: false
