@@ -6423,6 +6423,7 @@ class _FakeOwuiChat:
 
             @staticmethod
             async def upsert_message_to_chat_by_id_and_message_id(chat_id, message_id, message):
+                fake.upserts.append(message_id)
                 if not message.get("content"):        # as Open WebUI does (models/chats.py)
                     text = _owui_output_text(message.get("output"))
                     if text:
@@ -6430,6 +6431,7 @@ class _FakeOwuiChat:
                 msgs = fake.chat.chat["history"]["messages"]
                 msgs[message_id] = {**msgs.get(message_id, {}), **message}
                 return fake.chat
+        self.upserts = []
         self._chats = Chats
 
         class ChatMessages:
@@ -6611,21 +6613,109 @@ class TurnWriterStreamTests(_TurnWriterCase):
                                  "response.output_text.delta"])
         self.assertIs(self.owui.emitter_update_db, False, "the writer owns the DB writes")
 
-    async def test_the_db_is_written_on_item_boundaries_and_the_stream_on_every_event(self):
+    async def test_the_db_is_not_written_between_the_claim_and_the_end(self):
+        """ELI-115: each DB write rewrites the whole chat, about 14x its JSON
+        in Open WebUI's memory, so a write per item (two per tool call) was
+        most of a long chat's churn. A tab that opens the chat mid-turn reads
+        the response stream (`overlay_response_streams`), not the DB, and
+        after a crash the end is rebuilt from the transcript, so the DB gets
+        the claim and the end."""
         w = self.writer()
-        await w.feed(_delta("Reading"))           # opens: first item
-        writes_after_open = self.owui.msgs()["m1"].get("content")
-        await w.feed(_delta(" the logs"))         # same item: stream only
-        self.assertEqual(self.owui.msgs()["m1"].get("content"), writes_after_open)
-        await w.feed(_tool("start"))              # new item: boundary
-        self.assertEqual(self.owui.msgs()["m1"]["content"].strip()[:16], "Reading the logs")
-        self.assertEqual([i["type"] for i in self.owui.msgs()["m1"]["output"]],
-                         ["message", "function_call"])
-        await w.feed(_tool("result"))             # tool result: boundary
-        self.assertIn("function_call_output", [i["type"] for i in self.owui.msgs()["m1"]["output"]])
-        self.assertIs(self.owui.msgs()["m1"]["done"], False)
-        self.assertEqual(len(self.owui.streams), 4, "the response stream gets every event")
+        await w.feed(_delta("Reading the logs"))  # opens: the claim's own write
+        writes = len(self.owui.upserts)
+        for n in range(1, 41):
+            await w.feed(_tool("start", tcid=f"t{n}"))
+            await w.feed(_tool("result", tcid=f"t{n}"))
+        await w.feed(_delta("Found it."))
+        self.assertEqual(len(self.owui.upserts), writes, "no write per item or per call count")
+        self.assertEqual((self.owui.msgs()["m1"]["done"], self.owui.msgs()["m1"].get("output")),
+                         (False, []))
+        self.assertEqual(len(self.owui.streams), 2 * 40 + 2, "the response stream gets every event")
         self.assertEqual(self.owui.streams[-1][0], w.task_id)
+        self.assertTrue(self.owui.streams[-1][2].endswith("Found it."))
+
+        async def no_history(*_a, **_k):
+            return None
+        self.conn.session_history = no_history
+        await w.finalize()
+        self.assertEqual(len(self.owui.upserts), writes + 1, "the end")
+        m = self.owui.msgs()["m1"]
+        self.assertIs(m["done"], True)
+        self.assertEqual(sum(1 for i in m["output"] if i["type"] == "function_call_output"), 40)
+
+    def handed_writer(self, shown, request_task):
+        return _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
+                           run_id="agent-run-1", message_id="m1", takeover=True, renderer=shown,
+                           request_task=request_task)
+
+    async def test_a_handed_over_reply_is_written_once_after_the_requests_save(self):
+        """The handing request's own end-of-stream save writes `done: true`
+        over M, and it runs after the handover, in the request's task. The
+        handover's one write waits for that task to end, so it lands after
+        the save and M says `done: false` again: the state the orphan
+        reconcile adopts after a crash (ELI-90). Written before the save, as
+        a write at the handover itself was, it was overwritten at once."""
+        shown = _TurnRenderer()
+        shown.feed(_delta("Reading them."))
+        request_ends = asyncio.Event()
+        test = self
+
+        async def request():
+            await request_ends.wait()
+            await test.owui.end_request("m1", copy.deepcopy(shown.output))
+        task = asyncio.ensure_future(request())
+        w = self.handed_writer(shown, task)
+        writes = len(self.owui.upserts)
+        await w.feed(None)
+        await w.feed(_tool("start"))
+        self.assertEqual(len(self.owui.upserts), writes, "nothing before the request's save")
+        request_ends.set()
+        await task
+        for _ in range(5):
+            await asyncio.sleep(0)
+        self.assertEqual(len(self.owui.upserts), writes + 2, "the request's save, then the writer's")
+        m = self.owui.msgs()["m1"]
+        self.assertEqual((m["done"], m["content"]), (False, "Reading them."))
+        self.assertEqual([i["type"] for i in m["output"]][-1], "function_call",
+                         "what the writer had when the request ended")
+        for n in range(2, 30):
+            await w.feed(_tool("start", tcid=f"t{n}"))
+            await w.feed(_tool("result", tcid=f"t{n}"))
+        self.assertEqual(len(self.owui.upserts), writes + 2, "then nothing until the end")
+
+    async def test_a_handover_after_the_request_ended_is_written_at_once(self):
+        shown = _TurnRenderer()
+        shown.feed(_delta("Reading them."))
+        await self.owui.end_request("m1", copy.deepcopy(shown.output))
+        task = asyncio.ensure_future(asyncio.sleep(0))
+        await task
+        w = self.handed_writer(shown, task)
+        writes = len(self.owui.upserts)
+        await w.feed(None)
+        self.assertEqual(len(self.owui.upserts), writes + 1)
+        self.assertIs(self.owui.msgs()["m1"]["done"], False)
+
+    async def test_the_handover_write_never_lands_after_the_end(self):
+        """A run that ends before its handing request's task: the end's
+        `done: true` stays."""
+        shown = _TurnRenderer()
+        shown.feed(_delta("Reading them."))
+        request_ends = asyncio.Event()
+        task = asyncio.ensure_future(request_ends.wait())
+        w = self.handed_writer(shown, task)
+        await w.feed(None)
+
+        async def no_history(*_a, **_k):
+            return None
+        self.conn.session_history = no_history
+        await w.finalize()
+        writes = len(self.owui.upserts)
+        request_ends.set()
+        await task
+        for _ in range(5):
+            await asyncio.sleep(0)
+        self.assertEqual(len(self.owui.upserts), writes)
+        self.assertIs(self.owui.msgs()["m1"]["done"], True)
 
 
 
@@ -9807,10 +9897,20 @@ class GapHandoverReplayTests(_RoutingCase):
             {"role": "assistant", "idempotencyKey": f"cli-assistant:{run}",
              "content": [{"type": "text", "text": closing}]}]}
 
-    def _calls(self, message_id):
-        out = self.owui.msgs()[message_id].get("output") or []
+    @staticmethod
+    def _call_ids(out):
         return ([i.get("call_id") or i.get("id") for i in out if i.get("type") == "function_call"],
                 [i.get("call_id") or i.get("id") for i in out if i.get("type") == "function_call_output"])
+
+    def _calls(self, message_id):
+        return self._call_ids(self.owui.msgs()[message_id].get("output") or [])
+
+    def _shown_calls(self, message_id):
+        """What a tab that opens the chat now is shown mid-turn: the latest
+        response stream of the message (Open WebUI's `overlay_response_streams`
+        over the DB copy)."""
+        outs = [o for _t, m, _c, o in self.owui.streams if m == message_id]
+        return self._call_ids(outs[-1] if outs else [])
 
     async def _answer_msg2(self, second):
         for _ in range(400):
@@ -9845,10 +9945,11 @@ class GapHandoverReplayTests(_RoutingCase):
             {"type": "text", "text": self._nums(11, 20)})
         self.frame(_tool("result", tcid="toolu_1"))
         for _ in range(400):
-            if self._calls(self.M1)[1]:
+            if self._shown_calls(self.M1)[1]:
                 break
             await asyncio.sleep(0.005)
-        self.assertEqual(self._calls(self.M1), (["toolu_1"], ["toolu_1"]), "done when the tool ends")
+        self.assertEqual(self._shown_calls(self.M1), (["toolu_1"], ["toolu_1"]),
+                         "done when the tool ends")
         self.frame(_delta(self._nums(11, 20)))
         self.frame({"state": "final"}, event="chat")
         self.active = False

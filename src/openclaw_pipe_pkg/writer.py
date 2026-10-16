@@ -182,21 +182,6 @@ def _turn_note_item(note: str) -> dict:
             "role": "assistant", "content": [{"type": "output_text", "text": note}]}
 
 
-def _output_item_boundary(sent: list, current: list) -> bool:
-    """True when `current` has a new item, or an item other than a growing
-    message text changed (a tool result, a finished card)."""
-    if len(current) != len(sent):
-        return True
-    for i, (old, new) in enumerate(zip(sent, current)):
-        if old == new:
-            continue
-        growing_text = (i == len(current) - 1 and new.get("type") == "message"
-                        and old.get("id") == new.get("id"))
-        if not growing_text:
-            return True
-    return False
-
-
 # Open WebUI cancels a response identically for Stop and for Send now (both
 # call stopTasksByChatId; the message queue exists only in the browser), so
 # the backend can never tell them apart. The page can: this hook, installed
@@ -353,7 +338,8 @@ class _TurnWriter:
     def __init__(self, conn: "_GatewayConnection", *, session_key: str, chat_id: str,
                  user_id: str, run_id: str, message_id: str | None,
                  takeover: bool = False, renderer: "_TurnRenderer | None" = None,
-                 thinking: str | None = None, wake: dict | None = None, shown: str = ""):
+                 thinking: str | None = None, wake: dict | None = None, shown: str = "",
+                 request_task: "asyncio.Task | None" = None):
         self.conn = conn
         self.session_key, self.chat_id, self.user_id = session_key, chat_id, user_id
         self.run_id, self.message_id = run_id, message_id
@@ -383,6 +369,13 @@ class _TurnWriter:
         self.awaiting_row = False       # kept open for a Gateway recovery
         self.closed = False             # nothing more to write (ended, or M is someone else's)
         self.sent_output: list = []     # the `output` open tabs hold
+        # A handover's one mid-turn DB write, due once the request's task
+        # (`request_task`) is over: that task's end-of-stream save writes
+        # `done: true` over M, and this write puts back the `done: false` the
+        # orphan reconcile adopts after a crash (ELI-115).
+        self.handover_write_due = renderer is not None
+        self._request_task = request_task
+        self._persist_lock = asyncio.Lock()
         if renderer is not None:
             # A handed renderer is what the request showed: open tabs hold
             # those items, but under Open WebUI's ids, so an `added` would
@@ -475,20 +468,33 @@ class _TurnWriter:
 
     async def _stream(self) -> None:
         """Emit the output change as Responses events (Open WebUI forwards a
-        throttled shared copy to the chat room), keep the response stream
-        current for a tab that opens the chat mid-turn, and write the DB on
-        item boundaries (a new item, a tool result), not per text delta."""
+        throttled shared copy to the chat room) and keep the response stream
+        current for a tab that opens the chat mid-turn. The DB is written
+        mid-turn only once, at a handover (`_write_handover`)."""
         output, text = await self._view(final=False)
         emit = await self._emitter()
         for ev in _relay_output_events(self.sent_output, output):
             await emit({"type": "response:completion", "data": ev})
-        boundary = _output_item_boundary(self.sent_output, output)
         self.sent_output = copy.deepcopy(output)
         from open_webui.tasks import save_response_stream
 
         await save_response_stream(_owui_redis(), self.task_id, self.chat_id, self.message_id,
                                    text, self.sent_output)
-        if boundary:
+        if self.handover_write_due:
+            self.handover_write_due = False
+            task = self._request_task
+            if task is None or task.done():
+                await self._write_handover()
+            else:
+                task.add_done_callback(lambda _t: spawn_background(self._write_handover()))
+
+    async def _write_handover(self) -> None:
+        """M as the writer has it, `done: false`, after the handing request's
+        end-of-stream save (`done: true`). Skipped once the end is written."""
+        async with self._persist_lock:
+            if self.closed:
+                return
+            output, text = await self._view(final=False)
             await self._persist(done=False, output=output, text=text)
 
     def _rewrite(self, text: str) -> str:
@@ -814,7 +820,8 @@ class _TurnWriter:
             if note:
                 text = f"{text}\n\n{note}" if text else note
                 output.append(_turn_note_item(note))
-            await self._persist(done=True, output=output, text=text)
+            async with self._persist_lock:  # after a handover write under way
+                await self._persist(done=True, output=output, text=text)
             emit = await self._emitter()
             await emit({"type": "chat:completion", "data": {"done": True, "content": text,
                                                              "output": output}})
@@ -1260,7 +1267,9 @@ def _hand_over_run(conn: "_GatewayConnection", session_key: str, run_id: str, *,
     else:
         pump.handover = {"message_id": reply["message_id"], "renderer": reply["renderer"],
                          "thinking": thinking or (target or {}).get("thinking"), "shown": "",
-                         "no_resume": bool(reply.get("no_resume"))}
+                         "no_resume": bool(reply.get("no_resume")),
+                         # called from the request's own code: its task
+                         "request_task": asyncio.current_task()}
         for payload in reply["events"]:
             pump.queue.put_nowait(("event", payload))
     pump.stop_notice_before = conn._stop_notice_seen
@@ -1332,7 +1341,8 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
             pump.writer = _TurnWriter(conn, session_key=sess, chat_id=chat_id, user_id=user_id,
                                       run_id=run, message_id=handed["message_id"], takeover=True,
                                       renderer=handed["renderer"], thinking=handed.get("thinking"),
-                                      shown=handed.get("shown", ""))
+                                      shown=handed.get("shown", ""),
+                                      request_task=handed.get("request_task"))
             conn._turn_writers[(chat_id, handed["message_id"])] = pump.writer
             if handed.get("no_resume"):
                 # Kept by Send now (ELI-158): the user's new message is next

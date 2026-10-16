@@ -272,7 +272,7 @@ task registry, `create_task(redis, coro, id=chat_id)` (`tasks.py:157-178`), with
 stored in `M.meta.task_id`. Open WebUI then lists it for the chat (`main.py:2171`, ownership
 by `meta.task_id`, `models/chats.py:1947-1954`), and the Stop button's
 `POST /api/tasks/chat/{id}/stop` (`main.py:2192`) cancels it (section 3, case 7).
-`save_response_stream(... content, output)` (`tasks.py:199`) on each item boundary lets a tab
+`save_response_stream(... content, output)` (`tasks.py:199`) on every event lets a tab
 that opens the chat mid-turn see the current content through `overlay_response_streams`
 (`routers/chats.py:1431`). That replaces the 1 s snapshot timer (section 5).
 
@@ -286,8 +286,10 @@ start (gateway.py:1630-1633). The renderer's output diff becomes
 shapes Open WebUI folds for its own turns. They are emitted through
 `get_event_emitter({chat_id, message_id:M, user_id})` (`socket/main.py:1314`), so they reach
 the user's room and, throttled by Open WebUI itself (0.15 s, `:1366-1371`), the shared chat
-room. The DB gets `content`/`output` at each item boundary (a new item, a tool result) and
-at the end. Text deltas inside an item are carried by the response stream (2.3).
+room. The DB gets `content`/`output` once at a handover, then a checkpoint each time 10 more
+tool calls have finished, and at the end: every write rewrites the whole chat, so the live
+state is carried by the response stream (2.3) and the DB only by what a crash needs
+(ELI-115, [Rehydration](../rehydration-persistence.md#the-turn-writer)).
 
 ### 2.5 End: the run's own terminal, nothing else
 
@@ -625,7 +627,7 @@ Turn path, pipe.py and gateway.py:
 | Proactive debounce 120 s idle / 5 s poll / 600 s give-up | gateway.py:3036-3068 | remove (2.1 start push + DB claim) |
 | Sub-agent debounce, same values | gateway.py:4334-4375 | remove |
 | `_RELAY_MIN_IDLE_S = 120` via `session_idle_for` | gateway.py:3432, 1866-1891, 2585 | remove |
-| `_RELAY_SNAPSHOT_MIN_INTERVAL_S = 1.0` | gateway.py:3439, 3704-3723 | remove. Persist on item boundaries and keep live text in the response stream (2.3, 2.4). |
+| `_RELAY_SNAPSHOT_MIN_INTERVAL_S = 1.0` | gateway.py:3439, 3704-3723 | remove. Keep the live state in the response stream and persist only checkpoints and the end (2.3, 2.4). |
 | Inline idle close, `idle_probe_s = 30` + describe | pipe.py:1407, 2235-2269 | remove (P27; end only on terminal, 2.5) |
 | Restart resume trigger: the same 30 s idle probe plus the epoch bump, after a deferred `_is_restart_signature` error | pipe.py:1696-1720, 1885-1891 | remove. The resume fires on the owner rule (2.7): R's terminal push or the first `sessions.list` after `hello-ok`. |
 | First-event wait 60 s + describe probe | pipe.py:1684-1719 | remove. A quiet queue before the first event is answered by run state (`sessions.changed` / `sessions.list`), which the queue wait already uses. |
