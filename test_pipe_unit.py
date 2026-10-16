@@ -721,13 +721,44 @@ class OrphanStubReconcileTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_stub_no_request_has_claimed_is_left_alone(self):
         """ELI-156: a client writes the stub, then POSTs the completion. After
         an Open WebUI restart that POST loads the models, which starts this
-        sweep before the request has a task. No task id on the stub means no
-        request took it yet: it is not an orphan."""
+        sweep before the request has a task. No task id on a stub written
+        since this process started means its request may still be on its
+        way: it is not an orphan."""
         self.history, self.active = {"messages": []}, False
         del self._stub()["meta"]
-        self.assertEqual(await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB), "skip")
+        self._stub()["timestamp"] = 1_000_100
+        with mock.patch("openclaw_pipe._owui_process_started_at", return_value=1_000_000.5):
+            self.assertEqual(await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB), "skip")
         self.assertIs(self._stub()["done"], False)
         self.assertEqual(self._stub()["content"], "")
+
+    async def test_a_stub_older_than_this_process_with_no_task_is_an_orphan(self):
+        """ELI-156 review: Open WebUI died after the stub was written and
+        before its request took it, so it has no task id. Written before
+        this process started, no request here can fill it."""
+        self.history, self.active = {"messages": []}, False
+        del self._stub()["meta"]
+        self._stub()["timestamp"] = 999_990
+        with mock.patch("openclaw_pipe._owui_process_started_at", return_value=1_000_000.5):
+            self.assertEqual(await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB), "done")
+        self.assertIs(self._stub()["done"], True)
+        self.assertEqual(self._stub()["content"], ORPHAN_STUB_NOTE)
+
+    async def test_a_stub_from_the_second_this_process_started_is_not_counted_as_older(self):
+        self.history, self.active = {"messages": []}, False
+        del self._stub()["meta"]
+        self._stub()["timestamp"] = 1_000_000
+        with mock.patch("openclaw_pipe._owui_process_started_at", return_value=1_000_000.5):
+            self.assertEqual(await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB), "skip")
+
+    def test_the_process_start_is_read_from_proc(self):
+        started = openclaw_pipe._owui_process_started_at()
+        if not os.path.exists("/proc/self/stat"):
+            self.assertIsNone(started)
+            return
+        self.assertIsNotNone(started)
+        self.assertLessEqual(started, time.time() + 1)
+        self.assertGreater(started, time.time() - 7 * 86400)
 
     async def test_a_request_that_claims_the_stub_meanwhile_keeps_it(self):
         """ELI-156: Open WebUI stamps its task id on the stub while the
