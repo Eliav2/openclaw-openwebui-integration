@@ -291,13 +291,19 @@ def schedule_wake(session_key: str, message: str, in_s: float) -> None:
 
 # ── Page helpers ────────────────────────────────────────────────────
 
-def login(page: Page, token: str) -> None:
-    page.goto(BASE + "/auth")
-    # One screenshot per scene, in the light theme.
-    page.evaluate("t => { localStorage.setItem('token', t); localStorage.setItem('theme', 'light'); }", token)
+def signed_in_page(browser, token: str, device: dict) -> Page:
+    """A page in a new context that starts signed in, in the light theme.
+    The token is in the context's storage before any page loads: writing it
+    from a loaded /auth page raced that page's own boot, which read the
+    token, lost its session request to the next navigation and removed it."""
+    ctx = browser.new_context(**device, locale="en-US", timezone_id="UTC", color_scheme="light",
+                              storage_state={"cookies": [], "origins": [{"origin": BASE, "localStorage": [
+                                  {"name": "token", "value": token}, {"name": "theme", "value": "light"}]}]})
+    page = ctx.new_page()
     page.goto(BASE + "/")
     page.wait_for_selector("#chat-input", timeout=60_000)
     dismiss_popups(page)
+    return page
 
 
 def dismiss_popups(page: Page) -> None:
@@ -1019,10 +1025,7 @@ def main(argv=None) -> int:
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
         try:
-            ctx = browser.new_context(**PHONE, locale="en-US", timezone_id="UTC",
-                                      color_scheme="light")
-            page = ctx.new_page()
-            login(page, token)
+            page = signed_in_page(browser, token, PHONE)
             shooter.run("hero-tool-cards", scenes.hero, page)
             if scenes.hero_chat:
                 shooter.run("tool-card-expanded", scenes.expanded, page)
@@ -1052,10 +1055,7 @@ def main(argv=None) -> int:
                 shooter.run("thinking-level", scenes.thinking_level, page)
                 shooter.run("compact-before", scenes.compact, page)
             if scenes.hero_chat:
-                desk = browser.new_context(**DESKTOP, locale="en-US",
-                                           timezone_id="UTC", color_scheme="light")
-                dpage = desk.new_page()
-                login(dpage, token)
+                dpage = signed_in_page(browser, token, DESKTOP)
                 shooter.run("toolbar-button", scenes.toolbar, dpage)
         finally:
             browser.close()
