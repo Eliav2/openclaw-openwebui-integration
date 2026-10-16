@@ -126,17 +126,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [fix12, fix123]
-        rep: [1, 2, 3]
+        variant: [main, fix1, fix12, fix123]
+        rep: [1, 2, 3, 4, 5]
     steps:
       - name: Ref under test
         id: ref
         run: |
           case "${{ matrix.variant }}" in
             main)   echo "sha=60aebaa267faaeeb98b608a22dd0e129f03feba3" >> "$GITHUB_OUTPUT" ;;
-            fix1)   echo "sha=3fceb1c90ee4f34b13b52633028dabd44c7c0f6f" >> "$GITHUB_OUTPUT" ;;
-            fix12)  echo "sha=46d608bb5a326f980005d84c2feda1cdf4f6320f" >> "$GITHUB_OUTPUT" ;;
-            fix123) echo "sha=816926a4e4e69d4d4438211cbb2f37a100942562" >> "$GITHUB_OUTPUT" ;;
+            fix1)   echo "sha=a9f1e0be7254e703b6ef52d87cef284f6f29aa60" >> "$GITHUB_OUTPUT" ;;
+            fix12)  echo "sha=60d8973c10c6c57512795ac7a721e96568bf0255" >> "$GITHUB_OUTPUT" ;;
+            fix123) echo "sha=9b29a595cfdb4462604ee8a3325f71a5aab199e7" >> "$GITHUB_OUTPUT" ;;
           esac
       - uses: actions/checkout@v7
         with:
@@ -161,8 +161,7 @@ jobs:
         env:
           VARIANT: ${{ matrix.variant }}
           PAGE_SAVES: "0"
-          JOINS_ONLY: "1"
-          REJOIN_S: "1"
+          REJOIN_S: "5"
           REF: ${{ steps.ref.outputs.sha }}
           REP: ${{ matrix.rep }}
           OUT: ${{ runner.temp }}/pipe-replay-${{ matrix.variant }}-${{ matrix.rep }}.jsonl
@@ -180,3 +179,37 @@ jobs:
           path: |
             ${{ runner.temp }}/pipe-replay-${{ matrix.variant }}-${{ matrix.rep }}.jsonl
             ${{ runner.temp }}/e2e-logs
+
+  chat-size:
+    name: chat size alone (rep ${{ matrix.rep }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        rep: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: 9b29a595cfdb4462604ee8a3325f71a5aab199e7
+      - uses: actions/checkout@v7
+        with:
+          path: harness-src
+      - name: Start the stack and install the integration
+        uses: ./.github/actions/stack
+        env:
+          FAKE_LLM_SCENES: ${{ github.workspace }}/harness-src/probe115/replay-scene.json
+        with:
+          log_dir: ${{ runner.temp }}/e2e-logs
+      - name: Open WebUI on one CPU, nearer the Pi
+        run: docker update --cpus=1 owui
+      - name: Single operations, each in a restarted Open WebUI
+        env:
+          REP: ${{ matrix.rep }}
+          OUT: ${{ runner.temp }}/chat-size-${{ matrix.rep }}.jsonl
+        run: uv run --with httpx --with "python-socketio[asyncio_client]" python harness-src/probe115/chat_size.py
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: chat-size-${{ matrix.rep }}
+          path: ${{ runner.temp }}/chat-size-${{ matrix.rep }}.jsonl
