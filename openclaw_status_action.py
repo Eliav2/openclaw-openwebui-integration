@@ -6919,14 +6919,29 @@ def _message_text_blocks(message: dict) -> list:
             if isinstance(b, dict) and b.get("type") == "text" and (b.get("text") or "").strip()]
 
 
+def _spawn_message_text(message: dict) -> str | None:
+    """A child's spawn message as the wrapped prompt its model got, or None
+    when the message is not one. Up to OpenClaw 2026.9 `chat.history` shows
+    the wrapped prompt; from 2026.10.10 it shows the bare task and keeps the
+    prompt in `__openclaw.modelPromptProjection.text` (ELI-164)."""
+    if message.get("role") != "user":
+        return None
+    text = "\n".join(_message_text_blocks(message))
+    if _is_spawn_message(text):
+        return text
+    meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
+    projection = meta.get("modelPromptProjection") if isinstance(meta.get("modelPromptProjection"), dict) else {}
+    prompt = projection.get("text")
+    return prompt if _is_spawn_message(prompt) else None
+
+
 def _spawn_task_of(messages: list) -> str | None:
     """The task out of the child's spawn message, when the history read
     still holds it."""
     for m in messages or []:
-        if m.get("role") == "user":
-            text = "\n".join(_message_text_blocks(m))
-            if _is_spawn_message(text):
-                return _subagent_task_text(text)
+        wrapped = _spawn_message_text(m)
+        if wrapped:
+            return _subagent_task_text(wrapped)
     return None
 
 
@@ -6991,7 +7006,7 @@ def _drawer_run_items(messages: list) -> list:
             stretch.append(m)
             continue
         flush()
-        if not _is_spawn_message(text):      # the task itself is the header's
+        if not _spawn_message_text(m):      # the task itself is the header's
             items.append({"kind": "user", "text": text})
     flush()
     return items

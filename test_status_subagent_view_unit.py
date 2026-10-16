@@ -638,3 +638,39 @@ console.log(JSON.stringify({
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SpawnMessageShapeTests(unittest.TestCase):
+    """ELI-164: on OpenClaw 2026.10.10 `chat.history` shows a child's spawn
+    message as its bare task, and keeps the wrapped prompt the model got in
+    `__openclaw.modelPromptProjection.text`. The drawer read no task from it
+    and showed the task again as a user turn in the run."""
+
+    WRAPPED = ("<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\n\n[Subagent Context] You are running as a subagent "
+               "(depth 1/5). Complete the current [Subagent Task]; inherited conversation is background "
+               "context, not your assignment.\n\n[Subagent Task]\n\n<<<END_OPENCLAW_INTERNAL_CONTEXT>>>\n\n"
+               "Price out Fly.io.\n\n<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\n\nBegin. Execute the assigned "
+               "task to completion.\n\n<<<END_OPENCLAW_INTERNAL_CONTEXT>>>")
+
+    def messages(self):
+        return [
+            {"role": "user", "content": "Price out Fly.io.", "idempotencyKey": "r1:user",
+             "__openclaw": {"senderIsOwner": False,
+                            "modelPromptProjection": {"version": 1, "text": self.WRAPPED}}},
+            {"role": "assistant", "content": [{"type": "text", "text": "Fly.io: $5 a month."}]},
+            {"role": "user", "content": "Also Render."},
+            {"role": "assistant", "content": [{"type": "text", "text": "Render: $7."}]},
+        ]
+
+    def test_the_task_comes_from_the_projected_prompt(self):
+        self.assertEqual(openclaw_status_action._spawn_task_of(self.messages()), "Price out Fly.io.")
+
+    def test_the_spawn_message_is_not_a_turn_of_the_run(self):
+        items = openclaw_status_action._drawer_run_items(self.messages())
+        self.assertEqual([(i["kind"], i.get("text")) for i in items],
+                         [("text", "Fly.io: $5 a month."), ("user", "Also Render."), ("text", "Render: $7.")])
+
+    def test_the_9x_shape_still_reads(self):
+        old = [{"role": "user", "content": self.WRAPPED}] + self.messages()[1:]
+        self.assertEqual(openclaw_status_action._spawn_task_of(old), "Price out Fly.io.")
+        self.assertEqual(openclaw_status_action._drawer_run_items(old)[0]["kind"], "text")
