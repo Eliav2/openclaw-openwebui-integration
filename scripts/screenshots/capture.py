@@ -434,7 +434,7 @@ MOCK_BACKGROUND_SECTION = r"""() => {
   sec.className = 'mb-4';
   sec.appendChild(S.sectionHeader('Background (5)'));
   const rows = [
-    ['Shell', 'pytest -q tests/', 'running', '1:12', 'Started by this chat. Last line: 212 passed, collecting e2e/'],
+    ['Shell', 'npm run build', 'running', '1:12', 'Started by this chat. Last line: compiled 212 modules'],
     ['Agent', 'Survey the forecast repo', 'launched', '0:48', 'Claude Code agent: the reply stays open until it reports back'],
     ['Image', 'Watercolor fox for the README', 'running', '0:20', ''],
     ['Automation', 'Upstream watch', 'failed', '14:05', '401 from api.github.com, 3 runs in a row. Next run 20:05'],

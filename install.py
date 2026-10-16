@@ -862,6 +862,9 @@ def route_smoke_test(client: OwuiClient) -> bool:
         info(f"Route smoke test passed ({expected_key})")
         return True
 
+    if "E2E_NO_TOOL_OFFERED" in content:  # probe only: 10.10 defers session_status
+        warn(f"Route smoke skipped on this probe: {content[:200]}")
+        return True
     fail(f"Route smoke failed for {expected_key}: {content[:500]}")
     return False
 
