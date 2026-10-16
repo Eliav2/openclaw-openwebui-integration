@@ -1,0 +1,58 @@
+name: Probe ELI-115 memory
+
+# Throwaway probe (branch probe/eli115-memory only): Open WebUI 0.12's
+# anonymous memory under the requests a 30 MB chat gets.
+
+on:
+  push:
+    branches: ["probe/eli115-memory"]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: probe (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: default
+            env: ""
+            trace: "0"
+          - variant: arena2
+            env: "-e MALLOC_ARENA_MAX=2"
+            trace: "0"
+          - variant: trace
+            env: ""
+            trace: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+      - name: Open WebUI
+        run: |
+          source e2e/versions.env
+          docker run -d --name owui --network host ${{ matrix.env }} \
+            -e WEBUI_SECRET_KEY=probe-$(openssl rand -hex 8) -e ENABLE_OLLAMA_API=false \
+            -e ENABLE_OPENAI_API=false -e OFFLINE_MODE=true "$OWUI_IMAGE"
+          for i in $(seq 150); do curl -fsS localhost:8080/health && break; sleep 2; done
+          curl -fsS -X POST localhost:8080/api/v1/auths/signup -H 'Content-Type: application/json' \
+            -d '{"name":"probe","email":"probe@example.com","password":"probe-pass-1"}' >/dev/null
+          free -m; nproc
+      - name: Probe
+        env:
+          OWUI_EMAIL: probe@example.com
+          OWUI_PASSWORD: probe-pass-1
+          TRACE: ${{ matrix.trace }}
+          OUT: ${{ runner.temp }}/probe-${{ matrix.variant }}.jsonl
+        run: uv run --with httpx python probe115/driver.py
+      - name: Logs
+        if: always()
+        run: docker logs owui 2>&1 | tail -80
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: probe-${{ matrix.variant }}
+          path: ${{ runner.temp }}/probe-${{ matrix.variant }}.jsonl
