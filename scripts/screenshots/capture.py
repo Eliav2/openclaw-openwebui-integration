@@ -38,6 +38,8 @@ MODEL = "openclaw_gateway.default"
 PHONE = {"viewport": {"width": 390, "height": 844}, "device_scale_factor": 2,
          "is_mobile": True, "has_touch": True}
 DESKTOP = {"viewport": {"width": 1280, "height": 800}, "device_scale_factor": 2}
+# A small phone (iPhone SE): the Status dialog outgrows it and scrolls.
+SMALL_PHONE = {**PHONE, "viewport": {"width": 375, "height": 667}}
 TURN_TIMEOUT_MS = 150_000
 
 DENY = [re.compile(p, re.I) for p in (
@@ -289,6 +291,49 @@ def schedule_wake(session_key: str, message: str, in_s: float) -> None:
         raise RuntimeError(f"cron.add failed: {out.stderr[-1500:]}")
 
 
+def gateway_call(method: str, params: dict) -> dict:
+    out = subprocess.run(["openclaw", "gateway", "call", method, "--json", "--params", json.dumps(params)],
+                         capture_output=True, text=True, timeout=90)
+    if out.returncode:
+        raise RuntimeError(f"{method} failed: {out.stderr[-1500:]}")
+    return json.loads(out.stdout[out.stdout.find("{"):])
+
+
+def add_chat_automation(session_key: str) -> str:
+    """A daily automation that runs in this chat (ELI-163), next due
+    tomorrow morning; its id, to remove it after the scene."""
+    job = gateway_call("cron.add", {
+        "name": "Morning forecast chart", "schedule": {"kind": "cron", "expr": "0 7 * * *", "tz": "UTC"},
+        "sessionTarget": f"session:{session_key}",
+        "payload": {"kind": "agentTurn", "message": "Morning chart for the forecast app"},
+        "delivery": {"mode": "none"}})
+    return job.get("id") or job.get("job", {}).get("id")
+
+
+# The sample plugin's claudeCliUsage.status waits this file's milliseconds
+# (sample-usage/index.js): the one source a scene holds back.
+USAGE_DELAY_FILE = "/tmp/openclaw-screenshot-usage-delay-ms"
+STATUS_ROOT = "#openclaw-status-modal-root"
+# Each Status dialog section: still loading (its skeleton) or filled.
+SECTION_STATES = """() => Object.fromEntries(['context', 'limits', 'background', 'subagents', 'agents'].map(n => {
+  const s = document.getElementById('openclaw-status-section-' + n);
+  return [n, !s ? 'missing' : s.querySelector('[data-openclaw-loading]') ? 'loading' : 'filled'];
+}))"""
+# The dialog's scroll box and where its title bar and footer sit.
+DIALOG_LAYOUT = """() => {
+  const body = document.getElementById('openclaw-status-sections');
+  const panel = body.parentElement, [head, , foot] = panel.children;
+  const r = el => { const b = el.getBoundingClientRect(); return [Math.round(b.top), Math.round(b.bottom)]; };
+  return {viewport: [innerWidth, innerHeight], panel: r(panel), head: r(head), foot: r(foot),
+          scrollHeight: body.scrollHeight, clientHeight: body.clientHeight, scrollTop: Math.round(body.scrollTop)};
+}"""
+
+
+def open_fold(page: Page, name: str) -> None:
+    """Tap a folded Status dialog section open."""
+    page.locator(f"{STATUS_ROOT} [data-openclaw-fold={name}][data-open=false] [data-openclaw-fold-head]").click()
+
+
 # ── Page helpers ────────────────────────────────────────────────────
 
 def signed_in_page(browser, token: str, device: dict) -> Page:
@@ -487,6 +532,7 @@ class Scenes:
         self.token, self.s = token, shooter
         self.hero_chat: str | None = None
         self.spawn_chat: str | None = None
+        self.background_chat: str | None = None
 
     def hero(self, page: Page) -> None:
         """#1 hero-tool-cards mid-run, then #5 tool-card-expanded once done."""
@@ -605,11 +651,18 @@ class Scenes:
         wait_api(self.token, chat, "The benchmark is back", 240)
         wait_api(self.token, chat, "only station 4 changed", 240)
         page.locator('button[aria-label="OpenClaw status"]').click()
-        root = "#openclaw-status-modal-root"
+        root = STATUS_ROOT
+        # Nothing runs, so every section opens folded (ELI-163).
+        wait_js(page, f"""() => {{ const st = ({SECTION_STATES})(); const r = document.querySelector('{root}');
+          return Object.values(st).every(v => v === 'filled') && /subagents \\(2\\)/i.test(r.innerText)
+            && !r.querySelector('[data-openclaw-fold][data-open=true]'); }}""",
+                "the status dialog, every section folded", 60_000)
+        self.s.shot(page, "status-dialog-folded", text_selector=root)
+        open_fold(page, "subagents")
         wait_js(page, f"""() => {{ const r = document.querySelector('{root}'); if (!r) return false;
-          return /subagents \\(2\\)/i.test(r.innerText) && /noise table/i.test(r.innerText) && /forecast/i.test(r.innerText); }}""",
-                "the status dialog with both sub-agents", 60_000)
-        rows = f"{root} #openclaw-status-section-subagents button"
+          return /noise table/i.test(r.innerText) && /forecast/i.test(r.innerText); }}""",
+                "the unfolded sub-agents with their tasks", 60_000)
+        rows = f"{root} #openclaw-status-section-subagents [data-openclaw-row]"
         print("  dialog rows: " + json.dumps(page.evaluate(f"""() => [...document.querySelectorAll('{rows}')]
           .map(b => ({{h: Math.round(b.getBoundingClientRect().height), chars: b.innerText.length}}))""")), flush=True)
         self.s.shot(page, "subagents-long-dialog", text_selector=root)
@@ -630,6 +683,93 @@ class Scenes:
         self.s.shot(page, "subagents-unlabelled-drawer", text_selector="#openclaw-drawer-root")
         back_to_dialog(page)
         page.keyboard.press("Escape")
+
+    def background(self, page: Page) -> None:
+        """ELI-163: work left running in this chat. #1 the dialog with one
+        source held back (the sample rate limits), every other section
+        already filled; #2 Background unfolded with the four imports and the
+        chat's automation, the other sections opened."""
+        new_chat(page)
+        chat = send(page, "Import the station data for all four regions.")
+        wait_js(page, last_text_has("All four imports are running"), "the reply")
+        set_title(self.token, chat, "Station data import")
+        me = api("GET", "/api/v1/auths/", token=self.token)
+        job = add_chat_automation(f"agent:main:openwebui-{me['id']}-{chat}")
+        root = STATUS_ROOT
+        try:
+            with open(USAGE_DELAY_FILE, "w", encoding="utf-8") as fh:
+                fh.write("25000")
+            try:
+                opened = time.monotonic()
+                page.locator('button[aria-label="OpenClaw status"]').click()
+                wait_js(page, f"""() => {{ const st = ({SECTION_STATES})();
+                  return st.limits === 'loading' && ['context', 'background', 'subagents', 'agents'].every(n => st[n] === 'filled')
+                    && /import-stations/.test(document.querySelector('{root}').innerText); }}""",
+                        "every section but Rate limits filled", 20_000)
+                print(f"  {time.monotonic() - opened:.1f}s after the click: " + json.dumps(page.evaluate(SECTION_STATES)),
+                      flush=True)
+                self.s.shot(page, "status-dialog-loading", text_selector=root)
+            finally:
+                os.remove(USAGE_DELAY_FILE)
+            wait_js(page, f"() => ({SECTION_STATES})().limits === 'filled' && /week/i.test(document.querySelector('{root}').innerText)",
+                    "Rate limits, once its source answers", 40_000)
+            print(f"  Rate limits filled {time.monotonic() - opened:.1f}s after the click", flush=True)
+            open_fold(page, "subagents")
+            open_fold(page, "agents")
+            wait_js(page, f"""() => {{ const t = document.querySelector('{root}').innerText;
+              return /background \\(5\\)/i.test(t) && /Morning forecast chart/.test(t) && /no sub-agents/i.test(t); }}""",
+                    "Background with the imports and the automation, every section open", 30_000)
+            print("  background: " + json.dumps(page.locator("#openclaw-status-section-background").inner_text()[:600]),
+                  flush=True)
+            self.s.shot(page, "status-dialog-background", text_selector=root)
+            page.keyboard.press("Escape")
+        finally:
+            gateway_call("cron.remove", {"id": job})
+        self.background_chat = chat
+
+    def background_scrolled(self, page: Page) -> None:
+        """#3 the same dialog, every section open, on a small phone: it is
+        taller than the screen, so its sections scroll between its title bar
+        and its footer."""
+        page.goto(f"{BASE}/c/{self.background_chat}")
+        page.wait_for_selector("#chat-input", timeout=60_000)
+        page.locator('button[aria-label="OpenClaw status"]').click()
+        root = STATUS_ROOT
+        wait_js(page, f"() => Object.values(({SECTION_STATES})()).every(v => v === 'filled')", "every section filled", 60_000)
+        open_fold(page, "subagents")
+        open_fold(page, "agents")
+        page.evaluate("() => { document.getElementById('openclaw-status-sections').scrollTop = 1e6; }")
+        page.wait_for_timeout(300)
+        layout = page.evaluate(DIALOG_LAYOUT)
+        print("  dialog layout: " + json.dumps(layout), flush=True)
+        if layout["scrollHeight"] <= layout["clientHeight"]:
+            raise AssertionError(f"the dialog fits the screen, nothing scrolls: {layout}")
+        if layout["head"][0] < 0 or layout["foot"][1] > layout["viewport"][1]:
+            raise AssertionError(f"the title bar or the footer is off the screen: {layout}")
+        self.s.shot(page, "status-dialog-scrolled", text_selector=root)
+        page.keyboard.press("Escape")
+
+    def background_agent(self, page: Page) -> None:
+        """#4 a reply a background agent holds open says so in its status
+        row (the sample Agent tool answers as Claude Code's does)."""
+        new_chat(page)
+        chat = send(page, "Look into the station vendors for me.")
+        wait_js(page, f"() => {{ const a = {LAST_ASSISTANT}; return a && a.innerText.includes('Waiting on 1 background agent'); }}",
+                "the waiting line", 90_000)
+        set_title(self.token, chat, "Station vendors")
+        print("  reply: " + json.dumps(page.evaluate(f"() => {LAST_ASSISTANT}.innerText")[:300]), flush=True)
+        clip = f"""() => {{
+          const a = {LAST_ASSISTANT};
+          a.scrollIntoView({{block: 'end'}});
+          const nav = document.querySelector('nav');
+          const top = Math.max(a.getBoundingClientRect().top - 36, nav ? nav.getBoundingClientRect().bottom : 0);
+          const box = document.getElementById('message-input-container');
+          const bottom = Math.min(a.getBoundingClientRect().bottom + 8, box ? box.getBoundingClientRect().top : innerHeight);
+          return {{x: 0, y: top, width: innerWidth, height: bottom - top}};
+        }}"""
+        self.s.shot(page, "background-agent-waiting", clip_js=clip, text_selector=".chat-assistant >> nth=-1")
+        # The reply ends before the next scene starts.
+        wait_js(page, last_text_has("when it is in"), "the reply's end", 90_000)
 
     def model_picker(self, page: Page) -> None:
         new_chat(page)
@@ -1034,6 +1174,12 @@ def main(argv=None) -> int:
             shooter.run("question-card", scenes.question, page)
             shooter.run("status-dialog", scenes.status_and_drawer, page)
             shooter.run("subagents-long", scenes.subagents_long, page)
+            shooter.run("status-background", scenes.background, page)
+            if scenes.background_chat:
+                small = signed_in_page(browser, token, SMALL_PHONE)
+                shooter.run("status-dialog-scrolled", scenes.background_scrolled, small)
+                small.context.close()
+            shooter.run("background-agent-waiting", scenes.background_agent, page)
             shooter.run("model-picker", scenes.model_picker, page)
             shooter.run("agent-turn", scenes.agent_turn, page)
             shooter.run("media-turn", scenes.media_turn, page)

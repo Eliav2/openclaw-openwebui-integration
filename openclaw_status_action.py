@@ -4895,9 +4895,10 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     const el = document.createElement('div');
     el.id = id;
     el.className = 'mb-4';
-    el.dataset.openclawLoading = '1';
     if (title) el.appendChild(sectionHeader(title));
+    // Marks the section as still loading until a fill replaces it.
     const pulse = document.createElement('div');
+    pulse.dataset.openclawLoading = '1';
     pulse.innerHTML = '<div class="animate-pulse space-y-2">'
       + '<div class="h-3 w-2/3 bg-gray-200 dark:bg-gray-700 rounded"></div>'
       + '<div class="h-3 w-full bg-gray-200 dark:bg-gray-700 rounded"></div>'

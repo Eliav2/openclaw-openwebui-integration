@@ -96,4 +96,15 @@ cat > CHANGELOG.md <<'EOF'
 EOF
 commit 0 "Changelog for this week"
 
+# The station import the Background scene leaves running (ELI-163): outside
+# the repo, so the git scenes do not see it.
+mkdir -p "$ws/bin"
+cat > "$ws/bin/import-stations" <<'EOF'
+#!/bin/sh
+# Imports one region's station history (about fifteen minutes).
+sleep 900
+echo "$1 stations imported"
+EOF
+chmod +x "$ws/bin/import-stations"
+
 echo "sample project ready: $dir ($(git rev-list --count HEAD) commits)"

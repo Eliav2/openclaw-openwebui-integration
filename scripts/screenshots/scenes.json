@@ -430,6 +430,67 @@
           "delay": 0.03
         }
       ]
+    },
+    {
+      "_comment": "ELI-163: four imports left running in the background, for the Status dialog's Background section.",
+      "match": "Import the station data for all four regions",
+      "steps": [
+        {
+          "say": "Starting the four imports in the background.",
+          "tool": "exec",
+          "args": {
+            "command": "bin/import-stations north",
+            "background": true
+          }
+        },
+        {
+          "say": "",
+          "tool": "exec",
+          "args": {
+            "command": "bin/import-stations south",
+            "background": true
+          }
+        },
+        {
+          "say": "",
+          "tool": "exec",
+          "args": {
+            "command": "bin/import-stations coast",
+            "background": true
+          }
+        },
+        {
+          "say": "",
+          "tool": "exec",
+          "args": {
+            "command": "bin/import-stations mountain",
+            "background": true
+          }
+        },
+        {
+          "say": "All four imports are running in the background. Each takes about fifteen minutes; I'll tell you when they finish.",
+          "delay": 0.03
+        }
+      ]
+    },
+    {
+      "_comment": "ELI-163: a background agent holds the reply open (the sample Agent tool, sample-usage/index.js); the reply streams slowly so the shot sees its status row.",
+      "match": "Look into the station vendors",
+      "steps": [
+        {
+          "say": "I'll hand the vendor research to a background agent.",
+          "tool": "Agent",
+          "args": {
+            "description": "Station vendor research",
+            "run_in_background": true,
+            "prompt": "Compare the three weather station vendors on price, data access and support."
+          }
+        },
+        {
+          "say": "It's running. While it works: the three vendors all sell the same sensor, so the comparison comes down to the data plan and how long they keep the history. I'll post the agent's report here when it is in.",
+          "delay": 0.6
+        }
+      ]
     }
   ]
 }
