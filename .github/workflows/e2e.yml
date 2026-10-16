@@ -91,13 +91,13 @@ jobs:
           uv run --with-requirements requirements-dev.txt \
             pytest -v --junitxml="$RUNNER_TEMP/e2e-logs/junit.xml" e2e/test_e2e.py ${TESTS:+-k "$TESTS"}
 
-      - name: Integration suite (test_pipe.py) against the stack
-        # test_route_model_override asks a real model to call session_status and
-        # quote a line from it; the fake model cannot, and the e2e suite covers
-        # routing deterministically instead.
+      - name: Fixtures still match the installed OpenClaw
+        # The unit suite pins two Gateway source lines the Pipe matches on
+        # (the claude-cli exit error, the cron wake prompt). With OPENCLAW_DIST
+        # set these checks fail rather than skip when the dist is missing.
         run: |
-          uv run --with-requirements requirements-dev.txt \
-            pytest -v test_pipe.py -k "not test_route_model_override"
+          OPENCLAW_DIST="$(npm root -g)/openclaw/dist" uv run --with-requirements requirements-dev.txt \
+            pytest -v -rs test_pipe_unit.py -k "installed_dist"
 
       - name: Collect logs
         if: always()

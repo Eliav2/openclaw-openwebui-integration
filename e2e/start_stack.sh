@@ -70,9 +70,13 @@ cat >"$HOME/.openclaw/openclaw.json" <<EOF
   "models": {"mode": "merge", "providers": {"fake": {
     "baseUrl": "http://127.0.0.1:$FAKE_LLM_PORT/v1", "apiKey": "e2e",
     "api": "openai-completions",
-    "models": [{"id": "e2e-echo", "name": "E2E Echo"}]
+    "models": [{"id": "e2e-default", "name": "E2E Default"},
+               {"id": "e2e-echo", "name": "E2E Echo"}]
   }}},
-  "agents": {"defaults": {"model": {"primary": "fake/e2e-echo"}}}
+  "agents": {
+    "defaults": {"model": {"primary": "fake/e2e-default"}},
+    "list": [{"id": "main", "default": true}, {"id": "title-gen"}]
+  }
 }
 EOF
 if [[ -n "${STACK_CONFIG_PATCH:-}" ]]; then

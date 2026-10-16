@@ -8,13 +8,15 @@ pins it, and test_pipe_unit.ExitTextFixtureTest re-extracts it from the
 installed dist when one is present, so a reworded error fails the suite.
 
 usage: extract_openclaw_exit_errors.py [DIST_DIR] [--write]
+(DIST_DIR defaults to $OPENCLAW_DIST, else the global npm install's)
 """
 import glob
 import json
 import os
 import sys
 
-DEFAULT_DIST = "/config/.node_global/lib/node_modules/openclaw/dist"
+from openclaw_dist import default_dist
+
 NEEDLE = "Claude Code process exited with"
 FIXTURE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                        "test_fixture_openclaw_exit_errors.json")
@@ -33,7 +35,7 @@ def extract(dist_dir: str) -> dict | None:
 
 if __name__ == "__main__":
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    got = extract(args[0] if args else DEFAULT_DIST)
+    got = extract(args[0] if args else default_dist())
     if got is None:
         sys.exit(f"no line containing {NEEDLE!r} in cli-transport-*.mjs")
     if "--write" in sys.argv:
