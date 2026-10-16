@@ -10,6 +10,7 @@ real OWUI/websockets/cryptography environment.
 """
 
 import asyncio
+import copy
 import json
 import os
 import shutil
@@ -34,8 +35,7 @@ from openclaw_pipe import (  # noqa: E402
     Pipe,
     _COMPOSER_BUTTON_VERSION,
     _ComposerWatcher,
-    _composer_chat_is_openclaw,
-    _composer_latest_user_message_id,
+    _composer_chat_head,
     _composer_model_prefixes,
     _composer_note_model,
     _composer_own_function_id,
@@ -62,9 +62,21 @@ def _config_of(code):
 
 
 def _history(*rows, current=None):
-    """rows: (id, role, parentId)."""
-    messages = {mid: {"id": mid, "role": role, "parentId": parent} for mid, role, parent in rows}
+    """rows: (id, role, parentId[, model])."""
+    messages = {r[0]: {"id": r[0], "role": r[1], "parentId": r[2],
+                       "model": r[3] if len(r) > 3 else None} for r in rows}
     return {"messages": messages, "currentId": current or rows[-1][0]}
+
+
+def _rows(history, reads=None):
+    """`message(id)` for `_composer_chat_head`: the (role, parent_id, model_id)
+    of a `chat_message` row, read one at a time."""
+    async def message(mid):
+        if reads is not None:
+            reads.append(mid)
+        m = history["messages"].get(mid)
+        return (m["role"], m["parentId"], m["model"]) if m else None
+    return message
 
 
 class SnippetRenderTests(unittest.TestCase):
@@ -157,26 +169,40 @@ class EmitHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await _emit_composer_button(emitter))
 
 
-class ChatShapeHelperTests(unittest.TestCase):
-    def test_latest_user_message_skips_assistant_leaf(self):
-        h = _history(("u1", "user", None), ("a1", "assistant", "u1"),
-                     ("u2", "user", "a1"), ("a2", "assistant", "u2"))
-        self.assertEqual(_composer_latest_user_message_id(h), "u2")
+class ChatHeadTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-115: the watcher reads a chat's head, never the chat. Open WebUI
+    builds the whole chat in Python, about 14x its JSON, for every read of it,
+    and a tab's every join or reconnect made one."""
 
-    def test_latest_user_message_falls_back_to_leaf(self):
-        h = _history(("a1", "assistant", None))
-        self.assertEqual(_composer_latest_user_message_id(h), "a1")
-        self.assertIsNone(_composer_latest_user_message_id({}))
-        self.assertIsNone(_composer_latest_user_message_id(None))
+    async def head(self, history, reads=None):
+        return await _composer_chat_head("alice", history["currentId"], _rows(history, reads))
 
-    def test_openclaw_chat_detection(self):
-        prefixes = ["openclaw_gateway."]
-        self.assertTrue(_composer_chat_is_openclaw({"models": ["openclaw_gateway.default"]}, prefixes))
-        self.assertFalse(_composer_chat_is_openclaw({"models": ["llama3.2:1b"]}, prefixes))
-        leaf_only = {"models": [], "history": {"currentId": "a", "messages": {
-            "a": {"model": "openclaw_gateway.x"}}}}
-        self.assertTrue(_composer_chat_is_openclaw(leaf_only, prefixes))
-        self.assertFalse(_composer_chat_is_openclaw(None, prefixes))
+    async def test_the_latest_user_message_and_the_reply_model_in_two_reads(self):
+        h = _history(("u1", "user", None), ("a1", "assistant", "u1", "llama3.2:1b"),
+                     ("u2", "user", "a1"), ("a2", "assistant", "u2", "openclaw_gateway.default"))
+        reads = []
+        self.assertEqual(await self.head(h, reads), {
+            "user_id": "alice", "message_id": "u2", "model": "openclaw_gateway.default"})
+        self.assertEqual(reads, ["a2", "u2"])
+
+    async def test_a_user_message_last_takes_the_model_of_the_reply_before_it(self):
+        h = _history(("u1", "user", None), ("a1", "assistant", "u1", "openclaw_gateway.x"),
+                     ("u2", "user", "a1"))
+        reads = []
+        self.assertEqual(await self.head(h, reads), {
+            "user_id": "alice", "message_id": "u2", "model": "openclaw_gateway.x"})
+        self.assertEqual(reads, ["u2", "a1"])
+
+    async def test_with_no_user_message_the_current_one_is_the_target(self):
+        h = _history(("a1", "assistant", None, "openclaw_gateway.x"))
+        self.assertEqual((await self.head(h))["message_id"], "a1")
+        self.assertEqual(await _composer_chat_head("alice", None, _rows(h)),
+                         {"user_id": "alice", "message_id": None, "model": None})
+
+    async def test_a_missing_row_ends_the_walk(self):
+        h = _history(("u1", "user", None), ("a1", "assistant", "u1", "openclaw_gateway.x"),
+                     current="gone")
+        self.assertEqual(await self.head(h), {"user_id": "alice", "message_id": "gone", "model": None})
 
 
 class PipeTurnStartTests(unittest.IsolatedAsyncioTestCase):
@@ -311,9 +337,12 @@ class ActionDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class _FakeChat:
-    def __init__(self, user_id, models, history):
+    def __init__(self, user_id, model, history):
         self.user_id = user_id
-        self.chat = {"models": models, "history": history}
+        self.history = copy.deepcopy(history)
+        for m in self.history["messages"].values():
+            if m["role"] == "assistant":
+                m["model"] = model
 
 
 class _TestWatcher(_ComposerWatcher):
@@ -329,8 +358,12 @@ class _TestWatcher(_ComposerWatcher):
     def _session_pool_batches(self):
         return [list(self.pool.items())]
 
-    async def _load_chat(self, chat_id):
-        return self.chats.get(chat_id)
+    async def _chat_head(self, chat_id):
+        chat = self.chats.get(chat_id)
+        if chat is None:
+            return None
+        return await _composer_chat_head(chat.user_id, chat.history["currentId"],
+                                         _rows(chat.history))
 
     async def _call_sid(self, sid, payload):
         self.sent.append((sid, payload))
@@ -341,9 +374,9 @@ class ComposerWatcherTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.history = _history(("u1", "user", None), ("a1", "assistant", "u1"))
         self.chats = {
-            "oc": _FakeChat("alice", ["openclaw_gateway.default"], self.history),
-            "llama": _FakeChat("alice", ["llama3.2:1b"], self.history),
-            "bobs": _FakeChat("bob", ["openclaw_gateway.default"], self.history),
+            "oc": _FakeChat("alice", "openclaw_gateway.default", self.history),
+            "llama": _FakeChat("alice", "llama3.2:1b", self.history),
+            "bobs": _FakeChat("bob", "openclaw_gateway.default", self.history),
         }
 
     async def test_pushes_once_after_settle_to_that_sid_targeting_user_message(self):
@@ -406,13 +439,15 @@ class ComposerWatcherTests(unittest.IsolatedAsyncioTestCase):
         w = _TestWatcher(pool, self.chats)
         calls = []
 
+        head = w._chat_head
+
         async def flaky(chat_id):
             calls.append(chat_id)
             if len(calls) == 1:
                 raise RuntimeError("db hiccup")
-            return self.chats.get(chat_id)
+            return await head(chat_id)
 
-        w._load_chat = flaky
+        w._chat_head = flaky
         await w.tick(now=0.0)
         self.assertEqual(await w.tick(now=2.0), 0)
         self.assertEqual(await w.tick(now=6.0), 1)

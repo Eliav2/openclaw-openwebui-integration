@@ -4722,42 +4722,6 @@ async def _emit_composer_button(__event_emitter__, *, session_id=None, model_id=
         return False
 
 
-def _composer_latest_user_message_id(history: dict):
-    """Python twin of the snippet's targetMessageId(): the latest user message
-    on the current branch, else the current leaf, else None."""
-    if not isinstance(history, dict):
-        return None
-    messages = history.get("messages") or {}
-    current = history.get("currentId")
-    msg_id = current
-    for _ in range(500):
-        if not msg_id:
-            break
-        msg = messages.get(msg_id)
-        if not isinstance(msg, dict):
-            break
-        if msg.get("role") == "user":
-            return msg_id
-        msg_id = msg.get("parentId")
-    return current or None
-
-
-def _composer_chat_is_openclaw(chat_data: dict, prefixes) -> bool:
-    """Python twin of the snippet's chatModel(): any of the chat's models, or
-    the current leaf's model, starts with one of `prefixes`."""
-    if not isinstance(chat_data, dict):
-        return False
-    candidates = list(chat_data.get("models") or [])
-    history = chat_data.get("history") or {}
-    leaf = (history.get("messages") or {}).get(history.get("currentId")) or {}
-    if isinstance(leaf, dict) and leaf.get("model"):
-        candidates.append(leaf["model"])
-    return any(
-        isinstance(m, str) and any(m.startswith(p) for p in prefixes)
-        for m in candidates
-    )
-
-
 # --- action ----------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
