@@ -928,11 +928,23 @@ def _is_nested_tool_call(data: dict, known: "set | dict") -> bool:
     return len(parts) > 2 and parts[0] == "tool_call" and parts[1] in known
 
 
+OPENCLAW_MCP_PREFIX = "mcp__openclaw__"
+
+
+def _bare_tool_name(name: str) -> str:
+    """An OpenClaw tool by the name the Gateway's live events give it. claude-cli
+    calls them over MCP as `mcp__openclaw__<name>`, and its imported transcript
+    keeps that name while the live events strip it, so a rebuilt card was
+    titled differently from the one that streamed (on 2026.10 every claude-cli
+    shell command: `exec`)."""
+    return name[len(OPENCLAW_MCP_PREFIX):] if name.startswith(OPENCLAW_MCP_PREFIX) else name
+
+
 def _deferred_call_view(name: str, args_str: str) -> tuple[str, str] | None:
     """A deferred-tool wrapper call as the call it makes: the target's name
     (the last part of a catalog id like `openclaw:core:session_status`) and
     its arguments. None for any other call."""
-    if name not in DEFERRED_CALL_TOOLS:
+    if _bare_tool_name(name) not in DEFERRED_CALL_TOOLS:
         return None
     args = _json_object(args_str)
     target = args.get("id") if isinstance(args.get("id"), str) else args.get("name")
@@ -958,6 +970,7 @@ def _tool_card_view(name: str, args_str: str) -> tuple[str, str]:
     """The title and input a tool card shows. A spawn card is named after the
     sub-agent it started ("🤖 <label>") and shows the head of its task, not
     the whole prompt; any other card shows the call as made (ELI-155)."""
+    name = _bare_tool_name(name)
     if not _is_spawn_tool(name):
         return name, args_str
     args = _json_object(args_str)

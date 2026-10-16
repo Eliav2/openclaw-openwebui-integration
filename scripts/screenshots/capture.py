@@ -280,7 +280,9 @@ def upload_media(name: str, data: bytes) -> None:
 def schedule_wake(session_key: str, message: str, in_s: float) -> None:
     at = (datetime.datetime.now(datetime.timezone.utc)
           + datetime.timedelta(seconds=in_s)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-    params = {"name": "nightly-build-check", "schedule": {"kind": "at", "at": at},
+    # agentId: from OpenClaw 2026.10.10 a job needs its agent named when the
+    # Gateway has more than one (main, title-gen).
+    params = {"name": "nightly-build-check", "agentId": "main", "schedule": {"kind": "at", "at": at},
               "sessionTarget": f"session:{session_key}",
               "payload": {"kind": "agentTurn", "message": message},
               "delivery": {"mode": "none"}, "deleteAfterRun": True}

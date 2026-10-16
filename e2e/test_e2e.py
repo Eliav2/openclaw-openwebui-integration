@@ -320,7 +320,9 @@ def _session_key(token: str, chat_id: str) -> str:
 def _schedule_wake(key: str, message: str, in_s: float) -> str:
     at = (datetime.datetime.now(datetime.timezone.utc)
           + datetime.timedelta(seconds=in_s)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-    job = _gw("cron.add", {"name": f"e2e-wake-{uuid.uuid4().hex[:6]}",
+    # agentId: from OpenClaw 2026.10.10 a job needs its agent named when the
+    # Gateway has more than one (main, title-gen).
+    job = _gw("cron.add", {"name": f"e2e-wake-{uuid.uuid4().hex[:6]}", "agentId": "main",
                            "schedule": {"kind": "at", "at": at},
                            "sessionTarget": f"session:{key}",
                            "payload": {"kind": "agentTurn", "message": message},

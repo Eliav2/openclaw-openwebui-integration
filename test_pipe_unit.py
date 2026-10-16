@@ -917,6 +917,35 @@ class DeferredToolCallCardTests(unittest.TestCase):
         self.assertEqual(r.output[1]["output"][0]["text"], "<<<EXTERNAL_UNTRUSTED_CONTENT>>> page")
 
 
+class OpenClawMcpToolNameTests(unittest.TestCase):
+    """ELI-164: claude-cli calls OpenClaw's tools over MCP. The Gateway's live
+    tool events name them bare (`exec`, `stripOpenClawMcpToolPrefix`), the
+    imported claude transcript keeps `mcp__openclaw__exec`, so a rebuilt card
+    was titled differently from the one that streamed. From OpenClaw 2026.10
+    every claude-cli shell command is such a call (`exec`, not `Bash`)."""
+
+    def test_a_rebuilt_card_is_named_as_it_streamed(self):
+        args = {"command": "sleep 30; echo done", "yieldMs": 10000}
+        live = _TurnRenderer()
+        live.feed({"stream": "tool", "data": {"phase": "start", "name": "exec", "toolCallId": "toolu_1", "args": args}})
+        live.feed({"stream": "tool", "data": {"phase": "result", "name": "exec", "toolCallId": "toolu_1",
+                                              "result": "Command still running (session calm-reef)."}})
+        rebuilt = _history_renderer([{"role": "assistant", "content": [
+            {"type": "toolcall", "id": "toolu_1", "name": "mcp__openclaw__exec", "arguments": args},
+            {"type": "tool_result", "tool_use_id": "toolu_1", "name": "mcp__openclaw__exec",
+             "content": "Command still running (session calm-reef)."}]}])
+        names = lambda r: [i.get("name") for i in r.output if i["type"] == "function_call"]
+        self.assertEqual(names(live), ["exec"])
+        self.assertEqual(names(rebuilt), names(live))
+        self.assertEqual(rebuilt.output, live.output)
+
+    def test_other_mcp_servers_keep_their_names(self):
+        r = _TurnRenderer()
+        r.feed({"stream": "tool", "data": {"phase": "start", "name": "mcp__github__get_issue",
+                                           "toolCallId": "t", "args": {}}})
+        self.assertEqual(r.output[0]["name"], "mcp__github__get_issue")
+
+
 class SpawnCardTests(unittest.TestCase):
     """ELI-155: a sessions_spawn card was titled "sessions_spawn" (grouped as
     "Explored 2 sessions_spawn"), showed the whole task as input and the
@@ -6243,8 +6272,10 @@ class ExitTextFixtureTest(unittest.TestCase):
 class CronPromptFixtureTest(unittest.TestCase):
     """ELI-103: a wake is found by its admitted user turn's TEXT, the prefix
     `[cron:<jobId> <name>]`; the turn has no structured cron field. The
-    fixture holds the exact dist lines that build it; this test renders them
-    and, when the dist is installed here, fails if they have changed."""
+    fixture holds the exact dist lines that build it, one form per OpenClaw
+    line (2026.9: the prefix inline; 2026.10: on its own line, ELI-164); this
+    test renders each and, when a dist is installed here, fails unless it
+    holds one of them exactly."""
 
     FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "test_fixture_openclaw_cron_prompt.json")
@@ -6252,23 +6283,32 @@ class CronPromptFixtureTest(unittest.TestCase):
 
     def setUp(self):
         self.fx = json.load(open(self.FIXTURE))
+        self.forms = self.fx["forms"]
 
-    def render(self, name, message, time_line="Current time: x"):
-        base = re.search(r"`([^`]*)`", self.fx["base"]["source"]).group(1)
-        base = (base.replace("${input.job.id}", self.JOB).replace("${input.job.name}", name)
+    def render(self, form, name, message, time_line="Current time: x"):
+        tpl = lambda part: re.search(r"`([^`]*)`", form[part]["source"]).group(1)
+        prefix = (tpl("prefix") if "prefix" in form else "").replace(
+            "${input.job.id}", self.JOB).replace("${input.job.name}", name)
+        base = (tpl("base").replace("${sourcePromptPrefix}", prefix)
+                .replace("${input.job.id}", self.JOB).replace("${input.job.name}", name)
                 .replace("${message}", message)).strip()
-        body = re.search(r"`([^`]*)`", self.fx["command_body"]["source"]).group(1)
+        self.assertNotIn("${", base, base)
+        body = tpl("command_body")
         self.assertNotIn("${", body.replace("${base}", "").replace("${timeLine}", ""), body)
         return body.replace("${base}", base).replace("\\n", "\n").replace("${timeLine}", time_line)
 
     def turn(self, text):
         return {"role": "user", "content": text, "idempotencyKey": "turn-1:user", "timestamp": 5}
 
+    def test_both_openclaw_lines_are_pinned(self):
+        self.assertEqual(sorted(f["openclaw_version"].split(".")[1] for f in self.forms), ["10", "9"])
+
     def test_a_rendered_wake_prompt_is_a_wake_turn_of_its_job(self):
-        for name in ("eli103-wake", "nightly digest (v2)"):
-            with self.subTest(name):
-                got = wake_turns([self.turn(self.render(name, "Check the queue."))])
-                self.assertEqual([t["job"] for t in got], [self.JOB])
+        for form in self.forms:
+            for name in ("eli103-wake", "nightly digest (v2)"):
+                with self.subTest(form["openclaw_version"], name=name):
+                    got = wake_turns([self.turn(self.render(form, name, "Check the queue."))])
+                    self.assertEqual([t["job"] for t in got], [self.JOB])
 
     def test_the_text_seen_live_is_a_wake_turn(self):
         for label, text in self.fx["observed_turn_texts"].items():
@@ -6281,11 +6321,10 @@ class CronPromptFixtureTest(unittest.TestCase):
             from extract_openclaw_cron_prompt import extract
         got = extract(dist)
         self.assertIsNotNone(got, "the cron prompt lines are gone from the dist: re-check wake_turns")
-        for part in ("base", "command_body"):
-            self.assertEqual(got[part]["source"], self.fx[part]["source"],
-                             f"OpenClaw {got['openclaw_version']} changed the cron prompt "
-                             f"(fixture: {self.fx['openclaw_version']}); re-check _CRON_PROMPT_RE, "
-                             "then re-extract with scripts/extract_openclaw_cron_prompt.py --write")
+        parts = lambda f: {k: f[k]["source"] for k in ("prefix", "base", "command_body") if k in f}
+        self.assertIn(parts(got), [parts(f) for f in self.forms],
+                      f"OpenClaw {got['openclaw_version']} changed the cron prompt; re-check "
+                      "_CRON_PROMPT_RE, then re-extract with scripts/extract_openclaw_cron_prompt.py --write")
 
 
 class OomResumeLoopTest(unittest.TestCase):
