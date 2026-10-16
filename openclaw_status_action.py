@@ -5161,11 +5161,8 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     return wrap;
   }
 
-  // ── The sub-agent drawer (ELI-155) ──
-  // A compact header, then the sub-agent's run as a read-only chat: its
-  // messages in order, each tool call a collapsed card with its result, its
-  // reply last. The run is the one the chat itself would draw: the Action
-  // builds it with the Pipe's own history renderer.
+  // The sub-agent drawer: a compact header, then the run as a read-only chat,
+  // as the Pipe's history renderer draws it for the chat.
 
   // Open WebUI's tool card (ToolCallDisplay.svelte): its markup, classes and
   // icons, so a card here looks like one in the chat.
@@ -5211,7 +5208,7 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     card.dataset.openclawCard = c.id || '';
     const btn = document.createElement('div');
     btn.dataset.openclawCardButton = '1';
-    if (btn.setAttribute) btn.setAttribute('role', 'button');
+    btn.setAttribute('role', 'button');
     btn.className = 'py-1 text-[0.9375rem] text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 transition '
       + 'w-full min-w-0 cursor-pointer';
     const row = document.createElement('div');
@@ -5308,8 +5305,7 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
         el.rel = 'noopener noreferrer';
         el.className = 'text-blue-600 dark:text-blue-400 underline';
       } else {
-        el = document.createTextNode ? document.createTextNode(part) : null;
-        if (!el) { el = document.createElement('span'); el.textContent = part; }
+        el = document.createTextNode(part);
       }
       parent.appendChild(el);
     });
@@ -5426,17 +5422,10 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     const meta = document.getElementById('openclaw-drawer-meta');
     if (meta) {
       meta.innerHTML = '';
-      const parts = [];
-      if (root.__texts.model) {
-        const m = document.createElement('span');
-        m.textContent = root.__texts.model;
-        parts.push(m);
-      }
+      if (root.__texts.model) meta.appendChild(document.createTextNode(root.__texts.model));
       const parent = root.__parent;
       if (parent && parent.title) {
-        const from = document.createElement('span');
-        from.appendChild(document.createTextNode ? document.createTextNode('from ') : (function() {
-          const s = document.createElement('span'); s.textContent = 'from '; return s; })());
+        meta.appendChild(document.createTextNode((root.__texts.model ? ' · ' : '') + 'from '));
         let link;
         if (parent.chatId) {
           link = document.createElement('a');
@@ -5451,17 +5440,8 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
         link.dataset.openclawParent = '1';
         link.className = 'underline';
         link.textContent = parent.title;
-        from.appendChild(link);
-        parts.push(from);
+        meta.appendChild(link);
       }
-      parts.forEach(function(p, i) {
-        if (i) {
-          const dot = document.createElement('span');
-          dot.textContent = ' · ';
-          meta.appendChild(dot);
-        }
-        meta.appendChild(p);
-      });
       if (root.__controlUiUrl) {
         const link = controlUiLink(root.__controlUiUrl);
         link.style.marginLeft = '8px';
@@ -5533,8 +5513,8 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     } else if (status === 'running' || status === 'queued') {
       const steps = items.filter(function(it) { return it.kind === 'tool'; }).length;
       stream.appendChild(note('working', 'Working… (step ' + (steps + 1) + ')'));
-    } else if (DATA.note) {
-      stream.appendChild(note(DATA.note, DATA.noteText || ''));
+    } else if (DATA.noteText) {
+      stream.appendChild(note(DATA.note, DATA.noteText));
     }
     if (!stream.children.length) {
       const empty = document.createElement('div');
@@ -5656,12 +5636,14 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     panel.appendChild(content);
     if (child) stream.appendChild(skeletonSection('openclaw-drawer-loading'));
 
-    const footer = document.createElement('div');
-    footer.id = 'openclaw-drawer-footer';
-    footer.className = 'text-[11px] text-gray-400 dark:text-gray-600 px-4 py-2 '
-      + 'border-t border-gray-100 dark:border-gray-800';
-    footer.textContent = ' ';
-    if (child) panel.appendChild(footer);
+    if (child) {
+      const footer = document.createElement('div');
+      footer.id = 'openclaw-drawer-footer';
+      footer.className = 'text-[11px] text-gray-400 dark:text-gray-600 px-4 py-2 '
+        + 'border-t border-gray-100 dark:border-gray-800';
+      footer.textContent = ' ';
+      panel.appendChild(footer);
+    }
 
     document.addEventListener('keydown', onKey);
     document.body.appendChild(root);
@@ -5671,11 +5653,10 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
       const items = [];
       if (task.task) items.push({ kind: 'user', text: task.task });
       if (task.result) items.push({ kind: 'text', text: task.result });
-      const notes = { launched: 'Running in the background: its report comes as a message of its own.',
-                      'cut off': 'Cut off: the run ended before it returned.', running: 'Working…' };
       fillDrawer({ childSessionKey: root.dataset.taskId, items: items,
-                   note: notes[task.status] ? (task.status === 'running' ? 'working' : 'agent') : null,
-                   noteText: notes[task.status] || '' });
+                   note: task.status === 'running' ? 'working' : 'agent', noteText: {
+        launched: 'Running in the background: its report comes as a message of its own.',
+        'cut off': 'Cut off: the run ended before it returned.', running: 'Working…' }[task.status] });
       return;
     }
 
@@ -6513,12 +6494,10 @@ def _spawn_task_of(messages: list) -> str | None:
     return None
 
 
-# How the drawer reads a sub-agent's run. One page is the Gateway's largest
-# (CHAT_HISTORY_MAX_ENTRIES); text blocks keep up to 50000 characters each,
-# under the Gateway's per-message byte cap even for 2-byte scripts. Each
-# card's result is already capped by the chat's own rule (the renderer's), so
-# the run is bounded by a byte budget per read: the newest steps that fit,
-# the rest behind "Show earlier steps", which reads with the larger budget.
+# How the drawer reads a sub-agent's run: the Gateway's largest page
+# (CHAT_HISTORY_MAX_ENTRIES), text blocks up to 50000 characters, and a byte
+# budget per read: the newest steps that fit, the rest behind "Show earlier
+# steps", which reads with the larger budget.
 _DRAWER_HISTORY_PAGE = 1000
 _DRAWER_TEXT_MAX_CHARS = 50000
 _DRAWER_RUN_BYTES = 512 * 1024
@@ -6548,12 +6527,9 @@ async def _read_child_history(conn, child_key: str, budget: int, *, all_pages: b
 
 def _drawer_run_items(messages: list) -> list:
     """The child's run as the drawer's read-only chat, oldest first: the
-    turns it was sent after its task, and each stretch of its replies the
-    way the chat's own rebuild draws a run (`_history_renderer`): its text,
-    and a card per tool call with the call's result by the chat cards' rule
-    (a failed call named with ❌, its output led by the failure line). Both
-    transcript shapes; a claude-cli run's closer, which repeats the whole
-    run, is the renderer's to drop."""
+    turns it was sent after its task, and each stretch of its replies as
+    the chat's own rebuild draws it (`_history_renderer`): text, and a card
+    per tool call with its result."""
     items: list = []
     stretch: list = []
 

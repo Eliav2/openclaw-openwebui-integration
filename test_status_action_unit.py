@@ -277,6 +277,7 @@ class El {
   set textContent(v) { this.children = []; this.text = String(v); }
   get textContent() { return this.text + this.children.map((c) => c.textContent).join(''); }
   addEventListener() {}
+  setAttribute() {}
   walk(out = []) { for (const c of this.children) { out.push(c); c.walk(out); } return out; }
   querySelectorAll(sel) {
     const m = /^\[data-([a-z-]+)\]$/.exec(sel);
@@ -289,6 +290,7 @@ global.document = {
   body: new El('body'),
   documentElement: { classList: { contains: () => false } },
   createElement: (t) => new El(t),
+  createTextNode: (t) => { const e = new El('#text'); e.text = String(t); return e; },
   getElementById: (id) => document.body.walk().find((e) => e.id === id) || null,
   addEventListener() {}, removeEventListener() {},
 };
