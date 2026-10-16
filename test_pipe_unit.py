@@ -1342,6 +1342,56 @@ class ParkedCancelTests(unittest.IsolatedAsyncioTestCase):
         claim = asyncio.ensure_future(conn.claim_cancelled_turn("s"))
         self.assertEqual((await claim)["run_id"], "run-1")
 
+    def _park_with_reply(self, conn, carried=()):
+        """Park run-1 for a reply that shows message m1, with one event the
+        run sent after the cancel still buffered."""
+        q = conn.register_consumer("s", "run-1")
+        q.put_nowait({"type": "event", "payload": {"stream": "tool", "data": {"phase": "result"}}})
+        reply = {"message_id": "m1", "renderer": object()}
+        conn.park_cancelled_turn("s", "run-1", q, list(carried), 30, send_stop=False, reply=reply)
+        return reply
+
+    async def test_send_now_keeps_the_run_in_its_own_message(self):
+        """ELI-158: Send now kept the run for the NEXT reply, so the cancelled
+        message showed its running tool card as done and the run went on in
+        the new message. The run now stays in its own message: the turn
+        writer takes that message over with what it showed and the events
+        buffered since the cancel, and the next reply gets no run."""
+        conn, calls = self._conn()
+        reply = self._park_with_reply(conn)
+        with mock.patch("openclaw_pipe._hand_over_run", return_value=True) as hand:
+            conn.settle_parked_turn("s", "run-1", "send_now", hold_s=5)
+        hand.assert_called_once()
+        args, kwargs = hand.call_args
+        self.assertEqual(args[1:], ("s", "run-1"))
+        self.assertEqual(kwargs["reply"]["message_id"], "m1")
+        self.assertIs(kwargs["reply"]["renderer"], reply["renderer"])
+        self.assertEqual(len(kwargs["reply"]["events"]), 1, "the buffered event goes to the writer")
+        self.assertNotIn("s:run-1", conn._consumers)
+        self.assertIsNone(await conn.claim_cancelled_turn("s"))
+        await asyncio.sleep(0)
+        self.assertEqual(calls, [], "the run is never aborted")
+
+    async def test_messages_the_cancelled_reply_had_not_sent_still_reach_the_next(self):
+        conn, _ = self._conn()
+        self._park_with_reply(conn, carried=["first"])
+        with mock.patch("openclaw_pipe._hand_over_run", return_value=True):
+            conn.settle_parked_turn("s", "run-1", "send_now", hold_s=5)
+        claimed = await conn.claim_cancelled_turn("s")
+        self.assertIsNone(claimed["run_id"])
+        self.assertEqual(claimed["carried"], ["first"])
+
+    async def test_a_message_in_the_fallback_window_keeps_the_run_in_its_own_message(self):
+        """No page answer (a non-English Send now click): a new message inside
+        the window keeps the run, in its own message, as Send now does."""
+        conn, calls = self._conn()
+        self._park_with_reply(conn)
+        with mock.patch("openclaw_pipe._hand_over_run", return_value=True) as hand:
+            claimed = await conn.claim_cancelled_turn("s")
+        hand.assert_called_once()
+        self.assertIsNone(claimed["run_id"])
+        self.assertEqual(calls, [])
+
     def test_intent_query_reads_and_clears(self):
         from openclaw_pipe import _intent_query_js
         js = _intent_query_js("chat-1")

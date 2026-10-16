@@ -875,11 +875,14 @@ class Scenes:
         return chat
 
     def _both_answered(self, page: Page) -> None:
-        """The rebuild ran to its end (nothing aborted it), then the new
-        message got its own answer."""
-        wait_js(page, """() => { const all = [...document.querySelectorAll('.chat-assistant')].map(a => a.innerText).join('\\n');
-                 return all.includes('The cache is rebuilt') && all.includes("It's on main"); }""",
-                "the finished rebuild and the answer to the new message")
+        """The rebuild ran to its end in its own reply (nothing aborted it,
+        and it did not move to the next reply), then the new message got
+        its own answer."""
+        wait_js(page, """() => { const a = [...document.querySelectorAll('.chat-assistant')];
+                 return a.length >= 2 && a[0].innerText.includes('The cache is rebuilt')
+                   && a[a.length - 1].innerText.includes("It's on main")
+                   && !a[a.length - 1].innerText.includes('The cache is rebuilt'); }""",
+                "the rebuild finished in its own reply, and the new message's own answer")
         wait_js(page, f"() => {{ const m = {LAST_ASSISTANT}.closest('[id^=message-]'); return m && m.querySelector('button[aria-label=\"Copy\"]'); }}",
                 "the answer finished", 60_000)
 
@@ -888,11 +891,14 @@ class Scenes:
         default): it is in the chat at once, with no queue to click, while
         the rebuild is still running; then both are answered."""
         self._send_while_busy(page, "Cache rebuild")
+        # The rebuild's card is still running in its own reply (ELI-158: not
+        # marked done, not moved to the next reply).
         wait_js(page, f"""() => [...document.querySelectorAll('.user-message')]
                    .some(m => m.innerText.includes('Which branch is this on?'))
                  && !document.querySelector('button path[d="{SEND_NOW_ICON}"]')
-                 && !document.body.innerText.includes('The cache is rebuilt')""",
-                "the new message in the chat while the rebuild still runs", 30_000)
+                 && !document.body.innerText.includes('The cache is rebuilt')
+                 && {FIRST_ASSISTANT}.querySelectorAll('[role=button] .shimmer').length >= 1""",
+                "the new message in the chat while the rebuild's card still runs", 30_000)
         park_mouse(page)
         self.s.shot(page, "message-sent-mid-run")
         self._both_answered(page)
