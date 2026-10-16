@@ -353,6 +353,7 @@ SEND_NOW_ICON = "M4.5 10.5 12 3m0 0 7.5 7.5M12 3v18"
 ELAPSED_CELLS = """() => [...document.querySelectorAll('#openclaw-status-section-subagents span')]
   .filter(s => s.style.fontSize === '10px').map(s => s.textContent)"""
 FIRST_ASSISTANT = "document.querySelector('.chat-assistant')"
+REBUILD_SAYS = "Rebuilding the cache from the forecast API."
 
 
 def opened_card_clip(message_js: str) -> str:
@@ -897,10 +898,16 @@ class Scenes:
                    .some(m => m.innerText.includes('Which branch is this on?'))
                  && !document.querySelector('button path[d="{SEND_NOW_ICON}"]')
                  && !document.body.innerText.includes('The cache is rebuilt')
-                 && {FIRST_ASSISTANT}.querySelectorAll('[role=button] .shimmer').length >= 1""",
+                 && {FIRST_ASSISTANT}.querySelectorAll('[role=button] .shimmer').length >= 1
+                 && [...document.querySelectorAll('.chat-assistant')].pop().innerText.includes('Queued')""",
                 "the new message in the chat while the rebuild's card still runs", 30_000)
         park_mouse(page)
         self.s.shot(page, "message-sent-mid-run")
+        # The kept run's text shows once (ELI-158: the writer's takeover once
+        # spliced in a second copy).
+        said = page.evaluate(f"() => {FIRST_ASSISTANT}.innerText.split('{REBUILD_SAYS}').length - 1")
+        if said != 1:
+            raise RuntimeError(f"the rebuild's text shows {said} times in its reply")
         self._both_answered(page)
 
     def send_now(self, page: Page) -> None:
