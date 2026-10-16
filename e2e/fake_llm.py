@@ -25,9 +25,10 @@ whole):
   test, which checks that the reply names the model the Gateway actually
   routed to, so the answer has to come from the tool and not from here.
 
-A tool the agent does not offer directly is called through `tool_call` when
-that is offered: from OpenClaw 2026.10 most tools are deferred behind
-`tool_search` / `tool_call` and only a core set is sent as real schemas.
+A tool the agent does not offer directly is called through `tool_call`
+(OpenClaw 2026.10.1 to 10.4) or `dispatch_action` (from 2026.10.10) when that
+is offered: from OpenClaw 2026.10 most tools are deferred behind `tool_search`
+and only a core set is sent as real schemas.
 * `E2E_BG_EXEC`                        -> starts `sleep 25` with `exec` in the
   background, then replies `E2E_BG_STARTED`.
 * `E2E_SLOW TOKEN`                     -> replies `TOKEN slow-1 ... slow-10`, one
@@ -66,6 +67,9 @@ MODEL_ID = os.environ.get("FAKE_LLM_MODEL_ID", "e2e-echo")
 LOG_PATH = os.environ.get("FAKE_LLM_LOG", "")
 DEFAULT_REPLY = os.environ.get("FAKE_LLM_DEFAULT", "E2E fake model reply.")
 PREFERRED_TOOLS = ("session_status", "sessions_list", "memory_search")
+# The tool that calls a deferred one by id or name: `tool_call` on 2026.10.1 to
+# 10.4, `dispatch_action` from 2026.10.10.
+DEFERRED_CALL_TOOLS = ("dispatch_action", "tool_call")
 
 _EXACTLY = re.compile(r"exactly:?\s+([A-Za-z0-9_]{3,})")
 _ECHO = re.compile(r"E2E_ECHO: ([^\n]+)")
@@ -92,8 +96,9 @@ def _call(name: str, offered: list) -> dict | None:
     """Plan a call to `name`, directly or through the deferred `tool_call`."""
     if name in offered:
         return {"tool": name}
-    if "tool_call" in offered:
-        return {"tool": "tool_call", "args": {"id": name, "args": {}}}
+    for wrapper in DEFERRED_CALL_TOOLS:
+        if wrapper in offered:
+            return {"tool": wrapper, "args": {"id": name, "args": {}}}
     return None
 
 
@@ -203,8 +208,9 @@ def plan_reply(body: dict) -> dict:
         args = {"command": "sleep 25; echo e2e-bg-done", "background": True}
         if "exec" in offered:
             return {"tool": "exec", "args": args}
-        if "tool_call" in offered:
-            return {"tool": "tool_call", "args": {"id": "exec", "args": args}}
+        for wrapper in DEFERRED_CALL_TOOLS:
+            if wrapper in offered:
+                return {"tool": wrapper, "args": {"id": "exec", "args": args}}
         return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
 
     if "E2E_SPAWN" in user_text:
@@ -215,8 +221,9 @@ def plan_reply(body: dict) -> dict:
         args = {"task": SPAWN_TASK}
         if "sessions_spawn" in offered:
             return {"tool": "sessions_spawn", "args": args}
-        if "tool_call" in offered:
-            return {"tool": "tool_call", "args": {"id": "sessions_spawn", "args": args}}
+        for wrapper in DEFERRED_CALL_TOOLS:
+            if wrapper in offered:
+                return {"tool": wrapper, "args": {"id": "sessions_spawn", "args": args}}
         return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
 
     m = _SLOW.search(user_text)

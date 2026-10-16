@@ -128,3 +128,15 @@ jobs:
     uses: ./.github/workflows/e2e.yml
     with:
       lane: pinned
+
+  e2e-next:
+    # The OpenClaw release we are moving to (OPENCLAW_NEXT_VERSION in
+    # e2e/versions.env), on the pinned Open WebUI. Blocking, so a change that
+    # works on the pinned Gateway but breaks the next one is caught in its own
+    # PR. Drop it (or point it at the following release) once the pin moves.
+    name: E2E next
+    needs: [lint, test]
+    uses: ./.github/workflows/e2e.yml
+    with:
+      lane: next
+      openclaw_version: next

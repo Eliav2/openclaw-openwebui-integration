@@ -13,7 +13,7 @@ on:
         type: string
         default: ""
       openclaw_version:
-        description: npm spec for openclaw (empty = the pinned one in e2e/versions.env)
+        description: npm spec for openclaw (empty = the pinned one in e2e/versions.env, "next" = OPENCLAW_NEXT_VERSION there)
         type: string
         default: ""
       lane:

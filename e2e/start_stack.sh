@@ -80,8 +80,13 @@ cat >"$HOME/.openclaw/openclaw.json" <<EOF
                {"id": "e2e-echo", "name": "E2E Echo"}]
   }}},
   "agents": {
-    "defaults": {"model": {"primary": "fake/e2e-default"}},
-    "list": [{"id": "main", "default": true}, {"id": "title-gen"}]
+    "defaults": {
+      "model": {"primary": "fake/e2e-default"},
+      "heartbeat": {"agentId": "main"},
+      "systemAgent": {"agentId": "main"}
+    },
+    "ownership": "explicit",
+    "entries": {"main": {}, "title-gen": {}}
   }
 }
 EOF

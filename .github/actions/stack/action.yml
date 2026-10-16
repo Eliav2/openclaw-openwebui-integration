@@ -10,7 +10,7 @@ inputs:
     description: Open WebUI image (empty = the pinned one in e2e/versions.env)
     default: ""
   openclaw_version:
-    description: npm spec for openclaw (empty = the pinned one in e2e/versions.env)
+    description: npm spec for openclaw (empty = the pinned one in e2e/versions.env, "next" = OPENCLAW_NEXT_VERSION there)
     default: ""
   log_dir:
     description: Where the stack writes its logs
@@ -26,6 +26,7 @@ runs:
         IN_OPENCLAW_VERSION: ${{ inputs.openclaw_version }}
       run: |
         set -a; . e2e/versions.env; set +a
+        if [ "$IN_OPENCLAW_VERSION" = next ]; then IN_OPENCLAW_VERSION=$OPENCLAW_NEXT_VERSION; fi
         echo "OWUI_IMAGE=${IN_OWUI_IMAGE:-$OWUI_IMAGE}" >> "$GITHUB_ENV"
         echo "OPENCLAW_VERSION=${IN_OPENCLAW_VERSION:-$OPENCLAW_VERSION}" >> "$GITHUB_ENV"
         echo "Open WebUI: ${IN_OWUI_IMAGE:-$OWUI_IMAGE} / OpenClaw: openclaw@${IN_OPENCLAW_VERSION:-$OPENCLAW_VERSION}"
