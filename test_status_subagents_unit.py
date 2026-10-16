@@ -16,6 +16,7 @@ import unittest
 from unittest import mock
 
 import test_status_action_unit  # noqa: F401  (installs the module stubs)
+from _test_helpers import run_page
 from test_status_action_unit import _drawer_conn, _emitted_codes, _open_dialog
 
 import openclaw_status_action
@@ -361,15 +362,8 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_child_that_finishes_stops_counting_in_the_open_dialog(self):
         import asyncio
-        import json
-        import shutil
-        import subprocess
-        import tempfile
         from test_status_action_unit import _DIALOG_PAGE_JS, _render_modal_open_js
 
-        runtime = shutil.which("bun") or shutil.which("node")
-        if runtime is None:
-            self.skipTest("no bun or node")
         rows = [_child(CHILD_A, "running", startedAt=self.NOW - 1000)]
         previews = {CHILD_A: [{"role": "user", "text": WRAPPED_93}]}
         waiters, emitted = {}, []
@@ -404,17 +398,9 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
         identity = {"chatId": "c", "messageId": "m", "sessionId": "s", "owuiModel": "x"}
         payload = {"now": self.NOW, "open": _render_modal_open_js(identity), "fills": fills,
                    "steps": [{"advance": 60}]}
-        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
-            fh.write(_DIALOG_PAGE_JS)
-        try:
-            out = subprocess.run([runtime, fh.name], input=json.dumps(payload),
-                                 capture_output=True, text=True, timeout=60)
-        finally:
-            os.unlink(fh.name)
-        self.assertEqual(out.returncode, 0, out.stderr)
         # A minute later the ended child is still listed (ELI-152), with
         # its own duration, not counting up.
-        self.assertEqual(json.loads(out.stdout), [{"cells": ["1s"], "timers": 1}])
+        self.assertEqual(run_page(_DIALOG_PAGE_JS, payload), [{"cells": ["1s"], "timers": 1}])
 
 
 def _card(call_id, name, args, result=None):
@@ -524,14 +510,8 @@ class SubagentSectionRenderTests(unittest.TestCase):
     NOW = 1_783_790_100_000
 
     def _page(self, data):
-        import shutil
-        import subprocess
-        import tempfile
         from test_status_action_unit import _FAKE_DOM_JS, _render_modal_open_js
 
-        runtime = shutil.which("bun") or shutil.which("node")
-        if runtime is None:
-            self.skipTest("no bun or node")
         page = _FAKE_DOM_JS + r"""
 run(input.open);
 run(input.fill);
@@ -542,15 +522,7 @@ console.log(JSON.stringify(section.walk().filter((e) => e.children.length === 0 
         identity = {"chatId": "c", "messageId": "m", "sessionId": "s", "owuiModel": "x"}
         payload = {"now": self.NOW, "open": _render_modal_open_js(identity),
                    "fill": openclaw_status_action._render_subagents_fill_js(data)}
-        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
-            fh.write(page)
-        try:
-            out = subprocess.run([runtime, fh.name], input=json.dumps(payload),
-                                 capture_output=True, text=True, timeout=60)
-        finally:
-            os.unlink(fh.name)
-        self.assertEqual(out.returncode, 0, out.stderr)
-        return json.loads(out.stdout)
+        return run_page(page, payload)
 
     def test_both_groups_with_their_counts_and_states(self):
         task = {"id": CHILD_A, "title": "Research X", "status": "completed", "childSessionKey": CHILD_A,
@@ -575,30 +547,16 @@ console.log(JSON.stringify(section.walk().filter((e) => e.children.length === 0 
     def test_a_long_dialog_scrolls_instead_of_running_off_the_screen(self):
         """Up to 20 rows of each kind outgrow a phone screen: seen on the
         runner, the dialog's top and bottom were cut off with no scroll."""
-        import shutil
-        import subprocess
-        import tempfile
         from test_status_action_unit import _FAKE_DOM_JS, _render_modal_open_js
 
-        runtime = shutil.which("bun") or shutil.which("node")
-        if runtime is None:
-            self.skipTest("no bun or node")
         page = _FAKE_DOM_JS + r"""
 run(input.open);
 const panel = document.getElementById('openclaw-status-modal-root').children[0];
 console.log(JSON.stringify({maxHeight: panel.style.maxHeight, overflowY: panel.style.overflowY}));
 """
         identity = {"chatId": "c", "messageId": "m", "sessionId": "s", "owuiModel": "x"}
-        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
-            fh.write(page)
-        try:
-            out = subprocess.run([runtime, fh.name], input=json.dumps(
-                {"now": self.NOW, "open": _render_modal_open_js(identity)}),
-                capture_output=True, text=True, timeout=60)
-        finally:
-            os.unlink(fh.name)
-        self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertEqual(json.loads(out.stdout), {"maxHeight": "88vh", "overflowY": "auto"})
+        self.assertEqual(run_page(page, {"now": self.NOW, "open": _render_modal_open_js(identity)}),
+                         {"maxHeight": "88vh", "overflowY": "auto"})
 
 
 if __name__ == "__main__":

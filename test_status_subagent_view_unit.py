@@ -12,14 +12,11 @@ in-process agents had no detail at all (B10).
 
 import asyncio
 import json
-import os
-import shutil
-import subprocess
-import tempfile
 import unittest
 from unittest import mock
 
 import test_status_action_unit  # noqa: F401  (installs the module stubs)
+from _test_helpers import run_page
 from test_status_action_unit import _FAKE_DOM_JS, _drawer_conn, _emitted_codes
 
 import openclaw_status_action
@@ -65,19 +62,7 @@ run(input.open);
 
 
 def _page(body: str, payload: dict) -> dict:
-    runtime = shutil.which("bun") or shutil.which("node")
-    if runtime is None:
-        raise unittest.SkipTest("no bun or node")
-    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
-        fh.write(_PAGE_JS + body)
-    try:
-        out = subprocess.run([runtime, fh.name], input=json.dumps({"now": NOW, **payload}),
-                             capture_output=True, text=True, timeout=60)
-    finally:
-        os.unlink(fh.name)
-    if out.returncode != 0:
-        raise AssertionError(out.stderr)
-    return json.loads(out.stdout)
+    return run_page(_PAGE_JS + body, {"now": NOW, **payload})
 
 
 def _rows():

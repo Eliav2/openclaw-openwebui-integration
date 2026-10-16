@@ -10,13 +10,13 @@ import datetime
 import json
 import os
 import sys
-import tempfile
 import types
 import unittest
 from unittest import mock
 
 import conftest  # noqa: F401  (imports real pydantic before the stubs can shadow it)
 
+from _test_helpers import run_page  # noqa: E402
 from _test_stubs import install_stubs  # noqa: E402
 
 install_stubs()
@@ -210,21 +210,8 @@ class DialogSectionTests(unittest.TestCase):
     fake page: what a reader sees, not what the JS source contains."""
 
     def _page(self, fills, identity=FULL_IDENTITY, click=False, tz="UTC"):
-        import shutil
-        import subprocess
-        runtime = shutil.which("bun") or shutil.which("node")
-        if runtime is None:
-            self.skipTest("no bun or node")
         payload = {"now": 1, "open": _render_modal_open_js(identity), "fills": fills, "click": click}
-        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
-            fh.write(_SECTIONS_PAGE_JS)
-        try:
-            out = subprocess.run([runtime, fh.name], input=json.dumps(payload), capture_output=True,
-                                 text=True, timeout=60, env={**os.environ, "TZ": tz})
-        finally:
-            os.unlink(fh.name)
-        self.assertEqual(out.returncode, 0, out.stderr)
-        return json.loads(out.stdout)
+        return run_page(_SECTIONS_PAGE_JS, payload, tz=tz)
 
     @staticmethod
     def _context(pct):
@@ -304,23 +291,10 @@ class DrawerToolCardsStayOpenTests(unittest.TestCase):
                                        "error": None})
 
     def _page(self, steps):
-        import shutil
-        import subprocess
-        runtime = shutil.which("bun") or shutil.which("node")
-        if runtime is None:
-            self.skipTest("no bun or node")
         identity = {"chatId": "c", "messageId": "m", "sessionId": "s", "owuiModel": "x"}
         payload = {"now": 1, "open": _render_modal_open_js(identity),
                    "drawer": _render_drawer_open_js(self.TASK), "steps": steps}
-        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
-            fh.write(_DRAWER_CARDS_PAGE_JS)
-        try:
-            out = subprocess.run([runtime, fh.name], input=json.dumps(payload),
-                                 capture_output=True, text=True, timeout=60)
-        finally:
-            os.unlink(fh.name)
-        self.assertEqual(out.returncode, 0, out.stderr)
-        return json.loads(out.stdout)
+        return run_page(_DRAWER_CARDS_PAGE_JS, payload)
 
     def test_an_opened_card_stays_open_across_a_refill(self):
         a, b, c = self._call("call-a", "read"), self._call("call-b", "exec"), self._call("call-c", "write")
@@ -383,23 +357,10 @@ class ElapsedTickTests(unittest.TestCase):
     NOW = 1_783_790_100_000
 
     def _page(self, steps, tasks):
-        import shutil
-        import subprocess
-        runtime = shutil.which("bun") or shutil.which("node")
-        if runtime is None:
-            self.skipTest("no bun or node")
         identity = {"chatId": "c", "messageId": "m", "sessionId": "s", "owuiModel": "x"}
         fill = _render_subagents_fill_js({"tasks": tasks, "source": "pipe", "fetchedAt": "12:00:00", "error": None})
         payload = {"now": self.NOW, "open": _render_modal_open_js(identity), "fills": [fill], "steps": steps}
-        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
-            fh.write(_DIALOG_PAGE_JS)
-        try:
-            out = subprocess.run([runtime, fh.name], input=json.dumps(payload),
-                                 capture_output=True, text=True, timeout=60)
-        finally:
-            os.unlink(fh.name)
-        self.assertEqual(out.returncode, 0, out.stderr)
-        return json.loads(out.stdout)
+        return run_page(_DIALOG_PAGE_JS, payload)
 
     def _task(self, tid, status, started, ended=None):
         return {"id": tid, "title": tid, "status": status, "progressSummary": None, "terminalSummary": None,
@@ -1314,11 +1275,6 @@ class UpdatedTimeIsTheBrowsersClockTests(unittest.IsolatedAsyncioTestCase):
         return codes[0], next(c for c in codes if "openclaw-status-section-context" in c and c != codes[0])
 
     async def test_updated_is_on_the_readers_clock(self):
-        import shutil
-        import subprocess
-        runtime = shutil.which("bun") or shutil.which("node")
-        if runtime is None:
-            self.skipTest("no bun or node")
         opening, fill = await self._context_fill()
         page = _FAKE_DOM_JS + r"""
 run(input.open);
@@ -1326,16 +1282,7 @@ run(input.fill);
 const f = document.getElementById('openclaw-status-footer');
 process.stdout.write(JSON.stringify(f ? f.textContent : null));
 """
-        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
-            fh.write(page)
-        try:
-            out = subprocess.run([runtime, fh.name], input=json.dumps({"now": 1, "open": opening, "fill": fill}),
-                                 capture_output=True, text=True, timeout=60,
-                                 env={**os.environ, "TZ": "Asia/Jerusalem"})
-        finally:
-            os.unlink(fh.name)
-        self.assertEqual(out.returncode, 0, out.stderr)
-        footer = json.loads(out.stdout)
+        footer = run_page(page, {"now": 1, "open": opening, "fill": fill}, tz="Asia/Jerusalem")
         self.assertTrue(footer.startswith("Updated 12:00:00"), footer)
 
 
@@ -1390,11 +1337,6 @@ class ControlUiLinkTests(unittest.IsolatedAsyncioTestCase):
         return _emitted_codes(emitted)[0]
 
     def _links(self, opening, drawer=None):
-        import shutil
-        import subprocess
-        runtime = shutil.which("bun") or shutil.which("node")
-        if runtime is None:
-            self.skipTest("no bun or node")
         page = _FAKE_DOM_JS + r"""
 run(input.open);
 if (input.drawer) run(input.drawer);
@@ -1406,15 +1348,7 @@ const links = (id) => {
 process.stdout.write(JSON.stringify({dialog: links('openclaw-status-modal-root'),
                                      drawer: links('openclaw-drawer-root')}));
 """
-        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
-            fh.write(page)
-        try:
-            out = subprocess.run([runtime, fh.name], input=json.dumps({"now": 1, "open": opening, "drawer": drawer}),
-                                 capture_output=True, text=True, timeout=60)
-        finally:
-            os.unlink(fh.name)
-        self.assertEqual(out.returncode, 0, out.stderr)
-        return json.loads(out.stdout)
+        return run_page(page, {"now": 1, "open": opening, "drawer": drawer})
 
     async def test_the_dialog_and_drawer_link_to_their_sessions(self):
         url = "https://claw.example.com/chat/main/56b98d09f3b74e4fb2bb688ce63bfa53"
