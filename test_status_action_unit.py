@@ -1271,7 +1271,9 @@ class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "error")
         self.assertIn("taskId", _emitted_codes(emitted)[0])
 
-    async def test_polls_until_terminal_status_then_stops(self):
+    async def test_one_request_opens_and_fills_the_drawer_once(self):
+        """Opened from here (no `opened`): the drawer, then one fill of its
+        three tabs. The page asks again while the child runs (ELI-155)."""
         action = Action()
         emitted = []
 
@@ -1284,11 +1286,9 @@ class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
             if method == "sessions.describe":
                 get_calls["n"] += 1
                 self.assertEqual(params["key"], self.CHILD)
-                status = "running" if get_calls["n"] == 1 else "done"
                 return {"session": {"modelProvider": "anthropic", "model": "claude-sonnet-5",
-                                     "contextTokens": 1000000, "totalTokens": 5000, "status": status,
-                                     "startedAt": 1783790000000,
-                                     "endedAt": None if status == "running" else 1783790005000}}
+                                     "contextTokens": 1000000, "totalTokens": 5000, "status": "running",
+                                     "startedAt": 1783790000000, "endedAt": None}}
             if method == "chat.history":
                 self.assertEqual(params["sessionKey"], self.CHILD)
                 return {"messages": [{"role": "assistant", "content": [{"type": "text", "text": "working on it"}]}]}
@@ -1297,18 +1297,22 @@ class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
         fake_conn = _drawer_conn(fake_send_request)
 
         with mock.patch("openclaw_status_action._get_action_connection",
-                         new=mock.AsyncMock(return_value=(fake_conn, "pipe"))), \
-             mock.patch("openclaw_status_action.asyncio.sleep", new=mock.AsyncMock()):
+                         new=mock.AsyncMock(return_value=(fake_conn, "pipe"))):
             result = await action._run_subagent_detail(self.DETAIL_BODY, {"id": "u1"}, emitter)
 
         self.assertEqual(result["status"], "ok")
-        # Looped (running -> done), not a single-iteration happy path.
-        self.assertEqual(get_calls["n"], 2)
+        self.assertEqual(get_calls["n"], 1)
         codes = _emitted_codes(emitted)
-        self.assertIn("openclaw-drawer-root", codes[0])  # initial open
+        self.assertIn("openDrawer", codes[0])  # initial open
         self.assertTrue(any("openclaw-drawer-section-overview" in c for c in codes))
         self.assertTrue(any("openclaw-drawer-section-transcript" in c and "working on it" in c for c in codes))
         self.assertTrue(any("openclaw-drawer-section-tools" in c for c in codes))
+
+        emitted.clear()
+        with mock.patch("openclaw_status_action._get_action_connection",
+                         new=mock.AsyncMock(return_value=(fake_conn, "pipe"))):
+            await action._run_subagent_detail({**self.DETAIL_BODY, "opened": True}, {"id": "u1"}, emitter)
+        self.assertFalse(any("openDrawer" in c for c in _emitted_codes(emitted)))   # a page refresh
 
     async def test_running_subagent_shows_no_tool_calls_yet(self):
         """Pins the known ELI-26 gap so it can't be silently "fixed" again.
@@ -1366,42 +1370,6 @@ class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
         _rows, calls = _extract_transcript_and_tools(rows)
         self.assertEqual(len(calls), 1)
         self.assertTrue(calls[0]["isError"])
-
-    async def test_deadline_bounds_the_loop(self):
-        action = Action()
-        emitted = []
-
-        async def emitter(evt):
-            emitted.append(evt)
-
-        async def fake_send_request(method, params, timeout=5):
-            if method == "sessions.describe":
-                return {"session": {"status": "running"}}
-            if method == "chat.history":
-                return {"messages": []}
-            raise AssertionError(f"unexpected RPC: {method}")
-
-        fake_conn = _drawer_conn(fake_send_request)
-
-        # Simulate the poll deadline elapsing without a real wait: each
-        # asyncio.sleep call jumps the fake clock forward past it immediately.
-        clock = {"t": 0.0}
-
-        def fake_time():
-            return clock["t"]
-
-        async def fake_sleep(_seconds):
-            clock["t"] += 10_000
-
-        with mock.patch("openclaw_status_action._get_action_connection",
-                         new=mock.AsyncMock(return_value=(fake_conn, "pipe"))), \
-             mock.patch("openclaw_status_action.time.time", side_effect=fake_time), \
-             mock.patch("openclaw_status_action.asyncio.sleep", new=fake_sleep):
-            result = await action._run_subagent_detail(self.DETAIL_BODY, {"id": "u1"}, emitter)
-
-        # Never reaches a terminal status, but the loop still returns
-        # instead of hanging forever -- the whole point of the deadline.
-        self.assertEqual(result["status"], "ok")
 
 
 class SubagentProactiveMessageClickTests(unittest.IsolatedAsyncioTestCase):

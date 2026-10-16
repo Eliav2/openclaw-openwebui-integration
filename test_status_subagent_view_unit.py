@@ -294,6 +294,7 @@ class PollTests(unittest.IsolatedAsyncioTestCase):
 run(input.fill);
 const refreshes = () => fetches.filter((b) => b.mode === 'subagent-detail').length;
 const row = document.getElementById('openclaw-status-section-subagents').walk().find((e) => e.tagName === 'BUTTON');
+const base = timers.size;    // the dialog's own elapsed ticker
 row.onclick();
 """ + steps_js, {"open": _render_modal_open_js(IDENTITY), "fill": _section([unlabelled]),
                  "done": _render_drawer_overview_fill_js({
@@ -309,7 +310,7 @@ tick(5 * 60);
 const at20 = refreshes();
 run(input.done);
 tick(60);
-console.log(JSON.stringify({at15, at20, after: refreshes(), timers: timers.size}));
+console.log(JSON.stringify({at15, at20, after: refreshes(), timers: timers.size - base}));
 """)
         self.assertGreater(seen["at15"], 300)
         self.assertGreater(seen["at20"], seen["at15"] + 100)
@@ -323,7 +324,7 @@ const before = refreshes();
 const close = drawer().walk().find((e) => e.tagName === 'BUTTON' && (e.textContent === '×' || e.textContent === '‹ Back'));
 close.onclick();
 tick(60);
-console.log(JSON.stringify({before, after: refreshes(), open: !!drawer(), timers: timers.size}));
+console.log(JSON.stringify({before, after: refreshes(), open: !!drawer(), timers: timers.size - base}));
 """)
         self.assertGreater(seen["before"], 1)
         self.assertEqual(seen["after"], seen["before"])

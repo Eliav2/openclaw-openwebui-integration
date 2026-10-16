@@ -252,31 +252,303 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     return deltaS + 's';
   }
 
-  // Same same-origin/synthetic-mode trick as triggerCompact() above, just a
-  // different mode + extra taskId/title/status payload so the drawer
-  // (_DRAWER_OPEN_JS_TEMPLATE) can paint its header instantly from data the
-  // row already had, before Action._run_subagent_detail's own RPCs resolve.
-  function openSubagentDrawer(task) {
-    const token = localStorage.getItem('token');
-    fetch('/api/chat/actions/openclaw_status_action', {
+  // The dialog's own requests back to this same Action, the way
+  // triggerCompact() makes one: same-origin, OWUI's stored token, and the
+  // opening click's identity, so the Action's pushed fills reach this tab.
+  function askAction(extra) {
+    return fetch('/api/chat/actions/openclaw_status_action', {
       method: 'POST',
       headers: {
-        'Authorization': 'Bearer ' + token,
+        'Authorization': 'Bearer ' + localStorage.getItem('token'),
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
+      body: JSON.stringify(Object.assign({
         model: IDENTITY.owuiModel,
         chat_id: IDENTITY.chatId,
         id: IDENTITY.messageId,
         session_id: IDENTITY.sessionId,
-        mode: 'subagent-detail',
-        taskId: task.id,
-        taskTitle: task.title,
-        taskStatus: task.status,
-      }),
-    }).catch(function(err) {
-      console.error('[openclaw-status] could not open subagent drawer', err);
+      }, extra)),
     });
+  }
+
+  // A sub-agent's status as a coloured chip (ELI-155): the run statuses of
+  // a child session, and the states an in-process agent's card tells.
+  const CHIP = {
+    queued: ['Queued', '#9ca3af'], running: ['Running', '#3b82f6'], completed: ['Done', '#10b981'],
+    failed: ['Failed', '#f43f5e'], cancelled: ['Cancelled', '#f59e0b'], timed_out: ['Timed out', '#f59e0b'],
+    ended: ['Ended', '#9ca3af'], launched: ['Background', '#9ca3af'], returned: ['Returned', '#10b981'],
+    'cut off': ['Cut off', '#f59e0b'],
+  };
+  function setChip(chip, status) {
+    const c = CHIP[status] || [String(status || 'unknown'), '#9ca3af'];
+    chip.textContent = c[0];
+    chip.style.color = c[1];
+    chip.style.backgroundColor = c[1] + '22';
+    return chip;
+  }
+  function statusChip(status) {
+    const chip = document.createElement('span');
+    chip.dataset.openclawChip = '1';
+    chip.className = 'shrink-0 rounded-full font-semibold whitespace-nowrap';
+    chip.style.fontSize = '11px';
+    chip.style.padding = '1px 7px';
+    return setChip(chip, status);
+  }
+
+  // Inline, for the same reason as barColor(): a class OWUI's build never
+  // scanned can carry no CSS.
+  function oneLine(el) {
+    el.style.whiteSpace = 'nowrap';
+    el.style.overflow = 'hidden';
+    el.style.textOverflow = 'ellipsis';
+    el.style.minWidth = '0';
+    return el;
+  }
+
+  function clampLines(el, lines) {
+    el.style.display = '-webkit-box';
+    el.style.webkitBoxOrient = 'vertical';
+    el.style.webkitLineClamp = String(lines);
+    el.style.overflow = 'hidden';
+    return el;
+  }
+
+  // A titled text clamped to `lines`, with "Show all". Whether it is open is
+  // kept in `state[name]`, so a refill does not close it again.
+  function textBlock(name, label, text, lines, state) {
+    const wrap = document.createElement('div');
+    wrap.dataset.openclawBlock = name;
+    wrap.className = 'mb-4';
+    wrap.appendChild(sectionHeader(label));
+    const body = document.createElement('div');
+    body.dataset.openclawBlockText = '1';
+    body.className = 'text-sm text-gray-700 dark:text-gray-200 whitespace-pre-wrap break-words';
+    body.textContent = text;
+    clampLines(body, lines);
+    wrap.appendChild(body);
+    const more = document.createElement('button');
+    more.type = 'button';
+    more.dataset.openclawMore = name;
+    more.className = 'text-xs text-blue-600 dark:text-blue-400 mt-1';
+    function show(open) {
+      body.style.webkitLineClamp = open ? 'unset' : String(lines);
+      more.textContent = open ? 'Show less' : 'Show all';
+    }
+    more.onclick = function() { state[name] = !state[name]; show(state[name]); };
+    show(!!state[name]);
+    wrap.appendChild(more);
+    return wrap;
+  }
+
+  // The drawer's status line and its Result and Task, from what is known:
+  // the row at open, then each refresh.
+  function paintDrawer(root, task) {
+    if (task.status) {
+      const chip = document.getElementById('openclaw-drawer-chip');
+      if (chip) setChip(chip, task.status);
+      root.dataset.live = (task.status === 'running' || task.status === 'queued') ? 'true' : 'false';
+    }
+    const time = document.getElementById('openclaw-drawer-time');
+    if (time) time.textContent = elapsedTime(task.startedAt, task.endedAt);
+    if (task.result) root.__texts.result = task.result;
+    if (task.task) root.__texts.task = task.task;
+    const blocks = document.getElementById('openclaw-drawer-blocks');
+    if (!blocks) return;
+    blocks.innerHTML = '';
+    if (root.__texts.result) blocks.appendChild(textBlock('result', 'Result', root.__texts.result, 6, root.__open));
+    if (root.__texts.task) blocks.appendChild(textBlock('task', 'Task', root.__texts.task, 3, root.__open));
+    // "Show all" only where the clamp hid something (laid out by now).
+    Array.prototype.forEach.call(blocks.children, function(wrap) {
+      const body = wrap.children[1], more = wrap.children[2];
+      if (!root.__open[wrap.dataset.openclawBlock] && body.scrollHeight <= body.clientHeight) {
+        more.style.display = 'none';
+      }
+    });
+  }
+
+  // The sub-agent drawer (ELI-155): a side panel, or a full-screen sheet
+  // with a back button on a phone. Its header is one title line and one
+  // status line, so the tabs and the content keep the screen. `task.kind`
+  // "child" is a Gateway child session: its tabs fill from the Action, and
+  // while it runs the drawer asks again every few seconds until it ends or
+  // the drawer closes. "agent" is an in-process Agent call: what its card
+  // tells, nothing to fetch.
+  function openDrawer(task) {
+    const old = document.getElementById('openclaw-drawer-root');
+    if (old) (old.__close || function() { old.remove(); })();
+    const child = task.kind !== 'agent';
+    const phone = (window.innerWidth || 1024) < 768;
+
+    const root = document.createElement('div');
+    root.id = 'openclaw-drawer-root';
+    root.className = 'fixed inset-0';
+    // Inline: Open WebUI's CSS has no `z-[10000]` rule, so with the class the
+    // drawer had no z-index at all and opened behind the Status dialog
+    // (z-[9999]), which then swallowed every click on it (ELI-118).
+    root.style.zIndex = '10000';
+    root.dataset.taskId = task.childSessionKey || task.id;
+    root.__texts = {};
+    root.__open = {};
+    const onKey = function(e) { if (e.key === 'Escape') close(); };
+    function close() {
+      if (root.__poll) clearInterval(root.__poll);
+      root.__poll = null;
+      root.remove();
+      document.removeEventListener('keydown', onKey);
+    }
+    root.__close = close;
+
+    const backdrop = document.createElement('div');
+    backdrop.className = 'absolute inset-0';
+    backdrop.style.background = 'rgba(0,0,0,0.25)';
+    backdrop.onclick = close;
+    root.appendChild(backdrop);
+
+    const panel = document.createElement('div');
+    panel.className = 'absolute right-0 top-0 bottom-0 '
+      + 'bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 flex flex-col';
+    if (phone) {
+      panel.style.width = '100%';
+      panel.style.left = '0';
+    } else {
+      // A wide viewport keeps the sub-agent list glanceable beside it.
+      panel.className += ' shadow-xl border-l border-gray-100 dark:border-gray-800';
+      panel.style.width = 'min(420px, 88vw)';
+    }
+    panel.addEventListener('click', function(e) { e.stopPropagation(); });
+    root.appendChild(panel);
+
+    const header = document.createElement('div');
+    header.className = 'flex items-start gap-2 p-4 border-b border-gray-100 dark:border-gray-800';
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.onclick = close;
+    if (phone) {
+      closeBtn.textContent = '‹ Back';
+      closeBtn.className = 'text-sm text-blue-600 dark:text-blue-400 shrink-0 pr-1';
+      header.appendChild(closeBtn);
+    }
+    const headerText = document.createElement('div');
+    headerText.className = 'flex-1';
+    headerText.style.minWidth = '0';
+    const titleEl = document.createElement('div');
+    titleEl.dataset.openclawTitle = '1';
+    titleEl.className = 'text-sm font-semibold';
+    titleEl.textContent = task.title || task.id;
+    oneLine(titleEl);
+    headerText.appendChild(titleEl);
+    const meta = document.createElement('div');
+    meta.className = 'flex items-center gap-2 mt-1';
+    meta.style.flexWrap = 'wrap';
+    const chip = statusChip(task.status);
+    chip.id = 'openclaw-drawer-chip';
+    meta.appendChild(chip);
+    const time = document.createElement('span');
+    time.id = 'openclaw-drawer-time';
+    time.className = 'text-xs text-gray-500 dark:text-gray-400';
+    meta.appendChild(time);
+    if (task.controlUiUrl) meta.appendChild(controlUiLink(task.controlUiUrl));
+    headerText.appendChild(meta);
+    header.appendChild(headerText);
+    if (!phone) {
+      closeBtn.textContent = '×';
+      closeBtn.className = 'text-xl leading-none text-gray-400 hover:text-gray-700 '
+        + 'dark:hover:text-gray-200 px-1 shrink-0';
+      header.appendChild(closeBtn);
+    }
+    panel.appendChild(header);
+
+    const TABS = child ? ['Overview', 'Transcript', 'Tools'] : ['Overview'];
+    const panes = {};
+    if (child) {
+      const tabBar = document.createElement('div');
+      tabBar.className = 'flex gap-1 px-3 pt-2 border-b border-gray-100 dark:border-gray-800';
+      const tabClass = function(active) {
+        return 'text-xs font-medium px-2.5 py-1.5 rounded-t-lg border-b-2 '
+          + (active ? 'border-blue-500 text-blue-600 dark:text-blue-400'
+                    : 'border-transparent text-gray-400 dark:text-gray-500 '
+                      + 'hover:text-gray-600 dark:hover:text-gray-300');
+      };
+      TABS.forEach(function(name, i) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.textContent = name;
+        btn.dataset.tab = name;
+        btn.className = tabClass(i === 0);
+        btn.onclick = function() {
+          TABS.forEach(function(n) {
+            tabBar.querySelector('[data-tab="' + n + '"]').className = tabClass(n === name);
+            panes[n].style.display = n === name ? 'block' : 'none';
+          });
+        };
+        tabBar.appendChild(btn);
+      });
+      panel.appendChild(tabBar);
+    }
+
+    // The one scroller: the header and tabs above it stay short.
+    const content = document.createElement('div');
+    content.className = 'flex-1 p-4';
+    content.style.overflowY = 'auto';
+    content.style.minHeight = '0';
+    TABS.forEach(function(name, i) {
+      const pane = document.createElement('div');
+      pane.id = 'openclaw-drawer-pane-' + name.toLowerCase();
+      pane.style.display = i === 0 ? 'block' : 'none';
+      if (i === 0) {
+        const blocks = document.createElement('div');
+        blocks.id = 'openclaw-drawer-blocks';
+        pane.appendChild(blocks);
+      }
+      if (child) pane.appendChild(skeletonSection('openclaw-drawer-section-' + name.toLowerCase()));
+      panes[name] = pane;
+      content.appendChild(pane);
+    });
+    panel.appendChild(content);
+
+    if (child) {
+      const footer = document.createElement('div');
+      footer.id = 'openclaw-drawer-footer';
+      footer.className = 'text-[11px] text-gray-400 dark:text-gray-600 px-4 py-2 '
+        + 'border-t border-gray-100 dark:border-gray-800';
+      footer.textContent = ' ';
+      panel.appendChild(footer);
+    }
+
+    document.addEventListener('keydown', onKey);
+    document.body.appendChild(root);
+    paintDrawer(root, task);
+    if (!child) return;
+
+    // Each refresh is one Action request that fills the tabs once; the
+    // next waits for it to come back. A fill that ends the run stops it.
+    let inflight = false;
+    function refresh() {
+      if (!root.isConnected || root.dataset.live === 'false') {
+        if (root.__poll) clearInterval(root.__poll);
+        root.__poll = null;
+        return;
+      }
+      if (inflight) return;
+      inflight = true;
+      const done = function() { inflight = false; };
+      askAction({ mode: 'subagent-detail', opened: true, taskId: root.dataset.taskId }).then(done, done);
+    }
+    if (!task.server) {
+      inflight = true;
+      const first = function() { inflight = false; };
+      askAction({ mode: 'subagent-detail', opened: true, taskId: root.dataset.taskId }).then(first, first);
+    }
+    if (root.dataset.live === 'true') root.__poll = setInterval(refresh, IDENTITY.subagentPollMs || 2500);
+  }
+
+  function openSubagentDrawer(task) {
+    openDrawer(Object.assign({}, task, { kind: 'child' }));
+  }
+
+  function openAgentDetail(agent) {
+    openDrawer({ kind: 'agent', id: agent.id, title: agent.title, status: agent.state,
+                 task: agent.task, result: agent.result, startedAt: agent.startedAt });
   }
 
   window.__openclawStatus = {
@@ -284,7 +556,8 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     sectionHeader: sectionHeader, errorEl: errorEl,
     skeletonSection: skeletonSection, touchFooter: touchFooter, clockTime: clockTime, controlUiLink: controlUiLink,
     triggerCompact: triggerCompact, elapsedTime: elapsedTime, toMs: toMs,
-    openSubagentDrawer: openSubagentDrawer,
+    openSubagentDrawer: openSubagentDrawer, openAgentDetail: openAgentDetail, openDrawer: openDrawer,
+    paintDrawer: paintDrawer, statusChip: statusChip, oneLine: oneLine, clampLines: clampLines,
   };
 
   const root = document.createElement('div');
@@ -633,61 +906,59 @@ _SUBAGENTS_FILL_JS_TEMPLATE = r"""
     return name + ' (' + (total > shown ? shown + ' of ' + total : shown) + ')';
   }
 
-  const STATUS_COLOR = {
-    queued: '#9ca3af', running: '#3b82f6', completed: '#10b981',
-    failed: '#f43f5e', cancelled: '#f59e0b', timed_out: '#f59e0b',
-  };
+  // One row (ELI-155): a one-line title, a status chip and the time, then
+  // at most two lines of the latest reply. A long task is the drawer's.
+  function row(kind, title, status, timeEl, previewText, open) {
+    const el = document.createElement('button');
+    el.type = 'button';
+    el.dataset[kind] = '1';
+    el.className = 'w-full block text-left py-1.5 px-1.5 -mx-1.5 '
+      + 'rounded-lg hover:bg-gray-50 dark:hover:bg-gray-800/60';
+    el.onclick = open;
+    const top = document.createElement('div');
+    top.className = 'flex items-center gap-2';
+    const titleEl = document.createElement('div');
+    titleEl.dataset.openclawTitle = '1';
+    titleEl.className = 'text-sm text-gray-700 dark:text-gray-200 flex-1';
+    titleEl.textContent = title;
+    top.appendChild(S.oneLine(titleEl));
+    top.appendChild(S.statusChip(status));
+    if (timeEl) top.appendChild(timeEl);
+    el.appendChild(top);
+    if (previewText) {
+      const preview = document.createElement('div');
+      preview.dataset.openclawPreview = '1';
+      preview.className = 'text-xs text-gray-400 dark:text-gray-500 break-words mt-0.5';
+      preview.textContent = previewText;
+      el.appendChild(S.clampLines(preview, 2));
+    }
+    return el;
+  }
+
+  function timeCell(text) {
+    const cell = document.createElement('span');
+    cell.className = 'text-gray-400 dark:text-gray-500 shrink-0';
+    cell.style.fontSize = '10px';
+    cell.textContent = text;
+    return cell;
+  }
 
   if (tasks.length) section.appendChild(S.sectionHeader(countLabel('Subagents', tasks.length, DATA.total || 0)));
   tasks.forEach(function(t) {
-    const row = document.createElement('button');
-    row.type = 'button';
-    row.className = 'w-full flex items-start gap-2 text-left py-1.5 px-1.5 -mx-1.5 '
-      + 'rounded-lg hover:bg-gray-50 dark:hover:bg-gray-800/60';
-    row.onclick = function() { S.openSubagentDrawer(t); };
-
-    const dot = document.createElement('span');
-    dot.className = 'mt-1.5 h-1.5 w-1.5 rounded-full shrink-0'
-      + (t.status === 'running' ? ' animate-pulse' : '');
-    dot.style.backgroundColor = STATUS_COLOR[t.status] || '#9ca3af';
-    row.appendChild(dot);
-
-    const body = document.createElement('div');
-    body.className = 'min-w-0 flex-1';
-    const titleLine = document.createElement('div');
-    titleLine.className = 'text-sm text-gray-700 dark:text-gray-200 break-words';
-    titleLine.textContent = t.title || t.id;
-    body.appendChild(titleLine);
-
-    const sub = t.status === 'running' ? t.progressSummary : (t.terminalSummary || t.error);
-    if (sub) {
-      const subLine = document.createElement('div');
-      subLine.className = 'text-xs text-gray-400 dark:text-gray-500 break-words';
-      subLine.textContent = sub;
-      body.appendChild(subLine);
-    }
-    row.appendChild(body);
-
-    const elapsed = document.createElement('span');
-    elapsed.className = 'text-gray-400 dark:text-gray-500 shrink-0 mt-1.5';
-    elapsed.style.fontSize = '10px';
-    elapsed.textContent = S.elapsedTime(t.startedAt, t.endedAt);
+    const elapsed = timeCell(S.elapsedTime(t.startedAt, t.endedAt));
     const startMs = S.toMs(t.startedAt);
     // Still running: the dialog's ticker keeps this one counting up.
     if (t.status === 'running' && !t.endedAt && startMs != null) {
       elapsed.dataset.openclawStartedMs = String(startMs);
     }
-    row.appendChild(elapsed);
-
-    section.appendChild(row);
+    const preview = t.status === 'running' ? t.progressSummary : (t.terminalSummary || t.error);
+    section.appendChild(row('openclawRow', t.title || t.id, t.status, elapsed, preview,
+                            function() { S.openSubagentDrawer(t); }));
   });
 
   // Claude Code's in-process Agent calls (ELI-152): not Gateway sessions,
-  // so no drawer and no duration, only what the chat's tool cards tell.
-  const AGENT_STATE = {
-    running: ['running', '#3b82f6'], launched: ['launched in the background', '#9ca3af'],
-    returned: ['returned', '#10b981'], 'cut off': ['cut off', '#f59e0b'], failed: ['failed', '#f43f5e'],
-  };
+  // so no duration, only what the chat's tool cards tell; a tap shows its
+  // task and result (ELI-155).
   if (agents.length) {
     const head = S.sectionHeader(countLabel('In-process agents', agents.length, DATA.agentsTotal || 0));
     if (tasks.length) head.style.marginTop = '10px';
@@ -698,40 +969,17 @@ _SUBAGENTS_FILL_JS_TEMPLATE = r"""
     section.appendChild(note);
   }
   agents.forEach(function(a) {
-    const state = AGENT_STATE[a.state] || [a.state, '#9ca3af'];
-    const row = document.createElement('div');
-    row.className = 'w-full flex items-start gap-2 py-1.5';
-
-    const dot = document.createElement('span');
-    dot.className = 'mt-1.5 h-1.5 w-1.5 rounded-full shrink-0' + (a.state === 'running' ? ' animate-pulse' : '');
-    dot.style.backgroundColor = state[1];
-    row.appendChild(dot);
-
-    const body = document.createElement('div');
-    body.className = 'min-w-0 flex-1';
-    const titleLine = document.createElement('div');
-    titleLine.className = 'text-sm text-gray-700 dark:text-gray-200 break-words';
-    titleLine.textContent = a.title;
-    body.appendChild(titleLine);
-    const subLine = document.createElement('div');
-    subLine.className = 'text-xs text-gray-400 dark:text-gray-500 break-words';
-    subLine.textContent = state[0];
-    body.appendChild(subLine);
-    row.appendChild(body);
-
     // When its reply started, on the reader's clock.
     const started = S.toMs(a.startedAt);
+    let when = null;
     if (started != null) {
-      const when = document.createElement('span');
-      when.className = 'text-gray-400 dark:text-gray-500 shrink-0 mt-1.5';
-      when.style.fontSize = '10px';
-      when.textContent = new Date(started).toLocaleString([], {
+      when = timeCell(new Date(started).toLocaleString([], {
         month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
-      });
+      }));
       when.title = 'Started';
-      row.appendChild(when);
     }
-    section.appendChild(row);
+    section.appendChild(row('openclawAgentRow', a.title, a.state, when, a.result,
+                            function() { S.openAgentDetail(a); }));
   });
 
   S.touchFooter(DATA.fetchedAt, DATA.source);
@@ -739,137 +987,15 @@ _SUBAGENTS_FILL_JS_TEMPLATE = r"""
 """
 
 
-# Right-side slide-in panel, sibling to _MODAL_OPEN_JS_TEMPLATE -- deliberately
-# does NOT close/replace the parent status modal (different root id,
-# positioned to the side rather than centered) so the full subagent list
-# stays visible and glanceable behind it. Opened by S.openSubagentDrawer()
-# (defined in _MODAL_OPEN_JS_TEMPLATE) via a synthetic mode="subagent-detail"
-# call -- same self-call convention triggerCompact() already uses. All three
-# tab panes are created up front with skeletons; Action._run_subagent_detail
-# fills all three on every poll tick regardless of which tab is visible
-# (cheap: it's just a DOM update), so switching tabs is a pure visibility
-# toggle with no extra fetch involved.
+# The drawer opened from here rather than by a row tap: an old sub-agent
+# message's toolbar click. `S.openDrawer` (_MODAL_OPEN_JS_TEMPLATE) builds it;
+# `server` because this request fills it next. All three tab panes are
+# created up front with skeletons and every fill updates all three, so
+# switching tabs is a pure visibility toggle.
 _DRAWER_OPEN_JS_TEMPLATE = r"""
 (function() {
-  const TASK = __OPENCLAW_TASK__;
-  const existing = document.getElementById('openclaw-drawer-root');
-  if (existing) existing.remove();
-
   const S = window.__openclawStatus;
-  if (!S) return;
-
-  const root = document.createElement('div');
-  root.id = 'openclaw-drawer-root';
-  root.className = 'fixed inset-0';
-  // Inline: Open WebUI's CSS has no `z-[10000]` rule, so with the class the
-  // drawer had no z-index at all and opened behind the Status dialog
-  // (z-[9999]), which then swallowed every click on it (ELI-118).
-  root.style.zIndex = '10000';
-
-  const backdrop = document.createElement('div');
-  backdrop.className = 'absolute inset-0';
-  backdrop.style.background = 'rgba(0,0,0,0.25)';
-  backdrop.onclick = function() { root.remove(); };
-  root.appendChild(backdrop);
-
-  const panel = document.createElement('div');
-  panel.className = 'absolute right-0 top-0 bottom-0 '
-    + 'bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 '
-    + 'shadow-xl border-l border-gray-100 dark:border-gray-800 flex flex-col';
-  // Inline, not a `w-[420px] max-w-[92vw]` utility class -- same reasoning
-  // as the status modal's panel above. min() keeps this mobile-first: a
-  // narrow viewport wins the 88vw side (leaves a visible margin so the
-  // subagent list behind it stays glanceable, not edge-to-edge), a wide one
-  // wins the 420px cap.
-  panel.style.width = 'min(420px, 88vw)';
-  panel.addEventListener('click', function(e) { e.stopPropagation(); });
-  root.appendChild(panel);
-
-  const header = document.createElement('div');
-  header.className = 'flex items-start justify-between gap-2 p-4 border-b '
-    + 'border-gray-100 dark:border-gray-800';
-  const headerText = document.createElement('div');
-  headerText.className = 'min-w-0';
-  const titleEl = document.createElement('div');
-  titleEl.className = 'text-sm font-semibold break-words';
-  titleEl.textContent = TASK.title || TASK.id;
-  headerText.appendChild(titleEl);
-  const statusEl = document.createElement('div');
-  statusEl.id = 'openclaw-drawer-status';
-  statusEl.className = 'text-xs text-gray-400 dark:text-gray-500 mt-0.5';
-  statusEl.textContent = TASK.status || '';
-  headerText.appendChild(statusEl);
-  if (TASK.controlUiUrl) {
-    const link = S.controlUiLink(TASK.controlUiUrl);
-    link.className += ' inline-block mt-1';
-    headerText.appendChild(link);
-  }
-  header.appendChild(headerText);
-  const closeBtn = document.createElement('button');
-  closeBtn.type = 'button';
-  closeBtn.textContent = '×';
-  closeBtn.className = 'text-xl leading-none text-gray-400 hover:text-gray-700 '
-    + 'dark:hover:text-gray-200 px-1 shrink-0';
-  closeBtn.onclick = function() { root.remove(); };
-  header.appendChild(closeBtn);
-  panel.appendChild(header);
-
-  const TABS = ['Overview', 'Transcript', 'Tools'];
-  const tabBar = document.createElement('div');
-  tabBar.className = 'flex gap-1 px-3 pt-2 border-b border-gray-100 dark:border-gray-800';
-  const panes = {};
-  function tabClass(active) {
-    return 'text-xs font-medium px-2.5 py-1.5 rounded-t-lg border-b-2 '
-      + (active ? 'border-blue-500 text-blue-600 dark:text-blue-400'
-                : 'border-transparent text-gray-400 dark:text-gray-500 '
-                  + 'hover:text-gray-600 dark:hover:text-gray-300');
-  }
-  TABS.forEach(function(name, i) {
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.textContent = name;
-    btn.dataset.tab = name;
-    btn.className = tabClass(i === 0);
-    btn.onclick = function() {
-      TABS.forEach(function(n) {
-        const b = tabBar.querySelector('[data-tab="' + n + '"]');
-        const active = n === name;
-        b.className = tabClass(active);
-        panes[n].style.display = active ? 'block' : 'none';
-      });
-    };
-    tabBar.appendChild(btn);
-  });
-  panel.appendChild(tabBar);
-
-  const content = document.createElement('div');
-  content.className = 'flex-1 overflow-y-auto p-4';
-  TABS.forEach(function(name, i) {
-    const pane = document.createElement('div');
-    pane.id = 'openclaw-drawer-pane-' + name.toLowerCase();
-    pane.style.display = i === 0 ? 'block' : 'none';
-    pane.appendChild(S.skeletonSection('openclaw-drawer-section-' + name.toLowerCase()));
-    panes[name] = pane;
-    content.appendChild(pane);
-  });
-  panel.appendChild(content);
-
-  const footer = document.createElement('div');
-  footer.id = 'openclaw-drawer-footer';
-  footer.className = 'text-[11px] text-gray-400 dark:text-gray-600 px-4 py-2 '
-    + 'border-t border-gray-100 dark:border-gray-800';
-  footer.textContent = ' ';
-  panel.appendChild(footer);
-
-  const onKey = function(e) {
-    if (e.key === 'Escape') {
-      root.remove();
-      document.removeEventListener('keydown', onKey);
-    }
-  };
-  document.addEventListener('keydown', onKey);
-
-  document.body.appendChild(root);
+  if (S && S.openDrawer) S.openDrawer(Object.assign({ kind: 'child', server: true }, __OPENCLAW_TASK__));
 })();
 """
 
@@ -879,7 +1005,10 @@ _DRAWER_OPEN_JS_TEMPLATE = r"""
 _DRAWER_ERROR_JS_TEMPLATE = r"""
 (function() {
   const MESSAGE = __OPENCLAW_ERROR_MESSAGE__;
+  const KEY = __OPENCLAW_TASK_KEY__;
   const S = window.__openclawStatus;
+  const root = document.getElementById('openclaw-drawer-root');
+  if (KEY && (!root || root.dataset.taskId !== KEY)) return;
   ['overview', 'transcript', 'tools'].forEach(function(name) {
     const pane = document.getElementById('openclaw-drawer-pane-' + name);
     if (!pane) return;
@@ -894,14 +1023,11 @@ _DRAWER_OVERVIEW_FILL_JS_TEMPLATE = r"""
   const DATA = __OPENCLAW_STATUS_DATA__;
   const section = document.getElementById('openclaw-drawer-section-overview');
   const S = window.__openclawStatus;
-  if (!section || !S) return;
+  const root = document.getElementById('openclaw-drawer-root');
+  // A fill for a drawer since closed, or another sub-agent's, is dropped.
+  if (!section || !S || !root || root.dataset.taskId !== DATA.childSessionKey) return;
 
-  const statusEl = document.getElementById('openclaw-drawer-status');
-  if (statusEl && DATA.task) {
-    statusEl.textContent = DATA.task.status
-      + (DATA.task.terminalSummary ? ' · ' + DATA.task.terminalSummary : '')
-      + (DATA.task.error ? ' · ' + DATA.task.error : '');
-  }
+  if (DATA.task) S.paintDrawer(root, DATA.task);
 
   section.innerHTML = '';
   if (DATA.error) {
@@ -972,7 +1098,8 @@ _DRAWER_TRANSCRIPT_FILL_JS_TEMPLATE = r"""
   const section = document.getElementById('openclaw-drawer-section-transcript');
   const pane = document.getElementById('openclaw-drawer-pane-transcript');
   const S = window.__openclawStatus;
-  if (!section || !pane || !S) return;
+  const root = document.getElementById('openclaw-drawer-root');
+  if (!section || !pane || !S || !root || root.dataset.taskId !== DATA.childSessionKey) return;
 
   if (DATA.error) {
     section.innerHTML = '';
@@ -1042,7 +1169,8 @@ _DRAWER_TOOLS_FILL_JS_TEMPLATE = r"""
   const DATA = __OPENCLAW_STATUS_DATA__;
   const section = document.getElementById('openclaw-drawer-section-tools');
   const S = window.__openclawStatus;
-  if (!section || !S) return;
+  const root = document.getElementById('openclaw-drawer-root');
+  if (!section || !S || !root || root.dataset.taskId !== DATA.childSessionKey) return;
 
   // A live poll tick refills this tab every few seconds: keep each card open
   // or closed as the user left it, keyed by its tool call id (the call stays
@@ -1243,9 +1371,29 @@ def _subagent_task_texts(previews_resp):
     return out
 
 
+# A title is one line on a phone: the spawn label, else the task's first
+# sentence cut to this many characters (ELI-155).
+_SUBAGENT_TITLE_MAX = 60
+_FIRST_SENTENCE_RE = re.compile(r"(?<=[.!?])\s|\n")
+
+
+def _short_title(text):
+    """The first sentence of `text`, cut on a word to _SUBAGENT_TITLE_MAX
+    characters with an ellipsis."""
+    first = _FIRST_SENTENCE_RE.split(text.strip(), 1)[0].strip()
+    if len(first) <= _SUBAGENT_TITLE_MAX:
+        return first
+    cut = first[:_SUBAGENT_TITLE_MAX - 1]
+    space = cut.rfind(" ")
+    if space >= _SUBAGENT_TITLE_MAX // 2:
+        cut = cut[:space]
+    return cut.rstrip(" ,;:(") + "…"
+
+
 def _subagent_row(row, task_text=None):
-    """One Subagents row out of a child session row. The title is the task,
-    as the Tasks API had it, else the spawn label, else the key."""
+    """One Subagents row out of a child session row. The title is the spawn
+    label, else the task's first sentence, else the key; the whole task is
+    the drawer's to show (ELI-155)."""
     status = _subagent_status(row.get("status"))
     if status is None and row.get("endedAt"):
         status = "ended"    # a visible spawn's session carries no run status
@@ -1256,7 +1404,8 @@ def _subagent_row(row, task_text=None):
         preview = None
     return {
         "id": row["key"],
-        "title": task_text or row.get("label") or row["key"],
+        "title": (row.get("label") or "").strip() or (_short_title(task_text) if task_text else row["key"]),
+        "task": task_text,
         "status": status,
         "progressSummary": preview if live else None,
         "terminalSummary": preview if not live else None,
@@ -1290,6 +1439,7 @@ def _subagent_started(row):
 # for a sub-agent started in the background (its report comes later, as a
 # turn of its own).
 _AGENT_TOOL_NAME = "Agent"
+_AGENT_TEXT_MAX = 4000
 _AGENT_LAUNCHED_PREFIX = "Async agent launched"
 
 
@@ -1344,12 +1494,16 @@ def _agent_call_rows(chat):
             else:
                 state = "returned"
             ts = msg.get("timestamp")
+            prompt = args.get("prompt")
             rows.append({
                 "id": item.get("call_id") or item.get("id"),
                 "title": str(args.get("description") or args.get("subagent_type") or _AGENT_TOOL_NAME),
                 "subagentType": args.get("subagent_type"),
                 "state": state,
                 "startedAt": int(ts * 1000) if isinstance(ts, (int, float)) else None,
+                # What its detail shows (ELI-155), capped like a card's text.
+                "task": prompt[:_AGENT_TEXT_MAX] if isinstance(prompt, str) and prompt.strip() else None,
+                "result": text[:_AGENT_TEXT_MAX] if result is not None and text else None,
             })
     return rows[::-1]
 
@@ -1400,8 +1554,10 @@ def _render_drawer_open_js(task: dict) -> str:
     return _DRAWER_OPEN_JS_TEMPLATE.replace("__OPENCLAW_TASK__", _json_for_js(task))
 
 
-def _render_drawer_error_js(message: str) -> str:
-    return _DRAWER_ERROR_JS_TEMPLATE.replace("__OPENCLAW_ERROR_MESSAGE__", _json_for_js(message))
+def _render_drawer_error_js(message: str, task_key: str | None = None) -> str:
+    """`task_key`: only the drawer showing that sub-agent takes it."""
+    return (_DRAWER_ERROR_JS_TEMPLATE.replace("__OPENCLAW_ERROR_MESSAGE__", _json_for_js(message))
+            .replace("__OPENCLAW_TASK_KEY__", _json_for_js(task_key)))
 
 
 def _render_drawer_overview_fill_js(data: dict) -> str:
@@ -1416,15 +1572,53 @@ def _render_drawer_tools_fill_js(data: dict) -> str:
     return _DRAWER_TOOLS_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
 
 
-# Bounds for Action._run_subagent_detail's hold-open poll loop -- same
-# "hold the request, sleep, poll, keep emitting" shape _run_compact already
-# proves works (there, bounded to 180s). A subagent can legitimately run much
-# longer than a compact call, so this gets its own, longer ceiling; it exists
-# purely so a forgotten-open drawer (or a subagent stuck non-terminal) can't
-# pin the coroutine/connection open forever, not because 15 minutes is a
-# meaningful product limit.
-_SUBAGENT_POLL_MAX_S = 900
+# How long the open Status dialog follows its running sub-agents' pushed
+# changes (a request held open), so a forgotten dialog cannot pin it forever.
+_DIALOG_FOLLOW_MAX_S = 900
+# How often an open drawer refreshes a running sub-agent. The page polls,
+# not a held request, so the poll lives exactly as long as the drawer is open
+# and the sub-agent runs (ELI-155).
 _SUBAGENT_POLL_INTERVAL_S = 2.5
+
+
+def _is_cli_run_closer(message: dict) -> bool:
+    """The message a claude-cli run ends with in the Gateway's transcript
+    (`cli-assistant:<run>`): every assistant message of the run joined, the
+    whole progress log, after the run's own last turn."""
+    key = message.get("idempotencyKey") or (message.get("__openclaw") or {}).get("idempotencyKey")
+    return isinstance(key, str) and key.startswith("cli-assistant:")
+
+
+def _message_text_blocks(message: dict) -> list:
+    content = message.get("content")
+    if isinstance(content, str):
+        return [content.strip()] if content.strip() else []
+    return [b["text"].strip() for b in content or []
+            if isinstance(b, dict) and b.get("type") == "text" and (b.get("text") or "").strip()]
+
+
+def _final_reply_text(messages: list) -> str | None:
+    """A child's result: the last text block of its last assistant message,
+    passing over a claude-cli run's closer, which repeats the whole run
+    (ELI-155). The closer only when nothing else has text."""
+    assistant = [m for m in messages or [] if m.get("role") == "assistant"]
+    for skip_closer in (True, False):
+        for m in reversed(assistant):
+            blocks = [] if skip_closer and _is_cli_run_closer(m) else _message_text_blocks(m)
+            if blocks:
+                return blocks[-1]
+    return None
+
+
+def _spawn_task_of(messages: list) -> str | None:
+    """The task out of the child's spawn message, when the history read
+    still holds it."""
+    for m in messages or []:
+        if m.get("role") == "user":
+            text = "\n".join(_message_text_blocks(m))
+            if _is_spawn_message(text):
+                return _subagent_task_text(text)
+    return None
 
 
 def _extract_transcript_and_tools(messages: list) -> tuple[list, list]:
@@ -1600,6 +1794,7 @@ class Action:
                 "controlUiUrl": _control_ui_session_url(
                     self.valves.CONTROL_UI_URL,
                     _owui_session_key(self.valves.AGENT_ID, user_id, chat_id)),
+                "subagentPollMs": int(_SUBAGENT_POLL_INTERVAL_S * 1000),
             }
             await __event_emitter__({"type": "execute", "data": {"code": _render_modal_open_js(identity)}})
         else:
@@ -1763,7 +1958,9 @@ class Action:
                     # Titles fall back to the spawn label; the rows still render.
                     pipe_log(f"[status-action] sessions.preview (children) failed: {ex}")
             await __event_emitter__({"type": "execute", "data": {"code": _render_subagents_fill_js({
-                "tasks": [_subagent_row(r, task_texts.get(r["key"])) for r in shown],
+                "tasks": [{**_subagent_row(r, task_texts.get(r["key"])),
+                           "controlUiUrl": _control_ui_session_url(self.valves.CONTROL_UI_URL, r["key"])}
+                          for r in shown],
                 "total": len(children_seen),
                 "agents": agents[:_SUBAGENT_LIST_CAP], "agentsTotal": len(agents),
                 "source": source, "fetchedAt": int(time.time() * 1000), "error": None,
@@ -1788,10 +1985,10 @@ class Action:
         # child that ends meanwhile must show its end (ELI-127). Hold this
         # request open, as the drawer does, and refill the section on each
         # pushed change to a listed child's run state, until none is listed
-        # or the drawer's bound passes. Each event is taken before the read
+        # or the follow's bound passes. Each event is taken before the read
         # it guards, so no change slips between them. A closed dialog makes
         # every fill a no-op.
-        deadline = time.time() + _SUBAGENT_POLL_MAX_S
+        deadline = time.time() + _DIALOG_FOLLOW_MAX_S
         while listed:
             changes = [conn.session_change_event(k) for k in listed]
             following = listed
@@ -1930,24 +2127,13 @@ class Action:
         return await self._run_status(body, __user__, __event_emitter__, show_loading=False)
 
     async def _run_subagent_detail(self, body: dict, __user__, __event_emitter__):
-        """Opens the per-subagent drawer and holds this same request open for
-        the life of the subagent's run, polling and pushing fresh execute
-        fills roughly every _SUBAGENT_POLL_INTERVAL_S seconds -- the same
-        "hold the request open, sleep-poll, keep emitting" shape
-        _run_compact already uses and has proven works (there, bounded to
-        180s). Bounded here to _SUBAGENT_POLL_MAX_S so a forgotten-open
-        drawer, or a subagent that never reaches a terminal status, can't
-        pin this coroutine/connection open forever.
-
-        Deliberately has no "close" round-trip to cancel the loop early: if
-        the user closes the drawer (or reopens it for a different task,
-        which removes and recreates '#openclaw-drawer-root'), every fill
-        template's own `if (!section) return;` guard makes further
-        execute() pushes targeting the now-missing ids silent no-ops. Same
-        trade-off _run_compact already accepts (no cancel path there either)
-        -- wasted polling until the next terminal status or the deadline,
-        never a visible glitch.
-        """
+        """Fills the sub-agent drawer once and returns. The open drawer asks
+        again every _SUBAGENT_POLL_INTERVAL_S while its sub-agent runs (its
+        own poll, `S.openDrawer`), so the refresh lives exactly as long as
+        the drawer is open, with no deadline and nothing left polling for a
+        closed one (ELI-155). A row click opens the drawer in the page and
+        sends `opened`; without it (an old sub-agent message's toolbar
+        click) the drawer is opened from here first."""
         task_id = body.get("taskId")
         if not task_id:
             await __event_emitter__({"type": "execute", "data": {
@@ -1955,10 +2141,12 @@ class Action:
             }})
             return {"status": "error", "detail": "missing taskId"}
 
-        await __event_emitter__({"type": "execute", "data": {"code": _render_drawer_open_js({
-            "id": task_id, "title": body.get("taskTitle"), "status": body.get("taskStatus"),
-            "controlUiUrl": _control_ui_session_url(self.valves.CONTROL_UI_URL, task_id),
-        })}})
+        if not body.get("opened"):
+            await __event_emitter__({"type": "execute", "data": {"code": _render_drawer_open_js({
+                "id": task_id, "childSessionKey": task_id, "title": body.get("taskTitle"),
+                "status": body.get("taskStatus"),
+                "controlUiUrl": _control_ui_session_url(self.valves.CONTROL_UI_URL, task_id),
+            })}})
 
         if not task_id.startswith("agent:"):
             # A Tasks API id from a message written before ELI-100; only the
@@ -1973,97 +2161,80 @@ class Action:
         except Exception as ex:
             pipe_log(f"[status-action] subagent-detail connect failed: {ex}")
             await __event_emitter__({"type": "execute", "data": {
-                "code": _render_drawer_error_js(f"Could not connect: {ex}")
+                "code": _render_drawer_error_js(f"Could not connect: {ex}", task_id)
             }})
             return {"status": "error", "detail": str(ex)}
 
-        return await self._subagent_detail_poll_loop(
-            conn, source, task_id, __event_emitter__,
-        )
+        return await self._fill_subagent_detail(conn, source, task_id, __event_emitter__)
 
-    async def _subagent_detail_poll_loop(self, conn, source, task_id,
-                                         __event_emitter__):
-        """The drawer's poll body: refresh the child session and its history
-        every _SUBAGENT_POLL_INTERVAL_S until the subagent reaches a terminal
-        status or _SUBAGENT_POLL_MAX_S elapses. `task_id` is the child session
-        key.
-        """
-        deadline = time.time() + _SUBAGENT_POLL_MAX_S
-        while True:
-            child_key = task_id
-            try:
-                desc_resp, history_resp = await asyncio.gather(
-                    conn.send_request("sessions.describe", dict(key=child_key), timeout=8),
-                    conn.send_request(
-                        "chat.history", dict(sessionKey=child_key, limit=50, maxChars=4000), timeout=8,
-                    ),
-                )
-            except Exception as ex:
-                pipe_log(f"[status-action] subagent detail fetch failed: {ex}")
-                await __event_emitter__({"type": "execute", "data": {
-                    "code": _render_drawer_error_js(f"Could not fetch sub-agent: {ex}")
-                }})
-                return {"status": "error", "detail": str(ex)}
-
-            session_row = (desc_resp or {}).get("session") or {}
-            if not session_row:
-                await __event_emitter__({"type": "execute", "data": {
-                    "code": _render_drawer_error_js("Sub-agent not found.")
-                }})
-                return {"status": "error", "detail": "sub-agent not found"}
-
-            # KNOWN GAP (ELI-26): chat.history is blind to the in-flight
-            # turn, so while the subagent is running this yields nothing and
-            # every tool call appears at once when the turn flushes. There
-            # is no pipe-side fix -- a running session's tool events reach
-            # only the connection that started the run. See the note in
-            # gateway.py's reader loop for the measurement.
-            text_rows, tool_calls = _extract_transcript_and_tools(
-                (history_resp or {}).get("messages") or []
+    async def _fill_subagent_detail(self, conn, source, child_key, __event_emitter__):
+        """One read of the child session and its history, pushed to the
+        drawer's three tabs."""
+        try:
+            desc_resp, history_resp = await asyncio.gather(
+                conn.send_request("sessions.describe", dict(key=child_key), timeout=8),
+                conn.send_request(
+                    "chat.history", dict(sessionKey=child_key, limit=50, maxChars=4000), timeout=8,
+                ),
             )
-            task = _subagent_row({"key": child_key, **session_row})
-            if task["status"] not in ("queued", "running") and not task["terminalSummary"]:
-                # The child's last reply, as the Tasks API's terminal summary had it.
-                task["terminalSummary"] = next(
-                    (r["text"] for r in reversed(text_rows) if r.get("role") == "assistant" and r.get("text")),
-                    None,
-                )
+        except Exception as ex:
+            pipe_log(f"[status-action] subagent detail fetch failed: {ex}")
+            await __event_emitter__({"type": "execute", "data": {
+                "code": _render_drawer_error_js(f"Could not fetch sub-agent: {ex}", child_key)
+            }})
+            return {"status": "error", "detail": str(ex)}
 
-            provider = session_row.get("modelProvider")
-            model = session_row.get("model")
-            context_data = goal_data = None
-            context_tokens = session_row.get("contextTokens")
-            total_tokens = session_row.get("totalTokens")
-            if context_tokens and total_tokens is not None:
-                context_data = {
-                    "usedTokens": _fmt_tokens(total_tokens),
-                    "totalTokens": _fmt_tokens(context_tokens),
-                    "pct": round(total_tokens / context_tokens * 100, 1),
-                }
-            goal = session_row.get("goal")
-            if goal:
-                goal_line = _format_goal_line(goal)
-                if goal_line:
-                    goal_data = {"line": goal_line}
+        session_row = (desc_resp or {}).get("session") or {}
+        if not session_row:
+            await __event_emitter__({"type": "execute", "data": {
+                "code": _render_drawer_error_js("Sub-agent not found.", child_key)
+            }})
+            return {"status": "error", "detail": "sub-agent not found"}
 
-            fetched_at = int(time.time() * 1000)
-            await __event_emitter__({"type": "execute", "data": {"code": _render_drawer_overview_fill_js({
-                "task": task, "childSessionKey": child_key, "provider": provider, "model": model,
-                "context": context_data, "goal": goal_data, "source": source,
-                "fetchedAt": fetched_at, "error": None,
-            })}})
-            await __event_emitter__({"type": "execute", "data": {"code": _render_drawer_transcript_fill_js({
-                "childSessionKey": child_key, "messages": text_rows, "error": None,
-            })}})
-            await __event_emitter__({"type": "execute", "data": {"code": _render_drawer_tools_fill_js({
-                "childSessionKey": child_key, "toolCalls": tool_calls, "error": None,
-            })}})
+        # KNOWN GAP (ELI-26): chat.history is blind to the in-flight
+        # turn, so while the subagent is running this yields nothing and
+        # every tool call appears at once when the turn flushes. There
+        # is no pipe-side fix -- a running session's tool events reach
+        # only the connection that started the run. See the note in
+        # gateway.py's reader loop for the measurement.
+        messages = (history_resp or {}).get("messages") or []
+        text_rows, tool_calls = _extract_transcript_and_tools(messages)
+        task = _subagent_row({"key": child_key, **session_row}, _spawn_task_of(messages))
+        if task["status"] not in _LIVE_SUBAGENT_STATUSES and not task["terminalSummary"]:
+            # The child's last reply, as the Tasks API's terminal summary had it.
+            task["terminalSummary"] = next(
+                (r["text"] for r in reversed(text_rows) if r.get("role") == "assistant" and r.get("text")),
+                None,
+            )
+        task["result"] = _final_reply_text(messages)
 
-            if task.get("status") not in ("queued", "running"):
-                break
-            if time.time() >= deadline:
-                break
-            await asyncio.sleep(_SUBAGENT_POLL_INTERVAL_S)
+        provider = session_row.get("modelProvider")
+        model = session_row.get("model")
+        context_data = goal_data = None
+        context_tokens = session_row.get("contextTokens")
+        total_tokens = session_row.get("totalTokens")
+        if context_tokens and total_tokens is not None:
+            context_data = {
+                "usedTokens": _fmt_tokens(total_tokens),
+                "totalTokens": _fmt_tokens(context_tokens),
+                "pct": round(total_tokens / context_tokens * 100, 1),
+            }
+        goal = session_row.get("goal")
+        if goal:
+            goal_line = _format_goal_line(goal)
+            if goal_line:
+                goal_data = {"line": goal_line}
 
-        pipe_log(f"[status-action] subagent-detail loop ended taskId={task_id}")
+        fetched_at = int(time.time() * 1000)
+        await __event_emitter__({"type": "execute", "data": {"code": _render_drawer_overview_fill_js({
+            "task": task, "childSessionKey": child_key, "provider": provider, "model": model,
+            "context": context_data, "goal": goal_data, "source": source,
+            "fetchedAt": fetched_at, "error": None,
+        })}})
+        await __event_emitter__({"type": "execute", "data": {"code": _render_drawer_transcript_fill_js({
+            "childSessionKey": child_key, "messages": text_rows, "error": None,
+        })}})
+        await __event_emitter__({"type": "execute", "data": {"code": _render_drawer_tools_fill_js({
+            "childSessionKey": child_key, "toolCalls": tool_calls, "error": None,
+        })}})
         return {"status": "ok"}

@@ -83,7 +83,7 @@ class SubagentListTests(unittest.IsolatedAsyncioTestCase):
                                                __event_emitter__=emitter), conn)
         return calls, emitted, seen[-1]
 
-    async def test_lists_every_child_with_its_task_as_title_newest_first(self):
+    async def test_lists_every_child_titled_by_its_label_else_its_task_newest_first(self):
         rows = [
             _child(CHILD_DONE, "done", startedAt=900, endedAt=990),
             _child(CHILD_A, "running", startedAt=1000, lastMessagePreview="halfway"),
@@ -99,7 +99,8 @@ class SubagentListTests(unittest.IsolatedAsyncioTestCase):
         b, a, done = data["tasks"]
         self.assertEqual((a["title"], a["status"], a["childSessionKey"], a["startedAt"], a["progressSummary"]),
                          ("Research X and report.", "running", CHILD_A, 1000, "halfway"))
-        self.assertEqual((b["title"], b["status"]), ("Summarise Y.", "queued"))
+        # The spawn label wins; the task is the drawer's (ELI-155).
+        self.assertEqual((b["title"], b["task"], b["status"]), ("y-summary", "Summarise Y.", "queued"))
         self.assertEqual((done["status"], done["startedAt"], done["endedAt"]), ("completed", 900, 990))
         # Rendered: the section's own fill carries the rows.
         code = next(c for c in _emitted_codes(emitted)
@@ -244,14 +245,15 @@ class SubagentDrawerTests(unittest.IsolatedAsyncioTestCase):
                 {"id": PARENT_USER}, emitter)
         return result, emitted, conn
 
-    async def test_reads_the_child_session_until_it_ends(self):
+    async def test_reads_the_child_session_once_per_request(self):
+        """The open drawer asks again while the child runs (ELI-155)."""
         n = {"describe": 0}
 
         async def send_request(method, params, timeout=5):
             if method == "sessions.describe":
                 self.assertEqual(params["key"], CHILD_A)
                 n["describe"] += 1
-                done = n["describe"] > 1
+                done = True
                 return {"session": {"key": CHILD_A, "status": "done" if done else "running",
                                     "startedAt": 1783790000000, "endedAt": 1783790005000 if done else None,
                                     "modelProvider": "anthropic", "model": "claude-sonnet-5",
@@ -264,7 +266,7 @@ class SubagentDrawerTests(unittest.IsolatedAsyncioTestCase):
 
         result, emitted, conn = await self._drawer(CHILD_A, send_request)
         self.assertEqual(result["status"], "ok")
-        self.assertEqual(n["describe"], 2)   # polled running -> done, then stopped
+        self.assertEqual(n["describe"], 1)
         methods = [c.args[0] for c in conn.send_request.call_args_list]
         self.assertNotIn("tasks.get", methods)
         overview = [c for c in _emitted_codes(emitted) if "openclaw-drawer-section-overview" in c][-1]
@@ -560,13 +562,14 @@ console.log(JSON.stringify(section.walk().filter((e) => e.children.length === 0 
                   {"id": "t1", "title": "Tax research", "state": "launched", "startedAt": self.NOW - 600_000}]
         texts = self._page({"tasks": [task], "total": 21, "agents": agents, "agentsTotal": 2,
                             "source": "pipe", "fetchedAt": self.NOW, "error": None})
-        self.assertEqual(texts[:4], ["Subagents (1 of 21)", "Research X", "X is fine", "1m"])
+        self.assertEqual(texts[:5], ["Subagents (1 of 21)", "Research X", "Done", "1m", "X is fine"])
         self.assertIn("In-process agents (2)", texts)
         rest = texts[texts.index("In-process agents (2)") + 1:]
         self.assertEqual(rest[:2], ["Claude Code Agent calls in this chat, as their tool cards show them.",
                                     "Benchmark run"])
-        self.assertIn("running", rest)
-        self.assertIn("launched in the background", rest)
+        # Their states as chips (ELI-155).
+        self.assertIn("Running", rest)
+        self.assertIn("Background", rest)
 
     def test_nothing_to_show_hides_the_section(self):
         self.assertEqual(self._page({"tasks": [], "total": 0, "agents": [], "agentsTotal": 0,

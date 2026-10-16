@@ -46,22 +46,24 @@ Typing `/compact` in the message box does not compact the session: Open WebUI 0.
 
 ## Sub-agents
 
-The Subagents section lists every child session this chat's runs spawned, ended ones included, newest first, up to 20 ("20 of N" when there are more). A running one's elapsed time counts up while the dialog is open; one that finishes meanwhile shows its end as soon as the Gateway pushes the change. Below them, **In-process agents** lists the chat's Claude Code Agent calls, which are not Gateway sessions, as their tool cards show them: running, launched in the background, returned, cut off or failed, with no drawer.
+The Subagents section lists every child session this chat's runs spawned, ended ones included, newest first, up to 20 ("20 of N" when there are more). A running one's elapsed time counts up while the dialog is open; one that finishes meanwhile shows its end as soon as the Gateway pushes the change. Below them, **In-process agents** lists the chat's Claude Code Agent calls, which are not Gateway sessions, as their tool cards show them: running, in the background, returned, cut off or failed.
 
-Each row is titled with the sub-agent's task, read from the head of its transcript (`sessions.preview`), else its spawn label. While a sub-agent has just started, the row shows its task rather than the Gateway's spawn wrapper.
+Each row is one line: the sub-agent's spawn label (else the first sentence of its task, cut to 60 characters), its status, and its time, with up to two lines of its latest reply below. The whole task is in its drawer.
 
 ## Sub-agent drawer
 
 ![A running sub-agent's drawer, Transcript tab: its task, while it works](../img/subagent-drawer-light.png#gh-light-mode-only)
 ![A running sub-agent's drawer, Transcript tab: its task, while it works](../img/subagent-drawer-dark.png#gh-dark-mode-only)
 
-Click a sub-agent to open a side drawer with three tabs:
+Click a sub-agent to open its drawer: a side panel, or on a phone a full-screen sheet with a **‹ Back** button. Its header is the title, the status, the time and the link to the sub-agent in the Control UI, with three tabs below:
 
-- **Overview:** its status, when it started and how long it ran, its own context fill, its goal line, and its provider and model, which are often not the parent's.
+- **Overview:** its **Result** (the last block of its final reply, six lines, "Show all" for the rest) and its **Task** (three lines, "Show all"), then when it started and how long it ran, its own context fill, its goal line, and its provider and model, which are often not the parent's.
 - **Transcript:** the sub-agent's messages. Its first message shows the task it was given, not the spawn wrapper around it.
 - **Tools:** each tool call with its arguments and result, failed ones marked.
 
-The drawer reads the sub-agent's own transcript (`chat.history`) and refreshes about every 2.5 seconds until the sub-agent finishes, for at most 15 minutes. When tool calls show up depends on the runtime the sub-agent runs on:
+An in-process agent opens the same sheet with its task and result from its tool card, and no tabs.
+
+The drawer reads the sub-agent's own transcript (`chat.history`) and refreshes about every 2.5 seconds for as long as it is open and the sub-agent runs; closing it stops the refresh. For a claude-cli sub-agent the Result is its last turn, not the run's closing message, which repeats every message of the run. When tool calls show up depends on the runtime the sub-agent runs on:
 
 - **OpenClaw's own runtime:** tool calls show as they happen.
 - **claude-cli runtime:** its tool calls reach the transcript when its run ends, so the Tools tab fills at the end.
