@@ -126,13 +126,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [fix1, fix12]
-        rep: [1, 2, 3, 4, 5]
-        rejoin: ["100000"]
-        include:
-          - {variant: fix123, rep: 1, rejoin: "5"}
-          - {variant: fix123, rep: 2, rejoin: "5"}
-          - {variant: fix123, rep: 3, rejoin: "5"}
+        variant: [fix1, fix12h]
+        rep: [1, 2, 3]
+        rejoin: ["5"]
     steps:
       - name: Ref under test
         id: ref
@@ -141,6 +137,7 @@ jobs:
             main)   echo "sha=60aebaa267faaeeb98b608a22dd0e129f03feba3" >> "$GITHUB_OUTPUT" ;;
             fix1)   echo "sha=a9f1e0be7254e703b6ef52d87cef284f6f29aa60" >> "$GITHUB_OUTPUT" ;;
             fix12)  echo "sha=60d8973c10c6c57512795ac7a721e96568bf0255" >> "$GITHUB_OUTPUT" ;;
+            fix12h) echo "sha=75ef68ba02515e29ba99e687b15505c241da2d00" >> "$GITHUB_OUTPUT" ;;
             fix123) echo "sha=9b29a595cfdb4462604ee8a3325f71a5aab199e7" >> "$GITHUB_OUTPUT" ;;
           esac
       - uses: actions/checkout@v7
