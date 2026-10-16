@@ -170,6 +170,7 @@ def main():
         inproc(f"{tag} upsert conc4", {"op": "upsert", "chat": cid, "msg": last, "n": 8, "conc": 4})
         inproc(f"{tag} get_message", {"op": "get_message", "chat": cid, "msg": last, "n": 10})
         inproc(f"{tag} Chats.get_chat_by_id", {"op": "get", "chat": cid, "n": 10})
+        record({"kind": "breakdown", "mb": mb, **probe({"op": "breakdown", "chat": cid})})
     inproc("chat.history-sized json.loads 5MB x10", {"op": "jsonparse", "mb": 5, "n": 10})
     if TRACE:
         record({"kind": "snapshot", **probe({"op": "snapshot", "top": 20})})

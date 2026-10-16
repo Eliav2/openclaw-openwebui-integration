@@ -17,6 +17,12 @@ def _status():
             k, _, v = line.partition(":")
             if k in ("RssAnon", "VmSwap", "Threads", "VmHWM", "RssFile"):
                 out[k] = int(v.split()[0]) // 1024 if k != "Threads" else int(v.split()[0])
+    import os
+    try:
+        out["db_fds"] = sum(1 for fd in os.listdir("/proc/self/fd")
+                            if os.readlink(f"/proc/self/fd/{fd}").endswith("webui.db"))
+    except OSError:
+        pass
     if tracemalloc.is_tracing():
         cur, peak = tracemalloc.get_traced_memory()
         out["traced_mb"] = round(cur / 1048576, 1)
@@ -57,6 +63,35 @@ class Pipe:
             top = snap.statistics(cmd.get("key", "lineno"))[:cmd.get("top", 15)]
             return json.dumps({"status": _status(),
                                "top": [[str(s.traceback), round(s.size / 1048576, 2), s.count] for s in top]})
+
+        if op == "breakdown":
+            # The steps one upsert/get takes on the chat row, each measured
+            # alone with tracemalloc (peak while the step's result is held).
+            import sqlite3
+            from open_webui.models.chats import ChatModel
+            if not tracemalloc.is_tracing():
+                tracemalloc.start(1)
+            raw = sqlite3.connect("/app/backend/data/webui.db").execute(
+                "select chat from chat where id=?", (cmd["chat"],)).fetchone()[0]
+            steps = {"raw_json_mb": round(len(raw) / 1048576, 1)}
+
+            def step(name, fn):
+                tracemalloc.reset_peak()
+                base = tracemalloc.get_traced_memory()[0]
+                res = fn()
+                steps[name] = round((tracemalloc.get_traced_memory()[1] - base) / 1048576, 1)
+                return res
+
+            data = step("json.loads", lambda: json.loads(raw))
+            shell = await Chats.get_chat_by_id(cmd["chat"])
+            row = {**shell.model_dump(exclude={"chat"}), "chat": data}
+            del shell
+            gc.collect()
+            model = step("ChatModel.model_validate", lambda: ChatModel.model_validate(row))
+            step("_clean_null_bytes", lambda: Chats._clean_null_bytes(model.chat))
+            step("json.dumps", lambda: json.dumps(data))
+            step("model_dump", lambda: model.model_dump())
+            return json.dumps({"op": op, "steps": steps, "status": _status()})
 
         async def one(k):
             if op == "upsert":
