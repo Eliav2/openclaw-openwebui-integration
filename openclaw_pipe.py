@@ -10163,11 +10163,6 @@ class _PipeTurn:
                                 if events:
                                     # Text after a tool call is a new message item.
                                     self.fence_item_start = len(self.assistant_stream_text)
-                                await _emit_status(
-                                    self.__event_emitter__,
-                                    f"Running {name}...",
-                                    done=False,
-                                )
 
                             elif phase == "result":
                                 pipe_log(
@@ -10177,11 +10172,6 @@ class _PipeTurn:
                                 )
                                 for event in events:
                                     yield event
-                                await _emit_status(
-                                    self.__event_emitter__,
-                                    f"{name} done",
-                                    done=True,
-                                )
 
                         # --- Item events (progress) ---
                         if stream == "item":

@@ -9253,6 +9253,63 @@ class NeedsInputMarkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(self.MARKER, out)
 
 
+class ToolStatusEventTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-115: Open WebUI saves every `status` event by loading and rewriting
+    the whole chat (`add_message_status_to_chat_by_id_and_message_id`), about
+    14x the chat's JSON in memory. A "Running X..." / "X done" pair per tool
+    call made 26,746 of those writes in two days, up to 372 in one reply. The
+    tool cards already say running and done, so a reply's statuses are its
+    "Thinking..." and its final done, however many tools it calls."""
+
+    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
+    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
+    _reply = NoDroppedMessagesTests._reply
+    _queue = NoDroppedMessagesTests._queue
+    _delta = NoDroppedMessagesTests._delta
+    _final = NoDroppedMessagesTests._final
+    _until_registered = NoDroppedMessagesTests._until_registered
+
+    def _tool(self, phase, tcid):
+        data = {"phase": phase, "name": "Bash", "toolCallId": tcid, "args": {"command": "ls"}}
+        if phase == "result":
+            data["result"] = "ok"
+        return {"type": "event", "event": "agent", "payload": {
+            "sessionKey": self.SK, "runId": "run-1", "stream": "tool", "data": data}}
+
+    async def test_a_reply_with_tool_calls_sends_no_status_per_tool(self):
+        gen = self._reply("check the logs", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        for event in (self._delta("run-1", "Reading them."),
+                      self._tool("start", "toolu_1"), self._tool("result", "toolu_1"),
+                      self._tool("start", "toolu_2"), self._tool("result", "toolu_2"),
+                      self._delta("run-1", "Both done."), self._final("run-1")):
+            q.put_nowait(event)
+
+        async def drain():
+            got = [await first]
+            async for chunk in gen:
+                got.append(chunk)
+            return got
+        got = await asyncio.wait_for(drain(), 5)
+
+        statuses = [(e["data"]["description"], e["data"]["done"])
+                    for e in self.emitted if e.get("type") == "status"]
+        self.assertEqual(statuses, [("Thinking...", False), ("", True)])
+        # The cards still say it: each call shows running, then its output
+        # flips it to done (`call_id or id`, as structuredOutput.ts reads it).
+        cards = {}
+        for c in got:
+            item = c.get("item") if isinstance(c, dict) else None
+            if item:
+                cards.setdefault(item.get("call_id") or item.get("id"), []).append(
+                    (item["type"], item.get("status")))
+        for tcid in ("toolu_1", "toolu_2"):
+            self.assertEqual(cards[tcid], [("function_call", "in_progress"),
+                                           ("function_call_output", "completed")])
+
+
 class InlineOwnerRuleTests(unittest.IsolatedAsyncioTestCase):
     """ELI-100 DESIGN 2.7 for the inline user turn (item 1 of the order).
 

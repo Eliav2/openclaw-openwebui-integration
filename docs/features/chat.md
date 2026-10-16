@@ -28,7 +28,7 @@ Expand a card to see the arguments the agent passed and the result it got back. 
 
 ![A tool card opened: the command it ran and its output](../img/tool-card-expanded-light.png)
 
-A call that arrives without a tool-call id still shows: it falls back to a Markdown `<details type="tool_calls">` card rather than disappearing. The status row under the message tracks the same events in words: "Running \<tool\>..." then "\<tool\> done".
+A call that arrives without a tool-call id still shows: it falls back to a Markdown `<details type="tool_calls">` card rather than disappearing. The status row under the message says "Thinking..." for the whole run and does not repeat each call: the cards already show what is running, and Open WebUI saves every status change by rewriting the whole chat, so one per call made long chats slow.
 
 Always on. On Open WebUI older than the minimum a card can keep spinning after its tool finished: see [Versions](../versions.md).
 
