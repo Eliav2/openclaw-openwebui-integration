@@ -13,6 +13,7 @@ Everything here works as soon as the Pipe is installed, except entries marked:
 
 - [**Real-time streaming**](./chat.md#streaming): replies appear token by token, not all at once at the end
 - [**Native tool cards**](./chat.md#tool-cards): tool calls render as Open WebUI's own two-phase cards, expandable to their input and output
+- [**Sub-agent cards**](./chat.md#sub-agent-cards): a sub-agent the agent starts shows as a card named after it, with the head of its task and whether it started
 - [**Failed tools marked**](./chat.md#failed-tools): failed calls are labelled live, and a call that never returns is closed rather than left spinning
 - [**Questions as cards**](./questions.md) _(needs agent setup)_: agent questions become real question cards and dialogs (text, password, yes/no, single choice, multi-select) that survive a reload
 - [**Per-chat thinking control**](./chat.md#thinking-level) _(separate function)_: a toggle in the composer sets the reasoning level per chat, offering only the levels your models support

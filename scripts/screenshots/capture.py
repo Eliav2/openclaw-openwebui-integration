@@ -359,6 +359,25 @@ LAST_ASSISTANT = "[...document.querySelectorAll('.chat-assistant')].pop()"
 # The Status dialog's sub-agent elapsed cells (the only 10 px spans in it).
 ELAPSED_CELLS = """() => [...document.querySelectorAll('#openclaw-status-section-subagents span')]
   .filter(s => s.style.fontSize === '10px').map(s => s.textContent)"""
+FIRST_ASSISTANT = "document.querySelector('.chat-assistant')"
+
+
+def opened_card_clip(message_js: str) -> str:
+    """Just the message's first card, opened, centred in the viewport and
+    below the chat's sticky header (an element shot puts the header over
+    its top)."""
+    return f"""() => {{
+      const btn = {message_js}.querySelector('[role=button]');
+      let card = btn;
+      while (card.parentElement && !/output/i.test(card.innerText)) card = card.parentElement;
+      card.scrollIntoView({{block: 'center'}});
+      const r = card.getBoundingClientRect();
+      const nav = document.querySelector('nav');
+      const top = Math.max(r.top, nav ? nav.getBoundingClientRect().bottom : 0, 0);
+      return {{x: 0, y: top, width: innerWidth, height: Math.min(r.bottom + 12, innerHeight) - top}};
+    }}"""
+
+
 CARDS_STATE = f"""() => {{
   const a = {LAST_ASSISTANT}; if (!a) return null;
   return {{done: a.querySelectorAll('[role=button] .text-emerald-500').length,
@@ -471,6 +490,7 @@ class Scenes:
     def __init__(self, token: str, shooter: Shooter):
         self.token, self.s = token, shooter
         self.hero_chat: str | None = None
+        self.spawn_chat: str | None = None
 
     def hero(self, page: Page) -> None:
         """#1 hero-tool-cards mid-run, then #5 tool-card-expanded once done."""
@@ -496,19 +516,8 @@ class Scenes:
         page.locator(".chat-assistant").last.locator("[role=button]").first.click()
         wait_js(page, f"() => {{ const a = {LAST_ASSISTANT}; return a && /output/i.test(a.innerText) && a.innerText.includes('git log'); }}",
                 "the opened card's input and output")
-        # Just the opened card, centred in the viewport and below the chat's
-        # sticky header (an element shot puts the header over its top).
-        clip = f"""() => {{
-          const btn = {LAST_ASSISTANT}.querySelector('[role=button]');
-          let card = btn;
-          while (card.parentElement && !/output/i.test(card.innerText)) card = card.parentElement;
-          card.scrollIntoView({{block: 'center'}});
-          const r = card.getBoundingClientRect();
-          const nav = document.querySelector('nav');
-          const top = Math.max(r.top, nav ? nav.getBoundingClientRect().bottom : 0, 0);
-          return {{x: 0, y: top, width: innerWidth, height: Math.min(r.bottom + 12, innerHeight) - top}};
-        }}"""
-        self.s.shot(page, "tool-card-expanded", clip_js=clip, text_selector=".chat-assistant >> nth=-1")
+        self.s.shot(page, "tool-card-expanded", clip_js=opened_card_clip(LAST_ASSISTANT),
+                    text_selector=".chat-assistant >> nth=-1")
 
     def composer_status(self, page: Page) -> None:
         page.goto(f"{BASE}/c/{self.hero_chat}")
@@ -797,6 +806,19 @@ class Scenes:
           return {x: 0, y: 0, width: innerWidth, height: Math.min(bottom, innerHeight)};
         }"""
         self.s.shot(page, "subagent-result", clip_js=clip)
+        self.spawn_chat = chat
+
+    def spawn_card(self, page: Page) -> None:
+        """The parent's spawn card opened: named after the sub-agent, the
+        head of its task as input, one line saying it started as output."""
+        page.goto(f"{BASE}/c/{self.spawn_chat}")
+        wait_js(page, f"() => {{ const a = {FIRST_ASSISTANT}; return a && a.querySelector('[role=button] .text-emerald-500'); }}",
+                "the finished spawn card")
+        page.locator(".chat-assistant").first.locator("[role=button]").first.click()
+        wait_js(page, f"() => {{ const a = {FIRST_ASSISTANT}; return a && /output/i.test(a.innerText) && a.innerText.includes('git log'); }}",
+                "the opened card's input and output")
+        self.s.shot(page, "spawn-card", clip_js=opened_card_clip(FIRST_ASSISTANT),
+                    text_selector=".chat-assistant >> nth=0")
 
     def error_message(self, page: Page) -> None:
         """An actionable error: AGENT_ID names an agent the Gateway lacks."""
@@ -1010,6 +1032,8 @@ def main(argv=None) -> int:
             shooter.run("streaming", scenes.streaming_and_reload, page)
             shooter.run("usage-goal", scenes.usage_goal, page)
             shooter.run("subagent-result", scenes.subagent_result, page)
+            if scenes.spawn_chat:
+                shooter.run("spawn-card", scenes.spawn_card, page)
             shooter.run("error-message", scenes.error_message, page)
             shooter.run("chat-titles", scenes.chat_titles, page)
             shooter.run("stop", scenes.stop, page)

@@ -42,7 +42,7 @@ A sub-agent's own session is not a chat, so nothing is written for it directly. 
 
 - **Parent idle:** the Gateway hands the result to the parent as a new run. That run is an ordinary reply in the chat, and it usually quotes or summarises the result.
 - **Parent still running:** the result is steered into the running parent run, and shows up in the reply you are already watching.
-- **Parent answers with silence** (`NO_REPLY`): you still get the result, as one **Sub-agent** card labelled with the name the parent gave it when it spawned it. Expand the card to read the result.
+- **Parent answers with silence** (`NO_REPLY`): you still get the result, as one **Sub-agent** card labelled with the name the parent gave it when it spawned it, or the first sentence of its task. Expand the card to read the result.
 
 To watch a sub-agent while it works, open it from the [Status dialog](./status.md#sub-agents).
 

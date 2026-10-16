@@ -308,7 +308,7 @@
           "say": "I'll have a helper dig through the history while we keep talking.",
           "tool": "sessions_spawn",
           "args": {
-            "task": "Find the commit that added src/forecast/cache.py and explain what the cache does.",
+            "task": "Find the commit that added src/forecast/cache.py and explain what the cache does.\nStart from the file's git log, then read the file itself.\nSay when it came in, in which commit, and how long a forecast stays cached.\nKeep it to a short paragraph and change nothing.",
             "label": "Cache history"
           }
         },

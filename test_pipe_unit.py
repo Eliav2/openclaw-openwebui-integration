@@ -812,6 +812,108 @@ class TurnRendererOutputTests(unittest.TestCase):
         self.assertEqual(len(r.output), 2)
 
 
+class SpawnCardTests(unittest.TestCase):
+    """ELI-155: a sessions_spawn card was titled "sessions_spawn" (grouped as
+    "Explored 2 sessions_spawn"), showed the whole task as input and the
+    spawn receipt's JSON, UUIDs included, as output. It is now named after
+    the sub-agent, shows the head of its task and one line of outcome, the
+    same whether it streamed or was rebuilt from the transcript."""
+
+    LONG_TASK = ("Repo: the forecast-bench repository, re-clone it into your scratch folder.\n"
+                 "Workflow .github/workflows/bench.yml, code in experiments/bench/.\n"
+                 "Goal: a head-to-head, net of noise, on the same hourly data.\n"
+                 "Split 2021-06/2024-07 in-sample, the rest out-of-sample.\n"
+                 + "Report one table per split with MAE and RMSE. " * 20)
+    RECEIPT = {"status": "accepted", "childSessionKey": "agent:main:subagent:1d33ab12-9b17-4fed-a36f-7f2031dbcb32",
+               "runId": "5e93c66a-a9a8-41f4-8884-2073fc656900", "mode": "run"}
+
+    def live(self, name, args, result, is_error=False):
+        r = _TurnRenderer()
+        events = r.feed({"stream": "tool", "data": {"phase": "start", "name": name,
+                                                    "toolCallId": "t1", "args": args}})
+        events += r.feed({"stream": "tool", "data": {"phase": "result", "name": name, "toolCallId": "t1",
+                                                     "result": result, "isError": is_error}})
+        return r, events
+
+    def card(self, r):
+        call = next(i for i in r.output if i["type"] == "function_call")
+        out = next(i for i in r.output if i["type"] == "function_call_output")
+        return call["name"], json.loads(call["arguments"]), out["output"][0]["text"]
+
+    def test_a_labelled_spawn_is_named_after_its_label_with_the_head_of_its_task(self):
+        for name in ("sessions_spawn", "mcp__openclaw__sessions_spawn"):
+            r, events = self.live(name, {"task": self.LONG_TASK, "label": "Forecaster benchmark"},
+                                  json.dumps(self.RECEIPT))
+            title, args, output = self.card(r)
+            self.assertEqual(title, "🤖 Forecaster benchmark", name)
+            self.assertEqual(list(args), ["task"])
+            self.assertTrue(args["task"].startswith("Repo: the forecast-bench"))
+            self.assertLessEqual(len(args["task"]), openclaw_pipe.SPAWN_TASK_CHARS)
+            self.assertNotIn("Report one table", args["task"])
+            self.assertEqual(output, "Started: Forecaster benchmark")
+            self.assertNotIn("1d33ab12", json.dumps(r.output), "no session key or run id in the card")
+            started = [e["item"]["name"] for e in events
+                       if isinstance(e, dict) and e["item"]["type"] == "function_call"]
+            self.assertEqual(started, ["🤖 Forecaster benchmark"], "the live card is named so from its start")
+            self.assertIn('name="🤖 Forecaster benchmark"', r.visible_text, "the markdown card too")
+
+    def test_an_unlabelled_spawn_is_named_after_its_tasks_first_sentence(self):
+        r, _ = self.live("sessions_spawn", {"task": "Price out Fly.io for the forecast app. One small machine."},
+                         json.dumps(self.RECEIPT))
+        self.assertEqual(self.card(r)[0], "🤖 Price out Fly.io for the forecast app.")
+        r, _ = self.live("sessions_spawn", {"task": self.LONG_TASK}, json.dumps(self.RECEIPT))
+        title = self.card(r)[0]
+        self.assertTrue(title.startswith("🤖 Repo: the forecast-bench repository") and title.endswith("…"), title)
+        self.assertLessEqual(len(title), len("🤖 ") + openclaw_pipe.SUBAGENT_TITLE_MAX)
+
+    def test_a_short_task_is_shown_whole(self):
+        r, _ = self.live("sessions_spawn", {"task": "Line one.\nLine two."}, json.dumps(self.RECEIPT))
+        self.assertEqual(self.card(r)[1], {"task": "Line one.\nLine two."})
+
+    def test_a_refused_spawn_is_marked_failed_with_its_reason(self):
+        receipt = {"status": "forbidden", "errorCode": "agent_forbidden",
+                   "error": "agentId research is not allowed"}
+        r, events = self.live("sessions_spawn", {"task": "Look it up.", "label": "Lookup"}, json.dumps(receipt))
+        title, _, output = self.card(r)
+        self.assertEqual(title, f"🤖 Lookup {TOOL_ERROR_MARK}")
+        self.assertIn("Not started (forbidden): agentId research is not allowed", output)
+        self.assertNotIn("agent_forbidden", output)
+        relabels = [e["item"]["name"] for e in events
+                    if isinstance(e, dict) and e["item"]["type"] == "function_call"]
+        self.assertEqual(relabels[-1], f"🤖 Lookup {TOOL_ERROR_MARK}", "the mark shows live")
+
+    def test_a_tool_error_keeps_its_text(self):
+        r, _ = self.live("sessions_spawn", {"task": "Go.", "label": "Go"}, "spawn timed out", is_error=True)
+        title, _, output = self.card(r)
+        self.assertEqual(title, f"🤖 Go {TOOL_ERROR_MARK}")
+        self.assertIn("spawn timed out", output)
+
+    def test_a_receipt_that_is_not_json_is_shown_as_it_came(self):
+        r, _ = self.live("sessions_spawn", {"task": "Go.", "label": "Go"}, "started")
+        self.assertEqual(self.card(r)[2], "started")
+
+    def test_other_tools_are_shown_as_called(self):
+        r, _ = self.live("exec", {"command": "ls", "label": "x"}, json.dumps({"status": "accepted"}))
+        self.assertEqual(self.card(r), ("exec", {"command": "ls", "label": "x"}, json.dumps({"status": "accepted"})))
+
+    def test_the_rebuilt_card_is_the_streamed_card(self):
+        """claude-cli's transcript `tool_result` carries no tool name: the
+        result still knows it answered a spawn."""
+        args = {"task": self.LONG_TASK, "label": "Forecaster benchmark"}
+        streamed, _ = self.live("mcp__openclaw__sessions_spawn", args, json.dumps(self.RECEIPT))
+        rebuilt = _history_renderer([{"role": "assistant", "content": [
+            {"type": "toolcall", "id": "t1", "name": "mcp__openclaw__sessions_spawn", "arguments": args},
+            {"type": "tool_result", "tool_use_id": "t1",
+             "content": [{"type": "text", "text": json.dumps(self.RECEIPT)}]}]}])
+        self.assertEqual(self.card(rebuilt), self.card(streamed))
+        native = _history_renderer([
+            {"role": "assistant", "content": [{"type": "toolCall", "id": "t1", "name": "sessions_spawn",
+                                               "arguments": args}]},
+            {"role": "toolResult", "toolCallId": "t1", "toolName": "sessions_spawn",
+             "content": [{"type": "text", "text": json.dumps(self.RECEIPT)}]}])
+        self.assertEqual(self.card(native), self.card(streamed))
+
+
 class ThinkingNoteAnnouncementTests(unittest.TestCase):
     """The clamp note is per-message information about a standing setting.
 
@@ -8533,13 +8635,15 @@ class SilentAnnounceTests(_RoutingCase):
             return await parent(method, params, timeout)
         self.conn.send_request = send_request
 
-    def parent_history(self, reply):
+    SPAWN_ARGS = {"task": "Reply with exactly SUB-DONE-R10.", "label": "R10 probe sub-agent"}
+
+    def parent_history(self, reply, spawn_args=None):
         imported = {"importedFrom": "claude-cli"}
         return {"messages": [
             {"role": "user", "content": "spawn it", "idempotencyKey": "msg-x-1.0:user"},
             {"role": "assistant", "__openclaw": imported, "content": [
                 {"type": "toolcall", "id": "toolu_s", "name": "mcp__openclaw__sessions_spawn",
-                 "arguments": {"task": "Reply with exactly SUB-DONE-R10.", "label": "R10 probe sub-agent"}},
+                 "arguments": spawn_args or self.SPAWN_ARGS},
                 {"type": "tool_result", "tool_use_id": "toolu_s", "content": [{"type": "text", "text":
                     json.dumps({"status": "accepted", "childSessionKey": self.CHILD,
                                 "runId": self.CHILD_RUN})}]}]},
@@ -8548,8 +8652,8 @@ class SilentAnnounceTests(_RoutingCase):
             {"role": "assistant", "content": [{"type": "text", "text": reply}],
              "idempotencyKey": f"cli-assistant:{self.announce}"}]}
 
-    async def announce_run(self, reply):
-        self.history = self.parent_history(reply)
+    async def announce_run(self, reply, spawn_args=None):
+        self.history = self.parent_history(reply, spawn_args)
         _turn_route_now(self.conn, self.ev(self.announce, _delta(reply)))
         _turn_route_now(self.conn, self.ev(self.announce, {"state": "final"}))
         self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
@@ -8566,6 +8670,18 @@ class SilentAnnounceTests(_RoutingCase):
         self.assertEqual(len(calls), 1)
         self.assertIn("R10 probe sub-agent", calls[0]["arguments"])
         self.assertIn("SUB-DONE-R10", json.dumps(outputs))
+
+    async def test_the_card_of_an_unlabelled_child_is_named_after_its_tasks_first_sentence(self):
+        """ELI-155: with no spawn label the card's label was the whole task."""
+        task = ("Benchmark the forecasters against the baseline on the hourly data. "
+                + "Report a table per split. " * 40)
+        await self.announce_run("NO_REPLY", {"task": task})
+        (m,) = self.new_messages().values()
+        (call,) = [i for i in m["output"] if i["type"] == "function_call"]
+        label = json.loads(call["arguments"])["label"]
+        self.assertTrue(label.startswith("Benchmark the forecasters"), label)
+        self.assertLessEqual(len(label), 60)
+        self.assertNotIn("Report a table", call["arguments"])
 
     async def test_an_announce_the_parent_answered_shows_only_the_answer(self):
         await self.announce_run("The sub-agent returned SUB-DONE-R10.")

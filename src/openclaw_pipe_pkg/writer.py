@@ -781,8 +781,7 @@ class _TurnWriter:
                 if (isinstance(b, dict) and b.get("type") == "tool_result"
                         and child["child_session"] in json.dumps(b.get("content"))
                         and b.get("tool_use_id") in calls):
-                    args = calls[b["tool_use_id"]].get("arguments") or {}
-                    label = args.get("label") or args.get("task")
+                    label = _spawn_title(calls[b["tool_use_id"]].get("arguments") or {})
         tcid = f"subagent-{child['child_run']}"
         args_str = json.dumps({"label": label or child["child_session"]})
         call = _tool_call_started_event("Sub-agent", tcid, args_str)["item"]

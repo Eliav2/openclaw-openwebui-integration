@@ -4049,6 +4049,82 @@ TOOL_ERROR_MARK = "❌"
 # What a call the run ended without answering shows as its output.
 TOOL_NO_RESULT_NOTE = "(no result -- the run ended first)"
 
+SUBAGENT_TITLE_MAX = 60
+_FIRST_SENTENCE_RE = re.compile(r"(?<=[.!?])\s|\n")
+# How much of a sub-agent's task its spawn card shows as input.
+SPAWN_TASK_LINES = 3
+SPAWN_TASK_CHARS = 300
+
+
+def _short_title(text: str) -> str:
+    """The first sentence of `text`, cut on a word to SUBAGENT_TITLE_MAX
+    characters with an ellipsis: a sub-agent's title when it has no label."""
+    first = _FIRST_SENTENCE_RE.split(text.strip(), 1)[0].strip()
+    if len(first) <= SUBAGENT_TITLE_MAX:
+        return first
+    cut = first[:SUBAGENT_TITLE_MAX - 1]
+    space = cut.rfind(" ")
+    if space >= SUBAGENT_TITLE_MAX // 2:
+        cut = cut[:space]
+    return cut.rstrip(" ,;:(") + "…"
+
+
+def _is_spawn_tool(name: str) -> bool:
+    """`sessions_spawn`, bare (the Gateway's runtime) or as claude-cli names
+    the OpenClaw MCP tool (`mcp__openclaw__sessions_spawn`)."""
+    return name == "sessions_spawn" or (name.startswith("mcp__")
+                                        and name.endswith("__sessions_spawn"))
+
+
+def _json_object(text: str) -> dict:
+    try:
+        value = json.loads(text)
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _spawn_title(args: dict) -> str:
+    """A sub-agent's name: its spawn label, else its task's first sentence."""
+    task = str(args.get("task") or "").strip()
+    return str(args.get("label") or "").strip() or (_short_title(task) if task else "Sub-agent")
+
+
+def _spawn_task_head(task: str) -> str:
+    """The first SPAWN_TASK_LINES lines of a task, at most SPAWN_TASK_CHARS."""
+    lines = [line for line in task.strip().splitlines() if line.strip()]
+    head = "\n".join(lines[:SPAWN_TASK_LINES])
+    if len(head) > SPAWN_TASK_CHARS:
+        head = head[:SPAWN_TASK_CHARS - 1].rsplit(" ", 1)[0].rstrip(" ,;:(") + "…"
+    elif len(lines) > SPAWN_TASK_LINES:
+        head += "\n…"
+    return head
+
+
+def _tool_card_view(name: str, args_str: str) -> tuple[str, str]:
+    """The title and input a tool card shows. A spawn card is named after the
+    sub-agent it started ("🤖 <label>") and shows the head of its task, not
+    the whole prompt; any other card shows the call as made (ELI-155)."""
+    if not _is_spawn_tool(name):
+        return name, args_str
+    args = _json_object(args_str)
+    task = str(args.get("task") or "")
+    return f"🤖 {_spawn_title(args)}", json.dumps({"task": _spawn_task_head(task)} if task.strip() else {})
+
+
+def _spawn_result_view(args_str: str, result_str: str) -> tuple[str, bool]:
+    """A spawn's receipt as one line, and whether the spawn failed. The
+    receipt is JSON ({status, childSessionKey, runId, ...} or {status,
+    error}); anything else is shown as it came."""
+    receipt = _json_object(result_str)
+    status = receipt.get("status")
+    if not isinstance(status, str):
+        return result_str, False
+    if status == "accepted":
+        return f"Started: {_spawn_title(_json_object(args_str))}", False
+    error = str(receipt.get("error") or "").strip()
+    return f"Not started ({status})" + (f": {error}" if error else ""), True
+
 
 def _tool_call_error_relabel_event(name: str, tool_call_id: str, args_str: str) -> dict:
     """Re-announce a failed call's `function_call` item with ❌ in its name.
@@ -4135,6 +4211,8 @@ class _TurnRenderer:
         self._assistant_stream_text = ""
         self._last_item_text = ""
         self._active_tool_args: dict[str, str] = {}
+        # A result may carry no tool name (claude-cli's `tool_result`).
+        self._active_tool_names: dict[str, str] = {}
         self._tool_items: dict[str, dict] = {}
         self._tool_results: set[str] = set()
         # A new run continues the message (resume, recovery, answer run): its
@@ -4213,7 +4291,8 @@ class _TurnRenderer:
     def _tool_item(self, name: str, tcid: str, args_str: str, events: list) -> dict:
         """The call's card, opened (and its start event added to `events`)
         the first time the call is seen, by its start or, when that was
-        missed, by its result."""
+        missed, by its result. `name` and `args_str` are as the card shows
+        them (`_tool_card_view`)."""
         item = self._tool_items.get(tcid)
         if item is None:
             event = _tool_call_started_event(name, tcid, args_str)
@@ -4302,7 +4381,9 @@ class _TurnRenderer:
                 if tcid:
                     args_str = json.dumps(data.get("args", {}))
                     self._active_tool_args[tcid] = args_str
-                    self._tool_item(name, tcid, args_str, events)
+                    self._active_tool_names[tcid] = name
+                    card_name, card_args = _tool_card_view(name, args_str)
+                    self._tool_item(card_name, tcid, card_args, events)
             elif phase == "result":
                 if tcid and tcid in self._tool_results:
                     return events
@@ -4311,16 +4392,21 @@ class _TurnRenderer:
                 args_str = self._active_tool_args.pop(tcid, None) or json.dumps(
                     data.get("args", {})
                 )
+                name = self._active_tool_names.pop(tcid, None) or name
+                failed = data.get("isError") is True
+                if _is_spawn_tool(name) and not failed:
+                    result_str, failed = _spawn_result_view(args_str, result_str)
+                card_name, card_args = _tool_card_view(name, args_str)
                 self._add(_render_tool_result_block(
-                    name, tcid, args_str, result_str, data.get("meta", "")
+                    card_name, tcid, card_args, result_str, data.get("meta", "")
                 ))
                 if tcid:
                     self._tool_results.add(tcid)
-                    item = self._tool_item(name, tcid, args_str, events)
+                    item = self._tool_item(card_name, tcid, card_args, events)
                     item["status"] = "completed"
-                    if data.get("isError") is True:
-                        item["name"] = f"{name} {TOOL_ERROR_MARK}"
-                        events.append(_tool_call_error_relabel_event(name, tcid, args_str))
+                    if failed:
+                        item["name"] = f"{card_name} {TOOL_ERROR_MARK}"
+                        events.append(_tool_call_error_relabel_event(card_name, tcid, card_args))
                         result_str = _tool_error_banner(result_str)
                     event = _tool_call_result_event(tcid, result_str)
                     self.output.append(copy.deepcopy(event["item"]))
@@ -7201,8 +7287,7 @@ class _TurnWriter:
                 if (isinstance(b, dict) and b.get("type") == "tool_result"
                         and child["child_session"] in json.dumps(b.get("content"))
                         and b.get("tool_use_id") in calls):
-                    args = calls[b["tool_use_id"]].get("arguments") or {}
-                    label = args.get("label") or args.get("task")
+                    label = _spawn_title(calls[b["tool_use_id"]].get("arguments") or {})
         tcid = f"subagent-{child['child_run']}"
         args_str = json.dumps({"label": label or child["child_session"]})
         call = _tool_call_started_event("Sub-agent", tcid, args_str)["item"]

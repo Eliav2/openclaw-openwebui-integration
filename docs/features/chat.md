@@ -35,6 +35,19 @@ A call that arrives without a tool-call id still shows: it falls back to a Markd
 
 Always on. Native cards need a recent Open WebUI; on older releases they fall back quietly rather than erroring. See [Versions](../versions.md).
 
+## Sub-agent cards
+
+![A sub-agent's card opened: named after the sub-agent, the first lines of its task, and one line saying it started](../img/spawn-card-light.png#gh-light-mode-only)
+![A sub-agent's card opened: named after the sub-agent, the first lines of its task, and one line saying it started](../img/spawn-card-dark.png#gh-dark-mode-only)
+
+When the agent starts a sub-agent (`sessions_spawn`), its card is named after the sub-agent: 🤖 and the name the agent gave it, or the first sentence of its task, cut to 60 characters, when it gave none. Several sub-agents started in a row group as "Explored 🤖 Fly.io pricing, 🤖 Render pricing".
+
+Expanded, the card shows the first three lines of the task, not the whole prompt, and one line of outcome: "Started: \<name\>", or "Not started" with the reason, in which case the card is marked failed like any other tool. The full task, and what the sub-agent does with it, are in its [drawer](./status.md#sub-agent-drawer).
+
+A reply rebuilt from the transcript shows the same card.
+
+Always on.
+
 ## Failed tools
 
 ![A reply streaming: a read card marked with a cross because the file is missing, and an exec card still running](../img/failed-tool-live-light.png#gh-light-mode-only)
