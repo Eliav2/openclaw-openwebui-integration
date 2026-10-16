@@ -1,11 +1,14 @@
 """Helpers shared by the unit suites. Not a suite itself (pytest collects
 test_*.py only)."""
 
+import inspect
 import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -47,3 +50,45 @@ def action_gateway(conn, source: str = "pipe"):
     came from `source` (the Pipe's stashed connection by default)."""
     return mock.patch("openclaw_status_action._get_action_connection",
                       new=mock.AsyncMock(return_value=(conn, source)))
+
+
+def owui_modules(**main_attrs) -> dict:
+    """sys.modules entries for a stand-in Open WebUI: `open_webui`,
+    `open_webui.socket` and `open_webui.socket.main`, the last carrying
+    `main_attrs` (sio, SESSION_POOL, ...). Add other entries to the dict."""
+    owui = types.ModuleType("open_webui")
+    sock = types.ModuleType("open_webui.socket")
+    main = types.ModuleType("open_webui.socket.main")
+    for name, value in main_attrs.items():
+        setattr(main, name, value)
+    owui.socket, sock.main = sock, main
+    return {"open_webui": owui, "open_webui.socket": sock, "open_webui.socket.main": main}
+
+
+def fake_owui(test, **main_attrs):
+    """Install `owui_modules(**main_attrs)` until `test` ends (sys.modules is
+    restored then) and return the `open_webui.socket.main` stand-in."""
+    modules = owui_modules(**main_attrs)
+    patch = mock.patch.dict(sys.modules, modules)
+    patch.start()
+    test.addCleanup(patch.stop)
+    return modules["open_webui.socket.main"]
+
+
+class FakeSio:
+    """A stand-in for Open WebUI's socket.io server. Records every `call` as
+    (event, data, to, timeout) and every `emit` as (event, data, to); a
+    `call` returns what `reply(event, data, to, timeout)` returns (awaited
+    when it is a coroutine), or None without one."""
+
+    def __init__(self, reply=None):
+        self.calls, self.emits = [], []
+        self._reply = reply
+
+    async def call(self, event, data, to=None, timeout=None):
+        self.calls.append((event, data, to, timeout))
+        out = self._reply(event, data, to, timeout) if self._reply else None
+        return await out if inspect.isawaitable(out) else out
+
+    async def emit(self, event, data, to=None, **kwargs):
+        self.emits.append((event, data, to))

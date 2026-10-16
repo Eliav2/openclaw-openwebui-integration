@@ -19,6 +19,7 @@ from unittest import mock
 
 import test_pipe_unit  # noqa: F401  (installs the module stubs openclaw_pipe needs)
 from test_pipe_unit import _turn_history
+from _test_helpers import owui_modules
 
 import openclaw_pipe
 from openclaw_pipe import _owui_session_key, _GatewayConnection, turn_message_id
@@ -89,14 +90,10 @@ class _EndedWhileDownCase(unittest.IsolatedAsyncioTestCase):
 
         chats_mod = types.ModuleType("open_webui.models.chats")
         chats_mod.Chats = FakeChats
-        socket_main = types.ModuleType("open_webui.socket.main")
         self.sio = mock.AsyncMock()
-        socket_main.sio = self.sio
-        modules = {"open_webui": types.ModuleType("open_webui"),
+        modules = {**owui_modules(sio=self.sio),
                    "open_webui.models": types.ModuleType("open_webui.models"),
-                   "open_webui.models.chats": chats_mod,
-                   "open_webui.socket": types.ModuleType("open_webui.socket"),
-                   "open_webui.socket.main": socket_main}
+                   "open_webui.models.chats": chats_mod}
         self.conn = _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"))
 
         async def send_request(method, params, timeout=10):

@@ -15,6 +15,7 @@ import urllib.request
 from pathlib import Path
 
 import conftest  # noqa: F401  (imports real pydantic before the stubs can shadow it)
+from _test_helpers import fake_owui
 from _test_stubs import install_stubs
 
 ROOT = Path(__file__).resolve().parent
@@ -43,10 +44,7 @@ class StaleFileServerReapTests(unittest.TestCase):
     next deploy can reap it first."""
 
     def setUp(self):
-        self.stub_owui_socket_main = types.ModuleType("open_webui.socket.main")
-        sys.modules["open_webui"] = types.ModuleType("open_webui")
-        sys.modules["open_webui.socket"] = types.ModuleType("open_webui.socket")
-        sys.modules["open_webui.socket.main"] = self.stub_owui_socket_main
+        self.stub_owui_socket_main = fake_owui(self)
         # fs is a SimpleNamespace snapshot of the exec'd globals, not a
         # live view -- functions still close over the original dict via
         # __globals__, so mutating fs._file_server_started directly
@@ -62,8 +60,6 @@ class StaleFileServerReapTests(unittest.TestCase):
         # the suite order-dependent: it passed on 3.10-3.12 and failed on 3.13
         # purely because test ordering/timing differs.
         self._shutdown_stashed_server()
-        for name in ("open_webui.socket.main", "open_webui.socket", "open_webui"):
-            sys.modules.pop(name, None)
         fs._start_file_server.__globals__["_file_server_started"] = False
 
     def _shutdown_stashed_server(self):
