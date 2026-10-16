@@ -244,26 +244,29 @@ STORED = r"""
 import json, sqlite3, sys
 db = sqlite3.connect("file:/app/backend/data/webui.db?mode=ro", uri=True)
 out = {}
-for mid in json.loads(sys.argv[1]):
-    row = db.execute("select done, content, output, status_history from chat_message where id = ?",
-                     (mid,)).fetchone()
+for chat_id, mid in json.loads(sys.argv[1]):
+    row = db.execute("select done, content, output from chat_message where id = ?",
+                     (f"{chat_id}-{mid}",)).fetchone()
+    # Open WebUI keeps a message's statuses in the chat JSON only.
+    statuses = db.execute("select json_array_length(json_extract(chat, ?)) from chat where id = ?",
+                          (f'$.history.messages."{mid}".statusHistory', chat_id)).fetchone()
     if row is None:
         out[mid] = None
         continue
-    done, content, output, statuses = row
-    items = json.loads(output or "[]")
+    done, content, output = row
+    items = json.loads(output or "null") or []
     text = json.loads(content) if content and content.startswith('"') else (content or "")
     out[mid] = {"done": bool(done), "calls": sum(i.get("type") == "function_call" for i in items),
                 "results": sum(i.get("type") == "function_call_output" for i in items),
                 "ends_done": str(text).strip().endswith(sys.argv[2]),
-                "statuses": len(json.loads(statuses or "[]"))}
+                "statuses": (statuses or [None])[0]}
 print(json.dumps(out))
 """
 
 
 def stored(ids):
-    """What Open WebUI persisted for these `chat_message` ids (read-only, in
-    the container, not through Open WebUI)."""
+    """What Open WebUI persisted for these (chat id, message id) pairs
+    (read-only, in the container, not through Open WebUI)."""
     out = subprocess.check_output(["docker", "exec", "owui", "python3", "-c", STORED,
                                    json.dumps(ids), DONE], text=True)
     return json.loads(out)
@@ -298,8 +301,9 @@ async def main():
         await asyncio.gather(*background, return_exceptions=True)
     await asyncio.sleep(5)
     anon, swap = mem()
-    ids = [f"{t['chat']}-{t[k]}" for t in turns for k in ("inline", "wake")]
-    db = stored(ids)
+    print(json.dumps({"before": before, "peak": p.peak, "anon_peak": p.anon_peak,
+                      "after": anon + swap, "s": round(took, 1), "turns": turns}), flush=True)
+    db = stored([(t["chat"], t[k]) for t in turns for k in ("inline", "wake")])
     latest_user = {t["chat"]: t["user_message"] for t in turns}
     user_ids = {cid: {k for k, m in ch["history"]["messages"].items() if m["role"] == "user"}
                 for cid, ch in chats}
@@ -315,7 +319,7 @@ async def main():
            # until the inline turn's lands, that one after.
            "push_targets_user": all(j["pushed"] in user_ids[j["chat"]] for j in pushes),
            "push_latest_user": sum(j["pushed"] == latest_user[j["chat"]] for j in pushes),
-           "turns": [{**t, "inline_db": db[f"{t['chat']}-{t['inline']}"], "wake_db": db[f"{t['chat']}-{t['wake']}"]}
+           "turns": [{**t, "inline_db": db[t["inline"]], "wake_db": db[t["wake"]]}
                      for t in turns]}
     print(json.dumps(row), flush=True)
     with open(OUT, "a") as f:
