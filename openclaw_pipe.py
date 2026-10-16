@@ -5358,8 +5358,8 @@ class _GatewayConnection:
 
         `settle` (a coroutine function) asks the browser which button was
         pressed and calls `settle_parked_turn`: Stop releases it now, Send now
-        keeps the run in its own message (`_keep_in_own_message`) and holds
-        what the reply had not sent for the follow-up message. It runs as a background task
+        holds it for the follow-up message, whose claim keeps the run in its
+        own message (`_keep_in_own_message`). It runs as a background task
         started here, so interrupting the cancelled reply cannot interrupt it
         (ELI-95), and the entry is `resolved` when it returns, which the
         intent query's own bound ensures. Without one, nobody can say (no page
@@ -5477,19 +5477,15 @@ class _GatewayConnection:
             pipe_log(f"  cancel was a Stop: stopping run {str(run_id)[:20]}... now")
             entry["release"]()
         elif intent == "send_now":
-            if self._keep_in_own_message(session_key, entry):
-                pipe_log(f"  cancel was a Send now: run {str(run_id)[:20]}... goes on in "
-                         "its own message; the follow-up message waits for it")
-                if not entry["carried"]:
-                    self._pending_cancel_aborts.pop(session_key, None)
-                    if entry["task"] is not None:
-                        entry["task"].cancel()
-                else:
-                    self._arm_parked_timer(session_key, entry, hold_s)
-            else:
-                pipe_log(f"  cancel was a Send now: holding run {str(run_id)[:20]}... "
-                         f"for the follow-up message (up to {hold_s:g}s)")
-                self._arm_parked_timer(session_key, entry, hold_s)
+            # The follow-up message keeps the run (`claim_cancelled_turn`), not
+            # this answer: Open WebUI tells the tab the reply was cancelled,
+            # with its running tool cards drawn done, only after the cancel
+            # handling returns, which this answer can beat. A writer opened
+            # now would be overwritten. The page sends the follow-up only
+            # after Open WebUI finished the cancel.
+            pipe_log(f"  cancel was a Send now: holding run {str(run_id)[:20]}... "
+                     f"for the follow-up message (up to {hold_s:g}s)")
+            self._arm_parked_timer(session_key, entry, hold_s)
         else:
             pipe_log("  cancel intent unknown (no page hook or no answer): "
                      "keeping the fallback window")
@@ -5547,8 +5543,9 @@ class _GatewayConnection:
             return None
         if entry["task"] is not None:
             entry["task"].cancel()
-        # A new message inside the fallback window keeps the run, in its own
-        # message as Send now does; the new reply takes only the messages.
+        # The follow-up message (after Send now, or inside the fallback
+        # window) keeps the run in its own message; the new reply takes only
+        # the messages.
         self._keep_in_own_message(session_key, entry)
         return {"run_id": entry["run_id"], "queue": entry["queue"],
                 "carried": list(entry["carried"]),

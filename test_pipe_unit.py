@@ -1356,11 +1356,16 @@ class ParkedCancelTests(unittest.IsolatedAsyncioTestCase):
         message showed its running tool card as done and the run went on in
         the new message. The run now stays in its own message: the turn
         writer takes that message over with what it showed and the events
-        buffered since the cancel, and the next reply gets no run."""
+        buffered since the cancel, and the next reply gets no run. The
+        follow-up message hands it over, not the page's answer: Open WebUI's
+        own cancel event comes after that answer can and would overwrite
+        the writer's first events (#83 Screenshots)."""
         conn, calls = self._conn()
         reply = self._park_with_reply(conn)
         with mock.patch.object(openclaw_pipe._TurnHooks, "hand_over", return_value=True) as hand:
             conn.settle_parked_turn("s", "run-1", "send_now", hold_s=5)
+            hand.assert_not_called()
+            claimed = await conn.claim_cancelled_turn("s")
         hand.assert_called_once()
         args, kwargs = hand.call_args
         self.assertEqual(args[1:], ("s", "run-1"))
@@ -1368,7 +1373,7 @@ class ParkedCancelTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(kwargs["reply"]["renderer"], reply["renderer"])
         self.assertEqual(len(kwargs["reply"]["events"]), 1, "the buffered event goes to the writer")
         self.assertNotIn("s:run-1", conn._consumers)
-        self.assertIsNone(await conn.claim_cancelled_turn("s"))
+        self.assertIsNone(claimed["run_id"])
         await asyncio.sleep(0)
         self.assertEqual(calls, [], "the run is never aborted")
 
@@ -1377,7 +1382,7 @@ class ParkedCancelTests(unittest.IsolatedAsyncioTestCase):
         self._park_with_reply(conn, carried=["first"])
         with mock.patch.object(openclaw_pipe._TurnHooks, "hand_over", return_value=True):
             conn.settle_parked_turn("s", "run-1", "send_now", hold_s=5)
-        claimed = await conn.claim_cancelled_turn("s")
+            claimed = await conn.claim_cancelled_turn("s")
         self.assertIsNone(claimed["run_id"])
         self.assertEqual(claimed["carried"], ["first"])
 
@@ -9805,9 +9810,12 @@ class GapHandoverReplayTests(_RoutingCase):
     M1 = "11111111-1111-4111-8111-111111111111"
     M2 = "22222222-2222-4222-8222-222222222222"
 
-    async def _send_now_mid_tool(self):
+    async def _send_now_mid_tool(self, cancel_event=False):
         """Reply 1 streams 1..10 and starts a tool call; Send now; reply 2
-        brings MSG2. Returns reply 2 and the first run's id."""
+        brings MSG2. Returns reply 2 and the first run's id. `cancel_event`:
+        before MSG2, everything the cancel set off runs, then Open WebUI's
+        `chat:tasks:cancel` reaches the tab (`self.cancel_at` is its place
+        among the emits, `self.cancelled_output` its output)."""
         first = await self.start_reply("count to 20", self.M1, intent="send_now")
         run1 = self.run
         self.frame(_delta(self._nums(1, 10)))
@@ -9819,6 +9827,18 @@ class GapHandoverReplayTests(_RoutingCase):
         first["task"].cancel()                         # Send now
         await asyncio.gather(first["task"], return_exceptions=True)
         self.first = first
+        if cancel_event:
+            # The page answered Send now. Either the run is held for MSG2, or
+            # it was taken over at once and the writer has streamed it.
+            for _ in range(400):
+                entry = self.conn._pending_cancel_aborts.get(self.key)
+                if entry is not None and entry["resolved"].is_set():
+                    break
+                if entry is None and self._writer_events(self.M1):
+                    break
+                await asyncio.sleep(0.005)
+            self.cancel_at = len(self.owui.emits)
+            self.cancelled_output = _owui_cancelled_output(_owui_stream(first["chunks"])[1])
         second = await self.start_reply("MSG2", self.M2, intent="send_now", sends=False)
         for _ in range(400):
             if (self.M1 in [k[1] for k in self.conn._turn_writers]
@@ -9919,6 +9939,45 @@ class GapHandoverReplayTests(_RoutingCase):
                          ["message", "function_call", "function_call_output", "message"], order)
         self.assertEqual(self._count(" ".join(x for _t, _id, x in order if x)),
                          list(range(1, 14)), order)
+
+    def _writer_events(self, message_id, since=0):
+        return [d["data"]["data"] for e, d, _room in self.owui.emits[since:]
+                if e == "events" and d["message_id"] == message_id
+                and d["data"].get("type") == "response:completion"]
+
+    async def test_the_kept_runs_card_stays_running_after_open_webuis_cancel(self):
+        """#83 Screenshots (runs 38912098830, 38914753295): after Send now the
+        kept run's card showed done for 20 s while its tool still ran. Open
+        WebUI ends a cancelled reply by sending the tab `chat:tasks:cancel`
+        with its own copy of the output, a running tool call stamped
+        `incomplete` (drawn done), and the tab replaces the message's output
+        with it. It sends that after the Pipe's cancel handling returns, and
+        the page's Send now answer can come sooner: the writer that took the
+        message over then had its first events overwritten, and sent nothing
+        more for the card until the tool ended. The tab folds Open WebUI's
+        cancel output once everything the cancel set off has run, then the
+        writer's events: the card is running."""
+        if shutil.which("bun") is None:
+            if os.environ.get("CI"):
+                self.fail("bun is missing: the live-order tests must run in CI")
+            self.skipTest("bun runs the vendored Open WebUI frontend reducer")
+        await self._send_now_mid_tool(cancel_event=True)
+        stamped = [i for i in self.cancelled_output if i.get("type") == "function_call"]
+        self.assertEqual([i.get("status") for i in stamped], ["incomplete"],
+                         "Open WebUI's cancel shows the running card done")
+        for _ in range(400):
+            if self._writer_events(self.M1, since=self.cancel_at):
+                break
+            await asyncio.sleep(0.005)
+        live = _owui_live_output(
+            [{"type": "chat:tasks:cancel", "data": {"output": self.cancelled_output}}]
+            + self._writer_events(self.M1, since=self.cancel_at))
+        calls = [i for i in live if i.get("type") == "function_call"]
+        self.assertEqual([(i.get("id"), i.get("status")) for i in calls],
+                         [("toolu_1", "in_progress")], "the card is running")
+        self.assertEqual([i for i in live if i.get("type") == "function_call_output"], [])
+        self.assertEqual(self._count(" ".join(x for _t, _id, x in _item_order(live) if x)),
+                         list(range(1, 11)), live)
 
     async def test_a_gap_in_the_kept_run_is_repaired_in_its_own_message(self):
         """The run kept in its own message loses frames: the turn writer
@@ -11148,6 +11207,23 @@ def _owui_saved(chunks) -> tuple[str, list]:
     """(content, output) Open WebUI 0.12 saves for a pipe's yields."""
     content, output, _live = _owui_stream(chunks)
     return content, output
+
+
+def _owui_cancelled_output(output: list) -> list:
+    """What Open WebUI 0.12 sends the tab (`chat:tasks:cancel`) and saves when
+    a reply is cancelled (`save_cancelled_state`, utils/middleware.py:6652):
+    its output with in-progress items and running tool calls (a call stamped
+    completed with no output yet) stamped `incomplete`, which the tool card
+    draws as done (ToolCallDisplay.svelte `isDone`)."""
+    output = copy.deepcopy(output)
+    answered = {i.get("call_id") for i in output
+                if i.get("type") == "function_call_output" and i.get("call_id")}
+    for i in output:
+        running = (i.get("type") == "function_call" and i.get("status") == "completed"
+                   and (i.get("call_id") or i.get("id")) not in answered)
+        if i.get("status") == "in_progress" or running:
+            i["status"] = "incomplete"
+    return output
 
 
 def _owui_live_output(events: list) -> list:
