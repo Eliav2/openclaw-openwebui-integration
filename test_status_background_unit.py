@@ -339,8 +339,9 @@ global.fetch = (url, opts) => { fetches.push(JSON.parse(opts.body)); return Prom
 run(input.open);
 input.fills.forEach(run);
 const section = (n) => document.getElementById('openclaw-status-section-' + n);
-const texts = (n) => section(n).walk().filter((e) => e.children.length === 0 && e.text).map((e) => e.text);
-const fold = (n) => section(n).walk().find((e) => e.dataset.openclawFold === n);
+const texts = (n) => section(n) ? section(n).walk().filter((e) => e.children.length === 0 && e.text).map((e) => e.text) : null;
+// A fold by name, a nested one (Other automations) included.
+const fold = (n) => document.body.walk().find((e) => e.dataset.openclawFold === n);
 const out = {};
 for (const step of input.steps || []) {
   if (step.tap) fold(step.tap).children[0].onclick();
@@ -396,10 +397,22 @@ class BackgroundPageTests(unittest.TestCase):
 
     def test_an_owner_sees_the_other_automations_under_their_own_title(self):
         other = {**self.JOB, "id": "j2", "title": "heartbeat", "status": "scheduled", "error": None}
-        seen = self.page([_bg([], owner=True, automations=[other], automationsTotal=7)], ["background"])
+        seen = self.page([_bg([], owner=True, automations=[other], automationsTotal=7)], ["background", "other-automations"])
         texts = seen["background"]["texts"]
         self.assertEqual(texts[texts.index("Other automations (1 of 7)") + 1:][:2], ["heartbeat", "Scheduled"])
         self.assertTrue(texts[-1].startswith("next run "), texts)
+        # Their own fold, folded while none of them runs or failed.
+        self.assertEqual(seen["other-automations"]["open"], "false")
+
+    def test_other_automations_open_when_one_failed_or_runs(self):
+        for status in ("failed", "running"):
+            with self.subTest(status=status):
+                other = {**self.JOB, "id": "j2", "title": "watch", "status": status}
+                seen = self.page([_bg([], owner=True, automations=[other], automationsTotal=1)],
+                                 ["background", "other-automations"])
+                self.assertEqual(seen["other-automations"]["open"], "true")
+                # This chat's own section stays folded: nothing of its own runs.
+                self.assertEqual(seen["background"]["open"], "false")
 
     def test_a_folded_subagents_section_asks_for_its_rows_once_on_its_first_tap(self):
         pending = action._render_subagents_fill_js({

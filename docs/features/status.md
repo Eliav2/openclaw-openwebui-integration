@@ -74,7 +74,7 @@ The Background section lists what runs for this chat outside a reply, running fi
 
 Sub-agents are listed under Subagents, not here.
 
-Owners also see **Other automations**: the Gateway's automations that run elsewhere, running and failing ones first, up to five ("5 of N"). Anyone not in the Pipe's [`OWNER_USERS`](../configuration.md#owner_users) sees only their own chat's. With `OWNER_USERS` empty, everyone is an owner, as everywhere else.
+Owners also see **Other automations**: the Gateway's automations that run elsewhere, running and failing ones first, up to five ("5 of N"). They fold on their own, with their count in the title, and open only when one of them is running or failed. Anyone not in the Pipe's [`OWNER_USERS`](../configuration.md#owner_users) sees only their own chat's. With `OWNER_USERS` empty, everyone is an owner, as everywhere else.
 
 The section reads only when the dialog opens. OpenClaw 2026.10 removed the Gateway's task list (`tasks.list`): there the section says background commands and media jobs are not available on this Gateway, and still lists the chat's automations.
 

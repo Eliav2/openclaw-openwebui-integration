@@ -1422,7 +1422,8 @@ _AGENTS_FILL_JS_TEMPLATE = r"""
 
 # The Background section (ELI-163): this chat's background commands, media
 # jobs, automation runs and background agents, then (owners only) the
-# Gateway's other automations. A fold like Subagents. A source this Gateway
+# Gateway's other automations, in a fold of their own that opens only when
+# one runs or failed. A fold like Subagents. A source this Gateway
 # lacks says so in a note; one that failed says so too, and the rest shows.
 _BACKGROUND_FILL_JS_TEMPLATE = r"""
 (function() {
@@ -1439,7 +1440,7 @@ _BACKGROUND_FILL_JS_TEMPLATE = r"""
   const rows = DATA.rows || [];
   const others = DATA.automations || [];
   const isLive = function(r) { return r.status === 'running' || r.status === 'queued'; };
-  const live = rows.some(isLive) || others.some(isLive);
+  const live = rows.some(isLive);
   const fold = S.collapsible('background', S.countLabel('Background', rows.length, DATA.total || 0), live);
   section.appendChild(fold.wrap);
 
@@ -1479,10 +1480,13 @@ _BACKGROUND_FILL_JS_TEMPLATE = r"""
   rows.forEach(function(r) { fold.body.appendChild(row(r, false)); });
 
   if (DATA.owner && others.length) {
-    const head = S.sectionHeader(S.countLabel('Other automations', others.length, DATA.automationsTotal || 0));
-    head.style.marginTop = '10px';
-    fold.body.appendChild(head);
-    others.forEach(function(r) { fold.body.appendChild(row(r, true)); });
+    // The Gateway's own upkeep, mostly: folded unless one needs a look.
+    const notable = others.some(function(r) { return isLive(r) || r.status === 'failed'; });
+    const sub = S.collapsible('other-automations',
+      S.countLabel('Other automations', others.length, DATA.automationsTotal || 0), notable);
+    sub.wrap.style.marginTop = '10px';
+    fold.body.appendChild(sub.wrap);
+    others.forEach(function(r) { sub.body.appendChild(row(r, true)); });
   }
   S.touchFooter(DATA.fetchedAt, DATA.source);
 })();
