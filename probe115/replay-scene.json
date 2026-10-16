@@ -1,0 +1,334 @@
+{
+ "_comment": "ELI-115 pipe replay: 40 tool calls, then the closing line.",
+ "scenes": [
+  {
+   "match": "ELI115_REPLAY_TOOLS",
+   "steps": [
+    {
+     "say": "Step 1.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 2.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 3.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 4.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 5.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 6.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 7.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 8.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 9.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 10.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 11.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 12.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 13.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 14.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 15.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 16.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 17.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 18.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 19.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 20.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 21.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 22.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 23.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 24.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 25.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 26.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 27.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 28.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 29.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 30.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 31.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 32.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 33.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 34.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 35.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 36.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 37.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 38.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 39.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "Step 40.",
+     "tool": "read",
+     "args": {
+      "path": "replay/notes.txt"
+     },
+     "delay": 0.0
+    },
+    {
+     "say": "All forty read. ELI115_REPLAY_DONE",
+     "delay": 0.0
+    }
+   ]
+  }
+ ]
+}

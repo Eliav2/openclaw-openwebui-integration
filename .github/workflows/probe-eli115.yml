@@ -1,7 +1,10 @@
 name: Probe ELI-115 memory
 
 # Throwaway probe (branch probe/eli115-memory only): a replay of
-# 2026-10-16 07:12Z (status writes on and off) and the socket storm.
+# 2026-10-16 07:12Z (status writes on and off) and the socket storm; then the
+# fixes measured through the real Pipe (pipe-replay): the same harness
+# (probe115/pipe_replay.py, from this branch) against the Pipe installed from
+# main, main + fix 1, + fix 2, + fix 3 (the PR head).
 
 on:
   push:
@@ -50,6 +53,7 @@ jobs:
           path: ${{ runner.temp }}/probe-${{ matrix.variant }}.jsonl
 
   replay:
+    if: false
     name: replay (${{ matrix.mode }} ${{ matrix.malloc }})
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -114,3 +118,62 @@ jobs:
         with:
           name: storm
           path: ${{ runner.temp }}/storm.jsonl
+
+  pipe-replay:
+    name: pipe replay (${{ matrix.variant }} rep ${{ matrix.rep }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [main, fix1, fix12, fix123]
+        rep: [1, 2]
+    steps:
+      - name: Ref under test
+        id: ref
+        run: |
+          case "${{ matrix.variant }}" in
+            main)   echo "sha=60aebaa267faaeeb98b608a22dd0e129f03feba3" >> "$GITHUB_OUTPUT" ;;
+            fix1)   echo "sha=3fceb1c90ee4f34b13b52633028dabd44c7c0f6f" >> "$GITHUB_OUTPUT" ;;
+            fix12)  echo "sha=46d608bb5a326f980005d84c2feda1cdf4f6320f" >> "$GITHUB_OUTPUT" ;;
+            fix123) echo "sha=816926a4e4e69d4d4438211cbb2f37a100942562" >> "$GITHUB_OUTPUT" ;;
+          esac
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.ref.outputs.sha }}
+      - uses: actions/checkout@v7
+        with:
+          path: harness-src
+      - name: The file the scene's tool calls read
+        run: |
+          mkdir -p "$HOME/.openclaw/workspace/replay"
+          python3 -c "print(('replay notes line ' * 6 + '\\n') * 80, end='')" > "$HOME/.openclaw/workspace/replay/notes.txt"
+          wc -c "$HOME/.openclaw/workspace/replay/notes.txt"
+      - name: Start the stack and install the integration
+        uses: ./.github/actions/stack
+        env:
+          FAKE_LLM_SCENES: ${{ github.workspace }}/harness-src/probe115/replay-scene.json
+        with:
+          log_dir: ${{ runner.temp }}/e2e-logs
+      - name: Open WebUI on one CPU, nearer the Pi
+        run: docker update --cpus=1 owui
+      - name: Replay
+        env:
+          VARIANT: ${{ matrix.variant }}
+          REF: ${{ steps.ref.outputs.sha }}
+          REP: ${{ matrix.rep }}
+          OUT: ${{ runner.temp }}/pipe-replay-${{ matrix.variant }}-${{ matrix.rep }}.jsonl
+        run: uv run --with httpx --with "python-socketio[asyncio_client]" python harness-src/probe115/pipe_replay.py
+      - name: Pipe lines
+        if: always()
+        run: |
+          docker logs owui > "$RUNNER_TEMP/e2e-logs/open-webui.log" 2>&1 || true
+          grep -c "turn writer: finalized" "$RUNNER_TEMP/e2e-logs/open-webui.log" || true
+          grep -i "turn writer\|composer\|orphan" "$RUNNER_TEMP/e2e-logs/open-webui.log" | tail -40 || true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: pipe-replay-${{ matrix.variant }}-${{ matrix.rep }}
+          path: |
+            ${{ runner.temp }}/pipe-replay-${{ matrix.variant }}-${{ matrix.rep }}.jsonl
+            ${{ runner.temp }}/e2e-logs
