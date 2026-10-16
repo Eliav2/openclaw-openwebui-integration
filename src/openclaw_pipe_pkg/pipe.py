@@ -149,6 +149,8 @@ class Pipe:
     - SEND_STOP_ON_CANCEL: send /stop after chat.abort when OWUI cancels
     - INTERRUPT_GRACE_SECONDS: how long a cancel waits for a follow-up message
       before aborting the run (default 3; 0 aborts immediately)
+    - AUTO_SEND_WHILE_RUNNING: a message sent while a reply runs goes into
+      the chat at once instead of waiting in Open WebUI's queue (default True)
     """
 
     class Valves(BaseModel):
@@ -231,6 +233,15 @@ class Pipe:
                 "the rest of the running turn, then answers your message. A "
                 "plain Stop with no new message still stops the run after this "
                 "many seconds. 0 stops immediately, as before."
+        )
+        AUTO_SEND_WHILE_RUNNING: bool = Field(
+            default=True,
+            description="Recommended. A message you send while the agent is "
+                "working goes into the chat at once, instead of waiting in Open "
+                "WebUI's queue above the composer for you to click Send now. The "
+                "running reply is not stopped: the agent finishes its current "
+                "work, then answers your message. Off: Open WebUI queues it, "
+                "and it is sent when the reply ends or when you click Send now."
         )
         OWUI_BASE_URL: str = Field(
             default="http://127.0.0.1:8080",
@@ -826,10 +837,12 @@ class _PipeTurn:
         self.turn.unsent = list(self._send_texts) if self._send_texts else [self.text]
         if self.owui_origin_chat_id and self.__event_emitter__:
             # Lets a later cancel ask the page whether it was Stop or Send
-            # now. Idempotent in the page; fire-and-forget.
+            # now, and sends a message queued while this reply runs at once
+            # (AUTO_SEND_WHILE_RUNNING). Idempotent in the page; fire-and-forget.
             try:
                 await self.__event_emitter__(
-                    {"type": "execute", "data": {"code": _INTENT_HOOK_JS}})
+                    {"type": "execute", "data": {"code": _page_hooks_js(
+                        self.owui_origin_chat_id, _auto_send_on(self.pipe.valves))}})
             except Exception as ex:
                 pipe_log(f"  intent hook install failed: {ex!r}")
         # What actually went out in this turn's chat.send, for the

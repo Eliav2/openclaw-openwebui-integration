@@ -1906,6 +1906,20 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(e.get("type") == "execute" for e in self.emitted),
                         "the page hook is installed at turn start")
 
+    async def test_the_turn_tells_the_page_this_chats_auto_send_setting(self):
+        self.pipe.valves.AUTO_SEND_WHILE_RUNNING = False
+        r = self._reply("count", "m1")
+        first = asyncio.ensure_future(r.__anext__())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "1\n"))
+        q.put_nowait(self._final("run-1"))
+        await first
+        async for _chunk in r:
+            pass
+        codes = [e["data"]["code"] for e in self.emitted if e.get("type") == "execute"]
+        self.assertTrue(any('window.__ocAutoSend["chat-1"] = false' in c for c in codes), codes)
+
     async def test_stop_answer_stops_without_waiting(self):
         self.pipe.valves.INTERRUPT_GRACE_SECONDS = 30
         r1 = self._reply("count", "m1", intent="stop")
@@ -6824,7 +6838,9 @@ class TurnWriterEndTests(_TurnWriterCase):
 
     async def test_the_writer_installs_the_page_intent_hook_when_it_opens_m(self):
         await self.opened_writer()
-        self.assertIn(_INTENT_HOOK_JS, [e["data"]["code"] for e in self.owui.events("execute")])
+        codes = [e["data"]["code"] for e in self.owui.events("execute")]
+        self.assertTrue(any(_INTENT_HOOK_JS in c and 'window.__ocAutoSend["c1"] = true' in c
+                            for c in codes), codes)
 
     async def test_stop_aborts_the_run_and_finalizes_what_it_has(self):
         w = await self.opened_writer()
@@ -8866,6 +8882,92 @@ class IntentHookStopIconTests(unittest.TestCase):
 
     def test_no_english_only_running_check_is_left(self):
         self.assertNotIn('querySelector(\'button[aria-label="Stop"]', openclaw_pipe._INTENT_HOOK_JS)
+
+
+class AutoSendHookTests(unittest.TestCase):
+    """AUTO_SEND_WHILE_RUNNING: in an OpenClaw chat, a message Open WebUI
+    queues while a reply runs is sent at once by clicking its Send now, marked
+    as Send now so the run is kept. Runs the page hooks under node with a stub
+    page: Open WebUI's queued item (its Send now arrow) and its user messages."""
+
+    SEND_NOW_ICON = "M4.5 10.5 12 3m0 0 7.5 7.5M12 3v18"
+
+    def run_page(self, chat_flags: dict, steps: list, path="/c/chat-1") -> dict:
+        """Installs the hooks once per entry of `chat_flags` (as several turns
+        would), then plays `steps`: ["queue"] adds a queued item, ["user", id]
+        adds a user message, ["mutate"] fires the observer. Returns the clicks
+        (in order, by queued item) and the recorded intents."""
+        import shutil
+        import subprocess
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("no node")
+        script = textwrap.dedent("""
+            const [codes, steps, path, icon] = JSON.parse(process.argv[1]);
+            let observer = null;
+            const queue = [], users = [], clicks = [];
+            global.MutationObserver = class { constructor(f) { observer = f; } observe() {} };
+            global.window = {};
+            global.location = { pathname: path };
+            global.document = {
+              body: {},
+              addEventListener() {},
+              querySelectorAll(sel) {
+                if (sel.startsWith('.user-message')) return users.map((id) => ({ id: 'message-' + id }));
+                return [];
+              },
+              querySelector(sel) {
+                const item = queue[0];
+                if (!item || !sel.includes(':not([disabled])') || !sel.includes('path[d="' + icon + '"]')) return null;
+                return { closest: () => ({ click() { clicks.push(item.n); } }) };
+              },
+            };
+            for (const c of codes) new Function(c)();
+            let n = 0;
+            for (const s of steps) {
+              if (s[0] === 'queue') queue.push({ n: ++n });
+              else if (s[0] === 'user') { users.push(s[1]); queue.shift(); }
+              observer();
+            }
+            console.log(JSON.stringify({ clicks, intents: window.__ocIntents || {} }));
+        """)
+        codes = [openclaw_pipe._page_hooks_js(chat, on) for chat, on in chat_flags.items()]
+        out = subprocess.run([node, "-e", script, json.dumps([codes, steps, path, self.SEND_NOW_ICON])],
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout)
+
+    def test_a_queued_message_is_sent_at_once_as_send_now(self):
+        got = self.run_page({"chat-1": True}, [["user", "u1"], ["queue"]])
+        self.assertEqual(got["clicks"], [1])
+        self.assertEqual(got["intents"]["chat-1"]["kind"], "send_now")
+
+    def test_the_next_queued_message_waits_until_the_last_one_is_in_the_chat(self):
+        """Open WebUI ignores a Send now while it is still submitting the
+        previous one, so the second click waits for that user message."""
+        got = self.run_page({"chat-1": True}, [
+            ["user", "u1"], ["queue"], ["queue"], ["mutate"], ["user", "u2"]])
+        self.assertEqual(got["clicks"], [1, 2])
+
+    def test_a_second_queued_message_is_not_clicked_while_the_first_is_in_flight(self):
+        got = self.run_page({"chat-1": True}, [["user", "u1"], ["queue"], ["queue"], ["mutate"]])
+        self.assertEqual(got["clicks"], [1])
+
+    def test_off_leaves_the_message_in_open_webuis_queue(self):
+        got = self.run_page({"chat-1": False}, [["user", "u1"], ["queue"]])
+        self.assertEqual(got["clicks"], [])
+        self.assertEqual(got["intents"], {})
+
+    def test_a_chat_the_pipe_never_flagged_is_left_alone(self):
+        """A chat on another model gets no hooks from the Pipe, so no flag."""
+        got = self.run_page({"chat-1": True}, [["user", "u1"], ["queue"]], path="/c/chat-2")
+        self.assertEqual(got["clicks"], [])
+
+    def test_the_valve_defaults_on(self):
+        self.assertIs(openclaw_pipe.Pipe.Valves().AUTO_SEND_WHILE_RUNNING, True)
+        self.assertIs(openclaw_pipe._auto_send_on(types.SimpleNamespace()), True)
+        self.assertIs(openclaw_pipe._auto_send_on(
+            types.SimpleNamespace(AUTO_SEND_WHILE_RUNNING=False)), False)
 
 
 class RunSpanTests(unittest.TestCase):

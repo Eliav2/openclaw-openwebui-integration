@@ -70,6 +70,12 @@ Type: `float`. Default: `10.0`.
 
 Recommended: 10. Fallback only: the Pipe asks the page whether a cancel was Stop or Send now and acts on that at once; this window applies when the page cannot say (a non-English UI, API clients). Sending a message while the agent is working (Open WebUI's Send now, or sending with the message queue off) stops the current response. With this set, the agent's run is kept alive instead: the new reply first shows the rest of the running turn, then answers your message. A plain Stop with no new message still stops the run after this many seconds. 0 stops immediately, as before.
 
+### AUTO_SEND_WHILE_RUNNING
+
+Type: `bool`. Default: `True`.
+
+Recommended. A message you send while the agent is working goes into the chat at once, instead of waiting in Open WebUI's queue above the composer for you to click Send now. The running reply is not stopped: the agent finishes its current work, then answers your message. Off: Open WebUI queues it, and it is sent when the reply ends or when you click Send now.
+
 ### OWUI_BASE_URL
 
 Type: `str`. Default: `http://127.0.0.1:8080`.

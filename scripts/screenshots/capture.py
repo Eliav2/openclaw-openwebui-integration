@@ -347,6 +347,8 @@ def wait_js(page: Page, js: str, what: str, timeout_ms: int = TURN_TIMEOUT_MS) -
 
 
 LAST_ASSISTANT = "[...document.querySelectorAll('.chat-assistant')].pop()"
+# The Send now arrow of a message Open WebUI queued above the composer.
+SEND_NOW_ICON = "M4.5 10.5 12 3m0 0 7.5 7.5M12 3v18"
 # The Status dialog's sub-agent elapsed cells (the only 10 px spans in it).
 ELAPSED_CELLS = """() => [...document.querySelectorAll('#openclaw-status-section-subagents span')]
   .filter(s => s.style.fontSize === '10px').map(s => s.textContent)"""
@@ -861,36 +863,52 @@ class Scenes:
         park_mouse(page)
         self.s.shot(page, "stop")
 
-    def _busy_then_queue(self, page: Page, title: str) -> str:
+    def _send_while_busy(self, page: Page, title: str) -> str:
         new_chat(page)
         chat = send(page, "Rebuild the forecast cache.")
         wait_js(page, f"() => {{ const s = ({CARDS_STATE})(); return s && s.active >= 1; }}", "the running rebuild card")
         set_title(self.token, chat, title)
-        # A phone composer sends with the button, not Enter; while a reply
-        # runs, Open WebUI queues the message above the composer.
+        # A phone composer sends with the button, not Enter.
         page.locator("#chat-input").click()
         page.keyboard.type("Which branch is this on?", delay=5)
         page.locator("#send-message-button").click()
-        page.locator('button[aria-label="Send now"]').first.wait_for(timeout=30_000)
         return chat
 
-    def queued(self, page: Page) -> None:
-        """A message sent while the agent works: queued, then answered for real."""
-        self._busy_then_queue(page, "Cache rebuild")
-        park_mouse(page)
-        self.s.shot(page, "message-queued")
-        wait_js(page, last_text_has("It's on main"), "the queued message's own reply", TURN_TIMEOUT_MS)
-
-    def send_now(self, page: Page) -> None:
-        """Send now on a queued message: the running reply finishes, then the
-        new message gets its own answer."""
-        self._busy_then_queue(page, "Cache rebuild, send now")
-        page.locator('button[aria-label="Send now"]').first.click()
+    def _both_answered(self, page: Page) -> None:
+        """The rebuild ran to its end (nothing aborted it), then the new
+        message got its own answer."""
         wait_js(page, """() => { const all = [...document.querySelectorAll('.chat-assistant')].map(a => a.innerText).join('\\n');
                  return all.includes('The cache is rebuilt') && all.includes("It's on main"); }""",
                 "the finished rebuild and the answer to the new message")
         wait_js(page, f"() => {{ const m = {LAST_ASSISTANT}.closest('[id^=message-]'); return m && m.querySelector('button[aria-label=\"Copy\"]'); }}",
                 "the answer finished", 60_000)
+
+    def sent_mid_run(self, page: Page) -> None:
+        """A message sent while a tool runs (AUTO_SEND_WHILE_RUNNING, on by
+        default): it is in the chat at once, with no queue to click, while
+        the rebuild is still running; then both are answered."""
+        self._send_while_busy(page, "Cache rebuild")
+        wait_js(page, f"""() => [...document.querySelectorAll('.user-message')]
+                   .some(m => m.innerText.includes('Which branch is this on?'))
+                 && !document.querySelector('button path[d="{SEND_NOW_ICON}"]')
+                 && !document.body.innerText.includes('The cache is rebuilt')""",
+                "the new message in the chat while the rebuild still runs", 30_000)
+        park_mouse(page)
+        self.s.shot(page, "message-sent-mid-run")
+        self._both_answered(page)
+
+    def send_now(self, page: Page) -> None:
+        """AUTO_SEND_WHILE_RUNNING off: Open WebUI queues the message; Send
+        now on it lets the running reply finish, then the new message gets
+        its own answer."""
+        old = pipe_valves(self.token, AUTO_SEND_WHILE_RUNNING=False)
+        try:
+            self._send_while_busy(page, "Cache rebuild, send now")
+            page.locator('button[aria-label="Send now"]').first.wait_for(timeout=30_000)
+            page.locator('button[aria-label="Send now"]').first.click()
+            self._both_answered(page)
+        finally:
+            pipe_valves(self.token, **old)
         self.s.shot(page, "send-now")
 
     def image_input(self, page: Page) -> None:
@@ -1024,7 +1042,7 @@ def main(argv=None) -> int:
             shooter.run("error-message", scenes.error_message, page)
             shooter.run("chat-titles", scenes.chat_titles, page)
             shooter.run("stop", scenes.stop, page)
-            shooter.run("message-queued", scenes.queued, page)
+            shooter.run("message-sent-mid-run", scenes.sent_mid_run, page)
             shooter.run("send-now", scenes.send_now, page)
             shooter.run("image-input", scenes.image_input, page)
             shooter.run("valves", scenes.admin_valves, page)

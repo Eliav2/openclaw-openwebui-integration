@@ -2090,10 +2090,10 @@ class _ComposerWatcher:
         message_id = _composer_latest_user_message_id(data.get("history") or {})
         if not message_id:
             return "skip"
-        # The Stop / Send now intent hook rides along: a tab that opens the
-        # chat after a turn writer started must still answer its cancel query
-        # (ELI-100 case 8). Wrapped so the hook's own `return` ends only it.
-        code = ("(function () {" + _INTENT_HOOK_JS + "})();\n"
+        # The Stop / Send now intent hook and the auto-send hook ride along: a
+        # tab that opens the chat after a turn writer started must still
+        # answer its cancel query (ELI-100 case 8) and send what it queues.
+        code = (_page_hooks_js(chat_id, _auto_send_on(self.valves_getter()))
                 + _render_composer_button_js(session_id=sid, model_prefixes=prefixes, chat_id=chat_id))
         acked = await self._call_sid(sid, {
             "chat_id": chat_id,
@@ -6745,6 +6745,60 @@ return true;
 """
 
 
+# Open WebUI holds a message sent while a reply runs in a queue above the
+# composer, in the browser only, until the reply ends or Send now is clicked.
+# In an OpenClaw chat with AUTO_SEND_WHILE_RUNNING on, this hook clicks Send
+# now for the user as soon as a queued message appears, so the message lands
+# in the chat at once. The click is marked as Send now for the intent query,
+# so the run is kept, never aborted. The button is found by its icon, which
+# Open WebUI draws only there and does not translate. One click at a time: a
+# click is in flight until a new user message is the chat's last (Open WebUI
+# ignores a Send now while it is still submitting the previous one).
+_AUTO_SEND_HOOK_JS = r"""
+if (!window.__ocAutoSendHook) {
+  window.__ocAutoSendHook = true;
+  window.__ocAutoSend = window.__ocAutoSend || {};
+  const SEND_NOW_ICON = 'M4.5 10.5 12 3m0 0 7.5 7.5M12 3v18';
+  const chat = () => (location.pathname.match(/\/c\/([^/?#]+)/) || [])[1] || null;
+  const lastUser = () => {
+    const all = document.querySelectorAll('.user-message[id^="message-"]');
+    return all.length ? all[all.length - 1].id : null;
+  };
+  let inFlight = null;
+  const sendQueued = () => {
+    const c = chat();
+    if (!c || !window.__ocAutoSend[c]) return;
+    if (inFlight && inFlight.chat === c && inFlight.lastUser === lastUser()) return;
+    inFlight = null;
+    const path = document.querySelector(`button:not([disabled]) path[d="${SEND_NOW_ICON}"]`);
+    const b = path && path.closest('button');
+    if (!b) return;
+    inFlight = { chat: c, lastUser: lastUser() };
+    window.__ocIntents = window.__ocIntents || {};
+    window.__ocIntents[c] = { kind: 'send_now', t: Date.now() };
+    b.click();
+  };
+  new MutationObserver(sendQueued).observe(document.body, {
+    childList: true, subtree: true, attributes: true, attributeFilter: ['disabled'] });
+  window.__ocAutoSendScan = sendQueued;
+}
+"""
+
+
+def _page_hooks_js(chat_id: str | None, auto_send: bool) -> str:
+    """The page hooks an OpenClaw chat's tab gets: the Stop / Send now intent
+    hook and the auto-send hook, with this chat's auto-send setting."""
+    code = "(function () {" + _INTENT_HOOK_JS + "})();\n(function () {" + _AUTO_SEND_HOOK_JS + "})();\n"
+    if chat_id:
+        code += ("window.__ocAutoSend[" + json.dumps(chat_id) + "] = " + ("true" if auto_send else "false")
+                 + ";\nwindow.__ocAutoSendScan();\n")
+    return code
+
+
+def _auto_send_on(valves) -> bool:
+    return bool(getattr(valves, "AUTO_SEND_WHILE_RUNNING", True))
+
+
 def _intent_query_js(chat_id: str) -> str:
     """Read and clear what the page recorded for `chat_id` (see
     `_INTENT_HOOK_JS`). "none" means the hook is there but saw no click, so
@@ -6879,7 +6933,8 @@ class _TurnWriter:
         try:
             # Case 8: lets a cancel of this task ask the page whether it was
             # Stop or Send now. Idempotent in the page.
-            await (await self._emitter())({"type": "execute", "data": {"code": _INTENT_HOOK_JS}})
+            await (await self._emitter())({"type": "execute", "data": {
+                "code": _page_hooks_js(self.chat_id, _auto_send_on(self.conn._valves()))}})
         except Exception as ex:
             pipe_log(f"  turn writer: intent hook install failed: {ex!r}")
         pipe_log(f"  turn writer: opened {self.message_id[:8]}... ({claim['how']}) for run "
@@ -9016,6 +9071,8 @@ class Pipe:
     - SEND_STOP_ON_CANCEL: send /stop after chat.abort when OWUI cancels
     - INTERRUPT_GRACE_SECONDS: how long a cancel waits for a follow-up message
       before aborting the run (default 3; 0 aborts immediately)
+    - AUTO_SEND_WHILE_RUNNING: a message sent while a reply runs goes into
+      the chat at once instead of waiting in Open WebUI's queue (default True)
     """
 
     class Valves(BaseModel):
@@ -9098,6 +9155,15 @@ class Pipe:
                 "the rest of the running turn, then answers your message. A "
                 "plain Stop with no new message still stops the run after this "
                 "many seconds. 0 stops immediately, as before."
+        )
+        AUTO_SEND_WHILE_RUNNING: bool = Field(
+            default=True,
+            description="Recommended. A message you send while the agent is "
+                "working goes into the chat at once, instead of waiting in Open "
+                "WebUI's queue above the composer for you to click Send now. The "
+                "running reply is not stopped: the agent finishes its current "
+                "work, then answers your message. Off: Open WebUI queues it, "
+                "and it is sent when the reply ends or when you click Send now."
         )
         OWUI_BASE_URL: str = Field(
             default="http://127.0.0.1:8080",
@@ -9676,10 +9742,12 @@ class _PipeTurn:
         self.turn.unsent = list(self._send_texts) if self._send_texts else [self.text]
         if self.owui_origin_chat_id and self.__event_emitter__:
             # Lets a later cancel ask the page whether it was Stop or Send
-            # now. Idempotent in the page; fire-and-forget.
+            # now, and sends a message queued while this reply runs at once
+            # (AUTO_SEND_WHILE_RUNNING). Idempotent in the page; fire-and-forget.
             try:
                 await self.__event_emitter__(
-                    {"type": "execute", "data": {"code": _INTENT_HOOK_JS}})
+                    {"type": "execute", "data": {"code": _page_hooks_js(
+                        self.owui_origin_chat_id, _auto_send_on(self.pipe.valves))}})
             except Exception as ex:
                 pipe_log(f"  intent hook install failed: {ex!r}")
         # What actually went out in this turn's chat.send, for the

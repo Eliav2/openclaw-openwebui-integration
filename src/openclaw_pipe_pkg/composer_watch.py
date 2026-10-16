@@ -161,10 +161,10 @@ class _ComposerWatcher:
         message_id = _composer_latest_user_message_id(data.get("history") or {})
         if not message_id:
             return "skip"
-        # The Stop / Send now intent hook rides along: a tab that opens the
-        # chat after a turn writer started must still answer its cancel query
-        # (ELI-100 case 8). Wrapped so the hook's own `return` ends only it.
-        code = ("(function () {" + _INTENT_HOOK_JS + "})();\n"
+        # The Stop / Send now intent hook and the auto-send hook ride along: a
+        # tab that opens the chat after a turn writer started must still
+        # answer its cancel query (ELI-100 case 8) and send what it queues.
+        code = (_page_hooks_js(chat_id, _auto_send_on(self.valves_getter()))
                 + _render_composer_button_js(session_id=sid, model_prefixes=prefixes, chat_id=chat_id))
         acked = await self._call_sid(sid, {
             "chat_id": chat_id,

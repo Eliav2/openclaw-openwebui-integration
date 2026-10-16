@@ -29,11 +29,15 @@ Valves: [`GATEWAY_URL`](../configuration.md#gateway_url), [`GATEWAY_TOKEN`](../c
 
 ## Messages sent while the agent works
 
-Send a message while the agent is still working (from another tab, or while a run you did not start is active) and it waits for the current run to finish, then gets a real reply of its own. The status line says "Queued: waiting for the current run to finish...". What you do not get is a blank reply, which is what the naive implementation produces.
+Send a message while the agent is working, even in the middle of a long tool call, and it is in the chat at once. The tool is not interrupted and the run is not stopped: the agent finishes its current work, then answers your message in its own reply. What you do not get is a blank reply, which is what the naive implementation produces.
 
-![A message sent while a reply runs, held above the composer by Open WebUI](../img/message-queued-light.png)
+![A message sent while the cache rebuild runs: it is in the chat at once, and the rebuild keeps going](../img/message-sent-mid-run-light.png)
 
-In the tab where the reply is running, Open WebUI holds the new message itself, as above, and sends it when the reply ends. The Pipe's own queue is for a message from another tab or device, or one sent during a run you did not start.
+Left alone, Open WebUI would hold the message in a queue above the composer until the reply ends, and send it only when you click its Send now arrow. With [`AUTO_SEND_WHILE_RUNNING`](../configuration.md#auto_send_while_running) on (the default), the Pipe clicks it for you in OpenClaw chats as soon as the message is queued, and the click goes through [Send now](#send-now), which keeps the run. Turn the valve off to get Open WebUI's queue back. Open WebUI's own **Settings > Interface > Enable Message Queue** switch, when off, also sends at once, the same way.
+
+The agent reads your message once its current run is done, not between two tool calls. On the `claude-cli` runtime the Gateway cannot add a message to a run that is already going (OpenClaw 2026.9.3: such a message is dropped), so the Pipe holds it and sends it right after the run ends.
+
+A message from another tab or device, or one sent during a run you did not start, waits in the Pipe's own queue the same way. The status line says "Queued: waiting for the current run to finish...".
 
 Whether a run is active comes from the Gateway: `sessions.describe`, confirmed against `sessions.list`'s `hasActiveRun`, which holds across several Open WebUI processes. A parent that is paused waiting on a sub-agent counts as busy, not finished. The wait ends when the Gateway pushes that the run settled, with no polling and no time limit. A per-session send lock means two messages released at the same moment cannot merge into one run.
 
@@ -115,7 +119,7 @@ Open WebUI implements "Send now" on a queued message (and sending while a reply 
 
 ![After Send now: the running reply finished, then the new message's own answer](../img/send-now-light.png)
 
-So the Pipe asks the page. It installs a small listener in the chat page that records which you pressed: Stop or Escape, versus Send now or Enter while a reply runs. On a cancel it reads that answer through Open WebUI's `execute` event:
+So the Pipe asks the page. It installs a small listener in the chat page that records which you pressed: Stop or Escape, versus Send now or Enter while a reply runs. A Send now the Pipe clicks for you ([`AUTO_SEND_WHILE_RUNNING`](../configuration.md#auto_send_while_running)) is recorded as Send now too. On a cancel it reads that answer through Open WebUI's `execute` event:
 
 - **Stop:** the run is aborted at once.
 - **Send now:** the run is kept alive (up to 120 seconds) until your new message arrives. The new reply first streams the rest of the run (its remaining tool calls and text), then answers your message. The status line says "Continuing the current task; your message is next...".
@@ -124,7 +128,7 @@ While the page's answer is on its way, the run is held. So a Stop followed by Op
 
 Nothing is dropped along the way. The run's events are buffered from the moment of the cancel, so the new reply continues exactly where the old one stopped. A reply interrupted before it could send its own message (Send now twice in a row, or while it waits behind a running reply) hands that message on, and the next reply sends it together with its own. Open WebUI ends a reply either by cancelling it or by closing its stream, depending on timing; both are handled the same way.
 
-When the page cannot answer, `INTERRUPT_GRACE_SECONDS` applies as a fallback: a new message inside that window keeps the run, otherwise it is aborted. That happens when Open WebUI is in a language other than English (Stop is recognised by its icon, but Send now only by its English label) or for a client calling the API directly. `0` aborts at once.
+When the page cannot answer, `INTERRUPT_GRACE_SECONDS` applies as a fallback: a new message inside that window keeps the run, otherwise it is aborted. That happens when Open WebUI is in a language other than English and you click Send now yourself (Stop is recognised by its icon, but a Send now click only by its English label; the Pipe's own auto-send is recorded in any language) or for a client calling the API directly. `0` aborts at once.
 
 Valve: [`INTERRUPT_GRACE_SECONDS`](../configuration.md#interrupt_grace_seconds) (default `10`).
 

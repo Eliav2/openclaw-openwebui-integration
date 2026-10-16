@@ -48,7 +48,7 @@ To watch a sub-agent while it works, open it from the [Status dialog](./status.m
 
 - **Stop** aborts the run and finishes the message with what it has.
 - **Send now** (or Enter while the reply runs, with Open WebUI's message queue off) keeps the run going to its end in the same message; your message runs right after it.
-- **A message you send while it streams** is queued by Open WebUI, because the chat shows as generating. If it is sent anyway, the Pipe waits for the run to finish and then sends it as its own reply. It is never mixed into the agent's run.
+- **A message you send while it streams** is in the chat at once ([`AUTO_SEND_WHILE_RUNNING`](../configuration.md#auto_send_while_running)). The Pipe waits for the run to finish and then sends it as its own reply. It is never mixed into the agent's run.
 
 ## Images, files and questions
 
