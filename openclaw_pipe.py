@@ -4854,16 +4854,18 @@ class _GatewayConnection:
 
     def register_run_target(self, session_key: str, run_id: str,
                             chat_id: str | None, message_id: str | None,
-                            thinking: str | None = None) -> None:
+                            thinking: str | None = None,
+                            request_task_id: str | None = None) -> None:
         """Remember that this run streams into OWUI message `message_id` in
         `chat_id`, and start a shadow `_TurnRenderer` for it. No-op without both
         ids (e.g. a chat with no stable message id yet). `thinking`: the
-        turn's level, which a writer's resume keeps."""
+        turn's level, which a writer's resume keeps. `request_task_id`: Open
+        WebUI's task for the request, whose end a handover's write waits for."""
         if not (chat_id and message_id and run_id):
             return
         key = f"{session_key}:{run_id}"
         self._run_targets[key] = {"chat_id": chat_id, "message_id": message_id,
-                                  "thinking": thinking}
+                                  "thinking": thinking, "request_task_id": request_task_id}
         self._run_renderers[key] = _TurnRenderer()
         # Bound memory: a run that never emits a terminal would otherwise leak
         # its target/renderer forever. Far above any real concurrency.
@@ -4879,7 +4881,8 @@ class _GatewayConnection:
         key = f"{session_key}:{run_id}"
         target = self._run_targets[key]
         return {"message_id": target["message_id"], "renderer": self._run_renderers.get(key),
-                "thinking": thinking or target.get("thinking"), "shown": target.get("shown", "")}
+                "thinking": thinking or target.get("thinking"), "shown": target.get("shown", ""),
+                "request_task_id": target.get("request_task_id")}
 
     def unregister_run_target(self, session_key: str, run_id: str) -> None:
         key = f"{session_key}:{run_id}"
@@ -6509,6 +6512,15 @@ def _owui_redis():
     return getattr(getattr(app, "state", None), "redis", None)
 
 
+def _owui_request_task(task_id: str | None):
+    """The asyncio task Open WebUI runs a chat request in (main.py
+    `create_task`, keyed by the request's `task_id`): the Pipe call, then the
+    end-of-stream save of its message (utils/middleware.py). None once it
+    has ended (Open WebUI drops it then) or when unknown."""
+    if not task_id:
+        return None
+    return (getattr(sys.modules.get("open_webui.tasks"), "tasks", None) or {}).get(task_id)
+
 TURN_CUT_OFF_NOTE = ("_(This reply was cut off: the run was interrupted again after "
                      f"{MAX_TURN_RESUMES} attempts to continue it.)_")
 
@@ -6637,21 +6649,6 @@ def _is_sentinel_message_item(item: dict) -> bool:
 def _turn_note_item(note: str) -> dict:
     return {"type": "message", "id": f"msg_note_{uuid.uuid4().hex[:12]}", "status": "completed",
             "role": "assistant", "content": [{"type": "output_text", "text": note}]}
-
-
-def _output_item_boundary(sent: list, current: list) -> bool:
-    """True when `current` has a new item, or an item other than a growing
-    message text changed (a tool result, a finished card)."""
-    if len(current) != len(sent):
-        return True
-    for i, (old, new) in enumerate(zip(sent, current)):
-        if old == new:
-            continue
-        growing_text = (i == len(current) - 1 and new.get("type") == "message"
-                        and old.get("id") == new.get("id"))
-        if not growing_text:
-            return True
-    return False
 
 
 # Open WebUI cancels a response identically for Stop and for Send now (both
@@ -6810,7 +6807,8 @@ class _TurnWriter:
     def __init__(self, conn: "_GatewayConnection", *, session_key: str, chat_id: str,
                  user_id: str, run_id: str, message_id: str | None,
                  takeover: bool = False, renderer: "_TurnRenderer | None" = None,
-                 thinking: str | None = None, wake: dict | None = None, shown: str = ""):
+                 thinking: str | None = None, wake: dict | None = None, shown: str = "",
+                 request: "asyncio.Future | None" = None):
         self.conn = conn
         self.session_key, self.chat_id, self.user_id = session_key, chat_id, user_id
         self.run_id, self.message_id = run_id, message_id
@@ -6840,6 +6838,12 @@ class _TurnWriter:
         self.awaiting_row = False       # kept open for a Gateway recovery
         self.closed = False             # nothing more to write (ended, or M is someone else's)
         self.sent_output: list = []     # the `output` open tabs hold
+        # A handover owes M one write: Open WebUI's end-of-stream save of the
+        # request writes `done: true` over M, and the orphan reconcile adopts
+        # only `done: false`. `request` is that request's task: the write
+        # waits for it to end, so it lands after the save (ELI-115).
+        self.handover_owed = renderer is not None
+        self.request = request
         if renderer is not None:
             # A handed renderer is what the request showed: open tabs hold
             # those items, but under Open WebUI's ids, so an `added` would
@@ -6932,20 +6936,20 @@ class _TurnWriter:
 
     async def _stream(self) -> None:
         """Emit the output change as Responses events (Open WebUI forwards a
-        throttled shared copy to the chat room), keep the response stream
-        current for a tab that opens the chat mid-turn, and write the DB on
-        item boundaries (a new item, a tool result), not per text delta."""
+        throttled shared copy to the chat room) and keep the response stream
+        current for a tab that opens the chat mid-turn. Mid-turn the DB is
+        written only once at a handover, after the request's own save."""
         output, text = await self._view(final=False)
         emit = await self._emitter()
         for ev in _relay_output_events(self.sent_output, output):
             await emit({"type": "response:completion", "data": ev})
-        boundary = _output_item_boundary(self.sent_output, output)
         self.sent_output = copy.deepcopy(output)
         from open_webui.tasks import save_response_stream
 
         await save_response_stream(_owui_redis(), self.task_id, self.chat_id, self.message_id,
                                    text, self.sent_output)
-        if boundary:
+        if self.handover_owed and (self.request is None or self.request.done()):
+            self.handover_owed = False
             await self._persist(done=False, output=output, text=text)
 
     def _rewrite(self, text: str) -> str:
@@ -7717,7 +7721,8 @@ def _hand_over_run(conn: "_GatewayConnection", session_key: str, run_id: str, *,
     else:
         pump.handover = {"message_id": reply["message_id"], "renderer": reply["renderer"],
                          "thinking": thinking or (target or {}).get("thinking"), "shown": "",
-                         "no_resume": bool(reply.get("no_resume"))}
+                         "no_resume": bool(reply.get("no_resume")),
+                         "request_task_id": (target or {}).get("request_task_id")}
         for payload in reply["events"]:
             pump.queue.put_nowait(("event", payload))
     pump.stop_notice_before = conn._stop_notice_seen
@@ -7786,10 +7791,15 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
         if pump.writer is not None:
             pass  # adopted from a gone writer's message (_adopt_turn_message)
         elif handed is not None:
+            request = _owui_request_task(handed.get("request_task_id"))
             pump.writer = _TurnWriter(conn, session_key=sess, chat_id=chat_id, user_id=user_id,
                                       run_id=run, message_id=handed["message_id"], takeover=True,
                                       renderer=handed["renderer"], thinking=handed.get("thinking"),
-                                      shown=handed.get("shown", ""))
+                                      shown=handed.get("shown", ""), request=request)
+            if request is not None and not request.done():
+                # The request's save is done once its task is: stream again
+                # then, which writes the handover.
+                request.add_done_callback(lambda _t: pump.queue.put_nowait(("event", None)))
             conn._turn_writers[(chat_id, handed["message_id"])] = pump.writer
             if handed.get("no_resume"):
                 # Kept by Send now (ELI-158): the user's new message is next
@@ -10005,6 +10015,7 @@ class _PipeTurn:
         self.conn.register_run_target(
             self.session_key, self.our_run_id, self.owui_origin_chat_id, self.owui_message_id,
             thinking=self.resolved_thinking,
+            request_task_id=(self.__metadata__ or {}).get("task_id"),
         )
         # When the Gateway had admitted this reply's run (chat.send returned;
         # an adopted run already ran). An idle row read after it means the

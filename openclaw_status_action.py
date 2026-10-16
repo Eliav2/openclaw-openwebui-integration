@@ -2469,16 +2469,18 @@ class _GatewayConnection:
 
     def register_run_target(self, session_key: str, run_id: str,
                             chat_id: str | None, message_id: str | None,
-                            thinking: str | None = None) -> None:
+                            thinking: str | None = None,
+                            request_task_id: str | None = None) -> None:
         """Remember that this run streams into OWUI message `message_id` in
         `chat_id`, and start a shadow `_TurnRenderer` for it. No-op without both
         ids (e.g. a chat with no stable message id yet). `thinking`: the
-        turn's level, which a writer's resume keeps."""
+        turn's level, which a writer's resume keeps. `request_task_id`: Open
+        WebUI's task for the request, whose end a handover's write waits for."""
         if not (chat_id and message_id and run_id):
             return
         key = f"{session_key}:{run_id}"
         self._run_targets[key] = {"chat_id": chat_id, "message_id": message_id,
-                                  "thinking": thinking}
+                                  "thinking": thinking, "request_task_id": request_task_id}
         self._run_renderers[key] = _TurnRenderer()
         # Bound memory: a run that never emits a terminal would otherwise leak
         # its target/renderer forever. Far above any real concurrency.
@@ -2494,7 +2496,8 @@ class _GatewayConnection:
         key = f"{session_key}:{run_id}"
         target = self._run_targets[key]
         return {"message_id": target["message_id"], "renderer": self._run_renderers.get(key),
-                "thinking": thinking or target.get("thinking"), "shown": target.get("shown", "")}
+                "thinking": thinking or target.get("thinking"), "shown": target.get("shown", ""),
+                "request_task_id": target.get("request_task_id")}
 
     def unregister_run_target(self, session_key: str, run_id: str) -> None:
         key = f"{session_key}:{run_id}"

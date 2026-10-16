@@ -6410,6 +6410,8 @@ class _FakeOwuiChat:
                        "model": "openclaw_gateway.m", "done": True},
             }}}, current_message_id="a1", updated_at=0)
         self.rows, self.emits, self.tasks = {}, [], {}
+        # open_webui.tasks.tasks: the request tasks, by the request's task_id
+        self.request_tasks = {}
         lock = asyncio.Lock()
         fake = self
 
@@ -6423,6 +6425,7 @@ class _FakeOwuiChat:
 
             @staticmethod
             async def upsert_message_to_chat_by_id_and_message_id(chat_id, message_id, message):
+                fake.upserts.append(message_id)
                 if not message.get("content"):        # as Open WebUI does (models/chats.py)
                     text = _owui_output_text(message.get("output"))
                     if text:
@@ -6430,6 +6433,7 @@ class _FakeOwuiChat:
                 msgs = fake.chat.chat["history"]["messages"]
                 msgs[message_id] = {**msgs.get(message_id, {}), **message}
                 return fake.chat
+        self.upserts = []
         self._chats = Chats
 
         class ChatMessages:
@@ -6480,7 +6484,8 @@ class _FakeOwuiChat:
                 "open_webui.socket": mod("open_webui.socket"),
                 "open_webui.socket.main": self.socket_main,
                 "open_webui.tasks": mod("open_webui.tasks", create_task=create_task,
-                                        save_response_stream=save_response_stream),
+                                        save_response_stream=save_response_stream,
+                                        tasks=self.request_tasks),
                 "open_webui.main": mod("open_webui.main", app=types.SimpleNamespace(
                     state=types.SimpleNamespace(redis=None))),
                 "sqlalchemy": mod("sqlalchemy"), "sqlalchemy.orm": mod("sqlalchemy.orm"),
@@ -6611,22 +6616,45 @@ class TurnWriterStreamTests(_TurnWriterCase):
                                  "response.output_text.delta"])
         self.assertIs(self.owui.emitter_update_db, False, "the writer owns the DB writes")
 
-    async def test_the_db_is_written_on_item_boundaries_and_the_stream_on_every_event(self):
+    async def test_the_db_gets_no_write_mid_turn_and_the_stream_every_event(self):
+        """ELI-115: each DB write rewrites the whole chat, about 14x its JSON
+        in Open WebUI's memory, so a write per item (two per tool call) was
+        most of a long chat's churn. A tab that opens the chat mid-turn reads
+        the response stream (`overlay_response_streams`), not the DB: the DB
+        gets the claim and the end."""
         w = self.writer()
-        await w.feed(_delta("Reading"))           # opens: first item
-        writes_after_open = self.owui.msgs()["m1"].get("content")
-        await w.feed(_delta(" the logs"))         # same item: stream only
-        self.assertEqual(self.owui.msgs()["m1"].get("content"), writes_after_open)
-        await w.feed(_tool("start"))              # new item: boundary
-        self.assertEqual(self.owui.msgs()["m1"]["content"].strip()[:16], "Reading the logs")
-        self.assertEqual([i["type"] for i in self.owui.msgs()["m1"]["output"]],
-                         ["message", "function_call"])
-        await w.feed(_tool("result"))             # tool result: boundary
-        self.assertIn("function_call_output", [i["type"] for i in self.owui.msgs()["m1"]["output"]])
-        self.assertIs(self.owui.msgs()["m1"]["done"], False)
-        self.assertEqual(len(self.owui.streams), 4, "the response stream gets every event")
+        await w.feed(_delta("Reading the logs"))  # opens: the claim's own write
+        writes = len(self.owui.upserts)
+        for n in range(1, 16):
+            await w.feed(_tool("start", tcid=f"t{n}"))
+            await w.feed(_tool("result", tcid=f"t{n}"))
+        await w.feed(_delta("Found it."))
+        self.assertEqual(len(self.owui.upserts), writes, "no write per item")
+        self.assertEqual(self.owui.msgs()["m1"].get("output"), [])
+        self.assertEqual(len(self.owui.streams), 2 * 15 + 2, "the response stream gets every event")
         self.assertEqual(self.owui.streams[-1][0], w.task_id)
+        self.assertTrue(self.owui.streams[-1][2].endswith("Found it."))
 
+    async def test_a_handed_over_reply_is_written_once_at_the_handover(self):
+        """The request's own end-of-stream save writes `done: true` over M;
+        the handover's write is what says M is still being written, the
+        state the orphan reconcile adopts after a crash (ELI-90). Here the
+        request has already ended: the write comes at once, then none per
+        item."""
+        shown = _TurnRenderer()
+        shown.feed(_delta("Reading them."))
+        await self.owui.end_request("m1", copy.deepcopy(shown.output))
+        self.assertIs(self.owui.msgs()["m1"]["done"], True)
+        w = _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
+                        run_id="agent-run-1", message_id="m1", takeover=True, renderer=shown)
+        writes = len(self.owui.upserts)
+        await w.feed(None)
+        self.assertEqual(len(self.owui.upserts), writes + 1)
+        self.assertEqual((self.owui.msgs()["m1"]["done"], self.owui.msgs()["m1"]["content"]),
+                         (False, "Reading them."))
+        await w.feed(_tool("start"))
+        await w.feed(_tool("result"))
+        self.assertEqual(len(self.owui.upserts), writes + 1, "then no write per item")
 
 
 class TurnWriterEndTests(_TurnWriterCase):
@@ -7408,6 +7436,39 @@ class AgentTurnRoutingTests(_RoutingCase):
         m = self.owui.msgs()[self.STUB]
         self.assertIs(m["done"], True)
         self.assertEqual(m["content"], "Reading them.\n\nFound it.")
+
+    async def test_the_handover_write_lands_after_the_requests_own_save(self):
+        """ELI-115: the request's end-of-stream save (`done: true`) can land
+        after the writer's first stream. M's handover write waits for the
+        request's task to end, so the DB says `done: false` mid-turn, the
+        state the orphan reconcile adopts after a crash, with no later write
+        needed to say it again."""
+        run = pipe_run_id(self.CHAT, self.STUB)
+        self.add_stub(self.STUB, content="Reading them.")
+        request = asyncio.get_running_loop().create_future()
+        self.owui.request_tasks["req-1"] = request
+        self.conn.register_run_target(self.key, run, self.CHAT, self.STUB)
+        self.conn._run_targets[f"{self.key}:{run}"]["request_task_id"] = "req-1"
+        shown = self.conn._run_renderers[f"{self.key}:{run}"]
+        shown.feed(_delta("Reading them."))
+        self.assertTrue(await self.dispatch(run, _tool("start", tcid="toolu_1")))
+        await self.spin()
+        await self.dispatch(run, _tool("result", tcid="toolu_1"))
+        await self.spin()
+        # The request's save, then its task ends.
+        await self.owui.end_request(self.STUB, copy.deepcopy(shown.output))
+        self.assertIs(self.owui.msgs()[self.STUB]["done"], True)
+        writes = len(self.owui.upserts)
+        request.set_result(None)
+        await self.spin()
+        self.assertEqual(len(self.owui.upserts), writes + 1, "the handover's write, once")
+        m = self.owui.msgs()[self.STUB]
+        self.assertIs(m["done"], False)
+        self.assertEqual(sum(1 for i in m["output"] if i["type"] == "function_call_output"), 1)
+        await self.dispatch(run, _tool("start", tcid="toolu_2"))
+        await self.dispatch(run, _tool("result", tcid="toolu_2"))
+        await self.spin()
+        self.assertEqual(len(self.owui.upserts), writes + 1, "then none mid-turn")
 
     async def test_handover_an_inline_reply_that_ends_early_continues_in_its_own_message(self):
         run = pipe_run_id(self.CHAT, self.STUB)
@@ -9807,10 +9868,20 @@ class GapHandoverReplayTests(_RoutingCase):
             {"role": "assistant", "idempotencyKey": f"cli-assistant:{run}",
              "content": [{"type": "text", "text": closing}]}]}
 
-    def _calls(self, message_id):
-        out = self.owui.msgs()[message_id].get("output") or []
+    @staticmethod
+    def _call_ids(out):
         return ([i.get("call_id") or i.get("id") for i in out if i.get("type") == "function_call"],
                 [i.get("call_id") or i.get("id") for i in out if i.get("type") == "function_call_output"])
+
+    def _calls(self, message_id):
+        return self._call_ids(self.owui.msgs()[message_id].get("output") or [])
+
+    def _shown_calls(self, message_id):
+        """What a tab that opens the chat now is shown mid-turn: the latest
+        response stream of the message (Open WebUI's `overlay_response_streams`
+        over the DB copy)."""
+        outs = [o for _t, m, _c, o in self.owui.streams if m == message_id]
+        return self._call_ids(outs[-1] if outs else [])
 
     async def _answer_msg2(self, second):
         for _ in range(400):
@@ -9845,10 +9916,11 @@ class GapHandoverReplayTests(_RoutingCase):
             {"type": "text", "text": self._nums(11, 20)})
         self.frame(_tool("result", tcid="toolu_1"))
         for _ in range(400):
-            if self._calls(self.M1)[1]:
+            if self._shown_calls(self.M1)[1]:
                 break
             await asyncio.sleep(0.005)
-        self.assertEqual(self._calls(self.M1), (["toolu_1"], ["toolu_1"]), "done when the tool ends")
+        self.assertEqual(self._shown_calls(self.M1), (["toolu_1"], ["toolu_1"]),
+                         "done when the tool ends")
         self.frame(_delta(self._nums(11, 20)))
         self.frame({"state": "final"}, event="chat")
         self.active = False

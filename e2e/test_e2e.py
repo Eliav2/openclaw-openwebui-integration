@@ -681,6 +681,62 @@ def test_a_guest_run_continued_after_a_gateway_crash_stays_without_owner_rights(
     assert not any(o is True for _t, o in turns), f"an owner turn in a guest chat: {turns}"
 
 
+def _db_message(chat_id: str, message_id: str) -> dict:
+    """M as Open WebUI's DB holds it (what the orphan reconcile reads after a
+    crash), not the GET, which overlays a live response stream (`done: false`)."""
+    code = ("import json,sqlite3,sys;c=sqlite3.connect('/app/backend/data/webui.db');"
+            "r=c.execute('select chat from chat where id=?',(sys.argv[1],)).fetchone();"
+            "print(json.dumps(json.loads(r[0])['history']['messages'].get(sys.argv[2]) or {}))")
+    out = subprocess.run(["docker", "exec", "owui", "python3", "-c", code, chat_id, message_id],
+                         check=True, capture_output=True, text=True, timeout=60).stdout
+    return json.loads(out)
+
+
+@pytest.mark.skipif(not GATEWAY_PID_FILE or shutil.which("pgrep") is None or shutil.which("docker") is None,
+                    reason="needs the e2e stack's Gateway pid and Open WebUI container")
+def test_a_handed_over_reply_reads_not_done_in_the_db_once_its_request_ended(token):
+    """ELI-115: a Gateway crash hands the reply over to the turn writer. The
+    request's own end-of-stream save writes `done: true`; the writer's one
+    mid-turn write waits for the request's task to end, so while the run
+    goes on the DB says `done: false` (what the orphan reconcile adopts)."""
+    now = int(time.time())
+    uid, aid = str(uuid.uuid4()), str(uuid.uuid4())
+    prompt = "E2E_SLOW:40 E2E_HANDOVERDB"
+    user = {"id": uid, "parentId": None, "childrenIds": [aid], "role": "user",
+            "content": prompt, "timestamp": now, "models": [DEFAULT_MODEL]}
+    assistant = {"id": aid, "parentId": uid, "childrenIds": [], "role": "assistant",
+                 "content": "", "model": DEFAULT_MODEL, "timestamp": now, "done": False}
+    chat = {"title": "E2E handover DB", "models": [DEFAULT_MODEL],
+            "history": {"messages": {uid: user, aid: assistant}, "currentId": aid},
+            "messages": [user, assistant], "files": [], "tags": [], "timestamp": now * 1000}
+    status, created = _request("POST", "/api/v1/chats/new", {"chat": chat}, token)
+    assert status == 200, created
+    chat_id = created["id"]
+    key = _session_key(token, chat_id)
+    status, ack = _request("POST", "/api/chat/completions", {
+        "model": DEFAULT_MODEL, "messages": [{"role": "user", "content": prompt}],
+        "stream": True, "chat_id": chat_id, "id": aid, "session_id": f"e2e-{uuid.uuid4().hex[:8]}",
+        "parent_id": uid, "user_message": user}, token)
+    assert status == 200, ack
+    request_task = (_db_message(chat_id, aid).get("meta") or {}).get("task_id")
+    assert request_task, "Open WebUI records the request's task id on M"
+    _until("the run to start", lambda: _session_row(key).get("hasActiveRun"))
+    _kill_and_restart_gateway()
+
+    def request_ended():
+        status, got = _request("GET", "/api/tasks", token=token)
+        assert status == 200, got
+        return request_task not in got["tasks"]
+    _until("the request's task to end", request_ended, timeout_s=120)
+    # The reply is still being written (40 slow words): `done` here is the
+    # writer's mid-turn state, not its end.
+    _until("M to read done: false in the DB after the request's save",
+           lambda: _db_message(chat_id, aid).get("done") is False, timeout_s=30, every_s=0.5)
+    _until("the reply to finish", lambda: _db_message(chat_id, aid).get("done") is True,
+           timeout_s=300, every_s=3)
+    assert "slow-40" in (_db_message(chat_id, aid).get("content") or "")
+
+
 # ── The Status Action's Subagents section (ELI-106) ──────────────────────────
 # The section and its drawer read the chat's child sessions. The Action runs
 # here in the test process against the stack's Gateway, with the installed
