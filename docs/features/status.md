@@ -1,4 +1,4 @@
-The Status dialog shows a chat's context use, your rate limits and the sub-agents its runs spawned, fetched live when you open it. From there you can compact the session, or open any sub-agent's drawer to read its run like a chat.
+The Status dialog shows a chat's context use, your rate limits, what runs in the background for it and the sub-agents its runs spawned, fetched live when you open it. From there you can compact the session, or open any sub-agent's drawer to read its run like a chat.
 
 Applies to: Action (the composer Status button also needs the Pipe)
 Valves: `GATEWAY_URL`, `GATEWAY_TOKEN`, `DEVICE_IDENTITY`, `STATE_DIR`, `AGENT_ID`, `CONTROL_UI_URL` (Action); `COMPOSER_STATUS_BUTTON` (Pipe)
@@ -11,11 +11,31 @@ _Separate function: install the Status Action first, see [Status button](../inst
 
 _The rate limits in this screenshot are sample data._
 
-The Status Action adds a button to the message toolbar. It opens a dialog with three sections: Context, Rate Limits and Subagents.
+The Status Action adds a button to the message toolbar. It opens a dialog with five sections: Context, Rate limits, [Background](#background), [Subagents](#sub-agents) and In-process agents.
 
 ![The OpenClaw Status button on a reply's toolbar](../img/toolbar-button-light.png)
 
-Each section has its own skeleton and fills the moment its own request returns, so a slow sub-agent list does not hold up the context number. Usage bars are colour coded (green under 60%, amber from 60%, red from 85%), with the colours inlined so a theme cannot make them invisible.
+The dialog opens at once with every section's title. Each section then reads its own source and fills the moment that source answers, with its own loading, empty and error state, so a slow or failing source shows in its own section only:
+
+![The Status dialog while its rate limits are still loading: Context, Background, Subagents and In-process agents already filled](../img/status-dialog-loading-light.png)
+
+_Here the rate limits were held back on purpose, to show it._
+
+| Section | Reads |
+|---|---|
+| Context | `sessions.describe` |
+| Rate limits | `usage.status`, for the provider Context's read names (the same request); `claudeCliUsage.status` only when `usage.status` has no windows |
+| Background | `tasks.list`, `cron.list`, and Open WebUI's copy of the chat |
+| Subagents | `sessions.list` (the store's rows only); the sub-agents' transcripts (`sessions.preview`) only once the section is open |
+| In-process agents | Open WebUI's copy of the chat (the same read as Background's) |
+
+Each source is read once per open, all at the same time. Nothing is read while the dialog is closed: closing it tells the Action, which stops following its running sub-agents. In-process agents needs no Gateway, so it fills even when the Gateway cannot be reached.
+
+Background, Subagents and In-process agents fold, with their count in the title, for example "Background (3)". Each opens when something in it is running and starts folded otherwise; a tap opens or folds it, and stays that way while the dialog is open. When the dialog is taller than the screen, its sections scroll between the title bar and the footer, which stay in view, on a phone too:
+
+![The Status dialog on a small phone, scrolled to its end: the title bar and the footer stay on screen](../img/status-dialog-scrolled-light.png)
+
+Usage bars are colour coded (green under 60%, amber from 60%, red from 85%), with the colours inlined so a theme cannot make them invisible.
 
 The footer says when the dialog last refreshed and whether it used the Pipe's live connection (`via pipe`) or opened its own (`via action-own`). It reuses the Pipe's connection when one is open, and otherwise connects with the Pipe's saved device identity from `STATE_DIR`, so there is never a second device to approve. The Action's own connection only reads: it never writes a reply into a chat.
 
@@ -41,9 +61,36 @@ The `/compact` command becomes a turn in the session's stored transcript, so oth
 
 Typing `/compact` in the message box does not compact the session: Open WebUI 0.12 handles `/compact`, `/status`, `/fork` and `/model` itself, so they never reach OpenClaw. Use the Compact button in this dialog instead.
 
+## Background
+
+![The Background section: four station imports running, a daily automation for this chat, and the Gateway's other automations](../img/status-dialog-background-light.png)
+
+The Background section lists what runs for this chat outside a reply, running first, then the five newest that finished:
+
+- **Commands** left running in the background (`exec` with `background`, or one that outlived its wait), named by the command the chat's tool card shows.
+- **Image, Music and Video** jobs.
+- **Automations** that run in this chat: whether one is running, its next run, and its last error when it failed ("Failed 3 times in a row: ...").
+- **Agents**: Claude Code Agent calls started in the background, until the reply they hold open ends. A tap shows the task and the result, as under In-process agents.
+
+Sub-agents are listed under Subagents, not here.
+
+Owners also see **Other automations**: the Gateway's automations that run elsewhere, running and failing ones first, up to five ("5 of N"). Anyone not in the Pipe's [`OWNER_USERS`](../configuration.md#owner_users) sees only their own chat's. With `OWNER_USERS` empty, everyone is an owner, as everywhere else.
+
+The section reads only when the dialog opens. OpenClaw 2026.10 removed the Gateway's task list (`tasks.list`): there the section says background commands and media jobs are not available on this Gateway, and still lists the chat's automations.
+
+While a background agent holds a reply open, the reply's status row says so, so the chat does not look busy for no reason:
+
+![A reply's status row: Waiting on 1 background agent](../img/background-agent-waiting-light.png)
+
+It counts the background agents the reply started and stays until the reply ends.
+
 ## Sub-agents
 
-The Subagents section lists every child session this chat's runs spawned, ended ones included, newest first, up to 20 ("20 of N" when there are more). A running one's elapsed time counts up while the dialog is open; one that finishes meanwhile shows its end as soon as the Gateway pushes the change. Below them, **In-process agents** lists the chat's Claude Code Agent calls, which are not Gateway sessions, as their tool cards show them: running, in the background, returned, cut off or failed.
+The Subagents section lists every child session this chat's runs spawned, ended ones included, newest first, up to 20 ("20 of N" when there are more). A running one's elapsed time counts up while the dialog is open; one that finishes meanwhile shows its end as soon as the Gateway pushes the change. With none running, the section opens folded and reads the sub-agents' transcripts (their tasks and latest replies) on its first tap:
+
+![The Status dialog with every section folded, each with its count](../img/status-dialog-folded-light.png)
+
+**In-process agents** lists the chat's Claude Code Agent calls, which are not Gateway sessions, as their tool cards show them: running, in the background, returned, cut off or failed.
 
 Each row is one line: the sub-agent's spawn label (else the first sentence of its task, cut to 60 characters), its status, and its time, with up to two lines of its latest reply below. The whole task is in its drawer.
 
