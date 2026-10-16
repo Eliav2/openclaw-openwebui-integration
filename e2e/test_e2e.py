@@ -867,24 +867,6 @@ import types  # noqa: E402
 from unittest import mock  # noqa: E402
 
 
-def _background(tok: str, chat_id: str) -> tuple[dict, list]:
-    me = _me(tok)
-    codes = _run_action(tok, lambda a, emit: a.action(
-        {"chat_id": chat_id}, __user__={"id": me["id"]}, __event_emitter__=emit))
-    return _section_data(codes, "openclaw-status-section-background"), codes
-
-
-def test_the_status_action_lists_a_background_command(token):
-    chat_id, msg = _chat_turn(token, "E2E_BG_EXEC")
-    assert msg.get("content", "").strip() == "E2E_BG_STARTED", msg
-    data, _codes = _background(token, chat_id)
-    assert data["error"] is None and data["errors"] == [], data
-    assert data["tasksAvailable"] is True, data
-    commands = [r for r in data["rows"] if r["kind"] == "Command"]
-    # Titled by the command its tool card ran, not the Gateway's "CLI command".
-    assert [(r["title"], r["status"]) for r in commands] == [("sleep 25; echo e2e-bg-done", "running")], data
-
-
 class _LiveFunctions:
     """`open_webui.models.functions` for the Action run in this process: the
     live Open WebUI's saved Pipe valves, over its REST API. Inside Open WebUI
@@ -904,29 +886,63 @@ class _LiveFunctions:
         return valves
 
 
+class _LiveChats:
+    """`open_webui.models.chats`, likewise: the chat as the live Open WebUI
+    stores it, with its tool cards."""
+
+    def __init__(self, token: str):
+        self.token = token
+
+    def get_chat_by_id(self, chat_id):
+        status, row = _request("GET", f"/api/v1/chats/{chat_id}", token=self.token)
+        assert status == 200, row
+        return types.SimpleNamespace(user_id=row["user_id"], chat=row["chat"])
+
+
+def _background(tok: str, chat_id: str, admin_token: str) -> tuple[dict, list]:
+    """The Background section's data as `tok`'s user opens the dialog, with
+    the Action reading Open WebUI through its REST API (see above)."""
+    me = _me(tok)
+    functions = types.ModuleType("open_webui.models.functions")
+    functions.Functions = _LiveFunctions(admin_token)
+    chats = types.ModuleType("open_webui.models.chats")
+    chats.Chats = _LiveChats(tok)
+    owui = {"open_webui": types.ModuleType("open_webui"), "open_webui.models": types.ModuleType("open_webui.models"),
+            "open_webui.models.functions": functions, "open_webui.models.chats": chats}
+    with mock.patch.dict(sys.modules, owui):
+        codes = _run_action(tok, lambda a, emit: a.action(
+            {"chat_id": chat_id}, __user__={"id": me["id"]}, __event_emitter__=emit))
+    return _section_data(codes, "openclaw-status-section-background"), codes
+
+
+def test_the_status_action_lists_a_background_command(token):
+    chat_id, msg = _chat_turn(token, "E2E_BG_EXEC")
+    assert msg.get("content", "").strip() == "E2E_BG_STARTED", msg
+    data, _codes = _background(token, chat_id, token)
+    assert data["error"] is None and data["errors"] == [], data
+    assert data["tasksAvailable"] is True, data
+    commands = [r for r in data["rows"] if r["kind"] == "Command"]
+    # Titled by the command its tool card ran, not the Gateway's "CLI command".
+    assert [(r["title"], r["status"]) for r in commands] == [("sleep 25; echo e2e-bg-done", "running")], data
+
+
 def test_a_user_not_in_owner_users_never_sees_the_gateways_automations(token, guest_token):
     """Red team, through the real path: the guest's own Status dialog, read
     from the stack's Gateway with the installed Action's settings and the
     Pipe's saved OWNER_USERS (the owner's user id)."""
     me = _me(token)
     _set_owner_users(token, me["id"])
-    functions = types.ModuleType("open_webui.models.functions")
-    functions.Functions = _LiveFunctions(token)
-    owui = {"open_webui": types.ModuleType("open_webui"), "open_webui.models": types.ModuleType("open_webui.models"),
-            "open_webui.models.functions": functions}
     job = _gw("cron.add", {"name": "e2e-owner-only-automation", "schedule": {"kind": "cron", "expr": "0 4 1 1 *"},
                            "sessionTarget": "isolated", "payload": {"kind": "agentTurn", "message": "noop"},
                            "delivery": {"mode": "none"}, "agentId": "main"})
     try:
         o_chat, _ = _chat_turn(token, "Respond with exactly: E2E_OWNER_BG")
-        with mock.patch.dict(sys.modules, owui):
-            owner_view, _ = _background(token, o_chat)
+        owner_view, _ = _background(token, o_chat, token)
         # Precondition: the owner does see it, so the guest's empty list is the filter.
         assert owner_view["owner"] is True, owner_view
         assert "e2e-owner-only-automation" in [r["title"] for r in owner_view["automations"]], owner_view
         g_chat, _ = _chat_turn(guest_token, "Respond with exactly: E2E_GUEST_BG")
-        with mock.patch.dict(sys.modules, owui):
-            guest_view, codes = _background(guest_token, g_chat)
+        guest_view, codes = _background(guest_token, g_chat, token)
         assert guest_view["owner"] is False, guest_view
         assert guest_view["automations"] == [] and guest_view["automationsTotal"] == 0, guest_view
         assert not any("e2e-owner-only-automation" in c for c in codes), "an owner automation reached the guest's page"
