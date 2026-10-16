@@ -192,7 +192,9 @@ const ctx = el('openclaw-status-section-context');
 const compact = ctx ? ctx.walk().find((e) => e.tagName === 'BUTTON' && e.textContent === 'Compact') : null;
 if (input.click && compact) compact.onclick();
 console.log(JSON.stringify({
-  sections: ['context', 'limits', 'subagents'].map((n) => !!el('openclaw-status-section-' + n)),
+  sections: ['context', 'limits', 'background', 'subagents', 'agents'].map((n) => !!el('openclaw-status-section-' + n)),
+  titles: ['context', 'limits', 'background', 'subagents', 'agents'].map((n) => el('openclaw-status-section-' + n))
+    .map((e) => (e ? e.children[0].textContent : null)),
   context: text('openclaw-status-section-context'),
   limits: text('openclaw-status-section-limits'),
   wrap: text('openclaw-status-sections'),
@@ -226,8 +228,10 @@ class DialogSectionTests(unittest.TestCase):
                                        "sessionActive": session_active, "source": "pipe",
                                        "fetchedAt": 1, "error": None})
 
-    def test_the_dialog_opens_with_three_sections(self):
-        self.assertEqual(self._page([])["sections"], [True, True, True])
+    def test_the_dialog_opens_with_every_section_titled(self):
+        seen = self._page([])
+        self.assertEqual(seen["sections"], [True] * 5)
+        self.assertEqual(seen["titles"], ["Context", "Rate limits", "Background", "Subagents", "In-process agents"])
 
     def test_the_context_bar_colour_follows_usage(self):
         for pct, colour in ((95, "#f43f5e"), (70, "#f59e0b"), (10, "#10b981")):
@@ -238,7 +242,7 @@ class DialogSectionTests(unittest.TestCase):
 
     def test_no_windows_shows_a_note_and_why(self):
         seen = self._page([self._limits([], session_active=True)])
-        self.assertIn("Rate Limits", seen["limits"])
+        self.assertIn("Rate limits", seen["limits"])
         self.assertIn("No rate-limit data available right now (a response is in progress).", seen["limits"])
 
     def test_windows_show_without_the_note(self):
@@ -269,7 +273,7 @@ class DialogSectionTests(unittest.TestCase):
     def test_a_dialog_error_replaces_every_section(self):
         seen = self._page([self._context(10), _render_sections_error_js("Gateway unreachable")])
         self.assertEqual(seen["wrap"], "Gateway unreachable")
-        self.assertEqual(seen["sections"], [False, False, False])
+        self.assertEqual(seen["sections"], [False] * 5)
 
 
 class DrawerToolCardsStayOpenTests(unittest.TestCase):
@@ -602,11 +606,11 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(emitted[0]["type"], "notification")
         self.assertEqual(emitted[0]["data"]["type"], "error")
 
-    async def test_success_fills_all_three_sections_independently(self):
-        """Open happens before any network call; each of Context, Rate
-        Limits, Subagents then emits its own separate execute fill as its
-        own RPC resolves -- not one combined event. Exercises context+goal,
-        rate-limit windows, and a nonzero subagent count all end to end."""
+    async def test_success_fills_every_section_independently(self):
+        """Open happens before any network call; each section then emits
+        its own separate execute fill as its own source resolves -- not one
+        combined event. Exercises context+goal, rate-limit windows, and a
+        nonzero subagent count all end to end."""
         action = Action()
         emitted = []
         parent = "agent:main:openwebui-user-1-chat-1"
@@ -639,6 +643,10 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 ]}
             if method == "sessions.preview":
                 return {"previews": []}
+            if method == "tasks.list":
+                return {"tasks": []}
+            if method == "cron.list":
+                return {"jobs": []}
             raise AssertionError(f"unexpected RPC: {method}")
 
         fake_conn = mock.AsyncMock()
@@ -650,7 +658,8 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
             # happens before any network call, not just before return.
             self.assertEqual(len(emitted), 1)
             self.assertEqual(emitted[0]["type"], "execute")
-            self.assertIn("openclaw-status-section-context", emitted[0]["data"]["code"])
+            self.assertIn("'openclaw-status-section-' + s[0]", emitted[0]["data"]["code"])
+            self.assertIn('["context", "Context"]', emitted[0]["data"]["code"])
             self.assertIn("animate-pulse", emitted[0]["data"]["code"])
             return fake_conn, "pipe"
 
@@ -663,9 +672,9 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
         # Two children are running, so the dialog stays open to follow them.
         self.assertEqual(result, "following")
         codes = _emitted_codes(emitted)
-        # open + 3 independent fills + the Subagents re-read that starts the
+        # open + 5 independent fills + the Subagents re-read that starts the
         # follow (ELI-127)
-        self.assertEqual(len(codes), 5)
+        self.assertEqual(len(codes), 7)
 
         context_code = next(c for c in codes if "getElementById('openclaw-status-section-context')" in c)
         self.assertIn("anthropic", context_code)
@@ -681,7 +690,10 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"status": "completed"', subagents_code)
         self.assertNotIn("agent:main:subagent:d", subagents_code)
 
-    async def test_connect_failure_shows_dialog_wide_error(self):
+    async def test_connect_failure_errors_the_gateway_sections_only(self):
+        """Each section the Gateway fills says it could not connect, in its
+        own place; In-process agents reads Open WebUI's copy of the chat and
+        still fills."""
         action = Action()
         emitted = []
         emitter = RecordingEmitter(emitted)
@@ -694,9 +706,10 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["status"], "error")
         codes = _emitted_codes(emitted)
-        self.assertEqual(len(codes), 2)  # open, then one dialog-wide error fill
-        self.assertIn("openclaw-status-sections", codes[1])
-        self.assertIn("gateway unreachable", codes[1])
+        errors = [c for c in codes if "S.sectionError(" in c and "gateway unreachable" in c]
+        self.assertEqual(sorted(json.loads(c.split("S.sectionError(", 1)[1].split(",", 1)[0]) for c in errors),
+                         ["background", "context", "limits", "subagents"])
+        self.assertTrue(any("getElementById('openclaw-status-section-agents')" in c for c in codes))
 
     async def test_per_section_rpc_failure_only_errors_that_section(self):
         """A failure fetching one section's data (here: the child sessions) must
@@ -713,6 +726,8 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 return {"providers": []}
             if method == "sessions.list":
                 raise RuntimeError("children unavailable")
+            if method in ("tasks.list", "cron.list"):
+                return {}
             raise AssertionError(f"unexpected RPC: {method}")
 
         fake_conn = mock.AsyncMock()

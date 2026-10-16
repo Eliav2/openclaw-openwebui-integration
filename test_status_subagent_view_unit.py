@@ -409,7 +409,7 @@ class PollTests(unittest.IsolatedAsyncioTestCase):
         return _page(r"""
 run(input.fill);
 const refreshes = () => fetches.filter((b) => b.mode === 'subagent-detail').length;
-const row = document.getElementById('openclaw-status-section-subagents').walk().find((e) => e.tagName === 'BUTTON');
+const row = byData(document.getElementById('openclaw-status-section-subagents'), 'openclawRow')[0];
 const base = timers.size;    // the dialog's own elapsed ticker
 row.onclick();
 """ + steps_js, {"open": _render_modal_open_js(IDENTITY), "fill": _section([unlabelled]),
@@ -609,7 +609,7 @@ class InProcessAgentDetailTests(unittest.TestCase):
                  "task": "Compare IBKR and Trading212 for a small account.", "result": "IBKR: lower fees."}
         seen = _page(_RUN_JS + r"""
 run(input.fill);
-const row = byData(document.getElementById('openclaw-status-section-subagents'), 'openclawAgentRow')[0];
+const row = byData(document.getElementById('openclaw-status-section-agents'), 'openclawAgentRow')[0];
 row.onclick();
 console.log(JSON.stringify({
   title: byData(drawer(), 'openclawTitle').map((e) => e.textContent),
@@ -619,7 +619,9 @@ console.log(JSON.stringify({
   fetches: fetches.length,
   timers: timers.size,
 }));
-""", {"open": _render_modal_open_js(IDENTITY), "fill": _section([], [agent])})
+""", {"open": _render_modal_open_js(IDENTITY),
+                     "fill": openclaw_status_action._render_agents_fill_js(
+                         {"agents": [agent], "total": 1, "fetchedAt": NOW, "error": None})})
         self.assertEqual(seen["title"], ["Broker research"])
         self.assertEqual(seen["chip"], ["Returned"])
         self.assertEqual(seen["run"], [["user", "Compare IBKR and Trading212 for a small account."],

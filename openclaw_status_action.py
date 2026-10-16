@@ -4089,6 +4089,23 @@ async def _emit_status(__event_emitter__, description, *, done=False):
     )
 
 
+# Claude Code's in-process sub-agent tool, and what its card's result says for
+# one started in the background: its report comes later, and the run stays
+# open until it is in (ELI-163).
+_AGENT_TOOL_NAME = "Agent"
+_AGENT_LAUNCHED_PREFIX = "Async agent launched"
+
+
+def _is_background_agent_launch(name, result_text, is_error=False) -> bool:
+    return (not is_error and (name or "").strip() == _AGENT_TOOL_NAME
+            and (result_text or "").strip().startswith(_AGENT_LAUNCHED_PREFIX))
+
+
+def _background_agents_line(n: int) -> str:
+    """The status row of a reply a background agent holds open."""
+    return f"Waiting on {n} background agent{'' if n == 1 else 's'}"
+
+
 def _fmt_tokens(n) -> str:
     """Compact token count: 115212 -> '115k', 1000000 -> '1.0m'."""
     try:
@@ -4873,14 +4890,19 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     return err;
   }
 
-  function skeletonSection(id) {
+  // A section still loading: its title (when given) over a pulse.
+  function skeletonSection(id, title) {
     const el = document.createElement('div');
     el.id = id;
     el.className = 'mb-4';
-    el.innerHTML = '<div class="animate-pulse space-y-2">'
+    el.dataset.openclawLoading = '1';
+    if (title) el.appendChild(sectionHeader(title));
+    const pulse = document.createElement('div');
+    pulse.innerHTML = '<div class="animate-pulse space-y-2">'
       + '<div class="h-3 w-2/3 bg-gray-200 dark:bg-gray-700 rounded"></div>'
       + '<div class="h-3 w-full bg-gray-200 dark:bg-gray-700 rounded"></div>'
       + '</div>';
+    el.appendChild(pulse);
     return el;
   }
 
@@ -4935,6 +4957,7 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
         chat_id: IDENTITY.chatId,
         id: IDENTITY.messageId,
         session_id: IDENTITY.sessionId,
+        dialogId: IDENTITY.dialogId,
         mode: 'compact',
       }),
     }).catch(function(err) {
@@ -4987,6 +5010,7 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
         chat_id: IDENTITY.chatId,
         id: IDENTITY.messageId,
         session_id: IDENTITY.sessionId,
+        dialogId: IDENTITY.dialogId,
       }, extra)),
     });
   }
@@ -5592,6 +5616,141 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
                  task: agent.task, result: agent.result, startedAt: agent.startedAt });
   }
 
+  // "Subagents (3)", or "(20 of 31)" when the list is capped.
+  function countLabel(name, shown, total) {
+    return name + ' (' + (total > shown ? shown + ' of ' + total : shown) + ')';
+  }
+
+  // A section that folds (ELI-163): its title with its count, and a chevron.
+  // It opens when something in it runs at its first fill and is closed
+  // otherwise; a tap wins after that, so a refill leaves it as it is.
+  // `onOpen`: what to fetch the first time it is open (once per dialog).
+  const folds = {};
+  const foldFetched = {};
+  function collapsible(name, label, live, onOpen) {
+    if (!(name in folds)) folds[name] = !!live;
+    const wrap = document.createElement('div');
+    wrap.dataset.openclawFold = name;
+    const head = document.createElement('button');
+    head.type = 'button';
+    head.dataset.openclawFoldHead = name;
+    head.className = 'w-full flex items-center gap-2 text-left mb-1.5 '
+      + 'text-gray-400 dark:text-gray-500 hover:text-gray-700 dark:hover:text-gray-200';
+    // Divs, not spans: a 10 px span in a list is its time cell.
+    const text = document.createElement('div');
+    text.className = 'flex-1 font-semibold tracking-wide uppercase';
+    text.style.fontSize = '10px';  // inline: see sectionHeader()
+    text.textContent = label;
+    head.appendChild(text);
+    const chevron = document.createElement('div');
+    chevron.className = 'flex shrink-0';
+    head.appendChild(chevron);
+    wrap.appendChild(head);
+    const body = document.createElement('div');
+    body.dataset.openclawFoldBody = name;
+    wrap.appendChild(body);
+    function show(open) {
+      body.style.display = open ? 'block' : 'none';
+      chevron.innerHTML = open ? ICON.up : ICON.down;
+      head.setAttribute('aria-expanded', open ? 'true' : 'false');
+      wrap.dataset.open = open ? 'true' : 'false';
+      if (open && onOpen && !foldFetched[name]) {
+        foldFetched[name] = true;
+        onOpen();
+      }
+    }
+    head.onclick = function() { folds[name] = !folds[name]; show(folds[name]); };
+    show(folds[name]);
+    return { wrap: wrap, body: body };
+  }
+
+  // A section's error, under its own title, in its own place.
+  function sectionError(name, message) {
+    const section = document.getElementById('openclaw-status-section-' + name);
+    if (!section) return;
+    section.innerHTML = '';
+    section.className = 'mb-4';
+    const title = SECTIONS.find(function(s) { return s[0] === name; });
+    if (title) section.appendChild(sectionHeader(title[1]));
+    section.appendChild(errorEl(message));
+  }
+
+  // The dialog's sections, drawn at open with their titles: each fills on
+  // its own (ELI-163), so the dialog never waits for its slowest source.
+  const SECTIONS = __OPENCLAW_SECTIONS__;
+  function skeletons(wrap) {
+    SECTIONS.forEach(function(s) {
+      wrap.appendChild(skeletonSection('openclaw-status-section-' + s[0], s[1]));
+    });
+  }
+
+  // One list row (ELI-155): a one-line title (after a grey kind word when
+  // given), a status chip and the time, then at most two lines of preview.
+  // A row with `open` is a button that opens its detail.
+  function listRow(o) {
+    const el = document.createElement(o.open ? 'button' : 'div');
+    if (o.open) {
+      el.type = 'button';
+      el.onclick = o.open;
+    }
+    el.dataset[o.kind] = '1';
+    el.className = 'w-full block text-left py-1.5 px-1.5 -mx-1.5 rounded-lg'
+      + (o.open ? ' hover:bg-gray-50 dark:hover:bg-gray-800/60' : '');
+    const top = document.createElement('div');
+    top.className = 'flex items-center gap-2';
+    const titleEl = document.createElement('div');
+    titleEl.dataset.openclawTitle = '1';
+    titleEl.className = 'text-sm text-gray-700 dark:text-gray-200 flex-1';
+    if (o.kindLabel) {
+      const k = document.createElement('span');
+      k.dataset.openclawKind = '1';
+      k.className = 'text-gray-400 dark:text-gray-500';
+      k.textContent = o.kindLabel + ' ';
+      titleEl.appendChild(k);
+      const t = document.createElement('span');
+      t.textContent = o.title;
+      titleEl.appendChild(t);
+    } else {
+      titleEl.textContent = o.title;
+    }
+    top.appendChild(oneLine(titleEl));
+    top.appendChild(statusChip(o.status));
+    if (o.time) top.appendChild(o.time);
+    el.appendChild(top);
+    if (o.preview) {
+      const preview = document.createElement('div');
+      preview.dataset.openclawPreview = '1';
+      preview.className = 'text-xs text-gray-400 dark:text-gray-500 break-words mt-0.5';
+      preview.textContent = o.preview;
+      el.appendChild(clampLines(preview, 2));
+    }
+    return el;
+  }
+
+  function timeCell(text) {
+    const cell = document.createElement('span');
+    cell.className = 'text-gray-400 dark:text-gray-500 shrink-0';
+    cell.style.fontSize = '10px';
+    cell.textContent = text;
+    return cell;
+  }
+
+  // A run's time: counting up while it runs (the dialog's ticker rewrites a
+  // cell marked with its start), its duration once it ended.
+  function elapsedCell(startedAt, endedAt, running) {
+    const cell = timeCell(elapsedTime(startedAt, endedAt));
+    const startMs = toMs(startedAt);
+    if (running && !endedAt && startMs != null) cell.dataset.openclawStartedMs = String(startMs);
+    return cell;
+  }
+
+  function noteEl(text) {
+    const el = document.createElement('div');
+    el.className = 'text-xs text-gray-400 dark:text-gray-500 mb-1';
+    el.textContent = text;
+    return el;
+  }
+
   window.__openclawStatus = {
     identity: IDENTITY, isDark: isDark, barColor: barColor, makeBar: makeBar,
     sectionHeader: sectionHeader, errorEl: errorEl,
@@ -5599,6 +5758,9 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     triggerCompact: triggerCompact, elapsedTime: elapsedTime, toMs: toMs,
     openSubagentDrawer: openSubagentDrawer, openAgentDetail: openAgentDetail, openDrawer: openDrawer,
     fillDrawer: fillDrawer, statusChip: statusChip, oneLine: oneLine, clampLines: clampLines,
+    countLabel: countLabel, collapsible: collapsible, listRow: listRow, timeCell: timeCell,
+    elapsedCell: elapsedCell, noteEl: noteEl, sectionError: sectionError, skeletons: skeletons,
+    askAction: askAction,
   };
 
   const root = document.createElement('div');
@@ -5616,13 +5778,25 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
   // visible margin, not edge-to-edge), a wide one wins the 380px cap.
   panel.style.width = 'min(380px, 88vw)';
   // Up to 20 sub-agents of each kind (ELI-152) outgrow a phone screen: the
-  // panel scrolls instead of running off both edges of the centered overlay.
+  // panel is capped to the screen and its sections scroll between the title
+  // bar and the footer, which stay in view (ELI-163).
   panel.style.maxHeight = '88vh';
-  panel.style.overflowY = 'auto';
+  panel.style.display = 'flex';
+  panel.style.flexDirection = 'column';
   panel.addEventListener('click', function(e) { e.stopPropagation(); });
+
+  // Dismissed: tell the Action, so its open request stops reading for a
+  // dialog nobody sees (ELI-163). Best effort; its follow is bounded anyway.
+  function closeDialog() {
+    if (!root.isConnected) return;
+    root.remove();
+    document.removeEventListener('keydown', onKey);
+    if (IDENTITY.dialogId) askAction({ mode: 'status-closed' }).catch(function() {});
+  }
 
   const header = document.createElement('div');
   header.className = 'flex items-center justify-between mb-3';
+  header.style.flexShrink = '0';
   const title = document.createElement('div');
   title.className = 'text-sm font-semibold';
   title.textContent = 'OpenClaw Status';
@@ -5636,15 +5810,16 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
   closeBtn.textContent = '×';
   closeBtn.className = 'text-xl leading-none text-gray-400 hover:text-gray-700 '
     + 'dark:hover:text-gray-200 px-1';
-  closeBtn.onclick = function() { root.remove(); };
+  closeBtn.onclick = closeDialog;
   headerEnd.appendChild(closeBtn);
   panel.appendChild(header);
 
   const sections = document.createElement('div');
   sections.id = 'openclaw-status-sections';
-  sections.appendChild(skeletonSection('openclaw-status-section-context'));
-  sections.appendChild(skeletonSection('openclaw-status-section-limits'));
-  sections.appendChild(skeletonSection('openclaw-status-section-subagents'));
+  sections.style.overflowY = 'auto';
+  sections.style.minHeight = '0';
+  sections.style.flex = '1 1 auto';
+  skeletons(sections);
   panel.appendChild(sections);
 
   const footer = document.createElement('div');
@@ -5652,15 +5827,13 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
   footer.className = 'text-[11px] text-gray-400 dark:text-gray-600 pt-3 '
     + 'border-t border-gray-100 dark:border-gray-800';
   footer.textContent = ' ';
+  footer.style.flexShrink = '0';
   panel.appendChild(footer);
 
   root.appendChild(panel);
-  root.addEventListener('click', function() { root.remove(); });
+  root.addEventListener('click', closeDialog);
   const onKey = function(e) {
-    if (e.key === 'Escape') {
-      root.remove();
-      document.removeEventListener('keydown', onKey);
-    }
+    if (e.key === 'Escape') closeDialog();
   };
   document.addEventListener('keydown', onKey);
 
@@ -5698,10 +5871,10 @@ _RESET_SECTIONS_JS = r"""
   const wrap = document.getElementById('openclaw-status-sections');
   const S = window.__openclawStatus;
   if (!wrap || !S) return;
+  // The refresh's reads are a new dialog's: the page's later requests name it.
+  S.identity.dialogId = __OPENCLAW_DIALOG_ID__;
   wrap.innerHTML = '';
-  wrap.appendChild(S.skeletonSection('openclaw-status-section-context'));
-  wrap.appendChild(S.skeletonSection('openclaw-status-section-limits'));
-  wrap.appendChild(S.skeletonSection('openclaw-status-section-subagents'));
+  S.skeletons(wrap);
 })();
 """
 
@@ -5767,13 +5940,12 @@ _CONTEXT_FILL_JS_TEMPLATE = r"""
   const section = document.getElementById('openclaw-status-section-context');
   const S = window.__openclawStatus;
   if (!section || !S) return;
-  section.innerHTML = '';
-  section.className = 'mb-4';
-
   if (DATA.error) {
-    section.appendChild(S.errorEl(DATA.error));
+    S.sectionError('context', DATA.error);
     return;
   }
+  section.innerHTML = '';
+  section.className = 'mb-4';
 
   const sub = document.createElement('div');
   sub.className = 'text-xs text-gray-500 dark:text-gray-400 mb-3';
@@ -5853,19 +6025,18 @@ _LIMITS_FILL_JS_TEMPLATE = r"""
   if (!section || !S) return;
   section.innerHTML = '';
 
+  section.className = 'mb-4';
+  section.appendChild(S.sectionHeader('Rate limits'));
   if (DATA.error) {
-    section.className = 'mb-4';
     section.appendChild(S.errorEl(DATA.error));
     return;
   }
 
   if (!DATA.provider || DATA.provider === '?') {
-    section.className = '';
+    section.appendChild(S.noteEl('This session has no provider yet.'));
     return;
   }
 
-  section.className = 'mb-4';
-  section.appendChild(S.sectionHeader('Rate Limits'));
   if (DATA.windows.length === 0) {
     const note = document.createElement('div');
     note.className = 'text-xs text-gray-400 dark:text-gray-500';
@@ -5912,118 +6083,162 @@ _LIMITS_FILL_JS_TEMPLATE = r"""
 })();
 """
 
-# Deliberately hidden entirely (not even a header) when there are no tasks --
-# "general tracking, no detail": a permanently-visible
-# empty line for the common idle case would be more clutter than signal. Only
-# appears when there's actually something to report. Each row is clickable --
-# opens the per-subagent drawer (see _DRAWER_OPEN_JS_TEMPLATE) via
-# S.openSubagentDrawer, passing the already-known TaskSummary fields along so
-# the drawer can paint its header instantly, before any RPC resolves.
+# The Subagents section (ELI-152/155/163): a fold titled with its count, open
+# at its first fill when a child runs. A fold opened for the first time with
+# its rows still `pending` (the open read no transcripts for a section
+# nobody had opened) asks the Action for them (mode "subagent-rows"). Each
+# row opens the per-subagent drawer (S.openSubagentDrawer) with the fields it
+# already knows, so the drawer paints its header before any RPC resolves.
 _SUBAGENTS_FILL_JS_TEMPLATE = r"""
 (function() {
   const DATA = __OPENCLAW_STATUS_DATA__;
-  const section = document.getElementById('openclaw-status-section-subagents');
   const S = window.__openclawStatus;
+  const section = document.getElementById('openclaw-status-section-subagents');
   if (!section || !S) return;
-  section.innerHTML = '';
-
   if (DATA.error) {
-    section.className = 'mb-4';
-    section.appendChild(S.errorEl(DATA.error));
+    S.sectionError('subagents', DATA.error);
     return;
   }
-
-  const tasks = DATA.tasks || [];
-  const agents = DATA.agents || [];
-  if (!tasks.length && !agents.length) {
-    section.className = '';
-    return;
-  }
-
+  section.innerHTML = '';
   section.className = 'mb-4';
-
-  // "Subagents (3)", or "(20 of 31)" when the list is capped.
-  function countLabel(name, shown, total) {
-    return name + ' (' + (total > shown ? shown + ' of ' + total : shown) + ')';
+  const tasks = DATA.tasks || [];
+  const live = tasks.some(function(t) { return t.status === 'running' || t.status === 'queued'; });
+  const fold = S.collapsible('subagents', S.countLabel('Subagents', tasks.length, DATA.total || 0), live,
+    DATA.pending ? function() { S.askAction({ mode: 'subagent-rows' }).catch(function(err) {
+      S.sectionError('subagents', 'Could not load the sub-agents: ' + err);
+    }); } : null);
+  section.appendChild(fold.wrap);
+  if (!tasks.length) {
+    fold.body.appendChild(S.noteEl('No sub-agents in this chat.'));
+  } else if (DATA.pending) {
+    fold.body.appendChild(S.skeletonSection('openclaw-status-subagents-loading'));
   }
-
-  // One row (ELI-155): a one-line title, a status chip and the time, then
-  // at most two lines of the latest reply. A long task is the drawer's.
-  function row(kind, title, status, timeEl, previewText, open) {
-    const el = document.createElement('button');
-    el.type = 'button';
-    el.dataset[kind] = '1';
-    el.className = 'w-full block text-left py-1.5 px-1.5 -mx-1.5 '
-      + 'rounded-lg hover:bg-gray-50 dark:hover:bg-gray-800/60';
-    el.onclick = open;
-    const top = document.createElement('div');
-    top.className = 'flex items-center gap-2';
-    const titleEl = document.createElement('div');
-    titleEl.dataset.openclawTitle = '1';
-    titleEl.className = 'text-sm text-gray-700 dark:text-gray-200 flex-1';
-    titleEl.textContent = title;
-    top.appendChild(S.oneLine(titleEl));
-    top.appendChild(S.statusChip(status));
-    if (timeEl) top.appendChild(timeEl);
-    el.appendChild(top);
-    if (previewText) {
-      const preview = document.createElement('div');
-      preview.dataset.openclawPreview = '1';
-      preview.className = 'text-xs text-gray-400 dark:text-gray-500 break-words mt-0.5';
-      preview.textContent = previewText;
-      el.appendChild(S.clampLines(preview, 2));
-    }
-    return el;
-  }
-
-  function timeCell(text) {
-    const cell = document.createElement('span');
-    cell.className = 'text-gray-400 dark:text-gray-500 shrink-0';
-    cell.style.fontSize = '10px';
-    cell.textContent = text;
-    return cell;
-  }
-
-  if (tasks.length) section.appendChild(S.sectionHeader(countLabel('Subagents', tasks.length, DATA.total || 0)));
-  tasks.forEach(function(t) {
-    const elapsed = timeCell(S.elapsedTime(t.startedAt, t.endedAt));
-    const startMs = S.toMs(t.startedAt);
-    // Still running: the dialog's ticker keeps this one counting up.
-    if (t.status === 'running' && !t.endedAt && startMs != null) {
-      elapsed.dataset.openclawStartedMs = String(startMs);
-    }
-    const preview = t.status === 'running' ? t.progressSummary : (t.terminalSummary || t.error);
-    section.appendChild(row('openclawRow', t.title || t.id, t.status, elapsed, preview,
-                            function() { S.openSubagentDrawer(t); }));
+  if (!DATA.pending) tasks.forEach(function(t) {
+    const running = t.status === 'running';
+    fold.body.appendChild(S.listRow({
+      kind: 'openclawRow', title: t.title || t.id, status: t.status,
+      time: S.elapsedCell(t.startedAt, t.endedAt, running),
+      preview: running ? t.progressSummary : (t.terminalSummary || t.error),
+      open: function() { S.openSubagentDrawer(t); },
+    }));
   });
+  S.touchFooter(DATA.fetchedAt, DATA.source);
+})();
+"""
 
-  // Claude Code's in-process Agent calls (ELI-152): not Gateway sessions,
-  // so no duration, only what the chat's tool cards tell; a tap shows its
-  // task and result (ELI-155).
-  if (agents.length) {
-    const head = S.sectionHeader(countLabel('In-process agents', agents.length, DATA.agentsTotal || 0));
-    if (tasks.length) head.style.marginTop = '10px';
-    section.appendChild(head);
-    const note = document.createElement('div');
-    note.className = 'text-xs text-gray-400 dark:text-gray-500 mb-1';
-    note.textContent = 'Claude Code Agent calls in this chat, as their tool cards show them.';
-    section.appendChild(note);
+# Claude Code's in-process Agent calls (ELI-152): not Gateway sessions, so
+# no duration, only what the chat's tool cards tell; a tap shows its task and
+# result (ELI-155). Read from Open WebUI's copy of the chat alone, so this
+# section fills even when the Gateway does not answer.
+_AGENTS_FILL_JS_TEMPLATE = r"""
+(function() {
+  const DATA = __OPENCLAW_STATUS_DATA__;
+  const S = window.__openclawStatus;
+  const section = document.getElementById('openclaw-status-section-agents');
+  if (!section || !S) return;
+  if (DATA.error) {
+    S.sectionError('agents', DATA.error);
+    return;
   }
+  section.innerHTML = '';
+  section.className = 'mb-4';
+  const agents = DATA.agents || [];
+  const live = agents.some(function(a) { return a.state === 'running'; });
+  const fold = S.collapsible('agents', S.countLabel('In-process agents', agents.length, DATA.total || 0), live);
+  section.appendChild(fold.wrap);
+  fold.body.appendChild(S.noteEl(agents.length
+    ? 'Claude Code Agent calls in this chat, as their tool cards show them.'
+    : 'No Claude Code Agent calls in this chat.'));
   agents.forEach(function(a) {
     // When its reply started, on the reader's clock.
     const started = S.toMs(a.startedAt);
     let when = null;
     if (started != null) {
-      when = timeCell(new Date(started).toLocaleString([], {
+      when = S.timeCell(new Date(started).toLocaleString([], {
         month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
       }));
       when.title = 'Started';
     }
-    section.appendChild(row('openclawAgentRow', a.title, a.state, when, a.result,
-                            function() { S.openAgentDetail(a); }));
+    fold.body.appendChild(S.listRow({
+      kind: 'openclawAgentRow', title: a.title, status: a.state, time: when, preview: a.result,
+      open: function() { S.openAgentDetail(a); },
+    }));
   });
+})();
+"""
 
+# The Background section (ELI-163): this chat's background commands, media
+# jobs, automation runs and background agents, then (owners only) the
+# Gateway's other automations. A fold like Subagents. A source this Gateway
+# lacks says so in a note; one that failed says so too, and the rest shows.
+_BACKGROUND_FILL_JS_TEMPLATE = r"""
+(function() {
+  const DATA = __OPENCLAW_STATUS_DATA__;
+  const S = window.__openclawStatus;
+  const section = document.getElementById('openclaw-status-section-background');
+  if (!section || !S) return;
+  if (DATA.error) {
+    S.sectionError('background', DATA.error);
+    return;
+  }
+  section.innerHTML = '';
+  section.className = 'mb-4';
+  const rows = DATA.rows || [];
+  const others = DATA.automations || [];
+  const isLive = function(r) { return r.status === 'running' || r.status === 'queued'; };
+  const live = rows.some(isLive) || others.some(isLive);
+  const fold = S.collapsible('background', S.countLabel('Background', rows.length, DATA.total || 0), live);
+  section.appendChild(fold.wrap);
+
+  // An automation's time: running for, else when it runs next.
+  function automationTime(r) {
+    if (r.status === 'running') return S.elapsedCell(r.startedAt, null, true);
+    if (!r.nextRunAtMs) return null;
+    const cell = S.timeCell('next ' + new Date(r.nextRunAtMs).toLocaleString([], {
+      month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
+    }));
+    cell.title = 'Next run';
+    return cell;
+  }
+  function automationPreview(r) {
+    if (r.status !== 'failed') return null;
+    return (r.failedInARow > 1 ? 'Failed ' + r.failedInARow + ' times in a row: ' : '') + (r.error || '');
+  }
+  function row(r) {
+    if (r.job) {
+      return S.listRow({ kind: 'openclawBgRow', kindLabel: r.kind, title: r.title, status: r.status,
+                         time: automationTime(r), preview: automationPreview(r) });
+    }
+    return S.listRow({
+      kind: 'openclawBgRow', kindLabel: r.kind, title: r.title, status: r.status,
+      time: S.elapsedCell(r.startedAt, r.endedAt, isLive(r)), preview: r.preview,
+      open: r.agent ? function() { S.openAgentDetail(r.agent); } : null,
+    });
+  }
+
+  (DATA.errors || []).forEach(function(e) { fold.body.appendChild(S.errorEl(e)); });
+  if (!DATA.tasksAvailable) {
+    fold.body.appendChild(S.noteEl('Background commands and media jobs are not available on this Gateway.'));
+  }
+  if (!rows.length) fold.body.appendChild(S.noteEl('Nothing in the background for this chat.'));
+  rows.forEach(function(r) { fold.body.appendChild(row(r)); });
+
+  if (DATA.owner && others.length) {
+    const head = S.sectionHeader(S.countLabel('Other automations', others.length, DATA.automationsTotal || 0));
+    head.style.marginTop = '10px';
+    fold.body.appendChild(head);
+    others.forEach(function(r) { fold.body.appendChild(row(r)); });
+  }
   S.touchFooter(DATA.fetchedAt, DATA.source);
+})();
+"""
+
+# One section's error in its place (S.sectionError): a failed source
+# leaves every other section as it is.
+_SECTION_ERROR_JS_TEMPLATE = r"""
+(function() {
+  const S = window.__openclawStatus;
+  if (S && S.sectionError) S.sectionError(__OPENCLAW_SECTION__, __OPENCLAW_ERROR_MESSAGE__);
 })();
 """
 
@@ -6081,7 +6296,8 @@ def _json_for_js(data) -> str:
 
 
 def _render_modal_open_js(identity: dict) -> str:
-    return _MODAL_OPEN_JS_TEMPLATE.replace("__OPENCLAW_IDENTITY__", _json_for_js(identity))
+    return (_MODAL_OPEN_JS_TEMPLATE.replace("__OPENCLAW_IDENTITY__", _json_for_js(identity))
+            .replace("__OPENCLAW_SECTIONS__", _json_for_js([list(s) for s in _DIALOG_SECTIONS])))
 
 
 def _render_sections_error_js(message: str) -> str:
@@ -6189,15 +6405,16 @@ def _subagent_task_texts(previews_resp):
     return out
 
 
-def _subagent_row(row, task_text=None):
+def _subagent_row(row, task_text=None, latest=None):
     """One Subagents row out of a child session row. The title is the spawn
     label, else the task's first sentence, else the key; the whole task is
-    the drawer's to show (ELI-155)."""
+    the drawer's to show (ELI-155). The preview is the row's own last
+    message when the list read carried it, else `latest` (sessions.preview)."""
     status = _subagent_status(row.get("status"))
     if status is None and row.get("endedAt"):
         status = "ended"    # a visible spawn's session carries no run status
     live = status in _LIVE_SUBAGENT_STATUSES
-    preview = row.get("lastMessagePreview")
+    preview = row.get("lastMessagePreview") or latest
     if _is_spawn_message(preview):
         # Just spawned: the newest message is still the task (ELI-119).
         preview = None
@@ -6234,12 +6451,8 @@ def _subagent_started(row):
     return row.get("startedAt") or row.get("createdAt") or row.get("updatedAt") or 0
 
 
-# Claude Code's in-process sub-agent tool, and what its card's result says
-# for a sub-agent started in the background (its report comes later, as a
-# turn of its own).
-_AGENT_TOOL_NAME = "Agent"
+# How much of an Agent call's task and result its detail shows.
 _AGENT_TEXT_MAX = 4000
-_AGENT_LAUNCHED_PREFIX = "Async agent launched"
 
 
 def _owui_branch(chat):
@@ -6303,6 +6516,8 @@ def _agent_call_rows(chat):
                 # What its detail shows (ELI-155), capped like a card's text.
                 "task": prompt[:_AGENT_TEXT_MAX] if isinstance(prompt, str) and prompt.strip() else None,
                 "result": text[:_AGENT_TEXT_MAX] if result is not None and text else None,
+                # A background agent holds its reply open until its report is in.
+                "replyDone": bool(msg.get("done")),
             })
     return rows[::-1]
 
@@ -6325,6 +6540,263 @@ async def _load_owui_chat(chat_id, user_id):
 
 def _render_subagents_fill_js(data: dict) -> str:
     return _SUBAGENTS_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
+
+
+def _render_background_fill_js(data: dict) -> str:
+    return _BACKGROUND_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
+
+
+def _render_agents_fill_js(data: dict) -> str:
+    return _AGENTS_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
+
+
+def _render_section_error_js(section: str, message: str) -> str:
+    """One section's error in its place, under its own title; the others
+    keep what they show."""
+    return (_SECTION_ERROR_JS_TEMPLATE.replace("__OPENCLAW_SECTION__", _json_for_js(section))
+            .replace("__OPENCLAW_ERROR_MESSAGE__", _json_for_js(message)))
+
+
+# The dialog's sections in their order: id suffix and title. The page draws
+# them all at open (_MODAL_OPEN_JS_TEMPLATE), each fills on its own.
+_DIALOG_SECTIONS = (
+    ("context", "Context"),
+    ("limits", "Rate limits"),
+    ("background", "Background"),
+    ("subagents", "Subagents"),
+    ("agents", "In-process agents"),
+)
+# The sections the Gateway fills; In-process agents reads Open WebUI only.
+_GATEWAY_SECTIONS = ("context", "limits", "background", "subagents")
+
+
+# ---------------------------------------------------------------------------
+# Open Status dialogs (ELI-163), by the id the open hands the page: whose it
+# is, its session, the Subagents rows a folded section has yet to detail,
+# and a `closed` flag the page sets when it is dismissed, so nothing is read
+# for a dialog nobody looks at. In this process only; an entry lasts the
+# dialog's follow bound at most.
+
+_open_dialogs: dict = {}
+
+
+def _dialog_open(user_id: str, session_key: str) -> tuple:
+    now = time.time()
+    for k in [k for k, d in _open_dialogs.items() if d["expires"] < now]:
+        _open_dialogs.pop(k, None)
+    dialog_id = uuid.uuid4().hex
+    dialog = {"user": user_id, "session": session_key, "closed": asyncio.Event(),
+              "expires": now + _DIALOG_FOLLOW_MAX_S, "rows": [], "total": 0}
+    _open_dialogs[dialog_id] = dialog
+    return dialog_id, dialog
+
+
+def _dialog_of(body: dict, user_id: str):
+    """The caller's own open dialog the request names, else None."""
+    dialog = _open_dialogs.get(body.get("dialogId") or "")
+    return dialog if dialog and dialog["user"] == user_id else None
+
+
+def _subagent_previews(previews_resp) -> tuple:
+    """({key: task text}, {key: newest message}) from a sessions.preview
+    answer: the spawn's task when the preview still reaches it, and what the
+    child said last (none while its newest message is still the spawn)."""
+    latest = {}
+    for p in (previews_resp or {}).get("previews") or []:
+        texts = [i.get("text") for i in p.get("items") or [] if isinstance(i.get("text"), str) and i["text"].strip()]
+        if p.get("key") and texts and not _subagent_task_text(texts[-1]):
+            latest[p["key"]] = texts[-1].strip()
+    return _subagent_task_texts(previews_resp), latest
+
+
+async def _read_automations(conn) -> "list | None":
+    """Every enabled automation, or None on a Gateway without `cron.list`."""
+    try:
+        resp = await conn.send_request("cron.list", dict(limit=200), timeout=5)
+    except Exception as ex:
+        if _is_unknown_method(ex):
+            return None
+        raise
+    return (resp or {}).get("jobs") or []
+
+
+# ---------------------------------------------------------------------------
+# The Background section (ELI-163): what runs for this chat outside a reply.
+# Read once when the dialog opens, never polled.
+
+# The Gateway's task kinds the section lists, as the row's kind label. Its
+# other kinds are listed elsewhere (a sub-agent or ACP child is the
+# Subagents section's) or are its own upkeep (context maintenance).
+_BACKGROUND_KINDS = {
+    "exec": "Command",
+    "image_generation": "Image",
+    "music_generation": "Music",
+    "video_generation": "Video",
+    "automation_run": "Automation",
+}
+# How many finished items of this chat the section keeps, newest first; a
+# running one is always listed. Global automations: the first few, problems
+# first, the rest counted.
+_BACKGROUND_FINISHED_CAP = 5
+_GLOBAL_AUTOMATIONS_CAP = 5
+_LIVE_TASK_STATUSES = ("running", "queued")
+# The exec tool's answer for a command left running: "Command still running
+# (session good-lagoon, pid 2816)". The session is the task's sourceId.
+_EXEC_SESSION_RE = re.compile(r"\(session ([\w.-]+)")
+
+
+def _is_unknown_method(ex: Exception) -> bool:
+    return "unknown method" in str(ex).lower()
+
+
+async def _read_background_tasks(conn, session_key: str) -> "list | None":
+    """The adapter between the section and the Gateway's background work for
+    one session. OpenClaw 2026.9 lists it with `tasks.list`; 2026.10 removed
+    that method (background shell moved to `sessions.processes.list`, which
+    the upgrade wires in). A Gateway without it gives None: the section then
+    says it is not available here instead of failing."""
+    try:
+        resp = await conn.send_request("tasks.list", dict(sessionKey=session_key, limit=100), timeout=5)
+    except Exception as ex:
+        if _is_unknown_method(ex):
+            return None
+        raise
+    return (resp or {}).get("tasks") or []
+
+
+def _exec_commands(chat) -> dict:
+    """{exec session id: command} from the chat's own exec tool cards. The
+    Gateway's task for a background command is titled "CLI command"; its
+    sourceId is the session the card's result names."""
+    out = {}
+    for msg in _owui_branch(chat):
+        output = msg.get("output") or []
+        calls = {o.get("id"): o for o in output if o.get("type") == "function_call"}
+        for o in output:
+            if o.get("type") != "function_call_output":
+                continue
+            call = calls.get(o.get("call_id")) or {}
+            if (call.get("name") or "").replace(TOOL_ERROR_MARK, "").strip() != "exec":
+                continue
+            m = _EXEC_SESSION_RE.search(_card_text(o))
+            try:
+                args = json.loads(call.get("arguments") or "{}")
+            except ValueError:
+                args = {}
+            command = args.get("command") if isinstance(args, dict) else None
+            if m and isinstance(command, str) and command.strip():
+                out[m.group(1)] = command.strip()
+    return out
+
+
+def _belongs_to(task: dict, session_key: str) -> bool:
+    """A task this chat started (its requester), or one run in it (an
+    automation run's target session)."""
+    return session_key in (task.get("sessionKey"), task.get("childSessionKey"), task.get("ownerKey"))
+
+
+def _task_row(task: dict, commands: dict) -> dict:
+    kind = task.get("kind") or ""
+    title = (task.get("title") or "").strip()
+    if kind == "exec":
+        title = commands.get(task.get("sourceId") or "") or "Shell command"
+    status = task.get("status")
+    live = status in _LIVE_TASK_STATUSES
+    return {
+        "id": task.get("id") or task.get("taskId"),
+        "kind": _BACKGROUND_KINDS.get(kind, "Task"),
+        "title": title or _BACKGROUND_KINDS.get(kind, "Task"),
+        "status": status,
+        "startedAt": task.get("startedAt") or task.get("createdAt"),
+        "endedAt": None if live else (task.get("endedAt") or task.get("updatedAt")),
+        "preview": (task.get("progressSummary") if live
+                    else (task.get("error") or task.get("terminalSummary"))),
+    }
+
+
+def _job_bound_to(job: dict, session_key: str) -> bool:
+    """An automation that runs in this chat: `session:<key>`, or "current"
+    with the session it was made in."""
+    target = job.get("sessionTarget") or ""
+    return target == f"session:{session_key}" or (target == "current" and job.get("sessionKey") == session_key)
+
+
+def _job_status(job: dict) -> str:
+    state = job.get("state") or {}
+    if state.get("runningAtMs"):
+        return "running"
+    last = state.get("lastRunStatus") or state.get("lastStatus")
+    return {"ok": "completed", "error": "failed", "skipped": "skipped"}.get(last, "scheduled")
+
+
+def _automation_row(job: dict) -> dict:
+    state = job.get("state") or {}
+    status = _job_status(job)
+    return {
+        "id": job.get("id"),
+        "kind": "Automation",
+        "job": True,    # a schedule, not one run: its time is its next run
+        "title": (job.get("displayName") or job.get("name") or "").strip() or "Automation",
+        "status": status,
+        "startedAt": state.get("runningAtMs") if status == "running" else None,
+        "endedAt": None,
+        "error": state.get("lastError") if status == "failed" else None,
+        "failedInARow": state.get("consecutiveErrors") or 0,
+        "nextRunAtMs": job.get("nextRunAtMs") or state.get("nextRunAtMs"),
+        "lastRunAtMs": state.get("lastRunAtMs"),
+    }
+
+
+def _global_automation_order(row: dict):
+    """Running first, then failing, then the next to run."""
+    rank = {"running": 0, "failed": 1}.get(row["status"], 2)
+    return (rank, row.get("nextRunAtMs") or float("inf"))
+
+
+def _background_rows(tasks, jobs, agents, session_key: str, *, owner: bool, commands: dict) -> dict:
+    """The Background section's data. `tasks`: the Gateway's tasks for this
+    session (None: the Gateway has no task list). `jobs`: every automation
+    (None: not readable). `agents`: this chat's Agent call rows. Only what
+    belongs to this chat is listed, whoever asks; the Gateway's other
+    automations only when `owner` (OWNER_USERS)."""
+    automations_available = jobs is not None
+    jobs = [j for j in jobs or [] if j.get("enabled", True)]
+    mine = [j for j in jobs if _job_bound_to(j, session_key)]
+    job_ids = {j.get("id") for j in mine}
+    rows = [_automation_row(j) for j in mine]
+    for t in tasks or []:
+        if not _belongs_to(t, session_key) or (t.get("kind") or t.get("runtime")) not in _BACKGROUND_KINDS:
+            continue
+        if t.get("kind") == "automation_run" and t.get("sourceId") in job_ids:
+            continue    # its automation's own row says how it went
+        rows.append(_task_row(t, commands))
+    for a in agents or []:
+        if a.get("state") != "launched":
+            continue
+        rows.append({
+            "id": a["id"], "kind": "Agent", "title": a["title"],
+            # Its reply stays open until its report is in.
+            "status": "completed" if a.get("replyDone") else "running",
+            "startedAt": a.get("startedAt"), "endedAt": None, "preview": None,
+            "agent": a,
+        })
+    live = [r for r in rows if r["status"] in _LIVE_TASK_STATUSES]
+    rest = sorted((r for r in rows if r["status"] not in _LIVE_TASK_STATUSES),
+                  key=lambda r: r.get("startedAt") or r.get("lastRunAtMs") or 0, reverse=True)
+    live.sort(key=lambda r: r.get("startedAt") or 0, reverse=True)
+    others = []
+    if owner:
+        others = sorted((_automation_row(j) for j in jobs if not _job_bound_to(j, session_key)),
+                        key=_global_automation_order)
+    return {
+        "rows": live + rest[:_BACKGROUND_FINISHED_CAP],
+        "total": len(rows),
+        "owner": owner,
+        "automations": others[:_GLOBAL_AUTOMATIONS_CAP],
+        "automationsTotal": len(others),
+        "tasksAvailable": tasks is not None,
+        "automationsAvailable": automations_available,
+    }
 
 
 _TRAILING_UUID_RE = re.compile(
@@ -6585,6 +7057,15 @@ class Action:
             return await self._run_compact(body, __user__, __event_emitter__)
         if mode == "subagent-detail":
             return await self._run_subagent_detail(body, __user__, __event_emitter__)
+        if mode == "status-closed":
+            # The page's dialog was dismissed: its open request stops following.
+            dialog = _dialog_of(body, (__user__ or {}).get("id") or "unknown")
+            if dialog:
+                _open_dialogs.pop(body["dialogId"], None)
+                dialog["closed"].set()
+            return {"status": "ok"}
+        if mode == "subagent-rows":
+            return await self._run_subagent_rows(body, __user__, __event_emitter__)
         if mode is None:
             marker = _SUBAGENT_TASK_ID_MARKER_RE.search(body.get("content") or "")
             if marker:
@@ -6610,17 +7091,19 @@ class Action:
             )
 
     async def _run_status(self, body: dict, __user__, __event_emitter__, *, show_loading=True):
-        """Fetches and renders the dialog's three sections -- Context, Rate
-        Limits, Subagents -- each independently: its own skeleton at open,
-        its own fill event as soon as its own data is ready, not one
-        combined fetch-everything-then-render-once step. Subagents (sessions.list) has no dependency on the
-        other two at all. Rate Limits genuinely needs the active provider's
-        name, which only comes from sessions.describe -- rather than fake
-        independence there, its fill awaits Context's own resolution of
-        that RPC (the same Task object, not a second request) before adding
-        usage.status on top; it still has its own skeleton and fills in on
-        its own schedule, separate from Context's.
-        """
+        """Opens the dialog at once with every section's title, then fills
+        each section on its own the moment its own data is in (ELI-163): a
+        slow or failing source shows in its section only.
+
+        One request per source per open, all sent together: sessions.describe
+        (Context, and the provider Rate limits needs), usage.status,
+        sessions.list (Subagents: the store's rows, no transcripts read),
+        tasks.list and cron.list (Background), and Open WebUI's copy of the
+        chat (In-process agents, and Background's commands and agents). Read
+        only when needed: the claude-cli usage fallback when usage.status has
+        no windows, and the sub-agents' transcripts (sessions.preview) only
+        when the Subagents section opens, at once when a child runs, else on
+        the reader's first tap (mode "subagent-rows")."""
         chat_id = body.get("chat_id")
         user_id = (__user__ or {}).get("id") or "unknown"
 
@@ -6630,6 +7113,18 @@ class Action:
                 "data": {"type": "error", "content": "OpenClaw status: no chat_id on this message"},
             })
             return {"status": "error", "detail": "missing chat_id"}
+
+        session_key = _owui_session_key(self.valves.AGENT_ID, user_id, chat_id)
+        # A refresh from inside the dialog (after a compact) replaces the
+        # open's reads: the open stops following.
+        previous = _dialog_of(body, user_id)
+        if previous:
+            _open_dialogs.pop(body["dialogId"], None)
+            previous["closed"].set()
+        dialog_id, dialog = _dialog_open(user_id, session_key)
+
+        async def emit(code):
+            await __event_emitter__({"type": "execute", "data": {"code": code}})
 
         # chat_id/message_id/session_id/model never depend on any RPC --
         # they're already in `body` -- so they're embedded once at open
@@ -6641,49 +7136,58 @@ class Action:
                 "messageId": body.get("id"),
                 "sessionId": body.get("session_id"),
                 "owuiModel": body.get("model"),
-                "controlUiUrl": _control_ui_session_url(
-                    self.valves.CONTROL_UI_URL,
-                    _owui_session_key(self.valves.AGENT_ID, user_id, chat_id)),
+                "dialogId": dialog_id,
+                "controlUiUrl": _control_ui_session_url(self.valves.CONTROL_UI_URL, session_key),
                 "subagentPollMs": int(_SUBAGENT_POLL_INTERVAL_S * 1000),
             }
-            await __event_emitter__({"type": "execute", "data": {"code": _render_modal_open_js(identity)}})
+            await emit(_render_modal_open_js(identity))
         else:
             # Post-compact refresh: the dialog is already open, but
-            # _MODAL_COMPACTING_JS replaced the sections wrapper with its
-            # spinner, destroying the three section ids -- recreate fresh
-            # skeletons in their place before firing the refreshed RPCs.
-            await __event_emitter__({"type": "execute", "data": {"code": _RESET_SECTIONS_JS}})
+            # _MODAL_COMPACTING_JS replaced the sections with its spinner;
+            # put the sections back before the refreshed reads.
+            await emit(_RESET_SECTIONS_JS.replace("__OPENCLAW_DIALOG_ID__", _json_for_js(dialog_id)))
 
-        session_key = _owui_session_key(self.valves.AGENT_ID, user_id, chat_id)
+        # Open WebUI's own copy of the chat: no Gateway in it, so it is
+        # read before connecting and its section fills even with no Gateway.
+        chat_task = asyncio.ensure_future(_load_owui_chat(chat_id, user_id))
+
+        async def fill_agents():
+            agents = _agent_call_rows(await chat_task)
+            await emit(_render_agents_fill_js({
+                "agents": agents[:_SUBAGENT_LIST_CAP], "total": len(agents),
+                "fetchedAt": int(time.time() * 1000), "error": None,
+            }))
+
+        agents_ready = asyncio.ensure_future(fill_agents())
 
         try:
             conn, source = await _get_action_connection(lambda: self.valves)
         except Exception as ex:
             pipe_log(f"[status-action] connect failed: {ex}")
-            await __event_emitter__({
-                "type": "execute",
-                "data": {"code": _render_sections_error_js(f"Could not connect: {ex}")},
-            })
+            for section in _GATEWAY_SECTIONS:
+                await emit(_render_section_error_js(section, f"Could not connect: {ex}"))
+            await agents_ready
             return {"status": "error", "detail": str(ex)}
 
-        # Fired concurrently; each section's own coroutine below awaits
-        # only what it actually needs and emits its own fill the moment
-        # that's ready.
+        # Every source at once; each section awaits only its own.
         desc_task = asyncio.ensure_future(
-            conn.send_request("sessions.describe", dict(key=session_key), timeout=5)
-        )
+            conn.send_request("sessions.describe", dict(key=session_key), timeout=5))
         usage_task = asyncio.ensure_future(conn.send_request("usage.status", {}, timeout=5))
         # The parent's child sessions. The Gateway's spawnedBy filter keeps
         # the current ones only (active, or ended in the last 30 minutes),
         # so the open reads every session and picks the children itself
-        # (ELI-152); a refill follows the current ones with the filter.
+        # (ELI-152), from the store alone: a last message would read every
+        # session's transcript. A refill follows the current ones with the
+        # filter and their last messages.
+        children_task = asyncio.ensure_future(conn.send_request(
+            "sessions.list", dict(limit=1000), timeout=10))
+        tasks_task = asyncio.ensure_future(_read_background_tasks(conn, session_key))
+        jobs_task = asyncio.ensure_future(_read_automations(conn))
+
         def list_children():
             return conn.send_request(
                 "sessions.list", dict(spawnedBy=session_key, limit=50, includeLastMessage=True), timeout=5,
             )
-        children_task = asyncio.ensure_future(conn.send_request(
-            "sessions.list", dict(limit=1000, includeLastMessage=True), timeout=10))
-        chat_task = asyncio.ensure_future(_load_owui_chat(chat_id, user_id))
 
         async def fill_context():
             """Also resolves provider/session_row for fill_limits to reuse
@@ -6694,9 +7198,7 @@ class Action:
                 desc = await desc_task
             except Exception as ex:
                 pipe_log(f"[status-action] sessions.describe failed: {ex}")
-                await __event_emitter__({"type": "execute", "data": {
-                    "code": _render_context_fill_js({"error": f"Could not fetch context: {ex}"})
-                }})
+                await emit(_render_context_fill_js({"error": f"Could not fetch context: {ex}"}))
                 return None, {}
 
             session_row = (desc or {}).get("session") or {}
@@ -6725,7 +7227,7 @@ class Action:
                     )
                     goal_data = {"line": goal_line, "pct": goal_pct}
 
-            await __event_emitter__({"type": "execute", "data": {"code": _render_context_fill_js({
+            await emit(_render_context_fill_js({
                 "provider": provider,
                 "model": session_row.get("model") or "",
                 "context": context_data,
@@ -6733,27 +7235,29 @@ class Action:
                 "source": source,
                 "fetchedAt": int(time.time() * 1000),
                 "error": None,
-            })}})
+            }))
             return provider, session_row
 
         async def fill_limits():
+            # Which provider's windows to show is the session's: Context's
+            # read of it, the same request.
             provider, session_row = await context_ready
             if provider is None:
-                return  # fill_context already reported the fetch error
+                await emit(_render_limits_fill_js(
+                    {"error": "Could not tell which provider this chat uses (its context did not load)."}))
+                return
             try:
                 usage = await usage_task
             except Exception as ex:
                 pipe_log(f"[status-action] usage.status failed: {ex}")
-                await __event_emitter__({"type": "execute", "data": {
-                    "code": _render_limits_fill_js({"error": f"Could not fetch rate limits: {ex}"})
-                }})
+                await emit(_render_limits_fill_js({"error": f"Could not fetch rate limits: {ex}"}))
                 return
 
             windows_data = _limits_windows_for(usage, provider)
             if not windows_data and provider == "anthropic":
                 windows_data = await _claude_cli_usage_windows(conn)
 
-            await __event_emitter__({"type": "execute", "data": {"code": _render_limits_fill_js({
+            await emit(_render_limits_fill_js({
                 "provider": provider,
                 "windows": windows_data,
                 # Only used to word the empty-windows note -- a live run is
@@ -6765,87 +7269,121 @@ class Action:
                 "source": source,
                 "fetchedAt": int(time.time() * 1000),
                 "error": None,
-            })}})
+            }))
 
-        # Every child seen so far by key, and the tasks read off their
-        # transcript heads: a refill updates the rows it lists again.
-        children_seen, task_texts, agents = {}, {}, []
+        async def fill_background():
+            errors = []
+            try:
+                tasks = await tasks_task
+            except Exception as ex:
+                pipe_log(f"[status-action] tasks.list failed: {ex}")
+                tasks = []
+                errors.append(f"Could not read background tasks: {ex}")
+            try:
+                jobs = await jobs_task
+            except Exception as ex:
+                pipe_log(f"[status-action] cron.list failed: {ex}")
+                jobs = []
+                errors.append(f"Could not read automations: {ex}")
+            chat = await chat_task
+            try:
+                owner = await _sender_is_owner(conn, session_key)
+            except Exception:
+                owner = False
+            data = _background_rows(tasks, jobs, _agent_call_rows(chat), session_key,
+                                    owner=owner, commands=_exec_commands(chat))
+            await emit(_render_background_fill_js({
+                **data, "errors": errors, "source": source,
+                "fetchedAt": int(time.time() * 1000), "error": None,
+            }))
 
-        async def fill_subagents(children):
-            """No dependency on sessions.describe/usage.status at all --
-            session_key is already known synchronously, so this is the
-            most genuinely independent of the three sections.
+        # Every child seen so far by key, and what their transcripts told.
+        children_seen, task_texts, latest = {}, {}, {}
 
-            Lists every child session of this chat (ELI-152), ended ones
-            included, newest first, capped, with the chat's in-process
-            Agent calls as a second group. Each child row carries the
-            fields its click hands the detail drawer (see
-            S.openSubagentDrawer / Action._run_subagent_detail), so the
-            drawer can paint its header instantly before its own RPCs
-            resolve. A row's id is the child session key. Returns the keys
-            of the listed children still running."""
+        async def read_transcripts(keys):
+            """The task and newest message of each of `keys` not read yet."""
+            unread = [k for k in keys if k not in task_texts]
+            if not unread:
+                return
+            try:
+                previews = await conn.send_request(
+                    "sessions.preview", dict(keys=unread, limit=20, maxChars=2000), timeout=5,
+                )
+            except Exception as ex:
+                # Titles fall back to the spawn label; the rows still render.
+                pipe_log(f"[status-action] sessions.preview (children) failed: {ex}")
+                return
+            texts, newest = _subagent_previews(previews)
+            task_texts.update({k: None for k in unread})
+            task_texts.update(texts)
+            latest.update(newest)
+
+        def subagent_rows(shown):
+            return [{**_subagent_row(r, task_texts.get(r["key"]), latest.get(r["key"])),
+                     "controlUiUrl": _control_ui_session_url(self.valves.CONTROL_UI_URL, r["key"])}
+                    for r in shown]
+
+        async def fill_subagents(children, *, at_open=False):
+            """Lists every child session of this chat (ELI-152), ended ones
+            included, newest first, capped. Each row carries the fields its
+            click hands the detail drawer (see S.openSubagentDrawer /
+            Action._run_subagent_detail), so the drawer can paint its header
+            instantly before its own RPCs resolve. A row's id is the child
+            session key. At open, a section with no running child starts
+            folded (the page's rule), so its transcripts wait for a tap.
+            Returns the keys of the listed children still running."""
             try:
                 children_resp = await children
             except Exception as ex:
                 pipe_log(f"[status-action] sessions.list (children) failed: {ex}")
-                await __event_emitter__({"type": "execute", "data": {
-                    "code": _render_subagents_fill_js({"error": f"Could not fetch subagents: {ex}"})
-                }})
+                await emit(_render_subagents_fill_js({"error": f"Could not fetch subagents: {ex}"}))
                 return []
             for r in (children_resp or {}).get("sessions") or []:
                 if _is_child_of(r, session_key):
                     children_seen[r["key"]] = r
             shown = sorted(children_seen.values(), key=_subagent_started, reverse=True)[:_SUBAGENT_LIST_CAP]
-            untitled = [r["key"] for r in shown if r["key"] not in task_texts]
-            if untitled:
-                try:
-                    previews = await conn.send_request(
-                        "sessions.preview", dict(keys=untitled, limit=20, maxChars=2000), timeout=5,
-                    )
-                    task_texts.update({k: None for k in untitled})
-                    task_texts.update(_subagent_task_texts(previews))
-                except Exception as ex:
-                    # Titles fall back to the spawn label; the rows still render.
-                    pipe_log(f"[status-action] sessions.preview (children) failed: {ex}")
-            await __event_emitter__({"type": "execute", "data": {"code": _render_subagents_fill_js({
-                "tasks": [{**_subagent_row(r, task_texts.get(r["key"])),
-                           "controlUiUrl": _control_ui_session_url(self.valves.CONTROL_UI_URL, r["key"])}
-                          for r in shown],
-                "total": len(children_seen),
-                "agents": agents[:_SUBAGENT_LIST_CAP], "agentsTotal": len(agents),
+            running = [r["key"] for r in shown if _subagent_status(r.get("status")) in _LIVE_SUBAGENT_STATUSES]
+            pending = at_open and not running and bool(shown)
+            if not pending:
+                await read_transcripts([r["key"] for r in shown])
+            dialog["rows"], dialog["total"] = shown, len(children_seen)
+            await emit(_render_subagents_fill_js({
+                "tasks": subagent_rows(shown), "total": len(children_seen), "pending": pending,
                 "source": source, "fetchedAt": int(time.time() * 1000), "error": None,
-            })}})
-            return [r["key"] for r in shown if r.get("status") in _LIVE_SUBAGENT_STATUSES]
-
-        async def fill_subagents_at_open():
-            agents.extend(_agent_call_rows(await chat_task))
-            return await fill_subagents(children_task)
+            }))
+            return running
 
         context_ready = asyncio.ensure_future(fill_context())
         limits_ready = asyncio.ensure_future(fill_limits())
-        subagents_ready = asyncio.ensure_future(fill_subagents_at_open())
+        background_ready = asyncio.ensure_future(fill_background())
+        subagents_ready = asyncio.ensure_future(fill_subagents(children_task, at_open=True))
 
-        provider, _session_row = await context_ready
-        await limits_ready
-        listed = await subagents_ready
+        results = await asyncio.gather(context_ready, limits_ready, background_ready, subagents_ready,
+                                       agents_ready, return_exceptions=True)
+        for name, result in zip(("context", "limits", "background", "subagents", "agents"), results):
+            if isinstance(result, BaseException):
+                pipe_log(f"[status-action] {name} section failed: {result!r}")
+                await emit(_render_section_error_js(name, f"Could not load this section: {result}"))
+        listed = results[3] if isinstance(results[3], list) else []
 
-        pipe_log(f"[status-action] status dialog filled ({source}) provider={provider}")
+        pipe_log(f"[status-action] status dialog filled ({source})")
 
         # The ticker counts a running child up while the dialog is open, so a
         # child that ends meanwhile must show its end (ELI-127). Hold this
         # request open, as the drawer does, and refill the section on each
-        # pushed change to a listed child's run state, until none is listed
-        # or the follow's bound passes. Each event is taken before the read
-        # it guards, so no change slips between them. A closed dialog makes
-        # every fill a no-op.
+        # pushed change to a listed child's run state, until none is listed,
+        # the page closes the dialog, or the follow's bound passes. Each event
+        # is taken before the read it guards, so no change slips between them.
         deadline = time.time() + _DIALOG_FOLLOW_MAX_S
-        while listed:
+        closed = dialog["closed"]
+        while listed and not closed.is_set():
             changes = [conn.session_change_event(k) for k in listed]
             following = listed
             listed = await fill_subagents(list_children())
             if not listed or set(listed) - set(following):
                 continue    # none left, or a new child: take its event first
             waits = [asyncio.ensure_future(ev.wait()) for ev in changes]
+            waits.append(asyncio.ensure_future(closed.wait()))
             try:
                 done, _pending = await asyncio.wait(
                     waits, timeout=max(deadline - time.time(), 0), return_when=asyncio.FIRST_COMPLETED)
@@ -6854,6 +7392,38 @@ class Action:
                     w.cancel()
             if not done:
                 break
+        return {"status": "ok"}
+
+    async def _run_subagent_rows(self, body: dict, __user__, __event_emitter__):
+        """The reader opened a folded Subagents section (ELI-163): read the
+        listed children's transcripts, which the open left for this tap, and
+        fill the section again. The rows are the open's, kept with its
+        dialog, so the list is not read twice."""
+        user_id = (__user__ or {}).get("id") or "unknown"
+        dialog = _dialog_of(body, user_id)
+
+        async def emit(code):
+            await __event_emitter__({"type": "execute", "data": {"code": code}})
+
+        if dialog is None:
+            await emit(_render_subagents_fill_js({"error": "This dialog is out of date: open it again."}))
+            return {"status": "error", "detail": "unknown dialog"}
+        rows = dialog["rows"]
+        try:
+            conn, source = await _get_action_connection(lambda: self.valves)
+            previews = await conn.send_request(
+                "sessions.preview", dict(keys=[r["key"] for r in rows], limit=20, maxChars=2000), timeout=5)
+        except Exception as ex:
+            pipe_log(f"[status-action] sessions.preview (fold) failed: {ex}")
+            previews, source = None, "action-own"
+        texts, newest = _subagent_previews(previews)
+        await emit(_render_subagents_fill_js({
+            "tasks": [{**_subagent_row(r, texts.get(r["key"]), newest.get(r["key"])),
+                       "controlUiUrl": _control_ui_session_url(self.valves.CONTROL_UI_URL, r["key"])}
+                      for r in rows],
+            "total": dialog["total"], "pending": False,
+            "source": source, "fetchedAt": int(time.time() * 1000), "error": None,
+        }))
         return {"status": "ok"}
 
     async def _run_compact(self, body: dict, __user__, __event_emitter__):

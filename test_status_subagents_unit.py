@@ -52,6 +52,10 @@ def _list_rpc(rows, previews, calls):
         if method == "sessions.preview":
             return {"previews": [{"key": k, "status": "ok", "items": previews.get(k, [])}
                                  for k in params["keys"]]}
+        if method == "tasks.list":
+            return {"tasks": []}
+        if method == "cron.list":
+            return {"jobs": []}
         raise AssertionError(f"unexpected RPC: {method}")
     return send_request
 
@@ -63,23 +67,35 @@ def _child(key, status, **kw):
 
 class SubagentListTests(unittest.IsolatedAsyncioTestCase):
 
-    async def _open(self, rows, previews):
-        calls, emitted, seen = [], [], []
+    async def _open(self, rows, previews, *, unfold=False):
+        """Open the dialog; `unfold`: then tap a folded Subagents section
+        open, as the page does (mode "subagent-rows"). Returns the RPCs,
+        the emitted events and the last Subagents fill's data; the In-process
+        agents fill's data is on `self.agents_data`."""
+        calls, emitted, seen, agents = [], [], [], []
 
         emitter = RecordingEmitter(emitted)
 
         conn = mock.AsyncMock()
         conn.send_request = mock.AsyncMock(side_effect=_list_rpc(rows, previews, calls))
         real = openclaw_status_action._render_subagents_fill_js
+        real_agents = openclaw_status_action._render_agents_fill_js
 
         def spy(data):
             seen.append(data)
             return real(data)
 
         with action_gateway(conn), \
-             mock.patch("openclaw_status_action._render_subagents_fill_js", side_effect=spy):
+             mock.patch("openclaw_status_action._render_subagents_fill_js", side_effect=spy), \
+             mock.patch("openclaw_status_action._render_agents_fill_js",
+                        side_effect=lambda d: (agents.append(d), real_agents(d))[1]):
             await _open_dialog(Action().action({"chat_id": PARENT_CHAT}, __user__={"id": PARENT_USER},
                                                __event_emitter__=emitter), conn)
+            if unfold:
+                await Action().action({"chat_id": PARENT_CHAT, "mode": "subagent-rows",
+                                       "dialogId": _dialog_id(emitted)},
+                                      __user__={"id": PARENT_USER}, __event_emitter__=emitter)
+        self.agents_data = agents[-1] if agents else None
         return calls, emitted, seen[-1]
 
     async def test_lists_every_child_titled_by_its_label_else_its_task_newest_first(self):
@@ -91,8 +107,6 @@ class SubagentListTests(unittest.IsolatedAsyncioTestCase):
         previews = {CHILD_A: [{"role": "user", "text": WRAPPED_93}, {"role": "assistant", "text": "halfway"}],
                     CHILD_B: [{"role": "user", "text": WRAPPED_103}]}
         calls, emitted, data = await self._open(rows, previews)
-        methods = [m for m, _p in calls]
-        self.assertNotIn("tasks.list", methods)
         self.assertIsNone(data["error"])
         self.assertEqual([t["id"] for t in data["tasks"]], [CHILD_B, CHILD_A, CHILD_DONE])
         b, a, done = data["tasks"]
@@ -125,6 +139,8 @@ class SubagentListTests(unittest.IsolatedAsyncioTestCase):
         calls, _emitted, data = await self._open(rows, {})
         opened = next(p for m, p in calls if m == "sessions.list")
         self.assertNotIn("spawnedBy", opened)
+        # The store's rows only: a last message reads every session's transcript.
+        self.assertNotIn("includeLastMessage", opened)
         self.assertEqual([(t["id"][-4:], t["status"]) for t in data["tasks"]],
                          [("0002", "failed"), ("0004", "ended"), ("0001", "completed")])
         self.assertEqual(data["tasks"][0]["error"], "provider 529")
@@ -172,11 +188,35 @@ class SubagentListTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("sessions.preview", [m for m, _p in calls])
 
     async def test_an_ended_child_has_its_task_as_title_and_its_last_reply_as_summary(self):
-        _calls, _emitted, data = await self._open(
-            [_child(CHILD_DONE, "done", startedAt=900, endedAt=990, lastMessagePreview="Y is fine")],
-            {CHILD_DONE: [{"role": "user", "text": WRAPPED_103}, {"role": "assistant", "text": "Y is fine"}]})
+        """Nothing runs, so the section opens folded (ELI-163) and its
+        transcripts wait for the reader's tap; the tap reads them once and
+        lists the rows the open already read, without listing again."""
+        rows = [_child(CHILD_DONE, "done", startedAt=900, endedAt=990)]
+        previews = {CHILD_DONE: [{"role": "user", "text": WRAPPED_103}, {"role": "assistant", "text": "Y is fine"}]}
+        calls, _emitted, data = await self._open(rows, previews)
+        self.assertTrue(data["pending"])
+        self.assertNotIn("sessions.preview", [m for m, _p in calls])
+        calls, _emitted, data = await self._open(rows, previews, unfold=True)
+        self.assertFalse(data["pending"])
         (t,) = data["tasks"]
         self.assertEqual((t["title"], t["terminalSummary"]), ("Summarise Y.", "Y is fine"))
+        self.assertEqual([m for m, _p in calls].count("sessions.list"), 1)
+        self.assertEqual([m for m, _p in calls].count("sessions.preview"), 1)
+
+    async def test_a_tap_on_someone_elses_dialog_reads_nothing(self):
+        rows = [_child(CHILD_DONE, "done", startedAt=900, endedAt=990)]
+        calls, emitted = [], []
+        conn = mock.AsyncMock()
+        conn.send_request = mock.AsyncMock(side_effect=_list_rpc(rows, {}, calls))
+        with action_gateway(conn):
+            await _open_dialog(Action().action({"chat_id": PARENT_CHAT}, __user__={"id": PARENT_USER},
+                                               __event_emitter__=RecordingEmitter(emitted)), conn)
+            calls.clear()
+            result = await Action().action({"chat_id": PARENT_CHAT, "mode": "subagent-rows",
+                                            "dialogId": _dialog_id(emitted)},
+                                           __user__={"id": "someone-else"}, __event_emitter__=RecordingEmitter([]))
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(calls, [])
 
     async def test_title_falls_back_to_label_then_key(self):
         rows = [_child(CHILD_A, "running", label="research-x", startedAt=2),
@@ -208,6 +248,12 @@ class SubagentListTests(unittest.IsolatedAsyncioTestCase):
 
 async def _noop():
     return None
+
+
+def _dialog_id(emitted):
+    """The id the open handed the page (its IDENTITY)."""
+    code = next(c for c in _emitted_codes(emitted) if "const IDENTITY = " in c)
+    return json.loads(code.split("const IDENTITY = ", 1)[1].split(";\n", 1)[0])["dialogId"]
 
 
 class TaskTextTests(unittest.TestCase):
@@ -336,13 +382,18 @@ class SubagentDrawerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class NoTasksApiTests(unittest.TestCase):
+    """Sub-agents never come from the Tasks API, which 2026.10 removed. The
+    Background section reads `tasks.list` behind one adapter that degrades
+    on a Gateway without it (ELI-163)."""
 
-    def test_the_status_action_never_calls_the_tasks_api(self):
+    def test_only_the_background_adapter_calls_the_tasks_api(self):
         here = os.path.dirname(os.path.abspath(__file__))
         with open(os.path.join(here, "openclaw_status_action.py"), encoding="utf-8") as f:
             source = f.read()
-        for method in ('"tasks.list"', '"tasks.get"'):
-            self.assertNotIn(method, source)
+        self.assertNotIn('"tasks.get"', source)
+        self.assertEqual(source.count('"tasks.list"'), 1)
+        adapter = source.split("async def _read_background_tasks", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn('"tasks.list"', adapter)
 
 
 class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
@@ -480,9 +531,10 @@ class InProcessAgentTests(unittest.IsolatedAsyncioTestCase):
             _calls, emitted, data = await SubagentListTests._open(
                 self, [_child(CHILD_DONE, "done", startedAt=900, endedAt=990)], {})
         self.assertEqual([t["id"] for t in data["tasks"]], [CHILD_DONE])
-        self.assertEqual([a["title"] for a in data["agents"]],
+        agents = self.agents_data
+        self.assertEqual([a["title"] for a in agents["agents"]],
                          ["Benchmark run", "Venue research", "Strategy research", "Broker research", "Tax research"])
-        self.assertEqual(data["agentsTotal"], 5)
+        self.assertEqual(agents["total"], 5)
 
     async def test_another_users_chat_lists_no_agents(self):
         chats = types.ModuleType("open_webui.models.chats")
@@ -492,8 +544,8 @@ class InProcessAgentTests(unittest.IsolatedAsyncioTestCase):
                 "open_webui.models": types.ModuleType("open_webui.models"),
                 "open_webui.models.chats": chats}
         with mock.patch.dict(sys.modules, mods):
-            _calls, _emitted, data = await SubagentListTests._open(self, [], {})
-        self.assertEqual(data["agents"], [])
+            await SubagentListTests._open(self, [], {})
+        self.assertEqual(self.agents_data["agents"], [])
 
 
 class SubagentSectionRenderTests(unittest.TestCase):
@@ -501,19 +553,21 @@ class SubagentSectionRenderTests(unittest.TestCase):
 
     NOW = 1_783_790_100_000
 
-    def _page(self, data):
+    def _page(self, data, section="subagents"):
         from test_status_action_unit import _FAKE_DOM_JS, _render_modal_open_js
 
         page = _FAKE_DOM_JS + r"""
 run(input.open);
 run(input.fill);
-const section = document.getElementById('openclaw-status-section-subagents');
+const section = document.getElementById('openclaw-status-section-' + input.section);
 console.log(JSON.stringify(section.walk().filter((e) => e.children.length === 0 && e.text)
   .map((e) => e.text)));
 """
         identity = {"chatId": "c", "messageId": "m", "sessionId": "s", "owuiModel": "x"}
-        payload = {"now": self.NOW, "open": _render_modal_open_js(identity),
-                   "fill": openclaw_status_action._render_subagents_fill_js(data)}
+        render = (openclaw_status_action._render_subagents_fill_js if section == "subagents"
+                  else openclaw_status_action._render_agents_fill_js)
+        payload = {"now": self.NOW, "open": _render_modal_open_js(identity), "fill": render(data),
+                   "section": section}
         return run_page(page, payload)
 
     def test_both_groups_with_their_counts_and_states(self):
@@ -521,20 +575,22 @@ console.log(JSON.stringify(section.walk().filter((e) => e.children.length === 0 
                 "startedAt": self.NOW - 65_000, "endedAt": self.NOW - 5_000, "terminalSummary": "X is fine"}
         agents = [{"id": "t6", "title": "Benchmark run", "state": "running", "startedAt": self.NOW - 30_000},
                   {"id": "t1", "title": "Tax research", "state": "launched", "startedAt": self.NOW - 600_000}]
-        texts = self._page({"tasks": [task], "total": 21, "agents": agents, "agentsTotal": 2,
-                            "source": "pipe", "fetchedAt": self.NOW, "error": None})
+        texts = self._page({"tasks": [task], "total": 21, "source": "pipe", "fetchedAt": self.NOW, "error": None})
         self.assertEqual(texts[:5], ["Subagents (1 of 21)", "Research X", "Done", "1m", "X is fine"])
-        self.assertIn("In-process agents (2)", texts)
-        rest = texts[texts.index("In-process agents (2)") + 1:]
-        self.assertEqual(rest[:2], ["Claude Code Agent calls in this chat, as their tool cards show them.",
-                                    "Benchmark run"])
+        texts = self._page({"agents": agents, "total": 2, "fetchedAt": self.NOW, "error": None}, "agents")
+        self.assertEqual(texts[:3], ["In-process agents (2)",
+                                     "Claude Code Agent calls in this chat, as their tool cards show them.",
+                                     "Benchmark run"])
         # Their states as chips (ELI-155).
-        self.assertIn("Running", rest)
-        self.assertIn("Background", rest)
+        self.assertIn("Running", texts)
+        self.assertIn("Background", texts)
 
-    def test_nothing_to_show_hides_the_section(self):
-        self.assertEqual(self._page({"tasks": [], "total": 0, "agents": [], "agentsTotal": 0,
-                                     "source": "pipe", "fetchedAt": self.NOW, "error": None}), [])
+    def test_nothing_to_show_is_a_folded_count_of_zero(self):
+        """Every section keeps its title from the open on (ELI-163)."""
+        self.assertEqual(self._page({"tasks": [], "total": 0, "source": "pipe", "fetchedAt": self.NOW,
+                                     "error": None}), ["Subagents (0)", "No sub-agents in this chat."])
+        self.assertEqual(self._page({"agents": [], "total": 0, "fetchedAt": self.NOW, "error": None}, "agents"),
+                         ["In-process agents (0)", "No Claude Code Agent calls in this chat."])
 
     def test_a_long_dialog_scrolls_instead_of_running_off_the_screen(self):
         """Up to 20 rows of each kind outgrow a phone screen: seen on the
@@ -544,11 +600,18 @@ console.log(JSON.stringify(section.walk().filter((e) => e.children.length === 0 
         page = _FAKE_DOM_JS + r"""
 run(input.open);
 const panel = document.getElementById('openclaw-status-modal-root').children[0];
-console.log(JSON.stringify({maxHeight: panel.style.maxHeight, overflowY: panel.style.overflowY}));
+const body = document.getElementById('openclaw-status-sections');
+const [head, , foot] = panel.children;
+console.log(JSON.stringify({maxHeight: panel.style.maxHeight, display: panel.style.display,
+  bodyScroll: body.style.overflowY, bodyMin: body.style.minHeight,
+  pinned: [head.style.flexShrink, foot.style.flexShrink]}));
 """
         identity = {"chatId": "c", "messageId": "m", "sessionId": "s", "owuiModel": "x"}
+        # The sections scroll; the title bar (with its close button) and
+        # the footer stay in view.
         self.assertEqual(run_page(page, {"now": self.NOW, "open": _render_modal_open_js(identity)}),
-                         {"maxHeight": "88vh", "overflowY": "auto"})
+                         {"maxHeight": "88vh", "display": "flex", "bodyScroll": "auto", "bodyMin": "0",
+                          "pinned": ["0", "0"]})
 
 
 if __name__ == "__main__":
