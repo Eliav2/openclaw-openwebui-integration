@@ -20,3 +20,6 @@ venv/
 # Never commit real OWUI_EMAIL/OWUI_PASSWORD/GATEWAY_TOKEN values.
 .env.local
 
+
+# The deploy tooling's lock file
+.deploy.lock
