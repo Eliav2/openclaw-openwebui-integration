@@ -30,7 +30,7 @@ jobs:
             trace: "1"
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.3.0
       - name: Open WebUI
         run: |
           source e2e/versions.env
