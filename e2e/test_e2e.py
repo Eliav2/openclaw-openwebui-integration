@@ -845,7 +845,11 @@ def test_the_status_action_lists_a_running_subagent_and_opens_its_drawer(token):
     drawer = _section_data(codes, "openclaw-drawer-stream")
     assert drawer["childSessionKey"] == child, drawer
     assert drawer["task"]["status"] == "completed", drawer
-    assert drawer["task"]["task"] == SPAWN_TASK, drawer
+    if drawer["task"]["task"] != SPAWN_TASK:
+        first = next((m for m in _gw("chat.history", {"sessionKey": child, "limit": 20}).get("messages") or []
+                      if m.get("role") == "user"), None)
+        pytest.fail(f"drawer task {drawer['task']['task']!r}; the child's first user message: "
+                    f"{json.dumps(first)[:1500]}")
     assert drawer["task"]["endedAt"], drawer
     assert drawer["items"] and drawer["items"][-1]["kind"] == "text", drawer
     assert drawer["items"][-1]["text"].startswith("E2E_CHILDTASK slow-1"), drawer

@@ -74,7 +74,7 @@ cat >"$HOME/.openclaw/openclaw.json" <<EOF
     "auth": {"mode": "token", "token": "$GATEWAY_TOKEN"}
   },
   "models": {"mode": "merge", "providers": {"fake": {
-    "baseUrl": "http://127.0.0.1:$FAKE_LLM_PORT/v1", "apiKey": "e2e",
+    "baseUrl": "http://127.0.0.1:$FAKE_LLM_PORT/v1",
     "api": "openai-completions",
     "models": [{"id": "e2e-default", "name": "E2E Default"},
                {"id": "e2e-echo", "name": "E2E Echo"}]
