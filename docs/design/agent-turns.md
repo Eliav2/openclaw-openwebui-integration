@@ -589,7 +589,10 @@ no fourth run is sent. A unit test drives four consecutive 137 rows.
 11. **Several pipe connections after a redeploy (PR #14).** Every connection may see R's
     start. Only the one whose insert wins the row lock writes M, and a retired connection
     never claims (`_retired`, gateway.py:1380). Handover checks `openclaw_writer` against
-    the live registry. The result is one message, whatever the number of connections.
+    the live registry. A retired connection still serves the reply it streams; the new
+    load routes nothing such a connection has a consumer for (`_served_by_retired`), and
+    takes the run from the next event after that reply ends (PR #72). The result is one
+    message, whatever the number of connections.
 
 ## 4. Existing chats
 
