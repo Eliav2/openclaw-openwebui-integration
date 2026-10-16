@@ -223,6 +223,22 @@ class InterruptedTurnTailRecoveryTests(unittest.TestCase):
         self.assertIsNone(asyncio.run(_recover_turn_text(conn, self.KEY, "never asked")))
 
 
+async def _play_frames(conn, frames):
+    """Run `conn`'s event loop over `frames` (Gateway frames, in order), then
+    stop it the way a shutdown does, not as a tick timeout (which marks a gap)."""
+    frames = list(frames)
+
+    class ScriptedWS:
+        async def recv(self_):
+            if frames:
+                return json.dumps(frames.pop(0))
+            conn._stopped = True
+            raise asyncio.CancelledError
+
+    conn._ws = ScriptedWS()
+    await conn._event_loop()
+
+
 class SessionToolEventTests(unittest.IsolatedAsyncioTestCase):
     """ELI-92: tool activity of a run this connection did not start.
 
@@ -239,17 +255,7 @@ class SessionToolEventTests(unittest.IsolatedAsyncioTestCase):
                            "22222222-2222-2222-2222-222222222222")
 
     async def _run_loop(self, conn, frames):
-        frames = list(frames)
-
-        class ScriptedWS:
-            async def recv(self_):
-                if frames:
-                    return json.dumps(frames.pop(0))
-                conn._stopped = True
-                raise asyncio.CancelledError  # stop, not a tick timeout (which marks a gap)
-
-        conn._ws = ScriptedWS()
-        await conn._event_loop()
+        await _play_frames(conn, frames)
         for _ in range(5):
             await asyncio.sleep(0)
 
@@ -7624,17 +7630,7 @@ class RegressionPlanTests(_RoutingCase):
                                         "lastRunId": run, **row})
 
     async def scripted_loop(self, conn, frames):
-        frames = list(frames)
-
-        class ScriptedWS:
-            async def recv(self_):
-                if frames:
-                    return json.dumps(frames.pop(0))
-                conn._stopped = True
-                raise asyncio.CancelledError  # stop, not a tick timeout (which marks a gap)
-
-        conn._ws = ScriptedWS()
-        await conn._event_loop()
+        await _play_frames(conn, frames)
         await self.spin()
 
     async def test_two_connections_one_message(self):
