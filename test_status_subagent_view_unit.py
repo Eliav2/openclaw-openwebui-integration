@@ -368,6 +368,61 @@ console.log(JSON.stringify({blocks: t, chip: byData(drawer(), 'openclawChip').ma
         self.assertFalse(any(b.startswith("result:") for b in seen["blocks"]), seen["blocks"])
 
 
+def _native_long_run(calls: int) -> list:
+    """A child on the Gateway's own runtime that made `calls` tool calls: its
+    spawn message, then per call a text + `toolCall` message and a
+    `toolResult` message of its own, then its reply."""
+    messages = [{"role": "user", "content": "[Subagent Context] You are running as a subagent.\n"
+                                            "[Subagent Task]\nRead the README 55 times."}]
+    for i in range(1, calls + 1):
+        messages.append({"role": "assistant", "content": [
+            {"type": "text", "text": f"Pass {i}."},
+            {"type": "toolCall", "id": f"call_{i}", "name": "read", "arguments": {"path": "README.md"}}]})
+        messages.append({"role": "toolResult", "toolCallId": f"call_{i}", "toolName": "read",
+                         "content": [{"type": "text", "text": "# Forecast"}]})
+    messages.append({"role": "assistant", "content": [{"type": "text", "text": f"All {calls} passes are done."}]})
+    return messages
+
+
+class LongChildTests(unittest.IsolatedAsyncioTestCase):
+    """A child with many tool calls shows all of them. The Gateway honors
+    `limit` for its own runtime's history, where every result is a message
+    of its own: the drawer read the newest 50 messages, so a child with 55
+    calls showed its last 16, and its Transcript began at "Pass 40" (the
+    runner matrix, 2026-10-16)."""
+
+    async def test_a_native_child_with_55_tool_calls_shows_all_55(self):
+        history = _native_long_run(55)
+        asked = []
+
+        async def send_request(method, params, timeout=5):
+            if method == "sessions.describe":
+                return {"session": {"key": CHILD, "status": "done", "startedAt": NOW - 9_000, "endedAt": NOW,
+                                    "agentRuntime": {"id": "openclaw"}}}
+            if method == "chat.history":
+                asked.append(params)
+                limit = params.get("limit") or 200
+                page = history[-limit:]
+                return {"messages": page, "totalMessages": len(history), "hasMore": len(page) < len(history)}
+            if method == "sessions.list":
+                return {"sessions": []}
+            raise AssertionError(f"unexpected RPC: {method}")
+
+        emitted = []
+
+        async def emitter(evt):
+            emitted.append(evt)
+
+        with mock.patch("openclaw_status_action._get_action_connection",
+                        new=mock.AsyncMock(return_value=(_drawer_conn(send_request), "pipe"))):
+            await Action()._run_subagent_detail({"mode": "subagent-detail", "taskId": CHILD, "opened": True},
+                                                {"id": "u"}, emitter)
+        shown = "\n".join(_emitted_codes(emitted))
+        calls = {f"call_{i}" for i in range(1, 56) if f'"call_{i}"' in shown}
+        self.assertEqual(len(calls), 55, f"{len(calls)} of 55 calls shown; chat.history asked with {asked}")
+        self.assertIn("Pass 1.", shown)
+
+
 class InProcessAgentDetailTests(unittest.TestCase):
     """B10: an in-process agent opens the same sheet, from its tool card:
     its task and its result, nothing to poll."""
