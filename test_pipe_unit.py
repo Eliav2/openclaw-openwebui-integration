@@ -9512,7 +9512,13 @@ class GapHandoverReplayTests(_RoutingCase):
             if method == "chat.history":
                 return copy.deepcopy(test.history)
             if method == "sessions.list":
-                return {"sessions": [row()]}
+                # The row as the Gateway reads it now, but its response comes
+                # over the socket behind the frames already sent: an idle row
+                # never overtakes the run's own final.
+                read, target = row(), test.socket.got + test.socket.frames.qsize()
+                async with test.socket.moved:
+                    await test.socket.moved.wait_for(lambda: test.socket.taken >= target)
+                return {"sessions": [read]}
             if method == "sessions.subscribe":
                 return {"list": {"sessions": [row()] if test.active else []}}
             if method == "sessions.describe":
@@ -9524,9 +9530,16 @@ class GapHandoverReplayTests(_RoutingCase):
         class Socket:
             def __init__(self_):
                 self_.frames = asyncio.Queue()
+                self_.got = self_.taken = 0             # received / handled frames
+                self_.moved = asyncio.Condition()
 
             async def recv(self_):
+                # Asked for the next frame: the one before is handled.
+                self_.taken = self_.got
+                async with self_.moved:
+                    self_.moved.notify_all()
                 frame = await self_.frames.get()
+                self_.got += 1
                 if frame == "drop":
                     raise websockets.exceptions.ConnectionClosed(None, None)
                 return json.dumps(frame)
