@@ -1634,6 +1634,9 @@ TOOL_ERROR_MARK = "❌"
 # What a call the run ended without answering shows as its output.
 TOOL_NO_RESULT_NOTE = "(no result -- the run ended first)"
 
+# A sub-agent's title is one line on a phone: its spawn label, else its
+# task's first sentence cut to this many characters. The Status Action's
+# rows and drawer use it too (ELI-155).
 SUBAGENT_TITLE_MAX = 60
 _FIRST_SENTENCE_RE = re.compile(r"(?<=[.!?])\s|\n")
 # How much of a sub-agent's task its spawn card shows as input.
@@ -6143,25 +6146,6 @@ def _subagent_task_texts(previews_resp):
                 out[p["key"]] = text
                 break
     return out
-
-
-# A title is one line on a phone: the spawn label, else the task's first
-# sentence cut to this many characters (ELI-155).
-_SUBAGENT_TITLE_MAX = 60
-_FIRST_SENTENCE_RE = re.compile(r"(?<=[.!?])\s|\n")
-
-
-def _short_title(text):
-    """The first sentence of `text`, cut on a word to _SUBAGENT_TITLE_MAX
-    characters with an ellipsis."""
-    first = _FIRST_SENTENCE_RE.split(text.strip(), 1)[0].strip()
-    if len(first) <= _SUBAGENT_TITLE_MAX:
-        return first
-    cut = first[:_SUBAGENT_TITLE_MAX - 1]
-    space = cut.rfind(" ")
-    if space >= _SUBAGENT_TITLE_MAX // 2:
-        cut = cut[:space]
-    return cut.rstrip(" ,;:(") + "…"
 
 
 def _subagent_row(row, task_text=None):
