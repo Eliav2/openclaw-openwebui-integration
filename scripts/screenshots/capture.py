@@ -386,6 +386,26 @@ def visible_text(page: Page, selector: str | None = None) -> str:
         }).map(f => f.value).join('\\n')""")
 
 
+# Where the sub-agent drawer's parts sit against the viewport (ELI-155).
+DRAWER_LAYOUT = """() => {
+  const root = document.getElementById('openclaw-drawer-root'), panel = root && root.children[1];
+  const f = el => { if (!el) return null; const r = el.getBoundingClientRect();
+    return {top: Math.round(r.top), height: Math.round(r.height)}; };
+  const parts = panel ? [...panel.children] : [];
+  const scroller = parts.find(el => /auto|scroll/.test(getComputedStyle(el).overflowY));
+  return {viewport: [innerWidth, innerHeight], panel: f(panel), header: f(parts[0]),
+          headerLines: parts[0] ? parts[0].innerText.split('\\n').length : null,
+          scroller: f(scroller), scrollerIndex: parts.indexOf(scroller),
+          scrolls: !!scroller && scroller.scrollHeight > scroller.clientHeight};
+}"""
+
+
+def back_to_dialog(page: Page) -> None:
+    """Close the sub-agent drawer: its back button on a phone."""
+    page.locator("#openclaw-drawer-root button", has_text="Back").first.click()
+    page.wait_for_selector("#openclaw-drawer-root", state="detached", timeout=10_000)
+
+
 class Shooter:
     def __init__(self, out: str, only: set | None):
         self.out, self.only = out, only
@@ -548,6 +568,12 @@ class Scenes:
         print(f"  computed z-index: {z}", flush=True)
         if z["drawer"] == "auto" or (z["dialog"] != "auto" and int(z["drawer"]) <= int(z["dialog"])):
             raise AssertionError(f"the sub-agent drawer opens behind the status dialog (computed z-index {z})")
+        # The Overview: the reply so far as its Result, and its Task.
+        wait_js(page, """() => { const b = document.getElementById('openclaw-drawer-blocks');
+                 return b && b.querySelector('[data-openclaw-block=result]') && b.querySelector('[data-openclaw-block=task]'); }""",
+                "the drawer's Result and Task", 60_000)
+        print("  drawer layout: " + json.dumps(page.evaluate(DRAWER_LAYOUT)), flush=True)
+        self.s.shot(page, "subagent-drawer", text_selector="#openclaw-drawer-root")
         page.locator("#openclaw-drawer-root button", has_text="Transcript").first.click()
         # Tool results show only in the Tools tab (ELI-128); the child's first
         # turn carries a line of prose with its tool call, so the Transcript
@@ -555,7 +581,7 @@ class Scenes:
         wait_js(page, """() => { const d = document.querySelector('#openclaw-drawer-root');
                  return d && /\\buser\\b/i.test(d.innerText) && d.innerText.includes("start from the app's README"); }""",
                 "the drawer transcript's task and the child's prose", 60_000)
-        self.s.shot(page, "subagent-drawer", text_selector="#openclaw-drawer-root")
+        self.s.shot(page, "subagent-drawer-transcript", text_selector="#openclaw-drawer-root")
         # The Tools tab, its first card opened: what a tool's result looks like there.
         dump_child_history_shapes(f"agent:main:openwebui-{me['id']}-{chat}")
         page.locator("#openclaw-drawer-root button", has_text="Tools").first.click()
@@ -568,12 +594,48 @@ class Scenes:
         self.s.shot(page, "subagent-drawer-tools", text_selector="#openclaw-drawer-root")
         # Back to the dialog, a while after it opened: a running row's elapsed
         # time has moved on from what the dialog first showed (ELI-120).
-        page.mouse.click(12, 400)  # the drawer's backdrop, left of its panel
-        page.wait_for_selector("#openclaw-drawer-root", state="detached", timeout=10_000)
+        back_to_dialog(page)
         # Ten seconds after it opened, so the change reads at a glance.
         page.wait_for_timeout(max(0, 10_000 - (time.monotonic() - opened_at) * 1000))
         print(f"  elapsed at open {opened_elapsed}, now {page.evaluate(ELAPSED_CELLS)}", flush=True)
         self.s.shot(page, "status-dialog-later", text_selector=root)
+
+    def subagents_long(self, page: Page) -> None:
+        """Two finished sub-agents: one labelled with a 1,250-character task,
+        one with no label (ELI-155)."""
+        new_chat(page)
+        chat = send(page, "Benchmark the forecasters against our baseline")
+        wait_js(page, last_text_has("Two sub-agents are on it"), "the parent's reply")
+        set_title(self.token, chat, "Forecaster benchmark")
+        # The parent's replies to each result: both sub-agents have ended.
+        wait_api(self.token, chat, "The benchmark is back", 240)
+        wait_api(self.token, chat, "only station 4 changed", 240)
+        page.locator('button[aria-label="OpenClaw status"]').click()
+        root = "#openclaw-status-modal-root"
+        wait_js(page, f"""() => {{ const r = document.querySelector('{root}'); if (!r) return false;
+          return /subagents \\(2\\)/i.test(r.innerText) && /noise table/i.test(r.innerText) && /forecast/i.test(r.innerText); }}""",
+                "the status dialog with both sub-agents", 60_000)
+        rows = f"{root} #openclaw-status-section-subagents button"
+        print("  dialog rows: " + json.dumps(page.evaluate(f"""() => [...document.querySelectorAll('{rows}')]
+          .map(b => ({{h: Math.round(b.getBoundingClientRect().height), chars: b.innerText.length}}))""")), flush=True)
+        self.s.shot(page, "subagents-long-dialog", text_selector=root)
+        page.locator(rows).filter(has_text=re.compile("Forecaster benchmark|pre-registered baseline")).first.click()
+        page.wait_for_selector("#openclaw-drawer-root", timeout=30_000)
+        wait_js(page, "() => /PR #12/.test((document.getElementById('openclaw-drawer-root') || {}).innerText || '')",
+                "the drawer filled", 60_000)
+        print("  drawer layout: " + json.dumps(page.evaluate(DRAWER_LAYOUT)), flush=True)
+        self.s.shot(page, "subagents-long-drawer", text_selector="#openclaw-drawer-root")
+        page.locator("#openclaw-drawer-root [data-openclaw-more=task]").click()
+        self.s.shot(page, "subagents-long-task", text_selector="#openclaw-drawer-root")
+        back_to_dialog(page)
+        page.locator(rows).filter(has_text="noise table").first.click()
+        page.wait_for_selector("#openclaw-drawer-root", timeout=30_000)
+        wait_js(page, "() => /station 4/.test((document.getElementById('openclaw-drawer-root') || {}).innerText || '')",
+                "the unlabelled sub-agent's drawer", 60_000)
+        print("  drawer layout: " + json.dumps(page.evaluate(DRAWER_LAYOUT)), flush=True)
+        self.s.shot(page, "subagents-unlabelled-drawer", text_selector="#openclaw-drawer-root")
+        back_to_dialog(page)
+        page.keyboard.press("Escape")
 
     def model_picker(self, page: Page) -> None:
         new_chat(page)
@@ -939,6 +1001,7 @@ def main(argv=None) -> int:
                 shooter.run("thinking-toggle", scenes.thinking, page)
             shooter.run("question-card", scenes.question, page)
             shooter.run("status-dialog", scenes.status_and_drawer, page)
+            shooter.run("subagents-long", scenes.subagents_long, page)
             shooter.run("model-picker", scenes.model_picker, page)
             shooter.run("agent-turn", scenes.agent_turn, page)
             shooter.run("media-turn", scenes.media_turn, page)

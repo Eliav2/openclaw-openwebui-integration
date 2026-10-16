@@ -2,6 +2,79 @@
   "_comment": "Scripted model replies for the README screenshots (capture.py). A scene is picked by a phrase from the user's own message; step n answers the request that carries n tool results. Child scenes come first: a sub-agent's prompt can quote its parent's request.",
   "scenes": [
     {
+      "match": "PR #12 has the report and the CSVs",
+      "steps": [
+        {
+          "say": "The benchmark is back: the baseline holds out-of-sample, and ARIMA's in-sample win is flagged as overfit. The report is in PR #12.",
+          "delay": 0.03
+        }
+      ]
+    },
+    {
+      "match": "flagging it for the benchmark",
+      "steps": [
+        {
+          "say": "The fee check is back: only station 4 changed, from 0.10 to 0.08.",
+          "delay": 0.03
+        }
+      ]
+    },
+    {
+      "match": "pre-registered baseline (BaselineEnsemble",
+      "steps": [
+        {
+          "say": "Re-cloning into the scratch folder, then reading the workflow.",
+          "tool": "read",
+          "args": {
+            "path": "forecast/README.md"
+          }
+        },
+        {
+          "say": "Now rewriting run.sh (per-model runs, 2021-06/2024-07 in-sample/out-of-sample split, 1x and 2x noise, time-budgeted sharded tuning) and the workflow into a two-phase matrix. While the smoke run goes, rewriting report.py for the new label scheme. Prophet's warm-up looks fine for backtests. Checking the smoke eval phase now. Meanwhile, making the smoke run exercise the time-budget stop (5000 trials, 60 s budget) so the full run doesn't depend on an untested path. Full run dispatched: https://github.com/example/forecast-bench/actions/runs/38767910637. Phase 1 takes about 20 minutes (tuning budget 19 min), then phase 2. Polling. ARIMA is fast here (16 s per year). Waiting on the tuning shards. Still waiting on the 7 shards; the baseline and all 4 ARIMA jobs are done. Polling. The shards all stopped cleanly on the time budget. Done: the baseline holds out-of-sample; ARIMA beats it in-sample by 4% but loses by 2% out-of-sample (flagged as overfit). PR #12 has the report and the CSVs.",
+          "delay": 0.03
+        }
+      ]
+    },
+    {
+      "match": "Check the noise table in bench/noise.csv",
+      "steps": [
+        {
+          "say": "Reading the noise table.",
+          "tool": "read",
+          "args": {
+            "path": "forecast/README.md"
+          }
+        },
+        {
+          "say": "The table matches the station's published figures, except station 4, whose noise figure went from 0.10 to 0.08 in September. I changed nothing; flagging it for the benchmark.",
+          "delay": 0.03
+        }
+      ]
+    },
+    {
+      "match": "Benchmark the forecasters against our baseline",
+      "steps": [
+        {
+          "say": "I'll hand this to two sub-agents.",
+          "tool": "sessions_spawn",
+          "args": {
+            "task": "Repo: the forecast-bench repository (the local clone at ~/work/forecast-bench is STALE with no commits: re-clone into your scratch folder). Workflow .github/workflows/bench.yml, code in experiments/bench/. Goal: a head-to-head, net of noise, on the same hourly weather station data (2021-06-01 to 2026-10-14, already fetched by the workflow): our pre-registered baseline (BaselineEnsemble = daily moving averages 20/50/100, FIXED params, spec frozen in commit fde26af; do NOT tune it) vs 2-3 popular open-source forecasters (Prophet, ARIMA, plus one of the gradient-boosted ones) with tuned params. Split 2021-06/2024-07 in-sample, the rest out-of-sample; run each at 1x and 2x noise. Time-budget the tuning to 19 minutes per shard and shard it 7 ways. Report: one table per split with MAE, RMSE, coverage of the 80% interval and run time; flag any forecaster that beats the baseline out-of-sample by more than its in-sample margin (overfit). Do not change the baseline's spec, do not push to main, open a PR with the report and the raw CSVs attached, and post the run link when the full run is dispatched. Keep the tuning seeds fixed, so the run can be repeated. If the workflow fails twice in the same place, stop and report instead of retrying.",
+            "label": "Forecaster benchmark"
+          }
+        },
+        {
+          "say": "",
+          "tool": "sessions_spawn",
+          "args": {
+            "task": "Check the noise table in bench/noise.csv against the station's current published figures."
+          }
+        },
+        {
+          "say": "Two sub-agents are on it: the benchmark and a noise table check. I'll report when they're back."
+        }
+      ]
+    },
+    {
       "_comment": "The Gateway's compaction request quotes the whole conversation, so it comes first.",
       "match": "<conversation>\n[User]:",
       "steps": [

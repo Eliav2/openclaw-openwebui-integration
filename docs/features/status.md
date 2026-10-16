@@ -52,8 +52,8 @@ Each row is one line: the sub-agent's spawn label (else the first sentence of it
 
 ## Sub-agent drawer
 
-![A running sub-agent's drawer, Transcript tab: its task, while it works](../img/subagent-drawer-light.png#gh-light-mode-only)
-![A running sub-agent's drawer, Transcript tab: its task, while it works](../img/subagent-drawer-dark.png#gh-dark-mode-only)
+![A running sub-agent's drawer on a phone: a one-line header, its reply so far as the Result, and its Task](../img/subagent-drawer-light.png#gh-light-mode-only)
+![A running sub-agent's drawer on a phone: a one-line header, its reply so far as the Result, and its Task](../img/subagent-drawer-dark.png#gh-dark-mode-only)
 
 Click a sub-agent to open its drawer: a side panel, or on a phone a full-screen sheet with a **‹ Back** button. Its header is the title, the status, the time and the link to the sub-agent in the Control UI, with three tabs below:
 
