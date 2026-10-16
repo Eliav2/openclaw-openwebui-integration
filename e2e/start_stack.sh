@@ -86,7 +86,7 @@ cat >"$HOME/.openclaw/openclaw.json" <<EOF
       "systemAgent": {"agentId": "main"}
     },
     "ownership": "explicit",
-    "entries": {"main": {}, "title-gen": {}}
+    "entries": {"main": {"workspace": "$HOME/.openclaw/workspace"}, "title-gen": {}}
   }
 }
 EOF
