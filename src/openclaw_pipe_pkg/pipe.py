@@ -1185,6 +1185,9 @@ class _PipeTurn:
         self.owner_notice_before = False
         self.owner_resumes = 0
         self.owner_run = None
+        # Claude Code Agent calls started in the background: the run stays
+        # open until their reports are in, so the reply says why (ELI-163).
+        self.background_agents = 0
 
         self.adopt_new_run = True
         try:
@@ -1292,6 +1295,12 @@ class _PipeTurn:
                                 )
                                 for event in events:
                                     yield event
+                                if _is_background_agent_launch(name, _tool_result_text(data.get("result", {})),
+                                                               data.get("isError") is True):
+                                    self.background_agents += 1
+                                    # Until the reply ends: its usage rows replace it.
+                                    await _emit_status(self.__event_emitter__,
+                                                       _background_agents_line(self.background_agents))
 
                         # --- Item events (progress) ---
                         if stream == "item":

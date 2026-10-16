@@ -9594,6 +9594,57 @@ class InlineOwnerRuleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("sessions.list", self.rpc)
 
 
+
+class BackgroundAgentLineTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-163: a Claude Code Agent call started in the background holds its
+    reply open until its report is in, and the reply looked busy for no
+    reason. Its status row says why, until the reply ends."""
+
+    asyncTearDown = InlineOwnerRuleTests.asyncTearDown
+    _queue = InlineOwnerRuleTests._queue
+    _delta = InlineOwnerRuleTests._delta
+    _final = NoDroppedMessagesTests._final
+    _until_registered = InlineOwnerRuleTests._until_registered
+    _event = InlineOwnerRuleTests._event
+    _turn = InlineOwnerRuleTests._turn
+    USER, CHAT = InlineOwnerRuleTests.USER, InlineOwnerRuleTests.CHAT
+
+    async def asyncSetUp(self):
+        self.statuses = []
+        await InlineOwnerRuleTests.asyncSetUp(self)
+
+    def _reply(self, text, msg_id):
+        async def emitter(event):
+            if event.get("type") == "status":
+                self.statuses.append(event["data"]["description"])
+        body = {"model": "openclaw_gateway.default", "messages": [{"role": "user", "content": text}]}
+        meta = {"chat_id": self.CHAT, "user_id": self.USER, "message_id": msg_id}
+        return self.pipe._pipe_impl(body, emitter, __metadata__=meta)
+
+    def _tool(self, phase, name, tcid, result=None):
+        data = {"phase": phase, "name": name, "toolCallId": tcid, "args": {}}
+        if result is not None:
+            data["result"] = result
+        return self._event("agent", stream="tool", data=data)
+
+    async def test_the_reply_says_how_many_background_agents_it_waits_on(self):
+        launched = "Async agent launched successfully. agentId: a1 (internal metadata)"
+        await self._turn(
+            self._tool("start", "Agent", "t1"), self._tool("result", "Agent", "t1", launched),
+            self._tool("start", "Bash", "t2"), self._tool("result", "Bash", "t2", "ok"),
+            self._tool("start", "Agent", "t3"), self._tool("result", "Agent", "t3", launched),
+            self._tool("start", "Agent", "t4"), self._tool("result", "Agent", "t4", "Report: done"),
+            self._final("run-1"))
+        waiting = [s for s in self.statuses if s.startswith("Waiting on")]
+        self.assertEqual(waiting, ["Waiting on 1 background agent", "Waiting on 2 background agents"])
+        self.assertNotIn("Bash done", self.statuses)
+
+    async def test_an_agent_that_ran_in_the_foreground_is_not_waited_on(self):
+        await self._turn(self._tool("start", "Agent", "t1"), self._tool("result", "Agent", "t1", "Report: done"),
+                         self._final("run-1"))
+        self.assertFalse([s for s in self.statuses if s.startswith("Waiting on")])
+        self.assertNotIn("Agent done", self.statuses, "no status line per tool call (ELI-115)")
+
 class GapHandoverReplayTests(_RoutingCase):
     """ELI-147 slice 4: events lost on the Gateway socket (a dropped frame, a
     drop and reconnect) end the user's reply and hand its message to the

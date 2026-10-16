@@ -1241,6 +1241,23 @@ async def _emit_status(__event_emitter__, description, *, done=False):
     )
 
 
+# Claude Code's in-process sub-agent tool, and what its card's result says for
+# one started in the background: its report comes later, and the run stays
+# open until it is in (ELI-163).
+_AGENT_TOOL_NAME = "Agent"
+_AGENT_LAUNCHED_PREFIX = "Async agent launched"
+
+
+def _is_background_agent_launch(name, result_text, is_error=False) -> bool:
+    return (not is_error and (name or "").strip() == _AGENT_TOOL_NAME
+            and (result_text or "").strip().startswith(_AGENT_LAUNCHED_PREFIX))
+
+
+def _background_agents_line(n: int) -> str:
+    """The status row of a reply a background agent holds open."""
+    return f"Waiting on {n} background agent{'' if n == 1 else 's'}"
+
+
 def _fmt_tokens(n) -> str:
     """Compact token count: 115212 -> '115k', 1000000 -> '1.0m'."""
     try:
@@ -10080,6 +10097,9 @@ class _PipeTurn:
         self.owner_notice_before = False
         self.owner_resumes = 0
         self.owner_run = None
+        # Claude Code Agent calls started in the background: the run stays
+        # open until their reports are in, so the reply says why (ELI-163).
+        self.background_agents = 0
 
         self.adopt_new_run = True
         try:
@@ -10187,6 +10207,12 @@ class _PipeTurn:
                                 )
                                 for event in events:
                                     yield event
+                                if _is_background_agent_launch(name, _tool_result_text(data.get("result", {})),
+                                                               data.get("isError") is True):
+                                    self.background_agents += 1
+                                    # Until the reply ends: its usage rows replace it.
+                                    await _emit_status(self.__event_emitter__,
+                                                       _background_agents_line(self.background_agents))
 
                         # --- Item events (progress) ---
                         if stream == "item":
