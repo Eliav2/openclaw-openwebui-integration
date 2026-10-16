@@ -10048,7 +10048,7 @@ class _PipeTurn:
         self.last_snapshot_time = 0.0
         self.snapshot_interval_s = 1.0
         self.snapshot_min_delta_chars = 250
-        queued_shown = False
+        self.queued_shown = False
         # An interrupted run is not continued here: its message goes to the
         # turn writer, whose settled row decides who continues it (DESIGN 2.7).
         self.handed_over = False
@@ -10060,10 +10060,10 @@ class _PipeTurn:
         self.owner_resumes = 0
         self.owner_run = None
 
-        adopt_new_run = True
+        self.adopt_new_run = True
         try:
-            while adopt_new_run:
-                adopt_new_run = False
+            while self.adopt_new_run:
+                self.adopt_new_run = False
                 # A new run's text is a new message item.
                 self.fence_item_start = len(self.assistant_stream_text)
                 try:
@@ -10075,118 +10075,21 @@ class _PipeTurn:
                         msg = await self.queue.get()
 
                         if msg.get("type") == _ROW_MARKER_TYPE and self.awaiting_owner:
-                            step = await self.owner_step(msg.get("row") or {})
-                            if step is None:
-                                continue
-                            if step[0] == "end":
-                                if step[1]:
-                                    note = f"\n\n{step[1]}" if self.visible_message_text.strip() else step[1]
-                                    self.record_visible_chunk(note)
-                                    yield note
-                                    self.text_yielded = True
-                                self.done = True
-                            else:
-                                # The reply continues in the run that continues
-                                # this one: its events (held until now) and its end.
-                                _kind, new_run, new_queue = step
-                                self.conn.unregister_consumer(self.session_key, self.our_run_id, queue=self.queue)
-                                self.queue, self.our_run_id = new_queue, new_run
-                                self.turn.run_id, self.turn.queue = self.our_run_id, self.queue
-                                self.admitted_at, self.signals_lost = time.monotonic(), False
-                            self.awaiting_owner = False
-                            self.conn.stop_awaiting_owner(self.session_key, self.owner_run)
+                            async for chunk in self.on_owner_row(msg):
+                                yield chunk
                             continue
 
                         if msg.get("type") == _ROW_MARKER_TYPE:
-                            row = msg.get("row") or {}
-                            if row.get("status") == "queued" and not self.first_event_arrived \
-                                    and not queued_shown:
-                                queued_shown = True
-                                await _emit_status(
-                                    self.__event_emitter__,
-                                    "Waiting -- your message is queued behind an "
-                                    "active response...",
-                                    done=False,
-                                )
-                            # Read after this run was admitted, an idle session
-                            # means it is over, whichever run settled last. That
-                            # is the end signal once its own may have been lost
-                            # in a gap. A row read before the admission shows
-                            # nothing about it.
-                            admitted = msg.get("read_at", time.monotonic()) >= self.admitted_at
-                            if admitted and msg.get("resync"):
-                                self.signals_lost = True
-                            tail = None
-                            if row.get("hasActiveRun") is False and (
-                                    row.get("lastRunId") == self.our_run_id
-                                    or (admitted and self.signals_lost)):
-                                # The run settled while its terminal event never
-                                # reached this reply (dropped frame, socket gap).
-                                # Its transcript has what was lost.
-                                pipe_log(f"  run settled (row status {row.get('status')}, "
-                                         f"last run {str(row.get('lastRunId'))[:24]}) without its final")
-                                tail = await self.settled_tail(row)
-                            elif row.get("hasActiveRun") and msg.get("resync") and admitted:
-                                # After a gap the session is busy, maybe with a
-                                # later run: this run's closer says it ended.
-                                tail = await self.settled_tail(row, closer_only=True)
-                                if tail is not None:
-                                    pipe_log("  run closed in the transcript during a gap")
-                            if tail is not None:
-                                if tail:
-                                    self.record_visible_chunk(tail)
-                                    yield tail
-                                    self.text_yielded = True
-                                    await self.maybe_emit_snapshot(force=True)
-                                self.done = True
+                            async for chunk in self.on_settle_row(msg):
+                                yield chunk
                             continue
 
                         if msg.get("type") == _RESTART_MARKER_TYPE:
-                            # A new Gateway process: the run may be recovered
-                            # by it (a crash leaves its row `running`) or need
-                            # a resume. Its row decides, in the turn writer,
-                            # unless the reply `keeps_its_run`.
-                            if not self.keeps_its_run and _hand_over_run(self.conn, self.session_key,
-                                    self.our_run_id, thinking=self.resolved_thinking, read_row=True):
-                                self.handed_over = self.done = True
-                            elif self.awaiting_owner:
-                                spawn_background(self.conn.push_row(self.session_key))
-                            elif not self.owui_message_id:
-                                self.await_owner()
-                            else:
-                                pipe_log("  Gateway restarted; no message to hand over, waiting")
+                            self.on_restart()
                             continue
 
                         if msg.get("type") == _GAP_MARKER_TYPE:
-                            # Events were lost on the Gateway socket. The turn
-                            # writer rebuilds the message from the run's
-                            # transcript, cards included, so the reply hands
-                            # it over (ELI-147), with a copy of what it showed
-                            # (it closes its own open cards next) and the
-                            # events queued behind the gap. Its consumer goes
-                            # before any await, so nothing later lands here.
-                            # A reply that `keeps_its_run` keeps streaming, as
-                            # does one with no message (an API request). What a
-                            # gap lost there stays lost.
-                            self.signals_lost = True
-                            queued = []
-                            if not self.keeps_its_run and self.owui_message_id:
-                                queued = self.queue.take_all()
-                                if _hand_over_run(
-                                        self.conn, self.session_key, self.our_run_id,
-                                        thinking=self.resolved_thinking, read_row=True,
-                                        reply={"message_id": self.owui_message_id,
-                                               "renderer": copy.deepcopy(self.renderer),
-                                               "events": [m.get("payload") or {} for m in queued
-                                                          if m.get("type") == "event"]}):
-                                    self.conn.unregister_consumer(self.session_key, self.our_run_id,
-                                                                  queue=self.queue)
-                                    self.handed_over = self.done = True
-                                    continue
-                            for m in queued:
-                                self.queue.put_control(m)
-                            pipe_log("  event gap (Gateway socket dropped): "
-                                     "what it lost stays lost in this reply")
+                            self.on_gap()
                             continue
 
                         self.event_count += 1
@@ -10215,45 +10118,10 @@ class _PipeTurn:
                         err = (str(data.get("error", "unknown"))
                                if stream == "lifecycle" and phase == "error" else "")
                         aborted_run = state == "aborted" or data.get("aborted") is True
-                        # DESIGN 2.7: an outside kill of the CLI, or an abort
-                        # after a shutdown notice, may be continued by the
-                        # Gateway (a `running` row) or by a resume. The reply
-                        # decides neither: the turn writer takes the message
-                        # and the settled row picks the owner. Without a
-                        # message to hand over, or in a reply that
-                        # `keeps_its_run`, it ends here like any error.
-                        if _EXTERNAL_KILL_RE.search(err) or (aborted_run and self.conn._shutdown_seen):
-                            if not self.keeps_its_run and _hand_over_run(self.conn, self.session_key,
-                                    self.our_run_id, thinking=self.resolved_thinking):
-                                self.handed_over = self.done = True
-                                continue
-                            if not self.owui_message_id:
-                                self.await_owner()
-                                continue
-                        if stream == "lifecycle" and phase == "end":
-                            self.done = True
-                            pipe_log("  lifecycle end -> done")
-                        elif err:
-                            self.error_shown = f"\n\n**Error:** {err}"
-                            self.record_visible_chunk(self.error_shown)
-                            yield self.error_shown
-                            self.done = True
-                            pipe_log("  lifecycle error -> done")
-                        if state in ("final", "cancelled", "error", "aborted") or aborted_run:
-                            self.done = True
-                            pipe_log(f"  payload state='{state}' aborted={aborted_run} -> done")
-                        # A run the Gateway refused before it started (an
-                        # inline `/model` naming a model that is not allowed)
-                        # says why only here (ELI-139). A thinking-level
-                        # rejection is left to the retry below.
-                        run_error = str(payload.get("errorMessage") or "").strip() \
-                            if state == "error" else ""
-                        if (run_error and not self.error_shown
-                                and _thinking_rejection_retry_body(
-                                    self.body, run_error, self.resolved_thinking) is None):
-                            self.error_shown = f"\n\n**Error:** {run_error}"
-                            self.record_visible_chunk(self.error_shown)
-                            yield self.error_shown
+                        if self.hand_over_after_kill(err, aborted_run):
+                            continue
+                        async for chunk in self.on_completion(payload, stream, phase, state, err, aborted_run):
+                            yield chunk
 
                         # --- Run text and tool cards ---
                         # One renderer reads them, the one a turn writer uses
@@ -10316,144 +10184,17 @@ class _PipeTurn:
                                      f"title={str(data.get('title',''))[:50]}")
 
                 except (asyncio.CancelledError, GeneratorExit) as stop:
-                    # OWUI ended this response: the Stop button, or Send now /
-                    # interrupt, which stop it the same way and then send a
-                    # new message. It arrives as a task cancel when we are
-                    # awaiting, or as a generator close when we are suspended
-                    # at a yield (OWUI busy with the last chunk), which is
-                    # most of the time while text streams. Both paths land
-                    # here, so neither loses the abort, the handover or the
-                    # reply's own unsent message.
-                    #
-                    # Park first, synchronously: the run keeps going with its
-                    # events buffered. On Send now it goes on in this reply's
-                    # own message, through the turn writer (ELI-158); see
-                    # `park_cancelled_turn`. The awaits after it may be
-                    # interrupted themselves; nothing depends on them.
-                    self.aborted = True
-                    grace_s = float(getattr(self.pipe.valves, "INTERRUPT_GRACE_SECONDS", 0) or 0)
-                    self.turn.parked = True
-                    self.conn.park_cancelled_turn(
-                        self.session_key, self.our_run_id, self.queue, self.turn.unsent, grace_s,
-                        send_stop=self.pipe.valves.SEND_STOP_ON_CANCEL,
-                        run_text={"received": self.renderer.received,
-                                  "stream": self.assistant_stream_text,
-                                  "item": self.renderer.last_item},
-                        settle=functools.partial(
-                            _settle_cancel_intent, self.conn, self.session_key, self.our_run_id,
-                            self.owui_origin_chat_id, self.__event_call__),
-                        reply=({"message_id": self.owui_message_id,
-                                "renderer": copy.deepcopy(self.renderer)}
-                               if self.owui_message_id and not self.keeps_its_run else None),
-                    )
-                    pipe_log(
-                        f"Generator {type(stop).__name__}: run parked "
-                        f"{grace_s:g}s with {len(self.turn.unsent)} unsent "
-                        "message(s), in case a new message follows"
-                        if grace_s > 0 else
-                        f"Generator {type(stop).__name__}: sending chat.abort"
-                    )
-                    try:
-                        await self.maybe_emit_snapshot(force=True)
-                        await _emit_status(self.__event_emitter__, "Stopped", done=True)
-                    except (Exception, asyncio.CancelledError) as ex:
-                        pipe_log(f"  stop snapshot/status skipped: {ex!r}")
+                    await self.park(stop)
                     raise
 
                 else:
                     # Normal completion (no cancellation).
-                    if self.pending_prompt_text:
-                        # The buffered plain-text tail either fully resolved into a
-                        # needs-input trigger (see `_could_be_user_input_prefix`
-                        # above -- buffering only continues past the ambiguous
-                        # prefix stage while it keeps matching) or the run ended
-                        # mid-buffer without ever diverging. Either way, resolve it
-                        # now that the full text is available. `maybe_answer_user_input`
-                        # re-checks the trigger itself and returns False for a
-                        # partial/non-match, in which case fall back to showing it
-                        # as plain text so nothing is silently dropped.
-                        answer_res = await self.maybe_answer_user_input(self.pending_prompt_text)
-                        if answer_res.handled:
-                            # Answer delivered. Re-enter the main loop (via the outer
-                            # `while adopt_new_run`) to consume the follow-up -- whether
-                            # the run resumed in place (steer) or a new run was spawned
-                            # -- so the continuation reuses the same needs-input
-                            # re-detection, dedup and snapshot handling as any other
-                            # run instead of a separate, drift-prone copy of the loop.
-                            self.text_yielded = True
-                            detail_block = ""
-                            if answer_res.answer:
-                                detail_block = _ask_user_detail_block(
-                                    answer_res.prompt_text or self.pending_prompt_text, answer_res.answer
-                                )
-                                self.record_visible_chunk(detail_block)
-                                yield detail_block
-                                await self.maybe_emit_snapshot(force=True)
-                            self.conn.note_turn_rewrite(self.owui_origin_chat_id, self.owui_message_id,
-                                                   self.pending_prompt_text, detail_block)
-                            self.pending_prompt_text = ""
-                            if answer_res.new_run_id and answer_res.new_run_id != self.our_run_id:
-                                pipe_log(f"  continuing into new run: {answer_res.new_run_id[:20]}...")
-                                # The answer run continues this reply.
-                                self.switch_to_answer_run(answer_res)
-                                self.conn.unregister_consumer(self.session_key, self.our_run_id, queue=self.queue)
-                                self.queue = answer_res.queue or self.conn.register_consumer(
-                                    self.session_key, answer_res.new_run_id)
-                                self.our_run_id = answer_res.new_run_id
-                            else:
-                                pipe_log("  continuing in the same run after modal answer")
-                            self.done = False
-                            adopt_new_run = True
-                        else:
-                            # Modal not handled (cancelled / dismissed / gave up
-                            # on reconnect). Show the prompt as a fallback, but
-                            # never leak the literal "OpenClaw needs input:"
-                            # directive line as visible text.
-                            fallback = _ask_user_fallback_text(self.pending_prompt_text)
-                            self.conn.note_turn_rewrite(self.owui_origin_chat_id, self.owui_message_id,
-                                                   self.pending_prompt_text, fallback)
-                            if fallback:
-                                self.record_visible_chunk(fallback)
-                                yield fallback
-                                self.text_yielded = True
-                            self.pending_prompt_text = ""
-
-                    if self.pending_media_text:
-                        # The run ended with a MEDIA: directive still buffered --
-                        # either its filename never got a trailing whitespace
-                        # before the stream closed, or "MEDIA:" itself was still
-                        # incomplete. Nothing more is coming, so it's safe to
-                        # resolve now; `_resolve_media_text` still falls back to
-                        # showing it as plain text if resolution fails, so
-                        # nothing is silently dropped.
-                        resolved = await self.settle_held_media(self.pending_media_text)
-                        self.record_visible_chunk(resolved)
-                        yield resolved
-                        self.text_yielded = True
-                        self.pending_media_text = ""
-
-                    # Resolve any tool call that was announced but never got a
-                    # result (run cancelled, gateway dropped it, tool crashed).
-                    # Its card is a spinner until something completes it, and
-                    # OWUI's own "mark leftover in_progress items completed"
-                    # sweep does NOT reliably reach this path, so close them
-                    # here.
-                    #
-                    # A handed-over run is not over (its writer completes the
-                    # cards from the renderer it was handed), but this
-                    # request's output must still close them: Open WebUI's
-                    # post-stream sweep executes every `function_call` of the
-                    # stream that has no `function_call_output`, gets `Error:
-                    # Tool "Bash" not found.` and sends that back as a new
-                    # turn, whose stream then overwrites the writer's reply.
-                    # Only the yielded items are
-                    # closed; the handed renderer keeps the call open.
-                    if not adopt_new_run:
-                        note = ("(interrupted -- the reply continues when the run resumes)"
-                                if self.handed_over else TOOL_NO_RESULT_NOTE)
-                        for event in self.renderer.close_open_calls(note):
-                            pipe_log(f"  closing orphaned tool call {event['item']['call_id']}")
-                            yield event
+                    async for chunk in self.finish_held_prompt():
+                        yield chunk
+                    async for chunk in self.finish_held_media():
+                        yield chunk
+                    async for chunk in self.close_open_cards():
+                        yield chunk
 
         finally:
             if self.awaiting_owner:
@@ -10492,6 +10233,311 @@ class _PipeTurn:
                     await _emit_status(self.__event_emitter__, line, done=True)
             else:
                 await _emit_status(self.__event_emitter__, "", done=True)
+
+    async def on_owner_row(self, msg):
+        """A session row while the reply waits for its interrupted run's owner."""
+        step = await self.owner_step(msg.get("row") or {})
+        if step is None:
+            return
+        if step[0] == "end":
+            if step[1]:
+                note = f"\n\n{step[1]}" if self.visible_message_text.strip() else step[1]
+                self.record_visible_chunk(note)
+                yield note
+                self.text_yielded = True
+            self.done = True
+        else:
+            # The reply continues in the run that continues
+            # this one: its events (held until now) and its end.
+            _kind, new_run, new_queue = step
+            self.conn.unregister_consumer(self.session_key, self.our_run_id, queue=self.queue)
+            self.queue, self.our_run_id = new_queue, new_run
+            self.turn.run_id, self.turn.queue = self.our_run_id, self.queue
+            self.admitted_at, self.signals_lost = time.monotonic(), False
+        self.awaiting_owner = False
+        self.conn.stop_awaiting_owner(self.session_key, self.owner_run)
+
+    async def on_settle_row(self, msg):
+        """A session row: the queued status, or the run's end when its final was lost."""
+        row = msg.get("row") or {}
+        if row.get("status") == "queued" and not self.first_event_arrived \
+                and not self.queued_shown:
+            self.queued_shown = True
+            await _emit_status(
+                self.__event_emitter__,
+                "Waiting -- your message is queued behind an "
+                "active response...",
+                done=False,
+            )
+        # Read after this run was admitted, an idle session
+        # means it is over, whichever run settled last. That
+        # is the end signal once its own may have been lost
+        # in a gap. A row read before the admission shows
+        # nothing about it.
+        admitted = msg.get("read_at", time.monotonic()) >= self.admitted_at
+        if admitted and msg.get("resync"):
+            self.signals_lost = True
+        tail = None
+        if row.get("hasActiveRun") is False and (
+                row.get("lastRunId") == self.our_run_id
+                or (admitted and self.signals_lost)):
+            # The run settled while its terminal event never
+            # reached this reply (dropped frame, socket gap).
+            # Its transcript has what was lost.
+            pipe_log(f"  run settled (row status {row.get('status')}, "
+                     f"last run {str(row.get('lastRunId'))[:24]}) without its final")
+            tail = await self.settled_tail(row)
+        elif row.get("hasActiveRun") and msg.get("resync") and admitted:
+            # After a gap the session is busy, maybe with a
+            # later run: this run's closer says it ended.
+            tail = await self.settled_tail(row, closer_only=True)
+            if tail is not None:
+                pipe_log("  run closed in the transcript during a gap")
+        if tail is not None:
+            if tail:
+                self.record_visible_chunk(tail)
+                yield tail
+                self.text_yielded = True
+                await self.maybe_emit_snapshot(force=True)
+            self.done = True
+
+    def on_restart(self):
+        """The Gateway process changed under the run."""
+        # A new Gateway process: the run may be recovered
+        # by it (a crash leaves its row `running`) or need
+        # a resume. Its row decides, in the turn writer,
+        # unless the reply `keeps_its_run`.
+        if not self.keeps_its_run and _hand_over_run(self.conn, self.session_key,
+                self.our_run_id, thinking=self.resolved_thinking, read_row=True):
+            self.handed_over = self.done = True
+        elif self.awaiting_owner:
+            spawn_background(self.conn.push_row(self.session_key))
+        elif not self.owui_message_id:
+            self.await_owner()
+        else:
+            pipe_log("  Gateway restarted; no message to hand over, waiting")
+
+    def on_gap(self):
+        """Events were lost on the Gateway socket."""
+        # Events were lost on the Gateway socket. The turn
+        # writer rebuilds the message from the run's
+        # transcript, cards included, so the reply hands
+        # it over (ELI-147), with a copy of what it showed
+        # (it closes its own open cards next) and the
+        # events queued behind the gap. Its consumer goes
+        # before any await, so nothing later lands here.
+        # A reply that `keeps_its_run` keeps streaming, as
+        # does one with no message (an API request). What a
+        # gap lost there stays lost.
+        self.signals_lost = True
+        queued = []
+        if not self.keeps_its_run and self.owui_message_id:
+            queued = self.queue.take_all()
+            if _hand_over_run(
+                    self.conn, self.session_key, self.our_run_id,
+                    thinking=self.resolved_thinking, read_row=True,
+                    reply={"message_id": self.owui_message_id,
+                           "renderer": copy.deepcopy(self.renderer),
+                           "events": [m.get("payload") or {} for m in queued
+                                      if m.get("type") == "event"]}):
+                self.conn.unregister_consumer(self.session_key, self.our_run_id,
+                                              queue=self.queue)
+                self.handed_over = self.done = True
+                return
+        for m in queued:
+            self.queue.put_control(m)
+        pipe_log("  event gap (Gateway socket dropped): "
+                 "what it lost stays lost in this reply")
+
+    def hand_over_after_kill(self, err, aborted_run) -> bool:
+        """True when an outside kill or a shutdown abort took the run out of this reply."""
+        # DESIGN 2.7: an outside kill of the CLI, or an abort
+        # after a shutdown notice, may be continued by the
+        # Gateway (a `running` row) or by a resume. The reply
+        # decides neither: the turn writer takes the message
+        # and the settled row picks the owner. Without a
+        # message to hand over, or in a reply that
+        # `keeps_its_run`, it ends here like any error.
+        if _EXTERNAL_KILL_RE.search(err) or (aborted_run and self.conn._shutdown_seen):
+            if not self.keeps_its_run and _hand_over_run(self.conn, self.session_key,
+                    self.our_run_id, thinking=self.resolved_thinking):
+                self.handed_over = self.done = True
+                return True
+            if not self.owui_message_id:
+                self.await_owner()
+                return True
+        return False
+
+    async def on_completion(self, payload, stream, phase, state, err, aborted_run):
+        """The run's end signals and the error lines they show."""
+        if stream == "lifecycle" and phase == "end":
+            self.done = True
+            pipe_log("  lifecycle end -> done")
+        elif err:
+            self.error_shown = f"\n\n**Error:** {err}"
+            self.record_visible_chunk(self.error_shown)
+            yield self.error_shown
+            self.done = True
+            pipe_log("  lifecycle error -> done")
+        if state in ("final", "cancelled", "error", "aborted") or aborted_run:
+            self.done = True
+            pipe_log(f"  payload state='{state}' aborted={aborted_run} -> done")
+        # A run the Gateway refused before it started (an
+        # inline `/model` naming a model that is not allowed)
+        # says why only here (ELI-139). A thinking-level
+        # rejection is left to the retry below.
+        run_error = str(payload.get("errorMessage") or "").strip() \
+            if state == "error" else ""
+        if (run_error and not self.error_shown
+                and _thinking_rejection_retry_body(
+                    self.body, run_error, self.resolved_thinking) is None):
+            self.error_shown = f"\n\n**Error:** {run_error}"
+            self.record_visible_chunk(self.error_shown)
+            yield self.error_shown
+
+    async def park(self, stop):
+        """OWUI ended this response; park the run (see below)."""
+        # OWUI ended this response: the Stop button, or Send now /
+        # interrupt, which stop it the same way and then send a
+        # new message. It arrives as a task cancel when we are
+        # awaiting, or as a generator close when we are suspended
+        # at a yield (OWUI busy with the last chunk), which is
+        # most of the time while text streams. Both paths land
+        # here, so neither loses the abort, the handover or the
+        # reply's own unsent message.
+        #
+        # Park first, synchronously: the run keeps going with its
+        # events buffered. On Send now it goes on in this reply's
+        # own message, through the turn writer (ELI-158); see
+        # `park_cancelled_turn`. The awaits after it may be
+        # interrupted themselves; nothing depends on them.
+        self.aborted = True
+        grace_s = float(getattr(self.pipe.valves, "INTERRUPT_GRACE_SECONDS", 0) or 0)
+        self.turn.parked = True
+        self.conn.park_cancelled_turn(
+            self.session_key, self.our_run_id, self.queue, self.turn.unsent, grace_s,
+            send_stop=self.pipe.valves.SEND_STOP_ON_CANCEL,
+            run_text={"received": self.renderer.received,
+                      "stream": self.assistant_stream_text,
+                      "item": self.renderer.last_item},
+            settle=functools.partial(
+                _settle_cancel_intent, self.conn, self.session_key, self.our_run_id,
+                self.owui_origin_chat_id, self.__event_call__),
+            reply=({"message_id": self.owui_message_id,
+                    "renderer": copy.deepcopy(self.renderer)}
+                   if self.owui_message_id and not self.keeps_its_run else None),
+        )
+        pipe_log(
+            f"Generator {type(stop).__name__}: run parked "
+            f"{grace_s:g}s with {len(self.turn.unsent)} unsent "
+            "message(s), in case a new message follows"
+            if grace_s > 0 else
+            f"Generator {type(stop).__name__}: sending chat.abort"
+        )
+        try:
+            await self.maybe_emit_snapshot(force=True)
+            await _emit_status(self.__event_emitter__, "Stopped", done=True)
+        except (Exception, asyncio.CancelledError) as ex:
+            pipe_log(f"  stop snapshot/status skipped: {ex!r}")
+
+    async def finish_held_prompt(self):
+        """The run ended with a needs-input prompt held back: ask it, or show it."""
+        if self.pending_prompt_text:
+            # The buffered plain-text tail either fully resolved into a
+            # needs-input trigger (see `_could_be_user_input_prefix`
+            # above -- buffering only continues past the ambiguous
+            # prefix stage while it keeps matching) or the run ended
+            # mid-buffer without ever diverging. Either way, resolve it
+            # now that the full text is available. `maybe_answer_user_input`
+            # re-checks the trigger itself and returns False for a
+            # partial/non-match, in which case fall back to showing it
+            # as plain text so nothing is silently dropped.
+            answer_res = await self.maybe_answer_user_input(self.pending_prompt_text)
+            if answer_res.handled:
+                # Answer delivered. Re-enter the main loop (via the outer
+                # `while adopt_new_run`) to consume the follow-up -- whether
+                # the run resumed in place (steer) or a new run was spawned
+                # -- so the continuation reuses the same needs-input
+                # re-detection, dedup and snapshot handling as any other
+                # run instead of a separate, drift-prone copy of the loop.
+                self.text_yielded = True
+                detail_block = ""
+                if answer_res.answer:
+                    detail_block = _ask_user_detail_block(
+                        answer_res.prompt_text or self.pending_prompt_text, answer_res.answer
+                    )
+                    self.record_visible_chunk(detail_block)
+                    yield detail_block
+                    await self.maybe_emit_snapshot(force=True)
+                self.conn.note_turn_rewrite(self.owui_origin_chat_id, self.owui_message_id,
+                                       self.pending_prompt_text, detail_block)
+                self.pending_prompt_text = ""
+                if answer_res.new_run_id and answer_res.new_run_id != self.our_run_id:
+                    pipe_log(f"  continuing into new run: {answer_res.new_run_id[:20]}...")
+                    # The answer run continues this reply.
+                    self.switch_to_answer_run(answer_res)
+                    self.conn.unregister_consumer(self.session_key, self.our_run_id, queue=self.queue)
+                    self.queue = answer_res.queue or self.conn.register_consumer(
+                        self.session_key, answer_res.new_run_id)
+                    self.our_run_id = answer_res.new_run_id
+                else:
+                    pipe_log("  continuing in the same run after modal answer")
+                self.done = False
+                self.adopt_new_run = True
+            else:
+                # Modal not handled (cancelled / dismissed / gave up
+                # on reconnect). Show the prompt as a fallback, but
+                # never leak the literal "OpenClaw needs input:"
+                # directive line as visible text.
+                fallback = _ask_user_fallback_text(self.pending_prompt_text)
+                self.conn.note_turn_rewrite(self.owui_origin_chat_id, self.owui_message_id,
+                                       self.pending_prompt_text, fallback)
+                if fallback:
+                    self.record_visible_chunk(fallback)
+                    yield fallback
+                    self.text_yielded = True
+                self.pending_prompt_text = ""
+
+    async def finish_held_media(self):
+        """The run ended with a MEDIA: directive held back: resolve it now."""
+        if self.pending_media_text:
+            # The run ended with a MEDIA: directive still buffered --
+            # either its filename never got a trailing whitespace
+            # before the stream closed, or "MEDIA:" itself was still
+            # incomplete. Nothing more is coming, so it's safe to
+            # resolve now; `_resolve_media_text` still falls back to
+            # showing it as plain text if resolution fails, so
+            # nothing is silently dropped.
+            resolved = await self.settle_held_media(self.pending_media_text)
+            self.record_visible_chunk(resolved)
+            yield resolved
+            self.text_yielded = True
+            self.pending_media_text = ""
+
+    async def close_open_cards(self):
+        """Answer every tool card the run left open."""
+        # Resolve any tool call that was announced but never got a
+        # result (run cancelled, gateway dropped it, tool crashed).
+        # Its card is a spinner until something completes it, and
+        # OWUI's own "mark leftover in_progress items completed"
+        # sweep does NOT reliably reach this path, so close them
+        # here.
+        #
+        # A handed-over run is not over (its writer completes the
+        # cards from the renderer it was handed), but this
+        # request's output must still close them: Open WebUI's
+        # post-stream sweep executes every `function_call` of the
+        # stream that has no `function_call_output`, gets `Error:
+        # Tool "Bash" not found.` and sends that back as a new
+        # turn, whose stream then overwrites the writer's reply.
+        # Only the yielded items are
+        # closed; the handed renderer keeps the call open.
+        if not self.adopt_new_run:
+            note = ("(interrupted -- the reply continues when the run resumes)"
+                    if self.handed_over else TOOL_NO_RESULT_NOTE)
+            for event in self.renderer.close_open_calls(note):
+                pipe_log(f"  closing orphaned tool call {event['item']['call_id']}")
+                yield event
 
     @property
     def keeps_its_run(self) -> bool:
