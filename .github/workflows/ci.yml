@@ -29,7 +29,7 @@ jobs:
         run: uvx ruff@0.17.0 check --output-format github .
 
       - name: Shell scripts
-        run: shellcheck e2e/*.sh
+        run: shellcheck e2e/*.sh scripts/screenshots/*.sh
 
       - name: Workflows (actionlint)
         run: |
@@ -74,8 +74,8 @@ jobs:
         run: python3 build.py --check-all
 
       - name: Unit tests
-        # The live-instance suites (test_pipe.py, scripts/test_auto_title.py,
-        # e2e/) skip themselves here; the E2E job runs them against a real stack.
+        # e2e/ and the installed-dist fixture checks skip themselves here (no
+        # stack, no OpenClaw); the E2E job runs both.
         env:
           PY: ${{ matrix.python-version }}
         run: |

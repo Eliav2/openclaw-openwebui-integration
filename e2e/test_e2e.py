@@ -35,6 +35,7 @@ pytestmark = pytest.mark.skipif(
 
 BASE = os.environ.get("OWUI_URL", "http://localhost:8080").rstrip("/")
 DEFAULT_MODEL = "openclaw_gateway.default"
+E2E_TITLE = "🧪 E2E chat title"   # e2e/fake_llm.py TITLE
 TURN_TIMEOUT_S = float(os.environ.get("E2E_TURN_TIMEOUT", "120"))
 
 
@@ -71,24 +72,45 @@ def _drive_chat_turn(token: str, prompt: str, model: str = DEFAULT_MODEL) -> dic
     return _chat_turn(token, prompt, model)[1]
 
 
-def _chat_turn(token: str, prompt: str, model: str = DEFAULT_MODEL) -> tuple[str, dict]:
-    """(chat id, saved assistant message) of one turn in a new persisted chat."""
+def _chat_turn(token: str, prompt: str, model: str = DEFAULT_MODEL,
+               chat_id: str | None = None) -> tuple[str, dict]:
+    """(chat id, saved assistant message) of one turn in a new persisted chat,
+    or of the next turn in `chat_id`."""
     now = int(time.time())
     uid, aid = str(uuid.uuid4()), str(uuid.uuid4())
-    user = {"id": uid, "parentId": None, "childrenIds": [aid], "role": "user",
+    if chat_id:
+        status, got = _request("GET", f"/api/v1/chats/{chat_id}", token=token)
+        assert status == 200, f"chat read failed: {status} {got}"
+        chat = got["chat"]
+        parent = chat["history"]["currentId"]
+        chat["history"]["messages"][parent]["childrenIds"].append(uid)
+    else:
+        chat = {"title": "E2E", "models": [model], "history": {"messages": {}},
+                "messages": [], "files": [], "tags": [], "timestamp": now * 1000}
+        parent = None
+    user = {"id": uid, "parentId": parent, "childrenIds": [aid], "role": "user",
             "content": prompt, "timestamp": now, "models": [model]}
     assistant = {"id": aid, "parentId": uid, "childrenIds": [], "role": "assistant",
                  "content": "", "model": model, "timestamp": now, "done": False}
-    chat = {"title": "E2E", "models": [model],
-            "history": {"messages": {uid: user, aid: assistant}, "currentId": aid},
-            "messages": [user, assistant], "files": [], "tags": [],
-            "timestamp": now * 1000}
-    status, created = _request("POST", "/api/v1/chats/new", {"chat": chat}, token)
-    assert status == 200, f"chat create failed: {status} {created}"
-    chat_id = created["id"]
+    chat["history"]["messages"].update({uid: user, aid: assistant})
+    chat["history"]["currentId"] = aid
+    chat["messages"] = chat.get("messages", []) + [user, assistant]
+    if chat_id:
+        status, saved = _request("POST", f"/api/v1/chats/{chat_id}", {"chat": chat}, token)
+        assert status == 200, f"chat update failed: {status} {saved}"
+    else:
+        status, created = _request("POST", "/api/v1/chats/new", {"chat": chat}, token)
+        assert status == 200, f"chat create failed: {status} {created}"
+        chat_id = created["id"]
 
+    # The path to the new user message, as the browser sends it.
+    path, at = [], uid
+    while at:
+        m = chat["history"]["messages"][at]
+        path.insert(0, {"role": m["role"], "content": m["content"]})
+        at = m.get("parentId")
     status, ack = _request("POST", "/api/chat/completions", {
-        "model": model, "messages": [{"role": "user", "content": prompt}],
+        "model": model, "messages": path,
         "stream": True, "chat_id": chat_id, "id": aid,
         "session_id": f"e2e-{uuid.uuid4().hex[:8]}",
         "parent_id": uid, "user_message": user,
@@ -170,15 +192,39 @@ def test_streaming_reply_arrives_in_chunks(token):
 
 
 def test_routed_model_reaches_the_gateway(token):
+    """The stack's default model is fake/e2e-default, so a turn on the
+    selector's e2e-echo entry only reaches e2e-echo if the Pipe routed it."""
     status, body = _request("GET", "/api/models", token=token)
     routed = next(m["id"] for m in body["data"]
-                  if m["id"].startswith("openclaw_gateway.") and "e2e-echo" in m["id"])
-    status, body = _request("POST", "/api/chat/completions", {
-        "model": routed, "stream": False,
-        "messages": [{"role": "user", "content": "Respond with exactly: E2E_ROUTE_OK"}],
-    }, token, timeout=TURN_TIMEOUT_S)
-    assert status == 200, body
-    assert _completion_text(body) == "E2E_ROUTE_OK"
+                  if m["id"].startswith("openclaw_gateway.") and m["id"].endswith("/e2e-echo"))
+    for model, marker, served in ((DEFAULT_MODEL, "E2E_DEFAULT_OK", "e2e-default"),
+                                  (routed, "E2E_ROUTE_OK", "e2e-echo")):
+        status, body = _request("POST", "/api/chat/completions", {
+            "model": model, "stream": False,
+            "messages": [{"role": "user", "content": f"Respond with exactly: {marker}"}],
+        }, token, timeout=TURN_TIMEOUT_S)
+        assert status == 200, body
+        assert _completion_text(body) == marker
+        assert _model_request(marker).get("model") == served, (model, marker)
+
+
+def test_hebrew_and_emoji_round_trip_exactly(token):
+    text = 'שלום עולם! 👋🏽 "quoted" <b>not a tag</b> & 100% ✓'
+    msg = _drive_chat_turn(token, f"E2E_ECHO: {text}")
+    assert msg.get("content") == text, json.dumps(msg, ensure_ascii=False)[:1500]
+
+
+def test_the_second_exchange_titles_the_chat(token):
+    """The Pipe titles a chat itself, through the title-gen agent, once the
+    second exchange is done (OWUI's own title task is skipped)."""
+    chat_id, _ = _chat_turn(token, "E2E_ECHO: first exchange")
+    _chat_turn(token, "E2E_ECHO: second exchange", chat_id=chat_id)
+
+    def title():
+        status, got = _request("GET", f"/api/v1/chats/{chat_id}", token=token)
+        assert status == 200, got
+        return got["chat"].get("title") == E2E_TITLE
+    _until("the chat title", title, timeout_s=TURN_TIMEOUT_S)
 
 
 def test_persisted_chat_keeps_the_reply(token):
@@ -497,23 +543,32 @@ def _me(tok: str) -> dict:
     return me
 
 
-def _model_prompt(marker: str) -> str:
-    """The user text of the last model request whose current turn holds
+def _model_turn(marker: str) -> tuple[dict, str]:
+    """(request, user text) of the last model request whose current turn holds
     `marker`, from the fake model's request log: what the agent was given."""
     path = os.environ.get("E2E_FAKE_LLM_LOG", "")
     assert path and os.path.exists(path), f"no fake model log (E2E_FAKE_LLM_LOG={path!r})"
-    found = ""
+    found = None
     with open(path, encoding="utf-8") as f:
         for line in f:
-            messages = (json.loads(line).get("request") or {}).get("messages") or []
+            request = json.loads(line).get("request") or {}
+            messages = request.get("messages") or []
             last = max((i for i, m in enumerate(messages) if m.get("role") == "assistant"
                         and not m.get("tool_calls")), default=-1)
             text = "\n".join(_content_text(m.get("content")) for m in messages[last + 1:]
                              if m.get("role") == "user")
             if marker in text:
-                found = text
+                found = (request, text)
     assert found, f"the model never got a turn with {marker}"
     return found
+
+
+def _model_prompt(marker: str) -> str:
+    return _model_turn(marker)[1]
+
+
+def _model_request(marker: str) -> dict:
+    return _model_turn(marker)[0]
 
 
 def _content_text(content) -> str:

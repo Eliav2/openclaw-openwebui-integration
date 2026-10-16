@@ -11,8 +11,11 @@ text Open WebUI sent in its own envelope, so markers are searched, not matched
 whole):
 
 * `exactly: TOKEN` / `exactly TOKEN`  -> replies with TOKEN alone. Covers the
-  installer's smoke test ("reply with exactly OK_CONFIG_TEST") and the
-  integration suite's "Respond with exactly: PIPE_TEST_OK".
+  installer's smoke test ("reply with exactly OK_CONFIG_TEST").
+* `Create a concise title`            -> `TITLE` below: the Pipe's own chat-title
+  run (the `title-gen` agent), after a chat's second exchange.
+* `E2E_ECHO: any text`                 -> replies with the rest of that line,
+  byte for byte (Hebrew, emoji, markup), so a round trip can be exact.
 * `E2E_TOOL_CALL`                      -> first answers with a call to the
   `session_status` tool (any harmless tool the agent offers, if that one is
   missing), then, once the tool result is in the transcript, replies
@@ -63,9 +66,11 @@ DEFAULT_REPLY = os.environ.get("FAKE_LLM_DEFAULT", "E2E fake model reply.")
 PREFERRED_TOOLS = ("session_status", "sessions_list", "memory_search")
 
 _EXACTLY = re.compile(r"exactly:?\s+([A-Za-z0-9_]{3,})")
+_ECHO = re.compile(r"E2E_ECHO: ([^\n]+)")
 _SLOW = re.compile(r"E2E_SLOW(?::(\d{1,3}))?\s+([A-Za-z0-9_]{3,})")
 SLOW_WORDS = 10
 SPAWN_TASK = "E2E_SLOW:20 E2E_CHILDTASK"   # the sub-agent's task for E2E_SPAWN
+TITLE = "🧪 E2E chat title"
 DEPLOY_MID = "E2E_DEPLOY_MID " + " ".join(f"mid-{i}" for i in range(1, 21))
 DEPLOY_END = "E2E_DEPLOY_END " + " ".join(f"end-{i}" for i in range(1, 11))
 
@@ -154,6 +159,9 @@ def plan_reply(body: dict) -> dict:
     if scripted is not None:
         return scripted
 
+    if "Create a concise title" in user_text:
+        return {"text": TITLE}
+
     if "session_status" in user_text and "model line" in user_text:
         if tool_results:
             line = next((ln.strip() for ln in "\n".join(tool_results).splitlines()
@@ -202,6 +210,9 @@ def plan_reply(body: dict) -> dict:
         count = int(m.group(1) or SLOW_WORDS)
         words = " ".join(f"slow-{i}" for i in range(1, count + 1))
         return {"text": f"{m.group(2)} {words}", "delay": 1.0}
+    m = _ECHO.search(user_text)
+    if m:
+        return {"text": m.group(1)}
     m = _EXACTLY.search(user_text)
     if m:
         return {"text": m.group(1)}

@@ -70,17 +70,12 @@ tests with no external dependencies. `test_fixture_owui_streaming_handler.py`
 is not a suite, it's a verbatim copy of Open WebUI's streaming handler, used
 as a fixture to pin tool-card rendering against the real thing.
 
-`test_pipe.py` and `scripts/test_auto_title.py` are **integration tests**
-against a live OWUI. They **skip** unless `OWUI_EMAIL` and `OWUI_PASSWORD` are
-set, and skip with a diagnostic if login fails or the integration isn't registered. To
-actually run them:
-
-```bash
-export OWUI_URL=http://your-owui-host:8080
-export OWUI_EMAIL=admin@example.com
-export OWUI_PASSWORD=your-password
-uv run --with-requirements requirements-dev.txt pytest -q test_pipe.py
-```
+`e2e/test_e2e.py` skips unless `E2E_STACK=1`: it needs the stack that
+`e2e/start_stack.sh` brings up (see E2E below). Two fixture checks in
+`test_pipe_unit.py` (`-k installed_dist`) compare the Gateway source lines the
+Pipe matches on with an installed OpenClaw: `$OPENCLAW_DIST`, else the global
+npm install's. They skip when neither exists; the extractors that rewrite those
+fixtures (`scripts/extract_openclaw_*.py --write`) default to the same dist.
 
 ### CI
 
@@ -99,8 +94,11 @@ OpenAI-compatible model (`e2e/fake_llm.py`), a real OpenClaw Gateway pointed at
 it, and Open WebUI in Docker; installs the Pipe, Filter and Action with
 `uv run install*.py install` exactly as the README tells users to (device
 pairing and the installer's smoke test included); then runs `e2e/test_e2e.py`
-and `test_pipe.py` against it. Because the model is scripted, replies are
-asserted exactly, and a real tool call (`session_status`) is checked all the
+against it, and the installed-dist fixture checks against the Gateway it
+installed. Because the model is scripted, replies are
+asserted exactly, the model that served a turn is read from the fake model's
+request log (the stack's default, `e2e-default`, differs from the routed
+`e2e-echo`), and a real tool call (`session_status`) is checked all the
 way into the chat Open WebUI persisted, as a `function_call` with its matching
 `function_call_output`. Gateway, Open WebUI and model logs are uploaded as an
 artifact on every run.

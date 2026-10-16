@@ -6224,6 +6224,29 @@ class TurnOwnerTests(unittest.TestCase):
         self.assertEqual(turn_owner(_row("running", aborted=True), True), "gateway")
 
 
+@contextlib.contextmanager
+def _scripts_on_path():
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
+    try:
+        yield
+    finally:
+        sys.path.pop(0)
+
+
+def _installed_dist(test) -> str:
+    """The OpenClaw dist to check the fixtures against. With no OpenClaw
+    installed the check skips; with OPENCLAW_DIST set (the E2E job) a missing
+    dist fails it, so a wrong path cannot pass as a skip."""
+    with _scripts_on_path():
+        from openclaw_dist import default_dist
+    dist = default_dist()
+    if os.environ.get("OPENCLAW_DIST"):
+        test.assertTrue(os.path.isdir(dist), f"OPENCLAW_DIST={dist!r} is not a directory")
+    elif not dist or not os.path.isdir(dist):
+        test.skipTest(f"no OpenClaw dist installed (looked at {dist!r})")
+    return dist
+
+
 class ExitTextFixtureTest(unittest.TestCase):
     """The owner rule matches the Gateway's exit-error TEXT: the dist has no
     structured exit field (DESIGN 2.7). The fixture is the exact source line
@@ -6232,7 +6255,6 @@ class ExitTextFixtureTest(unittest.TestCase):
 
     FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "test_fixture_openclaw_exit_errors.json")
-    DIST = os.environ.get("OPENCLAW_DIST", "/config/.node_global/lib/node_modules/openclaw/dist")
 
     def setUp(self):
         self.fx = json.load(open(self.FIXTURE))
@@ -6261,14 +6283,10 @@ class ExitTextFixtureTest(unittest.TestCase):
                 self.assertEqual(turn_owner(_row("failed", text), False), "pipe")
 
     def test_the_installed_dist_still_has_the_fixture_line(self):
-        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
-        try:
+        dist = _installed_dist(self)
+        with _scripts_on_path():
             from extract_openclaw_exit_errors import extract
-        finally:
-            sys.path.pop(0)
-        if not os.path.isdir(self.DIST):
-            self.skipTest(f"no OpenClaw dist at {self.DIST}")
-        got = extract(self.DIST)
+        got = extract(dist)
         self.assertIsNotNone(got, "the exit-error line is gone from the dist: re-check the owner rule")
         self.assertEqual(got["source"], self.fx["source"],
                          f"OpenClaw {got['openclaw_version']} changed the exit-error text "
@@ -6284,7 +6302,6 @@ class CronPromptFixtureTest(unittest.TestCase):
 
     FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "test_fixture_openclaw_cron_prompt.json")
-    DIST = ExitTextFixtureTest.DIST
     JOB = "1542eaee-50d8-4583-8d9b-d28bb12e0145"
 
     def setUp(self):
@@ -6313,14 +6330,10 @@ class CronPromptFixtureTest(unittest.TestCase):
                 self.assertEqual([t["job"] for t in wake_turns([self.turn(text)])], [self.JOB])
 
     def test_the_installed_dist_still_has_the_fixture_lines(self):
-        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
-        try:
+        dist = _installed_dist(self)
+        with _scripts_on_path():
             from extract_openclaw_cron_prompt import extract
-        finally:
-            sys.path.pop(0)
-        if not os.path.isdir(self.DIST):
-            self.skipTest(f"no OpenClaw dist at {self.DIST}")
-        got = extract(self.DIST)
+        got = extract(dist)
         self.assertIsNotNone(got, "the cron prompt lines are gone from the dist: re-check wake_turns")
         for part in ("base", "command_body"):
             self.assertEqual(got[part]["source"], self.fx[part]["source"],

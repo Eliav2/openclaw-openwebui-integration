@@ -11,13 +11,15 @@ test_pipe_unit.CronPromptFixtureTest re-extracts them from the installed
 dist when one is present, so a reworded prompt fails the suite.
 
 usage: extract_openclaw_cron_prompt.py [DIST_DIR] [--write]
+(DIST_DIR defaults to $OPENCLAW_DIST, else the global npm install's)
 """
 import glob
 import json
 import os
 import sys
 
-DEFAULT_DIST = "/config/.node_global/lib/node_modules/openclaw/dist"
+from openclaw_dist import default_dist
+
 NEEDLES = {"base": "const base = `[cron:", "command_body": "commandBody = `${base}"}
 FIXTURE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                        "test_fixture_openclaw_cron_prompt.json")
@@ -39,7 +41,7 @@ def extract(dist_dir: str) -> dict | None:
 
 if __name__ == "__main__":
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    got = extract(args[0] if args else DEFAULT_DIST)
+    got = extract(args[0] if args else default_dist())
     if got is None:
         sys.exit(f"no isolated-agent-*.mjs holds all of {list(NEEDLES.values())}")
     if "--write" in sys.argv:
