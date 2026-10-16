@@ -213,6 +213,27 @@ console.log(JSON.stringify({first, after: blocks()}));
         self.assertEqual(seen["after"][0], ["result", [len(LONG_RESULT), "6"]])
 
 
+    def test_a_running_sub_agents_reply_so_far_is_latest_until_it_ends(self):
+        labelled, unlabelled = _rows()
+
+        def fill(status):
+            return _render_drawer_overview_fill_js({
+                "task": {**unlabelled, "status": status, "result": "Reading the noise table."},
+                "childSessionKey": OTHER, "provider": "anthropic", "model": "m", "context": None,
+                "goal": None, "source": "pipe", "fetchedAt": NOW, "error": None})
+        seen = _page(r"""
+run(input.drawer);
+const label = () => byData(drawer(), 'openclawBlock').map((b) => [b.dataset.openclawBlock, b.children[0].textContent]);
+run(input.running);
+const running = label();
+run(input.ended);
+console.log(JSON.stringify({running, ended: label()}));
+""", {"open": _render_modal_open_js(IDENTITY), "running": fill(unlabelled["status"]),
+      "ended": fill(labelled["status"]),
+      "drawer": _render_drawer_open_js({**unlabelled, "kind": "child", "controlUiUrl": None})})
+        self.assertEqual(seen["running"][0], ["result", "Latest"])
+        self.assertEqual(seen["ended"][0], ["result", "Result"])
+
 class FinalReplyTests(unittest.IsolatedAsyncioTestCase):
     """B5: the Result is the last block of the child's final reply. A
     claude-cli run ends with the Gateway's closer (`cli-assistant:<run>`),

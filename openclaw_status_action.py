@@ -5041,7 +5041,9 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     const blocks = document.getElementById('openclaw-drawer-blocks');
     if (!blocks) return;
     blocks.innerHTML = '';
-    if (root.__texts.result) blocks.appendChild(textBlock('result', 'Result', root.__texts.result, 6, root.__open));
+    // A running sub-agent's reply so far is not its result yet.
+    const resultLabel = root.dataset.live === 'true' ? 'Latest' : 'Result';
+    if (root.__texts.result) blocks.appendChild(textBlock('result', resultLabel, root.__texts.result, 6, root.__open));
     if (root.__texts.task) blocks.appendChild(textBlock('task', 'Task', root.__texts.task, 3, root.__open));
     // "Show all" only where the clamp hid something (laid out by now).
     Array.prototype.forEach.call(blocks.children, function(wrap) {

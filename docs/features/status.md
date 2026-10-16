@@ -52,12 +52,12 @@ Each row is one line: the sub-agent's spawn label (else the first sentence of it
 
 ## Sub-agent drawer
 
-![A running sub-agent's drawer on a phone: a one-line header, its reply so far as the Result, and its Task](../img/subagent-drawer-light.png#gh-light-mode-only)
-![A running sub-agent's drawer on a phone: a one-line header, its reply so far as the Result, and its Task](../img/subagent-drawer-dark.png#gh-dark-mode-only)
+![A running sub-agent's drawer on a phone: a one-line header, its reply so far as Latest, and its Task](../img/subagent-drawer-light.png#gh-light-mode-only)
+![A running sub-agent's drawer on a phone: a one-line header, its reply so far as Latest, and its Task](../img/subagent-drawer-dark.png#gh-dark-mode-only)
 
 Click a sub-agent to open its drawer: a side panel, or on a phone a full-screen sheet with a **‹ Back** button. Its header is the title, the status, the time and the link to the sub-agent in the Control UI, with three tabs below:
 
-- **Overview:** its **Result** (the last block of its final reply, six lines, "Show all" for the rest) and its **Task** (three lines, "Show all"), then when it started and how long it ran, its own context fill, its goal line, and its provider and model, which are often not the parent's.
+- **Overview:** its **Result** (the last block of its final reply, six lines, "Show all" for the rest; while it runs, its reply so far, as **Latest**) and its **Task** (three lines, "Show all"), then when it started and how long it ran, its own context fill, its goal line, and its provider and model, which are often not the parent's.
 - **Transcript:** the sub-agent's messages. Its first message shows the task it was given, not the spawn wrapper around it.
 - **Tools:** each tool call with its arguments and result, failed ones marked.
 
