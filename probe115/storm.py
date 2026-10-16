@@ -30,11 +30,12 @@ def anon():
                 return int(line.split()[1]) // 1024
 
 
-async def run(case, good, dead, chat_id, seconds=20):
-    stats = {"connects": 0, "server_disconnects": 0, "other_disconnects": 0}
-    auth = {"token": good if case == "valid" else dead}
-    sio = socketio.AsyncClient(reconnection=True, reconnection_delay=1, reconnection_delay_max=5)
-    done = asyncio.Event()
+async def cycle(token, chat_id, stats):
+    """One connect as the page makes it; True when the server disconnected it
+    (the bundle then calls `connect()` again at once)."""
+    sio = socketio.AsyncClient(reconnection=False)
+    gone = asyncio.Event()
+    reason = {}
 
     @sio.event
     async def connect():
@@ -43,30 +44,37 @@ async def run(case, good, dead, chat_id, seconds=20):
         await sio.emit("events:chat", {"chat_id": chat_id, "data": {"type": "typing", "data": {"typing": False}}})
 
     @sio.event
-    async def disconnect(reason=None):
-        if reason == sio.reason.SERVER_DISCONNECT:
-            stats["server_disconnects"] += 1
-            if done.is_set():
-                return
-            # The bundle: `C==="io server disconnect"&&n.connect()`, same auth.
-            if case == "refresh":
-                auth["token"] = good
-            asyncio.get_running_loop().create_task(reconnect())
-        else:
-            stats["other_disconnects"] += 1
+    async def disconnect(r=None):
+        reason["r"] = r
+        gone.set()
 
-    async def reconnect():
-        try:
-            await sio.connect(BASE, socketio_path="/ws/socket.io", transports=["websocket"], auth=auth)
-        except Exception:
-            pass
+    try:
+        await sio.connect(BASE, socketio_path="/ws/socket.io", transports=["websocket"], auth={"token": token})
+    except Exception:
+        stats["connect_errors"] += 1
+        return False
+    try:
+        await asyncio.wait_for(gone.wait(), 2)
+    except asyncio.TimeoutError:
+        await sio.disconnect()
+        return False
+    if reason.get("r") == sio.reason.SERVER_DISCONNECT:
+        stats["server_disconnects"] += 1
+        return True
+    stats["other_disconnects"] += 1
+    return False
 
+
+async def run(case, good, dead, chat_id, seconds=20):
+    stats = {"connects": 0, "server_disconnects": 0, "other_disconnects": 0, "connect_errors": 0}
+    token = good if case == "valid" else dead
     before = anon()
     t0 = time.monotonic()
-    await reconnect()
-    await asyncio.sleep(seconds)
-    done.set()
-    await sio.disconnect()
+    while time.monotonic() - t0 < seconds:
+        if not await cycle(token, chat_id, stats):
+            break     # the page stays connected (or backs off): no storm
+        if case == "refresh":
+            token = good  # an `auth` callback reads the current token on reconnect
     row = {"case": case, **stats, "per_min": round(stats["server_disconnects"] * 60 / (time.monotonic() - t0)),
            "anon_before": before, "anon_after": anon()}
     print(json.dumps(row), flush=True)

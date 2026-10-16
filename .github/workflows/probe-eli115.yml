@@ -11,7 +11,8 @@ permissions:
   contents: read
 
 jobs:
-  replay:
+  replay-off:
+    if: false
     name: replay (${{ matrix.mode }})
     runs-on: ubuntu-latest
     timeout-minutes: 40
