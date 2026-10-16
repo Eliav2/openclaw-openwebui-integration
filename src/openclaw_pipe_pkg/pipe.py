@@ -1480,12 +1480,15 @@ class _PipeTurn:
         # after a shutdown notice, may be continued by the
         # Gateway (a `running` row) or by a resume. The reply
         # decides neither: the turn writer takes the message
-        # and the settled row picks the owner. Without a
-        # message to hand over, or in a reply that
-        # `keeps_its_run`, it ends here like any error.
+        # and the settled row picks the owner. The row is
+        # read now too: its push can come before this
+        # reply reads the kill, with no pump to take it
+        # (ELI-159). Without a message to hand over, or in
+        # a reply that `keeps_its_run`, it ends here like
+        # any error.
         if _EXTERNAL_KILL_RE.search(err) or (aborted_run and self.conn._shutdown_seen):
             if not self.keeps_its_run and _hand_over_run(self.conn, self.session_key,
-                    self.our_run_id, thinking=self.resolved_thinking):
+                    self.our_run_id, thinking=self.resolved_thinking, read_row=True):
                 self.handed_over = self.done = True
                 return True
             if not self.owui_message_id:

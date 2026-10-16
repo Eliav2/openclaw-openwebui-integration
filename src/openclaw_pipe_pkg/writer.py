@@ -627,6 +627,12 @@ class _TurnWriter:
                      f"({decision}) after run {self.run_id[:24]}...")
             return
         self.awaiting_row = False
+        last = (row or {}).get("lastRunId")
+        if decision == "resume" and last and last not in self.runs:
+            # Every writer of the session gets its settled row, but only the
+            # run it names is resumed, by its own writer: a second resume
+            # would be a follow-up of the first, which fails (ELI-159).
+            decision = "finalize"
         if decision == "resume":
             self.resumes += 1
             self.pending_resume = True

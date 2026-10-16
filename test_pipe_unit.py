@@ -6794,6 +6794,33 @@ class TurnWriterEndTests(_TurnWriterCase):
         self.assertIs(self.m()["done"], False)
         self.assertEqual(w.resumes, 1)
 
+    async def test_a_row_of_another_run_resumes_only_that_run(self):
+        """ELI-159 (manager chat 56b98d09, 2026-10-16 07:36:55): one settled
+        row reached two writers of the session, 3df09ca2's (its run killed
+        at 07:33) and f93028bc's (sessions_send run ad4cc4fc, killed after
+        2 s). Both resumed; the second chat.send became a follow-up of the
+        first and failed ("no active tool authority snapshot"). Only the run
+        the row names is resumed; the other message ends cut off."""
+        mine = await self.opened_writer()
+        other = self.writer(run="ad4cc4fc-84e8-4746-9430-837aaf987f8e", message_id="m2")
+        row = {"status": "failed", "hasActiveRun": False, "lastRunId": other.run_id,
+               "lastRunError": "Claude Code process exited with signal SIGKILL"}
+        await mine.end(row)
+        await other.end(row)
+        sends = [p["idempotencyKey"] for m, p in self.sent if m == "chat.send"]
+        self.assertEqual(len(sends), 1)
+        self.assertTrue(sends[0].startswith("msg-c1-m2-resume-"))
+        self.assertTrue(mine.closed)
+        self.assertIs(self.m()["done"], True)
+        self.assertIn(openclaw_pipe.TURN_CUT_OFF_NOTE, self.m()["content"])
+
+    async def test_a_row_naming_the_writers_resume_run_resumes_again(self):
+        w = await self.opened_writer()
+        await w.end(self.KILLED)
+        await w.end({**self.KILLED, "lastRunId": w.run_id})
+        self.assertEqual(len([m for m, _ in self.sent if m == "chat.send"]), 2)
+        self.assertEqual(w.resumes, 2)
+
     async def test_a_resume_keeps_the_handed_over_thinking_level(self):
         """An inline turn handed over carries the level the user picked
         (ELI-85); the resume continues the same reply at that level."""
@@ -9366,6 +9393,27 @@ class InlineOwnerRuleTests(unittest.IsolatedAsyncioTestCase):
         items = await self._turn_items(self._tool_start(), self._restart)
         self.assertEqual(len(self.handed), 1)
         self.assert_no_call_left_for_open_webui(items)
+
+    async def test_a_settled_row_read_before_the_kill_reaches_the_reply_still_decides(self):
+        """ELI-159 (manager chat 56b98d09, 2026-10-16): claude-cli was
+        OOM-killed at 07:33:14 and the reply handed 3df09ca2 over at 07:33:26.
+        The settled push had come in between, when no pump was there to take
+        it, so the writer waited for the session's next settle, another run's
+        3.5 minutes later. The handover reads the row itself."""
+        kill = "Claude Code process exited with signal SIGKILL"
+        row = {"key": self.SK, "hasActiveRun": False, "status": "failed",
+               "lastRunId": "run-1", "lastRunError": kill}
+        fake = self.conn.send_request
+
+        async def send_request(method, params, timeout=10):
+            if method == "sessions.list":
+                return {"sessions": [dict(row)]}
+            return await fake(method, params, timeout)
+        self.conn.send_request = send_request
+        await self._turn(self._lifecycle_error(kill),
+                         lambda: self.conn._on_sessions_changed({"sessionKey": self.SK, **row}))
+        (_, _, pump), = self.handed
+        self.assertEqual(pump.queue.get_nowait(), ("settled", row))
 
     async def test_an_exit_143_mid_tool_leaves_no_card_for_open_webui_to_run(self):
         items = await self._turn_items(
