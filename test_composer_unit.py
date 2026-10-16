@@ -181,11 +181,6 @@ class StatusLabelWidthTests(unittest.TestCase):
         self.assertIn("b.title = 'OpenClaw status';", code)
         self.assertIn("b.setAttribute('aria-label', 'OpenClaw status');", code)
 
-    def test_version_bump_replaces_buttons_already_on_screen(self):
-        # ensure() swaps a button whose data-openclaw-version differs, so a
-        # page that already shows the clipped label gets the new one.
-        self.assertNotEqual(_COMPOSER_BUTTON_VERSION, "2")
-
 
 class EmitHelperTests(unittest.IsolatedAsyncioTestCase):
     async def test_emits_one_execute_event(self):
@@ -675,6 +670,58 @@ async function run(c) { return new Function('return (async () => { ' + c + ' })(
 """
 
 
+# A composer with the slot the button goes in and a button already on
+# screen, of `input.version`: what `ensure()` leaves there.
+_NODE_SLOT_HARNESS = r"""
+const code = require('fs').readFileSync(process.argv[2], 'utf8');
+const oldVersion = process.argv[3];
+globalThis.window = globalThis;
+window.addEventListener = function () {};
+window.removeEventListener = function () {};
+globalThis.location = { pathname: '/c/chat-1' };
+globalThis.localStorage = { getItem: function () { return 'tok'; } };
+globalThis.MutationObserver = class { observe() {} disconnect() {} };
+class El {
+  constructor(tag) { this.tagName = tag.toUpperCase(); this.children = []; this.parent = null;
+                     this.dataset = {}; this.attrs = {}; this.id = ''; }
+  setAttribute(k, v) { this.attrs[k] = v; }
+  getAttribute(k) { return this.attrs[k]; }
+  addEventListener() {}
+  appendChild(c) { if (c.parent) c.remove(); c.parent = this; this.children.push(c); return c; }
+  remove() { if (this.parent) this.parent.children = this.parent.children.filter((x) => x !== this);
+             this.parent = null; }
+  get lastElementChild() { return this.children[this.children.length - 1] || null; }
+  set innerHTML(v) {}
+}
+const group = new El('div');
+const chips = { querySelectorAll: function () { return [group]; } };
+const row = { querySelector: function () { return chips; } };
+const form = { querySelectorAll: function () { return []; }, contains: function () { return true; } };
+const integ = { closest: function (sel) { return sel === 'form' ? form : row; } };
+const old = new El('button');
+old.id = 'openclaw-composer-status-button';
+old.dataset.openclawVersion = oldVersion;
+group.appendChild(old);
+globalThis.document = {
+  body: { appendChild: function () {} },
+  documentElement: { classList: { contains: function () { return false; } } },
+  getElementById: function (id) { return id === 'integration-menu-button' ? integ : null; },
+  querySelectorAll: function (sel) { return group.children.filter(function (e) { return '#' + e.id === sel; }); },
+  createElement: function (t) { return new El(t); },
+};
+globalThis.fetch = function () { return Promise.reject(new Error('no fetch expected')); };
+(async function () {
+  await new Function('return (async () => { ' + code + ' })()')();
+  window.__openclawComposerBtn.ensure();
+  console.log(JSON.stringify({
+    oldKept: old.parent === group,
+    versions: group.children.map(function (b) { return b.dataset.openclawVersion; }),
+  }));
+  process.exit(0);
+})().catch(function (e) { console.log('ERR ' + e); process.exit(1); });
+"""
+
+
 @unittest.skipUnless(shutil.which("node"), "node not installed")
 class SnippetUnderNodeTests(unittest.TestCase):
     def _write(self, text, suffix):
@@ -696,6 +743,23 @@ class SnippetUnderNodeTests(unittest.TestCase):
         path = self._write(_render_composer_button_js(), ".js")
         proc = subprocess.run(["node", "--check", path], capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def _slot(self, old_version):
+        snippet = self._write(_render_composer_button_js(chat_id="chat-1"), ".js")
+        harness = self._write(_NODE_SLOT_HARNESS, ".cjs")
+        proc = subprocess.run(["node", harness, snippet, old_version],
+                              capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+
+    def test_a_button_of_an_older_version_is_replaced(self):
+        # A page that already shows an older button (the clipped label of
+        # ELI-123) gets the new one, once.
+        self.assertEqual(self._slot("2"), {"oldKept": False, "versions": [_COMPOSER_BUTTON_VERSION]})
+
+    def test_a_button_of_this_version_is_kept(self):
+        self.assertEqual(self._slot(_COMPOSER_BUTTON_VERSION),
+                         {"oldKept": True, "versions": [_COMPOSER_BUTTON_VERSION]})
 
     def test_installs_once_and_is_fail_safe_without_a_composer(self):
         result = self._run(_render_composer_button_js(), ["openclaw_gateway.default"])

@@ -350,10 +350,6 @@ class NoTasksApiTests(unittest.TestCase):
             self.assertNotIn(method, source)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
     """ELI-127: the dialog's ticker counts a running child up (ELI-120), and
     the dialog filled once, so a child that finished while it stayed open
@@ -603,3 +599,7 @@ console.log(JSON.stringify({maxHeight: panel.style.maxHeight, overflowY: panel.s
             os.unlink(fh.name)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(json.loads(out.stdout), {"maxHeight": "88vh", "overflowY": "auto"})
+
+
+if __name__ == "__main__":
+    unittest.main()
