@@ -5,7 +5,7 @@ Runs against the BUILT artifact, not the fragment, because the artifact is what
 Open WebUI actually loads. A fragment that passes and an artifact that does not
 is the failure mode a build step invites, so the build is part of the test.
 
-    python3 test_thinking_unit.py
+    python3 -m pytest test_thinking_unit.py
 """
 
 import importlib.util
@@ -15,6 +15,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -34,37 +35,17 @@ except ImportError as exc:  # pragma: no cover - environment guard
     _reason = f"this suite needs the real pydantic, got: {exc}"
     if os.environ.get("CI"):
         raise RuntimeError(f"CI installs pydantic, so this is a bug: {_reason}")
-    print(f"\nSKIPPED: {_reason}")
-    try:
-        import pytest
-    except ImportError:
-        sys.exit(0)
+    import pytest
     pytest.skip(_reason, allow_module_level=True)
-
-FAILURES = []
-
-
-def check(name, got, want):
-    if got != want:
-        FAILURES.append(f"{name}\n     got:  {got!r}\n     want: {want!r}")
-        print(f"  FAIL {name}")
-    else:
-        print(f"  ok   {name}")
 
 
 def load(state_dir=None):
     """Import the built artifact fresh, with STATE_DIR pointed wherever we want.
 
     Reimported per case because the dropdown is baked into UserValves at import
-    time. Testing that from a single cached import would silently only ever
-    exercise the first state dir.
-
-    Deliberately does NOT restore the env var itself: callers keep reading it
-    live (`available_levels()` is not baked in at import time the way
-    UserValves is), so restoring here would break the very assertions this
-    call is set up for. Callers that use a temp dir are responsible for
-    restoring the env var once they are done with it -- see the
-    `tempfile.TemporaryDirectory` block below.
+    time: testing that from one cached import would only ever exercise the
+    first state dir. `available_levels()` reads the variable live, so it stays
+    set; each test restores it (`_StateDirCase`).
     """
     if state_dir is None:
         os.environ.pop("OPENCLAW_BRIDGE_STATE_DIR", None)
@@ -76,161 +57,150 @@ def load(state_dir=None):
     return mod
 
 
-print("\nbuild is current")
-proc = subprocess.run([sys.executable, "build.py", "--check-all"],
-                      cwd=ROOT, capture_output=True, text=True)
-check("built artifacts match src/ (run: python3 build.py --all)", proc.returncode, 0)
-if proc.returncode != 0:
-    print("   " + (proc.stdout or proc.stderr).strip()[:400])
+FALLBACK = ["default", "off", "minimal", "low", "medium", "high"]
 
 
-print("\nOpen WebUI frontmatter")
-# OWUI reads function metadata ONLY from `key: value` lines in the leading
-# docstring. Prose parses to {} in silence, so assert with OWUI's own shape.
-head = ARTIFACT.read_text()[:4000]
-doc = head.split('"""')[1] if '"""' in head else ""
-meta = {}
-for line in doc.splitlines():
-    m = re.match(r"^\s*([a-z_]+):\s*(.+)$", line)
-    if m:
-        meta.setdefault(m.group(1), m.group(2).strip())
-check("title parsed", meta.get("title"), "OpenClaw Thinking")
-check("version parsed", meta.get("version"), "0.7.0")
-check("description parsed", bool(meta.get("description")), True)
-check("no requirements line (stdlib plus pydantic only)", "requirements" in meta, False)
+class _StateDirCase(unittest.TestCase):
+    def setUp(self):
+        before = os.environ.get("OPENCLAW_BRIDGE_STATE_DIR")
+
+        def restore():
+            if before is None:
+                os.environ.pop("OPENCLAW_BRIDGE_STATE_DIR", None)
+            else:
+                os.environ["OPENCLAW_BRIDGE_STATE_DIR"] = before
+        self.addCleanup(restore)
+        self.mod = load(state_dir="/nonexistent-on-purpose")
 
 
-print("\ndropdown contents")
-mod = load(state_dir="/nonexistent-on-purpose")
-check("falls back when there is no cache",
-      mod.available_levels(), ["default", "off", "minimal", "low", "medium", "high"])
+class BuildTests(unittest.TestCase):
+    def test_built_artifacts_match_src(self):
+        proc = subprocess.run([sys.executable, "build.py", "--check-all"],
+                              cwd=ROOT, capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0,
+                         "run: python3 build.py --all\n" + (proc.stdout or proc.stderr)[:400])
 
-# `load()` leaves OPENCLAW_BRIDGE_STATE_DIR pointed at whatever it last set,
-# since available_levels() reads it live rather than at import time (see
-# `load`'s docstring). Restore it once this whole temp-dir case is done, so a
-# path this block is about to delete does not leak into whatever the process
-# imports next.
-_state_dir_before_tempdir = os.environ.get("OPENCLAW_BRIDGE_STATE_DIR")
-try:
-    with tempfile.TemporaryDirectory() as td:
-        cache = Path(td) / "thinking-ladders.json"
-        cache.write_text(json.dumps(
-            {"levels": ["high", "off", "max", "medium", "xhigh", "low", "minimal"],
-             "updated": 1786784049}))
-        m2 = load(state_dir=td)
-        check("cache drives the list, ordered by rank",
-              m2.available_levels(),
-              ["default", "off", "minimal", "low", "medium", "high", "xhigh", "max"])
-        check("the built UserValves enum matches",
-              m2.Filter.UserValves.model_json_schema()["properties"]["level"]["enum"],
-              ["default", "off", "minimal", "low", "medium", "high", "xhigh", "max"])
-
-        cache.write_text(json.dumps({"levels": ["low", "bogus", "medium"]}))
-        check("unknown level ids in the cache are dropped",
-              load(state_dir=td).available_levels(), ["default", "low", "medium"])
-
-        cache.write_text("{ not json")
-        check("corrupt cache degrades to the fallback, does not raise",
-              load(state_dir=td).available_levels(),
-              ["default", "off", "minimal", "low", "medium", "high"])
-
-        cache.write_text(json.dumps({"levels": []}))
-        check("empty cache degrades to the fallback",
-              load(state_dir=td).available_levels(),
-              ["default", "off", "minimal", "low", "medium", "high"])
-finally:
-    if _state_dir_before_tempdir is None:
-        os.environ.pop("OPENCLAW_BRIDGE_STATE_DIR", None)
-    else:
-        os.environ["OPENCLAW_BRIDGE_STATE_DIR"] = _state_dir_before_tempdir
+    def test_open_webui_frontmatter(self):
+        # OWUI reads function metadata ONLY from `key: value` lines in the
+        # leading docstring. Prose parses to {} in silence, so assert with
+        # OWUI's own shape.
+        head = ARTIFACT.read_text()[:4000]
+        doc = head.split('"""')[1] if '"""' in head else ""
+        meta = {}
+        for line in doc.splitlines():
+            m = re.match(r"^\s*([a-z_]+):\s*(.+)$", line)
+            if m:
+                meta.setdefault(m.group(1), m.group(2).strip())
+        self.assertEqual(meta.get("title"), "OpenClaw Thinking")
+        self.assertEqual(meta.get("version"), "0.7.0")
+        self.assertTrue(meta.get("description"))
+        self.assertNotIn("requirements", meta, "stdlib plus pydantic only")
 
 
-print("\nclamping to a model's real ladder")
-c = mod.clamp_to_ladder
-LADDER = ["off", "minimal", "low", "medium", "high"]
-check("a supported level passes through untouched", c("medium", LADDER), ("medium", None))
-check("the unset sentinel sends nothing", c("default", LADDER), (None, None))
-check("empty sends nothing", c("", LADDER), (None, None))
+class DropdownTests(_StateDirCase):
+    def _cache(self, content):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        (Path(td.name) / "thinking-ladders.json").write_text(content)
+        return load(state_dir=td.name)
 
-got, note = c("max", LADDER)
-check("an unsupported level clamps DOWN to the nearest", got, "high")
-check("and says so", bool(note) and "max" in note and "high" in note, True)
+    def test_falls_back_when_there_is_no_cache(self):
+        self.assertEqual(self.mod.available_levels(), FALLBACK)
 
-got, note = c("xhigh", ["off"])
-check("an off-only ladder clamps all the way down", got, "off")
-check("off-only clamp is explained", bool(note), True)
+    def test_the_cache_drives_the_list_ordered_by_rank(self):
+        mod = self._cache(json.dumps({"levels": ["high", "off", "max", "medium", "xhigh", "low", "minimal"],
+                                      "updated": 1786784049}))
+        want = ["default", "off", "minimal", "low", "medium", "high", "xhigh", "max"]
+        self.assertEqual(mod.available_levels(), want)
+        self.assertEqual(mod.Filter.UserValves.model_json_schema()["properties"]["level"]["enum"], want)
 
-got, note = c("low", ["medium", "high"])
-check("a ladder with nothing at or below yields its lowest", got, "medium")
+    def test_unknown_level_ids_in_the_cache_are_dropped(self):
+        mod = self._cache(json.dumps({"levels": ["low", "bogus", "medium"]}))
+        self.assertEqual(mod.available_levels(), ["default", "low", "medium"])
 
-got, note = c("high", None)
-check("an unknown ladder passes the request through", (got, note), ("high", None))
-
-got, note = c("nonsense", LADDER)
-check("an unknown level is dropped, not guessed", got, None)
-check("and the drop is explained", bool(note), True)
-
-check("clamping never goes up",
-      c("minimal", ["off", "minimal", "low", "medium", "high"])[0], "minimal")
+    def test_a_corrupt_or_empty_cache_degrades_to_the_fallback(self):
+        self.assertEqual(self._cache("{ not json").available_levels(), FALLBACK)
+        self.assertEqual(self._cache(json.dumps({"levels": []})).available_levels(), FALLBACK)
 
 
-print("\nreading the Gateway's rejection as a ladder")
-# The parser lives in the shared fragment, so the filter artifact carries it
-# too. Asserting it here proves the fragment stays import-free: the filter
-# imports nothing beyond pydantic, and a stray `import re` in a helper the
-# filter never calls would still break every message it touches.
-p = mod.parse_thinking_rejection
-check("the real wording yields level, model and ladder",
-      p('Thinking level "high" is not supported for claude-cli/claude-opus-5.'
-        ' Use one of: off.'),
-      {"level": "high", "model": "claude-cli/claude-opus-5", "levels": ["off"]})
+class ClampTests(_StateDirCase):
+    LADDER = ["off", "minimal", "low", "medium", "high"]
 
-# The binary profile labels `low` as "on" (buildBinaryThinkingProfile). Taking
-# the label at face value would learn a one-level ladder for a two-level model
-# and clamp every request to `off`.
-check("the binary profile's 'on' label maps back to its id",
-      p('Thinking level "max" is not supported for anthropic/claude-sonnet-5.'
-        ' Use one of: off, on.')["levels"],
-      ["off", "low"])
+    def test_a_supported_level_passes_through(self):
+        c = self.mod.clamp_to_ladder
+        self.assertEqual(c("medium", self.LADDER), ("medium", None))
+        self.assertEqual(c("default", self.LADDER), (None, None))
+        self.assertEqual(c("", self.LADDER), (None, None))
+        self.assertEqual(c("minimal", self.LADDER)[0], "minimal", "clamping never goes up")
 
-check("a listed ladder comes back ordered by rank, not as written",
-      p('Thinking level "ultra" is not supported for x/y.'
-        ' Use one of: high, off, medium.')["levels"],
-      ["off", "medium", "high"])
-check("labels are matched case-insensitively",
-      p('Thinking level "max" is not supported for x/y. Use one of: Off, High.')["levels"],
-      ["off", "high"])
-check("prose after the sentence is not swallowed into the ladder",
-      p('Thinking level "max" is not supported for x/y. Use one of: off, low.'
-        ' Pick another level and try again.')["levels"],
-      ["off", "low"])
-check("a duplicate label is listed once",
-      p('Thinking level "max" is not supported for x/y. Use one of: off, off.')["levels"],
-      ["off"])
+    def test_an_unsupported_level_clamps_down_and_says_so(self):
+        got, note = self.mod.clamp_to_ladder("max", self.LADDER)
+        self.assertEqual(got, "high")
+        self.assertIn("max", note)
+        self.assertIn("high", note)
+        got, note = self.mod.clamp_to_ladder("xhigh", ["off"])
+        self.assertEqual(got, "off")
+        self.assertTrue(note)
 
-# Empty levels and "not a rejection" are different answers: the caller still
-# learns WHICH model rejected WHICH level, so it must test for None, not for
-# falsiness. Returning None here would silently skip the retry.
-parsed = p('Thinking level "max" is not supported for x/y. Use one of: turbo.')
-check("an all-unknown ladder is still a rejection", parsed is not None, True)
-check("with an empty ladder rather than a guess", parsed["levels"], [])
+    def test_a_ladder_with_nothing_at_or_below_yields_its_lowest(self):
+        self.assertEqual(self.mod.clamp_to_ladder("low", ["medium", "high"])[0], "medium")
 
-for text in (
-    "Let me think about supported levels here.",
-    "high is not supported in this context, unrelated to models.",
-    # The anchors are there but the "model" is prose: a model ref never
-    # contains a space, and that check is what keeps this from firing on
-    # assistant output that quotes the error while discussing it.
-    'Thinking level "high" is not supported for some models. Use one of: off.',
-    'Thinking level "high" is not supported for x/y.',   # no ladder clause
-    'is not supported for x/y. Use one of: off.',        # no head
-    '',
-    None,
-):
-    check(f"not a rejection: {str(text)[:44]!r}", p(text), None)
+    def test_an_unknown_ladder_passes_the_request_through(self):
+        self.assertEqual(self.mod.clamp_to_ladder("high", None), ("high", None))
+
+    def test_an_unknown_level_is_dropped_not_guessed(self):
+        got, note = self.mod.clamp_to_ladder("nonsense", self.LADDER)
+        self.assertIsNone(got)
+        self.assertTrue(note)
 
 
-print("\ninlet writes the shared field")
+class RejectionTests(_StateDirCase):
+    """The parser lives in the shared fragment, so the filter artifact
+    carries it too. Asserting it here proves the fragment stays import-free:
+    the filter imports nothing beyond pydantic."""
+
+    def test_the_real_wording_yields_level_model_and_ladder(self):
+        self.assertEqual(
+            self.mod.parse_thinking_rejection(
+                'Thinking level "high" is not supported for claude-cli/claude-opus-5. Use one of: off.'),
+            {"level": "high", "model": "claude-cli/claude-opus-5", "levels": ["off"]})
+
+    def test_ladder_labels(self):
+        p = self.mod.parse_thinking_rejection
+        # The binary profile labels `low` as "on" (buildBinaryThinkingProfile).
+        self.assertEqual(p('Thinking level "max" is not supported for anthropic/claude-sonnet-5.'
+                           ' Use one of: off, on.')["levels"], ["off", "low"])
+        self.assertEqual(p('Thinking level "ultra" is not supported for x/y.'
+                           ' Use one of: high, off, medium.')["levels"], ["off", "medium", "high"])
+        self.assertEqual(p('Thinking level "max" is not supported for x/y.'
+                           ' Use one of: Off, High.')["levels"], ["off", "high"])
+        self.assertEqual(p('Thinking level "max" is not supported for x/y. Use one of: off, low.'
+                           ' Pick another level and try again.')["levels"], ["off", "low"])
+        self.assertEqual(p('Thinking level "max" is not supported for x/y.'
+                           ' Use one of: off, off.')["levels"], ["off"])
+
+    def test_an_all_unknown_ladder_is_still_a_rejection(self):
+        # The caller still learns WHICH model rejected WHICH level, so it
+        # tests for None, not for falsiness.
+        parsed = self.mod.parse_thinking_rejection(
+            'Thinking level "max" is not supported for x/y. Use one of: turbo.')
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["levels"], [])
+
+    def test_not_a_rejection(self):
+        for text in (
+            "Let me think about supported levels here.",
+            "high is not supported in this context, unrelated to models.",
+            # The anchors are there but the "model" is prose: a model ref
+            # never contains a space.
+            'Thinking level "high" is not supported for some models. Use one of: off.',
+            'Thinking level "high" is not supported for x/y.',   # no ladder clause
+            'is not supported for x/y. Use one of: off.',        # no head
+            '',
+            None,
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(self.mod.parse_thinking_rejection(text))
 
 
 class _UV:
@@ -238,45 +208,38 @@ class _UV:
         self.level = level
 
 
-f = mod.Filter()
-check("toggle is an instance attribute", "toggle" in vars(f), True)
-check("icon is an instance attribute", "icon" in vars(f), True)
-check("toggle is on so the row renders", f.toggle, True)
+class InletTests(_StateDirCase):
+    def test_toggle_and_icon_are_instance_attributes(self):
+        f = self.mod.Filter()
+        self.assertIn("toggle", vars(f))
+        self.assertIn("icon", vars(f))
+        self.assertIs(f.toggle, True)
 
-check("a chosen level lands in reasoning_effort",
-      f.inlet({}, {"valves": _UV("high")}).get("reasoning_effort"), "high")
-check("valves as a plain dict work too",
-      f.inlet({}, {"valves": {"level": "low"}}).get("reasoning_effort"), "low")
-check("the unset sentinel leaves the body alone",
-      "reasoning_effort" in f.inlet({}, {"valves": _UV("default")}), False)
-check("no user context leaves the body alone",
-      "reasoning_effort" in f.inlet({}, None), False)
+    def test_a_chosen_level_lands_in_reasoning_effort(self):
+        f = self.mod.Filter()
+        self.assertEqual(f.inlet({}, {"valves": _UV("high")}).get("reasoning_effort"), "high")
+        self.assertEqual(f.inlet({}, {"valves": {"level": "low"}}).get("reasoning_effort"), "low")
+        self.assertNotIn("reasoning_effort", f.inlet({}, {"valves": _UV("default")}))
+        self.assertNotIn("reasoning_effort", f.inlet({}, None))
 
-# Single source of truth: Advanced Params writes the same key.
-check("by default the filter overrides Advanced Params",
-      f.inlet({"reasoning_effort": "low"}, {"valves": _UV("high")})["reasoning_effort"],
-      "high")
+    def test_advanced_params_override(self):
+        f = self.mod.Filter()
+        self.assertEqual(f.inlet({"reasoning_effort": "low"}, {"valves": _UV("high")})["reasoning_effort"],
+                         "high")
+        f2 = self.mod.Filter()
+        f2.valves.override_advanced_params = False
+        self.assertEqual(f2.inlet({"reasoning_effort": "low"}, {"valves": _UV("high")})["reasoning_effort"],
+                         "low")
+        self.assertEqual(f2.inlet({}, {"valves": _UV("high")})["reasoning_effort"], "high")
 
-f2 = mod.Filter()
-f2.valves.override_advanced_params = False
-check("with override off, Advanced Params wins",
-      f2.inlet({"reasoning_effort": "low"}, {"valves": _UV("high")})["reasoning_effort"],
-      "low")
-check("with override off and nothing set, the filter still writes",
-      f2.inlet({}, {"valves": _UV("high")})["reasoning_effort"], "high")
-
-check("a non-dict body is returned untouched", f.inlet(None, {"valves": _UV("high")}), None)
-
-body = {"messages": [{"role": "user", "content": "hi"}]}
-out = f.inlet(body, {"valves": _UV("medium")})
-check("inlet mutates and returns the same body", out is body, True)
-check("existing keys survive", out["messages"][0]["content"], "hi")
+    def test_the_body_is_mutated_in_place(self):
+        f = self.mod.Filter()
+        self.assertIsNone(f.inlet(None, {"valves": _UV("high")}))
+        body = {"messages": [{"role": "user", "content": "hi"}]}
+        out = f.inlet(body, {"valves": _UV("medium")})
+        self.assertIs(out, body)
+        self.assertEqual(out["messages"][0]["content"], "hi")
 
 
-print()
-if FAILURES:
-    print(f"{len(FAILURES)} FAILURE(S):")
-    for x in FAILURES:
-        print("  - " + x)
-    sys.exit(1)
-print("all passed")
+if __name__ == "__main__":
+    unittest.main()
