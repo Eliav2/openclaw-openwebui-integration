@@ -13,10 +13,11 @@
 # Open WebUI 0.12 tabs emit `events:chat` join/leave, and the server keeps the
 # joined ids in SESSION_POOL[sid]["chat_ids"] (socket/main.py). There is no
 # hook on the join itself, so this polls the pool. For each (sid, chat) pair,
-# after a short settle delay, it loads the chat, checks that the socket's own
-# user owns it and that it is on one of this Pipe's models, and sends the
-# snippet to that one socket (`to=sid`, never the user room) targeting the
-# chat's latest user message.
+# after a short settle delay, it reads the chat's head (`_composer_chat_head`:
+# its owner and its branch's newest messages, never the whole chat), checks
+# that the socket's own user owns it and that it is on one of this Pipe's
+# models, and sends the snippet to that one socket (`to=sid`, never the user
+# room) targeting the chat's latest user message.
 #
 # It is sent with `sio.call`, not `emit`: Chat.svelte acks an `execute` event
 # only after actually running it, and drops it (no ack) while the tab has not
@@ -40,6 +41,30 @@ _COMPOSER_WATCH_LIVENESS_S = 30.0
 _COMPOSER_WATCH_ATTR = "_openclaw_composer_watcher_v1"
 
 _composer_watcher_task = None
+
+
+async def _composer_chat_head(user_id, current_id, message) -> dict:
+    """What a push needs of a chat: {"user_id", "message_id", "model"}.
+    `message(id)` reads one message as (role, parent_id, model_id), or None.
+    `message_id` is the snippet's targetMessageId(): the latest user message
+    on the current branch, else the current message. `model` is the newest
+    assistant message's on the branch, the model the chat replies with."""
+    target, model, message_id = None, None, current_id
+    for _ in range(500):
+        if not message_id:
+            break
+        row = await message(message_id)
+        if row is None:
+            break
+        role, parent_id, model_id = row
+        if role == "assistant" and model is None:
+            model = model_id
+        if role == "user" and target is None:
+            target = message_id
+        if target is not None and model is not None:
+            break
+        message_id = parent_id
+    return {"user_id": user_id, "message_id": target or current_id, "model": model}
 
 
 class _ComposerWatcher:
@@ -66,12 +91,27 @@ class _ComposerWatcher:
         return [list(pool.items())]
 
     @staticmethod
-    async def _load_chat(chat_id):
-        from open_webui.models.chats import Chats
-        chat = Chats.get_chat_by_id(chat_id)
-        if asyncio.iscoroutine(chat):
-            chat = await chat
-        return chat
+    async def _chat_head(chat_id):
+        """`_composer_chat_head` of a chat, from Open WebUI's DB: the chat
+        row's owner and current message id, then one `chat_message` row per
+        step up the branch. Open WebUI builds a whole chat in Python, about
+        14x its JSON, for every read of the chat itself (ELI-115)."""
+        from sqlalchemy import select
+        from open_webui.internal.db import get_async_db_context
+        from open_webui.models.chats import Chat
+        from open_webui.models.chat_messages import ChatMessage
+
+        async with get_async_db_context() as db:
+            row = (await db.execute(select(Chat.user_id, Chat.current_message_id)
+                                    .where(Chat.id == chat_id))).first()
+            if row is None:
+                return None
+
+            async def message(message_id):
+                return (await db.execute(
+                    select(ChatMessage.role, ChatMessage.parent_id, ChatMessage.model_id)
+                    .where(ChatMessage.id == f"{chat_id}-{message_id}"))).first()
+            return await _composer_chat_head(row[0], row[1], message)
 
     @staticmethod
     async def _call_sid(sid, payload) -> bool:
@@ -151,14 +191,14 @@ class _ComposerWatcher:
         """"acked" (the tab ran it), "skip" (not ours to push) or "retry"."""
         if not user_id:
             return "skip"
-        chat = await self._load_chat(chat_id)
-        if chat is None or getattr(chat, "user_id", None) != user_id:
+        head = await self._chat_head(chat_id)
+        if head is None or head["user_id"] != user_id:
             return "skip"
-        data = getattr(chat, "chat", None) or {}
         prefixes = self.prefixes_getter()
-        if not _composer_chat_is_openclaw(data, prefixes):
+        model = head["model"]
+        if not (isinstance(model, str) and any(model.startswith(p) for p in prefixes)):
             return "skip"
-        message_id = _composer_latest_user_message_id(data.get("history") or {})
+        message_id = head["message_id"]
         if not message_id:
             return "skip"
         # The Stop / Send now intent hook and the auto-send hook ride along: a
