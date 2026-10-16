@@ -9,7 +9,6 @@
 target-version = "py310"
 extend-exclude = [
     "src/openclaw_pipe_pkg",
-    "openclaw_pipe.dev.py",
     # verbatim upstream copy, re-extracted rather than edited
     "test_fixture_owui_streaming_handler.py",
     "backups",

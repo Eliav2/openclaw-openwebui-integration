@@ -551,19 +551,10 @@ class Pipe:
                    __task__=None, __task_body__=None):
         """Main pipe entry point -- called by Open WebUI for each user message.
 
-        Thin wrapper around _pipe_impl so dev-only deploy-coordination hooks
-        (ELI-24) can bracket every turn without re-indenting the whole body.
+        Thin wrapper around _pipe_impl that hands a turn admitted by a
+        superseded load of this Function to the current load.
         """
         remember_owui_server()
-        # DEV-ONLY-START
-        async def _devcoord_report_wait(waited_s):
-            await _emit_status(
-                __event_emitter__,
-                f"⏳ Deploy in progress, waiting to start ({int(waited_s)}s)...",
-                done=False,
-            )
-        await _devcoord_wait_if_deploy_pending(on_wait=_devcoord_report_wait)
-        # DEV-ONLY-END
         current = await _current_load(self, __request__)
         if current is not None:
             pipe_log("Turn admitted by a superseded load of this Function: the current "
@@ -576,27 +567,16 @@ class Pipe:
                 async for item in turn_gen:
                     yield item
             return
-        # DEV-ONLY-START
-        _devcoord_marker = _devcoord_turn_begin()
-        _devcoord_beat = spawn_background(_devcoord_heartbeat(_devcoord_marker))
-        # DEV-ONLY-END
-        try:
-            # aclosing: when OWUI closes this generator, close the inner one
-            # now rather than whenever it is garbage-collected, so its cancel
-            # handling runs before the next message arrives.
-            async with contextlib.aclosing(self._pipe_impl(
-                body, __event_emitter__, __event_call__=__event_call__,
-                __user__=__user__, __metadata__=__metadata__, __request__=__request__,
-                __task__=__task__, __task_body__=__task_body__,
-            )) as turn_gen:
-                async for item in turn_gen:
-                    yield item
-        finally:
-            # DEV-ONLY-START
-            _devcoord_beat.cancel()
-            _devcoord_turn_end(_devcoord_marker)
-            # DEV-ONLY-END
-            pass
+        # aclosing: when OWUI closes this generator, close the inner one now
+        # rather than whenever it is garbage-collected, so its cancel handling
+        # runs before the next message arrives.
+        async with contextlib.aclosing(self._pipe_impl(
+            body, __event_emitter__, __event_call__=__event_call__,
+            __user__=__user__, __metadata__=__metadata__, __request__=__request__,
+            __task__=__task__, __task_body__=__task_body__,
+        )) as turn_gen:
+            async for item in turn_gen:
+                yield item
 
     async def _pipe_impl(self, body, __event_emitter__, __event_call__=None,
                    __user__=None, __metadata__=None, __request__=None,

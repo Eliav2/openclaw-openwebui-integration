@@ -16,8 +16,7 @@ Usage:
   python3 build.py --check-all  # drift guard for ALL artifacts. This is what CI
                               # runs; exits 1 if either is stale.
 
-  python3 build.py            # build -> openclaw_pipe.py only (DEV-ONLY blocks
-                              # stripped; this is the artifact real users install)
+  python3 build.py            # build -> openclaw_pipe.py only
   python3 build.py --check    # drift guard for openclaw_pipe.py only
   python3 build.py --filter        # build -> openclaw_thinking_filter.py only, the
                               # per-chat thinking control (a Filter, not a Pipe)
@@ -25,11 +24,6 @@ Usage:
   python3 build.py --action        # build -> openclaw_status_action.py only, the
                               # companion Action Function (see ARTIFACTS below)
   python3 build.py --check-action  # drift guard for openclaw_status_action.py only
-
-  python3 build.py --dev        # build -> openclaw_pipe.dev.py, DEV-ONLY blocks kept.
-                              # Internal-only deploy-coordination bundle; gitignored,
-                              # never distributed, rebuild before every dev deploy.
-  python3 build.py --check-dev  # same drift guard, for the dev bundle
 
 Each single-artifact invocation builds exactly one file. Prefer --all/--check-all
 so an edit to a shared fragment cannot leave the other artifact silently stale.
@@ -64,7 +58,6 @@ class Artifact(NamedTuple):
     dependency and sidesteps the whole issue."""
     frontmatter: Path
     out: Path
-    dev_out: "Path | None"
     module_order: tuple[str, ...]
 
 
@@ -74,7 +67,6 @@ class Artifact(NamedTuple):
 PIPE = Artifact(
     frontmatter=ROOT / "src" / "frontmatter.txt",
     out=ROOT / "openclaw_pipe.py",
-    dev_out=ROOT / "openclaw_pipe.dev.py",
     module_order=("_prelude", "identity", "state", "turns", "thinking", "media", "emit",
                   "composer", "composer_watch", "askuser", "gateway", "writer", "models",
                   "pipe"),
@@ -85,13 +77,10 @@ PIPE = Artifact(
 # "action" fragment. "emit" is included so the modal's numbers come from
 # the exact same _build_usage_status_lines/_fmt_tokens logic the status
 # line itself uses -- one source of truth, no risk of the two drifting
-# apart. It writes no turns, so it leaves out "writer" (ELI-149). No
-# dev/internal-tooling variant yet -- add a dev_out here if this artifact
-# ever grows a devcoord-style need for one.
+# apart. It writes no turns, so it leaves out "writer" (ELI-149).
 ACTION = Artifact(
     frontmatter=ROOT / "src" / "frontmatter-action.txt",
     out=ROOT / "openclaw_status_action.py",
-    dev_out=None,
     module_order=("_prelude", "identity", "state", "turns", "thinking", "gateway",
                   "emit", "composer", "action"),
 )
@@ -116,7 +105,6 @@ ACTION = Artifact(
 FILTER = Artifact(
     frontmatter=ROOT / "src" / "frontmatter-filter.txt",
     out=ROOT / "openclaw_thinking_filter.py",
-    dev_out=None,
     module_order=("thinking", "thinking_filter"),
 )
 
@@ -128,10 +116,6 @@ BANNER = (
 )
 
 FRAGMENT_HEADER_PREFIX = "# ---"  # strip the per-fragment BUILD FRAGMENT banner
-
-DEV_ONLY_START = "# DEV-ONLY-START"
-DEV_ONLY_END = "# DEV-ONLY-END"
-
 
 def _strip_fragment_banner(text: str) -> str:
     """Remove the leading 'BUILD FRAGMENT' banner block a fragment carries."""
@@ -148,48 +132,14 @@ def _strip_fragment_banner(text: str) -> str:
     return "".join(out_lines)
 
 
-def _strip_dev_only(text: str) -> str:
-    """Drop every '# DEV-ONLY-START' .. '# DEV-ONLY-END' block.
-
-    Dev/internal-tooling-only code (e.g. cross-agent deploy coordination,
-    ELI-24) lives in src/ so it's testable and reviewable in context, but
-    must never reach the artifact real users install -- hence stripped here
-    rather than gated at runtime.
-    """
-    out_lines = []
-    skipping = False
-    for line in text.splitlines(keepends=True):
-        stripped = line.strip()
-        if stripped == DEV_ONLY_START:
-            if skipping:
-                raise ValueError(f"nested {DEV_ONLY_START} marker")
-            skipping = True
-            continue
-        if stripped == DEV_ONLY_END:
-            if not skipping:
-                raise ValueError(f"{DEV_ONLY_END} without matching {DEV_ONLY_START}")
-            skipping = False
-            continue
-        if not skipping:
-            out_lines.append(line)
-    if skipping:
-        raise ValueError(f"unterminated {DEV_ONLY_START} marker")
-    return "".join(out_lines)
-
-
-def build(strip_dev_only: bool = True, artifact: Artifact = PIPE) -> str:
-    """Assemble one artifact's frontmatter + fragments into a flat .py file.
-
-    Defaults to PIPE so existing callers (install.py's
-    ``mod.build(strip_dev_only=not dev)``) keep working unchanged."""
+def build(artifact: Artifact = PIPE) -> str:
+    """Assemble one artifact's frontmatter + fragments into a flat .py file."""
     frontmatter = artifact.frontmatter.read_text()
     if not frontmatter.endswith("\n"):
         frontmatter += "\n"
     parts = [frontmatter, "\n", BANNER]
     for mod in artifact.module_order:
         body = _strip_fragment_banner((PKG / f"{mod}.py").read_text())
-        if strip_dev_only:
-            body = _strip_dev_only(body)
         parts.append("\n\n")
         parts.append(f"# --- {mod} " + "-" * (70 - len(mod)) + "\n")
         parts.append(body.rstrip("\n") + "\n")
@@ -332,42 +282,30 @@ def main():
     do_all = "--all" in sys.argv or "--check-all" in sys.argv
     action = "--action" in sys.argv or "--check-action" in sys.argv
     filt = "--filter" in sys.argv or "--check-filter" in sys.argv
-    dev = "--dev" in sys.argv or "--check-dev" in sys.argv
     checking = any(a in sys.argv
-                   for a in ("--check", "--check-dev", "--check-action",
-                             "--check-filter", "--check-all"))
+                   for a in ("--check", "--check-action", "--check-filter", "--check-all"))
 
-    if sum((action, filt, dev)) > 1:
-        print("Select only one of --action, --filter, or --dev", file=sys.stderr)
+    if action and filt:
+        print("Select only one of --action or --filter", file=sys.stderr)
         sys.exit(2)
 
     if do_all:
-        if dev or action or filt:
+        if action or filt:
             print("--all/--check-all already covers every distributed artifact; "
-                  "do not combine it with --action, --filter or --dev", file=sys.stderr)
+                  "do not combine it with --action or --filter", file=sys.stderr)
             sys.exit(2)
-        # Every distributed artifact. The dev bundle is deliberately excluded:
-        # it is gitignored, so there is no committed copy to drift against.
         targets = [(PIPE, PIPE.out, ""), (ACTION, ACTION.out, "--action"),
                    (FILTER, FILTER.out, "--filter")]
     elif action:
-        if dev:
-            print("ACTION has no --dev variant yet", file=sys.stderr)
-            sys.exit(2)
         targets = [(ACTION, ACTION.out, "--action")]
     elif filt:
-        if dev:
-            print("FILTER has no --dev variant yet", file=sys.stderr)
-            sys.exit(2)
         targets = [(FILTER, FILTER.out, "--filter")]
-    elif dev:
-        targets = [(PIPE, PIPE.dev_out, "--dev")]
     else:
         targets = [(PIPE, PIPE.out, "")]
 
     ok = True
     for artifact, out_path, rebuild_flag in targets:
-        built = build(strip_dev_only=(rebuild_flag != "--dev"), artifact=artifact)
+        built = build(artifact=artifact)
         if checking:
             ok = _check(out_path, built, rebuild_flag) and ok
         else:

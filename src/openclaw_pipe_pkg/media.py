@@ -458,62 +458,8 @@ def _start_file_server(port=18791):
             self._handle_upload()
 
         def do_POST(self):
-            # DEV-ONLY-START
-            # Cross-agent deploy coordination (ELI-24): install.py has no
-            # filesystem access to this container's STATE_DIR, so it signals
-            # a pending deploy over this same unauthenticated port instead.
-            # Dev/internal-tooling only -- stripped from openclaw_pipe.py by
-            # build.py, never present in the artifact end users install.
-            if self.path.rstrip("/") == "/__devcoord__/deploy-pending":
-                _write_json_file(_devcoord_pending_path(), {"requested": time.time()})
-                self.send_response(200)
-                self.end_headers()
-                return
-            if self.path.rstrip("/") == "/__devcoord__/drop-gateway-ws":
-                # Live test of a mid-run socket drop (repro_socket_drop.py).
-                # Close the Gateway socket from this thread, exactly as a
-                # network drop ends it: the event loop sees ConnectionClosed,
-                # marks the gap and reconnects.
-                conn = _gateway_connection
-                loop = getattr(conn, "_loop", None) if conn else None
-                ok = bool(loop and conn._ws)
-                if ok:
-                    asyncio.run_coroutine_threadsafe(conn._ws.close(), loop)
-                pipe_log(f"[devcoord] test socket drop requested: {'closing' if ok else 'no socket'}")
-                self.send_response(200 if ok else 409)
-                self.end_headers()
-                return
-            # DEV-ONLY-END
             self._handle_upload()
 
-        # DEV-ONLY-START
-        def do_GET(self):
-            if self.path.rstrip("/") == "/__devcoord__/status":
-                try:
-                    inflight = _devcoord_inflight_count()
-                except Exception:
-                    inflight = 0
-                body = json.dumps({"inflight": inflight}).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
-            super().do_GET()
-
-        def do_DELETE(self):
-            if self.path.rstrip("/") == "/__devcoord__/deploy-pending":
-                try:
-                    os.remove(_devcoord_pending_path())
-                except FileNotFoundError:
-                    pass
-                self.send_response(200)
-                self.end_headers()
-                return
-            self.send_response(404)
-            self.end_headers()
-        # DEV-ONLY-END
 
     try:
         server = HTTPServer(("0.0.0.0", port), _Handler)

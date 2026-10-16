@@ -1,6 +1,6 @@
 """Let the real pydantic win before any suite stubs it.
 
-Three unit suites (test_pipe_unit, test_status_action_unit, test_devcoord_unit)
+Three unit suites (test_pipe_unit, test_status_action_unit, test_file_server_unit)
 stub pydantic, websockets and cryptography so they run on a bare machine, each
 behind `if "<name>" not in sys.modules`. Standalone that is correct. Under
 pytest every suite shares one interpreter, so whichever module is collected

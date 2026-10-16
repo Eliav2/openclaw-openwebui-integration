@@ -21,6 +21,8 @@ Reinstalling updates in place: the function is never deleted and recreated, so `
 
 Run `install_action.py` after `install.py`, so the Action copies the Pipe's current valves.
 
+You can update while a reply is streaming: it finishes in its own message, once. See [redeploys](../features/reliability.md#redeploys).
+
 Updated the Pipe and use the thinking filter? Reload or re-save the filter once the Pipe has chatted with a new model, so its dropdown picks up the new levels; see [thinking control](./thinking-filter.md#show-your-models-real-levels).
 
 Updated the skills too? See [agent skills](./agent-skills.md#update-them).

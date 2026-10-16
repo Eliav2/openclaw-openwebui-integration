@@ -832,11 +832,10 @@ def test_a_reply_whose_run_ends_while_owui_is_stopped_is_completed_on_start(toke
 
 
 # ── A plain redeploy of the Pipe mid-reply (ELI-145) ─────────────────────────
-# The dev bundle's deploy coordination exists because a hot reload once cut the
-# reply that was streaming (ELI-23/ELI-24). This deploys the plain artifact the
-# way a user upgrades (`install.py repair`, no --dev-bundle) while a long reply
-# with tool calls streams, and checks what the user sees: the page's live
-# events and the saved message.
+# A hot reload once cut the reply that was streaming (ELI-23). This deploys the
+# Pipe the way a user upgrades (`install.py repair`) while a long reply with tool
+# calls streams, and checks what the user sees: the page's live events and the
+# saved message.
 
 import re  # noqa: E402
 import threading  # noqa: E402

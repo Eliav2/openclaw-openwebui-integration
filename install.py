@@ -29,8 +29,6 @@ From a local clone:
 
 from __future__ import annotations
 
-import contextlib
-import fcntl
 import json
 import os
 import shutil
@@ -93,8 +91,6 @@ class Config:
     owui_api_key: str
     file_server_base_url: str
     auto_approve: bool = True
-    dev_bundle: bool = False
-    confirm_downgrade_from_dev_bundle: bool = False
 
 
 def require_config(cfg: Config, *, need_gateway: bool) -> None:
@@ -389,13 +385,6 @@ def backup_function(fn: dict, valves: dict | None = None) -> None:
         info(f"Backed up existing valves to {valves_path}")
 
 
-def _resolve_pipe_file(cfg: Config) -> Path:
-    """openclaw_pipe.py is the artifact real users install (committed to git).
-    openclaw_pipe.dev.py is internal-only (ELI-24 cross-agent deploy
-    coordination), gitignored, and only ever deployed with --dev-bundle."""
-    return (ROOT / "openclaw_pipe.dev.py") if cfg.dev_bundle else PIPE_FILE
-
-
 ARTIFACT_URL = os.environ.get(
     "OPENCLAW_PIPE_ARTIFACT_URL",
     "https://raw.githubusercontent.com/Eliav2/openclaw-openwebui-integration"
@@ -441,7 +430,7 @@ def _fetch_pipe_file() -> str:
     return body
 
 
-def _rebuild_pipe_file(pipe_file: Path, *, dev: bool) -> None:
+def _rebuild_pipe_file(pipe_file: Path) -> None:
     """Always regenerate the deployed artifact from src/ before deploying, so
     a forgotten ``python3 build.py`` step can never cause a stale deploy.
 
@@ -458,61 +447,27 @@ def _rebuild_pipe_file(pipe_file: Path, *, dev: bool) -> None:
     spec = importlib.util.spec_from_file_location("_pipe_build", build_script)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    built = mod.build(strip_dev_only=not dev)
+    built = mod.build()
     if not pipe_file.exists() or pipe_file.read_text() != built:
         pipe_file.write_text(built)
         info(f"Rebuilt {pipe_file.name} from src/openclaw_pipe_pkg/")
 
 
-def _assert_not_silently_downgrading_from_dev_bundle(cfg: Config) -> None:
-    """Refuse to deploy the plain artifact over a live pipe that's currently
-    running the dev bundle, unless explicitly confirmed.
-
-    Forgetting --dev-bundle is an easy mistake (it defaults to False), and
-    the consequence isn't cosmetic: it silently replaces the coordinated
-    dev pipe with the plain stripped one, deleting the ELI-24 deploy-
-    coordination mechanism from the live instance and restoring the
-    original ELI-23 hazard (a mid-turn deploy kills that turn's own
-    generator) with zero warning. A live pipe only responds on
-    /__devcoord__/status if it's currently running the dev bundle, so that
-    response is a reliable signal this deploy would be a downgrade.
-    """
-    if cfg.dev_bundle or cfg.confirm_downgrade_from_dev_bundle:
-        return
-    base = _devcoord_base_url(cfg)
-    try:
-        _devcoord_request(f"{base}/__devcoord__/status", timeout=3.0)
-    except Exception:
-        return  # live pipe isn't running the dev bundle -- nothing to downgrade
-    raise SystemExit(
-        "Refusing to deploy: the live pipe is currently running the dev bundle "
-        "(which adds deploy coordination), but this deploy would overwrite it "
-        "with the plain public artifact -- silently removing that coordination "
-        "and restoring the hazard it exists to prevent: a deploy landing "
-        "mid-turn kills that turn's own generator, with no warning.\n"
-        "If you meant to deploy the dev bundle, add --dev-bundle.\n"
-        "If you really want to downgrade to the plain artifact on purpose, "
-        "re-run with --confirm-downgrade-from-dev-bundle."
-    )
-
-
 def update_or_create_function(client: OwuiClient, cfg: Config) -> dict:
-    _assert_not_silently_downgrading_from_dev_bundle(cfg)
-    pipe_file = _resolve_pipe_file(cfg)
-    _rebuild_pipe_file(pipe_file, dev=cfg.dev_bundle)
+    pipe_file = PIPE_FILE
+    _rebuild_pipe_file(pipe_file)
     running_without_a_clone = not (ROOT / "src").exists() and not (ROOT / ".git").exists()
-    if not pipe_file.exists() and not cfg.dev_bundle and running_without_a_clone:
+    if not pipe_file.exists() and running_without_a_clone:
         # No clone: running as `uv run <raw-url> install`, where __file__ is a
         # lone temp copy. Gate on "there is no repo here" rather than merely
         # "the artifact is missing" -- a partial checkout (sparse, blob-filtered,
         # or someone who deleted the artifact) would otherwise silently deploy
         # HEAD-of-main from the internet instead of failing loudly.
-        # Never for --dev-bundle, which is internal-only and never published.
         return deploy_function_code(client, PIPE_SPEC, _fetch_pipe_file())
     if not pipe_file.exists():
         raise SystemExit(
             f"Pipe file not found: {pipe_file}\n"
-            "Run `python3 build.py --dev` first, or drop --dev-bundle."
+            "Run `python3 build.py` first."
         )
     return deploy_function_code(client, PIPE_SPEC, pipe_file.read_text())
 
@@ -531,7 +486,7 @@ class FunctionSpec:
     type: str                      # "pipe", "action" or "filter"
     label: str                     # "Pipe", "Action", "Filter" in messages
     description: str
-    artifact: Path | None = None   # the Pipe resolves its own (dev bundle, no clone)
+    artifact: Path | None = None   # the Pipe resolves its own (it may need fetching, no clone)
     build_artifact: str = ""       # build.py's artifact object ("ACTION", "FILTER")
     global_: bool = True           # made global; False: left per-model, warned if global
     global_warning: str = ""
@@ -611,7 +566,7 @@ def rebuild_artifact(spec: FunctionSpec) -> None:
     module = importlib.util.spec_from_file_location(f"_{spec.type}_build", build_script)
     mod = importlib.util.module_from_spec(module)
     module.loader.exec_module(mod)
-    built = mod.build(strip_dev_only=True, artifact=getattr(mod, spec.build_artifact))
+    built = mod.build(artifact=getattr(mod, spec.build_artifact))
     if not spec.artifact.exists() or spec.artifact.read_text() != built:
         spec.artifact.write_text(built)
         info(f"Rebuilt {spec.artifact.name} from src/")
@@ -934,116 +889,9 @@ def print_status(client: OwuiClient) -> bool:
     return all([exists, active, global_, model, ident, paired])
 
 
-# --------------------------------------------------------------------------
-# Cross-agent deploy coordination (ELI-24, --dev-bundle only)
-#
-# install.py has no filesystem access to the pipe's STATE_DIR (it talks to
-# OWUI purely over HTTP, possibly from a different host entirely), so it
-# reaches the in-flight-turn signal via the dev-only routes on the pipe's
-# own media file server instead (see src/openclaw_pipe_pkg/media.py,
-# DEV-ONLY block). Those routes only exist when the running pipe was
-# deployed from openclaw_pipe.dev.py, hence this whole mechanism is a no-op
-# unless --dev-bundle is set.
-# --------------------------------------------------------------------------
-
-DEVCOORD_PORT = 18791
-
-
-def _devcoord_base_url(cfg: Config) -> str:
-    host = urllib.parse.urlparse(cfg.owui_url).hostname or "localhost"
-    return f"http://{host}:{DEVCOORD_PORT}"
-
-
-def _devcoord_request(url: str, *, method: str = "GET", timeout: float = 3.0):
-    req = urllib.request.Request(url, method=method)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.status, resp.read()
-
-
-@contextlib.contextmanager
-def _deploy_lock():
-    """Serialize concurrent install.py repair invocations on this host --
-    two agents hot-swapping the same function back-to-back is its own hazard
-    independent of in-flight turns."""
-    lock_path = ROOT / ".deploy.lock"
-    with open(lock_path, "w") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
-
-
-@contextlib.contextmanager
-def devcoord_deploy_guard(cfg: Config, *, alert_after_s: float = 120.0,
-                          alert_interval_s: float = 120.0, poll_interval_s: float = 1.0):
-    """Request the deploy, then wait -- with no upper bound -- for the
-    running pipe to report zero in-flight turns before yielding to let the
-    caller swap the function.
-
-    Deliberately does NOT force-deploy on a timeout: any turn still running
-    at swap time gets killed outright by OWUI's own hot-reload (the ELI-23
-    root cause), so an auto-force after some magic number of seconds would
-    just trade "deploy waited a bit longer" for "a user's in-flight reply
-    vanished" -- not acceptable. Past alert_after_s, and then every
-    alert_interval_s after that, this prints a loud warning instead of
-    forcing, so a genuinely stuck turn becomes a human decision (go
-    investigate/kill it, or Ctrl-C the deploy) rather than something a timer
-    silently kills.
-    """
-    if not cfg.dev_bundle:
-        yield
-        return
-
-    base = _devcoord_base_url(cfg)
-    with _deploy_lock():
-        try:
-            _devcoord_request(f"{base}/__devcoord__/deploy-pending", method="POST")
-        except Exception as ex:
-            warn(f"devcoord: could not reach running pipe ({ex}); deploying without coordination")
-            yield
-            return
-
-        drained = False
-        start = time.time()
-        next_alert = start + alert_after_s
-        while True:
-            try:
-                _, body = _devcoord_request(f"{base}/__devcoord__/status")
-                inflight = json.loads(body).get("inflight", 0)
-            except Exception as ex:
-                warn(f"devcoord: status check failed ({ex}); proceeding without waiting further")
-                break
-            if inflight == 0:
-                drained = True
-                break
-            now = time.time()
-            if now >= next_alert:
-                warn(
-                    f"devcoord: still waiting on {inflight} in-flight turn(s) after "
-                    f"{int(now - start)}s -- NOT force-deploying. If this is a "
-                    "genuinely stuck turn, investigate/kill it manually or Ctrl-C "
-                    "this deploy."
-                )
-                next_alert = now + alert_interval_s
-            time.sleep(poll_interval_s)
-
-        if drained:
-            info("devcoord: no in-flight turns, deploying")
-
-        try:
-            yield
-        finally:
-            try:
-                _devcoord_request(f"{base}/__devcoord__/deploy-pending", method="DELETE")
-            except Exception as ex:
-                warn(f"devcoord: could not clear deploy-pending flag ({ex})")
-
-
 def install_or_repair(client: OwuiClient, cfg: Config) -> dict:
     section("Function")
-    with devcoord_deploy_guard(cfg):
-        preserved_valves = update_or_create_function(client, cfg)
+    preserved_valves = update_or_create_function(client, cfg)
     ensure_active(client, PIPE_SPEC)
 
     section("Valves")
@@ -1127,16 +975,6 @@ def common_options(f):
         click.option("--auto-approve/--no-auto-approve", default=True,
                      help="Approve a matching pending OpenClaw device when a "
                           "smoke test reports 'pairing required'"),
-        click.option("--dev-bundle", envvar="OPENCLAW_DEV_BUNDLE", is_flag=True, default=False,
-                     help="Internal-only (ELI-24): deploy openclaw_pipe.dev.py "
-                          "(includes cross-agent deploy coordination) instead of "
-                          "the public openclaw_pipe.py. Never use for a real install."),
-        click.option("--confirm-downgrade-from-dev-bundle", is_flag=True, default=False,
-                     help="Required to deploy the plain artifact (i.e. without "
-                          "--dev-bundle) over a live pipe that's currently running "
-                          "the dev bundle -- without this, that deploy is refused "
-                          "since it would silently delete the ELI-24 deploy-"
-                          "coordination mechanism from the live instance."),
         click.option("--wizard", "-w", is_flag=True, default=False,
                      help="Prompt interactively for any missing required values"),
     ]

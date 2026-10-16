@@ -4,13 +4,12 @@
 install.py imports click/rich, which aren't installed in this environment's
 system python (it's normally run via `uv run install.py`, which resolves
 them into an ephemeral env). These tests stub both modules just enough to
-import install.py directly, the same way test_devcoord_unit.py stubs
+import install.py directly, the same way test_file_server_unit.py stubs
 websockets/cryptography/pydantic to import pipe.py fragments in isolation.
 
 Run: python3 -m unittest test_install_unit -v
 """
 import http.server
-import json
 import shutil
 import tempfile
 import sys
@@ -64,77 +63,6 @@ def _install_stub_modules():
 _install_stub_modules()
 sys.path.insert(0, str(ROOT))
 import install as inst  # noqa: E402
-
-
-class _FakeCfg:
-    dev_bundle = False
-    confirm_downgrade_from_dev_bundle = False
-    owui_url = "http://127.0.0.1:1"
-
-
-class DowngradeGuardTests(unittest.TestCase):
-    """A live pipe only answers /__devcoord__/status if it's running the dev
-    bundle, so that response is the signal used to refuse a plain (non
-    --dev-bundle) deploy that would silently delete the ELI-24 coordination
-    mechanism from the live instance."""
-
-    @classmethod
-    def setUpClass(cls):
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def do_GET(self):
-                if self.path == "/__devcoord__/status":
-                    body = json.dumps({"inflight": 0}).encode()
-                    self.send_response(200)
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
-                else:
-                    self.send_response(404)
-                    self.end_headers()
-
-            def log_message(self, *a):
-                pass
-
-        # Port 0: a fixed port collides with another suite running at the
-        # same time (setUpClass failed with EADDRINUSE, 2026-10-13).
-        cls.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
-        cls.port = cls.server.server_address[1]
-        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.server.shutdown()
-        cls.server.server_close()
-
-    def test_allows_plain_deploy_when_live_pipe_is_not_dev_bundle(self):
-        inst.DEVCOORD_PORT = 1  # nothing listening -- simulates a plain live pipe
-        inst._assert_not_silently_downgrading_from_dev_bundle(_FakeCfg())  # must not raise
-
-    def test_dev_bundle_flag_skips_the_check_entirely(self):
-        class Cfg(_FakeCfg):
-            dev_bundle = True
-            owui_url = f"http://127.0.0.1:{self.port}"
-
-        inst.DEVCOORD_PORT = self.port
-        inst._assert_not_silently_downgrading_from_dev_bundle(Cfg())  # must not raise
-
-    def test_refuses_plain_deploy_over_a_live_dev_bundle_pipe(self):
-        class Cfg(_FakeCfg):
-            owui_url = f"http://127.0.0.1:{self.port}"
-
-        inst.DEVCOORD_PORT = self.port
-        with self.assertRaises(SystemExit) as ctx:
-            inst._assert_not_silently_downgrading_from_dev_bundle(Cfg())
-        self.assertIn("Refusing to deploy", str(ctx.exception))
-        self.assertIn("--confirm-downgrade-from-dev-bundle", str(ctx.exception))
-
-    def test_confirm_flag_allows_the_downgrade(self):
-        class Cfg(_FakeCfg):
-            owui_url = f"http://127.0.0.1:{self.port}"
-            confirm_downgrade_from_dev_bundle = True
-
-        inst.DEVCOORD_PORT = self.port
-        inst._assert_not_silently_downgrading_from_dev_bundle(Cfg())  # must not raise
 
 
 class FetchPipeArtifactTests(unittest.TestCase):

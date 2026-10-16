@@ -9,7 +9,7 @@ Don't hand-edit them. Edit the fragments under `src/openclaw_pipe_pkg/`, then
 rebuild:
 
 ```bash
-python3 build.py --all        # rebuild BOTH artifacts (DEV-ONLY blocks stripped)
+python3 build.py --all        # rebuild every artifact and docs/configuration.md
 python3 build.py --check-all  # verify both committed artifacts match src/ (CI drift guard)
 
 python3 build.py              # rebuild openclaw_pipe.py only
@@ -63,7 +63,7 @@ pydantic, cryptography and websockets to the versions Open WebUI itself locks,
 because the artifacts run inside Open WebUI's interpreter.
 
 Most of the suite (`test_pipe_unit.py`, `test_status_action_unit.py`,
-`test_build.py`, `test_devcoord_unit.py`, `test_install_unit.py`,
+`test_build.py`, `test_file_server_unit.py`, `test_install_unit.py`,
 `test_migrate_models_unit.py`, `test_owui_api_unit.py`) is pure unit
 tests with no external dependencies. `test_fixture_owui_streaming_handler.py`
 is not a suite, it's a verbatim copy of Open WebUI's streaming handler, used

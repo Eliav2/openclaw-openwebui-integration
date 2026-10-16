@@ -730,7 +730,7 @@ Each case is checked for:
 The integration suite and `test_history_guard.py --live` 16/16 must stay unchanged. The
 manager re-runs at least three cases.
 
-**Rollout:** one PR, deployed with `--dev-bundle` after the measurements in section 7 pass.
+**Rollout:** one PR, deployed after the measurements in section 7 pass.
 
 **Rollback:**
 

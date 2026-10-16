@@ -119,7 +119,7 @@ openclaw-openwebui-integration/
 - **Status Action:** `_prelude`, `identity`, `state`, `turns`, `thinking`, `gateway`, `writer`, `emit`, `composer`, `action`. It reuses the Pipe's connection code verbatim, so its numbers come from the same logic as the Pipe's status line.
 - **Thinking filter:** `thinking`, `thinking_filter` only. It skips `_prelude` on purpose: a filter runs on every message, so it does not import `websockets` or `cryptography`.
 
-Blocks between `# DEV-ONLY-START` and `# DEV-ONLY-END` are stripped from the artifacts users install. `python3 build.py --dev` keeps them in `openclaw_pipe.dev.py`, a gitignored internal bundle that is never distributed. Build commands and the drift guard: [Development](./development.md#building-the-artifacts).
+Build commands and the drift guard: [Development](./development.md#building-the-artifacts).
 
 > `src/frontmatter.txt` is load-bearing: Open WebUI reads the function's title,
 > version, and `requirements:` from the leading docstring, and `build.py` emits
