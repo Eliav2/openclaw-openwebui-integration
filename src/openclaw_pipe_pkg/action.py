@@ -313,13 +313,11 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     return el;
   }
 
-  // A titled text clamped to `lines`, with "Show all". Whether it is open is
-  // kept in `state[name]`, so a refill does not close it again.
-  function textBlock(name, label, text, lines, state) {
+  // A text clamped to `lines`, with "Show all". Whether it is open is kept
+  // in `state[name]`, so a refill does not close it again.
+  function textBlock(name, text, lines, state) {
     const wrap = document.createElement('div');
     wrap.dataset.openclawBlock = name;
-    wrap.className = 'mb-4';
-    wrap.appendChild(sectionHeader(label));
     const body = document.createElement('div');
     body.dataset.openclawBlockText = '1';
     body.className = 'text-sm text-gray-700 dark:text-gray-200 whitespace-pre-wrap break-words';
@@ -340,8 +338,250 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     return wrap;
   }
 
-  // The drawer's status line and its Result and Task, from what is known:
-  // the row at open, then each refresh.
+  // ── The sub-agent drawer (ELI-155) ──
+  // A compact header, then the sub-agent's run as a read-only chat: its
+  // messages in order, each tool call a collapsed card with its result, its
+  // reply last. The run is the one the chat itself would draw: the Action
+  // builds it with the Pipe's own history renderer.
+
+  // Open WebUI's tool card (ToolCallDisplay.svelte): its markup, classes and
+  // icons, so a card here looks like one in the chat.
+  const ICON = {
+    done: '<svg class="size-4" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" aria-hidden="true">'
+      + '<path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75 11.25 15 15 9.75M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z"/></svg>',
+    none: '<svg class="size-3.5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
+      + '<path fill-rule="evenodd" d="M12 6.75a5.25 5.25 0 0 1 6.775-5.025.75.75 0 0 1 .313 1.248l-3.32 3.319c.063.475.276.934.641 1.299.365.365.824.578 1.3.64l3.318-3.319a.75.75 0 0 1 1.248.313 5.25 5.25 0 0 1-5.472 6.756c-1.018-.086-1.87.1-2.309.634L7.344 21.3A3.298 3.298 0 1 1 2.7 16.657l8.684-7.151c.533-.44.72-1.291.634-2.309A5.342 5.342 0 0 1 12 6.75ZM4.117 19.125a.75.75 0 0 1 .75-.75h.008a.75.75 0 0 1 .75.75v.008a.75.75 0 0 1-.75.75h-.008a.75.75 0 0 1-.75-.75v-.008Z" clip-rule="evenodd"/></svg>',
+    down: '<svg class="size-3" fill="none" viewBox="0 0 24 24" stroke-width="3.5" stroke="currentColor" aria-hidden="true">'
+      + '<path stroke-linecap="round" stroke-linejoin="round" d="m19.5 8.25-7.5 7.5-7.5-7.5"/></svg>',
+    up: '<svg class="size-3" fill="none" viewBox="0 0 24 24" stroke-width="3.5" stroke="currentColor" aria-hidden="true">'
+      + '<path stroke-linecap="round" stroke-linejoin="round" d="m4.5 15.75 7.5-7.5 7.5 7.5"/></svg>',
+  };
+
+  function parseJson(text) {
+    let value = text;
+    while (typeof value === 'string') {
+      try { value = JSON.parse(value); } catch (e) { break; }
+    }
+    return value;
+  }
+
+  function cardLabel(text) {
+    const el = document.createElement('div');
+    el.className = 'text-[0.625rem] uppercase tracking-wider font-normal text-gray-400 dark:text-gray-500 mb-1.5 px-1';
+    el.textContent = text;
+    return el;
+  }
+
+  function cardPre(text, json) {
+    const pre = document.createElement('pre');
+    pre.className = json
+      ? 'text-xs text-gray-600 dark:text-gray-300 whitespace-pre font-mono bg-gray-50 dark:bg-gray-900 rounded-lg p-2 overflow-x-auto'
+      : 'text-xs text-gray-600 dark:text-gray-300 whitespace-pre-wrap break-words font-mono';
+    pre.textContent = text;
+    return pre;
+  }
+
+  // One tool call: collapsed, its name and a done mark; open, its input and
+  // output. `opened[id]` keeps it open across refills, keyed by the call.
+  function toolCard(c, opened) {
+    const card = document.createElement('div');
+    card.dataset.openclawCard = c.id || '';
+    const btn = document.createElement('div');
+    btn.dataset.openclawCardButton = '1';
+    if (btn.setAttribute) btn.setAttribute('role', 'button');
+    btn.className = 'py-1 text-[0.9375rem] text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 transition '
+      + 'w-full min-w-0 cursor-pointer';
+    const row = document.createElement('div');
+    row.className = 'w-full min-w-0 max-w-full font-normal flex items-center gap-1.5';
+    const mark = document.createElement('div');
+    mark.className = c.result == null ? 'text-gray-400 dark:text-gray-500' : 'text-emerald-500 dark:text-emerald-400';
+    mark.innerHTML = c.result == null ? ICON.none : ICON.done;
+    row.appendChild(mark);
+    const label = document.createElement('div');
+    label.className = 'flex-1 min-w-0 line-clamp-1';
+    const name = document.createElement('span');
+    name.dataset.openclawCardName = '1';
+    name.className = 'text-black dark:text-white';
+    name.textContent = c.name;
+    label.appendChild(name);
+    row.appendChild(label);
+    const chevron = document.createElement('div');
+    chevron.className = 'flex shrink-0 self-center translate-y-[1px]';
+    row.appendChild(chevron);
+    btn.appendChild(row);
+    card.appendChild(btn);
+
+    const body = document.createElement('div');
+    body.className = 'border border-gray-50 dark:border-gray-850/30 rounded-2xl my-1.5 p-2.5 space-y-2';
+    const input = document.createElement('div');
+    input.appendChild(cardLabel('Input'));
+    const args = parseJson(c.args || '');
+    if (args && typeof args === 'object' && !Array.isArray(args)) {
+      const list = document.createElement('div');
+      list.className = 'px-1 space-y-0.5';
+      Object.keys(args).forEach(function(key) {
+        const line = document.createElement('div');
+        line.className = 'flex gap-2 text-xs py-0.5';
+        const k = document.createElement('span');
+        k.className = 'font-normal text-gray-600 dark:text-gray-400 shrink-0';
+        k.textContent = key;
+        const v = document.createElement('span');
+        v.className = 'text-gray-800 dark:text-gray-200 break-all';
+        v.textContent = typeof args[key] === 'object' ? JSON.stringify(args[key]) : String(args[key]);
+        line.appendChild(k);
+        line.appendChild(v);
+        list.appendChild(line);
+      });
+      input.appendChild(list);
+    } else if (c.args) {
+      input.appendChild(cardPre(String(c.args), false));
+    }
+    body.appendChild(input);
+    const output = document.createElement('div');
+    output.dataset.openclawCardOutput = '1';
+    output.appendChild(cardLabel('Output'));
+    if (c.result == null) {
+      const none = document.createElement('div');
+      none.className = 'text-xs text-gray-400 dark:text-gray-500 px-1';
+      none.textContent = 'No result.';
+      output.appendChild(none);
+    } else {
+      const parsed = parseJson(c.result);
+      output.appendChild(parsed !== null && typeof parsed === 'object'
+        ? cardPre(JSON.stringify(parsed, null, 2), true) : cardPre(c.result, false));
+    }
+    body.appendChild(output);
+    card.appendChild(body);
+
+    function show(open) {
+      body.style.display = open ? 'block' : 'none';
+      chevron.innerHTML = open ? ICON.up : ICON.down;
+      card.dataset.open = open ? 'true' : 'false';
+    }
+    btn.onclick = function() { opened[c.id] = !opened[c.id]; show(opened[c.id]); };
+    show(!!opened[c.id]);
+    return card;
+  }
+
+  // A message's text, with a safe subset of Markdown: paragraphs, lists,
+  // code blocks, **bold**, `code` and http(s) links. Built with textContent,
+  // so nothing in the text is ever HTML.
+  function inline(parent, text) {
+    text.split(/(\*\*[^*\n]+\*\*|`[^`\n]+`|\[[^\]\n]+\]\(https?:\/\/[^)\s]+\))/).forEach(function(part) {
+      if (!part) return;
+      let el;
+      if (/^\*\*[^*]+\*\*$/.test(part)) {
+        el = document.createElement('strong');
+        el.textContent = part.slice(2, -2);
+      } else if (/^`[^`]+`$/.test(part)) {
+        el = document.createElement('code');
+        el.className = 'rounded px-1.5 bg-gray-100 dark:bg-gray-800 font-mono text-xs';
+        el.textContent = part.slice(1, -1);
+      } else if (/^\[[^\]]+\]\(https?:\/\//.test(part)) {
+        el = document.createElement('a');
+        el.textContent = part.slice(1, part.indexOf(']('));
+        el.href = part.slice(part.indexOf('](') + 2, -1);
+        el.target = '_blank';
+        el.rel = 'noopener noreferrer';
+        el.className = 'text-blue-600 dark:text-blue-400 underline';
+      } else {
+        el = document.createTextNode ? document.createTextNode(part) : null;
+        if (!el) { el = document.createElement('span'); el.textContent = part; }
+      }
+      parent.appendChild(el);
+    });
+  }
+
+  function prose(text) {
+    const wrap = document.createElement('div');
+    wrap.dataset.openclawText = '1';
+    wrap.className = 'text-gray-800 dark:text-gray-200 break-words mb-2';
+    wrap.style.fontSize = '15px';
+    wrap.style.lineHeight = '1.6';
+    String(text).split(/(```[\s\S]*?(?:```|$))/).forEach(function(chunk) {
+      if (!chunk.trim()) return;
+      if (chunk.indexOf('```') === 0) {
+        const code = chunk.replace(/^```[^\n]*\n?/, '').replace(/```$/, '');
+        const pre = cardPre(code.replace(/\n$/, ''), true);
+        pre.className += ' mb-2';
+        wrap.appendChild(pre);
+        return;
+      }
+      chunk.split(/\n\s*\n/).forEach(function(block) {
+        const lines = block.split('\n').filter(function(l) { return l.trim(); });
+        if (!lines.length) return;
+        const bullets = lines.every(function(l) { return /^\s*[-*] /.test(l); });
+        const numbers = lines.every(function(l) { return /^\s*\d+[.)] /.test(l); });
+        if (bullets || numbers) {
+          const list = document.createElement(bullets ? 'ul' : 'ol');
+          list.className = (bullets ? 'list-disc ' : '') + 'pl-5 mb-2';
+          if (numbers) list.style.listStyleType = 'decimal';
+          lines.forEach(function(l) {
+            const li = document.createElement('li');
+            inline(li, l.replace(/^\s*(?:[-*]|\d+[.)]) /, ''));
+            list.appendChild(li);
+          });
+          wrap.appendChild(list);
+          return;
+        }
+        const p = document.createElement('p');
+        p.className = 'mb-2 whitespace-pre-wrap';
+        if (/^#{1,6} /.test(lines[0])) {
+          p.className += ' font-semibold';
+          lines[0] = lines[0].replace(/^#{1,6} /, '');
+        }
+        inline(p, lines.join('\n'));
+        wrap.appendChild(p);
+      });
+    });
+    return wrap;
+  }
+
+  // A turn someone sent the sub-agent after its task, as a chat shows a
+  // user message: a bubble on the right.
+  function userTurn(text) {
+    const row = document.createElement('div');
+    row.dataset.openclawUser = '1';
+    row.className = 'flex justify-end mb-3';
+    const bubble = document.createElement('div');
+    bubble.className = 'rounded-3xl bg-gray-50 dark:bg-gray-850 px-4 py-2 text-gray-800 dark:text-gray-200 '
+      + 'whitespace-pre-wrap break-words';
+    bubble.style.maxWidth = '85%';
+    bubble.style.fontSize = '15px';
+    bubble.textContent = text;
+    row.appendChild(bubble);
+    return row;
+  }
+
+  function note(kind, text, sub) {
+    const el = document.createElement('div');
+    el.dataset.openclawNote = kind;
+    el.className = 'text-sm text-gray-500 dark:text-gray-400 mt-2 mb-2';
+    const line = document.createElement('div');
+    line.className = 'flex items-center gap-2';
+    if (kind === 'working') {
+      const dot = document.createElement('span');
+      dot.className = 'inline-block rounded-full bg-blue-500 animate-pulse shrink-0';
+      dot.style.width = '8px';
+      dot.style.height = '8px';
+      line.appendChild(dot);
+    }
+    const t = document.createElement('span');
+    t.textContent = text;
+    line.appendChild(t);
+    el.appendChild(line);
+    if (sub) {
+      const s = document.createElement('div');
+      s.dataset.openclawLatest = '1';
+      s.className = 'text-xs text-gray-400 dark:text-gray-500 mt-1 whitespace-pre-wrap break-words';
+      s.textContent = sub;
+      clampLines(s, 3);
+      el.appendChild(s);
+    }
+    return el;
+  }
+
+  // The header from what is known: the row at open, then each refill.
   function paintDrawer(root, task) {
     if (task.status) {
       const chip = document.getElementById('openclaw-drawer-chip');
@@ -350,31 +590,145 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     }
     const time = document.getElementById('openclaw-drawer-time');
     if (time) time.textContent = elapsedTime(task.startedAt, task.endedAt);
-    if (task.result) root.__texts.result = task.result;
     if (task.task) root.__texts.task = task.task;
-    const blocks = document.getElementById('openclaw-drawer-blocks');
-    if (!blocks) return;
-    blocks.innerHTML = '';
-    // A running sub-agent's reply so far is not its result yet.
-    const resultLabel = root.dataset.live === 'true' ? 'Latest' : 'Result';
-    if (root.__texts.result) blocks.appendChild(textBlock('result', resultLabel, root.__texts.result, 6, root.__open));
-    if (root.__texts.task) blocks.appendChild(textBlock('task', 'Task', root.__texts.task, 3, root.__open));
-    // "Show all" only where the clamp hid something (laid out by now).
-    Array.prototype.forEach.call(blocks.children, function(wrap) {
-      const body = wrap.children[1], more = wrap.children[2];
-      if (!root.__open[wrap.dataset.openclawBlock] && body.scrollHeight <= body.clientHeight) {
-        more.style.display = 'none';
+    if (task.model) root.__texts.model = task.model;
+    const head = document.getElementById('openclaw-drawer-task');
+    if (head && root.__texts.task && root.dataset.kind !== 'agent') {
+      head.innerHTML = '';
+      head.appendChild(textBlock('task', root.__texts.task, 2, root.__open));
+      // "Show all" only where the clamp hid something (laid out by now).
+      const body = head.children[0].children[0], more = head.children[0].children[1];
+      if (!root.__open.task && body.scrollHeight <= body.clientHeight) more.style.display = 'none';
+    }
+    const meta = document.getElementById('openclaw-drawer-meta');
+    if (meta) {
+      meta.innerHTML = '';
+      const parts = [];
+      if (root.__texts.model) {
+        const m = document.createElement('span');
+        m.textContent = root.__texts.model;
+        parts.push(m);
       }
-    });
+      const parent = root.__parent;
+      if (parent && parent.title) {
+        const from = document.createElement('span');
+        from.appendChild(document.createTextNode ? document.createTextNode('from ') : (function() {
+          const s = document.createElement('span'); s.textContent = 'from '; return s; })());
+        let link;
+        if (parent.chatId) {
+          link = document.createElement('a');
+          link.href = '/c/' + parent.chatId;
+        } else {
+          link = document.createElement('button');
+          link.type = 'button';
+          link.onclick = function() {
+            openSubagentDrawer({ id: parent.childKey, childSessionKey: parent.childKey, title: parent.title });
+          };
+        }
+        link.dataset.openclawParent = '1';
+        link.className = 'underline';
+        link.textContent = parent.title;
+        from.appendChild(link);
+        parts.push(from);
+      }
+      parts.forEach(function(p, i) {
+        if (i) {
+          const dot = document.createElement('span');
+          dot.textContent = ' · ';
+          meta.appendChild(dot);
+        }
+        meta.appendChild(p);
+      });
+      if (root.__controlUiUrl) {
+        const link = controlUiLink(root.__controlUiUrl);
+        link.style.marginLeft = '8px';
+        meta.appendChild(link);
+      }
+    }
   }
 
-  // The sub-agent drawer (ELI-155): a side panel, or a full-screen sheet
-  // with a back button on a phone. Its header is one title line and one
-  // status line, so the tabs and the content keep the screen. `task.kind`
-  // "child" is a Gateway child session: its tabs fill from the Action, and
-  // while it runs the drawer asks again every few seconds until it ends or
-  // the drawer closes. "agent" is an in-process Agent call: what its card
-  // tells, nothing to fetch.
+  // The run: every item, then where it stands. Keeps the reader's place: at
+  // the bottom it follows the run, scrolled up it stays put.
+  function fillDrawer(DATA) {
+    const root = document.getElementById('openclaw-drawer-root');
+    const stream = document.getElementById('openclaw-drawer-stream');
+    if (!root || !stream || root.dataset.taskId !== DATA.childSessionKey) return;
+    if (DATA.parent) root.__parent = DATA.parent;
+    if (DATA.task) paintDrawer(root, DATA.task);
+    const scroller = stream.parentElement;
+    const first = !root.__filled;
+    const atBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 40;
+    const top = scroller.scrollTop;
+    root.__filled = true;
+
+    stream.innerHTML = '';
+    if (DATA.error) {
+      stream.appendChild(errorEl(DATA.error));
+      return;
+    }
+    const earlier = DATA.earlier;
+    if (earlier) {
+      const box = document.createElement('div');
+      box.dataset.openclawEarlier = '1';
+      box.className = 'text-xs text-gray-400 dark:text-gray-500 mb-3';
+      const t = document.createElement('span');
+      t.textContent = earlier.count
+        ? earlier.count + ' earlier step' + (earlier.count === 1 ? '' : 's') + ' not shown' + (earlier.more ? ', and more' : '')
+        : 'Earlier steps not shown';
+      box.appendChild(t);
+      if (!root.__earlier) {
+        const more = document.createElement('button');
+        more.type = 'button';
+        more.dataset.openclawShowEarlier = '1';
+        more.className = 'text-blue-600 dark:text-blue-400 ml-2';
+        more.textContent = 'Show earlier steps';
+        more.onclick = function() {
+          root.__earlier = true;
+          if (root.__ask) root.__ask();
+        };
+        box.appendChild(more);
+      }
+      stream.appendChild(box);
+    }
+    const items = DATA.items || [];
+    items.forEach(function(it) {
+      if (it.kind === 'user') stream.appendChild(userTurn(it.text));
+      else if (it.kind === 'text') stream.appendChild(prose(it.text));
+      else if (it.kind === 'tool') stream.appendChild(toolCard(it, root.__cards));
+    });
+    const status = DATA.task && DATA.task.status;
+    if (DATA.task && DATA.task.error) {
+      const err = errorEl(DATA.task.error);
+      err.dataset.openclawRunError = '1';
+      stream.appendChild(err);
+    }
+    if (DATA.note === 'cli-running') {
+      stream.appendChild(note('working', 'Working… tool calls appear when this run ends', DATA.latest));
+    } else if (DATA.note === 'cli-stopped') {
+      stream.appendChild(note('stopped', 'Stopped: its tool calls were not saved.'
+        + ' A claude-cli run saves them when it ends.'));
+    } else if (status === 'running' || status === 'queued') {
+      const steps = items.filter(function(it) { return it.kind === 'tool'; }).length;
+      stream.appendChild(note('working', 'Working… (step ' + (steps + 1) + ')'));
+    } else if (DATA.note) {
+      stream.appendChild(note(DATA.note, DATA.noteText || ''));
+    }
+    if (!stream.children.length) {
+      const empty = document.createElement('div');
+      empty.className = 'text-gray-400 dark:text-gray-500 text-xs';
+      empty.textContent = 'No messages.';
+      stream.appendChild(empty);
+    }
+    scroller.scrollTop = (first || atBottom) ? scroller.scrollHeight : top;
+    const footer = document.getElementById('openclaw-drawer-footer');
+    if (footer && DATA.fetchedAt) footer.textContent = 'Updated ' + clockTime(DATA.fetchedAt) + ' · via ' + DATA.source;
+  }
+
+  // A full-screen sheet with a ‹ Back button on a phone, a side panel on a
+  // wide screen. `task.kind` "child" is a Gateway child session: it fills
+  // from the Action, and while it runs the drawer asks again every few
+  // seconds until it ends or the drawer closes. "agent" is an in-process
+  // Agent call: its task and result, from its card, nothing to fetch.
   function openDrawer(task) {
     const old = document.getElementById('openclaw-drawer-root');
     if (old) (old.__close || function() { old.remove(); })();
@@ -389,8 +743,11 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     // (z-[9999]), which then swallowed every click on it (ELI-118).
     root.style.zIndex = '10000';
     root.dataset.taskId = task.childSessionKey || task.id;
+    root.dataset.kind = child ? 'child' : 'agent';
     root.__texts = {};
     root.__open = {};
+    root.__cards = {};
+    root.__controlUiUrl = task.controlUiUrl || null;
     const onKey = function(e) { if (e.key === 'Escape') close(); };
     function close() {
       if (root.__poll) clearInterval(root.__poll);
@@ -415,132 +772,113 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     } else {
       // A wide viewport keeps the sub-agent list glanceable beside it.
       panel.className += ' shadow-xl border-l border-gray-100 dark:border-gray-800';
-      panel.style.width = 'min(420px, 88vw)';
+      panel.style.width = 'min(480px, 92vw)';
     }
     panel.addEventListener('click', function(e) { e.stopPropagation(); });
     root.appendChild(panel);
 
+    // The header: name, status and time; model and where it came from; the
+    // head of its task.
     const header = document.createElement('div');
-    header.className = 'flex items-start gap-2 p-4 border-b border-gray-100 dark:border-gray-800';
+    header.className = 'px-4 pt-3 pb-3 border-b border-gray-100 dark:border-gray-800';
+    const top = document.createElement('div');
+    top.className = 'flex items-center gap-2';
     const closeBtn = document.createElement('button');
     closeBtn.type = 'button';
     closeBtn.onclick = close;
     if (phone) {
       closeBtn.textContent = '‹ Back';
       closeBtn.className = 'text-sm text-blue-600 dark:text-blue-400 shrink-0 pr-1';
-      header.appendChild(closeBtn);
+      top.appendChild(closeBtn);
     }
-    const headerText = document.createElement('div');
-    headerText.className = 'flex-1';
-    headerText.style.minWidth = '0';
     const titleEl = document.createElement('div');
     titleEl.dataset.openclawTitle = '1';
-    titleEl.className = 'text-sm font-semibold';
+    titleEl.className = 'text-sm font-semibold flex-1';
     titleEl.textContent = task.title || task.id;
     oneLine(titleEl);
-    headerText.appendChild(titleEl);
-    const meta = document.createElement('div');
-    meta.className = 'flex items-center gap-2 mt-1';
-    meta.style.flexWrap = 'wrap';
+    top.appendChild(titleEl);
     const chip = statusChip(task.status);
     chip.id = 'openclaw-drawer-chip';
-    meta.appendChild(chip);
+    top.appendChild(chip);
     const time = document.createElement('span');
     time.id = 'openclaw-drawer-time';
-    time.className = 'text-xs text-gray-500 dark:text-gray-400';
-    meta.appendChild(time);
-    if (task.controlUiUrl) meta.appendChild(controlUiLink(task.controlUiUrl));
-    headerText.appendChild(meta);
-    header.appendChild(headerText);
+    time.className = 'text-xs text-gray-500 dark:text-gray-400 shrink-0';
+    top.appendChild(time);
     if (!phone) {
       closeBtn.textContent = '×';
       closeBtn.className = 'text-xl leading-none text-gray-400 hover:text-gray-700 '
         + 'dark:hover:text-gray-200 px-1 shrink-0';
-      header.appendChild(closeBtn);
+      top.appendChild(closeBtn);
     }
+    header.appendChild(top);
+    const meta = document.createElement('div');
+    meta.id = 'openclaw-drawer-meta';
+    meta.className = 'text-xs text-gray-500 dark:text-gray-400 mt-1';
+    oneLine(meta);
+    header.appendChild(meta);
+    const taskHead = document.createElement('div');
+    taskHead.id = 'openclaw-drawer-task';
+    taskHead.className = 'mt-2';
+    header.appendChild(taskHead);
     panel.appendChild(header);
 
-    const TABS = child ? ['Overview', 'Transcript', 'Tools'] : ['Overview'];
-    const panes = {};
-    if (child) {
-      const tabBar = document.createElement('div');
-      tabBar.className = 'flex gap-1 px-3 pt-2 border-b border-gray-100 dark:border-gray-800';
-      const tabClass = function(active) {
-        return 'text-xs font-medium px-2.5 py-1.5 rounded-t-lg border-b-2 '
-          + (active ? 'border-blue-500 text-blue-600 dark:text-blue-400'
-                    : 'border-transparent text-gray-400 dark:text-gray-500 '
-                      + 'hover:text-gray-600 dark:hover:text-gray-300');
-      };
-      TABS.forEach(function(name, i) {
-        const btn = document.createElement('button');
-        btn.type = 'button';
-        btn.textContent = name;
-        btn.dataset.tab = name;
-        btn.className = tabClass(i === 0);
-        btn.onclick = function() {
-          TABS.forEach(function(n) {
-            tabBar.querySelector('[data-tab="' + n + '"]').className = tabClass(n === name);
-            panes[n].style.display = n === name ? 'block' : 'none';
-          });
-        };
-        tabBar.appendChild(btn);
-      });
-      panel.appendChild(tabBar);
-    }
-
-    // The one scroller: the header and tabs above it stay short.
+    // The one scroller: the run.
     const content = document.createElement('div');
-    content.className = 'flex-1 p-4';
+    content.className = 'flex-1 px-4 py-3';
     content.style.overflowY = 'auto';
     content.style.minHeight = '0';
-    TABS.forEach(function(name, i) {
-      const pane = document.createElement('div');
-      pane.id = 'openclaw-drawer-pane-' + name.toLowerCase();
-      pane.style.display = i === 0 ? 'block' : 'none';
-      if (i === 0) {
-        const blocks = document.createElement('div');
-        blocks.id = 'openclaw-drawer-blocks';
-        pane.appendChild(blocks);
-      }
-      if (child) pane.appendChild(skeletonSection('openclaw-drawer-section-' + name.toLowerCase()));
-      panes[name] = pane;
-      content.appendChild(pane);
-    });
+    const stream = document.createElement('div');
+    stream.id = 'openclaw-drawer-stream';
+    content.appendChild(stream);
     panel.appendChild(content);
+    if (child) stream.appendChild(skeletonSection('openclaw-drawer-loading'));
 
-    if (child) {
-      const footer = document.createElement('div');
-      footer.id = 'openclaw-drawer-footer';
-      footer.className = 'text-[11px] text-gray-400 dark:text-gray-600 px-4 py-2 '
-        + 'border-t border-gray-100 dark:border-gray-800';
-      footer.textContent = ' ';
-      panel.appendChild(footer);
-    }
+    const footer = document.createElement('div');
+    footer.id = 'openclaw-drawer-footer';
+    footer.className = 'text-[11px] text-gray-400 dark:text-gray-600 px-4 py-2 '
+      + 'border-t border-gray-100 dark:border-gray-800';
+    footer.textContent = ' ';
+    if (child) panel.appendChild(footer);
 
     document.addEventListener('keydown', onKey);
     document.body.appendChild(root);
     paintDrawer(root, task);
-    if (!child) return;
+    if (!child) {
+      // Its task as the turn that started it, its result as the reply.
+      const items = [];
+      if (task.task) items.push({ kind: 'user', text: task.task });
+      if (task.result) items.push({ kind: 'text', text: task.result });
+      const notes = { launched: 'Running in the background: its report comes as a message of its own.',
+                      'cut off': 'Cut off: the run ended before it returned.', running: 'Working…' };
+      fillDrawer({ childSessionKey: root.dataset.taskId, items: items,
+                   note: notes[task.status] ? (task.status === 'running' ? 'working' : 'agent') : null,
+                   noteText: notes[task.status] || '' });
+      return;
+    }
 
-    // Each refresh is one Action request that fills the tabs once; the
+    // Each refresh is one Action request that fills the drawer once; the
     // next waits for it to come back. A fill that ends the run stops it.
     let inflight = false;
+    let firstAsk = true;
+    function ask() {
+      if (inflight) return;
+      inflight = true;
+      const done = function() { inflight = false; };
+      askAction({ mode: 'subagent-detail', opened: true, taskId: root.dataset.taskId,
+                  first: firstAsk, earlier: !!root.__earlier }).then(done, done);
+      firstAsk = false;
+    }
+    root.__ask = ask;
     function refresh() {
       if (!root.isConnected || root.dataset.live === 'false') {
         if (root.__poll) clearInterval(root.__poll);
         root.__poll = null;
         return;
       }
-      if (inflight) return;
-      inflight = true;
-      const done = function() { inflight = false; };
-      askAction({ mode: 'subagent-detail', opened: true, taskId: root.dataset.taskId }).then(done, done);
+      ask();
     }
-    if (!task.server) {
-      inflight = true;
-      const first = function() { inflight = false; };
-      askAction({ mode: 'subagent-detail', opened: true, taskId: root.dataset.taskId }).then(first, first);
-    }
+    if (task.server) firstAsk = false;
+    else ask();
     if (root.dataset.live === 'true') root.__poll = setInterval(refresh, IDENTITY.subagentPollMs || 2500);
   }
 
@@ -559,7 +897,7 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     skeletonSection: skeletonSection, touchFooter: touchFooter, clockTime: clockTime, controlUiLink: controlUiLink,
     triggerCompact: triggerCompact, elapsedTime: elapsedTime, toMs: toMs,
     openSubagentDrawer: openSubagentDrawer, openAgentDetail: openAgentDetail, openDrawer: openDrawer,
-    paintDrawer: paintDrawer, statusChip: statusChip, oneLine: oneLine, clampLines: clampLines,
+    fillDrawer: fillDrawer, statusChip: statusChip, oneLine: oneLine, clampLines: clampLines,
   };
 
   const root = document.createElement('div');
@@ -991,9 +1329,7 @@ _SUBAGENTS_FILL_JS_TEMPLATE = r"""
 
 # The drawer opened from here rather than by a row tap: an old sub-agent
 # message's toolbar click. `S.openDrawer` (_MODAL_OPEN_JS_TEMPLATE) builds it;
-# `server` because this request fills it next. All three tab panes are
-# created up front with skeletons and every fill updates all three, so
-# switching tabs is a pure visibility toggle.
+# `server` because this request fills it next.
 _DRAWER_OPEN_JS_TEMPLATE = r"""
 (function() {
   const S = window.__openclawStatus;
@@ -1001,249 +1337,28 @@ _DRAWER_OPEN_JS_TEMPLATE = r"""
 })();
 """
 
-# Whole-drawer error (task not found, connect failure) -- replaces the
-# content of all three panes at once, same reasoning as
-# _SECTIONS_ERROR_JS_TEMPLATE for the outer modal.
+# Whole-drawer error (task not found, connect failure): the run's place
+# says what went wrong. `KEY`: only the drawer showing that sub-agent.
 _DRAWER_ERROR_JS_TEMPLATE = r"""
 (function() {
   const MESSAGE = __OPENCLAW_ERROR_MESSAGE__;
   const KEY = __OPENCLAW_TASK_KEY__;
   const S = window.__openclawStatus;
   const root = document.getElementById('openclaw-drawer-root');
-  if (KEY && (!root || root.dataset.taskId !== KEY)) return;
-  ['overview', 'transcript', 'tools'].forEach(function(name) {
-    const pane = document.getElementById('openclaw-drawer-pane-' + name);
-    if (!pane) return;
-    pane.innerHTML = '';
-    pane.appendChild(S ? S.errorEl(MESSAGE) : document.createTextNode(MESSAGE));
-  });
+  const stream = document.getElementById('openclaw-drawer-stream');
+  if (!stream || (KEY && (!root || root.dataset.taskId !== KEY))) return;
+  stream.innerHTML = '';
+  stream.appendChild(S ? S.errorEl(MESSAGE) : document.createTextNode(MESSAGE));
 })();
 """
 
-_DRAWER_OVERVIEW_FILL_JS_TEMPLATE = r"""
+# One read of the sub-agent: its header and its run (S.fillDrawer). A fill
+# for a drawer since closed, or another sub-agent's, is dropped there.
+_DRAWER_FILL_JS_TEMPLATE = r"""
 (function() {
   const DATA = __OPENCLAW_STATUS_DATA__;
-  const section = document.getElementById('openclaw-drawer-section-overview');
   const S = window.__openclawStatus;
-  const root = document.getElementById('openclaw-drawer-root');
-  // A fill for a drawer since closed, or another sub-agent's, is dropped.
-  if (!section || !S || !root || root.dataset.taskId !== DATA.childSessionKey) return;
-
-  if (DATA.task) S.paintDrawer(root, DATA.task);
-
-  section.innerHTML = '';
-  if (DATA.error) {
-    section.appendChild(S.errorEl(DATA.error));
-    return;
-  }
-  if (!DATA.task) {
-    const empty = document.createElement('div');
-    empty.className = 'text-gray-400 dark:text-gray-500 text-xs';
-    empty.textContent = 'No task data.';
-    section.appendChild(empty);
-    return;
-  }
-
-  const meta = document.createElement('div');
-  meta.className = 'text-xs text-gray-500 dark:text-gray-400 mb-3';
-  meta.textContent = 'Started ' + (S.elapsedTime(DATA.task.startedAt, null) || '?') + ' ago'
-    + (DATA.task.endedAt ? ' · ran ' + S.elapsedTime(DATA.task.startedAt, DATA.task.endedAt) : '');
-  section.appendChild(meta);
-
-  if (!DATA.childSessionKey) {
-    const notStarted = document.createElement('div');
-    notStarted.className = 'text-gray-400 dark:text-gray-500 text-xs';
-    notStarted.textContent = 'Not started yet.';
-    section.appendChild(notStarted);
-    return;
-  }
-
-  const sub = document.createElement('div');
-  sub.className = 'text-xs text-gray-500 dark:text-gray-400 mb-3';
-  sub.textContent = (DATA.provider || '?') + (DATA.model ? (' · ' + DATA.model) : '');
-  section.appendChild(sub);
-
-  if (DATA.context) {
-    section.appendChild(S.sectionHeader('Context'));
-    section.appendChild(S.makeBar(DATA.context.pct));
-    const label = document.createElement('div');
-    label.className = 'text-xs text-gray-500 dark:text-gray-400 mt-1.5 mb-3';
-    label.textContent = DATA.context.usedTokens + ' / ' + DATA.context.totalTokens
-      + ' tokens · ' + DATA.context.pct + '%';
-    section.appendChild(label);
-  }
-
-  if (DATA.goal) {
-    section.appendChild(S.sectionHeader('Goal'));
-    const line = document.createElement('div');
-    line.className = 'text-xs text-gray-700 dark:text-gray-200';
-    line.textContent = DATA.goal.line;
-    section.appendChild(line);
-  }
-
-  const df = document.getElementById('openclaw-drawer-footer');
-  if (df) df.textContent = 'Updated ' + S.clockTime(DATA.fetchedAt) + ' · via ' + DATA.source;
-})();
-"""
-
-# Message shape assumed here ({role, content: [{type: "text"|"toolcall"|
-# "tool_result"|"thinking", ...}]}) confirmed live against a real session via
-# sessions_history (chat.history is a display-normalized projection of the
-# same underlying transcript, not a separate schema, so expected to match --
-# see _extract_transcript_and_tools). Only renders rows that actually have
-# text after stripping tool-call/tool-result/thinking parts, so the
-# scrollback doesn't show empty gaps for pure tool-call turns (those live in
-# the Tools tab instead).
-_DRAWER_TRANSCRIPT_FILL_JS_TEMPLATE = r"""
-(function() {
-  const DATA = __OPENCLAW_STATUS_DATA__;
-  const section = document.getElementById('openclaw-drawer-section-transcript');
-  const pane = document.getElementById('openclaw-drawer-pane-transcript');
-  const S = window.__openclawStatus;
-  const root = document.getElementById('openclaw-drawer-root');
-  if (!section || !pane || !S || !root || root.dataset.taskId !== DATA.childSessionKey) return;
-
-  if (DATA.error) {
-    section.innerHTML = '';
-    section.appendChild(S.errorEl(DATA.error));
-    return;
-  }
-
-  if (!DATA.childSessionKey) {
-    section.innerHTML = '';
-    const notStarted = document.createElement('div');
-    notStarted.className = 'text-gray-400 dark:text-gray-500 text-xs';
-    notStarted.textContent = 'Not started yet.';
-    section.appendChild(notStarted);
-    return;
-  }
-
-  // Preserve "was already scrolled to bottom" before rebuilding, so a live
-  // poll tick doesn't yank the view away from wherever the user scrolled to
-  // read older messages.
-  const wasAtBottom = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 40;
-
-  section.innerHTML = '';
-  const ROLE_STYLE = {
-    user: 'text-gray-900 dark:text-gray-100',
-    assistant: 'text-gray-700 dark:text-gray-300',
-  };
-
-  const rows = DATA.messages || [];
-  if (!rows.length) {
-    const empty = document.createElement('div');
-    empty.className = 'text-gray-400 dark:text-gray-500 text-xs';
-    empty.textContent = 'No transcript yet.';
-    section.appendChild(empty);
-    return;
-  }
-
-  rows.forEach(function(m) {
-    if (!m.text) return;
-    const row = document.createElement('div');
-    row.className = 'text-xs mb-2.5 ' + (ROLE_STYLE[m.role] || ROLE_STYLE.assistant);
-    const roleLabel = document.createElement('div');
-    roleLabel.className = 'uppercase tracking-wide text-gray-400 dark:text-gray-500 mb-0.5';
-    roleLabel.style.fontSize = '10px';
-    roleLabel.textContent = m.role;
-    row.appendChild(roleLabel);
-    const text = document.createElement('div');
-    text.className = 'whitespace-pre-wrap break-words';
-    text.textContent = m.text;
-    row.appendChild(text);
-    section.appendChild(row);
-  });
-
-  if (wasAtBottom) pane.scrollTop = pane.scrollHeight;
-})();
-"""
-
-# Uses real <details>/<summary> (natively collapsible with zero JS) rather
-# than OWUI's own "<details type=\"tool_calls\">" markup convention: that
-# convention only renders as a card because OWUI's own markdown-message
-# component parses it out of a message's markdown source -- it does nothing
-# special for DOM nodes built directly via execute(), which is how this
-# whole drawer (like the rest of the status dialog) is delivered. A plain
-# native <details> gets the same "collapsible card" behavior for free
-# without depending on that unrelated rendering path.
-_DRAWER_TOOLS_FILL_JS_TEMPLATE = r"""
-(function() {
-  const DATA = __OPENCLAW_STATUS_DATA__;
-  const section = document.getElementById('openclaw-drawer-section-tools');
-  const S = window.__openclawStatus;
-  const root = document.getElementById('openclaw-drawer-root');
-  if (!section || !S || !root || root.dataset.taskId !== DATA.childSessionKey) return;
-
-  // A live poll tick refills this tab every few seconds: keep each card open
-  // or closed as the user left it, keyed by its tool call id (the call stays
-  // the same while its place in the history window moves), as the Transcript
-  // keeps its scroll (ELI-133).
-  const wasOpen = {};
-  section.querySelectorAll('[data-call-id]').forEach(function(d) {
-    wasOpen[d.dataset.callId] = !!d.open;
-  });
-
-  if (DATA.error) {
-    section.innerHTML = '';
-    section.appendChild(S.errorEl(DATA.error));
-    return;
-  }
-
-  if (!DATA.childSessionKey) {
-    section.innerHTML = '';
-    const notStarted = document.createElement('div');
-    notStarted.className = 'text-gray-400 dark:text-gray-500 text-xs';
-    notStarted.textContent = 'Not started yet.';
-    section.appendChild(notStarted);
-    return;
-  }
-
-  section.innerHTML = '';
-  const calls = DATA.toolCalls || [];
-  if (!calls.length) {
-    const empty = document.createElement('div');
-    empty.className = 'text-gray-400 dark:text-gray-500 text-xs';
-    empty.textContent = 'No tool calls yet.';
-    section.appendChild(empty);
-    return;
-  }
-
-  calls.forEach(function(c) {
-    const details = document.createElement('details');
-    details.className = 'mb-2 rounded-lg border border-gray-100 dark:border-gray-800 px-2.5 py-1.5';
-    if (c.id) {
-      details.dataset.callId = c.id;
-      details.open = !!wasOpen[c.id];
-    }
-    const summary = document.createElement('summary');
-    summary.className = 'text-xs font-medium cursor-pointer text-gray-700 dark:text-gray-200';
-    // Only ❌ vs 🔧 here: every card comes from chat.history, which only ever
-    // holds finished calls, so there is no in-flight state to distinguish.
-    summary.textContent = (c.isError ? '❌' : '🔧') + ' ' + c.name;
-    details.appendChild(summary);
-
-    const argsEl = document.createElement('pre');
-    argsEl.className = 'text-[11px] mt-1.5 whitespace-pre-wrap break-words '
-      + 'text-gray-500 dark:text-gray-400';
-    argsEl.textContent = c.arguments;
-    details.appendChild(argsEl);
-
-    if (c.result) {
-      const resultLabel = document.createElement('div');
-      resultLabel.className = 'uppercase tracking-wide text-gray-400 '
-        + 'dark:text-gray-500 mt-1.5';
-      resultLabel.style.fontSize = '10px';
-      resultLabel.textContent = 'Result';
-      details.appendChild(resultLabel);
-      const resultEl = document.createElement('pre');
-      resultEl.className = 'text-[11px] whitespace-pre-wrap break-words '
-        + 'text-gray-500 dark:text-gray-400';
-      resultEl.textContent = c.result;
-      details.appendChild(resultEl);
-    }
-
-    section.appendChild(details);
-  });
+  if (S && S.fillDrawer && document.getElementById('openclaw-drawer-stream')) S.fillDrawer(DATA);
 })();
 """
 
@@ -1543,16 +1658,8 @@ def _render_drawer_error_js(message: str, task_key: str | None = None) -> str:
             .replace("__OPENCLAW_TASK_KEY__", _json_for_js(task_key)))
 
 
-def _render_drawer_overview_fill_js(data: dict) -> str:
-    return _DRAWER_OVERVIEW_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
-
-
-def _render_drawer_transcript_fill_js(data: dict) -> str:
-    return _DRAWER_TRANSCRIPT_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
-
-
-def _render_drawer_tools_fill_js(data: dict) -> str:
-    return _DRAWER_TOOLS_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
+def _render_drawer_fill_js(data: dict) -> str:
+    return _DRAWER_FILL_JS_TEMPLATE.replace("__OPENCLAW_STATUS_DATA__", _json_for_js(data))
 
 
 # How long the open Status dialog follows its running sub-agents' pushed
@@ -1564,33 +1671,12 @@ _DIALOG_FOLLOW_MAX_S = 900
 _SUBAGENT_POLL_INTERVAL_S = 2.5
 
 
-def _is_cli_run_closer(message: dict) -> bool:
-    """The message a claude-cli run ends with in the Gateway's transcript
-    (`cli-assistant:<run>`): every assistant message of the run joined, the
-    whole progress log, after the run's own last turn."""
-    key = message.get("idempotencyKey") or (message.get("__openclaw") or {}).get("idempotencyKey")
-    return isinstance(key, str) and key.startswith("cli-assistant:")
-
-
 def _message_text_blocks(message: dict) -> list:
     content = message.get("content")
     if isinstance(content, str):
         return [content.strip()] if content.strip() else []
     return [b["text"].strip() for b in content or []
             if isinstance(b, dict) and b.get("type") == "text" and (b.get("text") or "").strip()]
-
-
-def _final_reply_text(messages: list) -> str | None:
-    """A child's result: the last text block of its last assistant message,
-    passing over a claude-cli run's closer, which repeats the whole run
-    (ELI-155). The closer only when nothing else has text."""
-    assistant = [m for m in messages or [] if m.get("role") == "assistant"]
-    for skip_closer in (True, False):
-        for m in reversed(assistant):
-            blocks = [] if skip_closer and _is_cli_run_closer(m) else _message_text_blocks(m)
-            if blocks:
-                return blocks[-1]
-    return None
 
 
 def _spawn_task_of(messages: list) -> str | None:
@@ -1604,51 +1690,136 @@ def _spawn_task_of(messages: list) -> str | None:
     return None
 
 
-def _extract_transcript_and_tools(messages: list) -> tuple[list, list]:
-    """Splits chat.history's message rows into plain-text transcript rows and
-    tool-call cards for the drawer's Transcript/Tools tabs.
+# How the drawer reads a sub-agent's run. One page is the Gateway's largest
+# (CHAT_HISTORY_MAX_ENTRIES); text blocks keep up to 50000 characters each,
+# under the Gateway's per-message byte cap even for 2-byte scripts. Each
+# card's result is already capped by the chat's own rule (the renderer's), so
+# the run is bounded by a byte budget per read: the newest steps that fit,
+# the rest behind "Show earlier steps", which reads with the larger budget.
+_DRAWER_HISTORY_PAGE = 1000
+_DRAWER_TEXT_MAX_CHARS = 50000
+_DRAWER_RUN_BYTES = 512 * 1024
+_DRAWER_RUN_BYTES_EARLIER = 4 * 1024 * 1024
 
-    The tool calls are the ones the chat's own rebuild makes cards of, read
-    by the same parser (`_history_events`, gateway.py), in both transcript
-    shapes (claude-cli's and the Gateway's own runtime's). Each card's result
-    is its output by the chat tool cards' rule, not the block list or the
-    {content, details} envelope as JSON (ELI-125). Text rows are every
-    message's text blocks; a plain string `content` is a single row.
-    """
-    text_rows: list = []
+
+async def _read_child_history(conn, child_key: str, budget: int, *, all_pages: bool) -> tuple[list, bool]:
+    """The child's transcript, oldest first, and whether it is whole. One
+    page by default; with `all_pages`, older pages too while the Gateway has
+    more and the budget lasts."""
+    messages: list = []
+    offset, size = 0, 0
+    while True:
+        params = dict(sessionKey=child_key, limit=_DRAWER_HISTORY_PAGE, maxChars=_DRAWER_TEXT_MAX_CHARS)
+        if offset:
+            params["offset"] = offset
+        resp = await conn.send_request("chat.history", params, timeout=8) or {}
+        page = resp.get("messages") or []
+        messages = page + messages
+        size += len(json.dumps(page))
+        more = bool(resp.get("hasMore"))
+        nxt = resp.get("nextOffset")
+        if not (all_pages and more and page and size < budget and isinstance(nxt, int) and nxt > offset):
+            return messages, not more
+        offset = nxt
+
+
+def _drawer_run_items(messages: list) -> list:
+    """The child's run as the drawer's read-only chat, oldest first: the
+    turns it was sent after its task, and each stretch of its replies the
+    way the chat's own rebuild draws a run (`_history_renderer`): its text,
+    and a card per tool call with the call's result by the chat cards' rule
+    (a failed call named with ❌, its output led by the failure line). Both
+    transcript shapes; a claude-cli run's closer, which repeats the whole
+    run, is the renderer's to drop."""
+    items: list = []
+    stretch: list = []
+
+    def flush():
+        if not stretch:
+            return
+        out = _history_renderer(stretch).output
+        results = {o.get("call_id"): _card_text(o) for o in out if o.get("type") == "function_call_output"}
+        for o in out:
+            if o.get("type") == "message":
+                text = "".join(c.get("text") or "" for c in o.get("content") or []).strip()
+                if text:
+                    items.append({"kind": "text", "text": text})
+            elif o.get("type") == "function_call":
+                # A call item's own id is its call id; only its output carries `call_id`.
+                items.append({"kind": "tool", "id": o.get("id"), "name": o.get("name") or "tool",
+                              "args": o.get("arguments") or "", "result": results.get(o.get("id"))})
+        stretch.clear()
+
     for m in messages or []:
-        role, content = m.get("role"), m.get("content")
-        if role == "toolResult":
-            continue  # shows in its call's Tools card only (ELI-128)
-        if isinstance(content, str):
-            text = content if content.strip() else ""
-        elif isinstance(content, list):
-            text = "\n".join(i["text"] for i in content
-                             if isinstance(i, dict) and i.get("type") == "text" and i.get("text"))
-        else:
+        text = "\n".join(_message_text_blocks(m)) if m.get("role") == "user" else ""
+        if not text:
+            stretch.append(m)
             continue
-        if text and role == "user" and _is_spawn_message(text):
-            # A child's first message is the Gateway's spawn wrapper: show
-            # the task in it, as the Subagents row does.
-            text = _subagent_task_text(text) or text
-        if text:
-            text_rows.append({"role": role, "text": text})
+        flush()
+        if not _is_spawn_message(text):      # the task itself is the header's
+            items.append({"kind": "user", "text": text})
+    flush()
+    return items
 
-    tool_calls: list = []
-    by_id: dict = {}
-    for event in _history_events(messages or []):
-        data = event["data"]
-        if event["stream"] != "tool":
-            continue
-        if data["phase"] == "start":
-            by_id[data["toolCallId"]] = call = {
-                "id": data["toolCallId"], "name": data["name"] or "tool",
-                "arguments": json.dumps(data["args"], indent=2), "result": None, "isError": False}
-            tool_calls.append(call)
-        elif (call := by_id.get(data["toolCallId"])) is not None:
-            call["result"] = _tool_result_text(data["result"])
-            call["isError"] = data["isError"]
-    return text_rows, tool_calls
+
+def _cap_run_items(items: list, budget: int) -> tuple[list, int]:
+    """The newest items that fit `budget` bytes, and how many older ones
+    did not. The last item always stays; when it alone is over, the end of
+    its text does (a reply's end is its conclusion)."""
+    sizes = [len(json.dumps(i)) for i in items]
+    total, dropped = sum(sizes), 0
+    while total > budget and dropped < len(items) - 1:
+        total -= sizes[dropped]
+        dropped += 1
+    kept = items[dropped:]
+    if total > budget and kept:
+        last = dict(kept[-1])
+        field = "result" if last.get("kind") == "tool" else "text"
+        text = last.get(field) or ""
+        room = max(0, len(text) - (total - budget) - 64)
+        last[field] = "…" + text[len(text) - room:] if room else "…"
+        kept = kept[:-1] + [last]
+    return kept, dropped
+
+
+_OWUI_SESSION_KEY_RE = re.compile(
+    r"^agent:[^:]+:openwebui-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})-"
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$", re.IGNORECASE)
+
+
+async def _drawer_parent(conn, session_row: dict, user_id) -> dict | None:
+    """Where the sub-agent came from, for the header's "from" link: an Open
+    WebUI chat by its title, or the sub-agent that spawned it by its label."""
+    key = session_row.get("spawnedBy") or session_row.get("parentSessionKey")
+    if not isinstance(key, str) or not key:
+        return None
+    m = _OWUI_SESSION_KEY_RE.match(key)
+    if m:
+        chat = await _load_owui_chat(m.group(2), user_id) if user_id else None
+        title = (chat or {}).get("title") if isinstance(chat, dict) else None
+        return {"title": title or "its chat", "chatId": m.group(2)}
+    try:
+        desc = await conn.send_request("sessions.describe", dict(key=key), timeout=5)
+    except Exception as ex:
+        pipe_log(f"[status-action] parent describe failed: {ex}")
+        return None
+    row = (desc or {}).get("session") or {}
+    return {"title": (row.get("label") or row.get("displayName") or "").strip() or key, "childKey": key}
+
+
+async def _latest_preview(conn, child_key: str) -> str | None:
+    """A running child's newest message as the session list previews it:
+    what a claude-cli child has said so far, while its transcript is still
+    empty."""
+    try:
+        resp = await conn.send_request(
+            "sessions.list", dict(search=child_key.rsplit(":", 1)[-1], limit=10, includeLastMessage=True), timeout=5)
+    except Exception as ex:
+        pipe_log(f"[status-action] latest preview failed: {ex}")
+        return None
+    row = next((r for r in (resp or {}).get("sessions") or [] if r.get("key") == child_key), {})
+    preview = row.get("lastMessagePreview")
+    return preview if isinstance(preview, str) and preview.strip() and not _is_spawn_message(preview) else None
 
 
 class Action:
@@ -2148,17 +2319,25 @@ class Action:
             }})
             return {"status": "error", "detail": str(ex)}
 
-        return await self._fill_subagent_detail(conn, source, task_id, __event_emitter__)
+        user_id = (__user__ or {}).get("id") if isinstance(__user__, dict) else None
+        return await self._fill_subagent_detail(
+            conn, source, task_id, __event_emitter__,
+            # The header's "from" link is read once, with the drawer's first fill.
+            parent_for=user_id if (body.get("first") or not body.get("opened")) else False,
+            earlier=bool(body.get("earlier")),
+        )
 
-    async def _fill_subagent_detail(self, conn, source, child_key, __event_emitter__):
-        """One read of the child session and its history, pushed to the
-        drawer's three tabs."""
+    async def _fill_subagent_detail(self, conn, source, child_key, __event_emitter__, *,
+                                    parent_for=False, earlier=False):
+        """One read of the child session and its whole run, pushed to the
+        drawer: its header, and the run as a read-only chat. `parent_for`:
+        the user to read the parent chat's title as, or False to skip it.
+        `earlier`: the reader asked for the steps a normal read leaves out."""
+        budget = _DRAWER_RUN_BYTES_EARLIER if earlier else _DRAWER_RUN_BYTES
         try:
-            desc_resp, history_resp = await asyncio.gather(
+            desc_resp, (messages, whole) = await asyncio.gather(
                 conn.send_request("sessions.describe", dict(key=child_key), timeout=8),
-                conn.send_request(
-                    "chat.history", dict(sessionKey=child_key, limit=50, maxChars=4000), timeout=8,
-                ),
+                _read_child_history(conn, child_key, budget, all_pages=earlier),
             )
         except Exception as ex:
             pipe_log(f"[status-action] subagent detail fetch failed: {ex}")
@@ -2174,50 +2353,27 @@ class Action:
             }})
             return {"status": "error", "detail": "sub-agent not found"}
 
-        # KNOWN GAP (ELI-26): chat.history is blind to the in-flight
-        # turn, so while the subagent is running this yields nothing and
-        # every tool call appears at once when the turn flushes. There
-        # is no pipe-side fix -- a running session's tool events reach
-        # only the connection that started the run. See the note in
-        # gateway.py's reader loop for the measurement.
-        messages = (history_resp or {}).get("messages") or []
-        text_rows, tool_calls = _extract_transcript_and_tools(messages)
         task = _subagent_row({"key": child_key, **session_row}, _spawn_task_of(messages))
-        if task["status"] not in _LIVE_SUBAGENT_STATUSES and not task["terminalSummary"]:
-            # The child's last reply, as the Tasks API's terminal summary had it.
-            task["terminalSummary"] = next(
-                (r["text"] for r in reversed(text_rows) if r.get("role") == "assistant" and r.get("text")),
-                None,
-            )
-        task["result"] = _final_reply_text(messages)
+        items, dropped = _cap_run_items(_drawer_run_items(messages), budget)
+        claude_cli = (session_row.get("agentRuntime") or {}).get("id") == "claude-cli"
+        note = latest = None
+        if claude_cli and task["status"] in _LIVE_SUBAGENT_STATUSES:
+            # A claude-cli run's messages reach its transcript when it ends
+            # (measured, Gateway 2026.9.3); until then its newest line is
+            # what the session list previews.
+            note, latest = "cli-running", await _latest_preview(conn, child_key)
+        elif claude_cli and task["status"] == "cancelled":
+            note = "cli-stopped"   # stopped before it ended: nothing of it was saved
+        parent = await _drawer_parent(conn, session_row, parent_for) if parent_for is not False else None
 
-        provider = session_row.get("modelProvider")
-        model = session_row.get("model")
-        context_data = goal_data = None
-        context_tokens = session_row.get("contextTokens")
-        total_tokens = session_row.get("totalTokens")
-        if context_tokens and total_tokens is not None:
-            context_data = {
-                "usedTokens": _fmt_tokens(total_tokens),
-                "totalTokens": _fmt_tokens(context_tokens),
-                "pct": round(total_tokens / context_tokens * 100, 1),
-            }
-        goal = session_row.get("goal")
-        if goal:
-            goal_line = _format_goal_line(goal)
-            if goal_line:
-                goal_data = {"line": goal_line}
-
-        fetched_at = int(time.time() * 1000)
-        await __event_emitter__({"type": "execute", "data": {"code": _render_drawer_overview_fill_js({
-            "task": task, "childSessionKey": child_key, "provider": provider, "model": model,
-            "context": context_data, "goal": goal_data, "source": source,
-            "fetchedAt": fetched_at, "error": None,
-        })}})
-        await __event_emitter__({"type": "execute", "data": {"code": _render_drawer_transcript_fill_js({
-            "childSessionKey": child_key, "messages": text_rows, "error": None,
-        })}})
-        await __event_emitter__({"type": "execute", "data": {"code": _render_drawer_tools_fill_js({
-            "childSessionKey": child_key, "toolCalls": tool_calls, "error": None,
+        await __event_emitter__({"type": "execute", "data": {"code": _render_drawer_fill_js({
+            "childSessionKey": child_key,
+            "task": {**{k: task[k] for k in ("title", "status", "startedAt", "endedAt", "task", "error")},
+                     "model": session_row.get("model")},
+            "parent": parent,
+            "items": items,
+            "earlier": {"count": dropped, "more": not whole} if dropped or not whole else None,
+            "note": note, "latest": latest,
+            "source": source, "fetchedAt": int(time.time() * 1000), "error": None,
         })}})
         return {"status": "ok"}

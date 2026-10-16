@@ -73,15 +73,13 @@ if "pydantic" not in sys.modules:
 
 from openclaw_status_action import (  # noqa: E402
     Action,
-    _extract_transcript_and_tools,
     _control_ui_session_url,
+    _drawer_run_items,
     _get_action_connection,
     _owui_session_key,
     _render_context_fill_js,
+    _render_drawer_fill_js,
     _render_drawer_open_js,
-    _render_drawer_overview_fill_js,
-    _render_drawer_tools_fill_js,
-    _render_drawer_transcript_fill_js,
     _render_limits_fill_js,
     _render_modal_open_js,
     _render_sections_error_js,
@@ -274,6 +272,7 @@ class El {
     this.parent = null;
   }
   get isConnected() { let n = this; while (n.parent) n = n.parent; return n === document.body; }
+  get parentElement() { return this.parent; }
   set innerHTML(v) { this.children = []; this.text = ''; }
   set textContent(v) { this.children = []; this.text = String(v); }
   get textContent() { return this.text + this.children.map((c) => c.textContent).join(''); }
@@ -317,20 +316,20 @@ console.log(JSON.stringify(seen));
 """
 
 
-_DRAWER_TOOLS_PAGE_JS = _FAKE_DOM_JS + r"""
+_DRAWER_CARDS_PAGE_JS = _FAKE_DOM_JS + r"""
 run(input.open);
 run(input.drawer);
-const cards = () => document.getElementById('openclaw-drawer-section-tools').walk()
-  .filter((e) => e.tagName === 'DETAILS');
+const cards = () => document.getElementById('openclaw-drawer-stream').walk()
+  .filter((e) => 'openclawCard' in e.dataset);
+const nameOf = (card) => card.walk().find((e) => 'openclawCardName' in e.dataset).textContent;
 const seen = [];
 for (const step of input.steps) {
   if (step.fill) run(step.fill);
   if (step.toggle) {
-    // What a click on a card's summary does: flip that <details>.
-    const card = cards().find((d) => d.children[0].textContent.endsWith(' ' + step.toggle));
-    card.open = !card.open;
+    // What a tap on a card's row does.
+    cards().find((c) => nameOf(c) === step.toggle).walk().find((e) => 'openclawCardButton' in e.dataset).onclick();
   }
-  seen.push(cards().map((d) => [d.children[0].textContent, !!d.open]));
+  seen.push(cards().map((c) => [nameOf(c), c.dataset.open === 'true']));
 }
 console.log(JSON.stringify(seen));
 """
@@ -338,21 +337,21 @@ console.log(JSON.stringify(seen));
 
 class DrawerToolCardsStayOpenTests(unittest.TestCase):
     """ELI-133 (ELI-110 screenshots, run 38636471099): while a sub-agent
-    runs, the drawer refills its Tools tab every 2.5 s, and each refill
-    rebuilt every card closed, so a card the user opened snapped shut. A
-    card keeps its open or closed state across refills, keyed by its tool
-    call id, as the Transcript keeps its scroll."""
+    runs, the drawer refills every 2.5 s, and each refill rebuilt every card
+    closed, so a card the user opened snapped shut. A card keeps its open or
+    closed state across refills, keyed by its tool call id."""
 
     TASK = {"id": "t1", "title": "Child", "status": "running", "childSessionKey": "agent:main:subagent:c",
             "startedAt": 1, "endedAt": None, "progressSummary": None, "terminalSummary": None, "error": None}
 
     @staticmethod
     def _call(cid, name):
-        return {"id": cid, "name": name, "arguments": "{}", "result": "ok", "isError": False}
+        return {"kind": "tool", "id": cid, "name": name, "args": "{}", "result": "ok"}
 
     def _fill(self, calls):
-        return _render_drawer_tools_fill_js({"childSessionKey": self.TASK["childSessionKey"],
-                                             "toolCalls": calls, "error": None})
+        return _render_drawer_fill_js({"childSessionKey": self.TASK["childSessionKey"], "items": calls,
+                                       "task": {"status": "running"}, "source": "pipe", "fetchedAt": 1,
+                                       "error": None})
 
     def _page(self, steps):
         import shutil
@@ -364,7 +363,7 @@ class DrawerToolCardsStayOpenTests(unittest.TestCase):
         payload = {"now": 1, "open": _render_modal_open_js(identity),
                    "drawer": _render_drawer_open_js(self.TASK), "steps": steps}
         with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
-            fh.write(_DRAWER_TOOLS_PAGE_JS)
+            fh.write(_DRAWER_CARDS_PAGE_JS)
         try:
             out = subprocess.run([runtime, fh.name], input=json.dumps(payload),
                                  capture_output=True, text=True, timeout=60)
@@ -377,65 +376,31 @@ class DrawerToolCardsStayOpenTests(unittest.TestCase):
         a, b, c = self._call("call-a", "read"), self._call("call-b", "exec"), self._call("call-c", "write")
         seen = self._page([{"fill": self._fill([a, b])}, {"toggle": "exec"},
                            {"fill": self._fill([a, b, c])}])
-        self.assertEqual(seen[1], [["🔧 read", False], ["🔧 exec", True]])
-        self.assertEqual(seen[2], [["🔧 read", False], ["🔧 exec", True], ["🔧 write", False]])
+        self.assertEqual(seen[1], [["read", False], ["exec", True]])
+        self.assertEqual(seen[2], [["read", False], ["exec", True], ["write", False]])
 
     def test_a_closed_card_stays_closed(self):
         a, b = self._call("call-a", "read"), self._call("call-b", "exec")
         seen = self._page([{"fill": self._fill([a, b])}, {"toggle": "read"}, {"toggle": "read"},
                            {"fill": self._fill([a, b])}])
-        self.assertEqual(seen[3], [["🔧 read", False], ["🔧 exec", False]])
+        self.assertEqual(seen[3], [["read", False], ["exec", False]])
 
     def test_the_state_follows_the_call_not_its_position(self):
-        """The history read is a window: when an older call drops out of it,
-        the open card is still the same call, now one place up."""
+        """When an older step drops out of the read, the open card is still
+        the same call, now one place up."""
         a, b, c = self._call("call-a", "read"), self._call("call-b", "exec"), self._call("call-c", "write")
         seen = self._page([{"fill": self._fill([a, b])}, {"toggle": "exec"},
                            {"fill": self._fill([b, c])}])
-        self.assertEqual(seen[2], [["🔧 exec", True], ["🔧 write", False]])
+        self.assertEqual(seen[2], [["exec", True], ["write", False]])
 
 
-_DRAWER_TRANSCRIPT_PAGE_JS = _FAKE_DOM_JS + r"""
-run(input.open);
-run(input.drawer);
-run(input.fill);
-const section = document.getElementById('openclaw-drawer-section-transcript');
-console.log(JSON.stringify(section.children.map((r) => r.children.map((c) => c.textContent))));
-"""
+class DrawerRunShowsEachResultOnceTests(unittest.TestCase):
+    """ELI-128: a tool's output shows once, in its card. In OpenClaw's own
+    shape (any runtime but claude-cli) the result is a `toolResult` message
+    of its own; it is never a turn of the run."""
 
-
-class DrawerTranscriptWithoutToolResultsTests(unittest.TestCase):
-    """ELI-128: a tool's output shows once, in its Tools card. In OpenClaw's
-    own shape (any runtime but claude-cli) the result is a `toolResult`
-    message of its own, and the Transcript showed it again as a TOOLRESULT
-    row; claude-cli's `tool_result` items never reached the Transcript."""
-
-    TASK = DrawerToolCardsStayOpenTests.TASK
-
-    def _transcript(self, history):
-        import shutil
-        import subprocess
-        runtime = shutil.which("bun") or shutil.which("node")
-        if runtime is None:
-            self.skipTest("no bun or node")
-        rows, _calls = _extract_transcript_and_tools(history)
-        identity = {"chatId": "c", "messageId": "m", "sessionId": "s", "owuiModel": "x"}
-        payload = {"now": 1, "open": _render_modal_open_js(identity),
-                   "drawer": _render_drawer_open_js(self.TASK),
-                   "fill": _render_drawer_transcript_fill_js(
-                       {"childSessionKey": self.TASK["childSessionKey"], "messages": rows, "error": None})}
-        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
-            fh.write(_DRAWER_TRANSCRIPT_PAGE_JS)
-        try:
-            out = subprocess.run([runtime, fh.name], input=json.dumps(payload),
-                                 capture_output=True, text=True, timeout=60)
-        finally:
-            os.unlink(fh.name)
-        self.assertEqual(out.returncode, 0, out.stderr)
-        return json.loads(out.stdout)
-
-    def test_the_gateways_own_shape_shows_no_result_rows(self):
-        shown = self._transcript([
+    def test_the_gateways_own_shape(self):
+        items = _drawer_run_items([
             {"role": "user", "content": "Read the staging deploy log."},
             {"role": "assistant", "content": [
                 {"type": "toolCall", "id": "call_1", "name": "read", "arguments": {"path": "README.md"}}]},
@@ -443,19 +408,21 @@ class DrawerTranscriptWithoutToolResultsTests(unittest.TestCase):
              "content": [{"type": "text", "text": "# Forecast"}]},
             {"role": "assistant", "content": [{"type": "text", "text": "The staging log is clean."}]},
         ])
-        self.assertEqual(shown, [["user", "Read the staging deploy log."],
-                                 ["assistant", "The staging log is clean."]])
+        self.assertEqual([(i["kind"], i.get("text") or i.get("result")) for i in items], [
+            ("user", "Read the staging deploy log."), ("tool", "# Forecast"),
+            ("text", "The staging log is clean.")])
 
-    def test_claude_cli_shape_is_unchanged(self):
-        shown = self._transcript([
+    def test_claude_cli_shape(self):
+        items = _drawer_run_items([
             {"role": "user", "content": "Read the staging deploy log."},
             {"role": "assistant", "content": [
                 {"type": "toolcall", "id": "t1", "name": "read", "arguments": {"path": "README.md"}},
                 {"type": "tool_result", "tool_use_id": "t1", "content": "# Forecast"},
                 {"type": "text", "text": "The staging log is clean."}]},
         ])
-        self.assertEqual(shown, [["user", "Read the staging deploy log."],
-                                 ["assistant", "The staging log is clean."]])
+        self.assertEqual([(i["kind"], i.get("text") or i.get("result")) for i in items], [
+            ("user", "Read the staging deploy log."), ("tool", "# Forecast"),
+            ("text", "The staging log is clean.")])
 
 
 class ElapsedTickTests(unittest.TestCase):
@@ -1062,17 +1029,17 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("openclaw-status-sections", codes[-1])
 
 
-class ExtractTranscriptAndToolsTests(unittest.TestCase):
-    """Message shape here mirrors what sessions_history returns for a real
-    session (confirmed live, 2026-07-12): content is a list of typed parts
-    ("text" / "toolcall" / "tool_result" / "thinking"), with a toolcall and
-    its matching tool_result sometimes sharing one message's content array.
-    chat.history is a display-normalized projection of the same underlying
-    transcript, not a separate schema, so this is the expected shape there
-    too."""
+class DrawerRunItemsTests(unittest.TestCase):
+    """The drawer's run (ELI-155): chat.history read the way the chat's own
+    rebuild reads it (`_history_renderer`), as text, user turns and a card
+    per tool call with its result."""
 
-    def test_splits_text_from_tool_calls_and_pairs_results(self):
-        messages = [
+    @staticmethod
+    def _tools(items):
+        return [i for i in items if i["kind"] == "tool"]
+
+    def test_text_and_tool_calls_in_order_with_their_results(self):
+        items = _drawer_run_items([
             {"role": "assistant", "content": [
                 {"type": "toolcall", "id": "t1", "name": "ToolSearch", "arguments": {"query": "foo"}},
                 {"type": "tool_result", "tool_use_id": "t1", "content": "found it", "name": "ToolSearch"},
@@ -1082,41 +1049,35 @@ class ExtractTranscriptAndToolsTests(unittest.TestCase):
                 {"type": "text", "text": "Here is the answer."},
             ]},
             {"role": "user", "content": "What about this?"},
-        ]
-        text_rows, tool_calls = _extract_transcript_and_tools(messages)
-
-        self.assertEqual(len(tool_calls), 1)
-        self.assertEqual(tool_calls[0]["name"], "ToolSearch")
-        self.assertIn("foo", tool_calls[0]["arguments"])
-        self.assertEqual(tool_calls[0]["result"], "found it")
-
-        # The tool-call-only message contributes no text row (goes in Tools
-        # tab instead); thinking is never shown in either tab.
-        self.assertEqual(len(text_rows), 2)
-        self.assertEqual(text_rows[0]["text"], "Here is the answer.")
-        self.assertNotIn("internal reasoning", text_rows[0]["text"])
-        self.assertEqual(text_rows[1], {"role": "user", "text": "What about this?"})
+        ])
+        self.assertEqual([i["kind"] for i in items], ["tool", "text", "user"])
+        self.assertEqual(items[0]["name"], "ToolSearch")
+        self.assertIn("foo", items[0]["args"])
+        self.assertEqual(items[0]["result"], "found it")
+        self.assertEqual(items[1]["text"], "Here is the answer.")
+        self.assertNotIn("internal reasoning", json.dumps(items))
+        self.assertEqual(items[2], {"kind": "user", "text": "What about this?"})
 
     def test_empty_and_missing_content_do_not_crash(self):
-        text_rows, tool_calls = _extract_transcript_and_tools([{"role": "user", "content": []}, {"role": "user"}])
-        self.assertEqual(text_rows, [])
-        self.assertEqual(tool_calls, [])
+        self.assertEqual(_drawer_run_items([{"role": "user", "content": []}, {"role": "user"}]), [])
 
-    def test_marks_failed_tool_result_as_error(self):
-        text_rows, tool_calls = _extract_transcript_and_tools([
+    def test_a_failed_call_is_marked_as_the_chat_marks_it(self):
+        from openclaw_status_action import TOOL_ERROR_MARK
+        items = _drawer_run_items([
             {"role": "assistant", "content": [
                 {"type": "toolcall", "id": "t1", "name": "Bash", "arguments": {"command": "nope"}},
                 {"type": "tool_result", "tool_use_id": "t1", "content": "boom",
                  "is_error": True, "name": "Bash"},
             ]},
         ])
-        self.assertTrue(tool_calls[0]["isError"])
+        self.assertEqual(items[0]["name"], f"Bash {TOOL_ERROR_MARK}")
+        self.assertTrue(items[0]["result"].startswith(f"{TOOL_ERROR_MARK} tool call failed"))
+        self.assertTrue(items[0]["result"].endswith("boom"))
 
     def test_a_result_shows_its_output_not_the_raw_envelope(self):
         """ELI-125: a tool_result's content can be a list of blocks or the
-        agent-tool envelope {content, details}. The Tools tab shows the
-        output, the same rule as the chat's tool cards (ELI-121), not the
-        whole thing as JSON with the tool's metadata in it."""
+        agent-tool envelope {content, details}. A card shows the output, the
+        chat tool cards' rule (ELI-121)."""
         results = {
             "text blocks": ([{"type": "text", "text": "a1b2 Fix the cache"}, {"type": "text", "text": "c3d4 Docs"}],
                             "a1b2 Fix the cache\nc3d4 Docs"),
@@ -1128,21 +1089,20 @@ class ExtractTranscriptAndToolsTests(unittest.TestCase):
         }
         for label, (content, shown) in results.items():
             with self.subTest(label):
-                _rows, tool_calls = _extract_transcript_and_tools([
+                items = _drawer_run_items([
                     {"role": "assistant", "content": [
                         {"type": "toolcall", "id": "t1", "name": "exec", "arguments": {"command": "git log"}},
                         {"type": "tool_result", "tool_use_id": "t1", "content": content},
                     ]},
                 ])
-                self.assertEqual(tool_calls[0]["result"], shown)
+                self.assertEqual(items[0]["result"], shown)
 
-    def test_the_gateways_own_tool_shape_fills_the_tools_tab(self):
+    def test_the_gateways_own_tool_shape(self):
         """Outside claude-cli imports, chat.history keeps OpenClaw's own shape
         (seen in the screenshots stack, 2026-10-14): a `toolCall` block in the
-        assistant message and the result as a `toolResult` message with
-        `toolCallId`. The Tools tab only knew claude-cli's shape and said
-        "No tool calls yet." for every such child."""
-        history = [
+        assistant message and the result as a `toolResult` message."""
+        from openclaw_status_action import TOOL_ERROR_MARK
+        items = _drawer_run_items([
             {"role": "user", "content": "Price out Fly.io."},
             {"role": "assistant", "content": [
                 {"type": "toolCall", "id": "call_1", "name": "read", "arguments": {"path": "README.md"}}]},
@@ -1152,43 +1112,31 @@ class ExtractTranscriptAndToolsTests(unittest.TestCase):
                 {"type": "toolCall", "id": "call_2", "name": "exec", "arguments": {"command": "false"}}]},
             {"role": "toolResult", "toolCallId": "call_2", "toolName": "exec", "isError": True,
              "content": [{"type": "text", "text": "exit 1"}]},
-        ]
-        _rows, tool_calls = _extract_transcript_and_tools(history)
-        self.assertEqual([(c["name"], c["result"], c["isError"]) for c in tool_calls], [
-            ("read", "# Forecast\nA small weather app.", False),
-            ("exec", "exit 1", True),
         ])
-        self.assertIn("README.md", tool_calls[0]["arguments"])
+        tools = self._tools(items)
+        self.assertEqual([(c["id"], c["name"]) for c in tools], [("call_1", "read"), ("call_2", f"exec {TOOL_ERROR_MARK}")])
+        self.assertEqual(tools[0]["result"], "# Forecast\nA small weather app.")
+        self.assertIn("README.md", tools[0]["args"])
 
-    def test_running_session_history_yields_no_tool_calls(self):
-        """The regression this whole live-buffer path exists for.
-
-        Measured against the real gateway (2026-07-30): while a subagent is
-        RUNNING, chat.history returns only its seed user message(s) -- an
-        in-flight turn isn't written to the session store until it completes,
-        at which point every tool call appears at once. So history alone can
-        never populate the Tools tab for a working subagent, which is exactly
-        the case the drawer was built to watch.
-        """
-        running_history = [
-            {"role": "user", "content": "[Subagent Context] You are running as a subagent"},
+    def test_a_running_claude_cli_child_has_no_tool_calls_yet(self):
+        """Measured against the real Gateway (2026-07-30, again 2026-10-16 on
+        2026.9.3): while a claude-cli child runs, chat.history holds only the
+        messages it was sent; its run reaches the transcript when it ends."""
+        items = _drawer_run_items([
+            {"role": "user", "content": "[Subagent Context] You are running as a subagent.\n[Subagent Task]\nDo X."},
             {"role": "user", "content": "[Inter-session message] status?"},
-        ]
-        text_rows, tool_calls = _extract_transcript_and_tools(running_history)
-        self.assertEqual(tool_calls, [])
-        self.assertEqual(len(text_rows), 2)
+        ])
+        self.assertEqual(items, [{"kind": "user", "text": "[Inter-session message] status?"}])
 
-    def test_the_tools_tab_and_the_chat_rebuild_read_the_same_calls(self):
-        """One transcript parser (ELI-147): the drawer's Tools tab lists the
-        calls the chat's rebuild makes cards of, in both transcript shapes.
-        A recorded DeepSeek run (the Gateway's own runtime) and a claude-cli
-        run with a failed call."""
-        from openclaw_status_action import _history_renderer, TOOL_ERROR_MARK
+    def test_the_drawer_and_the_chat_rebuild_read_the_same_calls(self):
+        """One transcript parser (ELI-147): the drawer's cards are the ones
+        the chat's rebuild makes, in both shapes. A recorded DeepSeek run (the
+        Gateway's own runtime) and a claude-cli run with a failed call."""
+        from openclaw_status_action import _history_renderer
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_fixture_native_history.json")
         with open(path) as f:
             native = json.load(f)["messages"]
         cli = [
-            {"role": "user", "content": "check the logs", "idempotencyKey": "run-1:user"},
             {"role": "assistant", "content": [
                 {"type": "toolcall", "id": "toolu_1", "name": "Bash", "arguments": {"command": "tail log"}},
                 {"type": "tool_result", "tool_use_id": "toolu_1", "name": "Bash", "content": "boom",
@@ -1197,13 +1145,11 @@ class ExtractTranscriptAndToolsTests(unittest.TestCase):
         ]
         for label, history in (("native", native), ("claude-cli", cli)):
             with self.subTest(label):
-                _rows, tool_calls = _extract_transcript_and_tools(history)
                 cards = [i for i in _history_renderer(history).output if i["type"] == "function_call"]
                 self.assertTrue(cards)
-                self.assertEqual(
-                    [(c["id"], c["name"], c["isError"]) for c in tool_calls],
-                    [(c["id"], c["name"].removesuffix(f" {TOOL_ERROR_MARK}"), c["name"].endswith(TOOL_ERROR_MARK))
-                     for c in cards])
+                runs = [m for m in history if m.get("role") != "user"]
+                self.assertEqual([(c["id"], c["name"]) for c in self._tools(_drawer_run_items(runs))],
+                                 [(c["id"], c["name"]) for c in cards])
 
 
 async def _open_dialog(opening, conn):
@@ -1273,7 +1219,7 @@ class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_one_request_opens_and_fills_the_drawer_once(self):
         """Opened from here (no `opened`): the drawer, then one fill of its
-        three tabs. The page asks again while the child runs (ELI-155)."""
+        header and run. The page asks again while the child runs (ELI-155)."""
         action = Action()
         emitted = []
 
@@ -1304,72 +1250,16 @@ class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(get_calls["n"], 1)
         codes = _emitted_codes(emitted)
         self.assertIn("openDrawer", codes[0])  # initial open
-        self.assertTrue(any("openclaw-drawer-section-overview" in c for c in codes))
-        self.assertTrue(any("openclaw-drawer-section-transcript" in c and "working on it" in c for c in codes))
-        self.assertTrue(any("openclaw-drawer-section-tools" in c for c in codes))
+        fills = [c for c in codes if "S.fillDrawer(DATA)" in c]
+        self.assertEqual(len(fills), 1)
+        self.assertIn('"model": "claude-sonnet-5"', fills[0])
+        self.assertIn('{"kind": "text", "text": "working on it"}', fills[0])
 
         emitted.clear()
         with mock.patch("openclaw_status_action._get_action_connection",
                          new=mock.AsyncMock(return_value=(fake_conn, "pipe"))):
             await action._run_subagent_detail({**self.DETAIL_BODY, "opened": True}, {"id": "u1"}, emitter)
         self.assertFalse(any("openDrawer" in c for c in _emitted_codes(emitted)))   # a page refresh
-
-    async def test_running_subagent_shows_no_tool_calls_yet(self):
-        """Pins the known ELI-26 gap so it can't be silently "fixed" again.
-
-        chat.history returns what a RUNNING subagent really returns -- seed user
-        messages only, zero tool calls (measured against the live gateway
-        2026-07-30). The Tools tab therefore renders its empty state for the
-        whole run, and that is not something the pipe can fix: a run's tool
-        events go only to the connection that started it, so the drawer -- which
-        starts nothing -- cannot receive them. Measured with two connections on
-        one session key: initiator 4 tool events, subscriber 0.
-
-        If a future change makes live tool calls appear here, it must come with
-        a Gateway-side change; flip this test then, and re-measure first.
-        """
-        action = Action()
-        emitted = []
-
-        async def emitter(evt):
-            emitted.append(evt)
-
-        async def fake_send_request(method, params, timeout=5):
-            if method == "sessions.describe":
-                return {"session": {"modelProvider": "anthropic", "model": "claude-sonnet-5",
-                                     "status": "done", "startedAt": 1783790000000}}
-            if method == "chat.history":
-                return {"messages": [
-                    {"role": "user", "content": "[Subagent Context] running as a subagent"},
-                ]}
-            raise AssertionError(f"unexpected RPC: {method}")
-
-        fake_conn = _drawer_conn(fake_send_request)
-
-        with mock.patch("openclaw_status_action._get_action_connection",
-                         new=mock.AsyncMock(return_value=(fake_conn, "pipe"))), \
-             mock.patch("openclaw_status_action.asyncio.sleep", new=mock.AsyncMock()):
-            result = await action._run_subagent_detail(self.DETAIL_BODY, {"id": "u1"}, emitter)
-
-        self.assertEqual(result["status"], "ok")
-        tools_code = [c for c in _emitted_codes(emitted)
-                      if "openclaw-drawer-section-tools" in c]
-        self.assertTrue(tools_code, "no Tools tab fill was emitted")
-        self.assertIn('"toolCalls": []', tools_code[-1].replace("'", '"'))
-
-    async def test_persisted_tool_error_marks_the_card(self):
-        """A flushed tool_result carrying is_error still marks the card ❌ --
-        the half of the change that works, since it reads persisted rows."""
-        rows = [
-            {"role": "assistant", "content": [
-                {"type": "toolcall", "id": "toolu_a", "name": "Read", "arguments": {}}]},
-            {"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": "toolu_a",
-                 "content": "boom", "is_error": True}]},
-        ]
-        _rows, calls = _extract_transcript_and_tools(rows)
-        self.assertEqual(len(calls), 1)
-        self.assertTrue(calls[0]["isError"])
 
 
 class SubagentProactiveMessageClickTests(unittest.IsolatedAsyncioTestCase):

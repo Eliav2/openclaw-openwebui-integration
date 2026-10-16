@@ -25,8 +25,8 @@ from test_status_action_unit import _FAKE_DOM_JS, _drawer_conn, _emitted_codes
 import openclaw_status_action
 from openclaw_status_action import (
     Action,
+    _render_drawer_fill_js,
     _render_drawer_open_js,
-    _render_drawer_overview_fill_js,
     _render_modal_open_js,
     _render_subagents_fill_js,
     _subagent_row,
@@ -141,15 +141,22 @@ console.log(JSON.stringify(byData(section, 'openclawRow').map((row) => ({
         self.assertEqual(seen[1]["chip"], "Running")
 
 
+def _fill(key, task, items=(), **extra):
+    return _render_drawer_fill_js({"childSessionKey": key, "task": task, "items": list(items), "parent": None,
+                                   "earlier": None, "note": None, "latest": None, "source": "pipe",
+                                   "fetchedAt": NOW, "error": None, **extra})
+
+
 class DrawerHeaderTests(unittest.TestCase):
-    """B2, B3, B4: the header is one title line and one status line, so the
-    tabs and the content keep the screen."""
+    """B2, B3, B4: the header is one title line with the status and time, a
+    model and "from" line, and the head of the task, two lines with "Show
+    all"; the run has the rest of the screen."""
 
     def _open(self, width):
         labelled, _ = _rows()
         return _page(r"""
 run(input.drawer);
-run(input.overview);
+run(input.fill);
 const panel = drawer().children[1];
 const header = panel.children[0];
 const scroller = panel.walk().find((e) => e.style.overflowY === 'auto');
@@ -157,25 +164,29 @@ console.log(JSON.stringify({
   header: header.textContent,
   title: byData(header, 'openclawTitle').map(style)[0] || null,
   chip: byData(header, 'openclawChip').map((e) => e.textContent)[0] || null,
+  task: byData(header, 'openclawBlockText').map(style)[0] || null,
   scroller: scroller ? { minHeight: scroller.style.minHeight || null } : null,
   width: panel.style.width || null,
   buttons: header.walk().filter((e) => e.tagName === 'BUTTON').map((e) => e.textContent),
+  tabs: drawer().walk().filter((e) => e.dataset.tab).length,
 }));
 """, {"width": width, "open": _render_modal_open_js(IDENTITY),
       "drawer": _render_drawer_open_js({**labelled, "kind": "child", "controlUiUrl": None}),
-      "overview": _render_drawer_overview_fill_js({
-          "task": {**labelled, "result": LONG_RESULT}, "childSessionKey": CHILD, "provider": "anthropic",
-          "model": "claude-opus-5-5", "context": None, "goal": None, "source": "pipe",
-          "fetchedAt": NOW, "error": None})})
+      "fill": _fill(CHILD, {**labelled, "model": "claude-opus-5-5"},
+                    [{"kind": "text", "text": LONG_RESULT}],
+                    parent={"title": "Investing upkeep", "chatId": "c"})})
 
-    def test_the_header_holds_no_task_and_no_reply(self):
+    def test_the_header_holds_the_task_head_and_no_reply(self):
         seen = self._open(1280)
-        self.assertNotIn("re-clone", seen["header"])
-        self.assertNotIn("two-phase matrix", seen["header"])
+        self.assertIn("re-clone", seen["header"])                  # the task, clamped
+        self.assertEqual(seen["task"]["lineClamp"], "2")
+        self.assertNotIn("two-phase matrix", seen["header"])       # the reply is the run's
         self.assertIn("invest-bot: freqtrade head-to-head", seen["header"])
+        self.assertIn("claude-opus-5-5 · from Investing upkeep", seen["header"])
         self.assertEqual(seen["title"], {"whiteSpace": "nowrap", "textOverflow": "ellipsis", "lineClamp": None})
         self.assertEqual(seen["chip"], "Done")
         self.assertEqual(seen["scroller"], {"minHeight": "0"})
+        self.assertEqual(seen["tabs"], 0)
 
     def test_a_phone_gets_a_full_screen_sheet_with_a_back_button(self):
         phone = self._open(390)
@@ -183,63 +194,165 @@ console.log(JSON.stringify({
         self.assertIn("‹ Back", phone["buttons"])
         self.assertNotIn("×", phone["buttons"])
         wide = self._open(1280)
-        self.assertEqual(wide["width"], "min(420px, 88vw)")
+        self.assertEqual(wide["width"], "min(480px, 92vw)")
         self.assertIn("×", wide["buttons"])
 
-
-class OverviewTests(unittest.TestCase):
-    """The Overview shows the Result (6 lines) and the Task (3 lines), each
-    with "Show all", which a refill keeps open."""
-
-    def test_result_and_task_clamped_with_show_all(self):
+    def test_show_all_on_the_task_survives_a_refill(self):
         labelled, _ = _rows()
-        fill = _render_drawer_overview_fill_js({
-            "task": {**labelled, "result": LONG_RESULT}, "childSessionKey": CHILD, "provider": "anthropic",
-            "model": "m", "context": None, "goal": None, "source": "pipe", "fetchedAt": NOW, "error": None})
         seen = _page(r"""
 run(input.drawer);
 run(input.fill);
-const blocks = () => byData(drawer(), 'openclawBlock').map((b) => [b.dataset.openclawBlock,
-  byData(b, 'openclawBlockText').map((e) => [e.textContent.length, style(e).lineClamp])[0]]);
-const first = blocks();
-const more = byData(drawer(), 'openclawMore')[1];
-if (more) more.onclick();                        // Show all on the Task
-run(input.fill);                                  // a refill keeps it open
-console.log(JSON.stringify({first, after: blocks()}));
-""", {"open": _render_modal_open_js(IDENTITY), "fill": fill,
-      "drawer": _render_drawer_open_js({**labelled, "kind": "child", "controlUiUrl": None})})
-        self.assertEqual(seen["first"], [["result", [len(LONG_RESULT), "6"]], ["task", [len(LONG_TASK), "3"]]])
-        self.assertEqual(seen["after"][1], ["task", [len(LONG_TASK), "unset"]])
-        self.assertEqual(seen["after"][0], ["result", [len(LONG_RESULT), "6"]])
+const clamp = () => byData(drawer(), 'openclawBlockText').map((e) => style(e).lineClamp)[0];
+const first = clamp();
+byData(drawer(), 'openclawMore')[0].onclick();
+run(input.fill);
+console.log(JSON.stringify({first, after: clamp()}));
+""", {"open": _render_modal_open_js(IDENTITY),
+      "drawer": _render_drawer_open_js({**labelled, "kind": "child", "controlUiUrl": None}),
+      "fill": _fill(CHILD, labelled)})
+        self.assertEqual(seen, {"first": "2", "after": "unset"})
 
 
-    def test_a_running_sub_agents_reply_so_far_is_latest_until_it_ends(self):
-        labelled, unlabelled = _rows()
+# What a filled drawer's run shows: each item's kind and text, and its notes.
+_RUN_JS = r"""
+const stream = () => document.getElementById('openclaw-drawer-stream');
+const shown = () => stream().children.map((e) => {
+  if ('openclawUser' in e.dataset) return ['user', e.textContent];
+  if ('openclawText' in e.dataset) return ['text', e.textContent];
+  if ('openclawCard' in e.dataset) return ['tool', byData(e, 'openclawCardName')[0].textContent];
+  if ('openclawNote' in e.dataset) return ['note', e.dataset.openclawNote, e.textContent];
+  if ('openclawEarlier' in e.dataset) return ['earlier', e.textContent];
+  if ('openclawRunError' in e.dataset) return ['error', e.textContent];
+  return ['other', e.textContent];
+});
+"""
 
-        def fill(status):
-            return _render_drawer_overview_fill_js({
-                "task": {**unlabelled, "status": status, "result": "Reading the noise table."},
-                "childSessionKey": OTHER, "provider": "anthropic", "model": "m", "context": None,
-                "goal": None, "source": "pipe", "fetchedAt": NOW, "error": None})
+
+class RunTests(unittest.TestCase):
+    """The run below the header: a read-only chat of the sub-agent's turns,
+    tool cards and reply, and where it stands."""
+
+    def _shown(self, fills, task=None, width=390):
+        _, unlabelled = _rows()
+        return _page(_RUN_JS + r"""
+run(input.drawer);
+const out = [];
+for (const f of input.fills) { run(f); out.push(shown()); }
+console.log(JSON.stringify(out));
+""", {"width": width, "open": _render_modal_open_js(IDENTITY),
+      "drawer": _render_drawer_open_js({**(task or unlabelled), "kind": "child", "controlUiUrl": None}),
+      "fills": fills})
+
+    def test_turns_cards_and_the_reply_in_order(self):
+        _, unlabelled = _rows()
+        seen = self._shown([_fill(OTHER, {**unlabelled, "status": "completed"}, [
+            {"kind": "text", "text": "Reading the noise table."},
+            {"kind": "tool", "id": "c1", "name": "read", "args": '{"path": "noise.csv"}', "result": "a,b"},
+            {"kind": "user", "text": "Also check station 4."},
+            {"kind": "text", "text": "Station 4 changed from 0.10 to 0.08."}])])
+        self.assertEqual(seen[0], [["text", "Reading the noise table."], ["tool", "read"],
+                                   ["user", "Also check station 4."],
+                                   ["text", "Station 4 changed from 0.10 to 0.08."]])
+
+    def test_a_running_child_says_which_step_it_is_on(self):
+        _, unlabelled = _rows()
+        call = {"kind": "tool", "id": "c1", "name": "read", "args": "{}", "result": "ok"}
+        seen = self._shown([_fill(OTHER, unlabelled, [call]),
+                            _fill(OTHER, {**unlabelled, "status": "completed", "endedAt": NOW}, [call])])
+        self.assertEqual(seen[0][-1], ["note", "working", "Working… (step 2)"])
+        self.assertEqual(seen[1], [["tool", "read"]])
+
+    def test_a_running_claude_cli_child_says_its_calls_come_at_the_end(self):
+        _, unlabelled = _rows()
+        seen = self._shown([_fill(OTHER, unlabelled, [], note="cli-running", latest="Re-cloning the repo.")])
+        self.assertEqual(seen[0], [["note", "working",
+                                    "Working… tool calls appear when this run endsRe-cloning the repo."]])
+
+    def test_a_stopped_claude_cli_child_says_its_calls_were_not_saved(self):
+        _, unlabelled = _rows()
+        seen = self._shown([_fill(OTHER, {**unlabelled, "status": "cancelled"},
+                                  [{"kind": "text", "text": "Running the probes."}], note="cli-stopped")])
+        self.assertEqual(seen[0][-1][:2], ["note", "stopped"])
+        self.assertIn("its tool calls were not saved", seen[0][-1][2])
+
+    def test_a_failed_childs_error_closes_the_run(self):
+        labelled, _ = _rows()
+        seen = self._shown([_fill(CHILD, {**labelled, "status": "failed", "error": "provider 529"})], labelled)
+        self.assertEqual(seen[0], [["error", "provider 529"]])
+
+    def test_text_is_never_html(self):
+        _, unlabelled = _rows()
+        seen = _page(_RUN_JS + r"""
+run(input.drawer);
+run(input.fill);
+const text = byData(stream(), 'openclawText')[0];
+console.log(JSON.stringify({
+  tags: text.walk().map((e) => e.tagName),
+  strong: text.walk().filter((e) => e.tagName === 'STRONG').map((e) => e.textContent),
+  code: text.walk().filter((e) => e.tagName === 'CODE').map((e) => e.textContent),
+  links: text.walk().filter((e) => e.tagName === 'A').map((e) => [e.textContent, e.href]),
+  all: text.textContent,
+}));
+""", {"open": _render_modal_open_js(IDENTITY),
+      "drawer": _render_drawer_open_js({**unlabelled, "kind": "child", "controlUiUrl": None}),
+      "fill": _fill(OTHER, {**unlabelled, "status": "completed"}, [{"kind": "text", "text":
+          "Done: **config.toml is missing**, see `settings.py` and [the run](https://example.com/r/1).\n\n"
+          "<img src=x onerror=alert(1)> [x](javascript:alert(1))\n\n- one\n- two"}])})
+        self.assertNotIn("IMG", seen["tags"])
+        self.assertEqual(seen["strong"], ["config.toml is missing"])
+        self.assertEqual(seen["code"], ["settings.py"])
+        self.assertEqual(seen["links"], [["the run", "https://example.com/r/1"]])
+        self.assertIn("<img src=x onerror=alert(1)> [x](javascript:alert(1))", seen["all"])
+        self.assertEqual(seen["tags"].count("LI"), 2)
+
+    def test_the_reader_keeps_their_place(self):
+        """At the bottom the run follows new steps; scrolled up it stays."""
+        _, unlabelled = _rows()
+        step = lambda n: [{"kind": "text", "text": f"Step {i}."} for i in range(n)]  # noqa: E731
         seen = _page(r"""
 run(input.drawer);
-const label = () => byData(drawer(), 'openclawBlock').map((b) => [b.dataset.openclawBlock, b.children[0].textContent]);
-run(input.running);
-const running = label();
-run(input.ended);
-console.log(JSON.stringify({running, ended: label()}));
-""", {"open": _render_modal_open_js(IDENTITY), "running": fill(unlabelled["status"]),
-      "ended": fill(labelled["status"]),
-      "drawer": _render_drawer_open_js({**unlabelled, "kind": "child", "controlUiUrl": None})})
-        self.assertEqual(seen["running"][0], ["result", "Latest"])
-        self.assertEqual(seen["ended"][0], ["result", "Result"])
+const scroller = document.getElementById('openclaw-drawer-stream').parent;
+scroller.clientHeight = 400;
+scroller.scrollHeight = 1000;
+run(input.fills[0]);
+const opened = scroller.scrollTop;                // a first fill shows the newest
+scroller.scrollTop = 100;                         // the reader scrolls up
+scroller.scrollHeight = 1200;
+run(input.fills[1]);
+const up = scroller.scrollTop;
+scroller.scrollTop = 800;                         // back at the bottom
+run(input.fills[2]);
+console.log(JSON.stringify({opened, up, bottom: scroller.scrollTop}));
+""", {"open": _render_modal_open_js(IDENTITY),
+      "drawer": _render_drawer_open_js({**unlabelled, "kind": "child", "controlUiUrl": None}),
+      "fills": [_fill(OTHER, unlabelled, step(n)) for n in (3, 4, 5)]})
+        self.assertEqual(seen, {"opened": 1000, "up": 100, "bottom": 1200})
+
+    def test_earlier_steps_left_out_can_be_shown(self):
+        _, unlabelled = _rows()
+        seen = _page(_RUN_JS + r"""
+run(input.drawer);
+run(input.fill);
+const before = shown()[0];
+const asked = fetches.length;
+byData(stream(), 'openclawShowEarlier')[0].onclick();
+console.log(JSON.stringify({before, request: fetches.slice(asked)}));
+""", {"open": _render_modal_open_js(IDENTITY),
+      "drawer": _render_drawer_open_js({**unlabelled, "kind": "child", "controlUiUrl": None, "server": True}),
+      "fill": _fill(OTHER, {**unlabelled, "status": "completed"}, [{"kind": "text", "text": "Last."}],
+                    earlier={"count": 39, "more": False})})
+        self.assertEqual(seen["before"], ["earlier", "39 earlier steps not shownShow earlier steps"])
+        self.assertEqual(len(seen["request"]), 1)
+        self.assertEqual(seen["request"][0]["mode"], "subagent-detail")
+        self.assertTrue(seen["request"][0]["earlier"])
+
 
 class FinalReplyTests(unittest.IsolatedAsyncioTestCase):
-    """B5: the Result is the last block of the child's final reply. A
-    claude-cli run ends with the Gateway's closer (`cli-assistant:<run>`),
-    which repeats every message of the run joined: the progress log."""
+    """B5: the run ends with the child's reply, once. A claude-cli run ends
+    with the Gateway's closer (`cli-assistant:<run>`), which repeats every
+    message of the run joined: the progress log."""
 
-    async def _overview(self, messages):
+    async def _items(self, messages):
         async def send_request(method, params, timeout=5):
             if method == "sessions.describe":
                 return {"session": {"key": CHILD, "status": "done", "startedAt": 1, "endedAt": 2}}
@@ -253,15 +366,14 @@ class FinalReplyTests(unittest.IsolatedAsyncioTestCase):
             emitted.append(evt)
 
         with mock.patch("openclaw_status_action._get_action_connection",
-                        new=mock.AsyncMock(return_value=(_drawer_conn(send_request), "pipe"))), \
-             mock.patch("openclaw_status_action.asyncio.sleep", new=mock.AsyncMock()):
+                        new=mock.AsyncMock(return_value=(_drawer_conn(send_request), "pipe"))):
             await Action()._run_subagent_detail({"mode": "subagent-detail", "taskId": CHILD}, {"id": "u"}, emitter)
-        code = [c for c in _emitted_codes(emitted) if "openclaw-drawer-section-overview" in c][-1]
-        return json.loads(code.split("const DATA = ", 1)[1].split(";\n", 1)[0])["task"]
+        code = [c for c in _emitted_codes(emitted) if "S.fillDrawer(DATA)" in c][-1]
+        return json.loads(code.split("const DATA = ", 1)[1].split(";\n", 1)[0])["items"]
 
-    async def test_a_claude_cli_run_shows_its_last_turn_not_the_closer(self):
+    async def test_a_claude_cli_run_ends_with_its_last_turn_not_the_closer(self):
         report = "The baseline won out-of-sample: +48.2%."
-        task = await self._overview([
+        items = await self._items([
             {"role": "assistant", "stopReason": "tool_use",
              "content": [{"type": "toolcall", "id": "t1", "name": "Bash", "arguments": {}}]},
             {"role": "assistant", "stopReason": "end_turn", "content": [{"type": "text", "text": report}]},
@@ -269,16 +381,18 @@ class FinalReplyTests(unittest.IsolatedAsyncioTestCase):
              "__openclaw": {"idempotencyKey": "cli-assistant:run-1"},
              "content": [{"type": "text", "text": "Now rewriting run.sh.\n\nPolling.\n\n" + report}]},
         ])
-        self.assertEqual(task["result"], report)
+        self.assertEqual([(i["kind"], i.get("text") or i.get("name")) for i in items],
+                         [("tool", "Bash"), ("text", report)])
 
-    async def test_the_gateways_own_runtime_shows_its_last_text_block(self):
-        task = await self._overview([
+    async def test_the_gateways_own_runtime_ends_with_its_last_text(self):
+        items = await self._items([
             {"role": "assistant", "content": [
                 {"type": "text", "text": "Reading the README."},
                 {"type": "toolCall", "id": "c1", "name": "read", "arguments": {}},
                 {"type": "text", "text": "Fly.io: about $3 a month."}]},
         ])
-        self.assertEqual(task["result"], "Fly.io: about $3 a month.")
+        self.assertEqual([i["kind"] for i in items], ["text", "tool", "text"])
+        self.assertEqual(items[-1]["text"], "Fly.io: about $3 a month.")
 
 
 class PollTests(unittest.IsolatedAsyncioTestCase):
@@ -318,10 +432,7 @@ const row = document.getElementById('openclaw-status-section-subagents').walk().
 const base = timers.size;    // the dialog's own elapsed ticker
 row.onclick();
 """ + steps_js, {"open": _render_modal_open_js(IDENTITY), "fill": _section([unlabelled]),
-                 "done": _render_drawer_overview_fill_js({
-                     "task": {**unlabelled, "status": "completed", "endedAt": NOW, "result": "ok"},
-                     "childSessionKey": OTHER, "provider": None, "model": None, "context": None,
-                     "goal": None, "source": "pipe", "fetchedAt": NOW, "error": None})})
+                 "done": _fill(OTHER, {**unlabelled, "status": "completed", "endedAt": NOW})})
 
     def test_the_drawer_refreshes_past_15_minutes_until_the_child_ends(self):
         seen = self._poll_page(r"""
@@ -357,70 +468,156 @@ console.log(JSON.stringify({before, after: refreshes(), open: !!drawer(), timers
         seen = _page(r"""
 run(input.drawer);
 run(input.stale);
-const t = byData(drawer(), 'openclawBlock').map((b) => b.dataset.openclawBlock + ':' + b.textContent.length);
-console.log(JSON.stringify({blocks: t, chip: byData(drawer(), 'openclawChip').map((e) => e.textContent)}));
+console.log(JSON.stringify({run: document.getElementById('openclaw-drawer-stream').textContent,
+                            chip: byData(drawer(), 'openclawChip').map((e) => e.textContent)}));
 """, {"open": _render_modal_open_js(IDENTITY),
       "drawer": _render_drawer_open_js({**unlabelled, "kind": "child", "controlUiUrl": None}),
-      "stale": _render_drawer_overview_fill_js({
-          "task": {**labelled, "result": LONG_RESULT}, "childSessionKey": CHILD, "provider": None,
-          "model": None, "context": None, "goal": None, "source": "pipe", "fetchedAt": NOW, "error": None})})
+      "stale": _fill(CHILD, labelled, [{"kind": "text", "text": LONG_RESULT}])})
         self.assertEqual(seen["chip"], ["Running"])
-        self.assertFalse(any(b.startswith("result:") for b in seen["blocks"]), seen["blocks"])
+        self.assertNotIn("two-phase matrix", seen["run"])
 
 
-def _native_long_run(calls: int) -> list:
-    """A child on the Gateway's own runtime that made `calls` tool calls: its
-    spawn message, then per call a text + `toolCall` message and a
-    `toolResult` message of its own, then its reply."""
-    messages = [{"role": "user", "content": "[Subagent Context] You are running as a subagent.\n"
-                                            "[Subagent Task]\nRead the README 55 times."}]
-    for i in range(1, calls + 1):
-        messages.append({"role": "assistant", "content": [
-            {"type": "text", "text": f"Pass {i}."},
-            {"type": "toolCall", "id": f"call_{i}", "name": "read", "arguments": {"path": "README.md"}}]})
-        messages.append({"role": "toolResult", "toolCallId": f"call_{i}", "toolName": "read",
-                         "content": [{"type": "text", "text": "# Forecast"}]})
-    messages.append({"role": "assistant", "content": [{"type": "text", "text": f"All {calls} passes are done."}]})
-    return messages
+async def _drawer_fill(send_request, body=None, user=None):
+    """Run one drawer request against a fake Gateway; returns its fill's DATA
+    and the RPCs it made."""
+    emitted = []
+
+    async def emitter(evt):
+        emitted.append(evt)
+
+    conn = _drawer_conn(send_request)
+    with mock.patch("openclaw_status_action._get_action_connection",
+                    new=mock.AsyncMock(return_value=(conn, "pipe"))):
+        await Action()._run_subagent_detail({"mode": "subagent-detail", "taskId": CHILD, "opened": True,
+                                             **(body or {})}, user or {"id": "u"}, emitter)
+    code = [c for c in _emitted_codes(emitted) if "S.fillDrawer(DATA)" in c][-1]
+    return (json.loads(code.split("const DATA = ", 1)[1].split(";\n", 1)[0]),
+            [(c.args[0], c.args[1]) for c in conn.send_request.call_args_list])
 
 
-class LongChildTests(unittest.IsolatedAsyncioTestCase):
-    """A child with many tool calls shows all of them. The Gateway honors
-    `limit` for its own runtime's history, where every result is a message
-    of its own: the drawer read the newest 50 messages, so a child with 55
-    calls showed its last 16, and its Transcript began at "Pass 40" (the
-    runner matrix, 2026-10-16)."""
+class RunReadTests(unittest.IsolatedAsyncioTestCase):
+    """How much of the run one read carries, and what a claude-cli child's
+    run can and cannot show."""
 
-    async def test_a_native_child_with_55_tool_calls_shows_all_55(self):
-        history = _native_long_run(55)
-        asked = []
+    async def test_a_run_over_the_byte_budget_keeps_its_newest_steps(self):
+        big = "x" * 7000
+        history = []
+        for i in range(80):
+            history.append({"role": "assistant", "content": [
+                {"type": "text", "text": f"Step {i}."},
+                {"type": "toolCall", "id": f"call_{i}", "name": "read", "arguments": {}}]})
+            history.append({"role": "toolResult", "toolCallId": f"call_{i}", "toolName": "read",
+                            "content": [{"type": "text", "text": big}]})
+        history.append({"role": "assistant", "content": [{"type": "text", "text": "Step 80."}]})
 
         async def send_request(method, params, timeout=5):
             if method == "sessions.describe":
-                return {"session": {"key": CHILD, "status": "done", "startedAt": NOW - 9_000, "endedAt": NOW,
+                return {"session": {"key": CHILD, "status": "done", "startedAt": 1, "endedAt": 2}}
+            if method == "chat.history":
+                return {"messages": history, "totalMessages": 80, "hasMore": False}
+            raise AssertionError(method)
+
+        data, _rpcs = await _drawer_fill(send_request)
+        self.assertLess(len(json.dumps(data["items"])), openclaw_status_action._DRAWER_RUN_BYTES)
+        self.assertEqual(data["items"][-1]["text"], "Step 80.")
+        self.assertEqual(data["earlier"], {"count": 161 - len(data["items"]), "more": False})
+        self.assertGreater(data["earlier"]["count"], 0)
+
+    def test_one_step_over_the_budget_keeps_its_end(self):
+        items, dropped = openclaw_status_action._cap_run_items(
+            [{"kind": "text", "text": "a" * 10}, {"kind": "text", "text": "b" * 5000 + "END"}], 1000)
+        self.assertEqual(dropped, 1)
+        self.assertTrue(items[0]["text"].startswith("…"))
+        self.assertTrue(items[0]["text"].endswith("END"))
+        self.assertLess(len(json.dumps(items)), 1000)
+
+    async def test_show_earlier_steps_reads_every_page(self):
+        def step(text):
+            return [{"role": "user", "content": "Go on."},
+                    {"role": "assistant", "content": [{"type": "text", "text": text}]}]
+        pages = {0: (step("Newest."), 1200), 1000: (step("Oldest."), None)}
+
+        async def send_request(method, params, timeout=5):
+            if method == "sessions.describe":
+                return {"session": {"key": CHILD, "status": "done", "startedAt": 1, "endedAt": 2}}
+            if method == "chat.history":
+                msgs, nxt = pages[params.get("offset", 0)]
+                return {"messages": msgs, "hasMore": nxt is not None, "nextOffset": 1000 if nxt else None}
+            raise AssertionError(method)
+
+        first, _ = await _drawer_fill(send_request)
+        self.assertEqual([i["text"] for i in first["items"]], ["Go on.", "Newest."])
+        self.assertEqual(first["earlier"], {"count": 0, "more": True})
+        everything, rpcs = await _drawer_fill(send_request, {"earlier": True})
+        self.assertEqual([i["text"] for i in everything["items"]], ["Go on.", "Oldest.", "Go on.", "Newest."])
+        self.assertIsNone(everything["earlier"])
+        self.assertEqual([p.get("offset") for m, p in rpcs if m == "chat.history"], [None, 1000])
+
+    async def test_a_running_claude_cli_child_shows_its_latest_line(self):
+        async def send_request(method, params, timeout=5):
+            if method == "sessions.describe":
+                return {"session": {"key": CHILD, "status": "running", "startedAt": 1,
+                                    "agentRuntime": {"id": "claude-cli"}}}
+            if method == "chat.history":
+                return {"messages": [{"role": "user", "content": "[Subagent Context] x\n[Subagent Task]\nDo X."}]}
+            if method == "sessions.list":
+                return {"sessions": [{"key": CHILD, "lastMessagePreview": "Re-cloning the repo."}]}
+            raise AssertionError(method)
+
+        data, _ = await _drawer_fill(send_request)
+        self.assertEqual((data["note"], data["latest"], data["items"]), ("cli-running", "Re-cloning the repo.", []))
+
+    async def test_a_stopped_claude_cli_child_says_its_calls_were_lost(self):
+        async def send_request(method, params, timeout=5):
+            if method == "sessions.describe":
+                return {"session": {"key": CHILD, "status": "killed", "startedAt": 1, "endedAt": 2,
+                                    "agentRuntime": {"id": "claude-cli"}}}
+            if method == "chat.history":
+                return {"messages": [{"role": "assistant", "content": [{"type": "text", "text": "Running."}]}]}
+            raise AssertionError(method)
+
+        data, _ = await _drawer_fill(send_request)
+        self.assertEqual((data["task"]["status"], data["note"]), ("cancelled", "cli-stopped"))
+
+    async def test_a_native_child_needs_no_note(self):
+        async def send_request(method, params, timeout=5):
+            if method == "sessions.describe":
+                return {"session": {"key": CHILD, "status": "killed", "startedAt": 1, "endedAt": 2,
                                     "agentRuntime": {"id": "openclaw"}}}
             if method == "chat.history":
-                asked.append(params)
-                limit = params.get("limit") or 200
-                page = history[-limit:]
-                return {"messages": page, "totalMessages": len(history), "hasMore": len(page) < len(history)}
-            if method == "sessions.list":
-                return {"sessions": []}
-            raise AssertionError(f"unexpected RPC: {method}")
+                return {"messages": []}
+            raise AssertionError(method)
 
-        emitted = []
+        data, _ = await _drawer_fill(send_request)
+        self.assertIsNone(data["note"])
 
-        async def emitter(evt):
-            emitted.append(evt)
+    async def test_the_first_fill_names_where_it_came_from(self):
+        chat = "11111111-2222-3333-4444-555555555555"
+        user = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        parent_child = "agent:main:subagent:cccccccc-0000-0000-0000-000000000003"
 
-        with mock.patch("openclaw_status_action._get_action_connection",
-                        new=mock.AsyncMock(return_value=(_drawer_conn(send_request), "pipe"))):
-            await Action()._run_subagent_detail({"mode": "subagent-detail", "taskId": CHILD, "opened": True},
-                                                {"id": "u"}, emitter)
-        shown = "\n".join(_emitted_codes(emitted))
-        calls = {f"call_{i}" for i in range(1, 56) if f'"call_{i}"' in shown}
-        self.assertEqual(len(calls), 55, f"{len(calls)} of 55 calls shown; chat.history asked with {asked}")
-        self.assertIn("Pass 1.", shown)
+        def gateway(spawned_by):
+            async def send_request(method, params, timeout=5):
+                if method == "sessions.describe" and params["key"] == CHILD:
+                    return {"session": {"key": CHILD, "status": "done", "startedAt": 1, "endedAt": 2,
+                                        "spawnedBy": spawned_by}}
+                if method == "sessions.describe":
+                    return {"session": {"key": parent_child, "label": "Benchmark lead"}}
+                if method == "chat.history":
+                    return {"messages": []}
+                raise AssertionError(method)
+            return send_request
+
+        with mock.patch("openclaw_status_action._load_owui_chat",
+                        new=mock.AsyncMock(return_value={"title": "Forecast app upkeep"})) as load:
+            data, _ = await _drawer_fill(gateway(f"agent:main:openwebui-{user}-{chat}"), {"first": True},
+                                         {"id": user})
+            later, rpcs = await _drawer_fill(gateway(f"agent:main:openwebui-{user}-{chat}"), {}, {"id": user})
+        self.assertEqual(data["parent"], {"title": "Forecast app upkeep", "chatId": chat})
+        load.assert_awaited_once_with(chat, user)
+        self.assertIsNone(later["parent"])                       # read once, with the first fill
+        nested, _ = await _drawer_fill(gateway(parent_child), {"first": True})
+        self.assertEqual(nested["parent"], {"title": "Benchmark lead", "childKey": parent_child})
 
 
 class InProcessAgentDetailTests(unittest.TestCase):
@@ -428,24 +625,28 @@ class InProcessAgentDetailTests(unittest.TestCase):
     its task and its result, nothing to poll."""
 
     def test_an_agent_row_opens_its_task_and_result(self):
+        """The same sheet: its task as the turn that started it, its result
+        as the reply."""
         agent = {"id": "t2", "title": "Broker research", "state": "returned", "startedAt": NOW - 60_000,
                  "task": "Compare IBKR and Trading212 for a small account.", "result": "IBKR: lower fees."}
-        seen = _page(r"""
+        seen = _page(_RUN_JS + r"""
 run(input.fill);
 const row = byData(document.getElementById('openclaw-status-section-subagents'), 'openclawAgentRow')[0];
 row.onclick();
 console.log(JSON.stringify({
   title: byData(drawer(), 'openclawTitle').map((e) => e.textContent),
   chip: byData(drawer(), 'openclawChip').map((e) => e.textContent),
-  blocks: byData(drawer(), 'openclawBlockText').map((e) => e.textContent),
-  tabs: drawer().walk().filter((e) => e.dataset.tab).length,
+  run: shown(),
+  taskHead: byData(drawer(), 'openclawBlock').length,
   fetches: fetches.length,
+  timers: timers.size,
 }));
 """, {"open": _render_modal_open_js(IDENTITY), "fill": _section([], [agent])})
         self.assertEqual(seen["title"], ["Broker research"])
         self.assertEqual(seen["chip"], ["Returned"])
-        self.assertEqual(seen["blocks"], ["IBKR: lower fees.", "Compare IBKR and Trading212 for a small account."])
-        self.assertEqual(seen["tabs"], 0)
+        self.assertEqual(seen["run"], [["user", "Compare IBKR and Trading212 for a small account."],
+                                       ["text", "IBKR: lower fees."]])
+        self.assertEqual(seen["taskHead"], 0)
         self.assertEqual(seen["fetches"], 0)
 
     def test_agent_rows_carry_the_cards_task_and_result(self):

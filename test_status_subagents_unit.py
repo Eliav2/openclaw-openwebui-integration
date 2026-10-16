@@ -245,6 +245,11 @@ class SubagentDrawerTests(unittest.IsolatedAsyncioTestCase):
                 {"id": PARENT_USER}, emitter)
         return result, emitted, conn
 
+    @staticmethod
+    def _fill(emitted):
+        code = [c for c in _emitted_codes(emitted) if "S.fillDrawer(DATA)" in c][-1]
+        return json.loads(code.split("const DATA = ", 1)[1].split(";\n", 1)[0])
+
     async def test_reads_the_child_session_once_per_request(self):
         """The open drawer asks again while the child runs (ELI-155)."""
         n = {"describe": 0}
@@ -253,9 +258,8 @@ class SubagentDrawerTests(unittest.IsolatedAsyncioTestCase):
             if method == "sessions.describe":
                 self.assertEqual(params["key"], CHILD_A)
                 n["describe"] += 1
-                done = True
-                return {"session": {"key": CHILD_A, "status": "done" if done else "running",
-                                    "startedAt": 1783790000000, "endedAt": 1783790005000 if done else None,
+                return {"session": {"key": CHILD_A, "status": "done",
+                                    "startedAt": 1783790000000, "endedAt": 1783790005000,
                                     "modelProvider": "anthropic", "model": "claude-sonnet-5",
                                     "contextTokens": 1000000, "totalTokens": 5000}}
             if method == "chat.history":
@@ -269,16 +273,16 @@ class SubagentDrawerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(n["describe"], 1)
         methods = [c.args[0] for c in conn.send_request.call_args_list]
         self.assertNotIn("tasks.get", methods)
-        overview = [c for c in _emitted_codes(emitted) if "openclaw-drawer-section-overview" in c][-1]
-        self.assertIn('"status": "completed"', overview)
-        self.assertIn('"terminalSummary": "X is fine"', overview)
-        self.assertIn('"endedAt": 1783790005000', overview)
-        self.assertIn(f'"childSessionKey": "{CHILD_A}"', overview)
+        data = self._fill(emitted)
+        self.assertEqual(data["childSessionKey"], CHILD_A)
+        self.assertEqual(data["task"]["status"], "completed")
+        self.assertEqual(data["task"]["endedAt"], 1783790005000)
+        self.assertEqual(data["items"], [{"kind": "text", "text": "X is fine"}])
 
-    async def test_the_transcript_opens_with_the_task_not_the_spawn_wrapper(self):
-        """The child's first user message is the Gateway's spawn wrapper; the
-        Transcript shows the task in it, the way the Subagents row does
-        (ELI-119), on both versions and both content shapes."""
+    async def test_the_task_is_the_headers_not_a_turn_of_the_run(self):
+        """The child's first user message is the Gateway's spawn wrapper: the
+        header shows the task in it, the way the Subagents row does (ELI-119),
+        and the run does not repeat it, on both versions and both shapes."""
         for wrapped, task in ((WRAPPED_93, "Research X and report."), (WRAPPED_103, "Summarise Y.")):
             for content in (wrapped, [{"type": "text", "text": wrapped}]):
                 with self.subTest(task=task, shape=type(content).__name__):
@@ -291,17 +295,15 @@ class SubagentDrawerTests(unittest.IsolatedAsyncioTestCase):
                         raise AssertionError(f"unexpected RPC: {method}")
 
                     _result, emitted, _conn = await self._drawer(CHILD_A, send_request)
-                    transcript = [c for c in _emitted_codes(emitted)
-                                  if "openclaw-drawer-section-transcript" in c][-1]
-                    self.assertIn(f'{{"role": "user", "text": "{task}"}}', transcript)
-                    self.assertNotIn("Subagent", transcript)
-                    self.assertNotIn("OPENCLAW_INTERNAL_CONTEXT", transcript)
+                    data = self._fill(emitted)
+                    self.assertEqual(data["task"]["task"], task)
+                    self.assertEqual(data["items"], [{"kind": "text", "text": "ok"}])
 
     def test_a_user_message_that_is_not_a_spawn_stays_as_written(self):
-        rows, _tools = openclaw_status_action._extract_transcript_and_tools(
+        items = openclaw_status_action._drawer_run_items(
             [{"role": "user", "content": "Mention [Subagent Task] in passing."},
              {"role": "assistant", "content": WRAPPED_93}])
-        self.assertEqual([r["text"] for r in rows], ["Mention [Subagent Task] in passing.", WRAPPED_93])
+        self.assertEqual([i["text"] for i in items], ["Mention [Subagent Task] in passing.", WRAPPED_93])
 
     async def test_a_failed_child_shows_its_error(self):
         async def send_request(method, params, timeout=5):
@@ -313,8 +315,7 @@ class SubagentDrawerTests(unittest.IsolatedAsyncioTestCase):
             raise AssertionError(f"unexpected RPC: {method}")
 
         _result, emitted, _conn = await self._drawer(CHILD_A, send_request)
-        overview = [c for c in _emitted_codes(emitted) if "openclaw-drawer-section-overview" in c][-1]
-        self.assertIn('"error": "provider 529"', overview)
+        self.assertEqual(self._fill(emitted)["task"]["error"], "provider 529")
 
     async def test_an_unknown_child_says_so(self):
         async def send_request(method, params, timeout=5):
