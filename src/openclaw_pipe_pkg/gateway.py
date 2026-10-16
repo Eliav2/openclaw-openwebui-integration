@@ -910,6 +910,50 @@ def _spawn_task_head(task: str) -> str:
     return head
 
 
+# The tools a model calls a deferred tool through, by its catalog id or name:
+# `tool_call` on OpenClaw 2026.10.1 to 10.4, `dispatch_action` from 10.10. The
+# Gateway also reports the target as a nested call of its own
+# (`parentToolCallId` = the wrapper's id, id `tool_call:<wrapper id>:...`).
+DEFERRED_CALL_TOOLS = ("dispatch_action", "tool_call")
+
+
+def _is_nested_tool_call(data: dict, known: "set | dict") -> bool:
+    """A tool event for a call another call made on the model's behalf (the
+    target of a deferred-tool wrapper). Its card is the wrapper's: a second
+    card would show the same action twice, nested inside the first."""
+    if data.get("parentToolCallId"):
+        return True
+    tcid = str(data.get("toolCallId") or "")
+    parts = tcid.split(":")
+    return len(parts) > 2 and parts[0] == "tool_call" and parts[1] in known
+
+
+def _deferred_call_view(name: str, args_str: str) -> tuple[str, str] | None:
+    """A deferred-tool wrapper call as the call it makes: the target's name
+    (the last part of a catalog id like `openclaw:core:session_status`) and
+    its arguments. None for any other call."""
+    if name not in DEFERRED_CALL_TOOLS:
+        return None
+    args = _json_object(args_str)
+    target = args.get("id") if isinstance(args.get("id"), str) else args.get("name")
+    if not isinstance(target, str) or not target.strip():
+        return None
+    inner = args.get("args")
+    if not isinstance(inner, dict):  # a flattened call: the target's arguments beside `id`
+        inner = {k: v for k, v in args.items() if k not in ("id", "name")}
+    return target.strip().rsplit(":", 1)[-1], json.dumps(inner)
+
+
+def _deferred_call_result_text(result_str: str) -> str:
+    """The target's result inside a wrapper's `{"tool": ..., "result": ...}`
+    envelope. Anything else (an error, external content in its fence) is
+    shown as it came."""
+    envelope = _json_object(result_str)
+    if not isinstance(envelope.get("tool"), dict) or "result" not in envelope:
+        return result_str
+    return _tool_result_text(envelope["result"])
+
+
 def _tool_card_view(name: str, args_str: str) -> tuple[str, str]:
     """The title and input a tool card shows. A spawn card is named after the
     sub-agent it started ("🤖 <label>") and shows the head of its task, not
@@ -1182,12 +1226,15 @@ class _TurnRenderer:
 
         if stream == "tool":
             tcid = data.get("toolCallId", "")
+            if _is_nested_tool_call(data, self._active_tool_names.keys() | self._tool_results):
+                return events
             if phase == "start":
                 if tcid:
                     args_str = json.dumps(data.get("args", {}))
                     self._active_tool_args[tcid] = args_str
                     self._active_tool_names[tcid] = name
-                    card_name, card_args = _tool_card_view(name, args_str)
+                    card_name, card_args = _tool_card_view(*(_deferred_call_view(name, args_str)
+                                                             or (name, args_str)))
                     self._tool_item(card_name, tcid, card_args, events)
             elif phase == "result":
                 if tcid and tcid in self._tool_results:
@@ -1198,6 +1245,10 @@ class _TurnRenderer:
                     data.get("args", {})
                 )
                 name = self._active_tool_names.pop(tcid, None) or name
+                deferred = _deferred_call_view(name, args_str)
+                if deferred:
+                    name, args_str = deferred
+                    result_str = _deferred_call_result_text(result_str)
                 failed = data.get("isError") is True
                 if _is_spawn_tool(name) and not failed:
                     result_str, failed = _spawn_result_view(args_str, result_str)

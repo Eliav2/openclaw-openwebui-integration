@@ -92,16 +92,7 @@
           "deepseek/deepseek-v4-flash"
         ]
       }
-    },
-    "list": [
-      {
-        "id": "main",
-        "default": true
-      },
-      {
-        "id": "title-gen"
-      }
-    ]
+    }
   },
   "plugins": {
     "load": {

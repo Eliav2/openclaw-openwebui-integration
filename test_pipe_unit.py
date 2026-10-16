@@ -824,6 +824,99 @@ class TurnRendererOutputTests(unittest.TestCase):
         self.assertEqual(len(r.output), 2)
 
 
+class DeferredToolCallCardTests(unittest.TestCase):
+    """ELI-164: from OpenClaw 2026.10 most tools are deferred, so the model
+    calls them through a wrapper (`tool_call` on 10.1 to 10.4,
+    `dispatch_action` from 10.10) and the Gateway reports the target as a
+    second, nested tool call (`parentToolCallId` = the wrapper's id). Both
+    became cards, the inner one inside the outer one's start and result. One
+    model action is one card, named and shown as the tool it ran, the same
+    whether it streamed or was rebuilt from the transcript."""
+
+    INNER = "Model: fake/e2e-default"
+
+    def envelope(self, target, text):
+        return {"content": [{"type": "text", "text": json.dumps(
+            {"tool": {"id": f"openclaw:core:{target}", "name": target, "source": "openclaw"},
+             "result": {"content": [{"type": "text", "text": text}]}}, indent=2)}]}
+
+    def live(self, wrapper="dispatch_action", target="session_status", args=None,
+             inner_result=None, parent_field=True):
+        inner_result = self.INNER if inner_result is None else inner_result
+        nested = f"tool_call:call_1:{target}:1"
+        link = {"parentToolCallId": "call_1"} if parent_field else {}
+        r, events = _TurnRenderer(), []
+        for data in (
+            {"phase": "start", "name": wrapper, "toolCallId": "call_1",
+             "args": {"id": f"openclaw:core:{target}", "args": args or {}}},
+            {"phase": "start", "name": target, "toolCallId": nested, "args": args or {}, **link},
+            {"phase": "result", "name": target, "toolCallId": nested,
+             "result": {"content": [{"type": "text", "text": inner_result}]}, **link},
+            {"phase": "result", "name": wrapper, "toolCallId": "call_1",
+             "result": self.envelope(target, inner_result)},
+        ):
+            events += r.feed({"stream": "tool", "data": data})
+        return r, events
+
+    def cards(self, r):
+        return [(i["type"], i.get("call_id") or i.get("id"), i.get("name")) for i in r.output
+                if i["type"] in ("function_call", "function_call_output")]
+
+    def test_one_card_named_after_the_target(self):
+        for wrapper in ("dispatch_action", "tool_call"):
+            with self.subTest(wrapper):
+                r, events = self.live(wrapper)
+                self.assertEqual(self.cards(r), [("function_call", "call_1", "session_status"),
+                                                 ("function_call_output", "call_1", None)])
+                started = [e["item"]["name"] for e in events
+                           if isinstance(e, dict) and e["item"]["type"] == "function_call"]
+                self.assertEqual(started, ["session_status"], "named so from its start")
+                call = r.output[0]
+                self.assertEqual(json.loads(call["arguments"]), {})
+                self.assertEqual(r.output[1]["output"][0]["text"], self.INNER,
+                                 "the card shows the target's result, not the wrapper's envelope")
+
+    def test_a_nested_call_known_only_by_its_id_is_still_folded(self):
+        r, _ = self.live(parent_field=False)
+        self.assertEqual([c[1] for c in self.cards(r)], ["call_1", "call_1"])
+
+    def test_a_spawn_through_the_wrapper_is_a_spawn_card(self):
+        receipt = json.dumps({"status": "accepted", "childSessionKey": "agent:main:subagent:x", "runId": "r"})
+        r, _ = self.live(target="sessions_spawn", args={"task": "Look it up.", "label": "Lookup"},
+                         inner_result=receipt)
+        self.assertEqual(r.output[0]["name"], "🤖 Lookup")
+        self.assertEqual(r.output[1]["output"][0]["text"], "Started: Lookup")
+
+    def test_the_rebuild_from_history_is_the_same_card(self):
+        history = [
+            {"role": "assistant", "content": [
+                {"type": "toolCall", "id": "call_1", "name": "dispatch_action",
+                 "arguments": {"id": "session_status", "args": {}}}]},
+            # 10.10 chat.history: the nested call as its own entry (role "custom").
+            {"role": "custom", "content": [
+                {"type": "toolCall", "id": "tool_call:call_1:session_status:1", "name": "session_status",
+                 "arguments": {}, "parentToolCallId": "call_1"},
+                {"type": "toolResult", "toolCallId": "tool_call:call_1:session_status:1",
+                 "parentToolCallId": "call_1", "content": [{"type": "text", "text": self.INNER}]}]},
+            {"role": "toolResult", "toolCallId": "call_1", "toolName": "dispatch_action",
+             "content": self.envelope("session_status", self.INNER)["content"]},
+        ]
+        rebuilt = _history_renderer(history)
+        live, _ = self.live()
+        self.assertEqual(self.cards(rebuilt), self.cards(live))
+        self.assertEqual(rebuilt.output[1]["output"], live.output[1]["output"])
+
+    def test_a_wrapper_result_that_is_not_an_envelope_shows_as_it_came(self):
+        r = _TurnRenderer()
+        r.feed({"stream": "tool", "data": {"phase": "start", "name": "dispatch_action", "toolCallId": "c",
+                                           "args": {"id": "web_fetch", "args": {"url": "x"}}}})
+        r.feed({"stream": "tool", "data": {"phase": "result", "name": "dispatch_action", "toolCallId": "c",
+                                           "result": "<<<EXTERNAL_UNTRUSTED_CONTENT>>> page"}})
+        self.assertEqual(r.output[0]["name"], "web_fetch")
+        self.assertEqual(json.loads(r.output[0]["arguments"]), {"url": "x"})
+        self.assertEqual(r.output[1]["output"][0]["text"], "<<<EXTERNAL_UNTRUSTED_CONTENT>>> page")
+
+
 class SpawnCardTests(unittest.TestCase):
     """ELI-155: a sessions_spawn card was titled "sessions_spawn" (grouped as
     "Explored 2 sessions_spawn"), showed the whole task as input and the
