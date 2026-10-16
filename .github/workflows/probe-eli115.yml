@@ -120,7 +120,7 @@ jobs:
           path: ${{ runner.temp }}/storm.jsonl
 
   pipe-replay:
-    name: pipe replay (${{ matrix.variant }} rep ${{ matrix.rep }})
+    name: pipe replay (${{ matrix.variant }} rep ${{ matrix.rep }} rejoin ${{ matrix.rejoin }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
@@ -128,6 +128,11 @@ jobs:
       matrix:
         variant: [fix1, fix12]
         rep: [1, 2, 3, 4, 5]
+        rejoin: ["100000"]
+        include:
+          - {variant: fix123, rep: 1, rejoin: "5"}
+          - {variant: fix123, rep: 2, rejoin: "5"}
+          - {variant: fix123, rep: 3, rejoin: "5"}
     steps:
       - name: Ref under test
         id: ref
@@ -161,8 +166,8 @@ jobs:
         env:
           VARIANT: ${{ matrix.variant }}
           PAGE_SAVES: "0"
-          # One join per chat at the start, then none: the turns alone.
-          REJOIN_S: "100000"
+          # 100000: one join per chat at the start, then none (the turns alone).
+          REJOIN_S: ${{ matrix.rejoin }}
           REF: ${{ steps.ref.outputs.sha }}
           REP: ${{ matrix.rep }}
           OUT: ${{ runner.temp }}/pipe-replay-${{ matrix.variant }}-${{ matrix.rep }}.jsonl

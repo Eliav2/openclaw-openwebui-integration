@@ -74,6 +74,7 @@ class Peak:
     def __enter__(self):
         a, s = mem()
         self.peak, self.anon_peak, self.stop = a + s, a, False
+        self.t0, self.peak_t, self.per_s = time.monotonic(), 0.0, {}
         self.t = threading.Thread(target=self.run, daemon=True)
         self.t.start()
         return self
@@ -81,7 +82,12 @@ class Peak:
     def run(self):
         while not self.stop:
             a, s = mem()
+            t = time.monotonic() - self.t0
+            if a + s > self.peak:
+                self.peak_t = t
             self.peak, self.anon_peak = max(self.peak, a + s), max(self.anon_peak, a)
+            sec = int(t)
+            self.per_s[sec] = max(self.per_s.get(sec, 0), a + s)
             time.sleep(0.02)
 
     def __exit__(self, *a):
@@ -220,6 +226,13 @@ async def page_saves(c, h, chat_id, chat, stop, lat):
             pass
 
 
+MARKS: dict = {}   # name -> [monotonic times], one per chat
+
+
+def mark(name):
+    MARKS.setdefault(name, []).append(time.monotonic())
+
+
 async def chat_turns(c, h, user_id, chat_id, chat, tab):
     """The inline turn, then the wake; returns their message ids."""
     now = int(time.time())
@@ -235,6 +248,7 @@ async def chat_turns(c, h, user_id, chat_id, chat, tab):
     chat["history"]["currentId"] = aid
     chat["messages"] = chat["messages"] + [user, stub]
     (await c.post(f"{BASE}/api/v1/chats/{chat_id}", headers=h, json={"chat": chat}, timeout=600)).raise_for_status()
+    mark("inserted")
     (await c.post(f"{BASE}/api/chat/completions", headers=h, timeout=120, json={
         "model": MODEL, "messages": [{"role": "user", "content": prompt}], "stream": True,
         "chat_id": chat_id, "id": aid, "session_id": tab.sid, "parent_id": uid,
@@ -242,12 +256,14 @@ async def chat_turns(c, h, user_id, chat_id, chat, tab):
     t0 = time.monotonic()
     await tab.until(lambda: aid in tab.done, TURN_TIMEOUT_S)
     inline_s = time.monotonic() - t0
+    mark("inline_done")
     key = f"agent:main:openwebui-{user_id}-{chat_id}"
     seen = set(tab.done)
     await asyncio.to_thread(schedule_wake, key, f"{SCENE} wake", 2)
     t1 = time.monotonic()
     await tab.until(lambda: set(tab.done) - seen, TURN_TIMEOUT_S)
     wake = next(iter(set(tab.done) - seen))
+    mark("wake_done")
     return {"chat": chat_id, "user_message": uid, "inline": aid, "wake": wake,
             "inline_s": round(inline_s, 1), "wake_s": round(time.monotonic() - t1, 1)}
 
@@ -352,6 +368,11 @@ async def main():
            "page_saves": len(save_lat), "page_save_avg_s": round(sum(save_lat) / max(1, len(save_lat)), 2),
            "page_save_max_s": max(save_lat or [0]),
            "joins": len(joins), "pushes": len(pushes),
+           # Where the peak falls: seconds from the start, the per-second
+           # maxima (MB), and when each chat reached each step.
+           "peak_t": round(p.peak_t, 1),
+           "per_s": [p.per_s.get(i, 0) for i in range(max(p.per_s, default=0) + 1)],
+           "marks": {k: [round(x - p.t0, 1) for x in v] for k, v in MARKS.items()},
            # A push targets a user message of its chat: the seeded last one
            # until the inline turn's lands, that one after.
            "push_targets_user": all(j["pushed"] in user_ids[j["chat"]] for j in pushes),
