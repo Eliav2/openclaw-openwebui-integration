@@ -101,12 +101,10 @@ class FetchPipeArtifactTests(unittest.TestCase):
         self.addCleanup(srv.server_close)
         return f"http://127.0.0.1:{srv.server_address[1]}/openclaw_pipe.py"
 
-    def test_fetches_and_writes_the_artifact(self):
+    def test_returns_the_fetched_artifact(self):
         body = b'"""frontmatter"""\n\n\nclass Pipe:\n    pass\n'
         inst.ARTIFACT_URL = self._serve(body)
-        got = inst._fetch_pipe_file()
-        self.assertIsInstance(got, str)
-        self.assertIn("class Pipe", got)
+        self.assertEqual(inst._fetch_pipe_file(), body.decode())
 
     def test_rejects_a_200_that_is_not_the_artifact(self):
         # A raw URL typo on GitHub can return an HTML page with status 200.
@@ -125,7 +123,24 @@ class FetchPipeArtifactTests(unittest.TestCase):
 
     def test_url_is_overridable_by_env(self):
         # Lets a fork, a pinned tag, or a local mirror drive the no-clone path.
-        self.assertIn("openclaw_pipe.py", inst.ARTIFACT_URL)
+        import importlib.util
+        import os
+        from unittest import mock
+
+        def fresh_url(**env):
+            spec = importlib.util.spec_from_file_location("install_env_probe", ROOT / "install.py")
+            mod = importlib.util.module_from_spec(spec)
+            # dataclasses look their module up in sys.modules while it runs.
+            with mock.patch.dict(os.environ, env), mock.patch.dict(sys.modules, {spec.name: mod}):
+                if not env:
+                    os.environ.pop("OPENCLAW_PIPE_ARTIFACT_URL", None)
+                spec.loader.exec_module(mod)
+            return mod.ARTIFACT_URL
+
+        self.assertEqual(fresh_url(OPENCLAW_PIPE_ARTIFACT_URL="http://mirror.example/openclaw_pipe.py"),
+                         "http://mirror.example/openclaw_pipe.py")
+        self.assertEqual(fresh_url(), "https://raw.githubusercontent.com/Eliav2/openclaw-openwebui-integration"
+                                      "/main/openclaw_pipe.py")
 
 
 class MirrorPipeValvesTests(unittest.TestCase):
