@@ -1,5 +1,5 @@
-"""Verbatim extraction of Open WebUI 0.12.0's
-`handle_responses_streaming_event` (`open_webui/utils/middleware.py:624-985`),
+"""Verbatim extraction of Open WebUI 0.12.3's
+`handle_responses_streaming_event` (`open_webui/utils/response.py:381-742`),
 used only to pin our event-emitting tests to OWUI's actual behavior instead of
 our belief about it (see ELI-75: a docstring-inferred belief about this exact
 function was wrong for months).
@@ -7,7 +7,11 @@ function was wrong for months).
 Re-extracted 2026-10-11 from the running 0.12.0 container
 (`docker exec app_4d14bf22_openwebui cat
 /app/backend/open_webui/utils/middleware.py`, byte-identical to the v0.12.0
-git tag). Changes since the previous 0.11.3 copy:
+git tag). Re-checked 2026-10-17 against 0.12.2 and 0.12.3 (the 0.12.3 PyPI
+wheel's `utils/response.py`, byte-identical to the v0.12.3 tag): 0.12.3 moved
+the function from `middleware.py` to `response.py`, with no change in its
+code (AST-equal, `scripts/check_owui_fixture.py`). Changes since the previous
+0.11.3 copy:
 
 - 0.11.4: the `response.output_item.added` dedup now matches on `call_id`
   only when the existing item has the same `type`. A `function_call_output`
@@ -27,7 +31,7 @@ card. The stale fixture is why our tests still passed while the live UI
 rendered nothing.
 
 Pure function, zero imports, no I/O, safe to extract with
-`sed -n '624,985p' open_webui/utils/middleware.py` and re-paste here if OWUI
+`sed -n '381,742p' open_webui/utils/response.py` and re-paste here if OWUI
 changes this handler. Do not hand-edit the body below; if it drifts from
 upstream, re-extract instead of patching in place. Check the line range
 against the installed version first, it moves between releases. Note the

@@ -32,8 +32,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURE = ROOT / "test_fixture_owui_streaming_handler.py"
 FUNCTION = "handle_responses_streaming_event"
+# 0.12.3 moved the handler from middleware.py to response.py.
 UPSTREAM = ("https://raw.githubusercontent.com/open-webui/open-webui/{ref}/"
-            "backend/open_webui/utils/middleware.py")
+            "backend/open_webui/utils/{module}.py")
+MODULES = ("response", "middleware")
 
 
 def find_function(source: str, origin: str) -> tuple[ast.AST, str]:
@@ -61,16 +63,30 @@ def main() -> int:
                         help="print the upstream function source and exit")
     args = parser.parse_args()
 
-    url = UPSTREAM.format(ref=args.ref)
-    try:
-        with urllib.request.urlopen(url, timeout=30) as resp:
-            upstream_src = resp.read().decode()
-    except urllib.error.URLError as exc:
-        print(f"could not fetch {url}: {exc}", file=sys.stderr)
+    up = None
+    for module in MODULES:
+        url = UPSTREAM.format(ref=args.ref, module=module)
+        try:
+            with urllib.request.urlopen(url, timeout=30) as resp:
+                upstream_src = resp.read().decode()
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                continue  # an older ref without this module
+            print(f"could not fetch {url}: {exc}", file=sys.stderr)
+            return 2
+        except urllib.error.URLError as exc:
+            print(f"could not fetch {url}: {exc}", file=sys.stderr)
+            return 2
+        try:
+            up = find_function(upstream_src, url)
+            break
+        except LookupError:
+            continue
+    if up is None:
+        print(f"{FUNCTION} not found in open-webui@{args.ref} ({', '.join(MODULES)})", file=sys.stderr)
         return 2
-
+    up_node, up_text = up
     try:
-        up_node, up_text = find_function(upstream_src, url)
         fx_node, fx_text = find_function(FIXTURE.read_text(), str(FIXTURE))
     except LookupError as exc:
         print(exc, file=sys.stderr)
