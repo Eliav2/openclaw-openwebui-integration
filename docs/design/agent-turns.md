@@ -421,7 +421,7 @@ The stop-mode notice in row 3 must come before R's terminal on the same connecti
 | `killed` after a `shutdown` without `restartExpectedMs` on this connection (F4) | pipe | the same resume |
 | `killed` with no such notice | nobody (a Stop) | finalizes M |
 | `failed` with any other error | nobody (a real error) | shows the error in M, as today |
-| `lastRunId` is a newer run | that run | nothing; rule E links a recovery run |
+| `lastRunId` is a newer run | that run | no resume of M: M ends (a cut-off note on an outside kill row) and that run's own writer decides; rule E links a recovery run whose events reached the pipe (ELI-159) |
 
 **Why there is never a double continuation.** The pipe resumes only rows the Gateway has
 already persisted as terminal, and the Gateway recovers only rows that are `running`. A row

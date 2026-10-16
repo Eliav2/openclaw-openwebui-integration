@@ -74,7 +74,7 @@ A Gateway restart in the middle of a reply does not cut it short. The reply cont
 - **The Gateway recovers the run** after a crash or a planned restart, because the run is still marked running. The Pipe follows the recovery run into the same message.
 - **The Pipe resumes the run** when the Gateway will not: the run's process was killed from outside (it exited with code 143 or 137, or a signal, as in a container stop), or the Gateway was shut down rather than restarted.
 
-On a resume, the agent is told what you can already see and what you asked, so it continues rather than starting over, and your original message is never sent twice. No resume is sent into a session that is busy with another run.
+On a resume, the agent is told what you can already see and what you asked, so it continues rather than starting over, and your original message is never sent twice. No resume is sent into a session that is busy with another run. Only the session's last run is resumed: if another run started and was killed after yours, yours ends with a cut-off note and only that later one is resumed.
 
 Resumes are capped at 3 per reply. Past that, the reply is finished with what it has and a note: "_(This reply was cut off: the run was interrupted again after 3 attempts to continue it.)_".
 
