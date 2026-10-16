@@ -2439,6 +2439,51 @@ class TickWatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(conn._tick_interval_s, 12.0)
 
 
+class RetiredConnectionServesItsReplyTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-150: a plain redeploy mid-reply. The previous load's connection is
+    retired but keeps serving the reply it streams; the new load's
+    connection gets the same run's events with no consumer of its own. Its
+    turn writer must not take the reply's message over while that reply
+    lives, and does once the reply has ended (one writer per message)."""
+
+    USER, CHAT, MSG = (str(uuid.UUID(int=1)), str(uuid.UUID(int=2)), str(uuid.UUID(int=3)))
+
+    async def test_no_takeover_while_the_retired_connection_serves_the_reply(self):
+        socket_main = types.ModuleType("open_webui.socket.main")
+        modules = {"open_webui": types.ModuleType("open_webui"),
+                   "open_webui.socket": types.ModuleType("open_webui.socket"),
+                   "open_webui.socket.main": socket_main}
+        valves = lambda: types.SimpleNamespace(AGENT_ID="main")   # noqa: E731
+        key = _owui_session_key("main", self.USER, self.CHAT)
+        run = f"msg-{self.CHAT}-{self.MSG}-1792100000.5"
+        old = _GatewayConnection(valves)
+        old.register_consumer(key, run)                # the reply the old load streams
+        socket_main._openclaw_gateway_connection_v1 = old
+        new = _GatewayConnection(valves)
+        spawned = []
+
+        def spawn(coro):
+            spawned.append(coro.__qualname__)
+            coro.close()
+        with mock.patch.dict(sys.modules, modules), \
+             mock.patch("openclaw_pipe._gateway_connection", None), \
+             mock.patch("openclaw_pipe._retired_connections", [], create=True), \
+             mock.patch("openclaw_pipe.spawn_background", spawn):
+            await _reap_stale_gateway_connection()     # the new load starts
+            self.assertTrue(old._retired)
+
+            def event(text):
+                return {"sessionKey": key, "runId": run, "stream": "assistant",
+                        "data": {"delta": text}}
+            self.assertFalse(_turn_route_now(new, event("mid-4")))
+            self.assertEqual(new._turn_pumps, {}, "no turn writer while the reply lives")
+
+            old.unregister_consumer(key, run)          # that reply ended before its run
+            self.assertTrue(_turn_route_now(new, event("mid-5")))
+        self.assertIn((key, run), new._turn_pumps)
+        self.assertIn("_turn_pump_loop", spawned)
+
+
 class GatewayReloadReapTests(unittest.IsolatedAsyncioTestCase):
     """Regression tests for the 2026-07-11 zombie-connection incident
     (P33/P36 sibling bug): OWUI's function loader execs every redeploy into a

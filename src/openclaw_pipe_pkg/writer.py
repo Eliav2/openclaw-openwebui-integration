@@ -1020,8 +1020,8 @@ def _turn_route_now(conn: "_GatewayConnection", payload: dict) -> bool:
     if not parsed:
         _note_child_result(conn, payload)
         return False
-    if conn.consumers_for_event(payload):
-        return False
+    if conn.consumers_for_event(payload) or _served_by_retired(payload):
+        return False  # a live reply, here or on an earlier load's connection, writes it
     if run.startswith(ACTION_RUN_PREFIX):
         return True  # the Status Action's own runs render nothing
     if (sess, run) in conn._held_for_live:
