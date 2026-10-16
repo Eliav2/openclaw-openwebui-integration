@@ -16,7 +16,7 @@ import unittest
 from unittest import mock
 
 import test_status_action_unit  # noqa: F401  (installs the module stubs)
-from _test_helpers import run_page
+from _test_helpers import RecordingEmitter, run_page
 from test_status_action_unit import _drawer_conn, _emitted_codes, _open_dialog
 
 import openclaw_status_action
@@ -66,8 +66,7 @@ class SubagentListTests(unittest.IsolatedAsyncioTestCase):
     async def _open(self, rows, previews):
         calls, emitted, seen = [], [], []
 
-        async def emitter(evt):
-            emitted.append(evt)
+        emitter = RecordingEmitter(emitted)
 
         conn = mock.AsyncMock()
         conn.send_request = mock.AsyncMock(side_effect=_list_rpc(rows, previews, calls))
@@ -233,9 +232,7 @@ class SubagentDrawerTests(unittest.IsolatedAsyncioTestCase):
 
     async def _drawer(self, task_id, send_request):
         emitted = []
-
-        async def emitter(evt):
-            emitted.append(evt)
+        emitter = RecordingEmitter(emitted)
 
         conn = _drawer_conn(send_request)
         with mock.patch("openclaw_status_action._get_action_connection",
@@ -373,8 +370,7 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
             # by the next pushed change to its run state.
             return waiters.setdefault(key, asyncio.Event())
 
-        async def emitter(evt):
-            emitted.append(evt)
+        emitter = RecordingEmitter(emitted)
 
         conn = mock.Mock()
         conn.send_request = mock.AsyncMock(side_effect=_list_rpc(rows, previews, []))

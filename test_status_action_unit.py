@@ -16,7 +16,7 @@ from unittest import mock
 
 import conftest  # noqa: F401  (imports real pydantic before the stubs can shadow it)
 
-from _test_helpers import run_page  # noqa: E402
+from _test_helpers import RecordingEmitter, run_page  # noqa: E402
 from _test_stubs import install_stubs  # noqa: E402
 
 install_stubs()
@@ -595,9 +595,7 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
     async def test_missing_chat_id_notifies_and_returns_error(self):
         action = Action()
         emitted = []
-
-        async def emitter(evt):
-            emitted.append(evt)
+        emitter = RecordingEmitter(emitted)
 
         result = await action.action({}, __user__={"id": "u1"}, __event_emitter__=emitter)
         self.assertEqual(result["status"], "error")
@@ -613,8 +611,7 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
         emitted = []
         parent = "agent:main:openwebui-user-1-chat-1"
 
-        async def emitter(evt):
-            emitted.append(evt)
+        emitter = RecordingEmitter(emitted)
 
         async def fake_send_request(method, params, timeout=5):
             if method == "sessions.describe":
@@ -687,9 +684,7 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
     async def test_connect_failure_shows_dialog_wide_error(self):
         action = Action()
         emitted = []
-
-        async def emitter(evt):
-            emitted.append(evt)
+        emitter = RecordingEmitter(emitted)
 
         with mock.patch("openclaw_status_action._get_action_connection",
                          new=mock.AsyncMock(side_effect=RuntimeError("gateway unreachable"))):
@@ -709,9 +704,7 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
         rendering their own real data."""
         action = Action()
         emitted = []
-
-        async def emitter(evt):
-            emitted.append(evt)
+        emitter = RecordingEmitter(emitted)
 
         async def fake_send_request(method, params, timeout=5):
             if method == "sessions.describe":
@@ -746,9 +739,7 @@ class ClaudeCliUsageFallbackTests(unittest.IsolatedAsyncioTestCase):
 
     async def _run(self, usage_status, cli_usage):
         emitted = []
-
-        async def emitter(evt):
-            emitted.append(evt)
+        emitter = RecordingEmitter(emitted)
 
         async def fake_send_request(method, params, timeout=5):
             if method == "sessions.describe":
@@ -831,9 +822,7 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
     async def test_blocked_when_a_run_is_already_active(self):
         action = Action()
         emitted = []
-
-        async def emitter(evt):
-            emitted.append(evt)
+        emitter = RecordingEmitter(emitted)
 
         fake_conn = mock.Mock()
         fake_conn.active_run_id_for_session = mock.Mock(return_value="some-active-run")
@@ -852,9 +841,7 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
     async def test_success_shows_compacting_then_refreshes_all_sections(self):
         action = Action()
         emitted = []
-
-        async def emitter(evt):
-            emitted.append(evt)
+        emitter = RecordingEmitter(emitted)
 
         describe_calls = {"n": 0}
 
@@ -902,9 +889,7 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
     async def test_timeout_shows_clear_message_not_infinite_spin(self):
         action = Action()
         emitted = []
-
-        async def emitter(evt):
-            emitted.append(evt)
+        emitter = RecordingEmitter(emitted)
 
         async def fake_send_request(method, params, timeout=5):
             if method == "chat.send":
@@ -1120,9 +1105,7 @@ class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
     async def test_missing_task_id_returns_error(self):
         action = Action()
         emitted = []
-
-        async def emitter(evt):
-            emitted.append(evt)
+        emitter = RecordingEmitter(emitted)
 
         result = await action._run_subagent_detail({"mode": "subagent-detail"}, {"id": "u1"}, emitter)
         self.assertEqual(result["status"], "error")
@@ -1133,9 +1116,7 @@ class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
         header and run. The page asks again while the child runs (ELI-155)."""
         action = Action()
         emitted = []
-
-        async def emitter(evt):
-            emitted.append(evt)
+        emitter = RecordingEmitter(emitted)
 
         get_calls = {"n": 0}
 
@@ -1245,9 +1226,7 @@ class UpdatedTimeIsTheBrowsersClockTests(unittest.IsolatedAsyncioTestCase):
 
     async def _context_fill(self):
         emitted = []
-
-        async def emitter(evt):
-            emitted.append(evt)
+        emitter = RecordingEmitter(emitted)
 
         async def fake_send_request(method, params, timeout=5):
             if method == "sessions.describe":
@@ -1315,9 +1294,7 @@ class ControlUiLinkTests(unittest.IsolatedAsyncioTestCase):
 
     async def _open_code(self, control_ui_url):
         emitted = []
-
-        async def emitter(evt):
-            emitted.append(evt)
+        emitter = RecordingEmitter(emitted)
 
         fake_conn = mock.AsyncMock()
         fake_conn.send_request = mock.AsyncMock(side_effect=lambda method, params, timeout=5: {

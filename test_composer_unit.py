@@ -22,6 +22,7 @@ from unittest import mock
 
 import conftest  # noqa: F401  (imports real pydantic before the stubs can shadow it)
 
+from _test_helpers import RecordingEmitter  # noqa: E402
 from _test_stubs import install_stubs  # noqa: E402
 
 install_stubs()
@@ -136,9 +137,7 @@ class StatusLabelWidthTests(unittest.TestCase):
 class EmitHelperTests(unittest.IsolatedAsyncioTestCase):
     async def test_emits_one_execute_event(self):
         events = []
-
-        async def emitter(e):
-            events.append(e)
+        emitter = RecordingEmitter(events)
 
         ok = await _emit_composer_button(emitter, session_id="sid1", model_id="mine.x")
         self.assertTrue(ok)
@@ -244,9 +243,7 @@ class ActionDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_status_run_emits_snippet_last(self):
         events = []
-
-        async def emitter(e):
-            events.append(e)
+        emitter = RecordingEmitter(events)
 
         action = openclaw_status_action.Action()
         result = await action.action({"session_id": "sockA"}, __user__={"id": "u"},
@@ -261,9 +258,7 @@ class ActionDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def _status_cfg(self, model):
         events = []
-
-        async def emitter(e):
-            events.append(e)
+        emitter = RecordingEmitter(events)
 
         action = openclaw_status_action.Action()
 
@@ -286,9 +281,7 @@ class ActionDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_compact_and_drawer_runs_do_not_emit(self):
         events = []
-
-        async def emitter(e):
-            events.append(e)
+        emitter = RecordingEmitter(events)
 
         action = openclaw_status_action.Action()
 
@@ -304,9 +297,7 @@ class ActionDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_emitted_even_when_the_run_raises(self):
         events = []
-
-        async def emitter(e):
-            events.append(e)
+        emitter = RecordingEmitter(events)
 
         action = openclaw_status_action.Action()
 

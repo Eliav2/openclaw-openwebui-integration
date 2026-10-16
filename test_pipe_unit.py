@@ -23,6 +23,7 @@ from unittest import mock
 
 import conftest  # noqa: F401  (imports real pydantic before the stubs can shadow it)
 
+from _test_helpers import RecordingEmitter  # noqa: E402
 from _test_stubs import install_stubs  # noqa: E402
 
 install_stubs()
@@ -3308,9 +3309,7 @@ class MediaBufferTests(unittest.TestCase):
 class StatusEmitterTests(unittest.IsolatedAsyncioTestCase):
     async def test_emits_owui_status_event(self):
         events = []
-
-        async def emitter(event):
-            events.append(event)
+        emitter = RecordingEmitter(events)
 
         await _emit_status(emitter, "Thinking...", done=False)
 
@@ -3585,9 +3584,7 @@ class UsageStatusLineTests(unittest.IsolatedAsyncioTestCase):
 class MessageSnapshotEmitterTests(unittest.IsolatedAsyncioTestCase):
     async def test_emits_persisted_replace_event(self):
         events = []
-
-        async def emitter(event):
-            events.append(event)
+        emitter = RecordingEmitter(events)
 
         await _emit_message_snapshot(emitter, "partial answer")
 
@@ -3601,9 +3598,7 @@ class MessageSnapshotEmitterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_emitter_or_empty_content_is_noop(self):
         events = []
-
-        async def emitter(event):
-            events.append(event)
+        emitter = RecordingEmitter(events)
 
         await _emit_message_snapshot(None, "partial answer")
         await _emit_message_snapshot(emitter, "")
@@ -9636,9 +9631,7 @@ class GapHandoverReplayTests(_RoutingCase):
         message_id = message_id or self.STUB
         self.add_stub(message_id)
         emitted = []
-
-        async def emitter(event):
-            emitted.append(event)
+        emitter = RecordingEmitter(emitted)
 
         async def event_call(event):
             return intent

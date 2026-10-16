@@ -28,3 +28,14 @@ def run_page(js: str, payload, tz: str | None = None):
     if out.returncode != 0:
         raise AssertionError(out.stderr)
     return json.loads(out.stdout)
+
+
+class RecordingEmitter:
+    """An `__event_emitter__` that keeps every event it is given, in order,
+    in `events` (the list passed in, or a new one)."""
+
+    def __init__(self, events: list | None = None):
+        self.events = [] if events is None else events
+
+    async def __call__(self, event):
+        self.events.append(event)

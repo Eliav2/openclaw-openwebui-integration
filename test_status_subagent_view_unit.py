@@ -16,7 +16,7 @@ import unittest
 from unittest import mock
 
 import test_status_action_unit  # noqa: F401  (installs the module stubs)
-from _test_helpers import run_page
+from _test_helpers import RecordingEmitter, run_page
 from test_status_action_unit import _FAKE_DOM_JS, _drawer_conn, _emitted_codes
 
 import openclaw_status_action
@@ -346,9 +346,7 @@ class FinalReplyTests(unittest.IsolatedAsyncioTestCase):
             raise AssertionError(f"unexpected RPC: {method}")
 
         emitted = []
-
-        async def emitter(evt):
-            emitted.append(evt)
+        emitter = RecordingEmitter(emitted)
 
         with mock.patch("openclaw_status_action._get_action_connection",
                         new=mock.AsyncMock(return_value=(_drawer_conn(send_request), "pipe"))):
@@ -466,9 +464,7 @@ async def _drawer_fill(send_request, body=None, user=None):
     """Run one drawer request against a fake Gateway; returns its fill's DATA
     and the RPCs it made."""
     emitted = []
-
-    async def emitter(evt):
-        emitted.append(evt)
+    emitter = RecordingEmitter(emitted)
 
     conn = _drawer_conn(send_request)
     with mock.patch("openclaw_status_action._get_action_connection",
