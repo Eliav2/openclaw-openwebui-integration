@@ -8313,6 +8313,14 @@ async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
                 conn, chat_id=chat_id, user_id=chat.user_id, message_id=stub_id,
                 session_key=_owui_session_key(agent_id, chat.user_id, chat_id),
                 meta=stub.get("meta") or {})
+        # Open WebUI stamps the task id of the request that will fill a stub
+        # on it just before it starts that task. With none, no request has
+        # taken the stub yet, and its request may still be on its way: after
+        # a restart, that request's own model listing starts this sweep
+        # (ELI-156). Only a stub a request took and lost is an orphan.
+        task_id = (stub.get("meta") or {}).get("task_id")
+        if not task_id:
+            return "skip"
         if await _owui_chat_has_live_task(chat_id):
             return "skip"  # a live request owns it
         session_key = _owui_session_key(agent_id, chat.user_id, chat_id)
@@ -8370,6 +8378,8 @@ async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
             return "skip"
         if _turn_writer_alive((current.get("meta") or {}).get("openclaw_writer")):
             return "skip"  # a turn writer took it over (DESIGN 2.6) and finishes it
+        if (current.get("meta") or {}).get("task_id") != task_id:
+            return "skip"  # a new request took it while the transcript was read
         claim = f"{session_key}:{run_id}" if run_id else None
         if claim:
             if claim in conn._claimed_runs:

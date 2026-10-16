@@ -576,9 +576,12 @@ class OrphanStubReconcileTests(unittest.IsolatedAsyncioTestCase):
         self.chat = {"history": {"currentId": self.STUB, "messages": {
             "u1": {"role": "user", "content": "check the logs", "childrenIds": [self.STUB]},
             self.STUB: {"role": "assistant", "content": "", "done": False,
-                        "parentId": "u1", "childrenIds": [], "model": "openclaw_gateway.m"},
+                        "parentId": "u1", "childrenIds": [], "model": "openclaw_gateway.m",
+                        # The task of the request that died with Open WebUI.
+                        "meta": {"task_id": "task-dead"}},
         }}}
         self.history = _turn_history(closed=False)
+        self.on_history = None
         self.active = True
         self.live_task = False
         test = self
@@ -613,6 +616,8 @@ class OrphanStubReconcileTests(unittest.IsolatedAsyncioTestCase):
 
         async def send_request(method, params, timeout=10):
             if method == "chat.history":
+                if test.on_history:
+                    test.on_history()
                 return copy.deepcopy(test.history)
             if method == "sessions.list":
                 return {"sessions": [{"key": test.sk, "hasActiveRun": test.active}]}
@@ -709,6 +714,29 @@ class OrphanStubReconcileTests(unittest.IsolatedAsyncioTestCase):
         self.history, self.active = _turn_history(), False
         self._stub()["meta"] = {"openclaw_writer": "writer-live", "openclaw_run": self.RUN}
         _register_turn_writer("writer-live")
+        self.assertEqual(await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB), "skip")
+        self.assertIs(self._stub()["done"], False)
+        self.assertEqual(self._stub()["content"], "")
+
+    async def test_a_stub_no_request_has_claimed_is_left_alone(self):
+        """ELI-156: a client writes the stub, then POSTs the completion. After
+        an Open WebUI restart that POST loads the models, which starts this
+        sweep before the request has a task. No task id on the stub means no
+        request took it yet: it is not an orphan."""
+        self.history, self.active = {"messages": []}, False
+        del self._stub()["meta"]
+        self.assertEqual(await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB), "skip")
+        self.assertIs(self._stub()["done"], False)
+        self.assertEqual(self._stub()["content"], "")
+
+    async def test_a_request_that_claims_the_stub_meanwhile_keeps_it(self):
+        """ELI-156: Open WebUI stamps its task id on the stub while the
+        transcript is being read. The stub is that request's now."""
+        self.history, self.active = {"messages": []}, False
+
+        def claim():
+            self._stub()["meta"] = {"task_id": "task-new"}
+        self.on_history = claim
         self.assertEqual(await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB), "skip")
         self.assertIs(self._stub()["done"], False)
         self.assertEqual(self._stub()["content"], "")
