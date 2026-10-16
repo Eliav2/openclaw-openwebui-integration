@@ -164,8 +164,6 @@ So pass the same values on every run. A re-run without `GATEWAY_URL` sets it bac
 
 `status` reports `function_exists`, `is_active`, `is_global`, `model_visible`, `has_gateway_url`, `has_gateway_token`, `has_device_identity`, `device_id` and `device_paired`. `device_paired` asks the local `openclaw` CLI, so it is only ever `true` on the Gateway host. On any other machine `status` and `healthcheck` exit 1 even when everything works; read the smoke test lines instead.
 
-`install` and `repair` also accept `--with-skills` (install the agent-side skills after the Pipe) and `--force-skills` (overwrite an existing skill). On the current version the installer exits before it reaches the skills step, so run `uv run install.py skills` on its own instead.
-
 ## The companion installers
 
 - `install_action.py` installs the Status Action and mirrors the five shared valves from the Pipe: [Status button](./status-action.md).

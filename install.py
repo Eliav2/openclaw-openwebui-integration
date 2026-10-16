@@ -189,7 +189,7 @@ def install_bundled_skills(force: bool = False) -> bool:
         else:
             ok = False
             fail(f"skill install failed: {d.name}"
-                 + ("" if force else "  (already present? re-run with --force-skills to overwrite)"))
+                 + ("" if force else "  (already present? re-run with --force to overwrite)"))
             detail = (proc.stderr or proc.stdout or "").strip().splitlines()
             for line in detail[-3:]:
                 console.print(f"    [dim]{line}[/dim]")
@@ -356,6 +356,18 @@ def get_valves(client: OwuiClient, function_id: str = FUNCTION_ID) -> dict:
     if status == 200 and isinstance(payload, dict):
         return payload
     return {}
+
+
+def post_valves(client: OwuiClient, function_id: str, current: dict, desired: dict) -> list:
+    """Post `desired` as `function_id`'s whole valve set when it differs from
+    `current`. Returns the names that changed (none: nothing was posted)."""
+    changed = sorted(k for k, v in desired.items() if current.get(k) != v)
+    if changed:
+        status, payload = client.request(
+            "POST", f"/api/v1/functions/id/{function_id}/valves/update", desired)
+        if status != 200 or not isinstance(payload, dict):
+            raise SystemExit(f"Valve update failed: {payload}")
+    return changed
 
 
 def model_exists(client: OwuiClient) -> bool:
@@ -682,19 +694,8 @@ def update_valves(client: OwuiClient, cfg: Config, preserved_valves: dict | None
         required["FILE_SERVER_BASE_URL"] = cfg.file_server_base_url
 
     desired = {**existing, **required}
-    changed = {k: v for k, v in desired.items() if current.get(k) != v}
-    if not changed:
-        info("Valves already up to date")
-        return desired
-
-    status, payload = client.request(
-        "POST",
-        f"/api/v1/functions/id/{FUNCTION_ID}/valves/update",
-        desired,
-    )
-    if status != 200 or not isinstance(payload, dict):
-        raise SystemExit(f"Valve update failed: {payload}")
-    info(f"Updated valves: {', '.join(sorted(changed.keys()))}")
+    changed = post_valves(client, FUNCTION_ID, current, desired)
+    info(f"Updated valves: {', '.join(changed)}" if changed else "Valves already up to date")
     return desired
 
 
@@ -985,17 +986,12 @@ def common_options(f):
 
 def _dispatch(command: str, **kwargs) -> None:
     wizard = kwargs.pop("wizard")
-    with_skills = kwargs.pop("with_skills", False)
-    force_skills = kwargs.pop("force_skills", False)
     cfg = Config(**kwargs)
     if wizard:
         cfg = run_wizard(cfg, need_gateway=command in {"install", "repair", "healthcheck"})
     cfg.owui_url = cfg.owui_url.rstrip("/")
     cfg.owui_api_base_url = (cfg.owui_api_base_url or cfg.owui_url).rstrip("/")
     execute(command, cfg)
-    if with_skills:
-        section("Agent-side skills")
-        install_bundled_skills(force=force_skills)
 
 
 @click.group()
@@ -1005,12 +1001,6 @@ def cli() -> None:
 
 @cli.command()
 @common_options
-@click.option("--with-skills", is_flag=True, default=False,
-              help="Also install the bundled agent-side skills with the local "
-                   "openclaw CLI. Only works on the Gateway host.")
-@click.option("--force-skills", is_flag=True, default=False,
-              help="Overwrite an existing skill of the same name. Off by "
-                   "default: OpenClaw keeps no history, so this is unrecoverable.")
 def install(**kwargs) -> None:
     """Create or update the pipe function, valves, and run a smoke test."""
     _dispatch("install", **kwargs)
@@ -1018,12 +1008,6 @@ def install(**kwargs) -> None:
 
 @cli.command()
 @common_options
-@click.option("--with-skills", is_flag=True, default=False,
-              help="Also install the bundled agent-side skills with the local "
-                   "openclaw CLI. Only works on the Gateway host.")
-@click.option("--force-skills", is_flag=True, default=False,
-              help="Overwrite an existing skill of the same name. Off by "
-                   "default: OpenClaw keeps no history, so this is unrecoverable.")
 def repair(**kwargs) -> None:
     """Same as install; use after a broken/partial setup."""
     _dispatch("repair", **kwargs)

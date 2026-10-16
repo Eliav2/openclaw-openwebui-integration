@@ -84,7 +84,6 @@ import json
 import html
 import os
 import uuid
-import logging
 import base64
 import time
 import threading
@@ -118,8 +117,6 @@ def pipe_log(*args):
     """Log to stdout so it appears in OWUI's backend logs."""
     print(f"[openclaw-pipe] {' '.join(str(a) for a in args)}", flush=True)
 
-logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -5039,7 +5036,6 @@ class _GatewayConnection:
             self._stopped = False
             await self._connect_and_start()
             if not self._event_loop_task or self._event_loop_task.done():
-                self._loop = asyncio.get_running_loop()
                 self._event_loop_task = asyncio.create_task(self._event_loop())
 
     async def send_request(self, method: str, params: dict, timeout: float = 10) -> dict:
@@ -5070,11 +5066,7 @@ class _GatewayConnection:
         registration critical section (see `_session_send_locks`). Created
         lazily; asyncio.Lock is created on the running loop the first time it
         is awaited."""
-        lock = self._session_send_locks.get(session_key)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._session_send_locks[session_key] = lock
-        return lock
+        return self._session_send_locks.setdefault(session_key, asyncio.Lock())
 
     MODEL_PATCH_CACHE_TTL_S = 60.0
 
@@ -5082,11 +5074,7 @@ class _GatewayConnection:
         """Per-session lock so a burst of same-session messages issues one
         sessions.patch, not N concurrent ones (ELI-59). Lazily created, same
         pattern as session_send_lock."""
-        lock = self._model_patch_locks.get(session_key)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._model_patch_locks[session_key] = lock
-        return lock
+        return self._model_patch_locks.setdefault(session_key, asyncio.Lock())
 
     def model_patch_cached(self, session_key: str, model: str | None) -> bool:
         """True if `model` was successfully applied to this session within the
@@ -5658,23 +5646,16 @@ class _GatewayConnection:
                 q.put_control({"type": _RESTART_MARKER_TYPE})
 
     def _note_gateway_boot(self, boot_id: str | None) -> None:
-        """Count a Gateway restart only when its boot id changes."""
+        """Count a Gateway restart only when its boot id changes. Every
+        supported Gateway sends one; below the minimum a restart goes
+        uncounted."""
         first = self.connection_epoch <= 1
-        if boot_id is None:
-            # TEMPORARY fallback for a Gateway that sends no bootId (older
-            # than 2026.9.x): a reconnect may be a restart, so count it as
-            # one, which is the behaviour before boot ids existed.
-            if not first:
-                self.gateway_restarts += 1
-                pipe_log("  reconnected; Gateway sent no bootId, treating it as a restart")
-                self._mark_gateway_restart()
-            return
         if self.gateway_boot_id is not None and boot_id != self.gateway_boot_id:
             self.gateway_restarts += 1
-            pipe_log(f"  Gateway restarted (bootId {self.gateway_boot_id[:8]} -> {boot_id[:8]})")
+            pipe_log(f"  Gateway restarted (bootId {self.gateway_boot_id[:8]} -> {str(boot_id)[:8]})")
             self._mark_gateway_restart()
         elif not first:
-            pipe_log(f"  reconnected to the same Gateway (bootId {boot_id[:8]}); runs continue")
+            pipe_log(f"  reconnected to the same Gateway (bootId {str(boot_id)[:8]}); runs continue")
         self.gateway_boot_id = boot_id
 
     async def _connect_and_start(self):

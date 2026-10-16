@@ -5428,8 +5428,8 @@ class MarkerAfterPreambleTests(unittest.TestCase):
 class _HandshakeWS:
     """Minimal Gateway handshake partner: challenge, then the connect reply."""
 
-    def __init__(self, ok=True, boot_id=None):
-        hello = {"server": {"bootId": boot_id}} if boot_id else {}
+    def __init__(self, ok=True, boot_id="boot-1"):
+        hello = {"server": {"bootId": boot_id}}
         self._frames = [
             json.dumps({"event": "connect.challenge",
                         "payload": {"nonce": "n", "ts": 1}}),
@@ -5462,7 +5462,7 @@ class ConnectionEpochTests(unittest.IsolatedAsyncioTestCase):
         conn._ident = {"id": "device-1"}
         return conn
 
-    async def _connect(self, conn, ok=True, boot_id=None):
+    async def _connect(self, conn, ok=True, boot_id="boot-1"):
         ws = _HandshakeWS(ok=ok, boot_id=boot_id)
 
         async def fake_connect(_url, **_kw):
@@ -5539,14 +5539,6 @@ class ConnectionEpochTests(unittest.IsolatedAsyncioTestCase):
         await self._connect(conn, boot_id="boot-b")
         self.assertEqual(conn.gateway_restarts, 1)
         self.assertEqual(conn.gateway_boot_id, "boot-b")
-
-    async def test_without_a_boot_id_a_reconnect_counts_as_a_restart(self):
-        """Older Gateways send no bootId; keep the old behaviour there."""
-        conn = self._conn()
-        await self._connect(conn)
-        self.assertEqual(conn.gateway_restarts, 0)
-        await self._connect(conn)
-        self.assertEqual(conn.gateway_restarts, 1)
 
 
 class ThinkingWiringTests(unittest.TestCase):

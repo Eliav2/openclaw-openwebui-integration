@@ -25,7 +25,7 @@ from __future__ import annotations
 import time
 
 from install import FUNCTION_ID as PIPE_FUNCTION_ID
-from install import ROOT, FunctionSpec, fail, function_cli, get_valves, info
+from install import ROOT, FunctionSpec, fail, function_cli, get_valves, info, post_valves
 
 FUNCTION_ID = "openclaw_status_action"
 # Valves mirrored verbatim from the Pipe's own valves.
@@ -44,19 +44,11 @@ def mirror_pipe_valves(client) -> dict:
         )
     desired = {k: pipe_valves[k] for k in VALVE_KEYS if k in pipe_valves}
     current = get_valves(client, FUNCTION_ID)
-    changed = {k: v for k, v in desired.items() if current.get(k) != v}
-    if not changed:
-        info("Valves already mirror the Pipe's")
-        return desired
-
     # Open WebUI replaces the whole valve set with what is posted, so the
     # Action's own valves (CONTROL_UI_URL) go along unchanged or they reset.
-    status, payload = client.request(
-        "POST", f"/api/v1/functions/id/{FUNCTION_ID}/valves/update", {**current, **desired},
-    )
-    if status != 200 or not isinstance(payload, dict):
-        raise SystemExit(f"Valve update failed: {payload}")
-    info(f"Mirrored valves from Pipe: {', '.join(sorted(changed.keys()))}")
+    changed = post_valves(client, FUNCTION_ID, current, {**current, **desired})
+    info(f"Mirrored valves from Pipe: {', '.join(changed)}" if changed
+         else "Valves already mirror the Pipe's")
     return desired
 
 

@@ -35,8 +35,6 @@ uv run install.py skills
 
 It needs no Open WebUI credentials. It detects the local `openclaw` CLI and installs every skill under `skills/`. If the CLI isn't there, the Gateway is usually on another machine: it says so, installs nothing, and prints the commands to run there instead.
 
-`install.py install --with-skills` is meant to do the same at the end of an install, but on the current version the installer exits before it reaches that step. Run `uv run install.py skills` on its own.
-
 ## Update them
 
 `git pull`, then re-run the same command with overwrite turned on. In the repo checkout on the Gateway host:
@@ -52,7 +50,7 @@ openclaw skills install ./skills/openclaw-owui-ask-user --force
 openclaw skills install ./skills/openclaw-owui-media --force
 ```
 
-Without `--force`, a skill that is already installed fails with "already present? re-run with --force-skills to overwrite"; for the `skills` command, the flag is `--force`.
+Without `--force`, a skill that is already installed fails with "already present? re-run with --force to overwrite".
 
 Overwriting is opt-in on purpose: OpenClaw keeps no history for skill installs, so an overwrite is unrecoverable, and a skill you wrote yourself should never be clobbered by an installer.
 

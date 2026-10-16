@@ -9,7 +9,6 @@ import json
 import html
 import os
 import uuid
-import logging
 import base64
 import time
 import threading
@@ -43,8 +42,6 @@ def pipe_log(*args):
     """Log to stdout so it appears in OWUI's backend logs."""
     print(f"[openclaw-pipe] {' '.join(str(a) for a in args)}", flush=True)
 
-logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------

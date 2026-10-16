@@ -115,7 +115,6 @@ BANNER = (
     "# ==========================================================================\n"
 )
 
-FRAGMENT_HEADER_PREFIX = "# ---"  # strip the per-fragment BUILD FRAGMENT banner
 
 def _strip_fragment_banner(text: str) -> str:
     """Remove the leading 'BUILD FRAGMENT' banner block a fragment carries."""
