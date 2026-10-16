@@ -7,15 +7,13 @@ Valves: `GATEWAY_URL`, `GATEWAY_TOKEN`, `DEVICE_IDENTITY`, `STATE_DIR`, `AGENT_I
 
 _Separate function: install the Status Action first, see [Status button](../install/status-action.md)._
 
-![The Status dialog: context used, 5-hour and weekly rate limits, two running sub-agents](../img/status-dialog-light.png#gh-light-mode-only)
-![The Status dialog: context used, 5-hour and weekly rate limits, two running sub-agents](../img/status-dialog-dark.png#gh-dark-mode-only)
+![The Status dialog: context used, 5-hour and weekly rate limits, two running sub-agents](../img/status-dialog-light.png)
 
 _The rate limits in this screenshot are sample data._
 
 The Status Action adds a button to the message toolbar. It opens a dialog with three sections: Context, Rate Limits and Subagents.
 
-![The OpenClaw Status button on a reply's toolbar](../img/toolbar-button-light.png#gh-light-mode-only)
-![The OpenClaw Status button on a reply's toolbar](../img/toolbar-button-dark.png#gh-dark-mode-only)
+![The OpenClaw Status button on a reply's toolbar](../img/toolbar-button-light.png)
 
 Each section has its own skeleton and fills the moment its own request returns, so a slow sub-agent list does not hold up the context number. Usage bars are colour coded (green under 60%, amber from 60%, red from 85%), with the colours inlined so a theme cannot make them invisible.
 
@@ -31,8 +29,7 @@ Rate limits come from the Gateway's `usage.status`. On a Gateway whose only Anth
 
 A Compact pill in the dialog header runs `/compact` on the session. While it works, the dialog shows a distinct "Compacting..." state, then refreshes with the numbers after compaction.
 
-![The Context section with its Compact pill](../img/compact-before-light.png#gh-light-mode-only)
-![The Context section with its Compact pill](../img/compact-before-dark.png#gh-dark-mode-only)
+![The Context section with its Compact pill](../img/compact-before-light.png)
 
 Right after a compact, the context number can read far lower than what the next request carries: it counts the kept conversation, without the system prompt and tools. The next reply brings it up to date.
 
@@ -52,8 +49,7 @@ Each row is one line: the sub-agent's spawn label (else the first sentence of it
 
 ## Sub-agent drawer
 
-![A running sub-agent's drawer on a phone: a one-line header, its reply so far as Latest, and its Task](../img/subagent-drawer-light.png#gh-light-mode-only)
-![A running sub-agent's drawer on a phone: a one-line header, its reply so far as Latest, and its Task](../img/subagent-drawer-dark.png#gh-dark-mode-only)
+![A running sub-agent's drawer on a phone: a one-line header, its reply so far as Latest, and its Task](../img/subagent-drawer-light.png)
 
 Click a sub-agent to open its drawer: a side panel, or on a phone a full-screen sheet with a **‹ Back** button. Its header is the title, the status, the time and the link to the sub-agent in the Control UI, with three tabs below:
 
@@ -74,8 +70,7 @@ The Tools tab reads both transcript shapes, so it works the same for either runt
 
 The Pipe also adds a **Status** button to the composer row of OpenClaw chats, right after the OpenClaw Thinking chip (or at the end of the composer's chips when that chip is off). It opens the same dialog through the Status Action, so the Action must be installed.
 
-![The Status button in the composer, next to the integrations button](../img/composer-status-light.png#gh-light-mode-only)
-![The Status button in the composer, next to the integrations button](../img/composer-status-dark.png#gh-dark-mode-only)
+![The Status button in the composer, next to the integrations button](../img/composer-status-light.png)
 
 Open WebUI has no extension point for the composer, so the button is put into the page by JavaScript. If a future Open WebUI changes the composer and the anchor is not found, the button simply does not appear. On Open WebUI 0.12 it appears as soon as a tab opens an OpenClaw chat; on older releases, after the next reply or the next click on the toolbar button.
 

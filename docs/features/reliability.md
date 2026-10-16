@@ -31,8 +31,7 @@ Valves: [`GATEWAY_URL`](../configuration.md#gateway_url), [`GATEWAY_TOKEN`](../c
 
 Send a message while the agent is still working (from another tab, or while a run you did not start is active) and it waits for the current run to finish, then gets a real reply of its own. The status line says "Queued: waiting for the current run to finish...". What you do not get is a blank reply, which is what the naive implementation produces.
 
-![A message sent while a reply runs, held above the composer by Open WebUI](../img/message-queued-light.png#gh-light-mode-only)
-![A message sent while a reply runs, held above the composer by Open WebUI](../img/message-queued-dark.png#gh-dark-mode-only)
+![A message sent while a reply runs, held above the composer by Open WebUI](../img/message-queued-light.png)
 
 In the tab where the reply is running, Open WebUI holds the new message itself, as above, and sends it when the reply ends. The Pipe's own queue is for a message from another tab or device, or one sent during a run you did not start.
 
@@ -46,8 +45,7 @@ Always on.
 
 Reload the page mid-reply, or open the chat on another device, and you see the answer so far instead of an empty reply. On Open WebUI 0.12, Open WebUI keeps the in-progress reply itself and shows it on reload. On older releases the Pipe saves the reply to the chat as it streams, at most every 2.5 seconds.
 
-![The same reply right after a page reload: the answer so far is there and still growing](../img/reload-mid-reply-light.png#gh-light-mode-only)
-![The same reply right after a page reload: the answer so far is there and still growing](../img/reload-mid-reply-dark.png#gh-dark-mode-only)
+![The same reply right after a page reload: the answer so far is there and still growing](../img/reload-mid-reply-light.png)
 
 If your tab or socket dies mid-stream, a forced final save means the finished text is in the database when you come back.
 
@@ -102,8 +100,7 @@ Always on.
 
 Pressing Stop in Open WebUI cancels the Pipe's reply. The Pipe first saves the partial answer, so what you already saw is not lost, then sends the Gateway a `chat.abort` for the run. Abort alone only ends the stream: a tool the agent started keeps running on the Gateway unless something also tells the agent to stop.
 
-![A reply stopped while its command was running: the card is closed, not spinning](../img/stop-light.png#gh-light-mode-only)
-![A reply stopped while its command was running: the card is closed, not spinning](../img/stop-dark.png#gh-dark-mode-only)
+![A reply stopped while its command was running: the card is closed, not spinning](../img/stop-light.png)
 
 That is what `/stop` is for. With `SEND_STOP_ON_CANCEL` on (the default), the Pipe sends it right after the abort, so a long shell command or browser action is killed instead of running on against a chat nobody is watching.
 
@@ -115,8 +112,7 @@ Valve: [`SEND_STOP_ON_CANCEL`](../configuration.md#send_stop_on_cancel) (on).
 
 Open WebUI implements "Send now" on a queued message (and sending while a reply runs with its message queue off) as a Stop followed by the new message. Both reach the server as the same cancel, and the queue lives only in the browser, so the server cannot tell them apart. Aborting on that cancel would kill the running reply and every sub-agent it spawned.
 
-![After Send now: the running reply finished, then the new message's own answer](../img/send-now-light.png#gh-light-mode-only)
-![After Send now: the running reply finished, then the new message's own answer](../img/send-now-dark.png#gh-dark-mode-only)
+![After Send now: the running reply finished, then the new message's own answer](../img/send-now-light.png)
 
 So the Pipe asks the page. It installs a small listener in the chat page that records which you pressed: Stop or Escape, versus Send now or Enter while a reply runs. On a cancel it reads that answer through Open WebUI's `execute` event:
 

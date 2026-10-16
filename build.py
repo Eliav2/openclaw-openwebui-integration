@@ -314,9 +314,7 @@ def render_configuration() -> str:
         "Changes apply on the next message, with no restart.",
         "",
         "![The Pipe's valves in Open WebUI's admin panel, from Owner Users down]"
-        "(./img/valves-light.png#gh-light-mode-only)",
-        "![The Pipe's valves in Open WebUI's admin panel, from Owner Users down]"
-        "(./img/valves-dark.png#gh-dark-mode-only)",
+        "(./img/valves-light.png)",
     ]
     for heading, fragment, filename in _VALVE_SOURCES:
         lines += ["", f"## {heading}", "", f"File: `{filename}`."]

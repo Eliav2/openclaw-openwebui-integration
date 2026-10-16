@@ -14,8 +14,7 @@ The implementation is in [`src/openclaw_pipe_pkg/askuser.py`](../../src/openclaw
 
 ## What the question looks like
 
-![A question from the agent as a card: three options with descriptions, the first tagged Recommended, and an Other field](../img/question-card-light.png#gh-light-mode-only)
-![A question from the agent as a card: three options with descriptions, the first tagged Recommended, and an Other field](../img/question-card-dark.png#gh-dark-mode-only)
+![A question from the agent as a card: three options with descriptions, the first tagged Recommended, and an Other field](../img/question-card-light.png)
 
 On a recent Open WebUI (see [Versions](../versions.md)) the question renders as Open WebUI's own inline question card, the one its built-in `ask_user` tool uses: a header, the question, one row per option with an optional description, the first option tagged Recommended, and an Other field for a typed answer. Older Open WebUI releases get the dialogs in the last column.
 

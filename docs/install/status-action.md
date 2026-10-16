@@ -8,13 +8,11 @@ Valves: [`GATEWAY_URL`](../configuration.md#gateway_url), [`GATEWAY_TOKEN`](../c
 
 A button on the message toolbar:
 
-![The OpenClaw Status button on the message toolbar](../img/toolbar-button-light.png#gh-light-mode-only)
-![The OpenClaw Status button on the message toolbar](../img/toolbar-button-dark.png#gh-dark-mode-only)
+![The OpenClaw Status button on the message toolbar](../img/toolbar-button-light.png)
 
 and, in OpenClaw chats, a **Status** button in the composer, next to the integrations button:
 
-![The Status button in the composer, next to the integrations button](../img/composer-status-light.png#gh-light-mode-only)
-![The Status button in the composer, next to the integrations button](../img/composer-status-dark.png#gh-dark-mode-only)
+![The Status button in the composer, next to the integrations button](../img/composer-status-light.png)
 
 Both open the same dialog. What it shows and how to use it: [Status](../features/status.md).
 
