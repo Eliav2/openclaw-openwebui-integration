@@ -126,7 +126,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [main, fix1, fix12, fix123]
+        variant: [fix1, fix12]
         rep: [1, 2, 3, 4, 5]
     steps:
       - name: Ref under test
@@ -161,7 +161,8 @@ jobs:
         env:
           VARIANT: ${{ matrix.variant }}
           PAGE_SAVES: "0"
-          REJOIN_S: "5"
+          # One join per chat at the start, then none: the turns alone.
+          REJOIN_S: "100000"
           REF: ${{ steps.ref.outputs.sha }}
           REP: ${{ matrix.rep }}
           OUT: ${{ runner.temp }}/pipe-replay-${{ matrix.variant }}-${{ matrix.rep }}.jsonl
@@ -181,6 +182,7 @@ jobs:
             ${{ runner.temp }}/e2e-logs
 
   chat-size:
+    if: false
     name: chat size alone (rep ${{ matrix.rep }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
