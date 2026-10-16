@@ -9639,6 +9639,15 @@ class BackgroundAgentLineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(waiting, ["Waiting on 1 background agent", "Waiting on 2 background agents"])
         self.assertNotIn("Bash done", self.statuses)
 
+    def test_what_counts_as_a_background_agent(self):
+        launch = self.ocp._is_background_agent_launch
+        launched = "Async agent launched successfully."
+        # Any case: the Gateway lowercases some tool names.
+        self.assertTrue(launch("Agent", launched) and launch("agent", launched))
+        self.assertFalse(launch("Agent", launched, True))
+        self.assertFalse(launch("Agent", "Report: done"))
+        self.assertFalse(launch("sessions_spawn", launched))
+
     async def test_an_agent_that_ran_in_the_foreground_is_not_waited_on(self):
         await self._turn(self._tool("start", "Agent", "t1"), self._tool("result", "Agent", "t1", "Report: done"),
                          self._final("run-1"))

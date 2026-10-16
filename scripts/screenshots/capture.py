@@ -317,7 +317,7 @@ STATUS_ROOT = "#openclaw-status-modal-root"
 # Each Status dialog section: still loading (its skeleton) or filled.
 SECTION_STATES = """() => Object.fromEntries(['context', 'limits', 'background', 'subagents', 'agents'].map(n => {
   const s = document.getElementById('openclaw-status-section-' + n);
-  return [n, !s ? 'missing' : s.querySelector('[data-openclaw-loading]') ? 'loading' : 'filled'];
+  return [n, !s ? 'missing' : s.querySelector(':scope > [data-openclaw-loading]') ? 'loading' : 'filled'];
 }))"""
 # The dialog's scroll box and where its title bar and footer sit.
 DIALOG_LAYOUT = """() => {
@@ -698,7 +698,8 @@ class Scenes:
         root = STATUS_ROOT
         try:
             with open(USAGE_DELAY_FILE, "w", encoding="utf-8") as fh:
-                fh.write("25000")
+                # Under the Action's 10 s timeout for this request.
+                fh.write("6000")
             try:
                 opened = time.monotonic()
                 page.locator('button[aria-label="OpenClaw status"]').click()

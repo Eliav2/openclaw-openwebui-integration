@@ -285,7 +285,7 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     queued: ['Queued', '#9ca3af'], running: ['Running', '#3b82f6'], completed: ['Done', '#10b981'],
     failed: ['Failed', '#f43f5e'], cancelled: ['Cancelled', '#f59e0b'], timed_out: ['Timed out', '#f59e0b'],
     ended: ['Ended', '#9ca3af'], launched: ['Background', '#9ca3af'], returned: ['Returned', '#10b981'],
-    'cut off': ['Cut off', '#f59e0b'],
+    'cut off': ['Cut off', '#f59e0b'], scheduled: ['Scheduled', '#9ca3af'], skipped: ['Skipped', '#f59e0b'],
   };
   function setChip(chip, status) {
     const c = CHIP[status] || [String(status || 'unknown'), '#9ca3af'];
@@ -948,9 +948,9 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     });
   }
 
-  // One list row (ELI-155): a one-line title (after a grey kind word when
-  // given), a status chip and the time, then at most two lines of preview.
-  // A row with `open` is a button that opens its detail.
+  // One list row (ELI-155): a one-line title, a status chip and the time,
+  // then at most two lines of preview. A row with `open` is a button that
+  // opens its detail.
   function listRow(o) {
     const el = document.createElement(o.open ? 'button' : 'div');
     if (o.open) {
@@ -965,18 +965,7 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     const titleEl = document.createElement('div');
     titleEl.dataset.openclawTitle = '1';
     titleEl.className = 'text-sm text-gray-700 dark:text-gray-200 flex-1';
-    if (o.kindLabel) {
-      const k = document.createElement('span');
-      k.dataset.openclawKind = '1';
-      k.className = 'text-gray-400 dark:text-gray-500';
-      k.textContent = o.kindLabel + ' ';
-      titleEl.appendChild(k);
-      const t = document.createElement('span');
-      t.textContent = o.title;
-      titleEl.appendChild(t);
-    } else {
-      titleEl.textContent = o.title;
-    }
+    titleEl.textContent = o.title;
     top.appendChild(oneLine(titleEl));
     top.appendChild(statusChip(o.status));
     if (o.time) top.appendChild(o.time);
@@ -1454,28 +1443,30 @@ _BACKGROUND_FILL_JS_TEMPLATE = r"""
   const fold = S.collapsible('background', S.countLabel('Background', rows.length, DATA.total || 0), live);
   section.appendChild(fold.wrap);
 
-  // An automation's time: running for, else when it runs next.
-  function automationTime(r) {
-    if (r.status === 'running') return S.elapsedCell(r.startedAt, null, true);
-    if (!r.nextRunAtMs) return null;
-    const cell = S.timeCell('next ' + new Date(r.nextRunAtMs).toLocaleString([], {
+  // The row's second line: what it is, then what it says. The title keeps
+  // the whole first line.
+  function line(kind, detail) {
+    return [kind, detail].filter(Boolean).join(' · ') || null;
+  }
+  // An automation: its error when it failed, else when it runs next.
+  function automationDetail(r) {
+    if (r.status === 'failed') {
+      return (r.failedInARow > 1 ? 'failed ' + r.failedInARow + ' times in a row: ' : '') + (r.error || '');
+    }
+    if (r.status === 'running' || !r.nextRunAtMs) return null;
+    return 'next run ' + new Date(r.nextRunAtMs).toLocaleString([], {
       month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
-    }));
-    cell.title = 'Next run';
-    return cell;
+    });
   }
-  function automationPreview(r) {
-    if (r.status !== 'failed') return null;
-    return (r.failedInARow > 1 ? 'Failed ' + r.failedInARow + ' times in a row: ' : '') + (r.error || '');
-  }
-  function row(r) {
+  function row(r, other) {
     if (r.job) {
-      return S.listRow({ kind: 'openclawBgRow', kindLabel: r.kind, title: r.title, status: r.status,
-                         time: automationTime(r), preview: automationPreview(r) });
+      return S.listRow({ kind: 'openclawBgRow', title: r.title, status: r.status,
+                         time: r.status === 'running' ? S.elapsedCell(r.startedAt, null, true) : null,
+                         preview: line(other ? null : r.kind, automationDetail(r)) });
     }
     return S.listRow({
-      kind: 'openclawBgRow', kindLabel: r.kind, title: r.title, status: r.status,
-      time: S.elapsedCell(r.startedAt, r.endedAt, isLive(r)), preview: r.preview,
+      kind: 'openclawBgRow', title: r.title, status: r.status,
+      time: S.elapsedCell(r.startedAt, r.endedAt, isLive(r)), preview: line(r.kind, r.preview),
       open: r.agent ? function() { S.openAgentDetail(r.agent); } : null,
     });
   }
@@ -1485,13 +1476,13 @@ _BACKGROUND_FILL_JS_TEMPLATE = r"""
     fold.body.appendChild(S.noteEl('Background commands and media jobs are not available on this Gateway.'));
   }
   if (!rows.length) fold.body.appendChild(S.noteEl('Nothing in the background for this chat.'));
-  rows.forEach(function(r) { fold.body.appendChild(row(r)); });
+  rows.forEach(function(r) { fold.body.appendChild(row(r, false)); });
 
   if (DATA.owner && others.length) {
     const head = S.sectionHeader(S.countLabel('Other automations', others.length, DATA.automationsTotal || 0));
     head.style.marginTop = '10px';
     fold.body.appendChild(head);
-    others.forEach(function(r) { fold.body.appendChild(row(r)); });
+    others.forEach(function(r) { fold.body.appendChild(row(r, true)); });
   }
   S.touchFooter(DATA.fetchedAt, DATA.source);
 })();
@@ -1750,7 +1741,7 @@ def _agent_call_rows(chat):
         results = {o.get("call_id"): o for o in output if o.get("type") == "function_call_output"}
         for item in output:
             name = item.get("name") or ""
-            if item.get("type") != "function_call" or name.replace(TOOL_ERROR_MARK, "").strip() != _AGENT_TOOL_NAME:
+            if item.get("type") != "function_call" or not _is_agent_tool(name.replace(TOOL_ERROR_MARK, "")):
                 continue
             try:
                 args = json.loads(item.get("arguments") or "{}")
@@ -1973,7 +1964,8 @@ def _task_row(task: dict, commands: dict) -> dict:
         "status": status,
         "startedAt": task.get("startedAt") or task.get("createdAt"),
         "endedAt": None if live else (task.get("endedAt") or task.get("updatedAt")),
-        "preview": (task.get("progressSummary") if live
+        # A running command's progress is always "Command running": its chip says so.
+        "preview": (None if live and kind == "exec" else task.get("progressSummary") if live
                     else (task.get("error") or task.get("terminalSummary"))),
     }
 

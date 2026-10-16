@@ -82,8 +82,9 @@ class RowTests(unittest.TestCase):
         data = self.rows([_task("exec", "running", title="CLI command", sourceId="good-lagoon",
                                 progressSummary="Command running")])
         cmd = next(r for r in data["rows"] if r["kind"] == "Command")
+        # Its progress is always "Command running", which its chip says.
         self.assertEqual((cmd["title"], cmd["status"], cmd["preview"], cmd["endedAt"]),
-                         ("sleep 25; echo done", "running", "Command running", None))
+                         ("sleep 25; echo done", "running", None, None))
 
     def test_kinds_this_section_lists_and_the_ones_it_leaves_to_others(self):
         data = self.rows([
@@ -377,9 +378,9 @@ class BackgroundPageTests(unittest.TestCase):
     def test_open_while_something_runs_with_the_count_in_its_title(self):
         seen = self.page([_bg([self.CMD, self.JOB])], ["background"])["background"]
         self.assertEqual(seen["open"], "true")
-        self.assertEqual(seen["texts"][:6], ["Background (2)", "Command ", "sleep 25; echo done", "Running", "1m",
-                                             "Command running"])
-        self.assertIn("Failed 3 times in a row: model 529", seen["texts"])
+        self.assertEqual(seen["texts"][:5], ["Background (2)", "sleep 25; echo done", "Running", "1m",
+                                             "Command · Command running"])
+        self.assertEqual(seen["texts"][5:8], ["nightly", "Failed", "Automation · failed 3 times in a row: model 529"])
 
     def test_folded_when_nothing_runs_and_a_tap_wins_over_a_refill(self):
         idle = _bg([{**self.CMD, "status": "completed", "endedAt": NOW}])
@@ -396,7 +397,9 @@ class BackgroundPageTests(unittest.TestCase):
     def test_an_owner_sees_the_other_automations_under_their_own_title(self):
         other = {**self.JOB, "id": "j2", "title": "heartbeat", "status": "scheduled", "error": None}
         seen = self.page([_bg([], owner=True, automations=[other], automationsTotal=7)], ["background"])
-        self.assertIn("Other automations (1 of 7)", seen["background"]["texts"])
+        texts = seen["background"]["texts"]
+        self.assertEqual(texts[texts.index("Other automations (1 of 7)") + 1:][:2], ["heartbeat", "Scheduled"])
+        self.assertTrue(texts[-1].startswith("next run "), texts)
 
     def test_a_folded_subagents_section_asks_for_its_rows_once_on_its_first_tap(self):
         pending = action._render_subagents_fill_js({

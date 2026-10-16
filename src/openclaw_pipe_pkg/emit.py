@@ -21,8 +21,14 @@ _AGENT_TOOL_NAME = "Agent"
 _AGENT_LAUNCHED_PREFIX = "Async agent launched"
 
 
+def _is_agent_tool(name) -> bool:
+    """Claude Code calls it `Agent`; in any case, as the Gateway lowercases
+    the names of some tools. OpenClaw has no tool of its own by that name."""
+    return (name or "").strip().lower() == _AGENT_TOOL_NAME.lower()
+
+
 def _is_background_agent_launch(name, result_text, is_error=False) -> bool:
-    return (not is_error and (name or "").strip() == _AGENT_TOOL_NAME
+    return (not is_error and _is_agent_tool(name)
             and (result_text or "").strip().startswith(_AGENT_LAUNCHED_PREFIX))
 
 
