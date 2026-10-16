@@ -32,7 +32,11 @@ OUT = os.environ.get("OUT", "pipe-replay.jsonl")
 MODEL = "openclaw_gateway.default"
 SIZES = [30, 16, 12]
 TOOLS = int(os.environ.get("TOOLS", "40"))
-REJOIN_S = 5
+REJOIN_S = float(os.environ.get("REJOIN_S", "5"))
+# JOINS_ONLY: no turns and no page saves, only the reconnecting tabs for
+# JOINS_S seconds (fix 3 alone).
+JOINS_ONLY = os.environ.get("JOINS_ONLY") == "1"
+JOINS_S = 60
 SCENE = "ELI115_REPLAY_TOOLS"      # replay-scene.json
 DONE = "ELI115_REPLAY_DONE"
 TURN_TIMEOUT_S = 900
@@ -292,6 +296,28 @@ async def main():
     stop = asyncio.Event()
     joins, save_lat = [], []
     t0 = time.monotonic()
+    if JOINS_ONLY:
+        with Peak() as p:
+            background = [asyncio.ensure_future(rejoining_tab(token, cid, stop, joins)) for cid, _ in chats]
+            await asyncio.sleep(JOINS_S)
+            stop.set()
+            await asyncio.gather(*background, return_exceptions=True)
+        await asyncio.sleep(5)
+        anon, swap = mem()
+        pushes = [j for j in joins if j.get("pushed")]
+        row = {"kind": "joins-only", "variant": os.environ.get("VARIANT"), "ref": os.environ.get("REF"),
+               "rep": os.environ.get("REP"), "rejoin_s": REJOIN_S, "chats_mb": SIZES,
+               "before": before, "peak": p.peak, "anon_peak": p.anon_peak, "after": anon + swap,
+               "joins": len(joins), "pushes": len(pushes),
+               "push_s_avg": round(sum(j["s"] for j in pushes) / max(1, len(pushes)), 2),
+               "push_last_user": all(j["pushed"] == ch["history"]["messages"][ch["history"]["currentId"]]["parentId"]
+                                     for j in pushes for cid, ch in chats if cid == j["chat"])}
+        print(json.dumps(row), flush=True)
+        with open(OUT, "a") as f:
+            f.write(json.dumps(row) + "\n")
+        if not pushes or not row["push_last_user"]:
+            raise SystemExit("consumer check failed: the tabs got no right push")
+        return
     with Peak() as p:
         background = [asyncio.ensure_future(rejoining_tab(token, cid, stop, joins)) for cid, _ in chats]
         if PAGE_SAVES:

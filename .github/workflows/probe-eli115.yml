@@ -126,7 +126,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [main, fix1, fix12, fix123]
+        variant: [fix12, fix123]
         rep: [1, 2, 3]
     steps:
       - name: Ref under test
@@ -161,6 +161,8 @@ jobs:
         env:
           VARIANT: ${{ matrix.variant }}
           PAGE_SAVES: "0"
+          JOINS_ONLY: "1"
+          REJOIN_S: "1"
           REF: ${{ steps.ref.outputs.sha }}
           REP: ${{ matrix.rep }}
           OUT: ${{ runner.temp }}/pipe-replay-${{ matrix.variant }}-${{ matrix.rep }}.jsonl
