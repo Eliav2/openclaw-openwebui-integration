@@ -479,7 +479,6 @@ MOCK_BACKGROUND_SECTION = r"""() => {
 MOCK_COMPOSER_CHIP = r"""() => {
   document.activeElement && document.activeElement.blur();
   const box = document.getElementById('message-input-container');
-  const form = box.querySelector('form');
   const row = document.createElement('div');
   row.className = 'flex justify-center';
   row.style.marginBottom = '8px';
@@ -491,7 +490,7 @@ MOCK_COMPOSER_CHIP = r"""() => {
   chip.innerHTML = '<span style="width:7px;height:7px;border-radius:9999px;background:#3b82f6;display:inline-block"></span>'
     + '3 running in the background<span style="color:#9ca3af;font-weight:500">· npm run build, 2 more</span>';
   row.appendChild(chip);
-  form.parentElement.insertBefore(row, form);
+  box.parentElement.insertBefore(row, box);
 }"""
 
 
@@ -847,8 +846,7 @@ class Scenes:
         page.wait_for_selector(root, state="detached", timeout=10_000)
         page.evaluate(MOCK_COMPOSER_CHIP)
         clip = """() => {
-          const f = document.getElementById('message-input-container');
-          const r = f.getBoundingClientRect();
+          const r = document.getElementById('message-input-container').getBoundingClientRect();
           const top = Math.max(0, r.top - 260);
           return {x: 0, y: top, width: innerWidth, height: Math.min(innerHeight, r.bottom + 8) - top};
         }"""
