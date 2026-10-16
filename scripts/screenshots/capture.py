@@ -425,6 +425,70 @@ def back_to_dialog(page: Page) -> None:
     page.wait_for_selector("#openclaw-drawer-root", state="detached", timeout=10_000)
 
 
+# ELI-163 mockups: static rows in the dialog's own style (window.__openclawStatus).
+MOCK_BACKGROUND_SECTION = r"""() => {
+  const S = window.__openclawStatus;
+  const anchor = document.getElementById('openclaw-status-section-limits');
+  const sec = document.createElement('div');
+  sec.id = 'openclaw-status-section-background';
+  sec.className = 'mb-4';
+  sec.appendChild(S.sectionHeader('Background (5)'));
+  const rows = [
+    ['Shell', 'pytest -q tests/', 'running', '1:12', 'Started by this chat. Last line: 212 passed, collecting e2e/'],
+    ['Agent', 'Survey the forecast repo', 'launched', '0:48', 'Claude Code agent: the reply stays open until it reports back'],
+    ['Image', 'Watercolor fox for the README', 'running', '0:20', ''],
+    ['Automation', 'Upstream watch', 'failed', '14:05', '401 from api.github.com, 3 runs in a row. Next run 20:05'],
+    ['Automation', 'Morning brief', 'completed', '07:30', 'Next run tomorrow 07:30'],
+  ];
+  rows.forEach(function(r) {
+    const el = document.createElement('button');
+    el.type = 'button';
+    el.className = 'w-full block text-left py-1.5 px-1.5 -mx-1.5 rounded-lg hover:bg-gray-50';
+    const top = document.createElement('div');
+    top.className = 'flex items-center gap-2';
+    const t = document.createElement('div');
+    t.className = 'text-sm text-gray-700 flex-1';
+    const k = document.createElement('span');
+    k.className = 'text-gray-400';
+    k.textContent = r[0] + '  ';
+    t.appendChild(k);
+    t.appendChild(document.createTextNode(r[1]));
+    top.appendChild(S.oneLine(t));
+    top.appendChild(S.statusChip(r[2]));
+    const time = document.createElement('span');
+    time.className = 'text-gray-400 shrink-0';
+    time.style.fontSize = '10px';
+    time.textContent = r[3];
+    top.appendChild(time);
+    el.appendChild(top);
+    if (r[4]) {
+      const p = document.createElement('div');
+      p.className = 'text-xs text-gray-400 break-words mt-0.5';
+      p.textContent = r[4];
+      el.appendChild(S.clampLines(p, 2));
+    }
+    sec.appendChild(el);
+  });
+  const stop = document.createElement('div');
+  stop.className = 'text-xs text-gray-400 mt-1';
+  stop.textContent = 'Tap a row for its output, Stop or Retry. Automations are shown to owners only.';
+  sec.appendChild(stop);
+  anchor.parentElement.insertBefore(sec, anchor);
+}"""
+
+MOCK_COMPOSER_CHIP = r"""() => {
+  const b = document.querySelector('button[aria-label="OpenClaw status"]');
+  const chip = document.createElement('button');
+  chip.type = 'button';
+  chip.id = 'openclaw-mock-chip';
+  chip.title = '3 background jobs running';
+  chip.className = 'flex gap-1 items-center text-xs rounded-full shrink-0 font-semibold';
+  chip.style.cssText = 'padding:3px 9px;color:#3b82f6;background:#3b82f622;';
+  chip.innerHTML = '<span style="width:6px;height:6px;border-radius:9999px;background:#3b82f6;display:inline-block"></span>3 running';
+  b.parentElement.insertBefore(chip, b.nextSibling);
+}"""
+
+
 class Shooter:
     def __init__(self, out: str, only: set | None):
         self.out, self.only = out, only
@@ -763,6 +827,27 @@ class Scenes:
         }}"""
         self.s.shot(page, "usage-goal", clip_js=clip, text_selector=".chat-assistant >> nth=-1")
 
+    def eli163_mockups(self, page: Page) -> None:
+        """ELI-163 step 0 mockups, injected into the real dialog and composer:
+        option A a Background section, option B a composer chip."""
+        page.goto(f"{BASE}/c/{self.hero_chat}")
+        page.locator('button[aria-label="OpenClaw status"]').click()
+        root = "#openclaw-status-modal-root"
+        wait_js(page, f"() => {{ const r = document.querySelector('{root}'); return r && /5h/.test(r.innerText) && !r.querySelector('.animate-pulse'); }}",
+                "the status dialog filled", 60_000)
+        page.evaluate(MOCK_BACKGROUND_SECTION)
+        self.s.shot(page, "eli163-option-a", text_selector=root)
+        page.keyboard.press("Escape")
+        page.wait_for_selector(root, state="detached", timeout=10_000)
+        page.evaluate(MOCK_COMPOSER_CHIP)
+        clip = """() => {
+          const f = document.getElementById('openclaw-mock-chip').closest('form');
+          const r = f.getBoundingClientRect();
+          const top = Math.max(0, r.top - 260);
+          return {x: 0, y: top, width: innerWidth, height: Math.min(innerHeight, r.bottom + 8) - top};
+        }"""
+        self.s.shot(page, "eli163-option-b", clip_js=clip, text_selector="form")
+
     def compact(self, page: Page) -> None:
         """The Status dialog's context section with its Compact pill, on the
         hero chat (three tool calls of history). No "after" shot: right after
@@ -1054,6 +1139,7 @@ def main(argv=None) -> int:
             if scenes.hero_chat:
                 shooter.run("thinking-level", scenes.thinking_level, page)
                 shooter.run("compact-before", scenes.compact, page)
+                shooter.run("eli163-mockups", scenes.eli163_mockups, page)
             if scenes.hero_chat:
                 dpage = signed_in_page(browser, token, DESKTOP)
                 shooter.run("toolbar-button", scenes.toolbar, dpage)
