@@ -36,7 +36,7 @@ async def _introduce_turn_message(chat_id: str, user_id: str, messages: dict, cu
     """Show a newly claimed message in every open tab of the chat without a
     reload: the shared `chat:messages` event to room `chat:<id>`, which the
     page merges and moves its view to (Open WebUI emits the same for its own
-    turns; measured live as M1)."""
+    turns)."""
     from open_webui.socket.main import sio
 
     await sio.emit("events", {
@@ -64,7 +64,7 @@ def _run_prompt_text(span: list | None) -> str:
 
 def _last_item_text(renderer: "_TurnRenderer") -> str:
     """The text of the run's last message item, the only one a closing
-    question can be in; fences never span items (review 2af1 F4). "" when
+    question can be in; fences never span items. "" when
     the run ended on a tool call."""
     last = renderer.output[-1] if renderer.output else None
     if last is None or last.get("type") != "message":
@@ -93,7 +93,7 @@ def _prompt_tail(text: str, start: int = 0) -> str:
 RESUME_DIRECTIVE_PREFIX = "[system] Your previous "
 
 
-# A request longer than this is quoted as its head and tail (review 2af1 F2).
+# A request longer than this is quoted as its head and tail.
 RESUME_REQUEST_MAX = 6000
 RESUME_REQUEST_HEAD = 2000
 # OpenClaw's inbound metadata blocks a stored user turn can start with
@@ -103,7 +103,7 @@ _INBOUND_META_RE = re.compile(
 
 
 def _strip_inbound_meta(text: str) -> str:
-    """`text` without the metadata blocks in front of it (review 2af1 F5)."""
+    """`text` without the metadata blocks in front of it."""
     while True:
         m = _INBOUND_META_RE.match(text or "")
         if not m:
@@ -113,7 +113,7 @@ def _strip_inbound_meta(text: str) -> str:
 
 def _quote_block(text: str) -> str:
     """`text` between two delimiter lines that occur in it as no line: a run
-    of dashes longer than any dash-only line of its own (review 2af1 F2b)."""
+    of dashes longer than any dash-only line of its own."""
     dashes = [len(x.strip()) for x in text.split("\n") if x.strip() and set(x.strip()) == {"-"}]
     delim = "-" * max([3] + [n + 1 for n in dashes])
     return f"{delim}\n{text}\n{delim}"
@@ -122,7 +122,7 @@ def _quote_block(text: str) -> str:
 def _clip_middle(text: str, limit: int = RESUME_REQUEST_MAX, head: int = RESUME_REQUEST_HEAD) -> str:
     """`text` within `limit` characters: its head and tail, the question a
     long request usually ends with included, and a line for what is left
-    out (review 2af1 F2)."""
+    out."""
     if len(text) <= limit:
         return text
     tail = limit - head
@@ -135,14 +135,13 @@ def _resume_directive(shown: str | None, request: str | None = None,
 
     A resume follows an outside kill (the owner rule), which also kills any
     tool call still running. Its result then reads like the command failing
-    (`Exit code 137`), and a resume that does not say why stopped there and
-    asked the user what to do (M3 window, 2026-10-13: 4 of 4).
+    (`Exit code 137`), so the resume says why, or the agent stops there and
+    asks the user what to do.
 
     `request`: the user's message the run was answering. The killed run's
     claude-cli session is not continued: the resume runs in a new one that
-    holds only this message (M3 window run 2, 2026-10-14: "I don't have the
-    rest of your sequence"), so the request travels in it. `attachments`:
-    how many images or files it carried, which do not travel (F3)."""
+    holds only this message, so the request travels in it. `attachments`:
+    how many images or files it carried, which do not travel."""
     cause = (
         "The Gateway restarted or your process was killed from outside while you "
         "were working. A tool call that was still running was killed by that, so "
@@ -381,7 +380,7 @@ class _TurnWriter:
         self.pending_resume = False     # a resume the Gateway refused; sent on the next hello-ok
         self.request: str | None = None  # the user's message M answers, quoted by a resume
         self.request_attachments = 0    # its images or files, which a resume cannot carry
-        self.awaiting_row = False       # kept open for a Gateway recovery (R2)
+        self.awaiting_row = False       # kept open for a Gateway recovery
         self.closed = False             # nothing more to write (ended, or M is someone else's)
         self.sent_output: list = []     # the `output` open tabs hold
         if renderer is not None:
@@ -531,8 +530,7 @@ class _TurnWriter:
             prev = run
 
     async def _view(self, *, final: bool) -> tuple[list, str]:
-        """(output, text) of M as the inline reply shows a run (review 2af1
-        R4): the rewrites it recorded (an image for a `MEDIA:` directive, a
+        """(output, text) of M as the inline reply shows a run: the rewrites it recorded (an image for a `MEDIA:` directive, a
         card for an answered ask-user prompt) applied to the renderer, a
         directive that first came after the handover resolved here, and,
         while the run streams, a directive whose filename is still arriving
@@ -602,8 +600,8 @@ class _TurnWriter:
         """Runs written into M whose events never reached this writer: restart
         recoveries that rule E maps to M (they ran while the socket was down,
         case 4), and pipe runs naming M, such as the question run an ask-user
-        answer run continues after an Open WebUI restart left no target
-        (review 2af1 R9). M's runs are put in transcript order."""
+        answer run continues after an Open WebUI restart left no target.
+        M's runs are put in transcript order."""
         order = []
         for run, tool in _history_user_turns(messages):
             if run in self.runs or (
@@ -620,7 +618,7 @@ class _TurnWriter:
             return
         decision = next_continuation(row, stop_notice_before, self.resumes)
         if decision in ("gateway", "wait"):
-            # The pump stays (R2): the recovery run takes M over (rule E), or a
+            # The pump stays: the recovery run takes M over (rule E), or a
             # later row leaves `running`. A recovery the Gateway gives up on
             # tombstones the row to failed (main-session-restart-recovery-
             # CPJjd8da.mjs:1150), which is that row.
@@ -645,8 +643,8 @@ class _TurnWriter:
 
     async def _ask_question(self) -> bool:
         """A run that ends with a question asks it as the inline reply does:
-        Open WebUI's question card on the tab viewing the chat (ELI-107
-        decision 1, option 1). One card call, bounded by its own timeout, so
+        Open WebUI's question card on the tab viewing the chat (ELI-107).
+        One card call, bounded by its own timeout, so
         M waits for no tab. The answer is sent as an `input` run that this
         writer adopts, and the question shows as its Ask User card. False
         when nothing was sent: no question, no tab on the chat, a cancel, a
@@ -719,8 +717,8 @@ class _TurnWriter:
         of the first run written into M, in transcript order, that is not
         itself a resume. Every run naming M counts, so M's own first run (a
         pipe run or an agent turn) is found even when this writer was made
-        for a later run of M, a redeploy's or an Open WebUI restart's (review
-        2af1 F1). (None, 0) when the transcript cannot be read (the resume
+        for a later run of M, a redeploy's or an Open WebUI restart's.
+        (None, 0) when the transcript cannot be read (the resume
         then goes without it)."""
         try:
             hist = await self.conn.session_history(self.session_key, limit=RUN_HISTORY_LIMIT)
@@ -733,8 +731,8 @@ class _TurnWriter:
             if not run or not (run in self.runs or run_message_id(
                     self.session_key, self.chat_id, run, messages) == self.message_id):
                 continue
-            # The user's answer to M's question and a resume are no request
-            # (review 2af1 N2): only M's reply run or an agent turn is.
+            # The user's answer to M's question and a resume are no request:
+            # only M's reply run or an agent turn is.
             if (parse_pipe_run_id(run) or {}).get("kind") in ("input", "resume"):
                 continue
             content = m.get("content")
@@ -744,7 +742,7 @@ class _TurnWriter:
                 if isinstance(b, dict) and b.get("type") == "text")
             text = _strip_inbound_meta(text)
             # Content blocks, or (how the Gateway stores an Open WebUI image
-            # turn) string content with the images in `__openclaw.media` (N1).
+            # turn) string content with the images in `__openclaw.media`.
             media = (m.get("__openclaw") or {}).get("media")
             attachments = max(sum(1 for b in blocks if isinstance(b, dict) and b.get("type") != "text"),
                               len(media) if isinstance(media, list) else 0)
@@ -823,7 +821,7 @@ class _TurnWriter:
 
     async def _show_silent_announce(self, hist: dict | None) -> None:
         """A sub-agent's completion the parent answered with silence (NO_REPLY)
-        still shows the child's result, as one card (review 2af1 R10): its
+        still shows the child's result, as one card: its
         label from the parent's spawn call, its result from the child's own
         transcript, or what was kept of it before a `cleanup: "delete"` (its
         chat final, or the transcript read as the announce run started).
@@ -853,8 +851,7 @@ class _TurnWriter:
     def release(self) -> None:
         """This writer's connection was retired by a newer deploy: end the Open
         WebUI task now and write nothing more. A task left registered keeps the
-        chat "generating" and makes orphan repair skip the chat (live 2026-10-13,
-        task 03904655 of retired 62b9927 held efe80f6a). M stays unfinished
+        chat "generating" and makes orphan repair skip the chat. M stays unfinished
         with this writer recorded, which no longer counts as live, so the
         successor adopts it (`_adopt_turn_message`) and finishes it once its
         run is over."""
@@ -873,9 +870,9 @@ class _TurnWriter:
         rebuilt = _history_renderer(wake_span(hist.get("messages"), self.wake["at"],
                                               self.wake["end"]))
         # Every card that streamed must be in it: the transcript may lack a
-        # wake's tool calls entirely (gate 2026-10-13: no import of the wake's
-        # CLI session with a user turn queued behind it), and an item count
-        # takes a text item for a card.
+        # wake's tool calls entirely (its CLI session is not imported while a
+        # user turn is queued behind it), and an item count takes a text item
+        # for a card.
         if (self._holds_streamed_calls(rebuilt, "wake's")
                 and len(rebuilt.output) >= len(self.renderer.output)
                 and len(rebuilt.text) >= len(self.renderer.text) and rebuilt.output):
@@ -886,14 +883,13 @@ class _TurnWriter:
 
         A run counts as covered when its span holds every call it streamed.
         A killed or aborted claude-cli run is never covered: its calls and
-        text are never imported (graceful window 2026-10-14; run 64028b9f).
+        text are never imported.
         The transcript is used from the first run k after which every run is
         covered; what streamed before run k's start is kept as it was, and
         the rebuild follows it with the live stream's break. So a resume
         after a killed run keeps the killed run's preamble and card, and a
-        recovery the writer joined late still gets its start back (crash
-        window 2026-10-14: its first text and card ran before the pipe was
-        back). None (keep what streamed) while a run has not closed, or when
+        recovery the writer joined late (its first text and card ran before
+        the pipe was back) still gets its start back. None (keep what streamed) while a run has not closed, or when
         the transcript covers nothing."""
         spans = [_history_span_messages(hist, r) for r in self.runs]
         if any(s is None for s in spans):
@@ -951,8 +947,8 @@ class _TurnWriter:
     def _holds_streamed_calls(self, rebuilt, whose: str) -> bool:
         """Whether a transcript rebuild holds every tool call that streamed
         into M. A transcript can lack them all: a wake's CLI session not yet
-        imported (gate 2026-10-13), or an aborted claude-cli run, whose tool
-        calls are never imported (run 64028b9f, 2026-10-14)."""
+        imported, or an aborted claude-cli run, whose tool calls are never
+        imported."""
         streamed = {o.get("id") for o in self.renderer.output if o.get("type") == "function_call"}
         missing = streamed - {o.get("id") for o in rebuilt.output if o.get("type") == "function_call"}
         if missing:
@@ -1024,9 +1020,8 @@ async def _transcript_view(conn: "_GatewayConnection", *, session_key: str, chat
     """(output, text) of M rebuilt from the transcript as the writer finalizes
     it (`_TurnWriter._view`): an answered ask-user prompt as its card, one
     nobody answered without its directive line, a `MEDIA:` directive as its
-    image. `content` is that text, so it always agrees with the items. The
-    ELI-94 reconcile wrote the bare rebuild and dropped an answered card
-    (ask-rebuild, 2026-10-14, chat d0f0c6ff)."""
+    image. `content` is that text, so it always agrees with the items, and
+    an answered card survives a reconcile."""
     view = _TurnWriter(conn, session_key=session_key, chat_id=chat_id, user_id=user_id,
                        run_id=runs[-1], message_id=message_id, renderer=rendered)
     view.runs = list(runs)
@@ -1085,7 +1080,7 @@ def _turn_route_now(conn: "_GatewayConnection", payload: dict) -> bool:
     if run.startswith(ACTION_RUN_PREFIX):
         return True  # the Status Action's own runs render nothing
     if (sess, run) in conn._held_for_live:
-        conn.drain_held(sess, run)  # the earlier ones first (review 2af1 N7)
+        conn.drain_held(sess, run)  # the earlier ones first
     if conn.live_reply_owns(sess, run):
         conn.hold_for_live(sess, run, payload)
         return True
@@ -1133,7 +1128,7 @@ def _note_child_result(conn: "_GatewayConnection", payload: dict) -> None:
     own chat final (`spawnedBy` = the parent, server-chat-CbnqM5f6.mjs
     emitChatTerminal): a `cleanup: "delete"` child is gone by the time its
     announce run ends (subagent-announce-BIG31XbZ.mjs:413), and a silent
-    announce shows this result (review 2af1 R10)."""
+    announce shows this result."""
     if payload.get("state") != "final" or not conn.parse_owui_session_key(payload.get("spawnedBy") or ""):
         return
     text = (_history_item(payload.get("message")) or {}).get("text") or ""
@@ -1203,8 +1198,7 @@ def _classifies(payload: dict) -> bool:
 
 
 def _turn_kind_known(conn: "_GatewayConnection", sess: str, run: str, payload: dict) -> bool:
-    """Review 2af1 R7: an agent run's events may reach the writer only once the
-    run is known not to be a heartbeat. Until then they are held in order;
+    """An agent run's events may reach the writer only once the run is known not to be a heartbeat. Until then they are held in order;
     the run's first classifying event releases them ahead of itself, its
     first flagged one drops them (`_note_heartbeat_run`), and its session's
     settled row releases them too (`_turn_settled`). A pipe run (the pipe
@@ -1399,8 +1393,7 @@ async def _wake_bind(conn: "_GatewayConnection", sess: str, run: str, user_id: s
     Returns ("bound", the job run's start), ("wait", None) while a cron job
     of this session runs but its turn is not readable yet (the embedded
     runtime commits it after the first events), or ("stray", None): nothing
-    runs a wake into this session, so the event is not a wake's (review
-    2af1 N2)."""
+    runs a wake into this session, so the event is not a wake's."""
     try:
         jobs = (await conn.send_request("cron.list", {"includeDisabled": True}, timeout=15)).get("jobs")
     except Exception as ex:
@@ -1411,8 +1404,8 @@ async def _wake_bind(conn: "_GatewayConnection", sess: str, run: str, user_id: s
     running_start = min((s for s in starts if isinstance(s, (int, float))), default=None)
     bound = conn._wake_turns_bound.setdefault(sess, set())
     # The turn is committed after its job started: read back until the window
-    # holds a message older than that start (review 2af1: a fixed 50-message
-    # window lost a wake that had written more before a reconnect).
+    # holds a message older than that start (a fixed window loses a wake that
+    # wrote more than it before a reconnect).
     limit, turn = 50, None
     while True:
         try:
@@ -1447,9 +1440,8 @@ async def _wake_job_start(conn: "_GatewayConnection", turn: dict, at_ms: float,
     the turn was written (`state.runningAtMs`), or have a finished run whose
     window holds both the turn and the event (`cron.runs`, kept after a
     one-shot job is deleted). Anything else that runs with runId = sessionId
-    (a node agent command, a compaction) is not a wake and opens no message
-    (live 2026-10-13: runningAtMs 1791863926518 precedes the turn's commit
-    1791863928462). An RPC failure answers None: the events wait."""
+    (a node agent command, a compaction) is not a wake and opens no message.
+    `runningAtMs` precedes the turn's commit by a few seconds. An RPC failure answers None: the events wait."""
     job, at = turn.get("job"), turn.get("at") or 0
     running = next(((j.get("state") or {}).get("runningAtMs") for j in jobs or []
                     if j.get("id") == job), None)
@@ -1504,7 +1496,7 @@ async def _wake_step(conn: "_GatewayConnection", sess: str, run: str, user_id: s
         if state == "stray":
             # Nothing runs a wake into this session: these events are no
             # wake's, and holding them would hand them to the next wake, which
-            # reuses this run id (review 2af1 N2). The next event is judged anew.
+            # reuses this run id. The next event is judged anew.
             pipe_log(f"  turn writer: {len(pump.held)} sessionId event(s) on {sess[-12:]} with no "
                      "running cron wake: not shown")
             pump.held.clear()
@@ -1557,7 +1549,7 @@ async def _wake_resync(conn: "_GatewayConnection") -> None:
         wake = pump.writer.wake
         if wake["job"] not in running:
             # The wake ended at its job run's finish, not now: a run queued
-            # behind it may have written since (review 2af1 N1). Unknown
+            # behind it may have written since. Unknown
             # (None): the transcript is not used, the message keeps what it
             # streamed.
             run = await _wake_job_run(conn, wake["job"], wake.get("at") or 0)
@@ -1617,7 +1609,7 @@ async def _turn_resync(conn: "_GatewayConnection", skip: set = frozenset()) -> N
     (except `skip`, known active) and end the ones that went idle while their
     settle was missed. Inline replies get the row busy or idle: one that lost
     its own final and settle in the gap looks for its closer even while a
-    later run keeps the session busy (review 2af1 N3)."""
+    later run keeps the session busy."""
     idle = {sess for (sess, _run) in [*conn._turn_pumps, *conn._turn_unkinded] if sess not in skip}
     idle |= {c.session_key for c in list(conn._consumers.values()) if c.session_key not in skip}
     for sess in idle:
@@ -1738,8 +1730,7 @@ async def _relay_emit_event(user_id: str, chat_id: str, message_id: str | None,
 # ── Orphaned reply stubs (ELI-90) ──
 # Open WebUI writes a reply's assistant message (`done: False`) before the
 # pipe sends anything, and only the request that streams the reply ever sets
-# `done: True`. When Open WebUI restarts mid-turn (three OOM kills on
-# 2026-10-12 16:21-16:25 UTC), that request is gone: the run finishes in the
+# `done: True`. When Open WebUI restarts mid-turn, that request is gone: the run finishes in the
 # Gateway, but the chat keeps an empty bubble that looks like it is still
 # running, forever. On the first load after the restart these stubs are
 # matched to their runs in the Gateway transcript and finished from it.
@@ -2034,8 +2025,8 @@ async def _reconcile_orphan_stubs(valves_getter) -> None:
     if stubs:
         pipe_log(f"  orphan stub reconcile: {len(stubs)} unfinished OpenClaw "
                  "repl(y/ies) in Open WebUI")
-    # One at a time: Open WebUI's SQLite rejected most of 45 concurrent chat
-    # writes (2026-10-12). Only a stub whose run is still going gets its own
+    # One at a time: Open WebUI's SQLite rejects concurrent chat writes.
+    # Only a stub whose run is still going gets its own
     # task, to wait for that run's settle.
     counts: dict = {}
     for chat_id, stub_id in stubs:

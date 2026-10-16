@@ -59,9 +59,9 @@ _GATEWAY_CONNECT_TIMEOUT_S = 10.0
 
 # Largest Gateway frame the socket accepts. websockets defaults to 1 MiB and
 # answers a bigger frame by closing the WHOLE connection (1009, "message too
-# big"), dropping every session's events: a 952-message `chat.history` is
-# 3.1 MB, and one large tool result in an agent or `session.message` event is
-# enough (measured 2026-10-12, repro_ws_max_size.py). Bounded, not None, so a
+# big"), dropping every session's events: a long `chat.history` is several
+# MB, and one large tool result in an agent or `session.message` event is
+# enough. Bounded, not None, so a
 # runaway frame still can't take the Open WebUI process's memory with it.
 GATEWAY_WS_MAX_SIZE = 64 * 1024 * 1024
 
@@ -261,8 +261,7 @@ def _recovery_text_from_items(items, user_text: str) -> str | None:
     Last, not first: a tool-using turn stores several assistant messages. On
     the claude-cli runtime the closing one repeats the whole turn's text
     (preambles included); on the embedded runtime it is the final answer. The
-    first one is only the opening preamble ("I'll look at ..."), which is what
-    recovery used to return.
+    first one is only the opening preamble ("I'll look at ...").
     """
     if not isinstance(items, list):
         return None
@@ -332,11 +331,9 @@ def _session_thinking_ladder(desc: dict) -> list | None:
     derives it as `metadata.levels.map(level => level.label)`, i.e. human
     labels ("Off", "Extra High", ...), not ids. Matching a requested level
     against labels silently breaks clamping (nothing in LEVEL_RANKS looks
-    like a label), so `thinkingOptions` must never be used for the ladder --
-    checking it first, as this used to, let an unsupported level fall
-    through the clamp and reach the gateway's own hard validation error
-    (ELI-85 field mixup, caused a live chat to hard-fail on every turn).
-    Kept only as a last-resort fallback in case a future gateway build ever
+    like a label), so `thinkingOptions` must never be used for the ladder:
+    an unsupported level would fall through the clamp and reach the
+    gateway's own hard validation error on every turn (ELI-85). Kept only as a last-resort fallback in case a future gateway build ever
     stops emitting `thinkingLevels` -- an imperfect ladder beats none.
 
     Returns None (not []) when the field is absent, because "no ladder known"
@@ -395,14 +392,13 @@ def _record_thinking_ladder(levels, model_key=None, authoritative=False,
       offers, because Open WebUI builds a valve dropdown once from the class
       and cannot vary it per selected model.
     * `models[<provider/model>]` is what the SEND path clamps against, and it
-      must be exact. Clamping against the union is what let `high` reach a
-      model whose only level is `off`.
+      must be exact: clamping against the union lets `high` reach a model
+      whose only level is `off`.
 
     `authoritative` marks a ladder the Gateway stated itself by rejecting a
     send. A merely observed one (from `sessions.describe`) must never overwrite
     it: describe resolves the ladder with no model catalog in scope and so
-    reports the generic base profile for catalog-gated models. Trusting the
-    weaker source second would undo the fix on the very next turn.
+    reports the generic base profile for catalog-gated models.
 
     Best-effort by design: a failed write costs a stale dropdown and one more
     rejected turn, and must never affect the message being sent.
@@ -568,7 +564,7 @@ def _coerce_text(value) -> str:
 
 def _content_has_image(raw_content) -> bool:
     """True if an OWUI message's `content` is a multimodal block list
-    (P39) that includes at least one image_url block. `content` is a
+    that includes at least one image_url block. `content` is a
     plain string for ordinary text-only messages -- only the list shape
     (sent when a user attaches an image) can carry one, so this returns
     False immediately for the common string case."""
@@ -585,12 +581,11 @@ _DATA_URL_RE = re.compile(r"^data:([^;,]*)(?:;[^,]*)?,(.*)$", re.DOTALL)
 
 def _extract_image_attachments(raw_content) -> list:
     """Pull inline images out of an OWUI multimodal `content` block list
-    (P39) and shape them for the gateway's `chat.send` `attachments` param:
+    and shape them for the gateway's `chat.send` `attachments` param:
     `{type, mimeType, fileName, content}` with `content` as base64.
 
     OWUI sends attached/pasted images as `image_url` blocks whose `url` is
-    a `data:<mime>;base64,<data>` URI (confirmed via OWUI's own request
-    shape, not just this bridge's tests) -- there is no plain-HTTP(S)
+    a `data:<mime>;base64,<data>` URI -- there is no plain-HTTP(S)
     `image_url` case to support here, so anything else is skipped rather
     than guessed at.
     """
@@ -641,9 +636,9 @@ _RESTART_MARKER_TYPE = "_pipe_restart"
 # lastRunId = the run) ends its reply even when its final event was lost;
 # `resync` marks a row read after a reconnect or a frame gap, where an idle
 # session means every admitted run is over; a `queued` row tells a reply
-# waiting for its first event why (review 2af1 timers).
+# waiting for its first event why.
 # `read_at` (time.monotonic) is when the row was read: a reply trusts an idle
-# row only when it was read after its run was admitted (review 2af1 N4).
+# row only when it was read after its run was admitted.
 _ROW_MARKER_TYPE = "_pipe_row"
 
 
@@ -674,9 +669,8 @@ def _item_delta_text(item_text: str, last_item_text: str, assistant_stream_text:
     # Not a prefix extension. If the item still contains the tail of what was
     # already received, it is the cumulative text with something missing
     # from the middle or the start (events lost while the Gateway socket was
-    # reconnecting): only what follows that tail is new. Returning the whole
-    # item here posted a second full copy of a 4000-line reply (2026-10-12).
-    # The missing piece comes back with the turn writer's transcript rebuild
+    # reconnecting): only what follows that tail is new; returning the whole
+    # item would post a second full copy of the reply. The missing piece comes back with the turn writer's transcript rebuild
     # (ELI-147), never appended here.
     # Shorter anchors too: the hole may sit inside the longest one.
     for n in (_WHOLE_TEXT_ANCHOR_CHARS, 128, _MIN_WHOLE_TEXT_ANCHOR_CHARS):
@@ -700,8 +694,7 @@ def _suppress_already_shown(delta: str, visible_message_text: str) -> str:
     `visible_message_text` without also updating `assistant_stream_text`.
     When that happens, `_item_delta_text`'s prefix check fails to match and
     it falls through to returning the *entire* cumulative text unchanged,
-    which then gets appended a second time with no separator (P27,
-    reproduced live 2026-07-10).
+    which then gets appended a second time with no separator.
 
     `visible_message_text` is the true, complete record of everything
     already recorded for this turn, so checking whether `delta` is already
@@ -724,9 +717,8 @@ def _attr(value: str) -> str:
     containing a literal newline fails to match and is silently DROPPED -- the
     tool card then renders with INPUT and no OUTPUT at all, with no error.
 
-    That was invisible for `arguments` (always `json.dumps`-ed, so its newlines
-    are already the two-char `\\n` escape) but hit almost every multi-line tool
-    `result`, which is passed through raw (2026-07-25).
+    `arguments` is always `json.dumps`-ed, so its newlines are already the
+    two-char `\\n` escape; a multi-line `result` is passed through raw.
 
     Encoding the newline as the numeric character reference `&#10;` keeps the
     attribute on one physical line for that regex while still decoding back to
@@ -761,21 +753,19 @@ def _tool_call_started_event(name: str, tool_call_id: str, args_str: str) -> dic
     That matters because the backend's output list is what feeds the live
     `chat:completion` emissions, the final done event AND the DB write -- so a
     tool call announced this way is mutable, unlike yielded markdown, which is
-    append-only for the rest of the turn (see the two-phase `<details>` attempt
-    that this replaced). The frontend renders a `function_call` with no matching
+    append-only for the rest of the turn. The frontend renders a `function_call` with no matching
     `function_call_output` as a spinner (`structuredOutput.ts::buildToolCallToken`).
 
     Ordering is by arrival: the item goes at the end of the output list, after
     the text streamed before it. It says so with `output_index`
     (`_OUTPUT_APPEND_INDEX`): the backend appends an item without one, but
     the chat tab's reducer (`structuredOutput.ts::applyResponseStreamEvent`)
-    splices it in BEFORE the last item, so the live card showed above the
-    text written before the call until a reload (ELI-122).
+    splices it in BEFORE the last item, and the live card would show above
+    the text written before the call until a reload (ELI-122).
 
-    The tool call id goes in `id`, and `call_id` is deliberately ABSENT. OWUI
-    0.11.0 appended every added item unconditionally, so the obvious shape
-    (`id="fc_<tid>"` + `call_id="<tid>"`) was safe. 0.11.1 rewrote that branch
-    to dedup first:
+    The tool call id goes in `id`, and `call_id` is deliberately ABSENT.
+    Open WebUI replaces an added item that shares its `id` or its `call_id`
+    with one it holds:
 
         existing_index = next(idx for idx, existing in enumerate(new_output)
             if (item['id'] and existing['id'] == item['id'])
@@ -783,11 +773,10 @@ def _tool_call_started_event(name: str, tool_call_id: str, args_str: str) -> dic
         if existing_index is not None: new_output[existing_index] = item
 
     -- so the `function_call_output` we send next, which must share the call
-    id to pair, matched this item on `call_id` and REPLACED it. The card is
-    built from the `function_call` item alone (`structuredOutput.ts`: `Ye()`
+    id to pair, would match this item on `call_id` and REPLACE it. The card
+    is built from the `function_call` item alone (`structuredOutput.ts`
     reads `call_id ?? id` and looks the output up in a by-call_id map), so
-    losing it means no card at all: no chevron, no Output, nothing. Every
-    chat from the 0.11.1 upgrade onward persisted `fc=0 fco=N`.
+    losing it means no card at all.
 
     Carrying the id in `id` only keeps both items distinct for the dedup
     (`<tid>` vs `fco_<tid>`, and neither has a `call_id` the other shares)
@@ -960,11 +949,9 @@ def _tool_call_error_relabel_event(name: str, tool_call_id: str, args_str: str) 
     hold, the backend (`handle_responses_streaming_event`, what is saved) and
     the chat tab (`structuredOutput.ts::applyResponseStreamEvent`, what shows
     while the reply streams). So the mark shows live, on any card, last or
-    not. The `response.name.done` used before only reached the backend, and
-    only its last item: the tab ignores that event, so the ❌ appeared when
-    the reply finished (ELI-124), and a call followed by anything else got
-    the banner alone. (`response.output_item.done` replaces by position in
-    the backend, which the pipe cannot know.)
+    not. `response.name.done` would reach only the backend's last item, and
+    the tab ignores it (ELI-124). (`response.output_item.done` replaces by
+    position in the backend, which the pipe cannot know.)
     """
     return _tool_call_started_event(f"{name} {TOOL_ERROR_MARK}", tool_call_id, args_str)
 
@@ -1004,19 +991,18 @@ class _TurnRenderer:
     """Reconstructs the visible assistant content of a run from its raw gateway
     event stream, mirroring the inline pipe loop's rendering.
 
-    Purpose (2026-07-19; handover since ELI-100): when the inline pipe generator ends BEFORE a
-    long run finishes (idle self-close, cancel, or a torn-down request), the
-    tail used to survive only as a truncated, tool-block-less *detached*
-    bubble read from a length-capped `sessions.preview`. This renderer instead
-    accumulates the COMPLETE content (assistant text + every tool block, in
-    order) straight from the same events the persistent connection already
-    dispatches, so the run's ORIGINAL OWUI message can be finalized to exactly
-    what a non-interrupted turn would have stored.
+    Purpose: when the inline pipe generator ends BEFORE a long run finishes
+    (cancel, or a torn-down request), the turn writer takes the message over
+    (ELI-100). This renderer accumulates the COMPLETE content (assistant text
+    + every tool block, in order) straight from the same events the
+    persistent connection already dispatches, so the run's ORIGINAL OWUI
+    message can be finalized to exactly what a non-interrupted turn would
+    have stored.
 
     Scope: assistant text deltas, item-carried text, and tool-result blocks.
     It holds the raw run text: the turn writer shows a resolved `MEDIA:` image
     and an answered ask-user card through the rewrites the inline reply
-    recorded (`note_turn_rewrite`, review 2af1 R4).
+    recorded (`note_turn_rewrite`).
     """
 
     def __init__(self):
@@ -1037,8 +1023,7 @@ class _TurnRenderer:
         self._tool_results: set[str] = set()
         # A new run continues the message (resume, recovery, answer run): its
         # first text gets the break the live stream puts between messages.
-        # The Gateway inserts it only inside one run (graceful window
-        # 2026-10-14: "...foreground.USER-DONE" across the resume).
+        # The Gateway inserts it only inside one run.
         self.run_boundary = False
 
     @property
@@ -1130,8 +1115,8 @@ class _TurnRenderer:
     def close_open_calls(self, note: str) -> list[dict]:
         """Answer every call still open with `note` and return those events.
         Open WebUI runs a streamed `function_call` that has no output when
-        the stream ends and sends the result back as a new turn (M3 crash
-        window, 2026-10-13); stored, it is a spinner forever."""
+        the stream ends and sends the result back as a new turn; stored, it
+        is a spinner forever."""
         events = self._unanswered(note)
         for event in events:
             self._tool_results.add(event["item"]["call_id"])
@@ -1243,8 +1228,8 @@ class _TurnRenderer:
 # loader execs each redeploy into a brand-new module object with no teardown hook
 # on the old one, so a connection left running by a previous deploy (a "zombie")
 # keeps its own event loop. With private bookkeeping it would not know that the
-# live connection already showed a run, and wrote that turn into the chat a
-# second time (P33, root-caused 2026-07-11). Stashing the bookkeeping on
+# live connection already showed a run, and would write that turn into the chat
+# a second time. Stashing the bookkeeping on
 # `open_webui.socket.main` (OWUI's own stable module, never reloaded by our
 # function) makes all connections read and write the *same* dicts. Since
 # ELI-100 a retired connection writes no turns at all (`_turn_route_now`).
@@ -1269,8 +1254,7 @@ def _shared_gateway_state() -> dict | None:
     # (stashed on OWUI's stable socket module), so a *new* key added in a
     # later version must be backfilled into the already-existing dict --
     # otherwise `__init__` does `_shared["new_key"]` and KeyErrors on the
-    # first request after redeploy (chat_write_locks hit exactly this,
-    # 2026-07-13).
+    # first request after redeploy.
     state.setdefault("delivered_live", {})
     state.setdefault("claimed_runs", {})
     state.setdefault("chat_write_locks", {})
@@ -1283,8 +1267,8 @@ class _RunQueue(asyncio.Queue):
     slower than its run streams holds the receive loop back instead of losing
     text. Control markers (a gap, a restart, a session row) go in past the
     bound: they are few, a lost one can leave a reply that never ends, and
-    the receive loop that puts them must never wait or raise (review 2af1 N5:
-    QueueFull there killed the loop and every run on the connection hung)."""
+    the receive loop that puts them must never wait or raise: QueueFull there
+    would kill the loop and hang every run on the connection."""
 
     def put_control(self, item) -> None:
         bound, self._maxsize = self._maxsize, 0
@@ -1382,36 +1366,18 @@ class _GatewayConnection:
         self._consumers: dict[str, _Consumer] = {}
 
         # Per-session locks serializing the queue-release -> chat.send -> run
-        # registration critical section. Two concurrent messages that release
-        # from the queue at the same instant would otherwise both send into the
-        # same idle window; the gateway steer-merges the second into the first,
-        # which then renders nothing ("no reply text"). Serializing the send so
-        # the next waiter observes the just-started run (via sessions.list
-        # hasActiveRun) closes that thundering-herd race. ELI-56.
+        # registration critical section (`session_send_lock`, ELI-56).
         self._session_send_locks: dict[str, asyncio.Lock] = {}
 
-        # Deferred aborts for cancelled turns, {session_key: {"run_id", "task"}}.
-        # OWUI 0.12 has no "send while running" that keeps the running turn:
-        # both its interrupt path and the queued message's "Send now" call
-        # stopTasksByChatId and then submit the new message ~0.5-0.8s later
-        # (measured live 2026-10-11). An immediate chat.abort on that cancel
-        # kills the turn AND every subagent it spawned (the gateway's
-        # chat.abort cascades through abortControlledSubagents). So the abort
-        # waits a short grace window, and a new message for the same session
-        # inside it claims the run instead of letting it die. A plain Stop
-        # (no follow-up message) still aborts once the window passes.
+        # Cancelled turns parked until they are claimed or released, by
+        # session key (`park_cancelled_turn`). An immediate chat.abort on a
+        # cancel would kill the turn AND every subagent it spawned, and Send
+        # now cancels the same way Stop does.
         self._pending_cancel_aborts: dict[str, dict] = {}
 
-        # ELI-59: last model applied per session, {session_key: (model, ts)}.
-        # A burst of near-simultaneous messages on one session all issue the
-        # SAME idempotent sessions.patch; under that contention the RPC can
-        # transiently time out and that message's answer is replaced by a
-        # "Model selection error". Caching the last applied value (with a
-        # short TTL -- the session model can drift externally, e.g. /model in
-        # the Control UI) lets same-model calls skip the RPC entirely, and the
-        # per-session patch lock collapses a burst to ONE in-flight patch.
-        # OWUI caveat: multiple worker processes each keep their own cache --
-        # imperfect, but strictly fewer redundant patches than before.
+        # Last model applied per session, {session_key: (model, ts)}, and the
+        # per-session patch locks (`model_patch_lock`, ELI-59). Each Open
+        # WebUI worker process keeps its own.
         self._model_patch_cache: dict[str, tuple[str | None, float]] = {}
         self._model_patch_locks: dict[str, asyncio.Lock] = {}
 
@@ -1434,7 +1400,7 @@ class _GatewayConnection:
         # has consumers for, but never writes turns (`_turn_route_now`) and
         # never reconnects once those runs are gone.
         self._retired = False
-        # ELI-100: this connection's identity as a turn writer. A message whose
+        # This connection's identity as a turn writer. A message whose
         # recorded writer is gone (`_turn_writer_alive`: retired here, or its
         # worker process exited) can be taken over (DESIGN 2.3); retire()
         # removes it.
@@ -1445,13 +1411,13 @@ class _GatewayConnection:
         self._turn_writers: dict = {}   # (chat_id, message_id) -> _TurnWriter
         self._turn_skip_runs: dict = {}  # (session_key, run_id) of heartbeat runs
         # (session_key, run_id) -> events of an agent run not yet known to be
-        # no heartbeat, and the runs known (review 2af1 R7, `_turn_kind_known`)
+        # no heartbeat, and the runs known (`_turn_kind_known`)
         self._turn_unkinded: dict = {}
         self._turn_kinded: dict = {}
-        # (child session, child run) -> a sub-agent's result (review 2af1 R10)
+        # (child session, child run) -> a sub-agent's result
         self._child_results: dict = {}
         # session_key -> run id of an inline reply with no Open WebUI message
-        # waiting for its interrupted run's owner (review 2af1 R14)
+        # waiting for its interrupted run's owner
         self._awaiting_owner: dict = {}
         self._session_ids: dict = {}     # session_key -> sessionId (a cron wake's run id)
         self._wake_turns_bound: dict = {}  # session_key -> wake turn keys given a message
@@ -1469,10 +1435,8 @@ class _GatewayConnection:
         # A reconnect is not a restart. `hello-ok.server.bootId` names the
         # Gateway process: same id after a reconnect = the same Gateway, its
         # runs are still going; a new id = it restarted and took them with it.
-        # Treating every reconnect as a restart sent a bogus "gateway
-        # restarted, resume" turn into live sessions and closed their OWUI
-        # replies while the real run kept going (2026-10-12, a 1s WebSocket
-        # drop under host memory pressure). `gateway_restarts` only counts
+        # A reconnect counted as a restart would send a bogus resume turn into
+        # live sessions and close their replies. `gateway_restarts` only counts
         # real restarts; consumers compare it, not `connection_epoch`.
         self.gateway_boot_id: str | None = None
         self.gateway_restarts = 0
@@ -1483,7 +1447,7 @@ class _GatewayConnection:
         # Delivery bookkeeping. When running inside OWUI these dicts are the
         # *same objects* for every `_GatewayConnection` in the process (see
         # `_shared_gateway_state`), so a turn shown live by one connection is
-        # seen as delivered by all of them (P33, 2026-07-11). Outside OWUI
+        # seen as delivered by all of them. Outside OWUI
         # (unit tests) each connection gets its own isolated dicts.
         _shared = _shared_gateway_state()
 
@@ -1493,19 +1457,14 @@ class _GatewayConnection:
             _shared["claimed_runs"] if _shared is not None else {}
         )
 
-        # Records, by "session_key:run_id", every *final* event that was
-        # actually dispatched to a live consumer queue (i.e. genuinely shown
-        # to an open browser tab, which persists it itself via OWUI's normal
-        # client-side flow). If the Gateway later re-emits a duplicate/retried
-        # final event for that same run_id after the tab's request has
-        # closed, this identity check catches it precisely -- unlike a
-        # content-equality check, it can't false-positive just because two
-        # unrelated turns happen to end with the same short text (e.g. "OK.",
-        # "Done."), and unlike the debounce timer alone, it doesn't depend on
-        # how long the session stays quiet afterward.
-        # Events of a run continuing a message (an ask-user answer) that
+        # `_delivered_live`: by "session_key:run_id", every *final* event
+        # dispatched to a live consumer queue (shown to an open tab, which
+        # persists it). A duplicate or retried final for that run id after
+        # the tab's request closed is caught by identity, never by comparing
+        # text (two turns can both end with "OK.").
+        # `_held_for_live`: events of a run continuing a message (an ask-user answer) that
         # arrived before its reply registered for it, while that reply still
-        # streams the message: never a turn writer's (review 2af1 N6).
+        # streams the message: never a turn writer's.
         self._held_for_live: dict[tuple[str, str], list] = {}
         self.unreachable_held_drains = 0
         self._delivered_live: dict[str, float] = (
@@ -1536,8 +1495,8 @@ class _GatewayConnection:
         # What the inline reply showed in place of raw run text, by
         # "chat_id:message_id": [(raw, shown)] for each resolved `MEDIA:`
         # directive and each ask-user prompt (its card, or its fallback text).
-        # A turn writer that takes the message over repeats them (review 2af1
-        # R4). Shared, so a successor deploy's writer has them too.
+        # A turn writer that takes the message over repeats them. Shared, so
+        # a successor deploy's writer has them too.
         self._turn_rewrites: dict[str, list] = (
             _shared["turn_rewrites"] if _shared is not None else {}
         )
@@ -1688,8 +1647,7 @@ class _GatewayConnection:
         `read_at`: when the row was read, if not just now (a resync's read
         started before its reply came back). `outside_loop`: put by a task,
         not the receive loop, which may be waiting to put an earlier event
-        into a full queue; the row waits its turn behind it (review 2af1
-        N9), in a task per queue so one stalled reply holds up no other."""
+        into a full queue; the row waits its turn behind it, in a task per queue so one stalled reply holds up no other."""
         marker = {"type": _ROW_MARKER_TYPE, "row": row, "resync": resync,
                   "read_at": time.monotonic() if read_at is None else read_at}
         for key, consumer in list(self._consumers.items()):
@@ -1746,7 +1704,7 @@ class _GatewayConnection:
         """Remember that this run streams into OWUI message `message_id` in
         `chat_id`, and start a shadow `_TurnRenderer` for it. No-op without both
         ids (e.g. a chat with no stable message id yet). `thinking`: the
-        turn's level, which a writer's resume keeps (review 2af1 R6)."""
+        turn's level, which a writer's resume keeps."""
         if not (chat_id and message_id and run_id):
             return
         key = f"{session_key}:{run_id}"
@@ -1794,11 +1752,11 @@ class _GatewayConnection:
                             shown: bool = True) -> None:
         """The inline reply moved from `run_id` to `next_run_id` (an ask-user
         answer run): the target and its shadow renderer follow it, so a
-        handover of the answer run continues the same reply (review 2af1 R9;
-        the writer finds the question run in the transcript as a pipe run of
-        the same message). The question run was shown to its end: its late
-        events open nothing. `shown=False` moves the target only: the answer
-        is not sent yet (review 2af1 N6), or its send failed and the target
+        handover of the answer run continues the same reply (the writer finds
+        the question run in the transcript as a pipe run of the same
+        message). The question run was shown to its end: its late events open
+        nothing. `shown=False` moves the target only: the answer is not sent
+        yet, or its send failed and the target
         moves back."""
         key = f"{session_key}:{run_id}"
         target = self._run_targets.pop(key, None)
@@ -1815,7 +1773,7 @@ class _GatewayConnection:
                           raw: str, shown: str) -> None:
         """The inline reply showed `shown` where its run said `raw` (a resolved
         `MEDIA:` directive, an ask-user prompt's card). A writer that takes
-        the message over shows the same (review 2af1 R4)."""
+        the message over shows the same."""
         if not (chat_id and message_id and raw) or raw == shown:
             return
         key = f"{chat_id}:{message_id}"
@@ -1953,7 +1911,7 @@ class _GatewayConnection:
         q = _RunQueue(maxsize=500)
         consumer.queues.append(q)
         for ev in self._held_for_live.pop((session_key, run_id), []):
-            q.put_nowait(_event_frame(ev))  # the run's first events, held for this reply (N6)
+            q.put_nowait(_event_frame(ev))  # the run's first events, held for this reply
         return q
 
     def unregister_consumer(self, session_key: str, run_id: str, queue: asyncio.Queue | None = None):
@@ -1983,11 +1941,11 @@ class _GatewayConnection:
         """True when `run_id` continues a message (an ask-user answer, a
         resume) that a live inline reply of another run still streams: its
         events wait for that reply (`register_consumer`) instead of opening a
-        second writer on the message (review 2af1 N6)."""
+        second writer on the message."""
         parsed = parse_pipe_run_id(run_id)
         waiting = self._awaiting_owner.get(session_key)
         if waiting and parsed is None and run_id != waiting:
-            # A reply with no message waits for its run's owner (R14): any
+            # A reply with no message waits for its run's owner: any
             # agent run here may be the Gateway's recovery of it. It waits
             # until the reply has read the transcript (rule E).
             return True
@@ -2007,7 +1965,7 @@ class _GatewayConnection:
 
     def _release_held(self, session_key: str) -> None:
         """A reply ended. The runs held for it stay held until they drain, in
-        their order of arrival (review 2af1 N7, N8): into the run's own queue
+        their order of arrival: into the run's own queue
         if a reply registers for it (`register_consumer`; the ask-user switch
         registers right after this release), before the run's next event
         (`_turn_route_now`), or here, in the background, for a run that sends
@@ -2158,8 +2116,7 @@ class _GatewayConnection:
         * `run_text` holds the run's text dedup baselines up to the cut
           ({"received", "stream", "item"}). The run's closing events repeat
           its WHOLE text; a claimer that starts from empty baselines takes all
-          of it for new and appends the entire reply again (seen live
-          2026-10-12: 2327..4000 followed by 1..4000).
+          of it for new and appends the entire reply again.
 
         * `reply` is the cancelled reply's own state, {message_id, renderer}:
           the message it showed the run in, and what it showed there.
@@ -2666,11 +2623,9 @@ class _GatewayConnection:
         This is the ONLY task that ever calls `self._ws.recv()`. Reconnects
         happen in place (`self._ws = None`, then `_reconnect()` blocks until
         a new socket is ready) rather than by spawning a second event-loop
-        task -- spawning a second task here previously caused a runaway
-        reconnect storm: the old coroutine kept looping after `_reconnect()`
-        returned, so two tasks raced on `self._ws.recv()`, each collision
-        raised its own exception, and each of *those* spawned yet another
-        task (2026-07-10 incident).
+        task: two tasks would race on `self._ws.recv()`, each collision would
+        raise, and each of *those* would spawn yet another task, a runaway
+        reconnect storm.
         """
         while not self._stopped:
             try:
@@ -2724,16 +2679,14 @@ class _GatewayConnection:
                     continue
 
                 # ── Event dispatch ──
-                # On tool events (re-measured 2026-10-12, gateway 2026.9.x;
-                # the 2026-07-30 ELI-26 measurement predates `session.tool`):
+                # On tool events:
                 #
                 #   * The connection that STARTS a run gets its tool activity
                 #     as `agent` events with payload.stream == "tool".
                 #   * Any connection subscribed to the session with
                 #     `sessions.messages.subscribe` gets the same payloads as
-                #     `session.tool` events, whoever started the run (measured:
-                #     observer got 3 start + 3 result, zero `agent` tool
-                #     events). That covers this connection after a reconnect,
+                #     `session.tool` events, whoever started the run (and no
+                #     `agent` tool events). That covers this connection after a reconnect,
                 #     and runs the Gateway starts itself (ELI-92).
                 #
                 # Both are folded into one path below, first copy wins.
@@ -2787,7 +2740,7 @@ class _GatewayConnection:
                         # Genuinely shown to a live tab, which persists it via
                         # OWUI's own client-side flow -- remember this so a
                         # later duplicate/retried final event for the same
-                        # run_id never reopens its message (P33).
+                        # run_id never reopens its message.
                         self.mark_delivered_live(payload["sessionKey"], payload["runId"])
                         # The inline turn is alive and took the final itself, so
                         # the parity shadow isn't needed for this run -- drop it.
@@ -2800,12 +2753,12 @@ class _GatewayConnection:
                     pipe_log("  dropped ambiguous or unmatched session-only event")
 
                 # If nothing matches at all, drop it.
-                # This efficiently filters cross-session bleed (P16).
+                # This efficiently filters cross-session bleed.
 
             except asyncio.TimeoutError:
                 # Not even a tick for two intervals: the socket is dead without
                 # having closed (half-open), so every run on it would wait
-                # forever (review 2af1 R13). Tear it down and reconnect.
+                # forever. Tear it down and reconnect.
                 pipe_log(f"  tick timeout: no frame for {2 * self._tick_interval_s:.0f}s, "
                          "reconnecting")
                 transport = getattr(self._ws, "transport", None)
@@ -2858,8 +2811,7 @@ class _GatewayConnection:
 # user-visible content was produced" -- never real assistant text to show a
 # human. An announce-follow-up run can legitimately finish with exactly one
 # of these as its only "assistant text", and writing it into a chat leaks
-# internal plumbing (P33, 2026-07-11: `ANNOUNCE_SKIP` landed as literal
-# message text).
+# internal plumbing.
 _SILENT_SENTINELS = {"ANNOUNCE_SKIP", "NO_REPLY", "no_reply"}
 
 
@@ -2927,9 +2879,8 @@ def _history_events(messages: list):
     closing message (`cli-assistant:<runId>`) repeats all of its text, so it
     only counts when nothing in its own run carried text (a plain, tool-free
     reply, or imports that carry tool blocks only). It counts in place: an
-    asked question's run closes before its answer run starts, and the
-    question was lost when only the last closer was kept (ask-rebuild,
-    2026-10-14, chat d0f0c6ff).
+    asked question's run closes before its answer run starts, so keeping
+    only the last closer would lose the question.
 
     A run on the Gateway's own runtime (GPT, Gemini, DeepSeek) keeps
     OpenClaw's shape: `toolCall` blocks, and each result a `toolResult`
@@ -2938,9 +2889,8 @@ def _history_events(messages: list):
 
     Text after a tool call is joined to the text before it with the separator
     the Gateway's live stream inserts there (`sawToolUseSinceText`), so the
-    rebuild equals what streamed (it streams as "\n\n<text>").
-    Plain concatenation glued a preamble to the answer ("...one at a time.
-    USER-DONE" with no break, restart window 2026-10-13)."""
+    rebuild equals what streamed (it streams as "\n\n<text>"), and a
+    preamble is not glued to the answer."""
     text = ""                 # what the events so far said
     run_text = False          # this run carried text before its closer
     tool_since_text = False   # the Gateway's `sawToolUseSinceText`
@@ -3011,7 +2961,7 @@ def _run_closed_by(message) -> str | None:
     """The run a `chat.history` message closes, or None. A claude-cli run
     closes with its `cli-assistant:<runId>` message. A run on the Gateway's
     own runtime has no such message: every message it writes carries
-    `__openclaw.runId` (the `chat.send` run id, probed live 2026-10-15), and
+    `__openclaw.runId` (the `chat.send` run id), and
     its last is an assistant message that did not stop for a tool call."""
     if not isinstance(message, dict) or message.get("role") != "assistant":
         return None
@@ -3032,9 +2982,7 @@ def _deepest_leaf_id(messages: dict, start_id: str | None) -> str | None:
     children -- e.g. right after an agent turn was appended. Anchoring a
     new message directly on `currentId` in that state appends it as
     a *sibling* of the existing child, which OWUI renders as a 1/2·2/2 variant
-    group instead of a linear message (observed 2026-07-13: a `Sub-agent
-    finished` message and the next agent message both parented to the same
-    node). Walking to the true leaf (following the most-recently-appended
+    group instead of a linear message. Walking to the true leaf (following the most-recently-appended
     child at each branch) makes every turn writer chain off the real tail.
     Cycle-guarded and depth-capped for safety against malformed history.
     """
@@ -3104,7 +3052,7 @@ _gateway_connection: _GatewayConnection | None = None
 _gateway_init_lock = asyncio.Lock()
 
 # Anchor for finding a connection left behind by a *previous* deploy of this
-# same function (P33/P36: OWUI's function loader (open_webui/utils/plugin.py)
+# same function (OWUI's function loader (open_webui/utils/plugin.py)
 # execs each redeploy into a brand-new module object with no teardown hook on
 # the old one -- a module-level singleton alone resets every deploy and orphans
 # the old module's WS/event-loop task forever). Stashing it as an attribute on

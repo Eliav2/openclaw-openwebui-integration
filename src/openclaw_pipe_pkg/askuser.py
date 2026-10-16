@@ -76,16 +76,11 @@ def _marker_line_index(text: str, in_fence=False):
 
     The marker only counts at the start of a line, but it does NOT have to be
     the start of the message: a reply usually explains itself first and asks at
-    the end. The buffer used to look only at the text after the LAST newline,
-    which is fine while tokens arrive one at a time, but wrong when a provider
-    delivers the whole reply as ONE cumulative chunk. In that case the marker
-    sat mid-string with its option lines after it, was never recognised, and
-    leaked into the chat as raw text with no dialog (seen live 2026-08-01 on a
-    claude-cli turn; token-streamed turns were unaffected, which is why this
-    looked intermittent).
+    the end. Every line is checked, not only the text after the last newline,
+    because a provider can deliver the whole reply as one cumulative chunk with
+    the marker mid-string.
 
-    A line inside a fenced code block is a quote, not a prompt (ELI-107: a
-    report quoting the block in a fence was held as a live prompt and hung).
+    A line inside a fenced code block is a quote, not a prompt (ELI-107).
     `in_fence`: a fence is open where `text` starts.
     """
     start, fence = 0, _fence_of(in_fence)
@@ -114,9 +109,7 @@ def _advance_input_prompt_buffer(pending: str, delta: str,
     a line boundary (e.g. a single chunk can contain the tail of one
     paragraph, the blank-line separator, *and* the start of the next one),
     so checking `delta.endswith("\\n")` at the yield site isn't enough on
-    its own (P22 follow-up, 2026-07-08 -- caught live: a reply that talked
-    normally first and only asked its question in the next paragraph never
-    got buffered, because the newline landed mid-delta, not at its edge).
+    its own.
 
     `in_fence`: a fenced code block is open where `pending + delta` starts
     (the shown text left it open); nothing in a fence is held (ELI-107).
@@ -260,8 +253,7 @@ def _build_choice_modal_js(
     There is no resolve/reject in scope, so the code must end with
     `return await new Promise(...)` whose executor's `resolve` is what button
     clicks call -- a bare top-level resolve() is a silent ReferenceError
-    swallowed by OWUI's try/catch (the modal then just hangs; confirmed live
-    2026-07-10).
+    swallowed by OWUI's try/catch, and the modal hangs.
 
     Single-select (multi=False): clicking a button resolves immediately to
     {value: label}. Multi-select (multi=True): each option toggles a checkbox;
@@ -686,9 +678,8 @@ async def _ask_user_native_card(
     Only an answer or a cancel shows the card was seen. Anything else (OWUI's
     timeout, a cancel the moment it arrives on a tab viewing another chat, a
     socket that never answers) returns None, as a cancel does: the reply then
-    ends with the question as text (ELI-107 decision 2). Re-showing the card
-    after a timeout kept a reply open with nothing on screen, about 20 minutes
-    on a socket that never answered (ELI-142).
+    ends with the question as text (ELI-107). The card is never re-shown after
+    a timeout: that keeps a reply open with nothing on screen (ELI-142).
     `owui_session_id`: the socket the turn started on. Once it is gone (a
     reload; no socket for an API caller) the card moves once to the tab
     viewing the chat, as the turn writer's card does.
@@ -764,7 +755,7 @@ class UserInputResult:
     new_run_id: str | None = None
     prompt_text: str | None = None
     answer: str | None = None
-    # The answer run's consumer queue, registered before its send (N6).
+    # The answer run's consumer queue, registered before its send.
     queue: object = None
 
 
@@ -809,7 +800,7 @@ def _live_session_id_for_user(user_id: str, session_pool, chat_id: str | None = 
     With `chat_id`, only a socket viewing that chat: OWUI 0.12 records the
     chats a socket has joined (`chat_ids`, events:chat join/leave). The
     user's first socket can be another tab or another client, where the card
-    never shows (ELI-58 live repro). The newest such socket is the tab the
+    never shows (ELI-58). The newest such socket is the tab the
     user opened last; with none, None, so the card waits for the user to
     open the chat. An OWUI that records no `chat_ids` gets any socket.
     """
@@ -825,8 +816,8 @@ async def _event_call_while_session_lives(__event_call__, payload: dict, session
     """`__event_call__(payload)`, given up once the socket it is bound to
     leaves OWUI's SESSION_POOL (the tab was reloaded or closed): OWUI answers
     a call on a gone socket only at its own timeout, up to 240 s, and the
-    card can be shown on the user's new socket only after that (ELI-58 live
-    repro). Answers as OWUI does for a gone socket."""
+    card can be shown on the user's new socket only after that (ELI-58).
+    Answers as OWUI does for a gone socket."""
     call = asyncio.ensure_future(asyncio.wait_for(__event_call__(payload), timeout=timeout_s))
     try:
         from open_webui.socket.main import SESSION_POOL

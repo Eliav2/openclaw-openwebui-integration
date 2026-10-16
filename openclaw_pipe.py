@@ -346,7 +346,7 @@ def _retire_turn_writer(writer_id: str) -> None:
 
 
 # Writer ids name their process, so another Open WebUI worker's writer can
-# be judged (review 2af1 R8): `<host>/<boot>/<pid>.<start>:<uuid>`, with the
+# be judged: `<host>/<boot>/<pid>.<start>:<uuid>`, with the
 # kernel's boot id and the process start time guarding against a reused pid.
 # A writer of this process is alive while its connection is (the set above);
 # one of another process on this host while that process runs. A writer of
@@ -795,12 +795,8 @@ _MEDIA_FNAME_RE = re.compile(r"\.[A-Za-z0-9]{1,8}$")
 
 def _looks_like_media_filename(fname: str) -> bool:
     """Return True only if fname plausibly names a real file (has an
-    extension). Without this, ordinary prose that happens to use "MEDIA:"
-    as a documentation term (e.g. "the MEDIA: fix is proven") gets its next
-    word treated as a filename and mangled into a broken image link --
-    confirmed live 2026-07-10 when explaining this very feature corrupted
-    "the MEDIA: fix" into `![fix](.../fix)`.
-    """
+    extension), so prose using "MEDIA:" as a term ("the MEDIA: fix") keeps
+    its next word as text instead of a broken image link."""
     return bool(_MEDIA_FNAME_RE.search(fname))
 
 
@@ -809,15 +805,11 @@ def _advance_media_buffer(pending: str, delta: str, ctx: str = "") -> tuple[str,
 
     Returns (text_to_yield_now, new_pending), mirroring
     `_advance_input_prompt_buffer`. A real streaming provider can deliver
-    "MEDIA:filename.png" split across multiple deltas at any point,
-    including mid-filename or mid-prefix -- resolving `_resolve_media`
-    eagerly against a single truncated delta either drops the directive
-    entirely (if "MEDIA:" itself is split, so neither chunk contains the
-    full prefix) or resolves it against a truncated filename (confirmed
-    live 2026-07-10: sending several images in one turn hit both failure
-    modes in the same message). Hold back from the first "MEDIA:" (or a
-    prefix of it that could still complete) until a whitespace char
-    confirms the filename is done.
+    "MEDIA:filename.png" split across deltas at any point, mid-prefix or
+    mid-filename, and resolving one delta alone drops the directive or
+    truncates its filename. Hold back from the first "MEDIA:" (or a prefix
+    of it that could still complete) until a whitespace char confirms the
+    filename is done.
 
     A directive in code is text and never held; one after a backtick run
     that may still open a code span is held until that is decided (ELI-111).
@@ -833,11 +825,10 @@ def _advance_media_buffer(pending: str, delta: str, ctx: str = "") -> tuple[str,
 def _take_media_fname(after_prefix: str) -> tuple[str, str]:
     """Split the text after a "MEDIA:" prefix into (filename, rest).
 
-    A filename ends at whitespace OR at the next "MEDIA:" directive. Splitting
-    on whitespace alone glued "X.pngMEDIA:X.png" into one bogus filename, and
-    the reply persisted as `![X.pngMEDIA:X.png](.../X.pngMEDIA:X.png)`, a link
-    that 404s (ELI-76). A copy of the same directive glued on with no separator
-    is dropped: nothing emits that on purpose, it is a re-delivered tail.
+    A filename ends at whitespace OR at the next "MEDIA:" directive, so
+    "X.pngMEDIA:Y.png" is two files, not one bogus name (ELI-76). A copy of
+    the same directive glued on with no separator is dropped: nothing emits
+    that on purpose, it is a re-delivered tail.
     """
     token = after_prefix.split()[0] if after_prefix else ""
     fname = token.split(_MEDIA_TRIGGER, 1)[0]
@@ -851,13 +842,12 @@ def _take_media_fname(after_prefix: str) -> tuple[str, str]:
     return fname, rest
 
 
-# ELI-111: a directive is code-aware, as the ask marker is (ELI-107). Code is
+# A directive is code-aware, as the ask marker is (ELI-107, ELI-111). Code is
 # a fenced block (CommonMark 4.5) or an inline code span (6.1): a backtick run
 # closed by the next run of the same length within its paragraph. A run with
 # no closer is a literal backtick, which is only known once its paragraph
 # ends. Indented code blocks are not tracked: an indented line in a list is
-# prose. A report quoting a directive in a double-backtick span had it
-# rendered as an image (message 442ecfa3, 2026-10-14).
+# prose.
 _BLOCK_START_RE = re.compile(r"^ {0,3}(#{1,6}(\s|$)|[-+*](\s|$)|\d{1,9}[.)](\s|$))")
 
 
@@ -992,12 +982,9 @@ def _replace_media(text: str, directives, replacement) -> str:
 def _resolve_media(text, base_url=None, ctx=""):
     """Convert every MEDIA:filename directive in text to embedded media.
 
-    A single reply can legitimately carry several images (confirmed live
-    2026-07-10 sending a 4-screenshot bug repro) -- this must loop over every
-    occurrence, not just the first, or later directives in the same chunk
-    silently pass through as literal "MEDIA:filename" text. Prose using
-    "MEDIA:" as a term (no file extension) and a directive quoted in code
-    (ELI-111) stay text. `ctx`: the text shown before `text` in its message
+    A reply can carry several images, so every directive is converted, not
+    just the first. Prose using "MEDIA:" as a term (no file extension) and a
+    directive quoted in code (ELI-111) stay text. `ctx`: the text shown before `text` in its message
     item.
     """
     if base_url is None:
@@ -1073,11 +1060,8 @@ async def _resolve_media_via_owui(
     """Upload every MEDIA: file in text to OWUI, in order, and attach each to
     the current message.
 
-    A single reply can legitimately carry several images (confirmed live
-    2026-07-10 sending a 4-screenshot bug repro) -- this must loop over every
-    occurrence, not just the first, or later directives in the same chunk
-    silently pass through as literal "MEDIA:filename" text. If any single
-    directive can't be resolved this way (file missing locally, bad name),
+    A reply can carry several images, so every directive is uploaded, not
+    just the first. If any single directive can't be resolved this way (file missing locally, bad name),
     bail out entirely with handled=False so the caller's fallback
     (`_resolve_media`) handles ALL directives uniformly via the external
     URL instead of leaving a mix of native-upload and unresolved directives
@@ -2243,16 +2227,11 @@ def _marker_line_index(text: str, in_fence=False):
 
     The marker only counts at the start of a line, but it does NOT have to be
     the start of the message: a reply usually explains itself first and asks at
-    the end. The buffer used to look only at the text after the LAST newline,
-    which is fine while tokens arrive one at a time, but wrong when a provider
-    delivers the whole reply as ONE cumulative chunk. In that case the marker
-    sat mid-string with its option lines after it, was never recognised, and
-    leaked into the chat as raw text with no dialog (seen live 2026-08-01 on a
-    claude-cli turn; token-streamed turns were unaffected, which is why this
-    looked intermittent).
+    the end. Every line is checked, not only the text after the last newline,
+    because a provider can deliver the whole reply as one cumulative chunk with
+    the marker mid-string.
 
-    A line inside a fenced code block is a quote, not a prompt (ELI-107: a
-    report quoting the block in a fence was held as a live prompt and hung).
+    A line inside a fenced code block is a quote, not a prompt (ELI-107).
     `in_fence`: a fence is open where `text` starts.
     """
     start, fence = 0, _fence_of(in_fence)
@@ -2281,9 +2260,7 @@ def _advance_input_prompt_buffer(pending: str, delta: str,
     a line boundary (e.g. a single chunk can contain the tail of one
     paragraph, the blank-line separator, *and* the start of the next one),
     so checking `delta.endswith("\\n")` at the yield site isn't enough on
-    its own (P22 follow-up, 2026-07-08 -- caught live: a reply that talked
-    normally first and only asked its question in the next paragraph never
-    got buffered, because the newline landed mid-delta, not at its edge).
+    its own.
 
     `in_fence`: a fenced code block is open where `pending + delta` starts
     (the shown text left it open); nothing in a fence is held (ELI-107).
@@ -2427,8 +2404,7 @@ def _build_choice_modal_js(
     There is no resolve/reject in scope, so the code must end with
     `return await new Promise(...)` whose executor's `resolve` is what button
     clicks call -- a bare top-level resolve() is a silent ReferenceError
-    swallowed by OWUI's try/catch (the modal then just hangs; confirmed live
-    2026-07-10).
+    swallowed by OWUI's try/catch, and the modal hangs.
 
     Single-select (multi=False): clicking a button resolves immediately to
     {value: label}. Multi-select (multi=True): each option toggles a checkbox;
@@ -2853,9 +2829,8 @@ async def _ask_user_native_card(
     Only an answer or a cancel shows the card was seen. Anything else (OWUI's
     timeout, a cancel the moment it arrives on a tab viewing another chat, a
     socket that never answers) returns None, as a cancel does: the reply then
-    ends with the question as text (ELI-107 decision 2). Re-showing the card
-    after a timeout kept a reply open with nothing on screen, about 20 minutes
-    on a socket that never answered (ELI-142).
+    ends with the question as text (ELI-107). The card is never re-shown after
+    a timeout: that keeps a reply open with nothing on screen (ELI-142).
     `owui_session_id`: the socket the turn started on. Once it is gone (a
     reload; no socket for an API caller) the card moves once to the tab
     viewing the chat, as the turn writer's card does.
@@ -2931,7 +2906,7 @@ class UserInputResult:
     new_run_id: str | None = None
     prompt_text: str | None = None
     answer: str | None = None
-    # The answer run's consumer queue, registered before its send (N6).
+    # The answer run's consumer queue, registered before its send.
     queue: object = None
 
 
@@ -2976,7 +2951,7 @@ def _live_session_id_for_user(user_id: str, session_pool, chat_id: str | None = 
     With `chat_id`, only a socket viewing that chat: OWUI 0.12 records the
     chats a socket has joined (`chat_ids`, events:chat join/leave). The
     user's first socket can be another tab or another client, where the card
-    never shows (ELI-58 live repro). The newest such socket is the tab the
+    never shows (ELI-58). The newest such socket is the tab the
     user opened last; with none, None, so the card waits for the user to
     open the chat. An OWUI that records no `chat_ids` gets any socket.
     """
@@ -2992,8 +2967,8 @@ async def _event_call_while_session_lives(__event_call__, payload: dict, session
     """`__event_call__(payload)`, given up once the socket it is bound to
     leaves OWUI's SESSION_POOL (the tab was reloaded or closed): OWUI answers
     a call on a gone socket only at its own timeout, up to 240 s, and the
-    card can be shown on the user's new socket only after that (ELI-58 live
-    repro). Answers as OWUI does for a gone socket."""
+    card can be shown on the user's new socket only after that (ELI-58).
+    Answers as OWUI does for a gone socket."""
     call = asyncio.ensure_future(asyncio.wait_for(__event_call__(payload), timeout=timeout_s))
     try:
         from open_webui.socket.main import SESSION_POOL
@@ -3238,9 +3213,9 @@ _GATEWAY_CONNECT_TIMEOUT_S = 10.0
 
 # Largest Gateway frame the socket accepts. websockets defaults to 1 MiB and
 # answers a bigger frame by closing the WHOLE connection (1009, "message too
-# big"), dropping every session's events: a 952-message `chat.history` is
-# 3.1 MB, and one large tool result in an agent or `session.message` event is
-# enough (measured 2026-10-12, repro_ws_max_size.py). Bounded, not None, so a
+# big"), dropping every session's events: a long `chat.history` is several
+# MB, and one large tool result in an agent or `session.message` event is
+# enough. Bounded, not None, so a
 # runaway frame still can't take the Open WebUI process's memory with it.
 GATEWAY_WS_MAX_SIZE = 64 * 1024 * 1024
 
@@ -3440,8 +3415,7 @@ def _recovery_text_from_items(items, user_text: str) -> str | None:
     Last, not first: a tool-using turn stores several assistant messages. On
     the claude-cli runtime the closing one repeats the whole turn's text
     (preambles included); on the embedded runtime it is the final answer. The
-    first one is only the opening preamble ("I'll look at ..."), which is what
-    recovery used to return.
+    first one is only the opening preamble ("I'll look at ...").
     """
     if not isinstance(items, list):
         return None
@@ -3511,11 +3485,9 @@ def _session_thinking_ladder(desc: dict) -> list | None:
     derives it as `metadata.levels.map(level => level.label)`, i.e. human
     labels ("Off", "Extra High", ...), not ids. Matching a requested level
     against labels silently breaks clamping (nothing in LEVEL_RANKS looks
-    like a label), so `thinkingOptions` must never be used for the ladder --
-    checking it first, as this used to, let an unsupported level fall
-    through the clamp and reach the gateway's own hard validation error
-    (ELI-85 field mixup, caused a live chat to hard-fail on every turn).
-    Kept only as a last-resort fallback in case a future gateway build ever
+    like a label), so `thinkingOptions` must never be used for the ladder:
+    an unsupported level would fall through the clamp and reach the
+    gateway's own hard validation error on every turn (ELI-85). Kept only as a last-resort fallback in case a future gateway build ever
     stops emitting `thinkingLevels` -- an imperfect ladder beats none.
 
     Returns None (not []) when the field is absent, because "no ladder known"
@@ -3574,14 +3546,13 @@ def _record_thinking_ladder(levels, model_key=None, authoritative=False,
       offers, because Open WebUI builds a valve dropdown once from the class
       and cannot vary it per selected model.
     * `models[<provider/model>]` is what the SEND path clamps against, and it
-      must be exact. Clamping against the union is what let `high` reach a
-      model whose only level is `off`.
+      must be exact: clamping against the union lets `high` reach a model
+      whose only level is `off`.
 
     `authoritative` marks a ladder the Gateway stated itself by rejecting a
     send. A merely observed one (from `sessions.describe`) must never overwrite
     it: describe resolves the ladder with no model catalog in scope and so
-    reports the generic base profile for catalog-gated models. Trusting the
-    weaker source second would undo the fix on the very next turn.
+    reports the generic base profile for catalog-gated models.
 
     Best-effort by design: a failed write costs a stale dropdown and one more
     rejected turn, and must never affect the message being sent.
@@ -3747,7 +3718,7 @@ def _coerce_text(value) -> str:
 
 def _content_has_image(raw_content) -> bool:
     """True if an OWUI message's `content` is a multimodal block list
-    (P39) that includes at least one image_url block. `content` is a
+    that includes at least one image_url block. `content` is a
     plain string for ordinary text-only messages -- only the list shape
     (sent when a user attaches an image) can carry one, so this returns
     False immediately for the common string case."""
@@ -3764,12 +3735,11 @@ _DATA_URL_RE = re.compile(r"^data:([^;,]*)(?:;[^,]*)?,(.*)$", re.DOTALL)
 
 def _extract_image_attachments(raw_content) -> list:
     """Pull inline images out of an OWUI multimodal `content` block list
-    (P39) and shape them for the gateway's `chat.send` `attachments` param:
+    and shape them for the gateway's `chat.send` `attachments` param:
     `{type, mimeType, fileName, content}` with `content` as base64.
 
     OWUI sends attached/pasted images as `image_url` blocks whose `url` is
-    a `data:<mime>;base64,<data>` URI (confirmed via OWUI's own request
-    shape, not just this bridge's tests) -- there is no plain-HTTP(S)
+    a `data:<mime>;base64,<data>` URI -- there is no plain-HTTP(S)
     `image_url` case to support here, so anything else is skipped rather
     than guessed at.
     """
@@ -3820,9 +3790,9 @@ _RESTART_MARKER_TYPE = "_pipe_restart"
 # lastRunId = the run) ends its reply even when its final event was lost;
 # `resync` marks a row read after a reconnect or a frame gap, where an idle
 # session means every admitted run is over; a `queued` row tells a reply
-# waiting for its first event why (review 2af1 timers).
+# waiting for its first event why.
 # `read_at` (time.monotonic) is when the row was read: a reply trusts an idle
-# row only when it was read after its run was admitted (review 2af1 N4).
+# row only when it was read after its run was admitted.
 _ROW_MARKER_TYPE = "_pipe_row"
 
 
@@ -3853,9 +3823,8 @@ def _item_delta_text(item_text: str, last_item_text: str, assistant_stream_text:
     # Not a prefix extension. If the item still contains the tail of what was
     # already received, it is the cumulative text with something missing
     # from the middle or the start (events lost while the Gateway socket was
-    # reconnecting): only what follows that tail is new. Returning the whole
-    # item here posted a second full copy of a 4000-line reply (2026-10-12).
-    # The missing piece comes back with the turn writer's transcript rebuild
+    # reconnecting): only what follows that tail is new; returning the whole
+    # item would post a second full copy of the reply. The missing piece comes back with the turn writer's transcript rebuild
     # (ELI-147), never appended here.
     # Shorter anchors too: the hole may sit inside the longest one.
     for n in (_WHOLE_TEXT_ANCHOR_CHARS, 128, _MIN_WHOLE_TEXT_ANCHOR_CHARS):
@@ -3879,8 +3848,7 @@ def _suppress_already_shown(delta: str, visible_message_text: str) -> str:
     `visible_message_text` without also updating `assistant_stream_text`.
     When that happens, `_item_delta_text`'s prefix check fails to match and
     it falls through to returning the *entire* cumulative text unchanged,
-    which then gets appended a second time with no separator (P27,
-    reproduced live 2026-07-10).
+    which then gets appended a second time with no separator.
 
     `visible_message_text` is the true, complete record of everything
     already recorded for this turn, so checking whether `delta` is already
@@ -3903,9 +3871,8 @@ def _attr(value: str) -> str:
     containing a literal newline fails to match and is silently DROPPED -- the
     tool card then renders with INPUT and no OUTPUT at all, with no error.
 
-    That was invisible for `arguments` (always `json.dumps`-ed, so its newlines
-    are already the two-char `\\n` escape) but hit almost every multi-line tool
-    `result`, which is passed through raw (2026-07-25).
+    `arguments` is always `json.dumps`-ed, so its newlines are already the
+    two-char `\\n` escape; a multi-line `result` is passed through raw.
 
     Encoding the newline as the numeric character reference `&#10;` keeps the
     attribute on one physical line for that regex while still decoding back to
@@ -3940,21 +3907,19 @@ def _tool_call_started_event(name: str, tool_call_id: str, args_str: str) -> dic
     That matters because the backend's output list is what feeds the live
     `chat:completion` emissions, the final done event AND the DB write -- so a
     tool call announced this way is mutable, unlike yielded markdown, which is
-    append-only for the rest of the turn (see the two-phase `<details>` attempt
-    that this replaced). The frontend renders a `function_call` with no matching
+    append-only for the rest of the turn. The frontend renders a `function_call` with no matching
     `function_call_output` as a spinner (`structuredOutput.ts::buildToolCallToken`).
 
     Ordering is by arrival: the item goes at the end of the output list, after
     the text streamed before it. It says so with `output_index`
     (`_OUTPUT_APPEND_INDEX`): the backend appends an item without one, but
     the chat tab's reducer (`structuredOutput.ts::applyResponseStreamEvent`)
-    splices it in BEFORE the last item, so the live card showed above the
-    text written before the call until a reload (ELI-122).
+    splices it in BEFORE the last item, and the live card would show above
+    the text written before the call until a reload (ELI-122).
 
-    The tool call id goes in `id`, and `call_id` is deliberately ABSENT. OWUI
-    0.11.0 appended every added item unconditionally, so the obvious shape
-    (`id="fc_<tid>"` + `call_id="<tid>"`) was safe. 0.11.1 rewrote that branch
-    to dedup first:
+    The tool call id goes in `id`, and `call_id` is deliberately ABSENT.
+    Open WebUI replaces an added item that shares its `id` or its `call_id`
+    with one it holds:
 
         existing_index = next(idx for idx, existing in enumerate(new_output)
             if (item['id'] and existing['id'] == item['id'])
@@ -3962,11 +3927,10 @@ def _tool_call_started_event(name: str, tool_call_id: str, args_str: str) -> dic
         if existing_index is not None: new_output[existing_index] = item
 
     -- so the `function_call_output` we send next, which must share the call
-    id to pair, matched this item on `call_id` and REPLACED it. The card is
-    built from the `function_call` item alone (`structuredOutput.ts`: `Ye()`
+    id to pair, would match this item on `call_id` and REPLACE it. The card
+    is built from the `function_call` item alone (`structuredOutput.ts`
     reads `call_id ?? id` and looks the output up in a by-call_id map), so
-    losing it means no card at all: no chevron, no Output, nothing. Every
-    chat from the 0.11.1 upgrade onward persisted `fc=0 fco=N`.
+    losing it means no card at all.
 
     Carrying the id in `id` only keeps both items distinct for the dedup
     (`<tid>` vs `fco_<tid>`, and neither has a `call_id` the other shares)
@@ -4139,11 +4103,9 @@ def _tool_call_error_relabel_event(name: str, tool_call_id: str, args_str: str) 
     hold, the backend (`handle_responses_streaming_event`, what is saved) and
     the chat tab (`structuredOutput.ts::applyResponseStreamEvent`, what shows
     while the reply streams). So the mark shows live, on any card, last or
-    not. The `response.name.done` used before only reached the backend, and
-    only its last item: the tab ignores that event, so the ❌ appeared when
-    the reply finished (ELI-124), and a call followed by anything else got
-    the banner alone. (`response.output_item.done` replaces by position in
-    the backend, which the pipe cannot know.)
+    not. `response.name.done` would reach only the backend's last item, and
+    the tab ignores it (ELI-124). (`response.output_item.done` replaces by
+    position in the backend, which the pipe cannot know.)
     """
     return _tool_call_started_event(f"{name} {TOOL_ERROR_MARK}", tool_call_id, args_str)
 
@@ -4183,19 +4145,18 @@ class _TurnRenderer:
     """Reconstructs the visible assistant content of a run from its raw gateway
     event stream, mirroring the inline pipe loop's rendering.
 
-    Purpose (2026-07-19; handover since ELI-100): when the inline pipe generator ends BEFORE a
-    long run finishes (idle self-close, cancel, or a torn-down request), the
-    tail used to survive only as a truncated, tool-block-less *detached*
-    bubble read from a length-capped `sessions.preview`. This renderer instead
-    accumulates the COMPLETE content (assistant text + every tool block, in
-    order) straight from the same events the persistent connection already
-    dispatches, so the run's ORIGINAL OWUI message can be finalized to exactly
-    what a non-interrupted turn would have stored.
+    Purpose: when the inline pipe generator ends BEFORE a long run finishes
+    (cancel, or a torn-down request), the turn writer takes the message over
+    (ELI-100). This renderer accumulates the COMPLETE content (assistant text
+    + every tool block, in order) straight from the same events the
+    persistent connection already dispatches, so the run's ORIGINAL OWUI
+    message can be finalized to exactly what a non-interrupted turn would
+    have stored.
 
     Scope: assistant text deltas, item-carried text, and tool-result blocks.
     It holds the raw run text: the turn writer shows a resolved `MEDIA:` image
     and an answered ask-user card through the rewrites the inline reply
-    recorded (`note_turn_rewrite`, review 2af1 R4).
+    recorded (`note_turn_rewrite`).
     """
 
     def __init__(self):
@@ -4216,8 +4177,7 @@ class _TurnRenderer:
         self._tool_results: set[str] = set()
         # A new run continues the message (resume, recovery, answer run): its
         # first text gets the break the live stream puts between messages.
-        # The Gateway inserts it only inside one run (graceful window
-        # 2026-10-14: "...foreground.USER-DONE" across the resume).
+        # The Gateway inserts it only inside one run.
         self.run_boundary = False
 
     @property
@@ -4309,8 +4269,8 @@ class _TurnRenderer:
     def close_open_calls(self, note: str) -> list[dict]:
         """Answer every call still open with `note` and return those events.
         Open WebUI runs a streamed `function_call` that has no output when
-        the stream ends and sends the result back as a new turn (M3 crash
-        window, 2026-10-13); stored, it is a spinner forever."""
+        the stream ends and sends the result back as a new turn; stored, it
+        is a spinner forever."""
         events = self._unanswered(note)
         for event in events:
             self._tool_results.add(event["item"]["call_id"])
@@ -4422,8 +4382,8 @@ class _TurnRenderer:
 # loader execs each redeploy into a brand-new module object with no teardown hook
 # on the old one, so a connection left running by a previous deploy (a "zombie")
 # keeps its own event loop. With private bookkeeping it would not know that the
-# live connection already showed a run, and wrote that turn into the chat a
-# second time (P33, root-caused 2026-07-11). Stashing the bookkeeping on
+# live connection already showed a run, and would write that turn into the chat
+# a second time. Stashing the bookkeeping on
 # `open_webui.socket.main` (OWUI's own stable module, never reloaded by our
 # function) makes all connections read and write the *same* dicts. Since
 # ELI-100 a retired connection writes no turns at all (`_turn_route_now`).
@@ -4448,8 +4408,7 @@ def _shared_gateway_state() -> dict | None:
     # (stashed on OWUI's stable socket module), so a *new* key added in a
     # later version must be backfilled into the already-existing dict --
     # otherwise `__init__` does `_shared["new_key"]` and KeyErrors on the
-    # first request after redeploy (chat_write_locks hit exactly this,
-    # 2026-07-13).
+    # first request after redeploy.
     state.setdefault("delivered_live", {})
     state.setdefault("claimed_runs", {})
     state.setdefault("chat_write_locks", {})
@@ -4462,8 +4421,8 @@ class _RunQueue(asyncio.Queue):
     slower than its run streams holds the receive loop back instead of losing
     text. Control markers (a gap, a restart, a session row) go in past the
     bound: they are few, a lost one can leave a reply that never ends, and
-    the receive loop that puts them must never wait or raise (review 2af1 N5:
-    QueueFull there killed the loop and every run on the connection hung)."""
+    the receive loop that puts them must never wait or raise: QueueFull there
+    would kill the loop and hang every run on the connection."""
 
     def put_control(self, item) -> None:
         bound, self._maxsize = self._maxsize, 0
@@ -4561,36 +4520,18 @@ class _GatewayConnection:
         self._consumers: dict[str, _Consumer] = {}
 
         # Per-session locks serializing the queue-release -> chat.send -> run
-        # registration critical section. Two concurrent messages that release
-        # from the queue at the same instant would otherwise both send into the
-        # same idle window; the gateway steer-merges the second into the first,
-        # which then renders nothing ("no reply text"). Serializing the send so
-        # the next waiter observes the just-started run (via sessions.list
-        # hasActiveRun) closes that thundering-herd race. ELI-56.
+        # registration critical section (`session_send_lock`, ELI-56).
         self._session_send_locks: dict[str, asyncio.Lock] = {}
 
-        # Deferred aborts for cancelled turns, {session_key: {"run_id", "task"}}.
-        # OWUI 0.12 has no "send while running" that keeps the running turn:
-        # both its interrupt path and the queued message's "Send now" call
-        # stopTasksByChatId and then submit the new message ~0.5-0.8s later
-        # (measured live 2026-10-11). An immediate chat.abort on that cancel
-        # kills the turn AND every subagent it spawned (the gateway's
-        # chat.abort cascades through abortControlledSubagents). So the abort
-        # waits a short grace window, and a new message for the same session
-        # inside it claims the run instead of letting it die. A plain Stop
-        # (no follow-up message) still aborts once the window passes.
+        # Cancelled turns parked until they are claimed or released, by
+        # session key (`park_cancelled_turn`). An immediate chat.abort on a
+        # cancel would kill the turn AND every subagent it spawned, and Send
+        # now cancels the same way Stop does.
         self._pending_cancel_aborts: dict[str, dict] = {}
 
-        # ELI-59: last model applied per session, {session_key: (model, ts)}.
-        # A burst of near-simultaneous messages on one session all issue the
-        # SAME idempotent sessions.patch; under that contention the RPC can
-        # transiently time out and that message's answer is replaced by a
-        # "Model selection error". Caching the last applied value (with a
-        # short TTL -- the session model can drift externally, e.g. /model in
-        # the Control UI) lets same-model calls skip the RPC entirely, and the
-        # per-session patch lock collapses a burst to ONE in-flight patch.
-        # OWUI caveat: multiple worker processes each keep their own cache --
-        # imperfect, but strictly fewer redundant patches than before.
+        # Last model applied per session, {session_key: (model, ts)}, and the
+        # per-session patch locks (`model_patch_lock`, ELI-59). Each Open
+        # WebUI worker process keeps its own.
         self._model_patch_cache: dict[str, tuple[str | None, float]] = {}
         self._model_patch_locks: dict[str, asyncio.Lock] = {}
 
@@ -4613,7 +4554,7 @@ class _GatewayConnection:
         # has consumers for, but never writes turns (`_turn_route_now`) and
         # never reconnects once those runs are gone.
         self._retired = False
-        # ELI-100: this connection's identity as a turn writer. A message whose
+        # This connection's identity as a turn writer. A message whose
         # recorded writer is gone (`_turn_writer_alive`: retired here, or its
         # worker process exited) can be taken over (DESIGN 2.3); retire()
         # removes it.
@@ -4624,13 +4565,13 @@ class _GatewayConnection:
         self._turn_writers: dict = {}   # (chat_id, message_id) -> _TurnWriter
         self._turn_skip_runs: dict = {}  # (session_key, run_id) of heartbeat runs
         # (session_key, run_id) -> events of an agent run not yet known to be
-        # no heartbeat, and the runs known (review 2af1 R7, `_turn_kind_known`)
+        # no heartbeat, and the runs known (`_turn_kind_known`)
         self._turn_unkinded: dict = {}
         self._turn_kinded: dict = {}
-        # (child session, child run) -> a sub-agent's result (review 2af1 R10)
+        # (child session, child run) -> a sub-agent's result
         self._child_results: dict = {}
         # session_key -> run id of an inline reply with no Open WebUI message
-        # waiting for its interrupted run's owner (review 2af1 R14)
+        # waiting for its interrupted run's owner
         self._awaiting_owner: dict = {}
         self._session_ids: dict = {}     # session_key -> sessionId (a cron wake's run id)
         self._wake_turns_bound: dict = {}  # session_key -> wake turn keys given a message
@@ -4648,10 +4589,8 @@ class _GatewayConnection:
         # A reconnect is not a restart. `hello-ok.server.bootId` names the
         # Gateway process: same id after a reconnect = the same Gateway, its
         # runs are still going; a new id = it restarted and took them with it.
-        # Treating every reconnect as a restart sent a bogus "gateway
-        # restarted, resume" turn into live sessions and closed their OWUI
-        # replies while the real run kept going (2026-10-12, a 1s WebSocket
-        # drop under host memory pressure). `gateway_restarts` only counts
+        # A reconnect counted as a restart would send a bogus resume turn into
+        # live sessions and close their replies. `gateway_restarts` only counts
         # real restarts; consumers compare it, not `connection_epoch`.
         self.gateway_boot_id: str | None = None
         self.gateway_restarts = 0
@@ -4662,7 +4601,7 @@ class _GatewayConnection:
         # Delivery bookkeeping. When running inside OWUI these dicts are the
         # *same objects* for every `_GatewayConnection` in the process (see
         # `_shared_gateway_state`), so a turn shown live by one connection is
-        # seen as delivered by all of them (P33, 2026-07-11). Outside OWUI
+        # seen as delivered by all of them. Outside OWUI
         # (unit tests) each connection gets its own isolated dicts.
         _shared = _shared_gateway_state()
 
@@ -4672,19 +4611,14 @@ class _GatewayConnection:
             _shared["claimed_runs"] if _shared is not None else {}
         )
 
-        # Records, by "session_key:run_id", every *final* event that was
-        # actually dispatched to a live consumer queue (i.e. genuinely shown
-        # to an open browser tab, which persists it itself via OWUI's normal
-        # client-side flow). If the Gateway later re-emits a duplicate/retried
-        # final event for that same run_id after the tab's request has
-        # closed, this identity check catches it precisely -- unlike a
-        # content-equality check, it can't false-positive just because two
-        # unrelated turns happen to end with the same short text (e.g. "OK.",
-        # "Done."), and unlike the debounce timer alone, it doesn't depend on
-        # how long the session stays quiet afterward.
-        # Events of a run continuing a message (an ask-user answer) that
+        # `_delivered_live`: by "session_key:run_id", every *final* event
+        # dispatched to a live consumer queue (shown to an open tab, which
+        # persists it). A duplicate or retried final for that run id after
+        # the tab's request closed is caught by identity, never by comparing
+        # text (two turns can both end with "OK.").
+        # `_held_for_live`: events of a run continuing a message (an ask-user answer) that
         # arrived before its reply registered for it, while that reply still
-        # streams the message: never a turn writer's (review 2af1 N6).
+        # streams the message: never a turn writer's.
         self._held_for_live: dict[tuple[str, str], list] = {}
         self.unreachable_held_drains = 0
         self._delivered_live: dict[str, float] = (
@@ -4715,8 +4649,8 @@ class _GatewayConnection:
         # What the inline reply showed in place of raw run text, by
         # "chat_id:message_id": [(raw, shown)] for each resolved `MEDIA:`
         # directive and each ask-user prompt (its card, or its fallback text).
-        # A turn writer that takes the message over repeats them (review 2af1
-        # R4). Shared, so a successor deploy's writer has them too.
+        # A turn writer that takes the message over repeats them. Shared, so
+        # a successor deploy's writer has them too.
         self._turn_rewrites: dict[str, list] = (
             _shared["turn_rewrites"] if _shared is not None else {}
         )
@@ -4867,8 +4801,7 @@ class _GatewayConnection:
         `read_at`: when the row was read, if not just now (a resync's read
         started before its reply came back). `outside_loop`: put by a task,
         not the receive loop, which may be waiting to put an earlier event
-        into a full queue; the row waits its turn behind it (review 2af1
-        N9), in a task per queue so one stalled reply holds up no other."""
+        into a full queue; the row waits its turn behind it, in a task per queue so one stalled reply holds up no other."""
         marker = {"type": _ROW_MARKER_TYPE, "row": row, "resync": resync,
                   "read_at": time.monotonic() if read_at is None else read_at}
         for key, consumer in list(self._consumers.items()):
@@ -4925,7 +4858,7 @@ class _GatewayConnection:
         """Remember that this run streams into OWUI message `message_id` in
         `chat_id`, and start a shadow `_TurnRenderer` for it. No-op without both
         ids (e.g. a chat with no stable message id yet). `thinking`: the
-        turn's level, which a writer's resume keeps (review 2af1 R6)."""
+        turn's level, which a writer's resume keeps."""
         if not (chat_id and message_id and run_id):
             return
         key = f"{session_key}:{run_id}"
@@ -4973,11 +4906,11 @@ class _GatewayConnection:
                             shown: bool = True) -> None:
         """The inline reply moved from `run_id` to `next_run_id` (an ask-user
         answer run): the target and its shadow renderer follow it, so a
-        handover of the answer run continues the same reply (review 2af1 R9;
-        the writer finds the question run in the transcript as a pipe run of
-        the same message). The question run was shown to its end: its late
-        events open nothing. `shown=False` moves the target only: the answer
-        is not sent yet (review 2af1 N6), or its send failed and the target
+        handover of the answer run continues the same reply (the writer finds
+        the question run in the transcript as a pipe run of the same
+        message). The question run was shown to its end: its late events open
+        nothing. `shown=False` moves the target only: the answer is not sent
+        yet, or its send failed and the target
         moves back."""
         key = f"{session_key}:{run_id}"
         target = self._run_targets.pop(key, None)
@@ -4994,7 +4927,7 @@ class _GatewayConnection:
                           raw: str, shown: str) -> None:
         """The inline reply showed `shown` where its run said `raw` (a resolved
         `MEDIA:` directive, an ask-user prompt's card). A writer that takes
-        the message over shows the same (review 2af1 R4)."""
+        the message over shows the same."""
         if not (chat_id and message_id and raw) or raw == shown:
             return
         key = f"{chat_id}:{message_id}"
@@ -5132,7 +5065,7 @@ class _GatewayConnection:
         q = _RunQueue(maxsize=500)
         consumer.queues.append(q)
         for ev in self._held_for_live.pop((session_key, run_id), []):
-            q.put_nowait(_event_frame(ev))  # the run's first events, held for this reply (N6)
+            q.put_nowait(_event_frame(ev))  # the run's first events, held for this reply
         return q
 
     def unregister_consumer(self, session_key: str, run_id: str, queue: asyncio.Queue | None = None):
@@ -5162,11 +5095,11 @@ class _GatewayConnection:
         """True when `run_id` continues a message (an ask-user answer, a
         resume) that a live inline reply of another run still streams: its
         events wait for that reply (`register_consumer`) instead of opening a
-        second writer on the message (review 2af1 N6)."""
+        second writer on the message."""
         parsed = parse_pipe_run_id(run_id)
         waiting = self._awaiting_owner.get(session_key)
         if waiting and parsed is None and run_id != waiting:
-            # A reply with no message waits for its run's owner (R14): any
+            # A reply with no message waits for its run's owner: any
             # agent run here may be the Gateway's recovery of it. It waits
             # until the reply has read the transcript (rule E).
             return True
@@ -5186,7 +5119,7 @@ class _GatewayConnection:
 
     def _release_held(self, session_key: str) -> None:
         """A reply ended. The runs held for it stay held until they drain, in
-        their order of arrival (review 2af1 N7, N8): into the run's own queue
+        their order of arrival: into the run's own queue
         if a reply registers for it (`register_consumer`; the ask-user switch
         registers right after this release), before the run's next event
         (`_turn_route_now`), or here, in the background, for a run that sends
@@ -5337,8 +5270,7 @@ class _GatewayConnection:
         * `run_text` holds the run's text dedup baselines up to the cut
           ({"received", "stream", "item"}). The run's closing events repeat
           its WHOLE text; a claimer that starts from empty baselines takes all
-          of it for new and appends the entire reply again (seen live
-          2026-10-12: 2327..4000 followed by 1..4000).
+          of it for new and appends the entire reply again.
 
         * `reply` is the cancelled reply's own state, {message_id, renderer}:
           the message it showed the run in, and what it showed there.
@@ -5845,11 +5777,9 @@ class _GatewayConnection:
         This is the ONLY task that ever calls `self._ws.recv()`. Reconnects
         happen in place (`self._ws = None`, then `_reconnect()` blocks until
         a new socket is ready) rather than by spawning a second event-loop
-        task -- spawning a second task here previously caused a runaway
-        reconnect storm: the old coroutine kept looping after `_reconnect()`
-        returned, so two tasks raced on `self._ws.recv()`, each collision
-        raised its own exception, and each of *those* spawned yet another
-        task (2026-07-10 incident).
+        task: two tasks would race on `self._ws.recv()`, each collision would
+        raise, and each of *those* would spawn yet another task, a runaway
+        reconnect storm.
         """
         while not self._stopped:
             try:
@@ -5903,16 +5833,14 @@ class _GatewayConnection:
                     continue
 
                 # ── Event dispatch ──
-                # On tool events (re-measured 2026-10-12, gateway 2026.9.x;
-                # the 2026-07-30 ELI-26 measurement predates `session.tool`):
+                # On tool events:
                 #
                 #   * The connection that STARTS a run gets its tool activity
                 #     as `agent` events with payload.stream == "tool".
                 #   * Any connection subscribed to the session with
                 #     `sessions.messages.subscribe` gets the same payloads as
-                #     `session.tool` events, whoever started the run (measured:
-                #     observer got 3 start + 3 result, zero `agent` tool
-                #     events). That covers this connection after a reconnect,
+                #     `session.tool` events, whoever started the run (and no
+                #     `agent` tool events). That covers this connection after a reconnect,
                 #     and runs the Gateway starts itself (ELI-92).
                 #
                 # Both are folded into one path below, first copy wins.
@@ -5966,7 +5894,7 @@ class _GatewayConnection:
                         # Genuinely shown to a live tab, which persists it via
                         # OWUI's own client-side flow -- remember this so a
                         # later duplicate/retried final event for the same
-                        # run_id never reopens its message (P33).
+                        # run_id never reopens its message.
                         self.mark_delivered_live(payload["sessionKey"], payload["runId"])
                         # The inline turn is alive and took the final itself, so
                         # the parity shadow isn't needed for this run -- drop it.
@@ -5979,12 +5907,12 @@ class _GatewayConnection:
                     pipe_log("  dropped ambiguous or unmatched session-only event")
 
                 # If nothing matches at all, drop it.
-                # This efficiently filters cross-session bleed (P16).
+                # This efficiently filters cross-session bleed.
 
             except asyncio.TimeoutError:
                 # Not even a tick for two intervals: the socket is dead without
                 # having closed (half-open), so every run on it would wait
-                # forever (review 2af1 R13). Tear it down and reconnect.
+                # forever. Tear it down and reconnect.
                 pipe_log(f"  tick timeout: no frame for {2 * self._tick_interval_s:.0f}s, "
                          "reconnecting")
                 transport = getattr(self._ws, "transport", None)
@@ -6037,8 +5965,7 @@ class _GatewayConnection:
 # user-visible content was produced" -- never real assistant text to show a
 # human. An announce-follow-up run can legitimately finish with exactly one
 # of these as its only "assistant text", and writing it into a chat leaks
-# internal plumbing (P33, 2026-07-11: `ANNOUNCE_SKIP` landed as literal
-# message text).
+# internal plumbing.
 _SILENT_SENTINELS = {"ANNOUNCE_SKIP", "NO_REPLY", "no_reply"}
 
 
@@ -6106,9 +6033,8 @@ def _history_events(messages: list):
     closing message (`cli-assistant:<runId>`) repeats all of its text, so it
     only counts when nothing in its own run carried text (a plain, tool-free
     reply, or imports that carry tool blocks only). It counts in place: an
-    asked question's run closes before its answer run starts, and the
-    question was lost when only the last closer was kept (ask-rebuild,
-    2026-10-14, chat d0f0c6ff).
+    asked question's run closes before its answer run starts, so keeping
+    only the last closer would lose the question.
 
     A run on the Gateway's own runtime (GPT, Gemini, DeepSeek) keeps
     OpenClaw's shape: `toolCall` blocks, and each result a `toolResult`
@@ -6117,9 +6043,8 @@ def _history_events(messages: list):
 
     Text after a tool call is joined to the text before it with the separator
     the Gateway's live stream inserts there (`sawToolUseSinceText`), so the
-    rebuild equals what streamed (it streams as "\n\n<text>").
-    Plain concatenation glued a preamble to the answer ("...one at a time.
-    USER-DONE" with no break, restart window 2026-10-13)."""
+    rebuild equals what streamed (it streams as "\n\n<text>"), and a
+    preamble is not glued to the answer."""
     text = ""                 # what the events so far said
     run_text = False          # this run carried text before its closer
     tool_since_text = False   # the Gateway's `sawToolUseSinceText`
@@ -6190,7 +6115,7 @@ def _run_closed_by(message) -> str | None:
     """The run a `chat.history` message closes, or None. A claude-cli run
     closes with its `cli-assistant:<runId>` message. A run on the Gateway's
     own runtime has no such message: every message it writes carries
-    `__openclaw.runId` (the `chat.send` run id, probed live 2026-10-15), and
+    `__openclaw.runId` (the `chat.send` run id), and
     its last is an assistant message that did not stop for a tool call."""
     if not isinstance(message, dict) or message.get("role") != "assistant":
         return None
@@ -6211,9 +6136,7 @@ def _deepest_leaf_id(messages: dict, start_id: str | None) -> str | None:
     children -- e.g. right after an agent turn was appended. Anchoring a
     new message directly on `currentId` in that state appends it as
     a *sibling* of the existing child, which OWUI renders as a 1/2·2/2 variant
-    group instead of a linear message (observed 2026-07-13: a `Sub-agent
-    finished` message and the next agent message both parented to the same
-    node). Walking to the true leaf (following the most-recently-appended
+    group instead of a linear message. Walking to the true leaf (following the most-recently-appended
     child at each branch) makes every turn writer chain off the real tail.
     Cycle-guarded and depth-capped for safety against malformed history.
     """
@@ -6283,7 +6206,7 @@ _gateway_connection: _GatewayConnection | None = None
 _gateway_init_lock = asyncio.Lock()
 
 # Anchor for finding a connection left behind by a *previous* deploy of this
-# same function (P33/P36: OWUI's function loader (open_webui/utils/plugin.py)
+# same function (OWUI's function loader (open_webui/utils/plugin.py)
 # execs each redeploy into a brand-new module object with no teardown hook on
 # the old one -- a module-level singleton alone resets every deploy and orphans
 # the old module's WS/event-loop task forever). Stashing it as an attribute on
@@ -6570,7 +6493,7 @@ async def _introduce_turn_message(chat_id: str, user_id: str, messages: dict, cu
     """Show a newly claimed message in every open tab of the chat without a
     reload: the shared `chat:messages` event to room `chat:<id>`, which the
     page merges and moves its view to (Open WebUI emits the same for its own
-    turns; measured live as M1)."""
+    turns)."""
     from open_webui.socket.main import sio
 
     await sio.emit("events", {
@@ -6598,7 +6521,7 @@ def _run_prompt_text(span: list | None) -> str:
 
 def _last_item_text(renderer: "_TurnRenderer") -> str:
     """The text of the run's last message item, the only one a closing
-    question can be in; fences never span items (review 2af1 F4). "" when
+    question can be in; fences never span items. "" when
     the run ended on a tool call."""
     last = renderer.output[-1] if renderer.output else None
     if last is None or last.get("type") != "message":
@@ -6627,7 +6550,7 @@ def _prompt_tail(text: str, start: int = 0) -> str:
 RESUME_DIRECTIVE_PREFIX = "[system] Your previous "
 
 
-# A request longer than this is quoted as its head and tail (review 2af1 F2).
+# A request longer than this is quoted as its head and tail.
 RESUME_REQUEST_MAX = 6000
 RESUME_REQUEST_HEAD = 2000
 # OpenClaw's inbound metadata blocks a stored user turn can start with
@@ -6637,7 +6560,7 @@ _INBOUND_META_RE = re.compile(
 
 
 def _strip_inbound_meta(text: str) -> str:
-    """`text` without the metadata blocks in front of it (review 2af1 F5)."""
+    """`text` without the metadata blocks in front of it."""
     while True:
         m = _INBOUND_META_RE.match(text or "")
         if not m:
@@ -6647,7 +6570,7 @@ def _strip_inbound_meta(text: str) -> str:
 
 def _quote_block(text: str) -> str:
     """`text` between two delimiter lines that occur in it as no line: a run
-    of dashes longer than any dash-only line of its own (review 2af1 F2b)."""
+    of dashes longer than any dash-only line of its own."""
     dashes = [len(x.strip()) for x in text.split("\n") if x.strip() and set(x.strip()) == {"-"}]
     delim = "-" * max([3] + [n + 1 for n in dashes])
     return f"{delim}\n{text}\n{delim}"
@@ -6656,7 +6579,7 @@ def _quote_block(text: str) -> str:
 def _clip_middle(text: str, limit: int = RESUME_REQUEST_MAX, head: int = RESUME_REQUEST_HEAD) -> str:
     """`text` within `limit` characters: its head and tail, the question a
     long request usually ends with included, and a line for what is left
-    out (review 2af1 F2)."""
+    out."""
     if len(text) <= limit:
         return text
     tail = limit - head
@@ -6669,14 +6592,13 @@ def _resume_directive(shown: str | None, request: str | None = None,
 
     A resume follows an outside kill (the owner rule), which also kills any
     tool call still running. Its result then reads like the command failing
-    (`Exit code 137`), and a resume that does not say why stopped there and
-    asked the user what to do (M3 window, 2026-10-13: 4 of 4).
+    (`Exit code 137`), so the resume says why, or the agent stops there and
+    asks the user what to do.
 
     `request`: the user's message the run was answering. The killed run's
     claude-cli session is not continued: the resume runs in a new one that
-    holds only this message (M3 window run 2, 2026-10-14: "I don't have the
-    rest of your sequence"), so the request travels in it. `attachments`:
-    how many images or files it carried, which do not travel (F3)."""
+    holds only this message, so the request travels in it. `attachments`:
+    how many images or files it carried, which do not travel."""
     cause = (
         "The Gateway restarted or your process was killed from outside while you "
         "were working. A tool call that was still running was killed by that, so "
@@ -6915,7 +6837,7 @@ class _TurnWriter:
         self.pending_resume = False     # a resume the Gateway refused; sent on the next hello-ok
         self.request: str | None = None  # the user's message M answers, quoted by a resume
         self.request_attachments = 0    # its images or files, which a resume cannot carry
-        self.awaiting_row = False       # kept open for a Gateway recovery (R2)
+        self.awaiting_row = False       # kept open for a Gateway recovery
         self.closed = False             # nothing more to write (ended, or M is someone else's)
         self.sent_output: list = []     # the `output` open tabs hold
         if renderer is not None:
@@ -7065,8 +6987,7 @@ class _TurnWriter:
             prev = run
 
     async def _view(self, *, final: bool) -> tuple[list, str]:
-        """(output, text) of M as the inline reply shows a run (review 2af1
-        R4): the rewrites it recorded (an image for a `MEDIA:` directive, a
+        """(output, text) of M as the inline reply shows a run: the rewrites it recorded (an image for a `MEDIA:` directive, a
         card for an answered ask-user prompt) applied to the renderer, a
         directive that first came after the handover resolved here, and,
         while the run streams, a directive whose filename is still arriving
@@ -7136,8 +7057,8 @@ class _TurnWriter:
         """Runs written into M whose events never reached this writer: restart
         recoveries that rule E maps to M (they ran while the socket was down,
         case 4), and pipe runs naming M, such as the question run an ask-user
-        answer run continues after an Open WebUI restart left no target
-        (review 2af1 R9). M's runs are put in transcript order."""
+        answer run continues after an Open WebUI restart left no target.
+        M's runs are put in transcript order."""
         order = []
         for run, tool in _history_user_turns(messages):
             if run in self.runs or (
@@ -7154,7 +7075,7 @@ class _TurnWriter:
             return
         decision = next_continuation(row, stop_notice_before, self.resumes)
         if decision in ("gateway", "wait"):
-            # The pump stays (R2): the recovery run takes M over (rule E), or a
+            # The pump stays: the recovery run takes M over (rule E), or a
             # later row leaves `running`. A recovery the Gateway gives up on
             # tombstones the row to failed (main-session-restart-recovery-
             # CPJjd8da.mjs:1150), which is that row.
@@ -7179,8 +7100,8 @@ class _TurnWriter:
 
     async def _ask_question(self) -> bool:
         """A run that ends with a question asks it as the inline reply does:
-        Open WebUI's question card on the tab viewing the chat (ELI-107
-        decision 1, option 1). One card call, bounded by its own timeout, so
+        Open WebUI's question card on the tab viewing the chat (ELI-107).
+        One card call, bounded by its own timeout, so
         M waits for no tab. The answer is sent as an `input` run that this
         writer adopts, and the question shows as its Ask User card. False
         when nothing was sent: no question, no tab on the chat, a cancel, a
@@ -7253,8 +7174,8 @@ class _TurnWriter:
         of the first run written into M, in transcript order, that is not
         itself a resume. Every run naming M counts, so M's own first run (a
         pipe run or an agent turn) is found even when this writer was made
-        for a later run of M, a redeploy's or an Open WebUI restart's (review
-        2af1 F1). (None, 0) when the transcript cannot be read (the resume
+        for a later run of M, a redeploy's or an Open WebUI restart's.
+        (None, 0) when the transcript cannot be read (the resume
         then goes without it)."""
         try:
             hist = await self.conn.session_history(self.session_key, limit=RUN_HISTORY_LIMIT)
@@ -7267,8 +7188,8 @@ class _TurnWriter:
             if not run or not (run in self.runs or run_message_id(
                     self.session_key, self.chat_id, run, messages) == self.message_id):
                 continue
-            # The user's answer to M's question and a resume are no request
-            # (review 2af1 N2): only M's reply run or an agent turn is.
+            # The user's answer to M's question and a resume are no request:
+            # only M's reply run or an agent turn is.
             if (parse_pipe_run_id(run) or {}).get("kind") in ("input", "resume"):
                 continue
             content = m.get("content")
@@ -7278,7 +7199,7 @@ class _TurnWriter:
                 if isinstance(b, dict) and b.get("type") == "text")
             text = _strip_inbound_meta(text)
             # Content blocks, or (how the Gateway stores an Open WebUI image
-            # turn) string content with the images in `__openclaw.media` (N1).
+            # turn) string content with the images in `__openclaw.media`.
             media = (m.get("__openclaw") or {}).get("media")
             attachments = max(sum(1 for b in blocks if isinstance(b, dict) and b.get("type") != "text"),
                               len(media) if isinstance(media, list) else 0)
@@ -7357,7 +7278,7 @@ class _TurnWriter:
 
     async def _show_silent_announce(self, hist: dict | None) -> None:
         """A sub-agent's completion the parent answered with silence (NO_REPLY)
-        still shows the child's result, as one card (review 2af1 R10): its
+        still shows the child's result, as one card: its
         label from the parent's spawn call, its result from the child's own
         transcript, or what was kept of it before a `cleanup: "delete"` (its
         chat final, or the transcript read as the announce run started).
@@ -7387,8 +7308,7 @@ class _TurnWriter:
     def release(self) -> None:
         """This writer's connection was retired by a newer deploy: end the Open
         WebUI task now and write nothing more. A task left registered keeps the
-        chat "generating" and makes orphan repair skip the chat (live 2026-10-13,
-        task 03904655 of retired 62b9927 held efe80f6a). M stays unfinished
+        chat "generating" and makes orphan repair skip the chat. M stays unfinished
         with this writer recorded, which no longer counts as live, so the
         successor adopts it (`_adopt_turn_message`) and finishes it once its
         run is over."""
@@ -7407,9 +7327,9 @@ class _TurnWriter:
         rebuilt = _history_renderer(wake_span(hist.get("messages"), self.wake["at"],
                                               self.wake["end"]))
         # Every card that streamed must be in it: the transcript may lack a
-        # wake's tool calls entirely (gate 2026-10-13: no import of the wake's
-        # CLI session with a user turn queued behind it), and an item count
-        # takes a text item for a card.
+        # wake's tool calls entirely (its CLI session is not imported while a
+        # user turn is queued behind it), and an item count takes a text item
+        # for a card.
         if (self._holds_streamed_calls(rebuilt, "wake's")
                 and len(rebuilt.output) >= len(self.renderer.output)
                 and len(rebuilt.text) >= len(self.renderer.text) and rebuilt.output):
@@ -7420,14 +7340,13 @@ class _TurnWriter:
 
         A run counts as covered when its span holds every call it streamed.
         A killed or aborted claude-cli run is never covered: its calls and
-        text are never imported (graceful window 2026-10-14; run 64028b9f).
+        text are never imported.
         The transcript is used from the first run k after which every run is
         covered; what streamed before run k's start is kept as it was, and
         the rebuild follows it with the live stream's break. So a resume
         after a killed run keeps the killed run's preamble and card, and a
-        recovery the writer joined late still gets its start back (crash
-        window 2026-10-14: its first text and card ran before the pipe was
-        back). None (keep what streamed) while a run has not closed, or when
+        recovery the writer joined late (its first text and card ran before
+        the pipe was back) still gets its start back. None (keep what streamed) while a run has not closed, or when
         the transcript covers nothing."""
         spans = [_history_span_messages(hist, r) for r in self.runs]
         if any(s is None for s in spans):
@@ -7485,8 +7404,8 @@ class _TurnWriter:
     def _holds_streamed_calls(self, rebuilt, whose: str) -> bool:
         """Whether a transcript rebuild holds every tool call that streamed
         into M. A transcript can lack them all: a wake's CLI session not yet
-        imported (gate 2026-10-13), or an aborted claude-cli run, whose tool
-        calls are never imported (run 64028b9f, 2026-10-14)."""
+        imported, or an aborted claude-cli run, whose tool calls are never
+        imported."""
         streamed = {o.get("id") for o in self.renderer.output if o.get("type") == "function_call"}
         missing = streamed - {o.get("id") for o in rebuilt.output if o.get("type") == "function_call"}
         if missing:
@@ -7558,9 +7477,8 @@ async def _transcript_view(conn: "_GatewayConnection", *, session_key: str, chat
     """(output, text) of M rebuilt from the transcript as the writer finalizes
     it (`_TurnWriter._view`): an answered ask-user prompt as its card, one
     nobody answered without its directive line, a `MEDIA:` directive as its
-    image. `content` is that text, so it always agrees with the items. The
-    ELI-94 reconcile wrote the bare rebuild and dropped an answered card
-    (ask-rebuild, 2026-10-14, chat d0f0c6ff)."""
+    image. `content` is that text, so it always agrees with the items, and
+    an answered card survives a reconcile."""
     view = _TurnWriter(conn, session_key=session_key, chat_id=chat_id, user_id=user_id,
                        run_id=runs[-1], message_id=message_id, renderer=rendered)
     view.runs = list(runs)
@@ -7619,7 +7537,7 @@ def _turn_route_now(conn: "_GatewayConnection", payload: dict) -> bool:
     if run.startswith(ACTION_RUN_PREFIX):
         return True  # the Status Action's own runs render nothing
     if (sess, run) in conn._held_for_live:
-        conn.drain_held(sess, run)  # the earlier ones first (review 2af1 N7)
+        conn.drain_held(sess, run)  # the earlier ones first
     if conn.live_reply_owns(sess, run):
         conn.hold_for_live(sess, run, payload)
         return True
@@ -7667,7 +7585,7 @@ def _note_child_result(conn: "_GatewayConnection", payload: dict) -> None:
     own chat final (`spawnedBy` = the parent, server-chat-CbnqM5f6.mjs
     emitChatTerminal): a `cleanup: "delete"` child is gone by the time its
     announce run ends (subagent-announce-BIG31XbZ.mjs:413), and a silent
-    announce shows this result (review 2af1 R10)."""
+    announce shows this result."""
     if payload.get("state") != "final" or not conn.parse_owui_session_key(payload.get("spawnedBy") or ""):
         return
     text = (_history_item(payload.get("message")) or {}).get("text") or ""
@@ -7737,8 +7655,7 @@ def _classifies(payload: dict) -> bool:
 
 
 def _turn_kind_known(conn: "_GatewayConnection", sess: str, run: str, payload: dict) -> bool:
-    """Review 2af1 R7: an agent run's events may reach the writer only once the
-    run is known not to be a heartbeat. Until then they are held in order;
+    """An agent run's events may reach the writer only once the run is known not to be a heartbeat. Until then they are held in order;
     the run's first classifying event releases them ahead of itself, its
     first flagged one drops them (`_note_heartbeat_run`), and its session's
     settled row releases them too (`_turn_settled`). A pipe run (the pipe
@@ -7933,8 +7850,7 @@ async def _wake_bind(conn: "_GatewayConnection", sess: str, run: str, user_id: s
     Returns ("bound", the job run's start), ("wait", None) while a cron job
     of this session runs but its turn is not readable yet (the embedded
     runtime commits it after the first events), or ("stray", None): nothing
-    runs a wake into this session, so the event is not a wake's (review
-    2af1 N2)."""
+    runs a wake into this session, so the event is not a wake's."""
     try:
         jobs = (await conn.send_request("cron.list", {"includeDisabled": True}, timeout=15)).get("jobs")
     except Exception as ex:
@@ -7945,8 +7861,8 @@ async def _wake_bind(conn: "_GatewayConnection", sess: str, run: str, user_id: s
     running_start = min((s for s in starts if isinstance(s, (int, float))), default=None)
     bound = conn._wake_turns_bound.setdefault(sess, set())
     # The turn is committed after its job started: read back until the window
-    # holds a message older than that start (review 2af1: a fixed 50-message
-    # window lost a wake that had written more before a reconnect).
+    # holds a message older than that start (a fixed window loses a wake that
+    # wrote more than it before a reconnect).
     limit, turn = 50, None
     while True:
         try:
@@ -7981,9 +7897,8 @@ async def _wake_job_start(conn: "_GatewayConnection", turn: dict, at_ms: float,
     the turn was written (`state.runningAtMs`), or have a finished run whose
     window holds both the turn and the event (`cron.runs`, kept after a
     one-shot job is deleted). Anything else that runs with runId = sessionId
-    (a node agent command, a compaction) is not a wake and opens no message
-    (live 2026-10-13: runningAtMs 1791863926518 precedes the turn's commit
-    1791863928462). An RPC failure answers None: the events wait."""
+    (a node agent command, a compaction) is not a wake and opens no message.
+    `runningAtMs` precedes the turn's commit by a few seconds. An RPC failure answers None: the events wait."""
     job, at = turn.get("job"), turn.get("at") or 0
     running = next(((j.get("state") or {}).get("runningAtMs") for j in jobs or []
                     if j.get("id") == job), None)
@@ -8038,7 +7953,7 @@ async def _wake_step(conn: "_GatewayConnection", sess: str, run: str, user_id: s
         if state == "stray":
             # Nothing runs a wake into this session: these events are no
             # wake's, and holding them would hand them to the next wake, which
-            # reuses this run id (review 2af1 N2). The next event is judged anew.
+            # reuses this run id. The next event is judged anew.
             pipe_log(f"  turn writer: {len(pump.held)} sessionId event(s) on {sess[-12:]} with no "
                      "running cron wake: not shown")
             pump.held.clear()
@@ -8091,7 +8006,7 @@ async def _wake_resync(conn: "_GatewayConnection") -> None:
         wake = pump.writer.wake
         if wake["job"] not in running:
             # The wake ended at its job run's finish, not now: a run queued
-            # behind it may have written since (review 2af1 N1). Unknown
+            # behind it may have written since. Unknown
             # (None): the transcript is not used, the message keeps what it
             # streamed.
             run = await _wake_job_run(conn, wake["job"], wake.get("at") or 0)
@@ -8151,7 +8066,7 @@ async def _turn_resync(conn: "_GatewayConnection", skip: set = frozenset()) -> N
     (except `skip`, known active) and end the ones that went idle while their
     settle was missed. Inline replies get the row busy or idle: one that lost
     its own final and settle in the gap looks for its closer even while a
-    later run keeps the session busy (review 2af1 N3)."""
+    later run keeps the session busy."""
     idle = {sess for (sess, _run) in [*conn._turn_pumps, *conn._turn_unkinded] if sess not in skip}
     idle |= {c.session_key for c in list(conn._consumers.values()) if c.session_key not in skip}
     for sess in idle:
@@ -8272,8 +8187,7 @@ async def _relay_emit_event(user_id: str, chat_id: str, message_id: str | None,
 # ── Orphaned reply stubs (ELI-90) ──
 # Open WebUI writes a reply's assistant message (`done: False`) before the
 # pipe sends anything, and only the request that streams the reply ever sets
-# `done: True`. When Open WebUI restarts mid-turn (three OOM kills on
-# 2026-10-12 16:21-16:25 UTC), that request is gone: the run finishes in the
+# `done: True`. When Open WebUI restarts mid-turn, that request is gone: the run finishes in the
 # Gateway, but the chat keeps an empty bubble that looks like it is still
 # running, forever. On the first load after the restart these stubs are
 # matched to their runs in the Gateway transcript and finished from it.
@@ -8568,8 +8482,8 @@ async def _reconcile_orphan_stubs(valves_getter) -> None:
     if stubs:
         pipe_log(f"  orphan stub reconcile: {len(stubs)} unfinished OpenClaw "
                  "repl(y/ies) in Open WebUI")
-    # One at a time: Open WebUI's SQLite rejected most of 45 concurrent chat
-    # writes (2026-10-12). Only a stub whose run is still going gets its own
+    # One at a time: Open WebUI's SQLite rejects concurrent chat writes.
+    # Only a stub whose run is still going gets its own
     # task, to wait for that run's settle.
     counts: dict = {}
     for chat_id, stub_id in stubs:
@@ -9037,9 +8951,8 @@ async def _current_load(pipe, request):
 
     A deploy execs the new content into a new module, and the first request
     there retires the old load's connection. A turn the old load admitted but
-    had not yet connected (the dev build holds new turns while a deploy is
-    pending, 24 min on 2026-10-13) then met the retired connection and was
-    lost as "gateway connection retired". Open WebUI's own lookup
+    had not yet connected would meet the retired connection and be lost as
+    "gateway connection retired". Open WebUI's own lookup
     (`get_function_module_by_id`, which also sets the valves) names the
     current load."""
     prefix = _function_module_prefix(__name__)
@@ -9399,15 +9312,12 @@ class Pipe:
 
         Sends a chat.send to a temp session and reads the run from its own
         signals: its assistant text up to its final event, or, when the final
-        was lost, its settle row and the transcript (review 2af1 timers). The
-        old 7 x 3 s `sessions.preview` poll dropped any title slower than that.
+        was lost, its settle row and the transcript. No poll and no timer.
 
         Runs under TITLE_GEN_AGENT_ID (a separate configured agent from
-        AGENT_ID), not the main conversation's agent. A bare/unprefixed
-        sessionKey previously defaulted onto the SAME agent as the live
-        conversation, so this background call shared its CLI process/queue
-        lane and queued behind any heavy turn (2026-07-10 regression). A
-        distinct agent id gets its own lane.
+        AGENT_ID), not the main conversation's agent: on the same agent it
+        would share the conversation's CLI process and queue lane and wait
+        behind any heavy turn.
         """
         prompt = (
             "Create a concise title (3-5 words) with a relevant emoji "
@@ -9655,9 +9565,8 @@ class _PipeTurn:
         self.session_model_key = None
         self.session_runtime = None
 
-        # --- P15: Short-circuit OWUI background tasks ---
-        # O10 addendum: image_prompt_generation and function_calling also get
-        # skipped here -- both already have a documented, silent OWUI-side
+        # --- Short-circuit OWUI background tasks ---
+        # image_prompt_generation and function_calling are skipped too: both already have a documented, silent OWUI-side
         # fallback for an empty response (raw user message / "no tool
         # needed" respectively), so skipping them costs
         # nothing and saves a full agent turn. moa_response_generation is
@@ -9815,9 +9724,8 @@ class _PipeTurn:
         # in-flight RPC, and (b) a TTL cache of the last applied model lets the
         # waiters (and the next ~60s of same-model messages) skip the RPC
         # entirely. Failure invalidates the cache so nothing sticks. A failure
-        # is reported, not retried: the July retry never saved a reply (every
-        # failure since, a model not allowed or a Gateway timeout, failed
-        # twice; ELI-131).
+        # is reported, not retried: a model not allowed or a Gateway timeout
+        # fails the same way twice (ELI-131).
         patch_err = None
         async with self.conn.model_patch_lock(self.session_key):
             if self.conn.model_patch_cached(self.session_key, self.model_override):
@@ -9882,16 +9790,10 @@ class _PipeTurn:
         # AUTHORITATIVELY by the gateway (sessions.describe), NOT by the
         # per-worker `active_run_id_for_session` registry: OWUI runs multiple
         # worker processes, so a run started while another worker handled the
-        # previous turn is invisible to this worker's registry. That blind spot
-        # let a concurrent message fall through to a fresh chat.send while the
-        # gateway still had an active run -- the gateway steer-merged it and
-        # returned a runId that instantly emits a single 'final' with no text,
-        # so the bubble rendered nothing and the real answer leaked out as a
-        # separate message. (Verified from live pipe logs 2026-07-18.)
+        # previous turn is invisible to this worker's registry.
 
-        # Open WebUI can call the pipe twice for one reply (ELI-82: 31 of
-        # 1150 replies from 2026-09-26 to 2026-10-14, the second call up to
-        # ten minutes later). Sending the message again runs it twice, and
+        # Open WebUI can call the pipe twice for one reply (ELI-82), the second
+        # call up to ten minutes later. Sending the message again runs it twice, and
         # the second answer, written last, replaces the first in the same
         # message. So a second call with the same text follows the run the
         # first one started and ends with that run's reply, rebuilt from the
@@ -9943,7 +9845,7 @@ class _PipeTurn:
             # at the end of this turn: sending it now would steer into the
             # live run, and the claude-cli runtime has no steering hook (the
             # gateway acks "started", then drops the message once the run
-            # ends -- measured 2026-10-11).
+            # ends).
             self.our_run_id = self.adopted_run_id
             self.resolved_thinking = None
             self.pending_clamp_note = ""
@@ -9965,18 +9867,17 @@ class _PipeTurn:
             # nothing ("no reply text"). Holding this lock only across the wait+send
             # (NOT the event loop below) means the next waiter re-checks AFTER our
             # run is registered and observes it active (sessions.list hasActiveRun),
-            # so it waits its turn instead of racing us. Confirmed thundering-herd
-            # phantom: two Captured runIds 10ms apart under a burst release (ELI-56).
-            # NOTE: do NOT prepend a `/queue followup` directive here. On the
-            # 2026.7.1 gateway that directive is NOT stripped from a device
-            # chat.send -- it leaked verbatim into the delivered message.
+            # so it waits its turn instead of racing us (ELI-56).
+            # NOTE: do NOT prepend a `/queue followup` directive here: the
+            # Gateway does not strip it from a device chat.send, so it leaks
+            # verbatim into the delivered message.
             async with self.conn.session_send_lock(self.session_key):
                 # Wait for the Gateway to push that the run settled
                 # (`sessions.changed`, see `session_change_event`), re-reading
                 # the authoritative state after each change. No poll, no
-                # settle window and no ceiling (ELI-88): the old 30-minute
-                # ceiling released a message into a run that was still going,
-                # where the Gateway queued it and claude-cli dropped it. A
+                # settle window and no ceiling (ELI-88): a ceiling releases a
+                # message into a run that is still going, where the Gateway
+                # queues it and claude-cli drops it. A
                 # resume that starts right after a settle is caught after the
                 # send instead (see `enqueued_not_started`). Stop cancels this
                 # wait like any other.
@@ -10048,8 +9949,8 @@ class _PipeTurn:
                 # Listen before sending: the run's first events can arrive
                 # before chat.send returns, and with no consumer they would go
                 # to the turn writer, which takes this reply's message over
-                # while the reply still streams (review 2af1 R12). The run id
-                # is the idempotency key.
+                # while the reply still streams. The run id is the idempotency
+                # key.
                 self.queue = self.conn.register_consumer(self.session_key, idempotency_key)
                 try:
                     send_resp = await _run_request(
@@ -10101,8 +10002,7 @@ class _PipeTurn:
         )
         # When the Gateway had admitted this reply's run (chat.send returned;
         # an adopted run already ran). An idle row read after it means the
-        # run is over; one read before may show the previous run's settle
-        # (review 2af1 N4).
+        # run is over; one read before may show the previous run's settle.
         self.admitted_at = float("-inf") if self.adopted_run_id else time.monotonic()
         # A gap or a resync since: this run's own final and settle may be
         # lost, so another run's settle row may be the first sign it ended.
@@ -10153,8 +10053,8 @@ class _PipeTurn:
         # turn writer, whose settled row decides who continues it (DESIGN 2.7).
         self.handed_over = False
         # A reply with no Open WebUI message (an API request) has nothing to
-        # hand over: it applies the owner rule itself, in its own stream
-        # (review 2af1 R14). Set while it waits for the interrupted run's row.
+        # hand over: it applies the owner rule itself, in its own stream.
+        # Set while it waits for the interrupted run's row.
         self.awaiting_owner = False
         self.owner_notice_before = False
         self.owner_resumes = 0
@@ -10164,7 +10064,7 @@ class _PipeTurn:
         try:
             while adopt_new_run:
                 adopt_new_run = False
-                # A new run's text is a new message item (review 2af1 F4).
+                # A new run's text is a new message item.
                 self.fence_item_start = len(self.assistant_stream_text)
                 try:
                     while not self.done:
@@ -10211,8 +10111,8 @@ class _PipeTurn:
                             # Read after this run was admitted, an idle session
                             # means it is over, whichever run settled last. That
                             # is the end signal once its own may have been lost
-                            # in a gap (review 2af1 N3). A row read before the
-                            # admission shows nothing about it (N4).
+                            # in a gap. A row read before the admission shows
+                            # nothing about it.
                             admitted = msg.get("read_at", time.monotonic()) >= self.admitted_at
                             if admitted and msg.get("resync"):
                                 self.signals_lost = True
@@ -10301,7 +10201,7 @@ class _PipeTurn:
                                 and not payload.get("message")):
                             self.enqueued_not_started = True
 
-                        # --- P16: Double-check session/run match ---
+                        # --- Double-check session/run match ---
                         evt_session = payload.get("sessionKey", "")
                         evt_run_id = payload.get("runId", "")
                         if evt_session and evt_session != self.session_key:
@@ -10421,9 +10321,9 @@ class _PipeTurn:
                     # new message. It arrives as a task cancel when we are
                     # awaiting, or as a generator close when we are suspended
                     # at a yield (OWUI busy with the last chunk), which is
-                    # most of the time while text streams. Handling only the
-                    # cancel left the close path with no abort, no handover
-                    # and the reply's own unsent message lost (2026-10-11).
+                    # most of the time while text streams. Both paths land
+                    # here, so neither loses the abort, the handover or the
+                    # reply's own unsent message.
                     #
                     # Park first, synchronously: the run keeps going with its
                     # events buffered. On Send now it goes on in this reply's
@@ -10494,7 +10394,7 @@ class _PipeTurn:
                             self.pending_prompt_text = ""
                             if answer_res.new_run_id and answer_res.new_run_id != self.our_run_id:
                                 pipe_log(f"  continuing into new run: {answer_res.new_run_id[:20]}...")
-                                # The answer run continues this reply (R9).
+                                # The answer run continues this reply.
                                 self.switch_to_answer_run(answer_res)
                                 self.conn.unregister_consumer(self.session_key, self.our_run_id, queue=self.queue)
                                 self.queue = answer_res.queue or self.conn.register_consumer(
@@ -10536,11 +10436,8 @@ class _PipeTurn:
                     # result (run cancelled, gateway dropped it, tool crashed).
                     # Its card is a spinner until something completes it, and
                     # OWUI's own "mark leftover in_progress items completed"
-                    # sweep does NOT reliably reach this path -- observed
-                    # 2026-07-25, where a delivered call stayed `in_progress`
-                    # in the persisted item and only rendered as done because
-                    # its result item happened to exist. So close them here
-                    # rather than relying on that.
+                    # sweep does NOT reliably reach this path, so close them
+                    # here.
                     #
                     # A handed-over run is not over (its writer completes the
                     # cards from the renderer it was handed), but this
@@ -10548,8 +10445,8 @@ class _PipeTurn:
                     # post-stream sweep executes every `function_call` of the
                     # stream that has no `function_call_output`, gets `Error:
                     # Tool "Bash" not found.` and sends that back as a new
-                    # turn, whose stream then overwrites the writer's reply
-                    # (M3 crash window, 2026-10-13). Only the yielded items are
+                    # turn, whose stream then overwrites the writer's reply.
+                    # Only the yielded items are
                     # closed; the handed renderer keeps the call open.
                     if not adopt_new_run:
                         note = ("(interrupted -- the reply continues when the run resumes)"
@@ -10642,7 +10539,7 @@ class _PipeTurn:
         if self.handed_over:
             # The turn writer owns the message now (DESIGN 2.6): no save of
             # this request's part into it, and no recovery or retry of a
-            # reply that showed nothing (the 98891cbb shape, ELI-147).
+            # reply that showed nothing (ELI-147).
             return
         if (self.enqueued_not_started and not self.text_yielded and not self.aborted
                 and not self.adopted_run_id and self.session_runtime == "claude-cli"
@@ -10738,10 +10635,8 @@ class _PipeTurn:
                     f"thinking: Gateway rejected level {self.resolved_thinking!r} "
                     f"({recovered!r}); retrying once without an explicit level"
                 )
-                # Say only what was actually observed. The previous wording
-                # asserted a cause it never checked ("this chat hadn't talked
-                # to it before"), which was false on every turn after the
-                # first and sent anyone reading it hunting the wrong bug.
+                # Say only what was actually observed, never a cause that was
+                # not checked.
                 if learned:
                     supported = ", ".join(repr(lv) for lv in learned)
                     retry_note = (
@@ -10907,7 +10802,7 @@ class _PipeTurn:
     async def recover_from_transcript(self) -> str | None:
         """The run's text read back: by its run id, else by its user text,
         which only a run seen here may use. With nothing of it seen, the
-        session's last reply may be another run's (review 2af1 N4)."""
+        session's last reply may be another run's."""
         try:
             hist = await self.conn.session_history(self.session_key, limit=RUN_TEXT_HISTORY_LIMIT)
             found, whole = _history_text_for_run(hist, self.our_run_id)
@@ -11003,10 +10898,10 @@ class _PipeTurn:
         # The answer continues this reply: its run id names it (ELI-100 2.2).
         idempotency_key = (pipe_run_id(self.chat_id, self.owui_message_id, "input") if self.owui_message_id
                            else f"user-input-{self.chat_id}-{time.time()}")
-        # Listen before sending, as for the first send (R12): the answer
-        # run's first events can arrive before chat.send returns, and with
-        # no consumer and no target they would open a second writer on
-        # this reply's message (review 2af1 N6).
+        # Listen before sending, as for the first send: the answer run's
+        # first events can arrive before chat.send returns, and with no
+        # consumer and no target they would open a second writer on this
+        # reply's message.
         answer_queue = self.conn.register_consumer(self.session_key, idempotency_key)
         self.conn.continue_run_target(self.session_key, self.our_run_id, idempotency_key, shown=False)
 
@@ -11046,9 +10941,9 @@ class _PipeTurn:
                                queue=answer_queue)
 
     def switch_to_answer_run(self, answer_res: UserInputResult) -> None:
-        """The reply continues in the answer run (R9). Its target moved
-        before the send when its consumer was registered then (N6); the
-        question run was shown to its end either way."""
+        """The reply continues in the answer run. Its target moved before the
+        send when its consumer was registered then; the question run was
+        shown to its end either way."""
         if answer_res.queue is not None:
             self.conn.mark_delivered_live(self.session_key, self.our_run_id)
         else:
@@ -11087,8 +10982,7 @@ class _PipeTurn:
             )
             if handled:
                 pipe_log("  resolved MEDIA: directive")
-                # A writer that takes this reply over shows the same image
-                # (review 2af1 R4).
+                # A writer that takes this reply over shows the same image.
                 self.conn.note_turn_rewrite(self.owui_origin_chat_id, self.owui_message_id,
                                             text, resolved)
                 shown_as = resolved
@@ -11097,7 +10991,7 @@ class _PipeTurn:
         self.record_visible_chunk(shown_as)
         yield shown_as
         # No `replace` snapshot per plain delta: a mid-stream one freezes the
-        # visible stream (P23/P25). Open WebUI keeps the in-flight text itself.
+        # visible stream. Open WebUI keeps the in-flight text itself.
         if shown_as is not text:
             await self.maybe_emit_snapshot()
 

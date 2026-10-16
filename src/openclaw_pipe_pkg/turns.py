@@ -106,7 +106,7 @@ def _retire_turn_writer(writer_id: str) -> None:
 
 
 # Writer ids name their process, so another Open WebUI worker's writer can
-# be judged (review 2af1 R8): `<host>/<boot>/<pid>.<start>:<uuid>`, with the
+# be judged: `<host>/<boot>/<pid>.<start>:<uuid>`, with the
 # kernel's boot id and the process start time guarding against a reused pid.
 # A writer of this process is alive while its connection is (the set above);
 # one of another process on this host while that process runs. A writer of

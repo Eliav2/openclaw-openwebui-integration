@@ -20,12 +20,8 @@ _MEDIA_FNAME_RE = re.compile(r"\.[A-Za-z0-9]{1,8}$")
 
 def _looks_like_media_filename(fname: str) -> bool:
     """Return True only if fname plausibly names a real file (has an
-    extension). Without this, ordinary prose that happens to use "MEDIA:"
-    as a documentation term (e.g. "the MEDIA: fix is proven") gets its next
-    word treated as a filename and mangled into a broken image link --
-    confirmed live 2026-07-10 when explaining this very feature corrupted
-    "the MEDIA: fix" into `![fix](.../fix)`.
-    """
+    extension), so prose using "MEDIA:" as a term ("the MEDIA: fix") keeps
+    its next word as text instead of a broken image link."""
     return bool(_MEDIA_FNAME_RE.search(fname))
 
 
@@ -34,15 +30,11 @@ def _advance_media_buffer(pending: str, delta: str, ctx: str = "") -> tuple[str,
 
     Returns (text_to_yield_now, new_pending), mirroring
     `_advance_input_prompt_buffer`. A real streaming provider can deliver
-    "MEDIA:filename.png" split across multiple deltas at any point,
-    including mid-filename or mid-prefix -- resolving `_resolve_media`
-    eagerly against a single truncated delta either drops the directive
-    entirely (if "MEDIA:" itself is split, so neither chunk contains the
-    full prefix) or resolves it against a truncated filename (confirmed
-    live 2026-07-10: sending several images in one turn hit both failure
-    modes in the same message). Hold back from the first "MEDIA:" (or a
-    prefix of it that could still complete) until a whitespace char
-    confirms the filename is done.
+    "MEDIA:filename.png" split across deltas at any point, mid-prefix or
+    mid-filename, and resolving one delta alone drops the directive or
+    truncates its filename. Hold back from the first "MEDIA:" (or a prefix
+    of it that could still complete) until a whitespace char confirms the
+    filename is done.
 
     A directive in code is text and never held; one after a backtick run
     that may still open a code span is held until that is decided (ELI-111).
@@ -58,11 +50,10 @@ def _advance_media_buffer(pending: str, delta: str, ctx: str = "") -> tuple[str,
 def _take_media_fname(after_prefix: str) -> tuple[str, str]:
     """Split the text after a "MEDIA:" prefix into (filename, rest).
 
-    A filename ends at whitespace OR at the next "MEDIA:" directive. Splitting
-    on whitespace alone glued "X.pngMEDIA:X.png" into one bogus filename, and
-    the reply persisted as `![X.pngMEDIA:X.png](.../X.pngMEDIA:X.png)`, a link
-    that 404s (ELI-76). A copy of the same directive glued on with no separator
-    is dropped: nothing emits that on purpose, it is a re-delivered tail.
+    A filename ends at whitespace OR at the next "MEDIA:" directive, so
+    "X.pngMEDIA:Y.png" is two files, not one bogus name (ELI-76). A copy of
+    the same directive glued on with no separator is dropped: nothing emits
+    that on purpose, it is a re-delivered tail.
     """
     token = after_prefix.split()[0] if after_prefix else ""
     fname = token.split(_MEDIA_TRIGGER, 1)[0]
@@ -76,13 +67,12 @@ def _take_media_fname(after_prefix: str) -> tuple[str, str]:
     return fname, rest
 
 
-# ELI-111: a directive is code-aware, as the ask marker is (ELI-107). Code is
+# A directive is code-aware, as the ask marker is (ELI-107, ELI-111). Code is
 # a fenced block (CommonMark 4.5) or an inline code span (6.1): a backtick run
 # closed by the next run of the same length within its paragraph. A run with
 # no closer is a literal backtick, which is only known once its paragraph
 # ends. Indented code blocks are not tracked: an indented line in a list is
-# prose. A report quoting a directive in a double-backtick span had it
-# rendered as an image (message 442ecfa3, 2026-10-14).
+# prose.
 _BLOCK_START_RE = re.compile(r"^ {0,3}(#{1,6}(\s|$)|[-+*](\s|$)|\d{1,9}[.)](\s|$))")
 
 
@@ -217,12 +207,9 @@ def _replace_media(text: str, directives, replacement) -> str:
 def _resolve_media(text, base_url=None, ctx=""):
     """Convert every MEDIA:filename directive in text to embedded media.
 
-    A single reply can legitimately carry several images (confirmed live
-    2026-07-10 sending a 4-screenshot bug repro) -- this must loop over every
-    occurrence, not just the first, or later directives in the same chunk
-    silently pass through as literal "MEDIA:filename" text. Prose using
-    "MEDIA:" as a term (no file extension) and a directive quoted in code
-    (ELI-111) stay text. `ctx`: the text shown before `text` in its message
+    A reply can carry several images, so every directive is converted, not
+    just the first. Prose using "MEDIA:" as a term (no file extension) and a
+    directive quoted in code (ELI-111) stay text. `ctx`: the text shown before `text` in its message
     item.
     """
     if base_url is None:
@@ -298,11 +285,8 @@ async def _resolve_media_via_owui(
     """Upload every MEDIA: file in text to OWUI, in order, and attach each to
     the current message.
 
-    A single reply can legitimately carry several images (confirmed live
-    2026-07-10 sending a 4-screenshot bug repro) -- this must loop over every
-    occurrence, not just the first, or later directives in the same chunk
-    silently pass through as literal "MEDIA:filename" text. If any single
-    directive can't be resolved this way (file missing locally, bad name),
+    A reply can carry several images, so every directive is uploaded, not
+    just the first. If any single directive can't be resolved this way (file missing locally, bad name),
     bail out entirely with handled=False so the caller's fallback
     (`_resolve_media`) handles ALL directives uniformly via the external
     URL instead of leaving a mix of native-upload and unresolved directives
