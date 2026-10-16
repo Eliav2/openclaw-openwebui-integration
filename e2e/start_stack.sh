@@ -88,7 +88,8 @@ EOF
 if [[ -n "${STACK_CONFIG_PATCH:-}" ]]; then
   openclaw config patch --file "$STACK_CONFIG_PATCH"
 fi
-openclaw config validate
+# Probe only: 10.10 moved agents.list to agents.entries; let its doctor migrate.
+openclaw config validate || { openclaw doctor --fix --yes --non-interactive; openclaw config validate; }
 nohup openclaw gateway run >"$LOG_DIR/gateway.log" 2>&1 &
 # The crash test kills this pid (and its children) and nothing else, so it can
 # never hit a Gateway the stack did not start.
