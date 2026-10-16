@@ -30,5 +30,5 @@
 ## Contribute
 
 - [Architecture](docs/architecture.md): message path and file layout
-- [Development](docs/development.md): building, testing, deploying a change
+- [Development](docs/development.md): building and testing a change
 - [Why](docs/why.md): this integration compared with OpenClaw's /v1 endpoint

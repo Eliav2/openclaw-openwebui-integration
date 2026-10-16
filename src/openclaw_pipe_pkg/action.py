@@ -80,7 +80,7 @@ async def _get_action_connection(valves_getter):
 # immediately, and each is replaced by its own `execute` fill event as soon
 # as ITS OWN gateway call resolves, rather than one combined
 # fetch-everything-then-render-once step where a slow call holds up
-# everything else. Subagents is fully independent (tasks.list only, no
+# everything else. Subagents is fully independent (sessions.list only, no
 # dependency on the other two). Rate Limits genuinely needs the active
 # provider's name, which only comes from sessions.describe -- rather than
 # faking independence there, its fill waits on Context's own resolution of
@@ -1893,7 +1893,7 @@ class Action:
         """Fetches and renders the dialog's three sections -- Context, Rate
         Limits, Subagents -- each independently: its own skeleton at open,
         its own fill event as soon as its own data is ready, not one
-        combined fetch-everything-then-render-once step. Subagents (tasks.list) has no dependency on the
+        combined fetch-everything-then-render-once step. Subagents (sessions.list) has no dependency on the
         other two at all. Rate Limits genuinely needs the active provider's
         name, which only comes from sessions.describe -- rather than fake
         independence there, its fill awaits Context's own resolution of

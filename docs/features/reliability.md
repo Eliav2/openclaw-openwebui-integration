@@ -1,7 +1,7 @@
 What keeps a reply whole when things go wrong: one self-healing connection, messages that queue instead of colliding, replies that survive a reload or a restart of either side, a Stop that really stops, and redeploys that leave nothing behind.
 
 Applies to: Pipe
-Valves: `GATEWAY_URL`, `GATEWAY_TOKEN`, `STATE_DIR`, `SEND_STOP_ON_CANCEL`, `INTERRUPT_GRACE_SECONDS`
+Valves: `GATEWAY_URL`, `GATEWAY_TOKEN`, `STATE_DIR`, `SEND_STOP_ON_CANCEL`, `INTERRUPT_GRACE_SECONDS`, `AUTO_SEND_WHILE_RUNNING`
 
 ## Persistent connection
 
@@ -47,7 +47,7 @@ Always on.
 
 ## Reload mid-reply
 
-Reload the page mid-reply, or open the chat on another device, and you see the answer so far instead of an empty reply. On Open WebUI 0.12, Open WebUI keeps the in-progress reply itself and shows it on reload. On older releases the Pipe saves the reply to the chat as it streams, at most every 2.5 seconds.
+Reload the page mid-reply, or open the chat on another device, and you see the answer so far instead of an empty reply. Open WebUI keeps the in-progress reply itself and shows it on reload.
 
 ![The same reply right after a page reload: the answer so far is there and still growing](../img/reload-mid-reply-light.png)
 
@@ -55,7 +55,7 @@ If your tab or socket dies mid-stream, a forced final save means the finished te
 
 The device identity and token persist in `STATE_DIR`, so restarting Open WebUI or reloading the function never asks you to pair again. If `STATE_DIR` is not writable, the Pipe falls back to `/tmp/openclaw-bridge` and logs `STATE_DIR unavailable` loudly rather than failing. Details and the fix: [Device pairing](../install/pairing.md).
 
-How Open WebUI persists a message mid-run, and why the Pipe saves it the way it does: [Rehydration](../rehydration-persistence.md).
+How Open WebUI keeps a message mid-run: [Rehydration](../rehydration-persistence.md).
 
 Valve: [`STATE_DIR`](../configuration.md#state_dir), default `/data/openclaw-bridge`.
 

@@ -6,7 +6,7 @@ project_url: https://github.com/Eliav2/openclaw-openwebui-integration
 version: 0.7.0
 license: MIT
 requirements: websockets, cryptography
-required_open_webui_version: 0.10.2
+required_open_webui_version: 0.12.0
 description: Chat with an OpenClaw Gateway agent inside Open WebUI over the Gateway's native WebSocket protocol, with real-time streaming, native tool-call cards, and a persistent agent session per conversation.
 
 OpenClaw Gateway Pipe for Open WebUI
@@ -34,10 +34,9 @@ How it works
 
 Requirements
 ------------
-- Open WebUI v0.10.2+ (developed and tested against 0.10.2 and 0.11.0).
-  Native tool-card rendering relies on Open WebUI's Responses-API streaming
-  handler; older releases are untested and the pipe performs no version check.
-- An OpenClaw Gateway, reachable from the Open WebUI backend
+- Open WebUI 0.12.0+ and an OpenClaw Gateway 2026.9.3+, reachable from the
+  Open WebUI backend. What an older release loses:
+  https://github.com/Eliav2/openclaw-openwebui-integration/blob/main/docs/versions.md
 - Python modules: websockets, cryptography, pydantic
 
   Open WebUI ships pydantic. The ``requirements:`` field above lets Open WebUI

@@ -40,7 +40,7 @@ The three functions: the **Pipe** is the chat integration, the **Status Action**
 
 - [Architecture](./architecture.md): how a message travels from Open WebUI to the agent and back, why the Pipe is an async generator, and the repo's file layout.
 - [Development](./development.md): editing the `src/` fragments, the build and its drift guard, running the tests, driving the integration over the Open WebUI API.
-- [Rehydration and persistence](./rehydration-persistence.md): how Open WebUI persists an assistant message and why the Pipe saves snapshots mid-run. Read it before touching snapshots or streaming.
+- [Rehydration and persistence](./rehydration-persistence.md): how Open WebUI keeps an assistant message mid-run. Read it before touching streaming or persistence.
 
 ## Design
 

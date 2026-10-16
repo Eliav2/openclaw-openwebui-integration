@@ -2,7 +2,7 @@ The Status Action adds an **OpenClaw Status** button that opens a dialog with th
 
 Applies to: Action, Pipe
 
-Valves: [`GATEWAY_URL`](../configuration.md#gateway_url), [`GATEWAY_TOKEN`](../configuration.md#gateway_token), [`DEVICE_IDENTITY`](../configuration.md#device_identity), [`STATE_DIR`](../configuration.md#state_dir), [`AGENT_ID`](../configuration.md#agent_id), [`COMPOSER_STATUS_BUTTON`](../configuration.md#composer_status_button)
+Valves: [`GATEWAY_URL`](../configuration.md#gateway_url-1), [`GATEWAY_TOKEN`](../configuration.md#gateway_token-1), [`DEVICE_IDENTITY`](../configuration.md#device_identity-1), [`STATE_DIR`](../configuration.md#state_dir-1), [`AGENT_ID`](../configuration.md#agent_id-1), [`CONTROL_UI_URL`](../configuration.md#control_ui_url), and the Pipe's [`COMPOSER_STATUS_BUTTON`](../configuration.md#composer_status_button)
 
 ## What you get
 
@@ -69,7 +69,7 @@ Without the plugin the rate-limit section shows a note instead, and the Open Web
 
 The Pipe adds the **Status** button to the composer of OpenClaw chats, right after the OpenClaw Thinking chip (or at the end of the composer's chips when that chip is off). It opens the same dialog through this Action, so the Action must be installed.
 
-This is an experiment. Open WebUI has no extension point for the composer, so the button is injected into the page by JavaScript: if a future Open WebUI changes the composer and the anchor is not found, the button simply does not appear. On Open WebUI 0.12 it appears as soon as a tab opens an OpenClaw chat; on older versions, after the next reply or the next click on the message toolbar button.
+This is an experiment. Open WebUI has no extension point for the composer, so the button is injected into the page by JavaScript: if a future Open WebUI changes the composer and the anchor is not found, the button simply does not appear. It appears as soon as a tab opens an OpenClaw chat.
 
 Turn it off with the Pipe's [`COMPOSER_STATUS_BUTTON`](../configuration.md#composer_status_button) valve (on by default). An already open tab keeps it until reload.
 

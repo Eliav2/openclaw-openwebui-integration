@@ -16,9 +16,10 @@ Only the tip of `main` is supported. Fixes ship there; there are no backports.
 
 ## What is in scope
 
-The two Open WebUI functions (`openclaw_pipe.py`, `openclaw_status_action.py`),
-their source fragments under `src/openclaw_pipe_pkg/`, and the installers
-(`install.py`, `install_action.py`).
+The three Open WebUI functions (`openclaw_pipe.py`, `openclaw_status_action.py`,
+`openclaw_thinking_filter.py`), their source fragments under
+`src/openclaw_pipe_pkg/`, and the installers (`install.py`, `install_action.py`,
+`install_filter.py`).
 
 Out of scope: Open WebUI itself, the OpenClaw Gateway, and the agent you route
 to. Report those upstream.
@@ -43,7 +44,8 @@ Gateway (`openclaw devices list` / `openclaw devices remove <id>`), delete
   `ENABLE_FILE_SERVER` on (the default), the integration serves
   `/tmp/openclaw-pipe-media` on port **18791**, bound to `0.0.0.0`, with
   `Access-Control-Allow-Origin: *` and no auth. Anyone who can reach that port
-  reads any file the agent has emitted. It is a fallback for the Open WebUI
+  reads any file the agent has emitted, and can upload files to it too (it
+  accepts PUT and POST). It is a fallback for the Open WebUI
   Files API path (`USE_OWUI_FILES`, on by default, same-origin). Keep 18791 off
   untrusted networks, or set `ENABLE_FILE_SERVER=False`.
 - **Anyone who can chat with the pipe can drive the configured agent** with

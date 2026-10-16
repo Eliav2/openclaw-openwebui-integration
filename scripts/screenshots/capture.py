@@ -6,7 +6,7 @@ up Open WebUI, the Gateway and the scripted model (scenes.json). Every shot is
 a real page in a phone-sized Chromium: real Open WebUI, the installed Pipe and
 Action, a real Gateway running real tools against a small sample project.
 
-Each shot waits for its own DOM state (never a fixed sleep), is taken in the
+Each shot waits for its own DOM state, is taken in the
 light theme, and fails if its visible text matches the deny-list (words that give
 away a test stack, anything with "@", the host name, token-shaped strings).
 A failed shot leaves a full-page screenshot and the page HTML under
@@ -190,7 +190,7 @@ def dump_children(session_key: str) -> None:
 
 def dump_child_history_shapes(session_key: str) -> None:
     """Print the shape of each child's chat.history (roles, block types and
-    the tool-linking keys, no text), the input of the drawer's Tools tab."""
+    the tool-linking keys, no text), the input of the sub-agent drawer's run."""
     def call(method, params):
         out = subprocess.run(["openclaw", "gateway", "call", method, "--json", "--params", json.dumps(params)],
                              capture_output=True, text=True, timeout=90)
@@ -1009,7 +1009,7 @@ class Scenes:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--out", default="docs/img")
-    ap.add_argument("--only", help="comma-separated shot names")
+    ap.add_argument("--only", help="comma-separated scene (run) names")
     a = ap.parse_args(argv)
     only = set(a.only.split(",")) if a.only else None
     shooter = Shooter(a.out, only)

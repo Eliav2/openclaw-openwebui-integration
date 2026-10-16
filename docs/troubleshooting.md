@@ -30,7 +30,7 @@ More on these commands: [The installer](./install/installer.md).
 | `ModuleNotFoundError: websockets` when the function loads | Open WebUI's frontmatter auto-install is off (`ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS=false`) or it runs in `OFFLINE_MODE`. Install `websockets` and `cryptography` into the Open WebUI image yourself. |
 | Models are listed as "-- example, Gateway not reached" | The Pipe has not reached your Gateway yet, so the picker shows a built-in example list instead of your models. Pick `OpenClaw · Default` (it always works), send one message to connect, then reload: the real list replaces it. If it persists, the Gateway is unreachable: check `GATEWAY_URL` and `GATEWAY_TOKEN`. |
 | "Could not start a session on agent `<id>`" | [`AGENT_ID`](./configuration.md#agent_id) names an agent your Gateway does not define. Use `main` unless you configured others. |
-| Tool calls not showing | The calls that draw tool cards fail silently. Check the backend log. On an older Open WebUI, tool cards fall back to plain text with no error: see [Versions](./versions.md). |
+| Tool calls not showing | The calls that draw tool cards fail silently. Check the backend log, and that Open WebUI is at least the minimum in [Versions](./versions.md). |
 | An image link points at port 18791 instead of being attached | The upload to Open WebUI's Files API failed and the Pipe fell back to its own file server. The log says `OWUI file upload failed; falling back`. Check [`OWUI_BASE_URL`](./configuration.md#owui_base_url), the request's login or [`OWUI_API_KEY`](./configuration.md#owui_api_key), and the Open WebUI log. See also [Security](./security.md#the-media-file-server). |
 | A reply goes quiet for a long time | The Pipe has no silence timeout: a quiet reply is usually a long tool call or the model thinking. The reply ends when the run ends, fails or is stopped. If the page stopped updating, reload: the partial answer is kept. Check the backend log for the turn. See [Reliability](./features/reliability.md). |
 | The answer stops after a Gateway restart | The Pipe resumes a reply cut off by a Gateway restart, up to 3 times per reply. After that the reply ends with a "cut off" note: the Gateway was down too long or kept restarting. Send the message again. |
@@ -68,7 +68,6 @@ One reply in the Pipe's log (an excerpt):
 ```text
 [openclaw-pipe] Messages: 1, last role: user
 [openclaw-pipe] Session key: agent:main:openwebui-<user id>-<chat id>
-[openclaw-pipe]   [diag] owui_msg_id=<message id> session_id=QHe3xkEulGUQ text_sha=94382a90 text_preview='What changed in this repo this week?'
 [openclaw-pipe] Cleared model override; using agent default
 [openclaw-pipe] Captured runId: msg-<chat id>-<message id>-1792018617.1007752
 [openclaw-pipe]   Tool start: exec
@@ -81,7 +80,6 @@ One reply in the Pipe's log (an excerpt):
 [openclaw-pipe]   Item: kind=tool status=completed title=read from forecast/CHANGELOG.md
 [openclaw-pipe]   lifecycle end -> done
 [openclaw-pipe] DONE -- 129 events processed, text yielded: True
-[openclaw-pipe]   terminal: aborted=False text_yielded=True visible=606 snapshotted=0
 ```
 
 On the Open WebUI host, with Docker (the container name depends on your deployment):
@@ -92,11 +90,8 @@ docker logs --since 30m open-webui 2>&1 | grep '\[openclaw-pipe\]'
 
 What you will find there, always on and not configurable:
 
-- for every turn: the session key, the run id, the event count, tool starts and results, and every snapshot decision with its reason;
-- snapshot decisions as `EMITTED` or `SKIPPED`, with the deciding condition;
-- a terminal line per turn: whether it was aborted, whether text was visible, and whether it was snapshotted;
+- for every turn: the session key, the run id, the event count, and tool starts and results;
 - a turn that produced no text at all, marked `[diag] PHANTOM (no text)`;
-- a message id and a short hash of the message text, so a duplicate, re-fired completion is identifiable;
 - `STATE_DIR unavailable`, when the Pipe fell back to `/tmp/openclaw-bridge`;
 - `OWUI file upload failed; falling back`, when an attachment went to the file server instead;
 - `resumed as ...`, with a count out of 3, when a reply continued after a Gateway restart.

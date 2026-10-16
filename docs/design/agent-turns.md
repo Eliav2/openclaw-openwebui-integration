@@ -1,6 +1,6 @@
 # Agent turns as normal chat replies (ELI-100, phase 1 design)
 
-Status: design only, no pipe code changes. Needs manager approval before phase 2.
+Status: implemented (ELI-100). This is the historical plan at `787a471`: most symbols it names (`_GapRepairSink`, `_heal_proactive_variants`, `PROACTIVE_DELIVERY_ENABLED` and others) are gone. Current behavior: [Agent turns](../features/agent-turns.md) and the code.
 Baseline: main `787a471`. Every `file:line` below is in `src/openclaw_pipe_pkg/` at that
 commit unless it names a dist file (OpenClaw 2026.9.3, `node_modules/openclaw/dist/`)
 or an Open WebUI file (0.12.0, container `/app/backend/open_webui/` and

@@ -93,7 +93,8 @@ OpenClaw also ships an [OpenAI-compatible `/v1` endpoint](https://docs.openclaw.
 |---|---|---|
 | Open WebUI | 0.12.0 | 0.12.0 |
 | OpenClaw Gateway | 2026.9.3 | 2026.9.3 |
-| Python (inside Open WebUI) | 3.10 | 3.10 to 3.13 |
+| Python inside Open WebUI (what Open WebUI ships) | 3.11 | 3.11 and 3.12 |
+| Python for `install.py` | 3.10 | 3.10 to 3.13 |
 
 What an older release loses, and the test runs behind these numbers: [Versions](./docs/versions.md).
 

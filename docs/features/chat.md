@@ -30,7 +30,7 @@ Expand a card to see the arguments the agent passed and the result it got back. 
 
 A call that arrives without a tool-call id still shows: it falls back to a Markdown `<details type="tool_calls">` card rather than disappearing. The status row under the message tracks the same events in words: "Running \<tool\>..." then "\<tool\> done".
 
-Always on. Native cards need a recent Open WebUI; on older releases they fall back quietly rather than erroring. See [Versions](../versions.md).
+Always on. On Open WebUI older than the minimum a card can keep spinning after its tool finished: see [Versions](../versions.md).
 
 ## Sub-agent cards
 

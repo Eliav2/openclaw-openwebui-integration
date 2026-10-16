@@ -175,8 +175,7 @@ class OwuiClient:
         OWUI 0.12 inserts the turn server-side (`Chats.insert_chat_turn`)
         and answers 409 when a `chat_id` arrives without those ids. The
         user message is parented on the chat's current leaf so the reply
-        continues the thread instead of starting a detached branch. 0.11
-        accepts the same fields.
+        continues the thread instead of starting a detached branch.
         """
         if history is None:
             history = []

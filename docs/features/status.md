@@ -68,6 +68,6 @@ The Pipe also adds a **Status** button to the composer row of OpenClaw chats, ri
 
 ![The Status button in the composer, next to the integrations button](../img/composer-status-light.png)
 
-Open WebUI has no extension point for the composer, so the button is put into the page by JavaScript. If a future Open WebUI changes the composer and the anchor is not found, the button simply does not appear. On Open WebUI 0.12 it appears as soon as a tab opens an OpenClaw chat; on older releases, after the next reply or the next click on the toolbar button.
+Open WebUI has no extension point for the composer, so the button is put into the page by JavaScript. If a future Open WebUI changes the composer and the anchor is not found, the button simply does not appear. It appears as soon as a tab opens an OpenClaw chat.
 
 Turn it off with the Pipe's [`COMPOSER_STATUS_BUTTON`](../configuration.md#composer_status_button) valve. An already open tab keeps the button until you reload it.

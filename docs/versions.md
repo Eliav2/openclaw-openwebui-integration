@@ -8,7 +8,8 @@ Applies to: Pipe, Action, Filter
 |---|---|---|
 | Open WebUI | 0.12.0 | 0.12.0 |
 | OpenClaw Gateway | 2026.9.3 | 2026.9.3 |
-| Python (inside Open WebUI) | 3.10 | 3.10 to 3.13 |
+| Python inside Open WebUI (what Open WebUI ships) | 3.11 | 3.11 and 3.12 |
+| Python for `install.py` | 3.10 | 3.10 to 3.13 |
 
 The "Tested in CI" versions are the ones the end-to-end suite runs on for every pull request (`e2e/versions.env`). The minimums come from the same suite run once on each older release; the results are below.
 

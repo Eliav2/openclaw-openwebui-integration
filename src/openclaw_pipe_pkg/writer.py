@@ -5,7 +5,7 @@
 
 
 # ---------------------------------------------------------------------------
-# The turn writer (ELI-100, DESIGN-agent-turns.md 2.3-2.5)
+# The turn writer (ELI-100, docs/design/agent-turns.md 2.3-2.5)
 # ---------------------------------------------------------------------------
 # One writer per run this connection renders outside a live `pipe()` request:
 # agent turns (cron wake, sessions_send, sub-agent announce, restart recovery)
@@ -1700,8 +1700,8 @@ def _relay_content_is_showable(text: str) -> bool:
     bubble: non-empty, not a silent sentinel, and not still a prefix that could
     grow into a sentinel-only run. Delaying introduce until this holds means a
     sentinel-only wake (`NO_REPLY`/`ANNOUNCE_SKIP`) never flashes an empty
-    bubble -- the same suppression the post-hoc path gets from
-    `_last_assistant_text_from_preview`, applied to a stream we watch grow.
+    bubble -- the same suppression a finished run's text gets, applied to a
+    stream we watch grow.
     """
     t = text.strip()
     if not t or t in _SILENT_SENTINELS:
@@ -1713,8 +1713,8 @@ def _relay_content_is_showable(text: str) -> bool:
 
 async def _relay_emit_event(user_id: str, chat_id: str, message_id: str | None,
                             data: dict) -> bool:
-    """Fire one OWUI socket `events` envelope to the user room (same transport
-    as `_emit_live_bootstrap_reload`). Returns False on any failure so callers
+    """Fire one OWUI socket `events` envelope to the user room. Returns
+    False on any failure so callers
     can log context; a failed emit never raises into the event loop."""
     if not message_id:
         return False
@@ -2083,7 +2083,7 @@ def _settled_run_span(history: dict, run_id: str) -> list | None:
 
 
 async def _reconcile_ended_while_down(conn: "_GatewayConnection", agent_id: str) -> None:
-    """ELI-94, DESIGN-agent-turns.md case 4. A graceful Open WebUI stop saves
+    """ELI-94, docs/design/agent-turns.md case 4. A graceful Open WebUI stop saves
     the reply it cancels `done: true` with what it had; the run goes on and
     closes while Open WebUI is down, so no event reaches this process and
     the ELI-90 pass (done:false only) skips it. Two recorded timestamps say

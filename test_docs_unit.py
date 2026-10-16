@@ -124,6 +124,24 @@ class VersionsTests(unittest.TestCase):
                 self.assertIn(self.owui, self._row(path, "Open WebUI"))
                 self.assertIn(self.openclaw, self._row(path, "OpenClaw Gateway"))
 
+    def test_functions_require_the_minimum_open_webui(self):
+        """Open WebUI refuses to install a function whose
+        `required_open_webui_version` is above its own version, so the field
+        must be the documented minimum: lower lets a release the Pipe breaks
+        on install it (spinning tool cards, missing agent replies)."""
+        minimums = {self._row(path, "Open WebUI").split("|")[2].strip()
+                    for path in (ROOT / "README.md", ROOT / "docs" / "versions.md")}
+        self.assertEqual(len(minimums), 1, f"README and versions.md disagree: {minimums}")
+        tested = tuple(int(x) for x in self.owui.split("."))
+        self.assertLessEqual(tuple(int(x) for x in next(iter(minimums)).split(".")), tested,
+                             "the minimum is above the version CI tests")
+        for name in ("openclaw_pipe.py", "openclaw_status_action.py", "openclaw_thinking_filter.py"):
+            with self.subTest(name):
+                field = re.search(r"^required_open_webui_version:\s*(\S+)$",
+                                  (ROOT / name).read_text(), re.M)
+                self.assertIsNotNone(field, f"{name} declares no required_open_webui_version")
+                self.assertEqual({field.group(1)}, minimums)
+
 
 if __name__ == "__main__":
     unittest.main()

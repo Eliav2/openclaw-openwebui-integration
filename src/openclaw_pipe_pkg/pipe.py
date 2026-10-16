@@ -139,18 +139,8 @@ class Pipe:
     Open WebUI Pipe that routes messages through OpenClaw Gateway via
     a persistent WebSocket connection.
 
-    Valves (configured in OWUI admin panel):
-    - GATEWAY_URL: OpenClaw Gateway address (default "localhost:18789")
-    - GATEWAY_TOKEN: Gateway API token (required)
-    - DEVICE_IDENTITY: (optional) persisted device identity JSON
-    - AGENT_ID: target agent (default "main")
-    - ENABLE_FILE_SERVER: start media file server (default True)
-    - USE_OWUI_FILES: upload MEDIA files into OWUI Files API (default True)
-    - SEND_STOP_ON_CANCEL: send /stop after chat.abort when OWUI cancels
-    - INTERRUPT_GRACE_SECONDS: how long a cancel waits for a follow-up message
-      before aborting the run (default 3; 0 aborts immediately)
-    - AUTO_SEND_WHILE_RUNNING: a message sent while a reply runs goes into
-      the chat at once instead of waiting in Open WebUI's queue (default True)
+    Valves (configured in the Open WebUI admin panel): see `Valves` below,
+    or docs/configuration.md, which is generated from it.
     """
 
     class Valves(BaseModel):
@@ -708,7 +698,7 @@ class _PipeTurn:
         # O10 addendum: image_prompt_generation and function_calling also get
         # skipped here -- both already have a documented, silent OWUI-side
         # fallback for an empty response (raw user message / "no tool
-        # needed" respectively -- see PLAN.md O10), so skipping them costs
+        # needed" respectively), so skipping them costs
         # nothing and saves a full agent turn. moa_response_generation is
         # deliberately excluded -- it is a user-triggered "Merge Responses"
         # request whose only output path is the streamed content itself, so
@@ -1159,9 +1149,7 @@ class _PipeTurn:
         if self.adopted_run_id and self.adopted_queue is not None:
             self.conn.seed_run_renderer(self.session_key, self.our_run_id, self.queue,
                                    run_text=self.adopted_run_text)
-        # Extracted once up front (not just at the terminal snapshot/auto-title
-        # step further below) so the mid-run REST snapshot gate has a token to
-        # use throughout the streaming loop, not only after it ends.
+        # The request's own token, for the auto-title request at the end.
         self.bearer_token = _extract_request_bearer(self.__request__)
 
     async def consume(self):

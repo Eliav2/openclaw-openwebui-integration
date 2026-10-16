@@ -55,7 +55,7 @@ The difference is what each one gives you:
 | Streams assistant text | Yes | Yes |
 | Client-declared OpenAI function tools | Yes | Not applicable |
 | **The agent's own tool calls:** its shell commands, file edits and searches | Not surfaced | Rendered live as native tool cards |
-| **Sub-agents** | Not surfaced | Listed with status, a transcript drawer per sub-agent |
+| **Sub-agents** | Not surfaced | Listed with status, a drawer per sub-agent showing its run |
 | **Questions mid-run** | No | Question cards and dialogs |
 | **Images and files the agent sends** | No | Attached natively |
 | **Context and rate-limit usage** | No | On demand, live |

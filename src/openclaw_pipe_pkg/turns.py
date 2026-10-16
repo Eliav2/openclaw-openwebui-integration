@@ -5,7 +5,7 @@
 
 
 # ---------------------------------------------------------------------------
-# Turn identity (ELI-100, DESIGN-agent-turns.md 2.2)
+# Turn identity (ELI-100, docs/design/agent-turns.md 2.2)
 # ---------------------------------------------------------------------------
 # Every run on an Open WebUI session key renders as one assistant message, and
 # which message is decided from the run id alone: any connection, deploy or

@@ -14,7 +14,7 @@ Usage:
   python3 build.py --all      # build ALL distributed artifacts. Use this after
                               # touching any fragment -- a fragment can feed both.
   python3 build.py --check-all  # drift guard for ALL artifacts. This is what CI
-                              # runs; exits 1 if either is stale.
+                              # runs; exits 1 if any is stale.
 
   python3 build.py            # build -> openclaw_pipe.py only
   python3 build.py --check    # drift guard for openclaw_pipe.py only
@@ -45,8 +45,8 @@ class Artifact(NamedTuple):
     keeping those as separate fragments rather than inlining them into
     pipe.py.
 
-    NamedTuple, not @dataclass: install.py's own _rebuild_pipe_file (and
-    this repo's install_action.py) load this module dynamically via
+    NamedTuple, not @dataclass: install.py's _rebuild_pipe_file and
+    rebuild_artifact load this module dynamically via
     importlib.util.module_from_spec + exec_module, which does NOT register
     the module in sys.modules the way a normal `import` does. @dataclass's
     class-processing internally does sys.modules.get(cls.__module__) to

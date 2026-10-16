@@ -16,18 +16,18 @@ The implementation is in [`src/openclaw_pipe_pkg/askuser.py`](../../src/openclaw
 
 ![A question from the agent as a card: three options with descriptions, the first tagged Recommended, and an Other field](../img/question-card-light.png)
 
-On a recent Open WebUI (see [Versions](../versions.md)) the question renders as Open WebUI's own inline question card, the one its built-in `ask_user` tool uses: a header, the question, one row per option with an optional description, the first option tagged Recommended, and an Other field for a typed answer. Older Open WebUI releases get the dialogs in the last column.
+The question renders as Open WebUI's own inline question card, the one its built-in `ask_user` tool uses: a header, the question, one row per option with an optional description, the first option tagged Recommended, and an Other field for a typed answer. Secrets and multi-select get a dialog instead.
 
-| Question looks like | Question card | Older Open WebUI |
-| --- | --- | --- |
-| anything else | card with a typed answer | a titled free-text input |
-| mentions secret, password, api key, token | a masked password field | a masked password field |
-| `(y/n)`, or a confirm verb plus `?` | card with Yes / No | a native yes/no confirmation |
-| two or more numbered options | card, one row per option | clickable choice buttons |
-| `(multiselect)` or "select all that apply" | checkboxes plus a Submit button | checkboxes plus a Submit button |
-| a JSON body with up to three `questions` | one card that steps through each | not supported |
+| Question looks like | Shown as |
+| --- | --- |
+| anything else | card with a typed answer |
+| mentions secret, password, api key, token | dialog: a masked password field |
+| `(y/n)`, or a confirm verb plus `?` | card with Yes / No |
+| two or more numbered options | card, one row per option |
+| `(multiselect)` or "select all that apply" | dialog: checkboxes plus a Submit button |
+| a JSON body with up to three `questions` | one card that steps through each |
 
-Secrets and multi-select keep the dialog even on a new Open WebUI, because the card has no masked input and picks one option per question.
+Secrets and multi-select get a dialog because the card has no masked input and picks one option per question.
 
 An option written as `1. Postgres - needs a server` shows `Postgres` as the choice and the rest as its description.
 
@@ -37,10 +37,10 @@ Confirmation and multi-select markers are recognised in English, Hebrew and Arab
 
 Answer the card and the run continues in the same reply. The exchange stays in the reply as a collapsible ❓ Ask User card that shows both the question and your answer.
 
-While it waits, the status line reads "Waiting for your reply -- the question is pending in this chat". You can reload or switch away and come back:
+While it waits you can reload or switch away and come back:
 
 - **Question card:** the card is shown once, on the tab that views the chat; a reload moves it to the reloaded tab. If it is not answered by Open WebUI's card timeout (4 minutes), or no tab views the chat (for example a client calling the API), the reply ends with the question as plain text.
-- **Older dialogs:** the dialog pops again on your new session each time you reconnect, for up to an hour, with the status "Waiting for your reply -- question is pending, reconnect anytime".
+- **Dialogs (secrets, multi-select):** the dialog pops again on your new session each time you reconnect, for up to an hour, with the status "Waiting for your reply -- question is pending, reconnect anytime".
 
 If you cancel the question, or it ends as text, the question stays in the reply as ordinary text with the trigger removed (a JSON form as its numbered questions with their options), so nothing is lost. Answer it with a normal message.
 

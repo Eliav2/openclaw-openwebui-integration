@@ -6,8 +6,8 @@ project_url: https://github.com/Eliav2/openclaw-openwebui-integration
 version: 0.7.0
 license: MIT
 requirements: websockets, cryptography
-required_open_webui_version: 0.10.2
-description: Companion Action for the OpenClaw Gateway Pipe. Adds a message-toolbar button that fetches live OpenClaw session context and usage from the Gateway on demand.
+required_open_webui_version: 0.12.0
+description: Companion Action for the OpenClaw Gateway Pipe. Adds a message-toolbar button that opens a dialog with the chat's live OpenClaw context, rate limits and sub-agents.
 
 OpenClaw Status Action for Open WebUI
 =======================================
@@ -17,8 +17,10 @@ adds a button to the message toolbar. Clicking it fetches live session
 context/usage data from the OpenClaw Gateway on demand -- not cached from
 the last turn -- so it stays accurate even minutes after the last message.
 
-The result is shown as a toast notification. This Action is read-only: it does
-not touch the Pipe or its status-line behavior.
+The result opens as a dialog with three sections: Context, Rate Limits and
+Subagents, where each sub-agent opens a drawer with its run. The dialog's
+Compact button compacts the session's context; everything else only
+reads.
 
 How it works
 ------------
@@ -29,12 +31,13 @@ How it works
    in this process. Still reuses the same on-disk device identity/token the
    Pipe already has (via STATE_DIR), so this never triggers a second
    device-pairing approval.
-3. Calls the same read-only Gateway RPCs the status line uses
-   (sessions.describe, usage.status), fresh on every click.
+3. Reads the Gateway fresh on every click: sessions.describe and
+   usage.status, sessions.list for the sub-agents and chat.history for a
+   sub-agent's run.
 
 Requirements
 ------------
-- Open WebUI v0.10.2+ (developed and tested against 0.10.2 and 0.11.0)
+- Open WebUI 0.12.0+ and an OpenClaw Gateway 2026.9.3+
 - The OpenClaw Gateway Pipe (openclaw_pipe.py) installed in the same OWUI
   instance -- this Action is a companion to it, not a replacement
 - Python modules: websockets, cryptography, pydantic (same as the Pipe).
@@ -55,10 +58,11 @@ Manual alternative:
 4. Paste the entire contents of this file
 5. Save and enable the function, then turn on the "Global" toggle so the
    button appears on every model's messages
-6. Configure the valves. Set all five to the exact same values as the Pipe's
-   valves -- DEVICE_IDENTITY especially, or a fallback connection registers as
-   a new device and asks for a second pairing approval:
+6. Configure the valves. Set these five to the exact same values as the
+   Pipe's valves -- DEVICE_IDENTITY especially, or a fallback connection
+   registers as a new device and asks for a second pairing approval:
    - GATEWAY_URL, GATEWAY_TOKEN, DEVICE_IDENTITY, STATE_DIR, AGENT_ID
+   CONTROL_UI_URL is the Action's own (a link to the Gateway's Control UI).
 """
 
 # ==========================================================================
@@ -238,7 +242,7 @@ def _write_json_file(path, data):
 # --- turns -----------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# Turn identity (ELI-100, DESIGN-agent-turns.md 2.2)
+# Turn identity (ELI-100, docs/design/agent-turns.md 2.2)
 # ---------------------------------------------------------------------------
 # Every run on an Open WebUI session key renders as one assistant message, and
 # which message is decided from the run id alone: any connection, deploy or
@@ -3454,7 +3458,7 @@ class _GatewayConnection:
         reconnect storm: the old coroutine kept looping after `_reconnect()`
         returned, so two tasks raced on `self._ws.recv()`, each collision
         raised its own exception, and each of *those* spawned yet another
-        task (2026-07-10 incident, see PLAN.md P36).
+        task (2026-07-10 incident).
         """
         while not self._stopped:
             try:
@@ -3702,7 +3706,7 @@ def _history_renderer(messages: list) -> "_TurnRenderer":
 
 def _history_events(messages: list):
     """`chat.history` messages as the live events that wrote them: the one
-    transcript parser, for the chat's rebuild and the dialog's Tools tab
+    transcript parser, for the chat's rebuild and the sub-agent drawer's run
     (ELI-147).
 
     claude-cli imports its transcript into the session as it goes: assistant
@@ -4900,7 +4904,7 @@ async def _get_action_connection(valves_getter):
 # immediately, and each is replaced by its own `execute` fill event as soon
 # as ITS OWN gateway call resolves, rather than one combined
 # fetch-everything-then-render-once step where a slow call holds up
-# everything else. Subagents is fully independent (tasks.list only, no
+# everything else. Subagents is fully independent (sessions.list only, no
 # dependency on the other two). Rate Limits genuinely needs the active
 # provider's name, which only comes from sessions.describe -- rather than
 # faking independence there, its fill waits on Context's own resolution of
@@ -6713,7 +6717,7 @@ class Action:
         """Fetches and renders the dialog's three sections -- Context, Rate
         Limits, Subagents -- each independently: its own skeleton at open,
         its own fill event as soon as its own data is ready, not one
-        combined fetch-everything-then-render-once step. Subagents (tasks.list) has no dependency on the
+        combined fetch-everything-then-render-once step. Subagents (sessions.list) has no dependency on the
         other two at all. Rate Limits genuinely needs the active provider's
         name, which only comes from sessions.describe -- rather than fake
         independence there, its fill awaits Context's own resolution of

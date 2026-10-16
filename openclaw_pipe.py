@@ -6,7 +6,7 @@ project_url: https://github.com/Eliav2/openclaw-openwebui-integration
 version: 0.7.0
 license: MIT
 requirements: websockets, cryptography
-required_open_webui_version: 0.10.2
+required_open_webui_version: 0.12.0
 description: Chat with an OpenClaw Gateway agent inside Open WebUI over the Gateway's native WebSocket protocol, with real-time streaming, native tool-call cards, and a persistent agent session per conversation.
 
 OpenClaw Gateway Pipe for Open WebUI
@@ -34,10 +34,9 @@ How it works
 
 Requirements
 ------------
-- Open WebUI v0.10.2+ (developed and tested against 0.10.2 and 0.11.0).
-  Native tool-card rendering relies on Open WebUI's Responses-API streaming
-  handler; older releases are untested and the pipe performs no version check.
-- An OpenClaw Gateway, reachable from the Open WebUI backend
+- Open WebUI 0.12.0+ and an OpenClaw Gateway 2026.9.3+, reachable from the
+  Open WebUI backend. What an older release loses:
+  https://github.com/Eliav2/openclaw-openwebui-integration/blob/main/docs/versions.md
 - Python modules: websockets, cryptography, pydantic
 
   Open WebUI ships pydantic. The ``requirements:`` field above lets Open WebUI
@@ -249,7 +248,7 @@ def _write_json_file(path, data):
 # --- turns -----------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# Turn identity (ELI-100, DESIGN-agent-turns.md 2.2)
+# Turn identity (ELI-100, docs/design/agent-turns.md 2.2)
 # ---------------------------------------------------------------------------
 # Every run on an Open WebUI session key renders as one assistant message, and
 # which message is decided from the run id alone: any connection, deploy or
@@ -5869,7 +5868,7 @@ class _GatewayConnection:
         reconnect storm: the old coroutine kept looping after `_reconnect()`
         returned, so two tasks raced on `self._ws.recv()`, each collision
         raised its own exception, and each of *those* spawned yet another
-        task (2026-07-10 incident, see PLAN.md P36).
+        task (2026-07-10 incident).
         """
         while not self._stopped:
             try:
@@ -6117,7 +6116,7 @@ def _history_renderer(messages: list) -> "_TurnRenderer":
 
 def _history_events(messages: list):
     """`chat.history` messages as the live events that wrote them: the one
-    transcript parser, for the chat's rebuild and the dialog's Tools tab
+    transcript parser, for the chat's rebuild and the sub-agent drawer's run
     (ELI-147).
 
     claude-cli imports its transcript into the session as it goes: assistant
@@ -6559,7 +6558,7 @@ async def _run_request(conn, method: str, params: dict, *, timeout: float = 10,
 # --- writer ----------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# The turn writer (ELI-100, DESIGN-agent-turns.md 2.3-2.5)
+# The turn writer (ELI-100, docs/design/agent-turns.md 2.3-2.5)
 # ---------------------------------------------------------------------------
 # One writer per run this connection renders outside a live `pipe()` request:
 # agent turns (cron wake, sessions_send, sub-agent announce, restart recovery)
@@ -8254,8 +8253,8 @@ def _relay_content_is_showable(text: str) -> bool:
     bubble: non-empty, not a silent sentinel, and not still a prefix that could
     grow into a sentinel-only run. Delaying introduce until this holds means a
     sentinel-only wake (`NO_REPLY`/`ANNOUNCE_SKIP`) never flashes an empty
-    bubble -- the same suppression the post-hoc path gets from
-    `_last_assistant_text_from_preview`, applied to a stream we watch grow.
+    bubble -- the same suppression a finished run's text gets, applied to a
+    stream we watch grow.
     """
     t = text.strip()
     if not t or t in _SILENT_SENTINELS:
@@ -8267,8 +8266,8 @@ def _relay_content_is_showable(text: str) -> bool:
 
 async def _relay_emit_event(user_id: str, chat_id: str, message_id: str | None,
                             data: dict) -> bool:
-    """Fire one OWUI socket `events` envelope to the user room (same transport
-    as `_emit_live_bootstrap_reload`). Returns False on any failure so callers
+    """Fire one OWUI socket `events` envelope to the user room. Returns
+    False on any failure so callers
     can log context; a failed emit never raises into the event loop."""
     if not message_id:
         return False
@@ -8637,7 +8636,7 @@ def _settled_run_span(history: dict, run_id: str) -> list | None:
 
 
 async def _reconcile_ended_while_down(conn: "_GatewayConnection", agent_id: str) -> None:
-    """ELI-94, DESIGN-agent-turns.md case 4. A graceful Open WebUI stop saves
+    """ELI-94, docs/design/agent-turns.md case 4. A graceful Open WebUI stop saves
     the reply it cancels `done: true` with what it had; the run goes on and
     closes while Open WebUI is down, so no event reaches this process and
     the ELI-90 pass (done:false only) skips it. Two recorded timestamps say
@@ -9120,18 +9119,8 @@ class Pipe:
     Open WebUI Pipe that routes messages through OpenClaw Gateway via
     a persistent WebSocket connection.
 
-    Valves (configured in OWUI admin panel):
-    - GATEWAY_URL: OpenClaw Gateway address (default "localhost:18789")
-    - GATEWAY_TOKEN: Gateway API token (required)
-    - DEVICE_IDENTITY: (optional) persisted device identity JSON
-    - AGENT_ID: target agent (default "main")
-    - ENABLE_FILE_SERVER: start media file server (default True)
-    - USE_OWUI_FILES: upload MEDIA files into OWUI Files API (default True)
-    - SEND_STOP_ON_CANCEL: send /stop after chat.abort when OWUI cancels
-    - INTERRUPT_GRACE_SECONDS: how long a cancel waits for a follow-up message
-      before aborting the run (default 3; 0 aborts immediately)
-    - AUTO_SEND_WHILE_RUNNING: a message sent while a reply runs goes into
-      the chat at once instead of waiting in Open WebUI's queue (default True)
+    Valves (configured in the Open WebUI admin panel): see `Valves` below,
+    or docs/configuration.md, which is generated from it.
     """
 
     class Valves(BaseModel):
@@ -9689,7 +9678,7 @@ class _PipeTurn:
         # O10 addendum: image_prompt_generation and function_calling also get
         # skipped here -- both already have a documented, silent OWUI-side
         # fallback for an empty response (raw user message / "no tool
-        # needed" respectively -- see PLAN.md O10), so skipping them costs
+        # needed" respectively), so skipping them costs
         # nothing and saves a full agent turn. moa_response_generation is
         # deliberately excluded -- it is a user-triggered "Merge Responses"
         # request whose only output path is the streamed content itself, so
@@ -10140,9 +10129,7 @@ class _PipeTurn:
         if self.adopted_run_id and self.adopted_queue is not None:
             self.conn.seed_run_renderer(self.session_key, self.our_run_id, self.queue,
                                    run_text=self.adopted_run_text)
-        # Extracted once up front (not just at the terminal snapshot/auto-title
-        # step further below) so the mid-run REST snapshot gate has a token to
-        # use throughout the streaming loop, not only after it ends.
+        # The request's own token, for the auto-title request at the end.
         self.bearer_token = _extract_request_bearer(self.__request__)
 
     async def consume(self):

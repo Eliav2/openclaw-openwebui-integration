@@ -12,12 +12,12 @@
 > - **Trigger:** assistant text deltas, not a typed tool-call event.
 > - **`secret`:** inferred by keyword-scanning the prompt, not a tool parameter.
 > - **N-way choices:** options are scraped from numbered lines (`1. foo`) and
->   rendered via a hand-built widget, because OWUI has no native
->   "pick one of N buttons" control. Only genuine yes/no prompts become a
->   confirmation dialog.
-> - **Timeouts:** 60s for the modal, 300s across a reconnect, not the single
->   5-minute timeout described below, and no `{"error": "User did not respond"}`
->   payload.
+>   rendered as Open WebUI's native question card, one row per option, as are
+>   yes/no and free-text prompts. Only secret and multi-select prompts get a
+>   dialog.
+> - **Timeouts:** the card's own timeout is 4 minutes; a dialog waits up to an
+>   hour across reconnects. Neither is the single 5-minute timeout described
+>   below, and there is no `{"error": "User did not respond"}` payload.
 >
 > Kept for the design rationale and as the reference for a future typed-event
 > version. Read `askuser.py` for current behavior.

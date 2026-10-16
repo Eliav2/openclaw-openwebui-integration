@@ -173,16 +173,13 @@ def plan_migration(chats, live_model_ids, pipe_id):
 def _fetch_all_chats(client: OwuiClient) -> list[dict]:
     """All of the signed-in user's chats, archived included.
 
-    OWUI 0.11 streams `/api/v1/chats/all` as NDJSON; older releases return one
-    JSON array. Accept both.
+    Open WebUI streams `/api/v1/chats/all` as NDJSON, one chat per line.
     """
     req = urllib.request.Request(
         f"{client.base_url}/api/v1/chats/all", headers=client._auth_headers()
     )
     with urllib.request.urlopen(req, timeout=120) as resp:
         raw = resp.read().decode("utf-8", "replace").strip()
-    if raw.startswith("["):
-        return json.loads(raw)
     return [json.loads(line) for line in raw.splitlines() if line.strip()]
 
 

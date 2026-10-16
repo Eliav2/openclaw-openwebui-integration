@@ -4,18 +4,21 @@ Editing the source fragments, rebuilding the artifacts, and running the tests.
 
 ## Building the artifacts
 
-`openclaw_pipe.py` and `openclaw_status_action.py` are **built artifacts**.
-Don't hand-edit them. Edit the fragments under `src/openclaw_pipe_pkg/`, then
+`openclaw_pipe.py`, `openclaw_status_action.py` and
+`openclaw_thinking_filter.py` are **built artifacts**, and so is
+`docs/configuration.md`. Don't hand-edit them. Edit the fragments under `src/openclaw_pipe_pkg/`, then
 rebuild:
 
 ```bash
 python3 build.py --all        # rebuild every artifact and docs/configuration.md
-python3 build.py --check-all  # verify both committed artifacts match src/ (CI drift guard)
+python3 build.py --check-all  # verify every committed artifact matches src/ (CI drift guard)
 
 python3 build.py              # rebuild openclaw_pipe.py only
 python3 build.py --action     # rebuild openclaw_status_action.py only
 python3 build.py --check      # drift guard, Pipe only
 python3 build.py --check-action  # drift guard, Action only
+python3 build.py --filter     # rebuild openclaw_thinking_filter.py only
+python3 build.py --check-filter  # drift guard, filter only
 ```
 
 Each single-artifact invocation builds exactly one file, and several fragments
@@ -40,7 +43,7 @@ User-facing problems are in [Troubleshooting](./troubleshooting.md).
 
 | Doc | What it covers |
 |-----|----------------|
-| [`docs/rehydration-persistence.md`](./rehydration-persistence.md) | How Open WebUI persists an assistant message, why `output` wins over `content`, and why the integration emits mid-run snapshots so a client reconnecting mid-turn isn't left staring at an empty message. Read this before changing anything about snapshots or streaming. |
+| [`docs/rehydration-persistence.md`](./rehydration-persistence.md) | How Open WebUI 0.12 keeps an assistant message mid-run, so a client reconnecting mid-turn sees the answer so far, and why a done:false message cannot be written. Read this before changing anything about streaming or persistence. |
 | [`docs/design/ask-user-modal.md`](./design/ask-user-modal.md) | Design spec for a tool-call-based ask-user flow. **Not implemented as written**: see the banner at the top; the shipped approach intercepts `OpenClaw needs input:` text. |
 
 `scripts/migrate_stale_chat_models.py` repoints chats whose saved model the
@@ -62,9 +65,7 @@ This is green on a fresh clone with no setup. `requirements-dev.txt` pins
 pydantic, cryptography and websockets to the versions Open WebUI itself locks,
 because the artifacts run inside Open WebUI's interpreter.
 
-Most of the suite (`test_pipe_unit.py`, `test_status_action_unit.py`,
-`test_build.py`, `test_file_server_unit.py`, `test_install_unit.py`,
-`test_migrate_models_unit.py`, `test_owui_api_unit.py`) is pure unit
+Most of the suite (`test_build.py` and every `test_*_unit.py`) is pure unit
 tests with no external dependencies. `test_fixture_owui_streaming_handler.py`
 is not a suite, it's a verbatim copy of Open WebUI's streaming handler, used
 as a fixture to pin tool-card rendering against the real thing.

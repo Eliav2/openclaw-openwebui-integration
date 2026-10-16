@@ -116,7 +116,7 @@ openclaw-openwebui-integration/
 `build.py` concatenates an ordered list of fragments per artifact, behind each artifact's frontmatter file. Several fragments feed more than one artifact:
 
 - **Pipe:** `_prelude`, `identity`, `state`, `turns`, `thinking`, `media`, `emit`, `composer`, `composer_watch`, `askuser`, `gateway`, `writer`, `models`, `pipe`.
-- **Status Action:** `_prelude`, `identity`, `state`, `turns`, `thinking`, `gateway`, `writer`, `emit`, `composer`, `action`. It reuses the Pipe's connection code verbatim, so its numbers come from the same logic as the Pipe's status line.
+- **Status Action:** `_prelude`, `identity`, `state`, `turns`, `thinking`, `gateway`, `emit`, `composer`, `action`. It reuses the Pipe's connection code verbatim, so its numbers come from the same logic as the Pipe's status line.
 - **Thinking filter:** `thinking`, `thinking_filter` only. It skips `_prelude` on purpose: a filter runs on every message, so it does not import `websockets` or `cryptography`.
 
 Build commands and the drift guard: [Development](./development.md#building-the-artifacts).

@@ -2686,7 +2686,7 @@ class _GatewayConnection:
         reconnect storm: the old coroutine kept looping after `_reconnect()`
         returned, so two tasks raced on `self._ws.recv()`, each collision
         raised its own exception, and each of *those* spawned yet another
-        task (2026-07-10 incident, see PLAN.md P36).
+        task (2026-07-10 incident).
         """
         while not self._stopped:
             try:
@@ -2934,7 +2934,7 @@ def _history_renderer(messages: list) -> "_TurnRenderer":
 
 def _history_events(messages: list):
     """`chat.history` messages as the live events that wrote them: the one
-    transcript parser, for the chat's rebuild and the dialog's Tools tab
+    transcript parser, for the chat's rebuild and the sub-agent drawer's run
     (ELI-147).
 
     claude-cli imports its transcript into the session as it goes: assistant
