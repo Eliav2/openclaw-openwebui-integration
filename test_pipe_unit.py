@@ -8367,6 +8367,45 @@ class RegressionPlanTests(_RoutingCase):
         self.assertEqual((self.cards(m), m["content"], m["done"]), (2, "Done.", True))
 
 
+class ShutdownHandoverTests(_RoutingCase):
+    """ELI-173, CI run 39056959056: `docker stop` mid-reply. Open WebUI's
+    shutdown cancelled the reply and saved it partial and done:true; the run's
+    next word reached the still-open Gateway connection, which handed it to a
+    turn writer. The writer took the message over and saved it done:false,
+    and the process exited before its end. The next process's startup
+    reconcile owns every reply of a shutdown (ELI-90, ELI-94): a dying process
+    writes none."""
+
+    SAVED = "E2E_DOWN slow-1"
+
+    def stopped_reply(self):
+        """The reply Open WebUI's shutdown cancelled and saved."""
+        run = pipe_run_id(self.CHAT, self.STUB)
+        self.add_stub(self.STUB, content=self.SAVED, done=True,
+                      statusHistory=[{"description": "Stopped", "done": True}])
+        self.conn.register_run_target(self.key, run, self.CHAT, self.STUB)
+        self.conn._run_renderers[f"{self.key}:{run}"].feed(_delta(self.SAVED))
+        return run
+
+    async def test_a_word_after_the_shutdown_cancel_leaves_the_saved_reply(self):
+        run = self.stopped_reply()
+        with mock.patch.object(openclaw_pipe, "_UVICORN_SERVER", types.SimpleNamespace(should_exit=True)):
+            await self.dispatch(run, _delta(" slow-2"))
+            await self.spin()
+        m = self.owui.msgs()[self.STUB]
+        self.assertEqual((m["content"], m["done"]), (self.SAVED, True))
+        self.assertEqual(self.conn._turn_pumps, {}, "no turn writer in a process that is shutting down")
+
+    async def test_while_serving_the_same_word_is_handed_to_a_writer(self):
+        """Control: the handover above is real (DESIGN 2.6), so the test
+        reaches the code that reopened the reply."""
+        run = self.stopped_reply()
+        await self.dispatch(run, _delta(" slow-2"))
+        await self.spin()
+        self.assertIn((self.key, run), self.conn._turn_pumps)
+        self.assertIs(self.owui.msgs()[self.STUB]["done"], False)
+
+
 class HandoverRewriteTests(_RoutingCase):
     """Review 2af1 R4 (P28), R6, R9: a handed-over reply ends as the inline
     reply showed it. The inline reply turns a `MEDIA:` directive into an image

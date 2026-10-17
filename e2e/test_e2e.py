@@ -1017,7 +1017,14 @@ def _down_state(token: str, chat_id: str, key: str) -> str:
 
 
 @pytest.mark.skipif(shutil.which("docker") is None, reason="needs the e2e stack's Open WebUI container")
-def test_a_reply_whose_run_ends_while_owui_is_stopped_is_completed_on_start(token):
+@pytest.mark.parametrize("down", [
+    # SIGTERM: Open WebUI's shutdown cancels the reply and saves what it
+    # showed, done:true. The Pipe writes nothing after it (ELI-173).
+    pytest.param(["stop", "-t", "30"], id="stop"),
+    # SIGKILL (an OOM kill): nothing saves the reply, it stays the empty stub, done:false.
+    pytest.param(["kill", "-s", "KILL"], id="kill"),
+])
+def test_a_reply_whose_run_ends_while_owui_is_stopped_is_completed_on_start(token, down):
     now = int(time.time())
     uid, aid = str(uuid.uuid4()), str(uuid.uuid4())
     prompt = f"E2E_SLOW:{DOWN_RUN_WORDS} E2E_DOWN"
@@ -1040,7 +1047,9 @@ def test_a_reply_whose_run_ends_while_owui_is_stopped_is_completed_on_start(toke
 
     # Stop Open WebUI while the run streams (the Gateway's own state says so).
     _until("the run to start", lambda: _session_row(key).get("hasActiveRun"))
-    subprocess.run(["docker", "stop", "-t", "30", "owui"], check=True, capture_output=True)
+    # The reply shows its first word (a GET overlays the live response stream).
+    _until("the reply to show text", lambda: _chat_messages(token, chat_id)[aid].get("content"))
+    subprocess.run(["docker", *down, "owui"], check=True, capture_output=True)
     assert _session_row(key).get("hasActiveRun"), (
         f"the run ended before Open WebUI was down; raise DOWN_RUN_WORDS ({DOWN_RUN_WORDS})")
     # The run closes while Open WebUI is down.
@@ -1048,10 +1057,15 @@ def test_a_reply_whose_run_ends_while_owui_is_stopped_is_completed_on_start(toke
     subprocess.run(["docker", "start", "owui"], check=True, capture_output=True)
     _until("Open WebUI to come back", _owui_up, timeout_s=300, every_s=2)
 
-    # The precondition this test is about: the stop saved a partial, finished reply.
+    # The precondition each case is about: what the down left of the reply.
     before = _chat_messages(token, chat_id)[aid]
-    assert before.get("done") is True and f"slow-{DOWN_RUN_WORDS}" not in (before.get("content") or ""), (
-        f"precondition: Open WebUI's stop should leave a partial done:true reply: {json.dumps(before)[:1500]}")
+    text = before.get("content") or ""
+    shown = ("empty" if not text else "partial" if text.startswith("E2E_DOWN")
+             and f"slow-{DOWN_RUN_WORDS}" not in text else "other")
+    expected = {"stop": (True, "partial"), "kill": (False, "empty")}[down[0]]
+    assert (before.get("done"), shown) == expected, (
+        f"precondition: docker {down[0]} should leave the reply done:{str(expected[0]).lower()} and {expected[1]}: "
+        f"{json.dumps(before)[:1500]}")
 
     # The first model listing after a start runs the startup reconcile.
     status, _models = _request("GET", "/api/models", token=token)
