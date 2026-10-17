@@ -60,7 +60,12 @@ RECORD_TEXTS = f"""() => {{
 
 
 def _seen(page) -> list:
-    return [t[-60:] for t in page.evaluate("() => window.__seen || []")]
+    return page.evaluate("() => window.__seen || []")
+
+
+def _tails(texts: list) -> list:
+    """For a failure message: the end of each text."""
+    return [t[-60:] for t in texts]
 
 
 def test_send_streams_the_reply_and_keeps_it(page):
@@ -81,9 +86,10 @@ def test_send_streams_the_reply_and_keeps_it(page):
         capture.wait_js(page, "() => !document.querySelector('button[aria-label=\"Stop\"]')",
                         "the Stop button gone (the reply is done)", TURN_MS)
     except TimeoutError as ex:
-        raise AssertionError(f"{ex}; texts the reply showed: {_seen(page)}") from None
-    partial = [t for t in _seen(page) if "BROWSER_STREAM slow-2" in t and "slow-10" not in t]
-    assert partial, f"the reply never showed part way through; texts it showed: {_seen(page)}"
+        raise AssertionError(f"{ex}; texts the reply showed: {_tails(_seen(page))}") from None
+    seen = _seen(page)
+    partial = [t for t in seen if "BROWSER_STREAM" in t and "slow-2" in t and "slow-10" not in t]
+    assert partial, f"the reply never showed part way through; texts it showed: {_tails(seen)}"
 
     page.reload()
     page.wait_for_selector("#chat-input", timeout=60_000)
