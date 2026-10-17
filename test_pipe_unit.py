@@ -3932,22 +3932,19 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(answer)
 
-    async def test_ask_user_input_modal_times_out(self):
+    async def test_an_unanswered_secret_dialog_ends_the_wait(self):
+        """OWUI puts no timeout on an input dialog; ours ends the wait, and
+        the question ends the reply as text."""
         async def event_call(event):
             await asyncio.sleep(0.05)
             return {"value": "late"}
 
-        # asyncio.TimeoutError, not the builtin: the two are the same class only
-        # from 3.11 on. `asyncio.wait_for` raises asyncio's on every version, so
-        # asserting the builtin passes on 3.11+ and fails on 3.10. The runtime
-        # code catches asyncio.TimeoutError throughout and is version-correct;
-        # this assertion was the only version-fragile spot.
-        with self.assertRaises(asyncio.TimeoutError):
-            await _ask_user_input_modal(
-                event_call,
-                "Codex needs input:\n\nPackage\nYour API key",
-                timeout_s=0.01,
-            )
+        answer = await asyncio.wait_for(_ask_user_input_modal(
+            event_call,
+            "Codex needs input:\n\nPackage\nYour API key",
+            timeout_s=0.01,
+        ), 2)
+        self.assertIsNone(answer)
 
     def test_ask_user_detail_block_renders_as_tool_call(self):
         block = _ask_user_detail_block(
@@ -4399,6 +4396,142 @@ class AskUserMultiSelectCardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event["type"], "input")
         self.assertEqual(event["data"]["type"], "password")
         self.assertEqual(event["data"]["title"], "Token")
+
+
+class AskUserSecretDialogTests(unittest.IsolatedAsyncioTestCase):
+    """A secret keeps OWUI's masked input dialog (the card has none), asked
+    the way the card is (ELI-148): once, moved once to the tab viewing the
+    chat when the turn's socket goes away, never re-shown after a timeout.
+    Its answer never shows in the chat."""
+
+    PROMPT = "OpenClaw needs input:\n\nToken\nPaste your API key"
+    VALUE = "s3cret-VALUE-9f2"
+
+    def _sio(self, pool, reply):
+        sio = FakeSio(lambda event, data, to, timeout: reply(data, to))
+        fake_owui(self, sio=sio, SESSION_POOL=pool)
+        return sio
+
+    async def _ask(self, event_call, **kw):
+        return await asyncio.wait_for(_ask_user_input_modal(
+            event_call, self.PROMPT, owui_user_id="user-1", owui_chat_id="chat-1",
+            owui_message_id="msg-1", poll_interval_s=0.01, **kw), 2)   # bounds the test only
+
+    async def test_a_reload_moves_the_dialog_to_the_reloaded_tab(self):
+        pool = {"sid-old": {"id": "user-1", "chat_ids": ["chat-1"]}}
+        sio = self._sio(pool, lambda data, to: {"value": self.VALUE})
+        pending = asyncio.get_running_loop().create_future()
+
+        async def event_call(event):
+            return await pending                       # the dialog left with the old page
+
+        async def reload_tab():
+            await asyncio.sleep(0.05)
+            del pool["sid-old"]
+            pool["sid-new"] = {"id": "user-1", "chat_ids": ["chat-1"]}
+        reloader = asyncio.ensure_future(reload_tab())
+        answer = await self._ask(event_call, owui_session_id="sid-old")
+        await reloader
+        self.assertEqual(answer, self.VALUE)
+        ((_event, data, to, timeout),) = sio.calls
+        self.assertEqual(to, "sid-new")
+        self.assertEqual((data["data"]["type"], data["data"]["data"]["type"]), ("input", "password"))
+        self.assertEqual(timeout, 240)
+        self.assertEqual(sio.emits, [], "no card to close")
+
+    async def test_with_no_tab_on_the_chat_the_question_ends_the_reply(self):
+        pool = {"sid-old": {"id": "user-1", "chat_ids": ["chat-1"]},
+                "sid-other": {"id": "user-1", "chat_ids": ["chat-x"]}}
+        sio = self._sio(pool, lambda data, to: {"value": self.VALUE})
+
+        async def event_call(event):
+            del pool["sid-old"]                        # the tab is closed
+            return await asyncio.get_running_loop().create_future()
+        self.assertIsNone(await self._ask(event_call, owui_session_id="sid-old"))
+        self.assertEqual(sio.calls, [], "never another chat's tab")
+
+    async def test_a_moved_dialog_that_is_never_answered_ends_the_wait(self):
+        pool = {"sid-tab": {"id": "user-1", "chat_ids": ["chat-1"]}}
+        sio = self._sio(pool, lambda data, to: {"error": "Event call timed out"})
+
+        async def event_call(event):
+            return {"error": "Client session disconnected."}
+        self.assertIsNone(await self._ask(event_call))
+        self.assertEqual(len(sio.calls), 1, "shown once, never re-shown")
+
+    def test_the_ask_user_block_never_shows_the_value(self):
+        block = _ask_user_detail_block(self.PROMPT, self.VALUE)
+        self.assertNotIn(self.VALUE, block)
+        self.assertIn("secret entered", block)
+        self.assertIn("Token", block)
+        # Any other answer shows as given.
+        self.assertIn('result="Blue"', _ask_user_detail_block(
+            "OpenClaw needs input:\n\nColor?\nPick\n1. Red\n2. Blue", "Blue"))
+
+
+class SecretAnswerNeverInTheChatTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-148: a secret typed into the masked dialog goes to the agent and
+    nowhere else the pipe writes: not the reply's text or items, not the
+    events it emits, not the rewrites a turn writer would apply to the
+    stored message, not the pipe log."""
+
+    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
+    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
+    _queue = NoDroppedMessagesTests._queue
+    _delta = NoDroppedMessagesTests._delta
+    _final = NoDroppedMessagesTests._final
+    _until_registered = NoDroppedMessagesTests._until_registered
+    VALUE = "s3cret-VALUE-9f2"
+
+    async def test_the_value_reaches_only_the_agent(self):
+        written, asked = [], []
+
+        async def emitter(event):
+            written.append(event)
+
+        async def event_call(event):
+            asked.append(event)
+            return {"value": self.VALUE} if event.get("type") == "input" else None
+        rewrites = []
+        note = self.conn.note_turn_rewrite
+        self.conn.note_turn_rewrite = lambda *a: (rewrites.append(a), note(*a))[1]
+        logged = []
+        log = mock.patch.object(self.ocp, "pipe_log", lambda *a, **k: logged.append(a))
+        log.start()
+        self.addCleanup(log.stop)
+
+        body = {"model": "openclaw_gateway.default", "messages": [{"role": "user", "content": "deploy"}]}
+        meta = {"chat_id": "chat-1", "user_id": "u1", "message_id": "m1"}
+        gen = self.pipe._pipe_impl(body, emitter, __metadata__=meta, __event_call__=event_call)
+        chunks = []
+
+        async def drain():
+            async for c in gen:
+                chunks.append(c)
+        task = asyncio.ensure_future(drain())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "I need a key.\n\nOpenClaw needs input:\n\nToken\nPaste your API key\n"))
+        q.put_nowait(self._final("run-1"))
+        for _ in range(400):
+            if len(self.sent) == 2:
+                break
+            await asyncio.sleep(0.005)
+        self.assertEqual(self.sent, ["deploy", self.VALUE], "the agent gets the value")
+        answer_run = next(r for r in ("run-2", self.keys[-1])
+                          if f"{self.SK}:{r}" in self.conn._consumers)
+        q2 = self._queue(answer_run)
+        q2.put_nowait(self._delta(answer_run, "Stored."))
+        q2.put_nowait(self._final(answer_run))
+        await asyncio.wait_for(task, 5)   # bounds the test only
+
+        self.assertEqual([e["type"] for e in asked if e.get("type") == "input"], ["input"])
+        shown = "".join(c for c in chunks if isinstance(c, str))
+        self.assertIn("secret entered", shown)
+        self.assertIn("Stored.", shown)
+        for where, what in (("reply", chunks), ("events", written), ("rewrites", rewrites),
+                            ("log", logged)):
+            self.assertNotIn(self.VALUE, json.dumps(what, default=repr), where)
 
 
 class DynamicModelSelectorTests(unittest.TestCase):

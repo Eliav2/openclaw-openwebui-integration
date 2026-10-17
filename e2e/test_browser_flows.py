@@ -110,8 +110,8 @@ def _answer_question(page, marker: str, question: str, answer) -> str:
     answer(page)
     capture.wait_js(page, "() => !document.querySelector('input[placeholder=\"Type your answer\"]')",
                     "the card gone after the answer", 30_000)
-    capture.wait_js(page, _last_assistant_js("t.includes('E2E_ANSWERED')"),
-                    "the reply to the answer", TURN_MS)
+    capture.wait_js(page, _last_assistant_js("t.includes('E2E_ANSWER_END')"),
+                    "the whole reply to the answer", TURN_MS)
     return page.evaluate(f"() => {capture.LAST_ASSISTANT}.innerText")
 
 
