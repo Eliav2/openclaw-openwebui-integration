@@ -45,26 +45,45 @@ def _last_assistant_js(body: str) -> str:
             f"const t = a.innerText; return {body}; }}")
 
 
+# Every distinct text the last assistant message shows, from every DOM change:
+# a state the user saw cannot fall between two polls.
+RECORD_TEXTS = f"""() => {{
+  window.__seen = [];
+  const push = () => {{
+    const a = {capture.LAST_ASSISTANT};
+    const t = a ? a.innerText.trim() : '';
+    const s = window.__seen;
+    if (t && s[s.length - 1] !== t) s.push(t);
+  }};
+  new MutationObserver(push).observe(document.body, {{subtree: true, childList: true, characterData: true}});
+}}"""
+
+
+def _seen(page) -> list:
+    return [t[-60:] for t in page.evaluate("() => window.__seen || []")]
+
+
 def test_send_streams_the_reply_and_keeps_it(page):
     """Send/stream: the reply shows word by word while the run goes, ends as
     the full reply with the composer ready again, and is still there after a
-    reload. The scripted model sends one word a second, so a reply that only
-    appears at the end fails the first wait."""
+    reload. The scripted model sends one word a second."""
     words = " ".join(f"slow-{i}" for i in range(1, 11))
     full = f"BROWSER_STREAM {words}"
     capture.new_chat(page)
+    page.evaluate(RECORD_TEXTS)
     chat_id = capture.send(page, "E2E_SLOW BROWSER_STREAM")
 
-    capture.wait_js(page, _last_assistant_js(
-        't.includes("BROWSER_STREAM slow-2") && !t.includes("slow-10")'),
-        "part of the reply on screen while the rest streams", TURN_MS)
-
-    capture.wait_js(page, _last_assistant_js(f"t.includes({json.dumps(full)})"),
-                    "the full reply", TURN_MS)
-    # The turn is over for the user: Open WebUI shows Stop while the last
-    # message is not done (MessageInput.svelte `isActive`), and hides it after.
-    capture.wait_js(page, "() => !document.querySelector('button[aria-label=\"Stop\"]')",
-                    "the Stop button gone (the reply is done)", TURN_MS)
+    try:
+        capture.wait_js(page, _last_assistant_js(f"t.includes({json.dumps(full)})"),
+                        "the full reply", TURN_MS)
+        # The turn is over for the user: Open WebUI shows Stop while the last
+        # message is not done (MessageInput.svelte `isActive`), and hides it after.
+        capture.wait_js(page, "() => !document.querySelector('button[aria-label=\"Stop\"]')",
+                        "the Stop button gone (the reply is done)", TURN_MS)
+    except TimeoutError as ex:
+        raise AssertionError(f"{ex}; texts the reply showed: {_seen(page)}") from None
+    partial = [t for t in _seen(page) if "BROWSER_STREAM slow-2" in t and "slow-10" not in t]
+    assert partial, f"the reply never showed part way through; texts it showed: {_seen(page)}"
 
     page.reload()
     page.wait_for_selector("#chat-input", timeout=60_000)
