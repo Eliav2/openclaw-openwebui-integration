@@ -73,7 +73,7 @@ pydantic) and `_test_helpers.py` (`run_page` for the fake-DOM page scripts,
 is not a suite, it's a verbatim copy of Open WebUI's streaming handler, used
 as a fixture to pin tool-card rendering against the real thing.
 
-`e2e/test_e2e.py` skips unless `E2E_STACK=1`: it needs the stack that
+`e2e/test_e2e.py` and `e2e/test_browser_flows.py` skip unless `E2E_STACK=1`: it needs the stack that
 `e2e/start_stack.sh` brings up (see E2E below). Two fixture checks in
 `test_pipe_unit.py` (`-k installed_dist`) compare the Gateway source lines the
 Pipe matches on with an installed OpenClaw: `$OPENCLAW_DIST`, else the global
@@ -98,7 +98,9 @@ it, and Open WebUI in Docker; installs the Pipe, Filter and Action with
 `uv run install*.py install` exactly as the README tells users to (device
 pairing and the installer's smoke test included); then runs `e2e/test_e2e.py`
 against it, and the installed-dist fixture checks against the Gateway it
-installed. Because the model is scripted, replies are
+installed. `e2e/test_browser_flows.py` then drives the same stack in Chromium
+with Playwright, one test per user flow, asserting on what the page shows (the
+browser helpers are `scripts/screenshots/capture.py`'s). Because the model is scripted, replies are
 asserted exactly, the model that served a turn is read from the fake model's
 request log (the stack's default, `e2e-default`, differs from the routed
 `e2e-echo`), and a real tool call (`session_status`) is checked all the

@@ -68,7 +68,20 @@ jobs:
           TESTS: ${{ inputs.tests }}
         run: |
           uv run --with-requirements requirements-dev.txt \
-            pytest -v --junitxml="$RUNNER_TEMP/e2e-logs/junit.xml" e2e/test_e2e.py ${TESTS:+-k "$TESTS"}
+            pytest -v --junitxml="$RUNNER_TEMP/e2e-logs/junit.xml" e2e/test_e2e.py ${TESTS:+-k "$TESTS"} && rc=0 || rc=$?
+          [ "$rc" -eq 0 ] || { [ -n "$TESTS" ] && [ "$rc" -eq 5 ]; }  # -k matched nothing here
+
+      - name: Install Chromium for Playwright
+        run: uv run --with-requirements requirements-browser.txt python -m playwright install --with-deps chromium
+
+      - name: Browser flows (Playwright)
+        # What the user sees, one test per flow (e2e/test_browser_flows.py).
+        env:
+          TESTS: ${{ inputs.tests }}
+        run: |
+          uv run --with-requirements requirements-dev.txt --with-requirements requirements-browser.txt \
+            pytest -v --junitxml="$RUNNER_TEMP/e2e-logs/junit-browser.xml" e2e/test_browser_flows.py ${TESTS:+-k "$TESTS"} && rc=0 || rc=$?
+          [ "$rc" -eq 0 ] || { [ -n "$TESTS" ] && [ "$rc" -eq 5 ]; }  # -k matched nothing here
 
       - name: Fixtures still match the installed OpenClaw
         # The unit suite pins two Gateway source lines the Pipe matches on
