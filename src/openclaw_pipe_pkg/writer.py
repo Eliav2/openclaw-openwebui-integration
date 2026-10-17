@@ -732,8 +732,8 @@ class _TurnWriter:
         if payload is None:
             return False
         try:
-            response = await _call_native_card_on_live_session(
-                self.user_id, self.chat_id, self.message_id, payload)
+            response = await _call_on_chat_tab(
+                self.user_id, self.chat_id, self.message_id, payload, _NATIVE_CARD_TIMEOUT_MS / 1000)
         except Exception as ex:
             pipe_log(f"  turn writer: question card failed: {ex!r}")
             return False

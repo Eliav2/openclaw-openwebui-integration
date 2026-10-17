@@ -240,6 +240,9 @@ def _extract_numbered_options(prompt_text: str) -> list[tuple[str, str]]:
     return [(m.group(1), m.group(2).strip()) for m in pattern.finditer(prompt_text or "")]
 
 
+# What the Ask User block shows for a secret's answer.
+SECRET_ANSWER_SHOWN = "•••• (secret entered)"
+
 _MULTI_MARKERS = (
     "(multiselect)", "(multi-select)", "(multi)", "[multiselect]", "[multi]",
     "select all that apply", "choose all that apply", "check all that apply",
@@ -525,54 +528,85 @@ def _format_native_answers(questions: list[dict], answers: dict) -> str:
     return "\n".join(f"{header}: {text}" for header, text in lines)
 
 
-async def _call_native_card_on_live_session(
-    owui_user_id: str, owui_chat_id: str | None, owui_message_id: str | None, payload: dict
+async def _call_on_chat_tab(
+    owui_user_id: str, owui_chat_id: str | None, owui_message_id: str | None, payload: dict,
+    timeout_s: float,
 ):
-    """Show the card on the user's current socket session, or return None when
-    they have none. Mirrors OWUI's own get_event_call for request:user_input:
-    a fresh interaction_id, the clamped timeout, and the closing
-    request:interaction:done event that removes the card from the screen."""
+    """Show `payload` on the user's socket viewing the chat, or return None
+    when there is none. A question card goes as OWUI's own get_event_call
+    sends it: a fresh interaction_id, and the closing request:interaction:done
+    event that removes the card from the screen."""
     try:
         from open_webui.socket.main import sio, SESSION_POOL
     except Exception as ex:
-        pipe_log(f"  native card retry unavailable (not running inside OWUI process?): {ex}")
+        pipe_log(f"  question on the chat's tab unavailable (not running inside OWUI process?): {ex}")
         return None
     sid = _live_session_id_for_user(owui_user_id, SESSION_POOL, owui_chat_id)
     if not sid:
         return None
-    pipe_log(f"  question card: showing it on session {sid[:8]}...")
+    pipe_log(f"  question: showing it on session {sid[:8]}...")
+    card = payload.get("type") == "request:user_input"
     interaction_id = str(uuid.uuid4())
-    data = {**payload["data"], "interaction_id": interaction_id}
-    timeout_s = min(max(data.get("timeout_ms", 120_000) / 1000, 60), 240)
+    if card:
+        payload = {**payload, "data": {**payload["data"], "interaction_id": interaction_id}}
     try:
         return await sio.call(
             "events",
-            {
-                "chat_id": owui_chat_id,
-                "message_id": owui_message_id,
-                "data": {**payload, "data": data},
-            },
+            {"chat_id": owui_chat_id, "message_id": owui_message_id, "data": payload},
             to=sid,
             timeout=timeout_s,
         )
     except Exception as ex:
         return {"error": f"Event call timed out: {ex!r}"}
     finally:
-        try:
-            await sio.emit(
-                "events",
-                {
-                    "chat_id": owui_chat_id,
-                    "message_id": owui_message_id,
-                    "data": {
-                        "type": "request:interaction:done",
-                        "data": {"interaction_id": interaction_id},
+        if card:
+            try:
+                await sio.emit(
+                    "events",
+                    {
+                        "chat_id": owui_chat_id,
+                        "message_id": owui_message_id,
+                        "data": {
+                            "type": "request:interaction:done",
+                            "data": {"interaction_id": interaction_id},
+                        },
                     },
-                },
-                to=sid,
-            )
-        except Exception:
-            pass
+                    to=sid,
+                )
+            except Exception:
+                pass
+
+
+async def _ask_where_the_chat_is(
+    __event_call__,
+    payload: dict,
+    timeout_s: float,
+    *,
+    grace_s: float = 0,
+    owui_user_id: str | None,
+    owui_chat_id: str | None,
+    owui_message_id: str | None,
+    poll_interval_s: float,
+    owui_session_id: str | None,
+):
+    """Ask once on the socket the turn started on (`owui_session_id`). Once
+    it is gone (a reload; no socket for an API caller) the question moves
+    once to the tab viewing the chat. Never re-shown after a timeout: that
+    keeps a reply open with nothing on screen (ELI-142)."""
+    response = await _event_call_while_session_lives(
+        __event_call__, payload, owui_session_id, timeout_s + grace_s, poll_interval_s
+    )
+    if owui_user_id and isinstance(response, dict) and "disconnected" in str(response.get("error", "")):
+        response = await _call_on_chat_tab(owui_user_id, owui_chat_id, owui_message_id, payload, timeout_s)
+    return response
+
+
+def _unanswered(response) -> str:
+    if response is None:
+        return "no tab views the chat"
+    if isinstance(response, dict):
+        return str(response.get("error") or response.get("status"))[:80]
+    return repr(response)[:80]
 
 
 async def _ask_user_native_card(
@@ -590,29 +624,45 @@ async def _ask_user_native_card(
     Only an answer or a cancel shows the card was seen. Anything else (OWUI's
     timeout, a cancel the moment it arrives on a tab viewing another chat, a
     socket that never answers) returns None, as a cancel does: the reply then
-    ends with the question as text (ELI-107). The card is never re-shown after
-    a timeout: that keeps a reply open with nothing on screen (ELI-142).
-    `owui_session_id`: the socket the turn started on. Once it is gone (a
-    reload; no socket for an API caller) the card moves once to the tab
-    viewing the chat, as the turn writer's card does.
+    ends with the question as text (ELI-107).
     """
-    response = await _event_call_while_session_lives(
-        __event_call__, payload, owui_session_id, payload["data"]["timeout_ms"] / 1000 + 15, poll_interval_s
+    response = await _ask_where_the_chat_is(
+        __event_call__, payload, payload["data"]["timeout_ms"] / 1000, grace_s=15,
+        owui_user_id=owui_user_id, owui_chat_id=owui_chat_id, owui_message_id=owui_message_id,
+        poll_interval_s=poll_interval_s, owui_session_id=owui_session_id,
     )
-    if owui_user_id and isinstance(response, dict) and "disconnected" in str(response.get("error", "")):
-        response = await _call_native_card_on_live_session(
-            owui_user_id, owui_chat_id, owui_message_id, payload
-        )
     if isinstance(response, dict) and response.get("status") == "answered":
         return _format_native_answers(payload["data"]["questions"], response.get("answers") or {}) or None
-    if response is None:
-        outcome = "no tab views the chat"
-    elif isinstance(response, dict):
-        outcome = str(response.get("error") or response.get("status"))
-    else:
-        outcome = repr(response)
-    pipe_log(f"  question card not answered ({outcome[:80]}); the question ends the reply as text")
+    pipe_log(f"  question card not answered ({_unanswered(response)}); the question ends the reply as text")
     return None
+
+
+async def _ask_user_secret(
+    __event_call__,
+    prompt_text: str,
+    *,
+    timeout_s: float,
+    owui_user_id: str | None,
+    owui_chat_id: str | None,
+    owui_message_id: str | None,
+    poll_interval_s: float,
+    owui_session_id: str | None = None,
+) -> str | None:
+    """Ask for a secret through OWUI's masked input dialog, as the card is
+    asked. OWUI puts no timeout on this dialog, so `timeout_s` ends the wait;
+    unanswered, the question ends the reply as text."""
+    try:
+        response = await _ask_where_the_chat_is(
+            __event_call__, _secret_input_payload(prompt_text), timeout_s,
+            owui_user_id=owui_user_id, owui_chat_id=owui_chat_id, owui_message_id=owui_message_id,
+            poll_interval_s=poll_interval_s, owui_session_id=owui_session_id,
+        )
+    except asyncio.TimeoutError:
+        response = {"error": f"no answer in {timeout_s:g} s"}
+    answer = _normalize_event_call_response(response)
+    if not answer:
+        pipe_log(f"  secret dialog not answered ({_unanswered(response)}); the question ends the reply as text")
+    return answer or None
 
 
 def _ask_user_detail_block(prompt_text: str, answer: str) -> str:
@@ -628,6 +678,9 @@ def _ask_user_detail_block(prompt_text: str, answer: str) -> str:
     the raw prompt text was fully suppressed once answered).
     """
     json_questions = _parse_ask_user_json(prompt_text)
+    if not json_questions and _parse_text_prompt(prompt_text)["secret"]:
+        # The block is written into the chat, so into Open WebUI's database.
+        answer = SECRET_ANSWER_SHOWN
     if json_questions:
         question_display = "\n\n".join(
             f"{q['header']}\n{q['question']}" for q in json_questions
@@ -757,8 +810,8 @@ async def _ask_user_input_modal(
 ) -> str | None:
     """Ask the user a needs-input prompt in the chat's tab: OWUI's question
     card (see _ask_user_native_card), or for a secret its masked input
-    dialog, asked once. None when unanswered: the question then ends the
-    reply as text. A dialog that times out raises asyncio.TimeoutError."""
+    dialog (_ask_user_secret). None when unanswered: the question then ends
+    the reply as text."""
     if not __event_call__ or not _is_user_input_prompt(prompt_text):
         return None
     native_payload = _native_ask_user_payload(prompt_text)
@@ -772,5 +825,13 @@ async def _ask_user_input_modal(
             poll_interval_s=poll_interval_s,
             owui_session_id=owui_session_id,
         )
-    response = await asyncio.wait_for(__event_call__(_secret_input_payload(prompt_text)), timeout=timeout_s)
-    return _normalize_event_call_response(response) or None
+    return await _ask_user_secret(
+        __event_call__,
+        prompt_text,
+        timeout_s=timeout_s,
+        owui_user_id=owui_user_id,
+        owui_chat_id=owui_chat_id,
+        owui_message_id=owui_message_id,
+        poll_interval_s=poll_interval_s,
+        owui_session_id=owui_session_id,
+    )

@@ -27,7 +27,7 @@ The question renders as Open WebUI's own inline question card, the one its built
 | `(multiselect)` or "select all that apply" | card that lists the options by number, with a typed answer |
 | a JSON body with up to three `questions` | one card that steps through each |
 
-A secret gets a dialog because the card has no masked input.
+A secret gets a dialog because the card has no masked input. The value goes only to the agent: the ❓ Ask User card in the reply shows `•••• (secret entered)` instead.
 
 The card picks one option per question, so a multi-select question lists its options by number and you type the ones you pick: `1, 3`, `1 3`, the options' text, or both mixed. The agent gets the options, comma-separated (`Cheese, Mushrooms`). An answer that is not only option numbers and names, such as a number out of range, reaches the agent as you typed it.
 
@@ -42,7 +42,7 @@ Answer the card and the run continues in the same reply. The exchange stays in t
 While it waits you can reload or switch away and come back:
 
 - **Question card:** the card is shown once, on the tab that views the chat; a reload moves it to the reloaded tab. If it is not answered by Open WebUI's card timeout (4 minutes), or no tab views the chat (for example a client calling the API), the reply ends with the question as plain text.
-- **Secret dialog:** shown once, on the tab the reply started on. If it is not answered within 4 minutes, or that tab is gone, the reply ends with the question as plain text.
+- **Secret dialog:** the same as the card: shown once, and a reload moves it to the reloaded tab. If it is not answered within 4 minutes, or no tab views the chat, the reply ends with the question as plain text.
 
 If you cancel the question, or it ends as text, the question stays in the reply as ordinary text with the trigger removed (a JSON form as its numbered questions with their options), so nothing is lost. Answer it with a normal message.
 
