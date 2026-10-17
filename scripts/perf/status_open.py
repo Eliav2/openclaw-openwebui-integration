@@ -266,6 +266,10 @@ def main(argv=None) -> int:
             page.goto(f"{cap.BASE}/c/{chat_id}")
             page.locator(".chat-assistant").last.wait_for(timeout=120_000)
             print(f"  chat page loaded in {time.time() - t:.1f}s", flush=True)
+            # The page script is in (the composer watcher delivered it): what a
+            # reader who opened the chat a moment ago has.
+            page.locator("#openclaw-composer-status-button").wait_for(timeout=60_000)
+            print(f"  status button in after {time.time() - t:.1f}s", flush=True)
             page.evaluate(OBSERVER_JS)
             for profile in args.profiles.split(","):
                 throttle(page, profile)
