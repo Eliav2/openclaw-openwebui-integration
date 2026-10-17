@@ -6618,6 +6618,23 @@ async def _run_request(conn, method: str, params: dict, *, timeout: float = 10,
 # Stop button reaches it.
 
 
+# Opens tried at a run's end while Open WebUI's DB is locked (ELI-167). Each
+# waits out sqlite's busy_timeout (Open WebUI: 5 s), so 6 is about 30 s.
+OPEN_AT_END_LOCKED_TRIES = 6
+
+
+def _db_locked(ex: BaseException) -> bool:
+    """sqlite's write lock held past busy_timeout: `database is locked`, as
+    sqlite3 raises it or SQLAlchemy wraps it."""
+    seen = set()
+    while ex is not None and id(ex) not in seen:
+        seen.add(id(ex))
+        if "database is locked" in str(ex):
+            return True
+        ex = ex.__cause__ or ex.__context__
+    return False
+
+
 async def _set_turn_meta(chat_id: str, message_id: str, meta: dict) -> bool:
     """Merge `meta` into message `message_id` under the chat's row lock."""
     from open_webui.models.chats import Chats
@@ -6981,6 +6998,7 @@ class _TurnWriter:
         # ELI-147): the transcript rebuild of M starts after it.
         self.shown = {run_id: shown} if shown else {}
         self.opened = False
+        self._claim: dict | None = None  # the committed claim, once (a locked open resumes after it)
         self.task_id: str | None = None
         # every run written into M, in transcript order (_adopt_recoveries_from)
         self.runs = [run_id]
@@ -7026,17 +7044,24 @@ class _TurnWriter:
         if not self.message_id:
             return False
         _register_turn_writer(self.conn.writer_id)
-        claim = await _claim_turn_message(self.chat_id, self.user_id, self.message_id,
-                                          self.run_id, self.conn.writer_id, takeover=takeover)
-        if not claim["claimed"]:
-            pipe_log(f"  turn writer: message {self.message_id[:8]}... is held by another writer")
-            return False
-        if claim["how"] == "new":
-            await _introduce_turn_message(self.chat_id, self.user_id, claim["messages"],
-                                          self.message_id)
+        # Each step is done once: a locked DB (ELI-167) can stop the open after
+        # the claim committed, and the next open goes on from there instead of
+        # reading its own claim as another writer's message.
+        if self._claim is None:
+            claim = await _claim_turn_message(self.chat_id, self.user_id, self.message_id,
+                                              self.run_id, self.conn.writer_id, takeover=takeover)
+            if not claim["claimed"]:
+                pipe_log(f"  turn writer: message {self.message_id[:8]}... is held by another writer")
+                return False
+            self._claim = claim
+            if claim["how"] == "new":
+                await _introduce_turn_message(self.chat_id, self.user_id, claim["messages"],
+                                              self.message_id)
+        claim = self._claim
         from open_webui.tasks import create_task
 
-        self.task_id, _ = await create_task(_owui_redis(), self._hold(), id=self.chat_id)
+        if self.task_id is None:
+            self.task_id, _ = await create_task(_owui_redis(), self._hold(), id=self.chat_id)
         meta = {"task_id": self.task_id}
         if self.wake is not None:
             # What a successor needs to adopt this message (ELI-103 step 4).
@@ -7075,7 +7100,17 @@ class _TurnWriter:
         if not self.opened:
             if not self._showable():
                 return
-            if not await self.open(takeover=self.takeover):
+            try:
+                opened = await self.open(takeover=self.takeover)
+            except Exception as ex:
+                if not _db_locked(ex):
+                    raise
+                # The renderer keeps everything; the run's next event opens
+                # (ELI-167). Each try already waited out Open WebUI's busy_timeout.
+                pipe_log(f"  turn writer: open of {self.message_id[:8]}... waits: Open WebUI's "
+                         f"database is locked; the run's next event tries again")
+                return
+            if not opened:
                 self.closed = True
                 return
         await self._stream()
@@ -7420,7 +7455,7 @@ class _TurnWriter:
                 if not (self._showable() or note):
                     await self._show_silent_announce(hist)
             if not self.opened:
-                if not (self._showable() or note) or not await self.open(takeover=self.takeover):
+                if not (self._showable() or note) or not await self._open_at_end():
                     return
             output, text = await self._view(final=True)
             output = [i for i in output if not _is_sentinel_message_item(i)]
@@ -7440,6 +7475,31 @@ class _TurnWriter:
                      f"{tools} tool card(s), {len(self.runs)} run(s))")
         finally:
             self._done.set()
+
+    async def _open_at_end(self) -> bool:
+        """The run is over and no event is left to retry a locked open on, so
+        try again a few times: each try is one BEGIN IMMEDIATE that sqlite
+        holds for Open WebUI's busy_timeout (5 s) while the lock's holder
+        finishes. A DB still locked after that is told, not dropped (ELI-167)."""
+        last = None
+        for _ in range(OPEN_AT_END_LOCKED_TRIES):
+            try:
+                return await self.open(takeover=self.takeover)
+            except Exception as ex:
+                if not _db_locked(ex):
+                    raise
+                last = ex
+        pipe_log(f"  turn writer: ERROR: run {self.run_id[:24]}... NOT WRITTEN to chat "
+                 f"{self.chat_id[:8]}... (message {self.message_id[:8]}...): Open WebUI's database "
+                 f"stayed locked for {OPEN_AT_END_LOCKED_TRIES} tries after the run ended ({last!r})")
+        try:
+            await (await self._emitter())({"type": "notification", "data": {
+                "type": "error",
+                "content": "OpenClaw: a reply could not be saved to this chat because Open WebUI's "
+                           "database stayed locked. See the pipe log."}})
+        except Exception as ex:
+            pipe_log(f"  turn writer: notification failed: {ex!r}")
+        return False
 
     async def _show_silent_announce(self, hist: dict | None) -> None:
         """A sub-agent's completion the parent answered with silence (NO_REPLY)

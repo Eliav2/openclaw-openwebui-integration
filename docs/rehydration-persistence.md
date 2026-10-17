@@ -26,6 +26,8 @@ A run the Pipe writes outside a live request (an agent turn, or a user turn whos
 
 Every write rewrites the whole chat, about 14 times its JSON in Open WebUI's memory, so a write per item (two per tool call) was most of a long chat's churn. Before ELI-115 the writer also wrote on every item boundary. What that changes when a process dies mid-turn:
 
+**A locked database at the open (ELI-167).** Open WebUI runs sqlite in WAL mode with a 5 s `busy_timeout`, and the claim begins with `BEGIN IMMEDIATE`, so `database is locked` means another writer held the lock for 5 s. The open then waits for the run's next event: the renderer keeps everything, and the open goes on from the step it reached (a committed claim is not claimed again). At the run's end, with no event left, the writer tries again up to 6 times, each try paced by that same busy wait (about 30 s). A database still locked after that leaves the run unwritten, logged as `NOT WRITTEN` with an error notification in the user's open tabs; it is never dropped silently.
+
 | Case | In the DB mid-turn, per item (before) | In the DB mid-turn (now) | How it ends (both) |
 |---|---|---|---|
 | Writer alive to the end, including a Gateway crash or restart while Open WebUI stays up | each item | the claim, or the handover | `finalize` from the writer's memory and the transcript; the mid-turn DB copy is never read |

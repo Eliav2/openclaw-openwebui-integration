@@ -8,6 +8,8 @@ import os
 import tempfile
 import textwrap
 import contextlib
+import io
+import sqlite3
 import copy
 import inspect
 import json
@@ -6546,6 +6548,9 @@ class _FakeOwuiChat:
         self.request_tasks = {}
         lock = asyncio.Lock()
         fake = self
+        # ELI-167: which row transactions (1-based) find sqlite's write lock
+        # held past busy_timeout; `locked_from` locks every one from there on.
+        self.transactions, self.locked, self.locked_from = 0, set(), None
 
         class Chats:
             @staticmethod
@@ -6553,6 +6558,11 @@ class _FakeOwuiChat:
             async def _chat_transaction(chat_id):
                 async with lock:
                     await asyncio.sleep(0)
+                    fake.transactions += 1
+                    n = fake.transactions
+                    if n in fake.locked or (fake.locked_from is not None and n >= fake.locked_from):
+                        # What BEGIN IMMEDIATE raises once Open WebUI's 5 s busy_timeout runs out.
+                        raise sqlite3.OperationalError("database is locked")
                     yield ("db", fake.chat)
 
             @staticmethod
@@ -6710,6 +6720,82 @@ def _tool(phase, tcid="t1", name="Bash", result="ok"):
     if phase == "result":
         data["result"] = result
     return {"stream": "tool", "data": data}
+
+
+class TurnWriterLockedDbTests(_TurnWriterCase):
+    """ELI-167: Open WebUI's sqlite write lock held past its busy_timeout
+    (5 s, WAL, BEGIN IMMEDIATE) when a run opens its message. The open waits
+    for the run's next event, or the run's end, and never loses the run; a DB
+    that stays locked fails visibly."""
+
+    RUN = "c0ffee00-0000-4000-8000-000000000001"  # a wake's run id is its sessionId
+
+    def wake_writer(self):
+        w = _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
+                        run_id=self.RUN, message_id="m1",
+                        wake={"key": "wake-1", "at": None, "job": "job-1"})
+        pump = openclaw_pipe._RunPump()
+        pump.wake, pump.writer = True, w
+        self.conn.session_history = mock.AsyncMock(return_value={"messages": []})
+        return w, pump
+
+    async def step(self, pump, item):
+        return await openclaw_pipe._wake_step(self.conn, self.KEY, self.RUN, self.USER, self.CHAT,
+                                              pump, "event", item)
+
+    async def test_a_wake_whose_open_finds_the_db_locked_opens_on_its_next_event(self):
+        w, pump = self.wake_writer()
+        self.owui.locked = {1}                      # the claim
+        await self.step(pump, _tool("start"))       # on main: raises into the pump's catch-all
+        self.assertFalse(w.opened)
+        self.assertFalse(w.closed, "still this run's writer: nothing is dropped")
+        self.assertNotIn("m1", self.owui.msgs())
+        await self.step(pump, _tool("result"))
+        self.assertTrue(w.opened, "the next event opens it")
+        await w.finalize()
+        m = self.owui.msgs()["m1"]
+        self.assertIs(m["done"], True)
+        self.assertEqual([i["type"] for i in m["output"]][:2], ["function_call", "function_call_output"],
+                         "the card from the event that met the lock is there")
+
+    async def test_a_lock_after_the_claim_resumes_the_open_where_it_stopped(self):
+        """The claim committed, then setting the task meta met the lock: the
+        next open must not read its own claim as another writer's message."""
+        w, pump = self.wake_writer()
+        self.owui.locked = {2}                      # claim ok, _set_turn_meta locked
+        await self.step(pump, _tool("start"))
+        self.assertFalse(w.opened)
+        await self.step(pump, _tool("result"))
+        self.assertTrue(w.opened)
+        self.assertFalse(w.closed)
+        self.assertEqual(len(self.owui.tasks), 1, "one task registered, not two")
+        self.assertEqual(len(self.owui.events("chat:messages")), 1, "introduced once")
+        self.assertEqual(self.owui.msgs()["m1"]["meta"]["task_id"], w.task_id)
+
+    async def test_a_wake_that_ends_while_the_db_is_locked_is_written_at_its_end(self):
+        w, pump = self.wake_writer()
+        self.owui.locked = {1}
+        await self.step(pump, _tool("start"))       # its only event before the end
+        self.owui.locked = {2, 3}                   # still held for two more busy waits
+        await w.finalize()
+        self.assertTrue(w.opened)
+        self.assertIs(self.owui.msgs()["m1"]["done"], True)
+
+    async def test_a_db_that_stays_locked_fails_visibly(self):
+        w, pump = self.wake_writer()
+        self.owui.locked_from = 1
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            await self.step(pump, _tool("start"))
+            await w.finalize()
+        self.assertNotIn("m1", self.owui.msgs())
+        self.assertTrue(w._done.is_set(), "the writer ends; nothing waits on it forever")
+        log = out.getvalue()
+        self.assertIn("NOT WRITTEN", log)
+        self.assertIn("database is locked", log)
+        notes = self.owui.events("notification")
+        self.assertEqual(len(notes), 1, "the user's open tabs are told, without the DB")
+        self.assertEqual(notes[0]["data"]["type"], "error")
 
 
 class TurnWriterStreamTests(_TurnWriterCase):
