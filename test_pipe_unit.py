@@ -6635,6 +6635,26 @@ class TurnWriterStreamTests(_TurnWriterCase):
         self.assertEqual(self.owui.streams[-1][0], w.task_id)
         self.assertTrue(self.owui.streams[-1][2].endswith("Found it."))
 
+    async def test_the_response_stream_is_saved_with_open_webui_0123s_signature(self):
+        """ELI-166: 0.12.3 dropped `content` from `save_response_stream`
+        (the GET rebuilds it from `output`, `get_output_text`). Called the
+        0.12.0 way, every writer event raised TypeError and killed the pump:
+        no cron wake was written (E2E on 0.12.3, run 38982585148)."""
+        saved = []
+
+        async def save_response_stream(redis, task_id, chat_id, message_id, output):
+            saved.append((task_id, message_id, copy.deepcopy(output)))
+            return 1
+        tasks = sys.modules["open_webui.tasks"]
+        with mock.patch.object(tasks, "save_response_stream", save_response_stream):
+            w = self.writer()
+            await w.feed(_delta("Reading the logs"))
+            await w.feed(_tool("start", tcid="t1"))
+        self.assertFalse(w.closed)
+        self.assertEqual(len(saved), 2)
+        self.assertEqual(saved[-1][0], w.task_id)
+        self.assertEqual([i["type"] for i in saved[-1][2]], ["message", "function_call"])
+
     async def test_a_handed_over_reply_is_written_once_at_the_handover(self):
         """The request's own end-of-stream save writes `done: true` over M;
         the handover's write is what says M is still being written, the
