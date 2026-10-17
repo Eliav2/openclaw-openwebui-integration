@@ -249,6 +249,10 @@ def turn_owner(row: dict, stop_notice_before: bool = False) -> str:
     status = (row or {}).get("status")
     if status == "running":
         return "gateway"
+    if status == "interrupted":
+        # 2026.10: marked for restart recovery, not started yet (probe
+        # 2026-10-17); a recovery it gives up on tombstones the row to failed.
+        return "gateway"
     if status == "failed" and _EXTERNAL_KILL_RE.search(str(row.get("lastRunError") or "")):
         return "pipe"
     if status == "killed" and stop_notice_before:
@@ -256,7 +260,8 @@ def turn_owner(row: dict, stop_notice_before: bool = False) -> str:
     return "none"
 
 
-def next_continuation(row: dict, stop_notice_before: bool, resumes_so_far: int) -> str:
+def next_continuation(row: dict, stop_notice_before: bool, resumes_so_far: int,
+                      after_restart: bool = False) -> str:
     """What the writer of M does when its run settles: `gateway` (keep M open
     for the recovery run), `wait` (another run holds the session: send
     nothing, decide again on its settle), `resume` (send
@@ -264,7 +269,14 @@ def next_continuation(row: dict, stop_notice_before: bool, resumes_so_far: int) 
     session is queued as a follow-up, and after a restart recovery that
     follow-up fails (M3-crash 04351f67), so a session with an active run
     never gets one. The budget is counted on M, so a resume that is cut the
-    same way again (an OOM loop) ends after MAX_TURN_RESUMES."""
+    same way again (an OOM loop) ends after MAX_TURN_RESUMES.
+
+    `after_restart`: the Gateway restarted since the run's first event. A
+    2026.10 Gateway serves rows before its recovery pass has judged the runs
+    the crash cut: idle with no status, for about 8 s (probe 2026-10-17). That
+    row is not a settle; the next pushed row decides."""
+    if after_restart and not (row or {}).get("hasActiveRun") and (row or {}).get("status") is None:
+        return "gateway"
     owner = turn_owner(row, stop_notice_before)
     if owner == "gateway":
         return "gateway"

@@ -9237,6 +9237,91 @@ class RunSpanTests(unittest.TestCase):
         self.assertEqual(len(_history_span_messages(hist, parent)), 2, "the parent keeps its own")
 
 
+
+class GatewayTenRecoveryRowTests(unittest.TestCase):
+    """ELI-164: OpenClaw 2026.10.10 rows across a restart, read every 100 ms in
+    the E2E stack (probe 2026-10-17): the session of a run the crash cut reads
+    idle with no status from the moment the Gateway listens until its recovery
+    pass marks it, about 8 s later; then `interrupted` with abortedLastRun;
+    then `running` with the recovery run. 2026.9.3 reads `running` throughout."""
+
+    UNJUDGED = {"status": None, "hasActiveRun": False, "abortedLastRun": False}
+    MARKED = {"status": "interrupted", "hasActiveRun": False, "abortedLastRun": True,
+              "lastRunError": "Run interrupted by Gateway restart or lost ownership"}
+
+    def test_a_row_marked_for_recovery_keeps_the_message_open(self):
+        self.assertEqual(next_continuation(self.MARKED, False, 0), "gateway")
+
+    def test_a_row_not_judged_yet_after_a_restart_keeps_the_message_open(self):
+        self.assertEqual(next_continuation(self.UNJUDGED, False, 0, after_restart=True), "gateway")
+
+    def test_without_a_restart_an_idle_row_with_no_status_still_finalizes(self):
+        self.assertEqual(next_continuation(self.UNJUDGED, False, 0), "finalize")
+
+
+class GatewayTenRecoveryRoutingTests(_RoutingCase):
+    """ELI-164: on 2026.10.10 the recovery run's own `:user` turn is committed
+    about 0.7 s after its lifecycle start (probe 2026-10-17: start 26.11 s,
+    `session.message` 26.84 s, turn readable 26.89 s), so chat.history read on
+    its first event cannot name the run it recovers yet."""
+
+    def recovery_turn(self):
+        return {"role": "user", "content": "[System] continue", "idempotencyKey": f"{self.REC}:user",
+                "provenance": {"kind": "internal_system", "sourceTool": "main_session_restart_recovery"}}
+
+    async def test_a_crashed_reply_and_its_late_named_recovery_are_one_message(self):
+        self.history = {"messages": [{"role": "user", "content": "x", "idempotencyKey": f"{self.RUN}:user"}]}
+        self.conn.gateway_boot_id = "boot-a"
+        _turn_route_now(self.conn, self.ev(self.RUN, _delta("Reading them.")))
+        await self.spin()
+        self.conn._note_gateway_boot("boot-b")          # the crash, seen at the reconnect
+        # Read after hello, before the recovery pass: idle, no status.
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False})
+        await self.spin()
+        mid = turn_message_id(self.key, self.RUN, self.CHAT)
+        self.assertIsNot(self.owui.msgs().get(mid, {}).get("done"), True,
+                         "the Gateway has not judged the run yet: M stays open")
+        # The recovery starts; its turn is not in the transcript yet.
+        self.conn._on_sessions_changed({"sessionKey": self.key, "phase": "start", "runId": self.REC,
+                                        "hasActiveRun": True, "status": "running"})
+        _turn_route_now(self.conn, self.ev(self.REC, {"stream": "lifecycle", "data": {"phase": "start"}}))
+        _turn_route_now(self.conn, self.ev(self.REC, _delta("Again.")))
+        await self.spin()
+        self.history["messages"].append(self.recovery_turn())
+        self.conn._on_session_message({"sessionKey": self.key, "messageId": "m-2", "messageSeq": 2})
+        await self.spin()
+        _turn_route_now(self.conn, self.ev(self.REC, _delta(" Found it.")))
+        _turn_route_now(self.conn, self.ev(self.REC, {"state": "final"}))
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False, "status": "done",
+                                        "lastRunId": self.REC, "reason": "chat.run.settled"})
+        await self.spin()
+        (got, m), = self.new_messages().items()
+        self.assertEqual(got, mid, "rule E: the recovery writes into the interrupted run's message")
+        self.assertIs(m["done"], True)
+        self.assertIn("Reading them.", m["content"])
+        self.assertIn("Found it.", m["content"])
+
+    async def test_a_run_whose_turn_never_comes_is_written_at_its_end(self):
+        """A run with no admitted turn (a queued follow-up, M3-crash 04351f67)
+        while M waits: its end resolves it, to its own message."""
+        self.history = {"messages": [{"role": "user", "content": "x", "idempotencyKey": f"{self.RUN}:user"}]}
+        self.conn.gateway_boot_id = "boot-a"
+        _turn_route_now(self.conn, self.ev(self.RUN, _delta("Reading them.")))
+        await self.spin()
+        self.conn._note_gateway_boot("boot-b")
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False})
+        await self.spin()
+        other = "04351f67-dbc3-4533-b2aa-2a0d88d79da0"
+        _turn_route_now(self.conn, self.ev(other, _delta("Follow-up.")))
+        _turn_route_now(self.conn, self.ev(other, {"state": "final"}))
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False, "status": "done",
+                                        "lastRunId": other, "reason": "chat.run.settled"})
+        await self.spin()
+        own = turn_message_id(self.key, other, self.CHAT)
+        self.assertIs(self.owui.msgs().get(own, {}).get("done"), True)
+        self.assertNotIn("Follow-up.", self.owui.msgs()[turn_message_id(self.key, self.RUN, self.CHAT)]
+                         .get("content", ""))
+
 if __name__ == "__main__":
     unittest.main()
 

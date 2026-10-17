@@ -689,6 +689,15 @@ def test_a_guest_run_continued_after_a_gateway_crash_stays_without_owner_rights(
     # Gateway's recovery or the pipe's resume), so its turn is checked too.
     assert len(turns) >= 2, f"no turn after the crash, nothing to check: {turns}\n{_down_state(guest_token, chat_id, key)}"
     assert not any(o is True for _t, o in turns), f"an owner turn in a guest chat: {turns}"
+    _assert_one_reply(guest_token, chat_id, aid)
+
+
+def _assert_one_reply(tok: str, chat_id: str, aid: str) -> None:
+    """A reply the crash cut and its recovery are one message: M (ELI-164;
+    on 2026.10.10 the recovery opened a second one)."""
+    replies = {k: (v.get("done"), len(v.get("content") or "")) for k, v in _chat_messages(tok, chat_id).items()
+               if v.get("role") == "assistant"}
+    assert list(replies) == [aid], f"the recovered reply is not one message: {replies}"
 
 
 def _db_message(chat_id: str, message_id: str) -> dict:
@@ -745,6 +754,7 @@ def test_a_handed_over_reply_reads_not_done_in_the_db_once_its_request_ended(tok
     _until("the reply to finish", lambda: _db_message(chat_id, aid).get("done") is True,
            timeout_s=300, every_s=3)
     assert "slow-40" in (_db_message(chat_id, aid).get("content") or "")
+    _assert_one_reply(token, chat_id, aid)
 
 
 # ── The Status Action's Subagents section (ELI-106) ──────────────────────────

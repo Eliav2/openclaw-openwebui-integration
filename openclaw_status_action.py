@@ -483,6 +483,10 @@ def turn_owner(row: dict, stop_notice_before: bool = False) -> str:
     status = (row or {}).get("status")
     if status == "running":
         return "gateway"
+    if status == "interrupted":
+        # 2026.10: marked for restart recovery, not started yet (probe
+        # 2026-10-17); a recovery it gives up on tombstones the row to failed.
+        return "gateway"
     if status == "failed" and _EXTERNAL_KILL_RE.search(str(row.get("lastRunError") or "")):
         return "pipe"
     if status == "killed" and stop_notice_before:
@@ -490,7 +494,8 @@ def turn_owner(row: dict, stop_notice_before: bool = False) -> str:
     return "none"
 
 
-def next_continuation(row: dict, stop_notice_before: bool, resumes_so_far: int) -> str:
+def next_continuation(row: dict, stop_notice_before: bool, resumes_so_far: int,
+                      after_restart: bool = False) -> str:
     """What the writer of M does when its run settles: `gateway` (keep M open
     for the recovery run), `wait` (another run holds the session: send
     nothing, decide again on its settle), `resume` (send
@@ -498,7 +503,14 @@ def next_continuation(row: dict, stop_notice_before: bool, resumes_so_far: int) 
     session is queued as a follow-up, and after a restart recovery that
     follow-up fails (M3-crash 04351f67), so a session with an active run
     never gets one. The budget is counted on M, so a resume that is cut the
-    same way again (an OOM loop) ends after MAX_TURN_RESUMES."""
+    same way again (an OOM loop) ends after MAX_TURN_RESUMES.
+
+    `after_restart`: the Gateway restarted since the run's first event. A
+    2026.10 Gateway serves rows before its recovery pass has judged the runs
+    the crash cut: idle with no status, for about 8 s (probe 2026-10-17). That
+    row is not a settle; the next pushed row decides."""
+    if after_restart and not (row or {}).get("hasActiveRun") and (row or {}).get("status") is None:
+        return "gateway"
     owner = turn_owner(row, stop_notice_before)
     if owner == "gateway":
         return "gateway"
@@ -2350,6 +2362,9 @@ class _GatewayConnection:
         # One Event per session someone is waiting on, set by the next
         # `sessions.changed` that carries run state for it (ELI-88).
         self._session_change_waiters: dict[str, asyncio.Event] = {}
+        # The same, set by the next `session.message` (a transcript append)
+        # for the session (ELI-164).
+        self._session_message_waiters: dict[str, asyncio.Event] = {}
         self._tool_events_seen: dict[tuple, bool] = {}
 
     async def _subscribe_all(self) -> None:
@@ -2448,6 +2463,24 @@ class _GatewayConnection:
             ev = self._session_change_waiters.pop(key, None)
             if ev is not None:
                 ev.set()
+        if session_key is None:
+            # A gap or a fresh subscription: an append may be among the lost.
+            for key in list(self._session_message_waiters):
+                self._session_message_waiters.pop(key).set()
+
+    def session_message_event(self, session_key: str) -> asyncio.Event:
+        """An Event set by the next `session.message` for `session_key` (the
+        Gateway appended a transcript message), or by a socket gap. Take it
+        BEFORE reading the transcript, as with `session_change_event`."""
+        ev = self._session_message_waiters.get(session_key)
+        if ev is None:
+            ev = self._session_message_waiters[session_key] = asyncio.Event()
+        return ev
+
+    def _on_session_message(self, payload: dict) -> None:
+        ev = self._session_message_waiters.pop(payload.get("sessionKey") or "", None)
+        if ev is not None:
+            ev.set()
 
     def _on_shutdown(self, payload: dict) -> None:
         """DESIGN 2.7 F4: the Gateway announces its close before it aborts any
@@ -3531,6 +3564,9 @@ class _GatewayConnection:
                     continue
                 if msg.get("type") == "event" and msg.get("event") == "shutdown":
                     self._on_shutdown(msg.get("payload") or {})
+                    continue
+                if msg.get("type") == "event" and msg.get("event") == "session.message":
+                    self._on_session_message(msg.get("payload") or {})
                     continue
                 if msg.get("type") == "event" and msg.get("event") == "session.tool":
                     # Same payload as an `agent` tool event (stream "tool",

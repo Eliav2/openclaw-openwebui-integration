@@ -621,13 +621,14 @@ class _TurnWriter:
                 order.append(run)
         self.runs = [*order, *(r for r in self.runs if r not in order)]
 
-    async def end(self, row: dict, stop_notice_before: bool = False) -> None:
+    async def end(self, row: dict, stop_notice_before: bool = False,
+                  after_restart: bool = False) -> None:
         """The current run settled; `row` is its settled session row (DESIGN
         2.5, 2.7). Keep M open for a recovery or a busy session, resume an
         outside kill, or finalize."""
         if self.closed:
             return
-        decision = next_continuation(row, stop_notice_before, self.resumes)
+        decision = next_continuation(row, stop_notice_before, self.resumes, after_restart)
         if decision in ("gateway", "wait"):
             # The pump stays: the recovery run takes M over (rule E), or a
             # later row leaves `running`. A recovery the Gateway gives up on
@@ -1075,6 +1076,8 @@ class _RunPump:
         self.stop_notice_before = False
         self.wake = False               # a cron wake: runId is the sessionId (ELI-103)
         self.held: list = []            # a wake's events before its turn is known
+        self.restarts_before = 0        # conn.gateway_restarts when the pump began
+        self.terminal = asyncio.Event()  # the run's terminal event was queued
         self.heartbeat = False          # a wake-id run the Gateway flagged isHeartbeat
 
 
@@ -1118,6 +1121,7 @@ def _turn_queue(conn: "_GatewayConnection", sess: str, run: str, parsed: tuple,
     pump = conn._turn_pumps.get((sess, run))
     if pump is None:
         pump = conn._turn_pumps[(sess, run)] = _RunPump()
+        pump.restarts_before = conn.gateway_restarts
         target = conn._run_targets.get(f"{sess}:{run}")
         if target is not None:
             # DESIGN 2.6: the request streaming this run ended before it. The
@@ -1136,6 +1140,8 @@ def _turn_queue(conn: "_GatewayConnection", sess: str, run: str, parsed: tuple,
             return True
     if payload.get("state") in ("final", "error", "aborted"):
         pump.stop_notice_before = conn._stop_notice_seen
+    if _is_terminal_event(payload):
+        pump.terminal.set()
     pump.queue.put_nowait(("event", payload))
     return True
 
@@ -1266,6 +1272,7 @@ def _hand_over_run(conn: "_GatewayConnection", session_key: str, run_id: str, *,
             or conn._retired or (session_key, run_id) in conn._turn_pumps):
         return False
     pump = conn._turn_pumps[(session_key, run_id)] = _RunPump()
+    pump.restarts_before = conn.gateway_restarts
     if reply is None:
         pump.handover = conn.handover_of(session_key, run_id, thinking)
     else:
@@ -1296,6 +1303,36 @@ def _turn_settled(conn: "_GatewayConnection", session_key: str, row: dict) -> No
     for (sess, _run), pump in list(conn._turn_pumps.items()):
         if sess == session_key:
             pump.queue.put_nowait(("settled", row))
+
+
+async def _await_recovery_turn(conn: "_GatewayConnection", sess: str, run: str,
+                               pump: _RunPump) -> None:
+    """Rule E needs a recovery run's own `:user` turn, and a 2026.10 Gateway
+    commits it about 0.7 s after the run's first event (probe 2026-10-17). So
+    while a message of the session waits for a recovery, a non-pipe run whose
+    turn is not in the transcript yet is resolved at the next transcript
+    append (`session.message`), or at its end: a run that never gets a turn
+    (a queued follow-up) is not a recovery. The resolve lock is not held."""
+    if parse_pipe_run_id(run) is not None:
+        return
+    while not pump.terminal.is_set():
+        if not any(w.session_key == sess and not w.closed and (w.awaiting_row or w.takeover)
+                   for w in list(conn._turn_writers.values())):
+            return
+        appended = conn.session_message_event(sess)
+        try:
+            messages = (await conn.session_history(sess, limit=50, max_chars=200)).get("messages")
+        except Exception as ex:
+            pipe_log(f"  turn writer: chat.history for run {run[:24]}... failed: {ex!r}")
+            return
+        if any(r == run for r, _tool in _history_user_turns(messages)):
+            return
+        waits = [asyncio.ensure_future(appended.wait()), asyncio.ensure_future(pump.terminal.wait())]
+        try:
+            await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for w in waits:
+                w.cancel()
 
 
 async def _turn_writer_for(conn: "_GatewayConnection", sess: str, run: str,
@@ -1360,6 +1397,7 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
         elif re.fullmatch(_UUID_RE, run) and run == await conn.session_id_for(sess):
             pump.wake = True
         else:
+            await _await_recovery_turn(conn, sess, run, pump)
             pump.writer = await _turn_writer_for(conn, sess, run, user_id, chat_id)
         while True:
             kind, item = await pump.queue.get()
@@ -1378,7 +1416,8 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
             # run's pump also gets the session's settle once its recovery has
             # taken M over, and the recovery's own pump may still hold events.
             if writer is not None and writer.run_id == run:
-                await writer.end(item, stop_notice_before=pump.stop_notice_before)
+                await writer.end(item, stop_notice_before=pump.stop_notice_before,
+                                 after_restart=conn.gateway_restarts > pump.restarts_before)
                 if writer.closed:
                     conn._turn_writers.pop((chat_id, writer.message_id), None)
                 elif writer.awaiting_row and writer.run_id == run:
@@ -1589,6 +1628,7 @@ async def _adopt_turn_message(conn: "_GatewayConnection", *, chat_id: str, user_
     if not run or (session_key, run) in conn._turn_pumps or conn._retired:
         return "skip"
     pump = conn._turn_pumps[(session_key, run)] = _RunPump()
+    pump.restarts_before = conn.gateway_restarts
     wake = meta.get("openclaw_wake") if isinstance(meta.get("openclaw_wake"), dict) else None
     if wake and wake.get("key"):
         pump.wake = True
