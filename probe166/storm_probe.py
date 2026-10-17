@@ -98,6 +98,14 @@ def main():
         t_login = time.time()
         url_at_login = page.url
         token_now = page.evaluate("() => localStorage.token")
+        time.sleep(5)
+        # A connection drop after the re-login (the trigger): a plain restart,
+        # same secret key, so token B stays valid. The page reconnects with
+        # whatever token its socket carries.
+        subprocess.run(["docker", "restart", "owui"], check=True, capture_output=True)
+        while not healthy():
+            time.sleep(1)
+        t_login = time.time()  # the window starts once Open WebUI is back
         time.sleep(WINDOW_S)
         ws_after = [t for t in ev["ws"] if t >= t_login]
         ver_after = [t for t in ev["version"] if t >= t_login]
