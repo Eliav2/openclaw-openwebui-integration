@@ -47,7 +47,7 @@ from openclaw_pipe import (
     _explain_session_patch_failure,
     _marker_line_index,
     _discover_models_with_source,
-    _modal_payload_from_user_input_prompt,
+    _parse_text_prompt,
     _truncate_at_repeated_marker,
     _dedupe_options,
     Pipe,
@@ -76,8 +76,8 @@ from openclaw_pipe import (
     _advance_input_prompt_buffer,
     _advance_media_buffer,
     _ask_user_detail_block,
+    _ask_user_fallback_text,
     _ask_user_input_modal,
-    _build_choice_modal_js,
     _build_usage_status_lines,
     _extract_numbered_options,
     _coerce_text,
@@ -93,7 +93,6 @@ from openclaw_pipe import (
     _item_assistant_text,
     _item_delta_text,
     _live_session_id_for_user,
-    _modal_payload_from_user_input_prompt,
     _native_ask_user_payload,
     _format_native_answers,
     _model_patch_matches,
@@ -3846,30 +3845,20 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(flush, "line one\nline two\nline three")
         self.assertEqual(pending, "")
 
-    def test_builds_owui_input_modal_payload(self):
-        # A free-text prompt with no numbered options stays a text input.
-        payload, is_confirmation = _modal_payload_from_user_input_prompt(
-            "Codex needs input:\n\nPackage\nName the package you want"
-        )
+    def test_free_text_prompt_fields(self):
+        f = _parse_text_prompt("Codex needs input:\n\nPackage\nName the package you want")
+        self.assertEqual(f["title"], "Package")
+        self.assertIn("Name the package", f["message"])
+        self.assertEqual((f["confirm"], f["secret"], f["options"]), (False, False, []))
 
-        self.assertEqual(payload["type"], "input")
-        self.assertEqual(payload["data"]["title"], "Package")
-        self.assertIn("Name the package", payload["data"]["message"])
-        self.assertEqual(
-            payload["data"]["placeholder"],
-            "Reply with a number or your answer",
-        )
-        self.assertFalse(is_confirmation)
-
-    def test_numbered_options_build_choice_payload(self):
-        # An enumerated option list becomes a clickable "choice" payload.
-        payload, is_confirmation = _modal_payload_from_user_input_prompt(
+    def test_numbered_options_are_the_options(self):
+        f = _parse_text_prompt(
             "OpenClaw needs input:\n\nFavorite color?\nPick one\n1. Red\n2. Green\n3. Blue"
         )
-        self.assertFalse(is_confirmation)
-        self.assertEqual(payload["type"], "choice")
-        self.assertEqual(payload["data"]["title"], "Favorite color?")
-        self.assertEqual(payload["data"]["options"], ["Red", "Green", "Blue"])
+        self.assertFalse(f["confirm"])
+        self.assertEqual(f["title"], "Favorite color?")
+        self.assertEqual(f["options"], ["Red", "Green", "Blue"])
+        self.assertFalse(f["multi"])
 
     def test_extract_numbered_options_parses_dot_and_paren(self):
         opts = _extract_numbered_options("intro\n1. alpha\n2) beta\n  3. gamma\nfooter")
@@ -3878,89 +3867,20 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
     def test_extract_numbered_options_none(self):
         self.assertEqual(_extract_numbered_options("no options here"), [])
 
-    def test_build_choice_modal_js_returns_execute_promise(self):
-        payload = _build_choice_modal_js("Title", "Message", ["Red", "Green"])
-        self.assertEqual(payload["type"], "execute")
-        code = payload["data"]["code"]
-        # Must resolve INSIDE a Promise -- a bare top-level resolve() silently
-        # ReferenceErrors under OWUI's execute wrapper (learned live).
-        self.assertIn("new Promise", code)
-        self.assertIn("resolve(", code)
-        # Option labels round-trip into the embedded JSON config.
-        self.assertIn("Red", code)
-        self.assertIn("Green", code)
-
-    def test_choice_modal_answer_normalizes_to_label(self):
-        # Button clicks resolve to {value: <label>}.
-        self.assertEqual(_normalize_event_call_response({"value": "Green"}), "Green")
-
-    def test_multiselect_marker_sets_multi_flag(self):
-        # A numbered-option prompt with a multiselect marker is still a choice,
-        # but flagged multi=True and the marker stripped from the display text.
-        payload, is_confirmation = _modal_payload_from_user_input_prompt(
+    def test_multiselect_marker_sets_multi_and_is_stripped(self):
+        f = _parse_text_prompt(
             "OpenClaw needs input:\n\nToppings (multiselect)\n"
             "Pick any\n1. Cheese\n2. Olives\n3. Mushrooms"
         )
-        self.assertFalse(is_confirmation)
-        self.assertEqual(payload["type"], "choice")
-        self.assertTrue(payload["data"]["multi"])
-        self.assertEqual(
-            payload["data"]["options"], ["Cheese", "Olives", "Mushrooms"]
-        )
+        self.assertTrue(f["multi"])
+        self.assertEqual(f["options"], ["Cheese", "Olives", "Mushrooms"])
         # The raw "(multiselect)" directive must not leak into the shown title.
-        self.assertNotIn("multiselect", payload["data"]["title"].lower())
-        self.assertEqual(payload["data"]["title"], "Toppings")
+        self.assertEqual(f["title"], "Toppings")
 
     def test_multiselect_hebrew_marker(self):
-        payload, _ = _modal_payload_from_user_input_prompt(
-            "OpenClaw needs input:\n\nמה בא לך? בחר כמה\n1. פיצה\n2. סושי"
-        )
-        self.assertEqual(payload["type"], "choice")
-        self.assertTrue(payload["data"]["multi"])
-
-    def test_single_select_default_not_multi(self):
-        # No marker => single-select (multi False), unchanged behavior.
-        payload, _ = _modal_payload_from_user_input_prompt(
-            "OpenClaw needs input:\n\nColor?\nPick\n1. Red\n2. Green"
-        )
-        self.assertEqual(payload["type"], "choice")
-        self.assertFalse(payload["data"]["multi"])
-
-    def test_build_choice_modal_js_multi_has_submit_and_join(self):
-        payload = _build_choice_modal_js(
-            "Title", "Message", ["Red", "Green"], multi=True
-        )
-        code = payload["data"]["code"]
-        # Multi mode accumulates a selection and resolves a joined string on
-        # an explicit Submit, rather than one-click-and-done. The shared JS
-        # body branches on the embedded cfg.multi flag at runtime.
-        self.assertIn("selected.join(', ')", code)
-        self.assertIn("Submit", code)
-        self.assertIn("new Promise", code)
-        self.assertIn(r'multi\": true', code)
-
-    def test_build_choice_modal_js_single_flags_multi_false(self):
-        # Single-select (default) keeps one-click-and-done: cfg.multi is false,
-        # so the shared JS never enters the checkbox/Submit branch at runtime.
-        payload = _build_choice_modal_js("Title", "Message", ["Red", "Green"])
-        code = payload["data"]["code"]
-        self.assertIn(r'multi\": false', code)
-        self.assertIn("finish({value: label})", code)
-
-    def test_multiselect_answer_normalizes_to_joined_labels(self):
-        # Submit resolves {value: "a, b"}; passes through verbatim.
-        self.assertEqual(
-            _normalize_event_call_response({"value": "Cheese, Olives"}),
-            "Cheese, Olives",
-        )
-
-    def test_marks_secret_prompts_as_password_inputs(self):
-        payload, is_confirmation = _modal_payload_from_user_input_prompt(
-            "Codex needs input:\n\nToken\nThis channel may show your reply to other participants."
-        )
-
-        self.assertEqual(payload["data"]["type"], "password")
-        self.assertFalse(is_confirmation)
+        f = _parse_text_prompt("OpenClaw needs input:\n\nמה בא לך? בחר כמה\n1. פיצה\n2. סושי")
+        self.assertTrue(f["multi"])
+        self.assertEqual(f["options"], ["פיצה", "סושי"])
 
     def test_normalizes_event_call_response_shapes(self):
         self.assertEqual(_normalize_event_call_response("  answer  "), "answer")
@@ -3973,62 +3893,37 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_normalize_event_call_response(True), "yes")
         self.assertEqual(_normalize_event_call_response(False), "no")
 
-    def test_confirmation_modal_for_explicit_yes_no(self):
-        payload, is_confirmation = _modal_payload_from_user_input_prompt(
-            "OpenClaw needs input:\n\nProceed?\nRun the deploy now? (y/n)"
+    def test_marks_secret_prompts(self):
+        f = _parse_text_prompt(
+            "Codex needs input:\n\nToken\nThis channel may show your reply to other participants."
         )
-        self.assertTrue(is_confirmation)
-        self.assertEqual(payload["type"], "confirmation")
+        self.assertTrue(f["secret"])
+        self.assertFalse(f["confirm"])
 
-    def test_confirmation_modal_for_confirm_verb_question(self):
-        payload, is_confirmation = _modal_payload_from_user_input_prompt(
-            "OpenClaw needs input:\n\nDelete file?\nDelete config.json?"
-        )
-        self.assertTrue(is_confirmation)
-        self.assertEqual(payload["type"], "confirmation")
+    def test_confirmation_for_explicit_yes_no(self):
+        f = _parse_text_prompt("OpenClaw needs input:\n\nProceed?\nRun the deploy now? (y/n)")
+        self.assertTrue(f["confirm"])
+
+    def test_confirmation_for_confirm_verb_question(self):
+        f = _parse_text_prompt("OpenClaw needs input:\n\nDelete file?\nDelete config.json?")
+        self.assertTrue(f["confirm"])
 
     def test_choice_question_is_not_confirmation(self):
         # A short "?" title that is really a free-text choice must NOT become
-        # a yes/no dialog (would silently strip the real answer).
-        payload, is_confirmation = _modal_payload_from_user_input_prompt(
-            "OpenClaw needs input:\n\nWhich model?\nWhich model should I use?"
-        )
-        self.assertFalse(is_confirmation)
-        self.assertEqual(payload["type"], "input")
+        # a yes/no question (would silently strip the real answer).
+        f = _parse_text_prompt("OpenClaw needs input:\n\nWhich model?\nWhich model should I use?")
+        self.assertEqual((f["confirm"], f["options"]), (False, []))
 
     def test_numbered_options_never_confirmation(self):
         # An enumerated option list is a choice even if a confirm verb appears.
-        payload, is_confirmation = _modal_payload_from_user_input_prompt(
-            "OpenClaw needs input:\n\nProceed how?\nProceed?\n1. rebase\n2. merge"
-        )
-        self.assertFalse(is_confirmation)
-        self.assertEqual(payload["type"], "choice")
-        self.assertEqual(payload["data"]["options"], ["rebase", "merge"])
+        f = _parse_text_prompt("OpenClaw needs input:\n\nProceed how?\nProceed?\n1. rebase\n2. merge")
+        self.assertFalse(f["confirm"])
+        self.assertEqual(f["options"], ["rebase", "merge"])
 
     def test_secret_marker_does_not_match_innocent_key_substring(self):
         # "monkey" contains "key" -- must not be flagged as a secret.
-        payload, _ = _modal_payload_from_user_input_prompt(
-            "OpenClaw needs input:\n\nName the monkey\nWhat should we call the monkey?"
-        )
-        self.assertNotEqual(payload["data"].get("type"), "password")
-
-    async def test_ask_user_input_modal_returns_answer(self):
-        calls = []
-
-        async def event_call(event):
-            calls.append(event)
-            return {"value": "pipx"}
-
-        answer = await _ask_user_input_modal(
-            event_call,
-            "Codex needs input:\n\nPackage\nChoose (multi)\n1. curl\n2. pipx",
-        )
-
-        self.assertEqual(answer, "pipx")
-        # A numbered-option prompt is delivered as a clickable-button overlay
-        # (an "execute" event), not a free-text input.
-        self.assertEqual(calls[0]["type"], "execute")
-        self.assertIn("resolve(", calls[0]["data"]["code"])
+        f = _parse_text_prompt("OpenClaw needs input:\n\nName the monkey\nWhat should we call the monkey?")
+        self.assertFalse(f["secret"])
 
     async def test_ask_user_input_modal_noops_without_event_call(self):
         answer = await _ask_user_input_modal(
@@ -4038,22 +3933,19 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(answer)
 
-    async def test_ask_user_input_modal_times_out(self):
+    async def test_an_unanswered_secret_dialog_ends_the_wait(self):
+        """OWUI puts no timeout on an input dialog; ours ends the wait, and
+        the question ends the reply as text."""
         async def event_call(event):
             await asyncio.sleep(0.05)
             return {"value": "late"}
 
-        # asyncio.TimeoutError, not the builtin: the two are the same class only
-        # from 3.11 on. `asyncio.wait_for` raises asyncio's on every version, so
-        # asserting the builtin passes on 3.11+ and fails on 3.10. The runtime
-        # code catches asyncio.TimeoutError throughout and is version-correct;
-        # this assertion was the only version-fragile spot.
-        with self.assertRaises(asyncio.TimeoutError):
-            await _ask_user_input_modal(
-                event_call,
-                "Codex needs input:\n\nPackage\nYour API key",
-                timeout_s=0.01,
-            )
+        answer = await asyncio.wait_for(_ask_user_input_modal(
+            event_call,
+            "Codex needs input:\n\nPackage\nYour API key",
+            timeout_s=0.01,
+        ), 2)
+        self.assertIsNone(answer)
 
     def test_ask_user_detail_block_renders_as_tool_call(self):
         block = _ask_user_detail_block(
@@ -4072,112 +3964,6 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_live_session_id_for_user("u2", pool), "sid-b")
         self.assertIsNone(_live_session_id_for_user("u3", pool))
         self.assertIsNone(_live_session_id_for_user("u1", {}))
-
-    async def test_ask_user_input_modal_retries_after_reconnect(self):
-        session_pool = {}
-
-        fake_sio = FakeSio(lambda *call: {"value": "42"})
-        fake_owui(self, sio=fake_sio, SESSION_POOL=session_pool)
-
-        async def event_call(payload):
-            raise asyncio.TimeoutError()
-
-        async def populate_session_soon():
-            await asyncio.sleep(0.02)
-            session_pool["sid-123"] = {"id": "user-1"}
-
-        populate_task = asyncio.ensure_future(populate_session_soon())
-        try:
-            answer = await _ask_user_input_modal(
-                event_call,
-                "OpenClaw needs input:\n\nQ\nAnswer? (multi)\n1. a\n2. b",
-                timeout_s=0.01,
-                owui_user_id="user-1",
-                owui_chat_id="chat-1",
-                owui_message_id="msg-1",
-                max_wait_s=1,
-                poll_interval_s=0.01,
-            )
-        finally:
-            await populate_task
-
-        self.assertEqual(answer, "42")
-        self.assertEqual(fake_sio.calls[0][2], "sid-123")
-        self.assertEqual(fake_sio.calls[0][1]["chat_id"], "chat-1")
-        self.assertEqual(fake_sio.calls[0][1]["message_id"], "msg-1")
-
-    async def test_reconnect_refires_to_same_session_after_a_timeout(self):
-        # Regression (2026-07-18): a reconnect modal that popped but wasn't
-        # clicked in time used to time out and then NEVER re-fire (seen_sids
-        # blocked the same session forever). Now a timed-out fire must be
-        # retried to the same live session on a later poll.
-        session_pool = {"sid-123": {"id": "user-1"}}
-
-        def reply(*call):
-            if len(fake_sio.calls) == 1:
-                raise asyncio.TimeoutError()  # away / didn't click in time
-            return {"value": "clicked"}
-
-        fake_sio = FakeSio(reply)
-        fake_owui(self, sio=fake_sio, SESSION_POOL=session_pool)
-
-        async def event_call(payload):
-            raise asyncio.TimeoutError()
-
-        answer = await _ask_user_input_modal(
-            event_call,
-            "OpenClaw needs input:\n\nQ\nAnswer? (multi)\n1. a\n2. b",
-            timeout_s=0.01,
-            owui_user_id="user-1",
-            owui_chat_id="chat-1",
-            owui_message_id="msg-1",
-            max_wait_s=1,
-            poll_interval_s=0.01,
-        )
-
-        self.assertEqual(answer, "clicked")
-        self.assertGreaterEqual(len(fake_sio.calls), 2)  # re-fired after the timeout
-
-    async def test_reconnect_gives_modal_a_human_interaction_timeout(self):
-        # The re-fired sio.call must wait a real human-interaction budget for a
-        # click (OWUI's WEBSOCKET_EVENT_CALLER_TIMEOUT, default 300s), not the
-        # old 30s that made modals vanish before they could be answered.
-        session_pool = {"sid-123": {"id": "user-1"}}
-        fake_sio = FakeSio(lambda *call: {"value": "ok"})
-        fake_owui(self, sio=fake_sio, SESSION_POOL=session_pool)
-
-        async def event_call(payload):
-            raise asyncio.TimeoutError()
-
-        await _ask_user_input_modal(
-            event_call,
-            "OpenClaw needs input:\n\nQ\nAnswer? (multi)\n1. a\n2. b",
-            timeout_s=0.01,
-            owui_user_id="user-1",
-            max_wait_s=1,
-            poll_interval_s=0.01,
-        )
-
-        self.assertGreaterEqual(fake_sio.calls[-1][3], 300)
-
-    async def test_ask_user_input_modal_gives_up_if_never_reconnects(self):
-        fake_sio = FakeSio()
-        fake_owui(self, sio=fake_sio, SESSION_POOL={})
-
-        async def event_call(payload):
-            raise asyncio.TimeoutError()
-
-        answer = await _ask_user_input_modal(
-            event_call,
-            "OpenClaw needs input:\n\nQ\nAnswer? (multi)\n1. a\n2. b",
-            timeout_s=0.01,
-            owui_user_id="user-1",
-            max_wait_s=0.05,
-            poll_interval_s=0.01,
-        )
-
-        self.assertIsNone(answer)
-        self.assertEqual(fake_sio.calls, [], "no live session, so no modal is fired")
 
 
 class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
@@ -4240,13 +4026,6 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(q["options"], [])
         self.assertTrue(q["allow_other"])
 
-    def test_secret_and_multiselect_keep_the_legacy_modal(self):
-        self.assertIsNone(_native_ask_user_payload(
-            "OpenClaw needs input:\n\nToken\nPaste your API key"
-        ))
-        self.assertIsNone(_native_ask_user_payload(
-            "OpenClaw needs input:\n\nToppings (multiselect)\nPick\n1. Cheese\n2. Olives"
-        ))
 
     def test_json_form_carries_several_questions(self):
         prompt = (
@@ -4313,7 +4092,7 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
 
         answer = await _ask_user_input_modal(
             event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
-            owui_user_id="user-1", max_wait_s=1, poll_interval_s=0.01,
+            owui_user_id="user-1", poll_interval_s=0.01,
         )
         self.assertIsNone(answer)
         self.assertEqual(len(calls), 1)
@@ -4331,7 +4110,7 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
 
             answer = await _ask_user_input_modal(
                 event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
-                owui_user_id="user-1", max_wait_s=60, poll_interval_s=0.01,
+                owui_user_id="user-1", poll_interval_s=0.01,
             )
             self.assertIsNone(answer, response)
             self.assertEqual(len(calls), 1, response)
@@ -4357,14 +4136,14 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
         answer = await asyncio.wait_for(_ask_user_input_modal(
             event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
             owui_user_id="user-1", owui_chat_id="chat-1", owui_message_id="msg-1",
-            max_wait_s=60, poll_interval_s=0.01), 2)
+            poll_interval_s=0.01), 2)
         self.assertIsNone(answer)
         self.assertEqual(sent, [], "never another chat's tab")
 
     async def test_a_tab_that_does_not_come_back_ends_the_wait(self):
         """The tab viewing the chat went away (a reload, a closed tab) while
         it held the card: the reply ends with the question as text instead
-        of waiting out max_wait_s."""
+        of waiting for the user to come back."""
         pool = {"sid-tab": {"id": "user-1", "chat_ids": ["chat-1"]}}
 
         async def call(data, to):
@@ -4377,7 +4156,7 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
         answer = await asyncio.wait_for(_ask_user_input_modal(
             event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
             owui_user_id="user-1", owui_chat_id="chat-1", owui_message_id="msg-1",
-            max_wait_s=60, poll_interval_s=0.01), 2)
+            poll_interval_s=0.01), 2)
         self.assertIsNone(answer)
 
     async def test_disconnected_session_moves_to_the_users_new_socket(self):
@@ -4390,7 +4169,7 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
         answer = await _ask_user_input_modal(
             event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
             owui_user_id="user-1", owui_chat_id="chat-1", owui_message_id="msg-1",
-            max_wait_s=1, poll_interval_s=0.01,
+            poll_interval_s=0.01,
         )
         self.assertEqual(answer, "a")
         _event, data, to, timeout = sio.calls[0]
@@ -4430,7 +4209,7 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
         answer = await _ask_user_input_modal(
             event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
             owui_user_id="user-1", owui_chat_id="chat-1", owui_message_id="msg-1",
-            max_wait_s=1, poll_interval_s=0.01)
+            poll_interval_s=0.01)
         self.assertEqual(answer, "a")
         self.assertEqual(sent, ["sid-tab"], "never another chat's tab")
 
@@ -4447,7 +4226,7 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
         answer = await asyncio.wait_for(_ask_user_input_modal(
             event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
             owui_user_id="user-1", owui_chat_id="chat-1", owui_message_id="msg-1",
-            max_wait_s=60, poll_interval_s=0.01), 2)
+            poll_interval_s=0.01), 2)
         self.assertIsNone(answer)
         self.assertEqual(sent, [], "never another chat's tab")
 
@@ -4470,7 +4249,7 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
         answer = await asyncio.wait_for(_ask_user_input_modal(
             event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
             owui_user_id="user-1", owui_chat_id="chat-1", owui_message_id="msg-1",
-            owui_session_id="sid-old", max_wait_s=5, poll_interval_s=0.01), 2)
+            owui_session_id="sid-old", poll_interval_s=0.01), 2)
         await reloader
         self.assertEqual(answer, "a")
         self.assertEqual(sent, ["sid-new"])
@@ -4493,7 +4272,7 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
         answer = await asyncio.wait_for(_ask_user_input_modal(
             event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
             owui_user_id="user-1", owui_chat_id="chat-1", owui_message_id="msg-1",
-            owui_session_id="sid-tab", max_wait_s=60, poll_interval_s=0.01), 2)
+            owui_session_id="sid-tab", poll_interval_s=0.01), 2)
         self.assertIsNone(answer)
         self.assertEqual(len(calls), 1, "one card, never re-shown")
 
@@ -4512,9 +4291,325 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
         answer = await asyncio.wait_for(_ask_user_input_modal(
             event_call, "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b",
             owui_user_id="user-1", owui_chat_id="chat-1", owui_message_id="msg-1",
-            max_wait_s=60, poll_interval_s=0.01), 2)
+            poll_interval_s=0.01), 2)
         self.assertIsNone(answer)
         self.assertEqual(sent, ["sid-tab"])
+
+
+class AskUserMultiSelectCardTests(unittest.IsolatedAsyncioTestCase):
+    """A multi-select question is a question card too (ELI-148): the card
+    picks one option per question, so it lists the options by number and
+    takes a typed answer, "1,3", which goes to the agent as the options.
+    Uses only the card's entry points, so it runs against any build."""
+
+    MULTI = ("OpenClaw needs input:\n\nToppings (multiselect)\nPick any\n"
+             "1. Cheese\n2. Olives - green ones\n3. Mushrooms")
+
+    def setUp(self):
+        sys.modules.setdefault("open_webui", types.ModuleType("open_webui"))
+        env = types.ModuleType("open_webui.env")
+        env.VERSION = "0.12.0"
+        sys.modules["open_webui.env"] = env
+        self.addCleanup(sys.modules.pop, "open_webui.env", None)
+
+    def _answer(self, typed, prompt=None):
+        payload = _native_ask_user_payload(prompt or self.MULTI)
+        self.assertIsNotNone(payload, "a multi-select question gets a card")
+        return _format_native_answers(payload["data"]["questions"],
+                                      {"answer": {"type": "other", "text": typed}})
+
+    def test_the_card_lists_the_options_by_number_and_takes_typing(self):
+        payload = _native_ask_user_payload(self.MULTI)
+        self.assertEqual(payload["type"], "request:user_input")
+        (q,) = payload["data"]["questions"]
+        self.assertEqual(q["header"], "Toppings")
+        # No option rows: a click on one answers the card at once.
+        self.assertEqual(q["options"], [])
+        self.assertTrue(q["allow_other"])
+        for line in ("1. Cheese", "2. Olives - green ones", "3. Mushrooms"):
+            self.assertIn(line, q["question"])
+        self.assertIn("Pick any", q["question"])
+        self.assertNotIn("multiselect", json.dumps(payload).lower())
+
+    def test_numbers_map_to_the_options(self):
+        for typed in ("1,3", "1, 3", " 1 3 ", "1;3", "3, 1, 3"):
+            want = "Mushrooms, Cheese" if typed.startswith("3") else "Cheese, Mushrooms"
+            self.assertEqual(self._answer(typed), want, typed)
+
+    def test_option_text_maps_to_the_options(self):
+        self.assertEqual(self._answer("cheese, Mushrooms"), "Cheese, Mushrooms")
+        # The short label before " - " names the option too.
+        self.assertEqual(self._answer("Olives"), "Olives - green ones")
+
+    def test_numbers_and_text_mixed(self):
+        self.assertEqual(self._answer("2, Mushrooms"), "Olives - green ones, Mushrooms")
+
+    def test_what_does_not_map_goes_as_typed(self):
+        for typed in ("1, 4", "0", "none of these", "1, pineapple", "2 and 3"):
+            self.assertEqual(self._answer(typed), typed, typed)
+
+    def test_an_empty_answer_sends_nothing(self):
+        self.assertEqual(self._answer("  "), "")
+        # Only separators name no option: as typed.
+        self.assertEqual(self._answer(" , "), ",")
+
+    def test_the_hebrew_marker_is_a_multi_select_card(self):
+        self.assertEqual(
+            self._answer("1 2", "OpenClaw needs input:\n\nמה בא לך? בחר כמה\n1. פיצה\n2. סושי"),
+            "פיצה, סושי")
+
+    async def test_the_inline_ask_shows_the_card_and_returns_the_options(self):
+        calls = []
+
+        async def event_call(event):
+            calls.append(event)
+            return {"status": "answered", "answers": {"answer": {"type": "other", "text": "1,3"}}}
+
+        answer = await _ask_user_input_modal(event_call, self.MULTI)
+        self.assertEqual(answer, "Cheese, Mushrooms")
+        self.assertEqual([c["type"] for c in calls], ["request:user_input"])
+
+    # Unchanged by ELI-148.
+
+    def test_single_select_keeps_its_option_rows(self):
+        payload = _native_ask_user_payload("OpenClaw needs input:\n\nColor?\nPick\n1. Red\n2. Green")
+        (q,) = payload["data"]["questions"]
+        self.assertEqual([o["label"] for o in q["options"]], ["Red", "Green"])
+        self.assertEqual(q["question"], "Pick")
+        answers = {"answer": {"type": "option", "option_index": 1, "label": "Green"}}
+        self.assertEqual(_format_native_answers(payload["data"]["questions"], answers), "Green")
+        # A typed "2" on a single-select card goes as typed, as before.
+        typed = {"answer": {"type": "other", "text": "2"}}
+        self.assertEqual(_format_native_answers(payload["data"]["questions"], typed), "2")
+
+    async def test_a_secret_keeps_the_masked_input(self):
+        prompt = "OpenClaw needs input:\n\nToken\nPaste your API key"
+        self.assertIsNone(_native_ask_user_payload(prompt), "the card has no masked field")
+        calls = []
+
+        async def event_call(event):
+            calls.append(event)
+            return {"value": " s3cret "}
+
+        answer = await _ask_user_input_modal(event_call, prompt)
+        self.assertEqual(answer, "s3cret")
+        (event,) = calls
+        self.assertEqual(event["type"], "input")
+        self.assertEqual(event["data"]["type"], "password")
+        self.assertEqual(event["data"]["title"], "Token")
+
+
+class AskUserSecretDialogTests(unittest.IsolatedAsyncioTestCase):
+    """A secret keeps OWUI's masked input dialog (the card has none), asked
+    the way the card is (ELI-148): once, moved once to the tab viewing the
+    chat when the turn's socket goes away, never re-shown after a timeout.
+    Its answer never shows in the chat."""
+
+    PROMPT = "OpenClaw needs input:\n\nToken\nPaste your API key"
+    VALUE = "s3cret-VALUE-9f2"
+
+    def _sio(self, pool, reply):
+        sio = FakeSio(lambda event, data, to, timeout: reply(data, to))
+        fake_owui(self, sio=sio, SESSION_POOL=pool)
+        return sio
+
+    async def _ask(self, event_call, **kw):
+        return await asyncio.wait_for(_ask_user_input_modal(
+            event_call, self.PROMPT, owui_user_id="user-1", owui_chat_id="chat-1",
+            owui_message_id="msg-1", poll_interval_s=0.01, **kw), 2)   # bounds the test only
+
+    async def test_a_reload_moves_the_dialog_to_the_reloaded_tab(self):
+        pool = {"sid-old": {"id": "user-1", "chat_ids": ["chat-1"]}}
+        sio = self._sio(pool, lambda data, to: {"value": self.VALUE})
+        pending = asyncio.get_running_loop().create_future()
+
+        async def event_call(event):
+            return await pending                       # the dialog left with the old page
+
+        async def reload_tab():
+            await asyncio.sleep(0.05)
+            del pool["sid-old"]
+            pool["sid-new"] = {"id": "user-1", "chat_ids": ["chat-1"]}
+        reloader = asyncio.ensure_future(reload_tab())
+        answer = await self._ask(event_call, owui_session_id="sid-old")
+        await reloader
+        self.assertEqual(answer, self.VALUE)
+        ((_event, data, to, timeout),) = sio.calls
+        self.assertEqual(to, "sid-new")
+        self.assertEqual((data["data"]["type"], data["data"]["data"]["type"]), ("input", "password"))
+        self.assertEqual(timeout, 240)
+        self.assertEqual(sio.emits, [], "no card to close")
+
+    async def test_with_no_tab_on_the_chat_the_question_ends_the_reply(self):
+        pool = {"sid-old": {"id": "user-1", "chat_ids": ["chat-1"]},
+                "sid-other": {"id": "user-1", "chat_ids": ["chat-x"]}}
+        sio = self._sio(pool, lambda data, to: {"value": self.VALUE})
+
+        async def event_call(event):
+            del pool["sid-old"]                        # the tab is closed
+            return await asyncio.get_running_loop().create_future()
+        self.assertIsNone(await self._ask(event_call, owui_session_id="sid-old"))
+        self.assertEqual(sio.calls, [], "never another chat's tab")
+
+    async def test_a_moved_dialog_that_is_never_answered_ends_the_wait(self):
+        pool = {"sid-tab": {"id": "user-1", "chat_ids": ["chat-1"]}}
+        sio = self._sio(pool, lambda data, to: {"error": "Event call timed out"})
+
+        async def event_call(event):
+            return {"error": "Client session disconnected."}
+        self.assertIsNone(await self._ask(event_call))
+        self.assertEqual(len(sio.calls), 1, "shown once, never re-shown")
+
+    def test_the_ask_user_block_never_shows_the_value(self):
+        block = _ask_user_detail_block(self.PROMPT, self.VALUE)
+        self.assertNotIn(self.VALUE, block)
+        self.assertIn("secret entered", block)
+        self.assertIn("Token", block)
+        # Any other answer shows as given.
+        self.assertIn('result="Blue"', _ask_user_detail_block(
+            "OpenClaw needs input:\n\nColor?\nPick\n1. Red\n2. Blue", "Blue"))
+
+
+class SecretAnswerNeverInTheChatTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-148: a secret typed into the masked dialog goes to the agent and
+    nowhere else the pipe writes: not the reply's text or items, not the
+    events it emits, not the rewrites a turn writer would apply to the
+    stored message, not the pipe log."""
+
+    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
+    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
+    _queue = NoDroppedMessagesTests._queue
+    _delta = NoDroppedMessagesTests._delta
+    _final = NoDroppedMessagesTests._final
+    _until_registered = NoDroppedMessagesTests._until_registered
+    VALUE = "s3cret-VALUE-9f2"
+
+    async def test_the_value_reaches_only_the_agent(self):
+        written, asked = [], []
+
+        async def emitter(event):
+            written.append(event)
+
+        async def event_call(event):
+            asked.append(event)
+            return {"value": self.VALUE} if event.get("type") == "input" else None
+        rewrites = []
+        note = self.conn.note_turn_rewrite
+        self.conn.note_turn_rewrite = lambda *a: (rewrites.append(a), note(*a))[1]
+        logged = []
+        log = mock.patch.object(self.ocp, "pipe_log", lambda *a, **k: logged.append(a))
+        log.start()
+        self.addCleanup(log.stop)
+
+        body = {"model": "openclaw_gateway.default", "messages": [{"role": "user", "content": "deploy"}]}
+        meta = {"chat_id": "chat-1", "user_id": "u1", "message_id": "m1"}
+        gen = self.pipe._pipe_impl(body, emitter, __metadata__=meta, __event_call__=event_call)
+        chunks = []
+
+        async def drain():
+            async for c in gen:
+                chunks.append(c)
+        task = asyncio.ensure_future(drain())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "I need a key.\n\nOpenClaw needs input:\n\nToken\nPaste your API key\n"))
+        q.put_nowait(self._final("run-1"))
+        for _ in range(400):
+            if len(self.sent) == 2:
+                break
+            await asyncio.sleep(0.005)
+        self.assertEqual(self.sent, ["deploy", self.VALUE], "the agent gets the value")
+        answer_run = next(r for r in ("run-2", self.keys[-1])
+                          if f"{self.SK}:{r}" in self.conn._consumers)
+        q2 = self._queue(answer_run)
+        q2.put_nowait(self._delta(answer_run, "Stored."))
+        q2.put_nowait(self._final(answer_run))
+        await asyncio.wait_for(task, 5)   # bounds the test only
+
+        self.assertEqual([e["type"] for e in asked if e.get("type") == "input"], ["input"])
+        shown = "".join(c for c in chunks if isinstance(c, str))
+        self.assertIn("secret entered", shown)
+        self.assertIn("Stored.", shown)
+        for where, what in (("reply", chunks), ("events", written), ("rewrites", rewrites),
+                            ("log", logged)):
+            self.assertNotIn(self.VALUE, json.dumps(what, default=repr), where)
+
+
+class SecretNotReceivedTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-148: a secret whose dialog got no answer (no tab on the chat, a
+    timeout, a cancel) must not end the reply asking for it in the chat,
+    which stores what is typed there. The reply says it was not received and
+    how to enter it; the agent is told once that nothing came."""
+
+    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
+    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
+    _queue = NoDroppedMessagesTests._queue
+    _delta = NoDroppedMessagesTests._delta
+    _final = NoDroppedMessagesTests._final
+    _until_registered = NoDroppedMessagesTests._until_registered
+    PROMPT = "OpenClaw needs input:\n\nToken\nPaste your API key here so I can deploy"
+    NOTICE = openclaw_pipe.SECRET_NOT_RECEIVED_FOR_AGENT
+
+    def assert_never_invites_a_chat_answer(self, text):
+        self.assertNotIn("Paste your API key", text, "the agent's own question asks for the value")
+        for invite in ("next message", "answer in", "reply with", "type it here", "needs input"):
+            self.assertNotIn(invite, text.lower())
+        self.assertIn("not received", text)
+        self.assertIn("never in the chat", text)
+
+    def test_the_fallback_text_never_invites_a_chat_answer(self):
+        self.assert_never_invites_a_chat_answer(_ask_user_fallback_text(self.PROMPT))
+        self.assertIn("**Token**", _ask_user_fallback_text(self.PROMPT))
+        # Rebuilt from the transcript after an Open WebUI restart, the same.
+        block = _ask_user_detail_block(self.PROMPT, f"[Sat 10:00] {self.NOTICE}")
+        self.assert_never_invites_a_chat_answer(block)
+        self.assertNotIn("secret entered", block)
+        # Any other question keeps its plain-text fallback.
+        self.assertEqual(_ask_user_fallback_text("OpenClaw needs input:\n\nColor?\nWhich color?"),
+                         "Color?\nWhich color?")
+
+    async def test_the_agent_is_told_once_and_the_chat_never_asks(self):
+        asked = []
+
+        async def emitter(event):
+            pass
+
+        async def event_call(event):
+            asked.append(event.get("type"))
+            return None                                     # nobody answers the dialog
+        body = {"model": "openclaw_gateway.default", "messages": [{"role": "user", "content": "deploy"}]}
+        meta = {"chat_id": "chat-1", "user_id": "u1", "message_id": "m1"}
+        gen = self.pipe._pipe_impl(body, emitter, __metadata__=meta, __event_call__=event_call)
+        chunks = []
+
+        async def drain():
+            async for c in gen:
+                chunks.append(c)
+        task = asyncio.ensure_future(drain())
+
+        async def until_sent(n):
+            for _ in range(400):
+                if len(self.sent) >= n:
+                    return
+                await asyncio.sleep(0.005)
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "I need a key.\n\n" + self.PROMPT + "\n"))
+        q.put_nowait(self._final("run-1"))
+        await until_sent(2)
+        self.assertEqual(self.sent, ["deploy", self.NOTICE], "the agent is told nothing came")
+        # The agent asks again in the same reply: the text alone this time.
+        answer_run = next(r for r in ("run-2", self.keys[-1]) if f"{self.SK}:{r}" in self.conn._consumers)
+        q2 = self._queue(answer_run)
+        q2.put_nowait(self._delta(answer_run, "Still need it.\n\n" + self.PROMPT + "\n"))
+        q2.put_nowait(self._final(answer_run))
+        await asyncio.wait_for(task, 5)   # bounds the test only
+        self.assertEqual(self.sent, ["deploy", self.NOTICE], "told once per reply")
+        self.assertEqual(asked.count("input"), 2, "each ask shows the dialog")
+        shown = "".join(c for c in chunks if isinstance(c, str))
+        self.assertEqual(shown.count("not received"), 2)
+        self.assertIn("Still need it.", shown)
+        self.assert_never_invites_a_chat_answer(shown.replace("I need a key.", "").replace("Still need it.", ""))
 
 
 class DynamicModelSelectorTests(unittest.TestCase):
@@ -5160,14 +5255,14 @@ class RepeatedAskUserMarkerTests(unittest.TestCase):
             "3. Park it")
 
     def test_repeated_block_yields_three_clean_options(self):
-        data = _modal_payload_from_user_input_prompt(self.REAL)[0]["data"]
+        data = _parse_text_prompt(self.REAL)
         self.assertEqual(data["options"],
                          ["Dev-tool micro-product",
                           "Prediction markets, small bankroll",
                           "Park it"])
 
     def test_no_option_label_leaks_the_internal_marker(self):
-        data = _modal_payload_from_user_input_prompt(self.REAL)[0]["data"]
+        data = _parse_text_prompt(self.REAL)
         for label in data["options"]:
             self.assertNotIn("needs input:", label.lower())
 
@@ -5181,8 +5276,8 @@ class RepeatedAskUserMarkerTests(unittest.TestCase):
         self.assertEqual(_truncate_at_repeated_marker(normal), normal)
 
     def test_normal_prompt_is_unaffected(self):
-        data = _modal_payload_from_user_input_prompt(
-            "OpenClaw needs input:\nPick one\n1. Alpha\n2. Beta\n3. Gamma")[0]["data"]
+        data = _parse_text_prompt(
+            "OpenClaw needs input:\nPick one\n1. Alpha\n2. Beta\n3. Gamma")
         self.assertEqual(data["title"], "Pick one")
         self.assertEqual(data["options"], ["Alpha", "Beta", "Gamma"])
 
@@ -5359,7 +5454,7 @@ class CatchAllDuplicatesAskUserPromptTests(unittest.TestCase):
     def test_dialog_offers_three_options_not_six(self):
         pending, received, visible = self._stream_withheld()
         pending += _catch_all_delta(self.BLOCK, received, visible)
-        data = _modal_payload_from_user_input_prompt(pending)[0]["data"]
+        data = _parse_text_prompt(pending)
         self.assertEqual(data["title"], "Pick a theme")
         self.assertEqual(data["options"], ["Dark", "Light", "Auto"])
 
@@ -5453,7 +5548,7 @@ class MarkerAfterPreambleTests(unittest.TestCase):
 
     def test_dialog_built_from_a_preamble_reply_is_clean(self):
         pending, _shown = self._feed([self.PREAMBLE + self.BLOCK])
-        data = _modal_payload_from_user_input_prompt(pending)[0]["data"]
+        data = _parse_text_prompt(pending)
         self.assertEqual(data["title"], "Pick a theme")
         self.assertEqual(data["options"], ["Dark", "Light", "Auto"])
 

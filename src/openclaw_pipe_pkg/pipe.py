@@ -645,6 +645,8 @@ class _PipeTurn:
     def __init__(self, pipe, body, __event_emitter__, __event_call__, __user__,
                  __metadata__, __request__, __task__, __task_body__,
                  _initial_visible_text, _send_texts, turn):
+        # The agent was told an unanswered secret never came (once per reply).
+        self.secret_not_received_sent = False
         self.pipe = pipe
         self.body = body
         self.__event_emitter__ = __event_emitter__
@@ -2056,15 +2058,21 @@ class _PipeTurn:
                 owui_chat_id=self.owui_origin_chat_id,
                 owui_message_id=(self.__metadata__ or {}).get("message_id"),
                 owui_session_id=(self.__metadata__ or {}).get("session_id"),
-                __event_emitter__=self.__event_emitter__,
             )
         except Exception as ex:
             pipe_log(f"  user input modal failed; falling back to chat prompt: {ex}")
             answer = None
         if answer is None:
             pipe_log("  user input modal cancelled or empty answer")
-            return UserInputResult(False, None)
-        pipe_log("  user input answered via OWUI modal")
+            # The reply tells the user not to type a secret into the chat, so
+            # the agent is told nothing came, once per reply: an agent that
+            # asks again gets the text alone.
+            if not _is_secret_prompt(prompt_text) or self.secret_not_received_sent:
+                return UserInputResult(False, None)
+            self.secret_not_received_sent = True
+            answer = SECRET_NOT_RECEIVED_FOR_AGENT
+        else:
+            pipe_log("  user input answered via OWUI modal")
         await _emit_status(self.__event_emitter__, "Sending answer...", done=False)
         # The answer continues this reply: its run id names it (ELI-100 2.2).
         idempotency_key = (pipe_run_id(self.chat_id, self.owui_message_id, "input") if self.owui_message_id

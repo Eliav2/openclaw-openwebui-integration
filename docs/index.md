@@ -21,7 +21,7 @@ The three functions: the **Pipe** is the chat integration, the **Status Action**
 - [Why this exists](./why.md): the native protocol versus a text API, and the full comparison with OpenClaw's `/v1` endpoint.
 - [Features](./features/index.md): the full feature list, each line linking to its page.
   - [Chat](./features/chat.md): streaming, tool cards, tool failures, image input, media, the status line, auto-title.
-  - [Questions](./features/questions.md): question cards and dialogs, which kind you get, and what happens on a reconnect.
+  - [Questions](./features/questions.md): question cards and the secret dialog, which kind you get, and what happens on a reconnect.
   - [Status](./features/status.md): the Status dialog, Compact, the sub-agent list and drawer, the composer button.
   - [Sessions and models](./features/sessions-and-models.md): one session per chat, the model picker, its size cap, `DEFAULT_MODEL`.
   - [Replies from the agent](./features/agent-turns.md): replies with no message from you: cron jobs, heartbeats, `sessions_send`, sub-agent results.
