@@ -52,6 +52,19 @@ def _owui_redis():
     return getattr(getattr(app, "state", None), "redis", None)
 
 
+async def _save_response_stream(task_id, chat_id, message_id, text: str, output: list) -> None:
+    """Open WebUI's mid-turn copy of a message, overlaid on a GET. 0.12.3
+    dropped its `content` argument: the GET rebuilds the text from `output`
+    (`get_output_text`), so it is passed only where it is still taken."""
+    import inspect
+    from open_webui.tasks import save_response_stream
+
+    if "content" in inspect.signature(save_response_stream).parameters:
+        await save_response_stream(_owui_redis(), task_id, chat_id, message_id, text, output)
+    else:
+        await save_response_stream(_owui_redis(), task_id, chat_id, message_id, output)
+
+
 def _owui_request_task(task_id: str | None):
     """The asyncio task Open WebUI runs a chat request in (main.py
     `create_task`, keyed by the request's `task_id`): the Pipe call, then the
@@ -484,10 +497,7 @@ class _TurnWriter:
         for ev in _relay_output_events(self.sent_output, output):
             await emit({"type": "response:completion", "data": ev})
         self.sent_output = copy.deepcopy(output)
-        from open_webui.tasks import save_response_stream
-
-        await save_response_stream(_owui_redis(), self.task_id, self.chat_id, self.message_id,
-                                   text, self.sent_output)
+        await _save_response_stream(self.task_id, self.chat_id, self.message_id, text, self.sent_output)
         if self.handover_owed and (self.request is None or self.request.done()):
             self.handover_owed = False
             await self._persist(done=False, output=output, text=text)
