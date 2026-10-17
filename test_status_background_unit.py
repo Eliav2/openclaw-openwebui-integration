@@ -147,7 +147,7 @@ class OwnerFilterTests(unittest.TestCase):
         self.assertEqual(data["automationsTotal"], 9)
 
 
-def _gateway(calls, *, fail=(), slow=None, unknown=(), running_child=False, jobs=None):
+def _gateway(calls, *, fail=(), slow=None, unknown=(), running_child=False, jobs=None, processes=None):
     """A 9.3 Gateway for one open: every request recorded; `fail`: methods
     that raise; `unknown`: methods this Gateway lacks; `slow`: method ->
     Event its answer waits for."""
@@ -174,6 +174,9 @@ def _gateway(calls, *, fail=(), slow=None, unknown=(), running_child=False, jobs
                                  for k in params["keys"]]}
         if method == "tasks.list":
             return {"tasks": [_task("exec", "running", title="CLI command", sourceId="good-lagoon")]}
+        if method == "sessions.processes.list":
+            assert params == {"key": KEY}, params
+            return {"sessionId": "s1", "processes": processes or [], "truncated": False}
         if method == "cron.list":
             return {"jobs": jobs if jobs is not None else [_job("heartbeat", "main")]}
         raise AssertionError(f"unexpected RPC: {method}")
@@ -282,10 +285,34 @@ class OpenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(before, ["agents", "context", "limits", "subagents"])
         self.assertIn("background", _fills(emitted))
 
-    async def test_a_gateway_without_tasks_list_says_so_and_still_lists_automations(self):
-        """2026.10 removed `tasks.*` (ELI-164 wires its replacement)."""
+    async def test_on_2026_10_commands_come_from_the_sessions_processes(self):
+        """2026.10 removed `tasks.*`; a session's background commands are
+        `sessions.processes.list` (ELI-163). Titled by the card's command."""
+        def proc(pid, name, status, **kw):
+            return {"processId": pid, "instanceId": "i-" + pid, "name": name, "status": status,
+                    "startedAt": NOW - 60_000, "tail": "", "truncated": False, "canStop": False, **kw}
+        calls = []
+        _result, emitted = await self._open(_gateway(calls, unknown=("tasks.list",), processes=[
+            proc("good-lagoon", "sleep 25;", "running", canStop=True),
+            proc("calm-reef", "ls /nope", "failed", endedAt=NOW - 50_000, exitCode=2,
+                 tail="ls: cannot access '/nope'\n"),
+            proc("old-pine", "make build", "killed", startedAt=NOW - 45_000, endedAt=NOW - 40_000),
+        ]))
+        bg = _fills(emitted)["background"]
+        self.assertTrue(bg["tasksAvailable"])
+        self.assertEqual(bg["errors"], [])
+        self.assertIn("sessions.processes.list", calls)
+        self.assertEqual([(r["kind"], r["title"], r["status"], r["preview"]) for r in bg["rows"]
+                          if r["kind"] == "Command"], [
+            ("Command", "sleep 25; echo done", "running", None),
+            ("Command", "make build", "cancelled", None),
+            ("Command", "ls /nope", "failed", "ls: cannot access '/nope'"),
+        ])
+
+    async def test_a_gateway_with_neither_list_says_so_and_still_lists_automations(self):
         mine = _job("mine", f"session:{KEY}")
-        _result, emitted = await self._open(_gateway([], unknown=("tasks.list",), jobs=[mine]))
+        _result, emitted = await self._open(
+            _gateway([], unknown=("tasks.list", "sessions.processes.list"), jobs=[mine]))
         bg = _fills(emitted)["background"]
         self.assertFalse(bg["tasksAvailable"])
         self.assertEqual(bg["errors"], [])

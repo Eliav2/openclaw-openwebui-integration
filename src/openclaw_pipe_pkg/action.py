@@ -2063,17 +2063,43 @@ def _is_unknown_method(ex: Exception) -> bool:
 
 async def _read_background_tasks(conn, session_key: str) -> "list | None":
     """The adapter between the section and the Gateway's background work for
-    one session. OpenClaw 2026.9 lists it with `tasks.list`; 2026.10 removed
-    that method (background shell moved to `sessions.processes.list`, which
-    the upgrade wires in). A Gateway without it gives None: the section then
-    says it is not available here instead of failing."""
+    one session, as task rows. OpenClaw 2026.9 lists it with `tasks.list`;
+    2026.10 removed that method, and a session's background commands are
+    `sessions.processes.list` (media jobs have no per-session list there). A
+    Gateway with neither gives None: the section then says it is not
+    available here instead of failing."""
     try:
         resp = await conn.send_request("tasks.list", dict(sessionKey=session_key, limit=100), timeout=5)
+        return (resp or {}).get("tasks") or []
+    except Exception as ex:
+        if not _is_unknown_method(ex):
+            raise
+    try:
+        resp = await conn.send_request("sessions.processes.list", dict(key=session_key), timeout=5)
     except Exception as ex:
         if _is_unknown_method(ex):
             return None
         raise
-    return (resp or {}).get("tasks") or []
+    return [_process_task(p, session_key) for p in (resp or {}).get("processes") or []]
+
+
+# A 2026.10 process's status as a task's.
+_PROCESS_STATUSES = {"running": "running", "completed": "completed", "failed": "failed", "killed": "cancelled"}
+
+
+def _process_task(process: dict, session_key: str) -> dict:
+    """One `sessions.processes.list` row as the task row `_task_row` reads: an
+    exec task whose sourceId is the process (the session its tool card
+    names), titled by the Gateway's short name until a card gives the
+    command, and a finished one's last line of output as its summary."""
+    lines = [ln for ln in (process.get("tail") or "").splitlines() if ln.strip()]
+    return {
+        "id": process.get("processId"), "kind": "exec", "sourceId": process.get("processId"),
+        "sessionKey": session_key, "title": process.get("name") or "",
+        "status": _PROCESS_STATUSES.get(process.get("status"), process.get("status")),
+        "startedAt": process.get("startedAt"), "endedAt": process.get("endedAt"),
+        "terminalSummary": lines[-1][:200] if lines else None,
+    }
 
 
 def _exec_commands(chat) -> dict:
@@ -2111,7 +2137,10 @@ def _task_row(task: dict, commands: dict) -> dict:
     kind = task.get("kind") or ""
     title = (task.get("title") or "").strip()
     if kind == "exec":
-        title = commands.get(task.get("sourceId") or "") or "Shell command"
+        # 2026.9 titles every one "CLI command"; a 2026.10 process has a
+        # short name ("make build"). The card's whole command wins.
+        own = "" if title == "CLI command" else title
+        title = commands.get(task.get("sourceId") or "") or own or "Shell command"
     status = task.get("status")
     live = status in _LIVE_TASK_STATUSES
     return {

@@ -25,13 +25,13 @@ _Here the rate limits were held back on purpose, to show it._
 |---|---|
 | Context | `sessions.describe` |
 | Rate limits | `usage.status`, for the provider Context's read names (the same request); `claudeCliUsage.status` only when `usage.status` has no windows |
-| Background | `tasks.list`, `cron.list`, and the chat's last 40 messages |
+| Background | `tasks.list` (OpenClaw 2026.9) or `sessions.processes.list` (2026.10), `cron.list`, and the chat's last 40 messages |
 | Subagents | `sessions.list` with `spawnedBy` (the current children, store rows only) and the [child index](#sub-agents); the sub-agents' transcripts (`sessions.preview`) only once the section is open |
 | In-process agents | The chat's last 40 messages (the same read as Background's) |
 
 Each source is read once per open, all at the same time. None grows with the chat: the chat's messages come from Open WebUI's message rows, the 40 newest of the current branch, so a 14 MB chat opens as fast as a new one. Nothing is read while the dialog is closed: closing it tells the Action, which stops following its running sub-agents. In-process agents needs no Gateway, so it fills even when the Gateway cannot be reached.
 
-Opening the dialog sends a small request, from the toolbar button or the composer's: the chat, the message and the model. Open WebUI's own handler for an Action button uploads every message of the branch first and saves the whole chat again after, which on a big chat over a phone connection takes seconds; the Status button skips it. Where the page does not know the chat's model yet, Open WebUI's handler runs as before.
+Opening the dialog sends a small request, from the toolbar button or the composer's: the chat, the message and the model. Open WebUI's own handler for an Action button uploads every message of the branch first and saves the whole chat again after, which on a big chat over a phone connection takes seconds; the Status button skips it. The model comes from the page script's delivery, else from the reply's own avatar. The script arrives within about a second of opening a chat; a click before that, or on a reply that is not on an OpenClaw model, goes through Open WebUI's handler as before.
 
 Background, Subagents and In-process agents fold, with their count in the title, for example "Background (3)". Each opens when something in it is running and starts folded otherwise; a tap opens or folds it, and stays that way while the dialog is open. When the dialog is taller than the screen, its sections scroll between the title bar and the footer, which stay in view, on a phone too:
 
@@ -78,7 +78,7 @@ Sub-agents are listed under Subagents, not here.
 
 Owners also see **Other automations**: the Gateway's automations that run elsewhere, running and failing ones first, up to five ("5 of N"). They fold on their own, with their count in the title, and open only when one of them is running or failed. Anyone not in the Pipe's [`OWNER_USERS`](../configuration.md#owner_users) sees only their own chat's. With `OWNER_USERS` empty, everyone is an owner, as everywhere else.
 
-The section reads only when the dialog opens. OpenClaw 2026.10 removed the Gateway's task list (`tasks.list`): there the section says background commands and media jobs are not available on this Gateway, and still lists the chat's automations.
+The section reads only when the dialog opens. OpenClaw 2026.10 removed the Gateway's task list (`tasks.list`): there the commands come from the session's process list (`sessions.processes.list`), with a finished one's last line of output under it, and media jobs are not listed (2026.10 has no per-chat list of them). A Gateway with neither list says background commands and media jobs are not available on it, and still lists the chat's automations.
 
 While a background agent holds a reply open, the reply's status row says so, so the chat does not look busy for no reason:
 

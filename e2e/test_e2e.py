@@ -939,9 +939,8 @@ def _background(tok: str, chat_id: str, admin_token: str) -> tuple[dict, list]:
     return _section_data(codes, "openclaw-status-section-background"), codes
 
 
-@pytest.mark.xfail(condition="_openclaw_release() >= (2026, 10)", strict=True,
-                   reason="tasks.* is gone from OpenClaw 2026.10; the 10.x source is sessions.processes.list (ELI-164)")
 def test_the_status_action_lists_a_background_command(token):
+    """2026.9 lists it with tasks.list, 2026.10 with sessions.processes.list (ELI-163)."""
     chat_id, msg = _chat_turn(token, "E2E_BG_EXEC")
     assert msg.get("content", "").strip() == "E2E_BG_STARTED", msg
     data, _codes = _background(token, chat_id, token)
