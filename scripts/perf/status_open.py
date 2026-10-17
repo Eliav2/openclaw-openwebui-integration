@@ -39,14 +39,14 @@ OBSERVER_JS = r"""() => {
     if (P.start === null) return;
     const now = performance.now();
     if (!P.marks.shell && document.querySelector('%s')) P.marks.shell = now;
+    const subs = document.getElementById('openclaw-status-section-subagents');
+    if (P.foldAt && !P.marks.fold && subs && !subs.querySelector('[data-openclaw-loading]')) P.marks.fold = now;
     for (const s of sections) {
       if (P.marks[s]) continue;
       const el = document.getElementById('openclaw-status-section-' + s);
       // Filled: nothing loading, or a closed fold waiting for its tap.
       const fold = el && el.querySelector('[data-openclaw-fold][data-open="false"]');
       if (el && (fold || !el.querySelector('[data-openclaw-loading]'))) P.marks[s] = now;
-      if (s === 'subagents' && P.foldAt && !P.marks.fold && el && !el.querySelector('[data-openclaw-loading]'))
-        P.marks.fold = now;
     }
   };
   new MutationObserver(tick).observe(document.documentElement, {childList: true, subtree: true});
