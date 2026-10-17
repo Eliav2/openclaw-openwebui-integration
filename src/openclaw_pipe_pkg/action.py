@@ -1726,6 +1726,28 @@ def _is_child_of(row, parent_key):
         row.get("spawnedBy"), row.get("parentSessionKey"))
 
 
+def _subagent_final(row):
+    """A child row that will not change: its run ended."""
+    if not row:
+        return False
+    status = _subagent_status(row.get("status"))
+    return status not in _LIVE_SUBAGENT_STATUSES and bool(status or row.get("endedAt"))
+
+
+async def _lookup_child(conn, key):
+    """One child session's row, by its key."""
+    try:
+        resp = await conn.send_request("sessions.list", dict(search=key.rsplit(":", 1)[-1], limit=10), timeout=5)
+    except Exception as ex:
+        pipe_log(f"[status-action] sessions.list (child {key}) failed: {ex}")
+        return None
+    return next((r for r in (resp or {}).get("sessions") or [] if r.get("key") == key), None)
+
+
+async def _resolved(value):
+    return value
+
+
 def _subagent_started(row):
     return row.get("startedAt") or row.get("createdAt") or row.get("updatedAt") or 0
 
@@ -2582,14 +2604,15 @@ class Action:
         desc_task = asyncio.ensure_future(
             conn.send_request("sessions.describe", dict(key=session_key), timeout=5))
         usage_task = asyncio.ensure_future(conn.send_request("usage.status", {}, timeout=5))
-        # The parent's child sessions. The Gateway's spawnedBy filter keeps
-        # the current ones only (active, or ended in the last 30 minutes),
-        # so the open reads every session and picks the children itself
-        # (ELI-152), from the store alone: a last message would read every
-        # session's transcript. A refill follows the current ones with the
-        # filter and their last messages.
-        children_task = asyncio.ensure_future(conn.send_request(
-            "sessions.list", dict(limit=1000), timeout=10))
+        # The parent's child sessions (ELI-152), without reading every
+        # session: `spawnedBy` gives the current ones (running, or ended in
+        # the last 30 minutes), the child index (state.py) every child the
+        # Pipe saw spawned with its last row. A new index is seeded once, from
+        # one full list, after the section's first fill.
+        current_task = asyncio.ensure_future(conn.send_request(
+            "sessions.list", dict(spawnedBy=session_key, limit=50), timeout=5))
+        seed_task = None if _subagent_index_seeded() else asyncio.ensure_future(
+            conn.send_request("sessions.list", dict(limit=1000), timeout=30))
         tasks_task = asyncio.ensure_future(_read_background_tasks(conn, session_key))
         jobs_task = asyncio.ensure_future(_read_automations(conn))
 
@@ -2727,6 +2750,36 @@ class Action:
             task_texts.update(texts)
             latest.update(newest)
 
+        async def read_children():
+            """The current children, then each indexed child they lack: its
+            kept row when it had ended, else a lookup by its key. A failed
+            list still shows the indexed children."""
+            known = _subagent_children(session_key)
+            error = None
+            try:
+                current = [r for r in ((await current_task) or {}).get("sessions") or []
+                           if _is_child_of(r, session_key)]
+            except Exception as ex:
+                error, current = ex, []
+            rows = {r["key"]: r for r in current}
+            stale = [k for k, snap in known.items() if k not in rows and not _subagent_final(snap)]
+            found = [r for r in await asyncio.gather(*(_lookup_child(conn, k) for k in stale[:_SUBAGENT_LIST_CAP]))
+                     if r]
+            rows.update({r["key"]: r for r in found})
+            rows.update({k: snap for k, snap in known.items() if k not in rows and snap})
+            if current or found:
+                _subagent_remember(session_key, rows=current + found)
+            if error is not None and not rows:
+                raise error
+            return {"sessions": list(rows.values())}
+
+        async def seeded_children():
+            """The seed's children of this chat the section lacks."""
+            everything = (await seed_task) or {}
+            _subagent_index_mark_seeded(everything.get("sessions") or [])
+            return {"sessions": [snap for k, snap in _subagent_children(session_key).items()
+                                 if snap and k not in children_seen]}
+
         def subagent_rows(shown):
             return [{**_subagent_row(r, task_texts.get(r["key"]), latest.get(r["key"])),
                      "controlUiUrl": _control_ui_session_url(self.valves.CONTROL_UI_URL, r["key"])}
@@ -2765,7 +2818,7 @@ class Action:
         context_ready = asyncio.ensure_future(fill_context())
         limits_ready = asyncio.ensure_future(fill_limits())
         background_ready = asyncio.ensure_future(fill_background())
-        subagents_ready = asyncio.ensure_future(fill_subagents(children_task, at_open=True))
+        subagents_ready = asyncio.ensure_future(fill_subagents(read_children(), at_open=True))
 
         results = await asyncio.gather(context_ready, limits_ready, background_ready, subagents_ready,
                                        agents_ready, return_exceptions=True)
@@ -2776,6 +2829,16 @@ class Action:
         listed = results[3] if isinstance(results[3], list) else []
 
         pipe_log(f"[status-action] status dialog filled ({source})")
+
+        if seed_task is not None:
+            try:
+                before = len(children_seen)
+                more = await seeded_children()
+                if more["sessions"] and not dialog["closed"].is_set():
+                    seen_running = await fill_subagents(_resolved(more))
+                    listed = seen_running if len(children_seen) > before else listed
+            except Exception as ex:
+                pipe_log(f"[status-action] child index seed failed: {ex}")
 
         # The ticker counts a running child up while the dialog is open, so a
         # child that ends meanwhile must show its end (ELI-127). Hold this

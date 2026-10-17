@@ -12,6 +12,10 @@ import types
 import unittest
 from unittest import mock
 
+# Bridge state the code under test writes (the sub-agent child index) goes to
+# a scratch dir, never the machine's real /data/openclaw-bridge.
+os.environ.setdefault("OPENCLAW_BRIDGE_STATE_DIR", tempfile.mkdtemp(prefix="oc-bridge-test-"))
+
 
 def run_page(js: str, payload, tz: str | None = None):
     """Run `js` (a fake-DOM page script) under bun, else node, with `payload`
@@ -45,9 +49,22 @@ class RecordingEmitter:
         self.events.append(event)
 
 
-def action_gateway(conn, source: str = "pipe"):
+def fresh_child_index():
+    """An empty sub-agent child index, already seeded (state.py), so one test's
+    children never show in another's dialog and no open seeds by surprise."""
+    import openclaw_status_action
+    path = os.path.join(os.environ["OPENCLAW_BRIDGE_STATE_DIR"], openclaw_status_action._SUBAGENT_INDEX_NAME)
+    if os.path.exists(path):
+        os.unlink(path)
+    openclaw_status_action._subagent_index_mark_seeded()
+
+
+def action_gateway(conn, source: str = "pipe", keep_index: bool = False):
     """Patch the Status Action's Gateway lookup to hand out `conn`, as if it
-    came from `source` (the Pipe's stashed connection by default)."""
+    came from `source` (the Pipe's stashed connection by default). Starts from
+    a fresh child index unless `keep_index`."""
+    if not keep_index:
+        fresh_child_index()
     return mock.patch("openclaw_status_action._get_action_connection",
                       new=mock.AsyncMock(return_value=(conn, source)))
 

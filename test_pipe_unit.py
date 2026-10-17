@@ -290,6 +290,23 @@ class SessionToolEventTests(unittest.IsolatedAsyncioTestCase):
             phases.append(q.get_nowait()["payload"]["data"]["phase"])
         self.assertEqual(phases, ["start", "result"])
 
+    async def test_an_accepted_spawn_is_recorded_in_the_child_index(self):
+        """The Status dialog lists a chat's children from this index (state.py),
+        not from a read of every session."""
+        child = "agent:main:subagent:aaaaaaaa-0000-0000-0000-000000000001"
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"OPENCLAW_BRIDGE_STATE_DIR": td}):
+            conn = _GatewayConnection(lambda: None)
+            frame = {"type": "event", "event": "session.tool", "payload": {
+                "runId": "run-1", "sessionKey": self.SK, "stream": "tool",
+                "data": {"phase": "result", "name": "sessions_spawn", "toolCallId": "t7",
+                         "result": json.dumps({"status": "accepted", "childSessionKey": child, "runId": "r"})}}}
+            await self._run_loop(conn, [frame])
+            for _ in range(40):
+                if openclaw_pipe._subagent_children(self.SK):
+                    break
+                await asyncio.sleep(0.05)
+            self.assertEqual(openclaw_pipe._subagent_children(self.SK), {child: None})
+
     async def test_a_run_starting_in_an_owui_session_subscribes_its_transcript_once(self):
         conn = _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"))
         conn.send_request = mock.AsyncMock(return_value={})

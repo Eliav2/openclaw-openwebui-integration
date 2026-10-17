@@ -992,6 +992,29 @@ def _spawn_result_view(args_str: str, result_str: str) -> tuple[str, bool]:
     return f"Not started ({status})" + (f": {error}" if error else ""), True
 
 
+def _spawned_child(payload: dict):
+    """(parent session key, child session key) of a tool event that is an
+    accepted spawn's result, else None: what the child index records. On
+    2026.10 the wrapper's nested call carries the spawn itself; the wrapper's
+    own envelope is read too."""
+    data = payload.get("data") or {}
+    if payload.get("stream") != "tool" or data.get("phase") != "result" or data.get("isError") is True:
+        return None
+    parent = payload.get("sessionKey")
+    text = _tool_result_text(data.get("result", {}))
+    name = _bare_tool_name(data.get("name") or "")
+    if _is_spawn_tool(name):
+        receipt = _json_object(text)
+    elif name in DEFERRED_CALL_TOOLS:
+        receipt = _json_object(_deferred_call_result_text(text))
+    else:
+        return None
+    child = receipt.get("childSessionKey")
+    if receipt.get("status") != "accepted" or not isinstance(child, str) or not child or not parent:
+        return None
+    return parent, child
+
+
 def _tool_call_error_relabel_event(name: str, tool_call_id: str, args_str: str) -> dict:
     """Re-announce a failed call's `function_call` item with ❌ in its name.
 
@@ -2807,6 +2830,11 @@ class _GatewayConnection:
                 payload = msg.get("payload", {})
                 if payload.get("stream") == "tool" and not self._first_tool_event(payload):
                     continue
+                spawned = _spawned_child(payload) if payload.get("stream") == "tool" else None
+                if spawned:
+                    # The Status dialog's child index (state.py), off the loop.
+                    asyncio.get_running_loop().run_in_executor(
+                        None, functools.partial(_subagent_remember, spawned[0], keys=[spawned[1]]))
 
                 # ── Shadow render ──
                 # Feed every event of a run we're tracking into its shadow

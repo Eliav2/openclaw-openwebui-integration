@@ -16,7 +16,7 @@ import unittest
 from unittest import mock
 
 import test_status_action_unit  # noqa: F401  (installs the module stubs)
-from _test_helpers import action_gateway, RecordingEmitter, run_page
+from _test_helpers import action_gateway, fresh_child_index, RecordingEmitter, run_page
 from test_status_action_unit import _drawer_conn, _emitted_codes, _open_dialog
 
 import openclaw_status_action
@@ -119,33 +119,6 @@ class SubagentListTests(unittest.IsolatedAsyncioTestCase):
         code = next(c for c in _emitted_codes(emitted)
                     if "getElementById('openclaw-status-section-subagents')" in c)
         self.assertIn("Research X and report.", code)
-
-    async def test_the_open_reads_every_session_not_the_30_minute_child_window(self):
-        """ELI-152: `sessions.list {spawnedBy}` keeps an ended child for 30
-        minutes only (the Gateway's shouldKeepStoreOnlyChildLink), so the
-        dialog's open reads the whole list and picks the chat's children by
-        `spawnedBy` or `parentSessionKey` itself."""
-        other = "agent:main:openwebui-user-1-other-chat"
-        rows = [
-            _child(CHILD_A, "done", startedAt=1000, endedAt=1050),
-            {"key": CHILD_B, "status": "failed", "parentSessionKey": PARENT_KEY, "startedAt": 2000,
-             "endedAt": 2100, "lastRunError": "provider 529"},
-            {"key": CHILD_DONE, "status": "done", "spawnedBy": other, "startedAt": 3000},
-            {"key": PARENT_KEY, "status": "running"},
-            # A visible spawn (`visible: true`): no run status, but ended.
-            _child("agent:main:dashboard:dddddddd-0000-0000-0000-000000000004", None,
-                   label="W1: engine", startedAt=1500, endedAt=1800),
-        ]
-        calls, _emitted, data = await self._open(rows, {})
-        opened = next(p for m, p in calls if m == "sessions.list")
-        self.assertNotIn("spawnedBy", opened)
-        # The store's rows only: a last message reads every session's transcript.
-        self.assertNotIn("includeLastMessage", opened)
-        self.assertEqual([(t["id"][-4:], t["status"]) for t in data["tasks"]],
-                         [("0002", "failed"), ("0004", "ended"), ("0001", "completed")])
-        self.assertEqual(data["tasks"][0]["error"], "provider 529")
-        self.assertEqual(data["tasks"][1]["title"], "W1: engine")
-        self.assertEqual(data["total"], 3)
 
     async def test_the_newest_twenty_are_listed(self):
         rows = [_child(f"agent:main:subagent:{n:08d}-0000-0000-0000-000000000000", "done",
@@ -444,6 +417,128 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
         # A minute later the ended child is still listed (ELI-152), with
         # its own duration, not counting up.
         self.assertEqual(run_page(_DIALOG_PAGE_JS, payload), [{"cells": ["1s"], "timers": 1}])
+
+
+class _WindowGateway:
+    """A Gateway's session store as 2026.9.3 lists it: `spawnedBy` returns a
+    parent's children that run or ended in the last 30 minutes only
+    (`current`), `search` matches keys, and no filter returns every row."""
+
+    def __init__(self, rows, current=(), fail_spawned_by=False):
+        self.rows, self.current, self.fail = rows, set(current), fail_spawned_by
+        self.calls = []
+
+    async def send_request(self, method, params, timeout=5):
+        self.calls.append((method, dict(params)))
+        if method == "sessions.list":
+            if "spawnedBy" in params:
+                if self.fail:
+                    raise TimeoutError("sessions.list timed out")
+                return {"sessions": [r for r in self.rows if r["key"] in self.current
+                                     and params["spawnedBy"] in (r.get("spawnedBy"), r.get("parentSessionKey"))]}
+            if "search" in params:
+                return {"sessions": [r for r in self.rows if params["search"] in r["key"]]}
+            return {"sessions": list(self.rows)}
+        return await _list_rpc([], {}, [])(method, params, timeout)
+
+    def full_reads(self):
+        return [p for m, p in self.calls if m == "sessions.list" and not ({"spawnedBy", "search"} & set(p))]
+
+
+class ChildIndexTests(unittest.IsolatedAsyncioTestCase):
+    """Subagents lists the chat's children without reading every session:
+    the children the Pipe saw it spawn (its child index), the current ones
+    (`spawnedBy`), and a direct lookup of a recorded child the 30-minute
+    window dropped. Ended children stay listed (ELI-152)."""
+
+    def setUp(self):
+        self.state = os.environ["OPENCLAW_BRIDGE_STATE_DIR"]
+        fresh_child_index()
+
+    async def _open(self, gw):
+        emitted, seen = [], []
+        real = openclaw_status_action._render_subagents_fill_js
+        with action_gateway(gw, keep_index=True), mock.patch(
+                "openclaw_status_action._render_subagents_fill_js",
+                side_effect=lambda d: (seen.append(d), real(d))[1]):
+            await _open_dialog(Action().action({"chat_id": PARENT_CHAT}, __user__={"id": PARENT_USER},
+                                               __event_emitter__=RecordingEmitter(emitted)), gw)
+        return seen
+
+    async def test_an_ended_child_out_of_the_window_is_listed_without_reading_every_session(self):
+        old = _child(CHILD_A, "done", startedAt=1000, endedAt=1050)
+        openclaw_status_action._subagent_remember(PARENT_KEY, rows=[old])
+        gw = _WindowGateway([old, _child(CHILD_B, "running", startedAt=2000)], current={CHILD_B})
+        seen = await self._open(gw)
+        self.assertEqual([t["id"] for t in seen[-1]["tasks"]], [CHILD_B, CHILD_A])
+        self.assertEqual(gw.full_reads(), [])
+        self.assertFalse(any("search" in p for _m, p in gw.calls))   # a final snapshot needs no lookup
+
+    async def test_a_recorded_child_the_window_dropped_is_looked_up_by_its_key(self):
+        openclaw_status_action._subagent_remember(PARENT_KEY, keys=[CHILD_A])
+        gw = _WindowGateway([_child(CHILD_A, "failed", startedAt=1000, endedAt=1100, lastRunError="529")])
+        seen = await self._open(gw)
+        self.assertEqual([(t["id"], t["status"]) for t in seen[-1]["tasks"]], [(CHILD_A, "failed")])
+        self.assertEqual(gw.full_reads(), [])
+        self.assertIn(("sessions.list", {"search": CHILD_A.rsplit(":", 1)[-1], "limit": 10}), gw.calls)
+        # Its ended row is kept: the next open needs no lookup.
+        self.assertEqual(openclaw_status_action._subagent_children(PARENT_KEY)[CHILD_A]["status"], "failed")
+
+    async def test_the_list_failing_still_shows_the_known_children(self):
+        openclaw_status_action._subagent_remember(PARENT_KEY, rows=[_child(CHILD_A, "done", startedAt=1, endedAt=2)])
+        seen = await self._open(_WindowGateway([], fail_spawned_by=True))
+        self.assertIsNone(seen[-1]["error"])
+        self.assertEqual([t["id"] for t in seen[-1]["tasks"]], [CHILD_A])
+
+    async def test_a_new_index_is_seeded_once_in_the_background(self):
+        os.unlink(os.path.join(self.state, openclaw_status_action._SUBAGENT_INDEX_NAME))
+        rows = [_child(CHILD_A, "done", startedAt=1000, endedAt=1050),
+                _child(CHILD_B, "running", startedAt=2000)]
+        gw = _WindowGateway(rows, current={CHILD_B})
+        seen = await self._open(gw)
+        self.assertEqual([t["id"] for t in seen[0]["tasks"]], [CHILD_B])          # first fill: no wait
+        self.assertEqual([t["id"] for t in seen[-1]["tasks"]], [CHILD_B, CHILD_A])  # then the seed's
+        self.assertEqual(len(gw.full_reads()), 1)
+        gw2 = _WindowGateway(rows, current={CHILD_B})
+        await self._open(gw2)
+        self.assertEqual(gw2.full_reads(), [])
+
+    async def test_the_seed_picks_the_chats_children_by_either_parent_field(self):
+        """ELI-152's rule for the one full list: a child names its parent in
+        `spawnedBy` or `parentSessionKey`; read from the store alone (a last
+        message reads every session's transcript)."""
+        os.unlink(os.path.join(self.state, openclaw_status_action._SUBAGENT_INDEX_NAME))
+        other = "agent:main:openwebui-user-1-other-chat"
+        rows = [
+            _child(CHILD_A, "done", startedAt=1000, endedAt=1050),
+            {"key": CHILD_B, "status": "failed", "parentSessionKey": PARENT_KEY, "startedAt": 2000,
+             "endedAt": 2100, "lastRunError": "provider 529"},
+            {"key": CHILD_DONE, "status": "done", "spawnedBy": other, "startedAt": 3000},
+            {"key": PARENT_KEY, "status": "running"},
+            # A visible spawn (`visible: true`): no run status, but ended.
+            _child("agent:main:dashboard:dddddddd-0000-0000-0000-000000000004", None,
+                   label="W1: engine", startedAt=1500, endedAt=1800),
+        ]
+        gw = _WindowGateway(rows)
+        data = (await self._open(gw))[-1]
+        self.assertEqual(gw.full_reads(), [{"limit": 1000}])
+        self.assertEqual([(t["id"][-4:], t["status"]) for t in data["tasks"]],
+                         [("0002", "failed"), ("0004", "ended"), ("0001", "completed")])
+        self.assertEqual(data["tasks"][0]["error"], "provider 529")
+        self.assertEqual(data["tasks"][1]["title"], "W1: engine")
+        self.assertEqual(data["total"], 3)
+
+    def test_the_pipe_records_an_accepted_spawn(self):
+        receipt = {"status": "accepted", "childSessionKey": CHILD_A, "runId": "r1"}
+        for name, result in (("sessions_spawn", json.dumps(receipt)),
+                             ("mcp__openclaw__sessions_spawn",
+                              {"content": [{"type": "text", "text": json.dumps(receipt)}]})):
+            payload = {"sessionKey": PARENT_KEY, "runId": "r", "stream": "tool",
+                       "data": {"phase": "result", "name": name, "toolCallId": "t", "result": result}}
+            self.assertEqual(openclaw_status_action._spawned_child(payload), (PARENT_KEY, CHILD_A))
+        refused = {"sessionKey": PARENT_KEY, "stream": "tool", "data": {
+            "phase": "result", "name": "sessions_spawn", "result": json.dumps({"status": "forbidden"})}}
+        self.assertIsNone(openclaw_status_action._spawned_child(refused))
 
 
 def _card(call_id, name, args, result=None):
