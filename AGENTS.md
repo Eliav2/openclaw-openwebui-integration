@@ -32,6 +32,10 @@ A PR that removes a feature removes its bullet, its section, its scene and its i
 
 `test_docs_unit.py` fails on a broken link, an unused or oversized image, an em dash, or a tested version that differs from `e2e/versions.env`. It cannot tell whether a feature is documented: reviewers check that against the list above.
 
+## User flows have a browser test
+
+A PR that adds a user flow (something a user does in the chat, the Status dialog or the composer) adds its test to `e2e/test_browser_flows.py` in the same PR: Playwright on the E2E stack, asserting on what the user sees (DOM state), waiting on state and never on time, with no retries. A PR that changes a flow keeps its test passing. These tests run on GitHub runners only, in the E2E job.
+
 ## Writing
 
 - No em dashes, in docs, code comments, commit messages or PR descriptions.
