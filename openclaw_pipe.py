@@ -500,6 +500,16 @@ def turn_owner(row: dict, stop_notice_before: bool = False) -> str:
     return "none"
 
 
+def judges_cut_runs_after_listening(version) -> bool:
+    """A 2026.10+ Gateway serves session rows before its restart-recovery pass
+    has judged the runs a crash cut (about 8 s, probe 2026-10-17). 2026.9.3
+    keeps a cut run's row `running` (persisted at lifecycle start,
+    session-lifecycle-state-C7hBzJwC.mjs:77, 102) and marks within ms. An
+    unknown version is treated as the old one: never wait on a no-status row."""
+    m = re.match(r"\s*(\d{4})\.(\d{1,2})\.", str(version or ""))
+    return bool(m) and (int(m.group(1)), int(m.group(2))) >= (2026, 10)
+
+
 def next_continuation(row: dict, stop_notice_before: bool, resumes_so_far: int,
                       after_restart: bool = False) -> str:
     """What the writer of M does when its run settles: `gateway` (keep M open
@@ -511,10 +521,11 @@ def next_continuation(row: dict, stop_notice_before: bool, resumes_so_far: int,
     never gets one. The budget is counted on M, so a resume that is cut the
     same way again (an OOM loop) ends after MAX_TURN_RESUMES.
 
-    `after_restart`: the Gateway restarted since the run's first event. A
-    2026.10 Gateway serves rows before its recovery pass has judged the runs
-    the crash cut: idle with no status, for about 8 s (probe 2026-10-17). That
-    row is not a settle; the next pushed row decides."""
+    `after_restart`: the Gateway restarted since the run's first event, the
+    run never reached its terminal, and the Gateway judges cut runs only after
+    it listens (`judges_cut_runs_after_listening`). Its idle no-status row is
+    then not a settle: the next pushed row decides, or the next transcript
+    append (a recovery's turn, or a give-up's tombstone notice)."""
     if after_restart and not (row or {}).get("hasActiveRun") and (row or {}).get("status") is None:
         return "gateway"
     owner = turn_owner(row, stop_notice_before)
@@ -4697,6 +4708,7 @@ class _GatewayConnection:
         # real restarts; consumers compare it, not `connection_epoch`.
         self.gateway_boot_id: str | None = None
         self.gateway_restarts = 0
+        self.gateway_version: str | None = None   # hello-ok.server.version
 
         # Next request id
         self._next_req_id = 1
@@ -4890,9 +4902,12 @@ class _GatewayConnection:
         return ev
 
     def _on_session_message(self, payload: dict) -> None:
-        ev = self._session_message_waiters.pop(payload.get("sessionKey") or "", None)
+        key = payload.get("sessionKey") or ""
+        ev = self._session_message_waiters.pop(key, None)
         if ev is not None:
             ev.set()
+        if _TURNS and key:
+            _TURNS.session_message(self, key)
 
     def _on_shutdown(self, payload: dict) -> None:
         """DESIGN 2.7 F4: the Gateway announces its close before it aborts any
@@ -5822,6 +5837,7 @@ class _GatewayConnection:
         self._reconnect_attempt = 0
         self.connection_epoch += 1
         self._thinking_note_shown.clear()
+        self.gateway_version = (hello_ok.get("server") or {}).get("version")
         self._note_gateway_boot((hello_ok.get("server") or {}).get("bootId"))
         pipe_log(
             f"Connected to Gateway (persistent) [epoch {self.connection_epoch}]"
@@ -7188,6 +7204,7 @@ class _TurnWriter:
     def adopt(self, run_id: str) -> None:
         """A run that continues M (a pipe resume, or a restart recovery that
         rule E maps here) is written into the same message."""
+        self.awaiting_row = False       # the recovery took M over
         if run_id not in self.runs:
             self.runs.append(run_id)
             self.run_marks.append((run_id, len(self.renderer.output), len(self.renderer.text)))
@@ -8003,8 +8020,10 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
             # run's pump also gets the session's settle once its recovery has
             # taken M over, and the recovery's own pump may still hold events.
             if writer is not None and writer.run_id == run:
+                unjudged = (conn.gateway_restarts > pump.restarts_before and not pump.terminal.is_set()
+                            and judges_cut_runs_after_listening(conn.gateway_version))
                 await writer.end(item, stop_notice_before=pump.stop_notice_before,
-                                 after_restart=conn.gateway_restarts > pump.restarts_before)
+                                 after_restart=unjudged)
                 if writer.closed:
                     conn._turn_writers.pop((chat_id, writer.message_id), None)
                 elif writer.awaiting_row and writer.run_id == run:
@@ -8851,6 +8870,27 @@ def _ensure_orphan_reconcile(valves_getter) -> None:
     _orphan_reconcile_task = spawn_background(_reconcile_orphan_stubs(valves_getter))
 
 
+def _turn_session_message(conn: "_GatewayConnection", sess: str) -> None:
+    """A transcript append in a session whose message waits for a recovery:
+    a Gateway that gives up tombstones the row to failed and appends a notice
+    without pushing the row (9.3 main-session-restart-recovery-CPJjd8da.mjs:
+    1135-1153, 10.10 -DnTvOdiE.mjs:1040-1062), so the append re-reads it."""
+    if any(w.session_key == sess and not w.closed and w.awaiting_row
+           for w in list(conn._turn_writers.values())):
+        spawn_background(_turn_reread_row(conn, sess))
+
+
+async def _turn_reread_row(conn: "_GatewayConnection", sess: str) -> None:
+    try:
+        lst = await conn.send_request("sessions.list", {"search": sess[-36:], "limit": 10}, timeout=15)
+    except Exception as ex:
+        pipe_log(f"  turn writer: row read after an append failed: {ex!r}")
+        return
+    row = next((r for r in (lst.get("sessions") or []) if r.get("key") == sess), None)
+    if row is not None and not row.get("hasActiveRun"):
+        _turn_settled(conn, sess, row)
+
+
 class _TurnHooks:
     """What `_GatewayConnection` calls into the turn writer with (`_TURNS`)."""
     route_now = staticmethod(_turn_route_now)
@@ -8859,6 +8899,7 @@ class _TurnHooks:
     settled = staticmethod(_turn_settled)
     note_heartbeat = staticmethod(_note_heartbeat_run)
     hand_over = staticmethod(_hand_over_run)
+    session_message = staticmethod(_turn_session_message)
 
 
 _TURNS = _TurnHooks

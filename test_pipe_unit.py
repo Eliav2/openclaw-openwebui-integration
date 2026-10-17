@@ -9274,6 +9274,7 @@ class GatewayTenRecoveryRoutingTests(_RoutingCase):
         self.conn.gateway_boot_id = "boot-a"
         _turn_route_now(self.conn, self.ev(self.RUN, _delta("Reading them.")))
         await self.spin()
+        self.conn.gateway_version = "2026.10.10-beta.1"
         self.conn._note_gateway_boot("boot-b")          # the crash, seen at the reconnect
         # Read after hello, before the recovery pass: idle, no status.
         self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False})
@@ -9301,6 +9302,62 @@ class GatewayTenRecoveryRoutingTests(_RoutingCase):
         self.assertIn("Reading them.", m["content"])
         self.assertIn("Found it.", m["content"])
 
+    def crash(self, version):
+        """RUN streamed "Reading them.", then the Gateway died and came back
+        (`version` from hello-ok.server.version)."""
+        self.history = {"messages": [{"role": "user", "content": "x", "idempotencyKey": f"{self.RUN}:user"}]}
+        self.conn.gateway_boot_id = "boot-a"
+        _turn_route_now(self.conn, self.ev(self.RUN, _delta("Reading them.")))
+
+    async def restarted(self, version, row):
+        await self.spin()
+        self.conn.gateway_version = version
+        self.conn._note_gateway_boot("boot-b")
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False, **row})
+        await self.spin()
+        return self.owui.msgs().get(turn_message_id(self.key, self.RUN, self.CHAT), {})
+
+    async def test_on_9_3_an_idle_row_with_no_status_after_a_restart_finalizes(self):
+        """9.3 rows keep `running` across a restart (persisted at lifecycle
+        start, session-lifecycle-state-C7hBzJwC.mjs:77/102) and the recovery
+        pass marks within ms of listening. A no-status row there is a session
+        whose start never persisted, which 9.3 never recovers and never pushes
+        again: M must not wait for it."""
+        self.crash("2026.9.3")
+        m = await self.restarted("2026.9.3", {})
+        self.assertIs(m.get("done"), True, "9.3: nothing would ever close M")
+
+    async def test_a_run_that_ended_before_the_crash_is_not_held(self):
+        """Its final arrived: no Gateway recovers a finished run."""
+        self.crash("2026.10.10-beta.1")
+        _turn_route_now(self.conn, self.ev(self.RUN, {"state": "final"}))
+        m = await self.restarted("2026.10.10-beta.1", {})
+        self.assertIs(m.get("done"), True, "a finished run must not wait for a recovery")
+
+    async def test_a_recovery_the_gateway_gives_up_on_closes_the_message(self):
+        """The give-up tombstones the row to failed and appends a notice
+        (9.3 main-session-restart-recovery-CPJjd8da.mjs:1135-1153, 10.10
+        -DnTvOdiE.mjs:1040-1062) but pushes no row: the notice's
+        `session.message` is what re-reads it."""
+        self.crash("2026.10.10-beta.1")
+        m = await self.restarted("2026.10.10-beta.1", {"status": "interrupted", "abortedLastRun": True})
+        self.assertIsNot(m.get("done"), True, "marked for recovery: M stays open")
+        tomb = {"key": self.key, "hasActiveRun": False, "status": "failed", "abortedLastRun": False,
+                "lastRunError": "Restart recovery gave up"}
+        test, base = self, self.conn.send_request
+
+        async def send_request(method, params, timeout=10):
+            if method == "sessions.list":
+                test.sent.append((method, params))
+                return {"sessions": [tomb]}
+            return await base(method, params, timeout)
+        self.conn.send_request = send_request
+        self.conn._on_session_message({"sessionKey": self.key, "messageId": "m-3", "messageSeq": 3})
+        await self.spin()
+        m = self.owui.msgs()[turn_message_id(self.key, self.RUN, self.CHAT)]
+        self.assertIs(m.get("done"), True, "the tombstone's notice closes M")
+        self.assertIn("Restart recovery gave up", m.get("content", ""))
+
     async def test_a_run_whose_turn_never_comes_is_written_at_its_end(self):
         """A run with no admitted turn (a queued follow-up, M3-crash 04351f67)
         while M waits: its end resolves it, to its own message."""
@@ -9308,6 +9365,7 @@ class GatewayTenRecoveryRoutingTests(_RoutingCase):
         self.conn.gateway_boot_id = "boot-a"
         _turn_route_now(self.conn, self.ev(self.RUN, _delta("Reading them.")))
         await self.spin()
+        self.conn.gateway_version = "2026.10.10-beta.1"
         self.conn._note_gateway_boot("boot-b")
         self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False})
         await self.spin()

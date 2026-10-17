@@ -601,6 +601,7 @@ class _TurnWriter:
     def adopt(self, run_id: str) -> None:
         """A run that continues M (a pipe resume, or a restart recovery that
         rule E maps here) is written into the same message."""
+        self.awaiting_row = False       # the recovery took M over
         if run_id not in self.runs:
             self.runs.append(run_id)
             self.run_marks.append((run_id, len(self.renderer.output), len(self.renderer.text)))
@@ -1416,8 +1417,10 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
             # run's pump also gets the session's settle once its recovery has
             # taken M over, and the recovery's own pump may still hold events.
             if writer is not None and writer.run_id == run:
+                unjudged = (conn.gateway_restarts > pump.restarts_before and not pump.terminal.is_set()
+                            and judges_cut_runs_after_listening(conn.gateway_version))
                 await writer.end(item, stop_notice_before=pump.stop_notice_before,
-                                 after_restart=conn.gateway_restarts > pump.restarts_before)
+                                 after_restart=unjudged)
                 if writer.closed:
                     conn._turn_writers.pop((chat_id, writer.message_id), None)
                 elif writer.awaiting_row and writer.run_id == run:
@@ -2264,6 +2267,27 @@ def _ensure_orphan_reconcile(valves_getter) -> None:
     _orphan_reconcile_task = spawn_background(_reconcile_orphan_stubs(valves_getter))
 
 
+def _turn_session_message(conn: "_GatewayConnection", sess: str) -> None:
+    """A transcript append in a session whose message waits for a recovery:
+    a Gateway that gives up tombstones the row to failed and appends a notice
+    without pushing the row (9.3 main-session-restart-recovery-CPJjd8da.mjs:
+    1135-1153, 10.10 -DnTvOdiE.mjs:1040-1062), so the append re-reads it."""
+    if any(w.session_key == sess and not w.closed and w.awaiting_row
+           for w in list(conn._turn_writers.values())):
+        spawn_background(_turn_reread_row(conn, sess))
+
+
+async def _turn_reread_row(conn: "_GatewayConnection", sess: str) -> None:
+    try:
+        lst = await conn.send_request("sessions.list", {"search": sess[-36:], "limit": 10}, timeout=15)
+    except Exception as ex:
+        pipe_log(f"  turn writer: row read after an append failed: {ex!r}")
+        return
+    row = next((r for r in (lst.get("sessions") or []) if r.get("key") == sess), None)
+    if row is not None and not row.get("hasActiveRun"):
+        _turn_settled(conn, sess, row)
+
+
 class _TurnHooks:
     """What `_GatewayConnection` calls into the turn writer with (`_TURNS`)."""
     route_now = staticmethod(_turn_route_now)
@@ -2272,6 +2296,7 @@ class _TurnHooks:
     settled = staticmethod(_turn_settled)
     note_heartbeat = staticmethod(_note_heartbeat_run)
     hand_over = staticmethod(_hand_over_run)
+    session_message = staticmethod(_turn_session_message)
 
 
 _TURNS = _TurnHooks

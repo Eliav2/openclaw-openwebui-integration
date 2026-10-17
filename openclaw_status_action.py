@@ -494,6 +494,16 @@ def turn_owner(row: dict, stop_notice_before: bool = False) -> str:
     return "none"
 
 
+def judges_cut_runs_after_listening(version) -> bool:
+    """A 2026.10+ Gateway serves session rows before its restart-recovery pass
+    has judged the runs a crash cut (about 8 s, probe 2026-10-17). 2026.9.3
+    keeps a cut run's row `running` (persisted at lifecycle start,
+    session-lifecycle-state-C7hBzJwC.mjs:77, 102) and marks within ms. An
+    unknown version is treated as the old one: never wait on a no-status row."""
+    m = re.match(r"\s*(\d{4})\.(\d{1,2})\.", str(version or ""))
+    return bool(m) and (int(m.group(1)), int(m.group(2))) >= (2026, 10)
+
+
 def next_continuation(row: dict, stop_notice_before: bool, resumes_so_far: int,
                       after_restart: bool = False) -> str:
     """What the writer of M does when its run settles: `gateway` (keep M open
@@ -505,10 +515,11 @@ def next_continuation(row: dict, stop_notice_before: bool, resumes_so_far: int,
     never gets one. The budget is counted on M, so a resume that is cut the
     same way again (an OOM loop) ends after MAX_TURN_RESUMES.
 
-    `after_restart`: the Gateway restarted since the run's first event. A
-    2026.10 Gateway serves rows before its recovery pass has judged the runs
-    the crash cut: idle with no status, for about 8 s (probe 2026-10-17). That
-    row is not a settle; the next pushed row decides."""
+    `after_restart`: the Gateway restarted since the run's first event, the
+    run never reached its terminal, and the Gateway judges cut runs only after
+    it listens (`judges_cut_runs_after_listening`). Its idle no-status row is
+    then not a settle: the next pushed row decides, or the next transcript
+    append (a recovery's turn, or a give-up's tombstone notice)."""
     if after_restart and not (row or {}).get("hasActiveRun") and (row or {}).get("status") is None:
         return "gateway"
     owner = turn_owner(row, stop_notice_before)
@@ -2285,6 +2296,7 @@ class _GatewayConnection:
         # real restarts; consumers compare it, not `connection_epoch`.
         self.gateway_boot_id: str | None = None
         self.gateway_restarts = 0
+        self.gateway_version: str | None = None   # hello-ok.server.version
 
         # Next request id
         self._next_req_id = 1
@@ -2478,9 +2490,12 @@ class _GatewayConnection:
         return ev
 
     def _on_session_message(self, payload: dict) -> None:
-        ev = self._session_message_waiters.pop(payload.get("sessionKey") or "", None)
+        key = payload.get("sessionKey") or ""
+        ev = self._session_message_waiters.pop(key, None)
         if ev is not None:
             ev.set()
+        if _TURNS and key:
+            _TURNS.session_message(self, key)
 
     def _on_shutdown(self, payload: dict) -> None:
         """DESIGN 2.7 F4: the Gateway announces its close before it aborts any
@@ -3410,6 +3425,7 @@ class _GatewayConnection:
         self._reconnect_attempt = 0
         self.connection_epoch += 1
         self._thinking_note_shown.clear()
+        self.gateway_version = (hello_ok.get("server") or {}).get("version")
         self._note_gateway_boot((hello_ok.get("server") or {}).get("bootId"))
         pipe_log(
             f"Connected to Gateway (persistent) [epoch {self.connection_epoch}]"

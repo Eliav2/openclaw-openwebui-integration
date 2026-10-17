@@ -1504,6 +1504,7 @@ class _GatewayConnection:
         # real restarts; consumers compare it, not `connection_epoch`.
         self.gateway_boot_id: str | None = None
         self.gateway_restarts = 0
+        self.gateway_version: str | None = None   # hello-ok.server.version
 
         # Next request id
         self._next_req_id = 1
@@ -1697,9 +1698,12 @@ class _GatewayConnection:
         return ev
 
     def _on_session_message(self, payload: dict) -> None:
-        ev = self._session_message_waiters.pop(payload.get("sessionKey") or "", None)
+        key = payload.get("sessionKey") or ""
+        ev = self._session_message_waiters.pop(key, None)
         if ev is not None:
             ev.set()
+        if _TURNS and key:
+            _TURNS.session_message(self, key)
 
     def _on_shutdown(self, payload: dict) -> None:
         """DESIGN 2.7 F4: the Gateway announces its close before it aborts any
@@ -2629,6 +2633,7 @@ class _GatewayConnection:
         self._reconnect_attempt = 0
         self.connection_epoch += 1
         self._thinking_note_shown.clear()
+        self.gateway_version = (hello_ok.get("server") or {}).get("version")
         self._note_gateway_boot((hello_ok.get("server") or {}).get("bootId"))
         pipe_log(
             f"Connected to Gateway (persistent) [epoch {self.connection_epoch}]"
