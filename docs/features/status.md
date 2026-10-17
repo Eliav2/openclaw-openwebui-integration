@@ -25,11 +25,13 @@ _Here the rate limits were held back on purpose, to show it._
 |---|---|
 | Context | `sessions.describe` |
 | Rate limits | `usage.status`, for the provider Context's read names (the same request); `claudeCliUsage.status` only when `usage.status` has no windows |
-| Background | `tasks.list`, `cron.list`, and Open WebUI's copy of the chat |
-| Subagents | `sessions.list` (the store's rows only); the sub-agents' transcripts (`sessions.preview`) only once the section is open |
-| In-process agents | Open WebUI's copy of the chat (the same read as Background's) |
+| Background | `tasks.list`, `cron.list`, and the chat's last 40 messages |
+| Subagents | `sessions.list` with `spawnedBy` (the current children, store rows only) and the [child index](#sub-agents); the sub-agents' transcripts (`sessions.preview`) only once the section is open |
+| In-process agents | The chat's last 40 messages (the same read as Background's) |
 
-Each source is read once per open, all at the same time. Nothing is read while the dialog is closed: closing it tells the Action, which stops following its running sub-agents. In-process agents needs no Gateway, so it fills even when the Gateway cannot be reached.
+Each source is read once per open, all at the same time. None grows with the chat: the chat's messages come from Open WebUI's message rows, the 40 newest of the current branch, so a 14 MB chat opens as fast as a new one. Nothing is read while the dialog is closed: closing it tells the Action, which stops following its running sub-agents. In-process agents needs no Gateway, so it fills even when the Gateway cannot be reached.
+
+Opening the dialog sends a small request, from the toolbar button or the composer's: the chat, the message and the model. Open WebUI's own handler for an Action button uploads every message of the branch first and saves the whole chat again after, which on a big chat over a phone connection takes seconds; the Status button skips it. Where the page does not know the chat's model yet, Open WebUI's handler runs as before.
 
 Background, Subagents and In-process agents fold, with their count in the title, for example "Background (3)". Each opens when something in it is running and starts folded otherwise; a tap opens or folds it, and stays that way while the dialog is open. When the dialog is taller than the screen, its sections scroll between the title bar and the footer, which stay in view, on a phone too:
 
@@ -90,7 +92,13 @@ The Subagents section lists every child session this chat's runs spawned, ended 
 
 ![The Status dialog with every section folded, each with its count](../img/status-dialog-folded-light.png)
 
-**In-process agents** lists the chat's Claude Code Agent calls, which are not Gateway sessions, as their tool cards show them: running, in the background, returned, cut off or failed.
+If that tap's request fails, for example when a phone loses its connection, the section says so and offers **Retry**.
+
+![The Subagents section after a tap whose request was dropped: the error, and Retry](../img/status-subagents-retry-light.png)
+
+The Gateway keeps an ended child in its children list for 30 minutes only, so the Pipe keeps a child index: each sub-agent it sees a chat spawn, and each one's last state as the dialog read it. It is one small file, `subagent-children.json` in the bridge state directory, so it survives restarts and redeploys; a chat untouched for 180 days is dropped from it, and each chat keeps its 200 newest children. Children spawned before the index existed are read in once, from one full list, the first time a dialog opens after the upgrade. A child spawned while the Pipe was not running shows while it runs and for 30 minutes after.
+
+**In-process agents** lists the chat's Claude Code Agent calls, which are not Gateway sessions, as their tool cards show them: running, in the background, returned, cut off or failed. A chat longer than 40 messages shows the calls in its last 40, and says so.
 
 Each row is one line: the sub-agent's spawn label (else the first sentence of its task, cut to 60 characters), its status, and its time, with up to two lines of its latest reply below. The whole task is in its drawer.
 
