@@ -660,7 +660,26 @@ class Scenes:
             && !r.querySelector('[data-openclaw-fold][data-open=true]'); }}""",
                 "the status dialog, every section folded", 60_000)
         self.s.shot(page, "status-dialog-folded", text_selector=root)
+        # The first tap's request is dropped, as a phone losing its connection
+        # drops it: the section says so and offers Retry, which loads the rows.
+        dropped = []
+
+        def drop_once(route):
+            if not dropped and "subagent-rows" in (route.request.post_data or ""):
+                dropped.append(1)
+                route.abort("internetdisconnected")
+            else:
+                route.continue_()
+        page.route("**/api/chat/actions/**", drop_once)
         open_fold(page, "subagents")
+        wait_js(page, """() => /could not load the sub-agents/i.test(
+          (document.getElementById('openclaw-status-section-subagents') || {}).innerText || '')""",
+                "the failed tap's message", 30_000)
+        self.s.shot(page, "status-subagents-retry", selector="#openclaw-status-section-subagents")
+        page.unroute("**/api/chat/actions/**")
+        retry = page.locator("#openclaw-status-section-subagents button", has_text="Retry")
+        if retry.count():
+            retry.click()
         wait_js(page, f"""() => {{ const r = document.querySelector('{root}'); if (!r) return false;
           return /noise table/i.test(r.innerText) && /forecast/i.test(r.innerText); }}""",
                 "the unfolded sub-agents with their tasks", 60_000)
