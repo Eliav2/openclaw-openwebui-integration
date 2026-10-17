@@ -3,6 +3,10 @@ name: Status open perf
 # How long the Status dialog takes to open and fill, by chat size
 # (scripts/perf/status_open.py). Run by hand.
 on:
+  push:
+    paths:
+      - scripts/perf/**
+      - .github/workflows/status-open-perf.yml
   workflow_dispatch:
     inputs:
       sizes:
@@ -29,8 +33,8 @@ jobs:
 
       - name: Measure
         env:
-          SIZES: ${{ inputs.sizes }}
-          OPENS: ${{ inputs.opens }}
+          SIZES: ${{ inputs.sizes || '10000,2000000,13000000' }}
+          OPENS: ${{ inputs.opens || '3' }}
         run: |
           uv run --with-requirements requirements-browser.txt python scripts/perf/status_open.py \
             --sizes "$SIZES" --opens "$OPENS" --out "$RUNNER_TEMP/logs/status-open.json"
