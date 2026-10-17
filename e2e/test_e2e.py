@@ -303,6 +303,14 @@ TURN_NS = uuid.UUID("6f1c3e2a-9d4b-4c6e-8a1f-0e0a1b100100")  # turns.TURN_NS
 WAKE_TIMEOUT_S = float(os.environ.get("E2E_WAKE_TIMEOUT", "180"))
 
 
+def _openclaw_release() -> tuple:
+    """(year, month) of the Gateway the stack installed, from `openclaw --version`."""
+    out = subprocess.run(["openclaw", "--version"], capture_output=True, text=True, timeout=60)
+    m = re.search(r"(\d{4})\.(\d{1,2})\.\d+", out.stdout)
+    assert m, f"no version in {out.stdout!r} {out.stderr[-300:]!r}"
+    return int(m.group(1)), int(m.group(2))
+
+
 def _gw(method: str, params: dict) -> dict:
     out = subprocess.run(["openclaw", "gateway", "call", method, "--json",
                           "--params", json.dumps(params)],
@@ -921,6 +929,8 @@ def _background(tok: str, chat_id: str, admin_token: str) -> tuple[dict, list]:
     return _section_data(codes, "openclaw-status-section-background"), codes
 
 
+@pytest.mark.xfail(condition="_openclaw_release() >= (2026, 10)", strict=True,
+                   reason="tasks.* is gone from OpenClaw 2026.10; the 10.x source is sessions.processes.list (ELI-164)")
 def test_the_status_action_lists_a_background_command(token):
     chat_id, msg = _chat_turn(token, "E2E_BG_EXEC")
     assert msg.get("content", "").strip() == "E2E_BG_STARTED", msg
