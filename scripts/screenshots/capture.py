@@ -1028,6 +1028,26 @@ class Scenes:
         wait_js(page, f"() => {{ const m = {LAST_ASSISTANT}.closest('[id^=message-]'); return m && m.querySelector('button[aria-label=\"Copy\"]'); }}",
                 "the answer finished", 60_000)
 
+    def _both_persisted(self, page: Page) -> None:
+        """What the page shows is also what Open WebUI stored: the rebuild's
+        reply and the new message's answer, each finished, in its own
+        message (ELI-166: 0.12.3 changed the first turn's save and the
+        response stream these replies are written through)."""
+        chat_id = page.url.rstrip("/").rsplit("/c/", 1)[-1]
+        deadline, last = time.time() + 60, None
+        while time.time() < deadline:
+            msgs = api("GET", f"/api/v1/chats/{chat_id}", token=self.token)["chat"]["history"]["messages"]
+            replies = sorted((m for m in msgs.values() if m.get("role") == "assistant"),
+                             key=lambda m: m.get("timestamp") or 0)
+            last = [(m.get("done"), (m.get("content") or "")[-60:]) for m in replies]
+            if (len(replies) >= 2 and all(m.get("done") is True for m in replies)
+                    and "The cache is rebuilt" in (replies[0].get("content") or "")
+                    and "It's on main" in (replies[-1].get("content") or "")
+                    and "The cache is rebuilt" not in (replies[-1].get("content") or "")):
+                return
+            time.sleep(1)
+        raise RuntimeError(f"stored replies of {chat_id} do not match the page: {last}")
+
     def sent_mid_run(self, page: Page) -> None:
         """A message sent while a tool runs (AUTO_SEND_WHILE_RUNNING, on by
         default): it is in the chat at once, with no queue to click, while
@@ -1050,6 +1070,7 @@ class Scenes:
         if said != 1:
             raise RuntimeError(f"the rebuild's text shows {said} times in its reply")
         self._both_answered(page)
+        self._both_persisted(page)
 
     def send_now(self, page: Page) -> None:
         """AUTO_SEND_WHILE_RUNNING off: Open WebUI queues the message; Send
@@ -1064,6 +1085,7 @@ class Scenes:
         finally:
             pipe_valves(self.token, **old)
         self.s.shot(page, "send-now")
+        self._both_persisted(page)
 
     def image_input(self, page: Page) -> None:
         """An image attached in the composer reaches the agent."""
