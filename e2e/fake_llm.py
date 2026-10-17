@@ -41,7 +41,7 @@ and only a core set is sent as real schemas.
   word a second. Long enough for the Pipe to be redeployed while it streams.
 * `E2E_ASK_SINGLE` / `E2E_ASK_MULTI`   -> asks a question: `ASK_SINGLE` or
   `ASK_MULTI` below. The next message answers it: the reply is
-  `E2E_ANSWERED <that message> E2E_ANSWER_END`, so a test sees what reached
+  `E2E_ANSWERED <the answer> E2E_ANSWER_END`, so a test sees what reached
   the agent once the reply has ended.
 * a scene from $FAKE_LLM_SCENES (JSON)  -> scripted multi-step replies for the
   README screenshots (scripts/screenshots/scenes.json). A scene is picked by a
@@ -179,9 +179,12 @@ def plan_reply(body: dict) -> dict:
 
     asked = messages[last_assistant] if last_assistant >= 0 else {}
     if "needs input:" in _text_of(asked.get("content")):
-        # The answer is the first user message, in the agent's envelope.
+        # The answer is the first user message's last paragraph: the agent
+        # puts "[date] Conversation info (untrusted metadata): ```json ...```"
+        # before it, and its runtime context follows as a separate message.
         first = next((_text_of(m.get("content")) for m in turn if m.get("role") == "user"), "")
-        return {"text": f"E2E_ANSWERED {' '.join(first.split())} {ANSWER_END}"}
+        answer = " ".join(first.strip().split("\n\n")[-1].split())
+        return {"text": f"E2E_ANSWERED {answer} {ANSWER_END}"}
     if "E2E_ASK_SINGLE" in user_text:
         return {"text": ASK_SINGLE}
     if "E2E_ASK_MULTI" in user_text:
