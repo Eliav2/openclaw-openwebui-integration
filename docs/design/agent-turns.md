@@ -520,7 +520,9 @@ no fourth run is sent. A unit test drives four consecutive 137 rows.
    throttled shared `chat:completion` updates from then on.
 3. **No tab open.** Same writes, nobody to emit to. Opening later shows the finished or
    in-progress message from the DB plus the overlay.
-4. **OWUI down during the run (ELI-94).** Run still going when OWUI is back: the startup
+4. **OWUI down during the run (ELI-94).** From the shutdown signal on, the dying process
+   opens no writer: OWUI's stop saves what the reply showed (done), a kill leaves the stub
+   (not done), and the next process finishes both (ELI-173). Run still going when OWUI is back: the startup
    reconcile (pipe.py:369 runs at the first model list after start) reads `sessions.list`
    and opens entries for active runs on OWUI keys. The handover rule (2.6) or the claim
    (2.3) finds or creates M and continues; the end rebuilds the whole run from the

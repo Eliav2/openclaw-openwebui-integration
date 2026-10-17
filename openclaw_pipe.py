@@ -8014,6 +8014,11 @@ def _turn_route_now(conn: "_GatewayConnection", payload: dict) -> bool:
         return False
     if conn.consumers_for_event(payload) or _served_by_retired(payload):
         return False  # a live reply, here or on an earlier load's connection, writes it
+    if owui_shutting_down():
+        # Open WebUI saved what each reply showed; the next process's startup
+        # reconcile finishes them (ELI-90, ELI-94). A writer opened now saved
+        # its message done:false over that and died with the process (ELI-173).
+        return True
     if run.startswith(ACTION_RUN_PREFIX):
         return True  # the Status Action's own runs render nothing
     if (sess, run) in conn._held_for_live:
