@@ -42,7 +42,11 @@ OBSERVER_JS = r"""() => {
     for (const s of sections) {
       if (P.marks[s]) continue;
       const el = document.getElementById('openclaw-status-section-' + s);
-      if (el && !el.querySelector('[data-openclaw-loading]')) P.marks[s] = now;
+      // Filled: nothing loading, or a closed fold waiting for its tap.
+      const fold = el && el.querySelector('[data-openclaw-fold][data-open="false"]');
+      if (el && (fold || !el.querySelector('[data-openclaw-loading]'))) P.marks[s] = now;
+      if (s === 'subagents' && P.foldAt && !P.marks.fold && el && !el.querySelector('[data-openclaw-loading]'))
+        P.marks.fold = now;
     }
   };
   new MutationObserver(tick).observe(document.documentElement, {childList: true, subtree: true});
@@ -58,7 +62,7 @@ OBSERVER_JS = r"""() => {
 
 CLICK_JS = r"""(sel) => {
   const P = window.__perf;
-  P.marks = {}; P.resources = [];
+  P.marks = {}; P.resources = []; P.foldAt = null;
   const btn = [...document.querySelectorAll(sel)].pop();
   if (!btn) return 'no button ' + sel;
   P.start = performance.now();
@@ -66,6 +70,16 @@ CLICK_JS = r"""(sel) => {
   return null;
 }"""
 
+
+# Taps the Subagents fold when it is closed with rows not read yet.
+FOLD_JS = r"""() => {
+  const el = document.getElementById('openclaw-status-section-subagents');
+  const head = el && el.querySelector('[data-openclaw-fold][data-open="false"] [data-openclaw-fold-head]');
+  if (!head || !el.querySelector('[data-openclaw-loading]')) return false;
+  window.__perf.foldAt = performance.now();
+  head.click();
+  return true;
+}"""
 
 # What an open that never filled looks like: the dialog, and each section's text.
 STUCK_JS = r"""() => {
@@ -185,17 +199,29 @@ def open_once(page, path: str, chat_id: str, log: list) -> dict:
     except PlaywrightTimeoutError:
         # Record what never filled instead of aborting the run.
         stuck = page.evaluate(STUCK_JS)
+    fold_text = None
+    if stuck is None and page.evaluate(FOLD_JS):
+        # The folded Subagents section, tapped: its rows come from a follow-up
+        # request (mode "subagent-rows").
+        try:
+            page.wait_for_function("() => window.__perf.marks.fold", timeout=30_000)
+        except PlaywrightTimeoutError:
+            pass
+        fold_text = page.evaluate(
+            "() => (document.getElementById('openclaw-status-section-subagents') || {}).innerText || ''")[:200]
     perf = page.evaluate("() => window.__perf")
     sub = page.evaluate("() => (document.getElementById('openclaw-status-section-subagents') || {}).innerText || ''")
     t0 = perf["start"]
     marks = {k: round(v - t0) for k, v in perf["marks"].items()}
+    if perf.get("foldAt"):
+        marks["foldAt"] = round(perf["foldAt"] - t0)
     # Closing ends the open request; Open WebUI then saves the whole chat for a
     # toolbar action. Wait for the requests to settle.
     page.keyboard.press("Escape")
     page.wait_for_timeout(4000)
     reqs = [{**q, "start": round(q["start"] - clicked), "end": round(q["end"] - clicked) if q["end"] else None}
             for q in log]
-    out = {"path": path, "marks": marks, "requests": reqs, "subagents": sub[:200]}
+    out = {"path": path, "marks": marks, "requests": reqs, "subagents": sub[:200], "fold": fold_text}
     if stuck is not None:
         out["stuck"] = stuck
         page.reload()
@@ -254,8 +280,8 @@ def main(argv=None) -> int:
             page.context.close()
         browser.close()
     rows = ["| chat | net | path | shell ms | " + " | ".join(SECTIONS)
-            + " | bytes up (action) | chat bytes moved | requests |",
-            "|---|---|---|---|" + "---|" * len(SECTIONS) + "---|---|---|"]
+            + " | fold tap | bytes up (action) | chat bytes moved | requests |",
+            "|---|---|---|---|" + "---|" * len(SECTIONS) + "---|---|---|---|"]
     for size in sorted({r["size"] for r in results}):
         for profile in args.profiles.split(","):
             for path in ("toolbar", "composer"):
@@ -267,8 +293,11 @@ def main(argv=None) -> int:
                 moved = max(sum((q["bytesOut"] or 0) + (q["bytesIn"] or 0) for q in r["requests"]
                                 if "/v1/chats/" in q["url"]) for r in rs)
                 n = max(len(r["requests"]) for r in rs)
+                taps = [r["marks"]["fold"] - r["marks"]["foldAt"] for r in rs if "fold" in r["marks"]]
+                tapped = [r for r in rs if r.get("fold") is not None]
+                tap = (f"{round(statistics.median(taps))}" if taps else "never") if tapped else "-"
                 rows.append(f"| {size / 1e6:.2f} MB | {profile} | {path} | {med('shell')} | "
-                            + " | ".join(str(med(s)) for s in SECTIONS) + f" | {up} | {moved} | {n} |")
+                            + " | ".join(str(med(s)) for s in SECTIONS) + f" | {tap} | {up} | {moved} | {n} |")
     table = "\n".join(rows)
     print(table)
     if args.out:
