@@ -2640,6 +2640,14 @@ def _extract_numbered_options(prompt_text: str) -> list[tuple[str, str]]:
 
 # What the Ask User block shows for a secret's answer.
 SECRET_ANSWER_SHOWN = "•••• (secret entered)"
+# What the agent gets once when the secret's dialog got no answer: the reply
+# tells the user not to type it into the chat, so no answer will come there.
+SECRET_NOT_RECEIVED_FOR_AGENT = (
+    "[Open WebUI] No answer: the masked dialog for the secret you asked for was not "
+    "answered, so nothing was received. Do not ask for it in the chat, which stores "
+    "what the user types. Use masked credential entry, or ask again when the user "
+    "has this chat open."
+)
 
 _MULTI_MARKERS = (
     "(multiselect)", "(multi-select)", "(multi)", "[multiselect]", "[multi]",
@@ -2701,6 +2709,20 @@ def _parse_text_prompt(prompt_text: str) -> dict:
         "options": options if len(options) >= 2 else [],
         "multi": multi,
     }
+
+
+def _is_secret_prompt(prompt_text: str) -> bool:
+    return not _parse_ask_user_json(prompt_text) and _parse_text_prompt(prompt_text)["secret"]
+
+
+def _secret_not_received_text(prompt_text: str) -> str:
+    """A secret nobody entered in its dialog, as the text that ends the
+    reply. Never the agent's own question: that asks for the value, and an
+    answer typed into the chat is stored in it."""
+    title = _parse_text_prompt(prompt_text)["title"]
+    return (f"**{title}**: not received. A secret is entered only in its masked dialog, "
+            "never in the chat, which keeps what you type. To enter it, open this chat "
+            "in a tab and ask the agent to try again: the dialog shows again.")
 
 
 def _secret_input_payload(prompt_text: str) -> dict:
@@ -2795,6 +2817,8 @@ def _ask_user_fallback_text(prompt_text: str) -> str:
     (ELI-142: it showed as the raw JSON). Any other prompt is its own text
     without the marker line."""
     questions = _parse_ask_user_json(prompt_text)
+    if not questions and _is_secret_prompt(prompt_text):
+        return _secret_not_received_text(prompt_text)
     if not questions:
         return _strip_input_marker_line(prompt_text)
     numbered = len(questions) > 1
@@ -3076,7 +3100,11 @@ def _ask_user_detail_block(prompt_text: str, answer: str) -> str:
     the raw prompt text was fully suppressed once answered).
     """
     json_questions = _parse_ask_user_json(prompt_text)
-    if not json_questions and _parse_text_prompt(prompt_text)["secret"]:
+    if SECRET_NOT_RECEIVED_FOR_AGENT in answer:
+        # The agent was told nothing came: the reply shows the question as
+        # not received, as an unanswered secret ends any reply.
+        return "\n" + _secret_not_received_text(prompt_text) + "\n"
+    if _is_secret_prompt(prompt_text):
         # The block is written into the chat, so into Open WebUI's database.
         answer = SECRET_ANSWER_SHOWN
     if json_questions:
@@ -9899,6 +9927,8 @@ class _PipeTurn:
     def __init__(self, pipe, body, __event_emitter__, __event_call__, __user__,
                  __metadata__, __request__, __task__, __task_body__,
                  _initial_visible_text, _send_texts, turn):
+        # The agent was told an unanswered secret never came (once per reply).
+        self.secret_not_received_sent = False
         self.pipe = pipe
         self.body = body
         self.__event_emitter__ = __event_emitter__
@@ -11316,8 +11346,15 @@ class _PipeTurn:
             answer = None
         if answer is None:
             pipe_log("  user input modal cancelled or empty answer")
-            return UserInputResult(False, None)
-        pipe_log("  user input answered via OWUI modal")
+            # The reply tells the user not to type a secret into the chat, so
+            # the agent is told nothing came, once per reply: an agent that
+            # asks again gets the text alone.
+            if not _is_secret_prompt(prompt_text) or self.secret_not_received_sent:
+                return UserInputResult(False, None)
+            self.secret_not_received_sent = True
+            answer = SECRET_NOT_RECEIVED_FOR_AGENT
+        else:
+            pipe_log("  user input answered via OWUI modal")
         await _emit_status(self.__event_emitter__, "Sending answer...", done=False)
         # The answer continues this reply: its run id names it (ELI-100 2.2).
         idempotency_key = (pipe_run_id(self.chat_id, self.owui_message_id, "input") if self.owui_message_id

@@ -76,6 +76,7 @@ from openclaw_pipe import (
     _advance_input_prompt_buffer,
     _advance_media_buffer,
     _ask_user_detail_block,
+    _ask_user_fallback_text,
     _ask_user_input_modal,
     _build_usage_status_lines,
     _extract_numbered_options,
@@ -4532,6 +4533,83 @@ class SecretAnswerNeverInTheChatTests(unittest.IsolatedAsyncioTestCase):
         for where, what in (("reply", chunks), ("events", written), ("rewrites", rewrites),
                             ("log", logged)):
             self.assertNotIn(self.VALUE, json.dumps(what, default=repr), where)
+
+
+class SecretNotReceivedTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-148: a secret whose dialog got no answer (no tab on the chat, a
+    timeout, a cancel) must not end the reply asking for it in the chat,
+    which stores what is typed there. The reply says it was not received and
+    how to enter it; the agent is told once that nothing came."""
+
+    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
+    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
+    _queue = NoDroppedMessagesTests._queue
+    _delta = NoDroppedMessagesTests._delta
+    _final = NoDroppedMessagesTests._final
+    _until_registered = NoDroppedMessagesTests._until_registered
+    PROMPT = "OpenClaw needs input:\n\nToken\nPaste your API key here so I can deploy"
+    NOTICE = openclaw_pipe.SECRET_NOT_RECEIVED_FOR_AGENT
+
+    def assert_never_invites_a_chat_answer(self, text):
+        self.assertNotIn("Paste your API key", text, "the agent's own question asks for the value")
+        for invite in ("next message", "answer in", "reply with", "type it here", "needs input"):
+            self.assertNotIn(invite, text.lower())
+        self.assertIn("not received", text)
+        self.assertIn("never in the chat", text)
+
+    def test_the_fallback_text_never_invites_a_chat_answer(self):
+        self.assert_never_invites_a_chat_answer(_ask_user_fallback_text(self.PROMPT))
+        self.assertIn("**Token**", _ask_user_fallback_text(self.PROMPT))
+        # Rebuilt from the transcript after an Open WebUI restart, the same.
+        block = _ask_user_detail_block(self.PROMPT, f"[Sat 10:00] {self.NOTICE}")
+        self.assert_never_invites_a_chat_answer(block)
+        self.assertNotIn("secret entered", block)
+        # Any other question keeps its plain-text fallback.
+        self.assertEqual(_ask_user_fallback_text("OpenClaw needs input:\n\nColor?\nWhich color?"),
+                         "Color?\nWhich color?")
+
+    async def test_the_agent_is_told_once_and_the_chat_never_asks(self):
+        asked = []
+
+        async def emitter(event):
+            pass
+
+        async def event_call(event):
+            asked.append(event.get("type"))
+            return None                                     # nobody answers the dialog
+        body = {"model": "openclaw_gateway.default", "messages": [{"role": "user", "content": "deploy"}]}
+        meta = {"chat_id": "chat-1", "user_id": "u1", "message_id": "m1"}
+        gen = self.pipe._pipe_impl(body, emitter, __metadata__=meta, __event_call__=event_call)
+        chunks = []
+
+        async def drain():
+            async for c in gen:
+                chunks.append(c)
+        task = asyncio.ensure_future(drain())
+
+        async def until_sent(n):
+            for _ in range(400):
+                if len(self.sent) >= n:
+                    return
+                await asyncio.sleep(0.005)
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "I need a key.\n\n" + self.PROMPT + "\n"))
+        q.put_nowait(self._final("run-1"))
+        await until_sent(2)
+        self.assertEqual(self.sent, ["deploy", self.NOTICE], "the agent is told nothing came")
+        # The agent asks again in the same reply: the text alone this time.
+        answer_run = next(r for r in ("run-2", self.keys[-1]) if f"{self.SK}:{r}" in self.conn._consumers)
+        q2 = self._queue(answer_run)
+        q2.put_nowait(self._delta(answer_run, "Still need it.\n\n" + self.PROMPT + "\n"))
+        q2.put_nowait(self._final(answer_run))
+        await asyncio.wait_for(task, 5)   # bounds the test only
+        self.assertEqual(self.sent, ["deploy", self.NOTICE], "told once per reply")
+        self.assertEqual(asked.count("input"), 2, "each ask shows the dialog")
+        shown = "".join(c for c in chunks if isinstance(c, str))
+        self.assertEqual(shown.count("not received"), 2)
+        self.assertIn("Still need it.", shown)
+        self.assert_never_invites_a_chat_answer(shown.replace("I need a key.", "").replace("Still need it.", ""))
 
 
 class DynamicModelSelectorTests(unittest.TestCase):
