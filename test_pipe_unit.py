@@ -1693,6 +1693,43 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
             out += chunk if isinstance(chunk, str) else ""
         self.assertIn("hi there", out)
 
+    async def test_queued_message_survives_a_redeploy_retiring_its_connection(self):
+        """ELI-172 (2026-10-17, chat 78624cb0): a message typed at 12:03:56Z
+        queued behind a running run. A deploy at 12:14:58Z retired the
+        connection the message waited on; it kept serving the in-flight run
+        and closed when that run ended (12:30:44Z), the very settle the
+        message waited for. Nothing woke the waiter: no chat.send, an empty
+        reply 42 minutes later. A closed socket gets no more pushes."""
+        closed = []
+
+        async def disconnect():
+            closed.append(True)
+        self.conn.disconnect = disconnect
+        self.active = True
+        self.conn.register_consumer(self.SK, "run-0")   # the long run being served
+        gen = self._reply("hello", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._spin()
+        self.assertEqual(self.sent, [])
+        self.assertTrue(any("Queued: waiting" in str(e) for e in self.emitted))
+
+        await self.conn.retire()                         # the redeploy
+        self.conn.unregister_consumer(self.SK, "run-0")  # the run ends
+        await self._spin()
+        if not closed:
+            self._settled(False)                         # its settle push
+        await self._until_registered("run-1")
+        self.assertEqual(self.sent, ["hello"])
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "hi there"))
+        q.put_nowait(self._final("run-1"))
+        out = await asyncio.wait_for(first, 2)
+        async for chunk in gen:
+            out += chunk if isinstance(chunk, str) else ""
+        self.assertIn("hi there", out)
+        await self._spin()
+        self.assertTrue(closed, "the retired connection closes once the queued message is served")
+
     async def test_a_reply_that_saw_its_run_end_leaves_no_parity_target(self):
         """The inline loop ends on `lifecycle end` and drops its consumer; the
         run's trailing `chat` final arrives after that. Measured live

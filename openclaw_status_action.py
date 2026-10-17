@@ -2358,6 +2358,10 @@ class _GatewayConnection:
         # Per-session locks serializing the queue-release -> chat.send -> run
         # registration critical section (`session_send_lock`, ELI-56).
         self._session_send_locks: dict[str, asyncio.Lock] = {}
+        # Open `send_section`s: a message waiting for its turn, then sending.
+        # A retired connection stays up for them as it does for consumers:
+        # closing it would leave the waiter with no settle push, ever (ELI-172).
+        self._open_send_sections = 0
 
         # Cancelled turns parked until they are claimed or released, by
         # session key (`park_cancelled_turn`). An immediate chat.abort on a
@@ -2821,7 +2825,7 @@ class _GatewayConnection:
         """Ensure the WS connection is up; connect/reconnect if needed."""
         if self._ws and self._event_loop_task and not self._event_loop_task.done():
             return
-        if self._retired and not self._consumers:
+        if self._retired and not self._serving():
             # Reviving a retired connection is how orphans piled up: each one
             # kept writing every agent turn with its own (older) code.
             raise GatewayError(
@@ -2864,6 +2868,21 @@ class _GatewayConnection:
         lazily; asyncio.Lock is created on the running loop the first time it
         is awaited."""
         return self._session_send_locks.setdefault(session_key, asyncio.Lock())
+
+    @contextlib.asynccontextmanager
+    async def send_section(self, session_key: str):
+        """`session_send_lock`, plus: this connection stays up until the
+        section ends, even if a newer deploy retires it meanwhile. The wait
+        for a running run to settle happens in here, and the settle is pushed
+        to this socket only (ELI-172: a deploy mid-wait closed it with the
+        run, and the queued message was never sent)."""
+        self._open_send_sections += 1
+        try:
+            async with self.session_send_lock(session_key):
+                yield
+        finally:
+            self._open_send_sections -= 1
+            self._close_if_retired_and_idle()
 
     MODEL_PATCH_CACHE_TTL_S = 60.0
 
@@ -2951,7 +2970,15 @@ class _GatewayConnection:
             del self._consumers[key]
             self._release_held(session_key)
         pipe_log(f"  unregistered consumer: {key[:60]}...")
-        if self._retired and not self._consumers:
+        self._close_if_retired_and_idle()
+
+    def _serving(self) -> bool:
+        """Work a retired connection still owes: replies streaming here, and
+        messages waiting here to send (ELI-172)."""
+        return bool(self._consumers or self._open_send_sections)
+
+    def _close_if_retired_and_idle(self) -> None:
+        if self._retired and not self._serving():
             pipe_log("  retired gateway connection: last run finished, closing")
             spawn_background(self.disconnect())
 
@@ -3380,7 +3407,8 @@ class _GatewayConnection:
         """Step down in favor of a newer deploy's connection.
 
         Runs that already have a consumer here keep being served until they
-        unregister (cutting them would lose the reply); everything else stops
+        unregister (cutting them would lose the reply), and so does a message
+        waiting here to send (`send_section`, ELI-172); everything else stops
         now. Once the last consumer leaves, the connection closes itself and
         `ensure_connected` refuses to bring it back.
         """
@@ -3390,10 +3418,10 @@ class _GatewayConnection:
             writer.release()
         for pump in list(self._turn_pumps.values()):
             pump.queue.put_nowait(("retired", None))
-        if self._consumers:
+        if self._serving():
             pipe_log(
                 f"  retired gateway connection: serving {len(self._consumers)} "
-                "in-flight run(s) before closing"
+                f"in-flight run(s) and {self._open_send_sections} queued message(s) before closing"
             )
             return
         await self.disconnect()

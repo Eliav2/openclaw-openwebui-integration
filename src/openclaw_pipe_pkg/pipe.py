@@ -997,7 +997,7 @@ class _PipeTurn:
             # NOTE: do NOT prepend a `/queue followup` directive here: the
             # Gateway does not strip it from a device chat.send, so it leaks
             # verbatim into the delivered message.
-            async with self.conn.session_send_lock(self.session_key):
+            async with self.conn.send_section(self.session_key):
                 # Wait for the Gateway to push that the run settled
                 # (`sessions.changed`, see `session_change_event`), re-reading
                 # the authoritative state after each change. No poll, no
