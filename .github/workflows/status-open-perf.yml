@@ -1,0 +1,55 @@
+name: Status open perf
+
+# How long the Status dialog takes to open and fill, by chat size
+# (scripts/perf/status_open.py). Run by hand.
+on:
+  push:
+    paths:
+      - scripts/perf/**
+      - .github/workflows/status-open-perf.yml
+  workflow_dispatch:
+    inputs:
+      sizes:
+        description: Chat sizes in bytes, comma separated
+        default: "0,2000000,13000000"
+      opens:
+        description: Opens per path per size
+        default: "3"
+
+jobs:
+  perf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Start the stack and install the integration
+        uses: ./.github/actions/stack
+        with:
+          log_dir: ${{ runner.temp }}/logs
+
+      - name: Install Chromium for Playwright
+        run: uv run --with-requirements requirements-browser.txt python -m playwright install --with-deps chromium
+
+      - name: Measure
+        env:
+          SIZES: ${{ inputs.sizes || '0,2000000,13000000' }}
+          OPENS: ${{ inputs.opens || '2' }}
+        run: |
+          uv run --with-requirements requirements-browser.txt python scripts/perf/status_open.py \
+            --sizes "$SIZES" --opens "$OPENS" --out "$RUNNER_TEMP/logs/status-open.json"
+
+      - name: Collect logs
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/logs"
+          docker logs owui > "$RUNNER_TEMP/logs/open-webui.log" 2>&1 || true
+          cp /tmp/openclaw/*.log "$RUNNER_TEMP/logs/" 2>/dev/null || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: status-open-perf
+          path: ${{ runner.temp }}/logs
+          retention-days: 7

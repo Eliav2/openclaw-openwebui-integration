@@ -29,7 +29,15 @@
 #     exists it shows nothing;
 #   * on click POSTs to the Status Action with the same body shape the dialog's
 #     own Compact button uses, so the existing Action flow opens the real
-#     dialog;
+#     dialog. The body is built from what the page already has: the chat's
+#     model (each delivery names it) and the latest user message on screen,
+#     so a click never downloads the chat;
+#   * takes over the message toolbar's "OpenClaw Status" button the same way
+#     when it knows the chat's model. Open WebUI's own handler uploads every
+#     message of the branch before the Action runs and saves the whole chat
+#     after it returns: on a 14 MB chat over a phone connection that is 8 s
+#     before the dialog shows and a 14 MB upload after (perf/status_open.py).
+#     Unknown model: Open WebUI's handler runs as before;
 #   * never throws into the page: errors become one console warning each and,
 #     for a failed click, a small toast.
 #
@@ -48,7 +56,7 @@
 # reply that is streaming into the same tab.
 # ---------------------------------------------------------------------------
 
-_COMPOSER_BUTTON_VERSION = "3"
+_COMPOSER_BUTTON_VERSION = "4"
 
 # The Status Action's function id (install_action.py's FUNCTION_ID; the
 # dialog's own JS calls the same fixed id) and the Pipe's default function id.
@@ -95,6 +103,8 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
     // Informational only: the Action does not use it for the status path.
     sessionId: null,
     cache: {},
+    // chat id -> its model, from the deliveries.
+    models: {},
     inflight: {},
     observer: null,
     timer: null,
@@ -119,6 +129,7 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
     // an OpenClaw chat, so that chat needs no lookup.
     if (typeof cfg.chatId === 'string' && cfg.chatId) {
       state.cache[cfg.chatId] = { ok: true, vouched: true, at: Date.now() };
+      if (typeof cfg.chatModel === 'string' && cfg.chatModel) state.models[cfg.chatId] = cfg.chatModel;
     }
     schedule();
   }
@@ -166,6 +177,44 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
       id = m.parentId;
     }
     return h.currentId || null;
+  }
+
+  // The message a toolbar button belongs to: Open WebUI renders each message
+  // in a `message-<id>` element.
+  function messageIdOf(el) {
+    const m = el && el.closest('[id^="message-"]');
+    return m ? m.id.slice('message-'.length) : null;
+  }
+
+  // The latest user message on screen: the current branch's, as rendered.
+  function latestUserMessageId() {
+    const users = document.querySelectorAll('.chat-user');
+    return users.length ? messageIdOf(users[users.length - 1]) : null;
+  }
+
+  function postAction(body) {
+    return fetch('/api/chat/actions/' + CFG.actionId, {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + token(),
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    }).then(function (r) {
+      if (r && !r.ok) {
+        return r.json().catch(function () { return {}; }).then(function (j) {
+          throw new Error((j && j.detail) || ('HTTP ' + r.status));
+        });
+      }
+    });
+  }
+
+  // The body from what the page has, or null when it lacks the model or a
+  // message (then the chat is read).
+  function bodyFromPage(chatId, messageId) {
+    const model = state.models[chatId];
+    if (!model || !messageId) return null;
+    return { model: model, chat_id: chatId, id: messageId, session_id: state.sessionId || 'openclaw-composer' };
   }
 
   function fetchChat(chatId) {
@@ -240,29 +289,33 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
     if (!chatId) return;
     state.busy = true;
     btn.style.opacity = '0.6';
-    fetchChat(chatId).then(function (chat) {
-      const body = actionBody(chatId, chat);
+    const known = bodyFromPage(chatId, latestUserMessageId());
+    (known ? Promise.resolve(known) : fetchChat(chatId).then(function (chat) {
+      return actionBody(chatId, chat);
+    })).then(function (body) {
       if (!body) throw new Error('this chat has no OpenClaw message yet');
-      return fetch('/api/chat/actions/' + CFG.actionId, {
-        method: 'POST',
-        headers: {
-          'Authorization': 'Bearer ' + token(),
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(body),
-      });
-    }).then(function (r) {
-      if (r && !r.ok) {
-        return r.json().catch(function () { return {}; }).then(function (j) {
-          throw new Error((j && j.detail) || ('HTTP ' + r.status));
-        });
-      }
+      return postAction(body);
     }).catch(function (err) {
       console.warn('[openclaw-composer] status failed', err);
       toast('OpenClaw status: ' + ((err && err.message) || err));
     }).then(function () {
       state.busy = false;
       btn.style.opacity = '';
+    });
+  }
+
+  // Capture phase, so it runs before Open WebUI's own click handler on the
+  // button and can stop it.
+  function onToolbarClick(e) {
+    const btn = e.target && e.target.closest && e.target.closest('button[aria-label="OpenClaw Status"]');
+    const chatId = btn ? currentChatId() : null;
+    const body = chatId ? bodyFromPage(chatId, messageIdOf(btn)) : null;
+    if (!body) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    postAction(body).catch(function (err) {
+      console.warn('[openclaw-composer] status failed', err);
+      toast('OpenClaw status: ' + ((err && err.message) || err));
     });
   }
 
@@ -374,6 +427,7 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
     if (state.timer) clearTimeout(state.timer);
     state.timer = null;
     window.removeEventListener('popstate', schedule);
+    document.removeEventListener('click', onToolbarClick, true);
     try { removeAll(); } catch (e) { /* page is going away */ }
   }
 
@@ -394,10 +448,12 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
         };
       },
       actionBody: actionBody,
+      openStatus: openStatus,
     };
     state.observer = new MutationObserver(schedule);
     state.observer.observe(document.body, { childList: true, subtree: true });
     window.addEventListener('popstate', schedule);
+    document.addEventListener('click', onToolbarClick, true);
     configure(CFG);
   } catch (e) {
     warnOnce('install failed', e);
@@ -430,16 +486,19 @@ def _composer_model_prefixes(model_id=None, own_id=None) -> list:
     return prefixes
 
 
-def _render_composer_button_js(*, session_id=None, model_prefixes=None, chat_id=None) -> str:
+def _render_composer_button_js(*, session_id=None, model_prefixes=None, chat_id=None,
+                               chat_model=None) -> str:
     """The install snippet with its config embedded as one JSON literal (same
     no-interpolation rule as action.py's `_json_for_js`: `<` escaped so the
-    payload can never close an enclosing script tag)."""
+    payload can never close an enclosing script tag). `chat_model` is the
+    vouched chat's model, carried only with `chat_id`."""
     config = {
         "version": _COMPOSER_BUTTON_VERSION,
         "actionId": _COMPOSER_ACTION_ID,
         "modelPrefixes": list(model_prefixes or [_COMPOSER_DEFAULT_MODEL_PREFIX]),
         "sessionId": session_id if isinstance(session_id, str) and session_id else None,
         "chatId": chat_id if isinstance(chat_id, str) and chat_id else None,
+        "chatModel": chat_model if chat_id and isinstance(chat_model, str) and chat_model else None,
         "thinkingChipLabel": _COMPOSER_THINKING_CHIP_LABEL,
     }
     payload = json.dumps(config).replace("<", "\\u003c")
@@ -447,7 +506,7 @@ def _render_composer_button_js(*, session_id=None, model_prefixes=None, chat_id=
 
 
 async def _emit_composer_button(__event_emitter__, *, session_id=None, model_id=None,
-                                chat_id=None, model_prefixes=None) -> bool:
+                                chat_id=None, model_prefixes=None, chat_model=None) -> bool:
     """Emit the install snippet through an OWUI event emitter. Best effort:
     returns False instead of raising, because a cosmetic button must never
     fail the turn or the Action that carries it."""
@@ -458,6 +517,7 @@ async def _emit_composer_button(__event_emitter__, *, session_id=None, model_id=
             session_id=session_id,
             model_prefixes=model_prefixes or _composer_model_prefixes(model_id),
             chat_id=chat_id,
+            chat_model=chat_model,
         )
         await __event_emitter__({"type": "execute", "data": {"code": code}})
         return True

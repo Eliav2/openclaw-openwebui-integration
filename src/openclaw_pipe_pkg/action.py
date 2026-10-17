@@ -1356,10 +1356,28 @@ _SUBAGENTS_FILL_JS_TEMPLATE = r"""
   section.className = 'mb-4';
   const tasks = DATA.tasks || [];
   const live = tasks.some(function(t) { return t.status === 'running' || t.status === 'queued'; });
+  // A failed ask (a dropped phone connection, a proxy's error page) says so
+  // in the fold with a Retry; a good one is answered by the Action's fill.
+  function loadRows() {
+    S.askAction({ mode: 'subagent-rows' }).then(function(r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+    }).catch(function(err) {
+      fold.body.innerHTML = '';
+      fold.body.appendChild(S.errorEl('Could not load the sub-agents: ' + ((err && err.message) || err)));
+      const retry = document.createElement('button');
+      retry.type = 'button';
+      retry.className = 'mt-1 text-xs underline text-gray-500 dark:text-gray-400';
+      retry.textContent = 'Retry';
+      retry.onclick = function() {
+        fold.body.innerHTML = '';
+        fold.body.appendChild(S.skeletonSection('openclaw-status-subagents-loading'));
+        loadRows();
+      };
+      fold.body.appendChild(retry);
+    });
+  }
   const fold = S.collapsible('subagents', S.countLabel('Subagents', tasks.length, DATA.total || 0), live,
-    DATA.pending ? function() { S.askAction({ mode: 'subagent-rows' }).catch(function(err) {
-      S.sectionError('subagents', 'Could not load the sub-agents: ' + err);
-    }); } : null);
+    DATA.pending ? loadRows : null);
   section.appendChild(fold.wrap);
   if (!tasks.length) {
     fold.body.appendChild(S.noteEl('No sub-agents in this chat.'));
@@ -2363,6 +2381,7 @@ class Action:
                 __event_emitter__,
                 session_id=body.get("session_id"),
                 chat_id=body.get("chat_id") if ours else None,
+                chat_model=model if ours else None,
             )
 
     async def _run_status(self, body: dict, __user__, __event_emitter__, *, show_loading=True):

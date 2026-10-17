@@ -1094,6 +1094,61 @@ def _drawer_conn(send_request):
     return conn
 
 
+_FOLD_TAP_PAGE_JS = _FAKE_DOM_JS + r"""
+const fetches = [];
+global.localStorage = { getItem: () => 'tok' };
+let answers = input.answers.slice();
+global.fetch = (url, opts) => {
+  fetches.push(JSON.parse(opts.body).mode);
+  const a = answers.shift();
+  return a === 'reject' ? Promise.reject(new TypeError('Failed to fetch')) : Promise.resolve({ ok: a === 200, status: a });
+};
+const settle = () => new Promise((r) => setTimeout(r, 0));
+run(input.open);
+input.fills.forEach(run);
+const section = () => document.getElementById('openclaw-status-section-subagents');
+const button = (label) => section().walk().find((e) => e.tagName === 'BUTTON' && e.textContent === label);
+(async () => {
+  const seen = [];
+  section().walk().find((e) => 'openclawFoldHead' in e.dataset).onclick();
+  await settle(); await settle();
+  seen.push({ text: section().textContent, retry: !!button('Retry') });
+  if (button('Retry')) { button('Retry').onclick(); await settle(); await settle(); }
+  seen.push({ text: section().textContent, retry: !!button('Retry') });
+  console.log(JSON.stringify({ fetches, seen }));
+})();
+"""
+
+
+class SubagentFoldTapTests(unittest.TestCase):
+    """A tap on the folded Subagents section asks the Action for its rows. A
+    request that fails (a dropped phone connection, a proxy's error page) says
+    so in the section with a Retry, instead of a skeleton that never ends."""
+
+    PENDING = {"tasks": [{"id": "agent:main:subagent:k1", "title": "Child", "status": "completed",
+                          "startedAt": 1, "endedAt": 2}],
+               "total": 1, "pending": True, "source": "pipe", "fetchedAt": 1, "error": None}
+
+    def _tap(self, answers):
+        identity = {**FULL_IDENTITY, "dialogId": "d1"}
+        payload = {"now": 1, "open": _render_modal_open_js(identity),
+                   "fills": [_render_subagents_fill_js(self.PENDING)], "answers": answers}
+        return run_page(_FOLD_TAP_PAGE_JS, payload)
+
+    def test_a_failed_response_offers_retry_and_retry_asks_again(self):
+        out = self._tap([502, 200])
+        self.assertEqual(out["fetches"], ["subagent-rows", "subagent-rows"])
+        self.assertIn("Could not load the sub-agents", out["seen"][0]["text"])
+        self.assertIn("HTTP 502", out["seen"][0]["text"])
+        self.assertTrue(out["seen"][0]["retry"])
+        self.assertFalse(out["seen"][1]["retry"])
+
+    def test_a_dropped_request_offers_retry(self):
+        out = self._tap(["reject"])
+        self.assertIn("Failed to fetch", out["seen"][0]["text"])
+        self.assertTrue(out["seen"][0]["retry"])
+
+
 class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
     """The Subagents section's rows fetch back to this same Action with a
     synthetic mode="subagent-detail" marker (see openSubagentDrawer() in

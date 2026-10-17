@@ -757,6 +757,7 @@ class _PipeTurn:
                 self.__event_emitter__,
                 session_id=(self.__metadata__ or {}).get("session_id"),
                 chat_id=(self.__metadata__ or {}).get("chat_id"),
+                chat_model=self.body.get("model"),
                 model_prefixes=_composer_note_model(self.body.get("model")),
             )
         pipe_log(f"Messages: {len(messages)}, last role: "

@@ -604,6 +604,8 @@ globalThis.document = {
   getElementById: function () { return null; },
   querySelectorAll: function () { return []; },
   createElement: function () { throw new Error('no composer in this fake DOM'); },
+  addEventListener: function () {},
+  removeEventListener: function () {},
 };
 let fetches = 0;
 globalThis.fetch = function () {
@@ -672,6 +674,8 @@ globalThis.document = {
   getElementById: function (id) { return id === 'integration-menu-button' ? integ : null; },
   querySelectorAll: function (sel) { return group.children.filter(function (e) { return '#' + e.id === sel; }); },
   createElement: function (t) { return new El(t); },
+  addEventListener: function () {},
+  removeEventListener: function () {},
 };
 globalThis.fetch = function () { return Promise.reject(new Error('no fetch expected')); };
 (async function () {
@@ -745,6 +749,153 @@ class SnippetUnderNodeTests(unittest.TestCase):
         result = self._run(_render_composer_button_js(chat_id="chat-1"), ["llama3.2:1b"])
         self.assertEqual(result["fetches"], 0)
         self.assertTrue(result["cachedOk"])
+
+
+class ChatModelDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    """Each delivery that vouches for a chat also names the chat's model, so a
+    click builds the Action's body without downloading the chat."""
+
+    def test_rendered_with_the_vouch_only(self):
+        cfg = _config_of(_render_composer_button_js(chat_id="c9", chat_model="openclaw_gateway.x"))
+        self.assertEqual(cfg["chatModel"], "openclaw_gateway.x")
+        self.assertIsNone(_config_of(_render_composer_button_js(chat_model="openclaw_gateway.x"))["chatModel"])
+
+    async def test_the_action_names_the_clicked_messages_model(self):
+        cfg = await ActionDeliveryTests._status_cfg(self, "openclaw_gateway.default")
+        self.assertEqual(cfg["chatModel"], "openclaw_gateway.default")
+        self.assertIsNone((await ActionDeliveryTests._status_cfg(self, "llama3.2:1b"))["chatModel"])
+
+    async def test_the_pipe_names_the_turns_model(self):
+        t = PipeTurnStartTests()
+        t.setUp()
+        body = {"model": "openclaw_gateway.default", "messages": [{"role": "user", "content": "hi"}]}
+        await t._run(body, __metadata__={"chat_id": "c1", "session_id": "sock1"})
+        cfg = _config_of(next(e for e in t.events if _is_composer_event(e))["data"]["code"])
+        self.assertEqual(cfg["chatModel"], "openclaw_gateway.default")
+
+    async def test_the_watcher_names_the_chats_reply_model(self):
+        history = _history(("u1", "user", None), ("a1", "assistant", "u1"))
+        w = _TestWatcher({"sidA": {"id": "alice", "chat_ids": ["oc"]}},
+                         {"oc": _FakeChat("alice", "openclaw_gateway.default", history)})
+        await w.tick(now=100.0)
+        await w.tick(now=102.0)
+        cfg = _config_of(w.sent[0][1]["data"]["data"]["code"])
+        self.assertEqual(cfg["chatModel"], "openclaw_gateway.default")
+
+
+# A chat page with one user and one assistant message, the composer button and
+# the assistant's toolbar "OpenClaw Status" button. Clicks each and records the
+# requests the page made and whether Open WebUI's own handler still ran.
+_NODE_CLICK_HARNESS = r"""
+const code = require('fs').readFileSync(process.argv[2], 'utf8');
+const which = process.argv[3];
+globalThis.window = globalThis;
+window.addEventListener = function () {};
+window.removeEventListener = function () {};
+globalThis.location = { pathname: '/c/chat-1' };
+globalThis.localStorage = { getItem: function () { return 'tok'; } };
+globalThis.MutationObserver = class { observe() {} disconnect() {} };
+const listeners = [];
+class El {
+  constructor(tag, attrs, parent) {
+    this.tagName = tag.toUpperCase(); this.attrs = attrs || {}; this.parent = parent || null;
+    this.id = this.attrs.id || ''; this.className = this.attrs.class || ''; this.dataset = {}; this.style = {};
+    this.children = []; if (parent) parent.children.push(this);
+  }
+  getAttribute(k) { return this.attrs[k]; }
+  setAttribute(k, v) { this.attrs[k] = v; }
+  addEventListener(t, f) { this.onclick = f; }
+  matches(sel) {
+    if (sel === '.chat-user') return this.className === 'chat-user';
+    if (sel === '[id^="message-"]') return this.id.indexOf('message-') === 0;
+    if (sel === 'button[aria-label="OpenClaw Status"]')
+      return this.tagName === 'BUTTON' && this.attrs['aria-label'] === 'OpenClaw Status';
+    return false;
+  }
+  closest(sel) { for (let e = this; e; e = e.parent) if (e.matches(sel)) return e; return null; }
+  get lastElementChild() { return null; }
+  set innerHTML(v) {}
+}
+const root = new El('div');
+const userMsg = new El('div', { id: 'message-u1' }, root);
+new El('div', { class: 'chat-user' }, userMsg);
+const asstMsg = new El('div', { id: 'message-a1' }, root);
+const toolbar = new El('button', { 'aria-label': 'OpenClaw Status' }, asstMsg);
+const icon = new El('svg', {}, toolbar);
+let owuiHandled = 0;
+globalThis.document = {
+  body: { appendChild: function () {} },
+  documentElement: { classList: { contains: function () { return false; } } },
+  getElementById: function () { return null; },
+  querySelectorAll: function (sel) { return sel === '.chat-user' ? [userMsg.children[0]] : []; },
+  createElement: function (t) { return new El(t); },
+  addEventListener: function (t, f, capture) { listeners.push({ t: t, f: f, capture: capture }); },
+  removeEventListener: function () {},
+};
+const requests = [];
+globalThis.fetch = function (url, opts) {
+  requests.push({ url: url, method: (opts && opts.method) || 'GET', body: opts && opts.body ? JSON.parse(opts.body) : null });
+  return Promise.resolve({ ok: true, json: function () { return Promise.resolve({}); } });
+};
+function click(target) {
+  let stopped = false, prevented = false;
+  const ev = { type: 'click', target: target, preventDefault: function () { prevented = true; },
+               stopPropagation: function () { stopped = true; }, stopImmediatePropagation: function () { stopped = true; } };
+  listeners.filter(function (l) { return l.t === 'click' && l.capture; }).forEach(function (l) { if (!stopped) l.f(ev); });
+  if (!stopped) owuiHandled++;
+  return prevented;
+}
+(async function () {
+  await new Function('return (async () => { ' + code + ' })()')();
+  let prevented = false;
+  if (which === 'toolbar') prevented = click(icon);
+  else window.__openclawComposerBtn.openStatus({ style: {} });
+  await new Promise(function (r) { setTimeout(r, 50); });
+  console.log(JSON.stringify({ requests: requests, owuiHandled: owuiHandled, prevented: prevented }));
+  process.exit(0);
+})().catch(function (e) { console.log('ERR ' + e); process.exit(1); });
+"""
+
+
+@unittest.skipUnless(shutil.which("node"), "node not installed")
+class ClickWithoutTheChatTests(unittest.TestCase):
+    """Opening the dialog sends a small body whatever the chat's size: no
+    download of the chat (composer button), no upload of its messages and no
+    whole-chat save after (Open WebUI's toolbar handler)."""
+
+    def _click(self, which, **cfg):
+        paths = []
+        for text, suffix in ((_render_composer_button_js(**cfg), ".js"), (_NODE_CLICK_HARNESS, ".cjs")):
+            fd, path = tempfile.mkstemp(suffix=suffix)
+            with os.fdopen(fd, "w") as fh:
+                fh.write(text)
+            self.addCleanup(os.unlink, path)
+            paths.append(path)
+        proc = subprocess.run(["node", paths[1], paths[0], which], capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+
+    def test_the_composer_button_posts_without_reading_the_chat(self):
+        out = self._click("composer", chat_id="chat-1", chat_model="openclaw_gateway.default", session_id="sock1")
+        self.assertEqual(out["requests"], [{
+            "url": "/api/chat/actions/openclaw_status_action", "method": "POST",
+            "body": {"model": "openclaw_gateway.default", "chat_id": "chat-1", "id": "u1", "session_id": "sock1"},
+        }])
+
+    def test_the_toolbar_button_is_taken_over_with_a_small_body(self):
+        out = self._click("toolbar", chat_id="chat-1", chat_model="openclaw_gateway.default", session_id="sock1")
+        self.assertEqual(out["owuiHandled"], 0)
+        self.assertTrue(out["prevented"])
+        self.assertEqual(out["requests"], [{
+            "url": "/api/chat/actions/openclaw_status_action", "method": "POST",
+            "body": {"model": "openclaw_gateway.default", "chat_id": "chat-1", "id": "a1", "session_id": "sock1"},
+        }])
+
+    def test_the_toolbar_is_left_to_open_webui_when_the_model_is_unknown(self):
+        out = self._click("toolbar", chat_id="chat-1", session_id="sock1")
+        self.assertEqual(out["owuiHandled"], 1)
+        self.assertFalse(out["prevented"])
+        self.assertEqual(out["requests"], [])
 
 
 if __name__ == "__main__":
