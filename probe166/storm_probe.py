@@ -8,8 +8,8 @@ without a session, the chat join gets it server-disconnected, and the page
 reconnects at once. 0.12.3 reads the token per connect (`auth: (cb) => ...`).
 
 Steps: sign in (token A), open a chat; restart Open WebUI with a new secret
-key (A dies); sign in again from inside the page (localStorage.token = B, as
-the /auth page does, no reload); count the page's socket.io connects and
+key (A dies); the page lands on /auth; sign in with its form (token B, back
+to the chat, no reload); count the page's socket.io connects and
 /api/version calls for WINDOW_S seconds. Prints one JSON line.
 """
 import json
@@ -85,15 +85,25 @@ def main():
             a_dead = False
         except Exception:
             a_dead = True
-        time.sleep(10)  # the page notices the restart and reconnects with token A
-        b = signin()
-        page.evaluate("(t) => { localStorage.token = t; }", b)  # what /auth does on sign-in
+        # The page's API calls now 401 and it lands on /auth (same page, no
+        # reload). Sign in there, as a user would: the form stores token B
+        # and SvelteKit's goto() returns to the chat, whose join runs on the
+        # socket the page built at load.
+        page.wait_for_url("**/auth**", timeout=120_000)
+        t_restart_seen = time.time()
+        page.locator('input[autocomplete="email"]').fill(EMAIL)
+        page.locator('input[type="password"]').first.fill(PASSWORD)
+        page.locator('button[type="submit"]').first.click()
+        page.wait_for_url(f"**/c/{chat}", timeout=60_000)
         t_login = time.time()
         url_at_login = page.url
+        token_now = page.evaluate("() => localStorage.token")
         time.sleep(WINDOW_S)
         ws_after = [t for t in ev["ws"] if t >= t_login]
         ver_after = [t for t in ev["version"] if t >= t_login]
         out = {"image": image, "a_dead_after_restart": a_dead, "url_at_login": url_at_login,
+               "token_changed": token_now != a,
+               "socket_connects_auth_page": sum(1 for t in ev["ws"] if t_restart_seen <= t < t_login),
                "before_restart": before, "window_s": WINDOW_S,
                "socket_connects_after_signin": len(ws_after), "api_version_after_signin": len(ver_after),
                "socket_connects_last_10s": sum(1 for t in ws_after if t >= t_login + WINDOW_S - 10),
