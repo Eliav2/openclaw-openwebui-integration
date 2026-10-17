@@ -6336,9 +6336,11 @@ _AGENTS_FILL_JS_TEMPLATE = r"""
   const live = agents.some(function(a) { return a.state === 'running'; });
   const fold = S.collapsible('agents', S.countLabel('In-process agents', agents.length, DATA.total || 0), live);
   section.appendChild(fold.wrap);
+  // A long chat is read from its recent messages only (DATA.recent of them).
+  const where = DATA.recent ? 'in this chat\'s last ' + DATA.recent + ' messages' : 'in this chat';
   fold.body.appendChild(S.noteEl(agents.length
-    ? 'Claude Code Agent calls in this chat, as their tool cards show them.'
-    : 'No Claude Code Agent calls in this chat.'));
+    ? 'Claude Code Agent calls ' + where + ', as their tool cards show them.'
+    : 'No Claude Code Agent calls ' + where + '.'));
   agents.forEach(function(a) {
     // When its reply started, on the reader's clock.
     const started = S.toMs(a.startedAt);
@@ -6716,6 +6718,117 @@ def _agent_call_rows(chat):
                 "replyDone": bool(msg.get("done")),
             })
     return rows[::-1]
+
+
+# How many of the chat's newest messages (its current branch) In-process
+# agents and Background read: their time must not grow with the chat.
+_RECENT_MESSAGES = 40
+
+
+async def _recent_branch(current_id, links, read_rows, read_blob_message, limit=_RECENT_MESSAGES):
+    """The last `limit` messages of a chat's current branch, chat-shaped
+    ({"history": {"currentId", "messages"}, "truncated"}) for the section
+    builders. `links` maps each message that has a row to its parent;
+    `read_rows(ids)` reads those messages ({id: message}) in one go;
+    `read_blob_message(id)` reads one message the chat's own copy holds but
+    no row does yet (Open WebUI writes some straight into the chat)."""
+    order, blob, seen, mid = [], {}, set(), current_id
+    while mid and mid not in seen and len(order) < limit:
+        seen.add(mid)
+        if mid in links:
+            parent = links[mid]
+        else:
+            msg = await read_blob_message(mid)
+            if not isinstance(msg, dict):
+                break
+            blob[mid] = msg
+            parent = msg.get("parentId")
+        order.append(mid)
+        mid = parent
+    with_rows = [m for m in order if m not in blob]
+    rows = await read_rows(with_rows) if with_rows else {}
+    messages = {m: {**(blob.get(m) or rows.get(m)), "id": m} for m in order if blob.get(m) or rows.get(m)}
+    return {"history": {"currentId": current_id, "messages": messages},
+            "truncated": bool(mid) and mid not in seen}
+
+
+async def _recent_of_chat(chat, limit=_RECENT_MESSAGES):
+    """`_recent_branch` of a chat already read whole."""
+    if not isinstance(chat, dict):
+        return chat
+    history = chat.get("history") or {}
+    msgs = history.get("messages") or {}
+
+    async def read_rows(ids):
+        return {i: msgs[i] for i in ids if isinstance(msgs.get(i), dict)}
+
+    async def no_blob(_mid):
+        return None
+    links = {k: v.get("parentId") for k, v in msgs.items() if isinstance(v, dict)}
+    return {**chat, **await _recent_branch(history.get("currentId"), links, read_rows, no_blob, limit)}
+
+
+async def _load_owui_recent(chat_id, user_id, limit=_RECENT_MESSAGES):
+    """The chat's last `limit` messages when it is this user's, read from
+    Open WebUI's message rows: the chat row's head, every row's parent link
+    (two short columns), then those messages' rows. Building the whole chat
+    costs about 14x its JSON in Python (ELI-115) and grows with the chat.
+    None on any failure (the sections then list no Agent calls); the whole
+    chat, cut the same way, where the rows cannot be read at all."""
+    try:
+        from sqlalchemy import select
+        from open_webui.internal.db import get_async_db_context
+        from open_webui.models.chats import Chat
+        from open_webui.models.chat_messages import ChatMessage
+    except Exception:
+        return await _recent_of_chat(await _load_owui_chat(chat_id, user_id), limit)
+    prefix = f"{chat_id}-"
+    try:
+        async with get_async_db_context() as db:
+            head = (await db.execute(select(Chat.user_id, Chat.current_message_id)
+                                     .where(Chat.id == chat_id))).first()
+            if head is None or head[0] != user_id:
+                return None
+            current = head[1] or (await db.execute(
+                select(Chat.chat[("history", "currentId")]).where(Chat.id == chat_id))).scalar()
+            links = {rid[len(prefix):]: parent for rid, parent in (await db.execute(
+                select(ChatMessage.id, ChatMessage.parent_id).where(ChatMessage.chat_id == chat_id))).all()
+                if isinstance(rid, str) and rid.startswith(prefix)}
+
+            async def read_rows(ids):
+                result = await db.execute(
+                    select(ChatMessage.id, ChatMessage.parent_id, ChatMessage.role, ChatMessage.output,
+                           ChatMessage.done, ChatMessage.created_at)
+                    .where(ChatMessage.id.in_([prefix + i for i in ids])))
+                return {rid[len(prefix):]: {"parentId": parent, "role": role, "output": output or [],
+                                            "done": done, "timestamp": created}
+                        for rid, parent, role, output, done, created in result.all()}
+
+            async def read_blob_message(mid):
+                return (await db.execute(select(Chat.chat[("history", "messages", mid)])
+                                         .where(Chat.id == chat_id))).scalar()
+            return await _recent_branch(current, links, read_rows, read_blob_message, limit)
+    except Exception as ex:
+        pipe_log(f"[status-action] could not read the chat's recent messages: {ex}")
+        return None
+
+
+async def _owui_chat_title(chat_id, user_id):
+    """The chat's title when it is this user's: one row, two columns."""
+    try:
+        from sqlalchemy import select
+        from open_webui.internal.db import get_async_db_context
+        from open_webui.models.chats import Chat
+    except Exception:
+        chat = await _load_owui_chat(chat_id, user_id)
+        return chat.get("title") if isinstance(chat, dict) else None
+    try:
+        async with get_async_db_context() as db:
+            row = (await db.execute(select(Chat.title, Chat.user_id).where(Chat.id == chat_id))).first()
+    except Exception as ex:
+        pipe_log(f"[status-action] could not read the chat's title: {ex}")
+        return None
+    return row[0] if row is not None and row[1] == user_id else None
 
 
 async def _load_owui_chat(chat_id, user_id):
@@ -7175,8 +7288,7 @@ async def _drawer_parent(conn, session_row: dict, user_id) -> dict | None:
         return None
     m = _OWUI_SESSION_KEY_RE.match(key)
     if m:
-        chat = await _load_owui_chat(m.group(2), user_id) if user_id else None
-        title = (chat or {}).get("title") if isinstance(chat, dict) else None
+        title = await _owui_chat_title(m.group(2), user_id) if user_id else None
         return {"title": title or "its chat", "chatId": m.group(2)}
     try:
         desc = await conn.send_request("sessions.describe", dict(key=key), timeout=5)
@@ -7360,14 +7472,17 @@ class Action:
             # put the sections back before the refreshed reads.
             await emit(_RESET_SECTIONS_JS.replace("__OPENCLAW_DIALOG_ID__", _json_for_js(dialog_id)))
 
-        # Open WebUI's own copy of the chat: no Gateway in it, so it is
-        # read before connecting and its section fills even with no Gateway.
-        chat_task = asyncio.ensure_future(_load_owui_chat(chat_id, user_id))
+        # The chat's newest messages from Open WebUI: no Gateway in it, so it
+        # is read before connecting and its section fills even with no
+        # Gateway.
+        chat_task = asyncio.ensure_future(_load_owui_recent(chat_id, user_id))
 
         async def fill_agents():
-            agents = _agent_call_rows(await chat_task)
+            chat = await chat_task
+            agents = _agent_call_rows(chat)
             await emit(_render_agents_fill_js({
                 "agents": agents[:_SUBAGENT_LIST_CAP], "total": len(agents),
+                "recent": _RECENT_MESSAGES if (chat or {}).get("truncated") else None,
                 "fetchedAt": int(time.time() * 1000), "error": None,
             }))
 

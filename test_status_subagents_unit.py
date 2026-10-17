@@ -548,6 +548,77 @@ class InProcessAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.agents_data["agents"], [])
 
 
+def _chain(n, missing_rows=()):
+    """A chat of `n` messages in one branch, m0 (oldest) to m{n-1}, each
+    assistant message with one Agent call; and readers over it as the narrow
+    read gets them: parent links of the messages with a row, the rows, and
+    the chat's own copy for the ones without."""
+    msgs = {}
+    for i in range(n):
+        role = "user" if i % 2 == 0 else "assistant"
+        msgs[f"m{i}"] = {"parentId": f"m{i - 1}" if i else None, "role": role, "timestamp": 1000 + i,
+                         "done": True, "output": _card(f"t{i}", "Agent", {"description": f"job {i}"}, "ok")
+                         if role == "assistant" else []}
+    reads = []
+    links = {k: v["parentId"] for k, v in msgs.items() if k not in missing_rows}
+
+    async def read_rows(ids):
+        reads.append(sorted(ids))
+        return {i: msgs[i] for i in ids}
+
+    async def read_blob_message(mid):
+        reads.append(("blob", mid))
+        return msgs.get(mid)
+    return links, read_rows, read_blob_message, reads
+
+
+class RecentBranchTests(unittest.IsolatedAsyncioTestCase):
+    """The In-process agents and Background sections read the chat's last 40
+    messages, not the whole chat: their time stays flat as a chat grows."""
+
+    async def test_a_long_chat_is_cut_to_the_recent_messages(self):
+        links, rows, blob, reads = _chain(100)
+        chat = await openclaw_status_action._recent_branch("m99", links, rows, blob, limit=40)
+        self.assertTrue(chat["truncated"])
+        self.assertEqual(len(chat["history"]["messages"]), 40)
+        self.assertEqual(reads, [sorted(f"m{i}" for i in range(60, 100))])   # one read, those rows only
+        titles = [r["title"] for r in openclaw_status_action._agent_call_rows(chat)]
+        self.assertEqual(titles[0], "job 99")
+        self.assertEqual(titles[-1], "job 61")
+
+    async def test_a_short_chat_is_whole(self):
+        links, rows, blob, _reads = _chain(6)
+        chat = await openclaw_status_action._recent_branch("m5", links, rows, blob, limit=40)
+        self.assertFalse(chat["truncated"])
+        self.assertEqual(len(chat["history"]["messages"]), 6)
+
+    async def test_a_message_with_no_row_yet_comes_from_the_chats_copy(self):
+        links, rows, blob, reads = _chain(6, missing_rows={"m5"})
+        chat = await openclaw_status_action._recent_branch("m5", links, rows, blob, limit=40)
+        self.assertIn(("blob", "m5"), reads)
+        self.assertEqual(len(chat["history"]["messages"]), 6)
+        self.assertEqual(openclaw_status_action._agent_call_rows(chat)[0]["title"], "job 5")
+
+    async def test_the_dialog_says_recent_when_it_cut(self):
+        chats = types.ModuleType("open_webui.models.chats")
+        whole = {}
+        for i in range(60):
+            role = "user" if i % 2 == 0 else "assistant"
+            whole[f"m{i}"] = {"id": f"m{i}", "parentId": f"m{i - 1}" if i else None, "role": role,
+                              "timestamp": 1000 + i, "done": True,
+                              "output": _card(f"t{i}", "Agent", {"description": f"job {i}"}, "ok")
+                              if role == "assistant" else []}
+        chats.Chats = types.SimpleNamespace(get_chat_by_id=lambda chat_id: types.SimpleNamespace(
+            user_id=PARENT_USER, chat={"history": {"currentId": "m59", "messages": whole}}))
+        mods = {"open_webui": types.ModuleType("open_webui"),
+                "open_webui.models": types.ModuleType("open_webui.models"),
+                "open_webui.models.chats": chats}
+        with mock.patch.dict(sys.modules, mods):
+            await SubagentListTests._open(self, [], {})
+        self.assertEqual(self.agents_data["total"], 20)       # the 20 Agent calls in the last 40 messages
+        self.assertEqual(self.agents_data["recent"], 40)
+
+
 class SubagentSectionRenderTests(unittest.TestCase):
     """What the section shows for both groups, run in a fake page."""
 
@@ -591,6 +662,16 @@ console.log(JSON.stringify(section.walk().filter((e) => e.children.length === 0 
                                      "error": None}), ["Subagents (0)", "No sub-agents in this chat."])
         self.assertEqual(self._page({"agents": [], "total": 0, "fetchedAt": self.NOW, "error": None}, "agents"),
                          ["In-process agents (0)", "No Claude Code Agent calls in this chat."])
+
+    def test_a_long_chat_says_its_agents_are_the_recent_ones(self):
+        agents = [{"id": "t6", "title": "Benchmark run", "state": "returned", "startedAt": self.NOW}]
+        texts = self._page({"agents": agents, "total": 1, "recent": 40, "fetchedAt": self.NOW, "error": None},
+                           "agents")
+        self.assertEqual(texts[1], "Claude Code Agent calls in this chat's last 40 messages, "
+                                   "as their tool cards show them.")
+        texts = self._page({"agents": [], "total": 0, "recent": 40, "fetchedAt": self.NOW, "error": None},
+                           "agents")
+        self.assertEqual(texts[1], "No Claude Code Agent calls in this chat's last 40 messages.")
 
     def test_a_long_dialog_scrolls_instead_of_running_off_the_screen(self):
         """Up to 20 rows of each kind outgrow a phone screen: seen on the
