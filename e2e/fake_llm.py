@@ -39,6 +39,9 @@ and only a core set is sent as real schemas.
   `E2E_DEPLOY_START` and a call, then `E2E_DEPLOY_MID mid-1 ... mid-20` one
   word a second and a second call, then `E2E_DEPLOY_END end-1 ... end-10` one
   word a second. Long enough for the Pipe to be redeployed while it streams.
+* `E2E_ASK_SINGLE` / `E2E_ASK_MULTI`   -> asks a question: `ASK_SINGLE` or
+  `ASK_MULTI` below. The next message answers it: the reply is
+  `E2E_ANSWERED <that message>`, so a test sees what reached the agent.
 * a scene from $FAKE_LLM_SCENES (JSON)  -> scripted multi-step replies for the
   README screenshots (scripts/screenshots/scenes.json). A scene is picked by a
   phrase in the user's own message, so the request in a screenshot reads like
@@ -79,6 +82,9 @@ SPAWN_TASK = "E2E_SLOW:20 E2E_CHILDTASK"   # the sub-agent's task for E2E_SPAWN
 TITLE = "🧪 E2E chat title"
 DEPLOY_MID = "E2E_DEPLOY_MID " + " ".join(f"mid-{i}" for i in range(1, 21))
 DEPLOY_END = "E2E_DEPLOY_END " + " ".join(f"end-{i}" for i in range(1, 11))
+ASK_SINGLE = "OpenClaw needs input:\n\nColor\nWhich color?\n1. Red\n2. Green\n3. Blue"
+ASK_MULTI = ("OpenClaw needs input:\n\nToppings (multiselect)\nWhich toppings?\n"
+             "1. Cheese\n2. Olives\n3. Mushrooms")
 
 
 def _text_of(content) -> str:
@@ -168,6 +174,16 @@ def plan_reply(body: dict) -> dict:
 
     if "Create a concise title" in user_text:
         return {"text": TITLE}
+
+    asked = messages[last_assistant] if last_assistant >= 0 else {}
+    if "needs input:" in _text_of(asked.get("content")):
+        # The answer is the first user message, in the agent's envelope.
+        first = next((_text_of(m.get("content")) for m in turn if m.get("role") == "user"), "")
+        return {"text": "E2E_ANSWERED " + " ".join(first.split())}
+    if "E2E_ASK_SINGLE" in user_text:
+        return {"text": ASK_SINGLE}
+    if "E2E_ASK_MULTI" in user_text:
+        return {"text": ASK_MULTI}
 
     if "session_status" in user_text and "model line" in user_text:
         if tool_results:

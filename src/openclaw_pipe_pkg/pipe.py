@@ -2056,7 +2056,6 @@ class _PipeTurn:
                 owui_chat_id=self.owui_origin_chat_id,
                 owui_message_id=(self.__metadata__ or {}).get("message_id"),
                 owui_session_id=(self.__metadata__ or {}).get("session_id"),
-                __event_emitter__=self.__event_emitter__,
             )
         except Exception as ex:
             pipe_log(f"  user input modal failed; falling back to chat prompt: {ex}")
