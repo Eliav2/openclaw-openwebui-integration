@@ -25,6 +25,7 @@ import uuid
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "screenshots"))
 import capture as cap  # noqa: E402  (api, signin, signed_in_page, dismiss_popups)
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError  # noqa: E402
 
 SECTIONS = ("context", "limits", "background", "subagents", "agents")
 ROOT = "#openclaw-status-modal-root"
@@ -64,6 +65,19 @@ CLICK_JS = r"""(sel) => {
   btn.click();
   return null;
 }"""
+
+
+# What an open that never filled looks like: the dialog, and each section's text.
+STUCK_JS = r"""() => {
+  const root = document.querySelector('%s');
+  const out = {modal: !!root, sections: {}};
+  for (const s of %s) {
+    const el = document.getElementById('openclaw-status-section-' + s);
+    out.sections[s] = el ? (el.querySelector('[data-openclaw-loading]') ? 'loading: ' : '')
+      + el.innerText.slice(0, 160) : null;
+  }
+  return out;
+}""" % (ROOT, json.dumps(SECTIONS))
 
 
 def filler(n_bytes: int) -> str:
@@ -164,8 +178,13 @@ def open_once(page, path: str, chat_id: str, log: list) -> dict:
     err = page.evaluate(CLICK_JS, sel)
     if err:
         raise RuntimeError(err)
-    page.wait_for_function("() => { const m = window.__perf.marks; return %s; }"
-                           % " && ".join(f"m.{s}" for s in SECTIONS), timeout=90_000)
+    stuck = None
+    try:
+        page.wait_for_function("() => { const m = window.__perf.marks; return %s; }"
+                               % " && ".join(f"m.{s}" for s in SECTIONS), timeout=60_000)
+    except PlaywrightTimeoutError:
+        # Record what never filled instead of aborting the run.
+        stuck = page.evaluate(STUCK_JS)
     perf = page.evaluate("() => window.__perf")
     sub = page.evaluate("() => (document.getElementById('openclaw-status-section-subagents') || {}).innerText || ''")
     t0 = perf["start"]
@@ -176,7 +195,13 @@ def open_once(page, path: str, chat_id: str, log: list) -> dict:
     page.wait_for_timeout(4000)
     reqs = [{**q, "start": round(q["start"] - clicked), "end": round(q["end"] - clicked) if q["end"] else None}
             for q in log]
-    return {"path": path, "marks": marks, "requests": reqs, "subagents": sub[:200]}
+    out = {"path": path, "marks": marks, "requests": reqs, "subagents": sub[:200]}
+    if stuck is not None:
+        out["stuck"] = stuck
+        page.reload()
+        page.locator(".chat-assistant").last.wait_for(timeout=120_000)
+        page.evaluate(OBSERVER_JS)
+    return out
 
 
 def main(argv=None) -> int:
