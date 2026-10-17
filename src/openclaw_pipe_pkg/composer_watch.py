@@ -28,8 +28,11 @@
 # without `chat_ids` the loop simply finds nothing.
 # ---------------------------------------------------------------------------
 
-_COMPOSER_WATCH_INTERVAL_S = 2.0
-_COMPOSER_WATCH_SETTLE_S = 1.0
+# Until the snippet lands, a toolbar Status click takes Open WebUI's slow path
+# (it uploads the chat's messages and saves the whole chat), so a newly opened
+# chat gets it within a second. A poll reads SESSION_POOL, in memory.
+_COMPOSER_WATCH_INTERVAL_S = 0.5
+_COMPOSER_WATCH_SETTLE_S = 0.5
 _COMPOSER_WATCH_ACK_TIMEOUT_S = 4.0
 _COMPOSER_WATCH_RETRY_S = 3.0
 _COMPOSER_WATCH_ATTEMPTS = 3

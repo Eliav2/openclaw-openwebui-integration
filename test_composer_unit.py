@@ -395,6 +395,13 @@ class ComposerWatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cfg["sessionId"], "sidA")
         self.assertEqual(cfg["chatId"], "oc")
 
+    async def test_a_newly_opened_chat_gets_the_script_within_a_second(self):
+        """Until it lands, a toolbar click takes Open WebUI's slow path."""
+        w = _TestWatcher({"sidA": {"id": "alice", "chat_ids": ["oc"]}}, self.chats)
+        self.assertEqual(await w.tick(now=100.0), 0)
+        self.assertEqual(await w.tick(now=100.0 + openclaw_pipe._COMPOSER_WATCH_INTERVAL_S), 1)
+        self.assertLessEqual(openclaw_pipe._COMPOSER_WATCH_INTERVAL_S * 2, 1.0)
+
     async def test_the_push_installs_the_stop_send_now_intent_hook(self):
         """ELI-100 case 8, live gate 2026-10-13: a tab that opens a chat after
         its agent turn started never got the intent hook (the writer installs
@@ -792,7 +799,7 @@ const which = process.argv[3];
 globalThis.window = globalThis;
 window.addEventListener = function () {};
 window.removeEventListener = function () {};
-globalThis.location = { pathname: '/c/chat-1' };
+globalThis.location = { pathname: '/c/chat-1', origin: 'http://owui' };
 globalThis.localStorage = { getItem: function () { return 'tok'; } };
 globalThis.MutationObserver = class { observe() {} disconnect() {} };
 const listeners = [];
@@ -813,6 +820,14 @@ class El {
     return false;
   }
   closest(sel) { for (let e = this; e; e = e.parent) if (e.matches(sel)) return e; return null; }
+  querySelector(sel) {
+    const m = /^img\[src\*="([^"]+)"\]$/.exec(sel);
+    if (!m) throw new Error('unsupported selector ' + sel);
+    const walk = (e) => { for (const c of e.children) {
+      if (c.tagName === 'IMG' && (c.attrs.src || '').indexOf(m[1]) !== -1) return c;
+      const f = walk(c); if (f) return f; } return null; };
+    return walk(this);
+  }
   get lastElementChild() { return null; }
   set innerHTML(v) {}
 }
@@ -820,6 +835,7 @@ const root = new El('div');
 const userMsg = new El('div', { id: 'message-u1' }, root);
 new El('div', { class: 'chat-user' }, userMsg);
 const asstMsg = new El('div', { id: 'message-a1' }, root);
+if (process.argv[4]) new El('img', { src: '/api/v1/models/model/profile/image?id=' + process.argv[4] + '&lang=en-US' }, asstMsg);
 const toolbar = new El('button', { 'aria-label': 'OpenClaw Status' }, asstMsg);
 const icon = new El('svg', {}, toolbar);
 let owuiHandled = 0;
@@ -863,7 +879,7 @@ class ClickWithoutTheChatTests(unittest.TestCase):
     download of the chat (composer button), no upload of its messages and no
     whole-chat save after (Open WebUI's toolbar handler)."""
 
-    def _click(self, which, **cfg):
+    def _click(self, which, avatar_model="", **cfg):
         paths = []
         for text, suffix in ((_render_composer_button_js(**cfg), ".js"), (_NODE_CLICK_HARNESS, ".cjs")):
             fd, path = tempfile.mkstemp(suffix=suffix)
@@ -871,7 +887,8 @@ class ClickWithoutTheChatTests(unittest.TestCase):
                 fh.write(text)
             self.addCleanup(os.unlink, path)
             paths.append(path)
-        proc = subprocess.run(["node", paths[1], paths[0], which], capture_output=True, text=True, timeout=30)
+        proc = subprocess.run(["node", paths[1], paths[0], which, avatar_model],
+                              capture_output=True, text=True, timeout=30)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         return json.loads(proc.stdout.strip().splitlines()[-1])
 
@@ -890,6 +907,18 @@ class ClickWithoutTheChatTests(unittest.TestCase):
             "url": "/api/chat/actions/openclaw_status_action", "method": "POST",
             "body": {"model": "openclaw_gateway.default", "chat_id": "chat-1", "id": "a1", "session_id": "sock1"},
         }])
+
+    def test_the_toolbar_takes_the_model_from_the_messages_own_avatar(self):
+        """A chat the page script was not delivered for yet (a chat switched
+        to in a tab that has the script): the message shows its model."""
+        out = self._click("toolbar", avatar_model="openclaw_gateway.default", session_id="sock1")
+        self.assertEqual(out["owuiHandled"], 0)
+        self.assertEqual(out["requests"][0]["body"]["model"], "openclaw_gateway.default")
+
+    def test_another_models_message_is_left_to_open_webui(self):
+        out = self._click("toolbar", avatar_model="llama3.2:1b", session_id="sock1")
+        self.assertEqual(out["owuiHandled"], 1)
+        self.assertEqual(out["requests"], [])
 
     def test_the_toolbar_is_left_to_open_webui_when_the_model_is_unknown(self):
         out = self._click("toolbar", chat_id="chat-1", session_id="sock1")

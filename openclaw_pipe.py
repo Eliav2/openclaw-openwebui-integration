@@ -1621,7 +1621,7 @@ async def _emit_message_snapshot(__event_emitter__, content):
 # reply that is streaming into the same tab.
 # ---------------------------------------------------------------------------
 
-_COMPOSER_BUTTON_VERSION = "4"
+_COMPOSER_BUTTON_VERSION = "5"
 
 # The Status Action's function id (install_action.py's FUNCTION_ID; the
 # dialog's own JS calls the same fixed id) and the Pipe's default function id.
@@ -1774,10 +1774,31 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
     });
   }
 
+  // The model a reply was written by, from its avatar: Open WebUI renders it
+  // as `/models/model/profile/image?id=<model id>` inside the message.
+  function modelOfMessage(el) {
+    const img = el && el.querySelector('img[src*="/models/model/profile/image?id="]');
+    if (!img) return null;
+    try {
+      const id = new URL(img.getAttribute('src'), location.origin).searchParams.get('id');
+      return isOpenclawModel(id) ? id : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // The newest reply's model on screen.
+  function latestReplyModel() {
+    const replies = document.querySelectorAll('.chat-assistant');
+    const el = replies.length ? replies[replies.length - 1].closest('[id^="message-"]') : null;
+    return modelOfMessage(el);
+  }
+
   // The body from what the page has, or null when it lacks the model or a
-  // message (then the chat is read).
-  function bodyFromPage(chatId, messageId) {
-    const model = state.models[chatId];
+  // message (then the chat is read). `model`: the page's own reading of it,
+  // for a chat no delivery has named yet.
+  function bodyFromPage(chatId, messageId, model) {
+    model = state.models[chatId] || model;
     if (!model || !messageId) return null;
     return { model: model, chat_id: chatId, id: messageId, session_id: state.sessionId || 'openclaw-composer' };
   }
@@ -1854,7 +1875,7 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
     if (!chatId) return;
     state.busy = true;
     btn.style.opacity = '0.6';
-    const known = bodyFromPage(chatId, latestUserMessageId());
+    const known = bodyFromPage(chatId, latestUserMessageId(), latestReplyModel());
     (known ? Promise.resolve(known) : fetchChat(chatId).then(function (chat) {
       return actionBody(chatId, chat);
     })).then(function (body) {
@@ -1874,7 +1895,8 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
   function onToolbarClick(e) {
     const btn = e.target && e.target.closest && e.target.closest('button[aria-label="OpenClaw Status"]');
     const chatId = btn ? currentChatId() : null;
-    const body = chatId ? bodyFromPage(chatId, messageIdOf(btn)) : null;
+    const message = btn ? btn.closest('[id^="message-"]') : null;
+    const body = chatId ? bodyFromPage(chatId, messageIdOf(btn), modelOfMessage(message)) : null;
     if (!body) return;
     e.preventDefault();
     e.stopImmediatePropagation();
@@ -2118,8 +2140,11 @@ async def _emit_composer_button(__event_emitter__, *, session_id=None, model_id=
 # without `chat_ids` the loop simply finds nothing.
 # ---------------------------------------------------------------------------
 
-_COMPOSER_WATCH_INTERVAL_S = 2.0
-_COMPOSER_WATCH_SETTLE_S = 1.0
+# Until the snippet lands, a toolbar Status click takes Open WebUI's slow path
+# (it uploads the chat's messages and saves the whole chat), so a newly opened
+# chat gets it within a second. A poll reads SESSION_POOL, in memory.
+_COMPOSER_WATCH_INTERVAL_S = 0.5
+_COMPOSER_WATCH_SETTLE_S = 0.5
 _COMPOSER_WATCH_ACK_TIMEOUT_S = 4.0
 _COMPOSER_WATCH_RETRY_S = 3.0
 _COMPOSER_WATCH_ATTEMPTS = 3
