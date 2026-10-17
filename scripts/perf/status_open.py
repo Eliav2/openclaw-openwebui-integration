@@ -134,42 +134,57 @@ def inflate(token: str, chat_id: str, size: int) -> int:
     return len(json.dumps(got))
 
 
-def open_once(page, path: str, chat_id: str, uploads: list) -> dict:
+# Network and CPU of a phone on mobile data, through Chrome DevTools.
+PROFILES = {
+    "lan": None,
+    "phone": {"net": {"offline": False, "latency": 60, "downloadThroughput": 4_000_000,
+                      "uploadThroughput": 1_000_000}, "cpu": 4},
+}
+
+
+def throttle(page, profile: str) -> None:
+    cfg = PROFILES[profile]
+    if not cfg:
+        return
+    cdp = page.context.new_cdp_session(page)
+    cdp.send("Network.enable")
+    cdp.send("Network.emulateNetworkConditions", cfg["net"])
+    cdp.send("Emulation.setCPUThrottlingRate", {"rate": cfg["cpu"]})
+
+
+def open_once(page, path: str, chat_id: str, log: list) -> dict:
     sel = 'button[aria-label="OpenClaw Status"]' if path == "toolbar" else 'button[aria-label="OpenClaw status"]'
     if path == "toolbar":
         page.locator(".chat-assistant").last.hover()
         page.locator(sel).last.wait_for(timeout=30_000)
     else:
         page.locator(sel).wait_for(timeout=60_000)
-    uploads.clear()
+    log.clear()
+    clicked = time.time() * 1000
     err = page.evaluate(CLICK_JS, sel)
     if err:
         raise RuntimeError(err)
     page.wait_for_function("() => { const m = window.__perf.marks; return %s; }"
                            % " && ".join(f"m.{s}" for s in SECTIONS), timeout=90_000)
-    # Open WebUI saves the whole chat once the toolbar action returns: wait for it.
-    page.wait_for_timeout(1500)
     perf = page.evaluate("() => window.__perf")
     sub = page.evaluate("() => (document.getElementById('openclaw-status-section-subagents') || {}).innerText || ''")
     t0 = perf["start"]
     marks = {k: round(v - t0) for k, v in perf["marks"].items()}
-    reqs = []
-    for r in perf["resources"]:
-        if r["start"] < t0 - 5:
-            continue
-        up = next((u for u in uploads if r["url"].endswith(u["url"].split("8080", 1)[-1])), None)
-        reqs.append({"url": r["url"].split("?")[0], "start": round(r["start"] - t0), "end": round(r["end"] - t0),
-                     "bytesIn": r["bytesIn"], "bytesOut": up["bytes"] if up else None})
+    # Closing ends the open request; Open WebUI then saves the whole chat for a
+    # toolbar action. Wait for the requests to settle.
     page.keyboard.press("Escape")
-    page.wait_for_timeout(800)
+    page.wait_for_timeout(4000)
+    reqs = [{**q, "start": round(q["start"] - clicked), "end": round(q["end"] - clicked) if q["end"] else None}
+            for q in log]
     return {"path": path, "marks": marks, "requests": reqs, "subagents": sub[:200]}
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--sizes", default="10000,2000000,13000000")
+    ap.add_argument("--sizes", default="0,2000000,13000000")
     ap.add_argument("--opens", type=int, default=3)
     ap.add_argument("--out", default="")
+    ap.add_argument("--profiles", default="lan,phone")
     args = ap.parse_args(argv)
     token = cap.signin()
     cap.quiet_background_tasks(token)
@@ -181,37 +196,54 @@ def main(argv=None) -> int:
             actual = inflate(token, chat_id, size)
             print(f"chat {chat_id}: {actual} bytes", flush=True)
             page = cap.signed_in_page(browser, token, cap.DESKTOP)
-            uploads: list = []
+            log: list = []
             console: list = []
-            page.on("request", lambda r: uploads.append({"url": r.url, "bytes": len(r.post_data_buffer or b"")})
-                    if r.method == "POST" else None)
+
+            def done(r, failed=False):
+                if not ("/api/chat/actions/" in r.url or "/api/v1/chats/" in r.url):
+                    return
+                t = r.timing
+                sizes = {} if failed else r.sizes()
+                log.append({"url": r.method + " " + r.url.split("8080", 1)[-1].split("?")[0], "start": t["startTime"],
+                            "end": t["startTime"] + t["responseEnd"] if t["responseEnd"] > 0 else None,
+                            "bytesOut": sizes.get("requestBodySize"), "bytesIn": sizes.get("responseBodySize"),
+                            "failed": r.failure if failed else None})
+            page.on("requestfinished", done)
+            page.on("requestfailed", lambda r: done(r, True))
             page.on("console", lambda m: console.append(m.text) if m.type in ("error", "warning") else None)
             t = time.time()
             page.goto(f"{cap.BASE}/c/{chat_id}")
             page.locator(".chat-assistant").last.wait_for(timeout=120_000)
             print(f"  chat page loaded in {time.time() - t:.1f}s", flush=True)
             page.evaluate(OBSERVER_JS)
-            for path in ("toolbar", "composer"):
-                for i in range(args.opens):
-                    r = {"size": actual, "chat": chat_id, "n": i, **open_once(page, path, chat_id, uploads)}
-                    print(json.dumps(r), flush=True)
-                    results.append(r)
+            for profile in args.profiles.split(","):
+                throttle(page, profile)
+                for path in ("toolbar", "composer"):
+                    for i in range(args.opens):
+                        r = {"size": actual, "profile": profile, "chat": chat_id, "n": i,
+                             **open_once(page, path, chat_id, log)}
+                        print(json.dumps(r), flush=True)
+                        results.append(r)
             if console:
                 print("  console: " + json.dumps(console[-10:])[:1500], flush=True)
             page.context.close()
         browser.close()
-    rows = ["| chat | path | shell ms | " + " | ".join(SECTIONS) + " | action POST out | chat GET/POST |",
-            "|---|---|---|" + "---|" * len(SECTIONS) + "---|---|"]
+    rows = ["| chat | net | path | shell ms | " + " | ".join(SECTIONS)
+            + " | bytes up (action) | chat bytes moved | requests |",
+            "|---|---|---|---|" + "---|" * len(SECTIONS) + "---|---|---|"]
     for size in sorted({r["size"] for r in results}):
-        for path in ("toolbar", "composer"):
-            rs = [r for r in results if r["size"] == size and r["path"] == path]
-            med = lambda k: round(statistics.median([r["marks"].get(k, -1) for r in rs]))  # noqa: E731
-            outs = [q["bytesOut"] for r in rs for q in r["requests"] if "/chat/actions/" in q["url"] and q["bytesOut"]]
-            chats = sorted({f"{q['url'].split('/')[-1][:6]}:{q['bytesOut'] or q['bytesIn']}" for r in rs
-                            for q in r["requests"] if "/v1/chats/" in q["url"]})
-            rows.append(f"| {size / 1e6:.2f} MB | {path} | {med('shell')} | "
-                        + " | ".join(str(med(s)) for s in SECTIONS)
-                        + f" | {max(outs) if outs else 0} | {len(chats)} |")
+        for profile in args.profiles.split(","):
+            for path in ("toolbar", "composer"):
+                rs = [r for r in results if r["size"] == size and r["path"] == path and r["profile"] == profile]
+                if not rs:
+                    continue
+                med = lambda k: round(statistics.median([r["marks"].get(k, -1) for r in rs]))  # noqa: E731
+                up = max([q["bytesOut"] or 0 for r in rs for q in r["requests"] if "/chat/actions/" in q["url"]] or [0])
+                moved = max(sum((q["bytesOut"] or 0) + (q["bytesIn"] or 0) for q in r["requests"]
+                                if "/v1/chats/" in q["url"]) for r in rs)
+                n = max(len(r["requests"]) for r in rs)
+                rows.append(f"| {size / 1e6:.2f} MB | {profile} | {path} | {med('shell')} | "
+                            + " | ".join(str(med(s)) for s in SECTIONS) + f" | {up} | {moved} | {n} |")
     table = "\n".join(rows)
     print(table)
     if args.out:
