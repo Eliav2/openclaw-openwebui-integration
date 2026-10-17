@@ -37,8 +37,9 @@ Each row is the full end-to-end suite on one pair, on GitHub's runners. The suit
 | 0.10.2 | 11 of 16 pass (1 skipped) | tool card stuck spinning; agent-started replies; sub-agent drawer (its parent reply never finished); Status CSS classes | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/38641673157) |
 | 0.11.0 | 11 of 16 pass (1 skipped) | the same as 0.10.2 | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/38641677528) |
 | 0.11.1 | 13 of 16 pass (1 skipped) | agent-started replies (two tests); Status CSS classes | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/38641680949) |
-| 0.12.0 | pass | | every pull request |
-| 0.12.2 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/38641684331) |
+| 0.12.0 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/39003313714) |
+| 0.12.2 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/39003315726) |
+| 0.12.3 | pass | | every pull request |
 
 ### OpenClaw, with Open WebUI 0.12.0
 
