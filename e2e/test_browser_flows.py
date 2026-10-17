@@ -96,3 +96,48 @@ def test_send_streams_the_reply_and_keeps_it(page):
     assert chat_id in page.url
     capture.wait_js(page, _last_assistant_js(f"t.includes({json.dumps(full)})"),
                     "the reply after a reload", 60_000)
+
+
+def _answer_question(page, marker: str, question: str, answer) -> str:
+    """Ask the scripted question, wait for the card above the composer,
+    answer it with `answer(page)`, and return the reply text the agent's
+    answer run wrote."""
+    capture.new_chat(page)
+    capture.send(page, marker)
+    capture.wait_js(page, f"() => document.body.innerText.includes({json.dumps(question)}) "
+                          "&& !!document.querySelector('input[placeholder=\"Type your answer\"]')",
+                    "the question card", TURN_MS)
+    answer(page)
+    capture.wait_js(page, "() => !document.querySelector('input[placeholder=\"Type your answer\"]')",
+                    "the card gone after the answer", 30_000)
+    capture.wait_js(page, _last_assistant_js("t.includes('E2E_ANSWERED')"),
+                    "the reply to the answer", TURN_MS)
+    return page.evaluate(f"() => {capture.LAST_ASSISTANT}.innerText")
+
+
+def test_a_single_select_question_is_answered_with_a_click(page):
+    """The card shows the options as rows; a click answers at once and the
+    agent gets the option."""
+    def click_green(pg):
+        pg.locator("section button", has=pg.locator("span", has_text="Green")).first.click()
+    reply = _answer_question(page, "E2E_ASK_SINGLE", "Which color?", click_green)
+    assert "E2E_ANSWERED" in reply and "Green" in reply.split("E2E_ANSWERED", 1)[1], reply[-200:]
+
+
+def test_a_multi_select_question_takes_typed_numbers(page):
+    """The card lists the options by number; "1, 3" typed and submitted
+    reaches the agent as the two options."""
+    seen = {}
+
+    def type_numbers(pg):
+        seen["card"] = pg.evaluate("() => document.body.innerText")
+        box = pg.locator('input[placeholder="Type your answer"]')
+        box.click()
+        box.fill("1, 3")
+        pg.get_by_role("button", name="Submit answers").click()
+    reply = _answer_question(page, "E2E_ASK_MULTI", "Which toppings?", type_numbers)
+    for line in ("1. Cheese", "2. Olives", "3. Mushrooms"):
+        assert line in seen["card"], f"the card lists {line!r}"
+    assert "multiselect" not in seen["card"].lower()
+    got = reply.split("E2E_ANSWERED", 1)[1]
+    assert "Cheese, Mushrooms" in got, reply[-200:]
