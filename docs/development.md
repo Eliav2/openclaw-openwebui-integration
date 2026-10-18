@@ -105,7 +105,9 @@ asserted exactly, the model that served a turn is read from the fake model's
 request log (the stack's default, `e2e-default`, differs from the routed
 `e2e-echo`), and a real tool call (`session_status`) is checked all the
 way into the chat Open WebUI persisted, as a `function_call` with its matching
-`function_call_output`. Gateway, Open WebUI and model logs are uploaded as an
+`function_call_output`. A third model, `e2e-think`, is the only reasoning one,
+so the thinking level a turn picks shows in that request log as
+`reasoning_effort`. Gateway, Open WebUI and model logs are uploaded as an
 artifact on every run.
 
 The versions it runs against are pinned in `e2e/versions.env`. Bump them in the

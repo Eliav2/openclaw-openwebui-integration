@@ -67,6 +67,9 @@ npm install --global --no-audit --no-fund "openclaw@$OPENCLAW_VERSION" >"$LOG_DI
   || { cat "$LOG_DIR/npm-install.log"; exit 1; }
 openclaw --version
 mkdir -p "$HOME/.openclaw"
+# e2e-think is the one reasoning model: the Gateway accepts a thinking level for
+# it (off to high on 2026.9) and sends it on as `reasoning_effort`, which the
+# fake model's request log shows. The other two take no level at all.
 cat >"$HOME/.openclaw/openclaw.json" <<EOF
 {
   "gateway": {
@@ -77,7 +80,9 @@ cat >"$HOME/.openclaw/openclaw.json" <<EOF
     "baseUrl": "http://127.0.0.1:$FAKE_LLM_PORT/v1",
     "api": "openai-completions",
     "models": [{"id": "e2e-default", "name": "E2E Default", "contextWindow": 200000},
-               {"id": "e2e-echo", "name": "E2E Echo", "contextWindow": 200000}]
+               {"id": "e2e-echo", "name": "E2E Echo", "contextWindow": 200000},
+               {"id": "e2e-think", "name": "E2E Think", "contextWindow": 200000,
+                "reasoning": true, "compat": {"supportsReasoningEffort": true}}]
   }}},
   "agents": {
     "defaults": {
