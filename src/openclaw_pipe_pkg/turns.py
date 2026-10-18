@@ -384,26 +384,57 @@ def run_message_id(session_key: str, chat_id: str, run_id: str, messages: list |
 # (session-accessor-CX17Bx59.mjs:3343-3347), so only the first wake into a
 # session ever gets one: never end or rebuild a wake from it.
 
+#
+# OpenClaw 2026.10.2+ records the wake's turn differently: no header in the
+# text but the cron provenance ({kind: internal_system, sourceTool: cron,
+# jobId, sourcePromptPrefix}), returned by `chat.history` as role "assistant"
+# (`_is_forwarded_turn`). Such a wake runs under its own run id and closes with
+# its own `cli-assistant:<runId>` (2026.10.3 and 10.5 fixtures), so it is an
+# ordinary agent turn: `shared_run` False, and no sessionId event binds it.
+
 _CRON_PROMPT_RE = re.compile(r"^\[cron:(?P<job>[^\s\]]+)[\s\]]")
 
 
+def _cron_turn_job(m: dict) -> str | None:
+    """The cron job a wake turn names: its provenance's (10.2+), else its
+    prompt's header (9.3, no provenance). None for any other turn."""
+    prov = m.get("provenance") if isinstance(m.get("provenance"), dict) else None
+    if prov:
+        if (prov.get("kind"), prov.get("sourceTool")) != ("internal_system", "cron"):
+            return None
+        hit = _CRON_PROMPT_RE.match(str(prov.get("sourcePromptPrefix") or ""))
+        return prov.get("jobId") or (hit.group("job") if hit else None)
+    hit = _CRON_PROMPT_RE.match(((_history_item(m) or {}).get("text") or "").lstrip())
+    return hit.group("job") if hit else None
+
+
 def wake_turns(messages: list) -> list:
-    """[{key, at, job}] of the cron wake user turns, in transcript order: `key`
-    is the turn id (its `:user` key without the suffix), `at` its commit time
-    (`recordTimestampMs`), `job` the cron job id from its prompt."""
+    """[{key, at, job, shared_run}] of the cron wake turns, in transcript
+    order: `key` is the turn id (its `:user` key without the suffix), `at` its
+    commit time (`recordTimestampMs`), `job` the cron job id, `shared_run`
+    True when the wake runs under the session's id (9.3, ELI-103). Reads
+    `chat.history` as returned or with its roles restored (`_transcript_roles`)."""
     out = []
     for m in messages or []:
-        key = _history_user_run_id(m)
-        if not key or parse_pipe_run_id(key) or m.get("provenance"):
+        if not isinstance(m, dict):
             continue
-        hit = _CRON_PROMPT_RE.match(((_history_item(m) or {}).get("text") or "").lstrip())
-        if not hit:
+        key = _history_user_run_id({**m, "role": "user"} if _is_forwarded_turn(m) else m)
+        if not key or parse_pipe_run_id(key):
+            continue
+        job = _cron_turn_job(m)
+        if not job:
             continue
         meta = m.get("__openclaw") if isinstance(m.get("__openclaw"), dict) else {}
         at = meta.get("recordTimestampMs") or m.get("timestamp")
         out.append({"key": key, "at": at if isinstance(at, (int, float)) else None,
-                    "job": hit.group("job")})
+                    "job": job, "shared_run": not m.get("provenance")})
     return out
+
+
+def _shared_wake_turns(messages: list) -> list:
+    """The wake turns whose wake runs under the session's id: the only ones a
+    sessionId event can belong to."""
+    return [w for w in wake_turns(messages) if w["shared_run"]]
 
 
 def wake_turn_at(messages: list, at_ms: float, bound=frozenset()) -> dict | None:
@@ -412,7 +443,7 @@ def wake_turn_at(messages: list, at_ms: float, bound=frozenset()) -> dict | None
     (`bound`). None while it is not committed yet (the embedded runtime writes
     the user turn without awaiting it, embedded-agent-DNQn_PMM.mjs:5891): the
     caller tries again on the wake's next event."""
-    for turn in reversed(wake_turns(messages)):
+    for turn in reversed(_shared_wake_turns(messages)):
         if turn["at"] is not None and turn["at"] <= at_ms:
             return None if turn["key"] in bound else turn
     return None
@@ -424,7 +455,7 @@ def wake_turn_of_run(messages: list, job: str, start_ms: float, bound=frozenset(
     while it is not committed yet: the embedded runtime writes it after the
     run's first events, so a turn is not looked for before the event (as
     `wake_turn_at` must, knowing no run)."""
-    for turn in reversed(wake_turns(messages)):
+    for turn in reversed(_shared_wake_turns(messages)):
         if turn["job"] == job and turn["at"] is not None and turn["at"] >= start_ms:
             return None if turn["key"] in bound else turn
     return None
