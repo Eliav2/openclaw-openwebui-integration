@@ -343,6 +343,20 @@ def test_a_secret_ask_with_numbered_steps_keeps_the_masked_dialog(page):
     _wait(page, _last_reply_done("E2E_ANSWER_END"), "the reply after the dialog")
 
 
+def test_a_hebrew_yes_no_question_gets_yes_and_no(page):
+    """A Hebrew "(כן/לא)" question is a yes/no question: the card offers Yes
+    and No, with no typed answer (ELI-193: it got a typed answer only)."""
+    capture.new_chat(page)
+    capture.send(page, "E2E_ASK_YES_NO_HE")
+    yes = page.locator("section button", has=page.locator("span", has_text="Yes")).first
+    yes.wait_for(timeout=TURN_MS)
+    assert page.evaluate("() => document.body.innerText.includes('למחוק את הקובץ')")
+    yes.click()
+    _wait(page, _last_assistant_js("t.includes('E2E_ANSWER_END')"), "the reply to the answer")
+    reply = page.evaluate(f"() => {capture.LAST_ASSISTANT}.innerText")
+    assert "E2E_ANSWERED yes E2E_ANSWER_END" in reply, reply[-200:]
+
+
 def test_a_multi_select_question_takes_typed_numbers(page):
     """The card lists the options by number; "1, 3" typed and submitted
     reaches the agent as the two options."""

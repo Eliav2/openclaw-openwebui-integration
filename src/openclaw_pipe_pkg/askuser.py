@@ -263,6 +263,7 @@ _MULTI_MARKERS = (
     "(multiselect)", "(multi-select)", "(multi)", "[multiselect]", "[multi]",
     "select all that apply", "choose all that apply", "check all that apply",
     "בחר כמה", "בחירה מרובה", "אפשר לבחור כמה", "בחר את כל",
+    "اختر كل ما ينطبق", "اختيار متعدد", "يمكنك اختيار أكثر من",
 )
 
 
@@ -293,12 +294,13 @@ def _parse_text_prompt(prompt_text: str) -> dict:
     # Yes/no only when the prompt clearly reads as binary: a free-text question
     # turned into yes/no loses the real answer. A numbered list is a choice.
     has_options = bool(re.search(r"(?m)^\s*\d+[.)]\s", prompt_text))
-    yn_markers = ("(y/n)", "[y/n]", "y/n?", "yes/no", "(yes/no)")
+    yn_markers = ("(y/n)", "[y/n]", "y/n?", "yes/no", "(yes/no)", "כן/לא", "כן / לא", "نعم/لا", "نعم / لا")
     confirm_verbs = (
         "confirm", "proceed", "overwrite", "are you sure", "do you want",
         "delete", "remove", "בטוח", "האם", "هل تريد",
     )
-    ends_question = message.rstrip().endswith("?") or title.rstrip().endswith("?")
+    # "؟" is the Arabic question mark.
+    ends_question = message.rstrip().endswith(("?", "؟")) or title.rstrip().endswith(("?", "؟"))
     # A secret unless it is clearly a choice (an explicit yes/no marker, or two
     # or more numbered options) and nothing asks for the value itself: a
     # choice that merely mentions a password keeps its answers (ELI-196), but
