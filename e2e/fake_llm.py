@@ -62,8 +62,9 @@ and only a core set is sent as real schemas.
 * `E2E_SECRET_REQUEST NAME`            -> calls `secrets` with action=request for
   NAME (OpenClaw's masked credential entry), then, once the tool result is in,
   replies `E2E_SECRET_RESULT <status>` with the result's first "status".
-* a scene from $FAKE_LLM_SCENES (JSON)  -> scripted multi-step replies for the
-  README screenshots (scripts/screenshots/scenes.json). A scene is picked by a
+* a scene from $FAKE_LLM_SCENES (JSON files, joined with `:`) -> scripted multi-step replies for the
+  README screenshots (scripts/screenshots/scenes.json) and the docs' demo GIFs
+  (scripts/demos/demos.json, loaded first). A scene is picked by a
   phrase in the user's own message, so the request in a screenshot reads like
   a real one. Step n of a scene answers the request that carries n tool
   results; a step can say something and call a tool in the same message.
@@ -164,11 +165,13 @@ def _harmless_call(offered: list) -> dict | None:
 
 
 def _load_scenes() -> list:
-    path = os.environ.get("FAKE_LLM_SCENES", "")
-    if not path:
-        return []
-    with open(path, encoding="utf-8") as fh:
-        return json.load(fh)["scenes"]
+    """The scenes of every file in $FAKE_LLM_SCENES (paths joined with
+    os.pathsep), in order: the first scene whose phrase matches wins."""
+    scenes = []
+    for path in filter(None, os.environ.get("FAKE_LLM_SCENES", "").split(os.pathsep)):
+        with open(path, encoding="utf-8") as fh:
+            scenes += json.load(fh)["scenes"]
+    return scenes
 
 
 SCENES = _load_scenes()
@@ -218,7 +221,13 @@ def plan_reply(body: dict) -> dict:
     # in this turn, before the new one; a run the Gateway resumes after a
     # restart gets its own "[System] ... continue" message after the user's
     # (2026.10.10). So the newest part of the turn that has a scripted answer
-    # is the one answered, else the whole turn.
+    # is the one answered, else the whole turn. A scene comes first: the
+    # Gateway's context block alone, the newest part, would otherwise take the
+    # generic answer to a question before the scene for that answer is seen.
+    for start in range(len(users) - 1, -1, -1):
+        plan = _scene_step("\n".join(users[start:]), len(tool_results), offered)
+        if plan is not None:
+            return plan
     for start in range(len(users) - 1, -1, -1):
         plan = _scripted("\n".join(users[start:]), messages, last_assistant, turn, tool_results, offered)
         if plan is not None:

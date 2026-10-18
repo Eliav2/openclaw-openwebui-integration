@@ -24,13 +24,15 @@ A PR that changes how something already documented behaves (a fix included) corr
 
 One screenshot per scene, in the light theme: no dark copies, in the docs or anywhere else.
 
-A PR with a visual change shows one Before and After pair in its description, light theme, from the Screenshots workflow.
+A PR with a visual change shows one Before and After pair in its description, light theme, from the Screenshots workflow. When the change unfolds over time (streaming, the queue, Stop, cards, the drawer), the After may be one light GIF from the Demos workflow (a demo in `scripts/demos/demos.json`) instead of a still; the Before stays one still. A static change keeps the still pair, and a backend change shows no images.
+
+A feature that is best seen moving can also show a demo GIF on its page: a demo in `scripts/demos/demos.json`, recorded by the Demos workflow into `docs/img/demos/` (light theme, 960 px wide, at most 15 s and 1 MB), shown as an `<img>` at most 800 wide.
 
 Every PR description has a `Docs:` line: what it updated, or "no change needed" and why, so the reviewer can check the claim.
 
 A PR that removes a feature removes its bullet, its section, its scene and its images in the same change, as the no-legacy rule says.
 
-`tests/test_docs_unit.py` fails on a broken link, an unused or oversized image, an image without a width or wider than its kind allows, an em dash, or a tested version that differs from `e2e/versions.env`. It cannot tell whether a feature is documented: reviewers check that against the list above.
+`tests/test_docs_unit.py` fails on a broken link, an unused or oversized image or demo GIF, an image without a width or wider than its kind allows, an em dash, or a tested version that differs from `e2e/versions.env`. It cannot tell whether a feature is documented: reviewers check that against the list above.
 
 ## User flows have a browser test
 

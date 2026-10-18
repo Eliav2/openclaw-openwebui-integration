@@ -133,6 +133,18 @@ against upstream's latest release and `main`. A scheduled failure opens or
 updates one tracking issue, so a breaking upstream release is visible before
 the pins are bumped.
 
+**Screenshots and Demos** (`.github/workflows/screenshots.yml` and
+`demos.yml`, by hand): the docs' images, from the E2E stack with the scripted
+model serving real-looking scenes (`scripts/screenshots/scenes.json`; the
+demos add `scripts/demos/demos.json`). `capture.py` takes the stills;
+`scripts/demos/record.py` records each demo in `demos.json` with the DevTools
+screencast at 2x, a drawn cursor, a ripple on each click and a badge for each
+key, then encodes it with ffmpeg into a light GIF, 960 px wide, at most 15 s and
+1 MB. Both fail when a page shows deny-listed text (words that give away a test
+stack). A demo waits on what the page shows, never on time: a reply is done when
+its text is stable and "Thinking…" is gone. Before committing a GIF, look at
+frames from it (`ffmpeg -i x.gif -vf "select=not(mod(n\,40))" -vsync 0 f%02d.png`).
+
 **CodeQL** runs on Python, JavaScript and the workflows themselves.
 **Dependabot** updates the GitHub Actions and the test tooling weekly.
 

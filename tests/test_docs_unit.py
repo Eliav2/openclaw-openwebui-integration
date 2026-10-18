@@ -11,6 +11,9 @@ ROOT = Path(__file__).resolve().parents[1]
 IMG = ROOT / "docs" / "img"
 IMAGE_BUDGET = 250 * 1024          # each image
 IMAGES_TOTAL_BUDGET = 4 * 1024 * 1024
+DEMOS = IMG / "demos"              # the demo GIFs, scripts/demos/record.py
+DEMO_BUDGET = 1024 * 1024          # each GIF, as record.py enforces
+DEMOS_TOTAL_BUDGET = 3 * 1024 * 1024
 # Contributor and design pages may name issues and internals; user pages may not.
 INTERNAL_OK = {"docs/architecture.md", "docs/development.md", "docs/metadata-contract.md",
                "docs/rehydration-persistence.md"}
@@ -27,16 +30,22 @@ PHONE_WIDTH = 320      # a phone shot, as the README shows it
 WIDE_MAX = 800
 
 
-def png_size(path: Path) -> tuple:
+def image_size(path: Path) -> tuple:
+    """(width, height) from the PNG or GIF header."""
     head = path.read_bytes()[:24]
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return int.from_bytes(head[6:8], "little"), int.from_bytes(head[8:10], "little")
     return int.from_bytes(head[16:20], "big"), int.from_bytes(head[20:24], "big")
 
 
-def image_width_limit(size: tuple) -> tuple:
+def image_width_limit(size: tuple, gif: bool = False) -> tuple:
     """(kind, largest display width). Shots are 2x captures, so none shows above half its
     pixel width: a strip (3x wider than tall) at half, a phone shot at PHONE_WIDTH, a wide
-    (desktop) shot at half, capped at WIDE_MAX."""
+    (desktop) shot at half, capped at WIDE_MAX. A demo GIF is encoded at 1x, so it shows
+    at most at its own width, capped at WIDE_MAX."""
     w, h = size
+    if gif:
+        return "demo", min(w, WIDE_MAX)
     if w >= 3 * h:
         return "strip", w // 2
     if w > 1000:
@@ -100,9 +109,12 @@ class DocsLinkTests(unittest.TestCase):
                 if path.endswith((".png", ".jpg", ".webp", ".gif")):
                     used.add((md.parent / path).resolve())
         images = sorted(p for p in IMG.iterdir() if p.is_file())
+        demos = sorted(p for p in DEMOS.iterdir() if p.is_file())
         self.assertEqual([p.name for p in images if p.stat().st_size > IMAGE_BUDGET], [])
         self.assertLessEqual(sum(p.stat().st_size for p in images), IMAGES_TOTAL_BUDGET)
-        self.assertEqual([p.name for p in images if p.resolve() not in used], [],
+        self.assertEqual([p.name for p in demos if p.suffix != ".gif" or p.stat().st_size > DEMO_BUDGET], [])
+        self.assertLessEqual(sum(p.stat().st_size for p in demos), DEMOS_TOTAL_BUDGET)
+        self.assertEqual([rel(p) for p in images + demos if p.resolve() not in used], [],
                          "images in docs/img that no page uses")
 
     def test_every_image_has_a_width_within_its_kind(self):
@@ -118,7 +130,7 @@ class DocsLinkTests(unittest.TestCase):
                 src = re.search(r'\bsrc="([^"]+)"', tag).group(1)
                 if re.match(r"^[a-z]+:", src):
                     continue
-                kind, limit = image_width_limit(png_size(md.parent / src))
+                kind, limit = image_width_limit(image_size(md.parent / src), src.endswith(".gif"))
                 width = re.search(r'\bwidth="(\d+)"', tag)
                 if not width:
                     bad.append(f"{rel(md)}: {src} has no width ({kind}: at most {limit})")
@@ -132,6 +144,12 @@ class DocsLinkTests(unittest.TestCase):
         self.assertEqual(image_width_limit((604, 168)), ("strip", 302))
         self.assertEqual(image_width_limit((1600, 1000)), ("wide", 800))
         self.assertEqual(image_width_limit((1200, 700)), ("wide", 600))
+        self.assertEqual(image_width_limit((960, 640), gif=True), ("demo", 800))
+        self.assertEqual(image_width_limit((640, 400), gif=True), ("demo", 640))
+
+    def test_image_size_reads_png_and_gif_headers(self):
+        self.assertEqual(image_size(IMG / "question-card-light.png"), (780, 1688))
+        self.assertEqual(image_size(DEMOS / "hero.gif"), (960, 640))
 
 
 class DocsWordingTests(unittest.TestCase):

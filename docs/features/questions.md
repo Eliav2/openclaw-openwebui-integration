@@ -39,6 +39,8 @@ Confirmation and multi-select markers are recognised in English, Hebrew and Arab
 
 Answer the card and the run continues in the same reply. The exchange stays in the reply as a collapsible ❓ Ask User card that shows both the question and your answer.
 
+<img src="../img/demos/question-card.gif" alt="A question card in a reply; a click on its first option answers it, and the reply goes on in the same message with the answer acted on" width="800">
+
 While it waits you can reload or switch away and come back:
 
 - **Question card:** the card is shown once, on the tab that views the chat; a reload moves it to the reloaded tab. If it is not answered by Open WebUI's card timeout (4 minutes), or no tab views the chat (for example a client calling the API), the reply ends with the question as plain text.

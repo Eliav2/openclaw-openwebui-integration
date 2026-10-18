@@ -1,0 +1,318 @@
+{
+  "_comment": "The docs' demo GIFs (record.py). `scenes` are scripted model replies like scripts/screenshots/scenes.json, kept short so each GIF fits in 15 s; the demo stack loads this file first, then scenes.json, so a demo can also use a screenshot scene. `demos` are the recordings: each one's steps run in order (record.py's Demo methods say what each step does).",
+  "scenes": [
+    {
+      "match": "What changed in the forecast app since Monday",
+      "steps": [
+        {
+          "say": "Checking the commit log first.",
+          "tool": "exec",
+          "args": {
+            "command": "cd forecast && git log --oneline --since='7 days ago'",
+            "title": "Commits since Monday"
+          }
+        },
+        {
+          "say": "And a quick build check.",
+          "tool": "exec",
+          "args": {
+            "command": "cd forecast && sleep 2 && python3 -m compileall -q src && echo build ok",
+            "title": "Check that the app still builds",
+            "yieldMs": 30000
+          }
+        },
+        {
+          "say": "Since Monday:\n\n- **Hourly view.** The day screen has an hourly strip with temperature and rain chance.\n- **Faster startup.** Forecasts are cached for ten minutes.\n- **Wind units fix.** Wind speed follows the unit setting again.\n\nThe build is clean.",
+          "delay": 0.015
+        }
+      ]
+    },
+    {
+      "match": "Run the type check and the linter on the forecast app",
+      "steps": [
+        {
+          "say": "Running the type check.",
+          "tool": "exec",
+          "args": {
+            "command": "cd forecast && sleep 3 && python3 -m compileall -q src && echo 'no type errors'",
+            "title": "Run the type check"
+          }
+        },
+        {
+          "say": "Now the linter.",
+          "tool": "exec",
+          "args": {
+            "command": "cd forecast && sleep 2 && echo 'no issues found'",
+            "title": "Run the linter"
+          }
+        },
+        {
+          "say": "Both are clean: no type errors, and the linter found nothing.",
+          "delay": 0.02
+        }
+      ]
+    },
+    {
+      "match": "Add CI checks to the forecast app",
+      "steps": [
+        {
+          "say": "Sure. One decision first.\n\nOpenClaw needs input:\n{\"questions\": [{\"id\": \"ci_provider\", \"header\": \"CI\", \"question\": \"Where should the checks run?\", \"options\": [{\"label\": \"GitHub Actions\", \"description\": \"Free for this repo, and the code already lives on GitHub.\"}, {\"label\": \"GitLab CI\", \"description\": \"Needs a mirror of the repo on GitLab.\"}, {\"label\": \"Only on my machine\", \"description\": \"A pre-push hook, no hosted CI.\"}]}]}"
+        }
+      ]
+    },
+    {
+      "match": "GitHub Actions",
+      "steps": [
+        {
+          "say": "GitHub Actions it is. Adding the workflow.",
+          "tool": "exec",
+          "args": {
+            "command": "cd forecast && mkdir -p .github/workflows && printf 'name: checks\\non: [push]\\n' > .github/workflows/checks.yml && echo written",
+            "title": "Add the checks workflow"
+          }
+        },
+        {
+          "say": "Done: `.github/workflows/checks.yml` runs the checks on every push.",
+          "delay": 0.02
+        }
+      ]
+    },
+    {
+      "match": "Refresh the forecast cache",
+      "steps": [
+        {
+          "say": "Refreshing the cache from the forecast API.",
+          "tool": "exec",
+          "args": {
+            "command": "cd forecast && sleep 7 && echo cache refreshed",
+            "title": "Refresh the forecast cache",
+            "yieldMs": 30000
+          }
+        },
+        {
+          "say": "The cache is fresh: 24 hours for each saved place.",
+          "delay": 0.02
+        }
+      ]
+    },
+    {
+      "match": "Which branch am I on",
+      "steps": [
+        {
+          "say": "You're on main. It's the only branch so far.",
+          "delay": 0.02
+        }
+      ]
+    }
+  ],
+  "demos": [
+    {
+      "name": "hero",
+      "steps": [
+        {
+          "do": "type",
+          "text": "What changed in the forecast app since Monday?"
+        },
+        {
+          "do": "send"
+        },
+        {
+          "do": "wait_reply_done"
+        },
+        {
+          "do": "pause",
+          "ms": 1500
+        }
+      ]
+    },
+    {
+      "name": "tool-cards",
+      "steps": [
+        {
+          "do": "type",
+          "text": "Run the type check and the linter on the forecast app."
+        },
+        {
+          "do": "send"
+        },
+        {
+          "do": "wait_reply_done"
+        },
+        {
+          "do": "pause",
+          "ms": 600
+        },
+        {
+          "do": "click",
+          "selector": ".chat-assistant >> nth=-1 >> [role=button] >> nth=0"
+        },
+        {
+          "do": "wait",
+          "js": "() => /output/i.test([...document.querySelectorAll('.chat-assistant')].pop().innerText)"
+        },
+        {
+          "do": "park"
+        },
+        {
+          "do": "pause",
+          "ms": 1800
+        }
+      ]
+    },
+    {
+      "name": "question-card",
+      "steps": [
+        {
+          "do": "type",
+          "text": "Add CI checks to the forecast app."
+        },
+        {
+          "do": "send"
+        },
+        {
+          "do": "wait",
+          "js": "() => document.body.innerText.includes('Where should the checks run?') && !!document.querySelector('input[placeholder=\"Type your answer\"]')"
+        },
+        {
+          "do": "pause",
+          "ms": 900
+        },
+        {
+          "do": "click",
+          "selector": "section button:has(span:text-is(\"GitHub Actions\"))"
+        },
+        {
+          "do": "park"
+        },
+        {
+          "do": "wait_reply_done"
+        },
+        {
+          "do": "pause",
+          "ms": 1500
+        }
+      ]
+    },
+    {
+      "name": "send-now",
+      "pipe_valves": {
+        "AUTO_SEND_WHILE_RUNNING": false
+      },
+      "steps": [
+        {
+          "do": "type",
+          "text": "Refresh the forecast cache."
+        },
+        {
+          "do": "send"
+        },
+        {
+          "do": "wait",
+          "js": "() => !![...document.querySelectorAll('.chat-assistant')].pop()?.querySelector('[role=button] .shimmer')"
+        },
+        {
+          "do": "type",
+          "text": "Which branch am I on?"
+        },
+        {
+          "do": "send"
+        },
+        {
+          "do": "wait",
+          "js": "() => !!document.querySelector('button[aria-label=\"Send now\"]')"
+        },
+        {
+          "do": "pause",
+          "ms": 400
+        },
+        {
+          "do": "keys",
+          "keys": [
+            "Send now"
+          ],
+          "ms": 1200
+        },
+        {
+          "do": "click",
+          "selector": "button[aria-label=\"Send now\"] >> nth=0"
+        },
+        {
+          "do": "wait",
+          "js": "() => { const a = [...document.querySelectorAll('.chat-assistant')]; return a.length >= 2 && a[0].innerText.includes('The cache is fresh') && a[a.length - 1].innerText.includes(\"You're on main\"); }"
+        },
+        {
+          "do": "wait_reply_done"
+        },
+        {
+          "do": "pause",
+          "ms": 800
+        }
+      ]
+    },
+    {
+      "name": "status-dialog",
+      "steps": [
+        {
+          "do": "record",
+          "on": false
+        },
+        {
+          "do": "type",
+          "text": "Compare hosting for the forecast app: Fly.io or Render?"
+        },
+        {
+          "do": "send"
+        },
+        {
+          "do": "wait",
+          "js": "() => [...document.querySelectorAll('.chat-assistant')].pop()?.innerText.includes('side by side')"
+        },
+        {
+          "do": "wait_children",
+          "phrases": [
+            "Price out Fly.io",
+            "Price out Render"
+          ]
+        },
+        {
+          "do": "park"
+        },
+        {
+          "do": "record",
+          "on": true
+        },
+        {
+          "do": "pause",
+          "ms": 600
+        },
+        {
+          "do": "click",
+          "selector": "button[aria-label=\"OpenClaw status\"]"
+        },
+        {
+          "do": "wait",
+          "js": "() => { const r = document.querySelector('#openclaw-status-modal-root'); return r && /subagents \\(2\\)/i.test(r.innerText) && r.innerText.includes('Fly.io'); }"
+        },
+        {
+          "do": "pause",
+          "ms": 1800
+        },
+        {
+          "do": "click",
+          "selector": "#openclaw-status-modal-root button:has-text(\"Fly.io\") >> nth=0"
+        },
+        {
+          "do": "wait",
+          "js": "() => { const s = document.getElementById('openclaw-drawer-stream'); return s && s.querySelector('[data-openclaw-card]') && s.innerText.includes(\"start from the app's README\"); }"
+        },
+        {
+          "do": "park"
+        },
+        {
+          "do": "pause",
+          "ms": 2500
+        }
+      ]
+    }
+  ]
+}

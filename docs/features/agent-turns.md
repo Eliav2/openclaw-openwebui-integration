@@ -50,6 +50,8 @@ To watch a sub-agent while it works, open it from the [Status dialog](./status.m
 - **Send now** (or Enter while the reply runs, with Open WebUI's message queue off) keeps the run going to its end in the same message; your message runs right after it.
 - **A message you send while it streams** is in the chat at once ([`AUTO_SEND_WHILE_RUNNING`](../configuration.md#auto_send_while_running)). The Pipe waits for the run to finish and then sends it as its own reply. It is never mixed into the agent's run.
 
+<img src="../img/demos/send-now.gif" alt="A second message sent while a reply runs waits in Open WebUI's queue; Send now posts it at once, marked queued until the first reply finishes, and then it gets its own reply" width="800">
+
 ## Images, files and questions
 
 A `MEDIA:` line in such a reply becomes an attached image or file, as in [your own replies](./chat.md#images-and-files-from-the-agent). There is no request of yours to borrow a login from, so the upload to Open WebUI's Files API uses the [`OWUI_API_KEY`](../configuration.md#owui_api_key) valve. Without it, the file falls back to the built-in file server link.
