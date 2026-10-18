@@ -2492,9 +2492,12 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         async def usage_rows(*a, **k):
             rows_asked.set()
             await asyncio.Event().wait()   # the Gateway calls, under way when Stop lands
-        patch = mock.patch.object(self.ocp, "_build_usage_status_lines", usage_rows)
-        patch.start()
-        self.addCleanup(patch.stop)
+        # Stopped here, before asyncTearDown stops the class's own patch of the
+        # same name: stopped after it, this one would restore that mock for good.
+        with mock.patch.object(self.ocp, "_build_usage_status_lines", usage_rows):
+            await self._stopped_as_it_ends_with_rows_pending(closed, rows_asked, between_chunks)
+
+    async def _stopped_as_it_ends_with_rows_pending(self, closed, rows_asked, between_chunks):
         reached = asyncio.Event()
 
         async def owui_work():
@@ -7289,6 +7292,10 @@ class _FakeOwuiChat:
                 msgs = fake.chat.chat["history"]["messages"]
                 msgs[message_id] = {**msgs.get(message_id, {}), **message}
                 return fake.chat
+
+            @staticmethod
+            async def get_message_by_id_and_message_id(chat_id, message_id):
+                return copy.deepcopy(fake.chat.chat["history"]["messages"].get(message_id))
         self.upserts = []
         self._chats = Chats
 
@@ -7681,6 +7688,11 @@ class TurnWriterEndTests(_TurnWriterCase):
                 return {"runId": params["idempotencyKey"], "status": "started"}
             if method == "chat.abort":
                 return {"aborted": True}
+            if method == "sessions.describe":
+                return {"session": {"modelProvider": "anthropic", "contextTokens": 1_000_000,
+                                    "totalTokens": 34_000}}
+            if method == "usage.status":
+                return {"providers": []}
             raise AssertionError(method)
         self.conn.send_request = send_request
 
@@ -7709,6 +7721,92 @@ class TurnWriterEndTests(_TurnWriterCase):
         self.assertEqual(self.owui.events("chat:active")[-1]["data"], {"active": False})
         self.assertTrue((await self.task_done(w)).done(), "the Open WebUI task ends with the run")
         self.assertTrue(w.closed)
+
+    USAGE = {"description": "🧠 34k/1.0m (3.4%)", "done": True}
+    LEFT_BY_THE_CANCEL = [{"description": "Thinking...", "done": False},
+                          {"description": "Stopped", "done": True},
+                          {"description": "", "done": True}]
+
+    def handed_writer(self, request=None):
+        """A Send now (or a send from another tab) mid-reply: the reply's
+        request parked its run, saved "Stopped" and an empty line into M's
+        status history (pipe.py `park`, then the reply's end), and handed M to
+        this writer (W5 chat 1ac3323c, message 0cb40f0e)."""
+        shown = _TurnRenderer()
+        shown.feed(_delta("Reading them."))
+        self.owui.msgs()["m1"] = {"id": "m1", "role": "assistant", "parentId": "q1",
+                                  "content": "Reading them.", "done": True,
+                                  "statusHistory": copy.deepcopy(self.LEFT_BY_THE_CANCEL)}
+        return _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
+                           run_id=self.RUN, message_id="m1", takeover=True, renderer=shown,
+                           request=request)
+
+    async def test_a_run_the_writer_finishes_ends_with_the_usage_line(self):
+        """ELI-210 (W5, QA C20): a reply the writer finished (a wake, a
+        sub-agent result, a takeover) had no usage line, which the normal
+        reply always shows after its text. Saved with the message, so a
+        reload keeps it, and sent to open tabs."""
+        w = await self.opened_writer()
+        await w.end({"status": "done", "hasActiveRun": False, "lastRunId": self.RUN})
+        self.assertEqual(self.m()["statusHistory"], [self.USAGE])
+        self.assertEqual(self.owui.events("status")[-1]["data"], self.USAGE)
+
+    async def test_a_takeover_that_finished_drops_the_cancels_stopped_line(self):
+        """ELI-210: the run went on after Send now, so the "Stopped" its
+        request saved is wrong: the finished takeover reads like a normal
+        reply, "Thinking..." then the usage line."""
+        w = self.handed_writer()
+        await w.feed(None)
+        await w.end({"status": "done", "hasActiveRun": False, "lastRunId": self.RUN})
+        self.assertEqual(self.m()["statusHistory"],
+                         [{"description": "Thinking...", "done": False}, self.USAGE])
+
+    async def test_a_takeover_waits_for_its_request_before_it_writes_the_status(self):
+        """The cancelled request saves its "Stopped" and empty lines until it
+        ends; a status write before that would be appended to, not final."""
+        request = asyncio.get_running_loop().create_future()
+        w = self.handed_writer(request=request)
+        await w.feed(None)
+        ending = asyncio.ensure_future(
+            w.end({"status": "done", "hasActiveRun": False, "lastRunId": self.RUN}))
+        for _ in range(50):
+            await asyncio.sleep(0)
+        self.assertFalse(ending.done(), "the final write waits for the request")
+        request.set_result(None)
+        await asyncio.wait_for(ending, 1)
+        self.assertEqual(self.m()["statusHistory"][-1], self.USAGE)
+
+    async def test_a_stop_ends_with_stopped_and_no_usage_line(self):
+        """A real Stop reads as the normal reply's Stop: "Stopped", no usage."""
+        for handed in (False, True):
+            with self.subTest(handed=handed):
+                self.owui.msgs().pop("m1", None)
+                self.sent.clear()
+                if handed:
+                    w = self.handed_writer()
+                    await w.feed(None)
+                    await w.open(takeover=True)
+                else:
+                    w = await self.opened_writer()
+                await self.cancel_from_the_page(w, "stop")
+                history = self.m().get("statusHistory") or []
+                self.assertEqual([h for h in history if h.get("description")][-1],
+                                 {"description": "Stopped", "done": True})
+                self.assertNotIn("🧠", json.dumps(history, ensure_ascii=False))
+
+    async def test_a_handed_over_reply_resumes_with_the_users_request(self):
+        """The writer kept Open WebUI's request task and the user's request
+        in one attribute; a handed-over reply cut off by a Gateway restart
+        quoted the task object instead of the request it continues."""
+        request = asyncio.get_running_loop().create_future()
+        request.set_result(None)
+        w = self.handed_writer(request=request)
+        await w.feed(None)
+        await w.end(self.KILLED)
+        sends = [p for m, p in self.sent if m == "chat.send"]
+        self.assertEqual(len(sends), 1)
+        self.assertIn("check the logs", sends[0]["message"])
+        self.assertNotIn("Future", sends[0]["message"])
 
     def _found_it_says(self, text):
         for m in self.history["messages"]:

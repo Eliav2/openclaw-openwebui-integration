@@ -7228,6 +7228,27 @@ async def _run_request(conn, method: str, params: dict, *, timeout: float = 10,
 # Opens tried at a run's end while Open WebUI's DB is locked (ELI-167). Each
 # waits out sqlite's busy_timeout (Open WebUI: 5 s), so 6 is about 30 s.
 OPEN_AT_END_LOCKED_TRIES = 6
+# How long M's final write waits for the request it was handed over from to
+# end (its own status lines are saved until then).
+FINAL_STATUS_REQUEST_WAIT_S = 30
+# What a cancel leaves at the end of a reply's status lines: "Stopped" from
+# `park`, then the reply's empty closing line. Wrong once the run went on in
+# the same message (Send now, or a message sent from another tab).
+_CANCEL_STATUS_TAIL = ("Stopped", "")
+
+
+def _final_status_history(history: list | None, lines: list, stopped: bool) -> tuple[list, list]:
+    """M's status lines when the writer ends it, and the ones it adds: the
+    cancel's tail dropped, then "Stopped" for a Stop, else the usage lines (an
+    empty closing line when there are none, as the inline reply ends)."""
+    kept = [h for h in (history or []) if isinstance(h, dict)]
+    while kept and kept[-1].get("done") is not False and kept[-1].get("description") in _CANCEL_STATUS_TAIL:
+        kept.pop()
+    if stopped:
+        new = [{"description": "Stopped", "done": True}]
+    else:
+        new = [{"description": line, "done": True} for line in lines] or [{"description": "", "done": True}]
+    return kept + new, new
 
 
 def _db_locked(ex: BaseException) -> bool:
@@ -7709,10 +7730,10 @@ class _TurnWriter:
         self.sent_output: list = []     # the `output` open tabs hold
         # A handover owes M one write: Open WebUI's end-of-stream save of the
         # request writes `done: true` over M, and the orphan reconcile adopts
-        # only `done: false`. `request` is that request's task: the write
+        # only `done: false`. `request_task` is that request's task: the write
         # waits for it to end, so it lands after the save (ELI-115).
         self.handover_owed = renderer is not None
-        self.request = request
+        self.request_task = request
         if renderer is not None:
             # A handed renderer is what the request showed: open tabs hold
             # those items, but under Open WebUI's ids, so an `added` would
@@ -7832,7 +7853,7 @@ class _TurnWriter:
             await emit({"type": "response:completion", "data": ev})
         self.sent_output = copy.deepcopy(output)
         await _save_response_stream(self.task_id, self.chat_id, self.message_id, text, self.sent_output)
-        if self.handover_owed and (self.request is None or self.request.done()):
+        if self.handover_owed and (self.request_task is None or self.request_task.done()):
             self.handover_owed = False
             await self._persist(done=False, output=output, text=text)
 
@@ -7920,17 +7941,41 @@ class _TurnWriter:
                 self._media_failed.add(directive)
 
     async def _persist(self, *, done: bool, output: list | None = None,
-                       text: str | None = None) -> None:
+                       text: str | None = None, status_history: list | None = None) -> None:
         from open_webui.models.chats import Chats
 
+        message = {"content": self.renderer.text if text is None else text,
+                   "output": output if output is not None else copy.deepcopy(self.renderer.output),
+                   "done": done}
+        if status_history is not None:
+            message["statusHistory"] = status_history
         try:
-            await _owui_upsert_message(
-                self.chat_id, self.message_id,
-                {"content": self.renderer.text if text is None else text,
-                 "output": output if output is not None else copy.deepcopy(self.renderer.output),
-                 "done": done})
+            await _owui_upsert_message(self.chat_id, self.message_id, message)
         except Exception as ex:
             pipe_log(f"  turn writer: persist failed: {ex}")
+
+    async def _persist_final(self, output: list, text: str, stopped: bool) -> list:
+        """The `done: true` write of M, with its final status lines in the same
+        write: the usage lines of a reply (`_build_usage_status_lines`, as the
+        inline reply ends), or "Stopped" for a Stop (ELI-210). Returns the
+        lines to send to open tabs.
+
+        After the request M was handed over from has ended: it saves its own
+        status lines into M until then."""
+        from open_webui.models.chats import Chats
+
+        if self.request_task is not None and not self.request_task.done():
+            await asyncio.wait({self.request_task}, timeout=FINAL_STATUS_REQUEST_WAIT_S)
+        lines = [] if stopped else await _build_usage_status_lines(self.conn, self.session_key)
+        async with self.conn._chat_write_lock(self.chat_id):
+            try:
+                saved = await Chats.get_message_by_id_and_message_id(self.chat_id, self.message_id) or {}
+            except Exception as ex:
+                saved = {}
+                pipe_log(f"  turn writer: reading M's status lines failed: {ex!r}")
+            history, new = _final_status_history(saved.get("statusHistory"), lines, stopped)
+            await self._persist(done=True, output=output, text=text, status_history=history)
+        return new
 
     def adopt(self, run_id: str) -> None:
         """A run that continues M (a pipe resume, or a restart recovery that
@@ -8124,11 +8169,11 @@ class _TurnWriter:
         pipe_log(f"  turn writer: resumed {self.message_id[:8]}... as {self.run_id[:32]}... "
                  f"({self.resumes}/{MAX_TURN_RESUMES})")
 
-    async def finalize(self, note: str | None = None) -> None:
+    async def finalize(self, note: str | None = None, stopped: bool = False) -> None:
         """Write M's last state, `done: true`: from the transcript when every
         run written into M has closed there, else what streamed. A silent
         sentinel is never written; a sentinel-only run that showed tool cards
-        keeps them (condition B)."""
+        keeps them (condition B). `stopped`: the user's Stop ended it."""
         if self.closed:
             return
         self.closed = True
@@ -8161,10 +8206,12 @@ class _TurnWriter:
             if note:
                 text = f"{text}\n\n{note}" if text else note
                 output.append(_turn_note_item(note))
-            await self._persist(done=True, output=output, text=text)
+            status = await self._persist_final(output, text, stopped)
             emit = await self._emitter()
             await emit({"type": "chat:completion", "data": {"done": True, "content": text,
                                                              "output": output}})
+            for line in status:
+                await emit({"type": "status", "data": line})
             await emit({"type": "chat:active", "data": {"active": False}})
             tools = sum(1 for i in output if i.get("type") == "function_call")
             pipe_log(f"  turn writer: finalized {self.message_id[:8]}... ({len(text)} chars, "
@@ -8353,7 +8400,7 @@ class _TurnWriter:
             pipe_log(f"  turn writer: chat.abort failed: {ex}")
         if not aborted and self.wake and self.wake.get("job"):
             await self._cancel_wake_run()
-        await self.finalize()
+        await self.finalize(stopped=True)
 
     async def _cancel_wake_run(self) -> None:
         """Stop a cron wake's run (ELI-192). On 2026.9 its run id is the

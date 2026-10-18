@@ -372,6 +372,27 @@ def _both_answered(page, run: str, answer: str) -> None:
     assert run in again[0]["text"] and answer in again[1]["text"], [r["text"][-80:] for r in again]
 
 
+def _ends_like_the_answer(page, token: str, run: str) -> None:
+    """The running reply (holding `run`), finished by the Pipe's writer after
+    a takeover, ends as the answer to the new message (an inline reply) does
+    (ELI-210): with the usage line whenever the answer has it (a Gateway that
+    reports no tokens shows none on either), and with no "Stopped" from the
+    cancel. In the saved status lines, and in the status line shown on the
+    reply (the page is reloaded by now)."""
+    saved = capture.api("GET", f"/api/v1/chats/{_chat_id(page)}", token=token)["chat"]["history"]["messages"]
+    replies = [m for m in saved.values() if m.get("role") == "assistant"]
+    held = [m for m in replies if run in (m.get("content") or "")]
+    assert len(held) == 1 and len(replies) == 2, [m.get("content", "")[-80:] for m in replies]
+    answer = next(m for m in replies if m is not held[0])
+    lines, ref = ([h.get("description") for h in m.get("statusHistory") or [] if isinstance(h, dict)]
+                  for m in (held[0], answer))
+    usage = lambda ls: any(str(line).startswith("\U0001f9e0") for line in ls)  # noqa: E731
+    assert usage(lines) == usage(ref), f"the running reply: {lines}; the answer: {ref}"
+    assert "Stopped" not in lines, f"a Stopped line: {lines}"
+    shown = page.evaluate(f"() => {_message_text_js(0)}")
+    assert "Stopped" not in shown and ("\U0001f9e0" in shown) == usage(ref), shown[-200:]
+
+
 def test_a_message_sent_while_a_reply_runs_is_in_the_chat_at_once(page):
     """Sent while busy (AUTO_SEND_WHILE_RUNNING, on by default): the message
     shows in the chat right away, not in Open WebUI's queue above the
@@ -430,8 +451,31 @@ def test_send_now_on_a_queued_message_keeps_the_running_reply(page, token):
         send_now.click()
         _wait(page, f"() => {_user_message_js('BROWSER_SENDNOW_ANSWER')}", "the message in the chat after Send now")
         _both_answered(page, run, "BROWSER_SENDNOW_ANSWER")
+        _ends_like_the_answer(page, token, run)
     finally:
         capture.pipe_valves(token, **old)
+
+
+def test_a_message_sent_from_a_second_tab_keeps_the_running_reply(page, token):
+    """A plain send from another tab (or the phone) on the same chat while
+    tab A streams (ELI-210): the running reply goes on to its end, ends with
+    the usage line like any reply, and the message gets its own answer."""
+    run = _slow("BROWSER_TAB2", 20)
+    capture.new_chat(page)
+    capture.send(page, "E2E_SLOW:20 BROWSER_TAB2")
+    _wait(page, _reply_js(0, "r.text.includes('BROWSER_TAB2 slow-1 slow-2')"), "the reply part way through")
+    other = page.context.new_page()
+    try:
+        other.goto(page.url)
+        other.wait_for_selector("#chat-input", timeout=60_000)
+        _type_and_send(other, "E2E_ECHO: BROWSER_TAB2_ANSWER")
+        _wait(other, _reply_js(-1, "all.length === 2 && all[0].done && r.done"
+                                   " && r.text.includes('BROWSER_TAB2_ANSWER')"), "the answer in the second tab")
+    finally:
+        other.close()
+    _reload(page)
+    _both_answered(page, run, "BROWSER_TAB2_ANSWER")
+    _ends_like_the_answer(page, token, run)
 
 
 def _message_text_js(index: int) -> str:
