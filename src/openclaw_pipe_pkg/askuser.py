@@ -891,7 +891,9 @@ async def _ask_user_input_modal(
 # transcript and the model only ever see the request and "stored".
 #
 # A stored secret is usable by the agent's runs only from OpenClaw 2026.10
-# (ELI-97), so an older Gateway's request is left to the Control UI, as before.
+# (ELI-97), so an older Gateway's request is left to the Control UI, as is a
+# guest's: the reply then says so, with a link to the chat's session there
+# from the Status Action's CONTROL_UI_URL (ELI-197).
 
 SECRET_REQUESTS_FROM = (2026, 10, 10)
 # question id -> the task asking for it
@@ -949,11 +951,13 @@ def secret_request_seen(conn, record) -> bool:
     question = _secret_request_question(record)
     if question is None or record.get("status", "pending") != "pending" or not record.get("id"):
         return False
-    if _gateway_release(conn.gateway_version) < SECRET_REQUESTS_FROM:
-        return False
     parsed = conn.parse_owui_session_key(record.get("sessionKey") or "")
     if not parsed or record["id"] in _SECRET_REQUESTS:
         return False
+    if _gateway_release(conn.gateway_version) < SECRET_REQUESTS_FROM:
+        _SECRET_REQUESTS[record["id"]] = spawn_background(
+            _say_where_to_answer(conn, record, question))
+        return True
     _SECRET_REQUESTS[record["id"]] = spawn_background(
         _answer_secret_request(conn, record, question, *parsed))
     return True
@@ -967,6 +971,46 @@ def secret_request_resolved(payload) -> None:
         task.cancel()
 
 
+async def _control_ui_url_setting() -> str:
+    """The Status Action's CONTROL_UI_URL, or "" when unset or unreadable."""
+    try:
+        from open_webui.models.functions import Functions
+        saved = await _owui_call(Functions.get_function_valves_by_id, _COMPOSER_ACTION_ID) or {}
+    except Exception:
+        return ""
+    return str(saved.get("CONTROL_UI_URL") or "") if isinstance(saved, dict) else ""
+
+
+def _secret_request_note(name: str, url: str | None, owner: bool) -> str:
+    if not owner:
+        return f"_The agent asks for the secret `{name}`: only the owner can enter it, in the OpenClaw Control UI._"
+    where = (f"the [OpenClaw Control UI]({url}) (this chat's session)" if url
+             else "the OpenClaw Control UI, in this chat's session")
+    return (f"_The agent asks for the secret `{name}`: enter it in {where}. "
+            "Open WebUI can't ask for it on this OpenClaw version._")
+
+
+async def _say_where_to_answer(conn, record: dict, question: dict, owner: bool | None = None) -> None:
+    """Add a note to the reply of the run that asked: where the request is
+    answered, since Open WebUI does not ask for it (ELI-197)."""
+    qid, key = record["id"], record.get("sessionKey") or ""
+    name = question["secretStore"]["name"]
+    try:
+        if owner is None:
+            owner = await _sender_is_owner(conn, key)
+        url = _control_ui_session_url(await _control_ui_url_setting(), key) if owner else None
+        payload = {"sessionKey": key, "stream": PIPE_NOTE_STREAM,
+                   "data": {"id": f"{_NOTE_ITEM_PREFIX}secret_{qid}",
+                            "text": _secret_request_note(name, url, owner)}}
+        if record.get("runId"):
+            payload["runId"] = record["runId"]
+        pipe_log(f"  secret request: {name} waits in the Control UI; the reply says so")
+        await conn.dispatch_run_event({"type": "event", "event": "agent", "payload": payload})
+    finally:
+        if _SECRET_REQUESTS.get(qid) is asyncio.current_task():
+            del _SECRET_REQUESTS[qid]
+
+
 async def _answer_secret_request(conn, record: dict, question: dict, user_id: str, chat_id: str) -> None:
     qid, name = record["id"], question["secretStore"]["name"]
     timeout_s = max(1.0, (record.get("expiresAtMs") or 0) / 1000 - time.time())
@@ -975,6 +1019,7 @@ async def _answer_secret_request(conn, record: dict, question: dict, user_id: st
         # The store is the owner's: a guest's chat cannot write into it.
         _SECRET_REQUESTS.pop(qid, None)
         pipe_log(f"  secret request: {name} in a chat of a user not in OWNER_USERS; left to the Control UI")
+        await _say_where_to_answer(conn, record, question, owner=False)
         return
     turn = _SECRET_ASKERS.get(record.get("sessionKey"))
     pipe_log(f"  secret request: {name} in chat {chat_id[:8]}... (question {qid[:8]}...)")

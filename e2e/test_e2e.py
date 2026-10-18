@@ -1593,6 +1593,45 @@ def test_a_cancelled_secret_dialog_tells_the_agent_no_credential_came(token):
         page.close()
 
 
+def test_on_2026_9_a_secret_request_says_where_to_answer_it(token):
+    """On OpenClaw 2026.9 Open WebUI does not ask for a requested secret
+    (ELI-97), so the reply says, while the request waits, that it is answered
+    in the OpenClaw Control UI, linked to this chat's session there (the
+    Status Action's CONTROL_UI_URL). ELI-197: the reply showed only a spinning
+    `secrets` card until the request expired."""
+    if _openclaw_release() >= (2026, 10):
+        pytest.skip("from OpenClaw 2026.10.10 Open WebUI asks for it itself (ELI-96)")
+    status, fns = _request("GET", "/api/v1/functions/", token=token)
+    assert status == 200, fns
+    [action_id] = [f["id"] for f in fns if f.get("type") == "action" and "status" in f["id"]]
+    before = _action_valves(token)
+    control_ui = "https://claw.example.invalid"
+    status, out = _request("POST", f"/api/v1/functions/id/{action_id}/valves/update",
+                           {**before, "CONTROL_UI_URL": control_ui}, token)
+    assert status == 200, out
+    name = f"DUMMY_SECRET_ELI197_{uuid.uuid4().hex[:6].upper()}"
+    page = _Page(token)
+    try:
+        chat_id, aid = _send_in_chat(token, page, None, f"E2E_SECRET_REQUEST {name}")
+        link = f"[OpenClaw Control UI]({control_ui}/chat/main/"
+
+        def note_shown():
+            return [i for i in page.streamed(aid) if i.get("type") == "message"
+                    and link in ((i.get("content") or [{}])[0].get("text") or "")]
+        [note] = page.wait("the note on where to answer it", note_shown, 60)
+        assert f"`{name}`" in note["content"][0]["text"], note
+        # The request expires after its 60 s; the agent then hears no credential came.
+        msgs = _wait_for(token, chat_id, ["E2E_SECRET_RESULT"])
+        output = msgs[aid].get("output") or []
+        kept = [i for i in output if i.get("id") == note["id"]]
+        assert kept and link in kept[0]["content"][0]["text"], json.dumps(output)[:2000]
+        assert "E2E_SECRET_RESULT" not in kept[0]["content"][0]["text"], kept
+        assert output.index(kept[0]) < len(output) - 1, "the agent's answer comes after the note"
+    finally:
+        page.close()
+        _request("POST", f"/api/v1/functions/id/{action_id}/valves/update", before, token)
+
+
 # ── ELI-176: a message right after a Gateway restart ───────────────────────
 
 def _pipe_log_since(since: str) -> str:

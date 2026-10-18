@@ -113,7 +113,11 @@ def attach_filter(token: str, model_id: str, filter_id: str) -> None:
 
 def pipe_valves(token: str, **changes) -> dict:
     """Set some of the Pipe's valves; returns the values they replaced."""
-    fid = "openclaw_gateway"
+    return function_valves(token, "openclaw_gateway", **changes)
+
+
+def function_valves(token: str, fid: str, **changes) -> dict:
+    """Set some valves of function `fid`; returns the values they replaced."""
     valves = api("GET", f"/api/v1/functions/id/{fid}/valves", token=token) or {}
     old = {k: valves.get(k) for k in changes}
     valves.update(changes)

@@ -2213,28 +2213,6 @@ def _background_rows(tasks, jobs, agents, session_key: str, *, commands: dict) -
     }
 
 
-_TRAILING_UUID_RE = re.compile(
-    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$", re.IGNORECASE)
-
-
-def _control_ui_session_url(base: str, session_key: str) -> str | None:
-    """The session's page in the OpenClaw Control UI (ELI-141).
-
-    The UI's short-id route, `<base>/chat/<agentId>/<id>`, where `<id>` is the
-    hex of the UUID the session key ends in (OpenClaw docs/web/urls.md; the UI
-    resolves it with `sessions.resolve {shortId}`). Every key the dialog shows
-    ends in one: `agent:<id>:openwebui-<user>-<chat>` and `agent:<id>:subagent:<uuid>`.
-    None without an http(s) base or for any other key."""
-    base = (base or "").strip().rstrip("/")
-    parts = (session_key or "").split(":", 2)
-    if not base.lower().startswith(("http://", "https://")) or len(parts) != 3 or parts[0] != "agent":
-        return None
-    m = _TRAILING_UUID_RE.search(parts[2])
-    if not m or not parts[1]:
-        return None
-    return f"{base}/chat/{parts[1]}/{m.group(1).lower().replace('-', '')}"
-
-
 def _render_drawer_open_js(task: dict) -> str:
     return _DRAWER_OPEN_JS_TEMPLATE.replace("__OPENCLAW_TASK__", _json_for_js(task))
 
@@ -2456,7 +2434,8 @@ class Action:
             description="The address you open the OpenClaw Control UI at, e.g. "
                         "https://openclaw.example.com. When set, the Status "
                         "dialog and the sub-agent drawer link to the session in "
-                        "it. Empty: no link."
+                        "it, and so does the Pipe's note on a secret request "
+                        "left to the Control UI. Empty: no link."
         )
 
     def __init__(self):

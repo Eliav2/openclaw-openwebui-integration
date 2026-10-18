@@ -1350,7 +1350,7 @@ class _PipeTurn:
                         # --- Run text and tool cards ---
                         # One renderer reads them, the one a turn writer uses
                         # (ELI-147).
-                        if stream in ("assistant", "item", "tool"):
+                        if stream in ("assistant", "item", "tool", PIPE_NOTE_STREAM):
                             added = self.renderer.feed(payload)
                             for text in (a for a in added if isinstance(a, str)):
                                 async for chunk in self.show_text(text):
@@ -1396,6 +1396,13 @@ class _PipeTurn:
                                     # Until the reply ends: its usage rows replace it.
                                     await _emit_status(self.__event_emitter__,
                                                        _background_agents_line(self.background_agents))
+
+                        # --- The Pipe's own notes (ELI-197) ---
+                        if stream == PIPE_NOTE_STREAM:
+                            for event in added:
+                                yield event
+                            # Text after the note is a new message item.
+                            self.fence_item_start = len(self.assistant_stream_text)
 
                         # --- Item events (progress) ---
                         if stream == "item":

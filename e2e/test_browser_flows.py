@@ -347,6 +347,29 @@ def test_send_now_on_a_queued_message_keeps_the_running_reply(page, token):
         capture.pipe_valves(token, **old)
 
 
+def test_on_2026_9_a_secret_request_links_the_control_ui(page, token):
+    """OpenClaw 2026.9: Open WebUI does not ask for a requested secret, so
+    the reply says where it is answered, a link to this chat's session in the
+    Control UI (the Status Action's CONTROL_UI_URL), on screen while the
+    request waits and after a reload (ELI-197)."""
+    if _openclaw_release() >= (2026, 10):
+        pytest.skip("from OpenClaw 2026.10.10 Open WebUI asks for it itself (ELI-96)")
+    control_ui = "https://claw.example.invalid"
+    old = capture.function_valves(token, "openclaw_status_action", CONTROL_UI_URL=control_ui)
+    link = f"() => [...document.querySelectorAll('.chat-assistant a[href^=\"{control_ui}/chat/main/\"]')]" \
+           ".some(a => a.innerText.includes('OpenClaw Control UI') && a.offsetParent !== null)"
+    try:
+        capture.new_chat(page)
+        capture.send(page, "E2E_SECRET_REQUEST DUMMY_SECRET_ELI197")
+        _wait(page, link, "the Control UI link while the request waits", 60_000)
+        # The request expires after its 60 s, then the agent answers.
+        _wait(page, _reply_js(-1, "r.done && r.text.includes('E2E_SECRET_RESULT')"), "the agent's answer")
+        _reload(page)
+        _wait(page, link, "the Control UI link after a reload", 30_000)
+    finally:
+        capture.function_valves(token, "openclaw_status_action", **old)
+
+
 def _message_text_js(index: int) -> str:
     """Reply `index`'s whole message as shown: its status line too."""
     return (f"(() => {{ const a = [...document.querySelectorAll('.chat-assistant')].at({index}); "

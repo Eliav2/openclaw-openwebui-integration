@@ -48,7 +48,7 @@ If you cancel any other question, or it ends as text, the question stays in the 
 
 ## Secrets the agent requests
 
-_Needs OpenClaw 2026.10.10 or later. On an older Gateway the request is left to the Control UI, as before: a secret stored there cannot be used by the agent's runs yet._
+_Needs OpenClaw 2026.10.10 or later. On an older Gateway the request is left to the Control UI: a secret stored there cannot be used by the agent's runs yet. The reply says so while the request waits, with a link to this chat's session in the Control UI when the Status Action's [`CONTROL_UI_URL`](../configuration.md#control_ui_url) is set._
 
 When the agent asks for a credential with OpenClaw's `secrets` tool (`action: request`), the Pipe shows the same masked dialog on the chat's tab, titled with the secret's name, the agent's reason and the hosts it may be sent to.
 
@@ -59,7 +59,7 @@ What you type goes straight to the Gateway's secret store (`question.resolve`). 
 - **Cancel:** the agent is told the request was cancelled and nothing is stored.
 - **No answer:** the dialog waits until the request expires (the agent's `timeoutSeconds`, 15 minutes by default), then the agent is told no credential arrived. It is shown like the secret dialog above: on the reply's tab, moved once to a reloaded tab.
 - **Answered elsewhere** (the Control UI): the dialog's wait ends and its answer is dropped.
-- **A user not in `OWNER_USERS`:** not asked. The secret store is the owner's, so a guest's chat cannot write into it; the request is left to the Control UI.
+- **A user not in `OWNER_USERS`:** not asked. The secret store is the owner's, so a guest's chat cannot write into it; the request is left to the Control UI, and the reply says only the owner can enter it there.
 
 ## Questions in replies the agent starts
 

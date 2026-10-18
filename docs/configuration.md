@@ -164,7 +164,7 @@ Copy this exactly from the Pipe's valves -- the same OpenClaw agent the Pipe rou
 
 Type: `str`. Default: empty.
 
-The address you open the OpenClaw Control UI at, e.g. https://openclaw.example.com. When set, the Status dialog and the sub-agent drawer link to the session in it. Empty: no link.
+The address you open the OpenClaw Control UI at, e.g. https://openclaw.example.com. When set, the Status dialog and the sub-agent drawer link to the session in it, and so does the Pipe's note on a secret request left to the Control UI. Empty: no link.
 
 ## Thinking filter
 

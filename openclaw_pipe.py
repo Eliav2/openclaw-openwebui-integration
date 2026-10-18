@@ -3314,7 +3314,9 @@ async def _ask_user_input_modal(
 # transcript and the model only ever see the request and "stored".
 #
 # A stored secret is usable by the agent's runs only from OpenClaw 2026.10
-# (ELI-97), so an older Gateway's request is left to the Control UI, as before.
+# (ELI-97), so an older Gateway's request is left to the Control UI, as is a
+# guest's: the reply then says so, with a link to the chat's session there
+# from the Status Action's CONTROL_UI_URL (ELI-197).
 
 SECRET_REQUESTS_FROM = (2026, 10, 10)
 # question id -> the task asking for it
@@ -3372,11 +3374,13 @@ def secret_request_seen(conn, record) -> bool:
     question = _secret_request_question(record)
     if question is None or record.get("status", "pending") != "pending" or not record.get("id"):
         return False
-    if _gateway_release(conn.gateway_version) < SECRET_REQUESTS_FROM:
-        return False
     parsed = conn.parse_owui_session_key(record.get("sessionKey") or "")
     if not parsed or record["id"] in _SECRET_REQUESTS:
         return False
+    if _gateway_release(conn.gateway_version) < SECRET_REQUESTS_FROM:
+        _SECRET_REQUESTS[record["id"]] = spawn_background(
+            _say_where_to_answer(conn, record, question))
+        return True
     _SECRET_REQUESTS[record["id"]] = spawn_background(
         _answer_secret_request(conn, record, question, *parsed))
     return True
@@ -3390,6 +3394,46 @@ def secret_request_resolved(payload) -> None:
         task.cancel()
 
 
+async def _control_ui_url_setting() -> str:
+    """The Status Action's CONTROL_UI_URL, or "" when unset or unreadable."""
+    try:
+        from open_webui.models.functions import Functions
+        saved = await _owui_call(Functions.get_function_valves_by_id, _COMPOSER_ACTION_ID) or {}
+    except Exception:
+        return ""
+    return str(saved.get("CONTROL_UI_URL") or "") if isinstance(saved, dict) else ""
+
+
+def _secret_request_note(name: str, url: str | None, owner: bool) -> str:
+    if not owner:
+        return f"_The agent asks for the secret `{name}`: only the owner can enter it, in the OpenClaw Control UI._"
+    where = (f"the [OpenClaw Control UI]({url}) (this chat's session)" if url
+             else "the OpenClaw Control UI, in this chat's session")
+    return (f"_The agent asks for the secret `{name}`: enter it in {where}. "
+            "Open WebUI can't ask for it on this OpenClaw version._")
+
+
+async def _say_where_to_answer(conn, record: dict, question: dict, owner: bool | None = None) -> None:
+    """Add a note to the reply of the run that asked: where the request is
+    answered, since Open WebUI does not ask for it (ELI-197)."""
+    qid, key = record["id"], record.get("sessionKey") or ""
+    name = question["secretStore"]["name"]
+    try:
+        if owner is None:
+            owner = await _sender_is_owner(conn, key)
+        url = _control_ui_session_url(await _control_ui_url_setting(), key) if owner else None
+        payload = {"sessionKey": key, "stream": PIPE_NOTE_STREAM,
+                   "data": {"id": f"{_NOTE_ITEM_PREFIX}secret_{qid}",
+                            "text": _secret_request_note(name, url, owner)}}
+        if record.get("runId"):
+            payload["runId"] = record["runId"]
+        pipe_log(f"  secret request: {name} waits in the Control UI; the reply says so")
+        await conn.dispatch_run_event({"type": "event", "event": "agent", "payload": payload})
+    finally:
+        if _SECRET_REQUESTS.get(qid) is asyncio.current_task():
+            del _SECRET_REQUESTS[qid]
+
+
 async def _answer_secret_request(conn, record: dict, question: dict, user_id: str, chat_id: str) -> None:
     qid, name = record["id"], question["secretStore"]["name"]
     timeout_s = max(1.0, (record.get("expiresAtMs") or 0) / 1000 - time.time())
@@ -3398,6 +3442,7 @@ async def _answer_secret_request(conn, record: dict, question: dict, user_id: st
         # The store is the owner's: a guest's chat cannot write into it.
         _SECRET_REQUESTS.pop(qid, None)
         pipe_log(f"  secret request: {name} in a chat of a user not in OWNER_USERS; left to the Control UI")
+        await _say_where_to_answer(conn, record, question, owner=False)
         return
     turn = _SECRET_ASKERS.get(record.get("sessionKey"))
     pipe_log(f"  secret request: {name} in chat {chat_id[:8]}... (question {qid[:8]}...)")
@@ -4238,6 +4283,36 @@ def _tool_call_started_event(name: str, tool_call_id: str, args_str: str) -> dic
     }
 
 
+_TRAILING_UUID_RE = re.compile(
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$", re.IGNORECASE)
+
+
+def _control_ui_session_url(base: str, session_key: str) -> str | None:
+    """The session's page in the OpenClaw Control UI (ELI-141).
+
+    The UI's short-id route, `<base>/chat/<agentId>/<id>`, where `<id>` is the
+    hex of the UUID the session key ends in (OpenClaw docs/web/urls.md; the UI
+    resolves it with `sessions.resolve {shortId}`). Every key the dialog shows
+    ends in one: `agent:<id>:openwebui-<user>-<chat>` and `agent:<id>:subagent:<uuid>`.
+    None without an http(s) base or for any other key."""
+    base = (base or "").strip().rstrip("/")
+    parts = (session_key or "").split(":", 2)
+    if not base.lower().startswith(("http://", "https://")) or len(parts) != 3 or parts[0] != "agent":
+        return None
+    m = _TRAILING_UUID_RE.search(parts[2])
+    if not m or not parts[1]:
+        return None
+    return f"{base}/chat/{parts[1]}/{m.group(1).lower().replace('-', '')}"
+
+
+# A note the Pipe adds to a reply (ELI-197): a Responses message item of its
+# own, carried as a run event of this made-up stream so the live reply and a
+# turn writer show it through the same `_TurnRenderer`. Its id is stable per
+# note, so the same note again replaces it.
+PIPE_NOTE_STREAM = "pipe_note"
+_NOTE_ITEM_PREFIX = "msg_note_"
+
+
 def _tool_call_result_event(tool_call_id: str, result_str: str) -> dict:
     """Complete a tool call announced by `_tool_call_started_event`.
 
@@ -4535,7 +4610,8 @@ class _TurnRenderer:
     message can be finalized to exactly what a non-interrupted turn would
     have stored.
 
-    Scope: assistant text deltas, item-carried text, and tool-result blocks.
+    Scope: assistant text deltas, item-carried text, tool-result blocks, and
+    the Pipe's own notes (`PIPE_NOTE_STREAM`).
     It holds the raw run text: the turn writer shows a resolved `MEDIA:` image
     and an answered ask-user card through the rewrites the inline reply
     recorded (`note_turn_rewrite`).
@@ -4617,7 +4693,8 @@ class _TurnRenderer:
         self._add(chunk)
         self.text += chunk
         last = self.output[-1] if self.output else None
-        if last is None or last.get("type") != "message":
+        if (last is None or last.get("type") != "message"
+                or str(last.get("id", "")).startswith(_NOTE_ITEM_PREFIX)):
             last = {
                 "type": "message",
                 "id": f"msg_{uuid.uuid4().hex[:24]}",
@@ -4715,6 +4792,20 @@ class _TurnRenderer:
                 item_delta = _suppress_already_shown(item_delta, self.visible_text)
                 if item_delta:
                     events.append(self._add_text(item_delta))
+
+        if stream == PIPE_NOTE_STREAM:
+            nid, text = data.get("id"), data.get("text")
+            if nid and text:
+                item = {"type": "message", "id": nid, "status": "completed", "role": "assistant",
+                        "content": [{"type": "output_text", "text": text}]}
+                at = next((n for n, i in enumerate(self.output) if i.get("id") == nid), None)
+                if at is None:
+                    self.output.append(item)
+                else:
+                    self.output[at] = item
+                events.append({"type": "response.output_item.added",
+                               "output_index": _OUTPUT_APPEND_INDEX, "item": copy.deepcopy(item)})
+            return events
 
         if stream == "tool":
             tcid = data.get("toolCallId", "")
@@ -5730,6 +5821,63 @@ class _GatewayConnection:
             return None
         return after[0:36], after[37:73]
 
+    async def dispatch_run_event(self, msg: dict) -> None:
+        """One `agent` or `chat` event of a run: its shadow render, then its
+        live reply, its turn writer, or nowhere. The receive loop's path for
+        every run event, and the Pipe's for its own notes (ELI-197)."""
+        payload = msg.get("payload", {})
+        if payload.get("stream") == "tool" and not self._first_tool_event(payload):
+            return
+        spawned = self._spawn_seen(payload) if payload.get("stream") == "tool" else None
+        if spawned:
+            # The Status dialog's child index (state.py), off the loop.
+            parent, child, task = spawned
+            asyncio.get_running_loop().run_in_executor(None, functools.partial(
+                _subagent_remember, parent, keys=[child], tasks={child: task} if task else None))
+
+        # ── Shadow render ──
+        # Feed every event of a run we're tracking into its shadow
+        # `_TurnRenderer`, whether or not a live consumer is still
+        # attached: the inline turn can end at any point, and the turn
+        # writer it hands over to starts from this content.
+        _evt_sess = payload.get("sessionKey", "")
+        _evt_run = payload.get("runId", "")
+        if _evt_sess and _evt_run:
+            _renderer = self._run_renderers.get(f"{_evt_sess}:{_evt_run}")
+            if _renderer is not None:
+                try:
+                    _renderer.feed(payload)
+                except Exception as ex:
+                    pipe_log(f"  shadow renderer feed failed: {ex}")
+
+        consumers = self.consumers_for_event(payload)
+
+        # ── ELI-100: a run no live request consumes is a turn ──
+        if not consumers and _TURNS and _TURNS.route_now(self, payload):
+            return
+
+        if consumers:
+            if not payload.get("runId"):
+                pipe_log("  dispatched session-only event to sole consumer")
+            if payload.get("state") == "final" and payload.get("sessionKey") and payload.get("runId"):
+                # Genuinely shown to a live tab, which persists it via
+                # OWUI's own client-side flow -- remember this so a
+                # later duplicate/retried final event for the same
+                # run_id never reopens its message.
+                self.mark_delivered_live(payload["sessionKey"], payload["runId"])
+                # The inline turn is alive and took the final itself, so
+                # the parity shadow isn't needed for this run -- drop it.
+                self.unregister_run_target(payload["sessionKey"], payload["runId"])
+            for q in consumers[0].queues:
+                await q.put(msg)
+            return
+
+        if payload.get("sessionKey") and not payload.get("runId"):
+            pipe_log("  dropped ambiguous or unmatched session-only event")
+
+        # If nothing matches at all, drop it.
+        # This efficiently filters cross-session bleed.
+
     def consumers_for_event(self, payload: dict) -> list[_Consumer]:
         """Return consumers that should receive a Gateway event payload."""
         evt_session = payload.get("sessionKey", "")
@@ -6416,58 +6564,7 @@ class _GatewayConnection:
                    msg.get("event") not in ("agent", "chat"):
                     continue
 
-                payload = msg.get("payload", {})
-                if payload.get("stream") == "tool" and not self._first_tool_event(payload):
-                    continue
-                spawned = self._spawn_seen(payload) if payload.get("stream") == "tool" else None
-                if spawned:
-                    # The Status dialog's child index (state.py), off the loop.
-                    parent, child, task = spawned
-                    asyncio.get_running_loop().run_in_executor(None, functools.partial(
-                        _subagent_remember, parent, keys=[child], tasks={child: task} if task else None))
-
-                # ── Shadow render ──
-                # Feed every event of a run we're tracking into its shadow
-                # `_TurnRenderer`, whether or not a live consumer is still
-                # attached: the inline turn can end at any point, and the turn
-                # writer it hands over to starts from this content.
-                _evt_sess = payload.get("sessionKey", "")
-                _evt_run = payload.get("runId", "")
-                if _evt_sess and _evt_run:
-                    _renderer = self._run_renderers.get(f"{_evt_sess}:{_evt_run}")
-                    if _renderer is not None:
-                        try:
-                            _renderer.feed(payload)
-                        except Exception as ex:
-                            pipe_log(f"  shadow renderer feed failed: {ex}")
-
-                consumers = self.consumers_for_event(payload)
-
-                # ── ELI-100: a run no live request consumes is a turn ──
-                if not consumers and _TURNS and _TURNS.route_now(self, payload):
-                    continue
-
-                if consumers:
-                    if not payload.get("runId"):
-                        pipe_log("  dispatched session-only event to sole consumer")
-                    if payload.get("state") == "final" and payload.get("sessionKey") and payload.get("runId"):
-                        # Genuinely shown to a live tab, which persists it via
-                        # OWUI's own client-side flow -- remember this so a
-                        # later duplicate/retried final event for the same
-                        # run_id never reopens its message.
-                        self.mark_delivered_live(payload["sessionKey"], payload["runId"])
-                        # The inline turn is alive and took the final itself, so
-                        # the parity shadow isn't needed for this run -- drop it.
-                        self.unregister_run_target(payload["sessionKey"], payload["runId"])
-                    for q in consumers[0].queues:
-                        await q.put(msg)
-                    continue
-
-                if payload.get("sessionKey") and not payload.get("runId"):
-                    pipe_log("  dropped ambiguous or unmatched session-only event")
-
-                # If nothing matches at all, drop it.
-                # This efficiently filters cross-session bleed.
+                await self.dispatch_run_event(msg)
 
             except asyncio.TimeoutError:
                 # Not even a tick for two intervals: the socket is dead without
@@ -11335,7 +11432,7 @@ class _PipeTurn:
                         # --- Run text and tool cards ---
                         # One renderer reads them, the one a turn writer uses
                         # (ELI-147).
-                        if stream in ("assistant", "item", "tool"):
+                        if stream in ("assistant", "item", "tool", PIPE_NOTE_STREAM):
                             added = self.renderer.feed(payload)
                             for text in (a for a in added if isinstance(a, str)):
                                 async for chunk in self.show_text(text):
@@ -11381,6 +11478,13 @@ class _PipeTurn:
                                     # Until the reply ends: its usage rows replace it.
                                     await _emit_status(self.__event_emitter__,
                                                        _background_agents_line(self.background_agents))
+
+                        # --- The Pipe's own notes (ELI-197) ---
+                        if stream == PIPE_NOTE_STREAM:
+                            for event in added:
+                                yield event
+                            # Text after the note is a new message item.
+                            self.fence_item_start = len(self.assistant_stream_text)
 
                         # --- Item events (progress) ---
                         if stream == "item":
