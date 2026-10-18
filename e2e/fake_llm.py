@@ -54,6 +54,10 @@ and only a core set is sent as real schemas.
 * anything else                        -> `E2E fake model reply.` (or
   $FAKE_LLM_DEFAULT)
 
+A turn can hold more than one message: a stopped run leaves its message with
+no reply, and a run the Gateway resumes after a restart gets its own
+"continue" message. The newest part of the turn with a marker is answered.
+
 Replies stream word by word so the streaming path sees several deltas.
 
 Every request is appended to $FAKE_LLM_LOG (JSON lines) for the CI artifact.
@@ -168,14 +172,28 @@ def plan_reply(body: dict) -> dict:
         default=-1,
     )
     turn = messages[last_assistant + 1:]
-    user_text = "\n".join(_text_of(m.get("content")) for m in turn if m.get("role") == "user")
-    after_user = turn
-    tool_results = [_text_of(m.get("content")) for m in after_user if m.get("role") == "tool"]
+    users = [_text_of(m.get("content")) for m in turn if m.get("role") == "user"]
+    tool_results = [_text_of(m.get("content")) for m in turn if m.get("role") == "tool"]
     offered = [
         (t.get("function") or {}).get("name")
         for t in body.get("tools") or []
     ]
+    # A stopped run leaves no reply in the transcript, so its message is still
+    # in this turn, before the new one; a run the Gateway resumes after a
+    # restart gets its own "[System] ... continue" message after the user's
+    # (2026.10.10). So the newest part of the turn that has a scripted answer
+    # is the one answered, else the whole turn.
+    for start in range(len(users) - 1, -1, -1):
+        plan = _scripted("\n".join(users[start:]), messages, last_assistant, turn, tool_results, offered)
+        if plan is not None:
+            return plan
+    return {"text": DEFAULT_REPLY}
 
+
+def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
+              tool_results: list, offered: list) -> dict | None:
+    """The scripted reply for a turn whose user text is `user_text`, or None
+    when nothing in it is scripted."""
     scripted = _scene_step(user_text, len(tool_results), offered)
     if scripted is not None:
         return scripted
@@ -280,7 +298,7 @@ def plan_reply(body: dict) -> dict:
     m = _EXACTLY.search(user_text)
     if m:
         return {"text": m.group(1)}
-    return {"text": DEFAULT_REPLY}
+    return None
 
 
 def _usage(body: dict, plan: dict) -> dict:
