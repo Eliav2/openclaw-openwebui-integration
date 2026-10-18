@@ -628,6 +628,54 @@ def _pid_tree(pid: int) -> list[int]:
     return [p for p in out if _alive(p)]
 
 
+import sqlite3  # noqa: E402
+
+# The Gateway's session store (start_stack.sh runs it with this HOME). Its
+# startup recovery reads it after a crash.
+GATEWAY_AGENT_DB = os.path.expanduser("~/.openclaw/agents/main/agent/openclaw-agent.sqlite")
+
+
+def _crash_recoverable(key: str) -> bool:
+    """The session's stored entry holds what the Gateway's startup recovery
+    needs to continue its run after a SIGKILL. `hasActiveRun` turns true about
+    50 ms before that write (ELI-174); a crash in between leaves nothing to
+    recover. 2026.9.3 recovers an entry stored as `status: "running"`
+    (main-session-restart-recovery-marking-CvQ2iWW3.mjs:241); 2026.10.10
+    stores no status mid-run and recovers an open `restartRecoveryRuns`
+    claim (store-maintenance-DW8Mtgc_.mjs:277), written at the run's start
+    (agent-command-CKyIJ22z.mjs:3853)."""
+    db = sqlite3.connect(f"file:{GATEWAY_AGENT_DB}?mode=ro", uri=True)
+    try:
+        row = db.execute("SELECT entry_json FROM session_nodes WHERE session_key = ?", (key,)).fetchone()
+    finally:
+        db.close()
+    entry = json.loads(row[0]) if row else {}
+    ended = set(entry.get("restartRecoveryTerminalRunIds") or [])
+    return entry.get("status") == "running" or any(
+        r.get("runId") not in ended for r in entry.get("restartRecoveryRuns") or [])
+
+
+GATEWAY_STATE_DB = os.path.expanduser("~/.openclaw/state/openclaw.sqlite")
+CRASH_LOOP_WINDOW_MS = 300_000   # GATEWAY_BOOT_LOOP_WINDOW_MS
+
+
+def _crash_loop_allows_a_crash() -> bool:
+    """The Gateway pauses restart recovery for 5 minutes once 3 of its boots
+    in 5 minutes ended unclean (GATEWAY_BOOT_LOOP_UNCLEAN_THRESHOLD, 2026.9.3
+    and 2026.10.10 alike), so a crash test run again soon after the last ones
+    has nothing to check (ELI-174). True while one more crash stays under it:
+    at most one earlier unclean boot (no completion) in the window, besides
+    the live one. The suite crashes twice, so in one run this is always true."""
+    db = sqlite3.connect(f"file:{GATEWAY_STATE_DB}?mode=ro", uri=True)
+    try:
+        started = [r[0] for r in db.execute(
+            "SELECT started_at_ms FROM gateway_boot_lifecycle WHERE completed_at_ms IS NULL"
+            " AND started_at_ms >= ? ORDER BY started_at_ms", (int(time.time() * 1000) - CRASH_LOOP_WINDOW_MS,))]
+    finally:
+        db.close()
+    return len(started[:-1]) <= 1
+
+
 def _kill_and_restart_gateway() -> None:
     """A crash (SIGKILL) of the Gateway start_stack.sh launched, then a fresh
     `openclaw gateway run` the way it runs it."""
@@ -658,6 +706,8 @@ def _kill_and_restart_gateway() -> None:
                     reason="needs the pid of the e2e stack's Gateway (E2E_GATEWAY_PID_FILE)")
 def test_a_guest_run_continued_after_a_gateway_crash_stays_without_owner_rights(
         token, guest_token, owner_users_set):
+    _until("the Gateway's crash-loop window to allow a crash", _crash_loop_allows_a_crash,
+           timeout_s=CRASH_LOOP_WINDOW_MS / 1000 + 30, every_s=5)
     now = int(time.time())
     uid, aid = str(uuid.uuid4()), str(uuid.uuid4())
     prompt = "E2E_SLOW:30 E2E_GUESTCUT"
@@ -677,13 +727,24 @@ def test_a_guest_run_continued_after_a_gateway_crash_stays_without_owner_rights(
         "stream": True, "chat_id": chat_id, "id": aid, "session_id": f"e2e-{uuid.uuid4().hex[:8]}",
         "parent_id": uid, "user_message": user}, guest_token)
     assert status == 200, ack
-    _until("the guest run to start", lambda: _session_row(key).get("hasActiveRun"))
+    _until("the guest run's recovery claim to be stored", lambda: _crash_recoverable(key))
     _kill_and_restart_gateway()
 
     def settled():
+        # The continuation's turn first: between the restart and the recovery's
+        # start the reply reads finished with no run active (ELI-174).
+        try:
+            turns = _user_turns(key)
+        except AssertionError:
+            return False   # chat.history refuses until the restarted Gateway's agent is up
+        if len(turns) < 2:
+            return False
         msg = _chat_messages(guest_token, chat_id).get(aid) or {}
         return msg.get("done") is True and not _session_row(key).get("hasActiveRun")
-    _until("the guest reply to settle after the restart", settled, timeout_s=300, every_s=3)
+    try:
+        _until("a turn after the crash and the guest reply to settle", settled, timeout_s=300, every_s=3)
+    except pytest.fail.Exception as ex:
+        pytest.fail(f"{ex}\n{_down_state(guest_token, chat_id, key)}")
     turns = _user_turns(key)
     # Precondition: something continued the run after the crash (the
     # Gateway's recovery or the pipe's resume), so its turn is checked too.
@@ -718,6 +779,8 @@ def test_a_handed_over_reply_reads_not_done_in_the_db_once_its_request_ended(tok
     request's own end-of-stream save writes `done: true`; the writer's one
     mid-turn write waits for the request's task to end, so while the run
     goes on the DB says `done: false` (what the orphan reconcile adopts)."""
+    _until("the Gateway's crash-loop window to allow a crash", _crash_loop_allows_a_crash,
+           timeout_s=CRASH_LOOP_WINDOW_MS / 1000 + 30, every_s=5)
     now = int(time.time())
     uid, aid = str(uuid.uuid4()), str(uuid.uuid4())
     prompt = "E2E_SLOW:40 E2E_HANDOVERDB"
@@ -739,7 +802,7 @@ def test_a_handed_over_reply_reads_not_done_in_the_db_once_its_request_ended(tok
     assert status == 200, ack
     request_task = (_db_message(chat_id, aid).get("meta") or {}).get("task_id")
     assert request_task, "Open WebUI records the request's task id on M"
-    _until("the run to start", lambda: _session_row(key).get("hasActiveRun"))
+    _until("the run's recovery claim to be stored", lambda: _crash_recoverable(key))
     _kill_and_restart_gateway()
 
     def request_ended():
