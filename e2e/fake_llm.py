@@ -36,6 +36,10 @@ and only a core set is sent as real schemas.
   `E2E_BG_AGENT_MID` and runs `exec` in the foreground until the file
   `bg-agent-gate-TOKEN` next to $FAKE_LLM_LOG exists (90 s at most), then
   replies `E2E_BG_AGENT_END`: the reply runs until the test lets it end.
+* `E2E_HOLD TOKEN`                      -> says `E2E_HOLD_START`, runs `exec` in
+  the foreground until the file `hold-TOKEN` next to $FAKE_LLM_LOG exists
+  (90 s at most), then replies `E2E_HOLD_END`: a run that goes on until the
+  test lets it end, or stops it.
 * `E2E_SLOW TOKEN`                     -> replies `TOKEN slow-1 ... slow-10`, one
   word a second, so a turn can be queued behind a run that is still going.
   `E2E_SLOW:<n> TOKEN` sends n words instead of 10 (a run that outlasts an
@@ -105,6 +109,7 @@ _SECRET_REQUEST = re.compile(r"E2E_SECRET_REQUEST ([A-Z][A-Z0-9_]{2,})")
 _STATUS = re.compile(r'\\?"status\\?":\s*\\?"([a-z_]+)')
 _BG_AGENT = re.compile(r"E2E_BG_AGENT ([A-Za-z0-9_]{3,})")
 BG_AGENT_TITLE = "E2E background agent"   # E2E_BG_AGENT: the Agent call's description
+_HOLD = re.compile(r"E2E_HOLD ([A-Za-z0-9_]{3,})")
 _SLOW = re.compile(r"E2E_SLOW(?::(\d{1,3}))?\s+([A-Za-z0-9_]{3,})")
 SLOW_WORDS = 10
 SPAWN_TASK = "E2E_SLOW:20 E2E_CHILDTASK"   # the sub-agent's task for E2E_SPAWN
@@ -123,6 +128,9 @@ WAKE_ASK = "E2E_WAKE_ASK_START " + " ".join(f"slow-{i}" for i in range(1, 7)) + 
 def bg_agent_gate(token: str) -> str:
     """E2E_BG_AGENT's file, next to the request log (the test writes it)."""
     return os.path.join(os.path.dirname(LOG_PATH) or "/tmp", f"bg-agent-gate-{token}")
+def hold_file(token: str) -> str:
+    """E2E_HOLD's file, next to the request log (the test writes it)."""
+    return os.path.join(os.path.dirname(LOG_PATH) or "/tmp", f"hold-{token}")
 
 
 def _text_of(content) -> str:
@@ -315,6 +323,19 @@ def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
                 return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
             return {"text": say, **call}
         return {"text": "E2E_BG_AGENT_END"}
+    m = _HOLD.search(user_text)
+    if m:
+        if tool_results:
+            return {"text": "E2E_HOLD_END"}
+        gate = hold_file(m.group(1))
+        # yieldMs: exec backgrounds a command after 10 s by default, and
+        # takes about 120 s at most.
+        call = _call_with("exec", {"command": f"for i in $(seq 450); do [ -e '{gate}' ] && break; "
+                                              "sleep 0.2; done; echo e2e-hold-released",
+                                   "yieldMs": 100_000}, offered)
+        if not call:
+            return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
+        return {"text": "E2E_HOLD_START", **call}
 
     if "E2E_BG_EXEC" in user_text:
         # One shell command left running in the background, for the Status

@@ -8198,12 +8198,41 @@ class _TurnWriter:
                  f"{intent or 'unknown'}")
         if intent != "stop" or self.closed:
             return
+        aborted = False
         try:
-            await _run_request(
+            resp = await _run_request(
                 self.conn, RUN_ABORT, {"sessionKey": self.session_key, "runId": self.run_id}, timeout=15)
+            aborted = bool((resp or {}).get("aborted"))
         except Exception as ex:
             pipe_log(f"  turn writer: chat.abort failed: {ex}")
+        if not aborted and self.wake and self.wake.get("job"):
+            await self._cancel_wake_run()
         await self.finalize()
+
+    async def _cancel_wake_run(self) -> None:
+        """Stop a cron wake's run (ELI-192). On 2026.9 its run id is the
+        sessionId, and chat.abort finds no chat run under it: the wake is its
+        job's cron run, which the job's running task cancels."""
+        job = self.wake["job"]
+        try:
+            resp = await self.conn.send_request("tasks.list", {"sessionKey": self.session_key, "limit": 100},
+                                                timeout=10)
+        except Exception as ex:
+            pipe_log(f"  turn writer: tasks.list for the wake's run failed: {ex}")
+            return
+        tasks = [t for t in (resp or {}).get("tasks") or []
+                 if t.get("runtime") == "cron" and t.get("sourceId") == job
+                 and t.get("status") in ("queued", "running")
+                 and self.session_key in (t.get("childSessionKey"), t.get("sessionKey"))]
+        if not tasks:
+            pipe_log(f"  turn writer: no running task of wake job {job[:8]}...: its run is not stopped")
+        for task in tasks:
+            try:
+                res = await self.conn.send_request("tasks.cancel", {"taskId": task["taskId"]}, timeout=15)
+                pipe_log(f"  turn writer: wake job {job[:8]}... run cancelled: "
+                         f"{bool((res or {}).get('cancelled'))} {(res or {}).get('reason') or ''}")
+            except Exception as ex:
+                pipe_log(f"  turn writer: tasks.cancel for wake job {job[:8]}... failed: {ex}")
 
     async def _hold(self) -> None:
         """The Open WebUI task: alive exactly while this writer owns the run.
