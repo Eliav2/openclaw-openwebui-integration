@@ -440,8 +440,10 @@ def test_the_status_dialog_compacts_the_chat(page):
     session is compacted (its summary request reaches the model), and the
     dialog comes back with the numbers."""
     if _openclaw_release() >= (2026, 10):
-        pytest.skip("ELI-177: on OpenClaw 2026.10 the session gets no usage, so the dialog has no "
-                    "context numbers or Compact button; remove when fixed")
+        pytest.skip("OpenClaw 2026.10: describe/list report no usage for a session created by "
+                    "chat.send until it is touched again, so the dialog has no context numbers or "
+                    "Compact button (Control UI and CLI are correct; ELI-177, canceled). "
+                    "Re-check on each OpenClaw upgrade.")
     nonce = f"BROWSER_COMPACT_{os.getpid()}_{len(_fake_llm_requests())}"
     capture.new_chat(page)
     capture.send(page, f"E2E_ECHO: {nonce}")
