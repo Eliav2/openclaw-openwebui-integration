@@ -23,7 +23,7 @@ The question renders as Open WebUI's own inline question card, the one its built
 | anything else | card with a typed answer |
 | mentions secret, password, api key, token | dialog: a masked password field |
 | `(y/n)`, or a confirm verb plus `?` | card with Yes / No |
-| two or more numbered options | card, one row per option |
+| two or more numbered options, one per line | card, one row per option |
 | `(multiselect)` or "select all that apply" | card that lists the options by number, with a typed answer |
 | a JSON body with up to three `questions` | one card that steps through each |
 
