@@ -33,7 +33,12 @@ def _db_locked(ex: BaseException) -> bool:
 
 
 async def _set_turn_meta(chat_id: str, message_id: str, meta: dict) -> bool:
-    """Merge `meta` into message `message_id` under the chat's row lock."""
+    """Merge `meta` into message `message_id` under the chat's row lock, never
+    cut short by a cancel (ELI-205)."""
+    return await _uncancellable(_set_turn_meta_now(chat_id, message_id, meta))
+
+
+async def _set_turn_meta_now(chat_id: str, message_id: str, meta: dict) -> bool:
     from open_webui.models.chats import Chats
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -283,7 +288,7 @@ async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str) 
             text = (current.get("content") or "").strip()
             text = f"{text}\n\n{note}" if text else note
             output = list(current.get("output") or []) + [_turn_note_item(note)]
-            await Chats.upsert_message_to_chat_by_id_and_message_id(
+            await _owui_upsert_message(
                 chat_id, message_id, {"content": text, "output": output, "done": True})
         await emit({"type": "chat:completion", "data": {"done": True, "content": text,
                                                          "output": output}})
@@ -704,7 +709,7 @@ class _TurnWriter:
         from open_webui.models.chats import Chats
 
         try:
-            await Chats.upsert_message_to_chat_by_id_and_message_id(
+            await _owui_upsert_message(
                 self.chat_id, self.message_id,
                 {"content": self.renderer.text if text is None else text,
                  "output": output if output is not None else copy.deepcopy(self.renderer.output),
@@ -2235,7 +2240,7 @@ async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
             conn._claimed_runs[claim] = True
         # Open WebUI answers None, logging nothing, when the write fails (its
         # transaction raised and was rolled back).
-        if await Chats.upsert_message_to_chat_by_id_and_message_id(
+        if await _owui_upsert_message(
                 chat_id, stub_id, fields) is None:
             if claim:
                 conn._claimed_runs.pop(claim, None)
@@ -2436,7 +2441,7 @@ async def _reconcile_chat_ended_runs(conn: "_GatewayConnection", session_key: st
             held_text = _coerce_text(current.get("content")).strip()
             if cards < held_cards or (cards == held_cards and len(text) <= len(held_text)):
                 continue  # holds as much as the transcript: never rewritten
-            if await Chats.upsert_message_to_chat_by_id_and_message_id(
+            if await _owui_upsert_message(
                     chat_id, mid, {"content": text, "output": output, "done": True}) is None:
                 pipe_log(f"  ended-while-down {mid[:8]}... in chat {chat_id[:8]}...: "
                          "Open WebUI did not save the write (ELI-94)")

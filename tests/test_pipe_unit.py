@@ -13267,6 +13267,91 @@ class ForwardedTurnHistoryTests(_RoutingCase):
                          self.FX["2026.9.3"]["messages"], "9.3 history is unchanged")
 
 
+class CancelledWriteFinishesTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-205: a cancel inside Open WebUI's DB write (BEGIN IMMEDIATE / commit
+    run in aiosqlite's thread) can wedge it and keep SQLite's write lock for
+    good, so every later write fails. A Stop must never cancel the Pipe's own
+    writes midway: the write finishes, then the cancel goes on."""
+
+    async def asyncSetUp(self):
+        self.events = []
+        self.in_db = asyncio.Event()       # the write is inside the DB call
+        self.release = asyncio.Event()     # the DB call returns
+        test = self
+        chat = types.SimpleNamespace(
+            title="New Chat", current_message_id=None,
+            chat={"history": {"messages": {"m1": {"id": "m1", "role": "assistant", "meta": {}}},
+                              "currentId": "m1"}})
+        self.chat = chat
+
+        async def db_call(what):
+            test.events.append(f"{what} start")
+            test.in_db.set()
+            await test.release.wait()
+            test.events.append(f"{what} done")
+
+        class Chats:
+            @staticmethod
+            @contextlib.asynccontextmanager
+            async def _chat_transaction(chat_id):
+                await db_call("begin")
+                yield ("db", chat)
+                test.events.append("commit")
+
+            @staticmethod
+            async def upsert_message_to_chat_by_id_and_message_id(chat_id, message_id, message):
+                await db_call("upsert")
+                return chat
+
+        class ChatMessages:
+            @staticmethod
+            async def upsert_message(*a, **kw):
+                return None
+
+        def mod(name, **attrs):
+            m = types.ModuleType(name)
+            m.__dict__.update(attrs)
+            return m
+        patch = mock.patch.dict(sys.modules, {
+            "open_webui.models": mod("open_webui.models"),
+            "open_webui.models.chats": mod("open_webui.models.chats", Chats=Chats),
+            "open_webui.models.chat_messages": mod("open_webui.models.chat_messages", ChatMessages=ChatMessages),
+            "sqlalchemy": mod("sqlalchemy"), "sqlalchemy.orm": mod("sqlalchemy.orm"),
+            "sqlalchemy.orm.attributes": mod("sqlalchemy.orm.attributes", flag_modified=lambda o, n: None)})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    async def _cancel_midway(self, coro, last_event):
+        task = asyncio.ensure_future(coro)
+        await asyncio.wait_for(self.in_db.wait(), 2)
+        task.cancel()                     # Stop, while the DB call runs
+        await asyncio.sleep(0)
+        self.release.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 2)
+        self.assertEqual(self.events[-1], last_event, f"the write was cut short: {self.events}")
+
+    async def test_set_turn_meta(self):
+        await self._cancel_midway(openclaw_pipe._set_turn_meta("c1", "m1", {"k": 1}), "commit")
+        self.assertEqual(self.chat.chat["history"]["messages"]["m1"]["meta"], {"k": 1})
+
+    async def test_set_title_unless_chosen(self):
+        await self._cancel_midway(openclaw_pipe._set_title_unless_chosen("c1", "A title"), "commit")
+        self.assertEqual(self.chat.title, "A title")
+
+    async def test_claim_turn_message(self):
+        await self._cancel_midway(_claim_turn_message("c1", "u1", "m2", "run-1", "w1"), "commit")
+        self.assertIn("m2", self.chat.chat["history"]["messages"])
+
+    async def test_message_upsert(self):
+        await self._cancel_midway(openclaw_pipe._owui_upsert_message("c1", "m1", {"done": True}), "upsert done")
+
+    def test_every_message_upsert_goes_through_the_guarded_helper(self):
+        src = inspect.getsource(openclaw_pipe)
+        calls = re.findall(r"Chats\.upsert_message_to_chat_by_id_and_message_id\(", src)
+        self.assertEqual(len(calls), 1, "a message upsert outside _owui_upsert_message")
+
+
 class AutoTitleTests(unittest.IsolatedAsyncioTestCase):
     """ELI-182: the Pipe's title replaces only the title Open WebUI set by
     itself, and shows at once in the open tab. QA 2026-10-18: a chat renamed

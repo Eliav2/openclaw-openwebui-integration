@@ -152,7 +152,12 @@ def _title_is_owui_default(title, chat: dict) -> bool:
 
 async def _set_title_unless_chosen(chat_id: str, title: str) -> bool:
     """Title the chat, under its row lock, unless its title was chosen
-    meanwhile (ELI-182). True when the title was set."""
+    meanwhile (ELI-182). True when the title was set. Never cut short by a
+    cancel (ELI-205)."""
+    return await _uncancellable(_set_title_unless_chosen_now(chat_id, title))
+
+
+async def _set_title_unless_chosen_now(chat_id: str, title: str) -> bool:
     from open_webui.models.chats import Chats
     async with Chats._chat_transaction(chat_id) as (_db, chat):
         if chat is None or not _title_is_owui_default(chat.title, chat.chat):
