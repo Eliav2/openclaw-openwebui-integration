@@ -103,6 +103,9 @@
     "entries": {
       "screenshot-sample-usage": {
         "enabled": true
+      },
+      "e2e-agent-tool": {
+        "enabled": false
       }
     }
   }

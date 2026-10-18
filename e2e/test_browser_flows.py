@@ -571,6 +571,40 @@ def test_the_subagent_drawer_follows_a_running_child_to_its_end(page):
     assert "E2E_CHILDTASK" in page.locator("#openclaw-drawer-root").inner_text()
 
 
+BG_AGENT_TITLE = "E2E background agent"   # e2e/fake_llm.py BG_AGENT_TITLE
+
+
+def test_the_status_dialog_lists_a_background_agent_while_its_reply_runs(page):
+    """Status dialog mid-reply (ELI-186): a reply that started an Agent in
+    the background and is still running. Background and In-process agents
+    list that agent while the reply runs, not only once it has ended. The
+    scripted model calls the stack's Agent tool (e2e/agent-tool), then runs a
+    command that waits for a file this test writes."""
+    token = f"t{os.getpid()}_{len(_fake_llm_requests())}"
+    # e2e/fake_llm.py bg_agent_gate
+    gate = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"bg-agent-gate-{token}")
+    capture.new_chat(page)
+    try:
+        capture.send(page, f"E2E_BG_AGENT {token}")
+        _wait(page, _reply_js(0, "r.text.includes('E2E_BG_AGENT_MID') && !r.done"), "the reply running past its Agent call")
+        _open_status(page)
+        # Background lists it running; In-process agents counts it (its fold
+        # opens by itself only for an agent the reply runs in the foreground).
+        for section, shown in (("background", BG_AGENT_TITLE), ("agents", "In-process agents (1)")):
+            _wait(page, f"""() => {{ const s = document.querySelector('#openclaw-status-section-{section}');
+                             return !!s && s.textContent.includes({json.dumps(shown)}); }}""",
+                  f"the background agent in the Status dialog's {section} section", 60_000)
+        # The reply cannot end before the gate exists: this was mid-reply.
+        assert not _replies(page)[0]["done"], "the reply ended before the dialog listed its agent"
+        background = page.locator("#openclaw-status-section-background").inner_text()
+        assert "Running" in background, background
+        page.keyboard.press("Escape")
+    finally:
+        open(gate, "w").close()
+    _wait(page, _turn_over("E2E_BG_AGENT_END"), "the reply's end")
+    os.remove(gate)
+
+
 def _chat_id(page) -> str:
     m = re.search(r"/c/([0-9a-f-]{36})", page.url)
     assert m, f"no chat id in {page.url}"

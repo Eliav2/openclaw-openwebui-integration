@@ -1252,6 +1252,10 @@ class _PipeTurn:
         # including what the text hooks still hold, so it is the baseline a
         # cumulative event is diffed against (ELI-80).
         self.renderer = _TurnRenderer()
+        # What the Status Action lists while this reply runs (ELI-186).
+        live_key = (self.owui_origin_chat_id, getattr(self, "owui_message_id", None))
+        if all(live_key):
+            _live_replies()[live_key] = self.renderer
         # The text this reply has shown, raw: the code state the text hooks
         # read. Continuing a run another reply started, both carry over (see
         # `park_cancelled_turn`), while what THIS reply shows,
@@ -1417,6 +1421,8 @@ class _PipeTurn:
                         yield chunk
 
         finally:
+            if all(live_key) and _live_replies().get(live_key) is self.renderer:
+                _live_replies().pop(live_key, None)
             if self.awaiting_owner:
                 self.conn.stop_awaiting_owner(self.session_key, self.owner_run)
             # A parked queue now belongs to whoever claims the run; releasing

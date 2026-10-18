@@ -10442,6 +10442,57 @@ class BackgroundAgentLineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(waiting, ["Waiting on 1 background agent", "Waiting on 2 background agents"])
         self.assertNotIn("Bash done", self.statuses)
 
+    async def test_the_status_action_lists_the_agent_while_the_reply_runs(self):
+        """ELI-186: Open WebUI saves a reply's tool cards only when it ends,
+        so mid-reply its row (and the chat) hold none. The Status Action
+        lists them from the Pipe streaming the reply, in the same process,
+        until the reply ends; then from what Open WebUI saved."""
+        import openclaw_status_action as action
+        launched = "Async agent launched successfully. agentId: a1 (internal metadata)"
+        # The chat as Open WebUI holds it mid-reply: the reply, done:false,
+        # with no output yet.
+        held = {"history": {"currentId": "m1", "messages": {"m1": {
+            "id": "m1", "parentId": None, "role": "assistant", "done": False, "content": "", "timestamp": 5}}}}
+        chats = types.ModuleType("open_webui.models.chats")
+        chats.Chats = types.SimpleNamespace(
+            get_chat_by_id=lambda chat_id: types.SimpleNamespace(user_id=self.USER, chat=held))
+        # The Pipe and the Action are two modules; they meet on Open WebUI's.
+        stub = mock.patch.dict(sys.modules, {"open_webui": types.ModuleType("open_webui"),
+                                             "open_webui.socket": types.ModuleType("open_webui.socket"),
+                                             "open_webui.socket.main": types.ModuleType("open_webui.socket.main"),
+                                             "open_webui.models": types.ModuleType("open_webui.models"),
+                                             "open_webui.models.chats": chats})
+        stub.start()
+        self.addCleanup(stub.stop)
+
+        async def listed():
+            chat = await action._load_owui_recent(self.CHAT, self.USER)
+            return [(r["title"], r["state"]) for r in action._agent_call_rows(chat)]
+
+        gen = self._reply("hello", "m1")
+
+        async def drain():
+            async for _chunk in gen:
+                pass
+        reply = asyncio.ensure_future(drain())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        start = self._tool("start", "Agent", "t1")
+        start["payload"]["data"]["args"] = {"description": "Vendor research", "run_in_background": True}
+        for event in (self._delta("run-1", "Starting it."), start, self._tool("result", "Agent", "t1", launched)):
+            q.put_nowait(event)
+
+        async def until_waiting():
+            while "Waiting on 1 background agent" not in self.statuses:
+                await asyncio.sleep(0)
+        # Bounds the test only.
+        await asyncio.wait_for(until_waiting(), 5)
+        self.assertFalse(reply.done())
+        self.assertEqual(await listed(), [("Vendor research", "launched")])
+        q.put_nowait(self._final("run-1"))
+        await asyncio.wait_for(reply, 5)
+        self.assertEqual(await listed(), [], "an ended reply is listed from what Open WebUI saved")
+
     def test_what_counts_as_a_background_agent(self):
         launch = self.ocp._is_background_agent_launch
         launched = "Async agent launched successfully."
