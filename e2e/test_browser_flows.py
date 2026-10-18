@@ -190,7 +190,13 @@ def test_a_question_left_for_a_new_message_ends_its_reply(page):
     """ELI-200: with the question card open, a new message is sent instead
     of an answer. The card goes, the question stays in its reply as text,
     and that reply is finished: no "Thinking..." left on it, also after a
-    reload; the new message gets its own answer."""
+    reload; the new message gets its own answer. Unskip on the next lane
+    when ELI-205 is fixed upstream."""
+    if _openclaw_release() >= (2026, 10):
+        pytest.skip("OpenClaw 2026.10 lane: this flow's Stop lands as the reply ends, so Open WebUI's "
+                    "own end-of-reply save is cancelled mid-transaction and keeps the SQLite lock, "
+                    "and every later test in the job fails (ELI-205, "
+                    "https://linear.app/eliavb/issue/ELI-205).")
     capture.new_chat(page)
     capture.send(page, "E2E_ASK_SINGLE")
     capture.wait_js(page, "() => document.body.innerText.includes('Which color?') "
