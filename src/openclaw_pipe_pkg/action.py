@@ -2778,7 +2778,11 @@ class Action:
                                  if snap and k not in children_seen]}
 
         def subagent_rows(shown):
-            return [{**_subagent_row(r, task_texts.get(r["key"]), latest.get(r["key"])),
+            # A child's transcript may not hold its spawn message yet: then
+            # the task its spawn call was given titles it (ELI-178).
+            spawned = _subagent_tasks(session_key)
+            return [{**_subagent_row(r, task_texts.get(r["key"]) or spawned.get(r["key"]),
+                                     latest.get(r["key"])),
                      "controlUiUrl": _control_ui_session_url(self.valves.CONTROL_UI_URL, r["key"])}
                     for r in shown]
 
@@ -2886,8 +2890,9 @@ class Action:
             pipe_log(f"[status-action] sessions.preview (fold) failed: {ex}")
             previews, source = None, "action-own"
         texts, newest = _subagent_previews(previews)
+        spawned = _subagent_tasks(dialog["session"])
         await emit(_render_subagents_fill_js({
-            "tasks": [{**_subagent_row(r, texts.get(r["key"]), newest.get(r["key"])),
+            "tasks": [{**_subagent_row(r, texts.get(r["key"]) or spawned.get(r["key"]), newest.get(r["key"])),
                        "controlUiUrl": _control_ui_session_url(self.valves.CONTROL_UI_URL, r["key"])}
                       for r in rows],
             "total": dialog["total"], "pending": False,
@@ -3088,7 +3093,9 @@ class Action:
             }})
             return {"status": "error", "detail": "sub-agent not found"}
 
-        task = _subagent_row({"key": child_key, **session_row}, _spawn_task_of(messages))
+        parent = session_row.get("spawnedBy") or session_row.get("parentSessionKey")
+        task = _subagent_row({"key": child_key, **session_row},
+                             _spawn_task_of(messages) or _subagent_tasks(parent).get(child_key))
         items, dropped = _cap_run_items(_drawer_run_items(messages), budget)
         claude_cli = (session_row.get("agentRuntime") or {}).get("id") == "claude-cli"
         note = latest = None

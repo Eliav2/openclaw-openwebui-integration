@@ -1015,6 +1015,22 @@ def _spawned_child(payload: dict):
     return parent, child
 
 
+def _spawn_call_task(payload: dict) -> str | None:
+    """The task a tool event's spawn call was given (the call itself, or the
+    one a deferred-tool wrapper makes), from its start event; else None."""
+    data = payload.get("data") or {}
+    if payload.get("stream") != "tool" or data.get("phase") != "start":
+        return None
+    name, args_str = _bare_tool_name(data.get("name") or ""), json.dumps(data.get("args") or {})
+    view = _deferred_call_view(name, args_str)
+    if view:
+        name, args_str = view
+    if not _is_spawn_tool(name):
+        return None
+    task = str(_json_object(args_str).get("task") or "").strip()
+    return task or None
+
+
 def _tool_call_error_relabel_event(name: str, tool_call_id: str, args_str: str) -> dict:
     """Re-announce a failed call's `function_call` item with ❌ in its name.
 
@@ -1624,6 +1640,9 @@ class _GatewayConnection:
         # for the session (ELI-164).
         self._session_message_waiters: dict[str, asyncio.Event] = {}
         self._tool_events_seen: dict[tuple, bool] = {}
+        # (session key, tool call id) -> the task of a spawn call that started
+        # and has no result yet (`_spawn_call_task`), for the child index.
+        self._spawn_tasks: dict[tuple, str] = {}
 
     async def _subscribe_all(self) -> None:
         """Renew this socket's subscriptions: the session index
@@ -1700,6 +1719,25 @@ class _GatewayConnection:
             for stale in list(self._tool_events_seen)[:2000]:
                 self._tool_events_seen.pop(stale, None)
         return True
+
+    def _spawn_seen(self, payload: dict):
+        """(parent, child, task or None) of an accepted spawn's result event,
+        else None. The task is the one the call's start event carried: the
+        receipt has none, and the child's transcript may not hold it yet."""
+        data = payload.get("data") or {}
+        call = (payload.get("sessionKey"), data.get("toolCallId"))
+        task = _spawn_call_task(payload)
+        if task:
+            self._spawn_tasks[call] = task
+            if len(self._spawn_tasks) > 200:
+                for stale in list(self._spawn_tasks)[:100]:
+                    self._spawn_tasks.pop(stale, None)
+            return None
+        if data.get("phase") != "result":
+            return None
+        task = self._spawn_tasks.pop(call, None)
+        spawned = _spawned_child(payload)
+        return (*spawned, task) if spawned else None
 
     def session_change_event(self, session_key: str) -> asyncio.Event:
         """An Event set by the next pushed change to `session_key`'s run state
@@ -2893,11 +2931,12 @@ class _GatewayConnection:
                 payload = msg.get("payload", {})
                 if payload.get("stream") == "tool" and not self._first_tool_event(payload):
                     continue
-                spawned = _spawned_child(payload) if payload.get("stream") == "tool" else None
+                spawned = self._spawn_seen(payload) if payload.get("stream") == "tool" else None
                 if spawned:
                     # The Status dialog's child index (state.py), off the loop.
-                    asyncio.get_running_loop().run_in_executor(
-                        None, functools.partial(_subagent_remember, spawned[0], keys=[spawned[1]]))
+                    parent, child, task = spawned
+                    asyncio.get_running_loop().run_in_executor(None, functools.partial(
+                        _subagent_remember, parent, keys=[child], tasks={child: task} if task else None))
 
                 # ── Shadow render ──
                 # Feed every event of a run we're tracking into its shadow

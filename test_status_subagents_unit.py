@@ -247,12 +247,12 @@ class TaskTextTests(unittest.TestCase):
 
 class SubagentDrawerTests(unittest.IsolatedAsyncioTestCase):
 
-    async def _drawer(self, task_id, send_request):
+    async def _drawer(self, task_id, send_request, keep_index=False):
         emitted = []
         emitter = RecordingEmitter(emitted)
 
         conn = _drawer_conn(send_request)
-        with action_gateway(conn), \
+        with action_gateway(conn, keep_index=keep_index), \
              mock.patch("openclaw_status_action.asyncio.sleep", new=mock.AsyncMock()):
             result = await Action()._run_subagent_detail(
                 {"mode": "subagent-detail", "taskId": task_id, "taskTitle": "Research X", "taskStatus": "running"},
@@ -312,6 +312,21 @@ class SubagentDrawerTests(unittest.IsolatedAsyncioTestCase):
                     data = self._fill(emitted)
                     self.assertEqual(data["task"]["task"], task)
                     self.assertEqual(data["items"], [{"kind": "text", "text": "ok"}])
+
+    async def test_a_child_whose_transcript_lacks_its_spawn_yet_shows_the_task_it_was_given(self):
+        """ELI-178: on 2026.10 the drawer can open before the spawn message is written."""
+        fresh_child_index()
+        openclaw_status_action._subagent_remember(PARENT_KEY, keys=[CHILD_A], tasks={CHILD_A: "Research X and report."})
+
+        async def send_request(method, params, timeout=5):
+            if method == "sessions.describe":
+                return {"session": {"key": CHILD_A, "status": "running", "startedAt": 1, "spawnedBy": PARENT_KEY}}
+            if method == "chat.history":
+                return {"messages": []}
+            raise AssertionError(f"unexpected RPC: {method}")
+
+        _result, emitted, _conn = await self._drawer(CHILD_A, send_request, keep_index=True)
+        self.assertEqual(self._fill(emitted)["task"]["task"], "Research X and report.")
 
     def test_a_user_message_that_is_not_a_spawn_stays_as_written(self):
         items = openclaw_status_action._drawer_run_items(
@@ -455,7 +470,7 @@ class ChildIndexTests(unittest.IsolatedAsyncioTestCase):
         self.state = os.environ["OPENCLAW_BRIDGE_STATE_DIR"]
         fresh_child_index()
 
-    async def _open(self, gw):
+    async def _open(self, gw, *, unfold=False):
         emitted, seen = [], []
         real = openclaw_status_action._render_subagents_fill_js
         with action_gateway(gw, keep_index=True), mock.patch(
@@ -463,7 +478,25 @@ class ChildIndexTests(unittest.IsolatedAsyncioTestCase):
                 side_effect=lambda d: (seen.append(d), real(d))[1]):
             await _open_dialog(Action().action({"chat_id": PARENT_CHAT}, __user__={"id": PARENT_USER},
                                                __event_emitter__=RecordingEmitter(emitted)), gw)
+            if unfold:
+                await Action().action({"chat_id": PARENT_CHAT, "mode": "subagent-rows",
+                                       "dialogId": _dialog_id(emitted)},
+                                      __user__={"id": PARENT_USER}, __event_emitter__=RecordingEmitter(emitted))
         return seen
+
+    async def test_a_child_whose_transcript_lacks_its_spawn_yet_is_titled_by_its_task(self):
+        """On 2026.10 a child's spawn message reaches its transcript after the
+        spawn returns, so a dialog opened at once read no task and titled the
+        running child by its key until it ended (ELI-178). The task the spawn
+        call was given, which the Pipe recorded, titles it instead."""
+        task = "Research X and report."
+        openclaw_status_action._subagent_remember(PARENT_KEY, keys=[CHILD_A], tasks={CHILD_A: task})
+        for status, unfold in (("running", False), ("done", True)):
+            with self.subTest(status):
+                gw = _WindowGateway([_child(CHILD_A, status, startedAt=1000)], current={CHILD_A})
+                row = (await self._open(gw, unfold=unfold))[-1]["tasks"][0]
+                self.assertEqual((row["title"], row["task"]),
+                                 (openclaw_status_action._short_title(task), task))
 
     async def test_an_ended_child_out_of_the_window_is_listed_without_reading_every_session(self):
         old = _child(CHILD_A, "done", startedAt=1000, endedAt=1050)
@@ -527,6 +560,28 @@ class ChildIndexTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data["tasks"][0]["error"], "provider 529")
         self.assertEqual(data["tasks"][1]["title"], "W1: engine")
         self.assertEqual(data["total"], 3)
+
+    def test_the_pipe_records_the_task_an_accepted_spawn_was_given(self):
+        """The receipt carries no task: the call's start event does, called
+        directly or through 2026.10's `dispatch_action` wrapper."""
+        receipt = json.dumps({"status": "accepted", "childSessionKey": CHILD_A, "runId": "r1"})
+        envelope = {"content": [{"type": "text", "text": json.dumps(
+            {"tool": {"id": "openclaw:core:sessions_spawn"}, "result": {"content": [{"type": "text", "text": receipt}]}})}]}
+        args = {"task": "Research X and report.", "runtime": "subagent"}
+        for name, call_args, result in (
+                ("sessions_spawn", args, receipt),
+                ("mcp__openclaw__sessions_spawn", args, receipt),
+                ("dispatch_action", {"id": "openclaw:core:sessions_spawn", "args": args}, envelope)):
+            with self.subTest(name):
+                conn = openclaw_status_action._GatewayConnection(lambda: types.SimpleNamespace())
+                seen = [conn._spawn_seen({"sessionKey": PARENT_KEY, "stream": "tool", "data": {
+                    "phase": phase, "name": name, "toolCallId": "t", **extra}})
+                    for phase, extra in (("start", {"args": call_args}), ("result", {"result": result}))]
+                self.assertEqual(seen, [None, (PARENT_KEY, CHILD_A, "Research X and report.")])
+        conn = openclaw_status_action._GatewayConnection(lambda: types.SimpleNamespace())
+        self.assertEqual(conn._spawn_seen({"sessionKey": PARENT_KEY, "stream": "tool", "data": {
+            "phase": "result", "name": "sessions_spawn", "toolCallId": "t", "result": receipt}}),
+            (PARENT_KEY, CHILD_A, None), "a result whose start was missed still records the child")
 
     def test_the_pipe_records_an_accepted_spawn(self):
         receipt = {"status": "accepted", "childSessionKey": CHILD_A, "runId": "r1"}
