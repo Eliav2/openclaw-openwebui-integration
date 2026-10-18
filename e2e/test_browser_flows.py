@@ -694,6 +694,41 @@ def test_a_reply_the_agent_starts_streams_into_the_open_tab_and_asks_there(page,
     assert _replies(page)[-1]["text"].count("Which color?") <= 1, _replies(page)[-1]["text"]
 
 
+def test_stop_on_a_reply_the_agent_starts_stops_its_run(page, token):
+    """Stop on a reply the agent started (a cron wake, ELI-192) in the open
+    tab: the message ends, and so does the run. Before, the run went on to
+    its end, its text shown nowhere. The scripted wake runs a command that
+    waits for a file this test writes only once the run is over."""
+    if _openclaw_release() >= (2026, 10):
+        pytest.skip("OpenClaw 2026.10: chat.abort by run id does not stop a cron run, and there is no "
+                    "tasks.cancel; the session-wide abort also drops queued turns (ELI-194).")
+    hold_token = f"stop{os.getpid()}_{len(_fake_llm_requests())}"
+    # e2e/fake_llm.py hold_file
+    hold = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{hold_token}")
+    capture.new_chat(page)
+    capture.send(page, "E2E_ECHO: BROWSER_WAKE_STOP")
+    _wait(page, _turn_over("BROWSER_WAKE_STOP"), "the first reply")
+    me = capture.api("GET", "/api/v1/auths/", token=token)
+    key = f"agent:main:openwebui-{me['id']}-{_chat_id(page)}"
+    job = capture.schedule_wake(key, f"E2E_HOLD {hold_token}", 2)
+    try:
+        _wait(page, _reply_js(1, "r.text.includes('E2E_HOLD_START') && !r.done"),
+              "the agent's reply running in the open tab")
+        page.locator('button[aria-label="Stop"]').click()
+        _wait(page, _reply_js(1, "r.done"), "the reply ended by Stop", 30_000)
+        deadline, runs = time.monotonic() + 60, []
+        while not runs and time.monotonic() < deadline:
+            runs = [e for e in capture.gateway_call("cron.runs", {"id": job}).get("entries") or []
+                    if e.get("action") == "finished"]
+    finally:
+        open(hold, "w").close()
+    assert runs, "the wake's run went on after Stop: its job never finished while the command held it"
+    assert runs[0].get("status") != "ok", f"the wake's run ran to its end: {runs[0]}"
+    history = capture.gateway_call("chat.history", {"sessionKey": key, "limit": 50})
+    assert "E2E_HOLD_END" not in json.dumps(history.get("messages")), "the stopped run still answered"
+    os.remove(hold)
+
+
 def test_an_attached_image_reaches_the_agent(page):
     """An image attached in the composer shows in the sent message, and the
     agent gets it as an image (the scripted model says how many images it
