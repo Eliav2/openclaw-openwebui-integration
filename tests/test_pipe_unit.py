@@ -2444,8 +2444,11 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(patch.stop)
         return closed
 
-    def _question_reply(self, msg_id):
-        """A reply whose run ends on a question; its card is cancelled."""
+    def _owui_request(self, text, msg_id, *, question=False, between_chunks=None):
+        """Run a reply the way Open WebUI does: in a request task registered
+        under the request's task id (`open_webui.tasks.tasks`), reading the
+        stream. `question`: the card is cancelled. `between_chunks`: an
+        awaitable factory Open WebUI's own code waits on after each chunk."""
         self.emitted = getattr(self, "emitted", [])
 
         async def emitter(event):
@@ -2455,10 +2458,61 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
             if event.get("type") == "request:user_input":
                 return {"status": "cancelled", "answers": {}}
             return None
-        body = {"model": "openclaw_gateway.default",
-                "messages": [{"role": "user", "content": "ask me"}]}
+        body = {"model": "openclaw_gateway.default", "messages": [{"role": "user", "content": text}]}
         meta = {"chat_id": "chat-1", "user_id": "u1", "message_id": msg_id, "task_id": "task-1"}
-        return self.pipe._pipe_impl(body, emitter, __metadata__=meta, __event_call__=event_call)
+        out = []
+
+        # Open WebUI's response object holds the stream: a Stop that lands in
+        # its own code leaves the generator suspended, never closed.
+        self.streams = getattr(self, "streams", [])
+        stream = self.pipe._pipe_impl(body, emitter, __metadata__=meta,
+                                      __event_call__=event_call if question else None)
+        self.streams.append(stream)
+
+        async def request():
+            async for chunk in stream:
+                out.append(chunk)
+                if between_chunks is not None:
+                    await between_chunks()
+        tasks_mod = types.ModuleType("open_webui.tasks")
+        tasks_mod.tasks = {}
+        patch = mock.patch.dict(sys.modules, {"open_webui.tasks": tasks_mod})
+        patch.start()
+        self.addCleanup(patch.stop)
+        tasks_mod.tasks["task-1"] = task = asyncio.ensure_future(request())
+        return task, out
+
+    async def _stopped_as_it_ends(self, between_chunks=None):
+        closed = self._record_status_closes()
+        rows_asked = asyncio.Event()
+
+        async def usage_rows(*a, **k):
+            rows_asked.set()
+            await asyncio.Event().wait()   # the Gateway calls, under way when Stop lands
+        patch = mock.patch.object(self.ocp, "_build_usage_status_lines", usage_rows)
+        patch.start()
+        self.addCleanup(patch.stop)
+        reached = asyncio.Event()
+
+        async def owui_work():
+            if any("Which?" in c for c in out if isinstance(c, str)):
+                reached.set()
+                await asyncio.Event().wait()   # Open WebUI busy with the chunk when Stop lands
+        task, out = self._owui_request("ask me", "m1", question=True,
+                                       between_chunks=owui_work if between_chunks else None)
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b"))
+        q.put_nowait(self._final("run-1"))
+        await asyncio.wait_for((reached if between_chunks else rows_asked).wait(), 30)
+        self.assertIn("Which?", "".join(c for c in out if isinstance(c, str)))
+        task.cancel()                    # the Stop that sends the new message
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        await self._spin()
+        statuses = [e["data"] for e in self.emitted if e.get("type") == "status"]
+        self.assertFalse(statuses[-1]["done"], f"precondition: the reply's status is open: {statuses}")
+        self.assertEqual(closed, ["m1"])
 
     async def test_a_reply_stopped_as_it_ends_closes_its_status(self):
         """ELI-200 (QA, live 2026-10-18 16:37): a question card is open, and a
@@ -2469,52 +2523,26 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         so that line was never written: the reply was saved done with its
         status still "Thinking..." (done: false), shimmering forever, also
         after a reload. Its run was over, so nothing was parked either."""
-        closed = self._record_status_closes()
-        rows_asked = asyncio.Event()
+        await self._stopped_as_it_ends()
 
-        async def usage_rows(*a, **k):
-            rows_asked.set()
-            await asyncio.Event().wait()   # the Gateway calls, under way when Stop lands
-        patch = mock.patch.object(self.ocp, "_build_usage_status_lines", usage_rows)
-        patch.start()
-        self.addCleanup(patch.stop)
-        gen = self._question_reply("m1")
-        out = []
-
-        async def owui_reads():          # Open WebUI's request task reading the stream
-            async for chunk in gen:
-                out.append(chunk)
-        reader = asyncio.ensure_future(owui_reads())
-        await self._until_registered("run-1")
-        q = self._queue("run-1")
-        q.put_nowait(self._delta("run-1", "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b"))
-        q.put_nowait(self._final("run-1"))
-        await asyncio.wait_for(rows_asked.wait(), 30)
-        self.assertIn("Which?", "".join(c for c in out if isinstance(c, str)))
-        reader.cancel()                  # the Stop that sends the new message
-        with self.assertRaises(asyncio.CancelledError):
-            await reader
-        await self._spin()
-        statuses = [e["data"] for e in self.emitted if e.get("type") == "status"]
-        self.assertFalse(statuses[-1]["done"], f"precondition: the reply's status is open: {statuses}")
-        self.assertEqual(closed, ["m1"])
+    async def test_a_stop_landing_in_open_webuis_own_code_closes_it_too(self):
+        """The same Stop landing while the reply waits at a yield, in Open
+        WebUI's own handling of the last chunk: the reply's generator is
+        never resumed or closed, so nothing in it runs again."""
+        await self._stopped_as_it_ends(between_chunks=True)
 
     async def test_a_reply_that_ended_leaves_its_last_status_alone(self):
         """Control: a reply that wrote its last status (usage lines, or an
-        empty done one) before it was closed keeps it."""
+        empty done one) before its request ended keeps it."""
         closed = self._record_status_closes()
-        gen = self._reply("hello", "m1")
-        first = asyncio.ensure_future(gen.__anext__())
+        task, out = self._owui_request("hello", "m1")
         await self._until_registered("run-1")
         self._queue("run-1").put_nowait(self._delta("run-1", "hi"))
         self._queue("run-1").put_nowait(self._final("run-1"))
-        await asyncio.wait_for(first, 30)
-        async for _ in gen:
-            pass
+        await asyncio.wait_for(task, 30)
+        await self._spin()
         statuses = [e["data"] for e in self.emitted if e.get("type") == "status"]
         self.assertTrue(statuses[-1]["done"])
-        await gen.aclose()
-        await self._spin()
         self.assertEqual(closed, [])
 
 

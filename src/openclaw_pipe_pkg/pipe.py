@@ -176,7 +176,8 @@ class _TurnState:
     `waiting` are the earlier replies, cancelled before they sent their
     message, whose messages are among `unsent`: each is ended with a note
     once those messages are sent, or dropped (ELI-188). `status_open`: the
-    last status line the reply showed is not done yet.
+    last status line the reply showed is not done yet; `handed_over`: the
+    turn writer took the reply's message over.
     """
     conn: object = None
     session_key: str | None = None
@@ -184,6 +185,7 @@ class _TurnState:
     reply: dict | None = None
     waiting: list = field(default_factory=list)
     status_open: bool = False
+    handed_over: bool = False
     unsent: list = field(default_factory=list)
     run_id: str | None = None
     queue: object = None
@@ -640,6 +642,20 @@ class Pipe:
                 if isinstance(event, dict) and event.get("type") == "status":
                     turn.status_open = not (event.get("data") or {}).get("done")
                 await __event_emitter__(event)
+        request = _owui_request_task((__metadata__ or {}).get("task_id"))
+        if request is not None and _send_texts is None:
+            def _request_ended(_task):
+                # Open WebUI ended the request (its own save of the message
+                # done) with this reply's status line still open, and nobody
+                # else owns the message: nothing will close the line now. A
+                # Stop as the reply ends does this (a question card cancelled
+                # by sending a new message, ELI-200), wherever the cancel
+                # lands: in the reply, or in Open WebUI's own code while the
+                # reply waits at a yield, which never closes the reply.
+                if turn.status_open and not turn.parked and not turn.handed_over and turn.reply:
+                    pipe_log("  request ended with the reply's status line open: closing it")
+                    spawn_background(_close_reply_status(turn.reply))
+            request.add_done_callback(_request_ended)
         try:
             async with contextlib.aclosing(self._pipe_turn(
                 body, emitter, __event_call__=__event_call__,
@@ -675,12 +691,6 @@ class Pipe:
                         turn.run_id, turn.chat_id, __event_call__),
                     waiting=waiting,
                 )
-            elif not turn.parked and turn.status_open and turn.reply:
-                # Nothing left to hand on (its run is over: a question card
-                # cancelled by sending a new message, ELI-200), but its status
-                # line still shows work going on, and nothing else ends it.
-                pipe_log(f"Reply {type(stop).__name__} with its status line open: closing it")
-                spawn_background(_close_reply_status(turn.reply))
             raise
 
     async def _pipe_turn(self, body, __event_emitter__, __event_call__=None,
@@ -1549,7 +1559,7 @@ class _PipeTurn:
         # unless the reply `keeps_its_run`.
         if not self.keeps_its_run and _hand_over_run(self.conn, self.session_key,
                 self.our_run_id, thinking=self.resolved_thinking, read_row=True):
-            self.handed_over = self.done = True
+            self.handed_over = self.done = self.turn.handed_over = True
         elif self.awaiting_owner:
             spawn_background(self.conn.push_row(self.session_key))
         elif not self.owui_message_id:
@@ -1582,7 +1592,7 @@ class _PipeTurn:
                                       if m.get("type") == "event"]}):
                 self.conn.unregister_consumer(self.session_key, self.our_run_id,
                                               queue=self.queue)
-                self.handed_over = self.done = True
+                self.handed_over = self.done = self.turn.handed_over = True
                 return
         for m in queued:
             self.queue.put_control(m)
@@ -1604,7 +1614,7 @@ class _PipeTurn:
         if _EXTERNAL_KILL_RE.search(err) or (aborted_run and self.conn._shutdown_seen):
             if not self.keeps_its_run and _hand_over_run(self.conn, self.session_key,
                     self.our_run_id, thinking=self.resolved_thinking, read_row=True):
-                self.handed_over = self.done = True
+                self.handed_over = self.done = self.turn.handed_over = True
                 return True
             if not self.owui_message_id:
                 self.await_owner()

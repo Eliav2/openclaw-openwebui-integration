@@ -230,9 +230,9 @@ REPLY_NOT_SENT_NOTE = "_(Stopped: this message was not sent to the agent.)_"
 
 async def _close_reply_status(ref: dict) -> None:
     """Close the status line reply `ref` ({chat_id, user_id, message_id,
-    request_task_id}) left open when it was closed with nothing left to do
-    (ELI-200): saved, so a reload shows it ended too. After the request's
-    own end-of-stream save, like `_close_unsent_reply`."""
+    request_task_id}) left open when its request ended (ELI-200): saved, so a
+    reload shows it ended too. After the request's own end-of-stream save,
+    like `_close_unsent_reply`."""
     request = _owui_request_task(ref.get("request_task_id"))
     if request is not None and not request.done():
         await asyncio.wait({request})
