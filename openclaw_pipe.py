@@ -1646,7 +1646,7 @@ async def _emit_message_snapshot(__event_emitter__, content):
 # reply that is streaming into the same tab.
 # ---------------------------------------------------------------------------
 
-_COMPOSER_BUTTON_VERSION = "5"
+_COMPOSER_BUTTON_VERSION = "6"
 
 # The Status Action's function id (install_action.py's FUNCTION_ID; the
 # dialog's own JS calls the same fixed id) and the Pipe's default function id.
@@ -1686,7 +1686,8 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
   // removing it (a layout this snippet does not understand): give up.
   const LOOP_LIMIT = 20;
   const LOOP_WINDOW_MS = 10000;
-  const SPARK_PATH = 'M9.813 15.904 9 18.75l-.813-2.846a4.5 4.5 0 0 0-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 0 0 3.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 0 0 3.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 0 0-3.09 3.09ZM18.259 8.715 18 9.75l-.259-1.035a3.375 3.375 0 0 0-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 0 0 2.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 0 0 2.456 2.456L21.75 6l-1.035.259a3.375 3.375 0 0 0-2.456 2.456ZM16.894 20.567 16.5 21.75l-.394-1.183a2.25 2.25 0 0 0-1.423-1.423L13.5 18.75l1.183-.394a2.25 2.25 0 0 0 1.423-1.423l.394-1.183.394 1.183a2.25 2.25 0 0 0 1.423 1.423l1.183.394-1.183.394a2.25 2.25 0 0 0-1.423 1.423Z';
+  // A paw, drawn in Heroicons' outline style (24x24, round caps), for "Claw".
+  const PAW_PATH = 'M11 6a1.5 2 0 1 1-3 0 1.5 2 0 0 1 3 0ZM16 6a1.5 2 0 1 1-3 0 1.5 2 0 0 1 3 0ZM7 10.5a1.5 1.75 0 1 1-3 0 1.5 1.75 0 0 1 3 0ZM20 10.5a1.5 1.75 0 1 1-3 0 1.5 1.75 0 0 1 3 0ZM12 12.75c-2.25 0-5.25 2.6-5.25 4.875 0 1.45 1.1 2.375 2.55 2.375.95 0 1.7-.45 2.7-.45s1.75.45 2.7.45c1.45 0 2.55-.925 2.55-2.375 0-2.275-3-4.875-5.25-4.875Z';
 
   const state = {
     prefixes: [],
@@ -1935,7 +1936,9 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
     const b = document.createElement('button');
     b.type = 'button';
     b.id = BTN_ID;
-    b.title = 'OpenClaw status';
+    // Shown as "Claw" (ELI-202); the aria-label keeps its old name, which the
+    // page scripts and the tests find the button by.
+    b.title = 'Claw';
     b.setAttribute('aria-label', 'OpenClaw status');
     b.dataset.openclawVersion = CFG.version;
     b.className = 'p-[0.375rem] flex gap-1 items-center text-sm rounded-full '
@@ -1943,11 +1946,11 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
       + 'bg-transparent text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800';
     b.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" '
       + 'stroke-width="1.75" stroke="currentColor" aria-hidden="true" class="size-4">'
-      + '<path stroke-linecap="round" stroke-linejoin="round" d="' + SPARK_PATH + '"/></svg>'
+      + '<path stroke-linecap="round" stroke-linejoin="round" d="' + PAW_PATH + '"/></svg>'
       // Icon-only below `sm`, like Open WebUI's own composer chips: at phone
       // width the chip row's overflow cut the label to "Stat" (ELI-123). The
       // title and aria-label still name it. Both classes ship in Open WebUI's CSS.
-      + '<span class="pr-0.5 hidden sm:inline">Status</span>';
+      + '<span class="pr-0.5 hidden sm:inline">Claw</span>';
     b.addEventListener('click', function (e) {
       e.preventDefault();
       e.stopPropagation();
@@ -10318,7 +10321,7 @@ class Pipe:
         )
         COMPOSER_STATUS_BUTTON: bool = Field(
             default=True,
-            description="Add an OpenClaw 'Status' button to the composer row of "
+            description="Add an OpenClaw 'Claw' button to the composer row of "
                 "OpenClaw chats (it opens the same dialog as the Status Action's "
                 "message button, so that Action must be installed). Installed "
                 "into the page at the start of each turn and when a tab opens an "
