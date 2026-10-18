@@ -1,45 +1,83 @@
 """E2E: end the run at Open WebUI's first "database is locked" (ELI-204).
 
-A sqlite write lock that is never released fails every write after it, so
-each later test waited out its whole timeout for a reply that could not
-come (20 tests x 60 s on run 39136858463). After each test this reads Open
-WebUI's new log lines; on the first "database is locked" it asks Open WebUI
-for a diagnostic dump (e2e/owui_dump.py) and stops the run, naming the dump.
+A task cancelled inside one of Open WebUI's DB writes can keep SQLite's write
+lock for good (ELI-205): every write after it fails, so each later test waited
+out its whole timeout for a reply that could not come (20 tests x 60 s on run
+39136858463). A thread follows Open WebUI's log while the tests run; the
+moment a line says "database is locked" it interrupts the test that is
+running, and the run ends naming that test and the line.
 """
 
+import _thread
 import os
 import shutil
 import subprocess
-import sys
+import threading
 import time
 
 import pytest
 
-sys.path.insert(0, os.path.dirname(__file__))
-import owui_dump  # noqa: E402
-
+CONTAINER = "owui"
 LOCKED = "database is locked"
-# From this run's start: an earlier run's lines are not this run's lock.
-_last_read = {"at": time.time()}
+# How soon the follower looks again after `docker logs -f` ends, which it does
+# whenever a test stops or restarts Open WebUI.
+RESTART_POLL_S = 1.0
+
+_state = {"test": "(between tests)", "line": None, "during": None}
 
 
-def _new_owui_log() -> str:
-    """Open WebUI's log lines since the previous call."""
-    since = _last_read["at"]
-    _last_read["at"] = time.time()
-    out = subprocess.run(["docker", "logs", "--since", f"{since:.3f}", owui_dump.CONTAINER],
-                         capture_output=True, text=True, timeout=60)
-    return out.stdout + out.stderr
+def _follow(stop: threading.Event) -> None:
+    since = time.time()
+    while not stop.is_set():
+        started = time.time()
+        proc = subprocess.Popen(["docker", "logs", "-f", "--since", f"{since:.3f}", CONTAINER],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+        _state["proc"] = proc
+        for line in proc.stdout:
+            if LOCKED in line and _state["line"] is None:
+                _state["line"], _state["during"] = line.strip()[:300], _state["test"]
+                _thread.interrupt_main()
+                proc.kill()
+                return
+        proc.wait()
+        since = started
+        stop.wait(RESTART_POLL_S)
 
 
-@pytest.fixture(autouse=True)
-def _owui_database_not_locked():
-    yield
+def _reason() -> str:
+    return (f"Open WebUI's database is locked (ELI-205), so every later test would time out. "
+            f"Running: {_state['during']}. Log: {_state['line']}")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _owui_lock_watch():
     if os.environ.get("E2E_STACK") != "1" or shutil.which("docker") is None:
+        yield
         return
-    log = _new_owui_log()
-    if LOCKED not in log:
-        return
-    line = next(ln for ln in log.splitlines() if LOCKED in ln)
-    pytest.exit(f"Open WebUI's database is locked, so every later test would time out: {line.strip()[:300]} "
-                f"| diagnostic dump: {owui_dump.dump()}", returncode=3)
+    stop = threading.Event()
+    watcher = threading.Thread(target=_follow, args=(stop,), name="owui-lock-watch", daemon=True)
+    watcher.start()
+    yield
+    stop.set()
+    proc = _state.get("proc")
+    if proc is not None and proc.poll() is None:
+        proc.kill()
+
+
+def pytest_runtest_logstart(nodeid, location):
+    _state["test"] = nodeid
+
+
+def pytest_runtest_logfinish(nodeid, location):
+    _state["test"] = "(between tests)"
+
+
+# The interrupt ends the session wherever it lands, in a test or between two.
+def pytest_keyboard_interrupt(excinfo):
+    if _state["line"] is not None:
+        print(f"\n{_reason()}")
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if _state["line"] is not None:
+        session.exitstatus = 3
