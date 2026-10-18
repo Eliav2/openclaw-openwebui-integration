@@ -375,9 +375,9 @@ def _both_answered(page, run: str, answer: str) -> None:
 def _ends_like_the_answer(page, token: str, run: str) -> None:
     """The running reply (holding `run`), finished by the Pipe's writer after
     a takeover, ends as the answer to the new message (an inline reply) does
-    (ELI-210): with the usage line whenever the answer has it (a Gateway that
-    reports no tokens shows none on either), and with no "Stopped" from the
-    cancel. In the saved status lines, and in the status line shown on the
+    (ELI-210): with no "Stopped" from the cancel, and with the usage line
+    whenever the answer has it (on 2026.10 the running reply is its session's
+    first run, which reports no usage yet: ELI-177). In the saved status lines, and in the status line shown on the
     reply (the page is reloaded by now)."""
     saved = capture.api("GET", f"/api/v1/chats/{_chat_id(page)}", token=token)["chat"]["history"]["messages"]
     replies = [m for m in saved.values() if m.get("role") == "assistant"]
@@ -387,10 +387,13 @@ def _ends_like_the_answer(page, token: str, run: str) -> None:
     lines, ref = ([h.get("description") for h in m.get("statusHistory") or [] if isinstance(h, dict)]
                   for m in (held[0], answer))
     usage = lambda ls: any(str(line).startswith("\U0001f9e0") for line in ls)  # noqa: E731
-    assert usage(lines) == usage(ref), f"the running reply: {lines}; the answer: {ref}"
-    assert "Stopped" not in lines, f"a Stopped line: {lines}"
     shown = page.evaluate(f"() => {_message_text_js(0)}")
-    assert "Stopped" not in shown and ("\U0001f9e0" in shown) == usage(ref), shown[-200:]
+    assert "Stopped" not in lines, f"a Stopped line: {lines}"
+    assert "Stopped" not in shown, shown[-200:]
+    if _openclaw_release() >= (2026, 10):
+        return  # the running reply is its session's first run: no usage reported yet (ELI-177)
+    assert usage(lines) == usage(ref), f"the running reply: {lines}; the answer: {ref}"
+    assert ("\U0001f9e0" in shown) == usage(ref), shown[-200:]
 
 
 def test_a_message_sent_while_a_reply_runs_is_in_the_chat_at_once(page):
