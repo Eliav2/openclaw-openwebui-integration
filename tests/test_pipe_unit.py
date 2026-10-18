@@ -4395,6 +4395,32 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(f["confirm"])
         self.assertEqual(f["options"], ["rebase", "merge"])
 
+    def test_a_choice_or_yes_no_question_that_mentions_a_secret_keeps_its_answers(self):
+        """ELI-196: a question with options or a yes/no answer that merely
+        mentions a password, secret or token got the masked dialog, without
+        its options or Yes/No, and what was typed reached the agent as a
+        plain answer it echoed into the chat."""
+        f = _parse_text_prompt("OpenClaw needs input:\n\nRouter entry\nOK to add the router-debug "
+                               "entry so W6 can use the password?\n1. Yes\n2. No")
+        self.assertEqual((f["secret"], f["options"]), (False, ["Yes", "No"]))
+        f = _parse_text_prompt("OpenClaw needs input:\n\nTokens\nRotate the API token now? (y/n)")
+        self.assertEqual((f["secret"], f["confirm"]), (False, True))
+        # A question that asks for the value itself still gets the dialog.
+        f = _parse_text_prompt("OpenClaw needs input:\n\nTest token\nPaste the test API token (password)")
+        self.assertEqual((f["secret"], f["confirm"], f["options"]), (True, False, []))
+
+    def test_a_secret_ask_keeps_the_masked_field_whatever_else_it_has(self):
+        """W3 on #137: asking for the value wins over steps written as a
+        numbered list, a confirm verb, or options under Codex's "may show
+        your reply" warning; a key typed into the card's Other field would
+        land in the chat."""
+        f = _parse_text_prompt("OpenClaw needs input:\n\nToken\nPaste your API key:\n1. Open Settings\n2. Copy the key")
+        self.assertEqual((f["secret"], f["options"]), (True, []))
+        f = _parse_text_prompt("OpenClaw needs input:\n\nPassword\nPlease confirm your password?")
+        self.assertEqual((f["secret"], f["confirm"]), (True, False))
+        f = _parse_text_prompt("Codex needs input:\n\nToken\nThis channel may show your reply to other participants.\n1. a\n2. b")
+        self.assertEqual((f["secret"], f["options"]), (True, []))
+
     def test_secret_marker_does_not_match_innocent_key_substring(self):
         # "monkey" contains "key" -- must not be flagged as a secret.
         f = _parse_text_prompt("OpenClaw needs input:\n\nName the monkey\nWhat should we call the monkey?")

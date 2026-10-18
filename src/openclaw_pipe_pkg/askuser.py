@@ -290,12 +290,6 @@ def _parse_text_prompt(prompt_text: str) -> dict:
         title = title or "OpenClaw needs input"
         message = message or "Please answer so the run can continue."
 
-    # Kept specific on purpose: a bare "key" matches innocent words ("monkey").
-    secret = any(
-        marker in text_lower
-        for marker in ("secret", "password", "may show your reply", "api key", "token")
-    )
-
     # Yes/no only when the prompt clearly reads as binary: a free-text question
     # turned into yes/no loses the real answer. A numbered list is a choice.
     has_options = bool(re.search(r"(?m)^\s*\d+[.)]\s", prompt_text))
@@ -305,9 +299,21 @@ def _parse_text_prompt(prompt_text: str) -> dict:
         "delete", "remove", "בטוח", "האם", "هل تريد",
     )
     ends_question = message.rstrip().endswith("?") or title.rstrip().endswith("?")
+    # A secret unless it is clearly a choice (an explicit yes/no marker, or two
+    # or more numbered options) and nothing asks for the value itself: a
+    # choice that merely mentions a password keeps its answers (ELI-196), but
+    # a key typed into the card's Other field would land in the chat. Kept
+    # specific on purpose: a bare "key" matches innocent words ("monkey").
+    mentions_secret = any(
+        marker in text_lower for marker in ("secret", "password", "api key", "token"))
+    asks_for_value = "may show your reply" in text_lower or bool(re.search(
+        r"\b(enter|paste|provide|type|send|give|share|input)\b[^.?!\n]{0,40}?"
+        r"(secret|password|api key|token)", text_lower))
+    yes_no = any(m in text_lower for m in yn_markers)
+    is_choice = yes_no or len(_extract_numbered_options(prompt_text)) >= 2
+    secret = asks_for_value or (mentions_secret and not is_choice)
     confirm = not secret and not has_options and (
-        any(m in text_lower for m in yn_markers)
-        or (any(w in text_lower for w in confirm_verbs) and ends_question)
+        yes_no or (any(w in text_lower for w in confirm_verbs) and ends_question)
     )
     options = [] if secret or confirm else _dedupe_options(
         [label for _, label in _extract_numbered_options(prompt_text)])
