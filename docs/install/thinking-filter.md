@@ -60,6 +60,8 @@ A global filter runs on every chat with every model, and this one writes `reason
 
 Once active, it does nothing until you switch the toggle on in a given conversation. Open WebUI does not run a toggled filter's `inlet` while the toggle is off, so an untouched chat behaves exactly as if the filter were not installed.
 
+Picking another model in the chat switches the toggle off again: Open WebUI resets the composer's toggles (filters, tools, web search) on every model change and keeps only the new model's defaults. Switch it back on after a model change.
+
 ## Show your models' real levels
 
 The Pipe should be installed first. The filter's level dropdown is filled from a cache the Pipe writes, `STATE_DIR/thinking-ladders.json`, with the levels it has seen your models support. Before the Pipe has run once, the dropdown falls back to the five levels every observed provider supports: `off`, `minimal`, `low`, `medium`, `high`.
