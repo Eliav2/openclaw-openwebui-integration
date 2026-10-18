@@ -29,10 +29,11 @@ _HELPER = r'''
 import ctypes, json, os, socket, sys
 port, pids = int(sys.argv[1]), set(sys.argv[2].split(","))
 conns = {}
-for line in open("/proc/net/tcp").read().splitlines()[1:]:
-    f = line.split()
-    if f[3] == "01" and int(f[2].split(":")[1], 16) == port and f[9] != "0":
-        conns[f[9]] = "127.0.0.1:%d->:%d" % (int(f[1].split(":")[1], 16), port)
+for table in ("tcp", "tcp6"):   # "localhost" can be ::1
+    for line in open("/proc/net/" + table).read().splitlines()[1:]:
+        f = line.split()
+        if f[3] == "01" and int(f[2].split(":")[1], 16) == port and f[9] != "0":
+            conns[f[9]] = "%s :%d->:%d" % (table, int(f[1].split(":")[1], 16), port)
 libc, done, out = ctypes.CDLL(None, use_errno=True), set(), []
 for pid in sorted(pids):
     try:

@@ -342,6 +342,9 @@ def test_a_message_queued_behind_a_run_waits_out_a_socket_drop(page):
     assert dropped, "no Gateway connection of Open WebUI was dropped"
     _wait(page, _reply_js(-1, "all.length === 2 && r.done"), "the queued message's reply done")
     assert "Error sending message" not in _replies(page)[1]["text"], _replies(page)[1]["text"]
+    # A word in flight during the drop can be missing from the running reply
+    # until its end, which the Pipe writes from the run's transcript.
+    _wait(page, _reply_js(0, f"r.text.includes({json.dumps(run)})"), "the running reply whole", 30_000)
     _both_answered(page, run, "BROWSER_DROP_ANSWER")
 
 
