@@ -184,6 +184,9 @@ class _ComposerWatcher:
                 pushed += 1
             if st is None:
                 continue
+            if result == "held":
+                st["attempts"] -= 1
+                continue
             if result == "retry" and st["attempts"] < _COMPOSER_WATCH_ATTEMPTS:
                 st["next"] = now + _COMPOSER_WATCH_RETRY_S
             else:
@@ -191,7 +194,9 @@ class _ComposerWatcher:
         return pushed
 
     async def _push(self, sid, chat_id, user_id) -> str:
-        """"acked" (the tab ran it), "skip" (not ours to push) or "retry"."""
+        """"acked" (the tab ran it), "skip" (not ours to push), "retry", or
+        "held": the tab shows an input dialog, which an `execute` would take
+        the answer of (ELI-195), so the push waits for it to close."""
         if not user_id:
             return "skip"
         head = await self._chat_head(chat_id)
@@ -210,6 +215,8 @@ class _ComposerWatcher:
         code = (_page_hooks_js(chat_id, _auto_send_on(self.valves_getter()))
                 + _render_composer_button_js(session_id=sid, model_prefixes=prefixes, chat_id=chat_id,
                                              chat_model=model))
+        if _dialog_open_on(sid):
+            return "held"
         acked = await self._call_sid(sid, {
             "chat_id": chat_id,
             "message_id": message_id,

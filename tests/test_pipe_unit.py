@@ -33,6 +33,7 @@ install_stubs()
 import websockets  # noqa: E402  (after the stubs)
 
 import openclaw_pipe  # noqa: E402
+import openclaw_status_action  # noqa: E402
 from openclaw_pipe import (
     ACTION_RUN_PREFIX, TURN_NS, _run_id_sent_at, parse_pipe_run_id, pipe_run_id, turn_message_id,
     _claim_turn_message, _register_turn_writer, _retire_turn_writer,
@@ -4942,6 +4943,96 @@ class AskUserSecretDialogTests(unittest.IsolatedAsyncioTestCase):
         # Any other answer shows as given.
         self.assertIn('result="Blue"', _ask_user_detail_block(
             "OpenClaw needs input:\n\nColor?\nPick\n1. Red\n2. Blue", "Blue"))
+
+
+class DialogHoldsExecutesTests(unittest.IsolatedAsyncioTestCase):
+    """Open WebUI 0.12's tab keeps one callback for its input dialog and the
+    `execute` event, and each overwrites it on arrival: an `execute` reaching
+    a tab while its dialog is open took the dialog's answer (ELI-195). While
+    the Pipe waits on a dialog, no `execute` goes to that socket: an emitted
+    one waits for the answer, a query is not sent."""
+
+    class Sio:
+        def __init__(self):
+            self.calls, self.emits = [], []
+            self.answer = asyncio.get_running_loop().create_future()
+
+        async def call(self, event, data, to=None, timeout=None):
+            self.calls.append((data, to))
+            if data["data"]["type"] == "input":
+                return await self.answer
+            return "stop"
+
+        async def emit(self, event, data, **kw):
+            self.emits.append((data, kw))
+
+    INPUT = {"type": "input", "data": {"title": "Token", "type": "password"}}
+
+    async def asyncSetUp(self):
+        self.sio = self.Sio()
+        self.pool = {"sidA": {"id": "user-1", "chat_ids": ["chat-1"]},
+                     "sidB": {"id": "user-1", "chat_ids": ["chat-1"]}}
+        fake_owui(self, sio=self.sio, SESSION_POOL=self.pool)
+
+    async def _dialog_on(self, sid):
+        """The input dialog, open on `sid` until `self.sio.answer` is set."""
+        others = {k: v for k, v in self.pool.items() if k != sid}
+        for k in others:
+            self.pool[k] = {**self.pool[k], "chat_ids": []}
+        dialog = asyncio.ensure_future(openclaw_pipe._call_on_chat_tab(
+            "user-1", "chat-1", "msg-1", self.INPUT, 60))
+        while not self.sio.calls:
+            await asyncio.sleep(0)
+        self.pool.update(others)
+        return dialog
+
+    async def test_an_execute_emitted_meanwhile_reaches_that_tab_after_the_answer(self):
+        dialog = await self._dialog_on("sidA")
+        emitter = RecordingEmitter()
+        # The Action artifact holds for the Pipe's dialog: the record is shared.
+        emit = openclaw_status_action._dialog_safe_emitter(emitter, "user-1", "chat-1", "msg-1")
+        await emit({"type": "execute", "data": {"code": "1"}})
+        await emit({"type": "status", "data": {"description": "x"}})
+        self.assertEqual([e["type"] for e in emitter.events], ["status"])
+        payload = {"chat_id": "chat-1", "message_id": "msg-1",
+                   "data": {"type": "execute", "data": {"code": "1"}}}
+        self.assertEqual(self.sio.emits, [(payload, {"room": "user:user-1", "skip_sid": ["sidA"]})])
+        self.sio.answer.set_result({"value": "v"})
+        await dialog
+        self.assertEqual(self.sio.emits[1:], [(payload, {"to": "sidA"})])
+        await emit({"type": "execute", "data": {"code": "2"}})
+        self.assertEqual(emitter.events[-1]["data"]["code"], "2", "no dialog: the emitter as is")
+
+    async def test_a_query_is_not_sent_to_a_tab_showing_the_dialog(self):
+        dialog = await self._dialog_on("sidA")
+        self.assertEqual(await openclaw_pipe._page_cancel_intent("user-1", "chat-1", "msg-1"), "stop")
+        queried = [to for data, to in self.sio.calls if data["data"]["type"] == "execute"]
+        self.assertEqual(queried, ["sidB"])
+        asked = []
+
+        async def event_call(payload):
+            asked.append(payload["type"])
+            return "stop"
+        call = openclaw_pipe._dialog_safe_event_call(event_call, "sidA", "user-1")
+        self.assertIsNone(await call({"type": "execute", "data": {"code": "q"}}))
+        self.assertEqual(asked, [])
+        self.sio.answer.set_result({"value": "v"})
+        await dialog
+        self.assertEqual(await call({"type": "execute", "data": {"code": "q"}}), "stop")
+
+    async def test_the_turns_own_dialog_holds_its_socket(self):
+        answered = asyncio.get_running_loop().create_future()
+
+        async def event_call(payload):
+            return await answered
+        call = openclaw_pipe._dialog_safe_event_call(event_call, "sidA", "user-1")
+        dialog = asyncio.ensure_future(call(self.INPUT))
+        await asyncio.sleep(0)
+        self.assertTrue(openclaw_pipe._dialog_open_on("sidA"))
+        self.assertFalse(openclaw_pipe._dialog_open_on("sidB"))
+        answered.set_result("v")
+        self.assertEqual(await dialog, "v")
+        self.assertFalse(openclaw_pipe._dialog_open_on("sidA"))
 
 
 class SecretAnswerNeverInTheChatTests(unittest.IsolatedAsyncioTestCase):

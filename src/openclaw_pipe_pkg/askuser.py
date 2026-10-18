@@ -579,12 +579,13 @@ async def _call_on_chat_tab(
     if card:
         payload = {**payload, "data": {**payload["data"], "interaction_id": interaction_id}}
     try:
-        return await sio.call(
-            "events",
-            {"chat_id": owui_chat_id, "message_id": owui_message_id, "data": payload},
-            to=sid,
-            timeout=timeout_s,
-        )
+        async with _holding_executes(sid, owui_user_id, payload.get("type")):
+            return await sio.call(
+                "events",
+                {"chat_id": owui_chat_id, "message_id": owui_message_id, "data": payload},
+                to=sid,
+                timeout=timeout_s,
+            )
     except Exception as ex:
         return {"error": f"Event call timed out: {ex!r}"}
     finally:

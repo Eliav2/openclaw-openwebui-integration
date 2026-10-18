@@ -4797,6 +4797,105 @@ async def _emit_message_snapshot(__event_emitter__, content):
     )
 
 
+
+# ---------------------------------------------------------------------------
+# A tab's input dialog and `execute` share one callback (ELI-195).
+#
+# Open WebUI 0.12's Chat.svelte keeps one callback slot for its `input` and
+# `confirmation` dialogs and for `execute`: each of these events overwrites
+# it on arrival, and the dialog's Confirm / Cancel answers whatever the slot
+# holds then. An `execute` that reaches a tab while its dialog is open takes
+# the dialog's answer, so the click is lost and the asker never hears back.
+# While a dialog is open on a socket, the socket is recorded here (shared by
+# the Pipe and the Action through `_shared_gateway_state`): an emitted
+# `execute` skips it and is delivered once the dialog is answered, and a
+# called one (a query) is not sent to it.
+# ---------------------------------------------------------------------------
+
+_SLOT_DIALOG_TYPES = ("input", "confirmation")
+_local_dialog_holds: dict = {}
+
+
+def _dialog_holds() -> dict:
+    """sid -> {"user_id", "open": open dialogs, "held": event payloads}."""
+    state = _shared_gateway_state()
+    return _local_dialog_holds if state is None else state.setdefault("dialog_holds", {})
+
+
+def _dialog_open_on(sid) -> bool:
+    return bool(sid) and sid in _dialog_holds()
+
+
+@contextlib.asynccontextmanager
+async def _holding_executes(sid, user_id, kind):
+    """Record `sid` as showing a dialog of `kind` for the block's duration,
+    then deliver the `execute` events held for it meanwhile, in order."""
+    if not sid or kind not in _SLOT_DIALOG_TYPES:
+        yield
+        return
+    holds = _dialog_holds()
+    entry = holds.get(sid)
+    if entry is None:
+        entry = holds[sid] = {"user_id": user_id, "open": 0, "held": []}
+    entry["open"] += 1
+    try:
+        yield
+    finally:
+        entry["open"] -= 1
+        if entry["open"] <= 0 and holds.get(sid) is entry:
+            del holds[sid]
+            if entry["held"]:
+                pipe_log(f"  dialog on {str(sid)[:8]}... answered: delivering "
+                         f"{len(entry['held'])} held execute event(s)")
+            for payload in entry["held"]:
+                try:
+                    from open_webui.socket.main import sio
+                    await sio.emit("events", payload, to=sid)
+                except Exception as ex:
+                    pipe_log(f"  held execute to {str(sid)[:8]}... failed: {ex!r}")
+
+
+def _dialog_safe_emitter(emitter, user_id, chat_id, message_id):
+    """`emitter`, except that an `execute` skips the user's sockets with an
+    open dialog (OWUI's emitter sends to the whole `user:<id>` room) and is
+    held for them."""
+    if emitter is None or not user_id:
+        return emitter
+
+    async def emit(event):
+        busy = []
+        if isinstance(event, dict) and event.get("type") == "execute":
+            holds = _dialog_holds()
+            busy = [sid for sid, e in list(holds.items()) if e.get("user_id") == user_id]
+        if not busy:
+            return await emitter(event)
+        payload = {"chat_id": chat_id, "message_id": message_id, "data": event}
+        for sid in busy:
+            holds[sid]["held"].append(payload)
+        pipe_log(f"  execute held for {len(busy)} tab(s) with an open dialog")
+        from open_webui.socket.main import sio
+        await sio.emit("events", payload, room=f"user:{user_id}", skip_sid=busy)
+
+    return emit
+
+
+def _dialog_safe_event_call(event_call, sid, user_id):
+    """`event_call` (bound to socket `sid`), recording its dialogs and never
+    sending an `execute` while one is open there: that query answers None."""
+    if event_call is None:
+        return None
+
+    async def call(payload):
+        kind = (payload or {}).get("type")
+        if kind == "execute" and _dialog_open_on(sid):
+            pipe_log(f"  execute query not sent: {str(sid)[:8]}... shows a dialog")
+            return None
+        async with _holding_executes(sid, user_id, kind):
+            return await event_call(payload)
+
+    return call
+
+
 # --- composer --------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -7832,6 +7931,9 @@ class Action:
         visually distinct icon. Detected here and redirected
         straight into the same subagent-detail drawer instead of the
         general status dialog, keyed off content rather than mode."""
+        # No `execute` reaches a tab while it shows an input dialog (ELI-195).
+        __event_emitter__ = _dialog_safe_emitter(
+            __event_emitter__, (__user__ or {}).get("id"), body.get("chat_id"), body.get("id"))
         mode = body.get("mode")
         if mode == "compact":
             return await self._run_compact(body, __user__, __event_emitter__)

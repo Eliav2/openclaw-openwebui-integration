@@ -23,7 +23,7 @@ from unittest import mock
 
 import conftest  # noqa: F401  (imports real pydantic before the stubs can shadow it)
 
-from _test_helpers import RecordingEmitter, fake_owui  # noqa: E402
+from _test_helpers import FakeSio, RecordingEmitter, fake_owui  # noqa: E402
 from _test_stubs import install_stubs  # noqa: E402
 
 install_stubs()
@@ -484,6 +484,29 @@ class ComposerWatcherTests(unittest.IsolatedAsyncioTestCase):
         await w.tick(now=0.0)
         await w.tick(now=5.0)
         self.assertEqual(w.sent, [])
+
+    async def test_no_push_to_a_tab_while_its_input_dialog_is_open(self):
+        """Open WebUI's input dialog and `execute` share one callback in the
+        tab: a push landing while the dialog is open took its answer (ELI-195,
+        a secret's Cancel lost on a new chat). The push waits for the answer
+        and spends no attempt meanwhile."""
+        pool = {"sidA": {"id": "alice", "chat_ids": ["oc"]}}
+        answer = asyncio.get_running_loop().create_future()
+        sio = FakeSio(lambda event, data, to, timeout: answer)
+        fake_owui(self, sio=sio, SESSION_POOL=pool)
+        dialog = asyncio.ensure_future(openclaw_pipe._call_on_chat_tab(
+            "alice", "oc", "u1", {"type": "input", "data": {"title": "Token"}}, 60))
+        while not sio.calls:
+            await asyncio.sleep(0)
+        w = _TestWatcher(pool, self.chats)
+        await w.tick(now=100.0)
+        for now in (102.0, 110.0, 120.0, 130.0):
+            self.assertEqual(await w.tick(now=now), 0)
+        self.assertEqual(w.sent, [], "an execute reached the tab showing the dialog")
+        answer.set_result({"value": "x"})
+        self.assertEqual(await dialog, {"value": "x"})
+        self.assertEqual(await w.tick(now=131.0), 1)
+        self.assertEqual([sid for sid, _ in w.sent], ["sidA"])
 
     async def test_sessions_without_chat_ids_are_ignored(self):
         pool = {"sidA": {"id": "alice"}, "sidB": None}

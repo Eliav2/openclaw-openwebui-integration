@@ -440,6 +440,10 @@ async def _page_cancel_intent(user_id: str, chat_id: str, message_id: str) -> st
             and chat_id in (sess.get("chat_ids") or [])]
     answers = set()
     for sid in sids:
+        if _dialog_open_on(sid):
+            # The query would take the open dialog's answer (ELI-195).
+            pipe_log(f"  turn writer: {sid[:8]}... shows a dialog; its intent is not asked")
+            continue
         try:
             resp = await socket_main.sio.call("events", {
                 "chat_id": chat_id, "message_id": message_id,
@@ -601,9 +605,10 @@ class _TurnWriter:
             from open_webui.socket.main import get_event_emitter
 
             # update_db=False: the writer owns this message's DB writes.
-            self._emit = await get_event_emitter(
+            self._emit = _dialog_safe_emitter(await get_event_emitter(
                 {"chat_id": self.chat_id, "message_id": self.message_id,
-                 "user_id": self.user_id}, update_db=False)
+                 "user_id": self.user_id}, update_db=False),
+                self.user_id, self.chat_id, self.message_id)
         return self._emit
 
     async def _stream(self) -> None:

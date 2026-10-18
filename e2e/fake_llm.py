@@ -63,6 +63,9 @@ and only a core set is sent as real schemas.
   `ASK_MULTI` below. The next message answers it: the reply is
   `E2E_ANSWERED <the answer> E2E_ANSWER_END`, so a test sees what reached
   the agent once the reply has ended.
+* `E2E_ASK_SECRET`                     -> asks for a secret: `ASK_SECRET` below,
+  which the Pipe asks in Open WebUI's masked dialog. The next message
+  answers it, echoed as for `E2E_ASK_SINGLE`.
 * `E2E_SECRET_REQUEST NAME`            -> calls `secrets` with action=request for
   NAME (OpenClaw's masked credential entry), then, once the tool result is in,
   replies `E2E_SECRET_RESULT <status>` with the result's first "status".
@@ -122,6 +125,7 @@ ANSWER_END = "E2E_ANSWER_END"   # the answer's echo is complete
 ASK_SINGLE = "OpenClaw needs input:\n\nColor\nWhich color?\n1. Red\n2. Green\n3. Blue"
 ASK_MULTI = ("OpenClaw needs input:\n\nToppings (multiselect)\nWhich toppings?\n"
              "1. Cheese\n2. Olives\n3. Mushrooms")
+ASK_SECRET = "OpenClaw needs input:\n\nTest token\nPaste the test API token (password)"
 WAKE_ASK = "E2E_WAKE_ASK_START " + " ".join(f"slow-{i}" for i in range(1, 7)) + "\n\n" + ASK_SINGLE
 
 
@@ -265,6 +269,8 @@ def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
         return {"text": ASK_SINGLE}
     if "E2E_ASK_MULTI" in user_text:
         return {"text": ASK_MULTI}
+    if "E2E_ASK_SECRET" in user_text:
+        return {"text": ASK_SECRET}
 
     if "session_status" in user_text and "model line" in user_text:
         if tool_results:

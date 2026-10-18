@@ -2491,6 +2491,9 @@ class Action:
         visually distinct icon. Detected here and redirected
         straight into the same subagent-detail drawer instead of the
         general status dialog, keyed off content rather than mode."""
+        # No `execute` reaches a tab while it shows an input dialog (ELI-195).
+        __event_emitter__ = _dialog_safe_emitter(
+            __event_emitter__, (__user__ or {}).get("id"), body.get("chat_id"), body.get("id"))
         mode = body.get("mode")
         if mode == "compact":
             return await self._run_compact(body, __user__, __event_emitter__)
