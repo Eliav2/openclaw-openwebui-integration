@@ -125,7 +125,12 @@ echo "image pulled after $(( SECONDS - PULL_START ))s, $(( SECONDS - WAIT_START 
 # Host networking so "localhost:18789" means the same Gateway from inside the
 # container as from the installer, which is the single-host layout the README's
 # defaults assume.
+# e2e/owui_diag: SIGUSR1 makes Open WebUI dump its tasks, threads and sqlite
+# connections into $LOG_DIR/owui-diag (ELI-204), which is uploaded with the logs.
+mkdir -p "$LOG_DIR/owui-diag"
 docker run -d --name owui --network host \
+  -v "$PWD/e2e/owui_diag:/e2e-diag:ro" -e PYTHONPATH=/e2e-diag \
+  -v "$LOG_DIR/owui-diag:/owui-diag" \
   -e WEBUI_SECRET_KEY="e2e-$(openssl rand -hex 16)" \
   -e ENABLE_OLLAMA_API=false \
   -e ENABLE_OPENAI_API=false \

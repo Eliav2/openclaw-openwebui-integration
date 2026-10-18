@@ -112,6 +112,16 @@ so the thinking level a turn picks shows in that request log as
 `reasoning_effort`. Gateway, Open WebUI and model logs are uploaded as an
 artifact on every run.
 
+If Open WebUI logs `database is locked` during an E2E run, the run stops
+after that test (`e2e/conftest.py`) instead of letting every later test wait
+out its timeout. The stack's Open WebUI loads `e2e/owui_diag/sitecustomize.py`,
+so SIGUSR1 makes it write a dump of its asyncio tasks (each with the
+coroutines it awaits and the sessions it holds), its threads, its sqlite
+connections and the locks on the database files, with the pid and command
+line of each holder. The stop takes one, and so does any failed CI run; they
+are uploaded with the logs under `owui-diag/`. `python3 e2e/owui_dump.py`
+takes one by hand.
+
 The versions it runs against are pinned in `e2e/versions.env`. Bump them in the
 PR that makes the code work with a new release, together with the matching
 pins in `requirements-dev.txt` and a re-extracted fixture
