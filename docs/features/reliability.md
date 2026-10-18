@@ -7,7 +7,7 @@ Valves: `GATEWAY_URL`, `GATEWAY_TOKEN`, `STATE_DIR`, `SEND_STOP_ON_CANCEL`, `INT
 
 One WebSocket connection to the Gateway is shared by every chat, rather than one per message.
 
-It reconnects on its own with exponential backoff, from 1 second up to 30, so a Gateway restart needs nothing from you. A message sent while it waits out a backoff does not wait for the next attempt: the Pipe tries at once and sends the message on that connection. If the Gateway is still down or starting, the reply says so and you send the message again. The Gateway sends a keepalive tick (every 30 seconds by default); a socket that sends no frame for two tick intervals is treated as dead and reconnected, rather than waited on forever.
+It reconnects on its own with exponential backoff, from 1 second up to 30, so a Gateway restart needs nothing from you. A message sent while it waits out a backoff does not wait for the next attempt: the Pipe tries at once and sends the message on that connection. If the Gateway is still down or starting, the reply says so and you send the message again. A message already queued behind a running reply when the socket drops keeps waiting: while the Pipe cannot ask the Gateway whether that run is still going, it treats it as still going, and sends the message once it has reconnected and the run has finished. The Gateway sends a keepalive tick (every 30 seconds by default); a socket that sends no frame for two tick intervals is treated as dead and reconnected, rather than waited on forever.
 
 The Pipe's log while the Gateway restarts (an excerpt):
 

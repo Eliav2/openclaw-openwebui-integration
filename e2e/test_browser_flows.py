@@ -325,6 +325,29 @@ def test_a_message_sent_while_a_reply_runs_is_in_the_chat_at_once(page):
     _both_answered(page, run, "BROWSER_BUSY_ANSWER")
 
 
+def test_a_message_queued_behind_a_run_waits_out_a_socket_drop(page):
+    """ELI-199: a message waits behind a run the Pipe keeps going in its own
+    reply, and the Pipe's Gateway socket drops (1006, the Gateway itself
+    stays up). The message must wait for the reconnect and then for the run,
+    and get its own answer: not be sent into the dropped socket and lost
+    ("Error sending message: gateway connection not ready")."""
+    import socket_drop
+    run = _slow("BROWSER_DROP", 20)
+    capture.new_chat(page)
+    capture.send(page, "E2E_SLOW:20 BROWSER_DROP")
+    _wait(page, _reply_js(0, "r.text.includes('BROWSER_DROP slow-1 slow-2')"), "the reply part way through")
+    _type_and_send(page, "E2E_ECHO: BROWSER_DROP_ANSWER")
+    _wait(page, "() => document.body.innerText.includes('Queued: waiting')", "the new message queued")
+    dropped = [d for d in socket_drop.drop() if "fd" in d]
+    assert dropped, "no Gateway connection of Open WebUI was dropped"
+    _wait(page, _reply_js(-1, "all.length === 2 && r.done"), "the queued message's reply done")
+    assert "Error sending message" not in _replies(page)[1]["text"], _replies(page)[1]["text"]
+    # A word in flight during the drop can be missing from the running reply
+    # until its end, which the Pipe writes from the run's transcript.
+    _wait(page, _reply_js(0, f"r.text.includes({json.dumps(run)})"), "the running reply whole", 30_000)
+    _both_answered(page, run, "BROWSER_DROP_ANSWER")
+
+
 def test_send_now_on_a_queued_message_keeps_the_running_reply(page, token):
     """Send now (AUTO_SEND_WHILE_RUNNING off): Open WebUI holds the message
     in its queue above the composer; Send now puts it in the chat without
