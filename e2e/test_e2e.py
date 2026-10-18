@@ -73,9 +73,10 @@ def _drive_chat_turn(token: str, prompt: str, model: str = DEFAULT_MODEL) -> dic
 
 
 def _chat_turn(token: str, prompt: str, model: str = DEFAULT_MODEL,
-               chat_id: str | None = None) -> tuple[str, dict]:
+               chat_id: str | None = None, extra: dict | None = None) -> tuple[str, dict]:
     """(chat id, saved assistant message) of one turn in a new persisted chat,
-    or of the next turn in `chat_id`."""
+    or of the next turn in `chat_id`. `extra`: more fields of the completion
+    request, as the browser adds them (`filter_ids` for a filter chip turned on)."""
     now = int(time.time())
     uid, aid = str(uuid.uuid4()), str(uuid.uuid4())
     if chat_id:
@@ -113,7 +114,7 @@ def _chat_turn(token: str, prompt: str, model: str = DEFAULT_MODEL,
         "model": model, "messages": path,
         "stream": True, "chat_id": chat_id, "id": aid,
         "session_id": f"e2e-{uuid.uuid4().hex[:8]}",
-        "parent_id": uid, "user_message": user,
+        "parent_id": uid, "user_message": user, **(extra or {}),
     }, token)
     # With a chat_id Open WebUI runs the turn as a background task and returns
     # an ack at once; the reply only exists in the persisted chat.
@@ -1595,3 +1596,117 @@ def test_a_message_sent_while_the_pipe_waits_to_reconnect_gets_its_reply(token):
         "precondition: the Pipe reconnected before the message went out"
     _, msg = _chat_turn(token, "Reply with exactly: E2E_AFTER_RESTART")
     assert msg.get("content", "").strip() == "E2E_AFTER_RESTART", msg.get("content")
+
+
+# ── MEDIA out and the thinking level (ELI-179) ───────────────────────────────
+# Two flows a user sees in the reply that had no end-to-end test: a file the
+# agent sends with a `MEDIA:<file>` line, and the thinking level picked with the
+# Thinking filter.
+
+MEDIA_DIR = "/tmp/openclaw-pipe-media"   # media.MEDIA_DIR, inside the Open WebUI container
+PNG_1PX = bytes.fromhex(
+    "89504e470d0a1a0a0000000d4948445200000001000000010806000000"
+    "1f15c4890000000d4944415478da63f8ffff3f0005fe02fea7d6a4a00000000049454e44ae426082")
+
+
+def _db_file_rows(filename: str) -> list:
+    """Open WebUI's `file` rows with this filename, from its DB."""
+    code = ("import json,sqlite3,sys;c=sqlite3.connect('/app/backend/data/webui.db');"
+            "print(json.dumps([{'id': r[0], 'user_id': r[1], 'meta': json.loads(r[2] or '{}')} for r in "
+            "c.execute('select id,user_id,meta from file where filename=?',(sys.argv[1],))]))")
+    out = subprocess.run(["docker", "exec", "owui", "python3", "-c", code, filename],
+                         check=True, capture_output=True, text=True, timeout=60).stdout
+    return json.loads(out)
+
+
+def _file_content(tok: str, file_id: str) -> bytes:
+    req = urllib.request.Request(f"{BASE}/api/v1/files/{file_id}/content",
+                                 headers={"Authorization": f"Bearer {tok}"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return resp.read()
+
+
+@pytest.mark.skipif(shutil.which("docker") is None, reason="needs the e2e stack's Open WebUI container")
+def test_a_media_line_from_the_agent_is_uploaded_attached_and_linked(token):
+    """The agent ends a line with `MEDIA:<file>`: the Pipe uploads the file to
+    Open WebUI, attaches it to the reply (the `files` event) and puts a link to
+    it where the line was. All three are read from Open WebUI's DB, which is
+    what a reload shows."""
+    name = f"e2e-media-{uuid.uuid4().hex[:8]}.png"
+    subprocess.run(["docker", "exec", "-i", "owui", "sh", "-c",
+                    f"mkdir -p {MEDIA_DIR} && cat > {MEDIA_DIR}/{name}"],
+                   input=PNG_1PX, check=True, timeout=60)
+    chat_id, msg = _chat_turn(token, f"E2E_ECHO: Here it is: MEDIA:{name} done")
+
+    rows = _db_file_rows(name)
+    assert len(rows) == 1, f"want one uploaded file row for {name}: {rows}"
+    file_id = rows[0]["id"]
+    assert rows[0]["user_id"] == _me(token)["id"], rows
+    assert rows[0]["meta"].get("content_type") == "image/png", rows
+    assert _file_content(token, file_id) == PNG_1PX
+
+    saved = _db_message(chat_id, msg["id"])
+    dump = json.dumps(saved)[:2000]
+    assert [f.get("id") for f in saved.get("files") or []] == [file_id], f"not attached: {dump}"
+    content = saved.get("content") or ""
+    assert f"![{name}](/api/v1/files/{file_id}/content)" in content, f"no link: {dump}"
+    assert "MEDIA:" not in content and content.startswith("Here it is:") and content.endswith("done"), dump
+
+
+THINKING_FILTER_ID = "openclaw_thinking"   # install_filter.py
+
+
+@pytest.fixture
+def think_model(token):
+    """The e2e-think entry with the Thinking filter attached, as the README has
+    a user do it (Workspace > Models > the model > Filters). Yields (model id,
+    pick), where pick(level) is the level the user picks in the filter; both are
+    undone afterwards."""
+    status, body = _request("GET", "/api/models", token=token)
+    assert status == 200, body
+    model = next(m["id"] for m in body["data"]
+                 if m["id"].startswith("openclaw_gateway.") and m["id"].endswith("/e2e-think"))
+    status, created = _request("POST", "/api/v1/models/create", {
+        "id": model, "base_model_id": None, "name": "E2E Think",
+        "meta": {"filterIds": [THINKING_FILTER_ID]}, "params": {},
+    }, token)
+    assert status == 200, created
+    # Open WebUI answers a completion from its cached model list, which only a
+    # model list read refreshes; the browser reads it after saving the model.
+    status, body = _request("GET", "/api/models", token=token)
+    entry = next(m for m in body["data"] if m["id"] == model)
+    assert [f["id"] for f in entry.get("filters") or []] == [THINKING_FILTER_ID], entry
+
+    def pick(level: str) -> None:
+        status, got = _request("POST", f"/api/v1/functions/id/{THINKING_FILTER_ID}/valves/user/update",
+                               {"level": level}, token)
+        assert status == 200 and got.get("level") == level, got
+
+    yield model, pick
+    pick("default")
+    _request("POST", "/api/v1/models/model/delete", {"id": model}, token)
+    _request("GET", "/api/models", token=token)
+
+
+def test_the_picked_thinking_level_reaches_the_model_and_a_clamp_says_so(token, think_model):
+    """A level the model supports reaches it unchanged (the Gateway sends
+    e2e-think's level on as `reasoning_effort`). A level above the model's
+    ladder (off to high, plus ultra above max on 2026.10) is sent as the
+    nearest one below, and the reply says so."""
+    model, pick = think_model
+    chip_on = {"filter_ids": [THINKING_FILTER_ID]}   # the filter's chip turned on in the composer
+
+    pick("low")
+    first_marker = f"E2E_THINK_LOW_{uuid.uuid4().hex[:6]}"
+    chat_id, first = _chat_turn(token, f"Respond with exactly: {first_marker}", model, extra=chip_on)
+    assert _model_request(first_marker).get("reasoning_effort") == "low"
+    assert first.get("content") == first_marker, json.dumps(first)[:1500]
+
+    pick("max")
+    second_marker = f"E2E_THINK_MAX_{uuid.uuid4().hex[:6]}"
+    _, second = _chat_turn(token, f"Respond with exactly: {second_marker}", model,
+                           chat_id=chat_id, extra=chip_on)
+    assert _model_request(second_marker).get("reasoning_effort") == "high"
+    content = second.get("content") or ""
+    assert "This model does not support thinking level 'max', using 'high' instead." in content, content
+    assert content.endswith(second_marker), content
