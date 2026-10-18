@@ -31,7 +31,7 @@ Valves: [`GATEWAY_URL`](../configuration.md#gateway_url), [`GATEWAY_TOKEN`](../c
 
 Send a message while the agent is working, even in the middle of a long tool call, and it is in the chat at once. The tool is not interrupted and the run is not stopped: it finishes in its own reply, with its tool card running until the tool really ends, then the agent answers your message in a reply of its own. What you do not get is a blank reply, which is what the naive implementation produces.
 
-![A message sent while the cache rebuild runs: it is in the chat at once, and the rebuild keeps going](../img/message-sent-mid-run-light.png)
+<img src="../img/message-sent-mid-run-light.png" alt="A message sent while the cache rebuild runs: it is in the chat at once, and the rebuild keeps going" width="320">
 
 Left alone, Open WebUI would hold the message in a queue above the composer until the reply ends, and send it only when you click its Send now arrow. With [`AUTO_SEND_WHILE_RUNNING`](../configuration.md#auto_send_while_running) on (the default), the Pipe clicks it for you in OpenClaw chats as soon as the message is queued, and the click goes through [Send now](#send-now), which keeps the run. Turn the valve off to get Open WebUI's queue back. Open WebUI's own **Settings > Interface > Enable Message Queue** switch, when off, also sends at once, the same way.
 
@@ -49,7 +49,7 @@ Always on.
 
 Reload the page mid-reply, or open the chat on another device, and you see the answer so far instead of an empty reply. Open WebUI keeps the in-progress reply itself and shows it on reload.
 
-![The same reply right after a page reload: the answer so far is there and still growing](../img/reload-mid-reply-light.png)
+<img src="../img/reload-mid-reply-light.png" alt="The same reply right after a page reload: the answer so far is there and still growing" width="320">
 
 If your tab or socket dies mid-stream, the reply still finishes and is saved: Open WebUI runs and saves it on the server, not in the tab.
 
@@ -105,7 +105,7 @@ Always on.
 
 Pressing Stop in Open WebUI cancels the Pipe's reply. The Pipe first saves the partial answer, so what you already saw is not lost, then sends the Gateway a `chat.abort` for the run. Abort alone only ends the stream: a tool the agent started keeps running on the Gateway unless something also tells the agent to stop.
 
-![A reply stopped while its command was running: the card is closed, not spinning](../img/stop-light.png)
+<img src="../img/stop-light.png" alt="A reply stopped while its command was running: the card is closed, not spinning" width="320">
 
 That is what `/stop` is for. With `SEND_STOP_ON_CANCEL` on (the default), the Pipe sends it right after the abort, so a long shell command or browser action is killed instead of running on against a chat nobody is watching.
 
@@ -117,7 +117,7 @@ Valve: [`SEND_STOP_ON_CANCEL`](../configuration.md#send_stop_on_cancel) (on).
 
 Open WebUI implements "Send now" on a queued message (and sending while a reply runs with its message queue off) as a Stop followed by the new message. Both reach the server as the same cancel, and the queue lives only in the browser, so the server cannot tell them apart. Aborting on that cancel would kill the running reply and every sub-agent it spawned.
 
-![After Send now: the rebuild finished in its own reply, then the new message's own answer](../img/send-now-light.png)
+<img src="../img/send-now-light.png" alt="After Send now: the rebuild finished in its own reply, then the new message's own answer" width="320">
 
 So the Pipe asks the page. It installs a small listener in the chat page that records which you pressed: Stop or Escape, versus Send now or Enter while a reply runs. A Send now the Pipe clicks for you ([`AUTO_SEND_WHILE_RUNNING`](../configuration.md#auto_send_while_running)) is recorded as Send now too. On a cancel it reads that answer through Open WebUI's `execute` event:
 

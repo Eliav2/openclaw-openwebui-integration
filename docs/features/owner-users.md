@@ -7,7 +7,7 @@ Valves: `OWNER_USERS`
 
 OpenClaw gives owner turns tools that act on your whole setup: scheduling automations, sending messages on your other channels, managing sessions, the terminal. With the valve empty (the default, and the behaviour before it existed), every Open WebUI user gets those.
 
-![The Pipe's valves in the admin panel, with the Owner Users field](../img/valves-light.png)
+<img src="../img/valves-light.png" alt="The Pipe's valves in the admin panel, with the Owner Users field" width="320">
 
 Set [`OWNER_USERS`](../configuration.md#owner_users) on the Pipe to the Open WebUI user ids or emails that should keep full rights, comma-separated. Usually that is just your own email.
 

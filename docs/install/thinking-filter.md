@@ -8,7 +8,7 @@ Valves: [`priority`](../configuration.md#priority), [`override_advanced_params`]
 
 A thinking control in the composer's integrations menu:
 
-![The thinking control in the composer's integrations menu](../img/thinking-toggle-light.png)
+<img src="../img/thinking-toggle-light.png" alt="The thinking control in the composer's integrations menu" width="320">
 
 Turn it on for a chat and pick a level in **Chat Controls** → **Valves**. The levels, what `default` and `off` mean, and how a level a model doesn't support is handled: [Chat](../features/chat.md).
 
@@ -64,7 +64,7 @@ Once active, it does nothing until you switch the toggle on in a given conversat
 
 The Pipe should be installed first. The filter's level dropdown is filled from a cache the Pipe writes, `STATE_DIR/thinking-ladders.json`, with the levels it has seen your models support. Before the Pipe has run once, the dropdown falls back to the five levels every observed provider supports: `off`, `minimal`, `low`, `medium`, `high`.
 
-![The level choices in Chat Controls > Valves](../img/thinking-level-light.png)
+<img src="../img/thinking-level-light.png" alt="The level choices in Chat Controls > Valves" width="320">
 
 The dropdown is baked in when Open WebUI loads the filter. So after the Pipe has completed a first chat with a given model, reload or re-save the filter function (**Admin Panel** → **Functions** → `openclaw_thinking` → **Save**) to pick up the real levels. Otherwise it keeps showing the fallback list until the next reload.
 
