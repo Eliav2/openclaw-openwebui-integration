@@ -5780,7 +5780,8 @@ class _GatewayConnection:
                             queue: asyncio.Queue | None, carried: list[str],
                             grace_s: float, send_stop: bool,
                             run_text: dict | None = None, settle=None,
-                            reply: dict | None = None) -> None:
+                            reply: dict | None = None,
+                            waiting: list | None = None) -> None:
         """Hand a cancelled reply's unfinished business to the next message.
 
         OWUI cancels a response the same way for Stop and for Send now /
@@ -5800,6 +5801,9 @@ class _GatewayConnection:
 
         * `reply` is the cancelled reply's own state, {message_id, renderer}:
           the message it showed the run in, and what it showed there.
+        * `waiting` are the replies whose messages are in `carried`
+          (`_TurnState.waiting`): the claimer ends each with a note once it
+          sent them; a release ends them as not sent (ELI-188).
 
         `settle` (a coroutine function) asks the browser which button was
         pressed and calls `settle_parked_turn`: Stop releases it now, Send now
@@ -5834,6 +5838,8 @@ class _GatewayConnection:
                 previous["task"].cancel()
             previous["resolved"].set()
             carried = list(previous["carried"]) + list(carried)
+            waiting = list(previous["waiting"]) + [
+                r for r in (waiting or []) if r not in previous["waiting"]]
             if previous["queue"] is not None and previous["queue"] is not queue:
                 self.unregister_consumer(
                     session_key, previous["run_id"], queue=previous["queue"])
@@ -5850,7 +5856,8 @@ class _GatewayConnection:
 
         entry = {"run_id": run_id, "queue": queue, "carried": list(carried),
                  "send_stop": send_stop, "task": None,
-                 "resolved": asyncio.Event(), "run_text": run_text, "reply": reply}
+                 "resolved": asyncio.Event(), "run_text": run_text, "reply": reply,
+                 "waiting": list(waiting or [])}
 
         def _release() -> None:
             # Read from the entry: a run kept in its own message is no longer
@@ -5860,6 +5867,8 @@ class _GatewayConnection:
             if entry["carried"]:
                 pipe_log(f"  stopped: dropping {len(entry['carried'])} unsent "
                          "message(s)")
+                if _TURNS is not None:
+                    _TURNS.end_unsent_replies(self, entry["waiting"], sent=False)
             if entry["run_id"]:
                 spawn_background(
                     self._abort_cancelled_run(session_key, entry["run_id"], send_stop))
@@ -5974,8 +5983,9 @@ class _GatewayConnection:
         (`_INTENT_QUERY_TIMEOUT_S`), and it always runs to its end in the
         background, so this needs no bound of its own (ELI-95).
 
-        Returns {"run_id", "queue", "carried"}; the caller now owns the run,
-        its buffered queue and the carried messages.
+        Returns {"run_id", "queue", "carried", "waiting"}; the caller now
+        owns the run, its buffered queue, the carried messages and the
+        replies waiting for them.
         """
         entry = self._pending_cancel_aborts.get(session_key)
         if entry is None:
@@ -5994,6 +6004,7 @@ class _GatewayConnection:
         self._keep_in_own_message(session_key, entry)
         return {"run_id": entry["run_id"], "queue": entry["queue"],
                 "carried": list(entry["carried"]),
+                "waiting": list(entry["waiting"]),
                 "run_text": entry.get("run_text")}
 
     def seed_run_renderer(self, session_key: str, run_id: str,
@@ -7242,6 +7253,55 @@ def _is_sentinel_message_item(item: dict) -> bool:
 def _turn_note_item(note: str) -> dict:
     return {"type": "message", "id": f"msg_note_{uuid.uuid4().hex[:12]}", "status": "completed",
             "role": "assistant", "content": [{"type": "output_text", "text": note}]}
+
+
+# The last word of a reply interrupted before it sent its own message
+# (ELI-188): the next reply sent it, or a Stop dropped it.
+REPLY_SENT_WITH_NEXT_NOTE = ("_(This message was sent together with your next one: "
+                             "the answer is in the next reply.)_")
+REPLY_NOT_SENT_NOTE = "_(Stopped: this message was not sent to the agent.)_"
+
+
+async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str) -> None:
+    """End reply `ref` ({chat_id, user_id, message_id, request_task_id}), which
+    was cancelled before it sent its message, with `note`: its "Queued" status
+    line done and the note after whatever it showed, saved and live.
+
+    Waits for the cancelled request to end first: Open WebUI's own save of
+    the message at the end of the request (`done: true`, as it was) would
+    land over this one."""
+    request = _owui_request_task(ref.get("request_task_id"))
+    if request is not None and not request.done():
+        await asyncio.wait({request})
+    from open_webui.models.chats import Chats
+    from open_webui.socket.main import get_event_emitter
+
+    chat_id, message_id = ref["chat_id"], ref["message_id"]
+    try:
+        # update_db: the status line is saved in the message's statusHistory.
+        emit = await get_event_emitter({"chat_id": chat_id, "message_id": message_id,
+                                        "user_id": ref.get("user_id")}, update_db=True)
+        await emit({"type": "status", "data": {"description": "", "done": True}})
+        async with conn._chat_write_lock(chat_id):
+            current = await Chats.get_message_by_id_and_message_id(chat_id, message_id) or {}
+            text = (current.get("content") or "").strip()
+            text = f"{text}\n\n{note}" if text else note
+            output = list(current.get("output") or []) + [_turn_note_item(note)]
+            await Chats.upsert_message_to_chat_by_id_and_message_id(
+                chat_id, message_id, {"content": text, "output": output, "done": True})
+        await emit({"type": "chat:completion", "data": {"done": True, "content": text,
+                                                         "output": output}})
+        pipe_log(f"  reply {message_id[:8]}... ended: {note}")
+    except Exception as ex:
+        pipe_log(f"  reply {message_id[:8]}...: closing note failed: {ex!r}")
+
+
+def _end_unsent_replies(conn: "_GatewayConnection", refs: list, *, sent: bool) -> None:
+    """End each reply in `refs` (see `_close_unsent_reply`) in the background:
+    its message went out with a later one (`sent`), or was dropped."""
+    for ref in refs:
+        spawn_background(_close_unsent_reply(
+            conn, ref, REPLY_SENT_WITH_NEXT_NOTE if sent else REPLY_NOT_SENT_NOTE))
 
 
 # Open WebUI cancels a response identically for Stop and for Send now (both
@@ -9418,6 +9478,7 @@ class _TurnHooks:
     note_heartbeat = staticmethod(_note_heartbeat_run)
     hand_over = staticmethod(_hand_over_run)
     session_message = staticmethod(_turn_session_message)
+    end_unsent_replies = staticmethod(_end_unsent_replies)
 
 
 _TURNS = _TurnHooks
@@ -10095,11 +10156,17 @@ class _TurnState:
     Gateway (its own, plus any carried over from a cancelled reply).
     `run_id` / `queue` are a run it is consuming, its own or one it adopted,
     and the consumer queue buffering that run's events. `parked` is set once
-    the cancel was handed to `park_cancelled_turn`.
+    the cancel was handed to `park_cancelled_turn`. `reply` is this reply's
+    own Open WebUI message ({chat_id, user_id, message_id, request_task_id});
+    `waiting` are the earlier replies, cancelled before they sent their
+    message, whose messages are among `unsent`: each is ended with a note
+    once those messages are sent, or dropped (ELI-188).
     """
     conn: object = None
     session_key: str | None = None
     chat_id: str | None = None
+    reply: dict | None = None
+    waiting: list = field(default_factory=list)
     unsent: list = field(default_factory=list)
     run_id: str | None = None
     queue: object = None
@@ -10533,7 +10600,7 @@ class Pipe:
     async def _pipe_impl(self, body, __event_emitter__, __event_call__=None,
                    __user__=None, __metadata__=None, __request__=None,
                    __task__=None, __task_body__=None, _initial_visible_text="",
-                   _send_texts=None):
+                   _send_texts=None, _waiting=None):
         """One reply: runs `_pipe_turn`, and makes sure a cancel or close at
         ANY point hands what the reply still owes to the next message (see
         `park_cancelled_turn`) instead of dropping it.
@@ -10546,9 +10613,10 @@ class Pipe:
         by closing the generator (GeneratorExit at a yield); both land here.
 
         `_send_texts` replaces this request's own text as what to send, for
-        the recursions that send messages carried over from earlier replies.
+        the recursions that send messages carried over from earlier replies;
+        `_waiting` are the replies those messages came from (`_TurnState`).
         """
-        turn = _TurnState()
+        turn = _TurnState(waiting=list(_waiting or []))
         try:
             async with contextlib.aclosing(self._pipe_turn(
                 body, __event_emitter__, __event_call__=__event_call__,
@@ -10569,6 +10637,11 @@ class Pipe:
                     f"{len(turn.unsent)} unsent message(s), run "
                     f"{str(turn.run_id)[:20]}"
                 )
+                # This reply never sent its message: it waits for the reply
+                # that does (or for the Stop that drops it) to say so.
+                waiting = list(turn.waiting)
+                if turn.unsent and turn.reply and turn.reply not in waiting:
+                    waiting.append(turn.reply)
                 turn.conn.park_cancelled_turn(
                     turn.session_key, turn.run_id, turn.queue, turn.unsent,
                     float(getattr(self.valves, "INTERRUPT_GRACE_SECONDS", 0) or 0),
@@ -10577,6 +10650,7 @@ class Pipe:
                     settle=functools.partial(
                         _settle_cancel_intent, turn.conn, turn.session_key,
                         turn.run_id, turn.chat_id, __event_call__),
+                    waiting=waiting,
                 )
             raise
 
@@ -10796,6 +10870,11 @@ class _PipeTurn:
             self.owui_origin_chat_id, self.session_key, self.__metadata__ or {}, messages)
         self.turn.unsent = (list(self._send_texts) if self._send_texts
                             else [history_prefix + self.text])
+        meta = self.__metadata__ or {}
+        if self.owui_origin_chat_id and meta.get("message_id"):
+            self.turn.reply = {"chat_id": self.owui_origin_chat_id, "user_id": user_id,
+                               "message_id": meta["message_id"],
+                               "request_task_id": meta.get("task_id")}
         if self.owui_origin_chat_id and self.__event_emitter__:
             # Lets a later cancel ask the page whether it was Stop or Send
             # now, and sends a message queued while this reply runs at once
@@ -10821,6 +10900,7 @@ class _PipeTurn:
         self.adopted_run_text = None
         claimed = await self.conn.claim_cancelled_turn(self.session_key)
         if claimed:
+            self.turn.waiting = claimed.get("waiting", []) + self.turn.waiting
             if claimed["carried"]:
                 self.turn.unsent = claimed["carried"] + self.turn.unsent
                 pipe_log(
@@ -11108,6 +11188,8 @@ class _PipeTurn:
                 self.conn.note_reply_sent(self.session_key, reply_id, self.our_run_id,
                                      "\n\n".join(t for t in self.sent_texts if t))
                 self.turn.unsent = []
+                _end_unsent_replies(self.conn, self.turn.waiting, sent=True)
+                self.turn.waiting = []
                 self.turn.run_id = self.our_run_id
                 self.turn.queue = self.queue
                 self.turn.run_text = None
@@ -11549,6 +11631,7 @@ class _PipeTurn:
             settle=functools.partial(
                 _settle_cancel_intent, self.conn, self.session_key, self.our_run_id,
                 self.owui_origin_chat_id, self.__event_call__),
+            waiting=self.turn.waiting,
             reply=({"message_id": self.owui_message_id,
                     "renderer": copy.deepcopy(self.renderer)}
                    if self.owui_message_id and not self.keeps_its_run else None),
@@ -11696,6 +11779,7 @@ class _PipeTurn:
                 yield separator
             # From here the recursive reply owns them, and parks them itself
             # if it is cancelled.
+            waiting, self.turn.waiting = self.turn.waiting, []
             self.turn.unsent = []
             async with contextlib.aclosing(self.pipe._pipe_impl(
                 self.body, self.__event_emitter__,
@@ -11703,7 +11787,7 @@ class _PipeTurn:
                 __metadata__=self.__metadata__, __request__=self.__request__,
                 __task__=self.__task__, __task_body__=self.__task_body__,
                 _initial_visible_text=self.visible_message_text,
-                _send_texts=send_texts,
+                _send_texts=send_texts, _waiting=waiting,
             )) as continuation:
                 async for item in continuation:
                     yield item

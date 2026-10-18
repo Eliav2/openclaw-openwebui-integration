@@ -2295,6 +2295,193 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         await r2.aclose()
         self.assertEqual(self.sent, ["first\n\nsecond"])
 
+    def _record_closes(self):
+        """What each interrupted reply was ended with, as (message_id, note)."""
+        closed = []
+
+        async def close(conn, ref, note):
+            closed.append((ref.get("message_id"), note))
+        patch = mock.patch.object(self.ocp, "_close_unsent_reply", close, create=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return closed
+
+    async def test_a_reply_interrupted_while_queued_ends_once_its_message_is_sent(self):
+        """ELI-188 (QA C7): Send twice while a reply runs. The 2nd reply,
+        cancelled while it waited, kept "Queued: waiting..." and no text
+        forever; its message was answered in the 3rd reply. It must say so,
+        once the 3rd reply really sent it, not before."""
+        closed = self._record_closes()
+        self.active = True
+        r1 = self._reply("second", "m2")
+        task = asyncio.ensure_future(r1.__anext__())
+        await self._spin()
+        self.assertTrue(any("Queued: waiting" in str(e) for e in self.emitted))
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        r2 = self._reply("third", "m3")
+        nxt = asyncio.ensure_future(self._read(r2, "OK"))
+        await self._spin()
+        self.assertEqual(self.sent, [])
+        self.assertEqual(closed, [], "still waiting: nothing to say yet")
+
+        self._settled(False)
+        await self._until_registered("run-1")
+        self.assertEqual(self.sent, ["second\n\nthird"])
+        await self._spin()
+        self.assertEqual(closed, [("m2", self.ocp.REPLY_SENT_WITH_NEXT_NOTE)])
+        self._queue("run-1").put_nowait(self._delta("run-1", "OK"))
+        self._queue("run-1").put_nowait(self._final("run-1"))
+        await nxt
+        await r2.aclose()
+        self.assertEqual(len(closed), 1)
+
+    async def test_a_queued_reply_stopped_says_its_message_was_not_sent(self):
+        """ELI-188 variant: Send now, then Stop. The Pipe drops the queued
+        message (the user stopped it), but its reply said "Queued" forever,
+        even after a reload."""
+        closed = self._record_closes()
+        self.active = True
+        r1 = self._reply("second", "m2", intent="stop")
+        task = asyncio.ensure_future(r1.__anext__())
+        await self._spin()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        for _ in range(200):
+            if closed:
+                break
+            await asyncio.sleep(0.005)
+        self.assertEqual(closed, [("m2", self.ocp.REPLY_NOT_SENT_NOTE)])
+        self.assertEqual(self.sent, [])
+
+    async def test_two_interrupted_replies_both_end_when_the_third_sends(self):
+        """Send now twice in a row while a run goes on: both waiting replies
+        hand their message on, and both say where it went."""
+        closed = self._record_closes()
+        self._hold_parked_timers()
+        self.active = True
+        for text, mid in (("a", "m2"), ("b", "m3")):
+            r = self._reply(text, mid)
+            t = asyncio.ensure_future(r.__anext__())
+            await self._spin()
+            t.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await t
+        r3 = self._reply("c", "m4")
+        nxt = asyncio.ensure_future(self._read(r3, "OK"))
+        await self._spin()
+        self._settled(False)
+        await self._until_registered("run-1")
+        await self._spin()
+        self.assertEqual(self.sent, ["a\n\nb\n\nc"])
+        self.assertEqual(sorted(closed), [("m2", self.ocp.REPLY_SENT_WITH_NEXT_NOTE),
+                                          ("m3", self.ocp.REPLY_SENT_WITH_NEXT_NOTE)])
+        self._queue("run-1").put_nowait(self._delta("run-1", "OK"))
+        self._queue("run-1").put_nowait(self._final("run-1"))
+        await nxt
+        await r3.aclose()
+
+
+class CloseUnsentReplyTests(unittest.IsolatedAsyncioTestCase):
+    """`_close_unsent_reply` (ELI-188): the interrupted reply's last write."""
+
+    async def test_it_waits_for_the_request_then_ends_the_message_with_the_note(self):
+        import openclaw_pipe as ocp
+        events, upserts, order = [], [], []
+        chat = {"history": {"messages": {"m2": {
+            "role": "assistant", "content": "", "done": True,
+            "statusHistory": [{"description": "Queued: waiting for the current run to finish…",
+                               "done": False}]}}}}
+
+        class Chats:
+            @staticmethod
+            async def get_message_by_id_and_message_id(chat_id, message_id):
+                return copy.deepcopy(chat["history"]["messages"].get(message_id))
+
+            @staticmethod
+            async def upsert_message_to_chat_by_id_and_message_id(chat_id, message_id, message):
+                order.append("upsert")
+                upserts.append((chat_id, message_id, copy.deepcopy(message)))
+
+        async def get_event_emitter(meta, update_db=True):
+            async def emit(event):
+                order.append(event["type"])
+                events.append((meta["message_id"], update_db, copy.deepcopy(event)))
+            return emit
+
+        release = asyncio.Event()
+
+        async def request():
+            await release.wait()
+            order.append("request-ended")
+        req = asyncio.ensure_future(request())
+        chats_mod = types.ModuleType("open_webui.models.chats")
+        chats_mod.Chats = Chats
+        tasks_mod = types.ModuleType("open_webui.tasks")
+        tasks_mod.tasks = {"task-2": req}
+        modules = {**owui_modules(get_event_emitter=get_event_emitter),
+                   "open_webui.models": types.ModuleType("open_webui.models"),
+                   "open_webui.models.chats": chats_mod, "open_webui.tasks": tasks_mod}
+        conn = _GatewayConnection(lambda: None)
+        ref = {"chat_id": "chat-1", "user_id": "u1", "message_id": "m2",
+               "request_task_id": "task-2"}
+        with mock.patch.dict(sys.modules, modules):
+            close = asyncio.ensure_future(ocp._close_unsent_reply(
+                conn, ref, ocp.REPLY_SENT_WITH_NEXT_NOTE))
+            for _ in range(20):
+                await asyncio.sleep(0)
+            self.assertEqual(order, [], "Open WebUI's own end-of-request save comes first")
+            release.set()
+            await asyncio.wait_for(close, 5)
+        self.assertEqual(order[0], "request-ended")
+        note = ocp.REPLY_SENT_WITH_NEXT_NOTE
+        (cid, mid, msg), = upserts
+        self.assertEqual((cid, mid, msg["content"], msg["done"]), ("chat-1", "m2", note, True))
+        self.assertEqual(msg["output"][-1]["content"][0]["text"], note)
+        status = [e for m, db, e in events if e["type"] == "status"]
+        self.assertEqual([s["data"]["done"] for s in status], [True], "the Queued line ends")
+        self.assertTrue(all(db for m, db, e in events if e["type"] == "status"),
+                        "the status is saved, so a reload shows it ended")
+        done = [e for m, db, e in events if e["type"] == "chat:completion"]
+        self.assertEqual(done[-1]["data"]["content"], note)
+        self.assertTrue(done[-1]["data"]["done"])
+
+    async def test_text_the_reply_already_showed_is_kept(self):
+        import openclaw_pipe as ocp
+        upserts = []
+
+        class Chats:
+            @staticmethod
+            async def get_message_by_id_and_message_id(chat_id, message_id):
+                return {"role": "assistant", "content": "earlier run text", "done": True,
+                        "output": [{"type": "message", "id": "x", "status": "completed",
+                                    "role": "assistant", "content": [
+                                        {"type": "output_text", "text": "earlier run text"}]}]}
+
+            @staticmethod
+            async def upsert_message_to_chat_by_id_and_message_id(chat_id, message_id, message):
+                upserts.append(copy.deepcopy(message))
+
+        async def get_event_emitter(meta, update_db=True):
+            async def emit(event):
+                pass
+            return emit
+        chats_mod = types.ModuleType("open_webui.models.chats")
+        chats_mod.Chats = Chats
+        modules = {**owui_modules(get_event_emitter=get_event_emitter),
+                   "open_webui.models": types.ModuleType("open_webui.models"),
+                   "open_webui.models.chats": chats_mod}
+        with mock.patch.dict(sys.modules, modules):
+            await ocp._close_unsent_reply(
+                _GatewayConnection(lambda: None),
+                {"chat_id": "c", "user_id": "u", "message_id": "m"}, ocp.REPLY_NOT_SENT_NOTE)
+        (msg,) = upserts
+        self.assertEqual(msg["content"], f"earlier run text\n\n{ocp.REPLY_NOT_SENT_NOTE}")
+        self.assertEqual(len(msg["output"]), 2)
+
 
 class SessionActiveSignalsTests(unittest.TestCase):
     """ELI-56: a concurrent message must queue behind a run that only LOOKS

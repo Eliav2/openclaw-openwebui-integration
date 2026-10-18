@@ -347,6 +347,61 @@ def test_send_now_on_a_queued_message_keeps_the_running_reply(page, token):
         capture.pipe_valves(token, **old)
 
 
+def _message_text_js(index: int) -> str:
+    """Reply `index`'s whole message as shown: its status line too."""
+    return (f"(() => {{ const a = [...document.querySelectorAll('.chat-assistant')].at({index}); "
+            f"const m = a && a.closest('[id^=\"message-\"]'); return m ? m.innerText : ''; }})()")
+
+
+def _says_where_its_message_went(page, index: int, note: str) -> None:
+    """Reply `index`, cancelled before it sent its message, is done and
+    says `note`; no "Queued" is left on it, also after a reload."""
+    queued = "Queued: waiting"
+    for when in ("", " after a reload"):
+        _wait(page, f"() => {_message_text_js(index)}.includes({json.dumps(note)})",
+              f"the interrupted reply saying {note!r}{when}", 60_000)
+        shown = page.evaluate(f"() => {_message_text_js(index)}")
+        assert queued not in shown, f"the interrupted reply still says Queued{when}: {shown[-200:]!r}"
+        assert _replies(page)[index]["done"], f"the interrupted reply is not done{when}"
+        if not when:
+            _reload(page)
+
+
+def test_a_reply_interrupted_while_queued_says_its_message_went_with_the_next(page):
+    """Send twice while a reply runs (ELI-188): the 2nd reply, waiting
+    behind the run, is interrupted by the 3rd message, which takes its
+    message along. The 2nd reply must not say "Queued" forever with no text:
+    it says its message went with the next one, which answers it."""
+    run = _slow("BROWSER_TWICE", 15)
+    capture.new_chat(page)
+    capture.send(page, "E2E_SLOW:15 BROWSER_TWICE")
+    _wait(page, _reply_js(0, "r.text.includes('BROWSER_TWICE slow-1 slow-2')"), "the reply part way through")
+    _type_and_send(page, "E2E_ECHO: BROWSER_TWICE_A")
+    _wait(page, "() => document.body.innerText.includes('Queued: waiting')", "the 2nd reply queued")
+    _type_and_send(page, "E2E_ECHO: BROWSER_TWICE_B")
+    _wait(page, _reply_js(-1, "all.length === 3 && all[0].done && r.done"
+                              " && r.text.includes('BROWSER_TWICE_A')"),
+          "the 3rd reply answering the 2nd message")
+    assert _replies(page)[0]["text"].count(run) == 1
+    _says_where_its_message_went(page, 1, "sent together with your next one")
+
+
+def test_a_queued_reply_stopped_says_its_message_was_not_sent(page):
+    """Send now, then Stop while the new message waits (ELI-188 variant):
+    the Pipe drops the message, as the user stopped it, and its reply says
+    so instead of "Queued" forever."""
+    capture.new_chat(page)
+    capture.send(page, "E2E_SLOW:15 BROWSER_SENDSTOP")
+    _wait(page, _reply_js(0, "r.text.includes('BROWSER_SENDSTOP slow-1 slow-2')"), "the reply part way through")
+    _type_and_send(page, "E2E_ECHO: BROWSER_SENDSTOP_ANSWER")
+    _wait(page, "() => document.body.innerText.includes('Queued: waiting')", "the 2nd reply queued")
+    page.locator('button[aria-label="Stop"]').click()
+    _wait(page, f"() => ({STOP_GONE})() && ({_reply_js(-1, 'all.length === 2 && r.done')})()",
+          "the stopped replies, done")
+    _says_where_its_message_went(page, 1, "this message was not sent")
+    assert "BROWSER_SENDSTOP_ANSWER" not in _replies(page)[1]["text"]
+
+
 def _from(texts: list, word: str) -> list:
     """The reply's words in each text, from `word` on (Open WebUI's status
     line, "Thinking...", can sit above them); texts with none are left out."""

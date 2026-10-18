@@ -171,11 +171,17 @@ class _TurnState:
     Gateway (its own, plus any carried over from a cancelled reply).
     `run_id` / `queue` are a run it is consuming, its own or one it adopted,
     and the consumer queue buffering that run's events. `parked` is set once
-    the cancel was handed to `park_cancelled_turn`.
+    the cancel was handed to `park_cancelled_turn`. `reply` is this reply's
+    own Open WebUI message ({chat_id, user_id, message_id, request_task_id});
+    `waiting` are the earlier replies, cancelled before they sent their
+    message, whose messages are among `unsent`: each is ended with a note
+    once those messages are sent, or dropped (ELI-188).
     """
     conn: object = None
     session_key: str | None = None
     chat_id: str | None = None
+    reply: dict | None = None
+    waiting: list = field(default_factory=list)
     unsent: list = field(default_factory=list)
     run_id: str | None = None
     queue: object = None
@@ -609,7 +615,7 @@ class Pipe:
     async def _pipe_impl(self, body, __event_emitter__, __event_call__=None,
                    __user__=None, __metadata__=None, __request__=None,
                    __task__=None, __task_body__=None, _initial_visible_text="",
-                   _send_texts=None):
+                   _send_texts=None, _waiting=None):
         """One reply: runs `_pipe_turn`, and makes sure a cancel or close at
         ANY point hands what the reply still owes to the next message (see
         `park_cancelled_turn`) instead of dropping it.
@@ -622,9 +628,10 @@ class Pipe:
         by closing the generator (GeneratorExit at a yield); both land here.
 
         `_send_texts` replaces this request's own text as what to send, for
-        the recursions that send messages carried over from earlier replies.
+        the recursions that send messages carried over from earlier replies;
+        `_waiting` are the replies those messages came from (`_TurnState`).
         """
-        turn = _TurnState()
+        turn = _TurnState(waiting=list(_waiting or []))
         try:
             async with contextlib.aclosing(self._pipe_turn(
                 body, __event_emitter__, __event_call__=__event_call__,
@@ -645,6 +652,11 @@ class Pipe:
                     f"{len(turn.unsent)} unsent message(s), run "
                     f"{str(turn.run_id)[:20]}"
                 )
+                # This reply never sent its message: it waits for the reply
+                # that does (or for the Stop that drops it) to say so.
+                waiting = list(turn.waiting)
+                if turn.unsent and turn.reply and turn.reply not in waiting:
+                    waiting.append(turn.reply)
                 turn.conn.park_cancelled_turn(
                     turn.session_key, turn.run_id, turn.queue, turn.unsent,
                     float(getattr(self.valves, "INTERRUPT_GRACE_SECONDS", 0) or 0),
@@ -653,6 +665,7 @@ class Pipe:
                     settle=functools.partial(
                         _settle_cancel_intent, turn.conn, turn.session_key,
                         turn.run_id, turn.chat_id, __event_call__),
+                    waiting=waiting,
                 )
             raise
 
@@ -872,6 +885,11 @@ class _PipeTurn:
             self.owui_origin_chat_id, self.session_key, self.__metadata__ or {}, messages)
         self.turn.unsent = (list(self._send_texts) if self._send_texts
                             else [history_prefix + self.text])
+        meta = self.__metadata__ or {}
+        if self.owui_origin_chat_id and meta.get("message_id"):
+            self.turn.reply = {"chat_id": self.owui_origin_chat_id, "user_id": user_id,
+                               "message_id": meta["message_id"],
+                               "request_task_id": meta.get("task_id")}
         if self.owui_origin_chat_id and self.__event_emitter__:
             # Lets a later cancel ask the page whether it was Stop or Send
             # now, and sends a message queued while this reply runs at once
@@ -897,6 +915,7 @@ class _PipeTurn:
         self.adopted_run_text = None
         claimed = await self.conn.claim_cancelled_turn(self.session_key)
         if claimed:
+            self.turn.waiting = claimed.get("waiting", []) + self.turn.waiting
             if claimed["carried"]:
                 self.turn.unsent = claimed["carried"] + self.turn.unsent
                 pipe_log(
@@ -1184,6 +1203,8 @@ class _PipeTurn:
                 self.conn.note_reply_sent(self.session_key, reply_id, self.our_run_id,
                                      "\n\n".join(t for t in self.sent_texts if t))
                 self.turn.unsent = []
+                _end_unsent_replies(self.conn, self.turn.waiting, sent=True)
+                self.turn.waiting = []
                 self.turn.run_id = self.our_run_id
                 self.turn.queue = self.queue
                 self.turn.run_text = None
@@ -1625,6 +1646,7 @@ class _PipeTurn:
             settle=functools.partial(
                 _settle_cancel_intent, self.conn, self.session_key, self.our_run_id,
                 self.owui_origin_chat_id, self.__event_call__),
+            waiting=self.turn.waiting,
             reply=({"message_id": self.owui_message_id,
                     "renderer": copy.deepcopy(self.renderer)}
                    if self.owui_message_id and not self.keeps_its_run else None),
@@ -1772,6 +1794,7 @@ class _PipeTurn:
                 yield separator
             # From here the recursive reply owns them, and parks them itself
             # if it is cancelled.
+            waiting, self.turn.waiting = self.turn.waiting, []
             self.turn.unsent = []
             async with contextlib.aclosing(self.pipe._pipe_impl(
                 self.body, self.__event_emitter__,
@@ -1779,7 +1802,7 @@ class _PipeTurn:
                 __metadata__=self.__metadata__, __request__=self.__request__,
                 __task__=self.__task__, __task_body__=self.__task_body__,
                 _initial_visible_text=self.visible_message_text,
-                _send_texts=send_texts,
+                _send_texts=send_texts, _waiting=waiting,
             )) as continuation:
                 async for item in continuation:
                     yield item

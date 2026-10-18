@@ -221,6 +221,55 @@ def _turn_note_item(note: str) -> dict:
             "role": "assistant", "content": [{"type": "output_text", "text": note}]}
 
 
+# The last word of a reply interrupted before it sent its own message
+# (ELI-188): the next reply sent it, or a Stop dropped it.
+REPLY_SENT_WITH_NEXT_NOTE = ("_(This message was sent together with your next one: "
+                             "the answer is in the next reply.)_")
+REPLY_NOT_SENT_NOTE = "_(Stopped: this message was not sent to the agent.)_"
+
+
+async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str) -> None:
+    """End reply `ref` ({chat_id, user_id, message_id, request_task_id}), which
+    was cancelled before it sent its message, with `note`: its "Queued" status
+    line done and the note after whatever it showed, saved and live.
+
+    Waits for the cancelled request to end first: Open WebUI's own save of
+    the message at the end of the request (`done: true`, as it was) would
+    land over this one."""
+    request = _owui_request_task(ref.get("request_task_id"))
+    if request is not None and not request.done():
+        await asyncio.wait({request})
+    from open_webui.models.chats import Chats
+    from open_webui.socket.main import get_event_emitter
+
+    chat_id, message_id = ref["chat_id"], ref["message_id"]
+    try:
+        # update_db: the status line is saved in the message's statusHistory.
+        emit = await get_event_emitter({"chat_id": chat_id, "message_id": message_id,
+                                        "user_id": ref.get("user_id")}, update_db=True)
+        await emit({"type": "status", "data": {"description": "", "done": True}})
+        async with conn._chat_write_lock(chat_id):
+            current = await Chats.get_message_by_id_and_message_id(chat_id, message_id) or {}
+            text = (current.get("content") or "").strip()
+            text = f"{text}\n\n{note}" if text else note
+            output = list(current.get("output") or []) + [_turn_note_item(note)]
+            await Chats.upsert_message_to_chat_by_id_and_message_id(
+                chat_id, message_id, {"content": text, "output": output, "done": True})
+        await emit({"type": "chat:completion", "data": {"done": True, "content": text,
+                                                         "output": output}})
+        pipe_log(f"  reply {message_id[:8]}... ended: {note}")
+    except Exception as ex:
+        pipe_log(f"  reply {message_id[:8]}...: closing note failed: {ex!r}")
+
+
+def _end_unsent_replies(conn: "_GatewayConnection", refs: list, *, sent: bool) -> None:
+    """End each reply in `refs` (see `_close_unsent_reply`) in the background:
+    its message went out with a later one (`sent`), or was dropped."""
+    for ref in refs:
+        spawn_background(_close_unsent_reply(
+            conn, ref, REPLY_SENT_WITH_NEXT_NOTE if sent else REPLY_NOT_SENT_NOTE))
+
+
 # Open WebUI cancels a response identically for Stop and for Send now (both
 # call stopTasksByChatId; the message queue exists only in the browser), so
 # the backend can never tell them apart. The page can: this hook, installed
@@ -2395,6 +2444,7 @@ class _TurnHooks:
     note_heartbeat = staticmethod(_note_heartbeat_run)
     hand_over = staticmethod(_hand_over_run)
     session_message = staticmethod(_turn_session_message)
+    end_unsent_replies = staticmethod(_end_unsent_replies)
 
 
 _TURNS = _TurnHooks
