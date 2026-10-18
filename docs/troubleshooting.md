@@ -41,7 +41,7 @@ More on these commands: [The installer](./install/installer.md).
 
 Failures name the thing that fixes them. When the cause is genuinely ambiguous, the message says so instead of guessing.
 
-![An error in the chat: the agent named in AGENT_ID does not exist on the Gateway](./img/error-message-light.png)
+<img src="./img/error-message-light.png" alt="An error in the chat: the agent named in AGENT_ID does not exist on the Gateway" width="320">
 
 | The chat shows | What to do |
 |---|---|

@@ -21,6 +21,29 @@ FENCE = re.compile(r"^(```|~~~).*?^\1", re.M | re.S)
 HEADING = re.compile(r"^#{1,6}\s+(.+?)\s*#*\s*$", re.M)
 
 
+MD_IMAGE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)[^)]*\)")
+IMG_TAG = re.compile(r'<img\b(?:[^>"]|"[^"]*")*>')
+PHONE_WIDTH = 320      # a phone shot, as the README shows it
+WIDE_MAX = 800
+
+
+def png_size(path: Path) -> tuple:
+    head = path.read_bytes()[:24]
+    return int.from_bytes(head[16:20], "big"), int.from_bytes(head[20:24], "big")
+
+
+def image_width_limit(size: tuple) -> tuple:
+    """(kind, largest display width). Shots are 2x captures, so none shows above half its
+    pixel width: a strip (3x wider than tall) at half, a phone shot at PHONE_WIDTH, a wide
+    (desktop) shot at half, capped at WIDE_MAX."""
+    w, h = size
+    if w >= 3 * h:
+        return "strip", w // 2
+    if w > 1000:
+        return "wide", min(w // 2, WIDE_MAX)
+    return "phone", PHONE_WIDTH
+
+
 def markdown_files() -> list:
     return [ROOT / "README.md"] + sorted((ROOT / "docs").rglob("*.md"))
 
@@ -81,6 +104,34 @@ class DocsLinkTests(unittest.TestCase):
         self.assertLessEqual(sum(p.stat().st_size for p in images), IMAGES_TOTAL_BUDGET)
         self.assertEqual([p.name for p in images if p.resolve() not in used], [],
                          "images in docs/img that no page uses")
+
+    def test_every_image_has_a_width_within_its_kind(self):
+        """github.com shows an image without a width at the full content column, so a phone
+        shot fills the page on desktop. Every local image is an <img> with a width."""
+        bad = []
+        for md in markdown_files():
+            text = re.sub(r"`[^`\n]*`", "", FENCE.sub("", md.read_text()))
+            for _alt, src in MD_IMAGE.findall(text):
+                if not re.match(r"^[a-z]+:", src):
+                    bad.append(f"{rel(md)}: {src} is ![...](...), use <img src alt width>")
+            for tag in IMG_TAG.findall(text):
+                src = re.search(r'\bsrc="([^"]+)"', tag).group(1)
+                if re.match(r"^[a-z]+:", src):
+                    continue
+                kind, limit = image_width_limit(png_size(md.parent / src))
+                width = re.search(r'\bwidth="(\d+)"', tag)
+                if not width:
+                    bad.append(f"{rel(md)}: {src} has no width ({kind}: at most {limit})")
+                elif int(width.group(1)) > limit:
+                    bad.append(f"{rel(md)}: {src} width {width.group(1)} > {limit} ({kind})")
+        self.assertEqual(bad, [])
+
+    def test_image_width_limits(self):
+        self.assertEqual(image_width_limit((780, 1688)), ("phone", 320))
+        self.assertEqual(image_width_limit((780, 430)), ("phone", 320))
+        self.assertEqual(image_width_limit((604, 168)), ("strip", 302))
+        self.assertEqual(image_width_limit((1600, 1000)), ("wide", 800))
+        self.assertEqual(image_width_limit((1200, 700)), ("wide", 600))
 
 
 class DocsWordingTests(unittest.TestCase):

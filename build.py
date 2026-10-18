@@ -262,8 +262,8 @@ def render_configuration() -> str:
         "([which ones](./install/installer.md#valves-the-installer-sets)) and keeps the rest. "
         "Changes apply on the next message, with no restart.",
         "",
-        "![The Pipe's valves in Open WebUI's admin panel, from Owner Users down]"
-        "(./img/valves-light.png)",
+        '<img src="./img/valves-light.png" alt="The Pipe\'s valves in Open WebUI\'s admin panel, '
+        'from Owner Users down" width="320">',
     ]
     for heading, fragment, filename in _VALVE_SOURCES:
         lines += ["", f"## {heading}", "", f"File: `{filename}`."]

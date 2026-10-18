@@ -107,7 +107,7 @@ The installer (or `healthcheck`) ends with:
 
 and the agent's reply streaming into the chat:
 
-![The agent's first reply in Open WebUI after install](../img/first-reply-light.png)
+<img src="../img/first-reply-light.png" alt="The agent's first reply in Open WebUI after install" width="320">
 
 ## Something off?
 

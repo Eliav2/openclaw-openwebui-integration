@@ -14,7 +14,7 @@ The implementation is in [`src/openclaw_pipe_pkg/askuser.py`](../../src/openclaw
 
 ## What the question looks like
 
-![A question from the agent as a card: three options with descriptions, the first tagged Recommended, and an Other field](../img/question-card-light.png)
+<img src="../img/question-card-light.png" alt="A question from the agent as a card: three options with descriptions, the first tagged Recommended, and an Other field" width="320">
 
 The question renders as Open WebUI's own inline question card, the one its built-in `ask_user` tool uses: a header, the question, one row per option with an optional description, the first option tagged Recommended, and an Other field for a typed answer. Only a secret gets a dialog instead.
 
@@ -52,7 +52,7 @@ _Needs OpenClaw 2026.10.10 or later. On an older Gateway the request is left to 
 
 When the agent asks for a credential with OpenClaw's `secrets` tool (`action: request`), the Pipe shows the same masked dialog on the chat's tab, titled with the secret's name, the agent's reason and the hosts it may be sent to.
 
-![The masked dialog for a secret the agent requested: its name, the reason, the allowed hosts and a password field](../img/secret-request-light.png)
+<img src="../img/secret-request-light.png" alt="The masked dialog for a secret the agent requested: its name, the reason, the allowed hosts and a password field" width="320">
 
 What you type goes straight to the Gateway's secret store (`question.resolve`). It is never in the chat, Open WebUI's database, the Pipe's log, the transcript or the model's context: the agent gets only `stored` and a reference to the secret. A toast says `stored` or `cancelled`.
 

@@ -7,17 +7,17 @@ Valves: `GATEWAY_URL`, `GATEWAY_TOKEN`, `DEVICE_IDENTITY`, `STATE_DIR`, `AGENT_I
 
 _Separate function: install the Status Action first, see [Status button](../install/status-action.md)._
 
-![The Status dialog: context used, 5-hour and weekly rate limits, two running sub-agents](../img/status-dialog-light.png)
+<img src="../img/status-dialog-light.png" alt="The Status dialog: context used, 5-hour and weekly rate limits, two running sub-agents" width="320">
 
 _The rate limits in this screenshot are sample data._
 
 The Status Action adds a button to the message toolbar. It opens a dialog with five sections: Context, Rate limits, [Background](#background), [Subagents](#sub-agents) and In-process agents.
 
-![The OpenClaw Status button on a reply's toolbar](../img/toolbar-button-light.png)
+<img src="../img/toolbar-button-light.png" alt="The OpenClaw Status button on a reply's toolbar" width="300">
 
 The dialog opens at once with every section's title. Each section then reads its own source and fills the moment that source answers, with its own loading, empty and error state, so a slow or failing source shows in its own section only:
 
-![The Status dialog while its rate limits are still loading: Context, Background, Subagents and In-process agents already filled](../img/status-dialog-loading-light.png)
+<img src="../img/status-dialog-loading-light.png" alt="The Status dialog while its rate limits are still loading: Context, Background, Subagents and In-process agents already filled" width="320">
 
 _Here the rate limits were held back on purpose, to show it._
 
@@ -35,7 +35,7 @@ Opening the dialog sends a small request, from the toolbar button or the compose
 
 Background, Subagents and In-process agents fold, with their count in the title, for example "Background (3)". Each opens when something in it is running and starts folded otherwise; a tap opens or folds it, and stays that way while the dialog is open. When the dialog is taller than the screen, its sections scroll between the title bar and the footer, which stay in view, on a phone too:
 
-![The Status dialog on a small phone, scrolled to its end: the title bar and the footer stay on screen](../img/status-dialog-scrolled-light.png)
+<img src="../img/status-dialog-scrolled-light.png" alt="The Status dialog on a small phone, scrolled to its end: the title bar and the footer stay on screen" width="320">
 
 Usage bars are colour coded (green under 60%, amber from 60%, red from 85%), with the colours inlined so a theme cannot make them invisible.
 
@@ -51,7 +51,7 @@ Rate limits come from the Gateway's `usage.status`. On a Gateway whose only Anth
 
 A Compact pill in the dialog header runs `/compact` on the session. While it works, the dialog shows a distinct "Compacting..." state, then refreshes with the numbers after compaction.
 
-![The Context section with its Compact pill](../img/compact-before-light.png)
+<img src="../img/compact-before-light.png" alt="The Context section with its Compact pill" width="302">
 
 Right after a compact, the context number can read far lower than what the next request carries: it counts the kept conversation, without the system prompt and tools. The next reply brings it up to date.
 
@@ -65,7 +65,7 @@ Typing `/compact` in the message box does not compact the session: Open WebUI 0.
 
 ## Background
 
-![The Background section: four station imports running and a daily automation for this chat](../img/status-dialog-background-light.png)
+<img src="../img/status-dialog-background-light.png" alt="The Background section: four station imports running and a daily automation for this chat" width="320">
 
 The Background section lists what runs for this chat outside a reply, running first, then the five newest that finished:
 
@@ -80,7 +80,7 @@ The section reads only when the dialog opens. OpenClaw 2026.10 removed the Gatew
 
 While a background agent holds a reply open, the reply's status row says so, so the chat does not look busy for no reason:
 
-![A reply's status row: Waiting on 1 background agent](../img/background-agent-waiting-light.png)
+<img src="../img/background-agent-waiting-light.png" alt="A reply's status row: Waiting on 1 background agent" width="320">
 
 It counts the background agents the reply started and stays until the reply ends.
 
@@ -88,11 +88,11 @@ It counts the background agents the reply started and stays until the reply ends
 
 The Subagents section lists every child session this chat's runs spawned, ended ones included, newest first, up to 20 ("20 of N" when there are more). A running one's elapsed time counts up while the dialog is open; one that finishes meanwhile shows its end as soon as the Gateway pushes the change. With none running, the section opens folded and reads the sub-agents' transcripts (their tasks and latest replies) on its first tap:
 
-![The Status dialog with every section folded, each with its count](../img/status-dialog-folded-light.png)
+<img src="../img/status-dialog-folded-light.png" alt="The Status dialog with every section folded, each with its count" width="320">
 
 If that tap's request fails, for example when a phone loses its connection, the section says so and offers **Retry**.
 
-![The Subagents section after a tap whose request was dropped: the error, and Retry](../img/status-subagents-retry-light.png)
+<img src="../img/status-subagents-retry-light.png" alt="The Subagents section after a tap whose request was dropped: the error, and Retry" width="302">
 
 The Gateway keeps an ended child in its children list for 30 minutes only, so the Pipe keeps a child index: each sub-agent it sees a chat spawn, and each one's last state as the dialog read it. It is one small file, `subagent-children.json` in the bridge state directory, so it survives restarts and redeploys; a chat untouched for 180 days is dropped from it, and each chat keeps its 200 newest children. Children spawned before the index existed are read in once, from one full list, the first time a dialog opens after the upgrade. A child spawned while the Pipe was not running shows while it runs and for 30 minutes after.
 
@@ -102,7 +102,7 @@ Each row is one line: the sub-agent's spawn label (else the first sentence of it
 
 ## Sub-agent drawer
 
-![A running sub-agent's drawer on a phone: its name, status and time, its model and the chat it came from, the head of its task, then its run so far with a tool card opened and the step it is on](../img/subagent-drawer-light.png)
+<img src="../img/subagent-drawer-light.png" alt="A running sub-agent's drawer on a phone: its name, status and time, its model and the chat it came from, the head of its task, then its run so far with a tool card opened and the step it is on" width="320">
 
 Click a sub-agent to open its drawer: a side panel, or on a phone a full-screen sheet with a **‹ Back** button. The top is a short header: the sub-agent's name, its status and its time; its model and the chat it came from (a link; for a sub-agent spawned by another sub-agent, its parent's drawer); and the first two lines of its task, with "Show all".
 
@@ -119,7 +119,7 @@ The drawer reads the sub-agent's whole transcript (`chat.history`). A very long 
 
 The Pipe also adds a **Status** button to the composer row of OpenClaw chats, right after the OpenClaw Thinking chip (or at the end of the composer's chips when that chip is off). It opens the same dialog through the Status Action, so the Action must be installed.
 
-![The Status button in the composer, next to the integrations button](../img/composer-status-light.png)
+<img src="../img/composer-status-light.png" alt="The Status button in the composer, next to the integrations button" width="374">
 
 Open WebUI has no extension point for the composer, so the button is put into the page by JavaScript. If a future Open WebUI changes the composer and the anchor is not found, the button simply does not appear. It appears as soon as a tab opens an OpenClaw chat.
 

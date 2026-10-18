@@ -17,7 +17,7 @@ A user-visible feature is anything a user sees, sets or runs: something in the c
 1. **`docs/features/index.md`:** its bullet, linking to its section.
 2. **Its page:** the section in `docs/features/` (or `docs/install/` for setup) that describes it, with its valves linked to `docs/configuration.md#<valve>`. `docs/configuration.md` is generated from the Valves classes: run `python3 build.py --all` after changing a valve.
 3. **The README's "What you get":** only when the feature is headline-level. Its image then also goes in the README's "In pictures".
-4. **Its screenshot:** a scene in `scripts/screenshots/scenes.json` and `capture.py`, taken by the Screenshots workflow, committed to `docs/img/` and shown next to its description. A feature with nothing on screen shows real log or command output as a code block instead.
+4. **Its screenshot:** a scene in `scripts/screenshots/scenes.json` and `capture.py`, taken by the Screenshots workflow, committed to `docs/img/` and shown next to its description as `<img src="..." alt="..." width="...">`, never `![alt](path)`: github.com shows an image without a width across the whole page. Width by kind: a phone shot 320, a strip (3x wider than tall) half its pixel width, a wide desktop shot half its pixel width up to 800. A feature with nothing on screen shows real log or command output as a code block instead.
 5. **`docs/versions.md`:** when the feature needs a newer Open WebUI or OpenClaw than the minimums.
 
 A PR that changes how something already documented behaves (a fix included) corrects the text and images that no longer hold, in the same PR. A stale doc is a bug in that PR, not a follow-up.
@@ -30,7 +30,7 @@ Every PR description has a `Docs:` line: what it updated, or "no change needed" 
 
 A PR that removes a feature removes its bullet, its section, its scene and its images in the same change, as the no-legacy rule says.
 
-`test_docs_unit.py` fails on a broken link, an unused or oversized image, an em dash, or a tested version that differs from `e2e/versions.env`. It cannot tell whether a feature is documented: reviewers check that against the list above.
+`test_docs_unit.py` fails on a broken link, an unused or oversized image, an image without a width or wider than its kind allows, an em dash, or a tested version that differs from `e2e/versions.env`. It cannot tell whether a feature is documented: reviewers check that against the list above.
 
 ## User flows have a browser test
 

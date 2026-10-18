@@ -7,7 +7,7 @@ Valves: `AGENT_ID`, `DEFAULT_MODEL`, `MAX_MODELS`, `STATE_DIR`
 
 Each Open WebUI chat maps to a stable OpenClaw session key:
 
-![Two messages and two replies in one chat, one OpenClaw session](../img/chat-titles-light.png)
+<img src="../img/chat-titles-light.png" alt="Two messages and two replies in one chat, one OpenClaw session" width="320">
 
 ```text
 agent:{AGENT_ID}:openwebui-{user_id}-{chat_id}
@@ -21,7 +21,7 @@ Valve: [`AGENT_ID`](../configuration.md#agent_id) (default `main`). Leave it as 
 
 ## Model picker
 
-![The model dropdown open: OpenClaw · Default, then the models discovered from the Gateway](../img/model-picker-light.png)
+<img src="../img/model-picker-light.png" alt="The model dropdown open: OpenClaw · Default, then the models discovered from the Gateway" width="320">
 
 The Pipe is a manifold function: its `pipes()` calls the Gateway's `models.list` and returns one picker entry per model, named `<Model> (<provider>) · OpenClaw`, plus an entry that is always there, **OpenClaw · Default**.
 
