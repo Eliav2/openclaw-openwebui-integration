@@ -6549,9 +6549,8 @@ _AGENTS_FILL_JS_TEMPLATE = r"""
 """
 
 # The Background section (ELI-163): this chat's background commands, media
-# jobs, automation runs and background agents, then (owners only) the
-# Gateway's other automations, in a fold of their own that opens only when
-# one runs or failed. A fold like Subagents. A source this Gateway
+# jobs, automation runs and background agents, and the automations bound to
+# it. A fold like Subagents. A source this Gateway
 # lacks says so in a note; one that failed says so too, and the rest shows.
 _BACKGROUND_FILL_JS_TEMPLATE = r"""
 (function() {
@@ -6566,7 +6565,6 @@ _BACKGROUND_FILL_JS_TEMPLATE = r"""
   section.innerHTML = '';
   section.className = 'mb-4';
   const rows = DATA.rows || [];
-  const others = DATA.automations || [];
   const isLive = function(r) { return r.status === 'running' || r.status === 'queued'; };
   const live = rows.some(isLive);
   const fold = S.collapsible('background', S.countLabel('Background', rows.length, DATA.total || 0), live);
@@ -6587,11 +6585,11 @@ _BACKGROUND_FILL_JS_TEMPLATE = r"""
       month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
     });
   }
-  function row(r, other) {
+  function row(r) {
     if (r.job) {
       return S.listRow({ kind: 'openclawBgRow', title: r.title, status: r.status,
                          time: r.status === 'running' ? S.elapsedCell(r.startedAt, null, true) : null,
-                         preview: line(other ? null : r.kind, automationDetail(r)) });
+                         preview: line(r.kind, automationDetail(r)) });
     }
     return S.listRow({
       kind: 'openclawBgRow', title: r.title, status: r.status,
@@ -6605,17 +6603,7 @@ _BACKGROUND_FILL_JS_TEMPLATE = r"""
     fold.body.appendChild(S.noteEl('Background commands and media jobs are not available on this Gateway.'));
   }
   if (!rows.length) fold.body.appendChild(S.noteEl('Nothing in the background for this chat.'));
-  rows.forEach(function(r) { fold.body.appendChild(row(r, false)); });
-
-  if (DATA.owner && others.length) {
-    // The Gateway's own upkeep, mostly: folded unless one needs a look.
-    const notable = others.some(function(r) { return isLive(r) || r.status === 'failed'; });
-    const sub = S.collapsible('other-automations',
-      S.countLabel('Other automations', others.length, DATA.automationsTotal || 0), notable);
-    sub.wrap.style.marginTop = '10px';
-    fold.body.appendChild(sub.wrap);
-    others.forEach(function(r) { sub.body.appendChild(row(r, true)); });
-  }
+  rows.forEach(function(r) { fold.body.appendChild(row(r)); });
   S.touchFooter(DATA.fetchedAt, DATA.source);
 })();
 """
@@ -7155,10 +7143,8 @@ _BACKGROUND_KINDS = {
     "automation_run": "Automation",
 }
 # How many finished items of this chat the section keeps, newest first; a
-# running one is always listed. Global automations: the first few, problems
-# first, the rest counted.
+# running one is always listed.
 _BACKGROUND_FINISHED_CAP = 5
-_GLOBAL_AUTOMATIONS_CAP = 5
 _LIVE_TASK_STATUSES = ("running", "queued")
 # The exec tool's answer for a command left running: "Command still running
 # (session good-lagoon, pid 2816)". The session is the task's sourceId.
@@ -7297,18 +7283,11 @@ def _automation_row(job: dict) -> dict:
     }
 
 
-def _global_automation_order(row: dict):
-    """Running first, then failing, then the next to run."""
-    rank = {"running": 0, "failed": 1}.get(row["status"], 2)
-    return (rank, row.get("nextRunAtMs") or float("inf"))
-
-
-def _background_rows(tasks, jobs, agents, session_key: str, *, owner: bool, commands: dict) -> dict:
+def _background_rows(tasks, jobs, agents, session_key: str, *, commands: dict) -> dict:
     """The Background section's data. `tasks`: the Gateway's tasks for this
     session (None: the Gateway has no task list). `jobs`: every automation
     (None: not readable). `agents`: this chat's Agent call rows. Only what
-    belongs to this chat is listed, whoever asks; the Gateway's other
-    automations only when `owner` (OWNER_USERS)."""
+    belongs to this chat is listed, whoever asks (ELI-175)."""
     automations_available = jobs is not None
     jobs = [j for j in jobs or [] if j.get("enabled", True)]
     mine = [j for j in jobs if _job_bound_to(j, session_key)]
@@ -7334,16 +7313,9 @@ def _background_rows(tasks, jobs, agents, session_key: str, *, owner: bool, comm
     rest = sorted((r for r in rows if r["status"] not in _LIVE_TASK_STATUSES),
                   key=lambda r: r.get("startedAt") or r.get("lastRunAtMs") or 0, reverse=True)
     live.sort(key=lambda r: r.get("startedAt") or 0, reverse=True)
-    others = []
-    if owner:
-        others = sorted((_automation_row(j) for j in jobs if not _job_bound_to(j, session_key)),
-                        key=_global_automation_order)
     return {
         "rows": live + rest[:_BACKGROUND_FINISHED_CAP],
         "total": len(rows),
-        "owner": owner,
-        "automations": others[:_GLOBAL_AUTOMATIONS_CAP],
-        "automationsTotal": len(others),
         "tasksAvailable": tasks is not None,
         "automationsAvailable": automations_available,
     }
@@ -7855,12 +7827,8 @@ class Action:
                 jobs = []
                 errors.append(f"Could not read automations: {ex}")
             chat = await chat_task
-            try:
-                owner = await _sender_is_owner(conn, session_key)
-            except Exception:
-                owner = False
             data = _background_rows(tasks, jobs, _agent_call_rows(chat), session_key,
-                                    owner=owner, commands=_exec_commands(chat))
+                                    commands=_exec_commands(chat))
             await emit(_render_background_fill_js({
                 **data, "errors": errors, "source": source,
                 "fetchedAt": int(time.time() * 1000), "error": None,

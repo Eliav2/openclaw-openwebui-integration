@@ -951,28 +951,30 @@ def test_the_status_action_lists_a_background_command(token):
     assert [(r["title"], r["status"]) for r in commands] == [("sleep 25; echo e2e-bg-done", "running")], data
 
 
-def test_a_user_not_in_owner_users_never_sees_the_gateways_automations(token, guest_token):
-    """Red team, through the real path: the guest's own Status dialog, read
+def test_the_status_dialog_lists_only_this_chats_automations(token, guest_token):
+    """ELI-175, through the real path: each user's own Status dialog, read
     from the stack's Gateway with the installed Action's settings and the
-    Pipe's saved OWNER_USERS (the owner's user id)."""
+    Pipe's saved OWNER_USERS (the owner's user id). An automation that runs
+    elsewhere reaches neither the owner's page nor the guest's; the one bound
+    to the chat is listed (so the list was read)."""
     me = _me(token)
     _set_owner_users(token, me["id"])
-    job = _gw("cron.add", {"name": "e2e-owner-only-automation", "schedule": {"kind": "cron", "expr": "0 4 1 1 *"},
-                           "sessionTarget": "isolated", "payload": {"kind": "agentTurn", "message": "noop"},
-                           "delivery": {"mode": "none"}, "agentId": "main"})
+
+    def add(name, target):
+        return _gw("cron.add", {"name": name, "schedule": {"kind": "cron", "expr": "0 4 1 1 *"},
+                                "sessionTarget": target, "payload": {"kind": "agentTurn", "message": "noop"},
+                                "delivery": {"mode": "none"}, "agentId": "main"})
+    jobs = [add("e2e-elsewhere-automation", "isolated")]
     try:
-        o_chat, _ = _chat_turn(token, "Respond with exactly: E2E_OWNER_BG")
-        owner_view, _ = _background(token, o_chat, token)
-        # Precondition: the owner does see it, so the guest's empty list is the filter.
-        assert owner_view["owner"] is True, owner_view
-        assert "e2e-owner-only-automation" in [r["title"] for r in owner_view["automations"]], owner_view
-        g_chat, _ = _chat_turn(guest_token, "Respond with exactly: E2E_GUEST_BG")
-        guest_view, codes = _background(guest_token, g_chat, token)
-        assert guest_view["owner"] is False, guest_view
-        assert guest_view["automations"] == [] and guest_view["automationsTotal"] == 0, guest_view
-        assert not any("e2e-owner-only-automation" in c for c in codes), "an owner automation reached the guest's page"
+        for tok, prompt in ((token, "E2E_OWNER_BG"), (guest_token, "E2E_GUEST_BG")):
+            chat_id, _ = _chat_turn(tok, f"Respond with exactly: {prompt}")
+            jobs.append(add(f"e2e-this-chat-{prompt}", f"session:{_session_key(tok, chat_id)}"))
+            view, codes = _background(tok, chat_id, token)
+            assert [r["title"] for r in view["rows"] if r.get("job")] == [f"e2e-this-chat-{prompt}"], view
+            assert not any("e2e-elsewhere-automation" in c for c in codes), f"another automation reached {prompt}'s page"
     finally:
-        _gw("cron.remove", {"id": job.get("id")})
+        for job in jobs:
+            _gw("cron.remove", {"id": job.get("id")})
         _set_owner_users(token, "")
 
 
