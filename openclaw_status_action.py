@@ -747,6 +747,18 @@ def wake_turn_at(messages: list, at_ms: float, bound=frozenset()) -> dict | None
     return None
 
 
+def wake_turn_of_run(messages: list, job: str, start_ms: float, bound=frozenset()) -> dict | None:
+    """The wake turn cron job `job`'s run that started at `start_ms` wrote:
+    its newest turn committed since, unless an earlier wake took it. None
+    while it is not committed yet: the embedded runtime writes it after the
+    run's first events, so a turn is not looked for before the event (as
+    `wake_turn_at` must, knowing no run)."""
+    for turn in reversed(wake_turns(messages)):
+        if turn["job"] == job and turn["at"] is not None and turn["at"] >= start_ms:
+            return None if turn["key"] in bound else turn
+    return None
+
+
 def wake_span(messages: list, start_ms: float, end_ms: float) -> list:
     """A wake's assistant messages: runs on one session are serialized, and
     claude-cli imports its transcript stamped with the CLI's own times, so
@@ -2455,6 +2467,9 @@ class _GatewayConnection:
         self._awaiting_owner: dict = {}
         self._session_ids: dict = {}     # session_key -> sessionId (a cron wake's run id)
         self._wake_turns_bound: dict = {}  # session_key -> wake turn keys given a message
+        # session_key -> [{job, start, end}] of the cron job runs into it this
+        # socket heard start (`cron` events), newest last (`note_cron_event`)
+        self._cron_runs: dict = {}
         self._turn_resolve_lock = asyncio.Lock()
         self._frame_seq: int | None = None
         self._stop_notice_seen = False  # `shutdown` without restartExpectedMs on this socket
@@ -2756,6 +2771,37 @@ class _GatewayConnection:
         if self._awaiting_owner.get(session_key) == run_id:
             del self._awaiting_owner[session_key]
             self._release_held(session_key)
+
+    def note_cron_event(self, payload: dict) -> None:
+        """Record a cron job run into a session from the Gateway's `cron`
+        event: `started` at `runAtMs`, `finished` after `durationMs`. A wake's
+        events are known by this run (`cron_run_at`): on 2026.9 a short wake's
+        one-shot job is deleted, and leaves `cron.list`, before its first
+        event is judged (ELI-181)."""
+        job = payload.get("job") if isinstance(payload.get("job"), dict) else {}
+        target, job_id, start = job.get("sessionTarget"), payload.get("jobId"), payload.get("runAtMs")
+        if not (job_id and isinstance(start, (int, float))):
+            return
+        run = next((r for runs in self._cron_runs.values() for r in runs
+                    if r["job"] == job_id and r["start"] == start), None)
+        if run is None:
+            if payload.get("action") != "started" or not (
+                    isinstance(target, str) and target.startswith("session:")):
+                return
+            runs = self._cron_runs.setdefault(target[len("session:"):], [])
+            run = {"job": job_id, "start": start, "end": None}
+            runs.append(run)
+            del runs[:-20]
+        if payload.get("action") == "finished" and isinstance(payload.get("durationMs"), (int, float)):
+            run["end"] = start + payload["durationMs"]
+
+    def cron_run_at(self, session_key: str, at_ms: float) -> dict | None:
+        """The recorded cron job run into `session_key` that `at_ms` falls in,
+        the newest such, else None."""
+        for run in reversed(self._cron_runs.get(session_key) or []):
+            if run["start"] <= at_ms and (run["end"] is None or at_ms <= run["end"]):
+                return run
+        return None
 
     def note_session_id(self, session_key: str, session_id) -> None:
         if session_key and isinstance(session_id, str) and session_id:
@@ -3840,6 +3886,9 @@ class _GatewayConnection:
                     msg = {"type": "event", "event": "agent", "payload": {
                         k: p[k] for k in ("runId", "sessionKey", "sessionId", "stream",
                                           "data", "seq", "ts") if k in p}}
+                if msg.get("type") == "event" and msg.get("event") == "cron":
+                    self.note_cron_event(msg.get("payload") or {})
+                    continue
                 if msg.get("type") != "event" or \
                    msg.get("event") not in ("agent", "chat"):
                     continue
