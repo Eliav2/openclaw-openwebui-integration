@@ -19,18 +19,20 @@ The agent also receives a provenance block naming the chat id, the user id and `
 
 Valve: [`AGENT_ID`](../configuration.md#agent_id) (default `main`). Leave it as `main` unless your Gateway defines other agents.
 
-## Edit, Regenerate and Clone
+## Edit, Regenerate, Fork and Clone
 
-The agent's memory of a chat is a single line of messages: each time you send, the Pipe passes on only your newest message, and the agent adds it to what it already has. Open WebUI's branching tools change what you see, but not what the agent remembers:
+The agent's memory of a chat is a single line of messages: each time you send, the Pipe passes on only your newest message, and the agent adds it to what it already has. Open WebUI's chat is a tree, so when you change what the chat shows, the Pipe tells the agent with a short note before your message (a sentence or two, never on a normal send):
 
-- **Edit a message:** the edited text reaches the agent as a new message. It still remembers your original message and its answer to it.
-- **Regenerate a reply:** the agent receives the same message a second time, right after its earlier answer, and it remembers both answers.
-- **Switch branches** with the arrows under a message: the agent is not told. Your next message is added to everything it already remembers, whichever branch you are looking at.
-- **Clone a chat** (or copy it into a new chat any other way): the copy is a new chat, so it gets a fresh session. The agent starts it with no memory of the copied messages, even though you can see them.
+- **Edit a message** and press Send: the note quotes the start of the message you replaced and says it, and everything after it, is no longer in the chat.
+- **Regenerate a reply** (Try Again): the note says the agent's earlier answer is no longer in the chat, so it answers your message afresh.
+- **Switch branches** with the arrows under a message, then send: the note says how many messages the chat no longer shows and how many it shows instead, quoting the first of each.
+- **Delete messages**, then send: the note says how many of the messages the agent remembers were deleted.
 
-Background work started from a chat (scheduled jobs, sub-agents) stays tied to the original chat, never to its clone.
+The agent still remembers the replaced messages; the note tells it which ones the chat no longer shows. Editing a message and pressing Save (without sending) changes only what you see.
 
-For a clean start, open a new chat. If the agent seems to be answering an older version of the conversation, tell it what changed in your next message.
+**Fork or clone a chat** (a reply's Fork chat button, or Clone in the sidebar's chat menu): the copy is a new chat with a fresh session. Its first message carries the copied messages once, so the agent continues where the copy starts. They are cut to about 8,000 tokens (32,000 characters): the newest messages are kept, the oldest left out whole (the agent is told how many), and tool-call details are left out. Background work started from a chat (scheduled jobs, sub-agents) stays tied to the original chat, never to its copy.
+
+For a clean start, open a new chat.
 
 ## Model picker
 

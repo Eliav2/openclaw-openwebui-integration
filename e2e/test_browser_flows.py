@@ -719,3 +719,169 @@ def test_a_title_the_user_chose_stays(page, token):
     saved = capture.chat_title(token, chat_id)
     assert saved == chosen, f"the chosen title was replaced by {saved!r} (Pipe: {decision})"
     assert page.evaluate(_sidebar_js(chat_id, chosen)), f"the tab shows {_shown_titles(page, chat_id)}"
+
+
+# Edit, Regenerate, a branch switch, Fork and Clone (ELI-183): the agent's
+# session is one line of messages, so each of these reaches the agent as a
+# short note before the message (or, for a copy, the copied messages once).
+# What reached the agent is read from the scripted model's request log; the
+# earlier messages are plain text, so a quote of them in the note carries no
+# marker the scripted model would act on.
+
+def _turn_text(messages: list) -> str:
+    """The user's side of a model request's newest turn: the user messages
+    after the last assistant message, without the Gateway's internal context
+    blocks."""
+    tail = []
+    for m in reversed(messages):
+        if m.get("role") == "assistant":
+            break
+        if m.get("role") == "user":
+            content = m.get("content")
+            parts = [content] if isinstance(content, str) else [
+                p.get("text", "") for p in content or [] if isinstance(p, dict)]
+            tail[:0] = [t for t in parts if not t.startswith("<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>")]
+    return "\n".join(tail)
+
+
+def _to_model(needle: str) -> list:
+    """The newest turn's user text of each model request whose newest turn
+    contains `needle`, oldest first."""
+    found = []
+    for r in _fake_llm_requests():
+        text = _turn_text(r["request"].get("messages") or [])
+        if needle in text:
+            found.append(text)
+    return found
+
+
+def _last_reply_done(needle: str) -> str:
+    done = _reply_js(-1, f"r.done && r.text.includes({json.dumps(needle)})")
+    return f"() => ({STOP_GONE})() && ({done})()"
+
+
+def _say(page, text: str, needle: str = "E2E fake model reply.") -> None:
+    """Send in the open chat (a new chat on the first message) and wait for the reply."""
+    if "/c/" in page.url:
+        _type_and_send(page, text)
+    else:
+        capture.send(page, text)
+    _wait(page, _last_reply_done(needle), f"the reply to {text!r}")
+
+
+def _edit_user_message(page, index: int, text: str) -> None:
+    """Edit user message `index` and press Send: Open WebUI sends the edit as a
+    new sibling of that message."""
+    msg = page.locator(".user-message").nth(index)
+    msg.hover()
+    msg.locator('button[aria-label="Edit"]').click()
+    box = page.locator('textarea[id^="message-edit-"]')
+    box.fill(text)
+    page.locator("#confirm-edit-message-button").click()
+
+
+def test_an_edited_message_reaches_the_agent_as_an_edit(page):
+    """Edit: the agent gets the edited message with a note naming the message
+    it replaces, so it answers the chat as shown."""
+    n = os.getpid()
+    capture.new_chat(page)
+    _say(page, f"first plain message {n}")
+    _say(page, f"second plain message {n}")
+    _edit_user_message(page, 1, f"E2E_ECHO: EDITED_{n}")
+    _wait(page, _last_reply_done(f"EDITED_{n}"), "the reply to the edit")
+    sent = _to_model(f"EDITED_{n}")
+    assert sent and f'the user edited their message "second plain message {n}"' in sent[-1], sent[-1:]
+    assert "[Open WebUI:" not in _to_model(f"second plain message {n}")[0], "a normal send carried a note"
+
+
+def test_a_regenerated_reply_reaches_the_agent_as_a_regenerate(page):
+    """Regenerate: the agent gets the same message again with a note that its
+    earlier answer is no longer in the chat."""
+    n = os.getpid()
+    capture.new_chat(page)
+    _say(page, f"E2E_ECHO: REGEN_{n}", f"REGEN_{n}")
+    page.locator(".chat-assistant").last.hover()
+    page.locator('button[aria-label="Regenerate"]').last.click()
+    page.get_by_text("Try Again", exact=True).click()
+    _wait(page, f"() => ({STOP_GONE})() && /\\b2\\s*\\/\\s*2\\b/.test(document.body.innerText)",
+          "the second answer (2/2)")
+    _wait(page, _last_reply_done(f"REGEN_{n}"), "the regenerated reply")
+    sent = _to_model(f"REGEN_{n}")
+    assert len(sent) >= 2, sent
+    assert "[Open WebUI:" not in sent[0], sent[0]
+    assert "the user asked for a new answer to the message below" in sent[-1], sent[-1]
+
+
+def test_switching_branches_reaches_the_agent_as_a_branch_switch(page):
+    """Branch switch: after an edit, the arrows go back to the original
+    message; the next message reaches the agent with a note naming what is no
+    longer shown and what is."""
+    n = os.getpid()
+    capture.new_chat(page)
+    _say(page, f"first plain message {n}")
+    _say(page, f"original branch {n}")
+    _edit_user_message(page, 1, f"edited branch {n}")
+    _wait(page, f"() => ({STOP_GONE})() && /\\b2\\s*\\/\\s*2\\b/.test(document.body.innerText)",
+          "the edit as branch 2/2")
+    _wait(page, _last_reply_done("E2E fake model reply."), "the reply to the edit")
+    msg = page.locator(".user-message").nth(1)
+    msg.hover()
+    page.locator('button[aria-label="Previous message"]').first.click()
+    _wait(page, _user_message_js(f"original branch {n}"), "the original branch shown again", 30_000)
+    _type_and_send(page, f"E2E_ECHO: AFTER_SWITCH_{n}")
+    _wait(page, _last_reply_done(f"AFTER_SWITCH_{n}"), "the reply on the original branch")
+    sent = _to_model(f"AFTER_SWITCH_{n}")
+    assert sent and "the user switched to another branch" in sent[-1], sent[-1:]
+    assert f'2 messages from "edited branch {n}" on are no longer shown' in sent[-1], sent[-1]
+    assert f'2 messages from "original branch {n}" on' in sent[-1], sent[-1]
+
+
+def _first_send_of_copy(page, n: int, word: str) -> str:
+    _type_and_send(page, f"E2E_ECHO: {word}_{n}")
+    _wait(page, _last_reply_done(f"{word}_{n}"), f"the reply in the {word.lower()}")
+    sent = _to_model(f"{word}_{n}")
+    assert len(sent) == 1, sent
+    return sent[0]
+
+
+def test_a_forked_chat_starts_with_the_copied_messages(page):
+    """Fork (a reply's Fork chat button): the new chat's first message
+    reaches the agent with the copied messages once; its second does not."""
+    n = os.getpid()
+    capture.new_chat(page)
+    source = capture.send(page, f"fork source question {n}")
+    _wait(page, _last_reply_done("E2E fake model reply."), "the source chat's reply")
+    page.locator(".chat-assistant").last.hover()
+    page.locator('button[aria-label="Fork chat"]').last.click()
+    _wait(page, f"() => /^\\/c\\//.test(location.pathname) && !location.pathname.includes({json.dumps(source)})",
+          "the forked chat open", 30_000)
+    page.wait_for_selector("#chat-input", timeout=60_000)
+    first = _first_send_of_copy(page, n, "FORKED")
+    assert "this chat is a copy of another chat" in first, first[:300]
+    assert f"User: fork source question {n}" in first and "Assistant: E2E fake model reply." in first, first[:600]
+    _say(page, f"E2E_ECHO: FORK_AGAIN_{n}", f"FORK_AGAIN_{n}")
+    assert "copy of another chat" not in _to_model(f"FORK_AGAIN_{n}")[-1]
+
+
+def test_a_cloned_chat_starts_with_the_copied_messages(page):
+    """Clone (the chat menu's Clone): the same as a fork, for the whole chat."""
+    n = os.getpid()
+    capture.new_chat(page)
+    source = capture.send(page, f"clone source question {n}")
+    _wait(page, _last_reply_done("E2E fake model reply."), "the source chat's reply")
+    # Clone is in the sidebar's menu for the chat.
+    page.locator('button[aria-label="Open Sidebar"]').first.click()
+    menus = page.locator('button[aria-label="Chat Menu"]')
+    mine = page.evaluate("""(href) => [...document.querySelectorAll('button[aria-label="Chat Menu"]')]
+      .findIndex(b => { for (let el = b.parentElement, i = 0; el && i < 6; el = el.parentElement, i++)
+                          if (el.querySelector(`a[href="${href}"]`)) return true; return false; })""",
+                         f"/c/{source}")
+    assert mine >= 0, "no sidebar menu for the chat"
+    menus.nth(mine).click()
+    page.locator("[role=menu]").get_by_text("Clone", exact=True).click()
+    _wait(page, f"() => /^\\/c\\//.test(location.pathname) && !location.pathname.includes({json.dumps(source)})",
+          "the clone open", 30_000)
+    page.wait_for_selector("#chat-input", timeout=60_000)
+    first = _first_send_of_copy(page, n, "CLONED")
+    assert "this chat is a copy of another chat" in first, first[:300]
+    assert f"User: clone source question {n}" in first, first[:600]

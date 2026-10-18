@@ -25,7 +25,7 @@ Everything here works as soon as the Pipe is installed, except entries marked:
 ## Sessions and models
 
 - [**Persistent sessions**](./sessions-and-models.md#one-session-per-chat): one stable OpenClaw session per Open WebUI chat, so the agent remembers context across messages
-- [**Edit, Regenerate and Clone**](./sessions-and-models.md#edit-regenerate-and-clone): only your newest message reaches the agent, so editing, regenerating, switching branches or cloning a chat does not change what it remembers
+- [**Edit, Regenerate, Fork and Clone**](./sessions-and-models.md#edit-regenerate-fork-and-clone): when you edit, regenerate, switch branches or delete messages, the agent is told what the chat no longer shows; a forked or cloned chat starts with the copied messages
 - [**Model picker**](./sessions-and-models.md#model-picker): one entry per model your Gateway knows, discovered with `models.list`
 - [**Picker size cap**](./sessions-and-models.md#picker-size-cap): keeps the picker from flooding with every model the Gateway knows
 - [**Owner users**](./owner-users.md): only the users you list act with the Gateway owner's rights

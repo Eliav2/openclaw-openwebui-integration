@@ -87,6 +87,7 @@ openclaw-openwebui-integration/
 │       ├── emit.py                  # Event emission / tool-card formatting helpers
 │       ├── media.py                  # MEDIA: directive handling, OWUI Files API upload, file server
 │       ├── models.py                  # Dynamic model discovery, cached list, fallback list
+│       ├── history.py                 # Edit/Regenerate/branch notes and the copied messages of a cloned chat
 │       ├── identity.py                 # Ed25519 device identity load/generate/persist
 │       ├── state.py                     # STATE_DIR read/write helpers
 │       ├── thinking.py                  # Thinking levels and clamping, shared by the Pipe and the Filter
@@ -115,7 +116,7 @@ openclaw-openwebui-integration/
 
 `build.py` concatenates an ordered list of fragments per artifact, behind each artifact's frontmatter file. Several fragments feed more than one artifact:
 
-- **Pipe:** `_prelude`, `identity`, `state`, `turns`, `thinking`, `media`, `emit`, `composer`, `composer_watch`, `askuser`, `gateway`, `writer`, `models`, `pipe`.
+- **Pipe:** `_prelude`, `identity`, `state`, `turns`, `thinking`, `media`, `emit`, `composer`, `composer_watch`, `askuser`, `gateway`, `writer`, `models`, `history`, `pipe`.
 - **Status Action:** `_prelude`, `identity`, `state`, `turns`, `thinking`, `gateway`, `emit`, `composer`, `action`. It reuses the Pipe's connection code verbatim, so its numbers come from the same logic as the Pipe's status line.
 - **Thinking filter:** `thinking`, `thinking_filter` only. It skips `_prelude` on purpose: a filter runs on every message, so it does not import `websockets` or `cryptography`.
 
