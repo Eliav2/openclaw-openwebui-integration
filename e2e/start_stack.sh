@@ -70,6 +70,10 @@ mkdir -p "$HOME/.openclaw"
 # e2e-think is the one reasoning model: the Gateway accepts a thinking level for
 # it (off to high on 2026.9) and sends it on as `reasoning_effort`, which the
 # fake model's request log shows. The other two take no level at all.
+#
+# No heartbeat, dreaming or weekly skill review: a job the Gateway schedules
+# itself can come due mid-suite and hold a clean stop's drain for minutes
+# (test_the_stack_gateway_schedules_no_work_of_its_own).
 cat >"$HOME/.openclaw/openclaw.json" <<EOF
 {
   "gateway": {
@@ -87,12 +91,14 @@ cat >"$HOME/.openclaw/openclaw.json" <<EOF
   "agents": {
     "defaults": {
       "model": {"primary": "fake/e2e-default"},
-      "heartbeat": {"agentId": "main"},
+      "heartbeat": {"agentId": "main", "every": "0m"},
       "systemAgent": {"agentId": "main"}
     },
     "ownership": "explicit",
     "entries": {"main": {"workspace": "$HOME/.openclaw/workspace"}, "title-gen": {}}
-  }
+  },
+  "skills": {"workshop": {"autonomous": {"mode": "off"}}},
+  "plugins": {"entries": {"memory-core": {"config": {"dreaming": {"enabled": false}}}}}
 }
 EOF
 if [[ -n "${STACK_CONFIG_PATCH:-}" ]]; then
