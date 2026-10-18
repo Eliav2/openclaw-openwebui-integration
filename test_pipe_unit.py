@@ -11602,6 +11602,56 @@ class SessionIdRunTests(_RoutingCase):
         self.assertEqual(got, {turn_message_id(self.key, self.W1, self.CHAT): "First wake.",
                                turn_message_id(self.key, self.W2, self.CHAT): "Second wake."})
 
+    async def stray_judged_while_the_next_wake_runs(self, after_final, *, cron_events=True):
+        """W1's repro (ELI-181): every wake leaves a trailing sessionId event
+        after its final, judged stray on a pump of its own. Judging it awaits
+        cron.list; wake two runs meanwhile, into that pump's queue. The
+        judgment returns stray, the pump ends, and wake two's events went
+        with it. `cron_events`: the Gateway's started / finished events for
+        wake two reached this socket. Returns wake two's message or None."""
+        await self.wake(self.W1, "First wake.")
+        inner, gate, blocked = self.conn.send_request, asyncio.Event(), asyncio.Event()
+
+        async def slow(method, params, timeout=10):
+            if method == "cron.list" and not gate.is_set():
+                blocked.set()
+                await gate.wait()   # the stray's judgment is slow (memory pressure in CI)
+            return await inner(method, params, timeout)
+        self.conn.send_request = slow
+        _turn_route_now(self.conn, self.sid_ev(_delta("trailing")))   # wake one's trailing event
+        await asyncio.wait_for(blocked.wait(), 5)
+        self.wake_turn(self.W2)
+        start = self.jobs[0]["state"]["runningAtMs"]
+        if cron_events:
+            self.heard("started", self.JOB, start)
+        _turn_route_now(self.conn, self.sid_ev(_delta("Second wake.")))
+        self.imported("Second wake.")
+        _turn_route_now(self.conn, self.sid_ev({"state": "final"}))
+        if cron_events:
+            self.heard("finished", self.JOB, start, self.tick())
+        after_final()
+        gate.set()
+        await self.spin()
+        return self.new_messages().get(turn_message_id(self.key, self.W2, self.CHAT))
+
+    def job_gone_run_log_late(self):
+        """The one-shot job is deleted; its cron.runs entry is not readable yet."""
+        self.job_finished()
+        self.cron_runs = self.cron_runs[:-1]
+
+    async def test_a_wake_queued_behind_a_stray_judgment_gets_its_message(self):
+        for name, after_final, cron_events in (
+                ("job still running", lambda: None, True),
+                ("job finished", self.job_finished, True),
+                ("job finished, its run log late", self.job_gone_run_log_late, True),
+                ("job finished, no cron event heard", self.job_finished, False)):
+            with self.subTest(name):
+                await self.asyncSetUp()
+                m = await self.stray_judged_while_the_next_wake_runs(after_final, cron_events=cron_events)
+                self.assertIsNotNone(m, "wake two got no message")
+                self.assertEqual(m["content"], "Second wake.")
+
+
 
 
 
