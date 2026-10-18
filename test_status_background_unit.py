@@ -4,8 +4,8 @@
 Background lists what runs for this chat outside a reply: background shell
 commands, media jobs and automation runs (`tasks.list` on 2026.9), the
 automations bound to this chat (`cron.list`), and Claude Code background
-agents (the chat's own Agent tool cards). Owners also see the Gateway's other
-automations. Every section of the dialog fills from its own source, once per
+agents (the chat's own Agent tool cards). Automations that run elsewhere
+are not listed, for anyone (ELI-175). Every section of the dialog fills from its own source, once per
 open: a slow or failing source shows in its own section only.
 """
 
@@ -71,10 +71,10 @@ def _chat(done=False):
 class RowTests(unittest.TestCase):
     """_background_rows: what belongs to this chat, and how it reads."""
 
-    def rows(self, tasks=(), jobs=(), chat=None, owner=False):
+    def rows(self, tasks=(), jobs=(), chat=None):
         chat = chat or _chat()
         return action._background_rows(list(tasks), list(jobs), action._agent_call_rows(chat), KEY,
-                                       owner=owner, commands=action._exec_commands(chat))
+                                       commands=action._exec_commands(chat))
 
     def test_a_background_command_is_titled_by_its_command(self):
         """The Gateway titles it "CLI command"; its sourceId is the exec
@@ -121,30 +121,9 @@ class RowTests(unittest.TestCase):
                          ["completed"])
 
     def test_no_task_list_on_this_gateway_is_said_not_failed(self):
-        data = action._background_rows(None, [], [], KEY, owner=False, commands={})
+        data = action._background_rows(None, [], [], KEY, commands={})
         self.assertFalse(data["tasksAvailable"])
         self.assertTrue(data["automationsAvailable"])
-
-
-class OwnerFilterTests(unittest.TestCase):
-    """The Gateway's other automations are an owner's only."""
-
-    JOBS = [_job("heartbeat", "main"), _job("watch", "isolated", lastRunStatus="error"),
-            _job("brief", "isolated", runningAtMs=NOW - 5000)] + [
-            _job(f"n{n}", "isolated") for n in range(6)]
-
-    def test_a_non_owner_sees_only_this_chats(self):
-        mine = _job("mine", f"session:{KEY}")
-        data = action._background_rows([], self.JOBS + [mine], [], KEY, owner=False, commands={})
-        self.assertEqual(data["automations"], [])
-        self.assertEqual(data["automationsTotal"], 0)
-        self.assertEqual([r["title"] for r in data["rows"]], ["mine"])
-
-    def test_an_owner_sees_running_then_failing_first_capped_at_five(self):
-        data = action._background_rows([], self.JOBS, [], KEY, owner=True, commands={})
-        self.assertEqual([r["title"] for r in data["automations"]][:2], ["brief", "watch"])
-        self.assertEqual(len(data["automations"]), 5)
-        self.assertEqual(data["automationsTotal"], 9)
 
 
 def _gateway(calls, *, fail=(), slow=None, unknown=(), running_child=False, jobs=None, processes=None):
@@ -318,16 +297,24 @@ class OpenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bg["errors"], [])
         self.assertIn("mine", [r["title"] for r in bg["rows"]])
 
-    async def test_a_non_owner_never_gets_the_gateways_other_automations(self):
-        """Through the Action's own path: OWNER_USERS names someone else."""
-        jobs = [_job("heartbeat", "main"), _job("mine", f"session:agent:main:openwebui-{INTRUDER}-{CHAT}")]
-        _result, emitted = await self._open(_gateway([], jobs=jobs), user=INTRUDER)
-        bg = _fills(emitted)["background"]
-        self.assertFalse(bg["owner"])
-        self.assertEqual(bg["automations"], [])
-        self.assertNotIn("heartbeat", json.dumps(_emitted_codes(emitted)))
-        _result, emitted = await self._open(_gateway([], jobs=jobs), user=OWNER)
-        self.assertEqual([r["title"] for r in _fills(emitted)["background"]["automations"]], ["heartbeat", "mine"])
+    async def test_no_one_gets_the_gateways_other_automations(self):
+        """ELI-175: the dialog is about this chat. Automations that run
+        elsewhere are not listed, for an owner (OWNER_USERS) or anyone else;
+        the chat's own automation is. Through the Action's own path."""
+        for user in (OWNER, INTRUDER):
+            with self.subTest(user=user):
+                jobs = [_job("gw-heartbeat", "main"), _job("gw-watch", "isolated", lastRunStatus="error"),
+                        _job("mine", f"session:agent:main:openwebui-{user}-{CHAT}")]
+                _result, emitted = await self._open(_gateway([], jobs=jobs), user=user)
+                bg = _fills(emitted)["background"]
+                self.assertEqual([r["title"] for r in bg["rows"] if r.get("job")], ["mine"])
+                self.assertNotIn("gw-", json.dumps(_emitted_codes(emitted)))
+                seen = run_page(_BG_PAGE_JS, {"now": NOW, "open": _render_modal_open_js(IDENTITY),
+                                              "fills": [action._render_background_fill_js(bg)],
+                                              "read": ["background", "other-automations"], "steps": []})
+                self.assertIn("mine", seen["background"]["texts"])
+                self.assertFalse(any("Other automations" in t for t in seen["background"]["texts"]))
+                self.assertIsNone(seen["other-automations"]["open"], "no fold of other automations")
 
     async def test_closing_the_dialog_stops_its_follow(self):
         """The page tells the Action it was dismissed (mode "status-closed"):
@@ -367,7 +354,7 @@ run(input.open);
 input.fills.forEach(run);
 const section = (n) => document.getElementById('openclaw-status-section-' + n);
 const texts = (n) => section(n) ? section(n).walk().filter((e) => e.children.length === 0 && e.text).map((e) => e.text) : null;
-// A fold by name, a nested one (Other automations) included.
+// A fold by name.
 const fold = (n) => document.body.walk().find((e) => e.dataset.openclawFold === n);
 const out = {};
 for (const step of input.steps || []) {
@@ -386,7 +373,7 @@ IDENTITY = {"chatId": "c", "messageId": "m", "sessionId": "s", "owuiModel": "x",
 
 def _bg(rows, **kw):
     return action._render_background_fill_js({
-        "rows": rows, "total": len(rows), "owner": False, "automations": [], "automationsTotal": 0,
+        "rows": rows, "total": len(rows),
         "tasksAvailable": True, "automationsAvailable": True, "errors": [], "source": "pipe",
         "fetchedAt": NOW, "error": None, **kw})
 
@@ -421,25 +408,6 @@ class BackgroundPageTests(unittest.TestCase):
         self.assertEqual(seen["texts"], ["Background (0)",
                                          "Background commands and media jobs are not available on this Gateway.",
                                          "Nothing in the background for this chat."])
-
-    def test_an_owner_sees_the_other_automations_under_their_own_title(self):
-        other = {**self.JOB, "id": "j2", "title": "heartbeat", "status": "scheduled", "error": None}
-        seen = self.page([_bg([], owner=True, automations=[other], automationsTotal=7)], ["background", "other-automations"])
-        texts = seen["background"]["texts"]
-        self.assertEqual(texts[texts.index("Other automations (1 of 7)") + 1:][:2], ["heartbeat", "Scheduled"])
-        self.assertTrue(texts[-1].startswith("next run "), texts)
-        # Their own fold, folded while none of them runs or failed.
-        self.assertEqual(seen["other-automations"]["open"], "false")
-
-    def test_other_automations_open_when_one_failed_or_runs(self):
-        for status in ("failed", "running"):
-            with self.subTest(status=status):
-                other = {**self.JOB, "id": "j2", "title": "watch", "status": status}
-                seen = self.page([_bg([], owner=True, automations=[other], automationsTotal=1)],
-                                 ["background", "other-automations"])
-                self.assertEqual(seen["other-automations"]["open"], "true")
-                # This chat's own section stays folded: nothing of its own runs.
-                self.assertEqual(seen["background"]["open"], "false")
 
     def test_a_folded_subagents_section_asks_for_its_rows_once_on_its_first_tap(self):
         pending = action._render_subagents_fill_js({

@@ -65,7 +65,7 @@ Typing `/compact` in the message box does not compact the session: Open WebUI 0.
 
 ## Background
 
-![The Background section: four station imports running, a daily automation for this chat, and the Gateway's other automations](../img/status-dialog-background-light.png)
+![The Background section: four station imports running and a daily automation for this chat](../img/status-dialog-background-light.png)
 
 The Background section lists what runs for this chat outside a reply, running first, then the five newest that finished:
 
@@ -75,8 +75,6 @@ The Background section lists what runs for this chat outside a reply, running fi
 - **Agents**: Claude Code Agent calls started in the background, until the reply they hold open ends. A tap shows the task and the result, as under In-process agents.
 
 Sub-agents are listed under Subagents, not here.
-
-Owners also see **Other automations**: the Gateway's automations that run elsewhere, running and failing ones first, up to five ("5 of N"). They fold on their own, with their count in the title, and open only when one of them is running or failed. Anyone not in the Pipe's [`OWNER_USERS`](../configuration.md#owner_users) sees only their own chat's. With `OWNER_USERS` empty, everyone is an owner, as everywhere else.
 
 The section reads only when the dialog opens. OpenClaw 2026.10 removed the Gateway's task list (`tasks.list`): there the commands come from the session's process list (`sessions.processes.list`), with a finished one's last line of output under it, and media jobs are not listed (2026.10 has no per-chat list of them). A Gateway with neither list says background commands and media jobs are not available on it, and still lists the chat's automations.
 
