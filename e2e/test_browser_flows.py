@@ -221,6 +221,25 @@ def _secret_dialog_open(page) -> None:
                     "the masked dialog", TURN_MS)
 
 
+def test_cancel_on_the_secret_dialog_tells_the_agent_and_the_card_says_cancelled(page):
+    """A question asking for a secret opens Open WebUI's masked dialog; its
+    Cancel reaches the agent as a cancel, and the reply's Ask User card says
+    cancelled (ELI-189: the agent got "no" and the card said a secret was
+    entered)."""
+    capture.new_chat(page)
+    capture.send(page, "E2E_ASK_SECRET")
+    _secret_dialog_open(page)
+    page.get_by_role("button", name="Cancel", exact=True).click()
+    capture.wait_js(page, "() => !document.querySelector('input.password')",
+                    "the dialog gone after Cancel", 30_000)
+    _wait(page, _last_reply_done("E2E_ANSWER_END"), "the reply to the cancel")
+    reply = page.evaluate(f"() => {capture.LAST_ASSISTANT}.innerText")
+    told = reply.split("E2E_ANSWERED", 1)[1].split("E2E_ANSWER_END", 1)[0].strip()
+    assert "cancel" in told.lower() and told.lower() != "no", f"the agent was told {told!r}"
+    card = _open_card(page, -1, "Ask User")
+    assert "Cancelled" in card and "secret entered" not in card, card[-300:]
+
+
 def test_status_opened_in_another_tab_leaves_the_secret_dialog_its_answer(page):
     """Open WebUI's input dialog and its `execute` event share one callback in
     the tab: an `execute` arriving while the dialog is open took the dialog's
