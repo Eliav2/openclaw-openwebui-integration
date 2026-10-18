@@ -508,9 +508,6 @@ def test_a_reply_the_agent_starts_streams_into_the_open_tab_and_asks_there(page,
     texts = _seen(page, _replies(page)[1]["id"])
     assert any("slow-1" in t and "slow-6" not in t for t in texts), \
         f"the reply did not stream in the tab: {_tails(texts)}"
-    if _openclaw_release() < (2026, 10):
-        pytest.skip("ELI-180: on OpenClaw 2026.9 a question at the end of a cron wake reply never "
-                    "becomes a card; remove when fixed")
     capture.wait_js(page, "() => !!document.querySelector('input[placeholder=\"Type your answer\"]')",
                     "the question card in the open tab", TURN_MS)
     page.locator("section button", has=page.locator("span", has_text="Green")).first.click()
@@ -519,6 +516,17 @@ def test_a_reply_the_agent_starts_streams_into_the_open_tab_and_asks_there(page,
     _wait(page, _reply_js(-1, "r.text.includes('E2E_ANSWER_END')"), "the reply to the answer")
     reply = _replies(page)[-1]["text"]
     assert "Green" in reply.split("E2E_ANSWERED", 1)[1], reply[-200:]
+    # One question, one answer: the reply keeps a single answered card, and a
+    # reload neither asks again nor shows the question twice.
+    saved = capture.api("GET", f"/api/v1/chats/{_chat_id(page)}", token=token)["chat"]["history"]["messages"]
+    asks = [m for m in saved.values() if 'name="Ask User"' in (m.get("content") or "")]
+    assert len(asks) == 1 and asks[0]["content"].count('name="Ask User"') == 1, [a["content"] for a in asks]
+    page.reload()
+    page.wait_for_selector("#chat-input", timeout=60_000)
+    _wait(page, _reply_js(-1, "r.done && r.text.includes('E2E_ANSWER_END')"), "the answered reply after a reload")
+    assert len(_replies(page)) == 2, [r["text"][-80:] for r in _replies(page)]
+    assert not page.query_selector('input[placeholder="Type your answer"]'), "asked again after a reload"
+    assert _replies(page)[-1]["text"].count("Which color?") <= 1, _replies(page)[-1]["text"]
 
 
 def test_an_attached_image_reaches_the_agent(page):

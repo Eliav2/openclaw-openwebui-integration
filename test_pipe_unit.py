@@ -11446,6 +11446,100 @@ class SessionIdRunTests(_RoutingCase):
         self.assertIs(m["done"], True)
         self.assertFalse(self.conn._turn_pumps)
 
+    # ── ELI-180: a wake that ends with a question ──
+
+    PROMPT = "OpenClaw needs input:\n\nColor?\nPick one\n1. Red\n2. Blue"
+
+    def tab_on_chat(self, call=None):
+        """A tab views the chat; `call` answers its question card (default:
+        "Blue"). chat.send is accepted."""
+        env = types.ModuleType("open_webui.env")
+        env.VERSION = "0.12.0"
+        p = mock.patch.dict(sys.modules, {"open_webui.env": env})
+        p.start()
+        self.addCleanup(p.stop)
+        self.owui.session_pool["sid-tab"] = {"id": self.USER, "chat_ids": [self.CHAT]}
+        self.owui.page_intent["sid-tab"] = WriterQuestionCardTests.ANSWERED
+        if call is not None:
+            p = mock.patch.object(openclaw_pipe, "_call_on_chat_tab", side_effect=call)
+            p.start()
+            self.addCleanup(p.stop)
+        inner, test = self.conn.send_request, self
+
+        async def send_request(method, params, timeout=10):
+            if method == "chat.send":
+                test.sent.append((method, copy.deepcopy(params)))
+                return {"runId": params["idempotencyKey"], "status": "started"}
+            return await inner(method, params, timeout)
+        self.conn.send_request = send_request
+
+    card_calls = WriterQuestionCardTests.card_calls
+    sends = WriterQuestionCardTests.sends
+
+    async def answer_run(self, run, text):
+        self.history["messages"] += HandoverRewriteTests.closed_run(self, run, text, user="Blue")
+        await self.dispatch(run, _delta(text))
+        await self.dispatch(run, {"state": "final"})
+        await HandoverRewriteTests.settle(self, run)
+
+    async def test_a_wake_that_ends_with_a_question_asks_it_on_the_tab(self):
+        """On 2026.9 a wake ends on its own terminal event (no row names its
+        run), and that end finalized the message without asking: the
+        question stayed as text that nothing could answer. It asks as a
+        run's end does, and the answer continues the wake's message."""
+        self.tab_on_chat()
+        await self.wake(self.W1, "Nightly check done.\n\n", self.PROMPT)
+        (to, _card), = self.card_calls()
+        self.assertEqual(to, "sid-tab")
+        (send,) = self.sends()
+        self.assertEqual(send["message"], "Blue")
+        mid = turn_message_id(self.key, self.W1, self.CHAT)
+        self.assertEqual(parse_pipe_run_id(send["idempotencyKey"]),
+                         {"chat": self.CHAT, "message": mid, "kind": "input"})
+        self.assertIs(self.new_messages()[mid]["done"], False, "the answer run continues the wake's reply")
+        await self.answer_run(send["idempotencyKey"], "Blue it is.")
+        (m,) = self.new_messages().values()
+        self.assertIs(m["done"], True)
+        self.assertTrue(m["content"].startswith("Nightly check done."), m["content"])
+        self.assertIn('name="Ask User"', m["content"])
+        self.assertIn('result="Blue"', m["content"])
+        self.assertTrue(m["content"].endswith("Blue it is."), m["content"])
+        self.assertNotIn("needs input", m["content"])
+        await _wake_resync(self.conn)    # a reconnect after it: nothing asks again
+        await self.spin()
+        self.assertEqual(len(self.card_calls()), 1, "one card")
+        self.assertEqual(len(self.sends()), 1, "one answer")
+
+    async def test_with_no_tab_on_the_chat_the_wakes_question_stays_text(self):
+        self.tab_on_chat()
+        self.owui.session_pool["sid-tab"]["chat_ids"] = ["another-chat"]
+        await self.wake(self.W1, "Nightly check done.\n\n", self.PROMPT)
+        self.assertEqual((self.card_calls(), self.sends()), ([], []))
+        (m,) = self.new_messages().values()
+        self.assertIs(m["done"], True)
+        self.assertEqual(m["content"], "Nightly check done.\n\nColor?\nPick one\n1. Red\n2. Blue")
+
+    async def test_the_next_wake_streams_while_a_wakes_question_card_is_open(self):
+        """Every wake into the session shares one run id, so one pump: the
+        card is asked off it, and the next wake is not held behind it."""
+        card = asyncio.get_running_loop().create_future()
+
+        async def call(*_a, **_k):
+            return await card
+        self.tab_on_chat(call)
+        await self.wake(self.W1, "First wake.\n\n", self.PROMPT)
+        await self.wake(self.W2, "Second wake.")
+        second = self.new_messages()[turn_message_id(self.key, self.W2, self.CHAT)]
+        self.assertIs(second["done"], True)
+        self.assertEqual(second["content"], "Second wake.")
+        first = turn_message_id(self.key, self.W1, self.CHAT)
+        self.assertIs(self.new_messages()[first]["done"], False, "still asking")
+        card.set_result(WriterQuestionCardTests.ANSWERED)
+        await self.spin()
+        (send,) = self.sends()
+        self.assertEqual(parse_pipe_run_id(send["idempotencyKey"])["message"], first)
+
+
 
 class WakeTurnTests(unittest.TestCase):
     def msg(self, key, text, at, **extra):
