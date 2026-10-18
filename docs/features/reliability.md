@@ -156,6 +156,18 @@ This is separate from the Pipe's own [chat titles](./chat.md#chat-titles), which
 
 Always on, not configurable.
 
+## Continue Response
+
+Open WebUI's Continue Response button (▷ under the last reply) asks the model to extend that reply in place. An OpenClaw run cannot be continued once it has ended, so the Pipe sends nothing to the agent and adds nothing to the reply: the reply stays as it was, and a toast says Continue isn't supported. To get more, send a message.
+
+In the log:
+
+```text
+[openclaw-pipe] Continue Response: the reply is complete, nothing sent to the agent
+```
+
+Without this, the agent was sent its own reply as if you had written it, and its answer was glued onto the end of the reply.
+
 ## Errors and logs
 
 Errors name the valve, the config key or the command that fixes them, and every reply logs to the Open WebUI backend log with an `[openclaw-pipe]` prefix. Both are covered in [Troubleshooting](../troubleshooting.md).
