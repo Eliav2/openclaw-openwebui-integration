@@ -2032,6 +2032,15 @@ class _GatewayConnection:
 
     # ── Public API ──────────────────────────────────────────────────
 
+    @property
+    def reconnecting(self) -> bool:
+        """The socket dropped and the event loop is bringing it back: until
+        then a request fails without reaching the Gateway (`send_request`).
+        The reconnect renews the subscriptions and wakes every
+        `session_change_event` waiter (`_subscribe_all`)."""
+        return (self._ws is None and not self._stopped and self._event_loop_task is not None
+                and not self._event_loop_task.done())
+
     async def ensure_connected(self):
         """Ensure the WS connection is up; connect/reconnect if needed."""
         if self._ws and self._event_loop_task and not self._event_loop_task.done():

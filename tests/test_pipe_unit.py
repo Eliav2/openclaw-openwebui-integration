@@ -2275,6 +2275,55 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("abort", self.rpc)
         self.assertEqual(self.conn._consumers, {}, "the parked queue is released")
 
+    async def test_a_queued_message_waits_out_a_socket_reconnect(self):
+        """ELI-199 (live 2026-10-18 15:56:42): a message queued behind a run
+        the turn writer holds. The Gateway socket drops (1006); the drop
+        wakes the queue's waiter, `sessions.describe` and `sessions.list`
+        both fail "not ready", and this worker's registry, which never saw
+        the held run, said idle: the message was sent into the dead socket
+        and lost ("Error sending message: gateway connection not ready").
+        While the socket is reconnecting the run state is unknown, so the
+        message waits; the reconnect wakes it, and it is sent once the run
+        really settled."""
+        real_send = self.conn.send_request
+
+        async def send_request(method, params, timeout=10):
+            if self.conn._ws is None:   # as `send_request` does mid-reconnect
+                raise self.ocp.GatewayError("gateway connection not ready (reconnecting)")
+            return await real_send(method, params, timeout)
+        self.conn.send_request = send_request
+        loop_task = asyncio.ensure_future(asyncio.Event().wait())  # the event loop, reconnecting
+        self.addCleanup(loop_task.cancel)
+        self.conn._event_loop_task = loop_task
+
+        self.active = True
+        gen = self._reply("queued", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._spin()
+        self.assertTrue(any("Queued: waiting" in str(e) for e in self.emitted))
+
+        self.conn._ws = None                # 1006: the socket is gone
+        self.conn._wake_session_waiters()   # the drop wakes every waiter (`_mark_event_gap`)
+        await self._spin()
+        self.assertEqual(self.sent, [], "sent while the run's state was unknown")
+        self.assertFalse(first.done(), f"the reply ended: {first.result() if first.done() else ''!r}")
+
+        self.conn._ws = object()            # reconnected, same Gateway; the run still goes
+        self.conn._wake_session_waiters()   # the renewed subscriptions wake it (`_subscribe_all`)
+        await self._spin()
+        self.assertEqual(self.sent, [])
+
+        self._settled(False)
+        await self._until_registered("run-1")
+        self.assertEqual(self.sent, ["queued"])
+        self._queue("run-1").put_nowait(self._delta("run-1", "ANSWER"))
+        self._queue("run-1").put_nowait(self._final("run-1"))
+        out = await asyncio.wait_for(first, 5)
+        async for chunk in gen:
+            out += chunk if isinstance(chunk, str) else ""
+        self.assertIn("ANSWER", out)
+        self.assertNotIn("Error sending message", out)
+
     async def test_cancel_while_queued_carries_the_message(self):
         self.active = True  # a run this chat did not start, e.g. a scheduled turn
         r1 = self._reply("first", "m1")

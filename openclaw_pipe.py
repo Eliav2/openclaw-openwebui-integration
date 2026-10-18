@@ -5472,6 +5472,15 @@ class _GatewayConnection:
 
     # ── Public API ──────────────────────────────────────────────────
 
+    @property
+    def reconnecting(self) -> bool:
+        """The socket dropped and the event loop is bringing it back: until
+        then a request fails without reaching the Gateway (`send_request`).
+        The reconnect renews the subscriptions and wakes every
+        `session_change_event` waiter (`_subscribe_all`)."""
+        return (self._ws is None and not self._stopped and self._event_loop_task is not None
+                and not self._event_loop_task.done())
+
     async def ensure_connected(self):
         """Ensure the WS connection is up; connect/reconnect if needed."""
         if self._ws and self._event_loop_task and not self._event_loop_task.done():
@@ -12032,6 +12041,15 @@ class _PipeTurn:
                     "list.hasActiveRun=True (subagent-yield gap; queueing)"
                 )
             return active
+        if self.conn.reconnecting:
+            # Neither probe reached the Gateway, so its run state is unknown,
+            # and the registry below cannot stand in for it: a run the turn
+            # writer holds is not in it, so it would say idle, and a queued
+            # message would be sent into the dead socket and lost (ELI-199).
+            # Busy: the waiter is woken again by the reconnect and re-reads.
+            pipe_log("  active-check: the Gateway socket is reconnecting; "
+                     "waiting for it before deciding")
+            return True
         return self.conn.active_run_id_for_session(self.session_key) is not None
 
     def await_owner(self) -> None:

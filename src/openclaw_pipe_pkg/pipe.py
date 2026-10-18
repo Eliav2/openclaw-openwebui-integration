@@ -2016,6 +2016,15 @@ class _PipeTurn:
                     "list.hasActiveRun=True (subagent-yield gap; queueing)"
                 )
             return active
+        if self.conn.reconnecting:
+            # Neither probe reached the Gateway, so its run state is unknown,
+            # and the registry below cannot stand in for it: a run the turn
+            # writer holds is not in it, so it would say idle, and a queued
+            # message would be sent into the dead socket and lost (ELI-199).
+            # Busy: the waiter is woken again by the reconnect and re-reads.
+            pipe_log("  active-check: the Gateway socket is reconnecting; "
+                     "waiting for it before deciding")
+            return True
         return self.conn.active_run_id_for_session(self.session_key) is not None
 
     def await_owner(self) -> None:
