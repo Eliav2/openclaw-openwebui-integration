@@ -2,7 +2,7 @@
 store-bound question) is asked in the chat's masked input dialog, and the
 typed value goes only to `question.resolve`.
 
-Run: uv run --with-requirements requirements-dev.txt pytest -q test_secret_request_unit.py
+Run: uv run --with-requirements requirements-dev.txt pytest -q tests/test_secret_request_unit.py
 """
 import asyncio
 import json
@@ -18,7 +18,7 @@ install_stubs()
 
 import openclaw_pipe as ocp  # noqa: E402
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VALUE = "s3cret-VALUE-eli96-7c1"
 KEY = "agent:main:openwebui-user-1-chat-1"
 

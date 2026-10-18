@@ -65,17 +65,17 @@ This is green on a fresh clone with no setup. `requirements-dev.txt` pins
 pydantic, cryptography and websockets to the versions Open WebUI itself locks,
 because the artifacts run inside Open WebUI's interpreter.
 
-Most of the suite (`test_build.py` and every `test_*_unit.py`) is pure unit
+Most of the suite (`tests/test_build.py` and every `tests/test_*_unit.py`) is pure unit
 tests with no external dependencies. What the suites share lives in two modules pytest
-does not collect: `_test_stubs.py` (stand-ins for websockets, cryptography and
-pydantic) and `_test_helpers.py` (`run_page` for the fake-DOM page scripts,
-`RecordingEmitter`, `action_gateway`, `fake_owui`/`owui_modules`, `FakeSio`). `test_fixture_owui_streaming_handler.py`
+does not collect: `tests/_test_stubs.py` (stand-ins for websockets, cryptography and
+pydantic) and `tests/_test_helpers.py` (`run_page` for the fake-DOM page scripts,
+`RecordingEmitter`, `action_gateway`, `fake_owui`/`owui_modules`, `FakeSio`). `tests/fixtures/test_fixture_owui_streaming_handler.py`
 is not a suite, it's a verbatim copy of Open WebUI's streaming handler, used
 as a fixture to pin tool-card rendering against the real thing.
 
 `e2e/test_e2e.py` and `e2e/test_browser_flows.py` skip unless `E2E_STACK=1`: it needs the stack that
 `e2e/start_stack.sh` brings up (see E2E below). Two fixture checks in
-`test_pipe_unit.py` (`-k installed_dist`) compare the Gateway source lines the
+`tests/test_pipe_unit.py` (`-k installed_dist`) compare the Gateway source lines the
 Pipe matches on with an installed OpenClaw: `$OPENCLAW_DIST`, else the global
 npm install's. They skip when neither exists; the extractors that rewrite those
 fixtures (`scripts/extract_openclaw_*.py --write`) default to the same dist.

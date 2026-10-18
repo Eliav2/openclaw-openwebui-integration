@@ -89,7 +89,7 @@ jobs:
         # set these checks fail rather than skip when the dist is missing.
         run: |
           OPENCLAW_DIST="$(npm root -g)/openclaw/dist" uv run --with-requirements requirements-dev.txt \
-            pytest -v -rs test_pipe_unit.py -k "installed_dist"
+            pytest -v -rs tests/test_pipe_unit.py -k "installed_dist"
 
       - name: Collect logs
         if: always()

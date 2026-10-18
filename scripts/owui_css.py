@@ -27,7 +27,7 @@ import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ACTION_SRC = os.path.join(ROOT, "src", "openclaw_pipe_pkg", "action.py")
-FIXTURE = os.path.join(ROOT, "test_fixture_owui_css_classes.txt")
+FIXTURE = os.path.join(ROOT, "tests", "fixtures", "test_fixture_owui_css_classes.txt")
 VERSIONS_ENV = os.path.join(ROOT, "e2e", "versions.env")
 
 # `x.className = '...' + '...' + (cond ? ' a' : '');` up to the statement's end,

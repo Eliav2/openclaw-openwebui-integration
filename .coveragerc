@@ -1,0 +1,5 @@
+# Coverage is of the product code (artifacts, src/, installers, scripts), not of
+# the suites that exercise it.
+[run]
+omit =
+    tests/*

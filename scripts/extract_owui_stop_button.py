@@ -17,7 +17,7 @@ import re
 import sys
 import zipfile
 
-FIXTURE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+FIXTURE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tests", "fixtures",
                        "test_fixture_owui_stop_button.json")
 
 

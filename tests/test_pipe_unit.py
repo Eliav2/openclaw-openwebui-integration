@@ -416,7 +416,7 @@ class HistoryRunRebuildTests(unittest.TestCase):
         picker) keeps OpenClaw's shape, not claude-cli's: `toolCall` blocks,
         and each result is a `toolResult` message of its own. Recorded from a
         DeepSeek session; the rebuild came back with no cards at all."""
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_fixture_native_history.json")
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "test_fixture_native_history.json")
         with open(path) as f:
             messages = json.load(f)["messages"]
         messages = messages + [{"role": "assistant", "stopReason": "stop",
@@ -438,7 +438,7 @@ class HistoryRunRebuildTests(unittest.TestCase):
         (recorded on an openwebui- session, DeepSeek V4 Flash): no closing
         `cli-assistant:` message; each message the run wrote carries its run
         id in `__openclaw.runId`, the last one with `stopReason` "stop"."""
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_fixture_native_chat_send.json")
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "test_fixture_native_chat_send.json")
         with open(path) as f:
             messages = json.load(f)["messages"]
         return messages, messages[0]["idempotencyKey"].removesuffix(":user")
@@ -6006,7 +6006,7 @@ class TestSpawnBackground(unittest.TestCase):
     def test_no_bare_create_task_left_in_sources(self):
         # A create_task whose result is discarded is exactly the bug; ruff's
         # RUF006 enforces this in CI, this keeps it true without ruff.
-        src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+        src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                            "src", "openclaw_pipe_pkg")
         offenders = []
         for name in sorted(os.listdir(src)):
@@ -6149,7 +6149,7 @@ class TurnIdentityTests(unittest.TestCase):
     def test_the_status_actions_runs_get_no_message(self):
         self.assertIsNone(turn_message_id(self.KEY, f"{ACTION_RUN_PREFIX}compact-{self.CHAT}-1.0"))
         self.assertIsNone(turn_message_id(self.KEY, ""))
-        src = open(os.path.join(os.path.dirname(__file__), "src", "openclaw_pipe_pkg",
+        src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "openclaw_pipe_pkg",
                                 "action.py")).read()
         self.assertIn('idempotency_key=f"{ACTION_RUN_PREFIX}compact-', src)
 
@@ -6352,7 +6352,7 @@ class TurnOwnerTests(unittest.TestCase):
 
 @contextlib.contextmanager
 def _scripts_on_path():
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
     try:
         yield
     finally:
@@ -6379,7 +6379,7 @@ class ExitTextFixtureTest(unittest.TestCase):
     extracted from the installed dist; this test renders its templates and,
     when the dist is installed here, fails if the line has changed."""
 
-    FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+    FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures",
                            "test_fixture_openclaw_exit_errors.json")
 
     def setUp(self):
@@ -6428,7 +6428,7 @@ class CronPromptFixtureTest(unittest.TestCase):
     test renders each and, when a dist is installed here, fails unless it
     holds one of them exactly."""
 
-    FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+    FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures",
                            "test_fixture_openclaw_cron_prompt.json")
     JOB = "1542eaee-50d8-4583-8d9b-d28bb12e0145"
 
@@ -9344,7 +9344,7 @@ class IntentHookStopIconTests(unittest.TestCase):
     translated. The fixture holds Open WebUI's button templates labelled
     t("Stop") (scripts/extract_owui_stop_button.py, re-extract on upgrade)."""
 
-    FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+    FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures",
                            "test_fixture_owui_stop_button.json")
 
     def test_the_hook_matches_the_composer_stop_icon(self):
@@ -9709,7 +9709,7 @@ class NeedsInputMarkerTests(unittest.IsolatedAsyncioTestCase):
     _final = NoDroppedMessagesTests._final
     _until_registered = NoDroppedMessagesTests._until_registered
     MARKER = openclaw_pipe._USER_INPUT_TRIGGER_PREFIXES[-1]
-    REPORT = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+    REPORT = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures",
                                          "test_fixture_eli107_report.json")))["text"]
 
     async def _stream(self, text, event_call, chunk=40):
@@ -11859,7 +11859,7 @@ class MediaDirectiveCodeAwareTests(unittest.IsolatedAsyncioTestCase):
     code span (any backtick run length) or a fenced block is text; one in
     prose, mid-line or not, is still a directive."""
 
-    FX = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+    FX = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures",
                                      "test_fixture_eli111_report.json")))
     BASE = "https://x"
     IN_CODE = (
@@ -12086,7 +12086,7 @@ def _owui_live_output(events: list) -> list:
     """The output list an Open WebUI 0.12 chat tab renders while the reply
     streams: `events` folded by the vendored frontend reducer
     (`test_fixture_owui_structured_output.ts`), run with bun."""
-    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "owui_live_fold.ts")
+    script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts", "owui_live_fold.ts")
     done = subprocess.run(["bun", script], input=json.dumps(events), capture_output=True,
                           text=True, check=True, timeout=60)
     return json.loads(done.stdout)
@@ -12606,7 +12606,7 @@ class ForwardedTurnHistoryTests(_RoutingCase):
     that starts the run. The fixture is the e2e wake session's history as
     each version returned it."""
 
-    FX = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+    FX = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures",
                                      "test_fixture_gh24_wake_history.json")))
 
     def with_cli_closers(self, messages):

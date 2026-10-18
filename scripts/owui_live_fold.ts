@@ -3,7 +3,7 @@
 // tests (ELI-122), and Open WebUI's `chat:tasks:cancel`. Reads a JSON array
 // of events on stdin, prints the output list the tab renders.
 //   bun scripts/owui_live_fold.ts < events.json
-import { applyResponseStreamEvent } from '../test_fixture_owui_structured_output.ts';
+import { applyResponseStreamEvent } from '../tests/fixtures/test_fixture_owui_structured_output.ts';
 
 const events = JSON.parse(await Bun.stdin.text());
 let output = [];

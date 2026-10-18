@@ -22,6 +22,19 @@ shim that the stubbed transport tests do not drive, so hoisting it here trades
 one broken suite for another. Nothing needs the real transport to be present.
 """
 
+import os
+import sys
+
+# The suites import the product modules (openclaw_pipe.py, build.py, install.py,
+# scripts/) from the repo root, and the vendored Open WebUI handler from
+# fixtures/. pytest.ini puts the root on the path for every pytest run (e2e/
+# included); this covers fixtures/ and standalone runs, through the
+# `import conftest` each stubbing suite starts with.
+_TESTS = os.path.dirname(os.path.abspath(__file__))
+for _path in (os.path.join(_TESTS, "fixtures"), os.path.dirname(_TESTS)):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
+
 try:
     import pydantic  # noqa: F401
 except ModuleNotFoundError as exc:

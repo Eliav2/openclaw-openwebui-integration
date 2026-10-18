@@ -375,7 +375,7 @@ class NoTasksApiTests(unittest.TestCase):
     on a Gateway without it (ELI-163)."""
 
     def test_only_the_background_adapter_calls_the_tasks_api(self):
-        here = os.path.dirname(os.path.abspath(__file__))
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(os.path.join(here, "openclaw_status_action.py"), encoding="utf-8") as f:
             source = f.read()
         self.assertNotIn('"tasks.get"', source)

@@ -33,8 +33,8 @@ jobs:
           config: |
             paths-ignore:
               - src/openclaw_pipe_pkg
-              - test_fixture_owui_streaming_handler.py
-              - test_fixture_owui_structured_output.ts
+              - tests/fixtures/test_fixture_owui_streaming_handler.py
+              - tests/fixtures/test_fixture_owui_structured_output.ts
       - uses: github/codeql-action/analyze@v4
         with:
           category: /language:${{ matrix.language }}

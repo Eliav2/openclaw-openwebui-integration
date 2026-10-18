@@ -2,7 +2,7 @@
 waits out a reconnect backoff takes the loop's attempt, made at once, instead
 of connecting a socket of its own that nothing reads.
 
-Run: uv run --with-requirements requirements-dev.txt pytest -q test_reconnect_unit.py
+Run: uv run --with-requirements requirements-dev.txt pytest -q tests/test_reconnect_unit.py
 """
 import asyncio
 import types

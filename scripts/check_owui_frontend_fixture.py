@@ -30,7 +30,7 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-FIXTURE = ROOT / "test_fixture_owui_structured_output.ts"
+FIXTURE = ROOT / "tests" / "fixtures" / "test_fixture_owui_structured_output.ts"
 UPSTREAM = ("https://raw.githubusercontent.com/open-webui/open-webui/{ref}/"
             "src/lib/components/chat/Messages/structuredOutput.ts")
 MARKER = "// ---- verbatim from upstream below this line ----\n"
