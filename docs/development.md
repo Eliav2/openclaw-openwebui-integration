@@ -94,7 +94,9 @@ Every push and PR runs `.github/workflows/ci.yml`:
 
 **E2E** (`.github/workflows/e2e.yml`, `e2e/`): starts a deterministic fake
 OpenAI-compatible model (`e2e/fake_llm.py`), a real OpenClaw Gateway pointed at
-it, and Open WebUI in Docker; installs the Pipe, Filter and Action with
+it (with one test-only plugin, `e2e/agent-tool`: an `Agent` tool that answers
+like Claude Code's, which the Gateway's own runtime does not have), and Open
+WebUI in Docker; installs the Pipe, Filter and Action with
 `uv run install*.py install` exactly as the README tells users to (device
 pairing and the installer's smoke test included); then runs `e2e/test_e2e.py`
 against it, and the installed-dist fixture checks against the Gateway it

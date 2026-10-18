@@ -1,0 +1,17 @@
+{
+  "id": "e2e-agent-tool",
+  "name": "E2E Agent tool",
+  "description": "Test-only: an Agent tool that answers like Claude Code's Agent call, for the end-to-end stack. Never install this on a real Gateway.",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false
+  },
+  "contracts": {
+    "tools": [
+      "Agent"
+    ]
+  }
+}

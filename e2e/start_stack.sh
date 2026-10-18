@@ -71,6 +71,8 @@ mkdir -p "$HOME/.openclaw"
 # it (off to high on 2026.9) and sends it on as `reasoning_effort`, which the
 # fake model's request log shows. The other two take no level at all.
 #
+# e2e/agent-tool adds an `Agent` tool that answers like Claude Code's.
+#
 # No heartbeat, dreaming or weekly skill review: a job the Gateway schedules
 # itself can come due mid-suite and hold a clean stop's drain for minutes
 # (test_the_stack_gateway_schedules_no_work_of_its_own).
@@ -98,7 +100,9 @@ cat >"$HOME/.openclaw/openclaw.json" <<EOF
     "entries": {"main": {"workspace": "$HOME/.openclaw/workspace"}, "title-gen": {}}
   },
   "skills": {"workshop": {"autonomous": {"mode": "off"}}},
-  "plugins": {"entries": {"memory-core": {"config": {"dreaming": {"enabled": false}}}}}
+  "plugins": {"load": {"paths": ["$PWD/e2e/agent-tool"]},
+              "entries": {"memory-core": {"config": {"dreaming": {"enabled": false}}},
+                          "e2e-agent-tool": {"enabled": true}}}
 }
 EOF
 if [[ -n "${STACK_CONFIG_PATCH:-}" ]]; then

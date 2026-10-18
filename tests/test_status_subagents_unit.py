@@ -749,6 +749,29 @@ class RecentBranchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(chat["history"]["messages"]), 6)
         self.assertEqual(openclaw_status_action._agent_call_rows(chat)[0]["title"], "job 5")
 
+    async def test_a_running_reply_lists_what_the_pipe_shows(self):
+        """ELI-186: Open WebUI saves a reply's calls only when it ends, so a
+        running reply's row holds none; the Pipe streaming it has them."""
+        links, read_rows, blob, _reads = _chain(6)
+        live = types.SimpleNamespace(output=_card("t5", "Agent", {"description": "background job"}, None))
+
+        async def rows_mid_reply(ids):
+            got = await read_rows(ids)
+            got["m5"] = {**got["m5"], "done": False, "output": []}
+            return got
+        replies = openclaw_status_action._live_replies()
+        with mock.patch.dict(replies, {("chat-1", "m5"): live}):
+            chat = await openclaw_status_action._recent_branch("m5", links, rows_mid_reply, blob, chat_id="chat-1")
+            self.assertEqual([(r["title"], r["state"], r["replyDone"])
+                              for r in openclaw_status_action._agent_call_rows(chat)[:1]],
+                             [("background job", "running", False)])
+            # A reply that has ended is read as Open WebUI saved it; another
+            # chat's reply is not this one.
+            chat = await openclaw_status_action._recent_branch("m5", links, read_rows, blob, chat_id="chat-1")
+            self.assertEqual(openclaw_status_action._agent_call_rows(chat)[0]["title"], "job 5")
+            chat = await openclaw_status_action._recent_branch("m5", links, rows_mid_reply, blob, chat_id="chat-2")
+            self.assertEqual(openclaw_status_action._agent_call_rows(chat)[0]["title"], "job 3")
+
     async def test_the_dialog_says_recent_when_it_cut(self):
         chats = types.ModuleType("open_webui.models.chats")
         whole = {}

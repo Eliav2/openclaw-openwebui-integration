@@ -2293,6 +2293,37 @@ def _shared_gateway_state() -> dict | None:
     return state
 
 
+# The replies this process is streaming, for the Status Action (ELI-186):
+# {(chat_id, message_id): the reply's _TurnRenderer}. Open WebUI saves a
+# reply's tool cards (its `output`) only when the reply ends, in the chat and
+# in its message row alike, so while it runs only the Pipe has them. The Pipe
+# and the Action are separate Function modules: like the Pipe's shared state,
+# the map lives on Open WebUI's own stable module, and outside Open WebUI on
+# this one.
+_LIVE_REPLIES_ATTR = "_openclaw_live_replies_v1"
+_live_replies_local: dict = {}
+
+
+def _live_replies() -> dict:
+    try:
+        import open_webui.socket.main as _owui_socket_main
+    except Exception:
+        return _live_replies_local
+    replies = getattr(_owui_socket_main, _LIVE_REPLIES_ATTR, None)
+    if replies is None:
+        replies = {}
+        setattr(_owui_socket_main, _LIVE_REPLIES_ATTR, replies)
+    return replies
+
+
+def _live_reply_output(chat_id, message_id):
+    """A copy of the tool cards and text a running reply shows so far, or
+    None when this process streams no such reply."""
+    renderer = _live_replies().get((chat_id, message_id))
+    output = getattr(renderer, "output", None)
+    return copy.deepcopy(output) if isinstance(output, list) else None
+
+
 class _RunQueue(asyncio.Queue):
     """A run's event queue. Events wait for room (`await put`): a reply read
     slower than its run streams holds the receive loop back instead of losing
@@ -7088,13 +7119,16 @@ def _agent_call_rows(chat):
 _RECENT_MESSAGES = 40
 
 
-async def _recent_branch(current_id, links, read_rows, read_blob_message, limit=_RECENT_MESSAGES):
+async def _recent_branch(current_id, links, read_rows, read_blob_message, limit=_RECENT_MESSAGES,
+                         chat_id=None):
     """The last `limit` messages of a chat's current branch, chat-shaped
     ({"history": {"currentId", "messages"}, "truncated"}) for the section
     builders. `links` maps each message that has a row to its parent;
     `read_rows(ids)` reads those messages ({id: message}) in one go;
     `read_blob_message(id)` reads one message the chat's own copy holds but
-    no row does yet (Open WebUI writes some straight into the chat)."""
+    no row does yet (Open WebUI writes some straight into the chat). A reply
+    of `chat_id` that this process's Pipe is streaming lists what it shows
+    so far."""
     order, blob, seen, mid = [], {}, set(), current_id
     while mid and mid not in seen and len(order) < limit:
         seen.add(mid)
@@ -7110,12 +7144,20 @@ async def _recent_branch(current_id, links, read_rows, read_blob_message, limit=
         mid = parent
     with_rows = [m for m in order if m not in blob]
     rows = await read_rows(with_rows) if with_rows else {}
+    # Open WebUI saves a reply's calls only when it ends, in its row and in
+    # the chat alike (ELI-186): a running reply's are with the Pipe.
+    for m in order:
+        msg = blob.get(m) or rows.get(m)
+        if isinstance(msg, dict) and msg.get("role") == "assistant" and not msg.get("done"):
+            live = _live_reply_output(chat_id, m)
+            if live is not None:
+                blob[m] = {**msg, "output": live}
     messages = {m: {**(blob.get(m) or rows.get(m)), "id": m} for m in order if blob.get(m) or rows.get(m)}
     return {"history": {"currentId": current_id, "messages": messages},
             "truncated": bool(mid) and mid not in seen}
 
 
-async def _recent_of_chat(chat, limit=_RECENT_MESSAGES):
+async def _recent_of_chat(chat, limit=_RECENT_MESSAGES, chat_id=None):
     """`_recent_branch` of a chat already read whole."""
     if not isinstance(chat, dict):
         return chat
@@ -7128,7 +7170,7 @@ async def _recent_of_chat(chat, limit=_RECENT_MESSAGES):
     async def no_blob(_mid):
         return None
     links = {k: v.get("parentId") for k, v in msgs.items() if isinstance(v, dict)}
-    return {**chat, **await _recent_branch(history.get("currentId"), links, read_rows, no_blob, limit)}
+    return {**chat, **await _recent_branch(history.get("currentId"), links, read_rows, no_blob, limit, chat_id)}
 
 
 async def _load_owui_recent(chat_id, user_id, limit=_RECENT_MESSAGES):
@@ -7144,7 +7186,7 @@ async def _load_owui_recent(chat_id, user_id, limit=_RECENT_MESSAGES):
         from open_webui.models.chats import Chat
         from open_webui.models.chat_messages import ChatMessage
     except Exception:
-        return await _recent_of_chat(await _load_owui_chat(chat_id, user_id), limit)
+        return await _recent_of_chat(await _load_owui_chat(chat_id, user_id), limit, chat_id)
     prefix = f"{chat_id}-"
     try:
         async with get_async_db_context() as db:
@@ -7170,7 +7212,7 @@ async def _load_owui_recent(chat_id, user_id, limit=_RECENT_MESSAGES):
             async def read_blob_message(mid):
                 return (await db.execute(select(Chat.chat[("history", "messages", mid)])
                                          .where(Chat.id == chat_id))).scalar()
-            return await _recent_branch(current, links, read_rows, read_blob_message, limit)
+            return await _recent_branch(current, links, read_rows, read_blob_message, limit, chat_id)
     except Exception as ex:
         pipe_log(f"[status-action] could not read the chat's recent messages: {ex}")
         return None
