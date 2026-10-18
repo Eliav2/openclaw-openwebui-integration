@@ -12,6 +12,8 @@ whole):
 
 * `exactly: TOKEN` / `exactly TOKEN`  -> replies with TOKEN alone. Covers the
   installer's smoke test ("reply with exactly OK_CONFIG_TEST").
+* `E2E_COMPACT_FAIL` anywhere in a chat -> its compaction's summary request is
+  refused (HTTP 400 `E2E_COMPACT_REFUSED`), so the compaction fails.
 * `Create a concise title`            -> `TITLE` below: the Pipe's own chat-title
   run (the `title-gen` agent), after a chat's second exchange.
 * `E2E_SPAWN_SILENT`                   -> spawns a sub-agent (task `E2E_SILENT_CHILD`,
@@ -241,6 +243,11 @@ def plan_reply(body: dict) -> dict:
     """Return {"text": str}, {"tool": name, "args"?: dict}, or both (text, then
     the call) for one request."""
     messages = body.get("messages") or []
+    # A compaction's summary request for a chat that carries E2E_COMPACT_FAIL:
+    # the model refuses it, so the Gateway's compaction fails (ELI-209).
+    if (any("summarization" in json.dumps(m.get("content")) for m in messages)
+            and "E2E_COMPACT_FAIL" in json.dumps(messages)):
+        return {"http_error": 400, "text": "E2E_COMPACT_REFUSED"}
     # The current turn is the run of user messages after the last assistant
     # reply: the Gateway appends its own context block as a separate user
     # message after the real one, so the last user message alone is not it.
@@ -531,6 +538,10 @@ class Handler(BaseHTTPRequestHandler):
             with open(LOG_PATH, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps({"ts": time.time(), "path": self.path,
                                      "request": body, "reply": plan}) + "\n")
+
+        if plan.get("http_error"):
+            self._json(plan["http_error"], {"error": {"message": plan["text"], "type": "invalid_request_error"}})
+            return
 
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         created = int(time.time())
