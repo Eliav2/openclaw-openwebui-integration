@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -623,3 +624,98 @@ def test_at_phone_width_the_status_button_fits_and_opens_the_dialog(page, token)
             assert phone.evaluate(FITS, sel) == "ok", f"{what}: {phone.evaluate(FITS, sel)}"
     finally:
         phone.context.close()
+
+
+E2E_TITLE = "🧪 E2E chat title"   # e2e/fake_llm.py TITLE
+
+
+def _two_exchanges(page, first: str, second: str) -> str:
+    """A new chat with two finished exchanges; returns its id."""
+    capture.new_chat(page)
+    chat_id = capture.send(page, f"E2E_ECHO: {first}")
+    _wait(page, _turn_over(first), "the first reply")
+    _type_and_send(page, f"E2E_ECHO: {second}")
+    _wait(page, f"() => ({STOP_GONE})() && ({_reply_js(-1, f'all.length === 2 && r.done && r.text.includes({json.dumps(second)})')})()",
+          "the second reply")
+    return chat_id
+
+
+def _titles_js(chat_id: str, title: str) -> str:
+    """The open tab shows `title`: the sidebar's entry of the chat and the browser tab."""
+    return (f"() => document.title.includes({json.dumps(title)}) && [...document.querySelectorAll("
+            f"'a[href=\"/c/{chat_id}\"]')].some(a => a.innerText.includes({json.dumps(title)}))")
+
+
+def _sidebar_js(chat_id: str, title: str) -> str:
+    """The sidebar's entry of the chat shows `title` (Open WebUI's own rename
+    leaves the browser tab's title as it was)."""
+    return (f"() => [...document.querySelectorAll('a[href=\"/c/{chat_id}\"]')]"
+            f".some(a => a.innerText.includes({json.dumps(title)}))")
+
+
+def _shown_titles(page, chat_id: str) -> str:
+    return page.evaluate(f"""() => JSON.stringify({{tab: document.title, sidebar: [...document.querySelectorAll(
+        'a[href="/c/{chat_id}"]')].map(a => a.innerText.trim())}})""")
+
+
+def _auto_title_decision(chat_id: str, since: str) -> str:
+    """The Pipe's auto-title decision for the chat, from its log: read as the
+    lines come (Open WebUI's stdout), until the decision line."""
+    pattern = re.compile(rf"Auto-title: (?:chat {re.escape(chat_id)}: |set to )")
+    proc = subprocess.Popen(["timeout", str(TURN_MS // 1000), "docker", "logs", "-f", "--since", since, "owui"],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        for line in proc.stdout:
+            if pattern.search(line):
+                return line.strip()
+        raise AssertionError(f"no auto-title decision for chat {chat_id} in the Pipe's log")
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_the_generated_title_shows_in_the_open_tab(page, token):
+    """After the second exchange the Pipe titles the chat, and the open tab
+    shows the new title at once, in the sidebar and the browser tab, with no
+    reload (ELI-182: it showed only after a reload)."""
+    chat_id = _two_exchanges(page, "BROWSER_TITLE_ONE", "BROWSER_TITLE_TWO")
+    try:
+        capture.wait_js(page, _titles_js(chat_id, E2E_TITLE), "the generated title in the open tab", TURN_MS)
+    except TimeoutError as ex:
+        raise AssertionError(f"{ex}; the tab shows {_shown_titles(page, chat_id)}, "
+                             f"the chat's saved title is {capture.chat_title(token, chat_id)!r}") from None
+
+
+def test_a_title_the_user_chose_stays(page, token):
+    """A chat renamed in the sidebar keeps its name after the next message:
+    the Pipe titles only a chat Open WebUI named by itself (ELI-182: the
+    rename was replaced by the generated title)."""
+    first, chosen = "BROWSER_RENAME_ONE", "BROWSER my own title"
+    capture.new_chat(page)
+    chat_id = capture.send(page, f"E2E_ECHO: {first}")
+    _wait(page, _turn_over(first), "the first reply")
+    # Open WebUI's own first title (its first message), before renaming over it.
+    capture.wait_js(page, _titles_js(chat_id, first), "Open WebUI's first title", 60_000)
+    # The sidebar is where a user renames a chat; open it if it is closed.
+    was_closed = page.locator('button[aria-label="Open Sidebar"]').first.is_visible()
+    if was_closed:
+        page.locator('button[aria-label="Open Sidebar"]').first.click()
+    try:
+        page.locator(f'a[href="/c/{chat_id}"]').dblclick()
+        box = page.locator(f"#chat-title-input-{chat_id}")
+        box.wait_for(timeout=10_000)
+        box.fill(chosen)
+        box.press("Enter")
+        capture.wait_js(page, _sidebar_js(chat_id, chosen), "the chosen title in the sidebar", 30_000)
+    finally:
+        if was_closed:
+            page.locator('button[aria-label="Close Sidebar"]').first.click()
+    assert capture.chat_title(token, chat_id) == chosen
+
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    _type_and_send(page, "E2E_ECHO: BROWSER_RENAME_TWO")
+    _wait(page, f"() => ({STOP_GONE})() && ({_reply_js(-1, 'all.length === 2 && r.done')})()", "the second reply")
+    decision = _auto_title_decision(chat_id, since)
+    saved = capture.chat_title(token, chat_id)
+    assert saved == chosen, f"the chosen title was replaced by {saved!r} (Pipe: {decision})"
+    assert page.evaluate(_sidebar_js(chat_id, chosen)), f"the tab shows {_shown_titles(page, chat_id)}"

@@ -110,7 +110,7 @@ Maximum number of models to show in the selector.
 
 Type: `bool`. Default: `True`.
 
-Auto-generate a chat title after the first exchange (like native OWUI). Uses a fast model; best-effort, non-blocking.
+Auto-generate a chat title after the first exchange (like native OWUI). Uses a fast model; best-effort, non-blocking. Never replaces a title the user chose.
 
 ### COMPOSER_STATUS_BUTTON
 

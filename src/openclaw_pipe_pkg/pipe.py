@@ -115,6 +115,54 @@ async def _settle_cancel_intent(conn, session_key, run_id, chat_id, event_call):
     conn.settle_parked_turn(session_key, run_id, intent, hold_s=_SEND_NOW_HOLD_S)
 
 
+# Open WebUI 0.12.3 creates a chat as "New Chat" (main.py, not translated).
+_OWUI_NEW_CHAT_TITLE = "New Chat"
+# What Open WebUI removes from a message before titling a chat with it
+# (middleware.py background_tasks_handler), and its skill mentions, which it
+# titles by their label (utils/skills.py SKILL_MENTION_STRIP_RE).
+_OWUI_TITLE_STRIP_RE = re.compile(
+    r'<details\b[^<>]*>(?:(?!<details\b).)*?<\/details>|!\[[^\[\]]*\]\([^()]*\)', re.S | re.I)
+_OWUI_SKILL_ID = r'(?:[a-z0-9_-]+|terminal:[^|>\s]+)'
+_OWUI_SKILL_MENTION_RE = re.compile(
+    rf'<(?:\$({_OWUI_SKILL_ID})(?:\|([^>]*))?|/({_OWUI_SKILL_ID})\|([^>]*))>')
+
+
+def _owui_title_from_message(content) -> str:
+    """The title Open WebUI gives a chat from its first message when its own
+    title task gives none (the Pipe skips that task)."""
+    if isinstance(content, list):
+        content = "\n".join(p["text"] for p in content if isinstance(p, dict)
+                            and p.get("type") == "text" and isinstance(p.get("text"), str))
+    if not isinstance(content, str):
+        return ""
+    text = _OWUI_TITLE_STRIP_RE.sub("", content).strip()
+    return _OWUI_SKILL_MENTION_RE.sub(lambda m: m.group(2) or m.group(4) or m.group(0), text)
+
+
+def _title_is_owui_default(title, chat: dict) -> bool:
+    """True while nobody chose the chat's title: it is still the one Open
+    WebUI set by itself ("New Chat", or a first message of the chat). Any
+    other title was chosen, by the user or by Open WebUI's own title model."""
+    if title in (None, "", _OWUI_NEW_CHAT_TITLE):
+        return True
+    messages = ((chat or {}).get("history") or {}).get("messages") or {}
+    return any(title == _owui_title_from_message(m.get("content"))
+               for m in messages.values() if m.get("role") == "user" and not m.get("parentId"))
+
+
+async def _set_title_unless_chosen(chat_id: str, title: str) -> bool:
+    """Title the chat, under its row lock, unless its title was chosen
+    meanwhile (ELI-182). True when the title was set."""
+    from open_webui.models.chats import Chats
+    async with Chats._chat_transaction(chat_id) as (_db, chat):
+        if chat is None or not _title_is_owui_default(chat.title, chat.chat):
+            return False
+        title = title.replace("\x00", "")
+        chat.title = title
+        chat.chat = {**(chat.chat or {}), "title": title}
+        return True
+
+
 @dataclass
 class _TurnState:
     """What one reply still owes the user if it is cancelled or closed now.
@@ -274,7 +322,8 @@ class Pipe:
         AUTO_TITLE: bool = Field(
             default=True,
             description="Auto-generate a chat title after the first exchange (like native OWUI). "
-                "Uses a fast model; best-effort, non-blocking."
+                "Uses a fast model; best-effort, non-blocking. Never replaces a title "
+                "the user chose."
         )
         COMPOSER_STATUS_BUTTON: bool = Field(
             default=True,
@@ -393,12 +442,13 @@ class Pipe:
 
     # ── Auto-title helpers ──────────────────────────────────────────
 
-    async def _auto_title(self, body, conn, visible_message_text,
-                          owui_origin_chat_id, bearer_token, session_key=""):
-        """Generate a chat title and set it via OWUI's REST API.
+    async def _auto_title(self, body, conn, visible_message_text, owui_origin_chat_id,
+                          session_key="", user_id="", message_id=None):
+        """Generate a chat title, set it and show it in the user's open tabs.
 
         Fires after the SECOND successful exchange (first message + response),
         when OWUI's chat_id is stable. The first request uses a temporary ID.
+        Replaces only a title nobody chose (`_title_is_owui_default`).
         Best-effort, non-blocking -- failures are logged but never surfaced.
         """
         if not self.valves.AUTO_TITLE:
@@ -419,17 +469,27 @@ class Pipe:
         user_text = user_msgs[0].get("content", "")[:400]
         assistant_preview = assistant_msgs[0].get("content", "")[:400]
 
-        pipe_log(f"Auto-title: generating title for chat {owui_origin_chat_id}")
-
         try:
+            from open_webui.models.chats import Chats
+            chat = await Chats.get_chat_by_id(owui_origin_chat_id)
+            if chat is not None and not _title_is_owui_default(chat.title, chat.chat):
+                pipe_log(f"Auto-title: chat {owui_origin_chat_id}: its title was chosen; no title")
+                return
+            pipe_log(f"Auto-title: generating title for chat {owui_origin_chat_id}")
             # The title run carries this chat's text, so it goes out with the
             # chat's owner status (OWNER_USERS), not the owner's.
             owner = await _sender_is_owner(conn, session_key)
             title = await self._generate_title_text(conn, user_text, assistant_preview, owner=owner)
             if not title:
                 return
-            await self._set_owui_chat_title(owui_origin_chat_id, title, bearer_token)
-            pipe_log(f"Auto-title: set to '{title}'")
+            if not await _set_title_unless_chosen(owui_origin_chat_id, title):
+                pipe_log(f"Auto-title: chat {owui_origin_chat_id}: its title was chosen meanwhile; kept")
+                return
+            pipe_log(f"Auto-title: chat {owui_origin_chat_id}: set to '{title}'")
+            # What Open WebUI sends for its own titles: the open tab retitles
+            # itself and its sidebar.
+            await _relay_emit_event(user_id, owui_origin_chat_id, message_id,
+                                    {"type": "chat:title", "data": title})
         except Exception as e:
             pipe_log(f"Auto-title: failed (non-fatal): {e}")
 
@@ -513,26 +573,6 @@ class Pipe:
         if len(title) > 80:
             title = title[:77] + "..."
         return title if title else None
-
-    async def _set_owui_chat_title(self, chat_id: str, title: str,
-                                    bearer_token: str | None):
-        """Set the chat title via OWUI's REST API (POST /api/v1/chats/{id})."""
-        token = bearer_token or self.valves.OWUI_API_KEY
-        if not token:
-            pipe_log("Auto-title: no OWUI auth token available")
-            return
-
-        data = json.dumps({"chat": {"title": title}}).encode()
-        req = urllib.request.Request(
-            f"{self.valves.OWUI_BASE_URL.rstrip('/')}/api/v1/chats/{chat_id}",
-            data=data,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        await asyncio.to_thread(urllib.request.urlopen, req, timeout=10)
 
     async def pipe(self, body, __event_emitter__, __event_call__=None,
                    __user__=None, __metadata__=None, __request__=None,
@@ -1799,8 +1839,9 @@ class _PipeTurn:
         if not self.aborted and self.text_yielded:
             spawn_background(
                 self.pipe._auto_title(
-                    self.body, self.conn, self.visible_message_text,
-                    self.owui_origin_chat_id, self.bearer_token, session_key=self.session_key,
+                    self.body, self.conn, self.visible_message_text, self.owui_origin_chat_id,
+                    session_key=self.session_key, user_id=self.owui_origin_user_id,
+                    message_id=self.owui_message_id,
                 )
             )
 
