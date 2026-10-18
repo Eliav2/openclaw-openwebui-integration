@@ -863,7 +863,15 @@ class _PipeTurn:
         self.turn.conn = self.conn
         self.turn.session_key = self.session_key
         self.turn.chat_id = self.owui_origin_chat_id
-        self.turn.unsent = list(self._send_texts) if self._send_texts else [self.text]
+        # When the chat no longer shows what the agent remembers (Edit,
+        # Regenerate, a branch switch) or is a copy it never saw, the message
+        # says so first (ELI-183). Not for the thinking-retry recursion, whose
+        # texts already went out once.
+        history_prefix = "" if self._send_texts else await _history_prefix(
+            self.conn, _state_dir(getattr(self.pipe.valves, "STATE_DIR", "")),
+            self.owui_origin_chat_id, self.session_key, self.__metadata__ or {}, messages)
+        self.turn.unsent = (list(self._send_texts) if self._send_texts
+                            else [history_prefix + self.text])
         if self.owui_origin_chat_id and self.__event_emitter__:
             # Lets a later cancel ask the page whether it was Stop or Send
             # now, and sends a message queued while this reply runs at once
