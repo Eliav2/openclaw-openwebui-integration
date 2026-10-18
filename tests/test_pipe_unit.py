@@ -5102,7 +5102,7 @@ class SecretAnswerNeverInTheChatTests(unittest.IsolatedAsyncioTestCase):
 
 class SecretNotReceivedTests(unittest.IsolatedAsyncioTestCase):
     """ELI-148: a secret whose dialog got no answer (no tab on the chat, a
-    timeout, a cancel) must not end the reply asking for it in the chat,
+    timeout; a cancel is SecretDialogCancelledTests) must not end the reply asking for it in the chat,
     which stores what is typed there. The reply says it was not received and
     how to enter it; the agent is told once that nothing came."""
 
@@ -5175,6 +5175,69 @@ class SecretNotReceivedTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(shown.count("not received"), 2)
         self.assertIn("Still need it.", shown)
         self.assert_never_invites_a_chat_answer(shown.replace("I need a key.", "").replace("Still need it.", ""))
+
+
+class SecretDialogCancelledTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-189: Cancel on the masked dialog resolves the event call with
+    False (Open WebUI 0.12.3 EventConfirmDialog `cancel`). The agent got the
+    answer "no" and the card said "•••• (secret entered)". The agent must
+    learn the user cancelled, and the card must say so."""
+
+    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
+    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
+    _queue = NoDroppedMessagesTests._queue
+    _delta = NoDroppedMessagesTests._delta
+    _final = NoDroppedMessagesTests._final
+    _until_registered = NoDroppedMessagesTests._until_registered
+    PROMPT = "OpenClaw needs input:\n\nToken\nPaste your API key (password)"
+
+    async def test_cancel_reaches_the_agent_as_a_cancel_and_the_card_says_cancelled(self):
+        async def emitter(event):
+            pass
+
+        async def event_call(event):
+            return False if event.get("type") == "input" else None    # the user clicks Cancel
+        body = {"model": "openclaw_gateway.default", "messages": [{"role": "user", "content": "deploy"}]}
+        meta = {"chat_id": "chat-1", "user_id": "u1", "message_id": "m1"}
+        gen = self.pipe._pipe_impl(body, emitter, __metadata__=meta, __event_call__=event_call)
+        chunks = []
+
+        async def drain():
+            async for c in gen:
+                chunks.append(c)
+        task = asyncio.ensure_future(drain())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "I need a key.\n\n" + self.PROMPT + "\n"))
+        q.put_nowait(self._final("run-1"))
+        for _ in range(400):
+            if len(self.sent) == 2:
+                break
+            await asyncio.sleep(0.005)
+        self.assertEqual(len(self.sent), 2, f"the agent hears back: {self.sent}")
+        told = self.sent[1]
+        self.assertNotEqual(told.strip().lower(), "no", "a cancel is not the answer 'no'")
+        self.assertIn("cancel", told.lower())
+        answer_run = next(r for r in ("run-2", self.keys[-1]) if f"{self.SK}:{r}" in self.conn._consumers)
+        q2 = self._queue(answer_run)
+        q2.put_nowait(self._delta(answer_run, "Understood, no key."))
+        q2.put_nowait(self._final(answer_run))
+        await asyncio.wait_for(task, 5)   # bounds the test only
+        shown = "".join(c for c in chunks if isinstance(c, str))
+        self.assertNotIn("secret entered", shown)
+        self.assertIn('result="Cancelled', shown)
+        self.assertIn("Understood, no key.", shown)
+
+    async def test_a_cancelled_card_rebuilt_from_the_transcript_says_cancelled(self):
+        """After an Open WebUI restart the card is rebuilt from what the agent
+        was sent, which the transcript prefixes with a time."""
+        async def event_call(event):
+            return False
+        told = await _ask_user_input_modal(event_call, self.PROMPT, owui_user_id=None, owui_chat_id="chat-1",
+                                           owui_message_id="m1", poll_interval_s=0.01)
+        block = _ask_user_detail_block(self.PROMPT, f"[Sat 10:00] {told}")
+        self.assertIn('result="Cancelled', block)
+        self.assertNotIn("secret entered", block)
 
 
 class DynamicModelSelectorTests(unittest.TestCase):

@@ -250,6 +250,14 @@ SECRET_NOT_RECEIVED_FOR_AGENT = (
     "what the user types. Use masked credential entry, or ask again when the user "
     "has this chat open."
 )
+# What the agent gets when the user cancels the secret's dialog (ELI-189),
+# and what the Ask User block shows for it.
+SECRET_CANCELLED_FOR_AGENT = (
+    "[Open WebUI] Cancelled: the user closed the masked dialog for the secret you "
+    "asked for without entering it, so nothing was received. Do not ask for it in "
+    "the chat, which stores what the user types."
+)
+SECRET_CANCELLED_SHOWN = "Cancelled (nothing entered)"
 
 _MULTI_MARKERS = (
     "(multiselect)", "(multi-select)", "(multi)", "[multiselect]", "[multi]",
@@ -689,6 +697,11 @@ async def _ask_user_secret(
         )
     except asyncio.TimeoutError:
         response = {"error": f"no answer in {timeout_s:g} s"}
+    if response is False:
+        # The dialog's Cancel (EventConfirmDialog resolves it with False),
+        # not a "no": the agent hears that the user cancelled.
+        pipe_log("  secret dialog cancelled by the user")
+        return SECRET_CANCELLED_FOR_AGENT
     answer = _normalize_event_call_response(response)
     if not answer:
         pipe_log(f"  secret dialog not answered ({_unanswered(response)}); the question ends the reply as text")
@@ -712,7 +725,9 @@ def _ask_user_detail_block(prompt_text: str, answer: str) -> str:
         # The agent was told nothing came: the reply shows the question as
         # not received, as an unanswered secret ends any reply.
         return "\n" + _secret_not_received_text(prompt_text) + "\n"
-    if _is_secret_prompt(prompt_text):
+    if SECRET_CANCELLED_FOR_AGENT in answer:
+        answer = SECRET_CANCELLED_SHOWN
+    elif _is_secret_prompt(prompt_text):
         # The block is written into the chat, so into Open WebUI's database.
         answer = SECRET_ANSWER_SHOWN
     if json_questions:
