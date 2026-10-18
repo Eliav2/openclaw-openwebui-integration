@@ -19,6 +19,19 @@ The agent also receives a provenance block naming the chat id, the user id and `
 
 Valve: [`AGENT_ID`](../configuration.md#agent_id) (default `main`). Leave it as `main` unless your Gateway defines other agents.
 
+## Edit, Regenerate and Clone
+
+The agent's memory of a chat is a single line of messages: each time you send, the Pipe passes on only your newest message, and the agent adds it to what it already has. Open WebUI's branching tools change what you see, but not what the agent remembers:
+
+- **Edit a message:** the edited text reaches the agent as a new message. It still remembers your original message and its answer to it.
+- **Regenerate a reply:** the agent receives the same message a second time, right after its earlier answer, and it remembers both answers.
+- **Switch branches** with the arrows under a message: the agent is not told. Your next message is added to everything it already remembers, whichever branch you are looking at.
+- **Clone a chat** (or copy it into a new chat any other way): the copy is a new chat, so it gets a fresh session. The agent starts it with no memory of the copied messages, even though you can see them.
+
+Background work started from a chat (scheduled jobs, sub-agents) stays tied to the original chat, never to its clone.
+
+For a clean start, open a new chat. If the agent seems to be answering an older version of the conversation, tell it what changed in your next message.
+
 ## Model picker
 
 <img src="../img/model-picker-light.png" alt="The model dropdown open: OpenClaw · Default, then the models discovered from the Gateway" width="320">
