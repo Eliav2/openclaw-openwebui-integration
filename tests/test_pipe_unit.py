@@ -2433,9 +2433,126 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         await nxt
         await r3.aclose()
 
+    def _record_status_closes(self):
+        """The replies whose open status line was closed after they ended."""
+        closed = []
+
+        async def close(ref):
+            closed.append(ref.get("message_id"))
+        patch = mock.patch.object(self.ocp, "_close_reply_status", close, create=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return closed
+
+    def _question_reply(self, msg_id):
+        """A reply whose run ends on a question; its card is cancelled."""
+        self.emitted = getattr(self, "emitted", [])
+
+        async def emitter(event):
+            self.emitted.append(event)
+
+        async def event_call(event):
+            if event.get("type") == "request:user_input":
+                return {"status": "cancelled", "answers": {}}
+            return None
+        body = {"model": "openclaw_gateway.default",
+                "messages": [{"role": "user", "content": "ask me"}]}
+        meta = {"chat_id": "chat-1", "user_id": "u1", "message_id": msg_id, "task_id": "task-1"}
+        return self.pipe._pipe_impl(body, emitter, __metadata__=meta, __event_call__=event_call)
+
+    async def test_a_reply_stopped_as_it_ends_closes_its_status(self):
+        """ELI-200 (QA, live 2026-10-18 16:37): a question card is open, and a
+        message is sent instead of pressing its Cancel. The card is cancelled,
+        the question ends the reply as text, and the reply goes on to its end:
+        its last status line waits for the usage rows (two Gateway calls).
+        Open WebUI's Stop for the new message cancels the reply right there,
+        so that line was never written: the reply was saved done with its
+        status still "Thinking..." (done: false), shimmering forever, also
+        after a reload. Its run was over, so nothing was parked either."""
+        closed = self._record_status_closes()
+        rows_asked = asyncio.Event()
+
+        async def usage_rows(*a, **k):
+            rows_asked.set()
+            await asyncio.Event().wait()   # the Gateway calls, under way when Stop lands
+        patch = mock.patch.object(self.ocp, "_build_usage_status_lines", usage_rows)
+        patch.start()
+        self.addCleanup(patch.stop)
+        gen = self._question_reply("m1")
+        out = []
+
+        async def owui_reads():          # Open WebUI's request task reading the stream
+            async for chunk in gen:
+                out.append(chunk)
+        reader = asyncio.ensure_future(owui_reads())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b"))
+        q.put_nowait(self._final("run-1"))
+        await asyncio.wait_for(rows_asked.wait(), 30)
+        self.assertIn("Which?", "".join(c for c in out if isinstance(c, str)))
+        reader.cancel()                  # the Stop that sends the new message
+        with self.assertRaises(asyncio.CancelledError):
+            await reader
+        await self._spin()
+        statuses = [e["data"] for e in self.emitted if e.get("type") == "status"]
+        self.assertFalse(statuses[-1]["done"], f"precondition: the reply's status is open: {statuses}")
+        self.assertEqual(closed, ["m1"])
+
+    async def test_a_reply_that_ended_leaves_its_last_status_alone(self):
+        """Control: a reply that wrote its last status (usage lines, or an
+        empty done one) before it was closed keeps it."""
+        closed = self._record_status_closes()
+        gen = self._reply("hello", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        self._queue("run-1").put_nowait(self._delta("run-1", "hi"))
+        self._queue("run-1").put_nowait(self._final("run-1"))
+        await asyncio.wait_for(first, 30)
+        async for _ in gen:
+            pass
+        statuses = [e["data"] for e in self.emitted if e.get("type") == "status"]
+        self.assertTrue(statuses[-1]["done"])
+        await gen.aclose()
+        await self._spin()
+        self.assertEqual(closed, [])
+
 
 class CloseUnsentReplyTests(unittest.IsolatedAsyncioTestCase):
     """`_close_unsent_reply` (ELI-188): the interrupted reply's last write."""
+
+    async def test_the_open_status_is_closed_and_saved_after_the_request(self):
+        """`_close_reply_status` (ELI-200): after Open WebUI's own save at the
+        end of the request, a done status, saved (update_db) so a reload
+        shows the line ended too."""
+        import openclaw_pipe as ocp
+        events, order = [], []
+
+        async def get_event_emitter(meta, update_db=True):
+            async def emit(event):
+                order.append(event["type"])
+                events.append((meta["message_id"], update_db, copy.deepcopy(event)))
+            return emit
+        release = asyncio.Event()
+
+        async def request():
+            await release.wait()
+            order.append("request-ended")
+        req = asyncio.ensure_future(request())
+        tasks_mod = types.ModuleType("open_webui.tasks")
+        tasks_mod.tasks = {"task-1": req}
+        modules = {**owui_modules(get_event_emitter=get_event_emitter), "open_webui.tasks": tasks_mod}
+        with mock.patch.dict(sys.modules, modules):
+            close = asyncio.ensure_future(ocp._close_reply_status(
+                {"chat_id": "chat-1", "user_id": "u1", "message_id": "m1", "request_task_id": "task-1"}))
+            for _ in range(20):
+                await asyncio.sleep(0)
+            self.assertEqual(order, [])
+            release.set()
+            await asyncio.wait_for(close, 5)
+        self.assertEqual(order, ["request-ended", "status"])
+        self.assertEqual(events, [("m1", True, {"type": "status",
+                                                "data": {"description": "", "done": True}})])
 
     async def test_it_waits_for_the_request_then_ends_the_message_with_the_note(self):
         import openclaw_pipe as ocp

@@ -7302,6 +7302,26 @@ REPLY_SENT_WITH_NEXT_NOTE = ("_(This message was sent together with your next on
 REPLY_NOT_SENT_NOTE = "_(Stopped: this message was not sent to the agent.)_"
 
 
+async def _close_reply_status(ref: dict) -> None:
+    """Close the status line reply `ref` ({chat_id, user_id, message_id,
+    request_task_id}) left open when it was closed with nothing left to do
+    (ELI-200): saved, so a reload shows it ended too. After the request's
+    own end-of-stream save, like `_close_unsent_reply`."""
+    request = _owui_request_task(ref.get("request_task_id"))
+    if request is not None and not request.done():
+        await asyncio.wait({request})
+    from open_webui.socket.main import get_event_emitter
+
+    message_id = ref["message_id"]
+    try:
+        emit = await get_event_emitter({"chat_id": ref["chat_id"], "message_id": message_id,
+                                        "user_id": ref.get("user_id")}, update_db=True)
+        await emit({"type": "status", "data": {"description": "", "done": True}})
+        pipe_log(f"  reply {message_id[:8]}... closed: its status line was left open")
+    except Exception as ex:
+        pipe_log(f"  reply {message_id[:8]}...: closing its status failed: {ex!r}")
+
+
 async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str) -> None:
     """End reply `ref` ({chat_id, user_id, message_id, request_task_id}), which
     was cancelled before it sent its message, with `note`: its "Queued" status
@@ -10200,13 +10220,15 @@ class _TurnState:
     own Open WebUI message ({chat_id, user_id, message_id, request_task_id});
     `waiting` are the earlier replies, cancelled before they sent their
     message, whose messages are among `unsent`: each is ended with a note
-    once those messages are sent, or dropped (ELI-188).
+    once those messages are sent, or dropped (ELI-188). `status_open`: the
+    last status line the reply showed is not done yet.
     """
     conn: object = None
     session_key: str | None = None
     chat_id: str | None = None
     reply: dict | None = None
     waiting: list = field(default_factory=list)
+    status_open: bool = False
     unsent: list = field(default_factory=list)
     run_id: str | None = None
     queue: object = None
@@ -10657,9 +10679,15 @@ class Pipe:
         `_waiting` are the replies those messages came from (`_TurnState`).
         """
         turn = _TurnState(waiting=list(_waiting or []))
+        emitter = None
+        if __event_emitter__:
+            async def emitter(event):
+                if isinstance(event, dict) and event.get("type") == "status":
+                    turn.status_open = not (event.get("data") or {}).get("done")
+                await __event_emitter__(event)
         try:
             async with contextlib.aclosing(self._pipe_turn(
-                body, __event_emitter__, __event_call__=__event_call__,
+                body, emitter, __event_call__=__event_call__,
                 __user__=__user__, __metadata__=__metadata__,
                 __request__=__request__, __task__=__task__,
                 __task_body__=__task_body__,
@@ -10692,6 +10720,12 @@ class Pipe:
                         turn.run_id, turn.chat_id, __event_call__),
                     waiting=waiting,
                 )
+            elif not turn.parked and turn.status_open and turn.reply:
+                # Nothing left to hand on (its run is over: a question card
+                # cancelled by sending a new message, ELI-200), but its status
+                # line still shows work going on, and nothing else ends it.
+                pipe_log(f"Reply {type(stop).__name__} with its status line open: closing it")
+                spawn_background(_close_reply_status(turn.reply))
             raise
 
     async def _pipe_turn(self, body, __event_emitter__, __event_call__=None,

@@ -175,13 +175,15 @@ class _TurnState:
     own Open WebUI message ({chat_id, user_id, message_id, request_task_id});
     `waiting` are the earlier replies, cancelled before they sent their
     message, whose messages are among `unsent`: each is ended with a note
-    once those messages are sent, or dropped (ELI-188).
+    once those messages are sent, or dropped (ELI-188). `status_open`: the
+    last status line the reply showed is not done yet.
     """
     conn: object = None
     session_key: str | None = None
     chat_id: str | None = None
     reply: dict | None = None
     waiting: list = field(default_factory=list)
+    status_open: bool = False
     unsent: list = field(default_factory=list)
     run_id: str | None = None
     queue: object = None
@@ -632,9 +634,15 @@ class Pipe:
         `_waiting` are the replies those messages came from (`_TurnState`).
         """
         turn = _TurnState(waiting=list(_waiting or []))
+        emitter = None
+        if __event_emitter__:
+            async def emitter(event):
+                if isinstance(event, dict) and event.get("type") == "status":
+                    turn.status_open = not (event.get("data") or {}).get("done")
+                await __event_emitter__(event)
         try:
             async with contextlib.aclosing(self._pipe_turn(
-                body, __event_emitter__, __event_call__=__event_call__,
+                body, emitter, __event_call__=__event_call__,
                 __user__=__user__, __metadata__=__metadata__,
                 __request__=__request__, __task__=__task__,
                 __task_body__=__task_body__,
@@ -667,6 +675,12 @@ class Pipe:
                         turn.run_id, turn.chat_id, __event_call__),
                     waiting=waiting,
                 )
+            elif not turn.parked and turn.status_open and turn.reply:
+                # Nothing left to hand on (its run is over: a question card
+                # cancelled by sending a new message, ELI-200), but its status
+                # line still shows work going on, and nothing else ends it.
+                pipe_log(f"Reply {type(stop).__name__} with its status line open: closing it")
+                spawn_background(_close_reply_status(turn.reply))
             raise
 
     async def _pipe_turn(self, body, __event_emitter__, __event_call__=None,
