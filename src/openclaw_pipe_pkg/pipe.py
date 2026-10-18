@@ -9,6 +9,8 @@
 # (and "done"), so a `not in (done, failed, cancelled)` test would treat every
 # resting session as active and hang every message. Only these gate the queue.
 _ACTIVE_RUN_STATES = ("active", "running", "streaming", "queued")
+# The Gateway's secret requests are asked in the chat (askuser.py, ELI-96).
+_QUESTION_HOOKS = (secret_request_seen, secret_request_resolved)
 
 
 def _session_active_from_signals(describe_status, list_has_active_run) -> bool:
@@ -662,12 +664,15 @@ class _PipeTurn:
         self.ended = False
 
     async def run(self):
-        for phase in (self.prepare, self.admit, self.consume, self.finish):
-            async with contextlib.aclosing(phase()) as items:
-                async for item in items:
-                    yield item
-            if self.ended:
-                return
+        try:
+            for phase in (self.prepare, self.admit, self.consume, self.finish):
+                async with contextlib.aclosing(phase()) as items:
+                    async for item in items:
+                        yield item
+                if self.ended:
+                    return
+        finally:
+            _secret_asker_leave(self)
 
     async def prepare(self):
         """The message, the connection, the session key, a cancelled reply's
@@ -1144,6 +1149,8 @@ class _PipeTurn:
 
     async def consume(self):
         """The run's events, until its end, a handover or a cancel."""
+        # A secret the run requests is asked on this reply's socket (ELI-96).
+        _secret_asker_join(self)
         # --- Consume events ---
         self.done = False
         self.event_count = 0

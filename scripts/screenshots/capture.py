@@ -301,6 +301,13 @@ def gateway_call(method: str, params: dict) -> dict:
     return json.loads(out.stdout[out.stdout.find("{"):])
 
 
+def gateway_release() -> tuple:
+    """(year, month, patch) of the stack's OpenClaw: some shots need a newer one."""
+    out = subprocess.run(["openclaw", "--version"], capture_output=True, text=True, timeout=60)
+    m = re.search(r"(\d{4})\.(\d{1,2})\.(\d+)", out.stdout)
+    return tuple(int(n) for n in m.groups()) if m else (0, 0, 0)
+
+
 def add_chat_automation(session_key: str) -> str:
     """A daily automation that runs in this chat (ELI-163), next due
     tomorrow morning; its id, to remove it after the scene."""
@@ -583,6 +590,19 @@ class Scenes:
                 "the question card with its options")
         set_title(self.token, chat, "CI for the forecast app")
         self.s.shot(page, "question-card")
+
+    def secret_request(self, page: Page) -> None:
+        """The masked dialog for a secret the agent requests (OpenClaw 2026.10.10+)."""
+        new_chat(page)
+        chat = send(page, "Save my weather API key for the forecast app")
+        # Open WebUI's SensitiveInput masks with its `password` class until
+        # its eye button is pressed.
+        wait_js(page, "() => !!document.querySelector('#event-confirm-input.password')",
+                "the masked secret dialog")
+        set_title(self.token, chat, "Weather API key")
+        page.locator("#event-confirm-input").fill("wk-8c1f3a9d0b")
+        self.s.shot(page, "secret-request")
+        page.get_by_role("button", name="Cancel").click()
 
     def status_and_drawer(self, page: Page) -> None:
         """#3 status-dialog with two running sub-agents, #4 subagent-drawer."""
@@ -1221,6 +1241,8 @@ def main(argv=None) -> int:
                 shooter.run("composer-status", scenes.composer_status, page)
                 shooter.run("thinking-toggle", scenes.thinking, page)
             shooter.run("question-card", scenes.question, page)
+            if gateway_release() >= (2026, 10, 10):
+                shooter.run("secret-request", scenes.secret_request, page)
             shooter.run("status-dialog", scenes.status_and_drawer, page)
             shooter.run("subagents-long", scenes.subagents_long, page)
             shooter.run("status-background", scenes.background, page)

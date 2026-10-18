@@ -491,6 +491,26 @@
           "delay": 0.6
         }
       ]
+    },
+    {
+      "match": "Save my weather API key",
+      "steps": [
+        {
+          "say": "I'll ask for it in a masked field, so it stays out of the chat.",
+          "tool": "secrets",
+          "args": {
+            "action": "request",
+            "name": "WEATHER_API_KEY",
+            "reason": "To fetch the hourly forecast for the forecast app",
+            "allowedHosts": [
+              "api.weather.gov"
+            ]
+          }
+        },
+        {
+          "say": "Stored WEATHER_API_KEY. The forecast app can call the weather service with it now."
+        }
+      ]
     }
   ]
 }

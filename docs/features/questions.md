@@ -1,4 +1,4 @@
-When the agent needs an answer mid-run, you get a real question card or dialog in Open WebUI instead of a wall of text nobody can answer. It survives a reload, and once answered the run continues in the same reply.
+When the agent needs an answer mid-run, you get a real question card or dialog in Open WebUI instead of a wall of text nobody can answer, and a secret it requests is entered in a masked dialog that keeps it out of the chat. It survives a reload, and once answered the run continues in the same reply.
 
 Applies to: Pipe
 
@@ -45,6 +45,21 @@ While it waits you can reload or switch away and come back:
 - **Secret dialog:** the same as the card: shown once, and a reload moves it to the reloaded tab. If it is not answered within 4 minutes, is cancelled, or no tab views the chat, the reply says the secret was not received, without asking for it: anything typed into the chat is stored in it. The agent is told once that nothing came, so it can ask again (the dialog shows again on a tab with the chat open) or use masked credential entry.
 
 If you cancel any other question, or it ends as text, the question stays in the reply as ordinary text with the trigger removed (a JSON form as its numbered questions with their options), so nothing is lost. Answer it with a normal message.
+
+## Secrets the agent requests
+
+_Needs OpenClaw 2026.10.10 or later. On an older Gateway the request is left to the Control UI, as before: a secret stored there cannot be used by the agent's runs yet._
+
+When the agent asks for a credential with OpenClaw's `secrets` tool (`action: request`), the Pipe shows the same masked dialog on the chat's tab, titled with the secret's name, the agent's reason and the hosts it may be sent to.
+
+![The masked dialog for a secret the agent requested: its name, the reason, the allowed hosts and a password field](../img/secret-request-light.png)
+
+What you type goes straight to the Gateway's secret store (`question.resolve`). It is never in the chat, Open WebUI's database, the Pipe's log, the transcript or the model's context: the agent gets only `stored` and a reference to the secret. A toast says `stored` or `cancelled`.
+
+- **Cancel:** the agent is told the request was cancelled and nothing is stored.
+- **No answer:** the dialog waits until the request expires (the agent's `timeoutSeconds`, 15 minutes by default), then the agent is told no credential arrived. It is shown like the secret dialog above: on the reply's tab, moved once to a reloaded tab.
+- **Answered elsewhere** (the Control UI): the dialog's wait ends and its answer is dropped.
+- **A user not in `OWNER_USERS`:** not asked. The secret store is the owner's, so a guest's chat cannot write into it; the request is left to the Control UI.
 
 ## Questions in replies the agent starts
 

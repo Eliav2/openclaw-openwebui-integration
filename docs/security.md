@@ -22,6 +22,8 @@ Where copies of them end up:
 
 Do not commit, paste or share any of them. Leave them out of bug reports.
 
+A secret the agent requests with OpenClaw's `secrets` tool is entered in a masked dialog and goes from it straight to the Gateway's secret store: the Pipe never writes, emits or logs it, and only an owner's chat is asked. See [Secrets the agent requests](./features/questions.md#secrets-the-agent-requests).
+
 If you think a device identity leaked, revoke it and pair a new one. On the Gateway host:
 
 ```bash

@@ -1174,6 +1174,7 @@ class _Page:
         self.token = token
         self.socket_id = None
         self.events: list = []          # (time.monotonic(), event payload)
+        self.calls: list = []           # (ack id, event payload): an event call waiting for its answer
         self.cond = threading.Condition()
         threading.Thread(target=self._read, daemon=True).start()
         self.wait("the socket.io connect", lambda: self.socket_id, 30)
@@ -1194,6 +1195,7 @@ class _Page:
                     self.cond.notify_all()
             elif raw.startswith("42"):
                 body = raw[2:].lstrip("0123456789")
+                ack_id = raw[2:len(raw) - len(body)]
                 try:
                     name, *args = json.loads(body)
                 except ValueError:
@@ -1201,6 +1203,8 @@ class _Page:
                 if name == "events" and args and isinstance(args[0], dict):
                     with self.cond:
                         self.events.append((time.monotonic(), args[0]))
+                        if ack_id:
+                            self.calls.append((ack_id, args[0]))
                         self.cond.notify_all()
 
     def wait(self, what: str, check, timeout_s: float = TURN_TIMEOUT_S):
@@ -1251,6 +1255,15 @@ class _Page:
             out.append(f"  {t - since:7.2f}s {(e.get('data') or {}).get('type')} {d.get('type', '')} "
                        f"{str(ident)[-12:]} {shown!r}")
         return f"{len(rows)} event(s) for {message_id[:8]}:\n" + "\n".join(out)
+
+    def call_of_type(self, kind: str):
+        """The first event call whose data has this type: (ack id, payload)."""
+        with self.cond:
+            return next(((a, e) for a, e in self.calls if (e.get("data") or {}).get("type") == kind), None)
+
+    def answer(self, ack_id: str, value) -> None:
+        """Answer an event call, as the tab does when its dialog is submitted."""
+        self.ws.send("43" + ack_id + json.dumps([value]))
 
     def close(self) -> None:
         self.ws.close()
@@ -1457,5 +1470,96 @@ def test_a_plain_redeploy_mid_reply_leaves_the_reply_whole(token, redeploy):
         assert not problems, "\n".join(problems) + "\nsaved replies:\n" + "\n".join(
             f"  {m['id'][:8]} done={m.get('done')} items={[i.get('type') for i in m.get('output') or []]} "
             f"text={_shown(m)!r}" for m in replies)
+    finally:
+        page.close()
+
+
+# ── ELI-96: a secret the agent requests is entered in a masked dialog ──────
+
+def _hits(needle: str) -> dict:
+    """How often `needle` shows up, by place: Open WebUI's database (with its
+    WAL) and backend log (the Pipe logs there), the Gateway's logs, the fake
+    model's request log (the model's context) and the session transcripts
+    (`.jsonl` up to 2026.9, the agent databases from 2026.10). The secret
+    store itself (the state database) is where the value belongs, so it is
+    not read."""
+    raw = needle.encode()
+    hits = {}
+    for path in ("/app/backend/data/webui.db", "/app/backend/data/webui.db-wal"):
+        out = subprocess.run(["docker", "exec", "owui", "cat", path], capture_output=True, timeout=60)
+        hits[f"owui {path}"] = out.stdout.count(raw)
+    out = subprocess.run(["docker", "logs", "owui"], capture_output=True, timeout=60)
+    hits["owui backend log (Pipe log)"] = (out.stdout + out.stderr).count(raw)
+    log_dir = os.environ.get("E2E_LOG_DIR", "")
+    files = {"gateway stdout": os.path.join(log_dir, "gateway.log") if log_dir else "",
+             "gateway file log": os.environ.get("E2E_GATEWAY_LOG")
+             or time.strftime("/tmp/openclaw/openclaw-%Y-%m-%d.log"),
+             "model requests": os.environ.get("E2E_FAKE_LLM_LOG", "")}
+    for root, _, names in os.walk(os.path.expanduser("~/.openclaw/agents")):
+        for n in names:
+            if n.endswith(".jsonl") or n.startswith("openclaw-agent.sqlite"):
+                files[f"transcript {n}"] = os.path.join(root, n)
+    for place, path in files.items():
+        if path and os.path.isfile(path):
+            with open(path, "rb") as fh:
+                hits[place] = hits.get(place, 0) + fh.read().count(raw)
+    return hits
+
+
+def test_a_requested_secret_is_entered_in_a_masked_dialog_and_kept_out_of_the_chat(token):
+    """The agent's `secrets` request shows Open WebUI's masked input dialog
+    on the chat's tab. The value typed there goes to the Gateway's secret
+    store, the agent gets "stored", and the value is nowhere else: not in
+    Open WebUI's database or logs, the Gateway's logs, the transcript or the
+    model's context."""
+    if _openclaw_release() < (2026, 10):
+        pytest.skip("OpenClaw 2026.9 stores a requested secret, but no run can use it (ELI-97): "
+                    "the Pipe leaves the request to the Control UI there, as before")
+    import secrets as _secrets
+    name = f"DUMMY_SECRET_ELI96_{uuid.uuid4().hex[:6].upper()}"
+    value = _secrets.token_urlsafe(30)   # 40 characters
+    page = _Page(token)
+    try:
+        chat_id, aid = _send_in_chat(token, page, None, f"E2E_SECRET_REQUEST {name}")
+        ack_id, call = page.wait("the masked dialog", lambda: page.call_of_type("input"), 45)
+        dialog = call["data"]["data"]
+        assert dialog.get("type") == "password", dialog
+        assert name in (dialog.get("title", "") + dialog.get("message", "")), dialog
+        page.answer(ack_id, value)
+        msgs = _wait_for(token, chat_id, ["E2E_SECRET_RESULT stored"])
+        listed = _gw("secrets.store.list", {})
+        assert any(e.get("name") == name for e in listed.get("entries") or []), listed
+        # The scan reads the right files: the request (its name) is in the
+        # transcript, the chat and the model's context.
+        found = _hits(name)
+        for place in ("owui /app/backend/data/webui.db", "model requests"):
+            assert found.get(place) or found.get(place + "-wal"), found
+        assert any(v for k, v in found.items() if k.startswith("transcript")), found
+        hits = _hits(value)
+        assert hits and set(hits.values()) == {0}, {k: v for k, v in hits.items() if v}
+        assert value not in json.dumps(msgs)
+        with page.cond:
+            others = [e for _, e in page.events if value in json.dumps(e)]
+        assert not others, "the value came back to the page in an event"
+    finally:
+        page.close()
+        try:
+            _gw("secrets.store.delete", {"name": name})
+        except AssertionError:
+            pass
+
+
+def test_a_cancelled_secret_dialog_tells_the_agent_no_credential_came(token):
+    if _openclaw_release() < (2026, 10):
+        pytest.skip("OpenClaw 2026.9: the Pipe leaves a secret request to the Control UI (ELI-97)")
+    name = f"DUMMY_SECRET_ELI96_{uuid.uuid4().hex[:6].upper()}"
+    page = _Page(token)
+    try:
+        chat_id, _ = _send_in_chat(token, page, None, f"E2E_SECRET_REQUEST {name}")
+        ack_id, _ = page.wait("the masked dialog", lambda: page.call_of_type("input"), 45)
+        page.answer(ack_id, False)       # what Open WebUI's dialog answers on Cancel
+        _wait_for(token, chat_id, ["E2E_SECRET_RESULT no_answer"])
+        listed = _gw("secrets.store.list", {})
+        assert not any(e.get("name") == name for e in listed.get("entries") or []), listed
     finally:
         page.close()
