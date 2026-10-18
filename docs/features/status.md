@@ -104,7 +104,7 @@ Each row is one line: the sub-agent's spawn label (else the first sentence of it
 
 <img src="../img/subagent-drawer-light.png" alt="A running sub-agent's drawer on a phone: its name, status and time, its model and the chat it came from, the head of its task, then its run so far with a tool card opened and the step it is on" width="320">
 
-Click a sub-agent to open its drawer: a side panel, or on a phone a full-screen sheet with a **‹ Back** button. The top is a short header: the sub-agent's name, its status and its time; its model and the chat it came from (a link; for a sub-agent spawned by another sub-agent, its parent's drawer); and the first two lines of its task, with "Show all".
+Click a sub-agent to open its drawer: a side panel, or on a phone a full-screen sheet with a **‹ Back** button. The top is a short header: the sub-agent's name, its status and its time; its model and the chat it came from (a link; for a sub-agent spawned by another sub-agent, its parent's drawer); and the first two lines of its task, with "Show all". Shown whole, a long task scrolls in its own box of up to 40% of the screen, so the run below it and the close button stay in reach.
 
 Below the header is the sub-agent's run as a read-only chat, oldest first: what it said, every tool call as a collapsed card (tap it for the input and the output; a failed one is marked ❌, as in the chat), any message it was sent after its task, and its reply last. The cards are the same ones the chat shows for a run, drawn from the same transcript the same way. There is no composer.
 

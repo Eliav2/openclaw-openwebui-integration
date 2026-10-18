@@ -48,6 +48,7 @@ and only a core set is sent as real schemas.
   the foreground until the file `hold-TOKEN` next to $FAKE_LLM_LOG exists
   (90 s at most), then replies `E2E_HOLD_END`: a run that goes on until the
   test lets it end, or stops it.
+* `E2E_SPAWN_LONG`                     -> `E2E_SPAWN` with a task 121 lines long.
 * `E2E_SLOW TOKEN`                     -> replies `TOKEN slow-1 ... slow-10`, one
   word a second, so a turn can be queued behind a run that is still going.
   `E2E_SLOW:<n> TOKEN` sends n words instead of 10 (a run that outlasts an
@@ -140,6 +141,9 @@ _HOLD = re.compile(r"E2E_HOLD ([A-Za-z0-9_]{3,})")
 _SLOW = re.compile(r"E2E_SLOW(?::(\d{1,3}))?\s+([A-Za-z0-9_]{3,})")
 SLOW_WORDS = 10
 SPAWN_TASK = "E2E_SLOW:20 E2E_CHILDTASK"   # the sub-agent's task for E2E_SPAWN
+# E2E_SPAWN_LONG's task: far taller than any screen once shown whole.
+LONG_SPAWN_TASK = SPAWN_TASK + "\n" + "\n".join(
+    f"Step {i}: check the vendor's data plan, its history window and its support terms." for i in range(1, 121))
 TITLE = "🧪 E2E chat title"
 DEPLOY_MID = "E2E_DEPLOY_MID " + " ".join(f"mid-{i}" for i in range(1, 21))
 DEPLOY_END = "E2E_DEPLOY_END " + " ".join(f"end-{i}" for i in range(1, 11))
@@ -443,7 +447,7 @@ def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
         # while the test reads the Status Action's Subagents section.
         if tool_results:
             return {"text": "E2E_SPAWNED"}
-        args = {"task": SPAWN_TASK}
+        args = {"task": LONG_SPAWN_TASK if "E2E_SPAWN_LONG" in user_text else SPAWN_TASK}
         if "sessions_spawn" in offered:
             return {"tool": "sessions_spawn", "args": args}
         for wrapper in DEFERRED_CALL_TOOLS:

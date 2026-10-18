@@ -819,6 +819,56 @@ def test_the_status_dialog_lists_a_background_agent_while_its_reply_runs(page):
     os.remove(gate)
 
 
+# The drawer's close control (× on a wide screen, ‹ Back on a phone) is on
+# screen and is what a tap at its centre reaches; and the task shown whole
+# scrolls inside its own box, which ends on screen.
+DRAWER_CLOSABLE = """() => {
+  const root = document.getElementById('openclaw-drawer-root');
+  const close = root && [...root.querySelectorAll('button')].find(b => /^(×|‹ Back)$/.test(b.textContent.trim()));
+  const body = root && root.querySelector('#openclaw-drawer-task [data-openclaw-block-text]');
+  if (!close || !body) return 'no close control or task text';
+  const r = close.getBoundingClientRect();
+  const W = innerWidth, H = innerHeight;
+  if (r.top < 0 || r.left < 0 || r.bottom > H || r.right > W) return 'close off screen: ' + JSON.stringify(r);
+  const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+  if (!hit || !close.contains(hit)) return 'close covered by ' + (hit ? hit.outerHTML.slice(0, 80) : null);
+  const b = body.getBoundingClientRect();
+  if (b.bottom > H) return 'task text runs off screen: bottom ' + b.bottom + ' > ' + H;
+  if (body.scrollHeight <= body.clientHeight) return 'task text does not scroll';
+  return 'ok';
+}"""
+
+
+@pytest.mark.parametrize("screen", ["desktop", "phone"])
+def test_a_long_task_shown_whole_keeps_the_drawer_closable(page, token, screen):
+    """Sub-agent drawer, "Show all" on a long task (ELI-201): the task grew
+    with no cap, past the bottom of the screen, and Eliav could not close the
+    drawer. Shown whole, it scrolls in its own box and the close control
+    stays in reach."""
+    view = page if screen == "desktop" else capture.signed_in_page(page.context.browser, token, capture.SMALL_PHONE)
+    try:
+        capture.new_chat(view)
+        capture.send(view, "E2E_SPAWN_LONG one helper")
+        _wait(view, _turn_over("E2E_SPAWNED"), "the parent's reply")
+        _open_status(view)
+        section = "#openclaw-status-section-subagents"
+        _wait(view, f"""() => {{ const s = document.querySelector('{section}');
+                         return !!s && s.innerText.includes('E2E_CHILDTASK'); }}""",
+              "the sub-agent in the Status dialog", 60_000)
+        view.locator(f"{section} button", has_text="E2E_CHILDTASK").first.click()
+        view.wait_for_selector('#openclaw-drawer-root [data-openclaw-more="task"]', timeout=30_000)
+        view.locator('#openclaw-drawer-root [data-openclaw-more="task"]').click()
+        _wait(view, """() => (document.querySelector('[data-openclaw-more="task"]') || {}).textContent === 'Show less'""",
+              "the task shown whole", 10_000)
+        verdict = view.evaluate(DRAWER_CLOSABLE)
+        assert verdict == "ok", verdict
+        view.locator("#openclaw-drawer-root button", has_text=re.compile(r"^(×|‹ Back)$")).click()
+        _wait(view, "() => !document.getElementById('openclaw-drawer-root')", "the drawer closed", 10_000)
+    finally:
+        if view is not page:
+            view.close()
+
+
 def _chat_id(page) -> str:
     m = re.search(r"/c/([0-9a-f-]{36})", page.url)
     assert m, f"no chat id in {page.url}"
