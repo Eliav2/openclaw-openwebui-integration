@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Guards for the bundle build: no drift, and the two hard OWUI constraints.
 
-Run: python3 -m unittest test_build -v
+Run: python3 -m pytest -q tests/test_build.py
 """
 import ast
 import builtins
@@ -13,7 +13,7 @@ from pathlib import Path
 
 import build as build_mod
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 BUILT = ROOT / "openclaw_pipe.py"
 ACTION_BUILT = ROOT / "openclaw_status_action.py"
 PKG = ROOT / "src" / "openclaw_pipe_pkg"

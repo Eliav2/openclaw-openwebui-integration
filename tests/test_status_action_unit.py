@@ -1040,7 +1040,7 @@ class DrawerRunItemsTests(unittest.TestCase):
         the chat's rebuild makes, in both shapes. A recorded DeepSeek run (the
         Gateway's own runtime) and a claude-cli run with a failed call."""
         from openclaw_status_action import _history_renderer
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_fixture_native_history.json")
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "test_fixture_native_history.json")
         with open(path) as f:
             native = json.load(f)["messages"]
         cli = [

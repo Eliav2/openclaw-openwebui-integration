@@ -5,7 +5,7 @@ Runs against the BUILT artifact, not the fragment, because the artifact is what
 Open WebUI actually loads. A fragment that passes and an artifact that does not
 is the failure mode a build step invites, so the build is part of the test.
 
-    python3 -m pytest test_thinking_unit.py
+    python3 -m pytest tests/test_thinking_unit.py
 """
 
 import importlib.util
@@ -18,7 +18,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 ARTIFACT = ROOT / "openclaw_thinking_filter.py"
 
 # Precondition, checked before anything else: this suite exercises the real

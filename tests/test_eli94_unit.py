@@ -8,7 +8,7 @@ messages. DESIGN-agent-turns.md case 4: the session's `updatedAt` is newer
 than the chat's `updated_at`, so `chat.history` is read and a run that closed
 after the chat was last written gets its message rebuilt from the transcript.
 
-Run: python3 -m pytest -q test_eli94_unit.py
+Run: python3 -m pytest -q tests/test_eli94_unit.py
 """
 import asyncio
 import copy
@@ -284,7 +284,7 @@ class AskReplyEndedWhileDownTests(_EndedWhileDownCase):
         super().setUp()
         import json
         import os
-        raw = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+        raw = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures",
                                 "test_fixture_eli94_ask_rebuild.json")).read()
         for real, test_id in self.REAL.items():
             raw = raw.replace(real, test_id)

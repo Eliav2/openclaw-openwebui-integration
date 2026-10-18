@@ -6,7 +6,7 @@ import os
 import unittest
 from unittest import mock
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _spec = importlib.util.spec_from_file_location(
     "owui_api", os.path.join(ROOT, "scripts", "owui_api.py"),
 )

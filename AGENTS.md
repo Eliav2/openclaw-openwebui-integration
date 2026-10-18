@@ -30,7 +30,7 @@ Every PR description has a `Docs:` line: what it updated, or "no change needed" 
 
 A PR that removes a feature removes its bullet, its section, its scene and its images in the same change, as the no-legacy rule says.
 
-`test_docs_unit.py` fails on a broken link, an unused or oversized image, an image without a width or wider than its kind allows, an em dash, or a tested version that differs from `e2e/versions.env`. It cannot tell whether a feature is documented: reviewers check that against the list above.
+`tests/test_docs_unit.py` fails on a broken link, an unused or oversized image, an image without a width or wider than its kind allows, an em dash, or a tested version that differs from `e2e/versions.env`. It cannot tell whether a feature is documented: reviewers check that against the list above.
 
 ## User flows have a browser test
 

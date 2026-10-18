@@ -7,7 +7,7 @@ them into an ephemeral env). These tests stub both modules just enough to
 import install.py directly, the same way test_file_server_unit.py stubs
 websockets/cryptography/pydantic to import pipe.py fragments in isolation.
 
-Run: python3 -m unittest test_install_unit -v
+Run: python3 -m pytest -q tests/test_install_unit.py
 """
 import http.server
 import shutil
@@ -18,7 +18,7 @@ import types
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _install_stub_modules():

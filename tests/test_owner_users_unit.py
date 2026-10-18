@@ -2,7 +2,7 @@
 over a second connection without operator.admin, so the Gateway does not
 treat that user's turns as the owner's and withholds owner-only tools.
 
-Run: python3 -m unittest test_owner_users_unit
+Run: python3 -m pytest -q tests/test_owner_users_unit.py
 """
 import ast
 import asyncio
@@ -21,7 +21,7 @@ import test_pipe_unit  # noqa: F401  (installs the module stubs openclaw_pipe ne
 import openclaw_pipe
 from openclaw_pipe import Pipe, GATEWAY_SCOPES, _sign_challenge
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RESTRICTED = ["operator.read", "operator.write"]
 # Every request that starts, steers or ends a run. Sent on the admin
 # connection, such a request makes the turn the owner's.
@@ -202,7 +202,7 @@ class EmptyValveParityTests(unittest.TestCase):
     """OWNER_USERS empty: the Gateway gets exactly what it got before."""
 
     def test_frames_match_the_code_before_the_valve(self):
-        want = json.load(open(os.path.join(HERE, "test_fixture_owner_users_empty_valve.json")))
+        want = json.load(open(os.path.join(HERE, "tests", "fixtures", "test_fixture_owner_users_empty_valve.json")))
         got = capture_frames(openclaw_pipe._GatewayConnection,
                              lambda conn, m, p: openclaw_pipe._run_request(
                                  conn, {"chat.send": openclaw_pipe.RUN_SEND,

@@ -18,7 +18,7 @@ import sys
 from openclaw_dist import default_dist
 
 NEEDLE = "Claude Code process exited with"
-FIXTURE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+FIXTURE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tests", "fixtures",
                        "test_fixture_openclaw_exit_errors.json")
 
 

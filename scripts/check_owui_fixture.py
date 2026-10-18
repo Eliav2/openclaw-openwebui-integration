@@ -30,7 +30,7 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-FIXTURE = ROOT / "test_fixture_owui_streaming_handler.py"
+FIXTURE = ROOT / "tests" / "fixtures" / "test_fixture_owui_streaming_handler.py"
 FUNCTION = "handle_responses_streaming_event"
 # 0.12.3 moved the handler from middleware.py to response.py.
 UPSTREAM = ("https://raw.githubusercontent.com/open-webui/open-webui/{ref}/"

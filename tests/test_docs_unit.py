@@ -7,7 +7,7 @@ import re
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 IMG = ROOT / "docs" / "img"
 IMAGE_BUDGET = 250 * 1024          # each image
 IMAGES_TOTAL_BUDGET = 4 * 1024 * 1024

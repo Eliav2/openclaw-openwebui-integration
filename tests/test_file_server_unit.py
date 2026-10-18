@@ -4,7 +4,7 @@ across a hot-swap redeploy. Execs the _prelude, state and media fragments into
 a throwaway namespace, with the third-party modules Open WebUI provides
 stubbed.
 
-Run: python3 -m unittest test_file_server_unit -v
+Run: python3 -m pytest -q tests/test_file_server_unit.py
 """
 import sys
 import time
@@ -18,7 +18,7 @@ import conftest  # noqa: F401  (imports real pydantic before the stubs can shado
 from _test_helpers import fake_owui
 from _test_stubs import install_stubs
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 PKG = ROOT / "src" / "openclaw_pipe_pkg"
 
 
