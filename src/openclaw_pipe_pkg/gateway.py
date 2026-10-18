@@ -1484,6 +1484,13 @@ class _GatewayConnection:
         # Reconnect state
         self._reconnect_attempt = 0
         self._max_backoff = 30  # seconds
+        # A turn that needs the connection while the event loop waits out a
+        # backoff asks it to try now (`_reconnect_now`) and waits for that
+        # attempt's outcome (a future in `_reconnect_waiters`): the event loop
+        # is the only reader of the socket, so the turn must not connect one of
+        # its own (ELI-176).
+        self._reconnect_now = asyncio.Event()
+        self._reconnect_waiters: list = []
         # The Gateway sends a `tick` event every `policy.tickIntervalMs` of
         # hello-ok (30 s, server-maintenance-Wf2jQ0wx.mjs:156); its own client
         # drops a socket that sent no frame for twice that ("tick timeout",
@@ -1932,6 +1939,21 @@ class _GatewayConnection:
             raise GatewayError(
                 "gateway connection retired: a newer deploy of the pipe owns it now"
             )
+        if self._event_loop_task and not self._event_loop_task.done() and not self._stopped:
+            # The event loop is reconnecting. A socket connected here would not
+            # be read until its backoff ends, and its next attempt would replace
+            # it: the turn's first request then timed out (ELI-176). Have the
+            # loop try now, and take that attempt's outcome.
+            waiter = asyncio.get_running_loop().create_future()
+            self._reconnect_waiters.append(waiter)
+            self._reconnect_now.set()
+            await asyncio.wait({waiter, self._event_loop_task}, return_when=asyncio.FIRST_COMPLETED)
+            if not waiter.done():
+                raise GatewayError("gateway connection stopped while reconnecting")
+            error = waiter.result()
+            if error is not None:
+                raise error if isinstance(error, GatewayError) else GatewayError(str(error))
+            return
         async with self._init_lock:
             if self._ws and self._event_loop_task and not self._event_loop_task.done():
                 return
@@ -2960,16 +2982,33 @@ class _GatewayConnection:
             self._reconnect_attempt += 1
             delay = min(2 ** (self._reconnect_attempt - 1), self._max_backoff)
             pipe_log(f"  reconnect in {delay}s (attempt {self._reconnect_attempt})")
-            await asyncio.sleep(delay)
+            try:
+                # A turn waiting for the connection ends the wait (ensure_connected).
+                await asyncio.wait_for(self._reconnect_now.wait(), delay)
+                pipe_log("  reconnecting now: a message is waiting for the connection")
+            except asyncio.TimeoutError:
+                pass
+            self._reconnect_now.clear()
             if self._stopped:
+                self._answer_reconnect_waiters(GatewayError("gateway connection stopped"))
                 return
             try:
                 await self._connect_and_start()
+                self._answer_reconnect_waiters(None)
                 return
             except Exception as e:
                 pipe_log(f"  reconnect failed: {e}")
                 self._ws = None
+                self._answer_reconnect_waiters(e)
                 # loop and try again
+
+    def _answer_reconnect_waiters(self, error) -> None:
+        """Hand a reconnect attempt's outcome to the turns waiting on it."""
+        waiters, self._reconnect_waiters = self._reconnect_waiters, []
+        self._reconnect_now.clear()   # asked during this attempt: it is the answer
+        for waiter in waiters:
+            if not waiter.done():
+                waiter.set_result(error)
 
 
 # Protocol sentinels (docs/tools/subagents.md:470-431) that mean "no

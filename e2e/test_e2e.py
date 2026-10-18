@@ -676,15 +676,18 @@ def _crash_loop_allows_a_crash() -> bool:
     return len(started[:-1]) <= 1
 
 
-def _kill_and_restart_gateway() -> None:
-    """A crash (SIGKILL) of the Gateway start_stack.sh launched, then a fresh
-    `openclaw gateway run` the way it runs it."""
+def _kill_and_restart_gateway(sig: int = 9, while_down=None) -> None:
+    """A crash (SIGKILL; SIGTERM for a clean stop) of the Gateway
+    start_stack.sh launched, then a fresh `openclaw gateway run` the way it
+    runs it. `while_down` runs once it is gone, before the relaunch."""
     with open(GATEWAY_PID_FILE) as f:
         pids = _pid_tree(int(f.read().strip()))
     assert pids, f"the stack's Gateway (pid file {GATEWAY_PID_FILE}) is not running"
     for p in pids:
-        os.kill(p, 9)
-    _until("the Gateway to be gone", lambda: not any(_alive(p) for p in pids), timeout_s=30)
+        os.kill(p, sig)
+    _until("the Gateway to be gone", lambda: not any(_alive(p) for p in pids), timeout_s=60)
+    if while_down:
+        while_down()
     log_path = os.path.join(os.path.dirname(GATEWAY_PID_FILE), "gateway-after-restart.log")
     log = open(log_path, "a")
     proc = subprocess.Popen(["openclaw", "gateway", "run"], stdout=log, stderr=subprocess.STDOUT,
@@ -1563,3 +1566,32 @@ def test_a_cancelled_secret_dialog_tells_the_agent_no_credential_came(token):
         assert not any(e.get("name") == name for e in listed.get("entries") or []), listed
     finally:
         page.close()
+
+
+# ── ELI-176: a message right after a Gateway restart ───────────────────────
+
+def _pipe_log_since(since: str) -> str:
+    """The Pipe's log lines (Open WebUI's stdout) since an RFC 3339 time."""
+    out = subprocess.run(["docker", "logs", "--since", since, "owui"],
+                         capture_output=True, text=True, timeout=60)
+    return out.stdout
+
+
+@pytest.mark.skipif(not GATEWAY_PID_FILE or shutil.which("pgrep") is None,
+                    reason="needs the pid of the e2e stack's Gateway (E2E_GATEWAY_PID_FILE)")
+def test_a_message_sent_while_the_pipe_waits_to_reconnect_gets_its_reply(token):
+    """After a Gateway restart the Pipe reconnects with a backoff (1 s up to
+    30 s). A message sent while it waits out the backoff must get its reply
+    (ELI-176: the turn connected a socket of its own, which nothing read until
+    the backoff ended, so the turn's first request timed out)."""
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    # Down until the Pipe waits its longest backoff, so the Gateway is back
+    # well before its next attempt.
+    _kill_and_restart_gateway(15, while_down=lambda: _until(
+        "the Pipe to wait 30 s before its next attempt",
+        lambda: "reconnect in 30s" in _pipe_log_since(since), timeout_s=120))
+    log = _pipe_log_since(since)
+    assert log.rfind("reconnect in ") > log.rfind("Connected to Gateway (persistent)"), \
+        "precondition: the Pipe reconnected before the message went out"
+    _, msg = _chat_turn(token, "Reply with exactly: E2E_AFTER_RESTART")
+    assert msg.get("content", "").strip() == "E2E_AFTER_RESTART", msg.get("content")
