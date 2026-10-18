@@ -677,6 +677,29 @@ def _crash_loop_allows_a_crash() -> bool:
     return len(started[:-1]) <= 1
 
 
+SUITE_SPAN_S = 3 * 3600   # longer than an E2E job runs
+
+
+def _gateway_own_jobs_due_within(seconds: float) -> list[str]:
+    """Names of the enabled jobs the Gateway scheduled itself (every job a
+    test adds is named `e2e-...`) that come due within `seconds`."""
+    soon = (time.time() + seconds) * 1000
+    jobs = _gw("cron.list", {"includeDisabled": True}).get("jobs") or []
+    return [j.get("name") for j in jobs if j.get("enabled") and not str(j.get("name")).startswith("e2e-")
+            and ((j.get("state") or {}).get("nextRunAtMs") or float("inf")) < soon]
+
+
+def test_the_stack_gateway_schedules_no_work_of_its_own():
+    """A job the Gateway runs on its own can come due mid-suite: its heartbeat
+    (every 30 minutes, at a random phase), memory dreaming (03:00 daily) or
+    the weekly skill review of each agent (a random phase too).
+    While the stack is busy, a due heartbeat waits for it to be idle and holds
+    a cron run open, so a clean stop (SIGTERM) then waits for it, up to its
+    315 s drain timeout: the reconnect test's Gateway outlived its 60 s
+    (cronRuns=1 activeTasks=1). The stack turns them off."""
+    assert _gateway_own_jobs_due_within(SUITE_SPAN_S) == []
+
+
 def _kill_and_restart_gateway(sig: int = 9, while_down=None) -> None:
     """A crash (SIGKILL; SIGTERM for a clean stop) of the Gateway
     start_stack.sh launched, then a fresh `openclaw gateway run` the way it
