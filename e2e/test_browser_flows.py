@@ -172,8 +172,7 @@ def _answer_question(page, marker: str, question: str, answer) -> str:
     answer(page)
     capture.wait_js(page, "() => !document.querySelector('input[placeholder=\"Type your answer\"]')",
                     "the card gone after the answer", 30_000)
-    capture.wait_js(page, _last_assistant_js("t.includes('E2E_ANSWER_END')"),
-                    "the whole reply to the answer", TURN_MS)
+    capture.wait_js(page, _last_reply_done("E2E_ANSWER_END"), "the whole reply to the answer", TURN_MS)
     return page.evaluate(f"() => {capture.LAST_ASSISTANT}.innerText")
 
 
@@ -213,6 +212,42 @@ def test_a_question_left_for_a_new_message_ends_its_reply(page):
         if not when:
             _reload(page)
             _wait(page, _reply_js(-1, "all.length === 2 && r.done"), "both replies after a reload", 60_000)
+
+
+def _secret_dialog_open(page) -> None:
+    # Open WebUI masks the field with a `password` class (CSS text-security), not type=password.
+    capture.wait_js(page, "() => document.body.innerText.includes('Paste the test API token') "
+                          "&& !!document.querySelector('input.password')",
+                    "the masked dialog", TURN_MS)
+
+
+def test_status_opened_in_another_tab_leaves_the_secret_dialog_its_answer(page):
+    """Open WebUI's input dialog and its `execute` event share one callback in
+    the tab: an `execute` arriving while the dialog is open took the dialog's
+    answer, so Confirm reached nobody (ELI-195). Status opened from a second
+    tab of the chat sends one to every tab of the user; the tab with the
+    dialog gets it once the dialog is answered."""
+    capture.new_chat(page)
+    capture.send(page, "E2E_ASK_SECRET")
+    _secret_dialog_open(page)
+    other = page.context.new_page()
+    try:
+        other.goto(page.url)
+        other.wait_for_selector("#chat-input", timeout=60_000)
+        _open_status(other)
+        page.locator("input.password").fill("e2e-secret-value")
+        page.get_by_role("button", name="Confirm", exact=True).click()
+        # Done and Stop gone: Open WebUI's request is over. Leaving while it
+        # still saves the reply can lock its database for good (ELI-195 CI).
+        _wait(page, _last_reply_done("E2E_ANSWER_END"), "the reply to the secret")
+        reply = page.evaluate(f"() => {capture.LAST_ASSISTANT}.innerText")
+        # The scripted model echoes what reached it.
+        assert "E2E_ANSWERED e2e-secret-value" in reply, reply[-200:]
+        # The held one: Status opens in this tab too, after the answer.
+        page.wait_for_selector("#openclaw-status-modal-root", timeout=30_000)
+        page.keyboard.press("Escape")
+    finally:
+        other.close()
 
 
 def test_a_multi_select_question_takes_typed_numbers(page):

@@ -610,6 +610,12 @@ class Pipe:
                 async for item in turn_gen:
                     yield item
             return
+        # No `execute` reaches a tab while it shows an input dialog (ELI-195).
+        meta = __metadata__ or {}
+        user_id = (__user__ or {}).get("id")
+        __event_emitter__ = _dialog_safe_emitter(
+            __event_emitter__, user_id, meta.get("chat_id"), meta.get("message_id"))
+        __event_call__ = _dialog_safe_event_call(__event_call__, meta.get("session_id"), user_id)
         # aclosing: when OWUI closes this generator, close the inner one now
         # rather than whenever it is garbage-collected, so its cancel handling
         # runs before the next message arrives.
