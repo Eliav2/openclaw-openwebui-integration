@@ -12725,3 +12725,110 @@ class ForwardedTurnHistoryTests(_RoutingCase):
         self.history = {"messages": self.FX["2026.9.3"]["messages"]}
         self.assertEqual((await self.conn.session_history(self.key))["messages"],
                          self.FX["2026.9.3"]["messages"], "9.3 history is unchanged")
+
+
+class AutoTitleTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-182: the Pipe's title replaces only the title Open WebUI set by
+    itself, and shows at once in the open tab. QA 2026-10-18: a chat renamed
+    to '[QA] My renamed chat' became '✅ QA Title Test One' after the next
+    message; a generated title showed only after a reload.
+
+    Open WebUI 0.12.3 creates a chat as 'New Chat'; its first-exchange title
+    task (which the Pipe skips) then falls back to the first user message,
+    without `<details>` blocks and images (main.py run_initial_title_generation,
+    middleware.py background_tasks_handler)."""
+
+    CHAT, USER, MID = "c1", "u1", "a2"
+    GENERATED = "🧪 Generated title"
+
+    def setUp(self):
+        self.chat = types.SimpleNamespace(title="hello there", chat={"title": "hello there", "history": {
+            "currentId": "a1", "messages": {
+                "q1": {"id": "q1", "role": "user", "parentId": None, "childrenIds": ["a1"],
+                       "content": "hello there"},
+                "a1": {"id": "a1", "role": "assistant", "parentId": "q1", "childrenIds": [],
+                       "content": "Hi!"},
+            }}})
+        test = self
+
+        class Chats:
+            @staticmethod
+            async def get_chat_by_id(chat_id):
+                return copy.deepcopy(test.chat) if chat_id == test.CHAT else None
+
+            @staticmethod
+            @contextlib.asynccontextmanager
+            async def _chat_transaction(chat_id):
+                yield ("db", test.chat if chat_id == test.CHAT else None)
+
+        chats_mod = types.ModuleType("open_webui.models.chats")
+        chats_mod.Chats = Chats
+        self.emits = []
+
+        class Sio:
+            @staticmethod
+            async def emit(event, data, room=None):
+                test.emits.append((event, data, room))
+
+        mods = {**owui_modules(sio=Sio), "open_webui.models": types.ModuleType("open_webui.models"),
+                "open_webui.models.chats": chats_mod}
+        p = mock.patch.dict(sys.modules, mods)
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(openclaw_pipe, "_sender_is_owner", mock.AsyncMock(return_value=True))
+        p.start()
+        self.addCleanup(p.stop)
+        self.pipe = Pipe()
+        self.pipe._generate_title_text = mock.AsyncMock(return_value=self.GENERATED)
+
+    def rename(self, title):
+        self.chat.title, self.chat.chat = title, {**self.chat.chat, "title": title}
+
+    async def second_message(self):
+        body = {"messages": [{"role": "user", "content": "hello there"},
+                             {"role": "assistant", "content": "Hi!"},
+                             {"role": "user", "content": "and now?"}]}
+        await self.pipe._auto_title(body, None, "and now?", self.CHAT,
+                                    session_key="agent:main:x", user_id=self.USER, message_id=self.MID)
+
+    def title_events(self):
+        return [(d["chat_id"], d["data"], room) for ev, d, room in self.emits
+                if ev == "events" and d["data"].get("type") == "chat:title"]
+
+    async def test_a_title_the_user_chose_is_kept(self):
+        self.rename("[QA] My renamed chat")
+        await self.second_message()
+        self.assertEqual((self.chat.title, self.chat.chat["title"]),
+                         ("[QA] My renamed chat", "[QA] My renamed chat"))
+        self.assertEqual(self.title_events(), [])
+
+    async def test_a_rename_while_the_title_is_generated_is_kept(self):
+        async def generate(*_a, **_k):
+            self.rename("Mine")
+            return self.GENERATED
+        self.pipe._generate_title_text = generate
+        await self.second_message()
+        self.assertEqual(self.chat.title, "Mine")
+        self.assertEqual(self.title_events(), [])
+
+    async def test_the_first_message_title_is_replaced_and_shown_in_the_open_tab(self):
+        await self.second_message()
+        self.assertEqual((self.chat.title, self.chat.chat["title"]), (self.GENERATED, self.GENERATED))
+        self.assertEqual(self.title_events(), [(self.CHAT, {"type": "chat:title", "data": self.GENERATED},
+                                                f"user:{self.USER}")])
+
+    async def test_new_chat_is_replaced(self):
+        self.rename("New Chat")
+        await self.second_message()
+        self.assertEqual(self.chat.title, self.GENERATED)
+
+    async def test_the_first_message_title_is_known_as_open_webui_derives_it(self):
+        """Text parts of a list content, `<details>` blocks and images removed,
+        stripped: what Open WebUI titled the chat with."""
+        self.chat.chat["history"]["messages"]["q1"]["content"] = [
+            {"type": "text", "text": "<details type=\"x\">ctx</details> look ![a](b.png) "},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}},
+            {"type": "text", "text": "here"}]
+        self.rename("look  \nhere")
+        await self.second_message()
+        self.assertEqual(self.chat.title, self.GENERATED)

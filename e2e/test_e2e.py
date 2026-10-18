@@ -86,7 +86,8 @@ def _chat_turn(token: str, prompt: str, model: str = DEFAULT_MODEL,
         parent = chat["history"]["currentId"]
         chat["history"]["messages"][parent]["childrenIds"].append(uid)
     else:
-        chat = {"title": "E2E", "models": [model], "history": {"messages": {}},
+        # Open WebUI creates a chat as "New Chat"; the Pipe titles only such a chat.
+        chat = {"title": "New Chat", "models": [model], "history": {"messages": {}},
                 "messages": [], "files": [], "tags": [], "timestamp": now * 1000}
         parent = None
     user = {"id": uid, "parentId": parent, "childrenIds": [aid], "role": "user",

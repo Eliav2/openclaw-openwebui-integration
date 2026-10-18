@@ -125,7 +125,9 @@ Always on.
 
 ## Chat titles
 
-The chat names itself with a short title and an emoji. When you send your second message, the Pipe titles the chat from the first exchange (your first message and the first reply).
+The chat names itself with a short title and an emoji. When you send your second message, the Pipe titles the chat from the first exchange (your first message and the first reply). The new title shows at once in the open tab's header and sidebar, with no reload.
+
+A title you chose stays. The Pipe replaces only the title Open WebUI gave the chat by itself ("New Chat", or your first message). If you renamed the chat, before your second message or while its title was being generated, or Open WebUI's own title model named it, the Pipe leaves it.
 
 <img src="../img/chat-titles-light.png" alt="A chat titled by the Pipe after its second message, the title in the header" width="320">
 
