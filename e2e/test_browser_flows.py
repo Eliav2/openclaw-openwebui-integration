@@ -267,6 +267,30 @@ def test_status_opened_in_another_tab_leaves_the_secret_dialog_its_answer(page):
         page.keyboard.press("Escape")
     finally:
         other.close()
+def test_a_choice_that_mentions_a_password_keeps_its_options(page):
+    """A question with options that mentions a password is a choice, not a
+    secret: the card with its options, never the masked dialog (ELI-196)."""
+    def click_no(pg):
+        assert not pg.query_selector("input.password"), "the masked dialog opened"
+        pg.locator("section button", has=pg.locator("span", has_text="No")).first.click()
+    reply = _answer_question(page, "E2E_ASK_MENTIONS_SECRET", "use the password?", click_no)
+    # Yes / No options answer as "yes" / "no", as a yes/no question does.
+    assert "E2E_ANSWERED no E2E_ANSWER_END" in reply, reply[-200:]
+
+
+def test_a_secret_ask_with_numbered_steps_keeps_the_masked_dialog(page):
+    """Asking for an API key with the steps as a numbered list is still a
+    secret: the masked dialog, never a card whose Other field would put the
+    key in the chat (W3 on ELI-196)."""
+    capture.new_chat(page)
+    capture.send(page, "E2E_ASK_SECRET_STEPS")
+    _wait(page, "() => document.body.innerText.includes('Paste your API key') "
+                "&& (!!document.querySelector('input.password') "
+                "|| !!document.querySelector('input[placeholder=\"Type your answer\"]'))",
+          "the question", TURN_MS)
+    assert page.query_selector("input.password"), "a card instead of the masked dialog"
+    page.get_by_role("button", name="Cancel", exact=True).click()
+    _wait(page, _last_reply_done("E2E_ANSWER_END"), "the reply after the dialog")
 
 
 def test_a_multi_select_question_takes_typed_numbers(page):
