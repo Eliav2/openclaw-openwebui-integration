@@ -466,9 +466,6 @@ def test_the_subagent_drawer_follows_a_running_child_to_its_end(page):
     """Sub-agent drawer: the Status dialog lists the running sub-agent;
     its row opens the drawer, which shows it running and then, with nothing
     clicked, done with the child's whole reply."""
-    if _openclaw_release() >= (2026, 10):
-        pytest.skip("ELI-178: on OpenClaw 2026.10 the Status dialog opens about 18 s late while a "
-                    "sub-agent runs, often after the child ended; remove when fixed")
     child = "E2E_CHILDTASK " + " ".join(f"slow-{i}" for i in range(1, 21))
     capture.new_chat(page)
     capture.send(page, "E2E_SPAWN one helper")

@@ -57,8 +57,10 @@ def _write_json_file(path, data):
 # Pipe and the Action (separate modules in one Open WebUI process), so it
 # survives restarts and redeploys. Each change is a read-modify-write under an
 # flock. Parents untouched for 180 days are dropped, and each keeps its 200
-# newest children. `seeded`: children spawned before this file existed were
-# folded in once, from one full list.
+# newest children. `tasks`: the task each spawn call was given, by child key,
+# which titles the child before its transcript holds the spawn message (on
+# 2026.10 that is written after the spawn returns, ELI-178). `seeded`: children
+# spawned before this file existed were folded in once, from one full list.
 # ---------------------------------------------------------------------------
 
 _SUBAGENT_INDEX_NAME = "subagent-children.json"
@@ -105,6 +107,8 @@ def _subagent_index_update(change) -> None:
                                                               or (children[k] or {}).get("createdAt")
                                                               or now))
                     entry["children"] = {k: children[k] for k in newest[:_SUBAGENT_INDEX_PER_PARENT]}
+                if entry.get("tasks"):
+                    entry["tasks"] = {k: t for k, t in entry["tasks"].items() if k in entry["children"]}
             _write_json_file(path, index)
     except Exception as ex:
         pipe_log(f"[subagents] could not update the child index: {ex}")
@@ -116,17 +120,26 @@ def _subagent_children(parent) -> dict:
     return dict(entry.get("children") or {})
 
 
-def _subagent_remember(parent, rows=(), keys=()) -> None:
-    """Record `parent`'s children: `keys` seen spawned, `rows` as just read."""
-    rows, keys = list(rows), list(keys)
-    if not parent or not (rows or keys):
+def _subagent_tasks(parent) -> dict:
+    """{child key: the task its spawn call was given} of `parent`."""
+    entry = _subagent_index_read()["parents"].get(parent) or {}
+    return dict(entry.get("tasks") or {})
+
+
+def _subagent_remember(parent, rows=(), keys=(), tasks=None) -> None:
+    """Record `parent`'s children: `keys` seen spawned, `rows` as just read,
+    `tasks` {child key: the task its spawn call was given}."""
+    rows, keys, tasks = list(rows), list(keys), dict(tasks or {})
+    if not parent or not (rows or keys or tasks):
         return
 
     def change(index):
         entry = index["parents"].setdefault(parent, {"at": 0, "children": {}})
         entry["at"] = int(time.time() * 1000)
-        for key in keys:
+        for key in [*keys, *tasks]:
             entry["children"].setdefault(key, None)
+        if tasks:
+            entry.setdefault("tasks", {}).update(tasks)
         for row in rows:
             entry["children"][row["key"]] = {k: row[k] for k in _SUBAGENT_SNAPSHOT_KEYS if row.get(k) is not None}
     _subagent_index_update(change)
