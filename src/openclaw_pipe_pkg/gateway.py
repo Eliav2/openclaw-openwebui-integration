@@ -2340,7 +2340,8 @@ class _GatewayConnection:
                             queue: asyncio.Queue | None, carried: list[str],
                             grace_s: float, send_stop: bool,
                             run_text: dict | None = None, settle=None,
-                            reply: dict | None = None) -> None:
+                            reply: dict | None = None,
+                            waiting: list | None = None) -> None:
         """Hand a cancelled reply's unfinished business to the next message.
 
         OWUI cancels a response the same way for Stop and for Send now /
@@ -2360,6 +2361,9 @@ class _GatewayConnection:
 
         * `reply` is the cancelled reply's own state, {message_id, renderer}:
           the message it showed the run in, and what it showed there.
+        * `waiting` are the replies whose messages are in `carried`
+          (`_TurnState.waiting`): the claimer ends each with a note once it
+          sent them; a release ends them as not sent (ELI-188).
 
         `settle` (a coroutine function) asks the browser which button was
         pressed and calls `settle_parked_turn`: Stop releases it now, Send now
@@ -2394,6 +2398,8 @@ class _GatewayConnection:
                 previous["task"].cancel()
             previous["resolved"].set()
             carried = list(previous["carried"]) + list(carried)
+            waiting = list(previous["waiting"]) + [
+                r for r in (waiting or []) if r not in previous["waiting"]]
             if previous["queue"] is not None and previous["queue"] is not queue:
                 self.unregister_consumer(
                     session_key, previous["run_id"], queue=previous["queue"])
@@ -2410,7 +2416,8 @@ class _GatewayConnection:
 
         entry = {"run_id": run_id, "queue": queue, "carried": list(carried),
                  "send_stop": send_stop, "task": None,
-                 "resolved": asyncio.Event(), "run_text": run_text, "reply": reply}
+                 "resolved": asyncio.Event(), "run_text": run_text, "reply": reply,
+                 "waiting": list(waiting or [])}
 
         def _release() -> None:
             # Read from the entry: a run kept in its own message is no longer
@@ -2420,6 +2427,8 @@ class _GatewayConnection:
             if entry["carried"]:
                 pipe_log(f"  stopped: dropping {len(entry['carried'])} unsent "
                          "message(s)")
+                if _TURNS is not None:
+                    _TURNS.end_unsent_replies(self, entry["waiting"], sent=False)
             if entry["run_id"]:
                 spawn_background(
                     self._abort_cancelled_run(session_key, entry["run_id"], send_stop))
@@ -2534,8 +2543,9 @@ class _GatewayConnection:
         (`_INTENT_QUERY_TIMEOUT_S`), and it always runs to its end in the
         background, so this needs no bound of its own (ELI-95).
 
-        Returns {"run_id", "queue", "carried"}; the caller now owns the run,
-        its buffered queue and the carried messages.
+        Returns {"run_id", "queue", "carried", "waiting"}; the caller now
+        owns the run, its buffered queue, the carried messages and the
+        replies waiting for them.
         """
         entry = self._pending_cancel_aborts.get(session_key)
         if entry is None:
@@ -2554,6 +2564,7 @@ class _GatewayConnection:
         self._keep_in_own_message(session_key, entry)
         return {"run_id": entry["run_id"], "queue": entry["queue"],
                 "carried": list(entry["carried"]),
+                "waiting": list(entry["waiting"]),
                 "run_text": entry.get("run_text")}
 
     def seed_run_renderer(self, session_key: str, run_id: str,
