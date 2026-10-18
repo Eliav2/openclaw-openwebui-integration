@@ -1651,14 +1651,32 @@ async def _wake_finish(conn: "_GatewayConnection", sess: str, run: str, pump: _R
         if not pump.heartbeat:
             pipe_log(f"  turn writer: a sessionId run on {sess[-12:]} ended with no running "
                      f"cron wake turn; {len(pump.held)} event(s) not shown")
+    elif not writer.closed:  # a heartbeat that already showed something is finished too
+        writer.wake["end"] = end_ms
+        # Off this pump: every wake into the session shares its run id, so
+        # the next wake's events must not wait behind a question card.
+        spawn_background(_wake_close(conn, writer, ask=not pump.heartbeat))
     else:
-        if not writer.closed:  # a heartbeat that already showed something is finished too
-            writer.wake["end"] = end_ms
-            await writer.finalize()
         conn._turn_writers.pop((writer.chat_id, writer.message_id), None)
     # The next wake reuses this run id: nothing remembered for it may carry over.
     conn._turn_skip_runs.pop((sess, run), None)
     conn._delivered_live.pop(f"{sess}:{run}", None)
+
+
+async def _wake_close(conn: "_GatewayConnection", writer: "_TurnWriter", *, ask: bool) -> None:
+    """End a wake's message as a run's end does (`_TurnWriter.end`): a wake
+    that ends with a question asks it on the tab viewing the chat, and the
+    answer run, which names this message, continues it (ELI-180). Else
+    finalize. The writer stays registered until it closes, so the answer
+    run's pump finds it (`_turn_writer_for`)."""
+    try:
+        if not (ask and await writer._ask_question()):
+            await writer.finalize()
+    except Exception as ex:
+        pipe_log(f"  turn writer: ending wake message {writer.message_id[:8]}... failed: {ex!r}")
+    finally:
+        if writer.closed:
+            conn._turn_writers.pop((writer.chat_id, writer.message_id), None)
 
 
 async def _wake_resync(conn: "_GatewayConnection") -> None:
