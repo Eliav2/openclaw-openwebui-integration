@@ -484,3 +484,105 @@ def test_the_subagent_drawer_follows_a_running_child_to_its_end(page):
     drawer = [json.loads(d) for d in page.evaluate("() => window.__drawer || []")]
     assert drawer[0]["chip"] == "Running", f"the drawer did not open on the running child: {drawer[:3]}"
     assert "E2E_CHILDTASK" in page.locator("#openclaw-drawer-root").inner_text()
+
+
+def _chat_id(page) -> str:
+    m = re.search(r"/c/([0-9a-f-]{36})", page.url)
+    assert m, f"no chat id in {page.url}"
+    return m.group(1)
+
+
+def test_a_reply_the_agent_starts_streams_into_the_open_tab_and_asks_there(page, token):
+    """A reply the agent starts (a cron wake into the chat's session) shows
+    in the tab open on the chat with no reload: a new message that streams
+    word by word, then the question it ends with as a card in that tab.
+    Answering the card reaches the agent."""
+    capture.new_chat(page)
+    capture.send(page, "E2E_ECHO: BROWSER_WAKE_CHAT")
+    _wait(page, _turn_over("BROWSER_WAKE_CHAT"), "the first reply")
+    me = capture.api("GET", "/api/v1/auths/", token=token)
+    key = f"agent:main:openwebui-{me['id']}-{_chat_id(page)}"
+    capture.schedule_wake(key, "E2E_WAKE_ASK", 2)
+    _wait(page, _reply_js(1, "r.text.includes('E2E_WAKE_ASK_START') && r.text.includes('Which color?')"),
+          "the agent's own reply in the open tab, with no reload")
+    texts = _seen(page, _replies(page)[1]["id"])
+    assert any("slow-1" in t and "slow-6" not in t for t in texts), \
+        f"the reply did not stream in the tab: {_tails(texts)}"
+    if _openclaw_release() < (2026, 10):
+        pytest.skip("ELI-180: on OpenClaw 2026.9 a question at the end of a cron wake reply never "
+                    "becomes a card; remove when fixed")
+    capture.wait_js(page, "() => !!document.querySelector('input[placeholder=\"Type your answer\"]')",
+                    "the question card in the open tab", TURN_MS)
+    page.locator("section button", has=page.locator("span", has_text="Green")).first.click()
+    capture.wait_js(page, "() => !document.querySelector('input[placeholder=\"Type your answer\"]')",
+                    "the card gone after the answer", 30_000)
+    _wait(page, _reply_js(-1, "r.text.includes('E2E_ANSWER_END')"), "the reply to the answer")
+    reply = _replies(page)[-1]["text"]
+    assert "Green" in reply.split("E2E_ANSWERED", 1)[1], reply[-200:]
+
+
+def test_an_attached_image_reaches_the_agent(page):
+    """An image attached in the composer shows in the sent message, and the
+    agent gets it as an image (the scripted model says how many images it
+    received and their types)."""
+    path = os.path.join(os.environ.get("E2E_LOG_DIR", "/tmp"), f"browser-attach-{os.getpid()}.png")
+    with open(path, "wb") as fh:
+        fh.write(capture.forecast_chart_png())
+    capture.new_chat(page)
+    page.locator('input[type="file"]:not(#camera-input)').set_input_files(path)
+    capture.wait_js(page, "() => [...document.querySelectorAll('form img')]"
+                          ".some(i => i.src.includes('/api/v1/files/'))",
+                    "the image in the composer", 30_000)
+    capture.send(page, "E2E_IMAGE_IN what is in this picture")
+    _wait(page, _turn_over("E2E_IMAGE_SEEN"), "the reply about the image")
+    assert page.evaluate("() => [...document.querySelectorAll('.user-message img')]"
+                         ".some(i => i.src.includes('/api/v1/files/'))"), "the sent message shows no image"
+    reply = _replies(page)[0]["text"]
+    assert "E2E_IMAGE_SEEN 1 image/png" in reply, f"the agent did not get the image: {reply[-200:]}"
+    assert "couldn't be relayed" not in reply, reply[-200:]
+
+
+# Each element of `sel`'s box is inside the screen and inside every ancestor
+# that clips it: what is cut off there is not on screen for the user.
+FITS = """(sel) => {
+  const el = document.querySelector(sel);
+  if (!el) return 'missing';
+  const r = el.getBoundingClientRect();
+  if (r.width === 0 || r.height === 0) return 'not shown';
+  const bad = [];
+  if (r.left < 0 || r.top < 0 || r.right > innerWidth + 0.5 || r.bottom > innerHeight + 0.5)
+    bad.push('screen ' + JSON.stringify([r.left, r.top, r.right, r.bottom]));
+  for (let a = el.parentElement; a; a = a.parentElement) {
+    const s = getComputedStyle(a);
+    if (s.overflowX === 'visible' && s.overflowY === 'visible') continue;
+    const p = a.getBoundingClientRect();
+    if (r.left < p.left - 0.5 || r.right > p.right + 0.5 || r.top < p.top - 0.5 || r.bottom > p.bottom + 0.5)
+      bad.push('clipped by ' + a.tagName + '.' + (a.className || '').toString().slice(0, 40));
+  }
+  if (el.scrollWidth > el.clientWidth + 1) bad.push('its own content overflows');
+  return bad.length ? bad.join('; ') : 'ok';
+}"""
+
+
+def test_at_phone_width_the_status_button_fits_and_opens_the_dialog(page, token):
+    """On a small phone (375 x 667) the composer's Status button is fully on
+    screen, not cut off by the chip row, and a tap opens the Status dialog
+    inside the screen: its close button and its footer are in view."""
+    phone = capture.signed_in_page(page.context.browser, token, capture.SMALL_PHONE)
+    try:
+        capture.new_chat(phone)
+        capture.send(phone, "E2E_ECHO: BROWSER_PHONE")
+        _wait(phone, _turn_over("BROWSER_PHONE"), "the reply")
+        button = 'button[aria-label="OpenClaw status"]'
+        phone.wait_for_selector(button, timeout=30_000)
+        assert phone.evaluate(FITS, button) == "ok", f"the Status button: {phone.evaluate(FITS, button)}"
+        phone.locator(button).tap()
+        phone.wait_for_selector("#openclaw-status-modal-root", timeout=30_000)
+        capture.wait_js(phone, "() => /via pipe/.test(document.getElementById('openclaw-status-modal-root').innerText)",
+                        "the dialog filled", 30_000)
+        for what, sel in (("the dialog", "#openclaw-status-modal-root > div"),
+                          ("its close button", "#openclaw-status-modal-root button"),
+                          ("its footer", "#openclaw-status-modal-root > div > div:last-child")):
+            assert phone.evaluate(FITS, sel) == "ok", f"{what}: {phone.evaluate(FITS, sel)}"
+    finally:
+        phone.context.close()

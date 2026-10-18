@@ -44,6 +44,12 @@ and only a core set is sent as real schemas.
   card), then says `E2E_CARDS_MID` and runs `sleep 6` with `exec` in the
   foreground (a card that runs for a while, then finishes), then replies
   `E2E_CARDS_END`.
+* `E2E_WAKE_ASK`                       -> for a reply the agent starts (a cron
+  wake): `E2E_WAKE_ASK_START slow-1 ... slow-6` one word a second, then the
+  `ASK_SINGLE` question below, so the reply streams before it asks.
+* `E2E_IMAGE_IN`                       -> `E2E_IMAGE_SEEN <n> <mime>...`: how many
+  images this turn's user messages carry as `image_url` parts, and their
+  types (`none` when there are none).
 * `E2E_ASK_SINGLE` / `E2E_ASK_MULTI`   -> asks a question: `ASK_SINGLE` or
   `ASK_MULTI` below. The next message answers it: the reply is
   `E2E_ANSWERED <the answer> E2E_ANSWER_END`, so a test sees what reached
@@ -104,6 +110,7 @@ ANSWER_END = "E2E_ANSWER_END"   # the answer's echo is complete
 ASK_SINGLE = "OpenClaw needs input:\n\nColor\nWhich color?\n1. Red\n2. Green\n3. Blue"
 ASK_MULTI = ("OpenClaw needs input:\n\nToppings (multiselect)\nWhich toppings?\n"
              "1. Cheese\n2. Olives\n3. Mushrooms")
+WAKE_ASK = "E2E_WAKE_ASK_START " + " ".join(f"slow-{i}" for i in range(1, 7)) + "\n\n" + ASK_SINGLE
 
 
 def _text_of(content) -> str:
@@ -226,6 +233,14 @@ def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
         first = next((_text_of(m.get("content")) for m in turn if m.get("role") == "user"), "")
         answer = " ".join(first.strip().split("\n\n")[-1].split())
         return {"text": f"E2E_ANSWERED {answer} {ANSWER_END}"}
+    if "E2E_WAKE_ASK" in user_text:
+        return {"text": WAKE_ASK, "delay": 1.0}
+    if "E2E_IMAGE_IN" in user_text:
+        images = [p for m in turn if m.get("role") == "user" and isinstance(m.get("content"), list)
+                  for p in m["content"] if isinstance(p, dict) and p.get("type") == "image_url"]
+        mimes = [((p.get("image_url") or {}).get("url") or "").split(";", 1)[0].removeprefix("data:")
+                 for p in images]
+        return {"text": f"E2E_IMAGE_SEEN {len(images)} {' '.join(mimes) or 'none'}"}
     if "E2E_ASK_SINGLE" in user_text:
         return {"text": ASK_SINGLE}
     if "E2E_ASK_MULTI" in user_text:
