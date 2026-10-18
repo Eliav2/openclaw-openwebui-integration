@@ -327,16 +327,21 @@ def _secret_not_received_text(prompt_text: str) -> str:
             "in a tab and ask the agent to try again: the dialog shows again.")
 
 
+def _masked_input_payload(title: str, message: str, placeholder: str = "Type your answer") -> dict:
+    """OWUI's input dialog with a masked field (`<input type="password">`)."""
+    return {"type": "input", "data": {
+        "title": title,
+        "message": message,
+        "placeholder": placeholder,
+        "type": "password",
+    }}
+
+
 def _secret_input_payload(prompt_text: str) -> dict:
     """OWUI's masked input dialog for a prompt asking for a secret: the card
     has no masked field."""
     fields = _parse_text_prompt(prompt_text)
-    return {"type": "input", "data": {
-        "title": fields["title"],
-        "message": fields["message"],
-        "placeholder": "Type your answer",
-        "type": "password",
-    }}
+    return _masked_input_payload(fields["title"], fields["message"])
 
 
 _OPTION_DESCRIPTION_SEPARATORS = (" - ", " – ", " — ")
@@ -863,3 +868,152 @@ async def _ask_user_input_modal(
         poll_interval_s=poll_interval_s,
         owui_session_id=owui_session_id,
     )
+
+
+# ---------------------------------------------------------------------------
+# Secret requests from the Gateway (ELI-96)
+# ---------------------------------------------------------------------------
+# The agent's `secrets` tool, action=request, is a Gateway question with one
+# store-bound secret question: {questionId: "secret_value", isSecret: true,
+# secretStore: {name, kind: "secret", allowedHosts?, reason?}}. The Gateway
+# broadcasts it as `question.requested`. `question.resolve {id, answers:
+# {answers: {secret_value: [value]}}}` from an operator makes the Gateway
+# itself write the value into its secret store, register it for log
+# redaction and answer the agent "stored"; `{id, cancel: true}` answers it
+# "cancelled". `question.resolved` follows either way, and on expiry
+# (2026.10.10-beta.1 dist: secrets-tool-f-CystZd.mjs:1253 request, :1298-1301
+# the agent's statuses; question-CtUDaC2R.mjs:230 broadcast, :289-370 resolve).
+#
+# It is asked as the ask-user secret is (ELI-148): the masked input dialog on
+# the reply's own socket, moved once to the tab viewing the chat. The typed
+# value goes from the dialog's answer straight into question.resolve. It is
+# never yielded, emitted, persisted or logged, so the chat, the database, the
+# transcript and the model only ever see the request and "stored".
+#
+# A stored secret is usable by the agent's runs only from OpenClaw 2026.10
+# (ELI-97), so an older Gateway's request is left to the Control UI, as before.
+
+SECRET_REQUESTS_FROM = (2026, 10, 10)
+# question id -> the task asking for it
+_SECRET_REQUESTS: dict = {}
+# session key -> the reply streaming its run, which asks on its own socket
+_SECRET_ASKERS: dict = {}
+
+
+def _gateway_release(version) -> tuple:
+    """(year, month, patch) of a Gateway version like "2026.10.10-beta.1"."""
+    m = re.match(r"(\d+)\.(\d+)\.(\d+)", str(version or ""))
+    return tuple(int(n) for n in m.groups()) if m else (0, 0, 0)
+
+
+def _secret_request_question(record) -> dict | None:
+    """The store-bound secret question of a `question.requested` record."""
+    if not isinstance(record, dict):
+        return None
+    questions = record.get("questions") or []
+    if len(questions) != 1 or not isinstance(questions[0], dict):
+        return None
+    question = questions[0]
+    store = question.get("secretStore")
+    if not question.get("isSecret") or not isinstance(store, dict) or not store.get("name") \
+            or not question.get("questionId"):
+        return None
+    return question
+
+
+def _secret_request_payload(question: dict) -> dict:
+    """The masked dialog for a secret request. Built from the request's
+    metadata only: there is no value to put in it."""
+    store = question["secretStore"]
+    lines = [str(store.get("reason") or "The agent asks for a secret.")]
+    hosts = store.get("allowedHosts") or []
+    lines.append("Allowed hosts: " + (", ".join(hosts) if hosts
+                                       else "none (usable only as a config SecretRef)"))
+    lines.append("It goes straight to OpenClaw's secret store, not into this chat.")
+    return _masked_input_payload(f"Secret: {store['name']}", "\n\n".join(lines),
+                                 placeholder=f"Paste {store['name']}")
+
+
+def _secret_asker_join(turn) -> None:
+    _SECRET_ASKERS[turn.session_key] = turn
+
+
+def _secret_asker_leave(turn) -> None:
+    if _SECRET_ASKERS.get(getattr(turn, "session_key", None)) is turn:
+        del _SECRET_ASKERS[turn.session_key]
+
+
+def secret_request_seen(conn, record) -> bool:
+    """`question.requested`: ask a secret request made in an Open WebUI chat.
+    False for anything else, or on a Gateway whose runs cannot use it."""
+    question = _secret_request_question(record)
+    if question is None or record.get("status", "pending") != "pending" or not record.get("id"):
+        return False
+    if _gateway_release(conn.gateway_version) < SECRET_REQUESTS_FROM:
+        return False
+    parsed = conn.parse_owui_session_key(record.get("sessionKey") or "")
+    if not parsed or record["id"] in _SECRET_REQUESTS:
+        return False
+    _SECRET_REQUESTS[record["id"]] = spawn_background(
+        _answer_secret_request(conn, record, question, *parsed))
+    return True
+
+
+def secret_request_resolved(payload) -> None:
+    """`question.resolved`: answered elsewhere (the Control UI), cancelled or
+    expired. The dialog's wait ends; whatever it gets later is dropped."""
+    task = _SECRET_REQUESTS.pop((payload or {}).get("id"), None)
+    if task is not None:
+        task.cancel()
+
+
+async def _answer_secret_request(conn, record: dict, question: dict, user_id: str, chat_id: str) -> None:
+    qid, name = record["id"], question["secretStore"]["name"]
+    timeout_s = max(1.0, (record.get("expiresAtMs") or 0) / 1000 - time.time())
+    payload = _secret_request_payload(question)
+    if not await _sender_is_owner(conn, record.get("sessionKey") or ""):
+        # The store is the owner's: a guest's chat cannot write into it.
+        _SECRET_REQUESTS.pop(qid, None)
+        pipe_log(f"  secret request: {name} in a chat of a user not in OWNER_USERS; left to the Control UI")
+        return
+    turn = _SECRET_ASKERS.get(record.get("sessionKey"))
+    pipe_log(f"  secret request: {name} in chat {chat_id[:8]}... (question {qid[:8]}...)")
+    try:
+        if turn is not None:
+            ask = _ask_where_the_chat_is(
+                turn.__event_call__, payload, timeout_s,
+                owui_user_id=user_id, owui_chat_id=chat_id, owui_message_id=turn.owui_message_id,
+                poll_interval_s=5, owui_session_id=(turn.__metadata__ or {}).get("session_id"))
+        else:
+            ask = _call_on_chat_tab(user_id, chat_id, None, payload, timeout_s)
+        response = await asyncio.wait_for(ask, timeout_s)
+    except asyncio.TimeoutError:
+        response = None
+    if _SECRET_REQUESTS.get(qid) is not asyncio.current_task():
+        return
+    del _SECRET_REQUESTS[qid]
+    if response is None:
+        # Expired with the dialog open, or no tab shows the chat: the Gateway
+        # expires it and the agent hears "No credential arrived".
+        pipe_log(f"  secret request: {name} not answered in Open WebUI")
+        return
+    # Only typed text is a value: a cancelled dialog answers False.
+    value = response.strip() if isinstance(response, str) else ""
+    params = ({"id": qid, "answers": {"answers": {question["questionId"]: [value]}},
+               "resolvedBy": "openwebui"} if value
+              else {"id": qid, "cancel": True, "resolvedBy": "openwebui"})
+    value = response = None
+    try:
+        result = await conn.send_request("question.resolve", params, timeout=30)
+        shown = "stored" if (result or {}).get("status") == "answered" else str((result or {}).get("status"))
+    except Exception as ex:
+        shown = f"not stored ({type(ex).__name__})"
+    finally:
+        params = None
+    pipe_log(f"  secret request: {name} {shown}")
+    if turn is not None and turn.__event_emitter__:
+        try:
+            await turn.__event_emitter__({"type": "notification", "data": {
+                "type": "success" if shown == "stored" else "info", "content": f"{name}: {shown}"}})
+        except Exception:
+            pass

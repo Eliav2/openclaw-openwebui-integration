@@ -1418,6 +1418,10 @@ class _Consumer:
 # build registers. None in the Status Action's build: it carries no turn
 # writer, and its own connection only makes requests (ELI-149).
 _TURNS = None
+# The Pipe's handlers for `question.requested` / `question.resolved`
+# (askuser.py, ELI-96), set by pipe.py. None in the Status Action, which asks
+# nothing; only the connection that writes turns asks, so a question is asked once.
+_QUESTION_HOOKS = None
 
 
 class _GatewayConnection:
@@ -2839,6 +2843,15 @@ class _GatewayConnection:
                     continue
                 if msg.get("type") == "event" and msg.get("event") == "shutdown":
                     self._on_shutdown(msg.get("payload") or {})
+                    continue
+                if msg.get("type") == "event" and msg.get("event") in ("question.requested",
+                                                                     "question.resolved"):
+                    if _QUESTION_HOOKS and self.writes_turns:
+                        seen, resolved = _QUESTION_HOOKS
+                        if msg["event"] == "question.requested":
+                            seen(self, msg.get("payload") or {})
+                        else:
+                            resolved(msg.get("payload") or {})
                     continue
                 if msg.get("type") == "event" and msg.get("event") == "session.message":
                     self._on_session_message(msg.get("payload") or {})
