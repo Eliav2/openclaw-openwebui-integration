@@ -10347,6 +10347,23 @@ class _PipeTurn:
             self.ended = True
             return
 
+        # --- Continue Response (ELI-184) ---
+        # Open WebUI's Continue sends the chat with the agent's own reply last,
+        # to be extended in place. OpenClaw has no way to continue a finished
+        # run, and forwarding that reply would send the agent its own words as
+        # the user's. So nothing goes to the agent and nothing is added to the
+        # reply (Open WebUI keeps it as it was); a toast says why.
+        messages = self.body.get("messages", [])
+        if messages and messages[-1].get("role") == "assistant":
+            pipe_log("Continue Response: the reply is complete, nothing sent to the agent")
+            if self.__event_emitter__:
+                await self.__event_emitter__({"type": "notification", "data": {
+                    "type": "info",
+                    "content": "Continue isn't supported for OpenClaw agents: the reply is "
+                               "already complete. Send a message to ask for more."}})
+            self.ended = True
+            return
+
         # --- Extract user message ---
         # OWUI sends `content` as a plain string for text-only messages, but
         # as a list of content blocks (`{"type": "text", ...}` /
@@ -10354,7 +10371,6 @@ class _PipeTurn:
         # Coercing through _coerce_text (already used elsewhere for gateway
         # event payloads with the same block shape) extracts and joins any
         # text blocks and safely no-ops on plain strings.
-        messages = self.body.get("messages", [])
         raw_content = messages[-1]["content"] if messages else ""
         self.text = _coerce_text(raw_content)
         has_image = _content_has_image(raw_content)

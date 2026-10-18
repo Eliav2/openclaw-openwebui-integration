@@ -1143,6 +1143,53 @@ class OwuiTaskNoopTests(unittest.TestCase):
         self.assertNotIn("moa_response_generation", values)
 
 
+class ContinueResponseTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-184: Open WebUI's Continue Response sends the chat with the agent's own
+    reply last. OpenClaw cannot continue a finished reply, so the Pipe sends
+    nothing to the agent, adds nothing to the reply, and says so in a toast."""
+
+    async def _prepare(self, messages):
+        events, connected = [], []
+
+        async def emitter(event):
+            events.append(event)
+
+        async def get_conn(valves_getter):
+            connected.append(True)
+            raise openclaw_pipe.GatewayError("stop at the connection")
+
+        pipe = openclaw_pipe.Pipe()
+        turn = openclaw_pipe._PipeTurn(
+            pipe, {"model": "openclaw_gateway.main", "messages": messages}, emitter, None, None,
+            {"chat_id": "chat-1", "user_id": "u1"}, None, None, None, "", [], None)
+        with mock.patch("openclaw_pipe._get_gateway_connection", get_conn), \
+                mock.patch("openclaw_pipe._start_file_server", lambda: None), \
+                mock.patch("openclaw_pipe._ensure_orphan_reconcile", lambda *a: None):
+            yielded = [item async for item in turn.prepare()]
+        return turn, yielded, events, connected
+
+    async def test_a_continue_sends_nothing_and_adds_nothing_to_the_reply(self):
+        turn, yielded, events, connected = await self._prepare([
+            {"role": "user", "content": "count 1 to 5"},
+            {"role": "assistant", "content": "1 2 3 4 5"},
+        ])
+        self.assertTrue(turn.ended)
+        self.assertEqual(yielded, [])
+        self.assertEqual(connected, [])
+        notes = [e["data"] for e in events if e.get("type") == "notification"]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("Continue", notes[0]["content"])
+        self.assertEqual([e for e in events if e.get("type") != "notification"], [])
+
+    async def test_a_user_message_last_still_goes_to_the_gateway(self):
+        turn, yielded, events, connected = await self._prepare([
+            {"role": "assistant", "content": "1 2 3 4 5"},
+            {"role": "user", "content": "and to 10?"},
+        ])
+        self.assertEqual(connected, [True])
+        self.assertEqual([e for e in events if e.get("type") == "notification"], [])
+
+
 class EventConsumerMatchingTests(unittest.TestCase):
     def test_matches_exact_session_and_run(self):
         conn = _GatewayConnection(lambda: None)

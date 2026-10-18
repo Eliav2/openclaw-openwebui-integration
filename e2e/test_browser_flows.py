@@ -235,6 +235,33 @@ def _reload(page) -> None:
     page.wait_for_selector("#chat-input", timeout=60_000)
 
 
+def test_continue_on_a_reply_adds_nothing_and_says_why(page):
+    """Continue Response (ELI-184): OpenClaw cannot continue a finished reply.
+    The reply stays as it was, also after a reload: nothing is glued onto it,
+    the agent is never sent its own reply as a message, and a toast says why."""
+    full = _slow("BROWSER_CONTINUE", 3)
+    capture.new_chat(page)
+    capture.send(page, "E2E_SLOW:3 BROWSER_CONTINUE")
+    _wait(page, _reply_js(-1, f"r.done && r.text.includes({json.dumps(full)})"), "the reply, done")
+    before = _replies(page)[-1]["text"]
+    asked = len(_fake_llm_requests())
+
+    page.locator(".chat-assistant").last.hover()
+    page.locator('button[aria-label="Continue Response"]').last.click()
+    _wait(page, """() => [...document.querySelectorAll('[data-sonner-toast]')]
+                  .some(t => t.innerText.includes("Continue isn't supported"))""",
+          "a toast saying Continue isn't supported", 30_000)
+    _wait(page, _reply_js(-1, "r.done"), "the reply done again after Continue")
+    page.wait_for_timeout(3_000)
+    assert _replies(page)[-1]["text"] == before, _tails(_seen(page))
+    sent = [r for r in _fake_llm_requests()[asked:] if "BROWSER_CONTINUE slow-1" in json.dumps(r["request"])]
+    assert sent == [], "the agent was sent its own reply"
+
+    _reload(page)
+    _wait(page, _reply_js(-1, "r.done"), "the reply after a reload", 60_000)
+    assert _replies(page)[-1]["text"] == before
+
+
 def test_stop_ends_the_reply_where_it_was(page):
     """Stop: the reply keeps the words shown so far and never grows after it
     (the run is stopped, its rest is not written into the message later), the

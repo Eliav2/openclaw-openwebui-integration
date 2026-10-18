@@ -54,6 +54,7 @@ Everything here works as soon as the Pipe is installed, except entries marked:
 - [**Send now keeps the run**](./reliability.md#send-now): Send now continues the running reply and then answers your message, instead of killing it
 - [**Clean redeploys**](./reliability.md#redeploys): a redeploy never leaves a duplicate connection writing every message twice
 - [**Background tasks skipped**](./reliability.md#open-webui-background-tasks): Open WebUI's own title, tag, follow-up, emoji and autocomplete calls never reach your agent
+- [**Continue Response handled**](./reliability.md#continue-response): Open WebUI's Continue button leaves a finished reply as it was and says why, instead of sending the agent its own reply
 - [**Actionable errors**](../troubleshooting.md): failures name the valve, the config key and the command that fixes them
 
 ## Setup
