@@ -39,6 +39,11 @@ and only a core set is sent as real schemas.
   `E2E_DEPLOY_START` and a call, then `E2E_DEPLOY_MID mid-1 ... mid-20` one
   word a second and a second call, then `E2E_DEPLOY_END end-1 ... end-10` one
   word a second. Long enough for the Pipe to be redeployed while it streams.
+* `E2E_CARDS`                          -> three tool cards' states: says
+  `E2E_CARDS_START` and calls `read` on a file that does not exist (a failed
+  card), then says `E2E_CARDS_MID` and runs `sleep 6` with `exec` in the
+  foreground (a card that runs for a while, then finishes), then replies
+  `E2E_CARDS_END`.
 * `E2E_ASK_SINGLE` / `E2E_ASK_MULTI`   -> asks a question: `ASK_SINGLE` or
   `ASK_MULTI` below. The next message answers it: the reply is
   `E2E_ANSWERED <the answer> E2E_ANSWER_END`, so a test sees what reached
@@ -93,6 +98,8 @@ SPAWN_TASK = "E2E_SLOW:20 E2E_CHILDTASK"   # the sub-agent's task for E2E_SPAWN
 TITLE = "🧪 E2E chat title"
 DEPLOY_MID = "E2E_DEPLOY_MID " + " ".join(f"mid-{i}" for i in range(1, 21))
 DEPLOY_END = "E2E_DEPLOY_END " + " ".join(f"end-{i}" for i in range(1, 11))
+CARDS_MISSING_FILE = "/nonexistent/e2e-cards-missing.txt"   # E2E_CARDS: a read that fails
+CARDS_SLOW_COMMAND = "sleep 6; echo e2e-cards-slept"         # E2E_CARDS: an exec that runs a while
 ANSWER_END = "E2E_ANSWER_END"   # the answer's echo is complete
 ASK_SINGLE = "OpenClaw needs input:\n\nColor\nWhich color?\n1. Red\n2. Green\n3. Blue"
 ASK_MULTI = ("OpenClaw needs input:\n\nToppings (multiselect)\nWhich toppings?\n"
@@ -118,6 +125,16 @@ def _call(name: str, offered: list) -> dict | None:
         if wrapper in offered:
             return {"tool": wrapper, "args": {"id": name, "args": {}}}
     return None
+
+
+def _call_with(name: str, args: dict, offered: list) -> dict | None:
+    """`_call`, with arguments for the tool."""
+    call = _call(name, offered)
+    if call and call["tool"] == name:
+        call["args"] = args
+    elif call:
+        call["args"]["args"] = args
+    return call
 
 
 def _harmless_call(offered: list) -> dict | None:
@@ -244,6 +261,17 @@ def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
         if len(tool_results) == 1:
             return {"text": DEPLOY_MID, "delay": 1.0, **call}
         return {"text": DEPLOY_END, "delay": 1.0}
+
+    if "E2E_CARDS" in user_text:
+        steps = [("E2E_CARDS_START", "read", {"path": CARDS_MISSING_FILE}),
+                 ("E2E_CARDS_MID", "exec", {"command": CARDS_SLOW_COMMAND})]
+        if len(tool_results) < len(steps):
+            say, name, args = steps[len(tool_results)]
+            call = _call_with(name, args, offered)
+            if not call:
+                return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
+            return {"text": say, **call}
+        return {"text": "E2E_CARDS_END"}
 
     if "E2E_BG_EXEC" in user_text:
         # One shell command left running in the background, for the Status
