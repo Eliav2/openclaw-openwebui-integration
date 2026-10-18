@@ -646,14 +646,15 @@ class Pipe:
         if request is not None and _send_texts is None:
             def _request_ended(_task):
                 # Open WebUI ended the request (its own save of the message
-                # done) with this reply's status line still open, and nobody
-                # else owns the message: nothing will close the line now. A
+                # done) with this reply's status line open, and nobody else
+                # owns the message: nothing will close the line now. A
                 # Stop as the reply ends does this (a question card cancelled
                 # by sending a new message, ELI-200), wherever the cancel
                 # lands: in the reply, or in Open WebUI's own code while the
                 # reply waits at a yield, which never closes the reply.
-                if turn.status_open and not turn.parked and not turn.handed_over and turn.reply:
-                    pipe_log("  request ended with the reply's status line open: closing it")
+                # A cancelled request is checked too: see `_close_reply_status`.
+                if ((turn.status_open or _task.cancelled()) and not turn.parked
+                        and not turn.handed_over and turn.reply):
                     spawn_background(_close_reply_status(turn.reply))
             request.add_done_callback(_request_ended)
         try:

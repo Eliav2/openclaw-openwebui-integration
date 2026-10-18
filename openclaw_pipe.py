@@ -7304,16 +7304,26 @@ REPLY_NOT_SENT_NOTE = "_(Stopped: this message was not sent to the agent.)_"
 
 async def _close_reply_status(ref: dict) -> None:
     """Close the status line reply `ref` ({chat_id, user_id, message_id,
-    request_task_id}) left open when its request ended (ELI-200): saved, so a
-    reload shows it ended too. After the request's own end-of-stream save,
-    like `_close_unsent_reply`."""
+    request_task_id}) left open when its request ended (ELI-200), if the
+    saved message still shows it open: saved, so a reload shows it ended too.
+    After the request's own end-of-stream save, like `_close_unsent_reply`.
+
+    The saved state decides, not what the reply sent: on a Stop, Open WebUI
+    closes the reply's stream (whose last status is written then) and saves
+    the cancelled message at the same time, two read-modify-writes of the
+    same chat, and the status write can be the one that is lost."""
     request = _owui_request_task(ref.get("request_task_id"))
     if request is not None and not request.done():
         await asyncio.wait({request})
+    from open_webui.models.chats import Chats
     from open_webui.socket.main import get_event_emitter
 
     message_id = ref["message_id"]
     try:
+        saved = await Chats.get_message_by_id_and_message_id(ref["chat_id"], message_id) or {}
+        last = (saved.get("statusHistory") or [None])[-1]
+        if not isinstance(last, dict) or last.get("done") is not False:
+            return
         emit = await get_event_emitter({"chat_id": ref["chat_id"], "message_id": message_id,
                                         "user_id": ref.get("user_id")}, update_db=True)
         await emit({"type": "status", "data": {"description": "", "done": True}})
@@ -10691,14 +10701,15 @@ class Pipe:
         if request is not None and _send_texts is None:
             def _request_ended(_task):
                 # Open WebUI ended the request (its own save of the message
-                # done) with this reply's status line still open, and nobody
-                # else owns the message: nothing will close the line now. A
+                # done) with this reply's status line open, and nobody else
+                # owns the message: nothing will close the line now. A
                 # Stop as the reply ends does this (a question card cancelled
                 # by sending a new message, ELI-200), wherever the cancel
                 # lands: in the reply, or in Open WebUI's own code while the
                 # reply waits at a yield, which never closes the reply.
-                if turn.status_open and not turn.parked and not turn.handed_over and turn.reply:
-                    pipe_log("  request ended with the reply's status line open: closing it")
+                # A cancelled request is checked too: see `_close_reply_status`.
+                if ((turn.status_open or _task.cancelled()) and not turn.parked
+                        and not turn.handed_over and turn.reply):
                     spawn_background(_close_reply_status(turn.reply))
             request.add_done_callback(_request_ended)
         try:

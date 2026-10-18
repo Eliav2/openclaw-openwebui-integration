@@ -230,16 +230,26 @@ REPLY_NOT_SENT_NOTE = "_(Stopped: this message was not sent to the agent.)_"
 
 async def _close_reply_status(ref: dict) -> None:
     """Close the status line reply `ref` ({chat_id, user_id, message_id,
-    request_task_id}) left open when its request ended (ELI-200): saved, so a
-    reload shows it ended too. After the request's own end-of-stream save,
-    like `_close_unsent_reply`."""
+    request_task_id}) left open when its request ended (ELI-200), if the
+    saved message still shows it open: saved, so a reload shows it ended too.
+    After the request's own end-of-stream save, like `_close_unsent_reply`.
+
+    The saved state decides, not what the reply sent: on a Stop, Open WebUI
+    closes the reply's stream (whose last status is written then) and saves
+    the cancelled message at the same time, two read-modify-writes of the
+    same chat, and the status write can be the one that is lost."""
     request = _owui_request_task(ref.get("request_task_id"))
     if request is not None and not request.done():
         await asyncio.wait({request})
+    from open_webui.models.chats import Chats
     from open_webui.socket.main import get_event_emitter
 
     message_id = ref["message_id"]
     try:
+        saved = await Chats.get_message_by_id_and_message_id(ref["chat_id"], message_id) or {}
+        last = (saved.get("statusHistory") or [None])[-1]
+        if not isinstance(last, dict) or last.get("done") is not False:
+            return
         emit = await get_event_emitter({"chat_id": ref["chat_id"], "message_id": message_id,
                                         "user_id": ref.get("user_id")}, update_db=True)
         await emit({"type": "status", "data": {"description": "", "done": True}})

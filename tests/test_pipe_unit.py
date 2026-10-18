@@ -2444,7 +2444,7 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(patch.stop)
         return closed
 
-    def _owui_request(self, text, msg_id, *, question=False, between_chunks=None):
+    def _owui_request(self, text, msg_id, *, question=False, between_chunks=None, after_stream=None):
         """Run a reply the way Open WebUI does: in a request task registered
         under the request's task id (`open_webui.tasks.tasks`), reading the
         stream. `question`: the card is cancelled. `between_chunks`: an
@@ -2474,6 +2474,8 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
                 out.append(chunk)
                 if between_chunks is not None:
                     await between_chunks()
+            if after_stream is not None:
+                await after_stream()   # Open WebUI's own work at the stream's end
         tasks_mod = types.ModuleType("open_webui.tasks")
         tasks_mod.tasks = {}
         patch = mock.patch.dict(sys.modules, {"open_webui.tasks": tasks_mod})
@@ -2531,6 +2533,30 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         never resumed or closed, so nothing in it runs again."""
         await self._stopped_as_it_ends(between_chunks=True)
 
+    async def test_a_cancelled_reply_has_its_saved_status_checked(self):
+        """The reply wrote its own last status, then Open WebUI's request was
+        cancelled by a Stop: its save of the cancelled message runs while the
+        status write may still be going, and the status write can be lost
+        there. A cancelled request always has its saved status checked."""
+        closed = self._record_status_closes()
+        at_end = asyncio.Event()
+
+        async def owui_end_work():
+            at_end.set()
+            await asyncio.Event().wait()
+        task, out = self._owui_request("hello", "m1", after_stream=owui_end_work)
+        await self._until_registered("run-1")
+        self._queue("run-1").put_nowait(self._delta("run-1", "hi"))
+        self._queue("run-1").put_nowait(self._final("run-1"))
+        await asyncio.wait_for(at_end.wait(), 30)
+        statuses = [e["data"] for e in self.emitted if e.get("type") == "status"]
+        self.assertTrue(statuses[-1]["done"], "precondition: the reply closed its own status")
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        await self._spin()
+        self.assertEqual(closed, ["m1"])
+
     async def test_a_reply_that_ended_leaves_its_last_status_alone(self):
         """Control: a reply that wrote its last status (usage lines, or an
         empty done one) before its request ended keeps it."""
@@ -2549,12 +2575,15 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
 class CloseUnsentReplyTests(unittest.IsolatedAsyncioTestCase):
     """`_close_unsent_reply` (ELI-188): the interrupted reply's last write."""
 
-    async def test_the_open_status_is_closed_and_saved_after_the_request(self):
-        """`_close_reply_status` (ELI-200): after Open WebUI's own save at the
-        end of the request, a done status, saved (update_db) so a reload
-        shows the line ended too."""
+    async def _close_status(self, saved_history, release_first=True):
         import openclaw_pipe as ocp
         events, order = [], []
+
+        class Chats:
+            @staticmethod
+            async def get_message_by_id_and_message_id(chat_id, message_id):
+                order.append("read")
+                return {"role": "assistant", "done": True, "statusHistory": copy.deepcopy(saved_history)}
 
         async def get_event_emitter(meta, update_db=True):
             async def emit(event):
@@ -2569,18 +2598,35 @@ class CloseUnsentReplyTests(unittest.IsolatedAsyncioTestCase):
         req = asyncio.ensure_future(request())
         tasks_mod = types.ModuleType("open_webui.tasks")
         tasks_mod.tasks = {"task-1": req}
-        modules = {**owui_modules(get_event_emitter=get_event_emitter), "open_webui.tasks": tasks_mod}
+        chats_mod = types.ModuleType("open_webui.models.chats")
+        chats_mod.Chats = Chats
+        modules = {**owui_modules(get_event_emitter=get_event_emitter), "open_webui.tasks": tasks_mod,
+                   "open_webui.models": types.ModuleType("open_webui.models"),
+                   "open_webui.models.chats": chats_mod}
         with mock.patch.dict(sys.modules, modules):
             close = asyncio.ensure_future(ocp._close_reply_status(
                 {"chat_id": "chat-1", "user_id": "u1", "message_id": "m1", "request_task_id": "task-1"}))
             for _ in range(20):
                 await asyncio.sleep(0)
-            self.assertEqual(order, [])
+            self.assertEqual(order, [], "Open WebUI's own save at the request's end comes first")
             release.set()
             await asyncio.wait_for(close, 5)
-        self.assertEqual(order, ["request-ended", "status"])
+        return order, events
+
+    async def test_a_saved_open_status_is_closed_after_the_request(self):
+        """`_close_reply_status` (ELI-200): after the request's end, the saved
+        message still ends on an open status: a done one is added, saved
+        (update_db) so a reload shows the line ended too."""
+        order, events = await self._close_status([{"description": "Thinking...", "done": False}])
+        self.assertEqual(order, ["request-ended", "read", "status"])
         self.assertEqual(events, [("m1", True, {"type": "status",
                                                 "data": {"description": "", "done": True}})])
+
+    async def test_a_saved_closed_status_is_left_as_it_is(self):
+        """The reply's own last status reached the saved message: nothing to add."""
+        order, events = await self._close_status([{"description": "Thinking...", "done": False},
+                                                  {"description": "🧠 10/200k", "done": True}])
+        self.assertEqual(events, [])
 
     async def test_it_waits_for_the_request_then_ends_the_message_with_the_note(self):
         import openclaw_pipe as ocp
