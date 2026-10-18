@@ -271,6 +271,43 @@ class HistoryPrefixTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self._prefix("u2", "a2", copied), "")
 
 
+class HistoryLineFilesTests(unittest.IsolatedAsyncioTestCase):
+    """STATE_DIR/history-line/ holds one small file per chat: a line is at
+    most HISTORY_TAIL_MAX ids, a copy's messages stay only until the next
+    send, and lines not sent to for HISTORY_LINE_KEEP_S are dropped."""
+
+    def test_old_lines_are_dropped_with_their_locks_and_recent_ones_kept(self):
+        import os
+        import time
+        folder = tempfile.mkdtemp()
+        old, new = os.path.join(folder, "old.json"), os.path.join(folder, "new.json")
+        for p in (old, old + ".lock", new, new + ".lock"):
+            open(p, "w").close()
+        long_ago = time.time() - ocp.HISTORY_LINE_KEEP_S - 60
+        os.utime(old, (long_ago, long_ago))
+        # A lock file is created once and never written: its age is no signal.
+        os.utime(new + ".lock", (long_ago, long_ago))
+        ocp._history_line_prune(folder, time.time() - ocp.HISTORY_LINE_KEEP_S)
+        self.assertEqual(sorted(os.listdir(folder)), ["new.json", "new.json.lock"])
+
+    async def test_a_copys_messages_are_kept_only_until_the_next_send(self):
+        folder = tempfile.mkdtemp()
+        tree = _chain("u1", "a1")
+        tree["u2"] = ("user", "a1", "go on")
+        rows = FakeRows(tree, origin="source-chat")
+        copied = [{"role": "user", "content": "Q " + "x" * 20000}, {"role": "assistant", "content": "A"},
+                  {"role": "user", "content": "go on"}]
+        with mock.patch.object(ocp, "_owui_history_rows", lambda chat_id: rows, create=True):
+            meta = {"user_message_id": "u2", "message_id": "a2"}
+            self.assertTrue(await _history_prefix(FakeConn(), folder, "chat-1", "k", meta, copied))
+            self.assertGreater(len(_history_line_read(folder, "chat-1")["prefix"]), 20000)
+            tree["a2"] = ("assistant", "u2", "")
+            tree["u3"] = ("user", "a2", "")
+            meta = {"user_message_id": "u3", "message_id": "a3"}
+            self.assertEqual(await _history_prefix(FakeConn(["k"]), folder, "chat-1", "k", meta, copied), "")
+        self.assertEqual(_history_line_read(folder, "chat-1")["prefix"], "")
+
+
 class HistoryIntakeTests(unittest.IsolatedAsyncioTestCase):
     """Through the Pipe's real request path: what `chat.send` carries."""
 

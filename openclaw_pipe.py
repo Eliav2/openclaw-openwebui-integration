@@ -9712,15 +9712,25 @@ def _history_line_write(state_dir: str, chat_id: str, data: dict) -> None:
         return
     if not _history_line_pruned:
         _history_line_pruned = True
-        cutoff = time.time() - HISTORY_LINE_KEEP_S
-        folder = os.path.dirname(path)
-        for name in os.listdir(folder):
-            full = os.path.join(folder, name)
-            try:
-                if os.path.getmtime(full) < cutoff:
-                    os.remove(full)
-            except OSError:
-                pass
+        _history_line_prune(os.path.dirname(path), time.time() - HISTORY_LINE_KEEP_S)
+
+
+def _history_line_prune(folder: str, cutoff: float) -> None:
+    """Drop the lines of chats not sent to since `cutoff` (a deleted chat's
+    line goes this way too: Open WebUI tells the Pipe nothing when a chat is
+    deleted). A line's age is its .json file's; its lock goes with it, since
+    a lock file is never written and its own age says nothing."""
+    for name in os.listdir(folder):
+        if not name.endswith(".json"):
+            continue
+        full = os.path.join(folder, name)
+        try:
+            if os.path.getmtime(full) < cutoff:
+                os.remove(full)
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(full + ".lock")
+        except OSError:
+            pass
 
 
 class _OwuiHistoryRows:
