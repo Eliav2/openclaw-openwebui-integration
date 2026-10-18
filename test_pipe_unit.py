@@ -11539,6 +11539,70 @@ class SessionIdRunTests(_RoutingCase):
         (send,) = self.sends()
         self.assertEqual(parse_pipe_run_id(send["idempotencyKey"])["message"], first)
 
+    # ── ELI-181: a wake whose job is gone before its first event is judged ──
+
+    def heard(self, action, job, start, end=None):
+        """The Gateway's `cron` event for a job run into this session (a Pipe
+        before ELI-181 ignored them)."""
+        getattr(self.conn, "note_cron_event", lambda _p: None)({"action": action, "jobId": job, "runAtMs": start,
+                                   **({"durationMs": end - start} if end is not None else {}),
+                                   "job": {"id": job, "sessionTarget": f"session:{self.key}"}})
+
+    def short_wake(self, key, text, job=None):
+        """A wake whose whole run is over before the Pipe judges its first
+        event (a ~40 ms run, on 2026.9 with the Pipe busy). Its first event
+        predates its own turn's commit: the embedded runtime writes the turn
+        after the run's first events. Returns the run's events, not routed."""
+        job = job or self.JOB
+        start = self.tick()
+        self.heard("started", job, start)
+        events = [self.sid_ev(_delta(text))]
+        at = self.tick()
+        self.history["messages"].append({
+            "role": "user", "content": f"[cron:{job} eli181-wake] {key}", "idempotencyKey": f"{key}:user",
+            "timestamp": at - 150, "__openclaw": {"idempotencyKey": f"{key}:user", "recordTimestampMs": at}})
+        events.append(self.sid_ev({"state": "final"}))
+        self.imported(text)
+        end = self.tick()
+        self.cron_runs.append({"jobId": job, "action": "finished", "runAtMs": start, "ts": end})
+        self.heard("finished", job, start, end)
+        self.jobs = []      # a one-shot job is deleted once it ran
+        return events
+
+    async def test_a_wake_whose_job_ended_before_its_first_event_is_judged_gets_its_message(self):
+        """PR #115 CI, 2026-10-18 07:24:29: WAKE_TWO never got a message; the
+        Pipe said "1 sessionId event(s) ... with no running cron wake". Its
+        job had left cron.list, and its first event was older than its turn,
+        so no turn matched: the wake was judged stray and the pump dropped
+        the rest of the run."""
+        for cron_runs_written in (True, False):
+            with self.subTest(cron_runs_written=cron_runs_written):
+                key = self.W1 if cron_runs_written else self.W2
+                events = self.short_wake(key, f"Short wake {key[:4]}.")
+                if not cron_runs_written:
+                    self.cron_runs.clear()
+                for ev in events:
+                    _turn_route_now(self.conn, ev)
+                await self.spin()
+                m = self.new_messages().get(turn_message_id(self.key, key, self.CHAT))
+                self.assertIsNotNone(m, "the wake got no message")
+                self.assertIs(m["done"], True)
+                self.assertEqual(m["content"], f"Short wake {key[:4]}.")
+
+    async def test_the_next_wakes_events_queued_behind_a_wakes_end_are_shown(self):
+        """Every wake into a session shares one run id, so one pump: what is
+        queued behind a wake's end is the next wake's, and must not be dropped
+        with the pump."""
+        first = self.short_wake(self.W1, "First wake.", job="job-1")
+        second = self.short_wake(self.W2, "Second wake.", job="job-2")
+        for ev in first + second:      # all queued before the pump judges any
+            _turn_route_now(self.conn, ev)
+        await self.spin()
+        got = {k: m["content"] for k, m in self.new_messages().items()}
+        self.assertEqual(got, {turn_message_id(self.key, self.W1, self.CHAT): "First wake.",
+                               turn_message_id(self.key, self.W2, self.CHAT): "Second wake."})
+
+
 
 
 class WakeTurnTests(unittest.TestCase):

@@ -389,6 +389,18 @@ def wake_turn_at(messages: list, at_ms: float, bound=frozenset()) -> dict | None
     return None
 
 
+def wake_turn_of_run(messages: list, job: str, start_ms: float, bound=frozenset()) -> dict | None:
+    """The wake turn cron job `job`'s run that started at `start_ms` wrote:
+    its newest turn committed since, unless an earlier wake took it. None
+    while it is not committed yet: the embedded runtime writes it after the
+    run's first events, so a turn is not looked for before the event (as
+    `wake_turn_at` must, knowing no run)."""
+    for turn in reversed(wake_turns(messages)):
+        if turn["job"] == job and turn["at"] is not None and turn["at"] >= start_ms:
+            return None if turn["key"] in bound else turn
+    return None
+
+
 def wake_span(messages: list, start_ms: float, end_ms: float) -> list:
     """A wake's assistant messages: runs on one session are serialized, and
     claude-cli imports its transcript stamped with the CLI's own times, so

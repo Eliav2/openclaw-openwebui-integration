@@ -1496,6 +1496,12 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
     finally:
         if conn._turn_pumps.get((sess, run)) is pump:
             conn._turn_pumps.pop((sess, run), None)
+            # Every wake into the session shares this run id: what queued
+            # behind this wake's end is the next run's, for a pump of its own.
+            while pump.wake and not pump.queue.empty():
+                kind, item = pump.queue.get_nowait()
+                if kind == "event" and item is not None:
+                    _turn_queue(conn, sess, run, parsed, item)
 
 
 def _is_terminal_event(payload: dict) -> bool:
@@ -1532,6 +1538,11 @@ async def _wake_bind(conn: "_GatewayConnection", sess: str, run: str, user_id: s
     starts = [(j.get("state") or {}).get("runningAtMs") for j in jobs or []
               if j.get("sessionTarget") == f"session:{sess}"]
     running_start = min((s for s in starts if isinstance(s, (int, float))), default=None)
+    # The job run this socket heard start and the event falls in: the wake
+    # is that run's, even once its one-shot job is gone from cron.list.
+    heard = conn.cron_run_at(sess, at_ms)
+    if heard is not None:
+        running_start = heard["start"]
     bound = conn._wake_turns_bound.setdefault(sess, set())
     # The turn is committed after its job started: read back until the window
     # holds a message older than that start (a fixed window loses a wake that
@@ -1543,14 +1554,18 @@ async def _wake_bind(conn: "_GatewayConnection", sess: str, run: str, user_id: s
         except Exception as ex:
             pipe_log(f"  turn writer: chat.history for a wake failed: {ex!r}")
             return "wait", None
-        turn = wake_turn_at(messages, at_ms, bound)
+        turn = (wake_turn_of_run(messages, heard["job"], heard["start"], bound) if heard is not None
+                else wake_turn_at(messages, at_ms, bound))
         oldest = min((m.get("timestamp") for m in messages
                       if isinstance(m.get("timestamp"), (int, float))), default=None)
         if (turn is not None or running_start is None or len(messages) < limit
                 or limit >= CHAT_HISTORY_MAX or (oldest is not None and oldest < running_start)):
             break
         limit = min(limit * 4, CHAT_HISTORY_MAX)
-    start = await _wake_job_start(conn, turn, at_ms, jobs) if turn is not None else None
+    if heard is not None:
+        start = heard["start"] if turn is not None else None
+    else:
+        start = await _wake_job_start(conn, turn, at_ms, jobs) if turn is not None else None
     if start is None:
         return ("wait", None) if running_start is not None else ("stray", None)
     bound.add(turn["key"])
