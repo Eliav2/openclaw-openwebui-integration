@@ -91,6 +91,13 @@ jobs:
           OPENCLAW_DIST="$(npm root -g)/openclaw/dist" uv run --with-requirements requirements-dev.txt \
             pytest -v -rs tests/test_pipe_unit.py -k "installed_dist"
 
+      - name: Open WebUI diagnostic dump
+        # What Open WebUI was doing when the run failed: its asyncio tasks,
+        # threads and sqlite connections, into e2e-logs/owui-diag/ (ELI-204).
+        # A run stopped at "database is locked" took one already.
+        if: failure()
+        run: python3 e2e/owui_dump.py "$RUNNER_TEMP/e2e-logs/owui-diag" || true
+
       - name: Collect logs
         if: always()
         run: |
