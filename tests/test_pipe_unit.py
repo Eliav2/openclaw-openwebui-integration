@@ -2433,9 +2433,200 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         await nxt
         await r3.aclose()
 
+    def _record_status_closes(self):
+        """The replies whose open status line was closed after they ended."""
+        closed = []
+
+        async def close(ref):
+            closed.append(ref.get("message_id"))
+        patch = mock.patch.object(self.ocp, "_close_reply_status", close, create=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return closed
+
+    def _owui_request(self, text, msg_id, *, question=False, between_chunks=None, after_stream=None):
+        """Run a reply the way Open WebUI does: in a request task registered
+        under the request's task id (`open_webui.tasks.tasks`), reading the
+        stream. `question`: the card is cancelled. `between_chunks`: an
+        awaitable factory Open WebUI's own code waits on after each chunk."""
+        self.emitted = getattr(self, "emitted", [])
+
+        async def emitter(event):
+            self.emitted.append(event)
+
+        async def event_call(event):
+            if event.get("type") == "request:user_input":
+                return {"status": "cancelled", "answers": {}}
+            return None
+        body = {"model": "openclaw_gateway.default", "messages": [{"role": "user", "content": text}]}
+        meta = {"chat_id": "chat-1", "user_id": "u1", "message_id": msg_id, "task_id": "task-1"}
+        out = []
+
+        # Open WebUI's response object holds the stream: a Stop that lands in
+        # its own code leaves the generator suspended, never closed.
+        self.streams = getattr(self, "streams", [])
+        stream = self.pipe._pipe_impl(body, emitter, __metadata__=meta,
+                                      __event_call__=event_call if question else None)
+        self.streams.append(stream)
+
+        async def request():
+            async for chunk in stream:
+                out.append(chunk)
+                if between_chunks is not None:
+                    await between_chunks()
+            if after_stream is not None:
+                await after_stream()   # Open WebUI's own work at the stream's end
+        tasks_mod = types.ModuleType("open_webui.tasks")
+        tasks_mod.tasks = {}
+        patch = mock.patch.dict(sys.modules, {"open_webui.tasks": tasks_mod})
+        patch.start()
+        self.addCleanup(patch.stop)
+        tasks_mod.tasks["task-1"] = task = asyncio.ensure_future(request())
+        return task, out
+
+    async def _stopped_as_it_ends(self, between_chunks=None):
+        closed = self._record_status_closes()
+        rows_asked = asyncio.Event()
+
+        async def usage_rows(*a, **k):
+            rows_asked.set()
+            await asyncio.Event().wait()   # the Gateway calls, under way when Stop lands
+        patch = mock.patch.object(self.ocp, "_build_usage_status_lines", usage_rows)
+        patch.start()
+        self.addCleanup(patch.stop)
+        reached = asyncio.Event()
+
+        async def owui_work():
+            if any("Which?" in c for c in out if isinstance(c, str)):
+                reached.set()
+                await asyncio.Event().wait()   # Open WebUI busy with the chunk when Stop lands
+        task, out = self._owui_request("ask me", "m1", question=True,
+                                       between_chunks=owui_work if between_chunks else None)
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b"))
+        q.put_nowait(self._final("run-1"))
+        await asyncio.wait_for((reached if between_chunks else rows_asked).wait(), 30)
+        self.assertIn("Which?", "".join(c for c in out if isinstance(c, str)))
+        task.cancel()                    # the Stop that sends the new message
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        await self._spin()
+        statuses = [e["data"] for e in self.emitted if e.get("type") == "status"]
+        self.assertFalse(statuses[-1]["done"], f"precondition: the reply's status is open: {statuses}")
+        self.assertEqual(closed, ["m1"])
+
+    async def test_a_reply_stopped_as_it_ends_closes_its_status(self):
+        """ELI-200 (QA, live 2026-10-18 16:37): a question card is open, and a
+        message is sent instead of pressing its Cancel. The card is cancelled,
+        the question ends the reply as text, and the reply goes on to its end:
+        its last status line waits for the usage rows (two Gateway calls).
+        Open WebUI's Stop for the new message cancels the reply right there,
+        so that line was never written: the reply was saved done with its
+        status still "Thinking..." (done: false), shimmering forever, also
+        after a reload. Its run was over, so nothing was parked either."""
+        await self._stopped_as_it_ends()
+
+    async def test_a_stop_landing_in_open_webuis_own_code_closes_it_too(self):
+        """The same Stop landing while the reply waits at a yield, in Open
+        WebUI's own handling of the last chunk: the reply's generator is
+        never resumed or closed, so nothing in it runs again."""
+        await self._stopped_as_it_ends(between_chunks=True)
+
+    async def test_a_cancelled_reply_has_its_saved_status_checked(self):
+        """The reply wrote its own last status, then Open WebUI's request was
+        cancelled by a Stop: its save of the cancelled message runs while the
+        status write may still be going, and the status write can be lost
+        there. A cancelled request always has its saved status checked."""
+        closed = self._record_status_closes()
+        at_end = asyncio.Event()
+
+        async def owui_end_work():
+            at_end.set()
+            await asyncio.Event().wait()
+        task, out = self._owui_request("hello", "m1", after_stream=owui_end_work)
+        await self._until_registered("run-1")
+        self._queue("run-1").put_nowait(self._delta("run-1", "hi"))
+        self._queue("run-1").put_nowait(self._final("run-1"))
+        await asyncio.wait_for(at_end.wait(), 30)
+        statuses = [e["data"] for e in self.emitted if e.get("type") == "status"]
+        self.assertTrue(statuses[-1]["done"], "precondition: the reply closed its own status")
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        await self._spin()
+        self.assertEqual(closed, ["m1"])
+
+    async def test_a_reply_that_ended_leaves_its_last_status_alone(self):
+        """Control: a reply that wrote its last status (usage lines, or an
+        empty done one) before its request ended keeps it."""
+        closed = self._record_status_closes()
+        task, out = self._owui_request("hello", "m1")
+        await self._until_registered("run-1")
+        self._queue("run-1").put_nowait(self._delta("run-1", "hi"))
+        self._queue("run-1").put_nowait(self._final("run-1"))
+        await asyncio.wait_for(task, 30)
+        await self._spin()
+        statuses = [e["data"] for e in self.emitted if e.get("type") == "status"]
+        self.assertTrue(statuses[-1]["done"])
+        self.assertEqual(closed, [])
+
 
 class CloseUnsentReplyTests(unittest.IsolatedAsyncioTestCase):
     """`_close_unsent_reply` (ELI-188): the interrupted reply's last write."""
+
+    async def _close_status(self, saved_history, release_first=True):
+        import openclaw_pipe as ocp
+        events, order = [], []
+
+        class Chats:
+            @staticmethod
+            async def get_message_by_id_and_message_id(chat_id, message_id):
+                order.append("read")
+                return {"role": "assistant", "done": True, "statusHistory": copy.deepcopy(saved_history)}
+
+        async def get_event_emitter(meta, update_db=True):
+            async def emit(event):
+                order.append(event["type"])
+                events.append((meta["message_id"], update_db, copy.deepcopy(event)))
+            return emit
+        release = asyncio.Event()
+
+        async def request():
+            await release.wait()
+            order.append("request-ended")
+        req = asyncio.ensure_future(request())
+        tasks_mod = types.ModuleType("open_webui.tasks")
+        tasks_mod.tasks = {"task-1": req}
+        chats_mod = types.ModuleType("open_webui.models.chats")
+        chats_mod.Chats = Chats
+        modules = {**owui_modules(get_event_emitter=get_event_emitter), "open_webui.tasks": tasks_mod,
+                   "open_webui.models": types.ModuleType("open_webui.models"),
+                   "open_webui.models.chats": chats_mod}
+        with mock.patch.dict(sys.modules, modules):
+            close = asyncio.ensure_future(ocp._close_reply_status(
+                {"chat_id": "chat-1", "user_id": "u1", "message_id": "m1", "request_task_id": "task-1"}))
+            for _ in range(20):
+                await asyncio.sleep(0)
+            self.assertEqual(order, [], "Open WebUI's own save at the request's end comes first")
+            release.set()
+            await asyncio.wait_for(close, 5)
+        return order, events
+
+    async def test_a_saved_open_status_is_closed_after_the_request(self):
+        """`_close_reply_status` (ELI-200): after the request's end, the saved
+        message still ends on an open status: a done one is added, saved
+        (update_db) so a reload shows the line ended too."""
+        order, events = await self._close_status([{"description": "Thinking...", "done": False}])
+        self.assertEqual(order, ["request-ended", "read", "status"])
+        self.assertEqual(events, [("m1", True, {"type": "status",
+                                                "data": {"description": "", "done": True}})])
+
+    async def test_a_saved_closed_status_is_left_as_it_is(self):
+        """The reply's own last status reached the saved message: nothing to add."""
+        order, events = await self._close_status([{"description": "Thinking...", "done": False},
+                                                  {"description": "🧠 10/200k", "done": True}])
+        self.assertEqual(events, [])
 
     async def test_it_waits_for_the_request_then_ends_the_message_with_the_note(self):
         import openclaw_pipe as ocp

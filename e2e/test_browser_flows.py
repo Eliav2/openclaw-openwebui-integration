@@ -186,6 +186,29 @@ def test_a_single_select_question_is_answered_with_a_click(page):
     assert "E2E_ANSWERED" in reply and "Green" in reply.split("E2E_ANSWERED", 1)[1], reply[-200:]
 
 
+def test_a_question_left_for_a_new_message_ends_its_reply(page):
+    """ELI-200: with the question card open, a new message is sent instead
+    of an answer. The card goes, the question stays in its reply as text,
+    and that reply is finished: no "Thinking..." left on it, also after a
+    reload; the new message gets its own answer."""
+    capture.new_chat(page)
+    capture.send(page, "E2E_ASK_SINGLE")
+    capture.wait_js(page, "() => document.body.innerText.includes('Which color?') "
+                          "&& !!document.querySelector('input[placeholder=\"Type your answer\"]')",
+                    "the question card", TURN_MS)
+    _type_and_send(page, "E2E_ECHO: BROWSER_INSTEAD_OF_ANSWER")
+    _wait(page, _reply_js(-1, "all.length === 2 && all[0].done && r.done"
+                              " && r.text.includes('BROWSER_INSTEAD_OF_ANSWER')"),
+          "the new message's answer")
+    for when in ("", " after a reload"):
+        shown = page.evaluate(f"() => {_message_text_js(0)}")
+        assert "Which color?" in shown, f"the question is gone from its reply{when}: {shown[-200:]!r}"
+        assert "Thinking..." not in shown, f"the question's reply still says Thinking...{when}: {shown[-200:]!r}"
+        if not when:
+            _reload(page)
+            _wait(page, _reply_js(-1, "all.length === 2 && r.done"), "both replies after a reload", 60_000)
+
+
 def test_a_multi_select_question_takes_typed_numbers(page):
     """The card lists the options by number; "1, 3" typed and submitted
     reaches the agent as the two options."""
