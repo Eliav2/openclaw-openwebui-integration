@@ -7776,6 +7776,25 @@ class TurnWriterEndTests(_TurnWriterCase):
         await asyncio.wait_for(ending, 1)
         self.assertEqual(self.m()["statusHistory"][-1], self.USAGE)
 
+    async def test_a_request_still_running_after_the_wait_is_logged(self):
+        """The final write stops waiting for its request after
+        FINAL_STATUS_REQUEST_WAIT_S; a write of the request after it could
+        bring "Stopped" back, so that is logged, not silent."""
+        request = asyncio.get_running_loop().create_future()
+        w = self.handed_writer(request=request)
+        await w.feed(None)
+        logged = []
+        with mock.patch.object(openclaw_pipe, "FINAL_STATUS_REQUEST_WAIT_S", 0.01), \
+                mock.patch.object(openclaw_pipe, "pipe_log", lambda *a, **k: logged.append(a[0])):
+            await w.end({"status": "done", "hasActiveRun": False, "lastRunId": self.RUN})
+        late = [line for line in logged if "request still running after" in line]
+        self.assertEqual(len(late), 1, logged)
+        self.assertIn(w.chat_id[:8], late[0])
+        self.assertIn(w.message_id[:8], late[0])
+        self.assertIn("its own status write may land after this one", late[0])
+        self.assertEqual(self.m()["statusHistory"][-1], self.USAGE)
+        request.set_result(None)
+
     async def test_a_stop_ends_with_stopped_and_no_usage_line(self):
         """A real Stop reads as the normal reply's Stop: "Stopped", no usage."""
         for handed in (False, True):

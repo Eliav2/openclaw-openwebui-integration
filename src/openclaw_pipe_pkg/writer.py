@@ -756,6 +756,12 @@ class _TurnWriter:
 
         if self.request_task is not None and not self.request_task.done():
             await asyncio.wait({self.request_task}, timeout=FINAL_STATUS_REQUEST_WAIT_S)
+            if not self.request_task.done():
+                # Its own status write can still land after this one and bring
+                # its "Stopped" back.
+                pipe_log(f"  turn writer: chat {self.chat_id[:8]}... message {self.message_id[:8]}...: "
+                         f"request still running after {FINAL_STATUS_REQUEST_WAIT_S} s; "
+                         f"its own status write may land after this one")
         lines = [] if stopped else await _build_usage_status_lines(self.conn, self.session_key)
         async with self.conn._chat_write_lock(self.chat_id):
             try:
