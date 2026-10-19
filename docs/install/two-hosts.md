@@ -1,3 +1,5 @@
+# Two hosts
+
 Open WebUI and the OpenClaw Gateway can run on different machines. The install is the same; this page says which part runs where, which address each setting needs, and what you do on the Gateway host.
 
 Applies to: Pipe, Action

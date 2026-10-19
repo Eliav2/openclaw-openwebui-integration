@@ -1,3 +1,5 @@
+# Questions
+
 When the agent needs an answer mid-run, you get a real question card or dialog in Open WebUI instead of a wall of text nobody can answer, and a secret it requests is entered in a masked dialog that keeps it out of the chat. It survives a reload, and once answered the run continues in the same reply.
 
 Applies to: Pipe

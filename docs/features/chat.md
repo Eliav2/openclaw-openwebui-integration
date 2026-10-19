@@ -1,3 +1,5 @@
+# Chat
+
 What a reply looks like in the chat: live text, the agent's tool calls as real cards, failures marked, images and files both ways, a usage line under each reply, and chat titles. Everything here works as soon as the Pipe is installed, except where a section says otherwise.
 
 Applies to: Pipe (the thinking level also needs the thinking filter)

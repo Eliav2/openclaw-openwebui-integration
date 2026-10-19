@@ -1,3 +1,5 @@
+# Status button
+
 The Status Action adds an **OpenClaw Status** button that opens a dialog with the session's context, your rate limits and its sub-agents, fetched live. It is a separate function that reuses the Pipe's connection and device, so there is no second pairing; install the Pipe first.
 
 Applies to: Action, Pipe

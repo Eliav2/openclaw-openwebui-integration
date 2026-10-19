@@ -1,3 +1,5 @@
+# Replies from the agent
+
 A reply the agent starts without a message from you (a cron job, another session's `sessions_send`, a finished sub-agent's result) appears in your chat as a normal reply, live, with its tool cards. It sits at the end of the chat like any other reply, with no label on it.
 
 Applies to: Pipe

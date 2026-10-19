@@ -1,3 +1,5 @@
+# Device pairing
+
 The Pipe signs in to the Gateway as a device with its own Ed25519 key, and you approve that device once on the Gateway host. After that the identity and its token survive Open WebUI restarts, function reloads and reinstalls.
 
 Applies to: Pipe, Action

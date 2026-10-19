@@ -1,3 +1,5 @@
+# Status
+
 The Status dialog shows a chat's context use, your rate limits, what runs in the background for it and the sub-agents its runs spawned, fetched live when you open it. From there you can compact the session, or open any sub-agent's drawer to read its run like a chat.
 
 Applies to: Action (the composer's Claw button also needs the Pipe)

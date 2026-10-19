@@ -1,3 +1,5 @@
+# Update and uninstall
+
 Update by re-running the installers: they change the code in place, keep the device identity and back up what was there. Uninstalling is done in Open WebUI's admin panel, plus revoking the device on the Gateway if you want it gone.
 
 Applies to: Pipe, Action, Filter

@@ -1,3 +1,5 @@
+# Security
+
 What to protect when you run this integration: the secrets it keeps, the optional media file server on port 18791, the agent privileges every chat user gets, and the scripts it runs in your browser.
 
 Applies to: Pipe, Action

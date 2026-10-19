@@ -1,3 +1,5 @@
+# Quick start
+
 The shortest path from nothing to your agent's first reply in Open WebUI: install the Pipe, approve the device once, say hello. Each step ends with a check, so you know it worked before you move on.
 
 Applies to: Pipe

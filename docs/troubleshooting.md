@@ -1,3 +1,5 @@
+# Troubleshooting
+
 Something not working? Find your symptom or the error in the chat below, then check the Open WebUI backend log for `[openclaw-pipe]` lines. If you still need help, the last section says what to put in a bug report.
 
 Applies to: Pipe, Action, Filter
@@ -49,7 +51,7 @@ Failures name the thing that fixes them. When the cause is genuinely ambiguous, 
 | "The Gateway rejected the credentials" | [`GATEWAY_TOKEN`](./configuration.md#gateway_token) must match `gateway.auth.token` in your OpenClaw config. |
 | "The GATEWAY_URL valve is empty", or "GATEWAY_URL has an unsupported scheme" | Set [`GATEWAY_URL`](./configuration.md#gateway_url) to a bare `host:port`, for example `localhost:18789`. A pasted `http://`, `https://`, `ws://` or `wss://` prefix is accepted and stripped; any other prefix is not. |
 | "No response from the OpenClaw Gateway at `<host:port>` within 10s", or "Could not connect to the OpenClaw Gateway at `<host:port>`" | Check `GATEWAY_URL`, that the Gateway is running, and that the Open WebUI backend can reach that host. |
-| 'Error sending message: Agent "<id>" no longer exists in configuration' (the screenshot above) | [`AGENT_ID`](./configuration.md#agent_id) names an agent your Gateway does not define. Use `main` unless you configured others. |
+| `Error sending message: Agent "<id>" no longer exists in configuration` (the screenshot above) | [`AGENT_ID`](./configuration.md#agent_id) names an agent your Gateway does not define. Use `main` unless you configured others. |
 | "Could not start a session on agent `<id>`" | Fix [`AGENT_ID`](./configuration.md#agent_id). The model may be fine: applying the model is just the first thing the Pipe asks the agent to do. |
 | "Model selection error: could not apply `<model>`" | The Gateway refused that model. Pick another one, or check [`DEFAULT_MODEL`](./configuration.md#default_model). |
 | "Could not start this conversation's session" | The cause is unclear. Check that `AGENT_ID` names an agent your Gateway defines and that the model is one it offers. |

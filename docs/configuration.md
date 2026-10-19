@@ -1,3 +1,5 @@
+# Configuration
+
 Every setting (valve) of the three functions, with its type, default and what it does. Generated from the code by `python3 build.py --all`; do not edit by hand.
 
 Applies to: Pipe, Action, Filter

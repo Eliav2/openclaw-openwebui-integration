@@ -252,6 +252,8 @@ def _valve_lines(valves: list, per_user: bool = False) -> list:
 def render_configuration() -> str:
     """docs/configuration.md, generated from the three Valves classes."""
     lines = [
+        "# Configuration",
+        "",
         "Every setting (valve) of the three functions, with its type, default and what it does. "
         "Generated from the code by `python3 build.py --all`; do not edit by hand.",
         "",
