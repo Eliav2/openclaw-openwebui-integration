@@ -56,7 +56,7 @@
 # reply that is streaming into the same tab.
 # ---------------------------------------------------------------------------
 
-_COMPOSER_BUTTON_VERSION = "6"
+_COMPOSER_BUTTON_VERSION = "7"
 
 # The Status Action's function id (install_action.py's FUNCTION_ID; the
 # dialog's own JS calls the same fixed id) and the Pipe's default function id.
@@ -96,8 +96,9 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
   // removing it (a layout this snippet does not understand): give up.
   const LOOP_LIMIT = 20;
   const LOOP_WINDOW_MS = 10000;
-  // A paw, drawn in Heroicons' outline style (24x24, round caps), for "Claw".
-  const PAW_PATH = 'M11 6a1.5 2 0 1 1-3 0 1.5 2 0 0 1 3 0ZM16 6a1.5 2 0 1 1-3 0 1.5 2 0 0 1 3 0ZM7 10.5a1.5 1.75 0 1 1-3 0 1.5 1.75 0 0 1 3 0ZM20 10.5a1.5 1.75 0 1 1-3 0 1.5 1.75 0 0 1 3 0ZM12 12.75c-2.25 0-5.25 2.6-5.25 4.875 0 1.45 1.1 2.375 2.55 2.375.95 0 1.7-.45 2.7-.45s1.75.45 2.7.45c1.45 0 2.55-.925 2.55-2.375 0-2.275-3-4.875-5.25-4.875Z';
+  // A crab claw (ELI-231): an open pincer with a tooth on each finger and a
+  // wrist, in Heroicons' outline style (24x24, round caps), for "Claw".
+  const CLAW_PATH = 'M6.3 14.6C4.6 11.7 5.7 7.1 8.7 4.6C10.8 2.8 13.4 2.3 15.6 3.1C14.3 3.7 13.4 4.4 13 5.3L13.9 6.5L12 6.9C11.6 7.5 11.3 8.1 11.2 8.7C11.1 11 12.7 12.9 15.1 12.7C16.4 12.5 17.3 11.9 17.8 11.1L17.1 10L18.6 9.7C18.6 9.2 18.6 8.7 18.5 8.2C20.5 10.2 20.6 13.4 18.9 15.8C17.1 18.3 14.2 18.8 11.6 17.8C9.5 17 7.5 16.1 6.3 14.6ZM7.8 16L5.4 19.6L9.1 21.1L11 17.6';
 
   const state = {
     prefixes: [],
@@ -356,7 +357,7 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
       + 'bg-transparent text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800';
     b.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" '
       + 'stroke-width="1.75" stroke="currentColor" aria-hidden="true" class="size-4">'
-      + '<path stroke-linecap="round" stroke-linejoin="round" d="' + PAW_PATH + '"/></svg>'
+      + '<path stroke-linecap="round" stroke-linejoin="round" d="' + CLAW_PATH + '"/></svg>'
       // Icon-only below `sm`, like Open WebUI's own composer chips: at phone
       // width the chip row's overflow cut the label to "Stat" (ELI-123). The
       // title and aria-label still name it. Both classes ship in Open WebUI's CSS.
