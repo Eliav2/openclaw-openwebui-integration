@@ -14,6 +14,10 @@ whole):
   installer's smoke test ("reply with exactly OK_CONFIG_TEST").
 * `Create a concise title`            -> `TITLE` below: the Pipe's own chat-title
   run (the `title-gen` agent), after a chat's second exchange.
+* `E2E_SPAWN_SILENT`                   -> spawns a sub-agent (task `E2E_SILENT_CHILD`,
+                                          label `silent helper`) that answers
+                                          `E2E_SILENT_RESULT done`; the parent answers that
+                                          completion `NO_REPLY` (ELI-217)
 * `E2E_ECHO: any text`                 -> replies with the rest of that line,
   byte for byte (Hebrew, emoji, markup), so a round trip can be exact.
 * `E2E_TOOL_CALL`                      -> first answers with a call to the
@@ -407,6 +411,18 @@ def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
             if wrapper in offered:
                 return {"tool": wrapper, "args": {"id": "secrets", "args": args}}
         return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
+
+    if "E2E_SILENT_RESULT" in user_text:
+        # The parent's turn for the child's completion (the announce): it
+        # stays silent, so the child's result shows only as the Pipe's card.
+        return {"text": "NO_REPLY"}
+    if "E2E_SILENT_CHILD" in user_text:
+        return {"text": "E2E_SILENT_RESULT done"}
+    if "E2E_SPAWN_SILENT" in user_text:
+        if tool_results:
+            return {"text": "E2E_SPAWNED"}
+        return _call_with("sessions_spawn", {"task": "E2E_SILENT_CHILD", "label": "silent helper"}, offered) or {
+            "text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
 
     if "E2E_SPAWN" in user_text:
         # Spawn one sub-agent whose own run is slow, so it is still running

@@ -979,6 +979,29 @@ def test_the_status_action_lists_a_running_subagent_and_opens_its_drawer(token):
     assert drawer["parent"]["chatId"] == chat_id, drawer
 
 
+def test_a_subagent_result_the_parent_answers_with_silence_shows_as_its_card(token):
+    """The parent answers a sub-agent's completion with NO_REPLY: the chat
+    still gets one message, a finished Sub-agent card holding the child's
+    result (ELI-138). On OpenClaw 2026.10.5 no such message came (ELI-217)."""
+    chat_id, msg = _chat_turn(token, "E2E_SPAWN_SILENT")
+    assert msg.get("content", "").strip() == "E2E_SPAWNED", msg
+
+    def card():
+        for m in _chat_messages(token, chat_id).values():
+            out = m.get("output") or []
+            calls = [o for o in out if o.get("type") == "function_call" and o.get("name") == "Sub-agent"]
+            results = [o for o in out if o.get("type") == "function_call_output"]
+            if m.get("role") == "assistant" and m.get("done") is True and calls and results:
+                return m, calls[0], results[0]
+        return None
+
+    found = _until("the silent sub-agent's card", card, timeout_s=120, every_s=2)
+    m, call, result = found
+    assert "silent helper" in call.get("arguments", ""), call
+    assert "E2E_SILENT_RESULT done" in json.dumps(result.get("output")), result
+    assert "NO_REPLY" not in (m.get("content") or ""), m.get("content")
+
+
 # ── A run that ends while Open WebUI is stopped (ELI-94) ─────────────────────
 # Keep this last: it stops and starts the Open WebUI container. A graceful stop
 # cancels the request streaming the reply and saves the message done:true with
