@@ -174,7 +174,7 @@ bun run docs:dev     # live preview at http://localhost:5173/openclaw-openwebui-
 bun run docs:build   # what CI runs; fails on a dead internal link
 ```
 
-The build also writes `llms.txt`, `llms-full.txt` and a raw `.md` next to every page, for agents. The `Docs site` workflow builds every pull request that touches the docs and deploys `main` to GitHub Pages.
+The build also writes `llms.txt`, `llms-full.txt` and a raw `.md` next to every page, for agents. A demo is a GIF in the Markdown (what github.com shows); when `scripts/demos/record.py` wrote its MP4 and WebM next to it, the site plays that muted, looping video instead, at twice the GIF's resolution. The `Docs site` workflow builds every pull request that touches the docs and deploys `main` to GitHub Pages.
 
 ## Driving the integration over the API
 
