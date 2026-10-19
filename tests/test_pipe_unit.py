@@ -1538,11 +1538,9 @@ class ParkedCancelTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(claimed["run_id"])
         self.assertEqual(calls, [])
 
-    def test_intent_query_reads_and_clears(self):
+    def test_intent_query_names_its_chat(self):
         from openclaw_pipe import _intent_query_js
-        js = _intent_query_js("chat-1")
-        self.assertIn('"chat-1"', js)
-        self.assertIn("delete all[c]", js)
+        self.assertIn('"chat-1"', _intent_query_js("chat-1"))
 
     def test_pipe_claims_before_model_patch(self):
         # The grace window is seconds; sessions.patch alone can take 10s+ with
@@ -2175,7 +2173,7 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
 
         async def event_call(event):
             code = (event.get("data") or {}).get("code", "")
-            if "delete all[c]" in code:   # the intent query
+            if "const i = all[c]" in code:   # the intent query
                 return await answer
             return True                  # the hook install at turn start
         body = {"model": "openclaw_gateway.default", "messages": [{"role": "user", "content": "count"}]}
@@ -10048,6 +10046,64 @@ class IntentHookStopIconTests(unittest.TestCase):
 
     def test_no_english_only_running_check_is_left(self):
         self.assertNotIn('querySelector(\'button[aria-label="Stop"]', openclaw_pipe._INTENT_HOOK_JS)
+
+
+class IntentOfOneStopTests(unittest.TestCase):
+    """ELI-198: Open WebUI's Stop cancels every task of the chat at once: a
+    reply waiting behind a run (after Send now, or queued) and the turn
+    writer holding that run. Each asks the page which button it was. The
+    query read and cleared the chat's record, so the first to ask got "stop"
+    and the writer got "none": its run went on. Runs the intent hook and its
+    query under node with a stub page."""
+
+    def run_page(self, steps: list) -> list:
+        """Plays `steps` on a page with the hook: ["stop"] clicks the
+        composer's Stop (a reply runs), ["submit", running] submits the
+        composer, ["query"] runs the intent query. The queries' answers."""
+        import shutil
+        import subprocess
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("no node")
+        script = textwrap.dedent("""
+            const [hook, query, steps] = JSON.parse(process.argv[1]);
+            const listeners = {};
+            let running = true;
+            const stop = { id: 'stop-response-button', getAttribute: () => null,
+                           querySelectorAll: () => [], closest() { return this; } };
+            const input = { closest: (sel) => (sel === '#chat-input' ? input : null) };
+            const form = { contains: (el) => el === input, querySelector: () => input,
+                           closest: () => null };
+            global.window = {};
+            global.location = { pathname: '/c/chat-1' };
+            global.document = {
+              addEventListener: (k, f) => { listeners[k] = f; },
+              querySelectorAll: (sel) => (sel === 'button' && running ? [stop] : []),
+              querySelector: (sel) => (sel === '#chat-input' ? input : null),
+            };
+            new Function(hook)();
+            const answers = [];
+            for (const s of steps) {
+              if (s[0] === 'stop') listeners.click({ target: stop });
+              else if (s[0] === 'submit') { running = s[1]; if (listeners.submit) listeners.submit({ target: form }); }
+              else answers.push(new Function(query)());
+            }
+            console.log(JSON.stringify(answers));
+        """)
+        args = [openclaw_pipe._INTENT_HOOK_JS, openclaw_pipe._intent_query_js("chat-1"), steps]
+        out = subprocess.run([node, "-e", script, json.dumps(args)], capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout)
+
+    def test_one_stop_answers_every_task_it_cancelled(self):
+        self.assertEqual(self.run_page([["stop"], ["query"], ["query"]]), ["stop", "stop"])
+
+    def test_a_new_message_ends_the_stop(self):
+        """A cancel after the next message is not that Stop's."""
+        self.assertEqual(self.run_page([["stop"], ["query"], ["submit", False], ["query"]]), ["stop", "none"])
+
+    def test_a_message_queued_while_a_reply_runs_keeps_it(self):
+        self.assertEqual(self.run_page([["stop"], ["submit", True], ["query"]]), ["stop"])
 
 
 class AutoSendHookTests(unittest.TestCase):
