@@ -10,6 +10,7 @@ Valves: `OWUI_API_KEY`
 When a run starts on a chat's session that you did not start from Open WebUI, the Pipe adds an assistant message at the end of that chat and streams the run into it, exactly as it streams your own replies: text token by token, tool cards that spin and complete, failed tools marked.
 
 - **Tab open on the chat:** the message appears without a reload and the view moves to it. Open WebUI shows the chat as generating, and its Stop button works on it: Stop ends the message and stops the run. The run is stopped by its id (`sessions.abort`), so messages queued behind it stay; on OpenClaw 2026.9, where that finds no automation run, its task is cancelled instead.
+- **Tab that opens the chat just as the reply starts:** it shows the reply too, also while it runs. Open WebUI can drop a message that arrives while the page is still loading the chat; the Pipe asks each tab on the chat whether it shows the reply once it has loaded, and sends the reply as it stands to a tab that does not. When the run ends, the finished reply goes to every open tab once more.
 - **Tab open on another chat, or no tab at all:** the message is written to the chat anyway. Open it later and you see the finished reply, or the reply so far if the run is still going.
 - **When the run fails,** the message ends with the run's error.
 - **When the run ends,** the message is rebuilt from the run's own transcript (`chat.history`), so text or tool cards lost on the way are filled in. Anything the transcript lacks keeps what streamed.
