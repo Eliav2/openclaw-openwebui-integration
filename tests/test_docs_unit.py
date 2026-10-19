@@ -11,9 +11,11 @@ ROOT = Path(__file__).resolve().parents[1]
 IMG = ROOT / "docs" / "img"
 IMAGE_BUDGET = 250 * 1024          # each image
 IMAGES_TOTAL_BUDGET = 4 * 1024 * 1024
-DEMOS = IMG / "demos"              # the demo GIFs, scripts/demos/record.py
+DEMOS = IMG / "demos"              # the demos, scripts/demos/record.py: a GIF, an MP4 and a WebM each
 DEMO_BUDGET = 1024 * 1024          # each GIF, as record.py enforces
-DEMOS_TOTAL_BUDGET = 3 * 1024 * 1024
+DEMOS_TOTAL_BUDGET = 6 * 1024 * 1024
+VIDEO_BUDGET = 1024 * 1024         # each MP4 and WebM, as record.py enforces
+VIDEOS_TOTAL_BUDGET = 8 * 1024 * 1024
 # Contributor and design pages may name issues and internals; user pages may not.
 INTERNAL_OK = {"docs/architecture.md", "docs/development.md", "docs/metadata-contract.md",
                "docs/rehydration-persistence.md"}
@@ -148,10 +150,18 @@ class DocsLinkTests(unittest.TestCase):
                 if path.endswith((".png", ".jpg", ".webp", ".gif")):
                     used.add((md.parent / path).resolve())
         images = sorted(p for p in IMG.iterdir() if p.is_file())
-        demos = sorted(p for p in DEMOS.iterdir() if p.is_file())
+        demos = sorted(p for p in DEMOS.iterdir() if p.suffix == ".gif")
+        videos = sorted(p for p in DEMOS.iterdir() if p.suffix in (".mp4", ".webm"))
         self.assertEqual([p.name for p in images if p.stat().st_size > IMAGE_BUDGET], [])
         self.assertLessEqual(sum(p.stat().st_size for p in images), IMAGES_TOTAL_BUDGET)
-        self.assertEqual([p.name for p in demos if p.suffix != ".gif" or p.stat().st_size > DEMO_BUDGET], [])
+        self.assertEqual([p.name for p in DEMOS.iterdir() if p.suffix not in (".gif", ".mp4", ".webm")], [])
+        self.assertEqual([p.name for p in demos if p.stat().st_size > DEMO_BUDGET], [])
+        self.assertEqual([p.name for p in videos if p.stat().st_size > VIDEO_BUDGET], [])
+        self.assertLessEqual(sum(p.stat().st_size for p in videos), VIDEOS_TOTAL_BUDGET)
+        # The site plays a demo's video in place of its GIF: both formats, next to a GIF a page shows.
+        stems = {p.stem for p in videos}
+        self.assertEqual(sorted(f"{s}: {ext}" for s in stems for ext in ("gif", "mp4", "webm")
+                                if not (DEMOS / f"{s}.{ext}").exists()), [])
         self.assertLessEqual(sum(p.stat().st_size for p in demos), DEMOS_TOTAL_BUDGET)
         self.assertEqual([rel(p) for p in images + demos if p.resolve() not in used], [],
                          "images in docs/img that no page uses")

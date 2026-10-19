@@ -1,11 +1,12 @@
 name: Demos
 
-# The docs' demo GIFs (scripts/demos/demos.json), recorded on the same stack
+# The docs' demos (scripts/demos/demos.json), recorded on the same stack
 # as the Screenshots workflow: real Open WebUI, this integration as installed
 # by its own installers, a real OpenClaw Gateway and the scripted model, with
 # the demos' own scenes loaded before the screenshots' ones. Desktop Chromium,
-# light theme only, each GIF at most 15 s and 1 MB. Run it by hand after a UI
-# change; the GIFs come back as an artifact to review, and the ones that are
+# light theme only, each at most 15 s, as a GIF (github.com, at most 1 MB) and an
+# MP4 and a WebM (the docs site, at most 1 MB each). Run it by hand after a UI
+# change; the files come back as an artifact to review, and the ones that are
 # kept get committed under docs/img/demos/.
 
 on:
@@ -66,12 +67,12 @@ jobs:
         run: |
           python3 - <<'EOF'
           import json, os
-          lines = ["| demo | seconds | KB |", "|---|---|---|"]
+          lines = ["| demo | seconds | GIF KB | MP4 KB | WebM KB |", "|---|---|---|---|---|"]
           path = os.path.join(os.environ["RUNNER_TEMP"], "demos.jsonl")
           for row in open(path) if os.path.exists(path) else []:
               if row.strip().startswith("{"):
                   d = json.loads(row)
-                  lines.append(f"| {d['name']} | {d['seconds']} | {d['kb']} |")
+                  lines.append(f"| {d['name']} | {d['seconds']} | {d['kb']} | {d.get('mp4_kb', '')} | {d.get('webm_kb', '')} |")
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
               fh.write("### Demos\n\n" + "\n".join(lines) + "\n")
           print("\n".join(lines))
@@ -84,7 +85,7 @@ jobs:
           docker logs owui > "$RUNNER_TEMP/logs/open-webui.log" 2>&1 || true
           cp /tmp/openclaw/*.log "$RUNNER_TEMP/logs/" 2>/dev/null || true
 
-      - name: Upload GIFs
+      - name: Upload recordings
         if: always()
         uses: actions/upload-artifact@v7
         with:

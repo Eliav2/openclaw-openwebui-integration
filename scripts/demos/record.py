@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Record the docs' demo GIFs from a running screenshot stack.
+"""Record the docs' demos from a running screenshot stack: a GIF, an MP4 and a WebM each.
 
 Each demo in demos.json is a short scripted session in a desktop Chromium:
 real Open WebUI, the installed Pipe and Action, a real Gateway and the
@@ -7,7 +7,10 @@ scripted model, so every run shows the same replies and leaves nothing in a
 real account. The page is captured with the DevTools screencast at 2x while
 a drawn cursor, a ripple on each click and a badge for each key make the
 steps easy to follow; ffmpeg then encodes the frames, with their real
-timing, into one light-theme GIF per demo.
+timing, into one light-theme recording per demo, three ways: a GIF for
+github.com (the Markdown shows it) and a muted MP4 and WebM at the capture's
+full 2x resolution, sharp text at a fraction of the GIF's size, which the docs
+site plays instead of the GIF (docs/.vitepress/config.mts).
 
     python3 scripts/demos/record.py --out docs/img/demos [--only hero,send-now]
 
@@ -40,6 +43,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 W, H = 960, 640            # CSS pixels; frames are captured at 2x and the GIF is W wide
 MAX_SECONDS = 15.0
 MAX_BYTES = 1024 * 1024
+MAX_VIDEO_BYTES = 1024 * 1024    # each of the MP4 and the WebM
 TYPE_DELAY_MS = 45
 
 # The drawn cursor, the click ripple and the key badge: page elements that
@@ -157,6 +161,34 @@ def encode(concat: str, out: str, fps: int = 20, colors: int = 128) -> int:
     return os.path.getsize(out)
 
 
+def encode_video(concat: str, out: str, crf: int) -> int:
+    """One muted video at the capture's 2x size (sharp text); the codec follows the extension.
+    Every frame is kept at its real timing, padded to an even size for yuv420p."""
+    vf = "fps=30,pad=ceil(iw/2)*2:ceil(ih/2)*2,format=yuv420p"
+    codec = (["-c:v", "libx264", "-preset", "slow", "-tune", "stillimage", "-crf", str(crf),
+              "-movflags", "+faststart"] if out.endswith(".mp4") else
+             ["-c:v", "libvpx-vp9", "-b:v", "0", "-crf", str(crf + 10), "-row-mt", "1",
+              "-deadline", "good", "-cpu-used", "2"])
+    subprocess.run([ffmpeg(), "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", concat,
+                    "-vf", vf, "-an", *codec, out], check=True)
+    return os.path.getsize(out)
+
+
+def encode_videos(concat: str, base: str) -> dict:
+    """The MP4 and the WebM next to the GIF, each under MAX_VIDEO_BYTES: the quality steps
+    down until it fits."""
+    sizes = {}
+    for ext in ("mp4", "webm"):
+        path = f"{base}.{ext}"
+        for crf in (24, 28, 32):
+            sizes[ext] = encode_video(concat, path, crf)
+            if sizes[ext] <= MAX_VIDEO_BYTES:
+                break
+        else:
+            raise AssertionError(f"{os.path.basename(path)}: {sizes[ext]} bytes, over {MAX_VIDEO_BYTES}")
+    return sizes
+
+
 class Demo:
     """One demo's steps on a page (STEPS maps each `do` to its method)."""
 
@@ -233,8 +265,17 @@ class Demo:
     async def record(self, step: dict) -> None:
         self.rec.record(step["on"])
 
+    async def reload(self, step: dict) -> None:
+        """Reload the page (the key badge says so first), then wait for the chat."""
+        await self.page.evaluate("__keys(['⟳ Reload'], 1200)")
+        await self.page.wait_for_timeout(700)
+        await self.page.reload()
+        await self.page.wait_for_selector("#chat-input", timeout=60_000)
+        await self.move(self.x, self.y, steps=1)
 
-STEPS = {"type", "send", "click", "wait", "wait_reply_done", "wait_children", "park", "pause", "keys", "record"}
+
+STEPS = {"type", "send", "click", "wait", "wait_reply_done", "wait_children", "park", "pause", "keys", "record",
+         "reload"}
 
 
 async def new_page(browser, token: str) -> Page:
@@ -295,8 +336,10 @@ async def run_demo(browser, token: str, spec: dict, out: str, host: str) -> dict
             size = encode(concat, path, fps=12, colors=96)
         if size > MAX_BYTES:
             raise AssertionError(f"{spec['name']}: {size} bytes, over {MAX_BYTES}")
+        videos = encode_videos(concat, os.path.join(out, spec["name"]))
         shutil.rmtree(work)
         return {"name": spec["name"], "path": path, "seconds": round(seconds, 1), "kb": round(size / 1024),
+                "mp4_kb": round(videos["mp4"] / 1024), "webm_kb": round(videos["webm"] / 1024),
                 "frames": len(rec.frames), "chat": demo.chat_id}
     except Exception:
         print(f"  frames kept in {work}", flush=True)

@@ -33,6 +33,35 @@ function repoLinks(md) {
   });
 }
 
+// A demo is a GIF in the Markdown, which is what github.com can show. The site plays the same
+// recording as a muted, looping video instead (sharper and smaller), when record.py wrote its
+// MP4 and WebM next to the GIF. The GIF stays inside the <video> for a browser without either.
+const DEMO_IMG = /<img\b[^>]*\bsrc="([^"]*\/demos\/([\w-]+))\.gif"[^>]*>/g;
+
+function demoVideos(md) {
+  md.core.ruler.push("demo-videos", (state) => {
+    const from = path.dirname(path.join(DOCS, state.env.relativePath ?? ""));
+    const swap = (html) =>
+      html.replace(DEMO_IMG, (img, stem) => {
+        const has = (ext) => existsSync(path.resolve(from, `${stem}.${ext}`));
+        if (!has("mp4") || !has("webm")) return img;
+        const width = /\bwidth="(\d+)"/.exec(img)?.[1] ?? "800";
+        const alt = /\balt="([^"]*)"/.exec(img)?.[1] ?? "";
+        return (
+          `<video class="demo" width="${width}" autoplay muted loop playsinline aria-label="${alt}">` +
+          `<source src="${stem}.webm" type="video/webm"><source src="${stem}.mp4" type="video/mp4">${img}</video>`
+        );
+      });
+    const visit = (tokens) => {
+      for (const t of tokens) {
+        if (t.children) visit(t.children);
+        if (t.type === "html_block" || t.type === "html_inline") t.content = swap(t.content);
+      }
+    };
+    visit(state.tokens);
+  });
+}
+
 // The home page: docs/index.md is the list of every page on GitHub; on the site it opens with a
 // hero and the feature cards, and the list follows them.
 const home = {
@@ -64,7 +93,12 @@ export default defineConfig({
   base,
   cleanUrls: true,
   head: [["link", { rel: "icon", type: "image/svg+xml", href: `${base}logo.svg` }]],
-  markdown: { config: repoLinks },
+  markdown: {
+    config(md) {
+      repoLinks(md);
+      demoVideos(md);
+    },
+  },
   transformPageData(page) {
     if (page.relativePath === "index.md") Object.assign(page.frontmatter, home);
   },

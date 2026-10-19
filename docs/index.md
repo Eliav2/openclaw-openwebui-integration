@@ -1,5 +1,9 @@
 # Docs
 
+<p align="center">
+  <img src="./img/demos/hero.gif" alt="A question typed in Open WebUI and sent; the agent's reply streams in, with a tool card for each command it runs, then a short summary" width="800">
+</p>
+
 Every page of the OpenClaw for Open WebUI docs, with one line on what it covers. Each page opens with a one-line summary, then an `Applies to:` line (Pipe, Action, Filter) and the valves it uses, so a person or an agent can tell from the top whether it is the right page.
 
 The three functions: the **Pipe** is the chat integration, the **Status Action** adds the Status button, and the **thinking filter** adds the per-chat thinking control.

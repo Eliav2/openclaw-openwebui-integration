@@ -1,6 +1,66 @@
 {
-  "_comment": "The docs' demo GIFs (record.py). `scenes` are scripted model replies like scripts/screenshots/scenes.json, kept short so each GIF fits in 15 s; the demo stack loads this file first, then scenes.json, so a demo can also use a screenshot scene. `demos` are the recordings: each one's steps run in order (record.py's Demo methods say what each step does).",
+  "_comment": "The docs' demos (record.py writes a GIF, an MP4 and a WebM each). `scenes` are scripted model replies like scripts/screenshots/scenes.json, kept short so each GIF fits in 15 s; the demo stack loads this file first, then scenes.json, so a demo can also use a screenshot scene. `demos` are the recordings: each one's steps run in order (record.py's Demo methods say what each step does).",
   "scenes": [
+    {
+      "match": "Write the changelog entry for the hourly view",
+      "steps": [
+        {
+          "say": "Here's the entry.\n\n**Hourly forecast.** The day screen now has an hourly strip: temperature, rain chance and wind for the next 24 hours. Tap an hour to see its details.\n\n**Faster startup.** Forecasts are cached for ten minutes, so the app opens on the last forecast at once and refreshes in the background.\n\n**Fixed:** wind speed follows the unit setting again.",
+          "delay": 0.12
+        }
+      ]
+    },
+    {
+      "match": "Draft a note to the team about the hourly view",
+      "steps": [
+        {
+          "say": "Here's a draft.\n\nHi all, the hourly view is ready for testing on staging. The day screen now shows an hourly strip with temperature, rain chance and wind for the next 24 hours, and a tap on an hour opens its details.\n\nWhat to check: the strip on a small phone, the units setting, and the first launch with no network. Please send anything odd to the release thread by Thursday, so we can ship to the app store next week.",
+          "delay": 0.15
+        }
+      ]
+    },
+    {
+      "match": "Run the full test suite on the forecast app",
+      "steps": [
+        {
+          "say": "Running the full suite. It takes a couple of minutes.",
+          "tool": "exec",
+          "args": {
+            "command": "cd forecast && sleep 90 && python3 -m compileall -q src && echo all tests passed",
+            "title": "Run the full test suite",
+            "yieldMs": 120000
+          }
+        },
+        {
+          "say": "All tests passed."
+        }
+      ]
+    },
+    {
+      "match": "Ship the forecast app to staging",
+      "steps": [
+        {
+          "say": "I'll start from the deploy script.",
+          "tool": "read",
+          "args": {
+            "path": "forecast/deploy/staging.sh"
+          }
+        },
+        {
+          "say": "There's no deploy script, so I'll build the app first.",
+          "tool": "exec",
+          "args": {
+            "command": "cd forecast && sleep 4 && python3 -m compileall -q src && echo build ok",
+            "title": "Build the app for staging",
+            "yieldMs": 30000
+          }
+        },
+        {
+          "say": "The build is clean. Staging has no deploy script yet, so I stopped there: want me to write one?",
+          "delay": 0.02
+        }
+      ]
+    },
     {
       "match": "What changed in the forecast app since Monday",
       "steps": [
@@ -311,6 +371,168 @@
         {
           "do": "pause",
           "ms": 2500
+        }
+      ]
+    },
+    {
+      "name": "streaming",
+      "steps": [
+        {
+          "do": "type",
+          "text": "Write the changelog entry for the hourly view."
+        },
+        {
+          "do": "send"
+        },
+        {
+          "do": "park"
+        },
+        {
+          "do": "wait_reply_done"
+        },
+        {
+          "do": "pause",
+          "ms": 1200
+        }
+      ]
+    },
+    {
+      "name": "reload-mid-reply",
+      "steps": [
+        {
+          "do": "type",
+          "text": "Draft a note to the team about the hourly view."
+        },
+        {
+          "do": "send"
+        },
+        {
+          "do": "park"
+        },
+        {
+          "do": "wait",
+          "js": "() => (() => [...document.querySelectorAll('.chat-assistant')].pop()?.innerText || '')().includes('next 24 hours')"
+        },
+        {
+          "do": "pause",
+          "ms": 600
+        },
+        {
+          "do": "reload"
+        },
+        {
+          "do": "wait",
+          "js": "() => (() => [...document.querySelectorAll('.chat-assistant')].pop()?.innerText || '')().includes('next 24 hours')"
+        },
+        {
+          "do": "pause",
+          "ms": 2500
+        }
+      ]
+    },
+    {
+      "name": "stop",
+      "steps": [
+        {
+          "do": "type",
+          "text": "Run the full test suite on the forecast app."
+        },
+        {
+          "do": "send"
+        },
+        {
+          "do": "wait",
+          "js": "() => (() => { const a = [...document.querySelectorAll('.chat-assistant')].pop(); return a ? {done: a.querySelectorAll('[role=button] .text-emerald-500').length, active: a.querySelectorAll('[role=button] .shimmer').length} : {done: 0, active: 0}; })().active >= 1"
+        },
+        {
+          "do": "pause",
+          "ms": 1800
+        },
+        {
+          "do": "click",
+          "selector": "button[aria-label=\"Stop\"]"
+        },
+        {
+          "do": "wait",
+          "js": "() => { const a = [...document.querySelectorAll('.chat-assistant')].pop(); const m = a && a.closest('[id^=message-]'); return (() => { const a = [...document.querySelectorAll('.chat-assistant')].pop(); return a ? {done: a.querySelectorAll('[role=button] .text-emerald-500').length, active: a.querySelectorAll('[role=button] .shimmer').length} : {done: 0, active: 0}; })().active === 0 && !!m && !!m.querySelector('button[aria-label=\"Copy\"]'); }"
+        },
+        {
+          "do": "park"
+        },
+        {
+          "do": "pause",
+          "ms": 1800
+        }
+      ]
+    },
+    {
+      "name": "failed-tool",
+      "steps": [
+        {
+          "do": "type",
+          "text": "Ship the forecast app to staging."
+        },
+        {
+          "do": "send"
+        },
+        {
+          "do": "park"
+        },
+        {
+          "do": "wait_reply_done"
+        },
+        {
+          "do": "pause",
+          "ms": 600
+        },
+        {
+          "do": "click",
+          "selector": ".chat-assistant >> nth=-1 >> [role=button] >> nth=0"
+        },
+        {
+          "do": "wait",
+          "js": "() => /staging\\.sh/.test([...document.querySelectorAll('.chat-assistant')].pop()?.innerText || '')"
+        },
+        {
+          "do": "park"
+        },
+        {
+          "do": "pause",
+          "ms": 1800
+        }
+      ]
+    },
+    {
+      "name": "sent-mid-run",
+      "steps": [
+        {
+          "do": "type",
+          "text": "Refresh the forecast cache."
+        },
+        {
+          "do": "send"
+        },
+        {
+          "do": "wait",
+          "js": "() => !![...document.querySelectorAll('.chat-assistant')].pop()?.querySelector('[role=button] .shimmer')"
+        },
+        {
+          "do": "type",
+          "text": "Which branch am I on?"
+        },
+        {
+          "do": "send"
+        },
+        {
+          "do": "wait",
+          "js": "() => { const a = [...document.querySelectorAll('.chat-assistant')]; return a.length >= 2 && a[0].innerText.includes('The cache is fresh') && a[a.length - 1].innerText.includes(\"You're on main\"); }"
+        },
+        {
+          "do": "wait_reply_done"
+        },
+        {
+          "do": "pause",
+          "ms": 800
         }
       ]
     }
