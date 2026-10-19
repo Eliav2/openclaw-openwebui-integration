@@ -305,12 +305,26 @@ TURN_NS = uuid.UUID("6f1c3e2a-9d4b-4c6e-8a1f-0e0a1b100100")  # turns.TURN_NS
 WAKE_TIMEOUT_S = float(os.environ.get("E2E_WAKE_TIMEOUT", "180"))
 
 
-def _openclaw_release() -> tuple:
-    """(year, month) of the Gateway the stack installed, from `openclaw --version`."""
+def _openclaw_version() -> tuple:
+    """(year, month, patch) of the Gateway the stack installed, from `openclaw --version`."""
     out = subprocess.run(["openclaw", "--version"], capture_output=True, text=True, timeout=60)
-    m = re.search(r"(\d{4})\.(\d{1,2})\.\d+", out.stdout)
+    m = re.search(r"(\d{4})\.(\d{1,2})\.(\d+)", out.stdout)
     assert m, f"no version in {out.stdout!r} {out.stderr[-300:]!r}"
-    return int(m.group(1)), int(m.group(2))
+    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+
+def _openclaw_release() -> tuple:
+    """(year, month) of the Gateway the stack installed."""
+    return _openclaw_version()[:2]
+
+
+def _skip_known_105_gap(issue: str, what: str) -> None:
+    """A known gap of the Pipe on OpenClaw 2026.10 before 2026.10.10 (the
+    pinned lane, the version live runs): skipped there under its issue, so the
+    lane stays honest. 2026.10.10 (the next lane) still runs the test."""
+    version = _openclaw_version()
+    if (2026, 10, 0) <= version < (2026, 10, 10):
+        pytest.skip(f"OpenClaw {'.'.join(map(str, version))}: {what} ({issue})")
 
 
 def _gw(method: str, params: dict) -> dict:
@@ -905,6 +919,8 @@ def _section_data(codes: list, element_id: str, index: int = -1) -> dict:
 
 
 def test_the_status_action_lists_a_running_subagent_and_opens_its_drawer(token):
+    _skip_known_105_gap("ELI-213", "the child's task comes without the [Subagent Task] wrapper, "
+                                   "so the drawer header shows no task")
     chat_id, msg = _chat_turn(token, "E2E_SPAWN one helper")
     assert msg.get("content", "").strip() == "E2E_SPAWNED", msg
     status, me = _request("GET", "/api/v1/auths/", token=token)
@@ -1543,6 +1559,7 @@ def test_a_requested_secret_is_entered_in_a_masked_dialog_and_kept_out_of_the_ch
     if _openclaw_release() < (2026, 10):
         pytest.skip("OpenClaw 2026.9 stores a requested secret, but no run can use it (ELI-97): "
                     "the Pipe leaves the request to the Control UI there, as before")
+    _skip_known_105_gap("ELI-212", "the Pipe's secret gate starts at 2026.10.10, so no dialog opens")
     import secrets as _secrets
     name = f"DUMMY_SECRET_ELI96_{uuid.uuid4().hex[:6].upper()}"
     value = _secrets.token_urlsafe(30)   # 40 characters
@@ -1580,6 +1597,7 @@ def test_a_requested_secret_is_entered_in_a_masked_dialog_and_kept_out_of_the_ch
 def test_a_cancelled_secret_dialog_tells_the_agent_no_credential_came(token):
     if _openclaw_release() < (2026, 10):
         pytest.skip("OpenClaw 2026.9: the Pipe leaves a secret request to the Control UI (ELI-97)")
+    _skip_known_105_gap("ELI-212", "the Pipe's secret gate starts at 2026.10.10, so no dialog opens")
     name = f"DUMMY_SECRET_ELI96_{uuid.uuid4().hex[:6].upper()}"
     page = _Page(token)
     try:
@@ -1609,6 +1627,8 @@ def test_a_message_sent_while_the_pipe_waits_to_reconnect_gets_its_reply(token):
     30 s). A message sent while it waits out the backoff must get its reply
     (ELI-176: the turn connected a socket of its own, which nothing read until
     the backoff ended, so the turn's first request timed out)."""
+    _skip_known_105_gap("ELI-214", "right after the restart the Gateway refuses the run "
+                                   "(startup inspection) and the Pipe shows that as the reply")
     since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     # Down until the Pipe waits its longest backoff, so the Gateway is back
     # well before its next attempt.
