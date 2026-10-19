@@ -19,9 +19,9 @@ so a plain `pytest` on a laptop never tries to talk to a live instance.
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
-import socket
 import time
 import urllib.error
 import urllib.request
@@ -734,24 +734,22 @@ def _kill_and_restart_gateway(sig: int = 9, while_down=None) -> None:
 STARTUP_REFUSAL = "has not completed startup inspection"
 
 
-def _gateway_listening() -> bool:
-    try:
-        with socket.create_connection(("127.0.0.1", 18789), timeout=1):
-            return True
-    except OSError:
-        return False
+# The Pipe's line for a message waiting through a refused reconnect.
+GATEWAY_DOWN_WAIT = "the Gateway refuses connections (down or restarting)"
 
 
 @pytest.mark.skipif(not GATEWAY_PID_FILE or shutil.which("pgrep") is None,
                     reason="needs the pid of the e2e stack's Gateway (E2E_GATEWAY_PID_FILE)")
-def test_a_message_sent_while_the_gateway_starts_gets_its_reply(token):
-    """A message sent as soon as a crashed Gateway's replacement takes
-    connections. OpenClaw 2026.10.5 first refuses connections ("gateway
-    starting; retry shortly", until its startup sidecars run), then, after an
-    unclean stop, refuses runs until it has inspected and prepared the agent's
-    database ("Agent main has not completed startup inspection and
+def test_a_message_sent_while_the_gateway_restarts_gets_its_reply(token):
+    """A message sent while a crashed Gateway is down, delivered once its
+    replacement is up. Both windows of a restart, in order: the port refuses
+    connections until the new process listens (the Pipe waits for its
+    reconnect); then OpenClaw 2026.10.5 refuses connections ("gateway
+    starting; retry shortly", until its startup sidecars run) and, after an
+    unclean stop, runs and subscriptions until it has inspected and prepared
+    the agent's database ("Agent main has not completed startup inspection and
     preparation"), both retryable UNAVAILABLE. The message gets its own reply;
-    neither refusal is shown as one."""
+    no refusal is shown as one."""
     _until("the Gateway's crash-loop window to allow a crash", _crash_loop_allows_a_crash,
            timeout_s=CRASH_LOOP_WINDOW_MS / 1000 + 30, every_s=5)
     chat_id, _ = _chat_turn(token, "Respond with exactly: E2E_BEFORE_RESTART")
@@ -763,25 +761,34 @@ def test_a_message_sent_while_the_gateway_starts_gets_its_reply(token):
     _until("the Gateway to be gone", lambda: not any(_alive(p) for p in pids), timeout_s=60)
     log_path = os.path.join(os.path.dirname(GATEWAY_PID_FILE), "gateway-after-restart.log")
     start = os.path.getsize(log_path) if os.path.exists(log_path) else 0
-    log = open(log_path, "a")
-    proc = subprocess.Popen(["openclaw", "gateway", "run"], stdout=log, stderr=subprocess.STDOUT,
-                            start_new_session=True)
-    with open(GATEWAY_PID_FILE, "w") as f:
-        f.write(str(proc.pid))
-    _until("the new Gateway's listener", _gateway_listening, timeout_s=120, every_s=0.1)
-    _, msg = _chat_turn(token, "Respond with exactly: E2E_DURING_STARTUP", chat_id=chat_id)
+    with concurrent.futures.ThreadPoolExecutor(1) as pool:
+        turn = pool.submit(_chat_turn, token, "Respond with exactly: E2E_DURING_RESTART", chat_id=chat_id)
+        try:
+            # The down window, for certain: the Pipe says it is waiting through
+            # a refused reconnect before there is a Gateway to connect to.
+            _until("the Pipe to wait for the Gateway",
+                   lambda: turn.done() or GATEWAY_DOWN_WAIT in _pipe_log_since(since), timeout_s=60, every_s=0.5)
+            assert not turn.done(), f"the turn ended while the Gateway was down: {turn.result()[1]!r}"
+        finally:
+            # Relaunched whatever happened, so a failure here leaves the later
+            # tests a Gateway.
+            proc = subprocess.Popen(["openclaw", "gateway", "run"], stdout=open(log_path, "a"),
+                                    stderr=subprocess.STDOUT, start_new_session=True)
+            with open(GATEWAY_PID_FILE, "w") as f:
+                f.write(str(proc.pid))
+        _, msg = turn.result()
     content = msg.get("content") or ""
     assert STARTUP_REFUSAL not in content, f"the startup refusal shown as the reply: {content[:300]!r}"
-    assert content.strip() == "E2E_DURING_STARTUP", f"the reply: {content[:300]!r}"
+    assert content.strip() == "E2E_DURING_RESTART", f"the reply: {content[:300]!r}"
     _until("the Gateway to finish starting", _gateway_up, timeout_s=180, every_s=2)
     with open(log_path, errors="replace") as f:
         f.seek(start)
         refused = sorted({m.group(1) for line in f if STARTUP_REFUSAL in line
                           for m in [re.search(r"res ✗ (\S+)", line)] if m})
     if _openclaw_release() >= (2026, 10):
-        # The test produces its own precondition: the Gateway refused the
-        # message or the transcript subscriptions the Pipe renews on connect.
-        assert refused, "the Gateway refused nothing while it was preparing: nothing was tested"
+        # The startup window: the Gateway refused the message or the
+        # transcript subscriptions the Pipe renews on connect.
+        assert refused, "the Gateway refused nothing while it was preparing: that window was not tested"
     # A renewal given up would leave the chat without tool events until the
     # next reconnect; the Gateway logs a renewal only when it is refused.
     gave_up = [line for line in _pipe_log_since(since).splitlines()

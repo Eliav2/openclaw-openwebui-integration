@@ -80,6 +80,7 @@ https://github.com/Eliav2/openclaw-openwebui-integration
 # --- _prelude --------------------------------------------------------------
 
 import asyncio
+import errno
 import json
 import html
 import os
@@ -5146,6 +5147,10 @@ class _GatewayConnection:
         # its own (ELI-176).
         self._reconnect_now = asyncio.Event()
         self._reconnect_waiters: list = []
+        # Turns waiting through a Gateway that refuses connections (down or
+        # restarting): while there are any, the event loop tries again at its
+        # first backoff step, not its longest.
+        self._turns_awaiting_gateway = 0
         # The Gateway sends a `tick` event every `policy.tickIntervalMs` of
         # hello-ok (30 s, server-maintenance-Wf2jQ0wx.mjs:156); its own client
         # drops a socket that sent no frame for twice that ("tick timeout",
@@ -5671,15 +5676,7 @@ class _GatewayConnection:
             # be read until its backoff ends, and its next attempt would replace
             # it: the turn's first request then timed out (ELI-176). Have the
             # loop try now, and take that attempt's outcome.
-            waiter = asyncio.get_running_loop().create_future()
-            self._reconnect_waiters.append(waiter)
-            self._reconnect_now.set()
-            await asyncio.wait({waiter, self._event_loop_task}, return_when=asyncio.FIRST_COMPLETED)
-            if not waiter.done():
-                raise GatewayError("gateway connection stopped while reconnecting")
-            error = waiter.result()
-            if error is not None:
-                raise error if isinstance(error, GatewayError) else GatewayError(str(error))
+            await self._await_reconnect()
             return
         async with self._init_lock:
             if self._ws and self._event_loop_task and not self._event_loop_task.done():
@@ -5688,6 +5685,42 @@ class _GatewayConnection:
             await self._connect_once_started()
             if not self._event_loop_task or self._event_loop_task.done():
                 self._event_loop_task = asyncio.create_task(self._event_loop())
+
+    async def _await_reconnect(self):
+        """Take the event loop's next reconnect outcome (ELI-176). A Gateway
+        that refuses the connection is down or restarting, and this socket was
+        up before, so it is not a wrong GATEWAY_URL: wait through the loop's
+        later attempts, up to GATEWAY_DOWN_WAIT_S, rather than answer the
+        message with the refusal. Any other failure is raised at once."""
+        deadline = time.monotonic() + GATEWAY_DOWN_WAIT_S
+        refusal = None
+        self._turns_awaiting_gateway += 1
+        try:
+            self._reconnect_now.set()
+            while True:
+                waiter = asyncio.get_running_loop().create_future()
+                self._reconnect_waiters.append(waiter)
+                # The loop's first attempt is made at once; later ones at its first step.
+                await asyncio.wait({waiter, self._event_loop_task},
+                                   timeout=None if refusal is None else max(0, deadline - time.monotonic()),
+                                   return_when=asyncio.FIRST_COMPLETED)
+                if not waiter.done():
+                    waiter.cancel()
+                    if self._event_loop_task.done():
+                        raise GatewayError("gateway connection stopped while reconnecting")
+                    raise refusal
+                error = waiter.result()
+                if error is None:
+                    return
+                error = error if isinstance(error, GatewayError) else GatewayError(str(error))
+                if not _gateway_refused(error) or time.monotonic() >= deadline:
+                    raise error
+                if refusal is None:
+                    pipe_log("  the Gateway refuses connections (down or restarting); the message "
+                             f"waits for the reconnect, up to {GATEWAY_DOWN_WAIT_S} s")
+                refusal = error
+        finally:
+            self._turns_awaiting_gateway -= 1
 
     async def send_request(self, method: str, params: dict, timeout: float = 10) -> dict:
         """Send a request and wait for the response."""
@@ -6389,11 +6422,13 @@ class _GatewayConnection:
             # exactly what happens when something answers but isn't a Gateway
             # (a reverse proxy returning 502 on the upgrade, an HTTP server on
             # the port). That is a configuration mistake, and it belongs in the
-            # chat naming the valve, not as an unattributed traceback.
+            # chat naming the valve, not as an unattributed traceback. A refused
+            # connect is marked: a reconnecting turn waits through it.
             raise GatewayError(
                 f"Could not connect to the OpenClaw Gateway at {host}:{port} "
                 f"({type(ex).__name__}: {ex}). Is the Gateway running, and is "
-                "the GATEWAY_URL valve pointing at it?"
+                "the GATEWAY_URL valve pointing at it?",
+                error={"code": GATEWAY_REFUSED_CODE} if _refused_connect(ex) else None,
             )
 
         # Handshake: receive challenge
@@ -6749,7 +6784,8 @@ class _GatewayConnection:
         """
         while not self._stopped:
             self._reconnect_attempt += 1
-            delay = min(2 ** (self._reconnect_attempt - 1), self._max_backoff)
+            delay = 1 if self._turns_awaiting_gateway else min(2 ** (self._reconnect_attempt - 1),
+                                                               self._max_backoff)
             pipe_log(f"  reconnect in {delay}s (attempt {self._reconnect_attempt})")
             try:
                 # A turn waiting for the connection ends the wait (ensure_connected).
@@ -7306,6 +7342,26 @@ async def _send_when_prepared(conn, method: str, params: dict, *, timeout: float
 # sent again after the time it names. No event marks the end of preparation.
 STARTUP_REFUSAL_CODE = "agent-database-inspection-pending"
 STARTUP_REFUSAL_WAIT_S = 300
+# How long a message waits for a Gateway that refuses connections after it was
+# reached (a restart: the port is closed until the new process listens).
+GATEWAY_DOWN_WAIT_S = 120
+GATEWAY_REFUSED_CODE = "connection-refused"
+
+
+def _refused_connect(ex) -> bool:
+    """Every address the host resolved to refused the TCP connect. asyncio
+    raises one OSError for all of them ("Multiple exceptions: ...") when their
+    messages differ, as for localhost's ::1 and 127.0.0.1."""
+    if isinstance(ex, ConnectionRefusedError):
+        return True
+    text = str(ex)
+    return (isinstance(ex, OSError) and text.startswith("Multiple exceptions:")
+            and text.count("[Errno") == text.count(f"[Errno {errno.ECONNREFUSED}]"))
+
+
+def _gateway_refused(ex) -> bool:
+    """A connect the Gateway's host refused: nothing listens on the port."""
+    return isinstance(ex, GatewayError) and ex.error.get("code") == GATEWAY_REFUSED_CODE
 
 
 def _gateway_starting_retry_ms(ex: GatewayError) -> int | None:
