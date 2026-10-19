@@ -44,6 +44,9 @@ W, H = 960, 640            # CSS pixels; frames are captured at 2x and the GIF i
 MAX_SECONDS = 15.0
 MAX_BYTES = 1024 * 1024
 MAX_VIDEO_BYTES = 1024 * 1024    # each of the MP4 and the WebM
+# While a step waits on the stack (the scripted model, a command), a frame the page holds longer
+# than this is dead time: the screen did not change, it only took that long on this runner.
+WAIT_HELD_MAX = 0.4
 TYPE_DELAY_MS = 45
 
 # The drawn cursor, the click ripple and the key badge: page elements that
@@ -96,6 +99,8 @@ class Recorder:
         self.frames: list = []        # (timestamp, jpeg bytes, starts a new segment)
         self._new_segment = True
         self._acks: set = set()       # in flight; a task nobody holds can be collected
+        # Frame ranges of the steps that wait on the stack: (first, end, longest shown s or None).
+        self.waits: list = []
         cdp.on("Page.screencastFrame", self._frame)
 
     def _frame(self, ev) -> None:
@@ -127,18 +132,33 @@ class Recorder:
             self._new_segment = True
         self.on = on
 
+    def durations(self) -> list:
+        """Each frame's time on screen: its real timing, except while a step waits on the stack.
+        There a frame held past WAIT_HELD_MAX is cut to it (nothing moved), and a wait with a
+        `show_ms` plays faster to fit it, so how fast this runner is never sets the length. A
+        pause in the recording shows as a 0.1 s cut."""
+        durs = []
+        for i, (ts, _, _) in enumerate(self.frames):
+            nxt = self.frames[i + 1] if i + 1 < len(self.frames) else None
+            durs.append(0.1 if nxt is None or nxt[2] else max(nxt[0] - ts, 0.01))
+        for first, end, show in self.waits:
+            for i in range(first, min(end, len(durs))):
+                durs[i] = min(durs[i], WAIT_HELD_MAX)
+            spent = sum(durs[first:end])
+            if show and spent > show:
+                for i in range(first, min(end, len(durs))):
+                    durs[i] = max(durs[i] * show / spent, 0.01)
+        return durs
+
     def write(self, work: str) -> tuple[str, float]:
-        """The frames as PNGs and an ffmpeg concat list with their real
-        durations; a pause in the recording shows as a 0.1 s cut."""
+        """The frames as JPEGs and an ffmpeg concat list with their durations (durations())."""
         if not self.frames:
             raise RuntimeError("no frames were recorded")
         lines, total = [], 0.0
-        for i, (ts, png, _) in enumerate(self.frames):
+        for (_, png, _), dur, i in zip(self.frames, self.durations(), range(len(self.frames))):
             path = os.path.join(work, f"{i:05d}.jpg")
             with open(path, "wb") as fh:
                 fh.write(png)
-            nxt = self.frames[i + 1] if i + 1 < len(self.frames) else None
-            dur = 0.1 if nxt is None or nxt[2] else max(nxt[0] - ts, 0.01)
             total += dur
             lines += [f"file '{path}'", f"duration {dur:.4f}"]
         lines.append(f"file '{os.path.join(work, f'{len(self.frames) - 1:05d}.jpg')}'")
@@ -246,13 +266,28 @@ class Demo:
         await self.page.wait_for_timeout(200)
         await self.page.mouse.click(x, y)
 
+    async def waiting(self, step: dict, until) -> None:
+        """Run a wait on the stack, its frames marked for durations()."""
+        first = len(self.rec.frames)
+        try:
+            await until
+        finally:
+            show = step.get("show_ms")
+            self.rec.waits.append((first, len(self.rec.frames), show / 1000 if show else None))
+
     async def wait(self, step: dict) -> None:
+        await self.waiting(step, self._wait(step))
+
+    async def wait_reply_done(self, step: dict) -> None:
+        await self.waiting(step, self._wait_reply_done(step))
+
+    async def _wait(self, step: dict) -> None:
         try:
             await self.page.wait_for_function(step["js"], timeout=step.get("timeout_ms", 150_000), polling=100)
         except Exception as ex:
             raise TimeoutError(f"waiting for {step['js'][:120]}: {ex}") from None
 
-    async def wait_reply_done(self, step: dict) -> None:
+    async def _wait_reply_done(self, step: dict) -> None:
         last, stable, deadline = "", 0, time.monotonic() + step.get("timeout_ms", 150_000) / 1000
         while stable < 4:
             if time.monotonic() > deadline:
@@ -332,17 +367,24 @@ async def run_demo(browser, token: str, spec: dict, out: str, host: str) -> dict
         first = spec["steps"][0] if spec["steps"] else {}
         rec.record(not (first.get("do") == "record" and first.get("on") is False))
         await page.wait_for_timeout(500)
+        starts = []
         for step in spec["steps"]:
             if step["do"] not in STEPS:
                 raise ValueError(f"{spec['name']}: unknown step {step['do']!r}")
+            starts.append((step["do"], len(rec.frames)))
             await getattr(demo, step["do"])(step)
         await rec.stop()
+        # Where the length goes: each step's seconds as the recording shows them.
+        durs = rec.durations() if rec.frames else []
+        bounds = [i for _, i in starts] + [len(durs)]
+        steps = [f"{do} {sum(durs[a:b]):.1f}" for (do, _), a, b in zip(starts, bounds, bounds[1:])
+                 if sum(durs[a:b]) >= 0.5]
         hits = capture.deny_hits(await page.evaluate("() => document.body.innerText"), (host,) if host else ())
         if hits:
             raise AssertionError(f"{spec['name']}: deny-listed text visible: {sorted(set(hits))[:10]}")
         concat, seconds = rec.write(work)
         if seconds > MAX_SECONDS:
-            raise AssertionError(f"{spec['name']}: {seconds:.1f} s, over {MAX_SECONDS:.0f} s")
+            raise AssertionError(f"{spec['name']}: {seconds:.1f} s, over {MAX_SECONDS:.0f} s ({', '.join(steps)})")
         path = os.path.join(out, f"{spec['name']}.gif")
         size = encode(concat, path)
         if size > MAX_BYTES:
@@ -353,7 +395,7 @@ async def run_demo(browser, token: str, spec: dict, out: str, host: str) -> dict
         shutil.rmtree(work)
         return {"name": spec["name"], "path": path, "seconds": round(seconds, 1), "kb": round(size / 1024),
                 "mp4_kb": round(videos["mp4"] / 1024), "webm_kb": round(videos["webm"] / 1024),
-                "frames": len(rec.frames), "frame_px": jpeg_size(rec.frames[-1][1]), "chat": demo.chat_id}
+                "frames": len(rec.frames), "frame_px": jpeg_size(rec.frames[-1][1]), "steps": steps, "chat": demo.chat_id}
     except Exception:
         print(f"  frames kept in {work}", flush=True)
         await page.screenshot(path=os.path.join(work, "failed.png"))

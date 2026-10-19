@@ -1,5 +1,5 @@
 {
-  "_comment": "The docs' demos (record.py writes a GIF, an MP4 and a WebM each). `scenes` are scripted model replies like scripts/screenshots/scenes.json, kept short so each GIF fits in 15 s; the demo stack loads this file first, then scenes.json, so a demo can also use a screenshot scene. `demos` are the recordings: each one's steps run in order (record.py's Demo methods say what each step does).",
+  "_comment": "The docs' demos (record.py writes a GIF, an MP4 and a WebM each). `scenes` are scripted model replies like scripts/screenshots/scenes.json, kept short so each GIF fits in 15 s; the demo stack loads this file first, then scenes.json, so a demo can also use a screenshot scene. `demos` are the recordings: each one's steps run in order (record.py's Demo methods say what each step does). A wait on a running command may set `show_ms`: it plays faster to fit, so the runner's speed never sets the demo's length.",
   "scenes": [
     {
       "match": "Write the changelog entry for the hourly view",
@@ -196,7 +196,8 @@
           "do": "send"
         },
         {
-          "do": "wait_reply_done"
+          "do": "wait_reply_done",
+          "show_ms": 6000
         },
         {
           "do": "pause",
@@ -298,7 +299,8 @@
         },
         {
           "do": "wait",
-          "js": "() => { const a = [...document.querySelectorAll('.chat-assistant')]; return a.length >= 2 && a[0].innerText.includes('The cache is fresh') && a[a.length - 1].innerText.includes(\"You're on main\"); }"
+          "js": "() => { const a = [...document.querySelectorAll('.chat-assistant')]; return a.length >= 2 && a[0].innerText.includes('The cache is fresh') && a[a.length - 1].innerText.includes(\"You're on main\"); }",
+          "show_ms": 4500
         },
         {
           "do": "wait_reply_done"
@@ -479,7 +481,8 @@
           "do": "park"
         },
         {
-          "do": "wait_reply_done"
+          "do": "wait_reply_done",
+          "show_ms": 5000
         },
         {
           "do": "pause",
@@ -525,7 +528,8 @@
         },
         {
           "do": "wait",
-          "js": "() => { const a = [...document.querySelectorAll('.chat-assistant')]; return a.length >= 2 && a[0].innerText.includes('The cache is fresh') && a[a.length - 1].innerText.includes(\"You're on main\"); }"
+          "js": "() => { const a = [...document.querySelectorAll('.chat-assistant')]; return a.length >= 2 && a[0].innerText.includes('The cache is fresh') && a[a.length - 1].innerText.includes(\"You're on main\"); }",
+          "show_ms": 4500
         },
         {
           "do": "wait_reply_done"
