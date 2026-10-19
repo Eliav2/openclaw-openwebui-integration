@@ -6093,8 +6093,14 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     more.type = 'button';
     more.dataset.openclawMore = name;
     more.className = 'text-xs text-blue-600 dark:text-blue-400 mt-1';
+    // Shown whole, the text scrolls in a box of at most 40% of the screen:
+    // uncapped, a long task pushed the header, "Show less" and the whole run
+    // below the bottom of the drawer, with nothing to scroll (ELI-201).
     function show(open) {
       body.style.webkitLineClamp = open ? 'unset' : String(lines);
+      body.style.maxHeight = open ? '40vh' : '';
+      body.style.overflowY = open ? 'auto' : 'hidden';
+      body.style.overscrollBehavior = open ? 'contain' : '';
       more.textContent = open ? 'Show less' : 'Show all';
     }
     more.onclick = function() { state[name] = !state[name]; show(state[name]); };
