@@ -1148,9 +1148,11 @@ def _session_row(key: str) -> dict:
 
 
 def _gateway_stdout_log() -> str:
-    """The e2e stack's Gateway console log (start_stack.sh's LOG_DIR)."""
-    return os.path.join(os.environ.get("E2E_LOG_DIR") or os.path.join(os.getcwd(), "e2e-logs"),
-                        "gateway.log")
+    """The e2e stack's Gateway console log, live while the suite runs:
+    start_stack.sh writes it beside the Gateway's pid file, whose path it
+    exports (E2E_GATEWAY_PID_FILE, in CI through GITHUB_ENV)."""
+    assert GATEWAY_PID_FILE, "needs the e2e stack's E2E_GATEWAY_PID_FILE"
+    return os.path.join(os.path.dirname(GATEWAY_PID_FILE), "gateway.log")
 
 
 def _until(what: str, check, timeout_s: float = WAKE_TIMEOUT_S, every_s: float = 1.0):
