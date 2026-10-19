@@ -19,6 +19,8 @@ Users not on the list reach the Gateway over a second connection, with its own d
 
 Every request that starts, stops or steers a run in their chats goes over that connection: sending a message, Stop, the model override, and the requests the Pipe sends on its own (a resume after a Gateway restart, a chat title, the answer to a question card). The Status dialog's Compact follows the same rule; the Status Action reads the list from the Pipe's saved valves. Reading history and showing replies stays on the main connection, which does not make a turn the owner's.
 
+A secret the agent asks for (its `secrets` tool) goes into the owner's secret store, so these chats never get the masked dialog. A run they send cannot ask: that connection lacks the `operator.questions` scope, and the Gateway refuses the request. A run the agent starts in their chat (a cron job, a sub-agent's result) has the Gateway's own scopes and can; the Pipe cancels that request at once and the reply says it needs the owner. Left open, it could be answered in the Control UI and put your secret into a reply they read. See [Questions](./questions.md#secrets-the-agent-requests).
+
 On a loopback Gateway the second device pairs silently. On a remote one, approve it like the first, see [Device pairing](../install/pairing.md). The `DEVICE_IDENTITY` valve names only the main identity; the second one always has its own file.
 
 ## What the agent still learns

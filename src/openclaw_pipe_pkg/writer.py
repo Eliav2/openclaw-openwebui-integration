@@ -228,6 +228,22 @@ def _turn_note_item(note: str) -> dict:
             "role": "assistant", "content": [{"type": "output_text", "text": note}]}
 
 
+def _keep_pipe_notes(streamed: list, renderer: "_TurnRenderer") -> None:
+    """The Pipe's own notes (`PIPE_NOTE_STREAM`) are in no transcript, so a
+    rebuild from one drops them: put each back after the item it followed
+    when it streamed, or at the end (ELI-229)."""
+    output = renderer.output
+    have = {i.get("id") for i in output}
+    for at, item in enumerate(streamed):
+        if not str(item.get("id") or "").startswith(_NOTE_ITEM_PREFIX) or item.get("id") in have:
+            continue
+        before = next((p.get("id") for p in reversed(streamed[:at]) if p.get("id") in have), None)
+        pos = next((n + 1 for n, i in enumerate(output) if i.get("id") == before), len(output)) \
+            if before else 0
+        output.insert(pos, copy.deepcopy(item))
+        have.add(item.get("id"))
+
+
 # The last word of a reply interrupted before it sent its own message
 # (ELI-188): the next reply sent it, or a Stop dropped it.
 REPLY_SENT_WITH_NEXT_NOTE = ("_(This message was sent together with your next one: "
@@ -952,6 +968,7 @@ class _TurnWriter:
             except Exception as ex:
                 hist = None
                 pipe_log(f"  turn writer: chat.history failed at the end: {ex!r}")
+            streamed = list(self.renderer.output)
             if self.wake is not None:
                 self._rebuild_wake(hist)
                 self.renderer.flush()
@@ -966,6 +983,7 @@ class _TurnWriter:
                 self.renderer.flush()
                 if not self._showable():
                     await self._show_silent_announce(hist)
+            _keep_pipe_notes(streamed, self.renderer)
             if not self.opened:
                 if not (self._showable() or note) or not await self._open_at_end():
                     return
