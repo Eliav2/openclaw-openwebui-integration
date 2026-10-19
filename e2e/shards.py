@@ -59,6 +59,7 @@ SHARDS = {
         f"{E2E}::test_a_guest_run_continued_after_a_gateway_crash_stays_without_owner_rights",
         f"{BROWSER}::test_send_streams_the_reply_and_keeps_it",
         f"{BROWSER}::test_a_single_select_question_is_answered_with_a_click",
+        f"{BROWSER}::test_a_hebrew_yes_no_question_gets_yes_and_no",
         f"{BROWSER}::test_a_question_from_the_ask_user_tool_is_answered_in_the_card",
         f"{BROWSER}::test_an_ask_user_question_asked_with_no_tab_open_shows_when_the_chat_is_opened",
         f"{BROWSER}::test_a_question_left_for_a_new_message_ends_its_reply",
