@@ -7904,6 +7904,9 @@ _SETUP_WORDS = {"cd", "pushd", "popd", "export", "set", "unset", "source", ".", 
                 "true", ":", "ulimit", "alias"}
 _WRAPPER_WORDS = {"setsid", "nohup", "exec", "env", "time", "nice", "stdbuf"}
 _SCRIPT_FLAGS = {"-c", "-e", "--eval"}
+_INTERPRETER_RE = re.compile(r"(python[\d.]*|node|bun|deno|perl|ruby|php|bash|sh|zsh|dash)$")
+# A loop or a condition reads by its head: "for n in 142 136 …".
+_COMPOUND_WORDS = {"for", "while", "until", "if", "case", "select"}
 _ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 _SHORT_COMMAND_MAX = 80
 
@@ -7923,6 +7926,8 @@ def _short_command(command: str) -> str:
                 if words and words[0] not in _SETUP_WORDS:
                     if tok.startswith("<<"):
                         cut = True
+                    elif tok.startswith((">", "<")) and words[-1].isdigit() and words[-1] + tok in command:
+                        words.pop()    # 2>/dev/null: the 2 is the redirect's
                     break
                 words = []
                 if tok.startswith(("<", ">")):
@@ -7937,7 +7942,7 @@ def _short_command(command: str) -> str:
                 words = []    # its duration
                 continue
             words.append(tok)
-            if tok in _SCRIPT_FLAGS and len(words) > 1:
+            if tok in _SCRIPT_FLAGS and len(words) > 1 and _INTERPRETER_RE.match(words[0].rsplit("/", 1)[-1]):
                 cut = True
                 break
     except ValueError:
@@ -7945,6 +7950,8 @@ def _short_command(command: str) -> str:
         return _cut((command or "").strip().splitlines()[0] if (command or "").strip() else "", _SHORT_COMMAND_MAX)
     if not words or words[0] in _SETUP_WORDS:
         return ""
+    if words[0] in _COMPOUND_WORDS:
+        cut = True
     if words[0].startswith("/"):
         words[0] = words[0].rsplit("/", 1)[-1]
     text = " ".join(shlex.quote(w) if w != shlex.quote(w) and " " in w else w for w in words)
