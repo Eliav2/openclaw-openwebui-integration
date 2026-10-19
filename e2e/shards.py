@@ -92,6 +92,7 @@ SHARDS = {
     "3": [
         f"{E2E}::test_a_reply_whose_run_ends_while_owui_is_stopped_is_completed_on_start",
         f"{E2E}::test_a_plain_redeploy_mid_reply_leaves_the_reply_whole",
+        f"{E2E}::test_a_cancelled_chat_write_leaves_the_database_writable",
         f"{BROWSER}::test_a_message_sent_while_a_reply_runs_is_in_the_chat_at_once",
         f"{BROWSER}::test_a_message_queued_behind_a_run_waits_out_a_socket_drop",
     ],
@@ -121,6 +122,7 @@ SHARDS = {
         f"{BROWSER}::test_switching_branches_reaches_the_agent_as_a_branch_switch",
         f"{BROWSER}::test_a_forked_chat_starts_with_the_copied_messages",
         f"{BROWSER}::test_a_cloned_chat_starts_with_the_copied_messages",
+        f"{BROWSER}::test_an_execute_while_the_input_dialog_is_open_leaves_the_dialog_its_answer",
     ],
 }
 
