@@ -211,6 +211,10 @@ async def _claim_turn_message_now(chat_id: str, user_id: str, message_id: str, r
     from sqlalchemy.orm.attributes import flag_modified
 
     async with Chats._chat_transaction(chat_id) as (db, chat):
+        if chat is None:
+            # Deleted in Open WebUI while its session lives on (ELI-218).
+            return {"claimed": False, "how": "gone", "message_id": message_id,
+                    "parent": None, "messages": {}}
         data = chat.chat or {}
         history = data.get("history") or {"messages": {}, "currentId": None}
         msgs = history.setdefault("messages", {})

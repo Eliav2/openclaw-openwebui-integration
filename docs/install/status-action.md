@@ -8,11 +8,11 @@ Valves: [`GATEWAY_URL`](../configuration.md#gateway_url-1), [`GATEWAY_TOKEN`](..
 
 A button on the message toolbar:
 
-<img src="../img/toolbar-button-light.png" alt="The OpenClaw Status button on the message toolbar" width="300">
+<img src="../img/toolbar-button-light.png" alt="The Status Action's paw button at the end of the message toolbar" width="300">
 
-and, in OpenClaw chats, a **Status** button in the composer, next to the integrations button:
+and, in OpenClaw chats, a **Claw** button (the Status Action) in the composer, next to the integrations button:
 
-<img src="../img/composer-status-light.png" alt="The Status button in the composer, next to the integrations button" width="374">
+<img src="../img/composer-status-light.png" alt="The Claw button in the composer, a paw next to the integrations button" width="374">
 
 Both open the same dialog. What it shows and how to use it: [Status](../features/status.md).
 
@@ -67,7 +67,7 @@ Without the plugin the rate-limit section shows a note instead, and the Open Web
 
 ## The composer Status button
 
-The Pipe adds the **Status** button to the composer of OpenClaw chats, right after the OpenClaw Thinking chip (or at the end of the composer's chips when that chip is off). It opens the same dialog through this Action, so the Action must be installed.
+The Pipe adds the **Claw** button to the composer of OpenClaw chats, right after the OpenClaw Thinking chip (or at the end of the composer's chips when that chip is off). It opens the same dialog through this Action, so the Action must be installed.
 
 This is an experiment. Open WebUI has no extension point for the composer, so the button is injected into the page by JavaScript: if a future Open WebUI changes the composer and the anchor is not found, the button simply does not appear. It appears as soon as a tab opens an OpenClaw chat.
 

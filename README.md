@@ -10,7 +10,7 @@ Chat with your OpenClaw agents from Open WebUI, on your phone, and watch them wo
 > You need a running [OpenClaw Gateway](https://github.com/openclaw/openclaw). This connects it to Open WebUI; it is not an agent itself. No OpenClaw yet? [Install it first](https://docs.openclaw.ai).
 
 <p align="center">
-  <img src="./docs/img/hero-tool-cards-light.png" alt="An agent at work in Open WebUI on a phone: two finished tool cards and one still running, with the agent's notes between them" width="320">
+  <img src="./docs/img/demos/hero.gif" alt="A question typed in Open WebUI and sent; the agent's reply streams in, with a tool card for each command it runs, then a short summary" width="800">
 </p>
 
 ## What you get
@@ -103,7 +103,7 @@ What an older release loses, and the test runs behind these numbers: [Versions](
 <p align="center">
   <img src="./docs/img/tool-card-expanded-light.png" alt="Live tool cards: a tool card opened to its command and its output" width="300">
   <img src="./docs/img/question-card-light.png" alt="Questions as dialogs: a question from the agent as a card with three options and a Recommended tag" width="300">
-  <img src="./docs/img/status-dialog-light.png" alt="Status: context used, 5-hour and weekly rate limits, two running sub-agents" width="300">
+  <img src="./docs/img/status-dialog-light.png" alt="The Status dialog, titled Claw: context used, 5-hour and weekly rate limits, two running sub-agents" width="300">
   <img src="./docs/img/model-picker-light.png" alt="Every Gateway model: the model picker open, listing the models the Gateway allows" width="300">
   <img src="./docs/img/agent-turn-light.png" alt="Cron jobs: a reply a cron job wrote into the open chat, with no message from you" width="300">
   <img src="./docs/img/reload-mid-reply-light.png" alt="Survives restarts: a reply right after a page reload, the answer so far still there and growing" width="300">

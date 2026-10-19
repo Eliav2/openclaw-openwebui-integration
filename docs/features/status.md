@@ -1,19 +1,19 @@
 The Status dialog shows a chat's context use, your rate limits, what runs in the background for it and the sub-agents its runs spawned, fetched live when you open it. From there you can compact the session, or open any sub-agent's drawer to read its run like a chat.
 
-Applies to: Action (the composer Status button also needs the Pipe)
+Applies to: Action (the composer's Claw button also needs the Pipe)
 Valves: `GATEWAY_URL`, `GATEWAY_TOKEN`, `DEVICE_IDENTITY`, `STATE_DIR`, `AGENT_ID`, `CONTROL_UI_URL` (Action); `COMPOSER_STATUS_BUTTON` (Pipe)
 
 ## The Status dialog
 
 _Separate function: install the Status Action first, see [Status button](../install/status-action.md)._
 
-<img src="../img/status-dialog-light.png" alt="The Status dialog: context used, 5-hour and weekly rate limits, two running sub-agents" width="320">
+<img src="../img/status-dialog-light.png" alt="The Status dialog, titled Claw: context used, 5-hour and weekly rate limits, two running sub-agents" width="320">
 
 _The rate limits in this screenshot are sample data._
 
-The Status Action adds a button to the message toolbar. It opens a dialog with five sections: Context, Rate limits, [Background](#background), [Subagents](#sub-agents) and In-process agents.
+The Status Action adds a button to the message toolbar. It opens a dialog, titled **Claw**, with five sections: Context, Rate limits, [Background](#background), [Subagents](#sub-agents) and In-process agents.
 
-<img src="../img/toolbar-button-light.png" alt="The OpenClaw Status button on a reply's toolbar" width="300">
+<img src="../img/toolbar-button-light.png" alt="The Status Action's paw button at the end of a reply's toolbar" width="300">
 
 The dialog opens at once with every section's title. Each section then reads its own source and fills the moment that source answers, with its own loading, empty and error state, so a slow or failing source shows in its own section only:
 
@@ -31,7 +31,7 @@ _Here the rate limits were held back on purpose, to show it._
 
 Each source is read once per open, all at the same time. None grows with the chat: the chat's messages come from Open WebUI's message rows, the 40 newest of the current branch, so a 14 MB chat opens as fast as a new one. Open WebUI saves a reply's tool cards only when the reply ends, so for a reply still running the sections take its calls from the Pipe streaming it, in the same Open WebUI process. Nothing is read while the dialog is closed: closing it tells the Action, which stops following its running sub-agents. In-process agents needs no Gateway, so it fills even when the Gateway cannot be reached.
 
-Opening the dialog sends a small request, from the toolbar button or the composer's: the chat, the message and the model. Open WebUI's own handler for an Action button uploads every message of the branch first and saves the whole chat again after, which on a big chat over a phone connection takes seconds; the Status button skips it. The model comes from the page script's delivery, else from the reply's own avatar. The script arrives within about a second of opening a chat; a click before that, or on a reply that is not on an OpenClaw model, goes through Open WebUI's handler as before.
+Opening the dialog sends a small request, from the toolbar button or the composer's: the chat, the message and the model. Open WebUI's own handler for an Action button uploads every message of the branch first and saves the whole chat again after, which on a big chat over a phone connection takes seconds; the Claw button skips it. The model comes from the page script's delivery, else from the reply's own avatar. The script arrives within about a second of opening a chat; a click before that, or on a reply that is not on an OpenClaw model, goes through Open WebUI's handler as before.
 
 Background, Subagents and In-process agents fold, with their count in the title, for example "Background (3)". Each opens when something in it is running and starts folded otherwise; a tap opens or folds it, and stays that way while the dialog is open. When the dialog is taller than the screen, its sections scroll between the title bar and the footer, which stay in view, on a phone too:
 
@@ -54,6 +54,8 @@ A Compact pill in the dialog header runs `/compact` on the session. While it wor
 <img src="../img/compact-before-light.png" alt="The Context section with its Compact pill" width="302">
 
 Right after a compact, the context number can read far lower than what the next request carries: it counts the kept conversation, without the system prompt and tools. The next reply brings it up to date.
+
+If the Gateway does not compact (the model refused the summary, say, or compaction is unavailable for the session), the Context section keeps its numbers and shows the Gateway's reason under them in red, for example "Compaction failed: Turn prefix summarization failed: 400 …". The `/compact` run ends as done either way, so the dialog reads the outcome from the run's own reply.
 
 It waits up to 180 seconds, the same as the default timeout of `openclaw sessions compact`. If it takes longer, the dialog says so; compaction may still finish in the background.
 
@@ -106,6 +108,8 @@ Each row is one line: the sub-agent's spawn label (else the first sentence of it
 
 Click a sub-agent to open its drawer: a side panel, or on a phone a full-screen sheet with a **‹ Back** button. The top is a short header: the sub-agent's name, its status and its time; its model and the chat it came from (a link; for a sub-agent spawned by another sub-agent, its parent's drawer); and the first two lines of its task, with "Show all".
 
+<img src="../img/demos/status-dialog.gif" alt="The Status dialog opened from the composer, two sub-agents running in it; a click on one opens its drawer with its task and its run so far" width="800">
+
 Below the header is the sub-agent's run as a read-only chat, oldest first: what it said, every tool call as a collapsed card (tap it for the input and the output; a failed one is marked ❌, as in the chat), any message it was sent after its task, and its reply last. The cards are the same ones the chat shows for a run, drawn from the same transcript the same way. There is no composer.
 
 An in-process agent opens the same sheet: its task as the message that started it, and its result as the reply.
@@ -117,9 +121,9 @@ The drawer reads the sub-agent's whole transcript (`chat.history`). A very long 
 
 ## Status button in the composer
 
-The Pipe also adds a **Status** button to the composer row of OpenClaw chats, right after the OpenClaw Thinking chip (or at the end of the composer's chips when that chip is off). It opens the same dialog through the Status Action, so the Action must be installed.
+The Pipe also adds a **Claw** button, with a paw, to the composer row of OpenClaw chats, right after the OpenClaw Thinking chip (or at the end of the composer's chips when that chip is off). It opens the same dialog through the Status Action, so the Action must be installed.
 
-<img src="../img/composer-status-light.png" alt="The Status button in the composer, next to the integrations button" width="374">
+<img src="../img/composer-status-light.png" alt="The Claw button in the composer, a paw next to the integrations button" width="374">
 
 Open WebUI has no extension point for the composer, so the button is put into the page by JavaScript. If a future Open WebUI changes the composer and the anchor is not found, the button simply does not appear. It appears as soon as a tab opens an OpenClaw chat.
 

@@ -765,6 +765,37 @@ def test_the_status_dialog_compacts_the_chat(page):
     page.keyboard.press("Escape")
 
 
+def test_a_compaction_the_gateway_refuses_shows_its_error(page):
+    """Status dialog + Compact, refused (ELI-209): the model refuses the
+    summary, so the Gateway's compaction fails and its reply says so. The
+    dialog showed "Compacting…" and then the same numbers, as if it had
+    worked. It says the compaction failed, with the Gateway's reason, and
+    keeps the numbers."""
+    if _openclaw_release() >= (2026, 10):
+        pytest.skip("OpenClaw 2026.10: the dialog has no Compact button for a session created by "
+                    "chat.send (ELI-177, as test_the_status_dialog_compacts_the_chat).")
+    nonce = f"BROWSER_COMPACT_FAIL_{os.getpid()}_{len(_fake_llm_requests())}"
+    capture.new_chat(page)
+    capture.send(page, f"E2E_ECHO: E2E_COMPACT_FAIL {nonce}")
+    _wait(page, _turn_over(nonce), "the reply")
+    _open_status(page)
+    context = "#openclaw-status-section-context"
+    numbers = f"""() => {{ const s = document.querySelector('{context}');
+      return !!s && /\\d+ \\/ 200k tokens/.test(s.innerText); }}"""
+    _wait(page, f"() => ({numbers})() && !!document.querySelector('{context} button')",
+          "the context numbers and the Compact button", 60_000)
+    page.locator(f"{context} button", has_text="Compact").click()
+    _wait(page, f"""() => (window.__dialog || []).some(t => t.includes('Compacting'))
+                     && !document.body.innerText.includes('Compacting…') && ({numbers})()""",
+          "Compacting…, then the dialog back")
+    refused = [r for r in _fake_llm_requests()
+               if r["reply"].get("http_error") and nonce in json.dumps(r["request"])]
+    assert refused, "precondition: the model never refused this chat's summary request"
+    shown = page.locator(context).inner_text()
+    assert "Compaction failed" in shown, f"the dialog shows no failure after a refused compaction: {shown!r}"
+    page.keyboard.press("Escape")
+
+
 def test_the_subagent_drawer_follows_a_running_child_to_its_end(page):
     """Sub-agent drawer: the Status dialog lists the running sub-agent;
     its row opens the drawer, which shows it running and then, with nothing
@@ -1027,6 +1058,35 @@ def test_the_generated_title_shows_in_the_open_tab(page, token):
                              f"the chat's saved title is {capture.chat_title(token, chat_id)!r}") from None
 
 
+def _rename_in_sidebar(page, chat_id: str, title: str) -> None:
+    """Rename the chat by a double click on its sidebar entry, as a user does.
+
+    The first click of a double click on the entry of a chat started from the
+    new-chat page navigates to it: the chat page loads it and ends by focusing
+    the message input. Open WebUI moves the focus back to the rename box
+    after a tick, and an Enter in between went to the message input, so the
+    rename stayed unsaved (ELI-220). So the chat is opened first, the load's
+    last step (the message input taking the focus) is awaited, and the
+    double click, a click on the open chat, starts no load."""
+    link = page.locator(f'a[href="/c/{chat_id}"]')
+    with page.expect_response(lambda r: r.request.method == "GET"
+                              and r.url.endswith(f"/api/v1/chats/{chat_id}")):
+        link.click()
+    capture.wait_js(page, "() => !!document.activeElement?.closest('#chat-input')",
+                    "the opened chat to focus its message input", 30_000)
+    link.dblclick()
+    box_id = f"chat-title-input-{chat_id}"
+    capture.wait_js(page, f"() => document.activeElement?.id === {json.dumps(box_id)}",
+                    "the rename box to take the focus", 10_000)
+    box = page.locator(f"#{box_id}")
+    box.fill(title)
+    with page.expect_request(lambda r: r.method == "POST"
+                             and r.url.endswith(f"/api/v1/chats/{chat_id}")) as saved:
+        box.press("Enter")
+    assert title in (saved.value.post_data or ""), saved.value.post_data
+    capture.wait_js(page, _sidebar_js(chat_id, title), "the chosen title in the sidebar", 30_000)
+
+
 def test_a_title_the_user_chose_stays(page, token):
     """A chat renamed in the sidebar keeps its name after the next message:
     the Pipe titles only a chat Open WebUI named by itself (ELI-182: the
@@ -1042,12 +1102,7 @@ def test_a_title_the_user_chose_stays(page, token):
     if was_closed:
         page.locator('button[aria-label="Open Sidebar"]').first.click()
     try:
-        page.locator(f'a[href="/c/{chat_id}"]').dblclick()
-        box = page.locator(f"#chat-title-input-{chat_id}")
-        box.wait_for(timeout=10_000)
-        box.fill(chosen)
-        box.press("Enter")
-        capture.wait_js(page, _sidebar_js(chat_id, chosen), "the chosen title in the sidebar", 30_000)
+        _rename_in_sidebar(page, chat_id, chosen)
     finally:
         if was_closed:
             page.locator('button[aria-label="Close Sidebar"]').first.click()
