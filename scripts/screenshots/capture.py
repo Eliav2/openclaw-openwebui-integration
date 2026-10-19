@@ -947,7 +947,7 @@ class Scenes:
             chat = send(page, "Check the forecast dashboard in a browser, please.")
             wait_js(page, f"""() => {{ const a = {LAST_ASSISTANT};
                      return a && a.innerText.includes('all three panels') && !a.innerText.includes('Thinking')
-                       && a.querySelector('button[aria-label="Copy"]'); }}""", "the finished reply")
+                       && document.querySelectorAll('button[aria-label="Copy"]').length > 0; }}""", "the finished reply")
             frame = f"{LAST_ASSISTANT}.querySelector('iframe')"
             wait_js(page, f"() => {{ const f = {frame}; return f && f.getBoundingClientRect().height > 150; }}",
                     "the live view in the reply, at its own height")
