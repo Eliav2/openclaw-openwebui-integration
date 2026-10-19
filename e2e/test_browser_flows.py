@@ -32,12 +32,17 @@ import capture  # noqa: E402
 TURN_MS = 120_000
 
 
-def _openclaw_release() -> tuple:
-    """(year, month) of the Gateway the stack installed, from `openclaw --version`."""
+def _openclaw_version() -> tuple:
+    """(year, month, patch) of the Gateway the stack installed, from `openclaw --version`."""
     out = subprocess.run(["openclaw", "--version"], capture_output=True, text=True, timeout=60)
-    m = re.search(r"(\d{4})\.(\d{1,2})\.\d+", out.stdout)
+    m = re.search(r"(\d{4})\.(\d{1,2})\.(\d+)", out.stdout)
     assert m, f"no version in {out.stdout!r} {out.stderr[-300:]!r}"
-    return int(m.group(1)), int(m.group(2))
+    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+
+def _openclaw_release() -> tuple:
+    """(year, month) of the Gateway the stack installed."""
+    return _openclaw_version()[:2]
 
 
 @pytest.fixture(scope="module")
@@ -736,11 +741,10 @@ def test_the_status_dialog_compacts_the_chat(page):
     with this chat's context numbers; Compact shows "Compacting…", the
     session is compacted (its summary request reaches the model), and the
     dialog comes back with the numbers."""
-    if _openclaw_release() >= (2026, 10):
-        pytest.skip("OpenClaw 2026.10: describe/list report no usage for a session created by "
-                    "chat.send until it is touched again, so the dialog has no context numbers or "
-                    "Compact button (Control UI and CLI are correct; ELI-177, canceled). "
-                    "Re-check on each OpenClaw upgrade.")
+    if _openclaw_version() >= (2026, 10, 10):
+        pytest.skip("OpenClaw 2026.10.10: a session's row gets no totals after its first run "
+                    "(only after the second), so the dialog has no context numbers or Compact "
+                    "button yet (ELI-223). 2026.10.5 writes them within seconds.")
     nonce = f"BROWSER_COMPACT_{os.getpid()}_{len(_fake_llm_requests())}"
     capture.new_chat(page)
     capture.send(page, f"E2E_ECHO: {nonce}")
@@ -876,6 +880,104 @@ def test_a_background_command_reads_by_its_title_and_a_tap_shows_the_command(pag
     page.keyboard.press("Escape")
 
 
+# The drawer's close control (× on a wide screen, ‹ Back on a phone) is on
+# screen and is what a tap at its centre reaches; and the task shown whole
+# scrolls inside its own box, which ends on screen.
+DRAWER_CLOSABLE = """() => {
+  const root = document.getElementById('openclaw-drawer-root');
+  const close = root && [...root.querySelectorAll('button')].find(b => /^(×|‹ Back)$/.test(b.textContent.trim()));
+  const body = root && root.querySelector('#openclaw-drawer-task [data-openclaw-block-text]');
+  if (!close || !body) return 'no close control or task text';
+  const r = close.getBoundingClientRect();
+  const W = innerWidth, H = innerHeight;
+  if (r.top < 0 || r.left < 0 || r.bottom > H || r.right > W) return 'close off screen: ' + JSON.stringify(r);
+  const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+  if (!hit || !close.contains(hit)) return 'close covered by ' + (hit ? hit.outerHTML.slice(0, 80) : null);
+  const b = body.getBoundingClientRect();
+  if (b.bottom > H) return 'task text runs off screen: bottom ' + b.bottom + ' > ' + H;
+  if (body.scrollHeight <= body.clientHeight) return 'task text does not scroll';
+  return 'ok';
+}"""
+
+
+@pytest.mark.parametrize("screen", ["desktop", "phone"])
+def test_a_long_task_shown_whole_keeps_the_drawer_closable(page, token, screen):
+    """Sub-agent drawer, "Show all" on a long task (ELI-201): the task grew
+    with no cap, past the bottom of the screen, and Eliav could not close the
+    drawer. Shown whole, it scrolls in its own box and the close control
+    stays in reach."""
+    view = page if screen == "desktop" else capture.signed_in_page(page.context.browser, token, capture.SMALL_PHONE)
+    try:
+        capture.new_chat(view)
+        capture.send(view, "E2E_SPAWN_LONG one helper")
+        _wait(view, _turn_over("E2E_SPAWNED"), "the parent's reply")
+        _open_status(view)
+        section = "#openclaw-status-section-subagents"
+        _wait(view, f"""() => {{ const s = document.querySelector('{section}');
+                         return !!s && s.innerText.includes('E2E_CHILDTASK'); }}""",
+              "the sub-agent in the Status dialog", 60_000)
+        view.locator(f"{section} button", has_text="E2E_CHILDTASK").first.click()
+        view.wait_for_selector('#openclaw-drawer-root [data-openclaw-more="task"]', timeout=30_000)
+        view.locator('#openclaw-drawer-root [data-openclaw-more="task"]').click()
+        _wait(view, """() => (document.querySelector('[data-openclaw-more="task"]') || {}).textContent === 'Show less'""",
+              "the task shown whole", 10_000)
+        verdict = view.evaluate(DRAWER_CLOSABLE)
+        assert verdict == "ok", verdict
+        view.locator("#openclaw-drawer-root button", has_text=re.compile(r"^(×|‹ Back)$")).click()
+        _wait(view, "() => !document.getElementById('openclaw-drawer-root')", "the drawer closed", 10_000)
+    finally:
+        if view is not page:
+            view.close()
+
+
+# The task text's first line is what its box shows: the box is scrolled to the
+# top and the first characters lie inside it, on screen.
+TASK_SHOWS_FIRST_LINE = """() => {
+  const body = document.querySelector('#openclaw-drawer-task [data-openclaw-block-text]');
+  if (!body) return 'no task text';
+  if (body.scrollTop !== 0) return 'task box scrolled to ' + body.scrollTop;
+  const node = body.firstChild;
+  const range = document.createRange();
+  range.setStart(node, 0);
+  range.setEnd(node, Math.min(10, node.length));
+  const r = range.getBoundingClientRect(), b = body.getBoundingClientRect();
+  if (r.top < b.top - 1 || r.bottom > b.bottom + 1) return 'first line outside the box: ' + r.top + '..' + r.bottom + ' vs ' + b.top + '..' + b.bottom;
+  if (b.top < 0 || b.bottom > innerHeight) return 'task box off screen: ' + b.top + '..' + b.bottom;
+  return 'ok';
+}"""
+
+
+def test_show_less_puts_a_long_task_back_at_its_first_lines(page, token):
+    """Sub-agent drawer (ELI-236): "Show all" on a long task, the task's box
+    scrolled down, then "Show less". The two-line preview must show the
+    task's first lines again, not two lines from wherever the box was
+    scrolled to."""
+    capture.new_chat(page)
+    capture.send(page, "E2E_SPAWN_LONG one helper")
+    _wait(page, _turn_over("E2E_SPAWNED"), "the parent's reply")
+    _open_status(page)
+    section = "#openclaw-status-section-subagents"
+    _wait(page, f"""() => {{ const s = document.querySelector('{section}');
+                     return !!s && s.innerText.includes('E2E_CHILDTASK'); }}""",
+          "the sub-agent in the Status dialog", 60_000)
+    page.locator(f"{section} button", has_text="E2E_CHILDTASK").first.click()
+    more = page.locator('#openclaw-drawer-root [data-openclaw-more="task"]')
+    more.wait_for(timeout=30_000)
+    more.click()
+    _wait(page, """() => (document.querySelector('[data-openclaw-more="task"]') || {}).textContent === 'Show less'""",
+          "the task shown whole", 10_000)
+    scrolled = page.evaluate("""() => {
+      const body = document.querySelector('#openclaw-drawer-task [data-openclaw-block-text]');
+      body.scrollTop = body.scrollHeight;
+      return body.scrollTop; }""")
+    assert scrolled > 0, "the task box did not scroll, so this proves nothing"
+    more.click()
+    _wait(page, """() => (document.querySelector('[data-openclaw-more="task"]') || {}).textContent === 'Show all'""",
+          "the task clamped again", 10_000)
+    verdict = page.evaluate(TASK_SHOWS_FIRST_LINE)
+    assert verdict == "ok", verdict
+
+
 def _chat_id(page) -> str:
     m = re.search(r"/c/([0-9a-f-]{36})", page.url)
     assert m, f"no chat id in {page.url}"
@@ -951,6 +1053,53 @@ def test_stop_on_a_reply_the_agent_starts_stops_its_run(page, token):
     history = capture.gateway_call("chat.history", {"sessionKey": key, "limit": 50})
     assert "E2E_HOLD_END" not in json.dumps(history.get("messages")), "the stopped run still answered"
     os.remove(hold)
+
+
+def test_a_tab_that_loads_the_chat_as_the_agent_starts_a_reply_shows_it(page, token):
+    """ELI-230: Open WebUI's loadChat fetches the chat, awaits its tags, then
+    assigns the history it fetched first. A reply the agent starts in that
+    window is introduced, merged, then overwritten: the tab never showed it
+    until a reload. The second tab's tags are held until the reply's message
+    is in the DB, which puts its introduction in that window every time. The
+    tab shows the reply while it runs; the tab open all along shows it once,
+    never blanked, also through the end's second send of it."""
+    word = f"LOADRACE{os.getpid()}"
+    capture.new_chat(page)
+    capture.send(page, "E2E_ECHO: BROWSER_LOAD_RACE")
+    _wait(page, _turn_over("BROWSER_LOAD_RACE"), "the first reply")
+    chat_id = _chat_id(page)
+    me = capture.api("GET", "/api/v1/auths/", token=token)
+    key = f"agent:main:openwebui-{me['id']}-{chat_id}"
+
+    def messages():
+        return capture.api("GET", f"/api/v1/chats/{chat_id}", token=token)["chat"]["history"]["messages"]
+    before = set(messages())
+    late = page.context.new_page()
+    held = []
+    late.route(f"**/api/v1/chats/{chat_id}/tags", lambda route: held.append(route))
+    try:
+        with late.expect_request(lambda r: r.url.endswith(f"/api/v1/chats/{chat_id}/tags"), timeout=60_000):
+            late.goto(page.url)
+        capture.gateway_call("chat.send", {"sessionKey": key, "message": f"E2E_SLOW:15 {word}",
+                                           "idempotencyKey": f"race-{word}", "deliver": False})
+        deadline = time.monotonic() + 60
+        while not any(m.get("role") == "assistant" for i, m in messages().items() if i not in before):
+            assert time.monotonic() < deadline, "the agent's reply never got its message"
+            late.wait_for_timeout(200)  # polls the DB; the route callback runs meanwhile
+        assert held, "the late tab's tags request was not held"
+        for route in held:
+            route.continue_()
+        _wait(late, _reply_js(1, f"r.text.includes({json.dumps(word)}) && !r.done"),
+              "the agent's reply in the tab that loaded the chat as it began, while it runs")
+        for tab in (late, page):
+            _wait(tab, _reply_js(1, f"r.done && r.text.includes({json.dumps(_slow(word, 15))})"), "the finished reply")
+            shown = [r["text"] for r in _replies(tab) if word in r["text"]]
+            assert len(shown) == 1 and shown[0].count(word) == 1, shown
+        texts = _seen(page, _replies(page)[1]["id"])
+        first = next(n for n, t in enumerate(texts) if word in t)
+        assert all(word in t for t in texts[first:]), f"the open tab's reply blanked: {_tails(texts)}"
+    finally:
+        late.close()
 
 
 def test_an_attached_image_reaches_the_agent(page):

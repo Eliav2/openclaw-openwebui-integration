@@ -236,6 +236,17 @@ def test_persisted_chat_keeps_the_reply(token):
     assert "E2E_PERSIST_OK" in (msg.get("content") or ""), json.dumps(msg)[:1500]
 
 
+def test_the_first_reply_in_a_new_chat_ends_with_the_usage_line(token):
+    """A new chat's first reply ends with its context line, as every later one
+    does. OpenClaw 2026.10 writes a session's first totals to its row just
+    after the run ends, so the line comes from the run's own usage (ELI-177)."""
+    chat_id, msg = _chat_turn(token, "E2E_ECHO: first reply usage")
+    lines = [h.get("description") for h in msg.get("statusHistory") or [] if isinstance(h, dict)]
+    usage = [line for line in lines if str(line).startswith("\U0001f9e0")]
+    # The fake model reports 10 prompt tokens; the stack's window is 200k.
+    assert usage and usage[-1].startswith("\U0001f9e0 10/200k"), f"chat {chat_id}: {lines}"
+
+
 def test_tool_call_persists_as_a_native_tool_card(token):
     """A tool call must land in the saved message as a function_call plus a
     matching function_call_output: an unmatched call renders as a spinner that
