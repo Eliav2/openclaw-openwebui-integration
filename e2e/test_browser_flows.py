@@ -32,12 +32,17 @@ import capture  # noqa: E402
 TURN_MS = 120_000
 
 
-def _openclaw_release() -> tuple:
-    """(year, month) of the Gateway the stack installed, from `openclaw --version`."""
+def _openclaw_version() -> tuple:
+    """(year, month, patch) of the Gateway the stack installed, from `openclaw --version`."""
     out = subprocess.run(["openclaw", "--version"], capture_output=True, text=True, timeout=60)
-    m = re.search(r"(\d{4})\.(\d{1,2})\.\d+", out.stdout)
+    m = re.search(r"(\d{4})\.(\d{1,2})\.(\d+)", out.stdout)
     assert m, f"no version in {out.stdout!r} {out.stderr[-300:]!r}"
-    return int(m.group(1)), int(m.group(2))
+    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+
+def _openclaw_release() -> tuple:
+    """(year, month) of the Gateway the stack installed."""
+    return _openclaw_version()[:2]
 
 
 @pytest.fixture(scope="module")
@@ -736,11 +741,10 @@ def test_the_status_dialog_compacts_the_chat(page):
     with this chat's context numbers; Compact shows "Compacting…", the
     session is compacted (its summary request reaches the model), and the
     dialog comes back with the numbers."""
-    if _openclaw_release() >= (2026, 10):
-        pytest.skip("OpenClaw 2026.10: describe/list report no usage for a session created by "
-                    "chat.send until it is touched again, so the dialog has no context numbers or "
-                    "Compact button (Control UI and CLI are correct; ELI-177, canceled). "
-                    "Re-check on each OpenClaw upgrade.")
+    if _openclaw_version() >= (2026, 10, 10):
+        pytest.skip("OpenClaw 2026.10.10: a session's row gets no totals after its first run "
+                    "(only after the second), so the dialog has no context numbers or Compact "
+                    "button yet (ELI-223). 2026.10.5 writes them within seconds.")
     nonce = f"BROWSER_COMPACT_{os.getpid()}_{len(_fake_llm_requests())}"
     capture.new_chat(page)
     capture.send(page, f"E2E_ECHO: {nonce}")

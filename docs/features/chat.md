@@ -115,6 +115,8 @@ After every reply, a status row shows where you stand:
 
 > 🧠 34k/1.0m (3.5%) · ⏱ 5h 62% left
 
+The context number is what the reply's own run filled, read from that run's usage, so a new chat's first reply has it too.
+
 You get one row per rate-limit window that reports a reset (`⏱ 5h 62% left (resets in 2h13m)`), and a goal line when the session has one (`🎯 Pursuing goal (204/50k)`, with paused, blocked, usage-limited, unmet and achieved variants).
 
 The rate-limit rows come from the Gateway's `usage.status` only. On a Gateway whose only Anthropic credential is a Claude CLI login (OpenClaw 2026.9.1 and later), it reports no windows, so the rows show the context and goal without limits; the [Status dialog](./status.md#rate-limits) still shows them. The screenshot's Gateway reports no windows either.
