@@ -6103,7 +6103,16 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
       body.style.overscrollBehavior = open ? 'contain' : '';
       more.textContent = open ? 'Show less' : 'Show all';
     }
-    more.onclick = function() { state[name] = !state[name]; show(state[name]); };
+    more.onclick = function() {
+      state[name] = !state[name];
+      show(state[name]);
+      if (state[name]) return;
+      // Clamped again, the preview is the text's first lines: a box left
+      // scrolled showed two lines from wherever it was (ELI-236). And if
+      // whatever holds the block scrolled past its top, bring it back.
+      body.scrollTop = 0;
+      wrap.scrollIntoView({ block: 'nearest' });
+    };
     show(!!state[name]);
     wrap.appendChild(more);
     return wrap;
