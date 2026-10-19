@@ -819,6 +819,14 @@ def _tool_call_started_event(name: str, tool_call_id: str, args_str: str) -> dic
     }
 
 
+# A note the Pipe adds to a reply (ELI-197): a Responses message item of its
+# own, carried as a run event of this made-up stream so the live reply and a
+# turn writer show it through the same `_TurnRenderer`. Its id is stable per
+# note, so the same note again replaces it.
+PIPE_NOTE_STREAM = "pipe_note"
+_NOTE_ITEM_PREFIX = "msg_note_"
+
+
 def _tool_call_result_event(tool_call_id: str, result_str: str) -> dict:
     """Complete a tool call announced by `_tool_call_started_event`.
 
@@ -1116,7 +1124,8 @@ class _TurnRenderer:
     message can be finalized to exactly what a non-interrupted turn would
     have stored.
 
-    Scope: assistant text deltas, item-carried text, and tool-result blocks.
+    Scope: assistant text deltas, item-carried text, tool-result blocks, and
+    the Pipe's own notes (`PIPE_NOTE_STREAM`).
     It holds the raw run text: the turn writer shows a resolved `MEDIA:` image
     and an answered ask-user card through the rewrites the inline reply
     recorded (`note_turn_rewrite`).
@@ -1238,7 +1247,8 @@ class _TurnRenderer:
         self._add(chunk)
         self.text += chunk
         last = self.output[-1] if self.output else None
-        if last is None or last.get("type") != "message":
+        if (last is None or last.get("type") != "message"
+                or str(last.get("id", "")).startswith(_NOTE_ITEM_PREFIX)):
             last = {
                 "type": "message",
                 "id": f"msg_{uuid.uuid4().hex[:24]}",
@@ -1336,6 +1346,20 @@ class _TurnRenderer:
                 item_delta = _suppress_already_shown(item_delta, self.visible_text)
                 if item_delta:
                     events.append(self._add_text(item_delta))
+
+        if stream == PIPE_NOTE_STREAM:
+            nid, text = data.get("id"), data.get("text")
+            if nid and text:
+                item = {"type": "message", "id": nid, "status": "completed", "role": "assistant",
+                        "content": [{"type": "output_text", "text": text}]}
+                at = next((n for n, i in enumerate(self.output) if i.get("id") == nid), None)
+                if at is None:
+                    self.output.append(item)
+                else:
+                    self.output[at] = item
+                events.append({"type": "response.output_item.added",
+                               "output_index": _OUTPUT_APPEND_INDEX, "item": copy.deepcopy(item)})
+            return events
 
         if stream == "tool":
             tcid = data.get("toolCallId", "")
@@ -2431,6 +2455,63 @@ class _GatewayConnection:
             return None
         return after[0:36], after[37:73]
 
+    async def dispatch_run_event(self, msg: dict) -> None:
+        """One `agent` or `chat` event of a run: its shadow render, then its
+        live reply, its turn writer, or nowhere. The receive loop's path for
+        every run event, and the Pipe's for its own notes (ELI-197)."""
+        payload = msg.get("payload", {})
+        if payload.get("stream") == "tool" and not self._first_tool_event(payload):
+            return
+        spawned = self._spawn_seen(payload) if payload.get("stream") == "tool" else None
+        if spawned:
+            # The Status dialog's child index (state.py), off the loop.
+            parent, child, task = spawned
+            asyncio.get_running_loop().run_in_executor(None, functools.partial(
+                _subagent_remember, parent, keys=[child], tasks={child: task} if task else None))
+
+        # ── Shadow render ──
+        # Feed every event of a run we're tracking into its shadow
+        # `_TurnRenderer`, whether or not a live consumer is still
+        # attached: the inline turn can end at any point, and the turn
+        # writer it hands over to starts from this content.
+        _evt_sess = payload.get("sessionKey", "")
+        _evt_run = payload.get("runId", "")
+        if _evt_sess and _evt_run:
+            _renderer = self._run_renderers.get(f"{_evt_sess}:{_evt_run}")
+            if _renderer is not None:
+                try:
+                    _renderer.feed(payload)
+                except Exception as ex:
+                    pipe_log(f"  shadow renderer feed failed: {ex}")
+
+        consumers = self.consumers_for_event(payload)
+
+        # ── ELI-100: a run no live request consumes is a turn ──
+        if not consumers and _TURNS and _TURNS.route_now(self, payload):
+            return
+
+        if consumers:
+            if not payload.get("runId"):
+                pipe_log("  dispatched session-only event to sole consumer")
+            if payload.get("state") == "final" and payload.get("sessionKey") and payload.get("runId"):
+                # Genuinely shown to a live tab, which persists it via
+                # OWUI's own client-side flow -- remember this so a
+                # later duplicate/retried final event for the same
+                # run_id never reopens its message.
+                self.mark_delivered_live(payload["sessionKey"], payload["runId"])
+                # The inline turn is alive and took the final itself, so
+                # the parity shadow isn't needed for this run -- drop it.
+                self.unregister_run_target(payload["sessionKey"], payload["runId"])
+            for q in consumers[0].queues:
+                await q.put(msg)
+            return
+
+        if payload.get("sessionKey") and not payload.get("runId"):
+            pipe_log("  dropped ambiguous or unmatched session-only event")
+
+        # If nothing matches at all, drop it.
+        # This efficiently filters cross-session bleed.
+
     def consumers_for_event(self, payload: dict) -> list[_Consumer]:
         """Return consumers that should receive a Gateway event payload."""
         evt_session = payload.get("sessionKey", "")
@@ -3126,58 +3207,7 @@ class _GatewayConnection:
                    msg.get("event") not in ("agent", "chat"):
                     continue
 
-                payload = msg.get("payload", {})
-                if payload.get("stream") == "tool" and not self._first_tool_event(payload):
-                    continue
-                spawned = self._spawn_seen(payload) if payload.get("stream") == "tool" else None
-                if spawned:
-                    # The Status dialog's child index (state.py), off the loop.
-                    parent, child, task = spawned
-                    asyncio.get_running_loop().run_in_executor(None, functools.partial(
-                        _subagent_remember, parent, keys=[child], tasks={child: task} if task else None))
-
-                # ── Shadow render ──
-                # Feed every event of a run we're tracking into its shadow
-                # `_TurnRenderer`, whether or not a live consumer is still
-                # attached: the inline turn can end at any point, and the turn
-                # writer it hands over to starts from this content.
-                _evt_sess = payload.get("sessionKey", "")
-                _evt_run = payload.get("runId", "")
-                if _evt_sess and _evt_run:
-                    _renderer = self._run_renderers.get(f"{_evt_sess}:{_evt_run}")
-                    if _renderer is not None:
-                        try:
-                            _renderer.feed(payload)
-                        except Exception as ex:
-                            pipe_log(f"  shadow renderer feed failed: {ex}")
-
-                consumers = self.consumers_for_event(payload)
-
-                # ── ELI-100: a run no live request consumes is a turn ──
-                if not consumers and _TURNS and _TURNS.route_now(self, payload):
-                    continue
-
-                if consumers:
-                    if not payload.get("runId"):
-                        pipe_log("  dispatched session-only event to sole consumer")
-                    if payload.get("state") == "final" and payload.get("sessionKey") and payload.get("runId"):
-                        # Genuinely shown to a live tab, which persists it via
-                        # OWUI's own client-side flow -- remember this so a
-                        # later duplicate/retried final event for the same
-                        # run_id never reopens its message.
-                        self.mark_delivered_live(payload["sessionKey"], payload["runId"])
-                        # The inline turn is alive and took the final itself, so
-                        # the parity shadow isn't needed for this run -- drop it.
-                        self.unregister_run_target(payload["sessionKey"], payload["runId"])
-                    for q in consumers[0].queues:
-                        await q.put(msg)
-                    continue
-
-                if payload.get("sessionKey") and not payload.get("runId"):
-                    pipe_log("  dropped ambiguous or unmatched session-only event")
-
-                # If nothing matches at all, drop it.
-                # This efficiently filters cross-session bleed.
+                await self.dispatch_run_event(msg)
 
             except asyncio.TimeoutError:
                 # Not even a tick for two intervals: the socket is dead without
@@ -3319,6 +3349,49 @@ def _history_text_for_run(history: dict, run_id: str) -> tuple[bool, str | None]
                 text = str(fallback.get("replacementText") or "").strip()
         return True, (text if text and text not in _SILENT_SENTINELS else None)
     return False, None
+
+
+def _usage_prompt_tokens(usage) -> int | None:
+    """The context a model call filled, from its `usage`, as OpenClaw counts a
+    session's `totalTokens` (`deriveContextPromptTokens`): the reported
+    `contextUsage`, else input + cacheRead + cacheWrite, else total - output.
+    None when the usage says nothing."""
+    if not isinstance(usage, dict):
+        return None
+    context = usage.get("contextUsage") if isinstance(usage.get("contextUsage"), dict) else {}
+    if context.get("state") == "unavailable":
+        return None
+    if context.get("state") == "available":
+        prompt = context.get("promptTokens")
+        return prompt if isinstance(prompt, (int, float)) and prompt > 0 else None
+    nums = {k: usage.get(k) if isinstance(usage.get(k), (int, float)) else 0
+            for k in ("input", "cacheRead", "cacheWrite", "output")}
+    prompt = nums["input"] + nums["cacheRead"] + nums["cacheWrite"]
+    if prompt > 0:
+        return prompt
+    total = usage.get("totalTokens", usage.get("total"))
+    if isinstance(total, (int, float)) and total - nums["output"] > 0:
+        return total - nums["output"]
+    return None
+
+
+def _history_usage_for_run(history: dict, run_id: str) -> dict | None:
+    """The `usage` of one run's last model call, from its newest assistant
+    message in `chat.history` that reports one. A run's messages carry its id
+    under `__openclaw.runId`, or, for the claude-cli runner's closing message
+    (whose usage is the run's last call), in `cli-assistant:<runId>`."""
+    messages = (history or {}).get("messages")
+    if not isinstance(messages, list) or not run_id:
+        return None
+    wanted = {run_id, f"cli-assistant:{run_id}"}
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
+        ids = {*_idempotency_keys(message), str(meta.get("runId") or ""), str(message.get("runId") or "")}
+        if ids & wanted and _usage_prompt_tokens(message.get("usage")):
+            return message["usage"]
+    return None
 
 
 def _history_renderer(messages: list) -> "_TurnRenderer":

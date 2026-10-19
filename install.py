@@ -623,6 +623,36 @@ def function_status(client: OwuiClient, spec: FunctionSpec) -> bool:
     return all(v for k, v in state.items() if k != "is_global" or spec.global_)
 
 
+def _in_host_netns() -> bool:
+    """True unless this process provably runs in another network namespace than
+    PID 1. Unreadable counts as the host: refusing a sandbox deploy is the safe
+    side."""
+    try:
+        return os.readlink("/proc/self/ns/net") == os.readlink("/proc/1/ns/net")
+    except OSError:
+        return True
+
+
+def sandbox_refusal(*, live: bool) -> str | None:
+    """Why a deploy must not run, or None (ELI-221).
+
+    A sandbox (e2e-local's run.sh) sets E2E_ROOT and runs in its own network
+    namespace, where localhost is the sandbox's Open WebUI. With E2E_ROOT set
+    in the host's namespace, the same command reaches the host's live Open
+    WebUI instead, so it needs --live."""
+    if live or not os.environ.get("E2E_ROOT") or not _in_host_netns():
+        return None
+    return ("Refusing to deploy: E2E_ROOT is set (a sandbox shell), but this runs in the "
+            "host's network namespace, so the target is the host's live Open WebUI. "
+            "Run it through the sandbox wrapper, or pass --live to deploy to the host.")
+
+
+def live_option(f):
+    return click.option("--live", is_flag=True, default=False,
+                        help="Deploy to the host's Open WebUI even though E2E_ROOT is set "
+                             "(a sandbox shell refuses that otherwise)")(f)
+
+
 def owui_options(f):
     for option in reversed([
         click.option("--owui-url", envvar="OWUI_URL", default="http://localhost:8080",
@@ -641,7 +671,10 @@ def function_cli(spec: FunctionSpec):
     def cli() -> None:
         pass
 
-    def run(command: str, owui_url: str, owui_email: str, owui_password: str) -> None:
+    def run(command: str, owui_url: str, owui_email: str, owui_password: str, live: bool = False) -> None:
+        refusal = command != "status" and sandbox_refusal(live=live)
+        if refusal:
+            raise SystemExit(refusal)
         if not owui_email or not owui_password:
             raise SystemExit("Missing required env/args: OWUI_EMAIL, OWUI_PASSWORD "
                              "(the same Open WebUI login install.py uses).")
@@ -658,8 +691,9 @@ def function_cli(spec: FunctionSpec):
     def add(command: str, help_text: str) -> None:
         @cli.command(name=command, help=help_text)
         @owui_options
-        def _command(owui_url: str, owui_email: str, owui_password: str) -> None:
-            run(command, owui_url, owui_email, owui_password)
+        @live_option
+        def _command(owui_url: str, owui_email: str, owui_password: str, live: bool) -> None:
+            run(command, owui_url, owui_email, owui_password, live)
 
     add("install", f"Create or update the {spec.label} function, then smoke test.")
     add("repair", "Same as install; use after a broken/partial setup.")
@@ -978,6 +1012,7 @@ def common_options(f):
                           "smoke test reports 'pairing required'"),
         click.option("--wizard", "-w", is_flag=True, default=False,
                      help="Prompt interactively for any missing required values"),
+        live_option,
     ]
     for option in reversed(options):
         f = option(f)
@@ -985,6 +1020,10 @@ def common_options(f):
 
 
 def _dispatch(command: str, **kwargs) -> None:
+    live = kwargs.pop("live")
+    refusal = command != "status" and sandbox_refusal(live=live)
+    if refusal:
+        raise SystemExit(refusal)
     wizard = kwargs.pop("wizard")
     cfg = Config(**kwargs)
     if wizard:
