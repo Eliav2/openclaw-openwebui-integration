@@ -28,6 +28,7 @@ The design behind this is in [Agent turns](../design/agent-turns.md).
 | Another session's `sessions_send` into this chat's session | a reply, live |
 | A sub-agent that finishes while its parent is idle | the parent's reply to the result, live |
 | A sub-agent that finishes while its parent is still running | part of the running reply |
+| A command the agent left running in the background that ends | the agent's reply to its result, live, finished when that run ends |
 | A Gateway restart recovery of an interrupted reply | continues that same reply |
 | A heartbeat run | nothing |
 

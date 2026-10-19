@@ -9233,7 +9233,16 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
             if kind == "event":
                 if writer is not None:
                     await writer.feed(item)
-                continue
+                if not (writer is not None and writer.run_id == run and _ends_on_own_final(run, item)):
+                    continue
+                # Its own final is the settle that may never be pushed: OpenClaw
+                # 2026.10.5 pushes `agent.input.settled` only for a chat.send or
+                # agent call, so a run the Gateway starts itself (a background
+                # command's end notice, heartbeat runner) leaves its last row
+                # `hasActiveRun: true` and goes idle unpushed (ELI-215). After a
+                # clean final the settled row could only finalize, so no row is
+                # waited for.
+                item = None
             # Only the pump of the writer's current run ends it: an interrupted
             # run's pump also gets the session's settle once its recovery has
             # taken M over, and the recovery's own pump may still hold events.
@@ -9258,6 +9267,14 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
                 kind, item = pump.queue.get_nowait()
                 if kind == "event" and item is not None:
                     _turn_queue(conn, sess, run, parsed, item)
+
+
+def _ends_on_own_final(run: str, payload) -> bool:
+    """A run the agent started (no pipe run id) whose chat final came: it
+    ended cleanly, so it is over whatever the session row says. An error or
+    abort still waits for its row (its note, a resume, a recovery)."""
+    return (isinstance(payload, dict) and payload.get("state") == "final"
+            and parse_pipe_run_id(run) is None)
 
 
 def _is_terminal_event(payload: dict) -> bool:

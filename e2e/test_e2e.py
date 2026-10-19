@@ -1119,6 +1119,30 @@ def test_the_status_action_lists_a_background_command(token):
     assert [(r["title"], r["status"]) for r in commands] == [("sleep 25; echo e2e-bg-done", "running")], data
 
 
+def test_the_reply_to_a_background_commands_end_finishes(token):
+    """ELI-215: when a command the agent left in the background ends, the
+    Gateway starts a run of its own on the session, and the turn writer gives
+    it a message. That message must finish once the run has ended; on
+    OpenClaw 2026.10.5 it stayed done:false (Open WebUI showed it generating,
+    and owui_send refused the chat as busy) until the next turn started."""
+    chat_id, msg = _chat_turn(token, "E2E_BG_EXEC")
+    assert msg.get("content", "").strip() == "E2E_BG_STARTED", msg
+    key = _session_key(token, chat_id)
+
+    def noticed_and_idle():
+        hist = _gw("chat.history", {"sessionKey": key, "limit": 50}).get("messages") or []
+        said = any(m.get("role") == "assistant" and "E2E_BG_NOTICED" in json.dumps(m.get("content"))
+                   for m in hist)
+        return said and _session_row(key).get("hasActiveRun") is False
+    # sleep 25, then the notice run: the Gateway's own record that it ended.
+    # The heartbeat runner holds the notice while other runs of the agent are active.
+    _until("the notice run to reply and the session to go idle", noticed_and_idle)
+    msgs = _wait_for(token, chat_id, ["E2E_BG_NOTICED"])
+    open_ = [(m.get("id", "")[:8], (m.get("content") or "")[:60]) for m in msgs.values()
+             if m.get("role") == "assistant" and m.get("done") is not True]
+    assert not open_, f"assistant messages left unfinished: {open_}"
+
+
 def test_the_status_dialog_lists_only_this_chats_automations(token, guest_token):
     """ELI-175, through the real path: each user's own Status dialog, read
     from the stack's Gateway with the installed Action's settings and the
