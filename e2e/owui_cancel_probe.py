@@ -26,6 +26,7 @@ src.close()
 dst.close()
 # Before Open WebUI's modules read it.
 os.environ["DATABASE_URL"] = f"sqlite:///{DB}"
+sys.path.insert(0, "/app/backend")
 
 from open_webui.models.chats import Chats  # noqa: E402
 from open_webui.models.users import Users  # noqa: E402
