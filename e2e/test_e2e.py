@@ -1303,6 +1303,10 @@ class _Page:
         with self.cond:
             return next(((a, e) for a, e in self.calls if (e.get("data") or {}).get("type") == kind), None)
 
+    def join(self, chat_id: str) -> None:
+        """Show the chat, as a tab does when it opens one (events:chat join)."""
+        self._emit("events:chat", {"chat_id": chat_id, "data": {"type": "join"}})
+
     def answer(self, ack_id: str, value) -> None:
         """Answer an event call, as the tab does when its dialog is submitted."""
         self.ws.send("43" + ack_id + json.dumps([value]))
@@ -1626,6 +1630,7 @@ def test_an_ask_user_tool_question_shows_the_card_and_the_answer_reaches_the_age
     page = _Page(token)
     try:
         chat_id, _ = _send_in_chat(token, page, None, "E2E_ASK_TOOL")
+        page.join(chat_id)
         # The precondition: the tool's question is pending on the Gateway.
         question = _until("the ask_user question on the Gateway", lambda: _pending_question(chat_id),
                           timeout_s=60)
@@ -1644,6 +1649,7 @@ def test_a_cancelled_ask_user_card_lets_the_agent_go_on_at_once(token):
     page = _Page(token)
     try:
         chat_id, _ = _send_in_chat(token, page, None, "E2E_ASK_TOOL")
+        page.join(chat_id)
         ack_id, _ = page.wait("the question card", lambda: page.call_of_type("request:user_input"), 60)
         page.answer(ack_id, {"status": "cancelled"})
         _wait_for(token, chat_id, ["E2E_ASK_TOOL_RESULT no_answer"])

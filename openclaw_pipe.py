@@ -2439,6 +2439,8 @@ class _ComposerWatcher:
 
     async def tick(self, now=None):
         if not self.enabled():
+            for key in self._pairs:
+                _chat_tab_left(*key)
             self._pairs.clear()
             return 0
         now = time.monotonic() if now is None else now
@@ -2463,6 +2465,7 @@ class _ComposerWatcher:
                     due.append((key, user_id))
         for key in [k for k in self._pairs if k not in live]:
             del self._pairs[key]
+            _chat_tab_left(*key)
         if not due:
             return 0
 
@@ -2478,6 +2481,8 @@ class _ComposerWatcher:
                 result = "retry"
             if result == "acked":
                 pushed += 1
+                # The tab shows the chat: an ask_user card can go there (askuser.py).
+                _chat_tab_ready(sid, chat_id)
             if st is None:
                 continue
             if result == "held":
@@ -2521,6 +2526,7 @@ class _ComposerWatcher:
         return "acked" if acked else "retry"
 
     async def run(self):
+        _CHAT_TABS_TRACKED[0] = True
         last_error = None
         next_liveness = 0.0
         state = "unknown"
@@ -2532,6 +2538,7 @@ class _ComposerWatcher:
                     state = await self.function_state()
                     if state == "gone":
                         pipe_log("[composer] Pipe function deleted; watcher stops")
+                        _CHAT_TABS_TRACKED[0] = False
                         return
                 if state != "inactive":
                     await self.tick()
@@ -3651,18 +3658,26 @@ async def _answer_secret_request(conn, record: dict, question: dict, user_id: st
 # gets no prompt of its own: unanswered, the run waited out the tool's
 # timeout (15 minutes by default) on "Thinking".
 #
-# It is asked as a needs-input card is: Open WebUI's question card on the
-# reply's socket, moved once to the tab viewing the chat. Unanswered (the
-# card's timeout, a cancel, no tab on the chat) the question is cancelled,
-# so the agent hears it at once and goes on.
+# It is asked in Open WebUI's question card, on the newest tab that has
+# loaded the chat (else the reply's own socket while it shows the chat). A
+# question asked with no such tab stays pending: the card shows once a tab
+# opens the chat, and moves to a newer one (a reload, a phone back from
+# sleep). The card gets no timeout of its own: Open WebUI answers its timeout
+# as it answers Cancel. So the question ends only on the card's Cancel, an
+# answer here or elsewhere (the Control UI), or the Gateway's own timeout.
+#
+# "Loaded the chat" is the composer watcher's ack (composer_watch.py): a tab
+# acks an `execute` only once it shows the chat, and cancels a card at once
+# while it does not, which must not read as the user's Cancel.
 
 # question id -> the task asking it
 _AGENT_QUESTIONS: dict = {}
 
 
-def _agent_question_payload(record, timeout_ms: int) -> dict | None:
+def _agent_question_payload(record, timeout_ms: int | None) -> dict | None:
     """Open WebUI's question card for an ask_user question record, or None
-    for anything else (a secret, no questions)."""
+    for anything else (a secret, no questions). `timeout_ms` None: the card
+    has no countdown of its own."""
     questions = record.get("questions") if isinstance(record, dict) else None
     if not isinstance(questions, list) or not questions:
         return None
@@ -3719,7 +3734,7 @@ def agent_question_seen(conn, record) -> bool:
     if not isinstance(record, dict) or record.get("status", "pending") != "pending" \
             or not record.get("id") or record["id"] in _AGENT_QUESTIONS:
         return False
-    if _agent_question_payload(record, _NATIVE_CARD_TIMEOUT_MS) is None:
+    if _agent_question_payload(record, None) is None:
         return False
     parsed = conn.parse_owui_session_key(record.get("sessionKey") or "")
     if not parsed:
@@ -3737,34 +3752,176 @@ def _open_writer_message_id(conn, chat_id: str, session_key: str) -> str | None:
     return None
 
 
+# chat id -> the sockets that have loaded the chat, oldest first
+_READY_CHAT_TABS: dict = {}
+# chat id -> events set when one more socket has loaded it
+_CHAT_TAB_WAITERS: dict = {}
+# Whether the composer watcher feeds _READY_CHAT_TABS (on by default).
+_CHAT_TABS_TRACKED = [False]
+# Without the watcher, how often a question with no tab looks for one.
+_UNTRACKED_TAB_POLL_S = 5.0
+
+
+def _chat_tab_ready(sid, chat_id) -> None:
+    """The composer watcher: socket `sid` shows chat `chat_id` loaded."""
+    tabs = _READY_CHAT_TABS.setdefault(chat_id, [])
+    if sid in tabs:
+        tabs.remove(sid)
+    tabs.append(sid)
+    for event in list(_CHAT_TAB_WAITERS.get(chat_id, ())):
+        event.set()
+
+
+def _chat_tab_left(sid, chat_id) -> None:
+    """The composer watcher: socket `sid` no longer shows chat `chat_id`."""
+    tabs = _READY_CHAT_TABS.get(chat_id)
+    if tabs and sid in tabs:
+        tabs.remove(sid)
+        if not tabs:
+            del _READY_CHAT_TABS[chat_id]
+
+
+def _views_chat(session_pool, sid, user_id, chat_id) -> bool:
+    session = session_pool.get(sid) if sid else None
+    return bool(session) and session.get("id") == user_id and (
+        "chat_ids" not in session or chat_id in (session.get("chat_ids") or []))
+
+
+def _agent_card_tab(session_pool, user_id, chat_id, own_sid) -> str | None:
+    """The socket to show an ask_user card on, or None while no tab can."""
+    for sid in reversed(_READY_CHAT_TABS.get(chat_id, [])):
+        if _views_chat(session_pool, sid, user_id, chat_id):
+            return sid
+    if _views_chat(session_pool, own_sid, user_id, chat_id):
+        return own_sid
+    if not _CHAT_TABS_TRACKED[0]:
+        return _live_session_id_for_user(user_id, session_pool, chat_id)
+    return None
+
+
+@contextlib.contextmanager
+def _chat_tab_signal(chat_id):
+    """An event set when one more socket loads the chat."""
+    event = asyncio.Event()
+    _CHAT_TAB_WAITERS.setdefault(chat_id, set()).add(event)
+    try:
+        yield event
+    finally:
+        waiters = _CHAT_TAB_WAITERS.get(chat_id)
+        if waiters is not None:
+            waiters.discard(event)
+            if not waiters:
+                del _CHAT_TAB_WAITERS[chat_id]
+
+
+async def _card_on_tab(sio, session_pool, sid, user_id, chat_id, message_id, payload, deadline):
+    """Show the card on `sid` until it answers: (response, None), or
+    (None, "moved") once a newer tab has loaded the chat or `sid` stops
+    showing it, or (None, None) at the deadline. The card leaves the screen
+    when the wait ends, however it ends."""
+    interaction_id = str(uuid.uuid4())
+    data = {**payload["data"], "interaction_id": interaction_id}
+    pipe_log(f"  ask_user: showing the card on session {sid[:8]}...")
+    with _chat_tab_signal(chat_id) as newer:
+        call = asyncio.ensure_future(sio.call(
+            "events", {"chat_id": chat_id, "message_id": message_id,
+                       "data": {**payload, "data": data}},
+            to=sid, timeout=max(1.0, deadline - time.time())))
+        try:
+            while True:
+                left = deadline - time.time()
+                if left <= 0:
+                    return None, None
+                tab_change = asyncio.ensure_future(newer.wait())
+                try:
+                    # The wait wakes on the answer, on a tab that loads the
+                    # chat, or every few seconds to see this socket is still
+                    # there (Open WebUI keeps a call to a gone socket open).
+                    done, _ = await asyncio.wait({call, tab_change}, timeout=min(left, 5.0),
+                                                 return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    tab_change.cancel()
+                if call in done:
+                    try:
+                        response = call.result()
+                    except Exception as ex:
+                        pipe_log(f"  ask_user: the card on {sid[:8]}... failed: {ex!r}")
+                        return None, "moved"
+                    if not _views_chat(session_pool, sid, user_id, chat_id):
+                        # Cancelled by a tab that left the chat, not by the user.
+                        return None, "moved"
+                    return response, None
+                newer.clear()
+                if _agent_card_tab(session_pool, user_id, chat_id, sid) != sid \
+                        or not _views_chat(session_pool, sid, user_id, chat_id):
+                    return None, "moved"
+        finally:
+            call.cancel()
+            try:
+                await sio.emit("events", {"chat_id": chat_id, "message_id": message_id, "data": {
+                    "type": "request:interaction:done", "data": {"interaction_id": interaction_id}}},
+                    to=sid)
+            except Exception:
+                pass
+
+
+async def _ask_agent_card(user_id, chat_id, message_id, own_sid, payload, deadline):
+    """The card's response, shown on whichever tab has the chat, or None at
+    the deadline."""
+    try:
+        from open_webui.socket.main import sio, SESSION_POOL
+    except Exception as ex:
+        pipe_log(f"  ask_user: no Open WebUI sockets here: {ex}")
+        return None
+    while (left := deadline - time.time()) > 0:
+        sid = _agent_card_tab(SESSION_POOL, user_id, chat_id, own_sid)
+        if sid is None:
+            with _chat_tab_signal(chat_id) as ready:
+                wait = left if _CHAT_TABS_TRACKED[0] else min(left, _UNTRACKED_TAB_POLL_S)
+                try:
+                    await asyncio.wait_for(ready.wait(), wait)
+                except asyncio.TimeoutError:
+                    pass
+            continue
+        response, moved = await _card_on_tab(sio, SESSION_POOL, sid, user_id, chat_id,
+                                             message_id, payload, deadline)
+        if moved:
+            if sid == own_sid:
+                own_sid = None
+            continue
+        return response
+    return None
+
+
 async def _answer_agent_question(conn, record: dict, user_id: str, chat_id: str) -> None:
     qid, key = record["id"], record.get("sessionKey") or ""
-    remaining_ms = (record.get("expiresAtMs") or 0) - time.time() * 1000
-    timeout_ms = int(min(_NATIVE_CARD_TIMEOUT_MS, remaining_ms)) if remaining_ms > 0 \
-        else _NATIVE_CARD_TIMEOUT_MS
-    payload = _agent_question_payload(record, max(1000, timeout_ms))
+    deadline = (record.get("expiresAtMs") or 0) / 1000 or time.time() + 900
+    payload = _agent_question_payload(record, None)
     questions = payload["data"]["questions"]
     turn = _SECRET_ASKERS.get(key)
+    message_id = turn.owui_message_id if turn is not None else _open_writer_message_id(conn, chat_id, key)
+    own_sid = (turn.__metadata__ or {}).get("session_id") if turn is not None else None
+    if not message_id:
+        # A card needs the reply it belongs to: Open WebUI cancels one for a
+        # message the tab does not have. Left to the Control UI.
+        _AGENT_QUESTIONS.pop(qid, None)
+        pipe_log(f"  ask_user: no reply in chat {chat_id[:8]}... streams the run; left to the Control UI")
+        return
     pipe_log(f"  ask_user: {len(questions)} question(s) in chat {chat_id[:8]}... (question {qid[:12]}...)")
-    if turn is not None:
-        response = await _ask_where_the_chat_is(
-            turn.__event_call__, payload, payload["data"]["timeout_ms"] / 1000, grace_s=15,
-            owui_user_id=user_id, owui_chat_id=chat_id, owui_message_id=turn.owui_message_id,
-            poll_interval_s=5, owui_session_id=(turn.__metadata__ or {}).get("session_id"))
-    else:
-        response = await _call_on_chat_tab(user_id, chat_id, _open_writer_message_id(conn, chat_id, key),
-                                           payload, payload["data"]["timeout_ms"] / 1000)
+    response = await _ask_agent_card(user_id, chat_id, message_id, own_sid, payload, deadline)
     if _AGENT_QUESTIONS.get(qid) is not asyncio.current_task():
         return
     del _AGENT_QUESTIONS[qid]
+    if response is None:
+        # The Gateway's timeout ends it and tells the agent.
+        pipe_log("  ask_user: not answered before the question expired")
+        return
     answers = (_agent_question_answers(questions, response.get("answers"))
                if isinstance(response, dict) and response.get("status") == "answered" else {})
     if answers:
         params = {"id": qid, "answers": {"answers": answers}, "resolvedBy": "openwebui"}
     else:
-        # Not answered here: cancelled, so the agent hears it now instead of
-        # at the tool's timeout.
-        pipe_log(f"  ask_user: not answered ({_unanswered(response)}); cancelling the question")
+        pipe_log("  ask_user: the card was cancelled")
         params = {"id": qid, "cancel": True, "resolvedBy": "openwebui"}
     try:
         result = await conn.send_request("question.resolve", params, timeout=30)

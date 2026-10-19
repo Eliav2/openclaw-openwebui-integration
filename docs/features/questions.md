@@ -50,9 +50,16 @@ If you cancel any other question, or it ends as text, the question stays in the 
 
 ## Questions from the agent's ask_user tool
 
-OpenClaw's own `ask_user` tool works too, with no agent setup. Its questions (up to three, each with its options) show as the same question card, on the reply's tab, moved once to a reloaded tab; the option you pick, or what you type in Other, goes back to the agent as the tool's answer. A multi-select question lists its options by number, as above, and each option you name reaches the agent.
+OpenClaw's own `ask_user` tool works too, with no agent setup. Its questions (up to three, each with its options) show as the same question card. The option you pick, or what you type in Other, goes back to the agent as the tool's answer. A multi-select question lists its options by number, as above, and each option you name reaches the agent.
 
-If the card is not answered by its timeout, is cancelled, or no tab views the chat, the question is cancelled at once: the agent hears that nobody answered and goes on, instead of waiting out the tool's timeout. Answered elsewhere (the Control UI), the card's answer is dropped.
+The card shows on the newest tab that has the chat open, and it waits for you:
+
+- **No tab open** (you closed it, or your phone slept): the question stays pending. It shows as soon as you open the chat again.
+- **A newer tab opens the chat** (a reload, the chat opened on your phone): the card moves there.
+- **Switching the tab to another chat** does not cancel it; it shows again when you come back.
+- The card has no countdown. The question ends only when you answer, press Cancel (the agent hears that you cancelled), answer it elsewhere (the Control UI; the card closes), or when the tool's own timeout ends it (15 minutes by default, set by the agent).
+
+The Pipe knows a tab has the chat open from the Status button it adds to the composer (`COMPOSER_STATUS_BUTTON`, on by default). With that valve off, it checks for a tab every few seconds instead.
 
 ## Secrets the agent requests
 
