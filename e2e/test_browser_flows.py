@@ -769,9 +769,6 @@ def test_a_compaction_the_gateway_refuses_shows_its_error(page):
     dialog showed "Compacting…" and then the same numbers, as if it had
     worked. It says the compaction failed, with the Gateway's reason, and
     keeps the numbers."""
-    if _openclaw_release() >= (2026, 10):
-        pytest.skip("OpenClaw 2026.10: the dialog has no Compact button for a session created by "
-                    "chat.send (ELI-177, as test_the_status_dialog_compacts_the_chat).")
     nonce = f"BROWSER_COMPACT_FAIL_{os.getpid()}_{len(_fake_llm_requests())}"
     capture.new_chat(page)
     capture.send(page, f"E2E_ECHO: E2E_COMPACT_FAIL {nonce}")
