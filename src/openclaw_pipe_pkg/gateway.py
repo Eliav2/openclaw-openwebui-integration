@@ -2855,9 +2855,10 @@ class _GatewayConnection:
             )
         )))
 
-        resp = json.loads(await asyncio.wait_for(ws.recv(), 10))
+        resp = await _connect_response(ws, "1")
         if not resp.get("ok"):
             err = resp.get("error")
+            pipe_log(f"  connect rejected: {json.dumps(err)[:500]}")
             raise GatewayError(
                 _explain_connect_rejection(
                     str((err or {}).get("message", "connect failed")),
@@ -3742,6 +3743,19 @@ STARTUP_REFUSAL_WAIT_S = 300
 # reached (a restart: the port is closed until the new process listens).
 GATEWAY_DOWN_WAIT_S = 120
 GATEWAY_REFUSED_CODE = "connection-refused"
+
+
+async def _connect_response(ws, req_id: str, timeout: float = 10) -> dict:
+    """The Gateway's response to our connect request: the first `res` frame
+    with its id. Any other frame before it is skipped (and logged): taken as
+    the response, it read as a rejection with no reason ("connect failed")."""
+    deadline = time.monotonic() + timeout
+    while True:
+        frame = json.loads(await asyncio.wait_for(ws.recv(), max(0, deadline - time.monotonic())))
+        if frame.get("type") == "res" and frame.get("id") == req_id:
+            return frame
+        pipe_log(f"  frame before the connect response, skipped: type={frame.get('type')!r} "
+                 f"event={frame.get('event')!r} id={frame.get('id')!r}")
 
 
 def _refused_connect(ex) -> bool:

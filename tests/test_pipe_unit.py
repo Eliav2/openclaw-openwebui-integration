@@ -3273,6 +3273,23 @@ class TickWatchTests(unittest.IsolatedAsyncioTestCase):
             await conn._connect_and_start()
         self.assertEqual(conn._tick_interval_s, 12.0)
 
+    async def test_a_frame_before_the_connect_response_is_not_taken_for_it(self):
+        # Taken as the response, any other frame read as a rejection with no
+        # reason: "**Gateway connection error:** connect failed".
+        conn = _GatewayConnection(lambda: types.SimpleNamespace(
+            GATEWAY_URL="localhost:18789", GATEWAY_TOKEN="tok"))
+        conn._ensure_identity = lambda valves: None
+        conn._ident = {"id": "device-1"}
+        ws = _HandshakeWS()
+        ws._frames.insert(1, json.dumps({"type": "event", "event": "health", "payload": {}}))
+
+        async def fake_connect(_url, **_kw):
+            return ws
+        with mock.patch.object(websockets, "connect", fake_connect, create=True), \
+                mock.patch("openclaw_pipe._sign_challenge", lambda *a, **k: {}):
+            await conn._connect_and_start()
+        self.assertEqual((conn.gateway_boot_id, ws._frames), ("boot-1", []), "the connect response was read")
+
 
 class RetiredConnectionServesItsReplyTests(unittest.IsolatedAsyncioTestCase):
     """ELI-150: a plain redeploy mid-reply. The previous load's connection is
@@ -6215,7 +6232,7 @@ class _HandshakeWS:
         self._frames = [
             json.dumps({"event": "connect.challenge",
                         "payload": {"nonce": "n", "ts": 1}}),
-            json.dumps({"ok": ok, "payload": hello,
+            json.dumps({"type": "res", "id": "1", "ok": ok, "payload": hello,
                         "error": {"message": "connect failed"}}),
         ]
         self.sent = []
