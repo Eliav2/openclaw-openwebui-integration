@@ -7755,6 +7755,119 @@ def _tool(phase, tcid="t1", name="Bash", result="ok"):
     return {"stream": "tool", "data": data}
 
 
+class TurnWriterTabRepairTests(_TurnWriterCase):
+    """ELI-230: a tab that loads the chat while M is introduced can lose M
+    (Open WebUI's loadChat assigns the history it fetched first, over the
+    introduction). Each tab showing the chat is asked, under M's parent, once
+    it has drawn the parent, whether it shows M; a tab that does not gets M
+    as it stands, alone. The run's end sends M once more, finished."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.owui.session_pool["sA"] = {"id": self.USER, "chat_ids": [self.CHAT]}
+        self.conn.session_history = mock.AsyncMock(return_value={"messages": []})
+
+    async def spin(self, n=50):
+        for _ in range(n):
+            await asyncio.sleep(0)
+
+    def probes(self, sid="sA"):
+        return [d for e, d, to in self.owui.calls if to == sid and "message-" in d["data"]["data"].get("code", "")]
+
+    def to_tab(self, sid="sA"):
+        return [d for e, d, to in self.owui.emits if to == sid and d["data"]["type"] == "chat:messages"]
+
+    async def test_a_tab_without_m_gets_m_as_it_stands(self):
+        self.owui.page_intent["sA"] = "missing"
+        w = self.writer()
+        await w.feed(_delta("Hello"))
+        await self.spin()
+        (probe,) = self.probes()
+        self.assertEqual(probe["message_id"], "a1", "asked under the parent, which the tab has")
+        self.assertIn("message-m1", probe["data"]["data"]["code"])
+        (repair,) = self.to_tab()
+        self.assertTrue(repair["shared"])
+        sent = repair["data"]["data"]
+        self.assertEqual(sent["currentId"], "m1")
+        self.assertEqual(sent["messages"]["a1"], {"id": "a1", "childrenIds": ["m1"]})
+        m = sent["messages"]["m1"]
+        self.assertEqual((m["content"], m["done"], m["parentId"]), ("Hello", False, "a1"))
+        self.assertEqual(m["output"], w.sent_output, "the base of the tab's next diff")
+        await w.feed(_delta(" there"))
+        await self.spin()
+        self.assertEqual(len(self.probes()), 1, "a repaired tab is not asked again")
+
+    async def test_a_tab_that_shows_m_is_left_alone(self):
+        self.owui.page_intent["sA"] = "present"
+        w = self.writer()
+        await w.feed(_delta("Hello"))
+        await self.spin()
+        await w.feed(_delta(" there"))
+        await self.spin()
+        self.assertEqual(len(self.probes()), 1, "a confirmed tab is not asked again")
+        self.assertEqual(self.to_tab(), [])
+
+    async def test_a_loading_tab_is_asked_again_one_probe_at_a_time(self):
+        answers = []
+
+        async def call(event, data, to=None, timeout=None):
+            self.owui.calls.append((event, copy.deepcopy(data), to))
+            answers.append(asyncio.get_running_loop().create_future())
+            return await answers[-1]
+        self.owui.socket_main.sio.call = call
+        w = self.writer()
+        await w.feed(_delta("Hello"))
+        await self.spin()
+        await w.feed(_delta(" there"))
+        await self.spin()
+        self.assertEqual(len(self.probes()), 1, "one probe in flight per tab")
+        answers[0].set_result("loading")
+        await self.spin()
+        await w.feed(_delta(" again"))
+        await self.spin()
+        self.assertEqual(len(self.probes()), 2, "a tab still loading is asked at the next step")
+        self.assertEqual(self.to_tab(), [])
+
+    async def test_no_repair_after_the_run_ended(self):
+        answers = []
+
+        async def call(event, data, to=None, timeout=None):
+            self.owui.calls.append((event, copy.deepcopy(data), to))
+            answers.append(asyncio.get_running_loop().create_future())
+            return await answers[-1]
+        self.owui.socket_main.sio.call = call
+        w = self.writer()
+        await w.feed(_delta("Hello"))
+        await self.spin()
+        await w.finalize()
+        answers[0].set_result("missing")
+        await self.spin()
+        self.assertEqual(self.to_tab(), [], "the end's own send covers it")
+
+    async def test_the_end_sends_m_once_more_finished_before_it_completes(self):
+        w = self.writer()
+        await w.feed(_delta("Hello"))
+        await w.finalize()
+        kinds = [d["data"]["type"] for e, d, room in self.owui.emits if e == "events"]
+        last_intro = len(kinds) - 1 - kinds[::-1].index("chat:messages")
+        self.assertLess(last_intro, kinds.index("chat:completion"), "before the completion that ends M")
+        final = [d for e, d, room in self.owui.emits
+                 if d["data"]["type"] == "chat:messages" and room == f"chat:{self.CHAT}"][-1]["data"]["data"]
+        m = final["messages"]["m1"]
+        self.assertEqual((m["content"], m["done"]), ("Hello", True))
+        self.assertEqual(final["messages"]["a1"], {"id": "a1", "childrenIds": ["m1"]})
+
+    async def test_a_message_taken_over_is_neither_probed_nor_sent_again(self):
+        """A pipe run's own stub: Open WebUI introduced it, tabs load it."""
+        w = _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
+                        run_id="agent-run-1", message_id="a1", takeover=True)
+        await w.feed(_delta("Hello"))
+        await self.spin()
+        await w.finalize()
+        self.assertEqual(self.probes(), [])
+        self.assertEqual(self.owui.events("chat:messages"), [])
+
+
 class TurnWriterLockedDbTests(_TurnWriterCase):
     """ELI-167: Open WebUI's sqlite write lock held past its busy_timeout
     (5 s, WAL, BEGIN IMMEDIATE) when a run opens its message. The open waits
@@ -9083,7 +9196,10 @@ class RegressionPlanTests(_RoutingCase):
         # The deterministic uuid5 gives one message even if both wrote it:
         # count the writers' own effects (review 2af1, Strong2).
         n_tasks = len(self.owui.tasks)
-        n_intro = len(self.owui.events("chat:messages"))
+        # The introductions of an unfinished M: the end sends it once more,
+        # finished (ELI-230).
+        n_intro = sum(1 for d in self.owui.events("chat:messages")
+                      if not d["data"]["messages"][d["data"]["currentId"]].get("done"))
         for conn in (self.conn, other):
             conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
                                        "status": "done", "lastRunId": self.RUN})
