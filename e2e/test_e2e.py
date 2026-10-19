@@ -1013,6 +1013,8 @@ def test_a_subagent_result_the_parent_answers_with_silence_shows_as_its_card(tok
         _until("the Gateway's retry of the delivery", lambda: failed_deliveries() >= 2,
                timeout_s=90, every_s=2)
     _, after = _chat_turn(token, "Respond with exactly: E2E_AFTER_CARD", chat_id=chat_id)
+    assert "couldn't generate a response" not in (after.get("content") or ""), \
+        "the user's own reply shows an error"
     assert (after.get("content") or "").strip() == "E2E_AFTER_CARD", after
     msgs = _chat_messages(token, chat_id)
     cards = [k for k, x in msgs.items() if any(

@@ -417,9 +417,12 @@ def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
 
     if "E2E_EMPTY_REPLY" in user_text:
         return {"text": ""}
-    if "E2E_SILENT_RESULT" in user_text:
+    if "E2E_SILENT_RESULT" in user_text and "[Internal task completion event]" in user_text:
         # The parent's turn for the child's completion (the announce): it
         # stays silent, so the child's result shows only as the Pipe's card.
+        # Only that turn: 2026.10.10 also lists the child's result in the
+        # context of the parent's next user turn ("Child results awaiting
+        # delivery").
         return {"text": "NO_REPLY"}
     if "E2E_SILENT_CHILD" in user_text and "[Subagent Task]" in user_text:
         # The child's own turn only: on 2026.10.5 the parent's later turns
