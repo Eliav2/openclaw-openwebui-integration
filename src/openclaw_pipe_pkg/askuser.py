@@ -1005,14 +1005,43 @@ def secret_request_resolved(payload) -> None:
         task.cancel()
 
 
+GUEST_SECRET_NOTE = "_The agent asked for the secret `{name}`. That needs the owner; it is not available here._"
+
+
+async def _cancel_guest_secret_request(conn, record: dict, name: str) -> None:
+    """Cancel a secret request made in a guest's chat and say so in the reply
+    of the run that asked, as a note of its own (ELI-229)."""
+    qid = record["id"]
+    try:
+        result = await conn.send_request("question.resolve", {"id": qid, "cancel": True,
+                                                               "resolvedBy": "openwebui"}, timeout=30)
+        shown = str((result or {}).get("status"))
+    except Exception as ex:
+        shown = f"not cancelled ({type(ex).__name__})"
+    finally:
+        if _SECRET_REQUESTS.get(qid) is asyncio.current_task():
+            del _SECRET_REQUESTS[qid]
+    pipe_log(f"  secret request: {name} in a chat of a user not in OWNER_USERS: {shown}")
+    payload = {"sessionKey": record.get("sessionKey") or "", "stream": PIPE_NOTE_STREAM,
+               "data": {"id": f"{_NOTE_ITEM_PREFIX}secret_{qid}", "text": GUEST_SECRET_NOTE.format(name=name)}}
+    if record.get("runId"):
+        payload["runId"] = record["runId"]
+    await conn.dispatch_run_event({"type": "event", "event": "agent", "payload": payload})
+
+
 async def _answer_secret_request(conn, record: dict, question: dict, user_id: str, chat_id: str) -> None:
     qid, name = record["id"], question["secretStore"]["name"]
     timeout_s = max(1.0, (record.get("expiresAtMs") or 0) / 1000 - time.time())
     payload = _secret_request_payload(question)
     if not await _sender_is_owner(conn, record.get("sessionKey") or ""):
-        # The store is the owner's: a guest's chat cannot write into it.
-        _SECRET_REQUESTS.pop(qid, None)
-        pipe_log(f"  secret request: {name} in a chat of a user not in OWNER_USERS; left to the Control UI")
+        # The store is the owner's: a guest's chat cannot write into it. Nor is
+        # it left pending: answered in the Control UI, it would hand the
+        # owner's secret to a run whose output the guest reads, and until then
+        # the run waits out the request (15 minutes by default). A run the
+        # guest sends cannot ask at all (its connection lacks
+        # operator.questions); one the agent starts in the guest's chat (a
+        # cron wake, an announce) can (ELI-229).
+        await _cancel_guest_secret_request(conn, record, name)
         return
     turn = _SECRET_ASKERS.get(record.get("sessionKey"))
     pipe_log(f"  secret request: {name} in chat {chat_id[:8]}... (question {qid[:8]}...)")

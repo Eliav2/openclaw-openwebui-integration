@@ -1984,6 +1984,37 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f"**Error:** {self._NOT_ALLOWED}", out)
         self.assertNotIn("no reply text", out)
 
+    def _spawn_card_events(self, run_id):
+        def tool(phase, **data):
+            return {"type": "event", "event": "agent", "payload": {
+                "sessionKey": self.SK, "runId": run_id, "stream": "tool",
+                "data": {"phase": phase, "name": "sessions_spawn", "toolCallId": "t1", **data}}}
+        return [tool("start", args={"task": "Answer what 17 times 3 is."}),
+                tool("result", result="Started: QA 17x3")]
+
+    async def test_a_run_that_answers_with_silence_after_its_card_keeps_the_card_alone(self):
+        """ELI-227 (live chat 0a13a1d4 on 2026.10.5): the reply started a
+        background sub-agent with sessions_spawn and answered NO_REPLY. The
+        message read "(This turn produced no reply text.)" under the card."""
+        gen = self._reply("start one", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        for ev in [*self._spawn_card_events("run-1"), self._delta("run-1", "NO_REPLY"),
+                   self._final("run-1")]:
+            self._queue("run-1").put_nowait(ev)
+        chunks = [await asyncio.wait_for(first, 2)]
+        chunks += [c async for c in gen]
+        text = "".join(c for c in chunks if isinstance(c, str))
+        self.assertNotIn("no reply text", text)
+        self.assertNotIn("NO_REPLY", text)
+        cards = [c for c in chunks if isinstance(c, dict) and c.get("type") == "response.output_item.added"
+                 and (c.get("item") or {}).get("type") == "function_call"]
+        self.assertEqual(len(cards), 1, "the card stays")
+
+    async def test_a_run_with_no_text_and_no_card_still_says_so(self):
+        out = await self._reply_text([self._final("run-1")])
+        self.assertIn("no reply text", out)
+
     async def test_a_lifecycle_error_is_not_shown_twice(self):
         out = await self._reply_text([
             {"type": "event", "event": "agent", "payload": {
@@ -7639,6 +7670,119 @@ def _tool(phase, tcid="t1", name="Bash", result="ok"):
     return {"stream": "tool", "data": data}
 
 
+class TurnWriterTabRepairTests(_TurnWriterCase):
+    """ELI-230: a tab that loads the chat while M is introduced can lose M
+    (Open WebUI's loadChat assigns the history it fetched first, over the
+    introduction). Each tab showing the chat is asked, under M's parent, once
+    it has drawn the parent, whether it shows M; a tab that does not gets M
+    as it stands, alone. The run's end sends M once more, finished."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.owui.session_pool["sA"] = {"id": self.USER, "chat_ids": [self.CHAT]}
+        self.conn.session_history = mock.AsyncMock(return_value={"messages": []})
+
+    async def spin(self, n=50):
+        for _ in range(n):
+            await asyncio.sleep(0)
+
+    def probes(self, sid="sA"):
+        return [d for e, d, to in self.owui.calls if to == sid and "message-" in d["data"]["data"].get("code", "")]
+
+    def to_tab(self, sid="sA"):
+        return [d for e, d, to in self.owui.emits if to == sid and d["data"]["type"] == "chat:messages"]
+
+    async def test_a_tab_without_m_gets_m_as_it_stands(self):
+        self.owui.page_intent["sA"] = "missing"
+        w = self.writer()
+        await w.feed(_delta("Hello"))
+        await self.spin()
+        (probe,) = self.probes()
+        self.assertEqual(probe["message_id"], "a1", "asked under the parent, which the tab has")
+        self.assertIn("message-m1", probe["data"]["data"]["code"])
+        (repair,) = self.to_tab()
+        self.assertTrue(repair["shared"])
+        sent = repair["data"]["data"]
+        self.assertEqual(sent["currentId"], "m1")
+        self.assertEqual(sent["messages"]["a1"], {"id": "a1", "childrenIds": ["m1"]})
+        m = sent["messages"]["m1"]
+        self.assertEqual((m["content"], m["done"], m["parentId"]), ("Hello", False, "a1"))
+        self.assertEqual(m["output"], w.sent_output, "the base of the tab's next diff")
+        await w.feed(_delta(" there"))
+        await self.spin()
+        self.assertEqual(len(self.probes()), 1, "a repaired tab is not asked again")
+
+    async def test_a_tab_that_shows_m_is_left_alone(self):
+        self.owui.page_intent["sA"] = "present"
+        w = self.writer()
+        await w.feed(_delta("Hello"))
+        await self.spin()
+        await w.feed(_delta(" there"))
+        await self.spin()
+        self.assertEqual(len(self.probes()), 1, "a confirmed tab is not asked again")
+        self.assertEqual(self.to_tab(), [])
+
+    async def test_a_loading_tab_is_asked_again_one_probe_at_a_time(self):
+        answers = []
+
+        async def call(event, data, to=None, timeout=None):
+            self.owui.calls.append((event, copy.deepcopy(data), to))
+            answers.append(asyncio.get_running_loop().create_future())
+            return await answers[-1]
+        self.owui.socket_main.sio.call = call
+        w = self.writer()
+        await w.feed(_delta("Hello"))
+        await self.spin()
+        await w.feed(_delta(" there"))
+        await self.spin()
+        self.assertEqual(len(self.probes()), 1, "one probe in flight per tab")
+        answers[0].set_result("loading")
+        await self.spin()
+        await w.feed(_delta(" again"))
+        await self.spin()
+        self.assertEqual(len(self.probes()), 2, "a tab still loading is asked at the next step")
+        self.assertEqual(self.to_tab(), [])
+
+    async def test_no_repair_after_the_run_ended(self):
+        answers = []
+
+        async def call(event, data, to=None, timeout=None):
+            self.owui.calls.append((event, copy.deepcopy(data), to))
+            answers.append(asyncio.get_running_loop().create_future())
+            return await answers[-1]
+        self.owui.socket_main.sio.call = call
+        w = self.writer()
+        await w.feed(_delta("Hello"))
+        await self.spin()
+        await w.finalize()
+        answers[0].set_result("missing")
+        await self.spin()
+        self.assertEqual(self.to_tab(), [], "the end's own send covers it")
+
+    async def test_the_end_sends_m_once_more_finished_before_it_completes(self):
+        w = self.writer()
+        await w.feed(_delta("Hello"))
+        await w.finalize()
+        kinds = [d["data"]["type"] for e, d, room in self.owui.emits if e == "events"]
+        last_intro = len(kinds) - 1 - kinds[::-1].index("chat:messages")
+        self.assertLess(last_intro, kinds.index("chat:completion"), "before the completion that ends M")
+        final = [d for e, d, room in self.owui.emits
+                 if d["data"]["type"] == "chat:messages" and room == f"chat:{self.CHAT}"][-1]["data"]["data"]
+        m = final["messages"]["m1"]
+        self.assertEqual((m["content"], m["done"]), ("Hello", True))
+        self.assertEqual(final["messages"]["a1"], {"id": "a1", "childrenIds": ["m1"]})
+
+    async def test_a_message_taken_over_is_neither_probed_nor_sent_again(self):
+        """A pipe run's own stub: Open WebUI introduced it, tabs load it."""
+        w = _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
+                        run_id="agent-run-1", message_id="a1", takeover=True)
+        await w.feed(_delta("Hello"))
+        await self.spin()
+        await w.finalize()
+        self.assertEqual(self.probes(), [])
+        self.assertEqual(self.owui.events("chat:messages"), [])
+
+
 class TurnWriterLockedDbTests(_TurnWriterCase):
     """ELI-167: Open WebUI's sqlite write lock held past its busy_timeout
     (5 s, WAL, BEGIN IMMEDIATE) when a run opens its message. The open waits
@@ -7901,6 +8045,37 @@ class TurnWriterEndTests(_TurnWriterCase):
         _, task = self.owui.tasks[w.task_id]
         await asyncio.wait_for(asyncio.shield(task), 1)
         return task
+
+    async def test_an_announce_after_a_silent_parent_does_not_take_the_parents_card(self):
+        """ELI-227 (live chat 0a13a1d4 on 2026.10.5): the parent spawned a
+        sub-agent and answered NO_REPLY, which leaves no closing message in
+        the transcript. The announce run has no user turn either, so its span
+        ran back to the parent's sessions_spawn call: its message showed that
+        card a second time. The parent's messages are older than the announce
+        run's start."""
+        ann = "announce:v1:agent:main:subagent:x:y"
+        started = 1792407300000
+        answer = "The background sub-agent finished and answered SUB-51."
+        self.history = {"messages": [
+            {"role": "user", "content": "spawn", "idempotencyKey": "msg-c1-p-1.0:user",
+             "timestamp": 1792407258841},
+            {"role": "user", "content": "Conversation info (untrusted metadata): {}",
+             "timestamp": 1792407260372, "__openclaw": {"importedFrom": "claude-cli"}},
+            {"role": "assistant", "stopReason": "tool_use", "timestamp": 1792407264343,
+             "__openclaw": {"importedFrom": "claude-cli"}, "content": [
+                 {"type": "toolcall", "id": "toolu_s", "name": "mcp__openclaw__sessions_spawn",
+                  "arguments": {"task": "Answer what 17 times 3 is."}},
+                 {"type": "tool_result", "tool_use_id": "toolu_s", "name": "mcp__openclaw__sessions_spawn",
+                  "content": [{"type": "text", "text": "Started: QA 17x3"}]}]},
+            {"role": "assistant", "stopReason": "stop", "timestamp": 1792407306581,
+             "idempotencyKey": f"cli-assistant:{ann}", "content": [{"type": "text", "text": answer}]}]}
+        w = self.writer(run=ann)
+        await w.feed({"runId": ann, "stream": "lifecycle", "data": {"phase": "start", "startedAt": started}})
+        await w.feed(_delta(answer))
+        self.assertTrue(w.opened)
+        await w.end({"status": "done", "hasActiveRun": False, "lastRunId": ann})
+        self.assertEqual(self.m()["content"], answer)
+        self.assertEqual([i["type"] for i in self.m()["output"]], ["message"])
 
     async def test_a_settled_run_is_finalized_from_its_transcript(self):
         w = await self.opened_writer()
@@ -8936,7 +9111,10 @@ class RegressionPlanTests(_RoutingCase):
         # The deterministic uuid5 gives one message even if both wrote it:
         # count the writers' own effects (review 2af1, Strong2).
         n_tasks = len(self.owui.tasks)
-        n_intro = len(self.owui.events("chat:messages"))
+        # The introductions of an unfinished M: the end sends it once more,
+        # finished (ELI-230).
+        n_intro = sum(1 for d in self.owui.events("chat:messages")
+                      if not d["data"]["messages"][d["data"]["currentId"]].get("done"))
         for conn in (self.conn, other):
             conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
                                        "status": "done", "lastRunId": self.RUN})

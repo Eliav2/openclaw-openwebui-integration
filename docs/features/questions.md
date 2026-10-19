@@ -76,7 +76,7 @@ What you type goes straight to the Gateway's secret store (`question.resolve`). 
 - **Cancel:** the agent is told the request was cancelled and nothing is stored.
 - **No answer:** the dialog waits until the request expires (the agent's `timeoutSeconds`, 15 minutes by default), then the agent is told no credential arrived. It is shown like the secret dialog above: on the reply's tab, moved once to a reloaded tab.
 - **Answered elsewhere** (the Control UI): the dialog's wait ends and its answer is dropped.
-- **A user not in `OWNER_USERS`:** not asked. The secret store is the owner's, so a guest's chat cannot write into it; the request is left to the Control UI.
+- **A user not in `OWNER_USERS`:** not asked. The secret store is the owner's, so a guest's chat cannot write into it. A run the guest sends cannot ask at all (the Gateway refuses it). A run the agent starts in the guest's chat (a cron job, a sub-agent's result) can: the Pipe cancels that request at once, so no secret can be handed into a reply the guest reads, and the reply says it needs the owner.
 
 ## Questions in replies the agent starts
 

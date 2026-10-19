@@ -24,7 +24,7 @@ KEY = "agent:main:openwebui-user-1-chat-1"
 
 
 def record(qid="q-1", status="pending", **store):
-    return {"id": qid, "status": status, "sessionKey": KEY, "expiresAtMs": 0,
+    return {"id": qid, "status": status, "sessionKey": KEY, "runId": "run-1", "expiresAtMs": 0,
             "questions": [{"questionId": "secret_value", "header": "API key",
                            "question": "Provide the secret for DUMMY.", "options": [],
                            "isSecret": True,
@@ -42,6 +42,7 @@ class FakeConn:
         self.gateway_version = version
         self.gateway_methods, self.gateway_events = methods, events
         self.sent = []
+        self.dispatched = []
 
     def parse_owui_session_key(self, key):
         return ("user-1", "chat-1") if key == KEY else None
@@ -49,6 +50,9 @@ class FakeConn:
     async def send_request(self, method, params, timeout=10):
         self.sent.append((method, json.loads(json.dumps(params))))
         return {"status": "cancelled" if "cancel" in params else "answered"}
+
+    async def dispatch_run_event(self, msg):
+        self.dispatched.append(json.loads(json.dumps(msg)))
 
 
 class FakeTurn:
@@ -146,11 +150,24 @@ class SecretRequestTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(conn.sent[0][0], "question.resolve")
 
     async def test_a_chat_of_a_user_not_in_owner_users_is_not_asked(self):
-        """The store is the owner's: a guest's chat must not write into it."""
+        """The store is the owner's: a guest's chat must not write into it,
+        and the request is cancelled at once rather than left answerable in
+        the Control UI for a run the guest reads (ELI-229). The reply of the
+        run that asked says it needs the owner."""
         conn, turn = FakeConn(), FakeTurn(VALUE)
         with mock.patch.object(ocp, "_sender_is_owner", mock.AsyncMock(return_value=False)):
-            await self._ask(conn, turn)
-        self.assertEqual((turn.asked, conn.sent), ([], []))
+            self.assertTrue(await self._ask(conn, turn))
+        self.assertEqual(turn.asked, [])
+        self.assertEqual(conn.sent, [("question.resolve", {"id": "q-1", "cancel": True,
+                                                           "resolvedBy": "openwebui"})])
+        [msg] = conn.dispatched
+        payload = msg["payload"]
+        self.assertEqual((msg["event"], payload["sessionKey"], payload["runId"], payload["stream"]),
+                         ("agent", KEY, "run-1", ocp.PIPE_NOTE_STREAM))
+        self.assertEqual(payload["data"]["id"], "msg_note_secret_q-1")
+        self.assertIn("`DUMMY`", payload["data"]["text"])
+        self.assertIn("needs the owner", payload["data"]["text"])
+        self.assertNotIn("q-1", ocp._SECRET_REQUESTS)
 
     async def test_answered_elsewhere_ends_the_wait_and_sends_nothing(self):
         conn = FakeConn()
@@ -195,6 +212,69 @@ class SecretRequestTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("_QUESTION_HOOKS = None", action)
         self.assertNotIn("def secret_request_seen", action)
         self.assertNotIn("def question_requested", action)
+
+
+class NoteItemTests(unittest.TestCase):
+    """A note item (ELI-229) through `_TurnRenderer`, the one renderer the
+    live reply and a turn writer share."""
+
+    def note(self, text="note one", nid="msg_note_secret_q-1"):
+        return {"sessionKey": KEY, "runId": "run-1", "stream": ocp.PIPE_NOTE_STREAM,
+                "data": {"id": nid, "text": text}}
+
+    def test_a_note_is_a_message_item_at_the_end(self):
+        r = ocp._TurnRenderer()
+        r.feed({"stream": "assistant", "data": {"delta": "before "}})
+        [event] = r.feed(self.note())
+        self.assertEqual(event["type"], "response.output_item.added")
+        self.assertEqual(event["output_index"], ocp._OUTPUT_APPEND_INDEX)
+        self.assertEqual(event["item"]["id"], "msg_note_secret_q-1")
+        self.assertEqual(event["item"]["content"][0]["text"], "note one")
+        self.assertEqual([i["id"] for i in r.output][-1], "msg_note_secret_q-1")
+        self.assertEqual(r.text, "before ", "a note is not run text")
+
+    def test_text_after_a_note_is_a_new_message(self):
+        r = ocp._TurnRenderer()
+        r.feed(self.note())
+        r.feed({"stream": "assistant", "data": {"delta": "after"}})
+        self.assertEqual([i["content"][0]["text"] for i in r.output], ["note one", "after"])
+
+    def test_the_same_note_again_replaces_it(self):
+        r = ocp._TurnRenderer()
+        r.feed(self.note())
+        r.feed(self.note("note two"))
+        self.assertEqual([i["content"][0]["text"] for i in r.output], ["note two"])
+
+    def test_a_rebuild_from_the_transcript_keeps_the_note_in_place(self):
+        """The turn writer rebuilds a reply from the transcript at its end;
+        the note is in no transcript, so it is put back after the item it
+        followed (ELI-229: the cancel note vanished from the saved reply)."""
+        call = {"type": "function_call", "id": "call_1"}
+        result = {"type": "function_call_output", "id": "fco_call_1"}
+        streamed = ocp._TurnRenderer()
+        streamed.output = [dict(call), dict(result)]
+        streamed.feed(self.note())
+        streamed.feed({"stream": "assistant", "data": {"delta": "streamed answer"}})
+        rebuilt = ocp._TurnRenderer()
+        rebuilt.output = [dict(call), dict(result), {"type": "message", "id": "msg_t", "content": []}]
+        ocp._keep_pipe_notes(streamed.output, rebuilt)
+        self.assertEqual([i["id"] for i in rebuilt.output],
+                         ["call_1", "fco_call_1", "msg_note_secret_q-1", "msg_t"])
+        ocp._keep_pipe_notes(streamed.output, rebuilt)
+        self.assertEqual(len(rebuilt.output), 4, "kept once")
+
+    def test_a_note_with_nothing_before_it_stays_first(self):
+        streamed = ocp._TurnRenderer()
+        streamed.feed(self.note())
+        rebuilt = ocp._TurnRenderer()
+        rebuilt.output = [{"type": "message", "id": "msg_t", "content": []}]
+        ocp._keep_pipe_notes(streamed.output, rebuilt)
+        self.assertEqual([i["id"] for i in rebuilt.output], ["msg_note_secret_q-1", "msg_t"])
+
+    def test_a_note_without_an_id_or_text_adds_nothing(self):
+        r = ocp._TurnRenderer()
+        self.assertEqual(r.feed({"stream": ocp.PIPE_NOTE_STREAM, "data": {"text": "x"}}), [])
+        self.assertEqual(r.output, [])
 
 
 if __name__ == "__main__":

@@ -101,6 +101,7 @@ Flags with no env var:
 |---|---|---|
 | `--wizard`, `-w` | off | Prompt interactively for any missing required values |
 | `--auto-approve` / `--no-auto-approve` | on | Approve a matching pending OpenClaw device when a smoke test reports "pairing required". Only works where the `openclaw` CLI is installed |
+| `--live` | off | Deploy even though `E2E_ROOT` is set. A shell with `E2E_ROOT` set belongs to a local E2E sandbox. There, `install`, `repair` and `healthcheck` refuse to run from the host's network namespace, where `localhost` is the host's real Open WebUI. Inside the sandbox's own namespace they run as usual. `install_action.py` and `install_filter.py` take the same flag |
 
 Supply the values as env vars or as flags. `uv run install.py install --help` lists every flag. Skip the wizard once they are set, in the repo checkout:
 
