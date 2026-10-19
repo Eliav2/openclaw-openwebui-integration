@@ -75,6 +75,9 @@ and only a core set is sent as real schemas.
 * `E2E_SECRET_REQUEST NAME`            -> calls `secrets` with action=request for
   NAME (OpenClaw's masked credential entry), then, once the tool result is in,
   replies `E2E_SECRET_RESULT <status>` with the result's first "status".
+* `E2E_ASK_TOOL`                       -> calls OpenClaw's `ask_user` tool with
+  `ASK_TOOL_ARGS` below, then, once the tool result is in, replies
+  `E2E_ASK_TOOL_RESULT <status> Database: <answer>` (the answer when there is one).
 * a scene from $FAKE_LLM_SCENES (JSON)  -> scripted multi-step replies for the
   README screenshots (scripts/screenshots/scenes.json). A scene is picked by a
   phrase in the user's own message, so the request in a screenshot reads like
@@ -113,6 +116,11 @@ DEFERRED_CALL_TOOLS = ("dispatch_action", "tool_call")
 
 _EXACTLY = re.compile(r"exactly:?\s+([A-Za-z0-9_]{3,})")
 _ECHO = re.compile(r"E2E_ECHO: ([^\n]+)")
+# E2E_ASK_TOOL: one question with two options, as a model calls ask_user.
+ASK_TOOL_ARGS = {"questions": [{"id": "db", "header": "Database", "question": "Which database?",
+                                "options": [{"label": "Postgres", "description": "needs a server"},
+                                            {"label": "SQLite"}]}],
+                 "timeoutSeconds": 300}
 _SECRET_REQUEST = re.compile(r"E2E_SECRET_REQUEST ([A-Z][A-Z0-9_]{2,})")
 # The result's JSON sits inside the tool's text, so its quotes may be escaped.
 _STATUS = re.compile(r'\\?"status\\?":\s*\\?"([a-z_]+)')
@@ -368,6 +376,15 @@ def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
             if wrapper in offered:
                 return {"tool": wrapper, "args": {"id": "exec", "args": args}}
         return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
+
+    if "E2E_ASK_TOOL" in user_text:
+        if tool_results:
+            result = "\n".join(tool_results)
+            status, line = _STATUS.search(result), re.search(r"Database: [A-Za-z]+", result)
+            return {"text": f"E2E_ASK_TOOL_RESULT {status.group(1) if status else 'none'} "
+                            f"{line.group(0) if line else ''}".rstrip()}
+        call = _call_with("ask_user", ASK_TOOL_ARGS, offered)
+        return call or {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
 
     m = _SECRET_REQUEST.search(user_text)
     if m:

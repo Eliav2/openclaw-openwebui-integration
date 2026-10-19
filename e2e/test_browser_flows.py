@@ -185,6 +185,20 @@ def test_a_single_select_question_is_answered_with_a_click(page):
     assert "E2E_ANSWERED" in reply and "Green" in reply.split("E2E_ANSWERED", 1)[1], reply[-200:]
 
 
+def test_a_question_from_the_ask_user_tool_is_answered_in_the_card(page):
+    """ELI-216: OpenClaw's ask_user tool asks through the Gateway, not the
+    reply text. Its question shows as the card, and the clicked option is
+    the tool's answer to the agent."""
+    capture.new_chat(page)
+    capture.send(page, "E2E_ASK_TOOL")
+    capture.wait_js(page, "() => document.body.innerText.includes('Which database?') "
+                          "&& !!document.querySelector('input[placeholder=\"Type your answer\"]')",
+                    "the ask_user card", TURN_MS)
+    page.locator("section button", has=page.locator("span", has_text="SQLite")).first.click()
+    capture.wait_js(page, _last_reply_done("E2E_ASK_TOOL_RESULT answered Database: SQLite"),
+                    "the reply with the tool's answer", TURN_MS)
+
+
 def test_a_question_left_for_a_new_message_ends_its_reply(page):
     """ELI-200: with the question card open, a new message is sent instead
     of an answer. The card goes, the question stays in its reply as text,

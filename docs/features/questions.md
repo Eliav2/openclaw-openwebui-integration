@@ -48,6 +48,12 @@ While it waits you can reload or switch away and come back:
 
 If you cancel any other question, or it ends as text, the question stays in the reply as ordinary text with the trigger removed (a JSON form as its numbered questions with their options), so nothing is lost. Answer it with a normal message. Sending a message while the card is open cancels it the same way, and its reply ends finished, with no "Thinking..." left on it.
 
+## Questions from the agent's ask_user tool
+
+OpenClaw's own `ask_user` tool works too, with no agent setup. Its questions (up to three, each with its options) show as the same question card, on the reply's tab, moved once to a reloaded tab; the option you pick, or what you type in Other, goes back to the agent as the tool's answer. A multi-select question lists its options by number, as above, and each option you name reaches the agent.
+
+If the card is not answered by its timeout, is cancelled, or no tab views the chat, the question is cancelled at once: the agent hears that nobody answered and goes on, instead of waiting out the tool's timeout. Answered elsewhere (the Control UI), the card's answer is dropped.
+
 ## Secrets the agent requests
 
 _Needs OpenClaw 2026.10.10 or later. On an older Gateway the request is left to the Control UI, as before: a secret stored there cannot be used by the agent's runs yet._

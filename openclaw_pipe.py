@@ -3107,12 +3107,19 @@ def _map_multi_answer(text: str, choices: list[str]) -> str:
     answer as typed.
     """
     text = (text or "").strip()
+    picked = _picked_choices(text, choices)
+    return ", ".join(picked) if picked else text
+
+
+def _picked_choices(text: str, choices: list[str]) -> list[str] | None:
+    """The options a typed multi-select answer names, in order (see
+    _map_multi_answer); None when it does not name options only."""
     by_name = {}
     for choice in choices:
         by_name.setdefault(choice.lower(), choice)
         by_name.setdefault(_split_option_description(choice)[0].lower(), choice)
     picked = []
-    for part in re.split(r"[,;،]", text):
+    for part in re.split(r"[,;،]", (text or "").strip()):
         part = part.strip()
         if not part:
             continue
@@ -3121,12 +3128,12 @@ def _map_multi_answer(text: str, choices: list[str]) -> str:
         elif re.fullmatch(r"\d+(\s+\d+)*", part):
             numbers = [int(n) for n in part.split()]
             if not all(1 <= n <= len(choices) for n in numbers):
-                return text
+                return None
             names = [choices[n - 1] for n in numbers]
         else:
-            return text
+            return None
         picked += [name for name in names if name not in picked]
-    return ", ".join(picked) if picked else text
+    return picked or None
 
 
 def _format_native_answers(questions: list[dict], answers: dict) -> str:
@@ -3507,7 +3514,8 @@ async def _ask_user_input_modal(
 SECRET_REQUESTS_FROM = (2026, 10, 10)
 # question id -> the task asking for it
 _SECRET_REQUESTS: dict = {}
-# session key -> the reply streaming its run, which asks on its own socket
+# session key -> the reply streaming its run, which asks the run's Gateway
+# questions (secret requests, the ask_user tool's) on its own socket
 _SECRET_ASKERS: dict = {}
 
 
@@ -3628,6 +3636,156 @@ async def _answer_secret_request(conn, record: dict, question: dict, user_id: st
                 "type": "success" if shown == "stored" else "info", "content": f"{name}: {shown}"}})
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# The agent's ask_user tool (ELI-216)
+# ---------------------------------------------------------------------------
+# OpenClaw's `ask_user` tool registers a Gateway question as the secret
+# request does: `question.requested` with up to three questions, each
+# {questionId, header, question, options: [{label, description?}],
+# multiSelect?, isOther: true}, and waits on `question.waitAnswer` for
+# `question.resolve {id, answers: {answers: {questionId: [values]}}}`
+# (2026.10.5 dist: ask-user-tool-*.mjs, ask-user-tool-normalization-*.mjs;
+# 2026.9.3 the same calls in openclaw-tools-*.mjs). A Gateway client chat
+# gets no prompt of its own: unanswered, the run waited out the tool's
+# timeout (15 minutes by default) on "Thinking".
+#
+# It is asked as a needs-input card is: Open WebUI's question card on the
+# reply's socket, moved once to the tab viewing the chat. Unanswered (the
+# card's timeout, a cancel, no tab on the chat) the question is cancelled,
+# so the agent hears it at once and goes on.
+
+# question id -> the task asking it
+_AGENT_QUESTIONS: dict = {}
+
+
+def _agent_question_payload(record, timeout_ms: int) -> dict | None:
+    """Open WebUI's question card for an ask_user question record, or None
+    for anything else (a secret, no questions)."""
+    questions = record.get("questions") if isinstance(record, dict) else None
+    if not isinstance(questions, list) or not questions:
+        return None
+    card = []
+    for index, raw in enumerate(questions):
+        if not isinstance(raw, dict) or raw.get("isSecret") or raw.get("secretStore"):
+            return None
+        qid, text = str(raw.get("questionId") or ""), str(raw.get("question") or "").strip()
+        if not qid or not text:
+            return None
+        options = [{"label": str(o.get("label") or "").strip(),
+                    "description": str(o.get("description") or "").strip()}
+                   for o in raw.get("options") or [] if isinstance(o, dict) and o.get("label")]
+        question = {
+            "id": qid,
+            "header": str(raw.get("header") or "").strip() or f"Question {index + 1}",
+            "question": text,
+            "options": options,
+            "allow_other": not options or raw.get("isOther") is not False,
+        }
+        if raw.get("multiSelect") and options:
+            # The card picks one option, so the options are listed by
+            # number and the picks typed, as for a needs-input multi-select.
+            listed = " · ".join(f"{n}. {o['label']}" for n, o in enumerate(options, 1))
+            question.update(question=f"{text} {listed}. Type the numbers you pick, like 1, 3",
+                            options=[], allow_other=True)
+            question[_MULTI_CHOICES_KEY] = [o["label"] for o in options]
+        card.append(question)
+    return {"type": "request:user_input",
+            "data": {"questions": card, "allow_other": True, "timeout_ms": timeout_ms}}
+
+
+def _agent_question_answers(questions: list[dict], answers) -> dict:
+    """The card's {question id: answer} as question.resolve's
+    {questionId: [values]}: the option's label as the agent wrote it, the
+    typed text, or a multi-select question's picked options."""
+    out = {}
+    for question in questions:
+        answer = answers.get(question["id"]) if isinstance(answers, dict) else None
+        if not isinstance(answer, dict):
+            continue
+        key = "text" if answer.get("type") == "other" else "label"
+        text = str(answer.get(key) or "").strip()
+        if not text:
+            continue
+        choices = question.get(_MULTI_CHOICES_KEY)
+        out[question["id"]] = (_picked_choices(text, choices) or [text]) if choices else [text]
+    return out
+
+
+def agent_question_seen(conn, record) -> bool:
+    """`question.requested`: ask an ask_user question made in an Open WebUI
+    chat. False for anything else."""
+    if not isinstance(record, dict) or record.get("status", "pending") != "pending" \
+            or not record.get("id") or record["id"] in _AGENT_QUESTIONS:
+        return False
+    if _agent_question_payload(record, _NATIVE_CARD_TIMEOUT_MS) is None:
+        return False
+    parsed = conn.parse_owui_session_key(record.get("sessionKey") or "")
+    if not parsed:
+        return False
+    _AGENT_QUESTIONS[record["id"]] = spawn_background(_answer_agent_question(conn, record, *parsed))
+    return True
+
+
+def _open_writer_message_id(conn, chat_id: str, session_key: str) -> str | None:
+    """The reply a turn writer streams the session's run into, for a run no
+    inline reply streams (one the agent started)."""
+    for writer in list(getattr(conn, "_turn_writers", {}).values()):
+        if writer.chat_id == chat_id and writer.session_key == session_key and not writer.closed:
+            return writer.message_id
+    return None
+
+
+async def _answer_agent_question(conn, record: dict, user_id: str, chat_id: str) -> None:
+    qid, key = record["id"], record.get("sessionKey") or ""
+    remaining_ms = (record.get("expiresAtMs") or 0) - time.time() * 1000
+    timeout_ms = int(min(_NATIVE_CARD_TIMEOUT_MS, remaining_ms)) if remaining_ms > 0 \
+        else _NATIVE_CARD_TIMEOUT_MS
+    payload = _agent_question_payload(record, max(1000, timeout_ms))
+    questions = payload["data"]["questions"]
+    turn = _SECRET_ASKERS.get(key)
+    pipe_log(f"  ask_user: {len(questions)} question(s) in chat {chat_id[:8]}... (question {qid[:12]}...)")
+    if turn is not None:
+        response = await _ask_where_the_chat_is(
+            turn.__event_call__, payload, payload["data"]["timeout_ms"] / 1000, grace_s=15,
+            owui_user_id=user_id, owui_chat_id=chat_id, owui_message_id=turn.owui_message_id,
+            poll_interval_s=5, owui_session_id=(turn.__metadata__ or {}).get("session_id"))
+    else:
+        response = await _call_on_chat_tab(user_id, chat_id, _open_writer_message_id(conn, chat_id, key),
+                                           payload, payload["data"]["timeout_ms"] / 1000)
+    if _AGENT_QUESTIONS.get(qid) is not asyncio.current_task():
+        return
+    del _AGENT_QUESTIONS[qid]
+    answers = (_agent_question_answers(questions, response.get("answers"))
+               if isinstance(response, dict) and response.get("status") == "answered" else {})
+    if answers:
+        params = {"id": qid, "answers": {"answers": answers}, "resolvedBy": "openwebui"}
+    else:
+        # Not answered here: cancelled, so the agent hears it now instead of
+        # at the tool's timeout.
+        pipe_log(f"  ask_user: not answered ({_unanswered(response)}); cancelling the question")
+        params = {"id": qid, "cancel": True, "resolvedBy": "openwebui"}
+    try:
+        result = await conn.send_request("question.resolve", params, timeout=30)
+        shown = str((result or {}).get("status"))
+    except Exception as ex:
+        shown = f"not resolved ({type(ex).__name__})"
+    pipe_log(f"  ask_user: {shown}")
+
+
+def question_requested(conn, record) -> bool:
+    """`question.requested`: a secret request or an ask_user question."""
+    return secret_request_seen(conn, record) or agent_question_seen(conn, record)
+
+
+def question_resolved(payload) -> None:
+    """`question.resolved`: answered elsewhere, cancelled or expired; the
+    card's or dialog's wait ends and whatever it gets later is dropped."""
+    secret_request_resolved(payload)
+    task = _AGENT_QUESTIONS.pop((payload or {}).get("id"), None)
+    if task is not None:
+        task.cancel()
 
 
 # --- gateway ---------------------------------------------------------------
@@ -10325,8 +10483,9 @@ def _owui_history_rows(chat_id: str):
 # (and "done"), so a `not in (done, failed, cancelled)` test would treat every
 # resting session as active and hang every message. Only these gate the queue.
 _ACTIVE_RUN_STATES = ("active", "running", "streaming", "queued")
-# The Gateway's secret requests are asked in the chat (askuser.py, ELI-96).
-_QUESTION_HOOKS = (secret_request_seen, secret_request_resolved)
+# The Gateway's questions (secret requests, ELI-96; the ask_user tool,
+# ELI-216) are asked in the chat (askuser.py).
+_QUESTION_HOOKS = (question_requested, question_resolved)
 
 
 def _session_active_from_signals(describe_status, list_has_active_run) -> bool:

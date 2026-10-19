@@ -170,11 +170,12 @@ class SecretRequestTests(unittest.IsolatedAsyncioTestCase):
 
     def test_only_the_pipe_asks(self):
         """The Status Action shares the connection code but asks nothing."""
-        self.assertEqual(ocp._QUESTION_HOOKS, (ocp.secret_request_seen, ocp.secret_request_resolved))
+        self.assertEqual(ocp._QUESTION_HOOKS, (ocp.question_requested, ocp.question_resolved))
         with open(os.path.join(HERE, "openclaw_status_action.py"), encoding="utf-8") as fh:
             action = fh.read()
         self.assertIn("_QUESTION_HOOKS = None", action)
         self.assertNotIn("def secret_request_seen", action)
+        self.assertNotIn("def question_requested", action)
 
 
 if __name__ == "__main__":
