@@ -1000,11 +1000,20 @@ def test_a_subagent_result_the_parent_answers_with_silence_shows_as_its_card(tok
     assert "silent helper" in call.get("arguments", ""), call
     assert "E2E_SILENT_RESULT done" in json.dumps(result.get("output")), result
     assert "NO_REPLY" not in (m.get("content") or ""), m.get("content")
-    # 2026.10.5 retries the delivery on a backoff (15 s, 30 s, ...): the card
-    # stays one, and the parent's next reply lands once, in its own message.
+    # 2026.10.5 counts the silence as a failed delivery and retries it on a
+    # backoff (15 s, then 30 s, ...). Once a retry has happened the card is
+    # still one, and the parent's next reply lands once, in its own message.
+    child_run = call["id"].removeprefix("subagent-")
+
+    def failed_deliveries() -> int:
+        with open(_gateway_stdout_log(), encoding="utf-8", errors="replace") as fh:
+            return fh.read().count(f"direct announce failed for run {child_run}")
+
+    if failed_deliveries():
+        _until("the Gateway's retry of the delivery", lambda: failed_deliveries() >= 2,
+               timeout_s=90, every_s=2)
     _, after = _chat_turn(token, "Respond with exactly: E2E_AFTER_CARD", chat_id=chat_id)
     assert (after.get("content") or "").strip() == "E2E_AFTER_CARD", after
-    time.sleep(35)
     msgs = _chat_messages(token, chat_id)
     cards = [k for k, x in msgs.items() if any(
         o.get("type") == "function_call" and o.get("name") == "Sub-agent" for o in x.get("output") or [])]
@@ -1136,6 +1145,12 @@ def test_the_status_dialog_lists_only_this_chats_automations(token, guest_token)
 def _session_row(key: str) -> dict:
     rows = _gw("sessions.list", {"search": key[-36:], "limit": 10}).get("sessions") or []
     return next((r for r in rows if r.get("key") == key), {})
+
+
+def _gateway_stdout_log() -> str:
+    """The e2e stack's Gateway console log (start_stack.sh's LOG_DIR)."""
+    return os.path.join(os.environ.get("E2E_LOG_DIR") or os.path.join(os.getcwd(), "e2e-logs"),
+                        "gateway.log")
 
 
 def _until(what: str, check, timeout_s: float = WAKE_TIMEOUT_S, every_s: float = 1.0):
