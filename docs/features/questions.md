@@ -48,6 +48,19 @@ While it waits you can reload or switch away and come back:
 
 If you cancel any other question, or it ends as text, the question stays in the reply as ordinary text with the trigger removed (a JSON form as its numbered questions with their options), so nothing is lost. Answer it with a normal message. Sending a message while the card is open cancels it the same way, and its reply ends finished, with no "Thinking..." left on it.
 
+## Questions from the agent's ask_user tool
+
+OpenClaw's own `ask_user` tool works too, with no agent setup. Its questions (up to three, each with its options) show as the same question card. The option you pick, or what you type in Other, goes back to the agent as the tool's answer. A multi-select question lists its options by number, as above, and each option you name reaches the agent.
+
+The card shows on the newest tab that has the chat open, and it waits for you:
+
+- **No tab open** (you closed it, or your phone slept): the question stays pending. It shows as soon as you open the chat again.
+- **A newer tab opens the chat** (a reload, the chat opened on your phone): the card moves there.
+- **Switching the tab to another chat** does not cancel it; it shows again when you come back.
+- The card has no countdown. The question ends only when you answer, press Cancel (the agent hears that you cancelled), answer it elsewhere (the Control UI; the card closes), or when the tool's own timeout ends it (15 minutes by default, set by the agent).
+
+The Pipe knows a tab has the chat open from the Status button it adds to the composer (`COMPOSER_STATUS_BUTTON`, on by default). With that valve off, it checks for a tab every few seconds instead.
+
 ## Secrets the agent requests
 
 _Needs a Gateway that offers OpenClaw's question protocol (`question.requested` and `question.resolve`; every release the Pipe supports does). A stored `secret` is used by a run only through the Gateway's secret egress proxy (`secrets.egressProxy`), whichever way it was entered._

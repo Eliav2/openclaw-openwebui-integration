@@ -1373,6 +1373,10 @@ class _Page:
         with self.cond:
             return next(((a, e) for a, e in self.calls if (e.get("data") or {}).get("type") == kind), None)
 
+    def join(self, chat_id: str) -> None:
+        """Show the chat, as a tab does when it opens one (events:chat join)."""
+        self._emit("events:chat", {"chat_id": chat_id, "data": {"type": "join"}})
+
     def answer(self, ack_id: str, value) -> None:
         """Answer an event call, as the tab does when its dialog is submitted."""
         self.ws.send("43" + ack_id + json.dumps([value]))
@@ -1668,6 +1672,51 @@ def test_a_cancelled_secret_dialog_tells_the_agent_no_credential_came(token):
         _wait_for(token, chat_id, ["E2E_SECRET_RESULT no_answer"])
         listed = _gw("secrets.store.list", {})
         assert not any(e.get("name") == name for e in listed.get("entries") or []), listed
+    finally:
+        page.close()
+
+
+# ── ELI-216: a question from the agent's ask_user tool ────────────────────
+
+def _pending_question(chat_id: str) -> dict | None:
+    """The chat's pending Gateway question, as `question.list` has it."""
+    listed = _gw("question.list", {})
+    return next((q for q in listed.get("questions") or []
+                 if chat_id in (q.get("sessionKey") or "") and q.get("status") == "pending"), None)
+
+
+def test_an_ask_user_tool_question_shows_the_card_and_the_answer_reaches_the_agent(token):
+    """The ask_user tool registers a Gateway question (`question.requested`)
+    and waits for its answer. The Pipe asks it in Open WebUI's question card,
+    and the option picked there reaches the agent as the tool's answer
+    (ELI-216: no card, and the reply sat on "Thinking" for 15 minutes)."""
+    page = _Page(token)
+    try:
+        chat_id, _ = _send_in_chat(token, page, None, "E2E_ASK_TOOL")
+        page.join(chat_id)
+        # The precondition: the tool's question is pending on the Gateway.
+        question = _until("the ask_user question on the Gateway", lambda: _pending_question(chat_id),
+                          timeout_s=60)
+        assert [q.get("questionId") for q in question.get("questions") or []] == ["db"], question
+        ack_id, call = page.wait("the question card", lambda: page.call_of_type("request:user_input"), 45)
+        card = call["data"]["data"]["questions"][0]
+        assert card["question"] == "Which database?", card
+        assert [o["label"] for o in card["options"]] == ["Postgres", "SQLite"], card
+        page.answer(ack_id, {"status": "answered", "answers": {"db": {"type": "option", "label": "SQLite"}}})
+        _wait_for(token, chat_id, ["E2E_ASK_TOOL_RESULT answered Database: SQLite"])
+    finally:
+        page.close()
+
+
+def test_a_cancelled_ask_user_card_lets_the_agent_go_on_at_once(token):
+    page = _Page(token)
+    try:
+        chat_id, _ = _send_in_chat(token, page, None, "E2E_ASK_TOOL")
+        page.join(chat_id)
+        ack_id, _ = page.wait("the question card", lambda: page.call_of_type("request:user_input"), 60)
+        page.answer(ack_id, {"status": "cancelled"})
+        _wait_for(token, chat_id, ["E2E_ASK_TOOL_RESULT no_answer"])
+        assert _pending_question(chat_id) is None
     finally:
         page.close()
 

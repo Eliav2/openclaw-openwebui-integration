@@ -185,6 +185,56 @@ def test_a_single_select_question_is_answered_with_a_click(page):
     assert "E2E_ANSWERED" in reply and "Green" in reply.split("E2E_ANSWERED", 1)[1], reply[-200:]
 
 
+def test_a_question_from_the_ask_user_tool_is_answered_in_the_card(page):
+    """ELI-216: OpenClaw's ask_user tool asks through the Gateway, not the
+    reply text. Its question shows as the card, and the clicked option is
+    the tool's answer to the agent."""
+    capture.new_chat(page)
+    capture.send(page, "E2E_ASK_TOOL")
+    capture.wait_js(page, "() => document.body.innerText.includes('Which database?') "
+                          "&& !!document.querySelector('input[placeholder=\"Type your answer\"]')",
+                    "the ask_user card", TURN_MS)
+    page.locator("section button", has=page.locator("span", has_text="SQLite")).first.click()
+    capture.wait_js(page, _last_reply_done("E2E_ASK_TOOL_RESULT answered Database: SQLite"),
+                    "the reply with the tool's answer", TURN_MS)
+
+
+def _pending_ask_user(chat_id: str):
+    """The chat's pending Gateway question, from `question.list`."""
+    out = subprocess.run(["openclaw", "gateway", "call", "question.list", "--json", "--params", "{}"],
+                         capture_output=True, text=True, timeout=90)
+    assert out.returncode == 0, out.stderr[-1500:]
+    listed = json.loads(out.stdout[out.stdout.find("{"):])
+    return next((q for q in listed.get("questions") or []
+                 if chat_id in (q.get("sessionKey") or "") and q.get("status") == "pending"), None)
+
+
+def test_an_ask_user_question_asked_with_no_tab_open_shows_when_the_chat_is_opened(page):
+    """ELI-216: the question comes after the tab is closed (or the phone
+    sleeps). It stays pending, the card shows when the chat is opened again,
+    and the answer reaches the agent."""
+    capture.new_chat(page)
+    chat_id = capture.send(page, "E2E_ASK_TOOL_LATER")
+    capture.wait_js(page, "() => document.body.innerText.includes('E2E_ASK_SOON')",
+                    "the reply before the question", TURN_MS)
+    page.goto("about:blank")         # the tab is closed: no socket shows the chat
+    deadline = time.time() + 60
+    while not _pending_ask_user(chat_id):
+        assert time.time() < deadline, \
+            "the ask_user question was never pending with no tab open (ended at once, or never asked)"
+        time.sleep(1)
+    # Still pending a while later: nothing gave up on it with no tab open.
+    page.wait_for_timeout(5_000)
+    assert _pending_ask_user(chat_id), "the question was ended while no tab was open"
+    page.goto(f"{capture.BASE}/c/{chat_id}")
+    capture.wait_js(page, "() => document.body.innerText.includes('Which database?') "
+                          "&& !!document.querySelector('input[placeholder=\"Type your answer\"]')",
+                    "the ask_user card on the reopened chat", TURN_MS)
+    page.locator("section button", has=page.locator("span", has_text="SQLite")).first.click()
+    capture.wait_js(page, _last_reply_done("E2E_ASK_TOOL_RESULT answered Database: SQLite"),
+                    "the reply with the tool's answer", TURN_MS)
+
+
 def test_a_question_left_for_a_new_message_ends_its_reply(page):
     """ELI-200: with the question card open, a new message is sent instead
     of an answer. The card goes, the question stays in its reply as text,

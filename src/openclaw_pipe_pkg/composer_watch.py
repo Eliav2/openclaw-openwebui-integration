@@ -143,6 +143,8 @@ class _ComposerWatcher:
 
     async def tick(self, now=None):
         if not self.enabled():
+            for key in self._pairs:
+                _chat_tab_left(*key)
             self._pairs.clear()
             return 0
         now = time.monotonic() if now is None else now
@@ -167,6 +169,7 @@ class _ComposerWatcher:
                     due.append((key, user_id))
         for key in [k for k in self._pairs if k not in live]:
             del self._pairs[key]
+            _chat_tab_left(*key)
         if not due:
             return 0
 
@@ -182,6 +185,8 @@ class _ComposerWatcher:
                 result = "retry"
             if result == "acked":
                 pushed += 1
+                # The tab shows the chat: an ask_user card can go there (askuser.py).
+                _chat_tab_ready(sid, chat_id)
             if st is None:
                 continue
             if result == "held":
@@ -225,6 +230,7 @@ class _ComposerWatcher:
         return "acked" if acked else "retry"
 
     async def run(self):
+        _CHAT_TABS_TRACKED[0] = True
         last_error = None
         next_liveness = 0.0
         state = "unknown"
@@ -236,6 +242,7 @@ class _ComposerWatcher:
                     state = await self.function_state()
                     if state == "gone":
                         pipe_log("[composer] Pipe function deleted; watcher stops")
+                        _CHAT_TABS_TRACKED[0] = False
                         return
                 if state != "inactive":
                     await self.tick()
