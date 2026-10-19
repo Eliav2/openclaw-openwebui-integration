@@ -1857,11 +1857,13 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         line: no answer ever comes on a closed socket, so the reply's end
         waited out the request's timeout and its done:true never landed."""
         closed = []
+        closed_event = asyncio.Event()
         hung = []
         send_request = self.conn.send_request
 
         async def disconnect():
             closed.append(True)
+            closed_event.set()
 
         async def closing_send_request(method, params, timeout=10):
             await asyncio.sleep(0.02)          # the answer's way back
@@ -1892,7 +1894,8 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
                 out += chunk if isinstance(chunk, str) else ""
         await asyncio.wait_for(rest(), 2)
         self.assertIn("hi", out)
-        self.assertTrue(closed, "the retired connection closed once the run ended")
+        # The close is a background task the dropped consumer starts.
+        await asyncio.wait_for(closed_event.wait(), 2)
         self.assertEqual(hung, [], "a request sent after the close")
         self.assertIn("chat.history", self.rpc, "the reply's usage was read before the close")
         usage = self.ocp._build_usage_status_lines.await_args.kwargs.get("run_usage")
