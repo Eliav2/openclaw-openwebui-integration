@@ -2070,8 +2070,8 @@ class Eli205Present(AssertionError):
 
 
 class ProbeIneffective(AssertionError):
-    """The probe did not produce its precondition (no cancel landed in a
-    commit), so its result proves nothing either way."""
+    """The probe did not produce its precondition (no cancel landed while
+    aiosqlite's thread ran the write), so its result proves nothing."""
 
 
 @pytest.mark.skipif(shutil.which("docker") is None, reason="needs the e2e stack's Open WebUI container")
@@ -2083,15 +2083,14 @@ class ProbeIneffective(AssertionError):
         "`_uncancellable` shield and this gate."))),
 ])
 def test_a_cancelled_chat_write_leaves_the_database_writable(token, mode):
-    """ELI-205: a Stop cancels a chat message write as it commits, and a
-    closed page cancels it again while SQLAlchemy drops the broken
-    connection; on an Open WebUI without open-webui#32745 the next write
-    fails or SQLite stays locked. The probe (e2e/owui_cancel_probe.py) fires
-    both cancels from SQLAlchemy's own events in the Open WebUI container, so
-    they land there on any machine, up to 60 times: `shielded` (through the
-    Pipe's write) must always pass; `raw` (no shield) shows whether Open
-    WebUI still needs it. A run where no cancel landed in a commit fails as
-    ProbeIneffective, never as a pass."""
+    """ELI-205: a Stop cancels a chat message write while aiosqlite's thread
+    runs one of its statements; on an Open WebUI without open-webui#32745
+    the cancelled write never ends and SQLite stays locked. The probe
+    (e2e/owui_cancel_probe.py) makes that window in the Open WebUI container,
+    so the cancel lands there on any machine, up to 60 times: `shielded`
+    (through the Pipe's write) must always pass; `raw` (no shield) shows
+    whether Open WebUI still needs it. A run where no cancel landed in the
+    thread fails as ProbeIneffective, never as a pass."""
     status, chat = _request("POST", "/api/v1/chats/new", {"chat": {
         "title": "ELI-205 probe", "messages": [], "history": {"messages": {}}}}, token)
     assert status == 200, chat
@@ -2112,7 +2111,7 @@ def test_a_cancelled_chat_write_leaves_the_database_writable(token, mode):
     result = json.loads(lines[-1])
     # In the test's output: attempts, and how many cancels landed where.
     print(f"ELI-205 probe ({mode}): {json.dumps(result)}")
-    if result["bug"] is None or not result["landed"]["commit"]:
+    if result["bug"] is None or not result["landed"]["in_thread"]:
         raise ProbeIneffective(result)
     if result["bug"]:
         raise Eli205Present(result)

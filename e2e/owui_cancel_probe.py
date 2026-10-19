@@ -1,24 +1,27 @@
-"""Runs inside the Open WebUI container: a Stop's cancel lands on a chat
-message write while it commits, and a second cancel lands while SQLAlchemy
-throws away the connection the first one broke, as a Stop followed by a
-closed page does (ELI-205, open-webui#32741). Prints one JSON line:
-{"bug": bool|None, "attempts": n, "landed": {"commit": n, "second": n}, "what": ...}.
+"""Runs inside the Open WebUI container: a Stop cancels a chat message write
+while aiosqlite's thread is running one of its statements, as it does to a
+reply being saved (ELI-205, open-webui#32741). Prints one JSON line:
+{"bug": bool|None, "attempts": n, "landed": {"in_thread": n}, "what": ...}.
 
 usage: owui_cancel_probe.py shielded|raw <attempts> <chat_id> <pipe file>
 
-Both cancels fire from SQLAlchemy's own events on Open WebUI's engine (the
-connection's `commit`, the pool's `invalidate`), so they land at the same
-point on any machine. A random delay missed the window on a fast CI runner
-and passed on an Open WebUI that has the bug. `landed` counts the cancels
-that fired there: the test refuses a run where none landed in a commit.
+The window is made, not waited for: another connection holds SQLite's write
+lock, so the write's `BEGIN IMMEDIATE` waits inside aiosqlite's thread (Open
+WebUI's busy timeout is 5 s); the cancel lands there 50 ms later (every
+other attempt twice, as a Stop then a closed page), then the lock is
+released. A random delay missed that window on a fast CI runner and passed
+on an Open WebUI that has the bug. `landed.in_thread` counts the cancels
+that landed while the statement was still in the thread: the test refuses a
+run where none did.
 
 `shielded` writes through the Pipe's `_owui_upsert_message` (the cancel hits
 its caller, the write goes on); `raw` calls Open WebUI's upsert directly, as
 the Pipe would without its shield. It runs on a copy of the DB, so what it
 breaks never reaches the running Open WebUI.
 
-The bug is present when a cancelled write never ends, the next write fails,
-or SQLite stays locked for another connection for 10 s.
+The bug is present when a cancelled write never ends, a write cannot start
+in 10 s, three writes after one fail in a row, or SQLite stays locked for
+another connection for 10 s.
 """
 import asyncio
 import importlib.util
@@ -43,31 +46,22 @@ from open_webui.models.chats import Chats  # noqa: E402
 from open_webui.models.users import Users  # noqa: E402
 from sqlalchemy import event  # noqa: E402
 
-landed = {"commit": 0, "second": 0}
-# The attempt's task: cancelled at its commit, then again at the invalidate.
-armed = {"first": None, "second": None}
+# Per attempt: the write's `BEGIN IMMEDIATE` reached aiosqlite's thread
+# (`sent`) and came back (`back`).
+seen = {"sent": None, "back": None}
+landed = {"in_thread": 0}
 
 
-@event.listens_for(owui_db.async_engine.sync_engine, "commit")
-def _cancel_at_commit(*_args):
-    task = armed["first"]
-    if task is None or task.done():
-        return
-    armed["first"], armed["second"] = None, task
-    landed["commit"] += 1
-    # Delivered at the commit's await, while aiosqlite's thread runs it.
-    task.cancel()
+@event.listens_for(owui_db.async_engine.sync_engine, "before_cursor_execute")
+def _sent(_conn, _cursor, statement, *_args):
+    if statement.lstrip().upper().startswith("BEGIN IMMEDIATE") and seen["sent"] is not None:
+        seen["sent"].set()
 
 
-@event.listens_for(owui_db.async_engine.sync_engine.pool, "invalidate")
-def _cancel_again(*_args):
-    task = armed["second"]
-    if task is None or task.done():
-        return
-    armed["second"] = None
-    landed["second"] += 1
-    # Delivered while the broken connection is being closed.
-    asyncio.get_running_loop().call_soon(task.cancel)
+@event.listens_for(owui_db.async_engine.sync_engine, "after_cursor_execute")
+def _back(_conn, _cursor, statement, *_args):
+    if statement.lstrip().upper().startswith("BEGIN IMMEDIATE") and seen["back"] is not None:
+        seen["back"].set()
 
 
 def writer():
@@ -101,19 +95,49 @@ async def main() -> dict:
     out = {"mode": mode, "bug": False, "attempts": 0, "landed": landed, "what": "DB writable throughout"}
     for i in range(attempts):
         out["attempts"] = i + 1
-        task = asyncio.ensure_future(write(chat_id, "eli205-probe", {"role": "assistant", "content": f"x{i}", "done": True}))
-        armed.update(first=task, second=None)
+        seen.update(sent=asyncio.Event(), back=asyncio.Event())
+        # Another connection holds SQLite's write lock, so the write's
+        # `BEGIN IMMEDIATE` waits in aiosqlite's thread (busy timeout 5 s):
+        # the cancel lands while the thread runs it, then the lock goes.
+        holder = sqlite3.connect(DB, isolation_level=None)
+        holder.execute("BEGIN IMMEDIATE")
+        try:
+            task = asyncio.ensure_future(write(chat_id, "eli205-probe", {"role": "assistant", "content": f"x{i}", "done": True}))
+            try:
+                await asyncio.wait_for(seen["sent"].wait(), 10)
+            except asyncio.TimeoutError:
+                # Earlier cancelled writes left the pool no usable connection.
+                task.cancel()
+                out.update(bug=True, what="a write could not start in 10 s: the pool's connections are stuck")
+                break
+            await asyncio.sleep(0.05)
+            if not seen["back"].is_set():
+                landed["in_thread"] += 1
+            task.cancel()
+            if i % 2:
+                # A second cancel, as a Stop followed by a closed page sends.
+                await asyncio.sleep(0)
+                task.cancel()
+        finally:
+            holder.rollback()
+            holder.close()
         # A shielded write goes on in the background after its caller is
         # cancelled: that write must end too.
         done, _ = await asyncio.wait({task, *pending()}, timeout=15)
-        armed.update(first=None, second=None)
         if pending() - done or task not in done:
             out.update(bug=True, what="the cancelled write never ended")
             break
-        try:
-            await asyncio.wait_for(Users.update_last_active_by_id(uid), 15)
-        except BaseException as ex:  # a CancelledError out of a wedged connection too
-            out.update(bug=True, what=f"the next write failed: {type(ex).__name__} {str(ex)[:120]}")
+        # A broken connection can fail the one write that next draws it from
+        # the pool; the bug is a DB that stays unwritable.
+        failures = []
+        for _ in range(3):
+            try:
+                await asyncio.wait_for(Users.update_last_active_by_id(uid), 15)
+                break
+            except BaseException as ex:  # a CancelledError out of a wedged connection too
+                failures.append(f"{type(ex).__name__} {str(ex)[:80]}")
+        if len(failures) == 3:
+            out.update(bug=True, what=f"the next writes failed: {failures}")
             break
     if locked_for_others():
         out.update(bug=True, what=out["what"] + "; SQLite stays locked for other connections")
