@@ -82,6 +82,31 @@ class StartupRefusalTests(unittest.IsolatedAsyncioTestCase):
                     await ocp._run_request(conn, ocp.RUN_SEND, dict(self.PARAMS), owner=True)
                 self.assertEqual(len(conn.sent), 1)
 
+    def patch_failed(self):
+        """2026.10.5's sessions.patch refusal while its session storage gets
+        ready, just after preparation (sessions-mutations-6pl7o9sA.mjs:142)."""
+        return ocp.GatewayError("Session patch failed unexpectedly. Retry the request.", error={
+            "code": "UNAVAILABLE", "message": "Session patch failed unexpectedly. Retry the request.",
+            "retryable": True})
+
+    async def test_a_request_refused_as_retryable_after_preparation_is_sent_again(self):
+        conn = FakeConn([refusal(), self.patch_failed(), {"ok": True}])
+        slept = []
+
+        async def sleep(s):
+            slept.append(s)
+        with mock.patch.object(ocp.asyncio, "sleep", sleep):
+            got = await ocp._send_when_prepared(conn, "sessions.patch", {"key": KEY})
+        self.assertEqual((got, len(conn.sent)), ({"ok": True}, 3))
+        self.assertEqual(slept, [0.001, 0.25], "the named wait, then the startup refusal's 250 ms")
+        self.assertEqual(len([line for line in self.logged if "refused as retryable" in line]), 1)
+
+    async def test_a_refusal_that_stays_retryable_fails_the_request_sooner(self):
+        conn = FakeConn([self.patch_failed()] * 1000)
+        with mock.patch.object(ocp, "RETRYABLE_REFUSAL_WAIT_S", 0.05):
+            with self.assertRaisesRegex(ocp.GatewayError, "Session patch failed"):
+                await asyncio.wait_for(ocp._send_when_prepared(conn, "sessions.patch", {"key": KEY}), 5)
+
     async def test_a_gateway_that_never_finishes_preparing_fails_the_send(self):
         conn = FakeConn([refusal()] * 1000)
         with mock.patch.object(ocp, "STARTUP_REFUSAL_WAIT_S", 0.05):

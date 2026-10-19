@@ -3714,20 +3714,35 @@ async def _run_request(conn, method: str, params: dict, *, timeout: float = 10,
 async def _send_when_prepared(conn, method: str, params: dict, *, timeout: float = 10):
     """`conn.send_request`, sent again while the Gateway refuses it only
     because it is still preparing the agent after its start, after the wait
-    each refusal names, up to STARTUP_REFUSAL_WAIT_S."""
-    deadline = time.monotonic() + STARTUP_REFUSAL_WAIT_S
-    told = False
+    each refusal names, up to STARTUP_REFUSAL_WAIT_S. Any other refusal the
+    Gateway calls retryable (UNAVAILABLE, `retryable`) is sent again too, up to
+    RETRYABLE_REFUSAL_WAIT_S from the first: right after preparation, 2026.10.5
+    refuses sessions.patch with "Session patch failed unexpectedly. Retry the
+    request." while its session storage gets ready (a log line says so; the
+    refusal itself names no reason and no wait)."""
+    started = time.monotonic()
+    deadline = started + STARTUP_REFUSAL_WAIT_S
+    told = set()
     while True:
         try:
             return await conn.send_request(method, params, timeout=timeout)
         except GatewayError as ex:
-            retry_ms = _startup_refusal_retry_ms(ex)
-            if retry_ms is None or time.monotonic() + retry_ms / 1000 > deadline:
+            retry_ms, why = _startup_refusal_retry_ms(ex), "preparing"
+            if retry_ms is None:
+                retry_ms, why = _retryable_refusal_retry_ms(ex), "retryable"
+                if retry_ms is not None and "retryable-since" not in told:
+                    told.add("retryable-since")
+                    retryable_deadline = time.monotonic() + RETRYABLE_REFUSAL_WAIT_S
+            if retry_ms is None or time.monotonic() + retry_ms / 1000 > (
+                    deadline if why == "preparing" else min(deadline, retryable_deadline)):
                 raise
-            if not told:
-                told = True
+            if why not in told:
+                told.add(why)
                 pipe_log(f"  {method}: the Gateway is still preparing the agent after its start; "
-                         f"sending again as it asks (every {retry_ms} ms, up to {STARTUP_REFUSAL_WAIT_S} s)")
+                         f"sending again as it asks (every {retry_ms} ms, up to {STARTUP_REFUSAL_WAIT_S} s)"
+                         if why == "preparing" else
+                         f"  {method}: refused as retryable ({ex}); sending again in {retry_ms} ms, "
+                         f"up to {RETRYABLE_REFUSAL_WAIT_S} s")
             await asyncio.sleep(retry_ms / 1000)
 
 
@@ -3739,6 +3754,7 @@ async def _send_when_prepared(conn, method: str, params: dict, *, timeout: float
 # sent again after the time it names. No event marks the end of preparation.
 STARTUP_REFUSAL_CODE = "agent-database-inspection-pending"
 STARTUP_REFUSAL_WAIT_S = 300
+RETRYABLE_REFUSAL_WAIT_S = 30
 # How long a message waits for a Gateway that refuses connections after it was
 # reached (a restart: the port is closed until the new process listens).
 GATEWAY_DOWN_WAIT_S = 120
@@ -3794,6 +3810,17 @@ def _startup_refusal_retry_ms(ex: GatewayError) -> int | None:
     err = getattr(ex, "error", None) or {}
     details = err.get("details") if isinstance(err.get("details"), dict) else {}
     if not err.get("retryable") or details.get("code") != STARTUP_REFUSAL_CODE:
+        return None
+    retry = err.get("retryAfterMs")
+    return int(retry) if isinstance(retry, (int, float)) and retry > 0 else 250
+
+
+def _retryable_refusal_retry_ms(ex: GatewayError) -> int | None:
+    """The wait before sending again a request the Gateway refused as
+    UNAVAILABLE and `retryable` for any other reason: the one it names, else
+    the startup refusal's 250 ms."""
+    err = getattr(ex, "error", None) or {}
+    if err.get("code") != "UNAVAILABLE" or err.get("retryable") is not True:
         return None
     retry = err.get("retryAfterMs")
     return int(retry) if isinstance(retry, (int, float)) and retry > 0 else 250
