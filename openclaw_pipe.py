@@ -5109,6 +5109,9 @@ class _TurnRenderer:
         # Text that opens a message item and is, so far, a silent sentinel or
         # the start of one (`_add_text`).
         self._held = ""
+        # The run answered with a silent sentinel alone (`flush`): no text is
+        # its reply, not something lost.
+        self.silenced = False
 
     @property
     def received(self) -> str:
@@ -5184,6 +5187,8 @@ class _TurnRenderer:
         """The run ended, or a card follows: held text that is not a
         sentinel is shown after all; returns it as added."""
         held, self._held = self._held, ""
+        if held.strip() in _SILENT_SENTINELS:
+            self.silenced = True
         if not held.strip() or held.strip() in _SILENT_SENTINELS:
             return ""
         return self._append_text(held)
@@ -8387,6 +8392,9 @@ class _TurnWriter:
         # Where each run's streamed part starts in the renderer, in adoption
         # order: (run, output index, text length). See `_from_transcript`.
         self.run_marks: list = [(run_id, 0, 0)]
+        # Each run's lifecycle `startedAt` (ms), where seen: it bounds the
+        # run's transcript span (`_history_run_messages`).
+        self.run_started: dict[str, float] = {}
         self.resumes = 0                # resume budget, counted on M (MAX_TURN_RESUMES)
         self.pending_resume = False     # a resume the Gateway refused; sent on the next hello-ok
         self.request: str | None = None  # the user's message M answers, quoted by a resume
@@ -8480,6 +8488,10 @@ class _TurnWriter:
             return
         try:
             if payload is not None:
+                data = payload.get("data") or {}
+                if payload.get("stream") == "lifecycle" and data.get("phase") == "start" \
+                        and isinstance(data.get("startedAt"), (int, float)) and payload.get("runId"):
+                    self.run_started.setdefault(payload["runId"], data["startedAt"])
                 self.renderer.feed(payload)
         except Exception as ex:
             pipe_log(f"  turn writer: renderer feed failed: {ex}")
@@ -8977,7 +8989,7 @@ class _TurnWriter:
         recovery the writer joined late (its first text and card ran before
         the pipe was back) still gets its start back. None (keep what streamed) while a run has not closed, or when
         the transcript covers nothing."""
-        spans = [_history_span_messages(hist, r) for r in self.runs]
+        spans = [_history_span_messages(hist, r, self.run_started.get(r)) for r in self.runs]
         if any(s is None for s in spans):
             return None
         out, text = self.renderer.output, self.renderer.text
@@ -9170,12 +9182,12 @@ async def _transcript_view(conn: "_GatewayConnection", *, session_key: str, chat
     return output, "" if text in _SILENT_SENTINELS else text
 
 
-def _history_span_messages(history: dict, run_id: str) -> list | None:
+def _history_span_messages(history: dict, run_id: str, started_ms: float | None = None) -> list | None:
     """One run's messages in `chat.history`, or None while it may still be
     writing. A closed run ends at its `cli-assistant:<runId>`; a run cut off
     with no closing turn (a crash, an outside kill) ends where the next
     admitted turn (a recovery, a resume) begins."""
-    closed = _history_run_messages(history, run_id)
+    closed = _history_run_messages(history, run_id, started_ms)
     if closed is not None:
         return closed
     messages = (history or {}).get("messages")
@@ -9880,12 +9892,14 @@ async def _turn_resync(conn: "_GatewayConnection", skip: set = frozenset()) -> N
         conn.row_to_consumers(sess, row, resync=True, read_at=read_at, outside_loop=True)
 
 
-def _history_run_messages(history: dict, run_id: str) -> list | None:
+def _history_run_messages(history: dict, run_id: str, started_ms: float | None = None) -> list | None:
     """One run's messages in `chat.history`: everything after the user
     message that started it, or after the previous run's closing message
     (a run with no user turn, e.g. a sub-agent announce), through its own
     closing message (`_run_closed_by`). None when the run has not closed
-    yet."""
+    yet. A previous run that answered with silence leaves no closing
+    message, so with the run's start time (`started_ms`, its lifecycle
+    start) messages stamped before it are not the run's (ELI-227)."""
     messages = (history or {}).get("messages")
     if not isinstance(messages, list) or not run_id:
         return None
@@ -9897,10 +9911,16 @@ def _history_run_messages(history: dict, run_id: str) -> list | None:
             continue
         start = end
         while start > 0 and (messages[start - 1] or {}).get("role") != "user" \
-                and not _run_closed_by(messages[start - 1]):
+                and not _run_closed_by(messages[start - 1]) \
+                and not _stamped_before(messages[start - 1], started_ms):
             start -= 1
         return messages[start:end + 1]
     return None
+
+
+def _stamped_before(message: dict, started_ms: float | None) -> bool:
+    ts = (message or {}).get("timestamp")
+    return started_ms is not None and isinstance(ts, (int, float)) and ts < started_ms
 
 
 def _relay_output_events(sent: list[dict], current: list[dict]) -> list[dict]:
@@ -12925,6 +12945,11 @@ class _PipeTurn:
             # The error is the reply: nothing to recover, and no
             # "no reply text" note under it.
             await self.maybe_emit_snapshot(force=True)
+        elif not self.aborted and not self.text_yielded and self.renderer.silenced and any(
+                i.get("type") == "function_call" for i in self.renderer.output):
+            # The run said nothing on purpose after its tool calls: the cards
+            # are the reply (ELI-227).
+            pipe_log("  the run answered with silence after its tool cards")
         elif not self.aborted and not self.text_yielded:
             recovered = await self.recover_from_transcript()
             retry_body = _thinking_rejection_retry_body(

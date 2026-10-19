@@ -1984,6 +1984,37 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f"**Error:** {self._NOT_ALLOWED}", out)
         self.assertNotIn("no reply text", out)
 
+    def _spawn_card_events(self, run_id):
+        def tool(phase, **data):
+            return {"type": "event", "event": "agent", "payload": {
+                "sessionKey": self.SK, "runId": run_id, "stream": "tool",
+                "data": {"phase": phase, "name": "sessions_spawn", "toolCallId": "t1", **data}}}
+        return [tool("start", args={"task": "Answer what 17 times 3 is."}),
+                tool("result", result="Started: QA 17x3")]
+
+    async def test_a_run_that_answers_with_silence_after_its_card_keeps_the_card_alone(self):
+        """ELI-227 (live chat 0a13a1d4 on 2026.10.5): the reply started a
+        background sub-agent with sessions_spawn and answered NO_REPLY. The
+        message read "(This turn produced no reply text.)" under the card."""
+        gen = self._reply("start one", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        for ev in [*self._spawn_card_events("run-1"), self._delta("run-1", "NO_REPLY"),
+                   self._final("run-1")]:
+            self._queue("run-1").put_nowait(ev)
+        chunks = [await asyncio.wait_for(first, 2)]
+        chunks += [c async for c in gen]
+        text = "".join(c for c in chunks if isinstance(c, str))
+        self.assertNotIn("no reply text", text)
+        self.assertNotIn("NO_REPLY", text)
+        cards = [c for c in chunks if isinstance(c, dict) and c.get("type") == "response.output_item.added"
+                 and (c.get("item") or {}).get("type") == "function_call"]
+        self.assertEqual(len(cards), 1, "the card stays")
+
+    async def test_a_run_with_no_text_and_no_card_still_says_so(self):
+        out = await self._reply_text([self._final("run-1")])
+        self.assertIn("no reply text", out)
+
     async def test_a_lifecycle_error_is_not_shown_twice(self):
         out = await self._reply_text([
             {"type": "event", "event": "agent", "payload": {
@@ -7935,6 +7966,37 @@ class TurnWriterEndTests(_TurnWriterCase):
         _, task = self.owui.tasks[w.task_id]
         await asyncio.wait_for(asyncio.shield(task), 1)
         return task
+
+    async def test_an_announce_after_a_silent_parent_does_not_take_the_parents_card(self):
+        """ELI-227 (live chat 0a13a1d4 on 2026.10.5): the parent spawned a
+        sub-agent and answered NO_REPLY, which leaves no closing message in
+        the transcript. The announce run has no user turn either, so its span
+        ran back to the parent's sessions_spawn call: its message showed that
+        card a second time. The parent's messages are older than the announce
+        run's start."""
+        ann = "announce:v1:agent:main:subagent:x:y"
+        started = 1792407300000
+        answer = "The background sub-agent finished and answered SUB-51."
+        self.history = {"messages": [
+            {"role": "user", "content": "spawn", "idempotencyKey": "msg-c1-p-1.0:user",
+             "timestamp": 1792407258841},
+            {"role": "user", "content": "Conversation info (untrusted metadata): {}",
+             "timestamp": 1792407260372, "__openclaw": {"importedFrom": "claude-cli"}},
+            {"role": "assistant", "stopReason": "tool_use", "timestamp": 1792407264343,
+             "__openclaw": {"importedFrom": "claude-cli"}, "content": [
+                 {"type": "toolcall", "id": "toolu_s", "name": "mcp__openclaw__sessions_spawn",
+                  "arguments": {"task": "Answer what 17 times 3 is."}},
+                 {"type": "tool_result", "tool_use_id": "toolu_s", "name": "mcp__openclaw__sessions_spawn",
+                  "content": [{"type": "text", "text": "Started: QA 17x3"}]}]},
+            {"role": "assistant", "stopReason": "stop", "timestamp": 1792407306581,
+             "idempotencyKey": f"cli-assistant:{ann}", "content": [{"type": "text", "text": answer}]}]}
+        w = self.writer(run=ann)
+        await w.feed({"runId": ann, "stream": "lifecycle", "data": {"phase": "start", "startedAt": started}})
+        await w.feed(_delta(answer))
+        self.assertTrue(w.opened)
+        await w.end({"status": "done", "hasActiveRun": False, "lastRunId": ann})
+        self.assertEqual(self.m()["content"], answer)
+        self.assertEqual([i["type"] for i in self.m()["output"]], ["message"])
 
     async def test_a_settled_run_is_finalized_from_its_transcript(self):
         w = await self.opened_writer()
