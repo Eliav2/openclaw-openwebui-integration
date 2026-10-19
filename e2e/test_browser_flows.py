@@ -781,11 +781,10 @@ def test_a_reply_the_agent_starts_streams_into_the_open_tab_and_asks_there(page,
 def test_stop_on_a_reply_the_agent_starts_stops_its_run(page, token):
     """Stop on a reply the agent started (a cron wake, ELI-192) in the open
     tab: the message ends, and so does the run. Before, the run went on to
-    its end, its text shown nowhere. The scripted wake runs a command that
-    waits for a file this test writes only once the run is over."""
-    if _openclaw_release() >= (2026, 10):
-        pytest.skip("OpenClaw 2026.10: chat.abort by run id does not stop a cron run, and there is no "
-                    "tasks.cancel; the session-wide abort also drops queued turns (ELI-194).")
+    its end, its text shown nowhere. On 2026.9 the wake's cron task is
+    cancelled; from 2026.10.5, which has no tasks.cancel, the run is aborted
+    by its id. The scripted wake runs a command that waits for a file this
+    test writes only once the run is over."""
     hold_token = f"stop{os.getpid()}_{len(_fake_llm_requests())}"
     # e2e/fake_llm.py hold_file
     hold = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{hold_token}")

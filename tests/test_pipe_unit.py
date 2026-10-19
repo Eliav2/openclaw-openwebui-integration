@@ -12187,11 +12187,12 @@ class SessionIdRunTests(_RoutingCase):
         await self.dispatch(run, {"state": "final"})
         await HandoverRewriteTests.settle(self, run)
 
-    def cron_task_gateway(self, abortable=False):
+    def cron_task_gateway(self, abortable=False, run_abortable=False):
         """The Gateway's answers for stopping a wake: chat.abort finds no run
         to abort on 2026.9 (a cron run is not a chat run, live 2026-10-18,
         ELI-192), the wake's job is a running cron task, and tasks.cancel
-        aborts that run."""
+        aborts that run. `run_abortable`: 2026.10.5, where sessions.abort
+        by the run's id aborts it and there is no tasks.list."""
         inner, test = self.conn.send_request, self
         self.cron_tasks = [{"taskId": "task-wake", "kind": "automation_run", "runtime": "cron",
                             "status": "running", "childSessionKey": self.key, "sourceId": self.JOB,
@@ -12203,6 +12204,12 @@ class SessionIdRunTests(_RoutingCase):
             if method == "chat.abort":
                 test.sent.append((method, copy.deepcopy(params)))
                 return {"ok": True, "aborted": abortable, "runIds": [params.get("runId")] if abortable else []}
+            if method == "sessions.abort":
+                test.sent.append((method, copy.deepcopy(params)))
+                return ({"ok": True, "abortedRunId": params.get("runId"), "status": "aborted"} if run_abortable
+                        else {"ok": True, "abortedRunId": None, "status": "no-active-run"})
+            if method == "tasks.list" and run_abortable:
+                raise RuntimeError("unknown method: tasks.list")
             if method == "tasks.list":
                 test.sent.append((method, copy.deepcopy(params)))
                 return {"tasks": copy.deepcopy(test.cron_tasks)}
@@ -12235,6 +12242,25 @@ class SessionIdRunTests(_RoutingCase):
         w = await self.stop_on_the_tab(mid)
         self.assertIn(("tasks.cancel", {"taskId": "task-wake"}), self.sent)
         self.assertNotIn(("tasks.cancel", {"taskId": "task-other"}), self.sent)
+        self.assertTrue(w.closed)
+        self.assertIs(self.new_messages()[mid]["done"], True)
+
+    async def test_stop_on_a_wake_on_2026_10_aborts_its_run_by_id(self):
+        """2026.10.5 has no tasks.cancel: Stop on a wake's reply let its run
+        go on to its end. sessions.abort with the run's id stops that run
+        alone, without clearQueued, so turns queued behind it stay."""
+        self.tab_on_chat()
+        self.cron_task_gateway(run_abortable=True)
+        self.wake_turn(self.W1)
+        _turn_route_now(self.conn, self.sid_ev(_delta("Looping: 1 of 8.")))
+        await self.spin()
+        mid = turn_message_id(self.key, self.W1, self.CHAT)
+        w = await self.stop_on_the_tab(mid)
+        self.assertIn(("sessions.abort", {"key": self.key, "runId": w.run_id}), self.sent)
+        self.assertNotIn("tasks.list", [m for m, _ in self.sent])
+        # chat.abort answers `aborted` for a wake on 2026.10.5 but stops
+        # only its running command (sandbox, 2026-10-19): never sent first.
+        self.assertNotIn("chat.abort", [m for m, _ in self.sent])
         self.assertTrue(w.closed)
         self.assertIs(self.new_messages()[mid]["done"], True)
 
