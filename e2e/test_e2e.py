@@ -430,6 +430,28 @@ def test_two_cron_wakes_in_a_row_get_one_finished_message_each(token):
     _assert_clean(token, chat_id, msgs)
 
 
+def test_a_run_on_a_deleted_chats_session_writes_nothing_and_fails_nothing(token):
+    """A chat deleted in Open WebUI keeps its Gateway session, so a cron job,
+    a sub-agent's late result or a background command's notice still runs
+    there. The turn writer read the missing chat row as one and failed on
+    every event of the run (ELI-218)."""
+    chat_id, _ = _chat_turn(token, "Respond with exactly: E2E_DELETED_CHAT")
+    key = _session_key(token, chat_id)
+    status, got = _request("DELETE", f"/api/v1/chats/{chat_id}", token=token)
+    assert status == 200 and got is True, got
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    _schedule_wake(key, "Reply with exactly: WAKE_AFTER_DELETE", 3)
+
+    def writer_said():
+        lines = [ln for ln in _pipe_log_since(since).splitlines() if "turn writer:" in ln]
+        return [ln for ln in lines if "is gone" in ln or "failed" in ln]
+    said = _until("the turn writer to meet the wake's run", writer_said)
+    assert not [ln for ln in said if "failed" in ln], said
+    assert any(chat_id[:8] in ln and "is gone" in ln for ln in said), said
+    status, _ = _request("GET", f"/api/v1/chats/{chat_id}", token=token)
+    assert status != 200, "nothing brought the deleted chat back"
+
+
 def test_a_message_queued_behind_a_wake_does_not_cut_it(token):
     chat_id, _ = _chat_turn(token, "Respond with exactly: E2E_QUEUE_CHAT")
     key = _session_key(token, chat_id)
