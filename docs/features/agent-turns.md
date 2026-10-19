@@ -9,8 +9,9 @@ Valves: `OWUI_API_KEY`
 
 When a run starts on a chat's session that you did not start from Open WebUI, the Pipe adds an assistant message at the end of that chat and streams the run into it, exactly as it streams your own replies: text token by token, tool cards that spin and complete, failed tools marked.
 
-- **Tab open on the chat:** the message appears without a reload and the view moves to it. Open WebUI shows the chat as generating, and its Stop button works on it.
+- **Tab open on the chat:** the message appears without a reload and the view moves to it. Open WebUI shows the chat as generating, and its Stop button works on it: Stop ends the message and stops the run. The run is stopped by its id (`sessions.abort`), so messages queued behind it stay; on OpenClaw 2026.9, where that finds no automation run, its task is cancelled instead.
 - **Tab open on another chat, or no tab at all:** the message is written to the chat anyway. Open it later and you see the finished reply, or the reply so far if the run is still going.
+- **When the run fails,** the message ends with the run's error.
 - **When the run ends,** the message is rebuilt from the run's own transcript (`chat.history`), so text or tool cards lost on the way are filled in. Anything the transcript lacks keeps what streamed.
 
 The message appears with the run's first tool call or first real text. A run that only answers with a silent sentinel (`NO_REPLY`, `ANNOUNCE_SKIP`) gets no message; one that ran tools first keeps its tool cards, with no text.
@@ -27,6 +28,7 @@ The design behind this is in [Agent turns](../design/agent-turns.md).
 | Another session's `sessions_send` into this chat's session | a reply, live |
 | A sub-agent that finishes while its parent is idle | the parent's reply to the result, live |
 | A sub-agent that finishes while its parent is still running | part of the running reply |
+| A command the agent left running in the background that ends | the agent's reply to its result, live, finished when that run ends |
 | A Gateway restart recovery of an interrupted reply | continues that same reply |
 | A heartbeat run | nothing |
 
@@ -40,7 +42,7 @@ A sub-agent's own session is not a chat, so nothing is written for it directly. 
 
 - **Parent idle:** the Gateway hands the result to the parent as a new run. That run is an ordinary reply in the chat, and it usually quotes or summarises the result.
 - **Parent still running:** the result is steered into the running parent run, and shows up in the reply you are already watching.
-- **Parent answers with silence** (`NO_REPLY`): you still get the result, as one **Sub-agent** card labelled with the name the parent gave it when it spawned it, or the first sentence of its task. Expand the card to read the result.
+- **Parent answers with silence** (`NO_REPLY`): you still get the result, as one **Sub-agent** card labelled with the name the parent gave it when it spawned it, or the first sentence of its task. Expand the card to read the result. On OpenClaw 2026.10 the Gateway counts that silence as a failed reply: the card carries its error ("Agent couldn't generate a response") below it, and the Gateway retries the delivery later. A retry adds no second card; one the parent answers aloud is a reply of its own.
 
 To watch a sub-agent while it works, open it from the [Status dialog](./status.md#sub-agents).
 

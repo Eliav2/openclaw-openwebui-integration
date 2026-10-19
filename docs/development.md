@@ -94,7 +94,9 @@ Every push and PR runs `.github/workflows/ci.yml`:
 
 **E2E** (`.github/workflows/e2e.yml`, `e2e/`): starts a deterministic fake
 OpenAI-compatible model (`e2e/fake_llm.py`), a real OpenClaw Gateway pointed at
-it, and Open WebUI in Docker; installs the Pipe, Filter and Action with
+it (with one test-only plugin, `e2e/agent-tool`: an `Agent` tool that answers
+like Claude Code's, which the Gateway's own runtime does not have), and Open
+WebUI in Docker; installs the Pipe, Filter and Action with
 `uv run install*.py install` exactly as the README tells users to (device
 pairing and the installer's smoke test included); then runs `e2e/test_e2e.py`
 against it, and the installed-dist fixture checks against the Gateway it
@@ -109,6 +111,11 @@ way into the chat Open WebUI persisted, as a `function_call` with its matching
 so the thinking level a turn picks shows in that request log as
 `reasoning_effort`. Gateway, Open WebUI and model logs are uploaded as an
 artifact on every run.
+
+If Open WebUI logs `database is locked` during an E2E run, `e2e/conftest.py`
+interrupts the running test and ends the run (exit code 3), naming that test
+and the log line: a lock that is never released (ELI-205) would otherwise
+fail every later test at its timeout.
 
 The versions it runs against are pinned in `e2e/versions.env`. Bump them in the
 PR that makes the code work with a new release, together with the matching

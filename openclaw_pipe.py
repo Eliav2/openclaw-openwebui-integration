@@ -527,6 +527,28 @@ def _writer_may_take_over(existing: dict) -> bool:
     return bool(writer) and existing.get("done") is False and not _turn_writer_alive(writer)
 
 
+async def _uncancellable(coro):
+    """Await `coro`, a write to Open WebUI's DB, to its end even when this task
+    is cancelled meanwhile (a Stop), then let the cancel go on. A cancel inside
+    Open WebUI's DB call (BEGIN IMMEDIATE or the commit run in aiosqlite's
+    thread) can wedge it and keep SQLite's write lock for good, so every later
+    write fails (ELI-205)."""
+    task = spawn_background(coro)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        if not task.done():
+            await asyncio.wait({task})
+        raise
+
+
+async def _owui_upsert_message(chat_id: str, message_id: str, fields: dict):
+    """Open WebUI's message upsert, never cut short by a cancel (ELI-205)."""
+    from open_webui.models.chats import Chats
+    return await _uncancellable(
+        Chats.upsert_message_to_chat_by_id_and_message_id(chat_id, message_id, fields))
+
+
 async def _claim_turn_message(chat_id: str, user_id: str, message_id: str, run_id: str,
                               writer_id: str, takeover: bool = False) -> dict:
     """Claim message `message_id` for run `run_id` in chat `chat_id`.
@@ -540,7 +562,14 @@ async def _claim_turn_message(chat_id: str, user_id: str, message_id: str, run_i
     `insert_chat_turn` does.
 
     Returns {claimed, how: new|takeover|taken, message_id, parent, messages}:
-    `messages` holds the changed nodes, for the `chat:messages` introduce."""
+    `messages` holds the changed nodes, for the `chat:messages` introduce.
+    Never cut short by a cancel (ELI-205)."""
+    return await _uncancellable(_claim_turn_message_now(
+        chat_id, user_id, message_id, run_id, writer_id, takeover))
+
+
+async def _claim_turn_message_now(chat_id: str, user_id: str, message_id: str, run_id: str,
+                                  writer_id: str, takeover: bool) -> dict:
     from open_webui.models.chats import Chats
     from open_webui.models.chat_messages import ChatMessages
     from sqlalchemy.orm.attributes import flag_modified
@@ -719,26 +748,57 @@ def run_message_id(session_key: str, chat_id: str, run_id: str, messages: list |
 # (session-accessor-CX17Bx59.mjs:3343-3347), so only the first wake into a
 # session ever gets one: never end or rebuild a wake from it.
 
+#
+# OpenClaw 2026.10.2+ records the wake's turn differently: no header in the
+# text but the cron provenance ({kind: internal_system, sourceTool: cron,
+# jobId, sourcePromptPrefix}), returned by `chat.history` as role "assistant"
+# (`_is_forwarded_turn`). Such a wake runs under its own run id and closes with
+# its own `cli-assistant:<runId>` (2026.10.3 and 10.5 fixtures), so it is an
+# ordinary agent turn: `shared_run` False, and no sessionId event binds it.
+
 _CRON_PROMPT_RE = re.compile(r"^\[cron:(?P<job>[^\s\]]+)[\s\]]")
 
 
+def _cron_turn_job(m: dict) -> str | None:
+    """The cron job a wake turn names: its provenance's (10.2+), else its
+    prompt's header (9.3, no provenance). None for any other turn."""
+    prov = m.get("provenance") if isinstance(m.get("provenance"), dict) else None
+    if prov:
+        if (prov.get("kind"), prov.get("sourceTool")) != ("internal_system", "cron"):
+            return None
+        hit = _CRON_PROMPT_RE.match(str(prov.get("sourcePromptPrefix") or ""))
+        return prov.get("jobId") or (hit.group("job") if hit else None)
+    hit = _CRON_PROMPT_RE.match(((_history_item(m) or {}).get("text") or "").lstrip())
+    return hit.group("job") if hit else None
+
+
 def wake_turns(messages: list) -> list:
-    """[{key, at, job}] of the cron wake user turns, in transcript order: `key`
-    is the turn id (its `:user` key without the suffix), `at` its commit time
-    (`recordTimestampMs`), `job` the cron job id from its prompt."""
+    """[{key, at, job, shared_run}] of the cron wake turns, in transcript
+    order: `key` is the turn id (its `:user` key without the suffix), `at` its
+    commit time (`recordTimestampMs`), `job` the cron job id, `shared_run`
+    True when the wake runs under the session's id (9.3, ELI-103). Reads
+    `chat.history` as returned or with its roles restored (`_transcript_roles`)."""
     out = []
     for m in messages or []:
-        key = _history_user_run_id(m)
-        if not key or parse_pipe_run_id(key) or m.get("provenance"):
+        if not isinstance(m, dict):
             continue
-        hit = _CRON_PROMPT_RE.match(((_history_item(m) or {}).get("text") or "").lstrip())
-        if not hit:
+        key = _history_user_run_id({**m, "role": "user"} if _is_forwarded_turn(m) else m)
+        if not key or parse_pipe_run_id(key):
+            continue
+        job = _cron_turn_job(m)
+        if not job:
             continue
         meta = m.get("__openclaw") if isinstance(m.get("__openclaw"), dict) else {}
         at = meta.get("recordTimestampMs") or m.get("timestamp")
         out.append({"key": key, "at": at if isinstance(at, (int, float)) else None,
-                    "job": hit.group("job")})
+                    "job": job, "shared_run": not m.get("provenance")})
     return out
+
+
+def _shared_wake_turns(messages: list) -> list:
+    """The wake turns whose wake runs under the session's id: the only ones a
+    sessionId event can belong to."""
+    return [w for w in wake_turns(messages) if w["shared_run"]]
 
 
 def wake_turn_at(messages: list, at_ms: float, bound=frozenset()) -> dict | None:
@@ -747,7 +807,7 @@ def wake_turn_at(messages: list, at_ms: float, bound=frozenset()) -> dict | None
     (`bound`). None while it is not committed yet (the embedded runtime writes
     the user turn without awaiting it, embedded-agent-DNQn_PMM.mjs:5891): the
     caller tries again on the wake's next event."""
-    for turn in reversed(wake_turns(messages)):
+    for turn in reversed(_shared_wake_turns(messages)):
         if turn["at"] is not None and turn["at"] <= at_ms:
             return None if turn["key"] in bound else turn
     return None
@@ -759,7 +819,7 @@ def wake_turn_of_run(messages: list, job: str, start_ms: float, bound=frozenset(
     while it is not committed yet: the embedded runtime writes it after the
     run's first events, so a turn is not looked for before the event (as
     `wake_turn_at` must, knowing no run)."""
-    for turn in reversed(wake_turns(messages)):
+    for turn in reversed(_shared_wake_turns(messages)):
         if turn["job"] == job and turn["at"] is not None and turn["at"] >= start_ms:
             return None if turn["key"] in bound else turn
     return None
@@ -1592,6 +1652,105 @@ async def _emit_message_snapshot(__event_emitter__, content):
     )
 
 
+
+# ---------------------------------------------------------------------------
+# A tab's input dialog and `execute` share one callback (ELI-195).
+#
+# Open WebUI 0.12's Chat.svelte keeps one callback slot for its `input` and
+# `confirmation` dialogs and for `execute`: each of these events overwrites
+# it on arrival, and the dialog's Confirm / Cancel answers whatever the slot
+# holds then. An `execute` that reaches a tab while its dialog is open takes
+# the dialog's answer, so the click is lost and the asker never hears back.
+# While a dialog is open on a socket, the socket is recorded here (shared by
+# the Pipe and the Action through `_shared_gateway_state`): an emitted
+# `execute` skips it and is delivered once the dialog is answered, and a
+# called one (a query) is not sent to it.
+# ---------------------------------------------------------------------------
+
+_SLOT_DIALOG_TYPES = ("input", "confirmation")
+_local_dialog_holds: dict = {}
+
+
+def _dialog_holds() -> dict:
+    """sid -> {"user_id", "open": open dialogs, "held": event payloads}."""
+    state = _shared_gateway_state()
+    return _local_dialog_holds if state is None else state.setdefault("dialog_holds", {})
+
+
+def _dialog_open_on(sid) -> bool:
+    return bool(sid) and sid in _dialog_holds()
+
+
+@contextlib.asynccontextmanager
+async def _holding_executes(sid, user_id, kind):
+    """Record `sid` as showing a dialog of `kind` for the block's duration,
+    then deliver the `execute` events held for it meanwhile, in order."""
+    if not sid or kind not in _SLOT_DIALOG_TYPES:
+        yield
+        return
+    holds = _dialog_holds()
+    entry = holds.get(sid)
+    if entry is None:
+        entry = holds[sid] = {"user_id": user_id, "open": 0, "held": []}
+    entry["open"] += 1
+    try:
+        yield
+    finally:
+        entry["open"] -= 1
+        if entry["open"] <= 0 and holds.get(sid) is entry:
+            del holds[sid]
+            if entry["held"]:
+                pipe_log(f"  dialog on {str(sid)[:8]}... answered: delivering "
+                         f"{len(entry['held'])} held execute event(s)")
+            for payload in entry["held"]:
+                try:
+                    from open_webui.socket.main import sio
+                    await sio.emit("events", payload, to=sid)
+                except Exception as ex:
+                    pipe_log(f"  held execute to {str(sid)[:8]}... failed: {ex!r}")
+
+
+def _dialog_safe_emitter(emitter, user_id, chat_id, message_id):
+    """`emitter`, except that an `execute` skips the user's sockets with an
+    open dialog (OWUI's emitter sends to the whole `user:<id>` room) and is
+    held for them."""
+    if emitter is None or not user_id:
+        return emitter
+
+    async def emit(event):
+        busy = []
+        if isinstance(event, dict) and event.get("type") == "execute":
+            holds = _dialog_holds()
+            busy = [sid for sid, e in list(holds.items()) if e.get("user_id") == user_id]
+        if not busy:
+            return await emitter(event)
+        payload = {"chat_id": chat_id, "message_id": message_id, "data": event}
+        for sid in busy:
+            holds[sid]["held"].append(payload)
+        pipe_log(f"  execute held for {len(busy)} tab(s) with an open dialog")
+        from open_webui.socket.main import sio
+        await sio.emit("events", payload, room=f"user:{user_id}", skip_sid=busy)
+
+    return emit
+
+
+def _dialog_safe_event_call(event_call, sid, user_id):
+    """`event_call` (bound to socket `sid`), recording its dialogs and never
+    sending an `execute` while one is open there: that query answers None."""
+    if event_call is None:
+        return None
+
+    async def call(payload):
+        kind = (payload or {}).get("type")
+        if kind == "execute" and _dialog_open_on(sid):
+            pipe_log(f"  execute query not sent: {str(sid)[:8]}... shows a dialog")
+            return None
+        async with _holding_executes(sid, user_id, kind):
+            return await event_call(payload)
+
+    return call
+
+
 # --- composer --------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -2283,6 +2442,8 @@ class _ComposerWatcher:
 
     async def tick(self, now=None):
         if not self.enabled():
+            for key in self._pairs:
+                _chat_tab_left(*key)
             self._pairs.clear()
             return 0
         now = time.monotonic() if now is None else now
@@ -2307,6 +2468,7 @@ class _ComposerWatcher:
                     due.append((key, user_id))
         for key in [k for k in self._pairs if k not in live]:
             del self._pairs[key]
+            _chat_tab_left(*key)
         if not due:
             return 0
 
@@ -2322,7 +2484,12 @@ class _ComposerWatcher:
                 result = "retry"
             if result == "acked":
                 pushed += 1
+                # The tab shows the chat: an ask_user card can go there (askuser.py).
+                _chat_tab_ready(sid, chat_id)
             if st is None:
+                continue
+            if result == "held":
+                st["attempts"] -= 1
                 continue
             if result == "retry" and st["attempts"] < _COMPOSER_WATCH_ATTEMPTS:
                 st["next"] = now + _COMPOSER_WATCH_RETRY_S
@@ -2331,7 +2498,9 @@ class _ComposerWatcher:
         return pushed
 
     async def _push(self, sid, chat_id, user_id) -> str:
-        """"acked" (the tab ran it), "skip" (not ours to push) or "retry"."""
+        """"acked" (the tab ran it), "skip" (not ours to push), "retry", or
+        "held": the tab shows an input dialog, which an `execute` would take
+        the answer of (ELI-195), so the push waits for it to close."""
         if not user_id:
             return "skip"
         head = await self._chat_head(chat_id)
@@ -2350,6 +2519,8 @@ class _ComposerWatcher:
         code = (_page_hooks_js(chat_id, _auto_send_on(self.valves_getter()))
                 + _render_composer_button_js(session_id=sid, model_prefixes=prefixes, chat_id=chat_id,
                                              chat_model=model))
+        if _dialog_open_on(sid):
+            return "held"
         acked = await self._call_sid(sid, {
             "chat_id": chat_id,
             "message_id": message_id,
@@ -2358,6 +2529,7 @@ class _ComposerWatcher:
         return "acked" if acked else "retry"
 
     async def run(self):
+        _CHAT_TABS_TRACKED[0] = True
         last_error = None
         next_liveness = 0.0
         state = "unknown"
@@ -2369,6 +2541,7 @@ class _ComposerWatcher:
                     state = await self.function_state()
                     if state == "gone":
                         pipe_log("[composer] Pipe function deleted; watcher stops")
+                        _CHAT_TABS_TRACKED[0] = False
                         return
                 if state != "inactive":
                     await self.tick()
@@ -2676,6 +2849,14 @@ SECRET_NOT_RECEIVED_FOR_AGENT = (
     "what the user types. Use masked credential entry, or ask again when the user "
     "has this chat open."
 )
+# What the agent gets when the user cancels the secret's dialog (ELI-189),
+# and what the Ask User block shows for it.
+SECRET_CANCELLED_FOR_AGENT = (
+    "[Open WebUI] Cancelled: the user closed the masked dialog for the secret you "
+    "asked for without entering it, so nothing was received. Do not ask for it in "
+    "the chat, which stores what the user types."
+)
+SECRET_CANCELLED_SHOWN = "Cancelled (nothing entered)"
 
 _MULTI_MARKERS = (
     "(multiselect)", "(multi-select)", "(multi)", "[multiselect]", "[multi]",
@@ -2708,12 +2889,6 @@ def _parse_text_prompt(prompt_text: str) -> dict:
         title = title or "OpenClaw needs input"
         message = message or "Please answer so the run can continue."
 
-    # Kept specific on purpose: a bare "key" matches innocent words ("monkey").
-    secret = any(
-        marker in text_lower
-        for marker in ("secret", "password", "may show your reply", "api key", "token")
-    )
-
     # Yes/no only when the prompt clearly reads as binary: a free-text question
     # turned into yes/no loses the real answer. A numbered list is a choice.
     has_options = bool(re.search(r"(?m)^\s*\d+[.)]\s", prompt_text))
@@ -2723,9 +2898,21 @@ def _parse_text_prompt(prompt_text: str) -> dict:
         "delete", "remove", "בטוח", "האם", "هل تريد",
     )
     ends_question = message.rstrip().endswith("?") or title.rstrip().endswith("?")
+    # A secret unless it is clearly a choice (an explicit yes/no marker, or two
+    # or more numbered options) and nothing asks for the value itself: a
+    # choice that merely mentions a password keeps its answers (ELI-196), but
+    # a key typed into the card's Other field would land in the chat. Kept
+    # specific on purpose: a bare "key" matches innocent words ("monkey").
+    mentions_secret = any(
+        marker in text_lower for marker in ("secret", "password", "api key", "token"))
+    asks_for_value = "may show your reply" in text_lower or bool(re.search(
+        r"\b(enter|paste|provide|type|send|give|share|input)\b[^.?!\n]{0,40}?"
+        r"(secret|password|api key|token)", text_lower))
+    yes_no = any(m in text_lower for m in yn_markers)
+    is_choice = yes_no or len(_extract_numbered_options(prompt_text)) >= 2
+    secret = asks_for_value or (mentions_secret and not is_choice)
     confirm = not secret and not has_options and (
-        any(m in text_lower for m in yn_markers)
-        or (any(w in text_lower for w in confirm_verbs) and ends_question)
+        yes_no or (any(w in text_lower for w in confirm_verbs) and ends_question)
     )
     options = [] if secret or confirm else _dedupe_options(
         [label for _, label in _extract_numbered_options(prompt_text)])
@@ -2930,12 +3117,19 @@ def _map_multi_answer(text: str, choices: list[str]) -> str:
     answer as typed.
     """
     text = (text or "").strip()
+    picked = _picked_choices(text, choices)
+    return ", ".join(picked) if picked else text
+
+
+def _picked_choices(text: str, choices: list[str]) -> list[str] | None:
+    """The options a typed multi-select answer names, in order (see
+    _map_multi_answer); None when it does not name options only."""
     by_name = {}
     for choice in choices:
         by_name.setdefault(choice.lower(), choice)
         by_name.setdefault(_split_option_description(choice)[0].lower(), choice)
     picked = []
-    for part in re.split(r"[,;،]", text):
+    for part in re.split(r"[,;،]", (text or "").strip()):
         part = part.strip()
         if not part:
             continue
@@ -2944,12 +3138,12 @@ def _map_multi_answer(text: str, choices: list[str]) -> str:
         elif re.fullmatch(r"\d+(\s+\d+)*", part):
             numbers = [int(n) for n in part.split()]
             if not all(1 <= n <= len(choices) for n in numbers):
-                return text
+                return None
             names = [choices[n - 1] for n in numbers]
         else:
-            return text
+            return None
         picked += [name for name in names if name not in picked]
-    return ", ".join(picked) if picked else text
+    return picked or None
 
 
 def _format_native_answers(questions: list[dict], answers: dict) -> str:
@@ -3005,12 +3199,13 @@ async def _call_on_chat_tab(
     if card:
         payload = {**payload, "data": {**payload["data"], "interaction_id": interaction_id}}
     try:
-        return await sio.call(
-            "events",
-            {"chat_id": owui_chat_id, "message_id": owui_message_id, "data": payload},
-            to=sid,
-            timeout=timeout_s,
-        )
+        async with _holding_executes(sid, owui_user_id, payload.get("type")):
+            return await sio.call(
+                "events",
+                {"chat_id": owui_chat_id, "message_id": owui_message_id, "data": payload},
+                to=sid,
+                timeout=timeout_s,
+            )
     except Exception as ex:
         return {"error": f"Event call timed out: {ex!r}"}
     finally:
@@ -3114,6 +3309,11 @@ async def _ask_user_secret(
         )
     except asyncio.TimeoutError:
         response = {"error": f"no answer in {timeout_s:g} s"}
+    if response is False:
+        # The dialog's Cancel (EventConfirmDialog resolves it with False),
+        # not a "no": the agent hears that the user cancelled.
+        pipe_log("  secret dialog cancelled by the user")
+        return SECRET_CANCELLED_FOR_AGENT
     answer = _normalize_event_call_response(response)
     if not answer:
         pipe_log(f"  secret dialog not answered ({_unanswered(response)}); the question ends the reply as text")
@@ -3137,7 +3337,9 @@ def _ask_user_detail_block(prompt_text: str, answer: str) -> str:
         # The agent was told nothing came: the reply shows the question as
         # not received, as an unanswered secret ends any reply.
         return "\n" + _secret_not_received_text(prompt_text) + "\n"
-    if _is_secret_prompt(prompt_text):
+    if SECRET_CANCELLED_FOR_AGENT in answer:
+        answer = SECRET_CANCELLED_SHOWN
+    elif _is_secret_prompt(prompt_text):
         # The block is written into the chat, so into Open WebUI's database.
         answer = SECRET_ANSWER_SHOWN
     if json_questions:
@@ -3322,7 +3524,8 @@ async def _ask_user_input_modal(
 SECRET_REQUESTS_FROM = (2026, 10, 10)
 # question id -> the task asking for it
 _SECRET_REQUESTS: dict = {}
-# session key -> the reply streaming its run, which asks on its own socket
+# session key -> the reply streaming its run, which asks the run's Gateway
+# questions (secret requests, the ask_user tool's) on its own socket
 _SECRET_ASKERS: dict = {}
 
 
@@ -3443,6 +3646,306 @@ async def _answer_secret_request(conn, record: dict, question: dict, user_id: st
                 "type": "success" if shown == "stored" else "info", "content": f"{name}: {shown}"}})
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# The agent's ask_user tool (ELI-216)
+# ---------------------------------------------------------------------------
+# OpenClaw's `ask_user` tool registers a Gateway question as the secret
+# request does: `question.requested` with up to three questions, each
+# {questionId, header, question, options: [{label, description?}],
+# multiSelect?, isOther: true}, and waits on `question.waitAnswer` for
+# `question.resolve {id, answers: {answers: {questionId: [values]}}}`
+# (2026.10.5 dist: ask-user-tool-*.mjs, ask-user-tool-normalization-*.mjs;
+# 2026.9.3 the same calls in openclaw-tools-*.mjs). A Gateway client chat
+# gets no prompt of its own: unanswered, the run waited out the tool's
+# timeout (15 minutes by default) on "Thinking".
+#
+# It is asked in Open WebUI's question card, on the newest tab that has
+# loaded the chat (else the reply's own socket while it shows the chat). A
+# question asked with no such tab stays pending: the card shows once a tab
+# opens the chat, and moves to a newer one (a reload, a phone back from
+# sleep). The card gets no timeout of its own: Open WebUI answers its timeout
+# as it answers Cancel. So the question ends only on the card's Cancel, an
+# answer here or elsewhere (the Control UI), or the Gateway's own timeout.
+#
+# "Loaded the chat" is the composer watcher's ack (composer_watch.py): a tab
+# acks an `execute` only once it shows the chat, and cancels a card at once
+# while it does not, which must not read as the user's Cancel.
+
+# question id -> the task asking it
+_AGENT_QUESTIONS: dict = {}
+
+
+def _agent_question_payload(record, timeout_ms: int | None) -> dict | None:
+    """Open WebUI's question card for an ask_user question record, or None
+    for anything else (a secret, no questions). `timeout_ms` None: the card
+    has no countdown of its own."""
+    questions = record.get("questions") if isinstance(record, dict) else None
+    if not isinstance(questions, list) or not questions:
+        return None
+    card = []
+    for index, raw in enumerate(questions):
+        if not isinstance(raw, dict) or raw.get("isSecret") or raw.get("secretStore"):
+            return None
+        qid, text = str(raw.get("questionId") or ""), str(raw.get("question") or "").strip()
+        if not qid or not text:
+            return None
+        options = [{"label": str(o.get("label") or "").strip(),
+                    "description": str(o.get("description") or "").strip()}
+                   for o in raw.get("options") or [] if isinstance(o, dict) and o.get("label")]
+        question = {
+            "id": qid,
+            "header": str(raw.get("header") or "").strip() or f"Question {index + 1}",
+            "question": text,
+            "options": options,
+            "allow_other": not options or raw.get("isOther") is not False,
+        }
+        if raw.get("multiSelect") and options:
+            # The card picks one option, so the options are listed by
+            # number and the picks typed, as for a needs-input multi-select.
+            listed = " · ".join(f"{n}. {o['label']}" for n, o in enumerate(options, 1))
+            question.update(question=f"{text} {listed}. Type the numbers you pick, like 1, 3",
+                            options=[], allow_other=True)
+            question[_MULTI_CHOICES_KEY] = [o["label"] for o in options]
+        card.append(question)
+    return {"type": "request:user_input",
+            "data": {"questions": card, "allow_other": True, "timeout_ms": timeout_ms}}
+
+
+def _agent_question_answers(questions: list[dict], answers) -> dict:
+    """The card's {question id: answer} as question.resolve's
+    {questionId: [values]}: the option's label as the agent wrote it, the
+    typed text, or a multi-select question's picked options."""
+    out = {}
+    for question in questions:
+        answer = answers.get(question["id"]) if isinstance(answers, dict) else None
+        if not isinstance(answer, dict):
+            continue
+        key = "text" if answer.get("type") == "other" else "label"
+        text = str(answer.get(key) or "").strip()
+        if not text:
+            continue
+        choices = question.get(_MULTI_CHOICES_KEY)
+        out[question["id"]] = (_picked_choices(text, choices) or [text]) if choices else [text]
+    return out
+
+
+def agent_question_seen(conn, record) -> bool:
+    """`question.requested`: ask an ask_user question made in an Open WebUI
+    chat. False for anything else."""
+    if not isinstance(record, dict) or record.get("status", "pending") != "pending" \
+            or not record.get("id") or record["id"] in _AGENT_QUESTIONS:
+        return False
+    if _agent_question_payload(record, None) is None:
+        return False
+    parsed = conn.parse_owui_session_key(record.get("sessionKey") or "")
+    if not parsed:
+        return False
+    _AGENT_QUESTIONS[record["id"]] = spawn_background(_answer_agent_question(conn, record, *parsed))
+    return True
+
+
+def _open_writer_message_id(conn, chat_id: str, session_key: str) -> str | None:
+    """The reply a turn writer streams the session's run into, for a run no
+    inline reply streams (one the agent started)."""
+    for writer in list(getattr(conn, "_turn_writers", {}).values()):
+        if writer.chat_id == chat_id and writer.session_key == session_key and not writer.closed:
+            return writer.message_id
+    return None
+
+
+# chat id -> the sockets that have loaded the chat, oldest first
+_READY_CHAT_TABS: dict = {}
+# chat id -> events set when one more socket has loaded it
+_CHAT_TAB_WAITERS: dict = {}
+# Whether the composer watcher feeds _READY_CHAT_TABS (on by default).
+_CHAT_TABS_TRACKED = [False]
+# Without the watcher, how often a question with no tab looks for one.
+_UNTRACKED_TAB_POLL_S = 5.0
+
+
+def _chat_tab_ready(sid, chat_id) -> None:
+    """The composer watcher: socket `sid` shows chat `chat_id` loaded."""
+    tabs = _READY_CHAT_TABS.setdefault(chat_id, [])
+    if sid in tabs:
+        tabs.remove(sid)
+    tabs.append(sid)
+    for event in list(_CHAT_TAB_WAITERS.get(chat_id, ())):
+        event.set()
+
+
+def _chat_tab_left(sid, chat_id) -> None:
+    """The composer watcher: socket `sid` no longer shows chat `chat_id`."""
+    tabs = _READY_CHAT_TABS.get(chat_id)
+    if tabs and sid in tabs:
+        tabs.remove(sid)
+        if not tabs:
+            del _READY_CHAT_TABS[chat_id]
+
+
+def _views_chat(session_pool, sid, user_id, chat_id) -> bool:
+    session = session_pool.get(sid) if sid else None
+    return bool(session) and session.get("id") == user_id and (
+        "chat_ids" not in session or chat_id in (session.get("chat_ids") or []))
+
+
+def _agent_card_tab(session_pool, user_id, chat_id, own_sid) -> str | None:
+    """The socket to show an ask_user card on, or None while no tab can."""
+    for sid in reversed(_READY_CHAT_TABS.get(chat_id, [])):
+        if _views_chat(session_pool, sid, user_id, chat_id):
+            return sid
+    if _views_chat(session_pool, own_sid, user_id, chat_id):
+        return own_sid
+    if not _CHAT_TABS_TRACKED[0]:
+        return _live_session_id_for_user(user_id, session_pool, chat_id)
+    return None
+
+
+@contextlib.contextmanager
+def _chat_tab_signal(chat_id):
+    """An event set when one more socket loads the chat."""
+    event = asyncio.Event()
+    _CHAT_TAB_WAITERS.setdefault(chat_id, set()).add(event)
+    try:
+        yield event
+    finally:
+        waiters = _CHAT_TAB_WAITERS.get(chat_id)
+        if waiters is not None:
+            waiters.discard(event)
+            if not waiters:
+                del _CHAT_TAB_WAITERS[chat_id]
+
+
+async def _card_on_tab(sio, session_pool, sid, user_id, chat_id, message_id, payload, deadline):
+    """Show the card on `sid` until it answers: (response, None), or
+    (None, "moved") once a newer tab has loaded the chat or `sid` stops
+    showing it, or (None, None) at the deadline. The card leaves the screen
+    when the wait ends, however it ends."""
+    interaction_id = str(uuid.uuid4())
+    data = {**payload["data"], "interaction_id": interaction_id}
+    pipe_log(f"  ask_user: showing the card on session {sid[:8]}...")
+    with _chat_tab_signal(chat_id) as newer:
+        call = asyncio.ensure_future(sio.call(
+            "events", {"chat_id": chat_id, "message_id": message_id,
+                       "data": {**payload, "data": data}},
+            to=sid, timeout=max(1.0, deadline - time.time())))
+        try:
+            while True:
+                left = deadline - time.time()
+                if left <= 0:
+                    return None, None
+                tab_change = asyncio.ensure_future(newer.wait())
+                try:
+                    # The wait wakes on the answer, on a tab that loads the
+                    # chat, or every few seconds to see this socket is still
+                    # there (Open WebUI keeps a call to a gone socket open).
+                    done, _ = await asyncio.wait({call, tab_change}, timeout=min(left, 5.0),
+                                                 return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    tab_change.cancel()
+                if call in done:
+                    try:
+                        response = call.result()
+                    except Exception as ex:
+                        pipe_log(f"  ask_user: the card on {sid[:8]}... failed: {ex!r}")
+                        return None, "moved"
+                    if not _views_chat(session_pool, sid, user_id, chat_id):
+                        # Cancelled by a tab that left the chat, not by the user.
+                        return None, "moved"
+                    return response, None
+                newer.clear()
+                if _agent_card_tab(session_pool, user_id, chat_id, sid) != sid \
+                        or not _views_chat(session_pool, sid, user_id, chat_id):
+                    return None, "moved"
+        finally:
+            call.cancel()
+            try:
+                await sio.emit("events", {"chat_id": chat_id, "message_id": message_id, "data": {
+                    "type": "request:interaction:done", "data": {"interaction_id": interaction_id}}},
+                    to=sid)
+            except Exception:
+                pass
+
+
+async def _ask_agent_card(user_id, chat_id, message_id, own_sid, payload, deadline):
+    """The card's response, shown on whichever tab has the chat, or None at
+    the deadline."""
+    try:
+        from open_webui.socket.main import sio, SESSION_POOL
+    except Exception as ex:
+        pipe_log(f"  ask_user: no Open WebUI sockets here: {ex}")
+        return None
+    while (left := deadline - time.time()) > 0:
+        sid = _agent_card_tab(SESSION_POOL, user_id, chat_id, own_sid)
+        if sid is None:
+            with _chat_tab_signal(chat_id) as ready:
+                wait = left if _CHAT_TABS_TRACKED[0] else min(left, _UNTRACKED_TAB_POLL_S)
+                try:
+                    await asyncio.wait_for(ready.wait(), wait)
+                except asyncio.TimeoutError:
+                    pass
+            continue
+        response, moved = await _card_on_tab(sio, SESSION_POOL, sid, user_id, chat_id,
+                                             message_id, payload, deadline)
+        if moved:
+            if sid == own_sid:
+                own_sid = None
+            continue
+        return response
+    return None
+
+
+async def _answer_agent_question(conn, record: dict, user_id: str, chat_id: str) -> None:
+    qid, key = record["id"], record.get("sessionKey") or ""
+    deadline = (record.get("expiresAtMs") or 0) / 1000 or time.time() + 900
+    payload = _agent_question_payload(record, None)
+    questions = payload["data"]["questions"]
+    turn = _SECRET_ASKERS.get(key)
+    message_id = turn.owui_message_id if turn is not None else _open_writer_message_id(conn, chat_id, key)
+    own_sid = (turn.__metadata__ or {}).get("session_id") if turn is not None else None
+    if not message_id:
+        # A card needs the reply it belongs to: Open WebUI cancels one for a
+        # message the tab does not have. Left to the Control UI.
+        _AGENT_QUESTIONS.pop(qid, None)
+        pipe_log(f"  ask_user: no reply in chat {chat_id[:8]}... streams the run; left to the Control UI")
+        return
+    pipe_log(f"  ask_user: {len(questions)} question(s) in chat {chat_id[:8]}... (question {qid[:12]}...)")
+    response = await _ask_agent_card(user_id, chat_id, message_id, own_sid, payload, deadline)
+    if _AGENT_QUESTIONS.get(qid) is not asyncio.current_task():
+        return
+    del _AGENT_QUESTIONS[qid]
+    if response is None:
+        # The Gateway's timeout ends it and tells the agent.
+        pipe_log("  ask_user: not answered before the question expired")
+        return
+    answers = (_agent_question_answers(questions, response.get("answers"))
+               if isinstance(response, dict) and response.get("status") == "answered" else {})
+    if answers:
+        params = {"id": qid, "answers": {"answers": answers}, "resolvedBy": "openwebui"}
+    else:
+        pipe_log("  ask_user: the card was cancelled")
+        params = {"id": qid, "cancel": True, "resolvedBy": "openwebui"}
+    try:
+        result = await conn.send_request("question.resolve", params, timeout=30)
+        shown = str((result or {}).get("status"))
+    except Exception as ex:
+        shown = f"not resolved ({type(ex).__name__})"
+    pipe_log(f"  ask_user: {shown}")
+
+
+def question_requested(conn, record) -> bool:
+    """`question.requested`: a secret request or an ask_user question."""
+    return secret_request_seen(conn, record) or agent_question_seen(conn, record)
+
+
+def question_resolved(payload) -> None:
+    """`question.resolved`: answered elsewhere, cancelled or expired; the
+    card's or dialog's wait ends and whatever it gets later is dropped."""
+    secret_request_resolved(payload)
+    task = _AGENT_QUESTIONS.pop((payload or {}).get("id"), None)
+    if task is not None:
+        task.cancel()
 
 
 # --- gateway ---------------------------------------------------------------
@@ -4808,6 +5311,37 @@ def _shared_gateway_state() -> dict | None:
     return state
 
 
+# The replies this process is streaming, for the Status Action (ELI-186):
+# {(chat_id, message_id): the reply's _TurnRenderer}. Open WebUI saves a
+# reply's tool cards (its `output`) only when the reply ends, in the chat and
+# in its message row alike, so while it runs only the Pipe has them. The Pipe
+# and the Action are separate Function modules: like the Pipe's shared state,
+# the map lives on Open WebUI's own stable module, and outside Open WebUI on
+# this one.
+_LIVE_REPLIES_ATTR = "_openclaw_live_replies_v1"
+_live_replies_local: dict = {}
+
+
+def _live_replies() -> dict:
+    try:
+        import open_webui.socket.main as _owui_socket_main
+    except Exception:
+        return _live_replies_local
+    replies = getattr(_owui_socket_main, _LIVE_REPLIES_ATTR, None)
+    if replies is None:
+        replies = {}
+        setattr(_owui_socket_main, _LIVE_REPLIES_ATTR, replies)
+    return replies
+
+
+def _live_reply_output(chat_id, message_id):
+    """A copy of the tool cards and text a running reply shows so far, or
+    None when this process streams no such reply."""
+    renderer = _live_replies().get((chat_id, message_id))
+    output = getattr(renderer, "output", None)
+    return copy.deepcopy(output) if isinstance(output, list) else None
+
+
 class _RunQueue(asyncio.Queue):
     """A run's event queue. Events wait for room (`await put`): a reply read
     slower than its run streams holds the receive loop back instead of losing
@@ -5443,6 +5977,15 @@ class _GatewayConnection:
         return lock
 
     # ── Public API ──────────────────────────────────────────────────
+
+    @property
+    def reconnecting(self) -> bool:
+        """The socket dropped and the event loop is bringing it back: until
+        then a request fails without reaching the Gateway (`send_request`).
+        The reconnect renews the subscriptions and wakes every
+        `session_change_event` waiter (`_subscribe_all`)."""
+        return (self._ws is None and not self._stopped and self._event_loop_task is not None
+                and not self._event_loop_task.done())
 
     async def ensure_connected(self):
         """Ensure the WS connection is up; connect/reconnect if needed."""
@@ -7070,7 +7613,12 @@ def _db_locked(ex: BaseException) -> bool:
 
 
 async def _set_turn_meta(chat_id: str, message_id: str, meta: dict) -> bool:
-    """Merge `meta` into message `message_id` under the chat's row lock."""
+    """Merge `meta` into message `message_id` under the chat's row lock, never
+    cut short by a cancel (ELI-205)."""
+    return await _uncancellable(_set_turn_meta_now(chat_id, message_id, meta))
+
+
+async def _set_turn_meta_now(chat_id: str, message_id: str, meta: dict) -> bool:
     from open_webui.models.chats import Chats
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -7265,6 +7813,36 @@ REPLY_SENT_WITH_NEXT_NOTE = ("_(This message was sent together with your next on
 REPLY_NOT_SENT_NOTE = "_(Stopped: this message was not sent to the agent.)_"
 
 
+async def _close_reply_status(ref: dict) -> None:
+    """Close the status line reply `ref` ({chat_id, user_id, message_id,
+    request_task_id}) left open when its request ended (ELI-200), if the
+    saved message still shows it open: saved, so a reload shows it ended too.
+    After the request's own end-of-stream save, like `_close_unsent_reply`.
+
+    The saved state decides, not what the reply sent: on a Stop, Open WebUI
+    closes the reply's stream (whose last status is written then) and saves
+    the cancelled message at the same time, two read-modify-writes of the
+    same chat, and the status write can be the one that is lost."""
+    request = _owui_request_task(ref.get("request_task_id"))
+    if request is not None and not request.done():
+        await asyncio.wait({request})
+    from open_webui.models.chats import Chats
+    from open_webui.socket.main import get_event_emitter
+
+    message_id = ref["message_id"]
+    try:
+        saved = await Chats.get_message_by_id_and_message_id(ref["chat_id"], message_id) or {}
+        last = (saved.get("statusHistory") or [None])[-1]
+        if not isinstance(last, dict) or last.get("done") is not False:
+            return
+        emit = await get_event_emitter({"chat_id": ref["chat_id"], "message_id": message_id,
+                                        "user_id": ref.get("user_id")}, update_db=True)
+        await emit({"type": "status", "data": {"description": "", "done": True}})
+        pipe_log(f"  reply {message_id[:8]}... closed: its status line was left open")
+    except Exception as ex:
+        pipe_log(f"  reply {message_id[:8]}...: closing its status failed: {ex!r}")
+
+
 async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str) -> None:
     """End reply `ref` ({chat_id, user_id, message_id, request_task_id}), which
     was cancelled before it sent its message, with `note`: its "Queued" status
@@ -7290,7 +7868,7 @@ async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str) 
             text = (current.get("content") or "").strip()
             text = f"{text}\n\n{note}" if text else note
             output = list(current.get("output") or []) + [_turn_note_item(note)]
-            await Chats.upsert_message_to_chat_by_id_and_message_id(
+            await _owui_upsert_message(
                 chat_id, message_id, {"content": text, "output": output, "done": True})
         await emit({"type": "chat:completion", "data": {"done": True, "content": text,
                                                          "output": output}})
@@ -7339,6 +7917,15 @@ if (!window.__ocIntentHook) {
     if (e.key === 'Escape') { mark('stop'); return; }
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.target && e.target.closest
         && e.target.closest('#chat-input')) mark('send_now');
+  }, true);
+  // One click answers every task it cancelled (ELI-198), so a query does not
+  // clear it: a new message, sent with nothing running, does.
+  document.addEventListener('submit', (e) => {
+    const f = e.target;
+    const input = document.querySelector('#chat-input');
+    if (running() || !f || !input || !f.contains(input)) return;
+    const c = chat();
+    if (c) delete window.__ocIntents[c];
   }, true);
 }
 return true;
@@ -7400,14 +7987,16 @@ def _auto_send_on(valves) -> bool:
 
 
 def _intent_query_js(chat_id: str) -> str:
-    """Read and clear what the page recorded for `chat_id` (see
-    `_INTENT_HOOK_JS`). "none" means the hook is there but saw no click, so
-    the cancel came from elsewhere; null means no hook at all."""
+    """Read what the page recorded for `chat_id` (see `_INTENT_HOOK_JS`).
+    Open WebUI's Stop cancels every task of the chat at once (a reply waiting
+    behind a run and the turn writer holding it), and each asks: the record
+    stays for all of them (ELI-198). "none" means the hook is there but saw
+    no click, so the cancel came from elsewhere; null means no hook at all."""
     return (
         "const c = " + json.dumps(chat_id) + ";"
         "const all = window.__ocIntents;"
         "if (!all) return null;"
-        "const i = all[c]; delete all[c];"
+        "const i = all[c];"
         "return (i && Date.now() - i.t < 60000) ? i.kind : 'none';"
     )
 
@@ -7442,6 +8031,10 @@ async def _page_cancel_intent(user_id: str, chat_id: str, message_id: str) -> st
             and chat_id in (sess.get("chat_ids") or [])]
     answers = set()
     for sid in sids:
+        if _dialog_open_on(sid):
+            # The query would take the open dialog's answer (ELI-195).
+            pipe_log(f"  turn writer: {sid[:8]}... shows a dialog; its intent is not asked")
+            continue
         try:
             resp = await socket_main.sio.call("events", {
                 "chat_id": chat_id, "message_id": message_id,
@@ -7603,9 +8196,10 @@ class _TurnWriter:
             from open_webui.socket.main import get_event_emitter
 
             # update_db=False: the writer owns this message's DB writes.
-            self._emit = await get_event_emitter(
+            self._emit = _dialog_safe_emitter(await get_event_emitter(
                 {"chat_id": self.chat_id, "message_id": self.message_id,
-                 "user_id": self.user_id}, update_db=False)
+                 "user_id": self.user_id}, update_db=False),
+                self.user_id, self.chat_id, self.message_id)
         return self._emit
 
     async def _stream(self) -> None:
@@ -7711,7 +8305,7 @@ class _TurnWriter:
         from open_webui.models.chats import Chats
 
         try:
-            await Chats.upsert_message_to_chat_by_id_and_message_id(
+            await _owui_upsert_message(
                 self.chat_id, self.message_id,
                 {"content": self.renderer.text if text is None else text,
                  "output": output if output is not None else copy.deepcopy(self.renderer.output),
@@ -7935,7 +8529,7 @@ class _TurnWriter:
                 rebuilt = self._from_transcript(hist) if hist else None
                 if rebuilt is not None:
                     self.renderer = rebuilt
-                if not (self._showable() or note):
+                if not self._showable():
                     await self._show_silent_announce(hist)
             if not self.opened:
                 if not (self._showable() or note) or not await self._open_at_end():
@@ -7997,21 +8591,36 @@ class _TurnWriter:
         result = await _child_result(self.conn, child)
         if not result:
             return
-        label = None
-        for m in (hist or {}).get("messages") or []:
-            blocks = m.get("content") if isinstance(m.get("content"), list) else []
-            calls = {b.get("id"): b for b in blocks if isinstance(b, dict) and b.get("type") == "toolcall"}
-            for b in blocks:
-                if (isinstance(b, dict) and b.get("type") == "tool_result"
-                        and child["child_session"] in json.dumps(b.get("content"))
-                        and b.get("tool_use_id") in calls):
-                    label = _spawn_title(calls[b["tool_use_id"]].get("arguments") or {})
+        # The spawn call whose result names the child, in either tool shape
+        # (claude-cli's blocks, or a native run's `toolResult` messages), made
+        # directly or through a deferred-tool wrapper (2026.10).
+        label, args = None, {}
+        for ev in _history_events((hist or {}).get("messages") or []):
+            data = ev.get("data") or {}
+            if ev.get("stream") != "tool":
+                continue
+            if data.get("phase") == "start":
+                call = (_bare_tool_name(data.get("name") or ""), json.dumps(data.get("args") or {}))
+                name, args_str = _deferred_call_view(*call) or call
+                if _is_spawn_tool(name):
+                    args[data.get("toolCallId")] = _json_object(args_str)
+            elif (data.get("toolCallId") in args
+                  and child["child_session"] in json.dumps(data.get("result"))):
+                label = _spawn_title(args[data["toolCallId"]])
         tcid = f"subagent-{child['child_run']}"
         args_str = json.dumps({"label": label or child["child_session"]})
         call = _tool_call_started_event("Sub-agent", tcid, args_str)["item"]
         call["status"] = "completed"
         self.renderer = _TurnRenderer()
         self.renderer.output = [call, _tool_call_result_event(tcid, result)["item"]]
+        if not self.opened:
+            # One card per child run, in a message of its own (ELI-217): 2026.10.5
+            # retries a delivery the parent met with silence under the same run
+            # id, and a retry's reply then lands in the run's message, not over
+            # the card, while a silent one rewrites the same card.
+            self.conn._turn_writers.pop((self.chat_id, self.message_id), None)
+            self.message_id = turn_message_id(self.session_key, tcid, self.chat_id)
+            self.conn._turn_writers[(self.chat_id, self.message_id)] = self
 
     def release(self) -> None:
         """This writer's connection was retired by a newer deploy: end the Open
@@ -8131,12 +8740,64 @@ class _TurnWriter:
                  f"{intent or 'unknown'}")
         if intent != "stop" or self.closed:
             return
-        try:
-            await _run_request(
-                self.conn, RUN_ABORT, {"sessionKey": self.session_key, "runId": self.run_id}, timeout=15)
-        except Exception as ex:
-            pipe_log(f"  turn writer: chat.abort failed: {ex}")
+        wake = bool(self.wake and self.wake.get("job"))
+        # A run the agent started (a cron wake) first, by its id: on
+        # 2026.10.5 chat.abort answers `aborted` for it but stops only its
+        # running command, and the run goes on to its end. There the wake
+        # is not bound as one (its run id is not the sessionId).
+        aborted = parse_pipe_run_id(self.run_id) is None and await self._abort_agent_run()
+        if not aborted:
+            try:
+                resp = await _run_request(
+                    self.conn, RUN_ABORT, {"sessionKey": self.session_key, "runId": self.run_id}, timeout=15)
+                aborted = bool((resp or {}).get("aborted"))
+            except Exception as ex:
+                pipe_log(f"  turn writer: chat.abort failed: {ex}")
+        if not aborted and wake:
+            await self._cancel_wake_run()
         await self.finalize()
+
+    async def _abort_agent_run(self) -> bool:
+        """Stop a run the agent started by its id: `sessions.abort` with a run id
+        stops that run alone and never clears the session's queue, so turns
+        queued behind the wake stay (2026.10.5 and 2026.10.10, which have no
+        tasks.cancel). On 2026.9 the wake's run id is the sessionId, and it
+        finds no run."""
+        try:
+            res = await self.conn.send_request("sessions.abort", {"key": self.session_key, "runId": self.run_id},
+                                               timeout=15)
+        except Exception as ex:
+            pipe_log(f"  turn writer: sessions.abort for the wake's run failed: {ex}")
+            return False
+        aborted = (res or {}).get("status") == "aborted"
+        if aborted:
+            pipe_log(f"  turn writer: run {self.run_id[:24]}... aborted by its id")
+        return aborted
+
+    async def _cancel_wake_run(self) -> None:
+        """Stop a cron wake's run (ELI-192) on 2026.9: chat.abort finds no
+        chat run under its id (the sessionId): the wake is its job's cron
+        run, which the job's running task cancels."""
+        job = self.wake["job"]
+        try:
+            resp = await self.conn.send_request("tasks.list", {"sessionKey": self.session_key, "limit": 100},
+                                                timeout=10)
+        except Exception as ex:
+            pipe_log(f"  turn writer: tasks.list for the wake's run failed: {ex}")
+            return
+        tasks = [t for t in (resp or {}).get("tasks") or []
+                 if t.get("runtime") == "cron" and t.get("sourceId") == job
+                 and t.get("status") in ("queued", "running")
+                 and self.session_key in (t.get("childSessionKey"), t.get("sessionKey"))]
+        if not tasks:
+            pipe_log(f"  turn writer: no running task of wake job {job[:8]}...: its run is not stopped")
+        for task in tasks:
+            try:
+                res = await self.conn.send_request("tasks.cancel", {"taskId": task["taskId"]}, timeout=15)
+                pipe_log(f"  turn writer: wake job {job[:8]}... run cancelled: "
+                         f"{bool((res or {}).get('cancelled'))} {(res or {}).get('reason') or ''}")
+            except Exception as ex:
+                pipe_log(f"  turn writer: tasks.cancel for wake job {job[:8]}... failed: {ex}")
 
     async def _hold(self) -> None:
         """The Open WebUI task: alive exactly while this writer owns the run.
@@ -8295,7 +8956,19 @@ def _turn_queue(conn: "_GatewayConnection", sess: str, run: str, parsed: tuple,
     if _is_terminal_event(payload):
         pump.terminal.set()
     pump.queue.put_nowait(("event", payload))
+    if _is_error_event(payload) and parse_pipe_run_id(run) is None:
+        # ELI-217: on 2026.10.5 a run the agent started that errors gets no
+        # settle push (its last is `phase: error`, hasActiveRun still true),
+        # though its row reads failed by its chat error. Its error events read
+        # the row; one still active waits for the next push.
+        spawn_background(_turn_reread_row(conn, sess))
     return True
+
+
+def _is_error_event(payload: dict) -> bool:
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    return payload.get("state") == "error" or (
+        payload.get("stream") == "lifecycle" and data.get("phase") == "error")
 
 
 def _note_child_result(conn: "_GatewayConnection", payload: dict) -> None:
@@ -8563,7 +9236,16 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
             if kind == "event":
                 if writer is not None:
                     await writer.feed(item)
-                continue
+                if not (writer is not None and writer.run_id == run and _ends_on_own_final(run, item)):
+                    continue
+                # Its own final is the settle that may never be pushed: OpenClaw
+                # 2026.10.5 pushes `agent.input.settled` only for a chat.send or
+                # agent call, so a run the Gateway starts itself (a background
+                # command's end notice, heartbeat runner) leaves its last row
+                # `hasActiveRun: true` and goes idle unpushed (ELI-215). After a
+                # clean final the settled row could only finalize, so no row is
+                # waited for.
+                item = None
             # Only the pump of the writer's current run ends it: an interrupted
             # run's pump also gets the session's settle once its recovery has
             # taken M over, and the recovery's own pump may still hold events.
@@ -8588,6 +9270,14 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
                 kind, item = pump.queue.get_nowait()
                 if kind == "event" and item is not None:
                     _turn_queue(conn, sess, run, parsed, item)
+
+
+def _ends_on_own_final(run: str, payload) -> bool:
+    """A run the agent started (no pipe run id) whose chat final came: it
+    ended cleanly, so it is over whatever the session row says. An error or
+    abort still waits for its row (its note, a resume, a recovery)."""
+    return (isinstance(payload, dict) and payload.get("state") == "final"
+            and parse_pipe_run_id(run) is None)
 
 
 def _is_terminal_event(payload: dict) -> bool:
@@ -9213,7 +9903,7 @@ async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
             conn._claimed_runs[claim] = True
         # Open WebUI answers None, logging nothing, when the write fails (its
         # transaction raised and was rolled back).
-        if await Chats.upsert_message_to_chat_by_id_and_message_id(
+        if await _owui_upsert_message(
                 chat_id, stub_id, fields) is None:
             if claim:
                 conn._claimed_runs.pop(claim, None)
@@ -9414,7 +10104,7 @@ async def _reconcile_chat_ended_runs(conn: "_GatewayConnection", session_key: st
             held_text = _coerce_text(current.get("content")).strip()
             if cards < held_cards or (cards == held_cards and len(text) <= len(held_text)):
                 continue  # holds as much as the transcript: never rewritten
-            if await Chats.upsert_message_to_chat_by_id_and_message_id(
+            if await _owui_upsert_message(
                     chat_id, mid, {"content": text, "output": output, "done": True}) is None:
                 pipe_log(f"  ended-while-down {mid[:8]}... in chat {chat_id[:8]}...: "
                          "Open WebUI did not save the write (ELI-94)")
@@ -9997,8 +10687,9 @@ def _owui_history_rows(chat_id: str):
 # (and "done"), so a `not in (done, failed, cancelled)` test would treat every
 # resting session as active and hang every message. Only these gate the queue.
 _ACTIVE_RUN_STATES = ("active", "running", "streaming", "queued")
-# The Gateway's secret requests are asked in the chat (askuser.py, ELI-96).
-_QUESTION_HOOKS = (secret_request_seen, secret_request_resolved)
+# The Gateway's questions (secret requests, ELI-96; the ask_user tool,
+# ELI-216) are asked in the chat (askuser.py).
+_QUESTION_HOOKS = (question_requested, question_resolved)
 
 
 def _session_active_from_signals(describe_status, list_has_active_run) -> bool:
@@ -10140,7 +10831,12 @@ def _title_is_owui_default(title, chat: dict) -> bool:
 
 async def _set_title_unless_chosen(chat_id: str, title: str) -> bool:
     """Title the chat, under its row lock, unless its title was chosen
-    meanwhile (ELI-182). True when the title was set."""
+    meanwhile (ELI-182). True when the title was set. Never cut short by a
+    cancel (ELI-205)."""
+    return await _uncancellable(_set_title_unless_chosen_now(chat_id, title))
+
+
+async def _set_title_unless_chosen_now(chat_id: str, title: str) -> bool:
     from open_webui.models.chats import Chats
     async with Chats._chat_transaction(chat_id) as (_db, chat):
         if chat is None or not _title_is_owui_default(chat.title, chat.chat):
@@ -10163,13 +10859,17 @@ class _TurnState:
     own Open WebUI message ({chat_id, user_id, message_id, request_task_id});
     `waiting` are the earlier replies, cancelled before they sent their
     message, whose messages are among `unsent`: each is ended with a note
-    once those messages are sent, or dropped (ELI-188).
+    once those messages are sent, or dropped (ELI-188). `status_open`: the
+    last status line the reply showed is not done yet; `handed_over`: the
+    turn writer took the reply's message over.
     """
     conn: object = None
     session_key: str | None = None
     chat_id: str | None = None
     reply: dict | None = None
     waiting: list = field(default_factory=list)
+    status_open: bool = False
+    handed_over: bool = False
     unsent: list = field(default_factory=list)
     run_id: str | None = None
     queue: object = None
@@ -10589,6 +11289,12 @@ class Pipe:
                 async for item in turn_gen:
                     yield item
             return
+        # No `execute` reaches a tab while it shows an input dialog (ELI-195).
+        meta = __metadata__ or {}
+        user_id = (__user__ or {}).get("id")
+        __event_emitter__ = _dialog_safe_emitter(
+            __event_emitter__, user_id, meta.get("chat_id"), meta.get("message_id"))
+        __event_call__ = _dialog_safe_event_call(__event_call__, meta.get("session_id"), user_id)
         # aclosing: when OWUI closes this generator, close the inner one now
         # rather than whenever it is garbage-collected, so its cancel handling
         # runs before the next message arrives.
@@ -10620,9 +11326,30 @@ class Pipe:
         `_waiting` are the replies those messages came from (`_TurnState`).
         """
         turn = _TurnState(waiting=list(_waiting or []))
+        emitter = None
+        if __event_emitter__:
+            async def emitter(event):
+                if isinstance(event, dict) and event.get("type") == "status":
+                    turn.status_open = not (event.get("data") or {}).get("done")
+                await __event_emitter__(event)
+        request = _owui_request_task((__metadata__ or {}).get("task_id"))
+        if request is not None and _send_texts is None:
+            def _request_ended(_task):
+                # Open WebUI ended the request (its own save of the message
+                # done) with this reply's status line open, and nobody else
+                # owns the message: nothing will close the line now. A
+                # Stop as the reply ends does this (a question card cancelled
+                # by sending a new message, ELI-200), wherever the cancel
+                # lands: in the reply, or in Open WebUI's own code while the
+                # reply waits at a yield, which never closes the reply.
+                # A cancelled request is checked too: see `_close_reply_status`.
+                if ((turn.status_open or _task.cancelled()) and not turn.parked
+                        and not turn.handed_over and turn.reply):
+                    spawn_background(_close_reply_status(turn.reply))
+            request.add_done_callback(_request_ended)
         try:
             async with contextlib.aclosing(self._pipe_turn(
-                body, __event_emitter__, __event_call__=__event_call__,
+                body, emitter, __event_call__=__event_call__,
                 __user__=__user__, __metadata__=__metadata__,
                 __request__=__request__, __task__=__task__,
                 __task_body__=__task_body__,
@@ -11240,6 +11967,10 @@ class _PipeTurn:
         # including what the text hooks still hold, so it is the baseline a
         # cumulative event is diffed against (ELI-80).
         self.renderer = _TurnRenderer()
+        # What the Status Action lists while this reply runs (ELI-186).
+        live_key = (self.owui_origin_chat_id, getattr(self, "owui_message_id", None))
+        if all(live_key):
+            _live_replies()[live_key] = self.renderer
         # The text this reply has shown, raw: the code state the text hooks
         # read. Continuing a run another reply started, both carry over (see
         # `park_cancelled_turn`), while what THIS reply shows,
@@ -11405,6 +12136,8 @@ class _PipeTurn:
                         yield chunk
 
         finally:
+            if all(live_key) and _live_replies().get(live_key) is self.renderer:
+                _live_replies().pop(live_key, None)
             if self.awaiting_owner:
                 self.conn.stop_awaiting_owner(self.session_key, self.owner_run)
             # A parked queue now belongs to whoever claims the run; releasing
@@ -11517,7 +12250,7 @@ class _PipeTurn:
         # unless the reply `keeps_its_run`.
         if not self.keeps_its_run and _hand_over_run(self.conn, self.session_key,
                 self.our_run_id, thinking=self.resolved_thinking, read_row=True):
-            self.handed_over = self.done = True
+            self.handed_over = self.done = self.turn.handed_over = True
         elif self.awaiting_owner:
             spawn_background(self.conn.push_row(self.session_key))
         elif not self.owui_message_id:
@@ -11550,7 +12283,7 @@ class _PipeTurn:
                                       if m.get("type") == "event"]}):
                 self.conn.unregister_consumer(self.session_key, self.our_run_id,
                                               queue=self.queue)
-                self.handed_over = self.done = True
+                self.handed_over = self.done = self.turn.handed_over = True
                 return
         for m in queued:
             self.queue.put_control(m)
@@ -11572,7 +12305,7 @@ class _PipeTurn:
         if _EXTERNAL_KILL_RE.search(err) or (aborted_run and self.conn._shutdown_seen):
             if not self.keeps_its_run and _hand_over_run(self.conn, self.session_key,
                     self.our_run_id, thinking=self.resolved_thinking, read_row=True):
-                self.handed_over = self.done = True
+                self.handed_over = self.done = self.turn.handed_over = True
                 return True
             if not self.owui_message_id:
                 self.await_owner()
@@ -11998,6 +12731,15 @@ class _PipeTurn:
                     "list.hasActiveRun=True (subagent-yield gap; queueing)"
                 )
             return active
+        if self.conn.reconnecting:
+            # Neither probe reached the Gateway, so its run state is unknown,
+            # and the registry below cannot stand in for it: a run the turn
+            # writer holds is not in it, so it would say idle, and a queued
+            # message would be sent into the dead socket and lost (ELI-199).
+            # Busy: the waiter is woken again by the reconnect and re-reads.
+            pipe_log("  active-check: the Gateway socket is reconnecting; "
+                     "waiting for it before deciding")
+            return True
         return self.conn.active_run_id_for_session(self.session_key) is not None
 
     def await_owner(self) -> None:

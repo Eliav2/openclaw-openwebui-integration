@@ -33,7 +33,12 @@ def _db_locked(ex: BaseException) -> bool:
 
 
 async def _set_turn_meta(chat_id: str, message_id: str, meta: dict) -> bool:
-    """Merge `meta` into message `message_id` under the chat's row lock."""
+    """Merge `meta` into message `message_id` under the chat's row lock, never
+    cut short by a cancel (ELI-205)."""
+    return await _uncancellable(_set_turn_meta_now(chat_id, message_id, meta))
+
+
+async def _set_turn_meta_now(chat_id: str, message_id: str, meta: dict) -> bool:
     from open_webui.models.chats import Chats
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -228,6 +233,36 @@ REPLY_SENT_WITH_NEXT_NOTE = ("_(This message was sent together with your next on
 REPLY_NOT_SENT_NOTE = "_(Stopped: this message was not sent to the agent.)_"
 
 
+async def _close_reply_status(ref: dict) -> None:
+    """Close the status line reply `ref` ({chat_id, user_id, message_id,
+    request_task_id}) left open when its request ended (ELI-200), if the
+    saved message still shows it open: saved, so a reload shows it ended too.
+    After the request's own end-of-stream save, like `_close_unsent_reply`.
+
+    The saved state decides, not what the reply sent: on a Stop, Open WebUI
+    closes the reply's stream (whose last status is written then) and saves
+    the cancelled message at the same time, two read-modify-writes of the
+    same chat, and the status write can be the one that is lost."""
+    request = _owui_request_task(ref.get("request_task_id"))
+    if request is not None and not request.done():
+        await asyncio.wait({request})
+    from open_webui.models.chats import Chats
+    from open_webui.socket.main import get_event_emitter
+
+    message_id = ref["message_id"]
+    try:
+        saved = await Chats.get_message_by_id_and_message_id(ref["chat_id"], message_id) or {}
+        last = (saved.get("statusHistory") or [None])[-1]
+        if not isinstance(last, dict) or last.get("done") is not False:
+            return
+        emit = await get_event_emitter({"chat_id": ref["chat_id"], "message_id": message_id,
+                                        "user_id": ref.get("user_id")}, update_db=True)
+        await emit({"type": "status", "data": {"description": "", "done": True}})
+        pipe_log(f"  reply {message_id[:8]}... closed: its status line was left open")
+    except Exception as ex:
+        pipe_log(f"  reply {message_id[:8]}...: closing its status failed: {ex!r}")
+
+
 async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str) -> None:
     """End reply `ref` ({chat_id, user_id, message_id, request_task_id}), which
     was cancelled before it sent its message, with `note`: its "Queued" status
@@ -253,7 +288,7 @@ async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str) 
             text = (current.get("content") or "").strip()
             text = f"{text}\n\n{note}" if text else note
             output = list(current.get("output") or []) + [_turn_note_item(note)]
-            await Chats.upsert_message_to_chat_by_id_and_message_id(
+            await _owui_upsert_message(
                 chat_id, message_id, {"content": text, "output": output, "done": True})
         await emit({"type": "chat:completion", "data": {"done": True, "content": text,
                                                          "output": output}})
@@ -302,6 +337,15 @@ if (!window.__ocIntentHook) {
     if (e.key === 'Escape') { mark('stop'); return; }
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.target && e.target.closest
         && e.target.closest('#chat-input')) mark('send_now');
+  }, true);
+  // One click answers every task it cancelled (ELI-198), so a query does not
+  // clear it: a new message, sent with nothing running, does.
+  document.addEventListener('submit', (e) => {
+    const f = e.target;
+    const input = document.querySelector('#chat-input');
+    if (running() || !f || !input || !f.contains(input)) return;
+    const c = chat();
+    if (c) delete window.__ocIntents[c];
   }, true);
 }
 return true;
@@ -363,14 +407,16 @@ def _auto_send_on(valves) -> bool:
 
 
 def _intent_query_js(chat_id: str) -> str:
-    """Read and clear what the page recorded for `chat_id` (see
-    `_INTENT_HOOK_JS`). "none" means the hook is there but saw no click, so
-    the cancel came from elsewhere; null means no hook at all."""
+    """Read what the page recorded for `chat_id` (see `_INTENT_HOOK_JS`).
+    Open WebUI's Stop cancels every task of the chat at once (a reply waiting
+    behind a run and the turn writer holding it), and each asks: the record
+    stays for all of them (ELI-198). "none" means the hook is there but saw
+    no click, so the cancel came from elsewhere; null means no hook at all."""
     return (
         "const c = " + json.dumps(chat_id) + ";"
         "const all = window.__ocIntents;"
         "if (!all) return null;"
-        "const i = all[c]; delete all[c];"
+        "const i = all[c];"
         "return (i && Date.now() - i.t < 60000) ? i.kind : 'none';"
     )
 
@@ -405,6 +451,10 @@ async def _page_cancel_intent(user_id: str, chat_id: str, message_id: str) -> st
             and chat_id in (sess.get("chat_ids") or [])]
     answers = set()
     for sid in sids:
+        if _dialog_open_on(sid):
+            # The query would take the open dialog's answer (ELI-195).
+            pipe_log(f"  turn writer: {sid[:8]}... shows a dialog; its intent is not asked")
+            continue
         try:
             resp = await socket_main.sio.call("events", {
                 "chat_id": chat_id, "message_id": message_id,
@@ -566,9 +616,10 @@ class _TurnWriter:
             from open_webui.socket.main import get_event_emitter
 
             # update_db=False: the writer owns this message's DB writes.
-            self._emit = await get_event_emitter(
+            self._emit = _dialog_safe_emitter(await get_event_emitter(
                 {"chat_id": self.chat_id, "message_id": self.message_id,
-                 "user_id": self.user_id}, update_db=False)
+                 "user_id": self.user_id}, update_db=False),
+                self.user_id, self.chat_id, self.message_id)
         return self._emit
 
     async def _stream(self) -> None:
@@ -674,7 +725,7 @@ class _TurnWriter:
         from open_webui.models.chats import Chats
 
         try:
-            await Chats.upsert_message_to_chat_by_id_and_message_id(
+            await _owui_upsert_message(
                 self.chat_id, self.message_id,
                 {"content": self.renderer.text if text is None else text,
                  "output": output if output is not None else copy.deepcopy(self.renderer.output),
@@ -898,7 +949,7 @@ class _TurnWriter:
                 rebuilt = self._from_transcript(hist) if hist else None
                 if rebuilt is not None:
                     self.renderer = rebuilt
-                if not (self._showable() or note):
+                if not self._showable():
                     await self._show_silent_announce(hist)
             if not self.opened:
                 if not (self._showable() or note) or not await self._open_at_end():
@@ -960,21 +1011,36 @@ class _TurnWriter:
         result = await _child_result(self.conn, child)
         if not result:
             return
-        label = None
-        for m in (hist or {}).get("messages") or []:
-            blocks = m.get("content") if isinstance(m.get("content"), list) else []
-            calls = {b.get("id"): b for b in blocks if isinstance(b, dict) and b.get("type") == "toolcall"}
-            for b in blocks:
-                if (isinstance(b, dict) and b.get("type") == "tool_result"
-                        and child["child_session"] in json.dumps(b.get("content"))
-                        and b.get("tool_use_id") in calls):
-                    label = _spawn_title(calls[b["tool_use_id"]].get("arguments") or {})
+        # The spawn call whose result names the child, in either tool shape
+        # (claude-cli's blocks, or a native run's `toolResult` messages), made
+        # directly or through a deferred-tool wrapper (2026.10).
+        label, args = None, {}
+        for ev in _history_events((hist or {}).get("messages") or []):
+            data = ev.get("data") or {}
+            if ev.get("stream") != "tool":
+                continue
+            if data.get("phase") == "start":
+                call = (_bare_tool_name(data.get("name") or ""), json.dumps(data.get("args") or {}))
+                name, args_str = _deferred_call_view(*call) or call
+                if _is_spawn_tool(name):
+                    args[data.get("toolCallId")] = _json_object(args_str)
+            elif (data.get("toolCallId") in args
+                  and child["child_session"] in json.dumps(data.get("result"))):
+                label = _spawn_title(args[data["toolCallId"]])
         tcid = f"subagent-{child['child_run']}"
         args_str = json.dumps({"label": label or child["child_session"]})
         call = _tool_call_started_event("Sub-agent", tcid, args_str)["item"]
         call["status"] = "completed"
         self.renderer = _TurnRenderer()
         self.renderer.output = [call, _tool_call_result_event(tcid, result)["item"]]
+        if not self.opened:
+            # One card per child run, in a message of its own (ELI-217): 2026.10.5
+            # retries a delivery the parent met with silence under the same run
+            # id, and a retry's reply then lands in the run's message, not over
+            # the card, while a silent one rewrites the same card.
+            self.conn._turn_writers.pop((self.chat_id, self.message_id), None)
+            self.message_id = turn_message_id(self.session_key, tcid, self.chat_id)
+            self.conn._turn_writers[(self.chat_id, self.message_id)] = self
 
     def release(self) -> None:
         """This writer's connection was retired by a newer deploy: end the Open
@@ -1094,12 +1160,64 @@ class _TurnWriter:
                  f"{intent or 'unknown'}")
         if intent != "stop" or self.closed:
             return
-        try:
-            await _run_request(
-                self.conn, RUN_ABORT, {"sessionKey": self.session_key, "runId": self.run_id}, timeout=15)
-        except Exception as ex:
-            pipe_log(f"  turn writer: chat.abort failed: {ex}")
+        wake = bool(self.wake and self.wake.get("job"))
+        # A run the agent started (a cron wake) first, by its id: on
+        # 2026.10.5 chat.abort answers `aborted` for it but stops only its
+        # running command, and the run goes on to its end. There the wake
+        # is not bound as one (its run id is not the sessionId).
+        aborted = parse_pipe_run_id(self.run_id) is None and await self._abort_agent_run()
+        if not aborted:
+            try:
+                resp = await _run_request(
+                    self.conn, RUN_ABORT, {"sessionKey": self.session_key, "runId": self.run_id}, timeout=15)
+                aborted = bool((resp or {}).get("aborted"))
+            except Exception as ex:
+                pipe_log(f"  turn writer: chat.abort failed: {ex}")
+        if not aborted and wake:
+            await self._cancel_wake_run()
         await self.finalize()
+
+    async def _abort_agent_run(self) -> bool:
+        """Stop a run the agent started by its id: `sessions.abort` with a run id
+        stops that run alone and never clears the session's queue, so turns
+        queued behind the wake stay (2026.10.5 and 2026.10.10, which have no
+        tasks.cancel). On 2026.9 the wake's run id is the sessionId, and it
+        finds no run."""
+        try:
+            res = await self.conn.send_request("sessions.abort", {"key": self.session_key, "runId": self.run_id},
+                                               timeout=15)
+        except Exception as ex:
+            pipe_log(f"  turn writer: sessions.abort for the wake's run failed: {ex}")
+            return False
+        aborted = (res or {}).get("status") == "aborted"
+        if aborted:
+            pipe_log(f"  turn writer: run {self.run_id[:24]}... aborted by its id")
+        return aborted
+
+    async def _cancel_wake_run(self) -> None:
+        """Stop a cron wake's run (ELI-192) on 2026.9: chat.abort finds no
+        chat run under its id (the sessionId): the wake is its job's cron
+        run, which the job's running task cancels."""
+        job = self.wake["job"]
+        try:
+            resp = await self.conn.send_request("tasks.list", {"sessionKey": self.session_key, "limit": 100},
+                                                timeout=10)
+        except Exception as ex:
+            pipe_log(f"  turn writer: tasks.list for the wake's run failed: {ex}")
+            return
+        tasks = [t for t in (resp or {}).get("tasks") or []
+                 if t.get("runtime") == "cron" and t.get("sourceId") == job
+                 and t.get("status") in ("queued", "running")
+                 and self.session_key in (t.get("childSessionKey"), t.get("sessionKey"))]
+        if not tasks:
+            pipe_log(f"  turn writer: no running task of wake job {job[:8]}...: its run is not stopped")
+        for task in tasks:
+            try:
+                res = await self.conn.send_request("tasks.cancel", {"taskId": task["taskId"]}, timeout=15)
+                pipe_log(f"  turn writer: wake job {job[:8]}... run cancelled: "
+                         f"{bool((res or {}).get('cancelled'))} {(res or {}).get('reason') or ''}")
+            except Exception as ex:
+                pipe_log(f"  turn writer: tasks.cancel for wake job {job[:8]}... failed: {ex}")
 
     async def _hold(self) -> None:
         """The Open WebUI task: alive exactly while this writer owns the run.
@@ -1258,7 +1376,19 @@ def _turn_queue(conn: "_GatewayConnection", sess: str, run: str, parsed: tuple,
     if _is_terminal_event(payload):
         pump.terminal.set()
     pump.queue.put_nowait(("event", payload))
+    if _is_error_event(payload) and parse_pipe_run_id(run) is None:
+        # ELI-217: on 2026.10.5 a run the agent started that errors gets no
+        # settle push (its last is `phase: error`, hasActiveRun still true),
+        # though its row reads failed by its chat error. Its error events read
+        # the row; one still active waits for the next push.
+        spawn_background(_turn_reread_row(conn, sess))
     return True
+
+
+def _is_error_event(payload: dict) -> bool:
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    return payload.get("state") == "error" or (
+        payload.get("stream") == "lifecycle" and data.get("phase") == "error")
 
 
 def _note_child_result(conn: "_GatewayConnection", payload: dict) -> None:
@@ -1526,7 +1656,16 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
             if kind == "event":
                 if writer is not None:
                     await writer.feed(item)
-                continue
+                if not (writer is not None and writer.run_id == run and _ends_on_own_final(run, item)):
+                    continue
+                # Its own final is the settle that may never be pushed: OpenClaw
+                # 2026.10.5 pushes `agent.input.settled` only for a chat.send or
+                # agent call, so a run the Gateway starts itself (a background
+                # command's end notice, heartbeat runner) leaves its last row
+                # `hasActiveRun: true` and goes idle unpushed (ELI-215). After a
+                # clean final the settled row could only finalize, so no row is
+                # waited for.
+                item = None
             # Only the pump of the writer's current run ends it: an interrupted
             # run's pump also gets the session's settle once its recovery has
             # taken M over, and the recovery's own pump may still hold events.
@@ -1551,6 +1690,14 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
                 kind, item = pump.queue.get_nowait()
                 if kind == "event" and item is not None:
                     _turn_queue(conn, sess, run, parsed, item)
+
+
+def _ends_on_own_final(run: str, payload) -> bool:
+    """A run the agent started (no pipe run id) whose chat final came: it
+    ended cleanly, so it is over whatever the session row says. An error or
+    abort still waits for its row (its note, a resume, a recovery)."""
+    return (isinstance(payload, dict) and payload.get("state") == "final"
+            and parse_pipe_run_id(run) is None)
 
 
 def _is_terminal_event(payload: dict) -> bool:
@@ -2176,7 +2323,7 @@ async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
             conn._claimed_runs[claim] = True
         # Open WebUI answers None, logging nothing, when the write fails (its
         # transaction raised and was rolled back).
-        if await Chats.upsert_message_to_chat_by_id_and_message_id(
+        if await _owui_upsert_message(
                 chat_id, stub_id, fields) is None:
             if claim:
                 conn._claimed_runs.pop(claim, None)
@@ -2377,7 +2524,7 @@ async def _reconcile_chat_ended_runs(conn: "_GatewayConnection", session_key: st
             held_text = _coerce_text(current.get("content")).strip()
             if cards < held_cards or (cards == held_cards and len(text) <= len(held_text)):
                 continue  # holds as much as the transcript: never rewritten
-            if await Chats.upsert_message_to_chat_by_id_and_message_id(
+            if await _owui_upsert_message(
                     chat_id, mid, {"content": text, "output": output, "done": True}) is None:
                 pipe_log(f"  ended-while-down {mid[:8]}... in chat {chat_id[:8]}...: "
                          "Open WebUI did not save the write (ELI-94)")

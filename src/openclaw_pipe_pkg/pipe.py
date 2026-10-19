@@ -9,8 +9,9 @@
 # (and "done"), so a `not in (done, failed, cancelled)` test would treat every
 # resting session as active and hang every message. Only these gate the queue.
 _ACTIVE_RUN_STATES = ("active", "running", "streaming", "queued")
-# The Gateway's secret requests are asked in the chat (askuser.py, ELI-96).
-_QUESTION_HOOKS = (secret_request_seen, secret_request_resolved)
+# The Gateway's questions (secret requests, ELI-96; the ask_user tool,
+# ELI-216) are asked in the chat (askuser.py).
+_QUESTION_HOOKS = (question_requested, question_resolved)
 
 
 def _session_active_from_signals(describe_status, list_has_active_run) -> bool:
@@ -152,7 +153,12 @@ def _title_is_owui_default(title, chat: dict) -> bool:
 
 async def _set_title_unless_chosen(chat_id: str, title: str) -> bool:
     """Title the chat, under its row lock, unless its title was chosen
-    meanwhile (ELI-182). True when the title was set."""
+    meanwhile (ELI-182). True when the title was set. Never cut short by a
+    cancel (ELI-205)."""
+    return await _uncancellable(_set_title_unless_chosen_now(chat_id, title))
+
+
+async def _set_title_unless_chosen_now(chat_id: str, title: str) -> bool:
     from open_webui.models.chats import Chats
     async with Chats._chat_transaction(chat_id) as (_db, chat):
         if chat is None or not _title_is_owui_default(chat.title, chat.chat):
@@ -175,13 +181,17 @@ class _TurnState:
     own Open WebUI message ({chat_id, user_id, message_id, request_task_id});
     `waiting` are the earlier replies, cancelled before they sent their
     message, whose messages are among `unsent`: each is ended with a note
-    once those messages are sent, or dropped (ELI-188).
+    once those messages are sent, or dropped (ELI-188). `status_open`: the
+    last status line the reply showed is not done yet; `handed_over`: the
+    turn writer took the reply's message over.
     """
     conn: object = None
     session_key: str | None = None
     chat_id: str | None = None
     reply: dict | None = None
     waiting: list = field(default_factory=list)
+    status_open: bool = False
+    handed_over: bool = False
     unsent: list = field(default_factory=list)
     run_id: str | None = None
     queue: object = None
@@ -601,6 +611,12 @@ class Pipe:
                 async for item in turn_gen:
                     yield item
             return
+        # No `execute` reaches a tab while it shows an input dialog (ELI-195).
+        meta = __metadata__ or {}
+        user_id = (__user__ or {}).get("id")
+        __event_emitter__ = _dialog_safe_emitter(
+            __event_emitter__, user_id, meta.get("chat_id"), meta.get("message_id"))
+        __event_call__ = _dialog_safe_event_call(__event_call__, meta.get("session_id"), user_id)
         # aclosing: when OWUI closes this generator, close the inner one now
         # rather than whenever it is garbage-collected, so its cancel handling
         # runs before the next message arrives.
@@ -632,9 +648,30 @@ class Pipe:
         `_waiting` are the replies those messages came from (`_TurnState`).
         """
         turn = _TurnState(waiting=list(_waiting or []))
+        emitter = None
+        if __event_emitter__:
+            async def emitter(event):
+                if isinstance(event, dict) and event.get("type") == "status":
+                    turn.status_open = not (event.get("data") or {}).get("done")
+                await __event_emitter__(event)
+        request = _owui_request_task((__metadata__ or {}).get("task_id"))
+        if request is not None and _send_texts is None:
+            def _request_ended(_task):
+                # Open WebUI ended the request (its own save of the message
+                # done) with this reply's status line open, and nobody else
+                # owns the message: nothing will close the line now. A
+                # Stop as the reply ends does this (a question card cancelled
+                # by sending a new message, ELI-200), wherever the cancel
+                # lands: in the reply, or in Open WebUI's own code while the
+                # reply waits at a yield, which never closes the reply.
+                # A cancelled request is checked too: see `_close_reply_status`.
+                if ((turn.status_open or _task.cancelled()) and not turn.parked
+                        and not turn.handed_over and turn.reply):
+                    spawn_background(_close_reply_status(turn.reply))
+            request.add_done_callback(_request_ended)
         try:
             async with contextlib.aclosing(self._pipe_turn(
-                body, __event_emitter__, __event_call__=__event_call__,
+                body, emitter, __event_call__=__event_call__,
                 __user__=__user__, __metadata__=__metadata__,
                 __request__=__request__, __task__=__task__,
                 __task_body__=__task_body__,
@@ -1252,6 +1289,10 @@ class _PipeTurn:
         # including what the text hooks still hold, so it is the baseline a
         # cumulative event is diffed against (ELI-80).
         self.renderer = _TurnRenderer()
+        # What the Status Action lists while this reply runs (ELI-186).
+        live_key = (self.owui_origin_chat_id, getattr(self, "owui_message_id", None))
+        if all(live_key):
+            _live_replies()[live_key] = self.renderer
         # The text this reply has shown, raw: the code state the text hooks
         # read. Continuing a run another reply started, both carry over (see
         # `park_cancelled_turn`), while what THIS reply shows,
@@ -1417,6 +1458,8 @@ class _PipeTurn:
                         yield chunk
 
         finally:
+            if all(live_key) and _live_replies().get(live_key) is self.renderer:
+                _live_replies().pop(live_key, None)
             if self.awaiting_owner:
                 self.conn.stop_awaiting_owner(self.session_key, self.owner_run)
             # A parked queue now belongs to whoever claims the run; releasing
@@ -1529,7 +1572,7 @@ class _PipeTurn:
         # unless the reply `keeps_its_run`.
         if not self.keeps_its_run and _hand_over_run(self.conn, self.session_key,
                 self.our_run_id, thinking=self.resolved_thinking, read_row=True):
-            self.handed_over = self.done = True
+            self.handed_over = self.done = self.turn.handed_over = True
         elif self.awaiting_owner:
             spawn_background(self.conn.push_row(self.session_key))
         elif not self.owui_message_id:
@@ -1562,7 +1605,7 @@ class _PipeTurn:
                                       if m.get("type") == "event"]}):
                 self.conn.unregister_consumer(self.session_key, self.our_run_id,
                                               queue=self.queue)
-                self.handed_over = self.done = True
+                self.handed_over = self.done = self.turn.handed_over = True
                 return
         for m in queued:
             self.queue.put_control(m)
@@ -1584,7 +1627,7 @@ class _PipeTurn:
         if _EXTERNAL_KILL_RE.search(err) or (aborted_run and self.conn._shutdown_seen):
             if not self.keeps_its_run and _hand_over_run(self.conn, self.session_key,
                     self.our_run_id, thinking=self.resolved_thinking, read_row=True):
-                self.handed_over = self.done = True
+                self.handed_over = self.done = self.turn.handed_over = True
                 return True
             if not self.owui_message_id:
                 self.await_owner()
@@ -2010,6 +2053,15 @@ class _PipeTurn:
                     "list.hasActiveRun=True (subagent-yield gap; queueing)"
                 )
             return active
+        if self.conn.reconnecting:
+            # Neither probe reached the Gateway, so its run state is unknown,
+            # and the registry below cannot stand in for it: a run the turn
+            # writer holds is not in it, so it would say idle, and a queued
+            # message would be sent into the dead socket and lost (ELI-199).
+            # Busy: the waiter is woken again by the reconnect and re-reads.
+            pipe_log("  active-check: the Gateway socket is reconnecting; "
+                     "waiting for it before deciding")
+            return True
         return self.conn.active_run_id_for_session(self.session_key) is not None
 
     def await_owner(self) -> None:

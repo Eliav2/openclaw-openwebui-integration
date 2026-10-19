@@ -33,6 +33,7 @@ install_stubs()
 import websockets  # noqa: E402  (after the stubs)
 
 import openclaw_pipe  # noqa: E402
+import openclaw_status_action  # noqa: E402
 from openclaw_pipe import (
     ACTION_RUN_PREFIX, TURN_NS, _run_id_sent_at, parse_pipe_run_id, pipe_run_id, turn_message_id,
     _claim_turn_message, _register_turn_writer, _retire_turn_writer,
@@ -1537,11 +1538,9 @@ class ParkedCancelTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(claimed["run_id"])
         self.assertEqual(calls, [])
 
-    def test_intent_query_reads_and_clears(self):
+    def test_intent_query_names_its_chat(self):
         from openclaw_pipe import _intent_query_js
-        js = _intent_query_js("chat-1")
-        self.assertIn('"chat-1"', js)
-        self.assertIn("delete all[c]", js)
+        self.assertIn('"chat-1"', _intent_query_js("chat-1"))
 
     def test_pipe_claims_before_model_patch(self):
         # The grace window is seconds; sessions.patch alone can take 10s+ with
@@ -2174,7 +2173,7 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
 
         async def event_call(event):
             code = (event.get("data") or {}).get("code", "")
-            if "delete all[c]" in code:   # the intent query
+            if "const i = all[c]" in code:   # the intent query
                 return await answer
             return True                  # the hook install at turn start
         body = {"model": "openclaw_gateway.default", "messages": [{"role": "user", "content": "count"}]}
@@ -2274,6 +2273,55 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.5)
         self.assertIn("abort", self.rpc)
         self.assertEqual(self.conn._consumers, {}, "the parked queue is released")
+
+    async def test_a_queued_message_waits_out_a_socket_reconnect(self):
+        """ELI-199 (live 2026-10-18 15:56:42): a message queued behind a run
+        the turn writer holds. The Gateway socket drops (1006); the drop
+        wakes the queue's waiter, `sessions.describe` and `sessions.list`
+        both fail "not ready", and this worker's registry, which never saw
+        the held run, said idle: the message was sent into the dead socket
+        and lost ("Error sending message: gateway connection not ready").
+        While the socket is reconnecting the run state is unknown, so the
+        message waits; the reconnect wakes it, and it is sent once the run
+        really settled."""
+        real_send = self.conn.send_request
+
+        async def send_request(method, params, timeout=10):
+            if self.conn._ws is None:   # as `send_request` does mid-reconnect
+                raise self.ocp.GatewayError("gateway connection not ready (reconnecting)")
+            return await real_send(method, params, timeout)
+        self.conn.send_request = send_request
+        loop_task = asyncio.ensure_future(asyncio.Event().wait())  # the event loop, reconnecting
+        self.addCleanup(loop_task.cancel)
+        self.conn._event_loop_task = loop_task
+
+        self.active = True
+        gen = self._reply("queued", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._spin()
+        self.assertTrue(any("Queued: waiting" in str(e) for e in self.emitted))
+
+        self.conn._ws = None                # 1006: the socket is gone
+        self.conn._wake_session_waiters()   # the drop wakes every waiter (`_mark_event_gap`)
+        await self._spin()
+        self.assertEqual(self.sent, [], "sent while the run's state was unknown")
+        self.assertFalse(first.done(), f"the reply ended: {first.result() if first.done() else ''!r}")
+
+        self.conn._ws = object()            # reconnected, same Gateway; the run still goes
+        self.conn._wake_session_waiters()   # the renewed subscriptions wake it (`_subscribe_all`)
+        await self._spin()
+        self.assertEqual(self.sent, [])
+
+        self._settled(False)
+        await self._until_registered("run-1")
+        self.assertEqual(self.sent, ["queued"])
+        self._queue("run-1").put_nowait(self._delta("run-1", "ANSWER"))
+        self._queue("run-1").put_nowait(self._final("run-1"))
+        out = await asyncio.wait_for(first, 5)
+        async for chunk in gen:
+            out += chunk if isinstance(chunk, str) else ""
+        self.assertIn("ANSWER", out)
+        self.assertNotIn("Error sending message", out)
 
     async def test_cancel_while_queued_carries_the_message(self):
         self.active = True  # a run this chat did not start, e.g. a scheduled turn
@@ -2384,9 +2432,200 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         await nxt
         await r3.aclose()
 
+    def _record_status_closes(self):
+        """The replies whose open status line was closed after they ended."""
+        closed = []
+
+        async def close(ref):
+            closed.append(ref.get("message_id"))
+        patch = mock.patch.object(self.ocp, "_close_reply_status", close, create=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return closed
+
+    def _owui_request(self, text, msg_id, *, question=False, between_chunks=None, after_stream=None):
+        """Run a reply the way Open WebUI does: in a request task registered
+        under the request's task id (`open_webui.tasks.tasks`), reading the
+        stream. `question`: the card is cancelled. `between_chunks`: an
+        awaitable factory Open WebUI's own code waits on after each chunk."""
+        self.emitted = getattr(self, "emitted", [])
+
+        async def emitter(event):
+            self.emitted.append(event)
+
+        async def event_call(event):
+            if event.get("type") == "request:user_input":
+                return {"status": "cancelled", "answers": {}}
+            return None
+        body = {"model": "openclaw_gateway.default", "messages": [{"role": "user", "content": text}]}
+        meta = {"chat_id": "chat-1", "user_id": "u1", "message_id": msg_id, "task_id": "task-1"}
+        out = []
+
+        # Open WebUI's response object holds the stream: a Stop that lands in
+        # its own code leaves the generator suspended, never closed.
+        self.streams = getattr(self, "streams", [])
+        stream = self.pipe._pipe_impl(body, emitter, __metadata__=meta,
+                                      __event_call__=event_call if question else None)
+        self.streams.append(stream)
+
+        async def request():
+            async for chunk in stream:
+                out.append(chunk)
+                if between_chunks is not None:
+                    await between_chunks()
+            if after_stream is not None:
+                await after_stream()   # Open WebUI's own work at the stream's end
+        tasks_mod = types.ModuleType("open_webui.tasks")
+        tasks_mod.tasks = {}
+        patch = mock.patch.dict(sys.modules, {"open_webui.tasks": tasks_mod})
+        patch.start()
+        self.addCleanup(patch.stop)
+        tasks_mod.tasks["task-1"] = task = asyncio.ensure_future(request())
+        return task, out
+
+    async def _stopped_as_it_ends(self, between_chunks=None):
+        closed = self._record_status_closes()
+        rows_asked = asyncio.Event()
+
+        async def usage_rows(*a, **k):
+            rows_asked.set()
+            await asyncio.Event().wait()   # the Gateway calls, under way when Stop lands
+        patch = mock.patch.object(self.ocp, "_build_usage_status_lines", usage_rows)
+        patch.start()
+        self.addCleanup(patch.stop)
+        reached = asyncio.Event()
+
+        async def owui_work():
+            if any("Which?" in c for c in out if isinstance(c, str)):
+                reached.set()
+                await asyncio.Event().wait()   # Open WebUI busy with the chunk when Stop lands
+        task, out = self._owui_request("ask me", "m1", question=True,
+                                       between_chunks=owui_work if between_chunks else None)
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "OpenClaw needs input:\n\nQ\nWhich?\n1. a\n2. b"))
+        q.put_nowait(self._final("run-1"))
+        await asyncio.wait_for((reached if between_chunks else rows_asked).wait(), 30)
+        self.assertIn("Which?", "".join(c for c in out if isinstance(c, str)))
+        task.cancel()                    # the Stop that sends the new message
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        await self._spin()
+        statuses = [e["data"] for e in self.emitted if e.get("type") == "status"]
+        self.assertFalse(statuses[-1]["done"], f"precondition: the reply's status is open: {statuses}")
+        self.assertEqual(closed, ["m1"])
+
+    async def test_a_reply_stopped_as_it_ends_closes_its_status(self):
+        """ELI-200 (QA, live 2026-10-18 16:37): a question card is open, and a
+        message is sent instead of pressing its Cancel. The card is cancelled,
+        the question ends the reply as text, and the reply goes on to its end:
+        its last status line waits for the usage rows (two Gateway calls).
+        Open WebUI's Stop for the new message cancels the reply right there,
+        so that line was never written: the reply was saved done with its
+        status still "Thinking..." (done: false), shimmering forever, also
+        after a reload. Its run was over, so nothing was parked either."""
+        await self._stopped_as_it_ends()
+
+    async def test_a_stop_landing_in_open_webuis_own_code_closes_it_too(self):
+        """The same Stop landing while the reply waits at a yield, in Open
+        WebUI's own handling of the last chunk: the reply's generator is
+        never resumed or closed, so nothing in it runs again."""
+        await self._stopped_as_it_ends(between_chunks=True)
+
+    async def test_a_cancelled_reply_has_its_saved_status_checked(self):
+        """The reply wrote its own last status, then Open WebUI's request was
+        cancelled by a Stop: its save of the cancelled message runs while the
+        status write may still be going, and the status write can be lost
+        there. A cancelled request always has its saved status checked."""
+        closed = self._record_status_closes()
+        at_end = asyncio.Event()
+
+        async def owui_end_work():
+            at_end.set()
+            await asyncio.Event().wait()
+        task, out = self._owui_request("hello", "m1", after_stream=owui_end_work)
+        await self._until_registered("run-1")
+        self._queue("run-1").put_nowait(self._delta("run-1", "hi"))
+        self._queue("run-1").put_nowait(self._final("run-1"))
+        await asyncio.wait_for(at_end.wait(), 30)
+        statuses = [e["data"] for e in self.emitted if e.get("type") == "status"]
+        self.assertTrue(statuses[-1]["done"], "precondition: the reply closed its own status")
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        await self._spin()
+        self.assertEqual(closed, ["m1"])
+
+    async def test_a_reply_that_ended_leaves_its_last_status_alone(self):
+        """Control: a reply that wrote its last status (usage lines, or an
+        empty done one) before its request ended keeps it."""
+        closed = self._record_status_closes()
+        task, out = self._owui_request("hello", "m1")
+        await self._until_registered("run-1")
+        self._queue("run-1").put_nowait(self._delta("run-1", "hi"))
+        self._queue("run-1").put_nowait(self._final("run-1"))
+        await asyncio.wait_for(task, 30)
+        await self._spin()
+        statuses = [e["data"] for e in self.emitted if e.get("type") == "status"]
+        self.assertTrue(statuses[-1]["done"])
+        self.assertEqual(closed, [])
+
 
 class CloseUnsentReplyTests(unittest.IsolatedAsyncioTestCase):
     """`_close_unsent_reply` (ELI-188): the interrupted reply's last write."""
+
+    async def _close_status(self, saved_history, release_first=True):
+        import openclaw_pipe as ocp
+        events, order = [], []
+
+        class Chats:
+            @staticmethod
+            async def get_message_by_id_and_message_id(chat_id, message_id):
+                order.append("read")
+                return {"role": "assistant", "done": True, "statusHistory": copy.deepcopy(saved_history)}
+
+        async def get_event_emitter(meta, update_db=True):
+            async def emit(event):
+                order.append(event["type"])
+                events.append((meta["message_id"], update_db, copy.deepcopy(event)))
+            return emit
+        release = asyncio.Event()
+
+        async def request():
+            await release.wait()
+            order.append("request-ended")
+        req = asyncio.ensure_future(request())
+        tasks_mod = types.ModuleType("open_webui.tasks")
+        tasks_mod.tasks = {"task-1": req}
+        chats_mod = types.ModuleType("open_webui.models.chats")
+        chats_mod.Chats = Chats
+        modules = {**owui_modules(get_event_emitter=get_event_emitter), "open_webui.tasks": tasks_mod,
+                   "open_webui.models": types.ModuleType("open_webui.models"),
+                   "open_webui.models.chats": chats_mod}
+        with mock.patch.dict(sys.modules, modules):
+            close = asyncio.ensure_future(ocp._close_reply_status(
+                {"chat_id": "chat-1", "user_id": "u1", "message_id": "m1", "request_task_id": "task-1"}))
+            for _ in range(20):
+                await asyncio.sleep(0)
+            self.assertEqual(order, [], "Open WebUI's own save at the request's end comes first")
+            release.set()
+            await asyncio.wait_for(close, 5)
+        return order, events
+
+    async def test_a_saved_open_status_is_closed_after_the_request(self):
+        """`_close_reply_status` (ELI-200): after the request's end, the saved
+        message still ends on an open status: a done one is added, saved
+        (update_db) so a reload shows the line ended too."""
+        order, events = await self._close_status([{"description": "Thinking...", "done": False}])
+        self.assertEqual(order, ["request-ended", "read", "status"])
+        self.assertEqual(events, [("m1", True, {"type": "status",
+                                                "data": {"description": "", "done": True}})])
+
+    async def test_a_saved_closed_status_is_left_as_it_is(self):
+        """The reply's own last status reached the saved message: nothing to add."""
+        order, events = await self._close_status([{"description": "Thinking...", "done": False},
+                                                  {"description": "🧠 10/200k", "done": True}])
+        self.assertEqual(events, [])
 
     async def test_it_waits_for_the_request_then_ends_the_message_with_the_note(self):
         import openclaw_pipe as ocp
@@ -4154,6 +4393,32 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(f["confirm"])
         self.assertEqual(f["options"], ["rebase", "merge"])
 
+    def test_a_choice_or_yes_no_question_that_mentions_a_secret_keeps_its_answers(self):
+        """ELI-196: a question with options or a yes/no answer that merely
+        mentions a password, secret or token got the masked dialog, without
+        its options or Yes/No, and what was typed reached the agent as a
+        plain answer it echoed into the chat."""
+        f = _parse_text_prompt("OpenClaw needs input:\n\nRouter entry\nOK to add the router-debug "
+                               "entry so W6 can use the password?\n1. Yes\n2. No")
+        self.assertEqual((f["secret"], f["options"]), (False, ["Yes", "No"]))
+        f = _parse_text_prompt("OpenClaw needs input:\n\nTokens\nRotate the API token now? (y/n)")
+        self.assertEqual((f["secret"], f["confirm"]), (False, True))
+        # A question that asks for the value itself still gets the dialog.
+        f = _parse_text_prompt("OpenClaw needs input:\n\nTest token\nPaste the test API token (password)")
+        self.assertEqual((f["secret"], f["confirm"], f["options"]), (True, False, []))
+
+    def test_a_secret_ask_keeps_the_masked_field_whatever_else_it_has(self):
+        """W3 on #137: asking for the value wins over steps written as a
+        numbered list, a confirm verb, or options under Codex's "may show
+        your reply" warning; a key typed into the card's Other field would
+        land in the chat."""
+        f = _parse_text_prompt("OpenClaw needs input:\n\nToken\nPaste your API key:\n1. Open Settings\n2. Copy the key")
+        self.assertEqual((f["secret"], f["options"]), (True, []))
+        f = _parse_text_prompt("OpenClaw needs input:\n\nPassword\nPlease confirm your password?")
+        self.assertEqual((f["secret"], f["confirm"]), (True, False))
+        f = _parse_text_prompt("Codex needs input:\n\nToken\nThis channel may show your reply to other participants.\n1. a\n2. b")
+        self.assertEqual((f["secret"], f["options"]), (True, []))
+
     def test_secret_marker_does_not_match_innocent_key_substring(self):
         # "monkey" contains "key" -- must not be flagged as a secret.
         f = _parse_text_prompt("OpenClaw needs input:\n\nName the monkey\nWhat should we call the monkey?")
@@ -4704,6 +4969,96 @@ class AskUserSecretDialogTests(unittest.IsolatedAsyncioTestCase):
             "OpenClaw needs input:\n\nColor?\nPick\n1. Red\n2. Blue", "Blue"))
 
 
+class DialogHoldsExecutesTests(unittest.IsolatedAsyncioTestCase):
+    """Open WebUI 0.12's tab keeps one callback for its input dialog and the
+    `execute` event, and each overwrites it on arrival: an `execute` reaching
+    a tab while its dialog is open took the dialog's answer (ELI-195). While
+    the Pipe waits on a dialog, no `execute` goes to that socket: an emitted
+    one waits for the answer, a query is not sent."""
+
+    class Sio:
+        def __init__(self):
+            self.calls, self.emits = [], []
+            self.answer = asyncio.get_running_loop().create_future()
+
+        async def call(self, event, data, to=None, timeout=None):
+            self.calls.append((data, to))
+            if data["data"]["type"] == "input":
+                return await self.answer
+            return "stop"
+
+        async def emit(self, event, data, **kw):
+            self.emits.append((data, kw))
+
+    INPUT = {"type": "input", "data": {"title": "Token", "type": "password"}}
+
+    async def asyncSetUp(self):
+        self.sio = self.Sio()
+        self.pool = {"sidA": {"id": "user-1", "chat_ids": ["chat-1"]},
+                     "sidB": {"id": "user-1", "chat_ids": ["chat-1"]}}
+        fake_owui(self, sio=self.sio, SESSION_POOL=self.pool)
+
+    async def _dialog_on(self, sid):
+        """The input dialog, open on `sid` until `self.sio.answer` is set."""
+        others = {k: v for k, v in self.pool.items() if k != sid}
+        for k in others:
+            self.pool[k] = {**self.pool[k], "chat_ids": []}
+        dialog = asyncio.ensure_future(openclaw_pipe._call_on_chat_tab(
+            "user-1", "chat-1", "msg-1", self.INPUT, 60))
+        while not self.sio.calls:
+            await asyncio.sleep(0)
+        self.pool.update(others)
+        return dialog
+
+    async def test_an_execute_emitted_meanwhile_reaches_that_tab_after_the_answer(self):
+        dialog = await self._dialog_on("sidA")
+        emitter = RecordingEmitter()
+        # The Action artifact holds for the Pipe's dialog: the record is shared.
+        emit = openclaw_status_action._dialog_safe_emitter(emitter, "user-1", "chat-1", "msg-1")
+        await emit({"type": "execute", "data": {"code": "1"}})
+        await emit({"type": "status", "data": {"description": "x"}})
+        self.assertEqual([e["type"] for e in emitter.events], ["status"])
+        payload = {"chat_id": "chat-1", "message_id": "msg-1",
+                   "data": {"type": "execute", "data": {"code": "1"}}}
+        self.assertEqual(self.sio.emits, [(payload, {"room": "user:user-1", "skip_sid": ["sidA"]})])
+        self.sio.answer.set_result({"value": "v"})
+        await dialog
+        self.assertEqual(self.sio.emits[1:], [(payload, {"to": "sidA"})])
+        await emit({"type": "execute", "data": {"code": "2"}})
+        self.assertEqual(emitter.events[-1]["data"]["code"], "2", "no dialog: the emitter as is")
+
+    async def test_a_query_is_not_sent_to_a_tab_showing_the_dialog(self):
+        dialog = await self._dialog_on("sidA")
+        self.assertEqual(await openclaw_pipe._page_cancel_intent("user-1", "chat-1", "msg-1"), "stop")
+        queried = [to for data, to in self.sio.calls if data["data"]["type"] == "execute"]
+        self.assertEqual(queried, ["sidB"])
+        asked = []
+
+        async def event_call(payload):
+            asked.append(payload["type"])
+            return "stop"
+        call = openclaw_pipe._dialog_safe_event_call(event_call, "sidA", "user-1")
+        self.assertIsNone(await call({"type": "execute", "data": {"code": "q"}}))
+        self.assertEqual(asked, [])
+        self.sio.answer.set_result({"value": "v"})
+        await dialog
+        self.assertEqual(await call({"type": "execute", "data": {"code": "q"}}), "stop")
+
+    async def test_the_turns_own_dialog_holds_its_socket(self):
+        answered = asyncio.get_running_loop().create_future()
+
+        async def event_call(payload):
+            return await answered
+        call = openclaw_pipe._dialog_safe_event_call(event_call, "sidA", "user-1")
+        dialog = asyncio.ensure_future(call(self.INPUT))
+        await asyncio.sleep(0)
+        self.assertTrue(openclaw_pipe._dialog_open_on("sidA"))
+        self.assertFalse(openclaw_pipe._dialog_open_on("sidB"))
+        answered.set_result("v")
+        self.assertEqual(await dialog, "v")
+        self.assertFalse(openclaw_pipe._dialog_open_on("sidA"))
+
+
 class SecretAnswerNeverInTheChatTests(unittest.IsolatedAsyncioTestCase):
     """ELI-148: a secret typed into the masked dialog goes to the agent and
     nowhere else the pipe writes: not the reply's text or items, not the
@@ -4771,7 +5126,7 @@ class SecretAnswerNeverInTheChatTests(unittest.IsolatedAsyncioTestCase):
 
 class SecretNotReceivedTests(unittest.IsolatedAsyncioTestCase):
     """ELI-148: a secret whose dialog got no answer (no tab on the chat, a
-    timeout, a cancel) must not end the reply asking for it in the chat,
+    timeout; a cancel is SecretDialogCancelledTests) must not end the reply asking for it in the chat,
     which stores what is typed there. The reply says it was not received and
     how to enter it; the agent is told once that nothing came."""
 
@@ -4844,6 +5199,69 @@ class SecretNotReceivedTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(shown.count("not received"), 2)
         self.assertIn("Still need it.", shown)
         self.assert_never_invites_a_chat_answer(shown.replace("I need a key.", "").replace("Still need it.", ""))
+
+
+class SecretDialogCancelledTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-189: Cancel on the masked dialog resolves the event call with
+    False (Open WebUI 0.12.3 EventConfirmDialog `cancel`). The agent got the
+    answer "no" and the card said "•••• (secret entered)". The agent must
+    learn the user cancelled, and the card must say so."""
+
+    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
+    asyncTearDown = NoDroppedMessagesTests.asyncTearDown
+    _queue = NoDroppedMessagesTests._queue
+    _delta = NoDroppedMessagesTests._delta
+    _final = NoDroppedMessagesTests._final
+    _until_registered = NoDroppedMessagesTests._until_registered
+    PROMPT = "OpenClaw needs input:\n\nToken\nPaste your API key (password)"
+
+    async def test_cancel_reaches_the_agent_as_a_cancel_and_the_card_says_cancelled(self):
+        async def emitter(event):
+            pass
+
+        async def event_call(event):
+            return False if event.get("type") == "input" else None    # the user clicks Cancel
+        body = {"model": "openclaw_gateway.default", "messages": [{"role": "user", "content": "deploy"}]}
+        meta = {"chat_id": "chat-1", "user_id": "u1", "message_id": "m1"}
+        gen = self.pipe._pipe_impl(body, emitter, __metadata__=meta, __event_call__=event_call)
+        chunks = []
+
+        async def drain():
+            async for c in gen:
+                chunks.append(c)
+        task = asyncio.ensure_future(drain())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "I need a key.\n\n" + self.PROMPT + "\n"))
+        q.put_nowait(self._final("run-1"))
+        for _ in range(400):
+            if len(self.sent) == 2:
+                break
+            await asyncio.sleep(0.005)
+        self.assertEqual(len(self.sent), 2, f"the agent hears back: {self.sent}")
+        told = self.sent[1]
+        self.assertNotEqual(told.strip().lower(), "no", "a cancel is not the answer 'no'")
+        self.assertIn("cancel", told.lower())
+        answer_run = next(r for r in ("run-2", self.keys[-1]) if f"{self.SK}:{r}" in self.conn._consumers)
+        q2 = self._queue(answer_run)
+        q2.put_nowait(self._delta(answer_run, "Understood, no key."))
+        q2.put_nowait(self._final(answer_run))
+        await asyncio.wait_for(task, 5)   # bounds the test only
+        shown = "".join(c for c in chunks if isinstance(c, str))
+        self.assertNotIn("secret entered", shown)
+        self.assertIn('result="Cancelled', shown)
+        self.assertIn("Understood, no key.", shown)
+
+    async def test_a_cancelled_card_rebuilt_from_the_transcript_says_cancelled(self):
+        """After an Open WebUI restart the card is rebuilt from what the agent
+        was sent, which the transcript prefixes with a time."""
+        async def event_call(event):
+            return False
+        told = await _ask_user_input_modal(event_call, self.PROMPT, owui_user_id=None, owui_chat_id="chat-1",
+                                           owui_message_id="m1", poll_interval_s=0.01)
+        block = _ask_user_detail_block(self.PROMPT, f"[Sat 10:00] {told}")
+        self.assertIn('result="Cancelled', block)
+        self.assertNotIn("secret entered", block)
 
 
 class DynamicModelSelectorTests(unittest.TestCase):
@@ -7955,6 +8373,50 @@ class AgentTurnRoutingTests(_RoutingCase):
     """ELI-100 DESIGN 2.1-2.5 wired: a run on an OWUI key that no live request
     consumes is written by a turn writer, as one ordinary message."""
 
+    async def test_a_run_with_no_settle_push_ends_on_its_own_final(self):
+        """ELI-215, OpenClaw 2026.10.5 probe: a run the Gateway starts itself
+        (a background command's end notice, heartbeat runner) gets no
+        `agent.input.settled` push: its last row is the lifecycle `phase: end`
+        one, still `hasActiveRun: true`, and the row goes idle later with no
+        push at all. Its own final ends the message."""
+        self.history = {"messages": [
+            {"role": "user", "content": "System: exec completed :: e2e-bg-done"},
+            {"role": "assistant", "idempotencyKey": f"cli-assistant:{self.RUN}",
+             "__openclaw": {"runId": self.RUN}, "content": [{"type": "text", "text": "E2E_BG_NOTICED"}]}]}
+        self.conn._on_sessions_changed({"sessionKey": self.key, "phase": "start", "runId": self.RUN,
+                                        "hasActiveRun": True, "status": "running"})
+        _turn_route_now(self.conn, self.ev(self.RUN, _delta("E2E_BG_NOTICED")))
+        _turn_route_now(self.conn, self.ev(self.RUN, {"stream": "lifecycle", "data": {"phase": "end"}}))
+        _turn_route_now(self.conn, self.ev(self.RUN, {"state": "final"}))
+        self.conn._on_sessions_changed({"sessionKey": self.key, "phase": "end", "runId": self.RUN,
+                                        "hasActiveRun": True, "status": "running", "lastRunId": self.RUN})
+        await self.spin()
+        (_mid, m), = self.new_messages().items()
+        self.assertEqual((m["content"], m["done"]), ("E2E_BG_NOTICED", True))
+        # A settle that does come later (9.3, or a chat.send run) finds it done.
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "done", "lastRunId": self.RUN})
+        await self.spin()
+        (_mid, again), = self.new_messages().items()
+        self.assertEqual((again["content"], again["done"]), ("E2E_BG_NOTICED", True))
+
+    async def test_a_run_that_ends_in_error_still_waits_for_its_row(self):
+        """Only a clean final ends the message on its own: an error's row
+        carries the note and may name a resume or a recovery (DESIGN 2.7)."""
+        self.conn._on_sessions_changed({"sessionKey": self.key, "phase": "start", "runId": self.RUN,
+                                        "hasActiveRun": True, "status": "running"})
+        _turn_route_now(self.conn, self.ev(self.RUN, _delta("partial")))
+        _turn_route_now(self.conn, self.ev(self.RUN, {"state": "error", "errorMessage": "boom"}))
+        await self.spin()
+        (_mid, m), = self.new_messages().items()
+        self.assertIs(m["done"], False)
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False, "status": "failed",
+                                        "lastRunId": self.RUN, "lastRunError": "boom"})
+        await self.spin()
+        (_mid, m), = self.new_messages().items()
+        self.assertIs(m["done"], True)
+        self.assertIn("boom", m["content"])
+
     async def test_an_agent_turn_renders_as_one_ordinary_message(self):
         handled = await self.run_turn(self.RUN)
         self.assertTrue(all(handled))
@@ -9570,6 +10032,236 @@ class SilentAnnounceTests(_RoutingCase):
         await self.announce_run("NO_REPLY")
         self.assertEqual(self.new_messages(), {})
 
+    # ELI-217: on 2026.10.5 a NO_REPLY to a completion is an empty response.
+    # The run fails ("Agent couldn't generate a response"), the Gateway retries
+    # the delivery on a backoff, and the session's last push for the run is
+    # `phase: error` with hasActiveRun still true: no settle is pushed, though
+    # sessions.list already reads the row failed (s105 probe, 2026-10-19).
+
+    ERROR_TEXT = "⚠️ Agent couldn't generate a response. Please try again."
+
+    def failed_row(self, active=False):
+        return {"key": self.key, "hasActiveRun": active,
+                "status": "running" if active else "failed", "lastRunId": self.announce,
+                "lastRunError": None if active else self.ERROR_TEXT}
+
+    def list_rows(self, *rows):
+        """sessions.list answers with these rows in turn, the last one again."""
+        rows, parent = list(rows), self.conn.send_request
+
+        async def send_request(method, params, timeout=10):
+            if method == "sessions.list":
+                self.sent.append((method, copy.deepcopy(params)))
+                return {"sessions": [rows.pop(0) if len(rows) > 1 else rows[0]]}
+            return await parent(method, params, timeout)
+        self.conn.send_request = send_request
+
+    async def failed_announce_run(self):
+        """The 10.5 run: no text, its lifecycle error, its chat error, and only
+        the `phase: error` push (hasActiveRun true)."""
+        h = self.parent_history("x")
+        self.history = {"messages": h["messages"][:-1]}  # a failed run has no closing message
+        self.conn._on_sessions_changed({"sessionKey": self.key, "phase": "start",
+                                        "runId": self.announce, "hasActiveRun": True,
+                                        "status": "running"})
+        _turn_route_now(self.conn, self.ev(self.announce, {"stream": "lifecycle",
+                                                           "data": {"phase": "start"}}))
+        _turn_route_now(self.conn, self.ev(self.announce, {"stream": "lifecycle", "data": {
+            "phase": "error", "error": self.ERROR_TEXT}}))
+        self.conn._on_sessions_changed({"sessionKey": self.key, "phase": "error",
+                                        "runId": self.announce, "hasActiveRun": True,
+                                        "status": "running", "lastRunId": self.announce})
+        _turn_route_now(self.conn, self.ev(self.announce, {"state": "error",
+                                                           "errorMessage": self.ERROR_TEXT}))
+        await self.spin()
+
+    def cards(self):
+        return [(mid, m) for mid, m in self.new_messages().items()
+                if any(i["type"] == "function_call" for i in m.get("output") or [])]
+
+    async def test_a_silent_announce_that_fails_on_2026_10_shows_its_card(self):
+        self.list_rows(self.failed_row(active=True), self.failed_row())
+        await self.failed_announce_run()
+        ((_mid, m),) = self.cards()
+        self.assertIs(m["done"], True)
+        self.assertIn("R10 probe sub-agent", json.dumps(m["output"]))
+        self.assertIn("SUB-DONE-R10", json.dumps(m["output"]))
+        self.assertEqual(self.conn._turn_pumps, {}, "the run's pump ended")
+
+    async def test_the_card_of_a_native_runs_spawn_is_named_by_its_label(self):
+        """A parent on the Gateway's own runtime records the spawn as a
+        `toolCall` block and a `toolResult` message (ELI-217: the card was
+        named after the child's session key)."""
+        h = self.parent_history("NO_REPLY")
+        result = json.dumps({"status": "accepted", "childSessionKey": self.CHILD,
+                             "runId": self.CHILD_RUN})
+        h["messages"][1] = {"role": "assistant", "content": [
+            {"type": "toolCall", "id": "call_s", "name": "sessions_spawn",
+             "arguments": self.SPAWN_ARGS}]}
+        h["messages"].insert(2, {"role": "toolResult", "toolCallId": "call_s",
+                                 "toolName": "sessions_spawn",
+                                 "content": [{"type": "text", "text": result}]})
+        self.history = h
+        _turn_route_now(self.conn, self.ev(self.announce, _delta("NO_REPLY")))
+        _turn_route_now(self.conn, self.ev(self.announce, {"state": "final"}))
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "done", "lastRunId": self.announce})
+        await self.spin()
+        (m,) = self.new_messages().values()
+        (call,) = [i for i in m["output"] if i["type"] == "function_call"]
+        self.assertIn("R10 probe sub-agent", call["arguments"])
+
+    async def test_the_card_of_a_spawn_made_through_a_deferred_tool_wrapper_is_named(self):
+        """On 2026.10 a native run calls `sessions_spawn` through `tool_call`
+        ({id, args}) when the tool is deferred; the card was named "Sub-agent"."""
+        h = self.parent_history("NO_REPLY")
+        result = json.dumps({"status": "accepted", "childSessionKey": self.CHILD,
+                             "runId": self.CHILD_RUN})
+        h["messages"][1] = {"role": "assistant", "content": [
+            {"type": "toolCall", "id": "call_w", "name": "tool_call",
+             "arguments": {"id": "sessions_spawn", "args": self.SPAWN_ARGS}}]}
+        h["messages"].insert(2, {"role": "toolResult", "toolCallId": "call_w", "toolName": "tool_call",
+                                 "content": [{"type": "text", "text": json.dumps(
+                                     {"tool": {"id": "sessions_spawn"}, "result": result})}]})
+        self.history = h
+        _turn_route_now(self.conn, self.ev(self.announce, _delta("NO_REPLY")))
+        _turn_route_now(self.conn, self.ev(self.announce, {"state": "final"}))
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "done", "lastRunId": self.announce})
+        await self.spin()
+        (m,) = self.new_messages().values()
+        (call,) = [i for i in m["output"] if i["type"] == "function_call"]
+        self.assertIn("R10 probe sub-agent", call["arguments"])
+
+    async def test_a_failed_announce_waits_while_its_row_is_still_active(self):
+        """No guess: a row still active at the error waits for the next push."""
+        self.list_rows(self.failed_row(active=True))
+        await self.failed_announce_run()
+        self.assertEqual(self.cards(), [])
+        self.assertTrue(self.conn._turn_pumps, "the pump waits for the settle")
+        self.conn._on_sessions_changed({"sessionKey": self.key, **self.failed_row()})
+        await self.spin()
+        self.assertEqual(len(self.cards()), 1)
+        self.assertEqual(self.conn._turn_pumps, {})
+
+    async def test_a_later_retry_reply_lands_once_beside_the_one_card(self):
+        """The Gateway retries the delivery under the same run id: a retry the
+        parent answers again with silence adds no second card, and the one it
+        answers aloud lands once, in a message of its own."""
+        self.list_rows(self.failed_row(active=True), self.failed_row())
+        await self.failed_announce_run()
+        self.list_rows(self.failed_row(active=True), self.failed_row())
+        await self.failed_announce_run()
+        self.assertEqual(len(self.cards()), 1)
+        self.list_rows({"key": self.key, "hasActiveRun": False, "status": "done",
+                        "lastRunId": self.announce})
+        await self.announce_run("The sub-agent returned SUB-DONE-R10.")
+        self.assertEqual(len(self.cards()), 1)
+        replies = [m for m in self.new_messages().values()
+                   if m.get("content") == "The sub-agent returned SUB-DONE-R10."]
+        self.assertEqual(len(replies), 1)
+        self.assertEqual(len(self.new_messages()), 2)
+
+    async def unsettled_announce_run(self, reply):
+        """An attempt answered aloud whose last push is `phase: end` with
+        hasActiveRun still true (2026.10.5, ELI-215): it ends on its final."""
+        self.history = self.parent_history(reply)
+        _turn_route_now(self.conn, self.ev(self.announce, _delta(reply)))
+        _turn_route_now(self.conn, self.ev(self.announce, {"state": "final"}))
+        self.conn._on_sessions_changed({"sessionKey": self.key, "phase": "end",
+                                        "runId": self.announce, "hasActiveRun": True,
+                                        "status": "running", "lastRunId": self.announce})
+        await self.spin()
+
+    async def test_a_retry_answered_aloud_with_no_settle_push_lands_once(self):
+        """ELI-215 with ELI-217: the retry that answers aloud gets no settle
+        either, so its own final ends its message, once, beside the one card."""
+        self.list_rows(self.failed_row(active=True), self.failed_row())
+        await self.failed_announce_run()
+        self.list_rows(self.failed_row(active=True), self.failed_row())
+        await self.failed_announce_run()
+        await self.unsettled_announce_run("The sub-agent returned SUB-DONE-R10.")
+        self.assertEqual(len(self.cards()), 1)
+        replies = [m for m in self.new_messages().values()
+                   if m.get("content") == "The sub-agent returned SUB-DONE-R10."]
+        self.assertEqual([m["done"] for m in replies], [True])
+        self.assertEqual(len(self.new_messages()), 2)
+        self.assertEqual(self.conn._turn_pumps, {})
+
+    async def test_a_retry_after_a_clean_final_does_not_reopen_its_message(self):
+        """A second attempt under the run id of one that already ended on its
+        final keeps the one message: done, with the first attempt's text, as
+        the settle path does on main (the message id is the run's). 10.5 never
+        retries a delivery that sent a visible reply (`hasAnnounceSendEvidence`,
+        subagent-announce-delivery-retry-BwPVtckd.mjs), so this guards a
+        Gateway change, not a path seen live."""
+        await self.unsettled_announce_run("First answer.")
+        await self.unsettled_announce_run("Second answer.")
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "done", "lastRunId": self.announce})
+        await self.spin()
+        self.assertEqual([(m["content"], m["done"]) for m in self.new_messages().values()],
+                         [("First answer.", True)])
+        self.assertEqual(self.conn._turn_pumps, {})
+
+
+class ErroredAgentRunTests(_RoutingCase):
+    """ELI-217: a run the agent started that errors on 2026.10.5 gets no
+    settle push (its last push is `phase: error`, hasActiveRun true), so its
+    message stayed open and its pump waited forever. Its error event reads
+    the row once; an idle row ends the message, an active one waits."""
+
+    ERROR_TEXT = "⚠️ Agent couldn't generate a response. Please try again."
+
+    def rows(self, *rows):
+        rows, parent = list(rows), self.conn.send_request
+
+        async def send_request(method, params, timeout=10):
+            if method == "sessions.list":
+                self.sent.append((method, copy.deepcopy(params)))
+                return {"sessions": [rows.pop(0) if len(rows) > 1 else rows[0]]}
+            return await parent(method, params, timeout)
+        self.conn.send_request = send_request
+
+    def row(self, active):
+        return {"key": self.key, "hasActiveRun": active, "status": "running" if active else "failed",
+                "lastRunId": self.RUN, "lastRunError": None if active else self.ERROR_TEXT}
+
+    async def errored_run(self):
+        self.history = {"messages": [
+            {"role": "user", "content": "x", "idempotencyKey": f"{self.RUN}:user"}]}
+        self.conn._on_sessions_changed({"sessionKey": self.key, "phase": "start", "runId": self.RUN,
+                                        "hasActiveRun": True, "status": "running"})
+        _turn_route_now(self.conn, self.ev(self.RUN, _delta("Working on it.")))
+        _turn_route_now(self.conn, self.ev(self.RUN, {"stream": "lifecycle", "data": {
+            "phase": "error", "error": self.ERROR_TEXT}}))
+        self.conn._on_sessions_changed({"sessionKey": self.key, "phase": "error", "runId": self.RUN,
+                                        "hasActiveRun": True, "status": "running",
+                                        "lastRunId": self.RUN})
+        _turn_route_now(self.conn, self.ev(self.RUN, {"state": "error",
+                                                      "errorMessage": self.ERROR_TEXT}))
+        await self.spin()
+
+    async def test_an_errored_agent_run_with_no_settle_push_ends_its_message(self):
+        self.rows(self.row(True), self.row(False))
+        await self.errored_run()
+        (m,) = self.new_messages().values()
+        self.assertIs(m["done"], True)
+        self.assertIn("Working on it.", m["content"])
+        self.assertIn(self.ERROR_TEXT, m["content"])
+        self.assertEqual(self.conn._turn_pumps, {})
+
+    async def test_an_errored_agent_run_whose_row_is_active_waits_for_its_settle(self):
+        self.rows(self.row(True))
+        await self.errored_run()
+        (m,) = self.new_messages().values()
+        self.assertIs(m["done"], False)
+        self.conn._on_sessions_changed({"sessionKey": self.key, **self.row(False)})
+        await self.spin()
+        (m,) = self.new_messages().values()
+        self.assertIs(m["done"], True)
+        self.assertEqual(self.conn._turn_pumps, {})
+
 
 class IntentHookStopIconTests(unittest.TestCase):
     """Review 2af1 R15: the page hook told Stop from Send now by the English
@@ -9628,6 +10320,64 @@ class IntentHookStopIconTests(unittest.TestCase):
 
     def test_no_english_only_running_check_is_left(self):
         self.assertNotIn('querySelector(\'button[aria-label="Stop"]', openclaw_pipe._INTENT_HOOK_JS)
+
+
+class IntentOfOneStopTests(unittest.TestCase):
+    """ELI-198: Open WebUI's Stop cancels every task of the chat at once: a
+    reply waiting behind a run (after Send now, or queued) and the turn
+    writer holding that run. Each asks the page which button it was. The
+    query read and cleared the chat's record, so the first to ask got "stop"
+    and the writer got "none": its run went on. Runs the intent hook and its
+    query under node with a stub page."""
+
+    def run_page(self, steps: list) -> list:
+        """Plays `steps` on a page with the hook: ["stop"] clicks the
+        composer's Stop (a reply runs), ["submit", running] submits the
+        composer, ["query"] runs the intent query. The queries' answers."""
+        import shutil
+        import subprocess
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("no node")
+        script = textwrap.dedent("""
+            const [hook, query, steps] = JSON.parse(process.argv[1]);
+            const listeners = {};
+            let running = true;
+            const stop = { id: 'stop-response-button', getAttribute: () => null,
+                           querySelectorAll: () => [], closest() { return this; } };
+            const input = { closest: (sel) => (sel === '#chat-input' ? input : null) };
+            const form = { contains: (el) => el === input, querySelector: () => input,
+                           closest: () => null };
+            global.window = {};
+            global.location = { pathname: '/c/chat-1' };
+            global.document = {
+              addEventListener: (k, f) => { listeners[k] = f; },
+              querySelectorAll: (sel) => (sel === 'button' && running ? [stop] : []),
+              querySelector: (sel) => (sel === '#chat-input' ? input : null),
+            };
+            new Function(hook)();
+            const answers = [];
+            for (const s of steps) {
+              if (s[0] === 'stop') listeners.click({ target: stop });
+              else if (s[0] === 'submit') { running = s[1]; if (listeners.submit) listeners.submit({ target: form }); }
+              else answers.push(new Function(query)());
+            }
+            console.log(JSON.stringify(answers));
+        """)
+        args = [openclaw_pipe._INTENT_HOOK_JS, openclaw_pipe._intent_query_js("chat-1"), steps]
+        out = subprocess.run([node, "-e", script, json.dumps(args)], capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout)
+
+    def test_one_stop_answers_every_task_it_cancelled(self):
+        self.assertEqual(self.run_page([["stop"], ["query"], ["query"]]), ["stop", "stop"])
+
+    def test_a_new_message_ends_the_stop(self):
+        """A cancel after the next message is not that Stop's."""
+        self.assertEqual(self.run_page([["stop"], ["query"], ["submit", False], ["query"]]), ["stop", "none"])
+
+    def test_a_message_queued_while_a_reply_runs_keeps_it(self):
+        self.assertEqual(self.run_page([["stop"], ["submit", True], ["query"]]), ["stop"])
 
 
 class AutoSendHookTests(unittest.TestCase):
@@ -10441,6 +11191,57 @@ class BackgroundAgentLineTests(unittest.IsolatedAsyncioTestCase):
         waiting = [s for s in self.statuses if s.startswith("Waiting on")]
         self.assertEqual(waiting, ["Waiting on 1 background agent", "Waiting on 2 background agents"])
         self.assertNotIn("Bash done", self.statuses)
+
+    async def test_the_status_action_lists_the_agent_while_the_reply_runs(self):
+        """ELI-186: Open WebUI saves a reply's tool cards only when it ends,
+        so mid-reply its row (and the chat) hold none. The Status Action
+        lists them from the Pipe streaming the reply, in the same process,
+        until the reply ends; then from what Open WebUI saved."""
+        import openclaw_status_action as action
+        launched = "Async agent launched successfully. agentId: a1 (internal metadata)"
+        # The chat as Open WebUI holds it mid-reply: the reply, done:false,
+        # with no output yet.
+        held = {"history": {"currentId": "m1", "messages": {"m1": {
+            "id": "m1", "parentId": None, "role": "assistant", "done": False, "content": "", "timestamp": 5}}}}
+        chats = types.ModuleType("open_webui.models.chats")
+        chats.Chats = types.SimpleNamespace(
+            get_chat_by_id=lambda chat_id: types.SimpleNamespace(user_id=self.USER, chat=held))
+        # The Pipe and the Action are two modules; they meet on Open WebUI's.
+        stub = mock.patch.dict(sys.modules, {"open_webui": types.ModuleType("open_webui"),
+                                             "open_webui.socket": types.ModuleType("open_webui.socket"),
+                                             "open_webui.socket.main": types.ModuleType("open_webui.socket.main"),
+                                             "open_webui.models": types.ModuleType("open_webui.models"),
+                                             "open_webui.models.chats": chats})
+        stub.start()
+        self.addCleanup(stub.stop)
+
+        async def listed():
+            chat = await action._load_owui_recent(self.CHAT, self.USER)
+            return [(r["title"], r["state"]) for r in action._agent_call_rows(chat)]
+
+        gen = self._reply("hello", "m1")
+
+        async def drain():
+            async for _chunk in gen:
+                pass
+        reply = asyncio.ensure_future(drain())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        start = self._tool("start", "Agent", "t1")
+        start["payload"]["data"]["args"] = {"description": "Vendor research", "run_in_background": True}
+        for event in (self._delta("run-1", "Starting it."), start, self._tool("result", "Agent", "t1", launched)):
+            q.put_nowait(event)
+
+        async def until_waiting():
+            while "Waiting on 1 background agent" not in self.statuses:
+                await asyncio.sleep(0)
+        # Bounds the test only.
+        await asyncio.wait_for(until_waiting(), 5)
+        self.assertFalse(reply.done())
+        self.assertEqual(await listed(), [("Vendor research", "launched")])
+        q.put_nowait(self._final("run-1"))
+        await asyncio.wait_for(reply, 5)
+        self.assertEqual(await listed(), [], "an ended reply is listed from what Open WebUI saved")
 
     def test_what_counts_as_a_background_agent(self):
         launch = self.ocp._is_background_agent_launch
@@ -11716,6 +12517,94 @@ class SessionIdRunTests(_RoutingCase):
         await self.dispatch(run, {"state": "final"})
         await HandoverRewriteTests.settle(self, run)
 
+    def cron_task_gateway(self, abortable=False, run_abortable=False):
+        """The Gateway's answers for stopping a wake: chat.abort finds no run
+        to abort on 2026.9 (a cron run is not a chat run, live 2026-10-18,
+        ELI-192), the wake's job is a running cron task, and tasks.cancel
+        aborts that run. `run_abortable`: 2026.10.5, where sessions.abort
+        by the run's id aborts it and there is no tasks.list."""
+        inner, test = self.conn.send_request, self
+        self.cron_tasks = [{"taskId": "task-wake", "kind": "automation_run", "runtime": "cron",
+                            "status": "running", "childSessionKey": self.key, "sourceId": self.JOB,
+                            "runId": f"cron:{self.JOB}:1:x"},
+                           {"taskId": "task-other", "kind": "automation_run", "runtime": "cron",
+                            "status": "running", "childSessionKey": "agent:main:other", "sourceId": "job-other"}]
+
+        async def send_request(method, params, timeout=10):
+            if method == "chat.abort":
+                test.sent.append((method, copy.deepcopy(params)))
+                return {"ok": True, "aborted": abortable, "runIds": [params.get("runId")] if abortable else []}
+            if method == "sessions.abort":
+                test.sent.append((method, copy.deepcopy(params)))
+                return ({"ok": True, "abortedRunId": params.get("runId"), "status": "aborted"} if run_abortable
+                        else {"ok": True, "abortedRunId": None, "status": "no-active-run"})
+            if method == "tasks.list" and run_abortable:
+                raise RuntimeError("unknown method: tasks.list")
+            if method == "tasks.list":
+                test.sent.append((method, copy.deepcopy(params)))
+                return {"tasks": copy.deepcopy(test.cron_tasks)}
+            if method == "tasks.cancel":
+                test.sent.append((method, copy.deepcopy(params)))
+                return {"found": True, "cancelled": True}
+            return await inner(method, params, timeout)
+        self.conn.send_request = send_request
+
+    async def stop_on_the_tab(self, mid):
+        w = self.conn._turn_writers[(self.CHAT, mid)]
+        self.owui.page_intent["sid-tab"] = "stop"
+        _, task = self.owui.tasks[w.task_id]
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await self.spin()
+        return w
+
+    async def test_stop_on_a_wake_in_the_open_tab_stops_its_run(self):
+        """ELI-192: Stop on a wake's reply ended the message, but the run went
+        on to its end, its text shown nowhere. On 2026.9 a wake's run id is
+        the sessionId and chat.abort finds no run under it: the wake is a
+        cron job run, which its task's cancel aborts."""
+        self.tab_on_chat()
+        self.cron_task_gateway()
+        self.wake_turn(self.W1)
+        _turn_route_now(self.conn, self.sid_ev(_delta("Looping: 1 of 8.")))
+        await self.spin()
+        mid = turn_message_id(self.key, self.W1, self.CHAT)
+        w = await self.stop_on_the_tab(mid)
+        self.assertIn(("tasks.cancel", {"taskId": "task-wake"}), self.sent)
+        self.assertNotIn(("tasks.cancel", {"taskId": "task-other"}), self.sent)
+        self.assertTrue(w.closed)
+        self.assertIs(self.new_messages()[mid]["done"], True)
+
+    async def test_stop_on_a_wake_on_2026_10_aborts_its_run_by_id(self):
+        """2026.10.5 has no tasks.cancel: Stop on a wake's reply let its run
+        go on to its end. sessions.abort with the run's id stops that run
+        alone, without clearQueued, so turns queued behind it stay."""
+        self.tab_on_chat()
+        self.cron_task_gateway(run_abortable=True)
+        self.wake_turn(self.W1)
+        _turn_route_now(self.conn, self.sid_ev(_delta("Looping: 1 of 8.")))
+        await self.spin()
+        mid = turn_message_id(self.key, self.W1, self.CHAT)
+        w = await self.stop_on_the_tab(mid)
+        self.assertIn(("sessions.abort", {"key": self.key, "runId": w.run_id}), self.sent)
+        self.assertNotIn("tasks.list", [m for m, _ in self.sent])
+        # chat.abort answers `aborted` for a wake on 2026.10.5 but stops
+        # only its running command (sandbox, 2026-10-19): never sent first.
+        self.assertNotIn("chat.abort", [m for m, _ in self.sent])
+        self.assertTrue(w.closed)
+        self.assertIs(self.new_messages()[mid]["done"], True)
+
+    async def test_stop_on_a_run_chat_abort_stops_cancels_no_task(self):
+        """A run chat.abort aborts is not cancelled again as a task."""
+        self.tab_on_chat()
+        self.cron_task_gateway(abortable=True)
+        self.wake_turn(self.W1)
+        _turn_route_now(self.conn, self.sid_ev(_delta("Looping: 1 of 8.")))
+        await self.spin()
+        await self.stop_on_the_tab(turn_message_id(self.key, self.W1, self.CHAT))
+        self.assertIn("chat.abort", [m for m, _ in self.sent])
+        self.assertNotIn("tasks.cancel", [m for m, _ in self.sent])
+
     async def test_a_wake_that_ends_with_a_question_asks_it_on_the_tab(self):
         """On 2026.9 a wake ends on its own terminal event (no row names its
         run), and that end finalized the message without asking: the
@@ -11901,7 +12790,7 @@ class WakeTurnTests(unittest.TestCase):
                 self.msg(pipe_run_id("c" * 8 + "-1111-2222-3333-444455556666",
                                      "d" * 8 + "-1111-2222-3333-444455556666"), "[cron:job-1 typed]", 12),
                 self.msg("u1", "hello", 13)]
-        self.assertEqual(wake_turns(msgs), [{"key": "w1", "at": 10, "job": "job-1"}])
+        self.assertEqual(wake_turns(msgs), [{"key": "w1", "at": 10, "job": "job-1", "shared_run": True}])
 
     def test_the_newest_turn_committed_by_the_event_not_yet_bound(self):
         msgs = [self.msg("w1", "[cron:a n] x", 10), self.msg("w2", "[cron:b n] y", 20)]
@@ -12912,6 +13801,91 @@ class ForwardedTurnHistoryTests(_RoutingCase):
         self.history = {"messages": self.FX["2026.9.3"]["messages"]}
         self.assertEqual((await self.conn.session_history(self.key))["messages"],
                          self.FX["2026.9.3"]["messages"], "9.3 history is unchanged")
+
+
+class CancelledWriteFinishesTests(unittest.IsolatedAsyncioTestCase):
+    """ELI-205: a cancel inside Open WebUI's DB write (BEGIN IMMEDIATE / commit
+    run in aiosqlite's thread) can wedge it and keep SQLite's write lock for
+    good, so every later write fails. A Stop must never cancel the Pipe's own
+    writes midway: the write finishes, then the cancel goes on."""
+
+    async def asyncSetUp(self):
+        self.events = []
+        self.in_db = asyncio.Event()       # the write is inside the DB call
+        self.release = asyncio.Event()     # the DB call returns
+        test = self
+        chat = types.SimpleNamespace(
+            title="New Chat", current_message_id=None,
+            chat={"history": {"messages": {"m1": {"id": "m1", "role": "assistant", "meta": {}}},
+                              "currentId": "m1"}})
+        self.chat = chat
+
+        async def db_call(what):
+            test.events.append(f"{what} start")
+            test.in_db.set()
+            await test.release.wait()
+            test.events.append(f"{what} done")
+
+        class Chats:
+            @staticmethod
+            @contextlib.asynccontextmanager
+            async def _chat_transaction(chat_id):
+                await db_call("begin")
+                yield ("db", chat)
+                test.events.append("commit")
+
+            @staticmethod
+            async def upsert_message_to_chat_by_id_and_message_id(chat_id, message_id, message):
+                await db_call("upsert")
+                return chat
+
+        class ChatMessages:
+            @staticmethod
+            async def upsert_message(*a, **kw):
+                return None
+
+        def mod(name, **attrs):
+            m = types.ModuleType(name)
+            m.__dict__.update(attrs)
+            return m
+        patch = mock.patch.dict(sys.modules, {
+            "open_webui.models": mod("open_webui.models"),
+            "open_webui.models.chats": mod("open_webui.models.chats", Chats=Chats),
+            "open_webui.models.chat_messages": mod("open_webui.models.chat_messages", ChatMessages=ChatMessages),
+            "sqlalchemy": mod("sqlalchemy"), "sqlalchemy.orm": mod("sqlalchemy.orm"),
+            "sqlalchemy.orm.attributes": mod("sqlalchemy.orm.attributes", flag_modified=lambda o, n: None)})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    async def _cancel_midway(self, coro, last_event):
+        task = asyncio.ensure_future(coro)
+        await asyncio.wait_for(self.in_db.wait(), 2)
+        task.cancel()                     # Stop, while the DB call runs
+        await asyncio.sleep(0)
+        self.release.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 2)
+        self.assertEqual(self.events[-1], last_event, f"the write was cut short: {self.events}")
+
+    async def test_set_turn_meta(self):
+        await self._cancel_midway(openclaw_pipe._set_turn_meta("c1", "m1", {"k": 1}), "commit")
+        self.assertEqual(self.chat.chat["history"]["messages"]["m1"]["meta"], {"k": 1})
+
+    async def test_set_title_unless_chosen(self):
+        await self._cancel_midway(openclaw_pipe._set_title_unless_chosen("c1", "A title"), "commit")
+        self.assertEqual(self.chat.title, "A title")
+
+    async def test_claim_turn_message(self):
+        await self._cancel_midway(_claim_turn_message("c1", "u1", "m2", "run-1", "w1"), "commit")
+        self.assertIn("m2", self.chat.chat["history"]["messages"])
+
+    async def test_message_upsert(self):
+        await self._cancel_midway(openclaw_pipe._owui_upsert_message("c1", "m1", {"done": True}), "upsert done")
+
+    def test_every_message_upsert_goes_through_the_guarded_helper(self):
+        src = inspect.getsource(openclaw_pipe)
+        calls = re.findall(r"Chats\.upsert_message_to_chat_by_id_and_message_id\(", src)
+        self.assertEqual(len(calls), 1, "a message upsert outside _owui_upsert_message")
 
 
 class AutoTitleTests(unittest.IsolatedAsyncioTestCase):

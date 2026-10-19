@@ -30,8 +30,10 @@ always type their own answer in the card's Other field.
 
 ## Offering choices
 
-Number the options and each becomes a clickable row. Add ` - ` and a short
-description after a label to show it beside the choice:
+Number the options, **one per line**, and each becomes a clickable row. Add
+` - ` and a short description after a label to show it beside the choice.
+Options on one line (`1. Red 2. Blue`) are not read as options: the user gets
+only a typed answer.
 
 ```
 OpenClaw needs input:
@@ -68,13 +70,17 @@ The user steps through the questions and submits once. You get one
 hide the typed answer; a question with no `options` is free text.
 
 For "pick any number of these", include a phrase like `select all that apply`
-or `(multiselect)` in the question. The dialog then renders checkboxes and a
-Submit button, and you get a comma-joined string back.
+or `(multiselect)` in the question, with the options numbered one per line. The
+card then lists the options by number and the user types the ones they pick;
+you get the picked options back comma-joined.
 
 ## Passwords and secrets
 
-If the question mentions a secret, a password, an API key, or a token, the
+If the question asks for a secret, a password, an API key, or a token, the
 dialog switches to a masked input automatically. You do not need to do anything.
+A question with numbered options or a `(y/n)` that only mentions one stays a
+normal question with its choices. Asking for the value itself ("paste your API
+key", "enter the password") always gets the masked field.
 
 ## Rules that matter
 

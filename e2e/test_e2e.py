@@ -19,6 +19,7 @@ so a plain `pytest` on a laptop never tries to talk to a live instance.
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import time
@@ -305,12 +306,26 @@ TURN_NS = uuid.UUID("6f1c3e2a-9d4b-4c6e-8a1f-0e0a1b100100")  # turns.TURN_NS
 WAKE_TIMEOUT_S = float(os.environ.get("E2E_WAKE_TIMEOUT", "180"))
 
 
-def _openclaw_release() -> tuple:
-    """(year, month) of the Gateway the stack installed, from `openclaw --version`."""
+def _openclaw_version() -> tuple:
+    """(year, month, patch) of the Gateway the stack installed, from `openclaw --version`."""
     out = subprocess.run(["openclaw", "--version"], capture_output=True, text=True, timeout=60)
-    m = re.search(r"(\d{4})\.(\d{1,2})\.\d+", out.stdout)
+    m = re.search(r"(\d{4})\.(\d{1,2})\.(\d+)", out.stdout)
     assert m, f"no version in {out.stdout!r} {out.stderr[-300:]!r}"
-    return int(m.group(1)), int(m.group(2))
+    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+
+def _openclaw_release() -> tuple:
+    """(year, month) of the Gateway the stack installed."""
+    return _openclaw_version()[:2]
+
+
+def _skip_known_105_gap(issue: str, what: str) -> None:
+    """A known gap of the Pipe on OpenClaw 2026.10 before 2026.10.10 (the
+    pinned lane, the version live runs): skipped there under its issue, so the
+    lane stays honest. 2026.10.10 (the next lane) still runs the test."""
+    version = _openclaw_version()
+    if (2026, 10, 0) <= version < (2026, 10, 10):
+        pytest.skip(f"OpenClaw {'.'.join(map(str, version))}: {what} ({issue})")
 
 
 def _gw(method: str, params: dict) -> dict:
@@ -965,6 +980,68 @@ def test_the_status_action_lists_a_running_subagent_and_opens_its_drawer(token):
     assert drawer["parent"]["chatId"] == chat_id, drawer
 
 
+def test_a_subagent_result_the_parent_answers_with_silence_shows_as_its_card(token):
+    """The parent answers a sub-agent's completion with NO_REPLY: the chat
+    still gets one message, a finished Sub-agent card holding the child's
+    result (ELI-138). On OpenClaw 2026.10.5 no such message came (ELI-217)."""
+    chat_id, msg = _chat_turn(token, "E2E_SPAWN_SILENT")
+    assert msg.get("content", "").strip() == "E2E_SPAWNED", msg
+
+    def card():
+        for m in _chat_messages(token, chat_id).values():
+            out = m.get("output") or []
+            calls = [o for o in out if o.get("type") == "function_call" and o.get("name") == "Sub-agent"]
+            results = [o for o in out if o.get("type") == "function_call_output"]
+            if m.get("role") == "assistant" and m.get("done") is True and calls and results:
+                return m, calls[0], results[0]
+        return None
+
+    found = _until("the silent sub-agent's card", card, timeout_s=120, every_s=2)
+    m, call, result = found
+    assert "silent helper" in call.get("arguments", ""), call
+    assert "E2E_SILENT_RESULT done" in json.dumps(result.get("output")), result
+    assert "NO_REPLY" not in (m.get("content") or ""), m.get("content")
+    # From 2026.10.5 the Gateway counts the silence as a failed delivery (the
+    # card then carries its error) and retries it on a backoff (15 s, then
+    # 30 s, ...). Once a retry has happened the card is still one, and the
+    # parent's next reply lands once, in its own message.
+    child_run = call["id"].removeprefix("subagent-")
+
+    def failed_deliveries() -> int:
+        return sum(line.count(child_run) > 0 and "did not produce a visible reply" in line
+                   for line in _gateway_file_log_lines())
+
+    if "couldn't generate a response" in (m.get("content") or ""):
+        _until("the Gateway's retry of the delivery", lambda: failed_deliveries() >= 2,
+               timeout_s=90, every_s=2)
+    _, after = _chat_turn(token, "Respond with exactly: E2E_AFTER_CARD", chat_id=chat_id)
+    assert "couldn't generate a response" not in (after.get("content") or ""), \
+        "the user's own reply shows an error"
+    assert (after.get("content") or "").strip() == "E2E_AFTER_CARD", after
+    msgs = _chat_messages(token, chat_id)
+    cards = [k for k, x in msgs.items() if any(
+        o.get("type") == "function_call" and o.get("name") == "Sub-agent" for o in x.get("output") or [])]
+    assert len(cards) == 1, cards
+    replies = [k for k, x in msgs.items() if (x.get("content") or "").strip() == "E2E_AFTER_CARD"]
+    assert len(replies) == 1, replies
+    _assert_clean(token, chat_id, msgs)
+
+
+def test_a_reply_the_agent_starts_that_errors_still_finishes(token):
+    """A run started on the chat's session from outside (the Gateway's
+    `agent` method, as `sessions_send` does) whose model answers nothing:
+    OpenClaw 2026.10.5 fails it ("Agent couldn't generate a response") and
+    pushes no settle for it (its last push is `phase: error` with
+    hasActiveRun true), so its message stayed generating (ELI-217). It
+    finishes with the run's error."""
+    chat_id, _ = _chat_turn(token, "Respond with exactly: E2E_AGENT_CHAT")
+    key = _session_key(token, chat_id)
+    _gw("agent", {"sessionKey": key, "message": "E2E_EMPTY_REPLY",
+                  "idempotencyKey": f"e2e-empty-{uuid.uuid4().hex[:8]}"})
+    msgs = _wait_for(token, chat_id, ["couldn't generate a response"])
+    _assert_clean(token, chat_id, msgs)
+
+
 # ── A run that ends while Open WebUI is stopped (ELI-94) ─────────────────────
 # Keep this last: it stops and starts the Open WebUI container. A graceful stop
 # cancels the request streaming the reply and saves the message done:true with
@@ -1042,6 +1119,30 @@ def test_the_status_action_lists_a_background_command(token):
     assert [(r["title"], r["status"]) for r in commands] == [("sleep 25; echo e2e-bg-done", "running")], data
 
 
+def test_the_reply_to_a_background_commands_end_finishes(token):
+    """ELI-215: when a command the agent left in the background ends, the
+    Gateway starts a run of its own on the session, and the turn writer gives
+    it a message. That message must finish once the run has ended; on
+    OpenClaw 2026.10.5 it stayed done:false (Open WebUI showed it generating,
+    and owui_send refused the chat as busy) until the next turn started."""
+    chat_id, msg = _chat_turn(token, "E2E_BG_EXEC")
+    assert msg.get("content", "").strip() == "E2E_BG_STARTED", msg
+    key = _session_key(token, chat_id)
+
+    def noticed_and_idle():
+        hist = _gw("chat.history", {"sessionKey": key, "limit": 50}).get("messages") or []
+        said = any(m.get("role") == "assistant" and "E2E_BG_NOTICED" in json.dumps(m.get("content"))
+                   for m in hist)
+        return said and _session_row(key).get("hasActiveRun") is False
+    # sleep 25, then the notice run: the Gateway's own record that it ended.
+    # The heartbeat runner holds the notice while other runs of the agent are active.
+    _until("the notice run to reply and the session to go idle", noticed_and_idle)
+    msgs = _wait_for(token, chat_id, ["E2E_BG_NOTICED"])
+    open_ = [(m.get("id", "")[:8], (m.get("content") or "")[:60]) for m in msgs.values()
+             if m.get("role") == "assistant" and m.get("done") is not True]
+    assert not open_, f"assistant messages left unfinished: {open_}"
+
+
 def test_the_status_dialog_lists_only_this_chats_automations(token, guest_token):
     """ELI-175, through the real path: each user's own Status dialog, read
     from the stack's Gateway with the installed Action's settings and the
@@ -1072,6 +1173,20 @@ def test_the_status_dialog_lists_only_this_chats_automations(token, guest_token)
 def _session_row(key: str) -> dict:
     rows = _gw("sessions.list", {"search": key[-36:], "limit": 10}).get("sessions") or []
     return next((r for r in rows if r.get("key") == key), {})
+
+
+def _gateway_file_log_lines() -> list[str]:
+    """The e2e stack Gateway's own file log, which lasts across its restarts:
+    E2E_GATEWAY_LOG where the stack sets it, else OpenClaw's default
+    /tmp/openclaw/openclaw-<date>.log (what CI collects at the end)."""
+    paths = ([os.environ["E2E_GATEWAY_LOG"]] if os.environ.get("E2E_GATEWAY_LOG")
+             else sorted(glob.glob("/tmp/openclaw/openclaw-*.log")))
+    assert paths and all(os.path.isfile(p) for p in paths), f"no Gateway file log: {paths}"
+    lines = []
+    for path in paths:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines += fh.readlines()
+    return lines
 
 
 def _until(what: str, check, timeout_s: float = WAKE_TIMEOUT_S, every_s: float = 1.0):
@@ -1288,6 +1403,10 @@ class _Page:
         """The first event call whose data has this type: (ack id, payload)."""
         with self.cond:
             return next(((a, e) for a, e in self.calls if (e.get("data") or {}).get("type") == kind), None)
+
+    def join(self, chat_id: str) -> None:
+        """Show the chat, as a tab does when it opens one (events:chat join)."""
+        self._emit("events:chat", {"chat_id": chat_id, "data": {"type": "join"}})
 
     def answer(self, ack_id: str, value) -> None:
         """Answer an event call, as the tab does when its dialog is submitted."""
@@ -1543,6 +1662,7 @@ def test_a_requested_secret_is_entered_in_a_masked_dialog_and_kept_out_of_the_ch
     if _openclaw_release() < (2026, 10):
         pytest.skip("OpenClaw 2026.9 stores a requested secret, but no run can use it (ELI-97): "
                     "the Pipe leaves the request to the Control UI there, as before")
+    _skip_known_105_gap("ELI-212", "the Pipe's secret gate starts at 2026.10.10, so no dialog opens")
     import secrets as _secrets
     name = f"DUMMY_SECRET_ELI96_{uuid.uuid4().hex[:6].upper()}"
     value = _secrets.token_urlsafe(30)   # 40 characters
@@ -1580,6 +1700,7 @@ def test_a_requested_secret_is_entered_in_a_masked_dialog_and_kept_out_of_the_ch
 def test_a_cancelled_secret_dialog_tells_the_agent_no_credential_came(token):
     if _openclaw_release() < (2026, 10):
         pytest.skip("OpenClaw 2026.9: the Pipe leaves a secret request to the Control UI (ELI-97)")
+    _skip_known_105_gap("ELI-212", "the Pipe's secret gate starts at 2026.10.10, so no dialog opens")
     name = f"DUMMY_SECRET_ELI96_{uuid.uuid4().hex[:6].upper()}"
     page = _Page(token)
     try:
@@ -1589,6 +1710,51 @@ def test_a_cancelled_secret_dialog_tells_the_agent_no_credential_came(token):
         _wait_for(token, chat_id, ["E2E_SECRET_RESULT no_answer"])
         listed = _gw("secrets.store.list", {})
         assert not any(e.get("name") == name for e in listed.get("entries") or []), listed
+    finally:
+        page.close()
+
+
+# ── ELI-216: a question from the agent's ask_user tool ────────────────────
+
+def _pending_question(chat_id: str) -> dict | None:
+    """The chat's pending Gateway question, as `question.list` has it."""
+    listed = _gw("question.list", {})
+    return next((q for q in listed.get("questions") or []
+                 if chat_id in (q.get("sessionKey") or "") and q.get("status") == "pending"), None)
+
+
+def test_an_ask_user_tool_question_shows_the_card_and_the_answer_reaches_the_agent(token):
+    """The ask_user tool registers a Gateway question (`question.requested`)
+    and waits for its answer. The Pipe asks it in Open WebUI's question card,
+    and the option picked there reaches the agent as the tool's answer
+    (ELI-216: no card, and the reply sat on "Thinking" for 15 minutes)."""
+    page = _Page(token)
+    try:
+        chat_id, _ = _send_in_chat(token, page, None, "E2E_ASK_TOOL")
+        page.join(chat_id)
+        # The precondition: the tool's question is pending on the Gateway.
+        question = _until("the ask_user question on the Gateway", lambda: _pending_question(chat_id),
+                          timeout_s=60)
+        assert [q.get("questionId") for q in question.get("questions") or []] == ["db"], question
+        ack_id, call = page.wait("the question card", lambda: page.call_of_type("request:user_input"), 45)
+        card = call["data"]["data"]["questions"][0]
+        assert card["question"] == "Which database?", card
+        assert [o["label"] for o in card["options"]] == ["Postgres", "SQLite"], card
+        page.answer(ack_id, {"status": "answered", "answers": {"db": {"type": "option", "label": "SQLite"}}})
+        _wait_for(token, chat_id, ["E2E_ASK_TOOL_RESULT answered Database: SQLite"])
+    finally:
+        page.close()
+
+
+def test_a_cancelled_ask_user_card_lets_the_agent_go_on_at_once(token):
+    page = _Page(token)
+    try:
+        chat_id, _ = _send_in_chat(token, page, None, "E2E_ASK_TOOL")
+        page.join(chat_id)
+        ack_id, _ = page.wait("the question card", lambda: page.call_of_type("request:user_input"), 60)
+        page.answer(ack_id, {"status": "cancelled"})
+        _wait_for(token, chat_id, ["E2E_ASK_TOOL_RESULT no_answer"])
+        assert _pending_question(chat_id) is None
     finally:
         page.close()
 
@@ -1609,6 +1775,8 @@ def test_a_message_sent_while_the_pipe_waits_to_reconnect_gets_its_reply(token):
     30 s). A message sent while it waits out the backoff must get its reply
     (ELI-176: the turn connected a socket of its own, which nothing read until
     the backoff ended, so the turn's first request timed out)."""
+    _skip_known_105_gap("ELI-214", "right after the restart the Gateway refuses the run "
+                                   "(startup inspection) and the Pipe shows that as the reply")
     since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     # Down until the Pipe waits its longest backoff, so the Gateway is back
     # well before its next attempt.

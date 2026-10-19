@@ -521,6 +521,28 @@ def _writer_may_take_over(existing: dict) -> bool:
     return bool(writer) and existing.get("done") is False and not _turn_writer_alive(writer)
 
 
+async def _uncancellable(coro):
+    """Await `coro`, a write to Open WebUI's DB, to its end even when this task
+    is cancelled meanwhile (a Stop), then let the cancel go on. A cancel inside
+    Open WebUI's DB call (BEGIN IMMEDIATE or the commit run in aiosqlite's
+    thread) can wedge it and keep SQLite's write lock for good, so every later
+    write fails (ELI-205)."""
+    task = spawn_background(coro)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        if not task.done():
+            await asyncio.wait({task})
+        raise
+
+
+async def _owui_upsert_message(chat_id: str, message_id: str, fields: dict):
+    """Open WebUI's message upsert, never cut short by a cancel (ELI-205)."""
+    from open_webui.models.chats import Chats
+    return await _uncancellable(
+        Chats.upsert_message_to_chat_by_id_and_message_id(chat_id, message_id, fields))
+
+
 async def _claim_turn_message(chat_id: str, user_id: str, message_id: str, run_id: str,
                               writer_id: str, takeover: bool = False) -> dict:
     """Claim message `message_id` for run `run_id` in chat `chat_id`.
@@ -534,7 +556,14 @@ async def _claim_turn_message(chat_id: str, user_id: str, message_id: str, run_i
     `insert_chat_turn` does.
 
     Returns {claimed, how: new|takeover|taken, message_id, parent, messages}:
-    `messages` holds the changed nodes, for the `chat:messages` introduce."""
+    `messages` holds the changed nodes, for the `chat:messages` introduce.
+    Never cut short by a cancel (ELI-205)."""
+    return await _uncancellable(_claim_turn_message_now(
+        chat_id, user_id, message_id, run_id, writer_id, takeover))
+
+
+async def _claim_turn_message_now(chat_id: str, user_id: str, message_id: str, run_id: str,
+                                  writer_id: str, takeover: bool) -> dict:
     from open_webui.models.chats import Chats
     from open_webui.models.chat_messages import ChatMessages
     from sqlalchemy.orm.attributes import flag_modified
@@ -713,26 +742,57 @@ def run_message_id(session_key: str, chat_id: str, run_id: str, messages: list |
 # (session-accessor-CX17Bx59.mjs:3343-3347), so only the first wake into a
 # session ever gets one: never end or rebuild a wake from it.
 
+#
+# OpenClaw 2026.10.2+ records the wake's turn differently: no header in the
+# text but the cron provenance ({kind: internal_system, sourceTool: cron,
+# jobId, sourcePromptPrefix}), returned by `chat.history` as role "assistant"
+# (`_is_forwarded_turn`). Such a wake runs under its own run id and closes with
+# its own `cli-assistant:<runId>` (2026.10.3 and 10.5 fixtures), so it is an
+# ordinary agent turn: `shared_run` False, and no sessionId event binds it.
+
 _CRON_PROMPT_RE = re.compile(r"^\[cron:(?P<job>[^\s\]]+)[\s\]]")
 
 
+def _cron_turn_job(m: dict) -> str | None:
+    """The cron job a wake turn names: its provenance's (10.2+), else its
+    prompt's header (9.3, no provenance). None for any other turn."""
+    prov = m.get("provenance") if isinstance(m.get("provenance"), dict) else None
+    if prov:
+        if (prov.get("kind"), prov.get("sourceTool")) != ("internal_system", "cron"):
+            return None
+        hit = _CRON_PROMPT_RE.match(str(prov.get("sourcePromptPrefix") or ""))
+        return prov.get("jobId") or (hit.group("job") if hit else None)
+    hit = _CRON_PROMPT_RE.match(((_history_item(m) or {}).get("text") or "").lstrip())
+    return hit.group("job") if hit else None
+
+
 def wake_turns(messages: list) -> list:
-    """[{key, at, job}] of the cron wake user turns, in transcript order: `key`
-    is the turn id (its `:user` key without the suffix), `at` its commit time
-    (`recordTimestampMs`), `job` the cron job id from its prompt."""
+    """[{key, at, job, shared_run}] of the cron wake turns, in transcript
+    order: `key` is the turn id (its `:user` key without the suffix), `at` its
+    commit time (`recordTimestampMs`), `job` the cron job id, `shared_run`
+    True when the wake runs under the session's id (9.3, ELI-103). Reads
+    `chat.history` as returned or with its roles restored (`_transcript_roles`)."""
     out = []
     for m in messages or []:
-        key = _history_user_run_id(m)
-        if not key or parse_pipe_run_id(key) or m.get("provenance"):
+        if not isinstance(m, dict):
             continue
-        hit = _CRON_PROMPT_RE.match(((_history_item(m) or {}).get("text") or "").lstrip())
-        if not hit:
+        key = _history_user_run_id({**m, "role": "user"} if _is_forwarded_turn(m) else m)
+        if not key or parse_pipe_run_id(key):
+            continue
+        job = _cron_turn_job(m)
+        if not job:
             continue
         meta = m.get("__openclaw") if isinstance(m.get("__openclaw"), dict) else {}
         at = meta.get("recordTimestampMs") or m.get("timestamp")
         out.append({"key": key, "at": at if isinstance(at, (int, float)) else None,
-                    "job": hit.group("job")})
+                    "job": job, "shared_run": not m.get("provenance")})
     return out
+
+
+def _shared_wake_turns(messages: list) -> list:
+    """The wake turns whose wake runs under the session's id: the only ones a
+    sessionId event can belong to."""
+    return [w for w in wake_turns(messages) if w["shared_run"]]
 
 
 def wake_turn_at(messages: list, at_ms: float, bound=frozenset()) -> dict | None:
@@ -741,7 +801,7 @@ def wake_turn_at(messages: list, at_ms: float, bound=frozenset()) -> dict | None
     (`bound`). None while it is not committed yet (the embedded runtime writes
     the user turn without awaiting it, embedded-agent-DNQn_PMM.mjs:5891): the
     caller tries again on the wake's next event."""
-    for turn in reversed(wake_turns(messages)):
+    for turn in reversed(_shared_wake_turns(messages)):
         if turn["at"] is not None and turn["at"] <= at_ms:
             return None if turn["key"] in bound else turn
     return None
@@ -753,7 +813,7 @@ def wake_turn_of_run(messages: list, job: str, start_ms: float, bound=frozenset(
     while it is not committed yet: the embedded runtime writes it after the
     run's first events, so a turn is not looked for before the event (as
     `wake_turn_at` must, knowing no run)."""
-    for turn in reversed(wake_turns(messages)):
+    for turn in reversed(_shared_wake_turns(messages)):
         if turn["job"] == job and turn["at"] is not None and turn["at"] >= start_ms:
             return None if turn["key"] in bound else turn
     return None
@@ -2293,6 +2353,37 @@ def _shared_gateway_state() -> dict | None:
     return state
 
 
+# The replies this process is streaming, for the Status Action (ELI-186):
+# {(chat_id, message_id): the reply's _TurnRenderer}. Open WebUI saves a
+# reply's tool cards (its `output`) only when the reply ends, in the chat and
+# in its message row alike, so while it runs only the Pipe has them. The Pipe
+# and the Action are separate Function modules: like the Pipe's shared state,
+# the map lives on Open WebUI's own stable module, and outside Open WebUI on
+# this one.
+_LIVE_REPLIES_ATTR = "_openclaw_live_replies_v1"
+_live_replies_local: dict = {}
+
+
+def _live_replies() -> dict:
+    try:
+        import open_webui.socket.main as _owui_socket_main
+    except Exception:
+        return _live_replies_local
+    replies = getattr(_owui_socket_main, _LIVE_REPLIES_ATTR, None)
+    if replies is None:
+        replies = {}
+        setattr(_owui_socket_main, _LIVE_REPLIES_ATTR, replies)
+    return replies
+
+
+def _live_reply_output(chat_id, message_id):
+    """A copy of the tool cards and text a running reply shows so far, or
+    None when this process streams no such reply."""
+    renderer = _live_replies().get((chat_id, message_id))
+    output = getattr(renderer, "output", None)
+    return copy.deepcopy(output) if isinstance(output, list) else None
+
+
 class _RunQueue(asyncio.Queue):
     """A run's event queue. Events wait for room (`await put`): a reply read
     slower than its run streams holds the receive loop back instead of losing
@@ -2928,6 +3019,15 @@ class _GatewayConnection:
         return lock
 
     # ── Public API ──────────────────────────────────────────────────
+
+    @property
+    def reconnecting(self) -> bool:
+        """The socket dropped and the event loop is bringing it back: until
+        then a request fails without reaching the Gateway (`send_request`).
+        The reconnect renews the subscriptions and wakes every
+        `session_change_event` waiter (`_subscribe_all`)."""
+        return (self._ws is None and not self._stopped and self._event_loop_task is not None
+                and not self._event_loop_task.done())
 
     async def ensure_connected(self):
         """Ensure the WS connection is up; connect/reconnect if needed."""
@@ -4726,6 +4826,105 @@ async def _emit_message_snapshot(__event_emitter__, content):
     await __event_emitter__(
         {"type": "replace", "data": {"content": content}}
     )
+
+
+
+# ---------------------------------------------------------------------------
+# A tab's input dialog and `execute` share one callback (ELI-195).
+#
+# Open WebUI 0.12's Chat.svelte keeps one callback slot for its `input` and
+# `confirmation` dialogs and for `execute`: each of these events overwrites
+# it on arrival, and the dialog's Confirm / Cancel answers whatever the slot
+# holds then. An `execute` that reaches a tab while its dialog is open takes
+# the dialog's answer, so the click is lost and the asker never hears back.
+# While a dialog is open on a socket, the socket is recorded here (shared by
+# the Pipe and the Action through `_shared_gateway_state`): an emitted
+# `execute` skips it and is delivered once the dialog is answered, and a
+# called one (a query) is not sent to it.
+# ---------------------------------------------------------------------------
+
+_SLOT_DIALOG_TYPES = ("input", "confirmation")
+_local_dialog_holds: dict = {}
+
+
+def _dialog_holds() -> dict:
+    """sid -> {"user_id", "open": open dialogs, "held": event payloads}."""
+    state = _shared_gateway_state()
+    return _local_dialog_holds if state is None else state.setdefault("dialog_holds", {})
+
+
+def _dialog_open_on(sid) -> bool:
+    return bool(sid) and sid in _dialog_holds()
+
+
+@contextlib.asynccontextmanager
+async def _holding_executes(sid, user_id, kind):
+    """Record `sid` as showing a dialog of `kind` for the block's duration,
+    then deliver the `execute` events held for it meanwhile, in order."""
+    if not sid or kind not in _SLOT_DIALOG_TYPES:
+        yield
+        return
+    holds = _dialog_holds()
+    entry = holds.get(sid)
+    if entry is None:
+        entry = holds[sid] = {"user_id": user_id, "open": 0, "held": []}
+    entry["open"] += 1
+    try:
+        yield
+    finally:
+        entry["open"] -= 1
+        if entry["open"] <= 0 and holds.get(sid) is entry:
+            del holds[sid]
+            if entry["held"]:
+                pipe_log(f"  dialog on {str(sid)[:8]}... answered: delivering "
+                         f"{len(entry['held'])} held execute event(s)")
+            for payload in entry["held"]:
+                try:
+                    from open_webui.socket.main import sio
+                    await sio.emit("events", payload, to=sid)
+                except Exception as ex:
+                    pipe_log(f"  held execute to {str(sid)[:8]}... failed: {ex!r}")
+
+
+def _dialog_safe_emitter(emitter, user_id, chat_id, message_id):
+    """`emitter`, except that an `execute` skips the user's sockets with an
+    open dialog (OWUI's emitter sends to the whole `user:<id>` room) and is
+    held for them."""
+    if emitter is None or not user_id:
+        return emitter
+
+    async def emit(event):
+        busy = []
+        if isinstance(event, dict) and event.get("type") == "execute":
+            holds = _dialog_holds()
+            busy = [sid for sid, e in list(holds.items()) if e.get("user_id") == user_id]
+        if not busy:
+            return await emitter(event)
+        payload = {"chat_id": chat_id, "message_id": message_id, "data": event}
+        for sid in busy:
+            holds[sid]["held"].append(payload)
+        pipe_log(f"  execute held for {len(busy)} tab(s) with an open dialog")
+        from open_webui.socket.main import sio
+        await sio.emit("events", payload, room=f"user:{user_id}", skip_sid=busy)
+
+    return emit
+
+
+def _dialog_safe_event_call(event_call, sid, user_id):
+    """`event_call` (bound to socket `sid`), recording its dialogs and never
+    sending an `execute` while one is open there: that query answers None."""
+    if event_call is None:
+        return None
+
+    async def call(payload):
+        kind = (payload or {}).get("type")
+        if kind == "execute" and _dialog_open_on(sid):
+            pipe_log(f"  execute query not sent: {str(sid)[:8]}... shows a dialog")
+            return None
+        async with _holding_executes(sid, user_id, kind):
+            return await event_call(payload)
+
+    return call
 
 
 # --- composer --------------------------------------------------------------
@@ -7091,13 +7290,16 @@ def _agent_call_rows(chat):
 _RECENT_MESSAGES = 40
 
 
-async def _recent_branch(current_id, links, read_rows, read_blob_message, limit=_RECENT_MESSAGES):
+async def _recent_branch(current_id, links, read_rows, read_blob_message, limit=_RECENT_MESSAGES,
+                         chat_id=None):
     """The last `limit` messages of a chat's current branch, chat-shaped
     ({"history": {"currentId", "messages"}, "truncated"}) for the section
     builders. `links` maps each message that has a row to its parent;
     `read_rows(ids)` reads those messages ({id: message}) in one go;
     `read_blob_message(id)` reads one message the chat's own copy holds but
-    no row does yet (Open WebUI writes some straight into the chat)."""
+    no row does yet (Open WebUI writes some straight into the chat). A reply
+    of `chat_id` that this process's Pipe is streaming lists what it shows
+    so far."""
     order, blob, seen, mid = [], {}, set(), current_id
     while mid and mid not in seen and len(order) < limit:
         seen.add(mid)
@@ -7113,12 +7315,20 @@ async def _recent_branch(current_id, links, read_rows, read_blob_message, limit=
         mid = parent
     with_rows = [m for m in order if m not in blob]
     rows = await read_rows(with_rows) if with_rows else {}
+    # Open WebUI saves a reply's calls only when it ends, in its row and in
+    # the chat alike (ELI-186): a running reply's are with the Pipe.
+    for m in order:
+        msg = blob.get(m) or rows.get(m)
+        if isinstance(msg, dict) and msg.get("role") == "assistant" and not msg.get("done"):
+            live = _live_reply_output(chat_id, m)
+            if live is not None:
+                blob[m] = {**msg, "output": live}
     messages = {m: {**(blob.get(m) or rows.get(m)), "id": m} for m in order if blob.get(m) or rows.get(m)}
     return {"history": {"currentId": current_id, "messages": messages},
             "truncated": bool(mid) and mid not in seen}
 
 
-async def _recent_of_chat(chat, limit=_RECENT_MESSAGES):
+async def _recent_of_chat(chat, limit=_RECENT_MESSAGES, chat_id=None):
     """`_recent_branch` of a chat already read whole."""
     if not isinstance(chat, dict):
         return chat
@@ -7131,7 +7341,7 @@ async def _recent_of_chat(chat, limit=_RECENT_MESSAGES):
     async def no_blob(_mid):
         return None
     links = {k: v.get("parentId") for k, v in msgs.items() if isinstance(v, dict)}
-    return {**chat, **await _recent_branch(history.get("currentId"), links, read_rows, no_blob, limit)}
+    return {**chat, **await _recent_branch(history.get("currentId"), links, read_rows, no_blob, limit, chat_id)}
 
 
 async def _load_owui_recent(chat_id, user_id, limit=_RECENT_MESSAGES):
@@ -7147,7 +7357,7 @@ async def _load_owui_recent(chat_id, user_id, limit=_RECENT_MESSAGES):
         from open_webui.models.chats import Chat
         from open_webui.models.chat_messages import ChatMessage
     except Exception:
-        return await _recent_of_chat(await _load_owui_chat(chat_id, user_id), limit)
+        return await _recent_of_chat(await _load_owui_chat(chat_id, user_id), limit, chat_id)
     prefix = f"{chat_id}-"
     try:
         async with get_async_db_context() as db:
@@ -7173,7 +7383,7 @@ async def _load_owui_recent(chat_id, user_id, limit=_RECENT_MESSAGES):
             async def read_blob_message(mid):
                 return (await db.execute(select(Chat.chat[("history", "messages", mid)])
                                          .where(Chat.id == chat_id))).scalar()
-            return await _recent_branch(current, links, read_rows, read_blob_message, limit)
+            return await _recent_branch(current, links, read_rows, read_blob_message, limit, chat_id)
     except Exception as ex:
         pipe_log(f"[status-action] could not read the chat's recent messages: {ex}")
         return None
@@ -7678,6 +7888,28 @@ async def _drawer_parent(conn, session_row: dict, user_id) -> dict | None:
     return {"title": (row.get("label") or row.get("displayName") or "").strip() or key, "childKey": key}
 
 
+async def _previewed_task(conn, child_key: str) -> str | None:
+    """The child's task out of `sessions.preview`, which keeps the spawn
+    message as the model got it. 2026.10.5's `chat.history` shows the bare
+    task with nothing that marks it as the spawn (its display projection
+    strips the envelope), so the history read alone does not find it."""
+    try:
+        resp = await conn.send_request("sessions.preview", dict(keys=[child_key], limit=20, maxChars=2000),
+                                       timeout=5)
+    except Exception as ex:
+        pipe_log(f"[status-action] sessions.preview (drawer task) failed: {ex}")
+        return None
+    return _subagent_task_texts(resp).get(child_key)
+
+
+def _without_bare_task(items: list, task: str | None) -> list:
+    """The drawer's items without a first user turn that is the task the
+    header shows: the spawn message as 2026.10.5's history shows it."""
+    if task and items and items[0].get("kind") == "user" and items[0].get("text", "").strip() == task.strip():
+        return items[1:]
+    return items
+
+
 async def _latest_preview(conn, child_key: str) -> str | None:
     """A running child's newest message as the session list previews it:
     what a claude-cli child has said so far, while its transcript is still
@@ -7773,6 +8005,9 @@ class Action:
         visually distinct icon. Detected here and redirected
         straight into the same subagent-detail drawer instead of the
         general status dialog, keyed off content rather than mode."""
+        # No `execute` reaches a tab while it shows an input dialog (ELI-195).
+        __event_emitter__ = _dialog_safe_emitter(
+            __event_emitter__, (__user__ or {}).get("id"), body.get("chat_id"), body.get("id"))
         mode = body.get("mode")
         if mode == "compact":
             return await self._run_compact(body, __user__, __event_emitter__)
@@ -8387,9 +8622,11 @@ class Action:
             return {"status": "error", "detail": "sub-agent not found"}
 
         parent = session_row.get("spawnedBy") or session_row.get("parentSessionKey")
-        task = _subagent_row({"key": child_key, **session_row},
-                             _spawn_task_of(messages) or _subagent_tasks(parent).get(child_key))
-        items, dropped = _cap_run_items(_drawer_run_items(messages), budget)
+        task_text = _spawn_task_of(messages) or _subagent_tasks(parent).get(child_key)
+        if task_text is None:
+            task_text = await _previewed_task(conn, child_key)
+        task = _subagent_row({"key": child_key, **session_row}, task_text)
+        items, dropped = _cap_run_items(_without_bare_task(_drawer_run_items(messages), task_text), budget)
         claude_cli = (session_row.get("agentRuntime") or {}).get("id") == "claude-cli"
         note = latest = None
         if claude_cli and task["status"] in _LIVE_SUBAGENT_STATUSES:
