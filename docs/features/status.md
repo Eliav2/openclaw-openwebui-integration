@@ -55,6 +55,8 @@ A Compact pill in the dialog header runs `/compact` on the session. While it wor
 
 Right after a compact, the context number can read far lower than what the next request carries: it counts the kept conversation, without the system prompt and tools. The next reply brings it up to date.
 
+If the Gateway does not compact (the model refused the summary, say, or compaction is unavailable for the session), the Context section keeps its numbers and shows the Gateway's reason under them in red, for example "Compaction failed: Turn prefix summarization failed: 400 …". The `/compact` run ends as done either way, so the dialog reads the outcome from the run's own reply.
+
 It waits up to 180 seconds, the same as the default timeout of `openclaw sessions compact`. If it takes longer, the dialog says so; compaction may still finish in the background.
 
 While a reply is running, Compact refuses with "A response is currently in progress", rather than compacting the session under a running turn.

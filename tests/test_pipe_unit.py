@@ -6803,7 +6803,7 @@ class TurnIdentityTests(unittest.TestCase):
         self.assertIsNone(turn_message_id(self.KEY, ""))
         src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "openclaw_pipe_pkg",
                                 "action.py")).read()
-        self.assertIn('idempotency_key=f"{ACTION_RUN_PREFIX}compact-', src)
+        self.assertIn('idempotency_key = f"{ACTION_RUN_PREFIX}compact-', src)
 
 
 
