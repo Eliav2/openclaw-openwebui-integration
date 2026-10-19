@@ -912,20 +912,25 @@ async def _ask_user_input_modal(
 # never yielded, emitted, persisted or logged, so the chat, the database, the
 # transcript and the model only ever see the request and "stored".
 #
-# A stored secret is usable by the agent's runs only from OpenClaw 2026.10
-# (ELI-97), so an older Gateway's request is left to the Control UI, as before.
+# It is asked whenever the Gateway offers that question protocol (hello-ok
+# features), whatever its version. Whether a run can then use the stored value
+# is the Gateway's config (secrets.egressProxy), the same on every release line
+# (ELI-97); the dialog only replaces the Control UI as the place to type it.
 
-SECRET_REQUESTS_FROM = (2026, 10, 10)
+SECRET_REQUEST_METHODS = ("question.resolve",)
+SECRET_REQUEST_EVENTS = ("question.requested", "question.resolved")
 # question id -> the task asking for it
 _SECRET_REQUESTS: dict = {}
 # session key -> the reply streaming its run, which asks on its own socket
 _SECRET_ASKERS: dict = {}
 
 
-def _gateway_release(version) -> tuple:
-    """(year, month, patch) of a Gateway version like "2026.10.10-beta.1"."""
-    m = re.match(r"(\d+)\.(\d+)\.(\d+)", str(version or ""))
-    return tuple(int(n) for n in m.groups()) if m else (0, 0, 0)
+def _secret_requests_offered(conn) -> bool:
+    """The Gateway offers what a secret request needs: its question events
+    and `question.resolve` (hello-ok features)."""
+    methods = getattr(conn, "gateway_methods", None) or ()
+    events = getattr(conn, "gateway_events", None) or ()
+    return all(m in methods for m in SECRET_REQUEST_METHODS) and all(e in events for e in SECRET_REQUEST_EVENTS)
 
 
 def _secret_request_question(record) -> dict | None:
@@ -967,11 +972,12 @@ def _secret_asker_leave(turn) -> None:
 
 def secret_request_seen(conn, record) -> bool:
     """`question.requested`: ask a secret request made in an Open WebUI chat.
-    False for anything else, or on a Gateway whose runs cannot use it."""
+    False for anything else, or on a Gateway that does not offer the question
+    protocol it needs."""
     question = _secret_request_question(record)
     if question is None or record.get("status", "pending") != "pending" or not record.get("id"):
         return False
-    if _gateway_release(conn.gateway_version) < SECRET_REQUESTS_FROM:
+    if not _secret_requests_offered(conn):
         return False
     parsed = conn.parse_owui_session_key(record.get("sessionKey") or "")
     if not parsed or record["id"] in _SECRET_REQUESTS:

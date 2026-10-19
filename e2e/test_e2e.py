@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import time
 import urllib.error
 import urllib.request
@@ -728,6 +729,64 @@ def _kill_and_restart_gateway(sig: int = 9, while_down=None) -> None:
                 pytest.fail(f"the relaunched Gateway exited ({proc.returncode}): {f.read()[-2000:]}")
         return _gateway_up()
     _until("the Gateway to come back", back, timeout_s=180, every_s=2)
+
+
+STARTUP_REFUSAL = "has not completed startup inspection"
+
+
+def _gateway_listening() -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", 18789), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+@pytest.mark.skipif(not GATEWAY_PID_FILE or shutil.which("pgrep") is None,
+                    reason="needs the pid of the e2e stack's Gateway (E2E_GATEWAY_PID_FILE)")
+def test_a_message_sent_while_the_gateway_starts_gets_its_reply(token):
+    """A message sent as soon as a crashed Gateway's replacement takes
+    connections. OpenClaw 2026.10.5 first refuses connections ("gateway
+    starting; retry shortly", until its startup sidecars run), then, after an
+    unclean stop, refuses runs until it has inspected and prepared the agent's
+    database ("Agent main has not completed startup inspection and
+    preparation"), both retryable UNAVAILABLE. The message gets its own reply;
+    neither refusal is shown as one."""
+    _until("the Gateway's crash-loop window to allow a crash", _crash_loop_allows_a_crash,
+           timeout_s=CRASH_LOOP_WINDOW_MS / 1000 + 30, every_s=5)
+    chat_id, _ = _chat_turn(token, "Respond with exactly: E2E_BEFORE_RESTART")
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    with open(GATEWAY_PID_FILE) as f:
+        pids = _pid_tree(int(f.read().strip()))
+    for p in pids:
+        os.kill(p, 9)   # unclean: the new Gateway inspects the agent's database in the background
+    _until("the Gateway to be gone", lambda: not any(_alive(p) for p in pids), timeout_s=60)
+    log_path = os.path.join(os.path.dirname(GATEWAY_PID_FILE), "gateway-after-restart.log")
+    start = os.path.getsize(log_path) if os.path.exists(log_path) else 0
+    log = open(log_path, "a")
+    proc = subprocess.Popen(["openclaw", "gateway", "run"], stdout=log, stderr=subprocess.STDOUT,
+                            start_new_session=True)
+    with open(GATEWAY_PID_FILE, "w") as f:
+        f.write(str(proc.pid))
+    _until("the new Gateway's listener", _gateway_listening, timeout_s=120, every_s=0.1)
+    _, msg = _chat_turn(token, "Respond with exactly: E2E_DURING_STARTUP", chat_id=chat_id)
+    content = msg.get("content") or ""
+    assert STARTUP_REFUSAL not in content, f"the startup refusal shown as the reply: {content[:300]!r}"
+    assert content.strip() == "E2E_DURING_STARTUP", f"the reply: {content[:300]!r}"
+    _until("the Gateway to finish starting", _gateway_up, timeout_s=180, every_s=2)
+    with open(log_path, errors="replace") as f:
+        f.seek(start)
+        refused = sorted({m.group(1) for line in f if STARTUP_REFUSAL in line
+                          for m in [re.search(r"res ✗ (\S+)", line)] if m})
+    if _openclaw_release() >= (2026, 10):
+        # The test produces its own precondition: the Gateway refused the
+        # message or the transcript subscriptions the Pipe renews on connect.
+        assert refused, "the Gateway refused nothing while it was preparing: nothing was tested"
+    # A renewal given up would leave the chat without tool events until the
+    # next reconnect; the Gateway logs a renewal only when it is refused.
+    gave_up = [line for line in _pipe_log_since(since).splitlines()
+               if "sessions.messages.subscribe" in line and " failed: " in line]
+    assert not gave_up, f"transcript subscriptions given up after the restart: {gave_up[:3]}"
 
 
 @pytest.mark.skipif(not GATEWAY_PID_FILE or shutil.which("pgrep") is None,
@@ -1540,9 +1599,6 @@ def test_a_requested_secret_is_entered_in_a_masked_dialog_and_kept_out_of_the_ch
     store, the agent gets "stored", and the value is nowhere else: not in
     Open WebUI's database or logs, the Gateway's logs, the transcript or the
     model's context."""
-    if _openclaw_release() < (2026, 10):
-        pytest.skip("OpenClaw 2026.9 stores a requested secret, but no run can use it (ELI-97): "
-                    "the Pipe leaves the request to the Control UI there, as before")
     import secrets as _secrets
     name = f"DUMMY_SECRET_ELI96_{uuid.uuid4().hex[:6].upper()}"
     value = _secrets.token_urlsafe(30)   # 40 characters
@@ -1578,8 +1634,6 @@ def test_a_requested_secret_is_entered_in_a_masked_dialog_and_kept_out_of_the_ch
 
 
 def test_a_cancelled_secret_dialog_tells_the_agent_no_credential_came(token):
-    if _openclaw_release() < (2026, 10):
-        pytest.skip("OpenClaw 2026.9: the Pipe leaves a secret request to the Control UI (ELI-97)")
     name = f"DUMMY_SECRET_ELI96_{uuid.uuid4().hex[:6].upper()}"
     page = _Page(token)
     try:
