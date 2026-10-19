@@ -5264,7 +5264,7 @@ def _dialog_safe_event_call(event_call, sid, user_id):
 # reply that is streaming into the same tab.
 # ---------------------------------------------------------------------------
 
-_COMPOSER_BUTTON_VERSION = "6"
+_COMPOSER_BUTTON_VERSION = "7"
 
 # The Status Action's function id (install_action.py's FUNCTION_ID; the
 # dialog's own JS calls the same fixed id) and the Pipe's default function id.
@@ -5304,8 +5304,9 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
   // removing it (a layout this snippet does not understand): give up.
   const LOOP_LIMIT = 20;
   const LOOP_WINDOW_MS = 10000;
-  // A paw, drawn in Heroicons' outline style (24x24, round caps), for "Claw".
-  const PAW_PATH = 'M11 6a1.5 2 0 1 1-3 0 1.5 2 0 0 1 3 0ZM16 6a1.5 2 0 1 1-3 0 1.5 2 0 0 1 3 0ZM7 10.5a1.5 1.75 0 1 1-3 0 1.5 1.75 0 0 1 3 0ZM20 10.5a1.5 1.75 0 1 1-3 0 1.5 1.75 0 0 1 3 0ZM12 12.75c-2.25 0-5.25 2.6-5.25 4.875 0 1.45 1.1 2.375 2.55 2.375.95 0 1.7-.45 2.7-.45s1.75.45 2.7.45c1.45 0 2.55-.925 2.55-2.375 0-2.275-3-4.875-5.25-4.875Z';
+  // A crab claw (ELI-231): an open pincer with a tooth on each finger and a
+  // wrist, in Heroicons' outline style (24x24, round caps), for "Claw".
+  const CLAW_PATH = 'M6.3 14.6C4.6 11.7 5.7 7.1 8.7 4.6C10.8 2.8 13.4 2.3 15.6 3.1C14.3 3.7 13.4 4.4 13 5.3L13.9 6.5L12 6.9C11.6 7.5 11.3 8.1 11.2 8.7C11.1 11 12.7 12.9 15.1 12.7C16.4 12.5 17.3 11.9 17.8 11.1L17.1 10L18.6 9.7C18.6 9.2 18.6 8.7 18.5 8.2C20.5 10.2 20.6 13.4 18.9 15.8C17.1 18.3 14.2 18.8 11.6 17.8C9.5 17 7.5 16.1 6.3 14.6ZM7.8 16L5.4 19.6L9.1 21.1L11 17.6';
 
   const state = {
     prefixes: [],
@@ -5564,7 +5565,7 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
       + 'bg-transparent text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800';
     b.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" '
       + 'stroke-width="1.75" stroke="currentColor" aria-hidden="true" class="size-4">'
-      + '<path stroke-linecap="round" stroke-linejoin="round" d="' + PAW_PATH + '"/></svg>'
+      + '<path stroke-linecap="round" stroke-linejoin="round" d="' + CLAW_PATH + '"/></svg>'
       // Icon-only below `sm`, like Open WebUI's own composer chips: at phone
       // width the chip row's overflow cut the label to "Stat" (ELI-123). The
       // title and aria-label still name it. Both classes ship in Open WebUI's CSS.
@@ -8248,20 +8249,20 @@ async def _latest_preview(conn, child_key: str) -> str | None:
     return preview if isinstance(preview, str) and preview.strip() and not _is_spawn_message(preview) else None
 
 
-# The toolbar button's icon, the composer chip's paw (ELI-202); without one
-# Open WebUI draws its default sparkle. A fixed gray stroke on purpose: Open
+# The toolbar button's icon, the composer chip's crab claw (ELI-231); without
+# one Open WebUI draws its default sparkle. A fixed gray stroke on purpose: Open
 # WebUI draws it as an <img>, so currentColor never resolves, and inverts it
 # 80% in dark mode; this gray stays a mid gray in both, like its own icons.
 ICON_URL = (
     "data:image/svg+xml;charset=utf-8,"
     "%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%20fill='none'%20"
     "stroke='%236b7280'%20stroke-width='1.6'%20stroke-linecap='round'%20stroke-linejoin='round'"
-    "%3E%3Cpath%20d='M11%206a1.5%202%200%201%201-3%200%201.5%202%200%200%201%203%200ZM16%206a"
-    "1.5%202%200%201%201-3%200%201.5%202%200%200%201%203%200ZM7%2010.5a1.5%201.75%200%201%201"
-    "-3%200%201.5%201.75%200%200%201%203%200ZM20%2010.5a1.5%201.75%200%201%201-3%200%201.5%20"
-    "1.75%200%200%201%203%200ZM12%2012.75c-2.25%200-5.25%202.6-5.25%204.875%200%201.45%201.1"
-    "%202.375%202.55%202.375.95%200%201.7-.45%202.7-.45s1.75.45%202.7.45c1.45%200%202.55-.925"
-    "%202.55-2.375%200-2.275-3-4.875-5.25-4.875Z'/%3E%3C/svg%3E"
+    "%3E%3Cpath%20d='M6.3%2014.6C4.6%2011.7%205.7%207.1%208.7%204.6C10.8%202.8%2013.4%202.3%2"
+    "015.6%203.1C14.3%203.7%2013.4%204.4%2013%205.3L13.9%206.5L12%206.9C11.6%207.5%2011.3%208"
+    ".1%2011.2%208.7C11.1%2011%2012.7%2012.9%2015.1%2012.7C16.4%2012.5%2017.3%2011.9%2017.8%2"
+    "011.1L17.1%2010L18.6%209.7C18.6%209.2%2018.6%208.7%2018.5%208.2C20.5%2010.2%2020.6%2013."
+    "4%2018.9%2015.8C17.1%2018.3%2014.2%2018.8%2011.6%2017.8C9.5%2017%207.5%2016.1%206.3%2014"
+    ".6ZM7.8%2016L5.4%2019.6L9.1%2021.1L11%2017.6'/%3E%3C/svg%3E"
 )
 
 
