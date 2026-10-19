@@ -977,6 +977,53 @@ def test_stop_on_a_reply_the_agent_starts_stops_its_run(page, token):
     os.remove(hold)
 
 
+def test_a_tab_that_loads_the_chat_as_the_agent_starts_a_reply_shows_it(page, token):
+    """ELI-230: Open WebUI's loadChat fetches the chat, awaits its tags, then
+    assigns the history it fetched first. A reply the agent starts in that
+    window is introduced, merged, then overwritten: the tab never showed it
+    until a reload. The second tab's tags are held until the reply's message
+    is in the DB, which puts its introduction in that window every time. The
+    tab shows the reply while it runs; the tab open all along shows it once,
+    never blanked, also through the end's second send of it."""
+    word = f"LOADRACE{os.getpid()}"
+    capture.new_chat(page)
+    capture.send(page, "E2E_ECHO: BROWSER_LOAD_RACE")
+    _wait(page, _turn_over("BROWSER_LOAD_RACE"), "the first reply")
+    chat_id = _chat_id(page)
+    me = capture.api("GET", "/api/v1/auths/", token=token)
+    key = f"agent:main:openwebui-{me['id']}-{chat_id}"
+
+    def messages():
+        return capture.api("GET", f"/api/v1/chats/{chat_id}", token=token)["chat"]["history"]["messages"]
+    before = set(messages())
+    late = page.context.new_page()
+    held = []
+    late.route(f"**/api/v1/chats/{chat_id}/tags", lambda route: held.append(route))
+    try:
+        with late.expect_request(lambda r: r.url.endswith(f"/api/v1/chats/{chat_id}/tags"), timeout=60_000):
+            late.goto(page.url)
+        capture.gateway_call("chat.send", {"sessionKey": key, "message": f"E2E_SLOW:15 {word}",
+                                           "idempotencyKey": f"race-{word}", "deliver": False})
+        deadline = time.monotonic() + 60
+        while not any(m.get("role") == "assistant" for i, m in messages().items() if i not in before):
+            assert time.monotonic() < deadline, "the agent's reply never got its message"
+            late.wait_for_timeout(200)  # polls the DB; the route callback runs meanwhile
+        assert held, "the late tab's tags request was not held"
+        for route in held:
+            route.continue_()
+        _wait(late, _reply_js(1, f"r.text.includes({json.dumps(word)}) && !r.done"),
+              "the agent's reply in the tab that loaded the chat as it began, while it runs")
+        for tab in (late, page):
+            _wait(tab, _reply_js(1, f"r.done && r.text.includes({json.dumps(_slow(word, 15))})"), "the finished reply")
+            shown = [r["text"] for r in _replies(tab) if word in r["text"]]
+            assert len(shown) == 1 and shown[0].count(word) == 1, shown
+        texts = _seen(page, _replies(page)[1]["id"])
+        first = next(n for n, t in enumerate(texts) if word in t)
+        assert all(word in t for t in texts[first:]), f"the open tab's reply blanked: {_tails(texts)}"
+    finally:
+        late.close()
+
+
 def test_an_attached_image_reaches_the_agent(page):
     """An image attached in the composer shows in the sent message, and the
     agent gets it as an image (the scripted model says how many images it
