@@ -7,13 +7,13 @@ Valves: `GATEWAY_URL`, `GATEWAY_TOKEN`, `DEVICE_IDENTITY`, `STATE_DIR`, `AGENT_I
 
 _Separate function: install the Status Action first, see [Status button](../install/status-action.md)._
 
-<img src="../img/status-dialog-light.png" alt="The Status dialog: context used, 5-hour and weekly rate limits, two running sub-agents" width="320">
+<img src="../img/status-dialog-light.png" alt="The Status dialog, titled Claw: context used, 5-hour and weekly rate limits, two running sub-agents" width="320">
 
 _The rate limits in this screenshot are sample data._
 
 The Status Action adds a button to the message toolbar. It opens a dialog, titled **Claw**, with five sections: Context, Rate limits, [Background](#background), [Subagents](#sub-agents) and In-process agents.
 
-<img src="../img/toolbar-button-light.png" alt="The OpenClaw Status button, a paw, on a reply's toolbar" width="300">
+<img src="../img/toolbar-button-light.png" alt="The Status Action's paw button at the end of a reply's toolbar" width="300">
 
 The dialog opens at once with every section's title. Each section then reads its own source and fills the moment that source answers, with its own loading, empty and error state, so a slow or failing source shows in its own section only:
 
@@ -119,7 +119,7 @@ The drawer reads the sub-agent's whole transcript (`chat.history`). A very long 
 
 The Pipe also adds a **Claw** button, with a paw, to the composer row of OpenClaw chats, right after the OpenClaw Thinking chip (or at the end of the composer's chips when that chip is off). It opens the same dialog through the Status Action, so the Action must be installed.
 
-<img src="../img/composer-status-light.png" alt="The Claw button in the composer, next to the integrations button" width="374">
+<img src="../img/composer-status-light.png" alt="The Claw button in the composer, a paw next to the integrations button" width="374">
 
 Open WebUI has no extension point for the composer, so the button is put into the page by JavaScript. If a future Open WebUI changes the composer and the anchor is not found, the button simply does not appear. It appears as soon as a tab opens an OpenClaw chat.
 
