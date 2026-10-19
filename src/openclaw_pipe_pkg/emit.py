@@ -37,6 +37,33 @@ def _background_agents_line(n: int) -> str:
     return f"Waiting on {n} background agent{'' if n == 1 else 's'}"
 
 
+# Live view of the agent's browser (LIVE_VIEW_URL): ids go into the URL as they
+# are, so they must be plain ids.
+_LIVE_VIEW_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def _live_view_url(valves, *, chat_id, message_id, user_id, email, tool_name, args_str):
+    """The embed URL for a reply whose tool call looks like browser use, or None.
+    None when the valve is off, the user is not in LIVE_VIEW_USERS, the tool does
+    not match LIVE_VIEW_TOOLS, or the URL would not be an http(s) URL: Open WebUI
+    renders any other embed string as HTML."""
+    template = (getattr(valves, "LIVE_VIEW_URL", "") or "").strip()
+    if not template or not re.match(r"^https?://", template, re.I):
+        return None
+    if not all(isinstance(v, str) and _LIVE_VIEW_ID.match(v) for v in (chat_id, message_id)):
+        return None
+    users = _parse_owner_users(getattr(valves, "LIVE_VIEW_USERS", "") or "")
+    if users and not _is_owner_user(users, user_id, email):
+        return None
+    try:
+        tools = re.compile(getattr(valves, "LIVE_VIEW_TOOLS", "") or r"(?!)", re.I)
+    except re.error:
+        return None
+    if not tools.search(f"{tool_name or ''} {args_str or ''}"):
+        return None
+    return template.replace("{chat_id}", chat_id).replace("{message_id}", message_id)
+
+
 def _fmt_tokens(n) -> str:
     """Compact token count: 115212 -> '115k', 1000000 -> '1.0m'."""
     try:
@@ -114,7 +141,8 @@ def _window_reset_line(w: dict) -> str | None:
     return f"⏱ {bit} (resets in {rel})"
 
 
-async def _build_usage_status_lines(conn, session_key, timeout: float = 5) -> list[str]:
+async def _build_usage_status_lines(conn, session_key, timeout: float = 5,
+                                    run_usage: dict | None = None) -> list[str]:
     """Best-effort final status lines: context window fill (combined with the
     provider's primary/nearest-term rate-limit window on the same line, kept
     deliberately thin -- no reset time), one full detail line per rate-limit
@@ -137,6 +165,12 @@ async def _build_usage_status_lines(conn, session_key, timeout: float = 5) -> li
     just omits that line. They're fetched concurrently (not one after the
     other) so this adds at most one round trip's worth of latency, not two,
     to the moment the status line settles after the reply text is done.
+
+    `run_usage`: the reply's own run's last-call usage. Its prompt tokens are
+    the context fill, over the row's `totalTokens`: OpenClaw 2026.10 writes a
+    session's first totals to its row just after the run ends, so a new
+    chat's first reply found none there, and every later reply read the run
+    before it (ELI-177). The window (`contextTokens`) still comes from the row.
     """
     describe_task = asyncio.ensure_future(
         conn.send_request("sessions.describe", dict(key=session_key), timeout=timeout)
@@ -151,7 +185,7 @@ async def _build_usage_status_lines(conn, session_key, timeout: float = 5) -> li
         session_row = (desc or {}).get("session") or {}
         provider = session_row.get("modelProvider")
         context_tokens = session_row.get("contextTokens")
-        total_tokens = session_row.get("totalTokens")
+        total_tokens = _usage_prompt_tokens(run_usage) or session_row.get("totalTokens")
         if context_tokens and total_tokens is not None:
             pct = round(total_tokens / context_tokens * 100, 1)
             context_bit = f"🧠 {_fmt_tokens(total_tokens)}/{_fmt_tokens(context_tokens)} ({pct:g}%)"

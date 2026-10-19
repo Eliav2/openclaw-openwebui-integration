@@ -32,12 +32,17 @@ import capture  # noqa: E402
 TURN_MS = 120_000
 
 
-def _openclaw_release() -> tuple:
-    """(year, month) of the Gateway the stack installed, from `openclaw --version`."""
+def _openclaw_version() -> tuple:
+    """(year, month, patch) of the Gateway the stack installed, from `openclaw --version`."""
     out = subprocess.run(["openclaw", "--version"], capture_output=True, text=True, timeout=60)
-    m = re.search(r"(\d{4})\.(\d{1,2})\.\d+", out.stdout)
+    m = re.search(r"(\d{4})\.(\d{1,2})\.(\d+)", out.stdout)
     assert m, f"no version in {out.stdout!r} {out.stderr[-300:]!r}"
-    return int(m.group(1)), int(m.group(2))
+    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+
+def _openclaw_release() -> tuple:
+    """(year, month) of the Gateway the stack installed."""
+    return _openclaw_version()[:2]
 
 
 @pytest.fixture(scope="module")
@@ -750,11 +755,10 @@ def test_the_status_dialog_compacts_the_chat(page):
     with this chat's context numbers; Compact shows "Compacting…", the
     session is compacted (its summary request reaches the model), and the
     dialog comes back with the numbers."""
-    if _openclaw_release() >= (2026, 10):
-        pytest.skip("OpenClaw 2026.10: describe/list report no usage for a session created by "
-                    "chat.send until it is touched again, so the dialog has no context numbers or "
-                    "Compact button (Control UI and CLI are correct; ELI-177, canceled). "
-                    "Re-check on each OpenClaw upgrade.")
+    if _openclaw_version() >= (2026, 10, 10):
+        pytest.skip("OpenClaw 2026.10.10: a session's row gets no totals after its first run "
+                    "(only after the second), so the dialog has no context numbers or Compact "
+                    "button yet (ELI-223). 2026.10.5 writes them within seconds.")
     nonce = f"BROWSER_COMPACT_{os.getpid()}_{len(_fake_llm_requests())}"
     capture.new_chat(page)
     capture.send(page, f"E2E_ECHO: {nonce}")
@@ -912,6 +916,54 @@ def test_a_long_task_shown_whole_keeps_the_drawer_closable(page, token, screen):
     finally:
         if view is not page:
             view.close()
+
+
+# The task text's first line is what its box shows: the box is scrolled to the
+# top and the first characters lie inside it, on screen.
+TASK_SHOWS_FIRST_LINE = """() => {
+  const body = document.querySelector('#openclaw-drawer-task [data-openclaw-block-text]');
+  if (!body) return 'no task text';
+  if (body.scrollTop !== 0) return 'task box scrolled to ' + body.scrollTop;
+  const node = body.firstChild;
+  const range = document.createRange();
+  range.setStart(node, 0);
+  range.setEnd(node, Math.min(10, node.length));
+  const r = range.getBoundingClientRect(), b = body.getBoundingClientRect();
+  if (r.top < b.top - 1 || r.bottom > b.bottom + 1) return 'first line outside the box: ' + r.top + '..' + r.bottom + ' vs ' + b.top + '..' + b.bottom;
+  if (b.top < 0 || b.bottom > innerHeight) return 'task box off screen: ' + b.top + '..' + b.bottom;
+  return 'ok';
+}"""
+
+
+def test_show_less_puts_a_long_task_back_at_its_first_lines(page, token):
+    """Sub-agent drawer (ELI-236): "Show all" on a long task, the task's box
+    scrolled down, then "Show less". The two-line preview must show the
+    task's first lines again, not two lines from wherever the box was
+    scrolled to."""
+    capture.new_chat(page)
+    capture.send(page, "E2E_SPAWN_LONG one helper")
+    _wait(page, _turn_over("E2E_SPAWNED"), "the parent's reply")
+    _open_status(page)
+    section = "#openclaw-status-section-subagents"
+    _wait(page, f"""() => {{ const s = document.querySelector('{section}');
+                     return !!s && s.innerText.includes('E2E_CHILDTASK'); }}""",
+          "the sub-agent in the Status dialog", 60_000)
+    page.locator(f"{section} button", has_text="E2E_CHILDTASK").first.click()
+    more = page.locator('#openclaw-drawer-root [data-openclaw-more="task"]')
+    more.wait_for(timeout=30_000)
+    more.click()
+    _wait(page, """() => (document.querySelector('[data-openclaw-more="task"]') || {}).textContent === 'Show less'""",
+          "the task shown whole", 10_000)
+    scrolled = page.evaluate("""() => {
+      const body = document.querySelector('#openclaw-drawer-task [data-openclaw-block-text]');
+      body.scrollTop = body.scrollHeight;
+      return body.scrollTop; }""")
+    assert scrolled > 0, "the task box did not scroll, so this proves nothing"
+    more.click()
+    _wait(page, """() => (document.querySelector('[data-openclaw-more="task"]') || {}).textContent === 'Show all'""",
+          "the task clamped again", 10_000)
+    verdict = page.evaluate(TASK_SHOWS_FIRST_LINE)
+    assert verdict == "ok", verdict
 
 
 def _chat_id(page) -> str:

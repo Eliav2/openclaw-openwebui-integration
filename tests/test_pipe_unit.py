@@ -1850,6 +1850,57 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         await self._spin()
         self.assertTrue(closed, "the retired connection closes once the queued message is served")
 
+    async def test_a_reply_on_a_retired_connection_reads_its_usage_before_the_close(self):
+        """#157 gate (ELI-102, 2026-10-19): a redeploy retired the connection
+        a reply streamed on. The run ended, dropping its consumer closed the
+        socket, and only then did the reply ask chat.history for its usage
+        line: no answer ever comes on a closed socket, so the reply's end
+        waited out the request's timeout and its done:true never landed."""
+        closed = []
+        closed_event = asyncio.Event()
+        hung = []
+        send_request = self.conn.send_request
+
+        async def disconnect():
+            closed.append(True)
+            closed_event.set()
+
+        async def closing_send_request(method, params, timeout=10):
+            await asyncio.sleep(0.02)          # the answer's way back
+            if closed:
+                hung.append(method)
+                await asyncio.Event().wait()   # the socket closed meanwhile: no answer, ever
+            return await send_request(method, params, timeout=timeout)
+        self.conn.disconnect = disconnect
+        self.conn.send_request = closing_send_request
+        self.history = {"messages": [{"role": "assistant", "content": "hi",
+                                      "usage": {"input": 10, "output": 5},
+                                      "__openclaw": {"runId": "run-1"}}]}
+
+        gen = self._reply("hello", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        await self.conn.retire()                         # the redeploy
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "hi"))
+        q.put_nowait({"type": "event", "event": "agent", "payload": {
+            "sessionKey": self.SK, "runId": "run-1", "stream": "lifecycle",
+            "data": {"phase": "end"}}})
+        out = await asyncio.wait_for(first, 2)
+
+        async def rest():
+            nonlocal out
+            async for chunk in gen:
+                out += chunk if isinstance(chunk, str) else ""
+        await asyncio.wait_for(rest(), 2)
+        self.assertIn("hi", out)
+        # The close is a background task the dropped consumer starts.
+        await asyncio.wait_for(closed_event.wait(), 2)
+        self.assertEqual(hung, [], "a request sent after the close")
+        self.assertIn("chat.history", self.rpc, "the reply's usage was read before the close")
+        usage = self.ocp._build_usage_status_lines.await_args.kwargs.get("run_usage")
+        self.assertEqual(usage, {"input": 10, "output": 5})
+
     async def test_a_reply_that_saw_its_run_end_leaves_no_parity_target(self):
         """The inline loop ends on `lifecycle end` and drops its consumer; the
         run's trailing `chat` final arrives after that. Measured live
@@ -4355,6 +4406,53 @@ class UsageStatusLineTests(unittest.IsolatedAsyncioTestCase):
         )
         lines = await _build_usage_status_lines(conn, "agent:main:x")
         self.assertTrue(all("🎯" not in line for line in lines))
+
+    async def test_the_runs_own_usage_fills_the_line_before_the_row_has_totals(self):
+        """OpenClaw 2026.10: a new session's row has its window but no totals
+        yet when the first reply ends; the run's own usage fills the line
+        (ELI-177)."""
+        conn = self._conn(describe_result={"session": {"contextTokens": 200_000}},
+                          usage_result={"providers": []})
+        self.assertEqual(await _build_usage_status_lines(conn, "agent:main:x"), [])
+        usage = {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 15}
+        lines = await _build_usage_status_lines(conn, "agent:main:x", run_usage=usage)
+        self.assertEqual(lines, ["🧠 10/200k (0%)"])
+
+    async def test_the_runs_own_usage_wins_over_the_previous_runs_row(self):
+        conn = self._conn(describe_result={"session": {"contextTokens": 1_000_000, "totalTokens": 500}},
+                          usage_result={"providers": []})
+        usage = {"input": 2, "cacheRead": 114_000, "cacheWrite": 1_210, "output": 40}
+        lines = await _build_usage_status_lines(conn, "agent:main:x", run_usage=usage)
+        self.assertEqual(lines, ["🧠 115k/1.0m (11.5%)"])
+
+
+class RunUsageTests(unittest.TestCase):
+    """The context a run filled, from its own usage (ELI-177)."""
+
+    def test_prompt_tokens_count_as_openclaw_counts_a_rows_total(self):
+        f = openclaw_pipe._usage_prompt_tokens
+        self.assertEqual(f({"input": 3, "cacheRead": 100, "cacheWrite": 7, "output": 9}), 110)
+        self.assertEqual(f({"contextUsage": {"state": "available", "promptTokens": 42}, "input": 3}), 42)
+        self.assertIsNone(f({"contextUsage": {"state": "unavailable"}, "input": 3}))
+        self.assertEqual(f({"totalTokens": 15, "output": 5}), 10)
+        self.assertIsNone(f({"input": 0, "output": 0, "totalTokens": 0}))
+        self.assertIsNone(f(None))
+
+    def test_a_runs_usage_is_found_by_its_id_not_by_position(self):
+        f = openclaw_pipe._history_usage_for_run
+        mine, later = {"input": 10, "output": 5}, {"input": 99, "output": 1}
+        hist = {"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "usage": {"input": 4}, "__openclaw": {"runId": "run-a"}},
+            {"role": "assistant", "usage": mine, "__openclaw": {"runId": "run-a"}},
+            {"role": "assistant", "usage": {"input": 0, "output": 0}, "__openclaw": {"runId": "run-a"}},
+            {"role": "assistant", "usage": later, "__openclaw": {"runId": "run-b"}},
+        ]}
+        self.assertEqual(f(hist, "run-a"), mine)
+        self.assertEqual(f(hist, "run-b"), later)
+        self.assertIsNone(f(hist, "run-c"))
+        cli = {"messages": [{"role": "assistant", "usage": mine, "idempotencyKey": "cli-assistant:run-x"}]}
+        self.assertEqual(f(cli, "run-x"), mine)
 
 
 class MessageSnapshotEmitterTests(unittest.IsolatedAsyncioTestCase):

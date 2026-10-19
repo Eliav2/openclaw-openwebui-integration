@@ -1,4 +1,5 @@
-"""E2E: end the run at Open WebUI's first "database is locked" (ELI-204).
+"""E2E: end the run at Open WebUI's first "database is locked" (ELI-204), and
+run only one shard's tests when E2E_SHARD is set (ELI-246, at the end).
 
 A task cancelled inside one of Open WebUI's DB writes can keep SQLite's write
 lock for good (ELI-205): every write after it fails, so each later test waited
@@ -81,3 +82,34 @@ def pytest_keyboard_interrupt(excinfo):
 def pytest_sessionfinish(session, exitstatus):
     if _state["line"] is not None:
         session.exitstatus = 3
+
+
+# ── Shards (ELI-246) ────────────────────────────────────────────────────────
+# With E2E_SHARD set, only that shard's tests of e2e/shards.py run. A listed
+# test this run collected nothing for fails the run: a renamed test must not
+# leave its shard quietly shorter.
+
+def _load_shards() -> dict:
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("e2e_shards", os.path.join(os.path.dirname(__file__), "shards.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.SHARDS
+
+
+def pytest_collection_modifyitems(config, items):
+    shard = os.environ.get("E2E_SHARD")
+    if not shard:
+        return
+    shards = _load_shards()
+    if shard not in shards:
+        raise pytest.UsageError(f"E2E_SHARD={shard!r} is not a shard of e2e/shards.py: {sorted(shards)}")
+    wanted = set(shards[shard])
+    key = {id(it): f"{it.path.name}::{getattr(it, 'originalname', it.name)}" for it in items}
+    collected = set(key.values())
+    files = {k.split("::")[0] for k in collected}
+    missing = sorted(w for w in wanted if w.split("::")[0] in files and w not in collected)
+    if missing:
+        raise pytest.UsageError(f"shard {shard} lists tests this run did not collect: {missing}")
+    config.hook.pytest_deselected(items=[it for it in items if key[id(it)] not in wanted])
+    items[:] = [it for it in items if key[id(it)] in wanted]
