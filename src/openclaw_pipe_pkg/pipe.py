@@ -1391,7 +1391,7 @@ class _PipeTurn:
                         # --- Run text and tool cards ---
                         # One renderer reads them, the one a turn writer uses
                         # (ELI-147).
-                        if stream in ("assistant", "item", "tool"):
+                        if stream in ("assistant", "item", "tool", PIPE_NOTE_STREAM):
                             added = self.renderer.feed(payload)
                             for text in (a for a in added if isinstance(a, str)):
                                 async for chunk in self.show_text(text):
@@ -1437,6 +1437,13 @@ class _PipeTurn:
                                     # Until the reply ends: its usage rows replace it.
                                     await _emit_status(self.__event_emitter__,
                                                        _background_agents_line(self.background_agents))
+
+                        # --- The Pipe's own notes (ELI-197) ---
+                        if stream == PIPE_NOTE_STREAM:
+                            for event in added:
+                                yield event
+                            # Text after the note is a new message item.
+                            self.fence_item_start = len(self.assistant_stream_text)
 
                         # --- Item events (progress) ---
                         if stream == "item":
@@ -1927,6 +1934,11 @@ class _PipeTurn:
             # The error is the reply: nothing to recover, and no
             # "no reply text" note under it.
             await self.maybe_emit_snapshot(force=True)
+        elif not self.aborted and not self.text_yielded and self.renderer.silenced and any(
+                i.get("type") == "function_call" for i in self.renderer.output):
+            # The run said nothing on purpose after its tool calls: the cards
+            # are the reply (ELI-227).
+            pipe_log("  the run answered with silence after its tool cards")
         elif not self.aborted and not self.text_yielded:
             recovered = await self.recover_from_transcript()
             retry_body = _thinking_rejection_retry_body(
