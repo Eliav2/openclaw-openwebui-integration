@@ -1535,7 +1535,7 @@ def test_an_execute_while_the_input_dialog_is_open_leaves_the_dialog_its_answer(
                 _wait(page, "() => window.__eli195Poked === true", "the execute while the dialog is open", 30_000)
         except Exception as ex:
             raise AssertionError(f"ELI-195 probe ineffective: {ex}") from None
-        else:
+        if mode == "held":
             assert page.evaluate("() => window.__eli195Poked") is False, "the held execute ran under the dialog"
         page.locator("input[placeholder=here], textarea[placeholder=here]").first.fill("hello")
         page.get_by_role("button", name="Confirm", exact=True).click()
