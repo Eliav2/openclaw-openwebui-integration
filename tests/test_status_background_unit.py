@@ -144,11 +144,14 @@ class RowTests(unittest.TestCase):
                                        "tail": "building\n\x1b[31mError:\x1b[0m   no   such  file\n\n"}, KEY)
         killed = action._process_task({"processId": "x", "name": "make", "status": "killed",
                                        "startedAt": NOW - 9000, "endedAt": NOW, "exitSignal": "SIGTERM"}, KEY)
-        data = self.rows([failed, killed, _task("exec", "completed", id="t9", sourceId="y", endedAt=NOW,
-                                                terminalSummary="Command completed")])
-        self.assertEqual([(r["title"], r["preview"]) for r in data["rows"] if r["kind"] == "Command"],
-                         [("sleep 25", "exit 2 · Error: no such file"), ("make", "SIGTERM"),
-                          ("Shell command", None)])
+        # 2026.10.5 says "completed" whatever the exit code.
+        nonzero = action._process_task({"processId": "z", "name": "ls /nope", "status": "completed",
+                                        "startedAt": NOW - 9500, "endedAt": NOW, "exitCode": 1, "tail": ""}, KEY)
+        data = self.rows([failed, killed, nonzero, _task("exec", "completed", id="t9", sourceId="y", endedAt=NOW,
+                                                         terminalSummary="Command completed")])
+        self.assertEqual([(r["title"], r["status"], r["preview"]) for r in data["rows"] if r["kind"] == "Command"],
+                         [("sleep 25", "failed", "exit 2 · Error: no such file"), ("make", "cancelled", "SIGTERM"),
+                          ("ls /nope", "failed", "exit 1"), ("Shell command", "completed", None)])
 
     def test_kinds_this_section_lists_and_the_ones_it_leaves_to_others(self):
         data = self.rows([

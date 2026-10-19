@@ -71,7 +71,7 @@ Typing `/compact` in the message box does not compact the session: Open WebUI 0.
 
 The Background section lists what runs for this chat outside a reply, running first, then the five newest that finished:
 
-- **Commands** left running in the background (`exec` with `background`, or one that outlived its wait), named by the title the agent gave the call, with the command's first real step under it while it runs ("python3 ci_wake.py 163", without the `cd ...` before it or an inline script). A command without a title is named by that step. Once it ends, the line under it says how: a failure's exit code or the signal that stopped it, and its last line of output ("exit 2 · islands: no such region"). Hover over a command, or tap it, to see the whole command.
+- **Commands** left running in the background (`exec` with `background`, or one that outlived its wait), named by the title the agent gave the call, with the command's first real step under it while it runs ("python3 ci_wake.py 163", without the `cd ...` before it or an inline script). A command without a title is named by that step. One that exits with a code other than 0 is Failed. Once it ends, the line under it says how: a failure's exit code or the signal that stopped it, and its last line of output ("exit 2 · islands: no such region"). Hover over a command, or tap it, to see the whole command.
 - **Image, Music and Video** jobs.
 - **Automations** that run in this chat: whether one is running, its next run, and its last error when it failed ("Failed 3 times in a row: ...").
 - **Agents**: Claude Code Agent calls started in the background, until the reply they hold open ends. A tap shows the task and the result, as under In-process agents.

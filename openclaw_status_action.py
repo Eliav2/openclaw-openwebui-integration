@@ -7876,10 +7876,13 @@ def _process_task(process: dict, session_key: str) -> dict:
     names), titled by the Gateway's short name until a card gives the
     command, and a finished one's last line of output as its summary."""
     lines = [ln for ln in (_clean_line(ln) for ln in (process.get("tail") or "").splitlines()) if ln]
+    status = _PROCESS_STATUSES.get(process.get("status"), process.get("status"))
+    if status == "completed" and process.get("exitCode") not in (None, 0):
+        status = "failed"    # 2026.10.5 says "completed" for any exit code (ELI-232)
     return {
         "id": process.get("processId"), "kind": "exec", "sourceId": process.get("processId"),
         "sessionKey": session_key, "title": process.get("name") or "",
-        "status": _PROCESS_STATUSES.get(process.get("status"), process.get("status")),
+        "status": status,
         "startedAt": process.get("startedAt"), "endedAt": process.get("endedAt"),
         "terminalSummary": lines[-1] if lines else None,
         "exitCode": process.get("exitCode"), "exitSignal": process.get("exitSignal"),
