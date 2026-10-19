@@ -947,6 +947,7 @@ class _TurnWriter:
                 pipe_log(f"  turn writer: chat.history failed at the end: {ex!r}")
             if self.wake is not None:
                 self._rebuild_wake(hist)
+                self.renderer.flush()
             else:
                 if hist:
                     self._adopt_recoveries_from(hist.get("messages") or [])
@@ -955,6 +956,7 @@ class _TurnWriter:
                 rebuilt = self._from_transcript(hist) if hist else None
                 if rebuilt is not None:
                     self.renderer = rebuilt
+                self.renderer.flush()
                 if not self._showable():
                     await self._show_silent_announce(hist)
             if not self.opened:

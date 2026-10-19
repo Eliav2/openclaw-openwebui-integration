@@ -23,6 +23,10 @@ whole):
 * `E2E_EMPTY_REPLY`                    -> an empty answer: OpenClaw 2026.10 fails
                                           the run ("Agent couldn't generate a
                                           response") after its one retry (ELI-217)
+* `E2E_SENTINEL_THEN_ANSWER`           -> says `NO_REPLY` with a harmless tool call,
+                                          then, after its result, answers
+                                          `E2E_LATE_ANSWER SUB-51`: a run that opened
+                                          with a sentinel and answered after all (ELI-219)
 * `E2E_ECHO: any text`                 -> replies with the rest of that line,
   byte for byte (Hebrew, emoji, markup), so a round trip can be exact.
 * `E2E_TOOL_CALL`                      -> first answers with a call to the
@@ -328,6 +332,13 @@ def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
         if call:
             return call
         return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
+
+    if "E2E_SENTINEL_THEN_ANSWER" in user_text:
+        if tool_results:
+            return {"text": "E2E_LATE_ANSWER SUB-51"}
+        call = _harmless_call(offered)
+        return ({"text": "NO_REPLY", **call} if call
+                else {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"})
 
     if "E2E_TOOL_CALL" in user_text:
         if tool_results:
