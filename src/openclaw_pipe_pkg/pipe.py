@@ -1927,6 +1927,11 @@ class _PipeTurn:
             # The error is the reply: nothing to recover, and no
             # "no reply text" note under it.
             await self.maybe_emit_snapshot(force=True)
+        elif not self.aborted and not self.text_yielded and self.renderer.silenced and any(
+                i.get("type") == "function_call" for i in self.renderer.output):
+            # The run said nothing on purpose after its tool calls: the cards
+            # are the reply (ELI-227).
+            pipe_log("  the run answered with silence after its tool cards")
         elif not self.aborted and not self.text_yielded:
             recovered = await self.recover_from_transcript()
             retry_body = _thinking_rejection_retry_body(

@@ -14,7 +14,7 @@ Two provider quirks are handled so you never see them:
 - Some runtimes resend the whole reply as one final cumulative frame. The Pipe recognises text it has already shown and drops the repeat, so the answer is never printed twice.
 - Other events carry their text as a whole item rather than as deltas. That text is shown too, not dropped.
 
-Internal scaffolding never reaches the reply: the Sender provenance block (see [the metadata contract](../metadata-contract.md)) and the silent sentinels an agent uses to mean "say nothing" (`NO_REPLY`, `ANNOUNCE_SKIP`) are filtered out, also when the agent says one and then answers after all (a background task that reported later).
+Internal scaffolding never reaches the reply: the Sender provenance block (see [the metadata contract](../metadata-contract.md)) and the silent sentinels an agent uses to mean "say nothing" (`NO_REPLY`, `ANNOUNCE_SKIP`) are filtered out, also when the agent says one and then answers after all (a background task that reported later). A reply that ran tools and then said only a sentinel keeps its tool cards, with no text and no "no reply text" note.
 
 Always on.
 
