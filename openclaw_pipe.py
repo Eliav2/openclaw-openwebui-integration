@@ -576,6 +576,10 @@ async def _claim_turn_message_now(chat_id: str, user_id: str, message_id: str, r
     from sqlalchemy.orm.attributes import flag_modified
 
     async with Chats._chat_transaction(chat_id) as (db, chat):
+        if chat is None:
+            # Deleted in Open WebUI while its session lives on (ELI-218).
+            return {"claimed": False, "how": "gone", "message_id": message_id,
+                    "parent": None, "messages": {}}
         data = chat.chat or {}
         history = data.get("history") or {"messages": {}, "currentId": None}
         msgs = history.setdefault("messages", {})
@@ -1806,7 +1810,7 @@ def _dialog_safe_event_call(event_call, sid, user_id):
 # reply that is streaming into the same tab.
 # ---------------------------------------------------------------------------
 
-_COMPOSER_BUTTON_VERSION = "5"
+_COMPOSER_BUTTON_VERSION = "6"
 
 # The Status Action's function id (install_action.py's FUNCTION_ID; the
 # dialog's own JS calls the same fixed id) and the Pipe's default function id.
@@ -1846,7 +1850,8 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
   // removing it (a layout this snippet does not understand): give up.
   const LOOP_LIMIT = 20;
   const LOOP_WINDOW_MS = 10000;
-  const SPARK_PATH = 'M9.813 15.904 9 18.75l-.813-2.846a4.5 4.5 0 0 0-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 0 0 3.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 0 0 3.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 0 0-3.09 3.09ZM18.259 8.715 18 9.75l-.259-1.035a3.375 3.375 0 0 0-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 0 0 2.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 0 0 2.456 2.456L21.75 6l-1.035.259a3.375 3.375 0 0 0-2.456 2.456ZM16.894 20.567 16.5 21.75l-.394-1.183a2.25 2.25 0 0 0-1.423-1.423L13.5 18.75l1.183-.394a2.25 2.25 0 0 0 1.423-1.423l.394-1.183.394 1.183a2.25 2.25 0 0 0 1.423 1.423l1.183.394-1.183.394a2.25 2.25 0 0 0-1.423 1.423Z';
+  // A paw, drawn in Heroicons' outline style (24x24, round caps), for "Claw".
+  const PAW_PATH = 'M11 6a1.5 2 0 1 1-3 0 1.5 2 0 0 1 3 0ZM16 6a1.5 2 0 1 1-3 0 1.5 2 0 0 1 3 0ZM7 10.5a1.5 1.75 0 1 1-3 0 1.5 1.75 0 0 1 3 0ZM20 10.5a1.5 1.75 0 1 1-3 0 1.5 1.75 0 0 1 3 0ZM12 12.75c-2.25 0-5.25 2.6-5.25 4.875 0 1.45 1.1 2.375 2.55 2.375.95 0 1.7-.45 2.7-.45s1.75.45 2.7.45c1.45 0 2.55-.925 2.55-2.375 0-2.275-3-4.875-5.25-4.875Z';
 
   const state = {
     prefixes: [],
@@ -2095,7 +2100,9 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
     const b = document.createElement('button');
     b.type = 'button';
     b.id = BTN_ID;
-    b.title = 'OpenClaw status';
+    // Shown as "Claw" (ELI-202); the aria-label keeps its old name, which the
+    // page scripts and the tests find the button by.
+    b.title = 'Claw';
     b.setAttribute('aria-label', 'OpenClaw status');
     b.dataset.openclawVersion = CFG.version;
     b.className = 'p-[0.375rem] flex gap-1 items-center text-sm rounded-full '
@@ -2103,11 +2110,11 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
       + 'bg-transparent text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800';
     b.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" '
       + 'stroke-width="1.75" stroke="currentColor" aria-hidden="true" class="size-4">'
-      + '<path stroke-linecap="round" stroke-linejoin="round" d="' + SPARK_PATH + '"/></svg>'
+      + '<path stroke-linecap="round" stroke-linejoin="round" d="' + PAW_PATH + '"/></svg>'
       // Icon-only below `sm`, like Open WebUI's own composer chips: at phone
       // width the chip row's overflow cut the label to "Stat" (ELI-123). The
       // title and aria-label still name it. Both classes ship in Open WebUI's CSS.
-      + '<span class="pr-0.5 hidden sm:inline">Status</span>';
+      + '<span class="pr-0.5 hidden sm:inline">Claw</span>';
     b.addEventListener('click', function (e) {
       e.preventDefault();
       e.stopPropagation();
@@ -7817,6 +7824,8 @@ async def _set_turn_meta_now(chat_id: str, message_id: str, meta: dict) -> bool:
     from sqlalchemy.orm.attributes import flag_modified
 
     async with Chats._chat_transaction(chat_id) as (db, chat):
+        if chat is None:
+            return False
         data = chat.chat or {}
         history = data.get("history") or {}
         msg = (history.get("messages") or {}).get(message_id)
@@ -8321,7 +8330,11 @@ class _TurnWriter:
             claim = await _claim_turn_message(self.chat_id, self.user_id, self.message_id,
                                               self.run_id, self.conn.writer_id, takeover=takeover)
             if not claim["claimed"]:
-                pipe_log(f"  turn writer: message {self.message_id[:8]}... is held by another writer")
+                if claim["how"] == "gone":
+                    pipe_log(f"  turn writer: chat {self.chat_id[:8]}... is gone; run "
+                             f"{self.run_id[:24]}... is not written")
+                else:
+                    pipe_log(f"  turn writer: message {self.message_id[:8]}... is held by another writer")
                 return False
             self._claim = claim
             if claim["how"] == "new":
@@ -9430,7 +9443,16 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
             if kind == "event":
                 if writer is not None:
                     await writer.feed(item)
-                continue
+                if not (writer is not None and writer.run_id == run and _ends_on_own_final(run, item)):
+                    continue
+                # Its own final is the settle that may never be pushed: OpenClaw
+                # 2026.10.5 pushes `agent.input.settled` only for a chat.send or
+                # agent call, so a run the Gateway starts itself (a background
+                # command's end notice, heartbeat runner) leaves its last row
+                # `hasActiveRun: true` and goes idle unpushed (ELI-215). After a
+                # clean final the settled row could only finalize, so no row is
+                # waited for.
+                item = None
             # Only the pump of the writer's current run ends it: an interrupted
             # run's pump also gets the session's settle once its recovery has
             # taken M over, and the recovery's own pump may still hold events.
@@ -9455,6 +9477,14 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
                 kind, item = pump.queue.get_nowait()
                 if kind == "event" and item is not None:
                     _turn_queue(conn, sess, run, parsed, item)
+
+
+def _ends_on_own_final(run: str, payload) -> bool:
+    """A run the agent started (no pipe run id) whose chat final came: it
+    ended cleanly, so it is over whatever the session row says. An error or
+    abort still waits for its row (its note, a resume, a recovery)."""
+    return (isinstance(payload, dict) and payload.get("state") == "final"
+            and parse_pipe_run_id(run) is None)
 
 
 def _is_terminal_event(payload: dict) -> bool:
@@ -11198,7 +11228,7 @@ class Pipe:
         )
         COMPOSER_STATUS_BUTTON: bool = Field(
             default=True,
-            description="Add an OpenClaw 'Status' button to the composer row of "
+            description="Add an OpenClaw 'Claw' button to the composer row of "
                 "OpenClaw chats (it opens the same dialog as the Status Action's "
                 "message button, so that Action must be installed). Installed "
                 "into the page at the start of each turn and when a tab opens an "

@@ -343,7 +343,7 @@ class Pipe:
         )
         COMPOSER_STATUS_BUTTON: bool = Field(
             default=True,
-            description="Add an OpenClaw 'Status' button to the composer row of "
+            description="Add an OpenClaw 'Claw' button to the composer row of "
                 "OpenClaw chats (it opens the same dialog as the Status Action's "
                 "message button, so that Action must be installed). Installed "
                 "into the page at the start of each turn and when a tab opens an "

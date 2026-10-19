@@ -431,6 +431,28 @@ def test_two_cron_wakes_in_a_row_get_one_finished_message_each(token):
     _assert_clean(token, chat_id, msgs)
 
 
+def test_a_run_on_a_deleted_chats_session_writes_nothing_and_fails_nothing(token):
+    """A chat deleted in Open WebUI keeps its Gateway session, so a cron job,
+    a sub-agent's late result or a background command's notice still runs
+    there. The turn writer read the missing chat row as one and failed on
+    every event of the run (ELI-218)."""
+    chat_id, _ = _chat_turn(token, "Respond with exactly: E2E_DELETED_CHAT")
+    key = _session_key(token, chat_id)
+    status, got = _request("DELETE", f"/api/v1/chats/{chat_id}", token=token)
+    assert status == 200 and got is True, got
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    _schedule_wake(key, "Reply with exactly: WAKE_AFTER_DELETE", 3)
+
+    def writer_said():
+        lines = [ln for ln in _pipe_log_since(since).splitlines() if "turn writer:" in ln]
+        return [ln for ln in lines if "is gone" in ln or "failed" in ln]
+    said = _until("the turn writer to meet the wake's run", writer_said)
+    assert not [ln for ln in said if "failed" in ln], said
+    assert any(chat_id[:8] in ln and "is gone" in ln for ln in said), said
+    status, _ = _request("GET", f"/api/v1/chats/{chat_id}", token=token)
+    assert status != 200, "nothing brought the deleted chat back"
+
+
 def test_a_message_queued_behind_a_wake_does_not_cut_it(token):
     chat_id, _ = _chat_turn(token, "Respond with exactly: E2E_QUEUE_CHAT")
     key = _session_key(token, chat_id)
@@ -1187,6 +1209,30 @@ def test_the_status_action_lists_a_background_command(token):
     commands = [r for r in data["rows"] if r["kind"] == "Command"]
     # Titled by the command its tool card ran, not the Gateway's "CLI command".
     assert [(r["title"], r["status"]) for r in commands] == [("sleep 25; echo e2e-bg-done", "running")], data
+
+
+def test_the_reply_to_a_background_commands_end_finishes(token):
+    """ELI-215: when a command the agent left in the background ends, the
+    Gateway starts a run of its own on the session, and the turn writer gives
+    it a message. That message must finish once the run has ended; on
+    OpenClaw 2026.10.5 it stayed done:false (Open WebUI showed it generating,
+    and owui_send refused the chat as busy) until the next turn started."""
+    chat_id, msg = _chat_turn(token, "E2E_BG_EXEC")
+    assert msg.get("content", "").strip() == "E2E_BG_STARTED", msg
+    key = _session_key(token, chat_id)
+
+    def noticed_and_idle():
+        hist = _gw("chat.history", {"sessionKey": key, "limit": 50}).get("messages") or []
+        said = any(m.get("role") == "assistant" and "E2E_BG_NOTICED" in json.dumps(m.get("content"))
+                   for m in hist)
+        return said and _session_row(key).get("hasActiveRun") is False
+    # sleep 25, then the notice run: the Gateway's own record that it ended.
+    # The heartbeat runner holds the notice while other runs of the agent are active.
+    _until("the notice run to reply and the session to go idle", noticed_and_idle)
+    msgs = _wait_for(token, chat_id, ["E2E_BG_NOTICED"])
+    open_ = [(m.get("id", "")[:8], (m.get("content") or "")[:60]) for m in msgs.values()
+             if m.get("role") == "assistant" and m.get("done") is not True]
+    assert not open_, f"assistant messages left unfinished: {open_}"
 
 
 def test_the_status_dialog_lists_only_this_chats_automations(token, guest_token):

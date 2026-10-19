@@ -1,0 +1,101 @@
+name: Demos
+
+# The docs' demo GIFs (scripts/demos/demos.json), recorded on the same stack
+# as the Screenshots workflow: real Open WebUI, this integration as installed
+# by its own installers, a real OpenClaw Gateway and the scripted model, with
+# the demos' own scenes loaded before the screenshots' ones. Desktop Chromium,
+# light theme only, each GIF at most 15 s and 1 MB. Run it by hand after a UI
+# change; the GIFs come back as an artifact to review, and the ones that are
+# kept get committed under docs/img/demos/.
+
+on:
+  workflow_dispatch:
+    inputs:
+      only:
+        description: Comma-separated demo names (empty = all)
+        type: string
+        default: ""
+  pull_request:
+    paths:
+      - scripts/demos/**
+      - .github/workflows/demos.yml
+
+permissions:
+  contents: read
+
+jobs:
+  demos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Sample project for the scenes
+        run: bash scripts/screenshots/sample_project.sh "$HOME/.openclaw/workspace"
+
+      - name: Gateway config patch
+        run: |
+          sed "s|@SCREENSHOTS_DIR@|$PWD/scripts/screenshots|" scripts/screenshots/stack-patch.json \
+            > "$RUNNER_TEMP/stack-patch.json"
+
+      - name: Start the stack and install the integration
+        uses: ./.github/actions/stack
+        env:
+          STACK_ADMIN_NAME: Sam
+          STACK_ADMIN_EMAIL: sam@example.com
+          STACK_CONFIG_PATCH: ${{ runner.temp }}/stack-patch.json
+          FAKE_LLM_SCENES: ${{ github.workspace }}/scripts/demos/demos.json:${{ github.workspace }}/scripts/screenshots/scenes.json
+          FAKE_LLM_DEFAULT: Sure.
+          FAKE_LLM_USAGE: estimate
+        with:
+          log_dir: ${{ runner.temp }}/logs
+
+      - name: Install Chromium for Playwright
+        run: uv run --with-requirements requirements-browser.txt python -m playwright install --with-deps chromium
+
+      - name: Record
+        env:
+          ONLY: ${{ inputs.only }}
+        run: |
+          uv run --with-requirements requirements-browser.txt --with imageio-ffmpeg==0.6.0 \
+            python scripts/demos/record.py --out "$RUNNER_TEMP/demos" ${ONLY:+--only "$ONLY"} \
+            | tee "$RUNNER_TEMP/demos.jsonl"
+
+      - name: Report sizes
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import json, os
+          lines = ["| demo | seconds | KB |", "|---|---|---|"]
+          path = os.path.join(os.environ["RUNNER_TEMP"], "demos.jsonl")
+          for row in open(path) if os.path.exists(path) else []:
+              if row.strip().startswith("{"):
+                  d = json.loads(row)
+                  lines.append(f"| {d['name']} | {d['seconds']} | {d['kb']} |")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
+              fh.write("### Demos\n\n" + "\n".join(lines) + "\n")
+          print("\n".join(lines))
+          EOF
+
+      - name: Collect logs
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/logs"
+          docker logs owui > "$RUNNER_TEMP/logs/open-webui.log" 2>&1 || true
+          cp /tmp/openclaw/*.log "$RUNNER_TEMP/logs/" 2>/dev/null || true
+
+      - name: Upload GIFs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: demos
+          path: ${{ runner.temp }}/demos
+          retention-days: 14
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: demos-logs
+          path: ${{ runner.temp }}/logs
+          retention-days: 7

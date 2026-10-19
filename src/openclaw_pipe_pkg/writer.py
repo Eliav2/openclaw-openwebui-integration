@@ -43,6 +43,8 @@ async def _set_turn_meta_now(chat_id: str, message_id: str, meta: dict) -> bool:
     from sqlalchemy.orm.attributes import flag_modified
 
     async with Chats._chat_transaction(chat_id) as (db, chat):
+        if chat is None:
+            return False
         data = chat.chat or {}
         history = data.get("history") or {}
         msg = (history.get("messages") or {}).get(message_id)
@@ -547,7 +549,11 @@ class _TurnWriter:
             claim = await _claim_turn_message(self.chat_id, self.user_id, self.message_id,
                                               self.run_id, self.conn.writer_id, takeover=takeover)
             if not claim["claimed"]:
-                pipe_log(f"  turn writer: message {self.message_id[:8]}... is held by another writer")
+                if claim["how"] == "gone":
+                    pipe_log(f"  turn writer: chat {self.chat_id[:8]}... is gone; run "
+                             f"{self.run_id[:24]}... is not written")
+                else:
+                    pipe_log(f"  turn writer: message {self.message_id[:8]}... is held by another writer")
                 return False
             self._claim = claim
             if claim["how"] == "new":
@@ -1656,7 +1662,16 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
             if kind == "event":
                 if writer is not None:
                     await writer.feed(item)
-                continue
+                if not (writer is not None and writer.run_id == run and _ends_on_own_final(run, item)):
+                    continue
+                # Its own final is the settle that may never be pushed: OpenClaw
+                # 2026.10.5 pushes `agent.input.settled` only for a chat.send or
+                # agent call, so a run the Gateway starts itself (a background
+                # command's end notice, heartbeat runner) leaves its last row
+                # `hasActiveRun: true` and goes idle unpushed (ELI-215). After a
+                # clean final the settled row could only finalize, so no row is
+                # waited for.
+                item = None
             # Only the pump of the writer's current run ends it: an interrupted
             # run's pump also gets the session's settle once its recovery has
             # taken M over, and the recovery's own pump may still hold events.
@@ -1681,6 +1696,14 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
                 kind, item = pump.queue.get_nowait()
                 if kind == "event" and item is not None:
                     _turn_queue(conn, sess, run, parsed, item)
+
+
+def _ends_on_own_final(run: str, payload) -> bool:
+    """A run the agent started (no pipe run id) whose chat final came: it
+    ended cleanly, so it is over whatever the session row says. An error or
+    abort still waits for its row (its note, a resume, a recovery)."""
+    return (isinstance(payload, dict) and payload.get("state") == "final"
+            and parse_pipe_run_id(run) is None)
 
 
 def _is_terminal_event(payload: dict) -> bool:
