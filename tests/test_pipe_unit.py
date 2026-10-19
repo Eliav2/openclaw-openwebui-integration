@@ -806,6 +806,81 @@ class TurnRendererOutputTests(unittest.TestCase):
         self.assertEqual(r.output[1]["status"], "completed")
         self.assertEqual(r.output[1]["arguments"], json.dumps({"p": 1}))
 
+    # ELI-219 (live chats e70feacd, f6c33478 on 2026.10.5): a claude-cli
+    # run starts a background Agent, answers NO_REPLY, and goes on once the
+    # task reports. The live stream had the sentinel, then the answer after
+    # the Gateway's message break, then the answer's own item event and the
+    # run's closer (its two messages joined by one newline). The reply read
+    # "NO_REPLY\n\n<answer>NO_REPLY\n<answer>".
+    ANSWER = "The background sub-agent finished and answered: SUB-51"
+
+    def feed_eli219(self, r):
+        r.feed({"stream": "tool", "data": {"phase": "start", "name": "Agent", "toolCallId": "t1",
+                                           "args": {"run_in_background": True}}})
+        r.feed({"stream": "tool", "data": {"phase": "result", "name": "Agent", "toolCallId": "t1",
+                                           "result": "Async agent launched successfully."}})
+        r.feed({"stream": "assistant", "data": {"delta": "NO_REPLY"}})
+        r.feed({"stream": "assistant", "data": {"delta": "\n\n" + self.ANSWER}})
+        r.feed({"stream": "item", "data": {"kind": "message", "text": self.ANSWER}})
+        r.feed({"stream": "item", "data": {"kind": "message", "text": "NO_REPLY\n" + self.ANSWER}})
+        r.flush()
+
+    def test_a_run_that_answered_no_reply_then_its_task_reported_shows_its_answer_once(self):
+        r = _TurnRenderer()
+        self.feed_eli219(r)
+        self.assertEqual(r.text, self.ANSWER)
+        texts = [i["content"][0]["text"] for i in r.output if i["type"] == "message"]
+        self.assertEqual(texts, [self.ANSWER])
+
+    # ELI-219 again (live chats 9562eda8, 6497a129 on 2026.10.5, Pipe 788ce7c):
+    # the same run with a short answer and no item events. The Gateway puts
+    # its message break ahead of the answer's first delta, and the run's
+    # closer is the catch-all assistant text with the CLI's messages joined by
+    # one newline. The reply read "SUB-51NO_REPLY\nSUB-51".
+    def test_a_closer_joining_the_messages_by_one_newline_is_not_shown_again(self):
+        r = _TurnRenderer()
+        r.feed({"stream": "tool", "data": {"phase": "start", "name": "Agent", "toolCallId": "t1",
+                                           "args": {"run_in_background": True}}})
+        r.feed({"stream": "tool", "data": {"phase": "result", "name": "Agent", "toolCallId": "t1",
+                                           "result": "Async agent launched successfully."}})
+        for delta in ("NO_REPLY", "\n\nSUB", "-51"):
+            r.feed({"stream": "assistant", "data": {"itemId": "cli-assistant:r1", "text": "", "delta": delta}})
+        r.feed({"stream": "assistant", "data": {"assistantMessageIndex": 1, "completedText": "SUB-51"}})
+        r.feed({"stream": "assistant", "data": {"itemId": "cli-assistant:r1", "text": "NO_REPLY\nSUB-51"}})
+        r.flush()
+        self.assertEqual(r.text, "SUB-51")
+        texts = [i["content"][0]["text"] for i in r.output if i["type"] == "message"]
+        self.assertEqual(texts, ["SUB-51"])
+
+    def test_a_sentinel_split_across_deltas_stays_out(self):
+        r = _TurnRenderer()
+        for d in ("NO", "_RE", "PLY"):
+            r.feed({"stream": "assistant", "data": {"delta": d}})
+        r.flush()
+        self.assertEqual((r.text, r.output), ("", []))
+
+    def test_a_short_reply_that_starts_like_a_sentinel_still_shows(self):
+        r = _TurnRenderer()
+        r.feed({"stream": "assistant", "data": {"delta": "NO"}})
+        self.assertEqual(r.text, "", "held while it may be a sentinel")
+        self.assertEqual(r.flush(), "NO")
+        self.assertEqual(r.text, "NO")
+        r = _TurnRenderer()
+        r.feed({"stream": "assistant", "data": {"delta": "NO"}})
+        r.feed({"stream": "assistant", "data": {"delta": " way, that is wrong."}})
+        self.assertEqual(r.text, "NO way, that is wrong.")
+
+    def test_a_sentinel_before_a_card_is_dropped_and_a_held_word_is_kept(self):
+        r = _TurnRenderer()
+        r.feed({"stream": "assistant", "data": {"delta": "NO_REPLY"}})
+        r.feed({"stream": "tool", "data": {"phase": "start", "name": "Read", "toolCallId": "t1", "args": {}}})
+        self.assertEqual([i["type"] for i in r.output], ["function_call"])
+        r = _TurnRenderer()
+        r.feed({"stream": "assistant", "data": {"delta": "NO"}})
+        added = r.feed({"stream": "tool", "data": {"phase": "start", "name": "Read", "toolCallId": "t1", "args": {}}})
+        self.assertEqual(added[0], "NO", "the held word goes out ahead of the card")
+        self.assertEqual([i["type"] for i in r.output], ["message", "function_call"])
+
     def test_failed_call_is_marked_and_explained(self):
         r = _TurnRenderer()
         r.feed({"stream": "tool", "data": {"phase": "result", "name": "Bash",
@@ -2306,11 +2381,22 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         await self._spin()
         self.assertEqual(self.sent, [], "sent while the run's state was unknown")
         self.assertFalse(first.done(), f"the reply ended: {first.result() if first.done() else ''!r}")
+        # It waits as a turn that needs the connection: the loop is asked to
+        # try now, and backs off at its first step while the turn waits.
+        self.assertTrue(self.conn._reconnect_now.is_set())
+        self.assertEqual(self.conn._turns_awaiting_gateway, 1)
+
+        refused = self.ocp.GatewayError("Connection refused", error={"code": self.ocp.GATEWAY_REFUSED_CODE})
+        self.conn._answer_reconnect_waiters(refused)   # the Gateway is still down
+        await self._spin()
+        self.assertFalse(first.done(), "a refused reconnect ended the reply")
 
         self.conn._ws = object()            # reconnected, same Gateway; the run still goes
+        self.conn._answer_reconnect_waiters(None)   # the loop's attempt succeeded
         self.conn._wake_session_waiters()   # the renewed subscriptions wake it (`_subscribe_all`)
         await self._spin()
         self.assertEqual(self.sent, [])
+        self.assertEqual(self.conn._turns_awaiting_gateway, 0)
 
         self._settled(False)
         await self._until_registered("run-1")
@@ -3270,6 +3356,23 @@ class TickWatchTests(unittest.IsolatedAsyncioTestCase):
                 mock.patch("openclaw_pipe._sign_challenge", lambda *a, **k: {}):
             await conn._connect_and_start()
         self.assertEqual(conn._tick_interval_s, 12.0)
+
+    async def test_a_frame_before_the_connect_response_is_not_taken_for_it(self):
+        # Taken as the response, any other frame read as a rejection with no
+        # reason: "**Gateway connection error:** connect failed".
+        conn = _GatewayConnection(lambda: types.SimpleNamespace(
+            GATEWAY_URL="localhost:18789", GATEWAY_TOKEN="tok"))
+        conn._ensure_identity = lambda valves: None
+        conn._ident = {"id": "device-1"}
+        ws = _HandshakeWS()
+        ws._frames.insert(1, json.dumps({"type": "event", "event": "health", "payload": {}}))
+
+        async def fake_connect(_url, **_kw):
+            return ws
+        with mock.patch.object(websockets, "connect", fake_connect, create=True), \
+                mock.patch("openclaw_pipe._sign_challenge", lambda *a, **k: {}):
+            await conn._connect_and_start()
+        self.assertEqual((conn.gateway_boot_id, ws._frames), ("boot-1", []), "the connect response was read")
 
 
 class RetiredConnectionServesItsReplyTests(unittest.IsolatedAsyncioTestCase):
@@ -6226,7 +6329,7 @@ class _HandshakeWS:
         self._frames = [
             json.dumps({"event": "connect.challenge",
                         "payload": {"nonce": "n", "ts": 1}}),
-            json.dumps({"ok": ok, "payload": hello,
+            json.dumps({"type": "res", "id": "1", "ok": ok, "payload": hello,
                         "error": {"message": "connect failed"}}),
         ]
         self.sent = []
@@ -6816,7 +6919,7 @@ class TurnIdentityTests(unittest.TestCase):
         self.assertIsNone(turn_message_id(self.KEY, ""))
         src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "openclaw_pipe_pkg",
                                 "action.py")).read()
-        self.assertIn('idempotency_key=f"{ACTION_RUN_PREFIX}compact-', src)
+        self.assertIn('idempotency_key = f"{ACTION_RUN_PREFIX}compact-', src)
 
 
 
@@ -10274,6 +10377,35 @@ class ErroredAgentRunTests(_RoutingCase):
         (m,) = self.new_messages().values()
         self.assertIs(m["done"], True)
         self.assertEqual(self.conn._turn_pumps, {})
+
+
+class DeletedChatAgentRunTests(_RoutingCase):
+    """ELI-218: a run on the session of a chat deleted in Open WebUI (a
+    sub-agent's late result, a cron job, a background command's notice) found
+    no chat row, and the turn writer read `chat.chat` off None: every event of
+    the run started a pump that failed again (six on the 2026-10-19 gate)."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.owui.chat = None          # Chats._chat_transaction yields None for a missing row
+        self.logged = []
+        log = mock.patch.object(openclaw_pipe, "pipe_log", lambda *a, **k: self.logged.append(a))
+        log.start()
+        self.addCleanup(log.stop)
+
+    def failures(self):
+        return [a for a in self.logged if "failed" in str(a[0])]
+
+    async def test_a_run_on_a_deleted_chats_session_writes_nothing_and_fails_nothing(self):
+        await self.run_turn(self.RUN)
+        self.assertEqual(self.failures(), [])
+        self.assertIsNone(self.owui.chat)
+        self.assertEqual(self.conn._turn_pumps, {})
+
+    async def test_it_is_logged_once_for_the_run(self):
+        await self.run_turn(self.RUN)
+        gone = [a for a in self.logged if "is gone" in str(a[0])]
+        self.assertEqual(len(gone), 1, self.logged)
 
 
 class IntentHookStopIconTests(unittest.TestCase):

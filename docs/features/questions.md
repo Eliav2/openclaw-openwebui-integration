@@ -39,6 +39,8 @@ Confirmation and multi-select markers are recognised in English, Hebrew and Arab
 
 Answer the card and the run continues in the same reply. The exchange stays in the reply as a collapsible ❓ Ask User card that shows both the question and your answer.
 
+<img src="../img/demos/question-card.gif" alt="A question card in a reply; a click on its first option answers it, and the reply goes on in the same message with the answer acted on" width="800">
+
 While it waits you can reload or switch away and come back:
 
 - **Question card:** the card is shown once, on the tab that views the chat; a reload moves it to the reloaded tab. If it is not answered by Open WebUI's card timeout (4 minutes), or no tab views the chat (for example a client calling the API), the reply ends with the question as plain text.
@@ -59,11 +61,11 @@ The card shows on the newest tab that has the chat open, and it waits for you:
 - **Switching the tab to another chat** does not cancel it; it shows again when you come back.
 - The card has no countdown. The question ends only when you answer, press Cancel (the agent hears that you cancelled), answer it elsewhere (the Control UI; the card closes), or when the tool's own timeout ends it (15 minutes by default, set by the agent).
 
-The Pipe knows a tab has the chat open from the Status button it adds to the composer (`COMPOSER_STATUS_BUTTON`, on by default). With that valve off, it checks for a tab every few seconds instead.
+The Pipe knows a tab has the chat open from the Claw button it adds to the composer (`COMPOSER_STATUS_BUTTON`, on by default). With that valve off, it checks for a tab every few seconds instead.
 
 ## Secrets the agent requests
 
-_Needs OpenClaw 2026.10.10 or later. On an older Gateway the request is left to the Control UI, as before: a secret stored there cannot be used by the agent's runs yet._
+_Needs a Gateway that offers OpenClaw's question protocol (`question.requested` and `question.resolve`; every release the Pipe supports does). A stored `secret` is used by a run only through the Gateway's secret egress proxy (`secrets.egressProxy`), whichever way it was entered._
 
 When the agent asks for a credential with OpenClaw's `secrets` tool (`action: request`), the Pipe shows the same masked dialog on the chat's tab, titled with the secret's name, the agent's reason and the hosts it may be sent to.
 
