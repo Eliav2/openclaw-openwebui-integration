@@ -116,7 +116,7 @@ Auto-generate a chat title after the first exchange (like native OWUI). Uses a f
 
 Type: `bool`. Default: `True`.
 
-Add an OpenClaw 'Status' button to the composer row of OpenClaw chats (it opens the same dialog as the Status Action's message button, so that Action must be installed). Installed into the page at the start of each turn and when a tab opens an OpenClaw chat. Turn off to stop delivering it; an already open tab keeps it until reload.
+Add an OpenClaw 'Claw' button to the composer row of OpenClaw chats (it opens the same dialog as the Status Action's message button, so that Action must be installed). Installed into the page at the start of each turn and when a tab opens an OpenClaw chat. Turn off to stop delivering it; an already open tab keeps it until reload.
 
 ### TITLE_GEN_AGENT_ID
 
