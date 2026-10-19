@@ -338,6 +338,15 @@ if (!window.__ocIntentHook) {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.target && e.target.closest
         && e.target.closest('#chat-input')) mark('send_now');
   }, true);
+  // One click answers every task it cancelled (ELI-198), so a query does not
+  // clear it: a new message, sent with nothing running, does.
+  document.addEventListener('submit', (e) => {
+    const f = e.target;
+    const input = document.querySelector('#chat-input');
+    if (running() || !f || !input || !f.contains(input)) return;
+    const c = chat();
+    if (c) delete window.__ocIntents[c];
+  }, true);
 }
 return true;
 """
@@ -398,14 +407,16 @@ def _auto_send_on(valves) -> bool:
 
 
 def _intent_query_js(chat_id: str) -> str:
-    """Read and clear what the page recorded for `chat_id` (see
-    `_INTENT_HOOK_JS`). "none" means the hook is there but saw no click, so
-    the cancel came from elsewhere; null means no hook at all."""
+    """Read what the page recorded for `chat_id` (see `_INTENT_HOOK_JS`).
+    Open WebUI's Stop cancels every task of the chat at once (a reply waiting
+    behind a run and the turn writer holding it), and each asks: the record
+    stays for all of them (ELI-198). "none" means the hook is there but saw
+    no click, so the cancel came from elsewhere; null means no hook at all."""
     return (
         "const c = " + json.dumps(chat_id) + ";"
         "const all = window.__ocIntents;"
         "if (!all) return null;"
-        "const i = all[c]; delete all[c];"
+        "const i = all[c];"
         "return (i && Date.now() - i.t < 60000) ? i.kind : 'none';"
     )
 
@@ -1134,21 +1145,44 @@ class _TurnWriter:
                  f"{intent or 'unknown'}")
         if intent != "stop" or self.closed:
             return
-        aborted = False
-        try:
-            resp = await _run_request(
-                self.conn, RUN_ABORT, {"sessionKey": self.session_key, "runId": self.run_id}, timeout=15)
-            aborted = bool((resp or {}).get("aborted"))
-        except Exception as ex:
-            pipe_log(f"  turn writer: chat.abort failed: {ex}")
-        if not aborted and self.wake and self.wake.get("job"):
+        wake = bool(self.wake and self.wake.get("job"))
+        # A run the agent started (a cron wake) first, by its id: on
+        # 2026.10.5 chat.abort answers `aborted` for it but stops only its
+        # running command, and the run goes on to its end. There the wake
+        # is not bound as one (its run id is not the sessionId).
+        aborted = parse_pipe_run_id(self.run_id) is None and await self._abort_agent_run()
+        if not aborted:
+            try:
+                resp = await _run_request(
+                    self.conn, RUN_ABORT, {"sessionKey": self.session_key, "runId": self.run_id}, timeout=15)
+                aborted = bool((resp or {}).get("aborted"))
+            except Exception as ex:
+                pipe_log(f"  turn writer: chat.abort failed: {ex}")
+        if not aborted and wake:
             await self._cancel_wake_run()
         await self.finalize()
 
+    async def _abort_agent_run(self) -> bool:
+        """Stop a run the agent started by its id: `sessions.abort` with a run id
+        stops that run alone and never clears the session's queue, so turns
+        queued behind the wake stay (2026.10.5 and 2026.10.10, which have no
+        tasks.cancel). On 2026.9 the wake's run id is the sessionId, and it
+        finds no run."""
+        try:
+            res = await self.conn.send_request("sessions.abort", {"key": self.session_key, "runId": self.run_id},
+                                               timeout=15)
+        except Exception as ex:
+            pipe_log(f"  turn writer: sessions.abort for the wake's run failed: {ex}")
+            return False
+        aborted = (res or {}).get("status") == "aborted"
+        if aborted:
+            pipe_log(f"  turn writer: run {self.run_id[:24]}... aborted by its id")
+        return aborted
+
     async def _cancel_wake_run(self) -> None:
-        """Stop a cron wake's run (ELI-192). On 2026.9 its run id is the
-        sessionId, and chat.abort finds no chat run under it: the wake is its
-        job's cron run, which the job's running task cancels."""
+        """Stop a cron wake's run (ELI-192) on 2026.9: chat.abort finds no
+        chat run under its id (the sessionId): the wake is its job's cron
+        run, which the job's running task cancels."""
         job = self.wake["job"]
         try:
             resp = await self.conn.send_request("tasks.list", {"sessionKey": self.session_key, "limit": 100},

@@ -989,8 +989,6 @@ def _section_data(codes: list, element_id: str, index: int = -1) -> dict:
 
 
 def test_the_status_action_lists_a_running_subagent_and_opens_its_drawer(token):
-    _skip_known_105_gap("ELI-213", "the child's task comes without the [Subagent Task] wrapper, "
-                                   "so the drawer header shows no task")
     chat_id, msg = _chat_turn(token, "E2E_SPAWN one helper")
     assert msg.get("content", "").strip() == "E2E_SPAWNED", msg
     status, me = _request("GET", "/api/v1/auths/", token=token)

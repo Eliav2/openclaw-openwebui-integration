@@ -532,6 +532,40 @@ def test_a_queued_reply_stopped_says_its_message_was_not_sent(page):
     assert "BROWSER_SENDSTOP_ANSWER" not in _replies(page)[1]["text"]
 
 
+def test_stop_after_send_now_stops_the_run(page, token):
+    """Stop after Send now (ELI-198): the running reply's run goes on in its
+    message (the turn writer holds it) and the new message waits behind it.
+    Stop cancels both, and both ask the page which button it was; the first
+    to ask took the answer, so the run went on and filled the stopped reply
+    later. The scripted run waits for a file this test writes only after
+    checking that the run is over."""
+    hold_token = f"sn{os.getpid()}_{len(_fake_llm_requests())}"
+    # e2e/fake_llm.py hold_file
+    hold = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{hold_token}")
+    capture.new_chat(page)
+    try:
+        capture.send(page, f"E2E_HOLD {hold_token}")
+        _wait(page, _reply_js(0, "r.text.includes('exec') && !r.done"), "the reply running its command")
+        _type_and_send(page, "E2E_ECHO: BROWSER_STOP_AFTER_SEND_NOW")
+        # The new message's reply waits behind the run, at the Pipe.
+        _wait(page, _reply_js(1, "r.text.includes('Queued') && !r.done"), "the new message's reply queued behind the run")
+        stop = page.locator('button[aria-label="Stop"]')
+        stop.wait_for(timeout=30_000)
+        stop.click()
+        me = capture.api("GET", "/api/v1/auths/", token=token)
+        key = f"agent:main:openwebui-{me['id']}-{_chat_id(page)}"
+        deadline, active = time.monotonic() + 60, True
+        while active and time.monotonic() < deadline:
+            rows = capture.gateway_call("sessions.list", {"search": _chat_id(page), "limit": 5}).get("sessions") or []
+            active = any(r.get("key") == key and r.get("hasActiveRun") for r in rows)
+    finally:
+        open(hold, "w").close()
+    assert not active, "the run went on after Stop: the session still had a running run"
+    history = capture.gateway_call("chat.history", {"sessionKey": key, "limit": 50})
+    assert "E2E_HOLD_END" not in json.dumps(history.get("messages")), "the stopped run still answered"
+    os.remove(hold)
+
+
 def _from(texts: list, word: str) -> list:
     """The reply's words in each text, from `word` on (Open WebUI's status
     line, "Thinking...", can sit above them); texts with none are left out."""
@@ -781,11 +815,10 @@ def test_a_reply_the_agent_starts_streams_into_the_open_tab_and_asks_there(page,
 def test_stop_on_a_reply_the_agent_starts_stops_its_run(page, token):
     """Stop on a reply the agent started (a cron wake, ELI-192) in the open
     tab: the message ends, and so does the run. Before, the run went on to
-    its end, its text shown nowhere. The scripted wake runs a command that
-    waits for a file this test writes only once the run is over."""
-    if _openclaw_release() >= (2026, 10):
-        pytest.skip("OpenClaw 2026.10: chat.abort by run id does not stop a cron run, and there is no "
-                    "tasks.cancel; the session-wide abort also drops queued turns (ELI-194).")
+    its end, its text shown nowhere. On 2026.9 the wake's cron task is
+    cancelled; from 2026.10.5, which has no tasks.cancel, the run is aborted
+    by its id. The scripted wake runs a command that waits for a file this
+    test writes only once the run is over."""
     hold_token = f"stop{os.getpid()}_{len(_fake_llm_requests())}"
     # e2e/fake_llm.py hold_file
     hold = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{hold_token}")

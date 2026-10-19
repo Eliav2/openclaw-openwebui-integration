@@ -49,7 +49,7 @@ Each row is the full end-to-end suite on one pair, on GitHub's runners. The suit
 | 2026.9.1 | 14 of 17 pass | the same as 2026.8.35 | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/38641691738) |
 | 2026.9.3 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/39173684021) |
 | 2026.10.3 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/38641695395) |
-| 2026.10.5 | pass, 1 test skipped for a known gap | sub-agent drawer header | every pull request |
+| 2026.10.5 | pass | | every pull request |
 
 ## Keeping this page true
 

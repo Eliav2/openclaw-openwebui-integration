@@ -1538,11 +1538,9 @@ class ParkedCancelTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(claimed["run_id"])
         self.assertEqual(calls, [])
 
-    def test_intent_query_reads_and_clears(self):
+    def test_intent_query_names_its_chat(self):
         from openclaw_pipe import _intent_query_js
-        js = _intent_query_js("chat-1")
-        self.assertIn('"chat-1"', js)
-        self.assertIn("delete all[c]", js)
+        self.assertIn('"chat-1"', _intent_query_js("chat-1"))
 
     def test_pipe_claims_before_model_patch(self):
         # The grace window is seconds; sessions.patch alone can take 10s+ with
@@ -2175,7 +2173,7 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
 
         async def event_call(event):
             code = (event.get("data") or {}).get("code", "")
-            if "delete all[c]" in code:   # the intent query
+            if "const i = all[c]" in code:   # the intent query
                 return await answer
             return True                  # the hook install at turn start
         body = {"model": "openclaw_gateway.default", "messages": [{"role": "user", "content": "count"}]}
@@ -10067,6 +10065,64 @@ class IntentHookStopIconTests(unittest.TestCase):
         self.assertNotIn('querySelector(\'button[aria-label="Stop"]', openclaw_pipe._INTENT_HOOK_JS)
 
 
+class IntentOfOneStopTests(unittest.TestCase):
+    """ELI-198: Open WebUI's Stop cancels every task of the chat at once: a
+    reply waiting behind a run (after Send now, or queued) and the turn
+    writer holding that run. Each asks the page which button it was. The
+    query read and cleared the chat's record, so the first to ask got "stop"
+    and the writer got "none": its run went on. Runs the intent hook and its
+    query under node with a stub page."""
+
+    def run_page(self, steps: list) -> list:
+        """Plays `steps` on a page with the hook: ["stop"] clicks the
+        composer's Stop (a reply runs), ["submit", running] submits the
+        composer, ["query"] runs the intent query. The queries' answers."""
+        import shutil
+        import subprocess
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("no node")
+        script = textwrap.dedent("""
+            const [hook, query, steps] = JSON.parse(process.argv[1]);
+            const listeners = {};
+            let running = true;
+            const stop = { id: 'stop-response-button', getAttribute: () => null,
+                           querySelectorAll: () => [], closest() { return this; } };
+            const input = { closest: (sel) => (sel === '#chat-input' ? input : null) };
+            const form = { contains: (el) => el === input, querySelector: () => input,
+                           closest: () => null };
+            global.window = {};
+            global.location = { pathname: '/c/chat-1' };
+            global.document = {
+              addEventListener: (k, f) => { listeners[k] = f; },
+              querySelectorAll: (sel) => (sel === 'button' && running ? [stop] : []),
+              querySelector: (sel) => (sel === '#chat-input' ? input : null),
+            };
+            new Function(hook)();
+            const answers = [];
+            for (const s of steps) {
+              if (s[0] === 'stop') listeners.click({ target: stop });
+              else if (s[0] === 'submit') { running = s[1]; if (listeners.submit) listeners.submit({ target: form }); }
+              else answers.push(new Function(query)());
+            }
+            console.log(JSON.stringify(answers));
+        """)
+        args = [openclaw_pipe._INTENT_HOOK_JS, openclaw_pipe._intent_query_js("chat-1"), steps]
+        out = subprocess.run([node, "-e", script, json.dumps(args)], capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout)
+
+    def test_one_stop_answers_every_task_it_cancelled(self):
+        self.assertEqual(self.run_page([["stop"], ["query"], ["query"]]), ["stop", "stop"])
+
+    def test_a_new_message_ends_the_stop(self):
+        """A cancel after the next message is not that Stop's."""
+        self.assertEqual(self.run_page([["stop"], ["query"], ["submit", False], ["query"]]), ["stop", "none"])
+
+    def test_a_message_queued_while_a_reply_runs_keeps_it(self):
+        self.assertEqual(self.run_page([["stop"], ["submit", True], ["query"]]), ["stop"])
+
+
 class AutoSendHookTests(unittest.TestCase):
     """AUTO_SEND_WHILE_RUNNING: in an OpenClaw chat, a message Open WebUI
     queues while a reply runs is sent at once by clicking its Send now, marked
@@ -12204,11 +12260,12 @@ class SessionIdRunTests(_RoutingCase):
         await self.dispatch(run, {"state": "final"})
         await HandoverRewriteTests.settle(self, run)
 
-    def cron_task_gateway(self, abortable=False):
+    def cron_task_gateway(self, abortable=False, run_abortable=False):
         """The Gateway's answers for stopping a wake: chat.abort finds no run
         to abort on 2026.9 (a cron run is not a chat run, live 2026-10-18,
         ELI-192), the wake's job is a running cron task, and tasks.cancel
-        aborts that run."""
+        aborts that run. `run_abortable`: 2026.10.5, where sessions.abort
+        by the run's id aborts it and there is no tasks.list."""
         inner, test = self.conn.send_request, self
         self.cron_tasks = [{"taskId": "task-wake", "kind": "automation_run", "runtime": "cron",
                             "status": "running", "childSessionKey": self.key, "sourceId": self.JOB,
@@ -12220,6 +12277,12 @@ class SessionIdRunTests(_RoutingCase):
             if method == "chat.abort":
                 test.sent.append((method, copy.deepcopy(params)))
                 return {"ok": True, "aborted": abortable, "runIds": [params.get("runId")] if abortable else []}
+            if method == "sessions.abort":
+                test.sent.append((method, copy.deepcopy(params)))
+                return ({"ok": True, "abortedRunId": params.get("runId"), "status": "aborted"} if run_abortable
+                        else {"ok": True, "abortedRunId": None, "status": "no-active-run"})
+            if method == "tasks.list" and run_abortable:
+                raise RuntimeError("unknown method: tasks.list")
             if method == "tasks.list":
                 test.sent.append((method, copy.deepcopy(params)))
                 return {"tasks": copy.deepcopy(test.cron_tasks)}
@@ -12252,6 +12315,25 @@ class SessionIdRunTests(_RoutingCase):
         w = await self.stop_on_the_tab(mid)
         self.assertIn(("tasks.cancel", {"taskId": "task-wake"}), self.sent)
         self.assertNotIn(("tasks.cancel", {"taskId": "task-other"}), self.sent)
+        self.assertTrue(w.closed)
+        self.assertIs(self.new_messages()[mid]["done"], True)
+
+    async def test_stop_on_a_wake_on_2026_10_aborts_its_run_by_id(self):
+        """2026.10.5 has no tasks.cancel: Stop on a wake's reply let its run
+        go on to its end. sessions.abort with the run's id stops that run
+        alone, without clearQueued, so turns queued behind it stay."""
+        self.tab_on_chat()
+        self.cron_task_gateway(run_abortable=True)
+        self.wake_turn(self.W1)
+        _turn_route_now(self.conn, self.sid_ev(_delta("Looping: 1 of 8.")))
+        await self.spin()
+        mid = turn_message_id(self.key, self.W1, self.CHAT)
+        w = await self.stop_on_the_tab(mid)
+        self.assertIn(("sessions.abort", {"key": self.key, "runId": w.run_id}), self.sent)
+        self.assertNotIn("tasks.list", [m for m, _ in self.sent])
+        # chat.abort answers `aborted` for a wake on 2026.10.5 but stops
+        # only its running command (sandbox, 2026-10-19): never sent first.
+        self.assertNotIn("chat.abort", [m for m, _ in self.sent])
         self.assertTrue(w.closed)
         self.assertIs(self.new_messages()[mid]["done"], True)
 
