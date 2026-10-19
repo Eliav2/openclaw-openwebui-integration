@@ -9988,6 +9988,194 @@ class SilentAnnounceTests(_RoutingCase):
         await self.announce_run("NO_REPLY")
         self.assertEqual(self.new_messages(), {})
 
+    # ELI-217: on 2026.10.5 a NO_REPLY to a completion is an empty response.
+    # The run fails ("Agent couldn't generate a response"), the Gateway retries
+    # the delivery on a backoff, and the session's last push for the run is
+    # `phase: error` with hasActiveRun still true: no settle is pushed, though
+    # sessions.list already reads the row failed (s105 probe, 2026-10-19).
+
+    ERROR_TEXT = "⚠️ Agent couldn't generate a response. Please try again."
+
+    def failed_row(self, active=False):
+        return {"key": self.key, "hasActiveRun": active,
+                "status": "running" if active else "failed", "lastRunId": self.announce,
+                "lastRunError": None if active else self.ERROR_TEXT}
+
+    def list_rows(self, *rows):
+        """sessions.list answers with these rows in turn, the last one again."""
+        rows, parent = list(rows), self.conn.send_request
+
+        async def send_request(method, params, timeout=10):
+            if method == "sessions.list":
+                self.sent.append((method, copy.deepcopy(params)))
+                return {"sessions": [rows.pop(0) if len(rows) > 1 else rows[0]]}
+            return await parent(method, params, timeout)
+        self.conn.send_request = send_request
+
+    async def failed_announce_run(self):
+        """The 10.5 run: no text, its lifecycle error, its chat error, and only
+        the `phase: error` push (hasActiveRun true)."""
+        h = self.parent_history("x")
+        self.history = {"messages": h["messages"][:-1]}  # a failed run has no closing message
+        self.conn._on_sessions_changed({"sessionKey": self.key, "phase": "start",
+                                        "runId": self.announce, "hasActiveRun": True,
+                                        "status": "running"})
+        _turn_route_now(self.conn, self.ev(self.announce, {"stream": "lifecycle",
+                                                           "data": {"phase": "start"}}))
+        _turn_route_now(self.conn, self.ev(self.announce, {"stream": "lifecycle", "data": {
+            "phase": "error", "error": self.ERROR_TEXT}}))
+        self.conn._on_sessions_changed({"sessionKey": self.key, "phase": "error",
+                                        "runId": self.announce, "hasActiveRun": True,
+                                        "status": "running", "lastRunId": self.announce})
+        _turn_route_now(self.conn, self.ev(self.announce, {"state": "error",
+                                                           "errorMessage": self.ERROR_TEXT}))
+        await self.spin()
+
+    def cards(self):
+        return [(mid, m) for mid, m in self.new_messages().items()
+                if any(i["type"] == "function_call" for i in m.get("output") or [])]
+
+    async def test_a_silent_announce_that_fails_on_2026_10_shows_its_card(self):
+        self.list_rows(self.failed_row(active=True), self.failed_row())
+        await self.failed_announce_run()
+        ((_mid, m),) = self.cards()
+        self.assertIs(m["done"], True)
+        self.assertIn("R10 probe sub-agent", json.dumps(m["output"]))
+        self.assertIn("SUB-DONE-R10", json.dumps(m["output"]))
+        self.assertEqual(self.conn._turn_pumps, {}, "the run's pump ended")
+
+    async def test_the_card_of_a_native_runs_spawn_is_named_by_its_label(self):
+        """A parent on the Gateway's own runtime records the spawn as a
+        `toolCall` block and a `toolResult` message (ELI-217: the card was
+        named after the child's session key)."""
+        h = self.parent_history("NO_REPLY")
+        result = json.dumps({"status": "accepted", "childSessionKey": self.CHILD,
+                             "runId": self.CHILD_RUN})
+        h["messages"][1] = {"role": "assistant", "content": [
+            {"type": "toolCall", "id": "call_s", "name": "sessions_spawn",
+             "arguments": self.SPAWN_ARGS}]}
+        h["messages"].insert(2, {"role": "toolResult", "toolCallId": "call_s",
+                                 "toolName": "sessions_spawn",
+                                 "content": [{"type": "text", "text": result}]})
+        self.history = h
+        _turn_route_now(self.conn, self.ev(self.announce, _delta("NO_REPLY")))
+        _turn_route_now(self.conn, self.ev(self.announce, {"state": "final"}))
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "done", "lastRunId": self.announce})
+        await self.spin()
+        (m,) = self.new_messages().values()
+        (call,) = [i for i in m["output"] if i["type"] == "function_call"]
+        self.assertIn("R10 probe sub-agent", call["arguments"])
+
+    async def test_the_card_of_a_spawn_made_through_a_deferred_tool_wrapper_is_named(self):
+        """On 2026.10 a native run calls `sessions_spawn` through `tool_call`
+        ({id, args}) when the tool is deferred; the card was named "Sub-agent"."""
+        h = self.parent_history("NO_REPLY")
+        result = json.dumps({"status": "accepted", "childSessionKey": self.CHILD,
+                             "runId": self.CHILD_RUN})
+        h["messages"][1] = {"role": "assistant", "content": [
+            {"type": "toolCall", "id": "call_w", "name": "tool_call",
+             "arguments": {"id": "sessions_spawn", "args": self.SPAWN_ARGS}}]}
+        h["messages"].insert(2, {"role": "toolResult", "toolCallId": "call_w", "toolName": "tool_call",
+                                 "content": [{"type": "text", "text": json.dumps(
+                                     {"tool": {"id": "sessions_spawn"}, "result": result})}]})
+        self.history = h
+        _turn_route_now(self.conn, self.ev(self.announce, _delta("NO_REPLY")))
+        _turn_route_now(self.conn, self.ev(self.announce, {"state": "final"}))
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "done", "lastRunId": self.announce})
+        await self.spin()
+        (m,) = self.new_messages().values()
+        (call,) = [i for i in m["output"] if i["type"] == "function_call"]
+        self.assertIn("R10 probe sub-agent", call["arguments"])
+
+    async def test_a_failed_announce_waits_while_its_row_is_still_active(self):
+        """No guess: a row still active at the error waits for the next push."""
+        self.list_rows(self.failed_row(active=True))
+        await self.failed_announce_run()
+        self.assertEqual(self.cards(), [])
+        self.assertTrue(self.conn._turn_pumps, "the pump waits for the settle")
+        self.conn._on_sessions_changed({"sessionKey": self.key, **self.failed_row()})
+        await self.spin()
+        self.assertEqual(len(self.cards()), 1)
+        self.assertEqual(self.conn._turn_pumps, {})
+
+    async def test_a_later_retry_reply_lands_once_beside_the_one_card(self):
+        """The Gateway retries the delivery under the same run id: a retry the
+        parent answers again with silence adds no second card, and the one it
+        answers aloud lands once, in a message of its own."""
+        self.list_rows(self.failed_row(active=True), self.failed_row())
+        await self.failed_announce_run()
+        self.list_rows(self.failed_row(active=True), self.failed_row())
+        await self.failed_announce_run()
+        self.assertEqual(len(self.cards()), 1)
+        self.list_rows({"key": self.key, "hasActiveRun": False, "status": "done",
+                        "lastRunId": self.announce})
+        await self.announce_run("The sub-agent returned SUB-DONE-R10.")
+        self.assertEqual(len(self.cards()), 1)
+        replies = [m for m in self.new_messages().values()
+                   if m.get("content") == "The sub-agent returned SUB-DONE-R10."]
+        self.assertEqual(len(replies), 1)
+        self.assertEqual(len(self.new_messages()), 2)
+
+
+class ErroredAgentRunTests(_RoutingCase):
+    """ELI-217: a run the agent started that errors on 2026.10.5 gets no
+    settle push (its last push is `phase: error`, hasActiveRun true), so its
+    message stayed open and its pump waited forever. Its error event reads
+    the row once; an idle row ends the message, an active one waits."""
+
+    ERROR_TEXT = "⚠️ Agent couldn't generate a response. Please try again."
+
+    def rows(self, *rows):
+        rows, parent = list(rows), self.conn.send_request
+
+        async def send_request(method, params, timeout=10):
+            if method == "sessions.list":
+                self.sent.append((method, copy.deepcopy(params)))
+                return {"sessions": [rows.pop(0) if len(rows) > 1 else rows[0]]}
+            return await parent(method, params, timeout)
+        self.conn.send_request = send_request
+
+    def row(self, active):
+        return {"key": self.key, "hasActiveRun": active, "status": "running" if active else "failed",
+                "lastRunId": self.RUN, "lastRunError": None if active else self.ERROR_TEXT}
+
+    async def errored_run(self):
+        self.history = {"messages": [
+            {"role": "user", "content": "x", "idempotencyKey": f"{self.RUN}:user"}]}
+        self.conn._on_sessions_changed({"sessionKey": self.key, "phase": "start", "runId": self.RUN,
+                                        "hasActiveRun": True, "status": "running"})
+        _turn_route_now(self.conn, self.ev(self.RUN, _delta("Working on it.")))
+        _turn_route_now(self.conn, self.ev(self.RUN, {"stream": "lifecycle", "data": {
+            "phase": "error", "error": self.ERROR_TEXT}}))
+        self.conn._on_sessions_changed({"sessionKey": self.key, "phase": "error", "runId": self.RUN,
+                                        "hasActiveRun": True, "status": "running",
+                                        "lastRunId": self.RUN})
+        _turn_route_now(self.conn, self.ev(self.RUN, {"state": "error",
+                                                      "errorMessage": self.ERROR_TEXT}))
+        await self.spin()
+
+    async def test_an_errored_agent_run_with_no_settle_push_ends_its_message(self):
+        self.rows(self.row(True), self.row(False))
+        await self.errored_run()
+        (m,) = self.new_messages().values()
+        self.assertIs(m["done"], True)
+        self.assertIn("Working on it.", m["content"])
+        self.assertIn(self.ERROR_TEXT, m["content"])
+        self.assertEqual(self.conn._turn_pumps, {})
+
+    async def test_an_errored_agent_run_whose_row_is_active_waits_for_its_settle(self):
+        self.rows(self.row(True))
+        await self.errored_run()
+        (m,) = self.new_messages().values()
+        self.assertIs(m["done"], False)
+        self.conn._on_sessions_changed({"sessionKey": self.key, **self.row(False)})
+        await self.spin()
+        (m,) = self.new_messages().values()
+        self.assertIs(m["done"], True)
+        self.assertEqual(self.conn._turn_pumps, {})
+
 
 class IntentHookStopIconTests(unittest.TestCase):
     """Review 2af1 R15: the page hook told Stop from Send now by the English

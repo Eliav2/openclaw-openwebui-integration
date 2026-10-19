@@ -949,7 +949,7 @@ class _TurnWriter:
                 rebuilt = self._from_transcript(hist) if hist else None
                 if rebuilt is not None:
                     self.renderer = rebuilt
-                if not (self._showable() or note):
+                if not self._showable():
                     await self._show_silent_announce(hist)
             if not self.opened:
                 if not (self._showable() or note) or not await self._open_at_end():
@@ -1011,21 +1011,36 @@ class _TurnWriter:
         result = await _child_result(self.conn, child)
         if not result:
             return
-        label = None
-        for m in (hist or {}).get("messages") or []:
-            blocks = m.get("content") if isinstance(m.get("content"), list) else []
-            calls = {b.get("id"): b for b in blocks if isinstance(b, dict) and b.get("type") == "toolcall"}
-            for b in blocks:
-                if (isinstance(b, dict) and b.get("type") == "tool_result"
-                        and child["child_session"] in json.dumps(b.get("content"))
-                        and b.get("tool_use_id") in calls):
-                    label = _spawn_title(calls[b["tool_use_id"]].get("arguments") or {})
+        # The spawn call whose result names the child, in either tool shape
+        # (claude-cli's blocks, or a native run's `toolResult` messages), made
+        # directly or through a deferred-tool wrapper (2026.10).
+        label, args = None, {}
+        for ev in _history_events((hist or {}).get("messages") or []):
+            data = ev.get("data") or {}
+            if ev.get("stream") != "tool":
+                continue
+            if data.get("phase") == "start":
+                call = (_bare_tool_name(data.get("name") or ""), json.dumps(data.get("args") or {}))
+                name, args_str = _deferred_call_view(*call) or call
+                if _is_spawn_tool(name):
+                    args[data.get("toolCallId")] = _json_object(args_str)
+            elif (data.get("toolCallId") in args
+                  and child["child_session"] in json.dumps(data.get("result"))):
+                label = _spawn_title(args[data["toolCallId"]])
         tcid = f"subagent-{child['child_run']}"
         args_str = json.dumps({"label": label or child["child_session"]})
         call = _tool_call_started_event("Sub-agent", tcid, args_str)["item"]
         call["status"] = "completed"
         self.renderer = _TurnRenderer()
         self.renderer.output = [call, _tool_call_result_event(tcid, result)["item"]]
+        if not self.opened:
+            # One card per child run, in a message of its own (ELI-217): 2026.10.5
+            # retries a delivery the parent met with silence under the same run
+            # id, and a retry's reply then lands in the run's message, not over
+            # the card, while a silent one rewrites the same card.
+            self.conn._turn_writers.pop((self.chat_id, self.message_id), None)
+            self.message_id = turn_message_id(self.session_key, tcid, self.chat_id)
+            self.conn._turn_writers[(self.chat_id, self.message_id)] = self
 
     def release(self) -> None:
         """This writer's connection was retired by a newer deploy: end the Open
@@ -1361,7 +1376,19 @@ def _turn_queue(conn: "_GatewayConnection", sess: str, run: str, parsed: tuple,
     if _is_terminal_event(payload):
         pump.terminal.set()
     pump.queue.put_nowait(("event", payload))
+    if _is_error_event(payload) and parse_pipe_run_id(run) is None:
+        # ELI-217: on 2026.10.5 a run the agent started that errors gets no
+        # settle push (its last is `phase: error`, hasActiveRun still true),
+        # though its row reads failed by its chat error. Its error events read
+        # the row; one still active waits for the next push.
+        spawn_background(_turn_reread_row(conn, sess))
     return True
+
+
+def _is_error_event(payload: dict) -> bool:
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    return payload.get("state") == "error" or (
+        payload.get("stream") == "lifecycle" and data.get("phase") == "error")
 
 
 def _note_child_result(conn: "_GatewayConnection", payload: dict) -> None:

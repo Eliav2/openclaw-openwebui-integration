@@ -19,6 +19,7 @@ so a plain `pytest` on a laptop never tries to talk to a live instance.
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import time
@@ -979,6 +980,68 @@ def test_the_status_action_lists_a_running_subagent_and_opens_its_drawer(token):
     assert drawer["parent"]["chatId"] == chat_id, drawer
 
 
+def test_a_subagent_result_the_parent_answers_with_silence_shows_as_its_card(token):
+    """The parent answers a sub-agent's completion with NO_REPLY: the chat
+    still gets one message, a finished Sub-agent card holding the child's
+    result (ELI-138). On OpenClaw 2026.10.5 no such message came (ELI-217)."""
+    chat_id, msg = _chat_turn(token, "E2E_SPAWN_SILENT")
+    assert msg.get("content", "").strip() == "E2E_SPAWNED", msg
+
+    def card():
+        for m in _chat_messages(token, chat_id).values():
+            out = m.get("output") or []
+            calls = [o for o in out if o.get("type") == "function_call" and o.get("name") == "Sub-agent"]
+            results = [o for o in out if o.get("type") == "function_call_output"]
+            if m.get("role") == "assistant" and m.get("done") is True and calls and results:
+                return m, calls[0], results[0]
+        return None
+
+    found = _until("the silent sub-agent's card", card, timeout_s=120, every_s=2)
+    m, call, result = found
+    assert "silent helper" in call.get("arguments", ""), call
+    assert "E2E_SILENT_RESULT done" in json.dumps(result.get("output")), result
+    assert "NO_REPLY" not in (m.get("content") or ""), m.get("content")
+    # From 2026.10.5 the Gateway counts the silence as a failed delivery (the
+    # card then carries its error) and retries it on a backoff (15 s, then
+    # 30 s, ...). Once a retry has happened the card is still one, and the
+    # parent's next reply lands once, in its own message.
+    child_run = call["id"].removeprefix("subagent-")
+
+    def failed_deliveries() -> int:
+        return sum(line.count(child_run) > 0 and "did not produce a visible reply" in line
+                   for line in _gateway_file_log_lines())
+
+    if "couldn't generate a response" in (m.get("content") or ""):
+        _until("the Gateway's retry of the delivery", lambda: failed_deliveries() >= 2,
+               timeout_s=90, every_s=2)
+    _, after = _chat_turn(token, "Respond with exactly: E2E_AFTER_CARD", chat_id=chat_id)
+    assert "couldn't generate a response" not in (after.get("content") or ""), \
+        "the user's own reply shows an error"
+    assert (after.get("content") or "").strip() == "E2E_AFTER_CARD", after
+    msgs = _chat_messages(token, chat_id)
+    cards = [k for k, x in msgs.items() if any(
+        o.get("type") == "function_call" and o.get("name") == "Sub-agent" for o in x.get("output") or [])]
+    assert len(cards) == 1, cards
+    replies = [k for k, x in msgs.items() if (x.get("content") or "").strip() == "E2E_AFTER_CARD"]
+    assert len(replies) == 1, replies
+    _assert_clean(token, chat_id, msgs)
+
+
+def test_a_reply_the_agent_starts_that_errors_still_finishes(token):
+    """A run started on the chat's session from outside (the Gateway's
+    `agent` method, as `sessions_send` does) whose model answers nothing:
+    OpenClaw 2026.10.5 fails it ("Agent couldn't generate a response") and
+    pushes no settle for it (its last push is `phase: error` with
+    hasActiveRun true), so its message stayed generating (ELI-217). It
+    finishes with the run's error."""
+    chat_id, _ = _chat_turn(token, "Respond with exactly: E2E_AGENT_CHAT")
+    key = _session_key(token, chat_id)
+    _gw("agent", {"sessionKey": key, "message": "E2E_EMPTY_REPLY",
+                  "idempotencyKey": f"e2e-empty-{uuid.uuid4().hex[:8]}"})
+    msgs = _wait_for(token, chat_id, ["couldn't generate a response"])
+    _assert_clean(token, chat_id, msgs)
+
+
 # ── A run that ends while Open WebUI is stopped (ELI-94) ─────────────────────
 # Keep this last: it stops and starts the Open WebUI container. A graceful stop
 # cancels the request streaming the reply and saves the message done:true with
@@ -1086,6 +1149,20 @@ def test_the_status_dialog_lists_only_this_chats_automations(token, guest_token)
 def _session_row(key: str) -> dict:
     rows = _gw("sessions.list", {"search": key[-36:], "limit": 10}).get("sessions") or []
     return next((r for r in rows if r.get("key") == key), {})
+
+
+def _gateway_file_log_lines() -> list[str]:
+    """The e2e stack Gateway's own file log, which lasts across its restarts:
+    E2E_GATEWAY_LOG where the stack sets it, else OpenClaw's default
+    /tmp/openclaw/openclaw-<date>.log (what CI collects at the end)."""
+    paths = ([os.environ["E2E_GATEWAY_LOG"]] if os.environ.get("E2E_GATEWAY_LOG")
+             else sorted(glob.glob("/tmp/openclaw/openclaw-*.log")))
+    assert paths and all(os.path.isfile(p) for p in paths), f"no Gateway file log: {paths}"
+    lines = []
+    for path in paths:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines += fh.readlines()
+    return lines
 
 
 def _until(what: str, check, timeout_s: float = WAKE_TIMEOUT_S, every_s: float = 1.0):
