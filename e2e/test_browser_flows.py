@@ -1461,8 +1461,9 @@ def test_an_execute_while_the_input_dialog_is_open_leaves_the_dialog_its_answer(
     the function. `held` (the Pipe's wrappers) must always pass; `raw` shows
     whether Open WebUI still needs them."""
     here = os.path.dirname(os.path.abspath(__file__))
-    subprocess.run(["docker", "cp", os.path.join(here, "..", "openclaw_pipe.py"), "owui:/tmp/openclaw_pipe_probe.py"],
-                   check=True, capture_output=True, timeout=60)
+    with open(os.path.join(here, "..", "openclaw_pipe.py"), "rb") as f:
+        subprocess.run(["docker", "exec", "-i", "owui", "sh", "-c", "cat > /tmp/openclaw_pipe_probe.py"], stdin=f,
+                       check=True, capture_output=True, timeout=60)
     fid = f"eli195_probe_{mode}"
     capture.api("DELETE", f"/api/v1/functions/id/{fid}/delete", token=token) if any(
         f.get("id") == fid for f in capture.api("GET", "/api/v1/functions/", token=token)) else None

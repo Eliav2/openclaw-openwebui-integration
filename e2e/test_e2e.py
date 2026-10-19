@@ -2089,7 +2089,9 @@ def test_a_cancelled_chat_write_leaves_the_database_writable(token, mode):
     here = os.path.dirname(os.path.abspath(__file__))
     for src, dst in ((os.path.join(here, "owui_cancel_probe.py"), "/tmp/owui_cancel_probe.py"),
                      (os.path.join(here, "..", "openclaw_pipe.py"), "/tmp/openclaw_pipe_probe.py")):
-        subprocess.run(["docker", "cp", src, f"owui:{dst}"], check=True, capture_output=True, timeout=60)
+        with open(src, "rb") as f:
+            subprocess.run(["docker", "exec", "-i", "owui", "sh", "-c", f"cat > {dst}"], stdin=f,
+                           check=True, capture_output=True, timeout=60)
     try:
         out = subprocess.run(["docker", "exec", "-w", "/app/backend", "owui", "python3", "/tmp/owui_cancel_probe.py",
                               mode, "400", chat["id"], "/tmp/openclaw_pipe_probe.py"],
