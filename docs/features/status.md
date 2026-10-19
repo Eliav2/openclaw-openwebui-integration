@@ -1,6 +1,6 @@
 The Status dialog shows a chat's context use, your rate limits, what runs in the background for it and the sub-agents its runs spawned, fetched live when you open it. From there you can compact the session, or open any sub-agent's drawer to read its run like a chat.
 
-Applies to: Action (the composer Status button also needs the Pipe)
+Applies to: Action (the composer's Claw button also needs the Pipe)
 Valves: `GATEWAY_URL`, `GATEWAY_TOKEN`, `DEVICE_IDENTITY`, `STATE_DIR`, `AGENT_ID`, `CONTROL_UI_URL` (Action); `COMPOSER_STATUS_BUTTON` (Pipe)
 
 ## The Status dialog
@@ -11,7 +11,7 @@ _Separate function: install the Status Action first, see [Status button](../inst
 
 _The rate limits in this screenshot are sample data._
 
-The Status Action adds a button to the message toolbar. It opens a dialog with five sections: Context, Rate limits, [Background](#background), [Subagents](#sub-agents) and In-process agents.
+The Status Action adds a button to the message toolbar. It opens a dialog, titled **Claw**, with five sections: Context, Rate limits, [Background](#background), [Subagents](#sub-agents) and In-process agents.
 
 <img src="../img/toolbar-button-light.png" alt="The OpenClaw Status button, a paw, on a reply's toolbar" width="300">
 
