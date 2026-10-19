@@ -1,23 +1,33 @@
-"""Runs inside the Open WebUI container: cancel a chat message write at a
-random point, again and again, as a Stop does to a reply being saved
-(ELI-205, open-webui#32741). Prints one JSON line:
-{"ok": bool, "cancels": n, "what": ...}.
+"""Runs inside the Open WebUI container: a Stop's cancel lands on a chat
+message write while it commits, and a second cancel lands while SQLAlchemy
+throws away the connection the first one broke, as a Stop followed by a
+closed page does (ELI-205, open-webui#32741). Prints one JSON line:
+{"bug": bool|None, "attempts": n, "landed": {"commit": n, "second": n}, "what": ...}.
 
-usage: owui_cancel_probe.py shielded|raw <cancels> <chat_id> <pipe file>
+usage: owui_cancel_probe.py shielded|raw <attempts> <chat_id> <pipe file>
 
-`shielded` writes through the Pipe's `_owui_upsert_message`, `raw` calls Open
-WebUI's upsert directly, as the Pipe would without its shield. It runs on a
-copy of the DB, so a lock it causes never reaches the running Open WebUI.
+Both cancels fire from SQLAlchemy's own events on Open WebUI's engine (the
+connection's `commit`, the pool's `invalidate`), so they land at the same
+point on any machine. A random delay missed the window on a fast CI runner
+and passed on an Open WebUI that has the bug. `landed` counts the cancels
+that fired there: the test refuses a run where none landed in a commit.
+
+`shielded` writes through the Pipe's `_owui_upsert_message` (the cancel hits
+its caller, the write goes on); `raw` calls Open WebUI's upsert directly, as
+the Pipe would without its shield. It runs on a copy of the DB, so what it
+breaks never reaches the running Open WebUI.
+
+The bug is present when a cancelled write never ends, the next write fails,
+or SQLite stays locked for another connection for 10 s.
 """
 import asyncio
 import importlib.util
 import json
 import os
-import random
 import sqlite3
 import sys
 
-mode, cancels, chat_id, pipe_file = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+mode, attempts, chat_id, pipe_file = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
 DB = "/tmp/eli205-probe.db"
 src = sqlite3.connect("/app/backend/data/webui.db")
 dst = sqlite3.connect(DB)
@@ -28,8 +38,36 @@ dst.close()
 os.environ["DATABASE_URL"] = f"sqlite:///{DB}"
 sys.path.insert(0, "/app/backend")
 
+from open_webui.internal import db as owui_db  # noqa: E402
 from open_webui.models.chats import Chats  # noqa: E402
 from open_webui.models.users import Users  # noqa: E402
+from sqlalchemy import event  # noqa: E402
+
+landed = {"commit": 0, "second": 0}
+# The attempt's task: cancelled at its commit, then again at the invalidate.
+armed = {"first": None, "second": None}
+
+
+@event.listens_for(owui_db.async_engine.sync_engine, "commit")
+def _cancel_at_commit(*_args):
+    task = armed["first"]
+    if task is None or task.done():
+        return
+    armed["first"], armed["second"] = None, task
+    landed["commit"] += 1
+    # Delivered at the commit's await, while aiosqlite's thread runs it.
+    task.cancel()
+
+
+@event.listens_for(owui_db.async_engine.sync_engine.pool, "invalidate")
+def _cancel_again(*_args):
+    task = armed["second"]
+    if task is None or task.done():
+        return
+    armed["second"] = None
+    landed["second"] += 1
+    # Delivered while the broken connection is being closed.
+    asyncio.get_running_loop().call_soon(task.cancel)
 
 
 def writer():
@@ -60,26 +98,26 @@ async def main() -> dict:
     write, pending = writer()
     users = await Users.get_users()
     uid = (users["users"] if isinstance(users, dict) else users)[0].id
-    for i in range(cancels):
+    out = {"mode": mode, "bug": False, "attempts": 0, "landed": landed, "what": "DB writable throughout"}
+    for i in range(attempts):
+        out["attempts"] = i + 1
         task = asyncio.ensure_future(write(chat_id, "eli205-probe", {"role": "assistant", "content": f"x{i}", "done": True}))
-        await asyncio.sleep(random.uniform(0, 0.01))
-        task.cancel()
-        if random.random() < 0.5:
-            await asyncio.sleep(0)
-            task.cancel()
-        # A second cancel can end the shield's caller while its write goes
-        # on in the background: that write must end too.
+        armed.update(first=task, second=None)
+        # A shielded write goes on in the background after its caller is
+        # cancelled: that write must end too.
         done, _ = await asyncio.wait({task, *pending()}, timeout=15)
-        done = not (pending() - done) and task in done
-        if not done:
-            return {"ok": False, "cancels": i + 1, "what": "the cancelled write never ended",
-                    "locked_for_others": locked_for_others()}
+        armed.update(first=None, second=None)
+        if pending() - done or task not in done:
+            out.update(bug=True, what="the cancelled write never ended")
+            break
         try:
             await asyncio.wait_for(Users.update_last_active_by_id(uid), 15)
         except BaseException as ex:  # a CancelledError out of a wedged connection too
-            return {"ok": False, "cancels": i + 1, "what": f"the next write failed: {type(ex).__name__} {str(ex)[:120]}",
-                    "locked_for_others": locked_for_others()}
-    return {"ok": True, "cancels": cancels, "what": "DB writable throughout", "locked_for_others": locked_for_others()}
+            out.update(bug=True, what=f"the next write failed: {type(ex).__name__} {str(ex)[:120]}")
+            break
+    if locked_for_others():
+        out.update(bug=True, what=out["what"] + "; SQLite stays locked for other connections")
+    return out
 
 
 # Not asyncio.run: its shutdown waits for a wedged write forever.
@@ -87,6 +125,7 @@ loop = asyncio.new_event_loop()
 try:
     result = loop.run_until_complete(main())
 except BaseException as ex:
-    result = {"ok": False, "cancels": None, "what": f"probe died: {type(ex).__name__} {str(ex)[:200]}"}
+    result = {"mode": mode, "bug": None, "attempts": None, "landed": landed,
+              "what": f"probe died: {type(ex).__name__} {str(ex)[:200]}"}
 print(json.dumps(result), flush=True)
 os._exit(0)  # a wedged aiosqlite thread would keep the process alive

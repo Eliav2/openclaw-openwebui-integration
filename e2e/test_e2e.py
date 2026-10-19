@@ -2069,6 +2069,11 @@ class Eli205Present(AssertionError):
     drop gate's expected way: a probe that could not run fails it for real."""
 
 
+class ProbeIneffective(AssertionError):
+    """The probe did not produce its precondition (no cancel landed in a
+    commit), so its result proves nothing either way."""
+
+
 @pytest.mark.skipif(shutil.which("docker") is None, reason="needs the e2e stack's Open WebUI container")
 @pytest.mark.parametrize("mode", [
     "shielded",
@@ -2078,11 +2083,15 @@ class Eli205Present(AssertionError):
         "`_uncancellable` shield and this gate."))),
 ])
 def test_a_cancelled_chat_write_leaves_the_database_writable(token, mode):
-    """ELI-205: a Stop cancels a chat message write mid-transaction; on an
-    Open WebUI without open-webui#32745 that write never ends or leaves SQLite
-    locked. The probe produces that cancel itself, hundreds of times, in the
-    Open WebUI container: `shielded` through the Pipe's write must always
-    pass; `raw` (no shield) shows whether Open WebUI still needs it."""
+    """ELI-205: a Stop cancels a chat message write as it commits, and a
+    closed page cancels it again while SQLAlchemy drops the broken
+    connection; on an Open WebUI without open-webui#32745 the next write
+    fails or SQLite stays locked. The probe (e2e/owui_cancel_probe.py) fires
+    both cancels from SQLAlchemy's own events in the Open WebUI container, so
+    they land there on any machine, up to 60 times: `shielded` (through the
+    Pipe's write) must always pass; `raw` (no shield) shows whether Open
+    WebUI still needs it. A run where no cancel landed in a commit fails as
+    ProbeIneffective, never as a pass."""
     status, chat = _request("POST", "/api/v1/chats/new", {"chat": {
         "title": "ELI-205 probe", "messages": [], "history": {"messages": {}}}}, token)
     assert status == 200, chat
@@ -2094,14 +2103,16 @@ def test_a_cancelled_chat_write_leaves_the_database_writable(token, mode):
                            check=True, capture_output=True, timeout=60)
     try:
         out = subprocess.run(["docker", "exec", "-w", "/app/backend", "owui", "python3", "/tmp/owui_cancel_probe.py",
-                              mode, "400", chat["id"], "/tmp/openclaw_pipe_probe.py"],
+                              mode, "60", chat["id"], "/tmp/openclaw_pipe_probe.py"],
                              capture_output=True, text=True, timeout=900)
     finally:
         _request("DELETE", f"/api/v1/chats/{chat['id']}", token=token)
     lines = [ln for ln in out.stdout.splitlines() if ln.startswith("{")]
     assert lines, f"the probe printed no result: {out.stdout[-500:]} {out.stderr[-1500:]}"
     result = json.loads(lines[-1])
-    # The cancels must have happened, or a pass proves nothing.
-    assert result["cancels"], result
-    if not result["ok"] or result["locked_for_others"]:
+    # In the test's output: attempts, and how many cancels landed where.
+    print(f"ELI-205 probe ({mode}): {json.dumps(result)}")
+    if result["bug"] is None or not result["landed"]["commit"]:
+        raise ProbeIneffective(result)
+    if result["bug"]:
         raise Eli205Present(result)

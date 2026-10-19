@@ -1525,12 +1525,16 @@ def test_an_execute_while_the_input_dialog_is_open_leaves_the_dialog_its_answer(
         page.evaluate("() => { window.__eli195Poked = false; }")
         capture.send(page, "hi")
         page.get_by_text("Type anything").wait_for(timeout=60_000)
-        # The precondition: the `execute` went out while the dialog is open.
-        page.get_by_text("execute sent").wait_for(timeout=30_000)
-        assert page.get_by_text("Type anything").is_visible(), "the dialog closed before the execute"
-        if mode == "raw":
-            # It reached this tab's page while the dialog shows.
-            _wait(page, "() => window.__eli195Poked === true", "the execute while the dialog is open", 30_000)
+        # The precondition: the `execute` went out while the dialog is open
+        # and, raw, the page ran it under the dialog. Without it the result
+        # proves nothing, so it fails as ineffective, never as the bug.
+        try:
+            page.get_by_text("execute sent").wait_for(timeout=30_000)
+            assert page.get_by_text("Type anything").is_visible(), "the dialog closed before the execute"
+            if mode == "raw":
+                _wait(page, "() => window.__eli195Poked === true", "the execute while the dialog is open", 30_000)
+        except Exception as ex:
+            raise AssertionError(f"ELI-195 probe ineffective: {ex}") from None
         else:
             assert page.evaluate("() => window.__eli195Poked") is False, "the held execute ran under the dialog"
         page.locator("input[placeholder=here], textarea[placeholder=here]").first.fill("hello")
@@ -1542,6 +1546,7 @@ def test_an_execute_while_the_input_dialog_is_open_leaves_the_dialog_its_answer(
         reply = page.evaluate(f"() => {capture.LAST_ASSISTANT}.innerText")
         # Held, the `execute` runs once the dialog is answered.
         _wait(page, "() => window.__eli195Poked === true", "the execute", 30_000)
+        print(f"ELI-195 probe ({mode}): execute ran under the dialog: {mode == 'raw'}; reply: {reply[-80:]!r}")
         if "got 'hello'" not in reply:
             raise Eli195Present(reply[-200:])
     finally:
