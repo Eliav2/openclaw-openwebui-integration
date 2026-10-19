@@ -2739,6 +2739,15 @@ class Action:
 
             context_tokens = session_row.get("contextTokens")
             total_tokens = session_row.get("totalTokens")
+            if context_tokens and total_tokens is None:
+                # OpenClaw 2026.10.10 writes no totals to a session's row
+                # after its first run (ELI-223): the newest call's own usage.
+                try:
+                    history = await conn.send_request(
+                        "chat.history", dict(sessionKey=session_key, limit=20), timeout=5)
+                    total_tokens = _history_latest_prompt_tokens(history)
+                except Exception as ex:
+                    pipe_log(f"[status-action] chat.history for the context failed: {ex}")
             context_data = None
             if context_tokens and total_tokens is not None:
                 context_data = {
