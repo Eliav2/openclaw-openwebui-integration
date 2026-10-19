@@ -575,6 +575,10 @@ async def _claim_turn_message_now(chat_id: str, user_id: str, message_id: str, r
     from sqlalchemy.orm.attributes import flag_modified
 
     async with Chats._chat_transaction(chat_id) as (db, chat):
+        if chat is None:
+            # Deleted in Open WebUI while its session lives on (ELI-218).
+            return {"claimed": False, "how": "gone", "message_id": message_id,
+                    "parent": None, "messages": {}}
         data = chat.chat or {}
         history = data.get("history") or {"messages": {}, "currentId": None}
         msgs = history.setdefault("messages", {})
@@ -7623,6 +7627,8 @@ async def _set_turn_meta_now(chat_id: str, message_id: str, meta: dict) -> bool:
     from sqlalchemy.orm.attributes import flag_modified
 
     async with Chats._chat_transaction(chat_id) as (db, chat):
+        if chat is None:
+            return False
         data = chat.chat or {}
         history = data.get("history") or {}
         msg = (history.get("messages") or {}).get(message_id)
@@ -8127,7 +8133,11 @@ class _TurnWriter:
             claim = await _claim_turn_message(self.chat_id, self.user_id, self.message_id,
                                               self.run_id, self.conn.writer_id, takeover=takeover)
             if not claim["claimed"]:
-                pipe_log(f"  turn writer: message {self.message_id[:8]}... is held by another writer")
+                if claim["how"] == "gone":
+                    pipe_log(f"  turn writer: chat {self.chat_id[:8]}... is gone; run "
+                             f"{self.run_id[:24]}... is not written")
+                else:
+                    pipe_log(f"  turn writer: message {self.message_id[:8]}... is held by another writer")
                 return False
             self._claim = claim
             if claim["how"] == "new":

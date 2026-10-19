@@ -31,6 +31,7 @@ The design behind this is in [Agent turns](../design/agent-turns.md).
 | A command the agent left running in the background that ends | the agent's reply to its result, live, finished when that run ends |
 | A Gateway restart recovery of an interrupted reply | continues that same reply |
 | A heartbeat run | nothing |
+| Any run on the session of a chat you deleted in Open WebUI | nothing: the chat stays deleted |
 
 Heartbeats never get a message: the Gateway hides heartbeat output itself, and heartbeat tool cards in your chat would be noise. A cron job running in an isolated session never reaches the chat either, since it does not run on the chat's session.
 

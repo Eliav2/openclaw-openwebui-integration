@@ -10263,6 +10263,35 @@ class ErroredAgentRunTests(_RoutingCase):
         self.assertEqual(self.conn._turn_pumps, {})
 
 
+class DeletedChatAgentRunTests(_RoutingCase):
+    """ELI-218: a run on the session of a chat deleted in Open WebUI (a
+    sub-agent's late result, a cron job, a background command's notice) found
+    no chat row, and the turn writer read `chat.chat` off None: every event of
+    the run started a pump that failed again (six on the 2026-10-19 gate)."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.owui.chat = None          # Chats._chat_transaction yields None for a missing row
+        self.logged = []
+        log = mock.patch.object(openclaw_pipe, "pipe_log", lambda *a, **k: self.logged.append(a))
+        log.start()
+        self.addCleanup(log.stop)
+
+    def failures(self):
+        return [a for a in self.logged if "failed" in str(a[0])]
+
+    async def test_a_run_on_a_deleted_chats_session_writes_nothing_and_fails_nothing(self):
+        await self.run_turn(self.RUN)
+        self.assertEqual(self.failures(), [])
+        self.assertIsNone(self.owui.chat)
+        self.assertEqual(self.conn._turn_pumps, {})
+
+    async def test_it_is_logged_once_for_the_run(self):
+        await self.run_turn(self.RUN)
+        gone = [a for a in self.logged if "is gone" in str(a[0])]
+        self.assertEqual(len(gone), 1, self.logged)
+
+
 class IntentHookStopIconTests(unittest.TestCase):
     """Review 2af1 R15: the page hook told Stop from Send now by the English
     aria-label, so in any other UI language a Stop read as "unknown" and the
