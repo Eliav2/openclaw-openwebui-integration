@@ -1850,6 +1850,54 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         await self._spin()
         self.assertTrue(closed, "the retired connection closes once the queued message is served")
 
+    async def test_a_reply_on_a_retired_connection_reads_its_usage_before_the_close(self):
+        """#157 gate (ELI-102, 2026-10-19): a redeploy retired the connection
+        a reply streamed on. The run ended, dropping its consumer closed the
+        socket, and only then did the reply ask chat.history for its usage
+        line: no answer ever comes on a closed socket, so the reply's end
+        waited out the request's timeout and its done:true never landed."""
+        closed = []
+        hung = []
+        send_request = self.conn.send_request
+
+        async def disconnect():
+            closed.append(True)
+
+        async def closing_send_request(method, params, timeout=10):
+            await asyncio.sleep(0.02)          # the answer's way back
+            if closed:
+                hung.append(method)
+                await asyncio.Event().wait()   # the socket closed meanwhile: no answer, ever
+            return await send_request(method, params, timeout=timeout)
+        self.conn.disconnect = disconnect
+        self.conn.send_request = closing_send_request
+        self.history = {"messages": [{"role": "assistant", "content": "hi",
+                                      "usage": {"input": 10, "output": 5},
+                                      "__openclaw": {"runId": "run-1"}}]}
+
+        gen = self._reply("hello", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        await self.conn.retire()                         # the redeploy
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "hi"))
+        q.put_nowait({"type": "event", "event": "agent", "payload": {
+            "sessionKey": self.SK, "runId": "run-1", "stream": "lifecycle",
+            "data": {"phase": "end"}}})
+        out = await asyncio.wait_for(first, 2)
+
+        async def rest():
+            nonlocal out
+            async for chunk in gen:
+                out += chunk if isinstance(chunk, str) else ""
+        await asyncio.wait_for(rest(), 2)
+        self.assertIn("hi", out)
+        self.assertTrue(closed, "the retired connection closed once the run ended")
+        self.assertEqual(hung, [], "a request sent after the close")
+        self.assertIn("chat.history", self.rpc, "the reply's usage was read before the close")
+        usage = self.ocp._build_usage_status_lines.await_args.kwargs.get("run_usage")
+        self.assertEqual(usage, {"input": 10, "output": 5})
+
     async def test_a_reply_that_saw_its_run_end_leaves_no_parity_target(self):
         """The inline loop ends on `lifecycle end` and drops its consumer; the
         run's trailing `chat` final arrives after that. Measured live

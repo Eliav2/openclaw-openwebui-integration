@@ -12562,24 +12562,30 @@ class _PipeTurn:
                 _live_replies().pop(live_key, None)
             if self.awaiting_owner:
                 self.conn.stop_awaiting_owner(self.session_key, self.owner_run)
-            # A parked queue now belongs to whoever claims the run; releasing
-            # it here would drop the events it is buffering.
-            if not self.turn.parked:
-                if self.done and not self.aborted and self.our_run_id and not self.handed_over:
-                    # The run ended in this reply. Its trailing `chat` final
-                    # lands after this consumer is gone and must not read as
-                    # "the reply ended before its run" (a handover would
-                    # rewrite the message OWUI is about to save) or as a run
-                    # nobody showed.
-                    self.conn.mark_delivered_live(self.session_key, self.our_run_id)
-                    self.conn.unregister_run_target(self.session_key, self.our_run_id)
-                self.conn.unregister_consumer(self.session_key, self.our_run_id, queue=self.queue)
-                self.turn.run_id = None
-                self.turn.queue = None
+            # The usage line is read while this reply still holds its
+            # consumer: dropping it closes a connection a redeploy retired,
+            # and a request sent then never gets its answer (#157 gate). The
+            # consumer is dropped even when a Stop lands during the read.
             status_lines = []
-            if not self.aborted and self.text_yielded and not self.adopted_run_id and not self.handed_over:
-                status_lines = await _build_usage_status_lines(
-                    self.conn, self.session_key, run_usage=await self.own_run_usage())
+            try:
+                if not self.aborted and self.text_yielded and not self.adopted_run_id and not self.handed_over:
+                    status_lines = await _build_usage_status_lines(
+                        self.conn, self.session_key, run_usage=await self.own_run_usage())
+            finally:
+                # A parked queue now belongs to whoever claims the run; releasing
+                # it here would drop the events it is buffering.
+                if not self.turn.parked:
+                    if self.done and not self.aborted and self.our_run_id and not self.handed_over:
+                        # The run ended in this reply. Its trailing `chat` final
+                        # lands after this consumer is gone and must not read as
+                        # "the reply ended before its run" (a handover would
+                        # rewrite the message OWUI is about to save) or as a run
+                        # nobody showed.
+                        self.conn.mark_delivered_live(self.session_key, self.our_run_id)
+                        self.conn.unregister_run_target(self.session_key, self.our_run_id)
+                    self.conn.unregister_consumer(self.session_key, self.our_run_id, queue=self.queue)
+                    self.turn.run_id = None
+                    self.turn.queue = None
             if self.adopted_run_id and not self.aborted:
                 await _emit_status(
                     self.__event_emitter__, "Sending your message…", done=False)
@@ -13242,7 +13248,8 @@ class _PipeTurn:
         if self.run_usage or not self.our_run_id:
             return self.run_usage
         try:
-            hist = await self.conn.session_history(self.session_key, limit=RUN_TEXT_HISTORY_LIMIT)
+            # As long as the usage line's other reads (`_build_usage_status_lines`).
+            hist = await self.conn.session_history(self.session_key, limit=RUN_TEXT_HISTORY_LIMIT, timeout=5)
         except Exception as ex:
             pipe_log(f"  usage line: chat.history failed: {ex!r}")
             return None
