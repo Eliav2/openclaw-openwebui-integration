@@ -508,6 +508,22 @@ class ComposerWatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await w.tick(now=131.0), 1)
         self.assertEqual([sid for sid, _ in w.sent], ["sidA"])
 
+    async def test_a_tab_that_acks_the_push_is_ready_for_an_ask_user_card(self):
+        """The ack says the tab shows the chat, so an ask_user card waiting
+        for a tab can go there (ELI-216); leaving the chat takes it back."""
+        openclaw_pipe._READY_CHAT_TABS.clear()
+        self.addCleanup(openclaw_pipe._READY_CHAT_TABS.clear)
+        pool = {"sidA": {"id": "alice", "chat_ids": ["oc"]}}
+        w = _TestWatcher(pool, self.chats, acks=[False])
+        await w.tick(now=0.0)
+        await w.tick(now=1.0)
+        self.assertEqual(openclaw_pipe._READY_CHAT_TABS, {}, "no ack yet: still loading")
+        await w.tick(now=5.0)
+        self.assertEqual(openclaw_pipe._READY_CHAT_TABS, {"oc": ["sidA"]})
+        pool["sidA"]["chat_ids"] = []
+        await w.tick(now=6.0)
+        self.assertEqual(openclaw_pipe._READY_CHAT_TABS, {})
+
     async def test_sessions_without_chat_ids_are_ignored(self):
         pool = {"sidA": {"id": "alice"}, "sidB": None}
         w = _TestWatcher(pool, self.chats)
