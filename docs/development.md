@@ -112,6 +112,15 @@ so the thinking level a turn picks shows in that request log as
 `reasoning_effort`. Gateway, Open WebUI and model logs are uploaded as an
 artifact on every run.
 
+The E2E job runs as 4 jobs per lane, side by side, each on its own stack and
+each running one shard of the tests (`e2e/shards.py`, picked by `E2E_SHARD`).
+A new E2E test goes in a shard in the same PR: `tests/test_e2e_shards.py`, in
+the Unit job, fails when a test is in no shard or in two, when the workflow's
+matrix and the shards differ, and when a shard holds more than two of the
+tests that crash the Gateway (a third crash on one stack waits up to 5 minutes
+for the Gateway's crash-loop window). The openclaw download and Playwright's
+Chromium are cached, keyed on their exact versions.
+
 If Open WebUI logs `database is locked` during an E2E run, `e2e/conftest.py`
 interrupts the running test and ends the run (exit code 3), naming that test
 and the log line: a lock that is never released (ELI-205) would otherwise
@@ -152,6 +161,7 @@ set -a; . e2e/versions.env; set +a
 bash e2e/start_stack.sh        # last line is an `export ...` for the test env
 export OWUI_URL=... OWUI_EMAIL=... OWUI_PASSWORD=... E2E_STACK=1   # paste it
 uv run --with-requirements requirements-dev.txt pytest -v e2e/test_e2e.py
+E2E_SHARD=2 uv run --with-requirements requirements-dev.txt pytest -v e2e/test_e2e.py   # one shard only
 ```
 
 ---

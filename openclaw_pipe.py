@@ -1489,6 +1489,33 @@ def _background_agents_line(n: int) -> str:
     return f"Waiting on {n} background agent{'' if n == 1 else 's'}"
 
 
+# Live view of the agent's browser (LIVE_VIEW_URL): ids go into the URL as they
+# are, so they must be plain ids.
+_LIVE_VIEW_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def _live_view_url(valves, *, chat_id, message_id, user_id, email, tool_name, args_str):
+    """The embed URL for a reply whose tool call looks like browser use, or None.
+    None when the valve is off, the user is not in LIVE_VIEW_USERS, the tool does
+    not match LIVE_VIEW_TOOLS, or the URL would not be an http(s) URL: Open WebUI
+    renders any other embed string as HTML."""
+    template = (getattr(valves, "LIVE_VIEW_URL", "") or "").strip()
+    if not template or not re.match(r"^https?://", template, re.I):
+        return None
+    if not all(isinstance(v, str) and _LIVE_VIEW_ID.match(v) for v in (chat_id, message_id)):
+        return None
+    users = _parse_owner_users(getattr(valves, "LIVE_VIEW_USERS", "") or "")
+    if users and not _is_owner_user(users, user_id, email):
+        return None
+    try:
+        tools = re.compile(getattr(valves, "LIVE_VIEW_TOOLS", "") or r"(?!)", re.I)
+    except re.error:
+        return None
+    if not tools.search(f"{tool_name or ''} {args_str or ''}"):
+        return None
+    return template.replace("{chat_id}", chat_id).replace("{message_id}", message_id)
+
+
 def _fmt_tokens(n) -> str:
     """Compact token count: 115212 -> '115k', 1000000 -> '1.0m'."""
     try:
@@ -11564,6 +11591,27 @@ class Pipe:
                 "OpenClaw chat. Turn off to stop delivering it; an already open "
                 "tab keeps it until reload."
         )
+        LIVE_VIEW_URL: str = Field(
+            default="",
+            description="(Optional.) Show the agent's browser live inside a "
+                "reply: when a reply first uses a browser tool, this URL is "
+                "added to it as an embed. {chat_id} and {message_id} are "
+                "replaced with the chat's and the reply's ids. It needs a "
+                "service that serves such a page for the agent's browser. "
+                "Empty: off."
+        )
+        LIVE_VIEW_TOOLS: str = Field(
+            default=r"^browser\b|\bplaywright\b|\bchromium\b|google-chrome|lease\.py own",
+            description="Which tool calls count as browser use for "
+                "LIVE_VIEW_URL: a regular expression, case-insensitive, "
+                "searched in the tool's name followed by its arguments."
+        )
+        LIVE_VIEW_USERS: str = Field(
+            default="",
+            description="Open WebUI user ids or emails, comma-separated, whose "
+                "replies get LIVE_VIEW_URL. Empty: everyone's, once "
+                "LIVE_VIEW_URL is set."
+        )
         TITLE_GEN_AGENT_ID: str = Field(
             default="title-gen",
             description="Agent id used for background chat-title generation. It must "
@@ -12623,6 +12671,7 @@ class _PipeTurn:
                             events = [a for a in added if isinstance(a, dict)]
                             if phase == "start":
                                 pipe_log(f"  Tool start: {name}")
+                                await self.maybe_show_live_view(name, data.get("args"))
                                 if events and self.pending_media_text:
                                     # The message item ends here, and with it
                                     # any code span a held directive waited on
@@ -13540,6 +13589,25 @@ class _PipeTurn:
             self.conn.mark_delivered_live(self.session_key, self.our_run_id)
         else:
             self.conn.continue_run_target(self.session_key, self.our_run_id, answer_res.new_run_id)
+
+    async def maybe_show_live_view(self, tool_name, args):
+        """Adds LIVE_VIEW_URL to this reply as an embed, once, at its first
+        browser tool call. Open WebUI saves it with the message."""
+        if getattr(self, "live_view_shown", False) or not self.__event_emitter__:
+            return
+        meta = self.__metadata__ or {}
+        url = _live_view_url(
+            self.pipe.valves, chat_id=self.owui_origin_chat_id, message_id=meta.get("message_id"),
+            user_id=(self.__user__ or {}).get("id"), email=(self.__user__ or {}).get("email"),
+            tool_name=tool_name, args_str=json.dumps(args or {}))
+        if not url:
+            return
+        self.live_view_shown = True
+        try:
+            await self.__event_emitter__({"type": "embeds", "data": {"embeds": [url]}})
+            pipe_log(f"  live view embed added: {url}")
+        except Exception as ex:
+            pipe_log(f"  live view embed failed: {ex!r}")
 
     async def show_text(self, text: str):
         """New run text from the renderer, assistant or item alike, through

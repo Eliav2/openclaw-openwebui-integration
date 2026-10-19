@@ -35,6 +35,17 @@ runs:
       with:
         node-version: 24
 
+    # npm's download cache for the openclaw install, keyed on the exact version
+    # (e2e/versions.env; a calendar version, 2026.x). A moving spec such as
+    # `latest` is never cached, so the compat watch always installs what npm
+    # serves today.
+    - name: Cache the openclaw download
+      if: ${{ startsWith(env.OPENCLAW_VERSION, '2') }}
+      uses: actions/cache@v6
+      with:
+        path: ~/.npm
+        key: npm-openclaw-${{ runner.os }}-${{ env.OPENCLAW_VERSION }}
+
     - uses: actions/setup-python@v7
       with:
         python-version: "3.11"
