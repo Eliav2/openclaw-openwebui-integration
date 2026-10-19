@@ -146,6 +146,10 @@ class Recorder:
         return concat, total
 
 
+def png_size(png: bytes) -> str:
+    return f"{int.from_bytes(png[16:20], 'big')}x{int.from_bytes(png[20:24], 'big')}"
+
+
 def ffmpeg() -> str:
     import imageio_ffmpeg
     return imageio_ffmpeg.get_ffmpeg_exe()
@@ -340,7 +344,7 @@ async def run_demo(browser, token: str, spec: dict, out: str, host: str) -> dict
         shutil.rmtree(work)
         return {"name": spec["name"], "path": path, "seconds": round(seconds, 1), "kb": round(size / 1024),
                 "mp4_kb": round(videos["mp4"] / 1024), "webm_kb": round(videos["webm"] / 1024),
-                "frames": len(rec.frames), "chat": demo.chat_id}
+                "frames": len(rec.frames), "frame_px": png_size(rec.frames[-1][1]), "chat": demo.chat_id}
     except Exception:
         print(f"  frames kept in {work}", flush=True)
         await page.screenshot(path=os.path.join(work, "failed.png"))
@@ -361,7 +365,9 @@ async def main_async(out: str, only: set | None) -> int:
     if host.lower() in "openclaw":
         host = ""  # a host named like the product would match every page
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch()
+        # The screencast sends frames at CSS-pixel size whatever the context's device scale; this
+        # flag makes them 2x (1920x1280), which keeps the videos' text sharp.
+        browser = await pw.chromium.launch(args=["--force-device-scale-factor=2"])
         try:
             for spec in demos:
                 if only and spec["name"] not in only:
