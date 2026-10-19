@@ -12570,10 +12570,15 @@ class _PipeTurn:
             # and the registry below cannot stand in for it: a run the turn
             # writer holds is not in it, so it would say idle, and a queued
             # message would be sent into the dead socket and lost (ELI-199).
-            # Busy: the waiter is woken again by the reconnect and re-reads.
+            # Wait for the reconnect as a turn that needs the connection
+            # (ensure_connected: the loop tries at once, then every second
+            # through a Gateway that refuses connections), then read again. A
+            # message that reached this check just before the drop was seen
+            # used to wait passively, while the loop backed off to 30 s.
             pipe_log("  active-check: the Gateway socket is reconnecting; "
                      "waiting for it before deciding")
-            return True
+            await self.conn.ensure_connected()
+            return await self._session_run_active()
         return self.conn.active_run_id_for_session(self.session_key) is not None
 
     def await_owner(self) -> None:

@@ -2306,11 +2306,22 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         await self._spin()
         self.assertEqual(self.sent, [], "sent while the run's state was unknown")
         self.assertFalse(first.done(), f"the reply ended: {first.result() if first.done() else ''!r}")
+        # It waits as a turn that needs the connection: the loop is asked to
+        # try now, and backs off at its first step while the turn waits.
+        self.assertTrue(self.conn._reconnect_now.is_set())
+        self.assertEqual(self.conn._turns_awaiting_gateway, 1)
+
+        refused = self.ocp.GatewayError("Connection refused", error={"code": self.ocp.GATEWAY_REFUSED_CODE})
+        self.conn._answer_reconnect_waiters(refused)   # the Gateway is still down
+        await self._spin()
+        self.assertFalse(first.done(), "a refused reconnect ended the reply")
 
         self.conn._ws = object()            # reconnected, same Gateway; the run still goes
+        self.conn._answer_reconnect_waiters(None)   # the loop's attempt succeeded
         self.conn._wake_session_waiters()   # the renewed subscriptions wake it (`_subscribe_all`)
         await self._spin()
         self.assertEqual(self.sent, [])
+        self.assertEqual(self.conn._turns_awaiting_gateway, 0)
 
         self._settled(False)
         await self._until_registered("run-1")
