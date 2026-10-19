@@ -754,11 +754,9 @@ def test_the_status_dialog_compacts_the_chat(page):
     """Status dialog + Compact: the composer's Status button opens the dialog
     with this chat's context numbers; Compact shows "Compacting…", the
     session is compacted (its summary request reaches the model), and the
-    dialog comes back with the numbers."""
-    if _openclaw_version() >= (2026, 10, 10):
-        pytest.skip("OpenClaw 2026.10.10: a session's row gets no totals after its first run "
-                    "(only after the second), so the dialog has no context numbers or Compact "
-                    "button yet (ELI-223). 2026.10.5 writes them within seconds.")
+    dialog comes back with the numbers. On OpenClaw 2026.10.10 a new
+    session's row has no totals after its first run: the numbers come from
+    the run's own usage (ELI-223)."""
     nonce = f"BROWSER_COMPACT_{os.getpid()}_{len(_fake_llm_requests())}"
     capture.new_chat(page)
     capture.send(page, f"E2E_ECHO: {nonce}")
@@ -785,9 +783,6 @@ def test_a_compaction_the_gateway_refuses_shows_its_error(page):
     dialog showed "Compacting…" and then the same numbers, as if it had
     worked. It says the compaction failed, with the Gateway's reason, and
     keeps the numbers."""
-    if _openclaw_release() >= (2026, 10):
-        pytest.skip("OpenClaw 2026.10: the dialog has no Compact button for a session created by "
-                    "chat.send (ELI-177, as test_the_status_dialog_compacts_the_chat).")
     nonce = f"BROWSER_COMPACT_FAIL_{os.getpid()}_{len(_fake_llm_requests())}"
     capture.new_chat(page)
     capture.send(page, f"E2E_ECHO: E2E_COMPACT_FAIL {nonce}")
