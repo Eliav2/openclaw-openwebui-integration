@@ -81,7 +81,7 @@ openclaw-openwebui-integration/
 │       ├── turns.py              # Which Open WebUI message each run writes into
 │       ├── writer.py             # Writes runs the agent starts (cron, heartbeat, sub-agent) into the chat
 │       ├── action.py              # Status Action class
-│       ├── composer.py            # Composer Status button: in-page JS snippet + emit helper
+│       ├── composer.py            # Composer Claw button: in-page JS snippet + emit helper
 │       ├── composer_watch.py      # Pipe only: pushes that snippet when a tab opens an OpenClaw chat
 │       ├── askuser.py              # "needs input:" interception + question card plumbing
 │       ├── emit.py                  # Event emission / tool-card formatting helpers
