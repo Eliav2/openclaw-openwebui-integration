@@ -1453,6 +1453,12 @@ class Eli195Present(AssertionError):
     drop gate's expected way."""
 
 
+class Eli195ProbeIneffective(AssertionError):
+    """`raw` could not show either way: the probe never got the `execute`
+    under the open dialog, or never replied. A real failure, never the
+    expected one, never a pass."""
+
+
 # A function that asks for input and, a second later, sends an `execute` to
 # the user's tabs while the dialog is open: open-webui#32742's probe. With
 # HOLD it wraps both the way the Pipe does before a turn (pipe.py, ELI-195),
@@ -1519,35 +1525,42 @@ def test_an_execute_while_the_input_dialog_is_open_leaves_the_dialog_its_answer(
                                                      "content": ELI195_PROBE % (mode == "held")}, token=token)
     capture.api("POST", f"/api/v1/functions/id/{fid}/toggle", token=token)
     try:
-        page.goto(f"{capture.BASE}/?models={fid}")
-        page.wait_for_selector("#chat-input", timeout=60_000)
-        capture.dismiss_popups(page)
-        page.evaluate("() => { window.__eli195Poked = false; }")
-        capture.send(page, "hi")
-        page.get_by_text("Type anything").wait_for(timeout=60_000)
-        # The precondition: the `execute` went out while the dialog is open
-        # and, raw, the page ran it under the dialog. Without it the result
-        # proves nothing, so it fails as ineffective, never as the bug.
-        try:
-            page.get_by_text("execute sent").wait_for(timeout=30_000)
-            assert page.get_by_text("Type anything").is_visible(), "the dialog closed before the execute"
-            if mode == "raw":
-                _wait(page, "() => window.__eli195Poked === true", "the execute while the dialog is open", 30_000)
-        except Exception as ex:
-            raise AssertionError(f"ELI-195 probe ineffective: {ex}") from None
-        if mode == "held":
-            assert page.evaluate("() => window.__eli195Poked") is False, "the held execute ran under the dialog"
-        page.locator("input[placeholder=here], textarea[placeholder=here]").first.fill("hello")
-        page.get_by_role("button", name="Confirm", exact=True).click()
-        try:
-            _wait(page, _last_assistant_js("t.includes('got ')"), "the probe's reply", 60_000)
-        except Exception as ex:
-            raise AssertionError(f"the probe never replied: {ex}") from None
-        reply = page.evaluate(f"() => {capture.LAST_ASSISTANT}.innerText")
-        # Held, the `execute` runs once the dialog is answered.
-        _wait(page, "() => window.__eli195Poked === true", "the execute", 30_000)
-        print(f"ELI-195 probe ({mode}): execute ran under the dialog: {mode == 'raw'}; reply: {reply[-80:]!r}")
-        if "got 'hello'" not in reply:
-            raise Eli195Present(reply[-200:])
+        _eli195_probe(page, mode, fid)
+    except Eli195Present:
+        raise
+    except Exception as ex:
+        if mode == "raw":
+            # Raw has three outcomes only: the bug (Eli195Present), its
+            # absence (a pass), or this.
+            raise Eli195ProbeIneffective(f"{type(ex).__name__}: {ex}") from None
+        raise
     finally:
         capture.api("DELETE", f"/api/v1/functions/id/{fid}/delete", token=token)
+
+
+def _eli195_probe(page, mode: str, fid: str) -> None:
+    page.goto(f"{capture.BASE}/?models={fid}")
+    page.wait_for_selector("#chat-input", timeout=60_000)
+    capture.dismiss_popups(page)
+    page.evaluate("() => { window.__eli195Poked = false; }")
+    capture.send(page, "hi")
+    page.get_by_text("Type anything").wait_for(timeout=60_000)
+    # The precondition: the `execute` went out while the dialog is open;
+    # raw, the page also ran it under the dialog; held, it did not.
+    page.get_by_text("execute sent").wait_for(timeout=30_000)
+    assert page.get_by_text("Type anything").is_visible(), "the dialog closed before the execute"
+    if mode == "raw":
+        _wait(page, "() => window.__eli195Poked === true", "the execute while the dialog is open", 30_000)
+    else:
+        assert page.evaluate("() => window.__eli195Poked") is False, "the held execute ran under the dialog"
+    page.locator("input[placeholder=here], textarea[placeholder=here]").first.fill("hello")
+    page.get_by_role("button", name="Confirm", exact=True).click()
+    # The probe always replies `got <answer>`, `got 'NO ANSWER'` after 30 s.
+    _wait(page, _last_assistant_js("t.includes('got ')"), "the probe's reply", 60_000)
+    reply = page.evaluate(f"() => {capture.LAST_ASSISTANT}.innerText")
+    print(f"ELI-195 probe ({mode}): execute ran under the dialog: {mode == 'raw'}; reply: {reply[-80:]!r}")
+    if "got 'hello'" not in reply:
+        raise Eli195Present(reply[-200:])
+    if mode == "held":
+        # Held, the `execute` runs once the dialog is answered.
+        _wait(page, "() => window.__eli195Poked === true", "the held execute after the answer", 30_000)
