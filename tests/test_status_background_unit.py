@@ -53,6 +53,15 @@ EXEC_CARD = [
     {"type": "function_call_output", "id": "o1", "call_id": "c1",
      "output": [{"type": "output_text", "text": "Command still running (session good-lagoon, pid 2816)."}]},
 ]
+# ELI-232: an agent's exec names its purpose in `title`.
+TITLED_COMMAND = ("cd /config/.openclaw/workspace/projects/session-manager && "
+                  "python3 ci_wake.py 163 --sha 2ef4275 > /tmp/w.log 2>&1")
+TITLED_CARD = [
+    {"type": "function_call", "id": "c2", "call_id": "c2", "name": "exec",
+     "arguments": json.dumps({"command": TITLED_COMMAND, "title": "ci_wake for PR 163", "background": True})},
+    {"type": "function_call_output", "id": "o2", "call_id": "c2",
+     "output": [{"type": "output_text", "text": "Command still running (session calm-reef, pid 2817)."}]},
+]
 AGENT_CARD = [
     {"type": "function_call", "id": "a1", "call_id": "a1", "name": "Agent",
      "arguments": json.dumps({"description": "Tax research", "run_in_background": True})},
@@ -64,8 +73,31 @@ AGENT_CARD = [
 def _chat(done=False):
     msgs = {"u": {"id": "u", "parentId": None, "role": "user", "content": "go", "timestamp": 1000},
             "a": {"id": "a", "parentId": "u", "role": "assistant", "timestamp": 1001, "done": done,
-                  "output": EXEC_CARD + AGENT_CARD}}
+                  "output": EXEC_CARD + TITLED_CARD + AGENT_CARD}}
     return {"history": {"currentId": "a", "messages": msgs}}
+
+
+class ShortCommandTests(unittest.TestCase):
+    """ELI-232: a command without a title reads as its first real command."""
+
+    def test_short_commands(self):
+        cases = [
+            ("sleep 25; echo done", "sleep 25"),
+            ("cd /config/.openclaw/workspace/projects/x && python3 ci_wake.py 136", "python3 ci_wake.py 136"),
+            ('cd /tmp; python3 -c "\nimport json;d=json.load(open(\'x\'))\nprint(d)"', "python3 -c …"),
+            ("export GH_CONFIG_DIR=/config/gh; R=Eliav2/x; /config/bin/gh run watch 123 --exit-status",
+             "gh run watch 123 --exit-status"),
+            ("GH_CONFIG_DIR=/config/gh /config/bin/gh pr view 5", "gh pr view 5"),
+            ("cd /tmp && python3 - <<'EOF'\nprint(\"unbalanced)\nEOF", "python3 - …"),
+            ("setsid nohup timeout 60 bin/import-stations north > /tmp/l 2>&1 &", "bin/import-stations north"),
+            ("cd /x\nnode -e 'console.log(1)'", "node -e …"),
+            ("git log --oneline | head -5", "git log --oneline"),
+            ("make build", "make build"),
+            ("cd /tmp", ""),
+            ("echo 'unbalanced", "echo 'unbalanced"),
+            ("python3 run.py " + "a" * 100, "python3 run.py " + "a" * 64 + "…"),
+        ]
+        self.assertEqual([action._short_command(c) for c, _ in cases], [w for _, w in cases])
 
 
 class RowTests(unittest.TestCase):
@@ -76,15 +108,42 @@ class RowTests(unittest.TestCase):
         return action._background_rows(list(tasks), list(jobs), action._agent_call_rows(chat), KEY,
                                        commands=action._exec_commands(chat))
 
-    def test_a_background_command_is_titled_by_its_command(self):
-        """The Gateway titles it "CLI command"; its sourceId is the exec
+    def test_a_background_command_is_titled_by_its_cards_title(self):
+        """ELI-232: the title the agent gave the exec call, the command's
+        first words under it while it runs, the whole command for a tap.
+        The Gateway titles it "CLI command"; its sourceId is the exec
         session the chat's tool card names."""
+        data = self.rows([_task("exec", "running", title="CLI command", sourceId="calm-reef",
+                                progressSummary="Command running")])
+        cmd = next(r for r in data["rows"] if r["kind"] == "Command")
+        self.assertEqual((cmd["title"], cmd["status"], cmd["preview"], cmd["command"], cmd["endedAt"]),
+                         ("ci_wake for PR 163", "running", "python3 ci_wake.py 163 --sha 2ef4275",
+                          TITLED_COMMAND, None))
+
+    def test_without_a_title_the_command_reads_short(self):
+        """No title on the card: its first real command names it, the whole
+        command still a tap away. Its progress is always "Command running",
+        which its chip says."""
         data = self.rows([_task("exec", "running", title="CLI command", sourceId="good-lagoon",
                                 progressSummary="Command running")])
         cmd = next(r for r in data["rows"] if r["kind"] == "Command")
-        # Its progress is always "Command running", which its chip says.
-        self.assertEqual((cmd["title"], cmd["status"], cmd["preview"], cmd["endedAt"]),
-                         ("sleep 25; echo done", "running", None, None))
+        self.assertEqual((cmd["title"], cmd["preview"], cmd["command"]),
+                         ("sleep 25", None, "sleep 25; echo done"))
+
+    def test_a_finished_command_says_how_it_ended(self):
+        """A failure's exit code and its last line of output, without the
+        terminal's colors; 2026.9's "Command completed" says nothing the
+        chip does not."""
+        failed = action._process_task({"processId": "good-lagoon", "name": "sleep 25;", "status": "failed",
+                                       "startedAt": NOW - 9000, "endedAt": NOW, "exitCode": 2,
+                                       "tail": "building\n\x1b[31mError:\x1b[0m   no   such  file\n\n"}, KEY)
+        killed = action._process_task({"processId": "x", "name": "make", "status": "killed",
+                                       "startedAt": NOW - 9000, "endedAt": NOW, "exitSignal": "SIGTERM"}, KEY)
+        data = self.rows([failed, killed, _task("exec", "completed", id="t9", sourceId="y", endedAt=NOW,
+                                                terminalSummary="Command completed")])
+        self.assertEqual([(r["title"], r["preview"]) for r in data["rows"] if r["kind"] == "Command"],
+                         [("sleep 25", "exit 2 · Error: no such file"), ("make", "SIGTERM"),
+                          ("Shell command", None)])
 
     def test_kinds_this_section_lists_and_the_ones_it_leaves_to_others(self):
         data = self.rows([
@@ -96,7 +155,7 @@ class RowTests(unittest.TestCase):
         self.assertEqual(sorted((r["kind"], r["status"]) for r in data["rows"]),
                          [("Agent", "running"), ("Command", "completed"), ("Image", "running")])
         done = next(r for r in data["rows"] if r["kind"] == "Command")
-        self.assertEqual((done["title"], done["preview"]), ("Shell command", "Command completed"))
+        self.assertEqual((done["title"], done["preview"]), ("Shell command", None))
 
     def test_running_first_then_the_newest_five_finished(self):
         finished = [_task("exec", "completed", id=f"f{n}", startedAt=NOW - n * 1000, sourceId="")
@@ -233,7 +292,7 @@ class OpenTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(not f.get("error") for f in fills.values()), fills)
         bg = fills["background"]
         self.assertEqual([(r["kind"], r["title"]) for r in bg["rows"]],
-                         [("Command", "sleep 25; echo done"), ("Agent", "Tax research")])
+                         [("Command", "sleep 25"), ("Agent", "Tax research")])
 
     async def test_a_failing_source_leaves_the_other_sections_intact(self):
         """Each source in turn fails; only the sections that read it say so."""
@@ -273,7 +332,7 @@ class OpenTests(unittest.IsolatedAsyncioTestCase):
         calls = []
         _result, emitted = await self._open(_gateway(calls, unknown=("tasks.list",), processes=[
             proc("good-lagoon", "sleep 25;", "running", canStop=True),
-            proc("calm-reef", "ls /nope", "failed", endedAt=NOW - 50_000, exitCode=2,
+            proc("calm-reef", "cd /config/.openclaw/wo", "failed", endedAt=NOW - 50_000, exitCode=2,
                  tail="ls: cannot access '/nope'\n"),
             proc("old-pine", "make build", "killed", startedAt=NOW - 45_000, endedAt=NOW - 40_000),
         ]))
@@ -283,9 +342,9 @@ class OpenTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("sessions.processes.list", calls)
         self.assertEqual([(r["kind"], r["title"], r["status"], r["preview"]) for r in bg["rows"]
                           if r["kind"] == "Command"], [
-            ("Command", "sleep 25; echo done", "running", None),
+            ("Command", "sleep 25", "running", None),
             ("Command", "make build", "cancelled", None),
-            ("Command", "ls /nope", "failed", "ls: cannot access '/nope'"),
+            ("Command", "ci_wake for PR 163", "failed", "exit 2 · ls: cannot access '/nope'"),
         ])
 
     async def test_a_gateway_with_neither_list_says_so_and_still_lists_automations(self):
@@ -360,10 +419,13 @@ const out = {};
 for (const step of input.steps || []) {
   if (step.tap) fold(step.tap).children[0].onclick();
   if (step.refill) run(input.fills[step.refill]);
+  if (step.tapRow != null) section('background').walk().filter((e) => e.dataset.openclawBgRow)[step.tapRow].onclick();
   if (step.close) document.getElementById('openclaw-status-modal-root').walk()
     .find((e) => e.tagName === 'BUTTON' && e.textContent === '×').onclick();
 }
 for (const n of input.read) out[n] = { open: fold(n) ? fold(n).dataset.open : null, texts: texts(n) };
+if (section('background')) out.hovers = section('background').walk().filter((e) => e.dataset.openclawBgRow)
+  .map((e) => [e.tagName, e.title || null]);
 out.fetches = fetches;
 console.log(JSON.stringify(out));
 """
@@ -396,6 +458,18 @@ class BackgroundPageTests(unittest.TestCase):
         self.assertEqual(seen["texts"][:5], ["Background (2)", "sleep 25; echo done", "Running", "1m",
                                              "Command · Command running"])
         self.assertEqual(seen["texts"][5:8], ["nightly", "Failed", "Automation · failed 3 times in a row: model 529"])
+
+    def test_a_tap_on_a_command_shows_the_whole_command(self):
+        """ELI-232: the title says what it is for; hover or a tap gives the
+        command itself, and a second tap hides it."""
+        cmd = {**self.CMD, "title": "ci_wake for PR 163", "preview": "python3 ci_wake.py 163",
+               "command": TITLED_COMMAND}
+        shown = self.page([_bg([cmd, self.JOB])], ["background"], [{"tapRow": 0}])
+        self.assertEqual(shown["hovers"], [["BUTTON", TITLED_COMMAND], ["DIV", None]])
+        self.assertEqual(shown["background"]["texts"][1:6],
+                         ["ci_wake for PR 163", "Running", "1m", "Command · python3 ci_wake.py 163", TITLED_COMMAND])
+        hidden = self.page([_bg([cmd])], ["background"], [{"tapRow": 0}, {"tapRow": 0}])
+        self.assertNotIn(TITLED_COMMAND, hidden["background"]["texts"])
 
     def test_folded_when_nothing_runs_and_a_tap_wins_over_a_refill(self):
         idle = _bg([{**self.CMD, "status": "completed", "endedAt": NOW}])

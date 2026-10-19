@@ -102,6 +102,12 @@ mkdir -p "$ws/bin"
 cat > "$ws/bin/import-stations" <<'EOF'
 #!/bin/sh
 # Imports one region's station history (about fifteen minutes).
+# --check <region>: whether the region exists, at once (ELI-232's failed row).
+if [ "$1" = --check ]; then
+  echo "checking $2"
+  echo "$2: no such region (north, south, coast, mountain)" >&2
+  exit 2
+fi
 sleep 900
 echo "$1 stations imported"
 EOF

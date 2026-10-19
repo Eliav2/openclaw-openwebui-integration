@@ -850,6 +850,32 @@ def test_the_status_dialog_lists_a_background_agent_while_its_reply_runs(page):
     os.remove(gate)
 
 
+BG_EXEC_TITLE, BG_EXEC_COMMAND = "E2E background sleep", "sleep 25; echo e2e-bg-done"   # e2e/fake_llm.py
+
+
+def test_a_background_command_reads_by_its_title_and_a_tap_shows_the_command(page):
+    """ELI-232: a command left running in the background is listed by the
+    title its exec call gave it, its first real command under it, and the
+    whole command on hover and on a tap, not the raw command as its title."""
+    capture.new_chat(page)
+    capture.send(page, "E2E_BG_EXEC")
+    _wait(page, _turn_over("E2E_BG_STARTED"), "the reply that leaves the command running")
+    _open_status(page)
+    section = "#openclaw-status-section-background"
+    _wait(page, f"""() => {{ const s = document.querySelector('{section}');
+                     return !!s && s.innerText.includes({json.dumps(BG_EXEC_TITLE)}); }}""",
+          "the command in the Background section, by its title", 60_000)
+    row = page.locator(f"{section} [data-openclaw-bg-row]", has_text=BG_EXEC_TITLE).first
+    assert "Command · sleep 25" in row.inner_text(), row.inner_text()
+    assert row.get_attribute("title") == BG_EXEC_COMMAND
+    assert row.locator("[data-openclaw-command]").count() == 0
+    row.click()
+    assert row.locator("[data-openclaw-command]").inner_text() == BG_EXEC_COMMAND
+    row.click()
+    assert row.locator("[data-openclaw-command]").count() == 0
+    page.keyboard.press("Escape")
+
+
 def _chat_id(page) -> str:
     m = re.search(r"/c/([0-9a-f-]{36})", page.url)
     assert m, f"no chat id in {page.url}"

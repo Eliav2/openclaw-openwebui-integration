@@ -143,6 +143,9 @@ _SECRET_REQUEST = re.compile(r"E2E_SECRET_REQUEST ([A-Z][A-Z0-9_]{2,})")
 _STATUS = re.compile(r'\\?"status\\?":\s*\\?"([a-z_]+)')
 _BG_AGENT = re.compile(r"E2E_BG_AGENT ([A-Za-z0-9_]{3,})")
 BG_AGENT_TITLE = "E2E background agent"   # E2E_BG_AGENT: the Agent call's description
+# E2E_BG_EXEC's command and the title its exec call gives it (ELI-232).
+BG_EXEC_COMMAND = "sleep 25; echo e2e-bg-done"
+BG_EXEC_TITLE = "E2E background sleep"
 _HOLD = re.compile(r"E2E_HOLD ([A-Za-z0-9_]{3,})")
 _SLOW = re.compile(r"E2E_SLOW(?::(\d{1,3}))?\s+([A-Za-z0-9_]{3,})")
 SLOW_WORDS = 10
@@ -409,7 +412,7 @@ def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
         # Action's Background section (ELI-163).
         if tool_results:
             return {"text": "E2E_BG_STARTED"}
-        args = {"command": "sleep 25; echo e2e-bg-done", "background": True}
+        args = {"command": BG_EXEC_COMMAND, "title": BG_EXEC_TITLE, "background": True}
         if "exec" in offered:
             return {"tool": "exec", "args": args}
         for wrapper in DEFERRED_CALL_TOOLS:
