@@ -14,25 +14,25 @@
       "match": "Draft a note to the team about the hourly view",
       "steps": [
         {
-          "say": "Here's a draft.\n\nHi all, the hourly view is ready for testing on staging. The day screen now shows an hourly strip with temperature, rain chance and wind for the next 24 hours, and a tap on an hour opens its details.\n\nWhat to check: the strip on a small phone, the units setting, and the first launch with no network. Please send anything odd to the release thread by Thursday, so we can ship to the app store next week.",
+          "say": "Here's a draft.\n\nHi all, the hourly view is ready to try on staging. The day screen now shows an hourly strip with temperature, rain chance and wind for the next 24 hours, and a tap on an hour opens its details.\n\nWhat to check: the strip on a small phone, the units setting, and the first launch with no network. Please send anything odd to the release thread by Thursday, so we can ship to the app store next week.",
           "delay": 0.15
         }
       ]
     },
     {
-      "match": "Run the full test suite on the forecast app",
+      "match": "Run the slow checks on the forecast app",
       "steps": [
         {
-          "say": "Running the full suite. It takes a couple of minutes.",
+          "say": "Running the slow checks. They take a couple of minutes.",
           "tool": "exec",
           "args": {
-            "command": "cd forecast && sleep 90 && python3 -m compileall -q src && echo all tests passed",
-            "title": "Run the full test suite",
+            "command": "cd forecast && sleep 90 && python3 -m compileall -q src && echo all checks passed",
+            "title": "Run the slow checks",
             "yieldMs": 120000
           }
         },
         {
-          "say": "All tests passed."
+          "say": "All checks passed."
         }
       ]
     },
@@ -435,7 +435,7 @@
       "steps": [
         {
           "do": "type",
-          "text": "Run the full test suite on the forecast app."
+          "text": "Run the slow checks on the forecast app."
         },
         {
           "do": "send"

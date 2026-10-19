@@ -57,7 +57,9 @@ jobs:
       - name: Record
         env:
           ONLY: ${{ inputs.only }}
+        # pipefail: a demo that failed fails the job, not only the summary.
         run: |
+          set -o pipefail
           uv run --with-requirements requirements-browser.txt --with imageio-ffmpeg==0.6.0 \
             python scripts/demos/record.py --out "$RUNNER_TEMP/demos" ${ONLY:+--only "$ONLY"} \
             | tee "$RUNNER_TEMP/demos.jsonl"
