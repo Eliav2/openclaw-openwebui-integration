@@ -33,16 +33,19 @@ from open_webui.models.users import Users  # noqa: E402
 
 
 def writer():
+    """(write, pending): `pending()` is the shielded writes still running
+    after their caller was cancelled (none for `raw`)."""
     if mode == "raw":
-        return Chats.upsert_message_to_chat_by_id_and_message_id
+        return Chats.upsert_message_to_chat_by_id_and_message_id, set
     spec = importlib.util.spec_from_file_location("openclaw_pipe_probe", pipe_file)
     pipe = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(pipe)
-    return pipe._owui_upsert_message
+    return pipe._owui_upsert_message, lambda: set(pipe._BACKGROUND_TASKS)
 
 
 def locked_for_others() -> bool:
-    c = sqlite3.connect(DB, timeout=2)
+    """A lock nobody releases: a write in flight holds it for milliseconds."""
+    c = sqlite3.connect(DB, timeout=10)
     try:
         c.execute("BEGIN IMMEDIATE")
         c.rollback()
@@ -54,7 +57,7 @@ def locked_for_others() -> bool:
 
 
 async def main() -> dict:
-    write = writer()
+    write, pending = writer()
     users = await Users.get_users()
     uid = (users["users"] if isinstance(users, dict) else users)[0].id
     for i in range(cancels):
@@ -64,7 +67,10 @@ async def main() -> dict:
         if random.random() < 0.5:
             await asyncio.sleep(0)
             task.cancel()
-        done, _ = await asyncio.wait({task}, timeout=15)
+        # A second cancel can end the shield's caller while its write goes
+        # on in the background: that write must end too.
+        done, _ = await asyncio.wait({task, *pending()}, timeout=15)
+        done = not (pending() - done) and task in done
         if not done:
             return {"ok": False, "cancels": i + 1, "what": "the cancelled write never ended",
                     "locked_for_others": locked_for_others()}
@@ -76,8 +82,10 @@ async def main() -> dict:
     return {"ok": True, "cancels": cancels, "what": "DB writable throughout", "locked_for_others": locked_for_others()}
 
 
+# Not asyncio.run: its shutdown waits for a wedged write forever.
+loop = asyncio.new_event_loop()
 try:
-    result = asyncio.run(main())
+    result = loop.run_until_complete(main())
 except BaseException as ex:
     result = {"ok": False, "cancels": None, "what": f"probe died: {type(ex).__name__} {str(ex)[:200]}"}
 print(json.dumps(result), flush=True)
