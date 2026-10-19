@@ -4616,6 +4616,12 @@ def _item_delta_text(item_text: str, last_item_text: str, assistant_stream_text:
         return ""
     if item_text.startswith(baseline):
         return item_text[len(baseline):]
+    if last_item_text and item_text.endswith("\n" + last_item_text):
+        # The run's whole text, its messages joined by newlines, closing with
+        # the message item already shown: a claude-cli run's closer after a
+        # second message (ELI-219), whose last item can be too short for the
+        # anchors below.
+        return ""
     # Not a prefix extension. If the item still contains the tail of what was
     # already received, it is the cumulative text with something missing
     # from the middle or the start (events lost while the Gateway socket was
@@ -5071,6 +5077,9 @@ class _TurnRenderer:
         # first text gets the break the live stream puts between messages.
         # The Gateway inserts it only inside one run.
         self.run_boundary = False
+        # Text that opens a message item and is, so far, a silent sentinel or
+        # the start of one (`_add_text`).
+        self._held = ""
 
     @property
     def received(self) -> str:
@@ -5118,7 +5127,39 @@ class _TurnRenderer:
             self.visible_text += chunk
 
     def _add_text(self, chunk: str) -> str:
-        """Append `chunk` to the run's text; returns it as added."""
+        """Append `chunk` to the run's text; returns it as added. A message
+        item that opens with a silent sentinel is held until it is told from
+        text: a sentinel followed by more text is dropped, and the run's own
+        answer follows (a claude-cli run that answered `NO_REPLY` and went on
+        after its background task reported, ELI-219). A sentinel alone stays
+        out; anything else is shown as it came (`flush` at the run's end)."""
+        if not chunk:
+            return ""
+        last = self.output[-1] if self.output else None
+        if last is None or last.get("type") != "message" or not last["content"][0]["text"]:
+            pending = self._held + chunk
+            lead = pending.lstrip()
+            if any(s.startswith(lead) for s in _SILENT_SENTINELS):
+                self._held = pending
+                return ""
+            self._held = ""
+            for s in _SILENT_SENTINELS:
+                if lead.startswith(s) and lead[len(s):len(s) + 1].isspace():
+                    pipe_log(f"  dropped a leading {s} before the run's text")
+                    pending = lead[len(s):].lstrip()
+                    break
+            chunk = pending
+        return self._append_text(chunk)
+
+    def flush(self) -> str:
+        """The run ended, or a card follows: held text that is not a
+        sentinel is shown after all; returns it as added."""
+        held, self._held = self._held, ""
+        if not held.strip() or held.strip() in _SILENT_SENTINELS:
+            return ""
+        return self._append_text(held)
+
+    def _append_text(self, chunk: str) -> str:
         if not chunk:
             return ""
         if self.run_boundary:
@@ -5232,6 +5273,7 @@ class _TurnRenderer:
                 return events
             if phase == "start":
                 if tcid:
+                    events.append(self.flush())
                     args_str = json.dumps(data.get("args", {}))
                     self._active_tool_args[tcid] = args_str
                     self._active_tool_names[tcid] = name
@@ -7146,6 +7188,7 @@ def _history_renderer(messages: list) -> "_TurnRenderer":
     r = _TurnRenderer()
     for payload in _history_events(messages):
         r.feed(payload)
+    r.flush()
     return r
 
 
@@ -8531,6 +8574,7 @@ class _TurnWriter:
                 pipe_log(f"  turn writer: chat.history failed at the end: {ex!r}")
             if self.wake is not None:
                 self._rebuild_wake(hist)
+                self.renderer.flush()
             else:
                 if hist:
                     self._adopt_recoveries_from(hist.get("messages") or [])
@@ -8539,6 +8583,7 @@ class _TurnWriter:
                 rebuilt = self._from_transcript(hist) if hist else None
                 if rebuilt is not None:
                     self.renderer = rebuilt
+                self.renderer.flush()
                 if not self._showable():
                     await self._show_silent_announce(hist)
             if not self.opened:
@@ -12138,6 +12183,10 @@ class _PipeTurn:
 
                 else:
                     # Normal completion (no cancellation).
+                    released = self.renderer.flush()
+                    if released:
+                        async for chunk in self.show_text(released):
+                            yield chunk
                     async for chunk in self.finish_held_prompt():
                         yield chunk
                     async for chunk in self.finish_held_media():

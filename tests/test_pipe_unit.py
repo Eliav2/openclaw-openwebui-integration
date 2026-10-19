@@ -806,6 +806,61 @@ class TurnRendererOutputTests(unittest.TestCase):
         self.assertEqual(r.output[1]["status"], "completed")
         self.assertEqual(r.output[1]["arguments"], json.dumps({"p": 1}))
 
+    # ELI-219 (live chats e70feacd, f6c33478 on 2026.10.5): a claude-cli
+    # run starts a background Agent, answers NO_REPLY, and goes on once the
+    # task reports. The live stream had the sentinel, then the answer after
+    # the Gateway's message break, then the answer's own item event and the
+    # run's closer (its two messages joined by one newline). The reply read
+    # "NO_REPLY\n\n<answer>NO_REPLY\n<answer>".
+    ANSWER = "The background sub-agent finished and answered: SUB-51"
+
+    def feed_eli219(self, r):
+        r.feed({"stream": "tool", "data": {"phase": "start", "name": "Agent", "toolCallId": "t1",
+                                           "args": {"run_in_background": True}}})
+        r.feed({"stream": "tool", "data": {"phase": "result", "name": "Agent", "toolCallId": "t1",
+                                           "result": "Async agent launched successfully."}})
+        r.feed({"stream": "assistant", "data": {"delta": "NO_REPLY"}})
+        r.feed({"stream": "assistant", "data": {"delta": "\n\n" + self.ANSWER}})
+        r.feed({"stream": "item", "data": {"kind": "message", "text": self.ANSWER}})
+        r.feed({"stream": "item", "data": {"kind": "message", "text": "NO_REPLY\n" + self.ANSWER}})
+        r.flush()
+
+    def test_a_run_that_answered_no_reply_then_its_task_reported_shows_its_answer_once(self):
+        r = _TurnRenderer()
+        self.feed_eli219(r)
+        self.assertEqual(r.text, self.ANSWER)
+        texts = [i["content"][0]["text"] for i in r.output if i["type"] == "message"]
+        self.assertEqual(texts, [self.ANSWER])
+
+    def test_a_sentinel_split_across_deltas_stays_out(self):
+        r = _TurnRenderer()
+        for d in ("NO", "_RE", "PLY"):
+            r.feed({"stream": "assistant", "data": {"delta": d}})
+        r.flush()
+        self.assertEqual((r.text, r.output), ("", []))
+
+    def test_a_short_reply_that_starts_like_a_sentinel_still_shows(self):
+        r = _TurnRenderer()
+        r.feed({"stream": "assistant", "data": {"delta": "NO"}})
+        self.assertEqual(r.text, "", "held while it may be a sentinel")
+        self.assertEqual(r.flush(), "NO")
+        self.assertEqual(r.text, "NO")
+        r = _TurnRenderer()
+        r.feed({"stream": "assistant", "data": {"delta": "NO"}})
+        r.feed({"stream": "assistant", "data": {"delta": " way, that is wrong."}})
+        self.assertEqual(r.text, "NO way, that is wrong.")
+
+    def test_a_sentinel_before_a_card_is_dropped_and_a_held_word_is_kept(self):
+        r = _TurnRenderer()
+        r.feed({"stream": "assistant", "data": {"delta": "NO_REPLY"}})
+        r.feed({"stream": "tool", "data": {"phase": "start", "name": "Read", "toolCallId": "t1", "args": {}}})
+        self.assertEqual([i["type"] for i in r.output], ["function_call"])
+        r = _TurnRenderer()
+        r.feed({"stream": "assistant", "data": {"delta": "NO"}})
+        added = r.feed({"stream": "tool", "data": {"phase": "start", "name": "Read", "toolCallId": "t1", "args": {}}})
+        self.assertEqual(added[0], "NO", "the held word goes out ahead of the card")
+        self.assertEqual([i["type"] for i in r.output], ["message", "function_call"])
+
     def test_failed_call_is_marked_and_explained(self):
         r = _TurnRenderer()
         r.feed({"stream": "tool", "data": {"phase": "result", "name": "Bash",
