@@ -1280,6 +1280,8 @@ class _PipeTurn:
         self.error_shown = ""  # the run's "**Error:**" line, once shown
         self.aborted = False
         self.first_event_arrived = False
+        # The run's last-call usage, from its `chat` final (ELI-177).
+        self.run_usage = None
         # The Gateway acks every chat.send with "started"; one that it queued
         # behind a run (or steered into one) instead gets a lone `chat` final
         # with no message as its first and only event.
@@ -1478,7 +1480,8 @@ class _PipeTurn:
                 self.turn.queue = None
             status_lines = []
             if not self.aborted and self.text_yielded and not self.adopted_run_id and not self.handed_over:
-                status_lines = await _build_usage_status_lines(self.conn, self.session_key)
+                status_lines = await _build_usage_status_lines(
+                    self.conn, self.session_key, run_usage=await self.own_run_usage())
             if self.adopted_run_id and not self.aborted:
                 await _emit_status(
                     self.__event_emitter__, "Sending your message…", done=False)
@@ -1645,6 +1648,11 @@ class _PipeTurn:
             yield self.error_shown
             self.done = True
             pipe_log("  lifecycle error -> done")
+        if state == "final" and payload.get("runId") in (None, self.our_run_id):
+            usage = (payload.get("message") or {}).get("usage") \
+                if isinstance(payload.get("message"), dict) else None
+            if _usage_prompt_tokens(usage):
+                self.run_usage = usage
         if state in ("final", "cancelled", "error", "aborted") or aborted_run:
             self.done = True
             pipe_log(f"  payload state='{state}' aborted={aborted_run} -> done")
@@ -2118,6 +2126,22 @@ class _PipeTurn:
         if (row or {}).get("status") in ("failed", "timeout") and row.get("lastRunError"):
             return ("end", f"**Error:** {row['lastRunError']}")
         return ("end", None)
+
+    async def own_run_usage(self) -> dict | None:
+        """This reply's run's last-call usage for its context line: from its
+        `chat` final, else from its own messages in the transcript (the final
+        may come after the run's lifecycle end has ended the reply)."""
+        if self.run_usage or not self.our_run_id:
+            return self.run_usage
+        try:
+            hist = await self.conn.session_history(self.session_key, limit=RUN_TEXT_HISTORY_LIMIT)
+        except Exception as ex:
+            pipe_log(f"  usage line: chat.history failed: {ex!r}")
+            return None
+        usage = _history_usage_for_run(hist, self.our_run_id)
+        if not usage:
+            pipe_log("  usage line: the run's messages report no usage; using the session row")
+        return usage
 
     async def recover_from_transcript(self) -> str | None:
         """The run's text read back: by its run id, else by its user text,

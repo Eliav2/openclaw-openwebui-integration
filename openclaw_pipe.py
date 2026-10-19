@@ -1560,7 +1560,8 @@ def _window_reset_line(w: dict) -> str | None:
     return f"⏱ {bit} (resets in {rel})"
 
 
-async def _build_usage_status_lines(conn, session_key, timeout: float = 5) -> list[str]:
+async def _build_usage_status_lines(conn, session_key, timeout: float = 5,
+                                    run_usage: dict | None = None) -> list[str]:
     """Best-effort final status lines: context window fill (combined with the
     provider's primary/nearest-term rate-limit window on the same line, kept
     deliberately thin -- no reset time), one full detail line per rate-limit
@@ -1583,6 +1584,12 @@ async def _build_usage_status_lines(conn, session_key, timeout: float = 5) -> li
     just omits that line. They're fetched concurrently (not one after the
     other) so this adds at most one round trip's worth of latency, not two,
     to the moment the status line settles after the reply text is done.
+
+    `run_usage`: the reply's own run's last-call usage. Its prompt tokens are
+    the context fill, over the row's `totalTokens`: OpenClaw 2026.10 writes a
+    session's first totals to its row just after the run ends, so a new
+    chat's first reply found none there, and every later reply read the run
+    before it (ELI-177). The window (`contextTokens`) still comes from the row.
     """
     describe_task = asyncio.ensure_future(
         conn.send_request("sessions.describe", dict(key=session_key), timeout=timeout)
@@ -1597,7 +1604,7 @@ async def _build_usage_status_lines(conn, session_key, timeout: float = 5) -> li
         session_row = (desc or {}).get("session") or {}
         provider = session_row.get("modelProvider")
         context_tokens = session_row.get("contextTokens")
-        total_tokens = session_row.get("totalTokens")
+        total_tokens = _usage_prompt_tokens(run_usage) or session_row.get("totalTokens")
         if context_tokens and total_tokens is not None:
             pct = round(total_tokens / context_tokens * 100, 1)
             context_bit = f"🧠 {_fmt_tokens(total_tokens)}/{_fmt_tokens(context_tokens)} ({pct:g}%)"
@@ -7132,6 +7139,49 @@ def _history_text_for_run(history: dict, run_id: str) -> tuple[bool, str | None]
     return False, None
 
 
+def _usage_prompt_tokens(usage) -> int | None:
+    """The context a model call filled, from its `usage`, as OpenClaw counts a
+    session's `totalTokens` (`deriveContextPromptTokens`): the reported
+    `contextUsage`, else input + cacheRead + cacheWrite, else total - output.
+    None when the usage says nothing."""
+    if not isinstance(usage, dict):
+        return None
+    context = usage.get("contextUsage") if isinstance(usage.get("contextUsage"), dict) else {}
+    if context.get("state") == "unavailable":
+        return None
+    if context.get("state") == "available":
+        prompt = context.get("promptTokens")
+        return prompt if isinstance(prompt, (int, float)) and prompt > 0 else None
+    nums = {k: usage.get(k) if isinstance(usage.get(k), (int, float)) else 0
+            for k in ("input", "cacheRead", "cacheWrite", "output")}
+    prompt = nums["input"] + nums["cacheRead"] + nums["cacheWrite"]
+    if prompt > 0:
+        return prompt
+    total = usage.get("totalTokens", usage.get("total"))
+    if isinstance(total, (int, float)) and total - nums["output"] > 0:
+        return total - nums["output"]
+    return None
+
+
+def _history_usage_for_run(history: dict, run_id: str) -> dict | None:
+    """The `usage` of one run's last model call, from its newest assistant
+    message in `chat.history` that reports one. A run's messages carry its id
+    under `__openclaw.runId`, or, for the claude-cli runner's closing message
+    (whose usage is the run's last call), in `cli-assistant:<runId>`."""
+    messages = (history or {}).get("messages")
+    if not isinstance(messages, list) or not run_id:
+        return None
+    wanted = {run_id, f"cli-assistant:{run_id}"}
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
+        ids = {*_idempotency_keys(message), str(meta.get("runId") or ""), str(message.get("runId") or "")}
+        if ids & wanted and _usage_prompt_tokens(message.get("usage")):
+            return message["usage"]
+    return None
+
+
 def _history_renderer(messages: list) -> "_TurnRenderer":
     """A `_TurnRenderer` fed one run's `chat.history` messages instead of its
     live events, so a run whose events were lost still ends as the same
@@ -11938,6 +11988,8 @@ class _PipeTurn:
         self.error_shown = ""  # the run's "**Error:**" line, once shown
         self.aborted = False
         self.first_event_arrived = False
+        # The run's last-call usage, from its `chat` final (ELI-177).
+        self.run_usage = None
         # The Gateway acks every chat.send with "started"; one that it queued
         # behind a run (or steered into one) instead gets a lone `chat` final
         # with no message as its first and only event.
@@ -12136,7 +12188,8 @@ class _PipeTurn:
                 self.turn.queue = None
             status_lines = []
             if not self.aborted and self.text_yielded and not self.adopted_run_id and not self.handed_over:
-                status_lines = await _build_usage_status_lines(self.conn, self.session_key)
+                status_lines = await _build_usage_status_lines(
+                    self.conn, self.session_key, run_usage=await self.own_run_usage())
             if self.adopted_run_id and not self.aborted:
                 await _emit_status(
                     self.__event_emitter__, "Sending your message…", done=False)
@@ -12303,6 +12356,11 @@ class _PipeTurn:
             yield self.error_shown
             self.done = True
             pipe_log("  lifecycle error -> done")
+        if state == "final" and payload.get("runId") in (None, self.our_run_id):
+            usage = (payload.get("message") or {}).get("usage") \
+                if isinstance(payload.get("message"), dict) else None
+            if _usage_prompt_tokens(usage):
+                self.run_usage = usage
         if state in ("final", "cancelled", "error", "aborted") or aborted_run:
             self.done = True
             pipe_log(f"  payload state='{state}' aborted={aborted_run} -> done")
@@ -12776,6 +12834,22 @@ class _PipeTurn:
         if (row or {}).get("status") in ("failed", "timeout") and row.get("lastRunError"):
             return ("end", f"**Error:** {row['lastRunError']}")
         return ("end", None)
+
+    async def own_run_usage(self) -> dict | None:
+        """This reply's run's last-call usage for its context line: from its
+        `chat` final, else from its own messages in the transcript (the final
+        may come after the run's lifecycle end has ended the reply)."""
+        if self.run_usage or not self.our_run_id:
+            return self.run_usage
+        try:
+            hist = await self.conn.session_history(self.session_key, limit=RUN_TEXT_HISTORY_LIMIT)
+        except Exception as ex:
+            pipe_log(f"  usage line: chat.history failed: {ex!r}")
+            return None
+        usage = _history_usage_for_run(hist, self.our_run_id)
+        if not usage:
+            pipe_log("  usage line: the run's messages report no usage; using the session row")
+        return usage
 
     async def recover_from_transcript(self) -> str | None:
         """The run's text read back: by its run id, else by its user text,

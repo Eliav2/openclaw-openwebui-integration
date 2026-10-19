@@ -3189,6 +3189,49 @@ def _history_text_for_run(history: dict, run_id: str) -> tuple[bool, str | None]
     return False, None
 
 
+def _usage_prompt_tokens(usage) -> int | None:
+    """The context a model call filled, from its `usage`, as OpenClaw counts a
+    session's `totalTokens` (`deriveContextPromptTokens`): the reported
+    `contextUsage`, else input + cacheRead + cacheWrite, else total - output.
+    None when the usage says nothing."""
+    if not isinstance(usage, dict):
+        return None
+    context = usage.get("contextUsage") if isinstance(usage.get("contextUsage"), dict) else {}
+    if context.get("state") == "unavailable":
+        return None
+    if context.get("state") == "available":
+        prompt = context.get("promptTokens")
+        return prompt if isinstance(prompt, (int, float)) and prompt > 0 else None
+    nums = {k: usage.get(k) if isinstance(usage.get(k), (int, float)) else 0
+            for k in ("input", "cacheRead", "cacheWrite", "output")}
+    prompt = nums["input"] + nums["cacheRead"] + nums["cacheWrite"]
+    if prompt > 0:
+        return prompt
+    total = usage.get("totalTokens", usage.get("total"))
+    if isinstance(total, (int, float)) and total - nums["output"] > 0:
+        return total - nums["output"]
+    return None
+
+
+def _history_usage_for_run(history: dict, run_id: str) -> dict | None:
+    """The `usage` of one run's last model call, from its newest assistant
+    message in `chat.history` that reports one. A run's messages carry its id
+    under `__openclaw.runId`, or, for the claude-cli runner's closing message
+    (whose usage is the run's last call), in `cli-assistant:<runId>`."""
+    messages = (history or {}).get("messages")
+    if not isinstance(messages, list) or not run_id:
+        return None
+    wanted = {run_id, f"cli-assistant:{run_id}"}
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
+        ids = {*_idempotency_keys(message), str(meta.get("runId") or ""), str(message.get("runId") or "")}
+        if ids & wanted and _usage_prompt_tokens(message.get("usage")):
+            return message["usage"]
+    return None
+
+
 def _history_renderer(messages: list) -> "_TurnRenderer":
     """A `_TurnRenderer` fed one run's `chat.history` messages instead of its
     live events, so a run whose events were lost still ends as the same

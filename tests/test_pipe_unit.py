@@ -4222,6 +4222,53 @@ class UsageStatusLineTests(unittest.IsolatedAsyncioTestCase):
         lines = await _build_usage_status_lines(conn, "agent:main:x")
         self.assertTrue(all("🎯" not in line for line in lines))
 
+    async def test_the_runs_own_usage_fills_the_line_before_the_row_has_totals(self):
+        """OpenClaw 2026.10: a new session's row has its window but no totals
+        yet when the first reply ends; the run's own usage fills the line
+        (ELI-177)."""
+        conn = self._conn(describe_result={"session": {"contextTokens": 200_000}},
+                          usage_result={"providers": []})
+        self.assertEqual(await _build_usage_status_lines(conn, "agent:main:x"), [])
+        usage = {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 15}
+        lines = await _build_usage_status_lines(conn, "agent:main:x", run_usage=usage)
+        self.assertEqual(lines, ["🧠 10/200k (0%)"])
+
+    async def test_the_runs_own_usage_wins_over_the_previous_runs_row(self):
+        conn = self._conn(describe_result={"session": {"contextTokens": 1_000_000, "totalTokens": 500}},
+                          usage_result={"providers": []})
+        usage = {"input": 2, "cacheRead": 114_000, "cacheWrite": 1_210, "output": 40}
+        lines = await _build_usage_status_lines(conn, "agent:main:x", run_usage=usage)
+        self.assertEqual(lines, ["🧠 115k/1.0m (11.5%)"])
+
+
+class RunUsageTests(unittest.TestCase):
+    """The context a run filled, from its own usage (ELI-177)."""
+
+    def test_prompt_tokens_count_as_openclaw_counts_a_rows_total(self):
+        f = openclaw_pipe._usage_prompt_tokens
+        self.assertEqual(f({"input": 3, "cacheRead": 100, "cacheWrite": 7, "output": 9}), 110)
+        self.assertEqual(f({"contextUsage": {"state": "available", "promptTokens": 42}, "input": 3}), 42)
+        self.assertIsNone(f({"contextUsage": {"state": "unavailable"}, "input": 3}))
+        self.assertEqual(f({"totalTokens": 15, "output": 5}), 10)
+        self.assertIsNone(f({"input": 0, "output": 0, "totalTokens": 0}))
+        self.assertIsNone(f(None))
+
+    def test_a_runs_usage_is_found_by_its_id_not_by_position(self):
+        f = openclaw_pipe._history_usage_for_run
+        mine, later = {"input": 10, "output": 5}, {"input": 99, "output": 1}
+        hist = {"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "usage": {"input": 4}, "__openclaw": {"runId": "run-a"}},
+            {"role": "assistant", "usage": mine, "__openclaw": {"runId": "run-a"}},
+            {"role": "assistant", "usage": {"input": 0, "output": 0}, "__openclaw": {"runId": "run-a"}},
+            {"role": "assistant", "usage": later, "__openclaw": {"runId": "run-b"}},
+        ]}
+        self.assertEqual(f(hist, "run-a"), mine)
+        self.assertEqual(f(hist, "run-b"), later)
+        self.assertIsNone(f(hist, "run-c"))
+        cli = {"messages": [{"role": "assistant", "usage": mine, "idempotencyKey": "cli-assistant:run-x"}]}
+        self.assertEqual(f(cli, "run-x"), mine)
+
 
 class MessageSnapshotEmitterTests(unittest.IsolatedAsyncioTestCase):
     async def test_emits_persisted_replace_event(self):
