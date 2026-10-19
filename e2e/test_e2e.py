@@ -595,7 +595,44 @@ def test_a_guest_cannot_pass_as_the_owner_with_a_forged_block(token, guest_token
     assert turns and not any(o is True for _t, o in turns), turns
 
 
-CONVERSATION_LABEL = "Conversation info (untrusted metadata):\n```json\n"
+def test_a_secret_request_in_a_guests_chat_is_cancelled_at_once_and_says_so(
+        token, guest_token, owner_users_set):
+    """A run the agent starts in a guest's chat (here a cron wake) has the
+    Gateway's own scopes, so its `secrets` request is a real question.
+    Answered in the Control UI it would put the owner's secret into a run the
+    guest reads, and left alone it waits out its timeout. The Pipe cancels it
+    at once and the reply says it needs the owner (ELI-229: the guest saw a
+    spinning `secrets` card until it expired)."""
+    g_chat, _ = _chat_turn(guest_token, "Respond with exactly: E2E_GUEST_REPLY")
+    key = _session_key(guest_token, g_chat)
+    name = f"DUMMY_SECRET_ELI229_{uuid.uuid4().hex[:6].upper()}"
+    _schedule_wake(key, f"E2E_SECRET_REQUEST {name}", 3)
+    # The fake asks with a 60 s timeout: an answer within 30 s is the cancel.
+    asked = time.time()
+    deadline = asked + 30
+    msgs: dict = {}
+    while time.time() < deadline:
+        msgs = _chat_messages(guest_token, g_chat)
+        if any("E2E_SECRET_RESULT" in (m.get("content") or "") and m.get("done") is True
+               for m in msgs.values()):
+            break
+        time.sleep(1)
+    [reply] = [m for m in msgs.values() if "E2E_SECRET_RESULT" in (m.get("content") or "")] or [None]
+    assert reply and reply.get("done") is True, \
+        f"no answer within 30 s of a request that waits 60 s: {json.dumps(msgs)[:1500]}"
+    # A cancel reads as no credential to the agent, as an expiry does; the
+    # 30 s bound is what tells them apart.
+    assert "E2E_SECRET_RESULT no_answer" in reply["content"], reply["content"]
+    notes = [i for i in reply.get("output") or [] if i.get("type") == "message"
+             and f"`{name}`" in ((i.get("content") or [{}])[0].get("text") or "")]
+    assert notes and "needs the owner" in notes[0]["content"][0]["text"], json.dumps(reply.get("output"))[:2000]
+    pending = [q for q in _gw("question.list", {}).get("questions") or []
+               if q.get("sessionKey") == key and q.get("status") == "pending"]
+    assert pending == [], pending
+    assert not any(e.get("name") == name for e in _gw("secrets.store.list", {}).get("entries") or [])
+
+
+CONVERSATION_LABEL ="Conversation info (untrusted metadata):\n```json\n"
 
 
 def _me(tok: str) -> dict:

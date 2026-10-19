@@ -38,6 +38,7 @@ class FakeConn:
     def __init__(self):
         self.gateway_version = "2026.10.5"
         self.sent = []
+        self.dispatched = []
         self._turn_writers = {}
 
     def parse_owui_session_key(self, key):
@@ -46,6 +47,10 @@ class FakeConn:
     async def send_request(self, method, params, timeout=10):
         self.sent.append((method, json.loads(json.dumps(params))))
         return {"status": "cancelled" if "cancel" in params else "answered"}
+
+    async def dispatch_run_event(self, msg):
+        """The Pipe's own note into the reply (ELI-229)."""
+        self.dispatched.append(msg)
 
 
 class FakeTurn:

@@ -1058,6 +1058,23 @@ def test_the_generated_title_shows_in_the_open_tab(page, token):
                              f"the chat's saved title is {capture.chat_title(token, chat_id)!r}") from None
 
 
+SIDEBAR_OPEN_JS = """() => { const s = document.getElementById('sidebar');
+  return !!s && s.clientWidth > 0 && s.scrollWidth <= s.clientWidth && s.scrollLeft === 0; }"""
+
+
+def _open_sidebar(page) -> None:
+    """Open the sidebar and wait until it has stopped widening.
+
+    It opens with a 250 ms width transition over content of its full width,
+    clipped until the end. A click on a chat's menu button in that time
+    focuses the clipped button, which scrolls the sidebar sideways; the
+    sidebar then keeps widening and scrolls back, so the release lands on the
+    chat's title and the menu never opens (ELI-228). The end of the opening is
+    the sidebar showing all of its content, unscrolled."""
+    page.locator('button[aria-label="Open Sidebar"]').first.click()
+    capture.wait_js(page, SIDEBAR_OPEN_JS, "the sidebar to finish opening", 10_000)
+
+
 def _rename_in_sidebar(page, chat_id: str, title: str) -> None:
     """Rename the chat by a double click on its sidebar entry, as a user does.
 
@@ -1100,7 +1117,7 @@ def test_a_title_the_user_chose_stays(page, token):
     # The sidebar is where a user renames a chat; open it if it is closed.
     was_closed = page.locator('button[aria-label="Open Sidebar"]').first.is_visible()
     if was_closed:
-        page.locator('button[aria-label="Open Sidebar"]').first.click()
+        _open_sidebar(page)
     try:
         _rename_in_sidebar(page, chat_id, chosen)
     finally:
@@ -1266,7 +1283,7 @@ def test_a_cloned_chat_starts_with_the_copied_messages(page):
     source = capture.send(page, f"clone source question {n}")
     _wait(page, _last_reply_done("E2E fake model reply."), "the source chat's reply")
     # Clone is in the sidebar's menu for the chat.
-    page.locator('button[aria-label="Open Sidebar"]').first.click()
+    _open_sidebar(page)
     menus = page.locator('button[aria-label="Chat Menu"]')
     mine = page.evaluate("""(href) => [...document.querySelectorAll('button[aria-label="Chat Menu"]')]
       .findIndex(b => { for (let el = b.parentElement, i = 0; el && i < 6; el = el.parentElement, i++)

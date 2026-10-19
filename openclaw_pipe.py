@@ -3614,14 +3614,43 @@ def secret_request_resolved(payload) -> None:
         task.cancel()
 
 
+GUEST_SECRET_NOTE = "_The agent asked for the secret `{name}`. That needs the owner; it is not available here._"
+
+
+async def _cancel_guest_secret_request(conn, record: dict, name: str) -> None:
+    """Cancel a secret request made in a guest's chat and say so in the reply
+    of the run that asked, as a note of its own (ELI-229)."""
+    qid = record["id"]
+    try:
+        result = await conn.send_request("question.resolve", {"id": qid, "cancel": True,
+                                                               "resolvedBy": "openwebui"}, timeout=30)
+        shown = str((result or {}).get("status"))
+    except Exception as ex:
+        shown = f"not cancelled ({type(ex).__name__})"
+    finally:
+        if _SECRET_REQUESTS.get(qid) is asyncio.current_task():
+            del _SECRET_REQUESTS[qid]
+    pipe_log(f"  secret request: {name} in a chat of a user not in OWNER_USERS: {shown}")
+    payload = {"sessionKey": record.get("sessionKey") or "", "stream": PIPE_NOTE_STREAM,
+               "data": {"id": f"{_NOTE_ITEM_PREFIX}secret_{qid}", "text": GUEST_SECRET_NOTE.format(name=name)}}
+    if record.get("runId"):
+        payload["runId"] = record["runId"]
+    await conn.dispatch_run_event({"type": "event", "event": "agent", "payload": payload})
+
+
 async def _answer_secret_request(conn, record: dict, question: dict, user_id: str, chat_id: str) -> None:
     qid, name = record["id"], question["secretStore"]["name"]
     timeout_s = max(1.0, (record.get("expiresAtMs") or 0) / 1000 - time.time())
     payload = _secret_request_payload(question)
     if not await _sender_is_owner(conn, record.get("sessionKey") or ""):
-        # The store is the owner's: a guest's chat cannot write into it.
-        _SECRET_REQUESTS.pop(qid, None)
-        pipe_log(f"  secret request: {name} in a chat of a user not in OWNER_USERS; left to the Control UI")
+        # The store is the owner's: a guest's chat cannot write into it. Nor is
+        # it left pending: answered in the Control UI, it would hand the
+        # owner's secret to a run whose output the guest reads, and until then
+        # the run waits out the request (15 minutes by default). A run the
+        # guest sends cannot ask at all (its connection lacks
+        # operator.questions); one the agent starts in the guest's chat (a
+        # cron wake, an announce) can (ELI-229).
+        await _cancel_guest_secret_request(conn, record, name)
         return
     turn = _SECRET_ASKERS.get(record.get("sessionKey"))
     pipe_log(f"  secret request: {name} in chat {chat_id[:8]}... (question {qid[:8]}...)")
@@ -4783,6 +4812,14 @@ def _tool_call_started_event(name: str, tool_call_id: str, args_str: str) -> dic
     }
 
 
+# A note the Pipe adds to a reply (ELI-197): a Responses message item of its
+# own, carried as a run event of this made-up stream so the live reply and a
+# turn writer show it through the same `_TurnRenderer`. Its id is stable per
+# note, so the same note again replaces it.
+PIPE_NOTE_STREAM = "pipe_note"
+_NOTE_ITEM_PREFIX = "msg_note_"
+
+
 def _tool_call_result_event(tool_call_id: str, result_str: str) -> dict:
     """Complete a tool call announced by `_tool_call_started_event`.
 
@@ -5080,7 +5117,8 @@ class _TurnRenderer:
     message can be finalized to exactly what a non-interrupted turn would
     have stored.
 
-    Scope: assistant text deltas, item-carried text, and tool-result blocks.
+    Scope: assistant text deltas, item-carried text, tool-result blocks, and
+    the Pipe's own notes (`PIPE_NOTE_STREAM`).
     It holds the raw run text: the turn writer shows a resolved `MEDIA:` image
     and an answered ask-user card through the rewrites the inline reply
     recorded (`note_turn_rewrite`).
@@ -5202,7 +5240,8 @@ class _TurnRenderer:
         self._add(chunk)
         self.text += chunk
         last = self.output[-1] if self.output else None
-        if last is None or last.get("type") != "message":
+        if (last is None or last.get("type") != "message"
+                or str(last.get("id", "")).startswith(_NOTE_ITEM_PREFIX)):
             last = {
                 "type": "message",
                 "id": f"msg_{uuid.uuid4().hex[:24]}",
@@ -5300,6 +5339,20 @@ class _TurnRenderer:
                 item_delta = _suppress_already_shown(item_delta, self.visible_text)
                 if item_delta:
                     events.append(self._add_text(item_delta))
+
+        if stream == PIPE_NOTE_STREAM:
+            nid, text = data.get("id"), data.get("text")
+            if nid and text:
+                item = {"type": "message", "id": nid, "status": "completed", "role": "assistant",
+                        "content": [{"type": "output_text", "text": text}]}
+                at = next((n for n, i in enumerate(self.output) if i.get("id") == nid), None)
+                if at is None:
+                    self.output.append(item)
+                else:
+                    self.output[at] = item
+                events.append({"type": "response.output_item.added",
+                               "output_index": _OUTPUT_APPEND_INDEX, "item": copy.deepcopy(item)})
+            return events
 
         if stream == "tool":
             tcid = data.get("toolCallId", "")
@@ -6395,6 +6448,63 @@ class _GatewayConnection:
             return None
         return after[0:36], after[37:73]
 
+    async def dispatch_run_event(self, msg: dict) -> None:
+        """One `agent` or `chat` event of a run: its shadow render, then its
+        live reply, its turn writer, or nowhere. The receive loop's path for
+        every run event, and the Pipe's for its own notes (ELI-197)."""
+        payload = msg.get("payload", {})
+        if payload.get("stream") == "tool" and not self._first_tool_event(payload):
+            return
+        spawned = self._spawn_seen(payload) if payload.get("stream") == "tool" else None
+        if spawned:
+            # The Status dialog's child index (state.py), off the loop.
+            parent, child, task = spawned
+            asyncio.get_running_loop().run_in_executor(None, functools.partial(
+                _subagent_remember, parent, keys=[child], tasks={child: task} if task else None))
+
+        # ── Shadow render ──
+        # Feed every event of a run we're tracking into its shadow
+        # `_TurnRenderer`, whether or not a live consumer is still
+        # attached: the inline turn can end at any point, and the turn
+        # writer it hands over to starts from this content.
+        _evt_sess = payload.get("sessionKey", "")
+        _evt_run = payload.get("runId", "")
+        if _evt_sess and _evt_run:
+            _renderer = self._run_renderers.get(f"{_evt_sess}:{_evt_run}")
+            if _renderer is not None:
+                try:
+                    _renderer.feed(payload)
+                except Exception as ex:
+                    pipe_log(f"  shadow renderer feed failed: {ex}")
+
+        consumers = self.consumers_for_event(payload)
+
+        # ── ELI-100: a run no live request consumes is a turn ──
+        if not consumers and _TURNS and _TURNS.route_now(self, payload):
+            return
+
+        if consumers:
+            if not payload.get("runId"):
+                pipe_log("  dispatched session-only event to sole consumer")
+            if payload.get("state") == "final" and payload.get("sessionKey") and payload.get("runId"):
+                # Genuinely shown to a live tab, which persists it via
+                # OWUI's own client-side flow -- remember this so a
+                # later duplicate/retried final event for the same
+                # run_id never reopens its message.
+                self.mark_delivered_live(payload["sessionKey"], payload["runId"])
+                # The inline turn is alive and took the final itself, so
+                # the parity shadow isn't needed for this run -- drop it.
+                self.unregister_run_target(payload["sessionKey"], payload["runId"])
+            for q in consumers[0].queues:
+                await q.put(msg)
+            return
+
+        if payload.get("sessionKey") and not payload.get("runId"):
+            pipe_log("  dropped ambiguous or unmatched session-only event")
+
+        # If nothing matches at all, drop it.
+        # This efficiently filters cross-session bleed.
+
     def consumers_for_event(self, payload: dict) -> list[_Consumer]:
         """Return consumers that should receive a Gateway event payload."""
         evt_session = payload.get("sessionKey", "")
@@ -7090,58 +7200,7 @@ class _GatewayConnection:
                    msg.get("event") not in ("agent", "chat"):
                     continue
 
-                payload = msg.get("payload", {})
-                if payload.get("stream") == "tool" and not self._first_tool_event(payload):
-                    continue
-                spawned = self._spawn_seen(payload) if payload.get("stream") == "tool" else None
-                if spawned:
-                    # The Status dialog's child index (state.py), off the loop.
-                    parent, child, task = spawned
-                    asyncio.get_running_loop().run_in_executor(None, functools.partial(
-                        _subagent_remember, parent, keys=[child], tasks={child: task} if task else None))
-
-                # ── Shadow render ──
-                # Feed every event of a run we're tracking into its shadow
-                # `_TurnRenderer`, whether or not a live consumer is still
-                # attached: the inline turn can end at any point, and the turn
-                # writer it hands over to starts from this content.
-                _evt_sess = payload.get("sessionKey", "")
-                _evt_run = payload.get("runId", "")
-                if _evt_sess and _evt_run:
-                    _renderer = self._run_renderers.get(f"{_evt_sess}:{_evt_run}")
-                    if _renderer is not None:
-                        try:
-                            _renderer.feed(payload)
-                        except Exception as ex:
-                            pipe_log(f"  shadow renderer feed failed: {ex}")
-
-                consumers = self.consumers_for_event(payload)
-
-                # ── ELI-100: a run no live request consumes is a turn ──
-                if not consumers and _TURNS and _TURNS.route_now(self, payload):
-                    continue
-
-                if consumers:
-                    if not payload.get("runId"):
-                        pipe_log("  dispatched session-only event to sole consumer")
-                    if payload.get("state") == "final" and payload.get("sessionKey") and payload.get("runId"):
-                        # Genuinely shown to a live tab, which persists it via
-                        # OWUI's own client-side flow -- remember this so a
-                        # later duplicate/retried final event for the same
-                        # run_id never reopens its message.
-                        self.mark_delivered_live(payload["sessionKey"], payload["runId"])
-                        # The inline turn is alive and took the final itself, so
-                        # the parity shadow isn't needed for this run -- drop it.
-                        self.unregister_run_target(payload["sessionKey"], payload["runId"])
-                    for q in consumers[0].queues:
-                        await q.put(msg)
-                    continue
-
-                if payload.get("sessionKey") and not payload.get("runId"):
-                    pipe_log("  dropped ambiguous or unmatched session-only event")
-
-                # If nothing matches at all, drop it.
-                # This efficiently filters cross-session bleed.
+                await self.dispatch_run_event(msg)
 
             except asyncio.TimeoutError:
                 # Not even a tick for two intervals: the socket is dead without
@@ -8117,6 +8176,22 @@ def _turn_note_item(note: str) -> dict:
             "role": "assistant", "content": [{"type": "output_text", "text": note}]}
 
 
+def _keep_pipe_notes(streamed: list, renderer: "_TurnRenderer") -> None:
+    """The Pipe's own notes (`PIPE_NOTE_STREAM`) are in no transcript, so a
+    rebuild from one drops them: put each back after the item it followed
+    when it streamed, or at the end (ELI-229)."""
+    output = renderer.output
+    have = {i.get("id") for i in output}
+    for at, item in enumerate(streamed):
+        if not str(item.get("id") or "").startswith(_NOTE_ITEM_PREFIX) or item.get("id") in have:
+            continue
+        before = next((p.get("id") for p in reversed(streamed[:at]) if p.get("id") in have), None)
+        pos = next((n + 1 for n, i in enumerate(output) if i.get("id") == before), len(output)) \
+            if before else 0
+        output.insert(pos, copy.deepcopy(item))
+        have.add(item.get("id"))
+
+
 # The last word of a reply interrupted before it sent its own message
 # (ELI-188): the next reply sent it, or a Stop dropped it.
 REPLY_SENT_WITH_NEXT_NOTE = ("_(This message was sent together with your next one: "
@@ -8841,6 +8916,7 @@ class _TurnWriter:
             except Exception as ex:
                 hist = None
                 pipe_log(f"  turn writer: chat.history failed at the end: {ex!r}")
+            streamed = list(self.renderer.output)
             if self.wake is not None:
                 self._rebuild_wake(hist)
                 self.renderer.flush()
@@ -8855,6 +8931,7 @@ class _TurnWriter:
                 self.renderer.flush()
                 if not self._showable():
                     await self._show_silent_announce(hist)
+            _keep_pipe_notes(streamed, self.renderer)
             if not self.opened:
                 if not (self._showable() or note) or not await self._open_at_end():
                     return
@@ -12403,7 +12480,7 @@ class _PipeTurn:
                         # --- Run text and tool cards ---
                         # One renderer reads them, the one a turn writer uses
                         # (ELI-147).
-                        if stream in ("assistant", "item", "tool"):
+                        if stream in ("assistant", "item", "tool", PIPE_NOTE_STREAM):
                             added = self.renderer.feed(payload)
                             for text in (a for a in added if isinstance(a, str)):
                                 async for chunk in self.show_text(text):
@@ -12449,6 +12526,13 @@ class _PipeTurn:
                                     # Until the reply ends: its usage rows replace it.
                                     await _emit_status(self.__event_emitter__,
                                                        _background_agents_line(self.background_agents))
+
+                        # --- The Pipe's own notes (ELI-197) ---
+                        if stream == PIPE_NOTE_STREAM:
+                            for event in added:
+                                yield event
+                            # Text after the note is a new message item.
+                            self.fence_item_start = len(self.assistant_stream_text)
 
                         # --- Item events (progress) ---
                         if stream == "item":
