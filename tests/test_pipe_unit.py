@@ -10044,6 +10044,51 @@ class SilentAnnounceTests(_RoutingCase):
         self.assertIn("SUB-DONE-R10", json.dumps(m["output"]))
         self.assertEqual(self.conn._turn_pumps, {}, "the run's pump ended")
 
+    async def test_the_card_of_a_native_runs_spawn_is_named_by_its_label(self):
+        """A parent on the Gateway's own runtime records the spawn as a
+        `toolCall` block and a `toolResult` message (ELI-217: the card was
+        named after the child's session key)."""
+        h = self.parent_history("NO_REPLY")
+        result = json.dumps({"status": "accepted", "childSessionKey": self.CHILD,
+                             "runId": self.CHILD_RUN})
+        h["messages"][1] = {"role": "assistant", "content": [
+            {"type": "toolCall", "id": "call_s", "name": "sessions_spawn",
+             "arguments": self.SPAWN_ARGS}]}
+        h["messages"].insert(2, {"role": "toolResult", "toolCallId": "call_s",
+                                 "toolName": "sessions_spawn",
+                                 "content": [{"type": "text", "text": result}]})
+        self.history = h
+        _turn_route_now(self.conn, self.ev(self.announce, _delta("NO_REPLY")))
+        _turn_route_now(self.conn, self.ev(self.announce, {"state": "final"}))
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "done", "lastRunId": self.announce})
+        await self.spin()
+        (m,) = self.new_messages().values()
+        (call,) = [i for i in m["output"] if i["type"] == "function_call"]
+        self.assertIn("R10 probe sub-agent", call["arguments"])
+
+    async def test_the_card_of_a_spawn_made_through_a_deferred_tool_wrapper_is_named(self):
+        """On 2026.10 a native run calls `sessions_spawn` through `tool_call`
+        ({id, args}) when the tool is deferred; the card was named "Sub-agent"."""
+        h = self.parent_history("NO_REPLY")
+        result = json.dumps({"status": "accepted", "childSessionKey": self.CHILD,
+                             "runId": self.CHILD_RUN})
+        h["messages"][1] = {"role": "assistant", "content": [
+            {"type": "toolCall", "id": "call_w", "name": "tool_call",
+             "arguments": {"id": "sessions_spawn", "args": self.SPAWN_ARGS}}]}
+        h["messages"].insert(2, {"role": "toolResult", "toolCallId": "call_w", "toolName": "tool_call",
+                                 "content": [{"type": "text", "text": json.dumps(
+                                     {"tool": {"id": "sessions_spawn"}, "result": result})}]})
+        self.history = h
+        _turn_route_now(self.conn, self.ev(self.announce, _delta("NO_REPLY")))
+        _turn_route_now(self.conn, self.ev(self.announce, {"state": "final"}))
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "done", "lastRunId": self.announce})
+        await self.spin()
+        (m,) = self.new_messages().values()
+        (call,) = [i for i in m["output"] if i["type"] == "function_call"]
+        self.assertIn("R10 probe sub-agent", call["arguments"])
+
     async def test_a_failed_announce_waits_while_its_row_is_still_active(self):
         """No guess: a row still active at the error waits for the next push."""
         self.list_rows(self.failed_row(active=True))
