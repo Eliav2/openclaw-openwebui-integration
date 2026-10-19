@@ -533,7 +533,7 @@ class Shooter:
 
 
 LIVE_VIEW_PAGE = """<!doctype html><meta charset=utf-8><style>
- body { margin: 0; font: 12px system-ui, sans-serif; color: #6b6b76; }
+ body { margin: 0 2px; font: 12px system-ui, sans-serif; color: #6b6b76; }
  .shot { border: 1px solid #e3e3e8; border-radius: 8px; overflow: hidden; color: #1b1b1f; margin: 4px 0; }
  .bar { background: #f1f1f4; padding: 6px 10px; border-bottom: 1px solid #e3e3e8; }
  .page { padding: 12px; }
@@ -945,7 +945,9 @@ class Scenes:
         try:
             new_chat(page)
             chat = send(page, "Check the forecast dashboard in a browser, please.")
-            wait_js(page, last_text_has("all three panels"), "the finished reply")
+            wait_js(page, f"""() => {{ const a = {LAST_ASSISTANT};
+                     return a && a.innerText.includes('all three panels') && !a.innerText.includes('Thinking')
+                       && a.querySelector('button[aria-label="Copy"]'); }}""", "the finished reply")
             frame = f"{LAST_ASSISTANT}.querySelector('iframe')"
             wait_js(page, f"() => {{ const f = {frame}; return f && f.getBoundingClientRect().height > 150; }}",
                     "the live view in the reply, at its own height")
