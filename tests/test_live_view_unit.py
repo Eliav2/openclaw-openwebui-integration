@@ -3,6 +3,7 @@ tool gets the configured page as an embed, once, for the users it is set for.
 
 Run: python3 -m pytest -q tests/test_live_view_unit.py
 """
+import json
 import types
 import unittest
 
@@ -39,6 +40,32 @@ class LiveViewUrlTests(unittest.TestCase):
                            ("web_fetch", '{"url": "https://example.org"}')):
             with self.subTest(tool=tool, args=args):
                 self.assertIsNone(live_view_url(tool, args))
+
+    def test_the_default_on_real_tool_calls(self):
+        # ELI-248: on the claude-cli runtime the agent drives its browser with exec
+        # running `openclaw browser <verb>`; no tool is called "browser" there
+        browser_use = (
+            ("exec", {"command": "B=/config/.node_global/bin/openclaw; $B browser --json open https://en.wikipedia.org/wiki/Octopus 2>&1 | tail -20"}),
+            ("exec", {"command": "B=x; sleep 15; for i in 1 2; do $B browser press PageDown; done"}),
+            ("exec", {"command": "openclaw browser tabs"}),
+            ("browser", {"action": "open", "url": "https://x"}),
+            ("exec", {"command": "python3 /config/bin/browser-guard/lease.py own --caller qa -- bun shot.ts"}),
+        )
+        not_browser_use = (
+            ("exec", {"command": "/config/.node_global/bin/openclaw browser --help 2>&1 | head -50"}),
+            ("exec", {"command": "cd /config/.openclaw/workspace/projects/browser-replay && git status"}),
+            ("exec", {"command": "grep -n frame-ancestors /config/.openclaw/workspace/projects/browser-replay/src/server.ts"}),
+            # a private browser that is never recorded: its embed could only say so
+            ("exec", {"command": "timeout 600 python3 /config/bin/browser-guard/lease.py own --no-record --caller w7-qa -- bun blank_probe.ts"}),
+            ("exec", {"command": "systemctl --user restart browser-replay"}),
+            ("exec", {"command": "echo the browser opened fine"}),
+        )
+        for tool, args in browser_use:
+            with self.subTest(tool=tool, args=args):
+                self.assertIsNotNone(live_view_url(tool, json.dumps(args)))
+        for tool, args in not_browser_use:
+            with self.subTest(tool=tool, args=args):
+                self.assertIsNone(live_view_url(tool, json.dumps(args)))
 
     def test_only_the_users_it_is_set_for(self):
         self.assertIsNotNone(live_view_url(user="u-1", LIVE_VIEW_USERS="U-1, someone@example.org"))
