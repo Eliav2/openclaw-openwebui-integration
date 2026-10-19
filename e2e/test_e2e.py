@@ -763,19 +763,23 @@ def test_a_message_sent_while_the_gateway_restarts_gets_its_reply(token):
     start = os.path.getsize(log_path) if os.path.exists(log_path) else 0
     with concurrent.futures.ThreadPoolExecutor(1) as pool:
         turn = pool.submit(_chat_turn, token, "Respond with exactly: E2E_DURING_RESTART", chat_id=chat_id)
+        def relaunch():
+            proc = subprocess.Popen(["openclaw", "gateway", "run"], stdout=open(log_path, "a"),
+                                    stderr=subprocess.STDOUT, start_new_session=True)
+            with open(GATEWAY_PID_FILE, "w") as f:
+                f.write(str(proc.pid))
         try:
             # The down window, for certain: the Pipe says it is waiting through
             # a refused reconnect before there is a Gateway to connect to.
             _until("the Pipe to wait for the Gateway",
                    lambda: turn.done() or GATEWAY_DOWN_WAIT in _pipe_log_since(since), timeout_s=60, every_s=0.5)
             assert not turn.done(), f"the turn ended while the Gateway was down: {turn.result()[1]!r}"
-        finally:
-            # Relaunched whatever happened, so a failure here leaves the later
-            # tests a Gateway.
-            proc = subprocess.Popen(["openclaw", "gateway", "run"], stdout=open(log_path, "a"),
-                                    stderr=subprocess.STDOUT, start_new_session=True)
-            with open(GATEWAY_PID_FILE, "w") as f:
-                f.write(str(proc.pid))
+        except BaseException:
+            # The later tests still get a Gateway.
+            relaunch()
+            _until("the Gateway to come back", _gateway_up, timeout_s=180, every_s=2)
+            raise
+        relaunch()
         _, msg = turn.result()
     content = msg.get("content") or ""
     assert STARTUP_REFUSAL not in content, f"the startup refusal shown as the reply: {content[:300]!r}"
