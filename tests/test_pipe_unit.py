@@ -10162,6 +10162,48 @@ class SilentAnnounceTests(_RoutingCase):
         self.assertEqual(len(replies), 1)
         self.assertEqual(len(self.new_messages()), 2)
 
+    async def unsettled_announce_run(self, reply):
+        """An attempt answered aloud whose last push is `phase: end` with
+        hasActiveRun still true (2026.10.5, ELI-215): it ends on its final."""
+        self.history = self.parent_history(reply)
+        _turn_route_now(self.conn, self.ev(self.announce, _delta(reply)))
+        _turn_route_now(self.conn, self.ev(self.announce, {"state": "final"}))
+        self.conn._on_sessions_changed({"sessionKey": self.key, "phase": "end",
+                                        "runId": self.announce, "hasActiveRun": True,
+                                        "status": "running", "lastRunId": self.announce})
+        await self.spin()
+
+    async def test_a_retry_answered_aloud_with_no_settle_push_lands_once(self):
+        """ELI-215 with ELI-217: the retry that answers aloud gets no settle
+        either, so its own final ends its message, once, beside the one card."""
+        self.list_rows(self.failed_row(active=True), self.failed_row())
+        await self.failed_announce_run()
+        self.list_rows(self.failed_row(active=True), self.failed_row())
+        await self.failed_announce_run()
+        await self.unsettled_announce_run("The sub-agent returned SUB-DONE-R10.")
+        self.assertEqual(len(self.cards()), 1)
+        replies = [m for m in self.new_messages().values()
+                   if m.get("content") == "The sub-agent returned SUB-DONE-R10."]
+        self.assertEqual([m["done"] for m in replies], [True])
+        self.assertEqual(len(self.new_messages()), 2)
+        self.assertEqual(self.conn._turn_pumps, {})
+
+    async def test_a_retry_after_a_clean_final_does_not_reopen_its_message(self):
+        """A second attempt under the run id of one that already ended on its
+        final keeps the one message: done, with the first attempt's text, as
+        the settle path does on main (the message id is the run's). 10.5 never
+        retries a delivery that sent a visible reply (`hasAnnounceSendEvidence`,
+        subagent-announce-delivery-retry-BwPVtckd.mjs), so this guards a
+        Gateway change, not a path seen live."""
+        await self.unsettled_announce_run("First answer.")
+        await self.unsettled_announce_run("Second answer.")
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "done", "lastRunId": self.announce})
+        await self.spin()
+        self.assertEqual([(m["content"], m["done"]) for m in self.new_messages().values()],
+                         [("First answer.", True)])
+        self.assertEqual(self.conn._turn_pumps, {})
+
 
 class ErroredAgentRunTests(_RoutingCase):
     """ELI-217: a run the agent started that errors on 2026.10.5 gets no
