@@ -904,6 +904,54 @@ def test_a_long_task_shown_whole_keeps_the_drawer_closable(page, token, screen):
             view.close()
 
 
+# The task text's first line is what its box shows: the box is scrolled to the
+# top and the first characters lie inside it, on screen.
+TASK_SHOWS_FIRST_LINE = """() => {
+  const body = document.querySelector('#openclaw-drawer-task [data-openclaw-block-text]');
+  if (!body) return 'no task text';
+  if (body.scrollTop !== 0) return 'task box scrolled to ' + body.scrollTop;
+  const node = body.firstChild;
+  const range = document.createRange();
+  range.setStart(node, 0);
+  range.setEnd(node, Math.min(10, node.length));
+  const r = range.getBoundingClientRect(), b = body.getBoundingClientRect();
+  if (r.top < b.top - 1 || r.bottom > b.bottom + 1) return 'first line outside the box: ' + r.top + '..' + r.bottom + ' vs ' + b.top + '..' + b.bottom;
+  if (b.top < 0 || b.bottom > innerHeight) return 'task box off screen: ' + b.top + '..' + b.bottom;
+  return 'ok';
+}"""
+
+
+def test_show_less_puts_a_long_task_back_at_its_first_lines(page, token):
+    """Sub-agent drawer (ELI-236): "Show all" on a long task, the task's box
+    scrolled down, then "Show less". The two-line preview must show the
+    task's first lines again, not two lines from wherever the box was
+    scrolled to."""
+    capture.new_chat(page)
+    capture.send(page, "E2E_SPAWN_LONG one helper")
+    _wait(page, _turn_over("E2E_SPAWNED"), "the parent's reply")
+    _open_status(page)
+    section = "#openclaw-status-section-subagents"
+    _wait(page, f"""() => {{ const s = document.querySelector('{section}');
+                     return !!s && s.innerText.includes('E2E_CHILDTASK'); }}""",
+          "the sub-agent in the Status dialog", 60_000)
+    page.locator(f"{section} button", has_text="E2E_CHILDTASK").first.click()
+    more = page.locator('#openclaw-drawer-root [data-openclaw-more="task"]')
+    more.wait_for(timeout=30_000)
+    more.click()
+    _wait(page, """() => (document.querySelector('[data-openclaw-more="task"]') || {}).textContent === 'Show less'""",
+          "the task shown whole", 10_000)
+    scrolled = page.evaluate("""() => {
+      const body = document.querySelector('#openclaw-drawer-task [data-openclaw-block-text]');
+      body.scrollTop = body.scrollHeight;
+      return body.scrollTop; }""")
+    assert scrolled > 0, "the task box did not scroll, so this proves nothing"
+    more.click()
+    _wait(page, """() => (document.querySelector('[data-openclaw-more="task"]') || {}).textContent === 'Show all'""",
+          "the task clamped again", 10_000)
+    verdict = page.evaluate(TASK_SHOWS_FIRST_LINE)
+    assert verdict == "ok", verdict
+
+
 def _chat_id(page) -> str:
     m = re.search(r"/c/([0-9a-f-]{36})", page.url)
     assert m, f"no chat id in {page.url}"
