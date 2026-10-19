@@ -68,7 +68,7 @@ Everything here works as soon as the Pipe is installed, except entries marked:
 | File | Open WebUI type | Purpose |
 | --- | --- | --- |
 | [`openclaw_pipe.py`](../../openclaw_pipe.py) | [Pipe](https://docs.openwebui.com/features/extensibility/plugin/functions/pipe) (manifold) | The chat integration: almost everything above |
-| [`openclaw_status_action.py`](../../openclaw_status_action.py) | [Action](https://docs.openwebui.com/features/extensibility/plugin/functions/action) | The Status button and dialog; reuses the Pipe's live connection and device identity, so there is no second pairing |
+| [`openclaw_status_action.py`](../../openclaw_status_action.py) | [Action](https://docs.openwebui.com/features/extensibility/plugin/functions/action) | The Claw button and dialog; reuses the Pipe's live connection and device identity, so there is no second pairing |
 | [`openclaw_thinking_filter.py`](../../openclaw_thinking_filter.py) | [Filter](https://docs.openwebui.com/features/extensibility/plugin/functions/filter) | The per-chat thinking toggle in the composer. Optional, and imports nothing but the standard library and pydantic |
 
 All three are generated from the same `src/openclaw_pipe_pkg/` source fragments. Contributing: [Development](../development.md).
