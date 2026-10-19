@@ -1000,6 +1000,33 @@ def test_a_subagent_result_the_parent_answers_with_silence_shows_as_its_card(tok
     assert "silent helper" in call.get("arguments", ""), call
     assert "E2E_SILENT_RESULT done" in json.dumps(result.get("output")), result
     assert "NO_REPLY" not in (m.get("content") or ""), m.get("content")
+    # 2026.10.5 retries the delivery on a backoff (15 s, 30 s, ...): the card
+    # stays one, and the parent's next reply lands once, in its own message.
+    _, after = _chat_turn(token, "Respond with exactly: E2E_AFTER_CARD", chat_id=chat_id)
+    assert (after.get("content") or "").strip() == "E2E_AFTER_CARD", after
+    time.sleep(35)
+    msgs = _chat_messages(token, chat_id)
+    cards = [k for k, x in msgs.items() if any(
+        o.get("type") == "function_call" and o.get("name") == "Sub-agent" for o in x.get("output") or [])]
+    assert len(cards) == 1, cards
+    replies = [k for k, x in msgs.items() if (x.get("content") or "").strip() == "E2E_AFTER_CARD"]
+    assert len(replies) == 1, replies
+    _assert_clean(token, chat_id, msgs)
+
+
+def test_a_reply_the_agent_starts_that_errors_still_finishes(token):
+    """A run started on the chat's session from outside (the Gateway's
+    `agent` method, as `sessions_send` does) whose model answers nothing:
+    OpenClaw 2026.10.5 fails it ("Agent couldn't generate a response") and
+    pushes no settle for it (its last push is `phase: error` with
+    hasActiveRun true), so its message stayed generating (ELI-217). It
+    finishes with the run's error."""
+    chat_id, _ = _chat_turn(token, "Respond with exactly: E2E_AGENT_CHAT")
+    key = _session_key(token, chat_id)
+    _gw("agent", {"sessionKey": key, "message": "E2E_EMPTY_REPLY",
+                  "idempotencyKey": f"e2e-empty-{uuid.uuid4().hex[:8]}"})
+    msgs = _wait_for(token, chat_id, ["couldn't generate a response"])
+    _assert_clean(token, chat_id, msgs)
 
 
 # ── A run that ends while Open WebUI is stopped (ELI-94) ─────────────────────
