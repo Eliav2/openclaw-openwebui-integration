@@ -738,6 +738,18 @@ def test_the_stack_gateway_schedules_no_work_of_its_own():
     assert _gateway_own_jobs_due_within(SUITE_SPAN_S) == []
 
 
+def test_the_gateway_reports_the_version_the_stack_installed():
+    """The Pipe's version gates read the Gateway's own version (hello-ok
+    `server.version`). OpenClaw takes it from OPENCLAW_VERSION before its
+    package version (dist version-*.mjs, resolveRuntimeServiceVersion,
+    `env-first`), so a stack that leaves the npm spec there (`latest`) runs a
+    Gateway that reports `latest`, and every gate takes its pre-2026.10 path
+    (ELI-225). `status` reads the same value."""
+    reported = _gw("status", {}).get("runtimeVersion")
+    assert reported and tuple(map(int, re.findall(r"\d+", reported)[:3])) == _openclaw_version(), \
+        f"the Gateway reports {reported!r}; `openclaw --version` says {_openclaw_version()}"
+
+
 def _kill_and_restart_gateway(sig: int = 9, while_down=None) -> None:
     """A crash (SIGKILL; SIGTERM for a clean stop) of the Gateway
     start_stack.sh launched, then a fresh `openclaw gateway run` the way it
