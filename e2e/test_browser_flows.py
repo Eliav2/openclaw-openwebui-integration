@@ -1023,6 +1023,35 @@ def test_the_generated_title_shows_in_the_open_tab(page, token):
                              f"the chat's saved title is {capture.chat_title(token, chat_id)!r}") from None
 
 
+def _rename_in_sidebar(page, chat_id: str, title: str) -> None:
+    """Rename the chat by a double click on its sidebar entry, as a user does.
+
+    The first click of a double click on the entry of a chat started from the
+    new-chat page navigates to it: the chat page loads it and ends by focusing
+    the message input. Open WebUI moves the focus back to the rename box
+    after a tick, and an Enter in between went to the message input, so the
+    rename stayed unsaved (ELI-220). So the chat is opened first, the load's
+    last step (the message input taking the focus) is awaited, and the
+    double click, a click on the open chat, starts no load."""
+    link = page.locator(f'a[href="/c/{chat_id}"]')
+    with page.expect_response(lambda r: r.request.method == "GET"
+                              and r.url.endswith(f"/api/v1/chats/{chat_id}")):
+        link.click()
+    capture.wait_js(page, "() => !!document.activeElement?.closest('#chat-input')",
+                    "the opened chat to focus its message input", 30_000)
+    link.dblclick()
+    box_id = f"chat-title-input-{chat_id}"
+    capture.wait_js(page, f"() => document.activeElement?.id === {json.dumps(box_id)}",
+                    "the rename box to take the focus", 10_000)
+    box = page.locator(f"#{box_id}")
+    box.fill(title)
+    with page.expect_request(lambda r: r.method == "POST"
+                             and r.url.endswith(f"/api/v1/chats/{chat_id}")) as saved:
+        box.press("Enter")
+    assert title in (saved.value.post_data or ""), saved.value.post_data
+    capture.wait_js(page, _sidebar_js(chat_id, title), "the chosen title in the sidebar", 30_000)
+
+
 def test_a_title_the_user_chose_stays(page, token):
     """A chat renamed in the sidebar keeps its name after the next message:
     the Pipe titles only a chat Open WebUI named by itself (ELI-182: the
@@ -1038,12 +1067,7 @@ def test_a_title_the_user_chose_stays(page, token):
     if was_closed:
         page.locator('button[aria-label="Open Sidebar"]').first.click()
     try:
-        page.locator(f'a[href="/c/{chat_id}"]').dblclick()
-        box = page.locator(f"#chat-title-input-{chat_id}")
-        box.wait_for(timeout=10_000)
-        box.fill(chosen)
-        box.press("Enter")
-        capture.wait_js(page, _sidebar_js(chat_id, chosen), "the chosen title in the sidebar", 30_000)
+        _rename_in_sidebar(page, chat_id, chosen)
     finally:
         if was_closed:
             page.locator('button[aria-label="Close Sidebar"]').first.click()
