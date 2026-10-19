@@ -12451,7 +12451,7 @@ class WakeTurnTests(unittest.TestCase):
                 self.msg(pipe_run_id("c" * 8 + "-1111-2222-3333-444455556666",
                                      "d" * 8 + "-1111-2222-3333-444455556666"), "[cron:job-1 typed]", 12),
                 self.msg("u1", "hello", 13)]
-        self.assertEqual(wake_turns(msgs), [{"key": "w1", "at": 10, "job": "job-1"}])
+        self.assertEqual(wake_turns(msgs), [{"key": "w1", "at": 10, "job": "job-1", "shared_run": True}])
 
     def test_the_newest_turn_committed_by_the_event_not_yet_bound(self):
         msgs = [self.msg("w1", "[cron:a n] x", 10), self.msg("w2", "[cron:b n] y", 20)]
