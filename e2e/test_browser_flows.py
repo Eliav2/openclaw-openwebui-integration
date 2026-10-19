@@ -474,9 +474,10 @@ def _ends_like_the_answer(page, token: str, run: str) -> None:
     """The running reply (holding `run`), finished by the Pipe's writer after
     a takeover, ends as the answer to the new message (an inline reply) does
     (ELI-210): with no "Stopped" from the cancel, and with the usage line
-    whenever the answer has it (on 2026.10 the running reply is its session's
-    first run, which reports no usage yet: ELI-177). In the saved status lines, and in the status line shown on the
-    reply (the page is reloaded by now)."""
+    whenever the answer has it. On 2026.10 the running reply is its session's
+    first run, whose row has no totals yet: the line comes from the run's own
+    usage (ELI-177). In the saved status lines, and in the status line shown
+    on the reply (the page is reloaded by now)."""
     saved = capture.api("GET", f"/api/v1/chats/{_chat_id(page)}", token=token)["chat"]["history"]["messages"]
     replies = [m for m in saved.values() if m.get("role") == "assistant"]
     held = [m for m in replies if run in (m.get("content") or "")]
@@ -488,8 +489,6 @@ def _ends_like_the_answer(page, token: str, run: str) -> None:
     shown = page.evaluate(f"() => {_message_text_js(0)}")
     assert "Stopped" not in lines, f"a Stopped line: {lines}"
     assert "Stopped" not in shown, shown[-200:]
-    if _openclaw_release() >= (2026, 10):
-        return  # the running reply is its session's first run: no usage reported yet (ELI-177)
     assert usage(lines) == usage(ref), f"the running reply: {lines}; the answer: {ref}"
     assert ("\U0001f9e0" in shown) == usage(ref), shown[-200:]
 

@@ -8846,11 +8846,13 @@ class _TurnWriter:
         except Exception as ex:
             pipe_log(f"  turn writer: persist failed: {ex}")
 
-    async def _persist_final(self, output: list, text: str, stopped: bool) -> list:
+    async def _persist_final(self, output: list, text: str, stopped: bool,
+                             run_usage: dict | None = None) -> list:
         """The `done: true` write of M, with its final status lines in the same
         write: the usage lines of a reply (`_build_usage_status_lines`, as the
         inline reply ends), or "Stopped" for a Stop (ELI-210). Returns the
-        lines to send to open tabs.
+        lines to send to open tabs. `run_usage`: the last run's own usage,
+        for a session whose row has no totals yet (ELI-177).
 
         After the request M was handed over from has ended: it saves its own
         status lines into M until then."""
@@ -8864,7 +8866,8 @@ class _TurnWriter:
                 pipe_log(f"  turn writer: chat {self.chat_id[:8]}... message {self.message_id[:8]}...: "
                          f"request still running after {FINAL_STATUS_REQUEST_WAIT_S} s; "
                          f"its own status write may land after this one")
-        lines = [] if stopped else await _build_usage_status_lines(self.conn, self.session_key)
+        lines = [] if stopped else await _build_usage_status_lines(
+            self.conn, self.session_key, run_usage=run_usage)
         async with self.conn._chat_write_lock(self.chat_id):
             try:
                 saved = await Chats.get_message_by_id_and_message_id(self.chat_id, self.message_id) or {}
@@ -9108,7 +9111,10 @@ class _TurnWriter:
             if note:
                 text = f"{text}\n\n{note}" if text else note
                 output.append(_turn_note_item(note))
-            status = await self._persist_final(output, text, stopped)
+            # The newest run written into M that reports its usage.
+            run_usage = next(filter(None, (_history_usage_for_run(hist, r) for r in reversed(self.runs))),
+                             None) if hist else None
+            status = await self._persist_final(output, text, stopped, run_usage)
             if self._introduced():
                 # ELI-230: once more, finished, for a tab that lost M and was
                 # not repaired. A tab that has M merges the same content; the

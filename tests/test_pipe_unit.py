@@ -8214,6 +8214,27 @@ class TurnWriterEndTests(_TurnWriterCase):
         self.assertEqual(self.m()["statusHistory"], [self.USAGE])
         self.assertEqual(self.owui.events("status")[-1]["data"], self.USAGE)
 
+    async def test_a_first_run_the_writer_finishes_gets_its_usage_from_the_run(self):
+        """ELI-210 on OpenClaw 2026.10: a session's row has no totals yet when
+        its first run ends (ELI-177), so a writer-finished first reply had no
+        usage line. The line comes from the run's own usage, as the inline
+        reply's does."""
+        describe = self.conn.send_request
+
+        async def send_request(method, params, timeout=10):
+            if method == "sessions.describe":
+                return {"session": {"modelProvider": "anthropic", "contextTokens": 200_000}}
+            return await describe(method, params, timeout=timeout)
+        self.conn.send_request = send_request
+        closer = next(m for m in self.history["messages"]
+                      if m.get("idempotencyKey") == f"cli-assistant:{self.RUN}")
+        closer["usage"] = {"input": 10, "cacheRead": 0, "cacheWrite": 0, "output": 5}
+        w = await self.opened_writer()
+        await w.end({"status": "done", "hasActiveRun": False, "lastRunId": self.RUN})
+        usage = {"description": "🧠 10/200k (0%)", "done": True}
+        self.assertEqual(self.m()["statusHistory"], [usage])
+        self.assertEqual(self.owui.events("status")[-1]["data"], usage)
+
     async def test_a_takeover_that_finished_drops_the_cancels_stopped_line(self):
         """ELI-210: the run went on after Send now, so the "Stopped" its
         request saved is wrong: the finished takeover reads like a normal
