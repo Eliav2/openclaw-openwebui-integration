@@ -106,6 +106,8 @@ Each row is one line: the sub-agent's spawn label (else the first sentence of it
 
 Click a sub-agent to open its drawer: a side panel, or on a phone a full-screen sheet with a **‹ Back** button. The top is a short header: the sub-agent's name, its status and its time; its model and the chat it came from (a link; for a sub-agent spawned by another sub-agent, its parent's drawer); and the first two lines of its task, with "Show all".
 
+<img src="../img/demos/status-dialog.gif" alt="The Status dialog opened from the composer, two sub-agents running in it; a click on one opens its drawer with its task and its run so far" width="800">
+
 Below the header is the sub-agent's run as a read-only chat, oldest first: what it said, every tool call as a collapsed card (tap it for the input and the output; a failed one is marked ❌, as in the chat), any message it was sent after its task, and its reply last. The cards are the same ones the chat shows for a run, drawn from the same transcript the same way. There is no composer.
 
 An in-process agent opens the same sheet: its task as the message that started it, and its result as the reply.

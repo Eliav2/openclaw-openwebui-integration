@@ -26,6 +26,8 @@ Tool calls are sent as Responses-API output items, so Open WebUI draws them with
 
 Expand a card to see the arguments the agent passed and the result it got back. Arguments are capped at 3000 characters and results at 8000, so one huge tool result cannot bury the conversation.
 
+<img src="../img/demos/tool-cards.gif" alt="Two tool cards in a reply: each spins while its command runs and turns into a finished card, then the first is opened to its command and output" width="800">
+
 <img src="../img/tool-card-expanded-light.png" alt="A tool card opened: the command it ran and its output" width="320">
 
 A call that arrives without a tool-call id still shows: it falls back to a Markdown `<details type="tool_calls">` card rather than disappearing. The status row under the message says "Thinking..." for the whole run and does not repeat each call: the cards already show what is running, and Open WebUI saves every status change by rewriting the whole chat, so one per call made long chats slow.
