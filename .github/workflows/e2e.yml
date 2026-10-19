@@ -44,11 +44,24 @@ permissions:
 
 jobs:
   e2e:
-    name: E2E (${{ inputs.lane }})
+    # One job per shard of e2e/shards.py, each on its own stack, side by side
+    # (ELI-246). tests/test_e2e_shards.py checks that this matrix is exactly
+    # those shards and that they hold every E2E test once.
+    name: E2E (${{ inputs.lane }} ${{ matrix.shard }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ["1", "2", "3", "4"]
+    env:
+      E2E_SHARD: ${{ matrix.shard }}
     steps:
       - uses: actions/checkout@v7
+
+      - name: Shard plan
+        id: plan
+        run: python3 e2e/shards.py "$E2E_SHARD" | tee -a "$GITHUB_OUTPUT"
 
       - name: Start the stack and install the integration
         uses: ./.github/actions/stack
@@ -64,6 +77,7 @@ jobs:
           echo "### E2E lane \`$LANE\`: \`$OWUI_IMAGE\`, \`openclaw@$OPENCLAW_VERSION\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: End-to-end suite
+        if: steps.plan.outputs.e2e == 'true'
         env:
           TESTS: ${{ inputs.tests }}
         run: |
@@ -71,11 +85,22 @@ jobs:
             pytest -v --junitxml="$RUNNER_TEMP/e2e-logs/junit.xml" e2e/test_e2e.py ${TESTS:+-k "$TESTS"} && rc=0 || rc=$?
           [ "$rc" -eq 0 ] || { [ -n "$TESTS" ] && [ "$rc" -eq 5 ]; }  # -k matched nothing here
 
+      - name: Cache Playwright's Chromium
+        if: steps.plan.outputs.browser == 'true'
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('requirements-browser.txt') }}
+
       - name: Install Chromium for Playwright
+        # The system libraries always (apt, not cached); the browser itself
+        # only on a cache miss, as playwright skips a build it already has.
+        if: steps.plan.outputs.browser == 'true'
         run: uv run --with-requirements requirements-browser.txt python -m playwright install --with-deps chromium
 
       - name: Browser flows (Playwright)
         # What the user sees, one test per flow (e2e/test_browser_flows.py).
+        if: steps.plan.outputs.browser == 'true'
         env:
           TESTS: ${{ inputs.tests }}
         run: |
@@ -104,6 +129,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: e2e-logs-${{ inputs.lane }}
+          name: e2e-logs-${{ inputs.lane }}-${{ matrix.shard }}
           path: ${{ runner.temp }}/e2e-logs
           retention-days: 14
