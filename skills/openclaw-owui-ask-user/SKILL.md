@@ -46,7 +46,7 @@ Which database should I use?
 
 You get back the label the user clicked, for example `SQLite`, or the text they
 typed instead. **The card tags the first option Recommended, so list your
-recommendation first.** A yes/no question (`(y/n)`) shows Yes and No and returns
+recommendation first.** A yes/no question (`(y/n)`, `(כן/לא)`, `(نعم/لا)`) shows Yes and No and returns
 `yes` or `no`.
 
 ## Several questions at once
