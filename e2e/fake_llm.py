@@ -37,7 +37,8 @@ A tool the agent does not offer directly is called through `tool_call`
 is offered: from OpenClaw 2026.10 most tools are deferred behind `tool_search`
 and only a core set is sent as real schemas.
 * `E2E_BG_EXEC`                        -> starts `sleep 25` with `exec` in the
-  background, then replies `E2E_BG_STARTED`.
+  background, then replies `E2E_BG_STARTED`. The Gateway's notice that the
+  command ended (its output `e2e-bg-done`) gets `E2E_BG_NOTICED`.
 * `E2E_BG_AGENT TOKEN`                  -> calls `Agent` (e2e/agent-tool) with
   run_in_background, which answers "Async agent launched", says
   `E2E_BG_AGENT_MID` and runs `exec` in the foreground until the file
@@ -373,6 +374,9 @@ def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
             return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
         return {"text": "E2E_HOLD_START", **call}
 
+    if "e2e-bg-done" in user_text:
+        # The run the Gateway starts when E2E_BG_EXEC's command ends (ELI-215).
+        return {"text": "E2E_BG_NOTICED"}
     if "E2E_BG_EXEC" in user_text:
         # One shell command left running in the background, for the Status
         # Action's Background section (ELI-163).

@@ -8373,6 +8373,50 @@ class AgentTurnRoutingTests(_RoutingCase):
     """ELI-100 DESIGN 2.1-2.5 wired: a run on an OWUI key that no live request
     consumes is written by a turn writer, as one ordinary message."""
 
+    async def test_a_run_with_no_settle_push_ends_on_its_own_final(self):
+        """ELI-215, OpenClaw 2026.10.5 probe: a run the Gateway starts itself
+        (a background command's end notice, heartbeat runner) gets no
+        `agent.input.settled` push: its last row is the lifecycle `phase: end`
+        one, still `hasActiveRun: true`, and the row goes idle later with no
+        push at all. Its own final ends the message."""
+        self.history = {"messages": [
+            {"role": "user", "content": "System: exec completed :: e2e-bg-done"},
+            {"role": "assistant", "idempotencyKey": f"cli-assistant:{self.RUN}",
+             "__openclaw": {"runId": self.RUN}, "content": [{"type": "text", "text": "E2E_BG_NOTICED"}]}]}
+        self.conn._on_sessions_changed({"sessionKey": self.key, "phase": "start", "runId": self.RUN,
+                                        "hasActiveRun": True, "status": "running"})
+        _turn_route_now(self.conn, self.ev(self.RUN, _delta("E2E_BG_NOTICED")))
+        _turn_route_now(self.conn, self.ev(self.RUN, {"stream": "lifecycle", "data": {"phase": "end"}}))
+        _turn_route_now(self.conn, self.ev(self.RUN, {"state": "final"}))
+        self.conn._on_sessions_changed({"sessionKey": self.key, "phase": "end", "runId": self.RUN,
+                                        "hasActiveRun": True, "status": "running", "lastRunId": self.RUN})
+        await self.spin()
+        (_mid, m), = self.new_messages().items()
+        self.assertEqual((m["content"], m["done"]), ("E2E_BG_NOTICED", True))
+        # A settle that does come later (9.3, or a chat.send run) finds it done.
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "done", "lastRunId": self.RUN})
+        await self.spin()
+        (_mid, again), = self.new_messages().items()
+        self.assertEqual((again["content"], again["done"]), ("E2E_BG_NOTICED", True))
+
+    async def test_a_run_that_ends_in_error_still_waits_for_its_row(self):
+        """Only a clean final ends the message on its own: an error's row
+        carries the note and may name a resume or a recovery (DESIGN 2.7)."""
+        self.conn._on_sessions_changed({"sessionKey": self.key, "phase": "start", "runId": self.RUN,
+                                        "hasActiveRun": True, "status": "running"})
+        _turn_route_now(self.conn, self.ev(self.RUN, _delta("partial")))
+        _turn_route_now(self.conn, self.ev(self.RUN, {"state": "error", "errorMessage": "boom"}))
+        await self.spin()
+        (_mid, m), = self.new_messages().items()
+        self.assertIs(m["done"], False)
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False, "status": "failed",
+                                        "lastRunId": self.RUN, "lastRunError": "boom"})
+        await self.spin()
+        (_mid, m), = self.new_messages().items()
+        self.assertIs(m["done"], True)
+        self.assertIn("boom", m["content"])
+
     async def test_an_agent_turn_renders_as_one_ordinary_message(self):
         handled = await self.run_turn(self.RUN)
         self.assertTrue(all(handled))
@@ -10117,6 +10161,48 @@ class SilentAnnounceTests(_RoutingCase):
                    if m.get("content") == "The sub-agent returned SUB-DONE-R10."]
         self.assertEqual(len(replies), 1)
         self.assertEqual(len(self.new_messages()), 2)
+
+    async def unsettled_announce_run(self, reply):
+        """An attempt answered aloud whose last push is `phase: end` with
+        hasActiveRun still true (2026.10.5, ELI-215): it ends on its final."""
+        self.history = self.parent_history(reply)
+        _turn_route_now(self.conn, self.ev(self.announce, _delta(reply)))
+        _turn_route_now(self.conn, self.ev(self.announce, {"state": "final"}))
+        self.conn._on_sessions_changed({"sessionKey": self.key, "phase": "end",
+                                        "runId": self.announce, "hasActiveRun": True,
+                                        "status": "running", "lastRunId": self.announce})
+        await self.spin()
+
+    async def test_a_retry_answered_aloud_with_no_settle_push_lands_once(self):
+        """ELI-215 with ELI-217: the retry that answers aloud gets no settle
+        either, so its own final ends its message, once, beside the one card."""
+        self.list_rows(self.failed_row(active=True), self.failed_row())
+        await self.failed_announce_run()
+        self.list_rows(self.failed_row(active=True), self.failed_row())
+        await self.failed_announce_run()
+        await self.unsettled_announce_run("The sub-agent returned SUB-DONE-R10.")
+        self.assertEqual(len(self.cards()), 1)
+        replies = [m for m in self.new_messages().values()
+                   if m.get("content") == "The sub-agent returned SUB-DONE-R10."]
+        self.assertEqual([m["done"] for m in replies], [True])
+        self.assertEqual(len(self.new_messages()), 2)
+        self.assertEqual(self.conn._turn_pumps, {})
+
+    async def test_a_retry_after_a_clean_final_does_not_reopen_its_message(self):
+        """A second attempt under the run id of one that already ended on its
+        final keeps the one message: done, with the first attempt's text, as
+        the settle path does on main (the message id is the run's). 10.5 never
+        retries a delivery that sent a visible reply (`hasAnnounceSendEvidence`,
+        subagent-announce-delivery-retry-BwPVtckd.mjs), so this guards a
+        Gateway change, not a path seen live."""
+        await self.unsettled_announce_run("First answer.")
+        await self.unsettled_announce_run("Second answer.")
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "done", "lastRunId": self.announce})
+        await self.spin()
+        self.assertEqual([(m["content"], m["done"]) for m in self.new_messages().values()],
+                         [("First answer.", True)])
+        self.assertEqual(self.conn._turn_pumps, {})
 
 
 class ErroredAgentRunTests(_RoutingCase):
