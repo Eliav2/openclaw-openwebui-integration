@@ -94,6 +94,7 @@ import contextlib
 import copy
 import functools
 import re
+import shlex
 import signal
 import mimetypes
 import urllib.error

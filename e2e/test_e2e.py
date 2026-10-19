@@ -1281,8 +1281,10 @@ def test_the_status_action_lists_a_background_command(token):
     assert data["error"] is None and data["errors"] == [], data
     assert data["tasksAvailable"] is True, data
     commands = [r for r in data["rows"] if r["kind"] == "Command"]
-    # Titled by the command its tool card ran, not the Gateway's "CLI command".
-    assert [(r["title"], r["status"]) for r in commands] == [("sleep 25; echo e2e-bg-done", "running")], data
+    # Titled by the title its exec call gave it, not the Gateway's "CLI
+    # command" or the command's first words (ELI-232); the command under it.
+    assert [(r["title"], r["status"], r["preview"], r["command"]) for r in commands] == [
+        ("E2E background sleep", "running", "sleep 25", "sleep 25; echo e2e-bg-done")], data
 
 
 def test_the_reply_to_a_background_commands_end_finishes(token):
