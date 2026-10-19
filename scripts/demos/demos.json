@@ -6,7 +6,7 @@
       "steps": [
         {
           "say": "Here's the entry.\n\n**Hourly forecast.** The day screen now has an hourly strip: temperature, rain chance and wind for the next 24 hours. Tap an hour to see its details.\n\n**Faster startup.** Forecasts are cached for ten minutes, so the app opens on the last forecast at once and refreshes in the background.\n\n**Fixed:** wind speed follows the unit setting again.",
-          "delay": 0.12
+          "delay": 0.09
         }
       ]
     },
@@ -15,7 +15,7 @@
       "steps": [
         {
           "say": "Here's a draft.\n\nHi all, the hourly view is ready to try on staging. The day screen now shows an hourly strip with temperature, rain chance and wind for the next 24 hours, and a tap on an hour opens its details.\n\nWhat to check: the strip on a small phone, the units setting, and the first launch with no network. Please send anything odd to the release thread by Thursday, so we can ship to the app store next week.",
-          "delay": 0.15
+          "delay": 0.1
         }
       ]
     },
@@ -215,7 +215,7 @@
         },
         {
           "do": "pause",
-          "ms": 1800
+          "ms": 1100
         }
       ]
     },
@@ -305,7 +305,7 @@
         },
         {
           "do": "pause",
-          "ms": 800
+          "ms": 400
         }
       ]
     },
@@ -392,7 +392,7 @@
         },
         {
           "do": "pause",
-          "ms": 1200
+          "ms": 800
         }
       ]
     },
@@ -426,7 +426,7 @@
         },
         {
           "do": "pause",
-          "ms": 2500
+          "ms": 1800
         }
       ]
     },

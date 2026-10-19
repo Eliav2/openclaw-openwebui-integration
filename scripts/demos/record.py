@@ -93,7 +93,7 @@ class Recorder:
 
     def __init__(self, cdp):
         self.cdp, self.on = cdp, False
-        self.frames: list = []        # (timestamp, png bytes, starts a new segment)
+        self.frames: list = []        # (timestamp, jpeg bytes, starts a new segment)
         self._new_segment = True
         self._acks: set = set()       # in flight; a task nobody holds can be collected
         cdp.on("Page.screencastFrame", self._frame)
@@ -117,7 +117,9 @@ class Recorder:
         await self.cdp.send("Page.stopScreencast")
 
     async def start(self) -> None:
-        await self.cdp.send("Page.startScreencast", {"format": "png", "maxWidth": W * 2, "maxHeight": H * 2,
+        # JPEG at high quality: at 2x, PNG frames took long enough to encode that the page ran slower.
+        await self.cdp.send("Page.startScreencast", {"format": "jpeg", "quality": 92,
+                                                     "maxWidth": W * 2, "maxHeight": H * 2,
                                                      "everyNthFrame": 1})
 
     def record(self, on: bool) -> None:
@@ -132,22 +134,29 @@ class Recorder:
             raise RuntimeError("no frames were recorded")
         lines, total = [], 0.0
         for i, (ts, png, _) in enumerate(self.frames):
-            path = os.path.join(work, f"{i:05d}.png")
+            path = os.path.join(work, f"{i:05d}.jpg")
             with open(path, "wb") as fh:
                 fh.write(png)
             nxt = self.frames[i + 1] if i + 1 < len(self.frames) else None
             dur = 0.1 if nxt is None or nxt[2] else max(nxt[0] - ts, 0.01)
             total += dur
             lines += [f"file '{path}'", f"duration {dur:.4f}"]
-        lines.append(f"file '{os.path.join(work, f'{len(self.frames) - 1:05d}.png')}'")
+        lines.append(f"file '{os.path.join(work, f'{len(self.frames) - 1:05d}.jpg')}'")
         concat = os.path.join(work, "concat.txt")
         with open(concat, "w") as fh:
             fh.write("\n".join(lines) + "\n")
         return concat, total
 
 
-def png_size(png: bytes) -> str:
-    return f"{int.from_bytes(png[16:20], 'big')}x{int.from_bytes(png[20:24], 'big')}"
+def jpeg_size(jpeg: bytes) -> str:
+    """WxH from a JPEG's frame header (SOF0/SOF2)."""
+    i = 2
+    while i + 9 < len(jpeg):
+        marker, length = jpeg[i + 1], int.from_bytes(jpeg[i + 2:i + 4], "big")
+        if marker in (0xC0, 0xC2):
+            return f"{int.from_bytes(jpeg[i + 7:i + 9], 'big')}x{int.from_bytes(jpeg[i + 5:i + 7], 'big')}"
+        i += 2 + length
+    return "?"
 
 
 def ffmpeg() -> str:
@@ -344,7 +353,7 @@ async def run_demo(browser, token: str, spec: dict, out: str, host: str) -> dict
         shutil.rmtree(work)
         return {"name": spec["name"], "path": path, "seconds": round(seconds, 1), "kb": round(size / 1024),
                 "mp4_kb": round(videos["mp4"] / 1024), "webm_kb": round(videos["webm"] / 1024),
-                "frames": len(rec.frames), "frame_px": png_size(rec.frames[-1][1]), "chat": demo.chat_id}
+                "frames": len(rec.frames), "frame_px": jpeg_size(rec.frames[-1][1]), "chat": demo.chat_id}
     except Exception:
         print(f"  frames kept in {work}", flush=True)
         await page.screenshot(path=os.path.join(work, "failed.png"))
