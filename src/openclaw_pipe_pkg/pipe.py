@@ -1450,6 +1450,10 @@ class _PipeTurn:
 
                 else:
                     # Normal completion (no cancellation).
+                    released = self.renderer.flush()
+                    if released:
+                        async for chunk in self.show_text(released):
+                            yield chunk
                     async for chunk in self.finish_held_prompt():
                         yield chunk
                     async for chunk in self.finish_held_media():

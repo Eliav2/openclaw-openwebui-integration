@@ -1119,6 +1119,20 @@ def test_a_subagent_result_the_parent_answers_with_silence_shows_as_its_card(tok
     _assert_clean(token, chat_id, msgs)
 
 
+def test_a_reply_that_opens_with_no_reply_and_answers_after_shows_the_answer_once(token):
+    """The agent says NO_REPLY, runs a tool, and answers after all (a
+    claude-cli run whose background Agent reported, live on 2026.10.5): the
+    reply showed `NO_REPLY` and the answer twice (ELI-219)."""
+    chat_id, msg = _chat_turn(token, "E2E_SENTINEL_THEN_ANSWER")
+    content = msg.get("content") or ""
+    assert "NO_REPLY" not in content, content
+    assert content.count("E2E_LATE_ANSWER SUB-51") == 1, content
+    texts = [" ".join(c.get("text", "") for c in o.get("content") or [])
+             for o in msg.get("output") or [] if o.get("type") == "message"]
+    assert not any("NO_REPLY" in t for t in texts), texts
+    assert sum(t.count("E2E_LATE_ANSWER SUB-51") for t in texts) == 1, texts
+
+
 def test_a_reply_the_agent_starts_that_errors_still_finishes(token):
     """A run started on the chat's session from outside (the Gateway's
     `agent` method, as `sessions_send` does) whose model answers nothing:
