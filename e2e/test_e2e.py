@@ -19,6 +19,7 @@ so a plain `pytest` on a laptop never tries to talk to a live instance.
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import time
@@ -1000,16 +1001,17 @@ def test_a_subagent_result_the_parent_answers_with_silence_shows_as_its_card(tok
     assert "silent helper" in call.get("arguments", ""), call
     assert "E2E_SILENT_RESULT done" in json.dumps(result.get("output")), result
     assert "NO_REPLY" not in (m.get("content") or ""), m.get("content")
-    # 2026.10.5 counts the silence as a failed delivery and retries it on a
-    # backoff (15 s, then 30 s, ...). Once a retry has happened the card is
-    # still one, and the parent's next reply lands once, in its own message.
+    # From 2026.10.5 the Gateway counts the silence as a failed delivery (the
+    # card then carries its error) and retries it on a backoff (15 s, then
+    # 30 s, ...). Once a retry has happened the card is still one, and the
+    # parent's next reply lands once, in its own message.
     child_run = call["id"].removeprefix("subagent-")
 
     def failed_deliveries() -> int:
-        with open(_gateway_stdout_log(), encoding="utf-8", errors="replace") as fh:
-            return fh.read().count(f"direct announce failed for run {child_run}")
+        return sum(line.count(child_run) > 0 and "did not produce a visible reply" in line
+                   for line in _gateway_file_log_lines())
 
-    if failed_deliveries():
+    if "couldn't generate a response" in (m.get("content") or ""):
         _until("the Gateway's retry of the delivery", lambda: failed_deliveries() >= 2,
                timeout_s=90, every_s=2)
     _, after = _chat_turn(token, "Respond with exactly: E2E_AFTER_CARD", chat_id=chat_id)
@@ -1149,12 +1151,18 @@ def _session_row(key: str) -> dict:
     return next((r for r in rows if r.get("key") == key), {})
 
 
-def _gateway_stdout_log() -> str:
-    """The e2e stack's Gateway console log, live while the suite runs:
-    start_stack.sh writes it beside the Gateway's pid file, whose path it
-    exports (E2E_GATEWAY_PID_FILE, in CI through GITHUB_ENV)."""
-    assert GATEWAY_PID_FILE, "needs the e2e stack's E2E_GATEWAY_PID_FILE"
-    return os.path.join(os.path.dirname(GATEWAY_PID_FILE), "gateway.log")
+def _gateway_file_log_lines() -> list[str]:
+    """The e2e stack Gateway's own file log, which lasts across its restarts:
+    E2E_GATEWAY_LOG where the stack sets it, else OpenClaw's default
+    /tmp/openclaw/openclaw-<date>.log (what CI collects at the end)."""
+    paths = ([os.environ["E2E_GATEWAY_LOG"]] if os.environ.get("E2E_GATEWAY_LOG")
+             else sorted(glob.glob("/tmp/openclaw/openclaw-*.log")))
+    assert paths and all(os.path.isfile(p) for p in paths), f"no Gateway file log: {paths}"
+    lines = []
+    for path in paths:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines += fh.readlines()
+    return lines
 
 
 def _until(what: str, check, timeout_s: float = WAKE_TIMEOUT_S, every_s: float = 1.0):
