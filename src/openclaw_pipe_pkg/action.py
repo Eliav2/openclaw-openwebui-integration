@@ -1205,11 +1205,20 @@ _CONTEXT_FILL_JS_TEMPLATE = r"""
   sub.textContent = DATA.provider + (DATA.model ? (' · ' + DATA.model) : '');
   section.appendChild(sub);
 
+  // A compaction the Gateway refused, in its own words (ELI-209).
+  function addNotice() {
+    if (!DATA.notice) return;
+    const notice = S.errorEl(DATA.notice);
+    notice.className += ' mt-2';
+    section.appendChild(notice);
+  }
+
   if (!DATA.context) {
     const empty = document.createElement('div');
     empty.className = 'text-gray-400 dark:text-gray-500 text-xs';
     empty.textContent = 'No context data available for this session yet.';
     section.appendChild(empty);
+    addNotice();
     return;
   }
 
@@ -1240,6 +1249,7 @@ _CONTEXT_FILL_JS_TEMPLATE = r"""
   label.textContent = DATA.context.usedTokens + ' / ' + DATA.context.totalTokens
     + ' tokens · ' + DATA.context.pct + '%';
   section.appendChild(label);
+  addNotice();
 
   if (DATA.goal) {
     const goalWrap = document.createElement('div');
@@ -2303,6 +2313,36 @@ def _spawn_task_of(messages: list) -> str | None:
     return None
 
 
+# A /compact run always ends "done": whether it compacted is only in its
+# reply, the Gateway's "⚙️ Compaction ..." line. These lead a refusal.
+_COMPACT_REFUSALS = ("Compaction failed", "Compaction unavailable")
+
+
+def _compact_reply(messages: list, idempotency_key: str) -> str | None:
+    """The text of the compact run's own reply: the assistant message that
+    carries the run's idempotency key, else the first one after the
+    `/compact` turn (whose key is the run's plus ":user")."""
+    def key_of(m):
+        meta = m.get("__openclaw") if isinstance(m.get("__openclaw"), dict) else {}
+        return m.get("idempotencyKey") or meta.get("idempotencyKey")
+
+    after_ours = None
+    for m in messages or []:
+        if key_of(m) == f"{idempotency_key}:user":
+            after_ours = True
+        elif m.get("role") == "assistant" and (key_of(m) == idempotency_key or after_ours):
+            return "\n".join(_message_text_blocks(m))
+    return None
+
+
+def _compact_refusal(reply: str | None) -> str | None:
+    """The Gateway's reason when its reply says it did not compact, without
+    the leading gear and the trailing context figures."""
+    text = (reply or "").strip().removeprefix("⚙️").strip()
+    head = text.split(" • ")[0].strip().rstrip(".")
+    return head if head.startswith(_COMPACT_REFUSALS) else None
+
+
 # How the drawer reads a sub-agent's run: the Gateway's largest page
 # (CHAT_HISTORY_MAX_ENTRIES), text blocks up to 50000 characters, and a byte
 # budget per read: the newest steps that fit, the rest behind "Show earlier
@@ -2573,7 +2613,7 @@ class Action:
                 chat_model=model if ours else None,
             )
 
-    async def _run_status(self, body: dict, __user__, __event_emitter__, *, show_loading=True):
+    async def _run_status(self, body: dict, __user__, __event_emitter__, *, show_loading=True, notice=None):
         """Opens the dialog at once with every section's title, then fills
         each section on its own the moment its own data is in (ELI-163): a
         slow or failing source shows in its section only.
@@ -2719,6 +2759,7 @@ class Action:
                 "model": session_row.get("model") or "",
                 "context": context_data,
                 "goal": goal_data,
+                "notice": notice,
                 "source": source,
                 "fetchedAt": int(time.time() * 1000),
                 "error": None,
@@ -3016,12 +3057,13 @@ class Action:
         # it's about to finish in a second.
         await __event_emitter__({"type": "execute", "data": {"code": _MODAL_COMPACTING_JS}})
 
+        idempotency_key = f"{ACTION_RUN_PREFIX}compact-{chat_id}-{time.time()}"
         try:
             compact_params = _owui_chat_send_params(
                 session_key=session_key,
                 message="/compact",
                 # ACTION_RUN_PREFIX: the turn path never gives this run a message.
-                idempotency_key=f"{ACTION_RUN_PREFIX}compact-{chat_id}-{time.time()}",
+                idempotency_key=idempotency_key,
                 owui_chat_id=chat_id,
                 owui_user_id=user_id,
             )
@@ -3070,6 +3112,19 @@ class Action:
                 "data": {"code": _render_sections_error_js(f"Compact {status}.")},
             })
             return {"status": "error", "detail": status}
+
+        # The run is done either way; its reply says whether it compacted
+        # (ELI-209). A reply that cannot be read leaves the numbers to speak.
+        try:
+            history = await conn.send_request("chat.history", dict(sessionKey=session_key, limit=10), timeout=8)
+            refusal = _compact_refusal(_compact_reply((history or {}).get("messages"), idempotency_key))
+        except Exception as ex:
+            pipe_log(f"[status-action] compact reply read failed: {ex}")
+            refusal = None
+        if refusal:
+            pipe_log(f"[status-action] compact refused: {refusal}")
+            await self._run_status(body, __user__, __event_emitter__, show_loading=False, notice=refusal)
+            return {"status": "error", "detail": refusal}
 
         pipe_log("[status-action] compact done, refreshing status")
         return await self._run_status(body, __user__, __event_emitter__, show_loading=False)

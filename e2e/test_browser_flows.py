@@ -761,6 +761,37 @@ def test_the_status_dialog_compacts_the_chat(page):
     page.keyboard.press("Escape")
 
 
+def test_a_compaction_the_gateway_refuses_shows_its_error(page):
+    """Status dialog + Compact, refused (ELI-209): the model refuses the
+    summary, so the Gateway's compaction fails and its reply says so. The
+    dialog showed "Compacting…" and then the same numbers, as if it had
+    worked. It says the compaction failed, with the Gateway's reason, and
+    keeps the numbers."""
+    if _openclaw_release() >= (2026, 10):
+        pytest.skip("OpenClaw 2026.10: the dialog has no Compact button for a session created by "
+                    "chat.send (ELI-177, as test_the_status_dialog_compacts_the_chat).")
+    nonce = f"BROWSER_COMPACT_FAIL_{os.getpid()}_{len(_fake_llm_requests())}"
+    capture.new_chat(page)
+    capture.send(page, f"E2E_ECHO: E2E_COMPACT_FAIL {nonce}")
+    _wait(page, _turn_over(nonce), "the reply")
+    _open_status(page)
+    context = "#openclaw-status-section-context"
+    numbers = f"""() => {{ const s = document.querySelector('{context}');
+      return !!s && /\\d+ \\/ 200k tokens/.test(s.innerText); }}"""
+    _wait(page, f"() => ({numbers})() && !!document.querySelector('{context} button')",
+          "the context numbers and the Compact button", 60_000)
+    page.locator(f"{context} button", has_text="Compact").click()
+    _wait(page, f"""() => (window.__dialog || []).some(t => t.includes('Compacting'))
+                     && !document.body.innerText.includes('Compacting…') && ({numbers})()""",
+          "Compacting…, then the dialog back")
+    refused = [r for r in _fake_llm_requests()
+               if r["reply"].get("http_error") and nonce in json.dumps(r["request"])]
+    assert refused, "precondition: the model never refused this chat's summary request"
+    shown = page.locator(context).inner_text()
+    assert "Compaction failed" in shown, f"the dialog shows no failure after a refused compaction: {shown!r}"
+    page.keyboard.press("Escape")
+
+
 def test_the_subagent_drawer_follows_a_running_child_to_its_end(page):
     """Sub-agent drawer: the Status dialog lists the running sub-agent;
     its row opens the drawer, which shows it running and then, with nothing
