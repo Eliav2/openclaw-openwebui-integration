@@ -1052,7 +1052,7 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
   header.style.flexShrink = '0';
   const title = document.createElement('div');
   title.className = 'text-sm font-semibold';
-  title.textContent = 'OpenClaw Status';
+  title.textContent = 'Claw';
   header.appendChild(title);
   const headerEnd = document.createElement('div');
   headerEnd.className = 'flex items-center gap-3';
@@ -1205,11 +1205,20 @@ _CONTEXT_FILL_JS_TEMPLATE = r"""
   sub.textContent = DATA.provider + (DATA.model ? (' · ' + DATA.model) : '');
   section.appendChild(sub);
 
+  // A compaction the Gateway refused, in its own words (ELI-209).
+  function addNotice() {
+    if (!DATA.notice) return;
+    const notice = S.errorEl(DATA.notice);
+    notice.className += ' mt-2';
+    section.appendChild(notice);
+  }
+
   if (!DATA.context) {
     const empty = document.createElement('div');
     empty.className = 'text-gray-400 dark:text-gray-500 text-xs';
     empty.textContent = 'No context data available for this session yet.';
     section.appendChild(empty);
+    addNotice();
     return;
   }
 
@@ -1240,6 +1249,7 @@ _CONTEXT_FILL_JS_TEMPLATE = r"""
   label.textContent = DATA.context.usedTokens + ' / ' + DATA.context.totalTokens
     + ' tokens · ' + DATA.context.pct + '%';
   section.appendChild(label);
+  addNotice();
 
   if (DATA.goal) {
     const goalWrap = document.createElement('div');
@@ -2303,6 +2313,36 @@ def _spawn_task_of(messages: list) -> str | None:
     return None
 
 
+# A /compact run always ends "done": whether it compacted is only in its
+# reply, the Gateway's "⚙️ Compaction ..." line. These lead a refusal.
+_COMPACT_REFUSALS = ("Compaction failed", "Compaction unavailable")
+
+
+def _compact_reply(messages: list, idempotency_key: str) -> str | None:
+    """The text of the compact run's own reply: the assistant message that
+    carries the run's idempotency key, else the first one after the
+    `/compact` turn (whose key is the run's plus ":user")."""
+    def key_of(m):
+        meta = m.get("__openclaw") if isinstance(m.get("__openclaw"), dict) else {}
+        return m.get("idempotencyKey") or meta.get("idempotencyKey")
+
+    after_ours = None
+    for m in messages or []:
+        if key_of(m) == f"{idempotency_key}:user":
+            after_ours = True
+        elif m.get("role") == "assistant" and (key_of(m) == idempotency_key or after_ours):
+            return "\n".join(_message_text_blocks(m))
+    return None
+
+
+def _compact_refusal(reply: str | None) -> str | None:
+    """The Gateway's reason when its reply says it did not compact, without
+    the leading gear and the trailing context figures."""
+    text = (reply or "").strip().removeprefix("⚙️").strip()
+    head = text.split(" • ")[0].strip().rstrip(".")
+    return head if head.startswith(_COMPACT_REFUSALS) else None
+
+
 # How the drawer reads a sub-agent's run: the Gateway's largest page
 # (CHAT_HISTORY_MAX_ENTRIES), text blocks up to 50000 characters, and a byte
 # budget per read: the newest steps that fit, the rest behind "Show earlier
@@ -2414,6 +2454,28 @@ async def _drawer_parent(conn, session_row: dict, user_id) -> dict | None:
     return {"title": (row.get("label") or row.get("displayName") or "").strip() or key, "childKey": key}
 
 
+async def _previewed_task(conn, child_key: str) -> str | None:
+    """The child's task out of `sessions.preview`, which keeps the spawn
+    message as the model got it. 2026.10.5's `chat.history` shows the bare
+    task with nothing that marks it as the spawn (its display projection
+    strips the envelope), so the history read alone does not find it."""
+    try:
+        resp = await conn.send_request("sessions.preview", dict(keys=[child_key], limit=20, maxChars=2000),
+                                       timeout=5)
+    except Exception as ex:
+        pipe_log(f"[status-action] sessions.preview (drawer task) failed: {ex}")
+        return None
+    return _subagent_task_texts(resp).get(child_key)
+
+
+def _without_bare_task(items: list, task: str | None) -> list:
+    """The drawer's items without a first user turn that is the task the
+    header shows: the spawn message as 2026.10.5's history shows it."""
+    if task and items and items[0].get("kind") == "user" and items[0].get("text", "").strip() == task.strip():
+        return items[1:]
+    return items
+
+
 async def _latest_preview(conn, child_key: str) -> str | None:
     """A running child's newest message as the session list previews it:
     what a claude-cli child has said so far, while its transcript is still
@@ -2427,6 +2489,23 @@ async def _latest_preview(conn, child_key: str) -> str | None:
     row = next((r for r in (resp or {}).get("sessions") or [] if r.get("key") == child_key), {})
     preview = row.get("lastMessagePreview")
     return preview if isinstance(preview, str) and preview.strip() and not _is_spawn_message(preview) else None
+
+
+# The toolbar button's icon, the composer chip's paw (ELI-202); without one
+# Open WebUI draws its default sparkle. A fixed gray stroke on purpose: Open
+# WebUI draws it as an <img>, so currentColor never resolves, and inverts it
+# 80% in dark mode; this gray stays a mid gray in both, like its own icons.
+ICON_URL = (
+    "data:image/svg+xml;charset=utf-8,"
+    "%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%20fill='none'%20"
+    "stroke='%236b7280'%20stroke-width='1.6'%20stroke-linecap='round'%20stroke-linejoin='round'"
+    "%3E%3Cpath%20d='M11%206a1.5%202%200%201%201-3%200%201.5%202%200%200%201%203%200ZM16%206a"
+    "1.5%202%200%201%201-3%200%201.5%202%200%200%201%203%200ZM7%2010.5a1.5%201.75%200%201%201"
+    "-3%200%201.5%201.75%200%200%201%203%200ZM20%2010.5a1.5%201.75%200%201%201-3%200%201.5%20"
+    "1.75%200%200%201%203%200ZM12%2012.75c-2.25%200-5.25%202.6-5.25%204.875%200%201.45%201.1"
+    "%202.375%202.55%202.375.95%200%201.7-.45%202.7-.45s1.75.45%202.7.45c1.45%200%202.55-.925"
+    "%202.55-2.375%200-2.275-3-4.875-5.25-4.875Z'/%3E%3C/svg%3E"
+)
 
 
 class Action:
@@ -2472,6 +2551,7 @@ class Action:
 
     def __init__(self):
         self.valves = self.Valves()
+        self.icon_url = ICON_URL
 
     async def action(self, body: dict, __user__=None, __event_emitter__=None):
         """Dispatches on body["mode"]: the default ("status", or absent --
@@ -2533,7 +2613,7 @@ class Action:
                 chat_model=model if ours else None,
             )
 
-    async def _run_status(self, body: dict, __user__, __event_emitter__, *, show_loading=True):
+    async def _run_status(self, body: dict, __user__, __event_emitter__, *, show_loading=True, notice=None):
         """Opens the dialog at once with every section's title, then fills
         each section on its own the moment its own data is in (ELI-163): a
         slow or failing source shows in its section only.
@@ -2679,6 +2759,7 @@ class Action:
                 "model": session_row.get("model") or "",
                 "context": context_data,
                 "goal": goal_data,
+                "notice": notice,
                 "source": source,
                 "fetchedAt": int(time.time() * 1000),
                 "error": None,
@@ -2976,12 +3057,13 @@ class Action:
         # it's about to finish in a second.
         await __event_emitter__({"type": "execute", "data": {"code": _MODAL_COMPACTING_JS}})
 
+        idempotency_key = f"{ACTION_RUN_PREFIX}compact-{chat_id}-{time.time()}"
         try:
             compact_params = _owui_chat_send_params(
                 session_key=session_key,
                 message="/compact",
                 # ACTION_RUN_PREFIX: the turn path never gives this run a message.
-                idempotency_key=f"{ACTION_RUN_PREFIX}compact-{chat_id}-{time.time()}",
+                idempotency_key=idempotency_key,
                 owui_chat_id=chat_id,
                 owui_user_id=user_id,
             )
@@ -3030,6 +3112,19 @@ class Action:
                 "data": {"code": _render_sections_error_js(f"Compact {status}.")},
             })
             return {"status": "error", "detail": status}
+
+        # The run is done either way; its reply says whether it compacted
+        # (ELI-209). A reply that cannot be read leaves the numbers to speak.
+        try:
+            history = await conn.send_request("chat.history", dict(sessionKey=session_key, limit=10), timeout=8)
+            refusal = _compact_refusal(_compact_reply((history or {}).get("messages"), idempotency_key))
+        except Exception as ex:
+            pipe_log(f"[status-action] compact reply read failed: {ex}")
+            refusal = None
+        if refusal:
+            pipe_log(f"[status-action] compact refused: {refusal}")
+            await self._run_status(body, __user__, __event_emitter__, show_loading=False, notice=refusal)
+            return {"status": "error", "detail": refusal}
 
         pipe_log("[status-action] compact done, refreshing status")
         return await self._run_status(body, __user__, __event_emitter__, show_loading=False)
@@ -3108,9 +3203,11 @@ class Action:
             return {"status": "error", "detail": "sub-agent not found"}
 
         parent = session_row.get("spawnedBy") or session_row.get("parentSessionKey")
-        task = _subagent_row({"key": child_key, **session_row},
-                             _spawn_task_of(messages) or _subagent_tasks(parent).get(child_key))
-        items, dropped = _cap_run_items(_drawer_run_items(messages), budget)
+        task_text = _spawn_task_of(messages) or _subagent_tasks(parent).get(child_key)
+        if task_text is None:
+            task_text = await _previewed_task(conn, child_key)
+        task = _subagent_row({"key": child_key, **session_row}, task_text)
+        items, dropped = _cap_run_items(_without_bare_task(_drawer_run_items(messages), task_text), budget)
         claude_cli = (session_row.get("agentRuntime") or {}).get("id") == "claude-cli"
         note = latest = None
         if claude_cli and task["status"] in _LIVE_SUBAGENT_STATUSES:

@@ -80,6 +80,7 @@ https://github.com/Eliav2/openclaw-openwebui-integration
 # --- _prelude --------------------------------------------------------------
 
 import asyncio
+import errno
 import json
 import html
 import os
@@ -575,6 +576,10 @@ async def _claim_turn_message_now(chat_id: str, user_id: str, message_id: str, r
     from sqlalchemy.orm.attributes import flag_modified
 
     async with Chats._chat_transaction(chat_id) as (db, chat):
+        if chat is None:
+            # Deleted in Open WebUI while its session lives on (ELI-218).
+            return {"claimed": False, "how": "gone", "message_id": message_id,
+                    "parent": None, "messages": {}}
         data = chat.chat or {}
         history = data.get("history") or {"messages": {}, "currentId": None}
         msgs = history.setdefault("messages", {})
@@ -748,26 +753,57 @@ def run_message_id(session_key: str, chat_id: str, run_id: str, messages: list |
 # (session-accessor-CX17Bx59.mjs:3343-3347), so only the first wake into a
 # session ever gets one: never end or rebuild a wake from it.
 
+#
+# OpenClaw 2026.10.2+ records the wake's turn differently: no header in the
+# text but the cron provenance ({kind: internal_system, sourceTool: cron,
+# jobId, sourcePromptPrefix}), returned by `chat.history` as role "assistant"
+# (`_is_forwarded_turn`). Such a wake runs under its own run id and closes with
+# its own `cli-assistant:<runId>` (2026.10.3 and 10.5 fixtures), so it is an
+# ordinary agent turn: `shared_run` False, and no sessionId event binds it.
+
 _CRON_PROMPT_RE = re.compile(r"^\[cron:(?P<job>[^\s\]]+)[\s\]]")
 
 
+def _cron_turn_job(m: dict) -> str | None:
+    """The cron job a wake turn names: its provenance's (10.2+), else its
+    prompt's header (9.3, no provenance). None for any other turn."""
+    prov = m.get("provenance") if isinstance(m.get("provenance"), dict) else None
+    if prov:
+        if (prov.get("kind"), prov.get("sourceTool")) != ("internal_system", "cron"):
+            return None
+        hit = _CRON_PROMPT_RE.match(str(prov.get("sourcePromptPrefix") or ""))
+        return prov.get("jobId") or (hit.group("job") if hit else None)
+    hit = _CRON_PROMPT_RE.match(((_history_item(m) or {}).get("text") or "").lstrip())
+    return hit.group("job") if hit else None
+
+
 def wake_turns(messages: list) -> list:
-    """[{key, at, job}] of the cron wake user turns, in transcript order: `key`
-    is the turn id (its `:user` key without the suffix), `at` its commit time
-    (`recordTimestampMs`), `job` the cron job id from its prompt."""
+    """[{key, at, job, shared_run}] of the cron wake turns, in transcript
+    order: `key` is the turn id (its `:user` key without the suffix), `at` its
+    commit time (`recordTimestampMs`), `job` the cron job id, `shared_run`
+    True when the wake runs under the session's id (9.3, ELI-103). Reads
+    `chat.history` as returned or with its roles restored (`_transcript_roles`)."""
     out = []
     for m in messages or []:
-        key = _history_user_run_id(m)
-        if not key or parse_pipe_run_id(key) or m.get("provenance"):
+        if not isinstance(m, dict):
             continue
-        hit = _CRON_PROMPT_RE.match(((_history_item(m) or {}).get("text") or "").lstrip())
-        if not hit:
+        key = _history_user_run_id({**m, "role": "user"} if _is_forwarded_turn(m) else m)
+        if not key or parse_pipe_run_id(key):
+            continue
+        job = _cron_turn_job(m)
+        if not job:
             continue
         meta = m.get("__openclaw") if isinstance(m.get("__openclaw"), dict) else {}
         at = meta.get("recordTimestampMs") or m.get("timestamp")
         out.append({"key": key, "at": at if isinstance(at, (int, float)) else None,
-                    "job": hit.group("job")})
+                    "job": job, "shared_run": not m.get("provenance")})
     return out
+
+
+def _shared_wake_turns(messages: list) -> list:
+    """The wake turns whose wake runs under the session's id: the only ones a
+    sessionId event can belong to."""
+    return [w for w in wake_turns(messages) if w["shared_run"]]
 
 
 def wake_turn_at(messages: list, at_ms: float, bound=frozenset()) -> dict | None:
@@ -776,7 +812,7 @@ def wake_turn_at(messages: list, at_ms: float, bound=frozenset()) -> dict | None
     (`bound`). None while it is not committed yet (the embedded runtime writes
     the user turn without awaiting it, embedded-agent-DNQn_PMM.mjs:5891): the
     caller tries again on the wake's next event."""
-    for turn in reversed(wake_turns(messages)):
+    for turn in reversed(_shared_wake_turns(messages)):
         if turn["at"] is not None and turn["at"] <= at_ms:
             return None if turn["key"] in bound else turn
     return None
@@ -788,7 +824,7 @@ def wake_turn_of_run(messages: list, job: str, start_ms: float, bound=frozenset(
     while it is not committed yet: the embedded runtime writes it after the
     run's first events, so a turn is not looked for before the event (as
     `wake_turn_at` must, knowing no run)."""
-    for turn in reversed(wake_turns(messages)):
+    for turn in reversed(_shared_wake_turns(messages)):
         if turn["job"] == job and turn["at"] is not None and turn["at"] >= start_ms:
             return None if turn["key"] in bound else turn
     return None
@@ -1774,7 +1810,7 @@ def _dialog_safe_event_call(event_call, sid, user_id):
 # reply that is streaming into the same tab.
 # ---------------------------------------------------------------------------
 
-_COMPOSER_BUTTON_VERSION = "5"
+_COMPOSER_BUTTON_VERSION = "6"
 
 # The Status Action's function id (install_action.py's FUNCTION_ID; the
 # dialog's own JS calls the same fixed id) and the Pipe's default function id.
@@ -1814,7 +1850,8 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
   // removing it (a layout this snippet does not understand): give up.
   const LOOP_LIMIT = 20;
   const LOOP_WINDOW_MS = 10000;
-  const SPARK_PATH = 'M9.813 15.904 9 18.75l-.813-2.846a4.5 4.5 0 0 0-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 0 0 3.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 0 0 3.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 0 0-3.09 3.09ZM18.259 8.715 18 9.75l-.259-1.035a3.375 3.375 0 0 0-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 0 0 2.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 0 0 2.456 2.456L21.75 6l-1.035.259a3.375 3.375 0 0 0-2.456 2.456ZM16.894 20.567 16.5 21.75l-.394-1.183a2.25 2.25 0 0 0-1.423-1.423L13.5 18.75l1.183-.394a2.25 2.25 0 0 0 1.423-1.423l.394-1.183.394 1.183a2.25 2.25 0 0 0 1.423 1.423l1.183.394-1.183.394a2.25 2.25 0 0 0-1.423 1.423Z';
+  // A paw, drawn in Heroicons' outline style (24x24, round caps), for "Claw".
+  const PAW_PATH = 'M11 6a1.5 2 0 1 1-3 0 1.5 2 0 0 1 3 0ZM16 6a1.5 2 0 1 1-3 0 1.5 2 0 0 1 3 0ZM7 10.5a1.5 1.75 0 1 1-3 0 1.5 1.75 0 0 1 3 0ZM20 10.5a1.5 1.75 0 1 1-3 0 1.5 1.75 0 0 1 3 0ZM12 12.75c-2.25 0-5.25 2.6-5.25 4.875 0 1.45 1.1 2.375 2.55 2.375.95 0 1.7-.45 2.7-.45s1.75.45 2.7.45c1.45 0 2.55-.925 2.55-2.375 0-2.275-3-4.875-5.25-4.875Z';
 
   const state = {
     prefixes: [],
@@ -2063,7 +2100,9 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
     const b = document.createElement('button');
     b.type = 'button';
     b.id = BTN_ID;
-    b.title = 'OpenClaw status';
+    // Shown as "Claw" (ELI-202); the aria-label keeps its old name, which the
+    // page scripts and the tests find the button by.
+    b.title = 'Claw';
     b.setAttribute('aria-label', 'OpenClaw status');
     b.dataset.openclawVersion = CFG.version;
     b.className = 'p-[0.375rem] flex gap-1 items-center text-sm rounded-full '
@@ -2071,11 +2110,11 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
       + 'bg-transparent text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800';
     b.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" '
       + 'stroke-width="1.75" stroke="currentColor" aria-hidden="true" class="size-4">'
-      + '<path stroke-linecap="round" stroke-linejoin="round" d="' + SPARK_PATH + '"/></svg>'
+      + '<path stroke-linecap="round" stroke-linejoin="round" d="' + PAW_PATH + '"/></svg>'
       // Icon-only below `sm`, like Open WebUI's own composer chips: at phone
       // width the chip row's overflow cut the label to "Stat" (ELI-123). The
       // title and aria-label still name it. Both classes ship in Open WebUI's CSS.
-      + '<span class="pr-0.5 hidden sm:inline">Status</span>';
+      + '<span class="pr-0.5 hidden sm:inline">Claw</span>';
     b.addEventListener('click', function (e) {
       e.preventDefault();
       e.stopPropagation();
@@ -2408,6 +2447,8 @@ class _ComposerWatcher:
 
     async def tick(self, now=None):
         if not self.enabled():
+            for key in self._pairs:
+                _chat_tab_left(*key)
             self._pairs.clear()
             return 0
         now = time.monotonic() if now is None else now
@@ -2432,6 +2473,7 @@ class _ComposerWatcher:
                     due.append((key, user_id))
         for key in [k for k in self._pairs if k not in live]:
             del self._pairs[key]
+            _chat_tab_left(*key)
         if not due:
             return 0
 
@@ -2447,6 +2489,8 @@ class _ComposerWatcher:
                 result = "retry"
             if result == "acked":
                 pushed += 1
+                # The tab shows the chat: an ask_user card can go there (askuser.py).
+                _chat_tab_ready(sid, chat_id)
             if st is None:
                 continue
             if result == "held":
@@ -2490,6 +2534,7 @@ class _ComposerWatcher:
         return "acked" if acked else "retry"
 
     async def run(self):
+        _CHAT_TABS_TRACKED[0] = True
         last_error = None
         next_liveness = 0.0
         state = "unknown"
@@ -2501,6 +2546,7 @@ class _ComposerWatcher:
                     state = await self.function_state()
                     if state == "gone":
                         pipe_log("[composer] Pipe function deleted; watcher stops")
+                        _CHAT_TABS_TRACKED[0] = False
                         return
                 if state != "inactive":
                     await self.tick()
@@ -2808,6 +2854,14 @@ SECRET_NOT_RECEIVED_FOR_AGENT = (
     "what the user types. Use masked credential entry, or ask again when the user "
     "has this chat open."
 )
+# What the agent gets when the user cancels the secret's dialog (ELI-189),
+# and what the Ask User block shows for it.
+SECRET_CANCELLED_FOR_AGENT = (
+    "[Open WebUI] Cancelled: the user closed the masked dialog for the secret you "
+    "asked for without entering it, so nothing was received. Do not ask for it in "
+    "the chat, which stores what the user types."
+)
+SECRET_CANCELLED_SHOWN = "Cancelled (nothing entered)"
 
 _MULTI_MARKERS = (
     "(multiselect)", "(multi-select)", "(multi)", "[multiselect]", "[multi]",
@@ -2840,12 +2894,6 @@ def _parse_text_prompt(prompt_text: str) -> dict:
         title = title or "OpenClaw needs input"
         message = message or "Please answer so the run can continue."
 
-    # Kept specific on purpose: a bare "key" matches innocent words ("monkey").
-    secret = any(
-        marker in text_lower
-        for marker in ("secret", "password", "may show your reply", "api key", "token")
-    )
-
     # Yes/no only when the prompt clearly reads as binary: a free-text question
     # turned into yes/no loses the real answer. A numbered list is a choice.
     has_options = bool(re.search(r"(?m)^\s*\d+[.)]\s", prompt_text))
@@ -2855,9 +2903,21 @@ def _parse_text_prompt(prompt_text: str) -> dict:
         "delete", "remove", "בטוח", "האם", "هل تريد",
     )
     ends_question = message.rstrip().endswith("?") or title.rstrip().endswith("?")
+    # A secret unless it is clearly a choice (an explicit yes/no marker, or two
+    # or more numbered options) and nothing asks for the value itself: a
+    # choice that merely mentions a password keeps its answers (ELI-196), but
+    # a key typed into the card's Other field would land in the chat. Kept
+    # specific on purpose: a bare "key" matches innocent words ("monkey").
+    mentions_secret = any(
+        marker in text_lower for marker in ("secret", "password", "api key", "token"))
+    asks_for_value = "may show your reply" in text_lower or bool(re.search(
+        r"\b(enter|paste|provide|type|send|give|share|input)\b[^.?!\n]{0,40}?"
+        r"(secret|password|api key|token)", text_lower))
+    yes_no = any(m in text_lower for m in yn_markers)
+    is_choice = yes_no or len(_extract_numbered_options(prompt_text)) >= 2
+    secret = asks_for_value or (mentions_secret and not is_choice)
     confirm = not secret and not has_options and (
-        any(m in text_lower for m in yn_markers)
-        or (any(w in text_lower for w in confirm_verbs) and ends_question)
+        yes_no or (any(w in text_lower for w in confirm_verbs) and ends_question)
     )
     options = [] if secret or confirm else _dedupe_options(
         [label for _, label in _extract_numbered_options(prompt_text)])
@@ -3062,12 +3122,19 @@ def _map_multi_answer(text: str, choices: list[str]) -> str:
     answer as typed.
     """
     text = (text or "").strip()
+    picked = _picked_choices(text, choices)
+    return ", ".join(picked) if picked else text
+
+
+def _picked_choices(text: str, choices: list[str]) -> list[str] | None:
+    """The options a typed multi-select answer names, in order (see
+    _map_multi_answer); None when it does not name options only."""
     by_name = {}
     for choice in choices:
         by_name.setdefault(choice.lower(), choice)
         by_name.setdefault(_split_option_description(choice)[0].lower(), choice)
     picked = []
-    for part in re.split(r"[,;،]", text):
+    for part in re.split(r"[,;،]", (text or "").strip()):
         part = part.strip()
         if not part:
             continue
@@ -3076,12 +3143,12 @@ def _map_multi_answer(text: str, choices: list[str]) -> str:
         elif re.fullmatch(r"\d+(\s+\d+)*", part):
             numbers = [int(n) for n in part.split()]
             if not all(1 <= n <= len(choices) for n in numbers):
-                return text
+                return None
             names = [choices[n - 1] for n in numbers]
         else:
-            return text
+            return None
         picked += [name for name in names if name not in picked]
-    return ", ".join(picked) if picked else text
+    return picked or None
 
 
 def _format_native_answers(questions: list[dict], answers: dict) -> str:
@@ -3247,6 +3314,11 @@ async def _ask_user_secret(
         )
     except asyncio.TimeoutError:
         response = {"error": f"no answer in {timeout_s:g} s"}
+    if response is False:
+        # The dialog's Cancel (EventConfirmDialog resolves it with False),
+        # not a "no": the agent hears that the user cancelled.
+        pipe_log("  secret dialog cancelled by the user")
+        return SECRET_CANCELLED_FOR_AGENT
     answer = _normalize_event_call_response(response)
     if not answer:
         pipe_log(f"  secret dialog not answered ({_unanswered(response)}); the question ends the reply as text")
@@ -3270,7 +3342,9 @@ def _ask_user_detail_block(prompt_text: str, answer: str) -> str:
         # The agent was told nothing came: the reply shows the question as
         # not received, as an unanswered secret ends any reply.
         return "\n" + _secret_not_received_text(prompt_text) + "\n"
-    if _is_secret_prompt(prompt_text):
+    if SECRET_CANCELLED_FOR_AGENT in answer:
+        answer = SECRET_CANCELLED_SHOWN
+    elif _is_secret_prompt(prompt_text):
         # The block is written into the chat, so into Open WebUI's database.
         answer = SECRET_ANSWER_SHOWN
     if json_questions:
@@ -3449,20 +3523,26 @@ async def _ask_user_input_modal(
 # never yielded, emitted, persisted or logged, so the chat, the database, the
 # transcript and the model only ever see the request and "stored".
 #
-# A stored secret is usable by the agent's runs only from OpenClaw 2026.10
-# (ELI-97), so an older Gateway's request is left to the Control UI, as before.
+# It is asked whenever the Gateway offers that question protocol (hello-ok
+# features), whatever its version. Whether a run can then use the stored value
+# is the Gateway's config (secrets.egressProxy), the same on every release line
+# (ELI-97); the dialog only replaces the Control UI as the place to type it.
 
-SECRET_REQUESTS_FROM = (2026, 10, 10)
+SECRET_REQUEST_METHODS = ("question.resolve",)
+SECRET_REQUEST_EVENTS = ("question.requested", "question.resolved")
 # question id -> the task asking for it
 _SECRET_REQUESTS: dict = {}
-# session key -> the reply streaming its run, which asks on its own socket
+# session key -> the reply streaming its run, which asks the run's Gateway
+# questions (secret requests, the ask_user tool's) on its own socket
 _SECRET_ASKERS: dict = {}
 
 
-def _gateway_release(version) -> tuple:
-    """(year, month, patch) of a Gateway version like "2026.10.10-beta.1"."""
-    m = re.match(r"(\d+)\.(\d+)\.(\d+)", str(version or ""))
-    return tuple(int(n) for n in m.groups()) if m else (0, 0, 0)
+def _secret_requests_offered(conn) -> bool:
+    """The Gateway offers what a secret request needs: its question events
+    and `question.resolve` (hello-ok features)."""
+    methods = getattr(conn, "gateway_methods", None) or ()
+    events = getattr(conn, "gateway_events", None) or ()
+    return all(m in methods for m in SECRET_REQUEST_METHODS) and all(e in events for e in SECRET_REQUEST_EVENTS)
 
 
 def _secret_request_question(record) -> dict | None:
@@ -3504,11 +3584,12 @@ def _secret_asker_leave(turn) -> None:
 
 def secret_request_seen(conn, record) -> bool:
     """`question.requested`: ask a secret request made in an Open WebUI chat.
-    False for anything else, or on a Gateway whose runs cannot use it."""
+    False for anything else, or on a Gateway that does not offer the question
+    protocol it needs."""
     question = _secret_request_question(record)
     if question is None or record.get("status", "pending") != "pending" or not record.get("id"):
         return False
-    if _gateway_release(conn.gateway_version) < SECRET_REQUESTS_FROM:
+    if not _secret_requests_offered(conn):
         return False
     parsed = conn.parse_owui_session_key(record.get("sessionKey") or "")
     if not parsed or record["id"] in _SECRET_REQUESTS:
@@ -3578,6 +3659,306 @@ async def _answer_secret_request(conn, record: dict, question: dict, user_id: st
             pass
 
 
+# ---------------------------------------------------------------------------
+# The agent's ask_user tool (ELI-216)
+# ---------------------------------------------------------------------------
+# OpenClaw's `ask_user` tool registers a Gateway question as the secret
+# request does: `question.requested` with up to three questions, each
+# {questionId, header, question, options: [{label, description?}],
+# multiSelect?, isOther: true}, and waits on `question.waitAnswer` for
+# `question.resolve {id, answers: {answers: {questionId: [values]}}}`
+# (2026.10.5 dist: ask-user-tool-*.mjs, ask-user-tool-normalization-*.mjs;
+# 2026.9.3 the same calls in openclaw-tools-*.mjs). A Gateway client chat
+# gets no prompt of its own: unanswered, the run waited out the tool's
+# timeout (15 minutes by default) on "Thinking".
+#
+# It is asked in Open WebUI's question card, on the newest tab that has
+# loaded the chat (else the reply's own socket while it shows the chat). A
+# question asked with no such tab stays pending: the card shows once a tab
+# opens the chat, and moves to a newer one (a reload, a phone back from
+# sleep). The card gets no timeout of its own: Open WebUI answers its timeout
+# as it answers Cancel. So the question ends only on the card's Cancel, an
+# answer here or elsewhere (the Control UI), or the Gateway's own timeout.
+#
+# "Loaded the chat" is the composer watcher's ack (composer_watch.py): a tab
+# acks an `execute` only once it shows the chat, and cancels a card at once
+# while it does not, which must not read as the user's Cancel.
+
+# question id -> the task asking it
+_AGENT_QUESTIONS: dict = {}
+
+
+def _agent_question_payload(record, timeout_ms: int | None) -> dict | None:
+    """Open WebUI's question card for an ask_user question record, or None
+    for anything else (a secret, no questions). `timeout_ms` None: the card
+    has no countdown of its own."""
+    questions = record.get("questions") if isinstance(record, dict) else None
+    if not isinstance(questions, list) or not questions:
+        return None
+    card = []
+    for index, raw in enumerate(questions):
+        if not isinstance(raw, dict) or raw.get("isSecret") or raw.get("secretStore"):
+            return None
+        qid, text = str(raw.get("questionId") or ""), str(raw.get("question") or "").strip()
+        if not qid or not text:
+            return None
+        options = [{"label": str(o.get("label") or "").strip(),
+                    "description": str(o.get("description") or "").strip()}
+                   for o in raw.get("options") or [] if isinstance(o, dict) and o.get("label")]
+        question = {
+            "id": qid,
+            "header": str(raw.get("header") or "").strip() or f"Question {index + 1}",
+            "question": text,
+            "options": options,
+            "allow_other": not options or raw.get("isOther") is not False,
+        }
+        if raw.get("multiSelect") and options:
+            # The card picks one option, so the options are listed by
+            # number and the picks typed, as for a needs-input multi-select.
+            listed = " · ".join(f"{n}. {o['label']}" for n, o in enumerate(options, 1))
+            question.update(question=f"{text} {listed}. Type the numbers you pick, like 1, 3",
+                            options=[], allow_other=True)
+            question[_MULTI_CHOICES_KEY] = [o["label"] for o in options]
+        card.append(question)
+    return {"type": "request:user_input",
+            "data": {"questions": card, "allow_other": True, "timeout_ms": timeout_ms}}
+
+
+def _agent_question_answers(questions: list[dict], answers) -> dict:
+    """The card's {question id: answer} as question.resolve's
+    {questionId: [values]}: the option's label as the agent wrote it, the
+    typed text, or a multi-select question's picked options."""
+    out = {}
+    for question in questions:
+        answer = answers.get(question["id"]) if isinstance(answers, dict) else None
+        if not isinstance(answer, dict):
+            continue
+        key = "text" if answer.get("type") == "other" else "label"
+        text = str(answer.get(key) or "").strip()
+        if not text:
+            continue
+        choices = question.get(_MULTI_CHOICES_KEY)
+        out[question["id"]] = (_picked_choices(text, choices) or [text]) if choices else [text]
+    return out
+
+
+def agent_question_seen(conn, record) -> bool:
+    """`question.requested`: ask an ask_user question made in an Open WebUI
+    chat. False for anything else."""
+    if not isinstance(record, dict) or record.get("status", "pending") != "pending" \
+            or not record.get("id") or record["id"] in _AGENT_QUESTIONS:
+        return False
+    if _agent_question_payload(record, None) is None:
+        return False
+    parsed = conn.parse_owui_session_key(record.get("sessionKey") or "")
+    if not parsed:
+        return False
+    _AGENT_QUESTIONS[record["id"]] = spawn_background(_answer_agent_question(conn, record, *parsed))
+    return True
+
+
+def _open_writer_message_id(conn, chat_id: str, session_key: str) -> str | None:
+    """The reply a turn writer streams the session's run into, for a run no
+    inline reply streams (one the agent started)."""
+    for writer in list(getattr(conn, "_turn_writers", {}).values()):
+        if writer.chat_id == chat_id and writer.session_key == session_key and not writer.closed:
+            return writer.message_id
+    return None
+
+
+# chat id -> the sockets that have loaded the chat, oldest first
+_READY_CHAT_TABS: dict = {}
+# chat id -> events set when one more socket has loaded it
+_CHAT_TAB_WAITERS: dict = {}
+# Whether the composer watcher feeds _READY_CHAT_TABS (on by default).
+_CHAT_TABS_TRACKED = [False]
+# Without the watcher, how often a question with no tab looks for one.
+_UNTRACKED_TAB_POLL_S = 5.0
+
+
+def _chat_tab_ready(sid, chat_id) -> None:
+    """The composer watcher: socket `sid` shows chat `chat_id` loaded."""
+    tabs = _READY_CHAT_TABS.setdefault(chat_id, [])
+    if sid in tabs:
+        tabs.remove(sid)
+    tabs.append(sid)
+    for event in list(_CHAT_TAB_WAITERS.get(chat_id, ())):
+        event.set()
+
+
+def _chat_tab_left(sid, chat_id) -> None:
+    """The composer watcher: socket `sid` no longer shows chat `chat_id`."""
+    tabs = _READY_CHAT_TABS.get(chat_id)
+    if tabs and sid in tabs:
+        tabs.remove(sid)
+        if not tabs:
+            del _READY_CHAT_TABS[chat_id]
+
+
+def _views_chat(session_pool, sid, user_id, chat_id) -> bool:
+    session = session_pool.get(sid) if sid else None
+    return bool(session) and session.get("id") == user_id and (
+        "chat_ids" not in session or chat_id in (session.get("chat_ids") or []))
+
+
+def _agent_card_tab(session_pool, user_id, chat_id, own_sid) -> str | None:
+    """The socket to show an ask_user card on, or None while no tab can."""
+    for sid in reversed(_READY_CHAT_TABS.get(chat_id, [])):
+        if _views_chat(session_pool, sid, user_id, chat_id):
+            return sid
+    if _views_chat(session_pool, own_sid, user_id, chat_id):
+        return own_sid
+    if not _CHAT_TABS_TRACKED[0]:
+        return _live_session_id_for_user(user_id, session_pool, chat_id)
+    return None
+
+
+@contextlib.contextmanager
+def _chat_tab_signal(chat_id):
+    """An event set when one more socket loads the chat."""
+    event = asyncio.Event()
+    _CHAT_TAB_WAITERS.setdefault(chat_id, set()).add(event)
+    try:
+        yield event
+    finally:
+        waiters = _CHAT_TAB_WAITERS.get(chat_id)
+        if waiters is not None:
+            waiters.discard(event)
+            if not waiters:
+                del _CHAT_TAB_WAITERS[chat_id]
+
+
+async def _card_on_tab(sio, session_pool, sid, user_id, chat_id, message_id, payload, deadline):
+    """Show the card on `sid` until it answers: (response, None), or
+    (None, "moved") once a newer tab has loaded the chat or `sid` stops
+    showing it, or (None, None) at the deadline. The card leaves the screen
+    when the wait ends, however it ends."""
+    interaction_id = str(uuid.uuid4())
+    data = {**payload["data"], "interaction_id": interaction_id}
+    pipe_log(f"  ask_user: showing the card on session {sid[:8]}...")
+    with _chat_tab_signal(chat_id) as newer:
+        call = asyncio.ensure_future(sio.call(
+            "events", {"chat_id": chat_id, "message_id": message_id,
+                       "data": {**payload, "data": data}},
+            to=sid, timeout=max(1.0, deadline - time.time())))
+        try:
+            while True:
+                left = deadline - time.time()
+                if left <= 0:
+                    return None, None
+                tab_change = asyncio.ensure_future(newer.wait())
+                try:
+                    # The wait wakes on the answer, on a tab that loads the
+                    # chat, or every few seconds to see this socket is still
+                    # there (Open WebUI keeps a call to a gone socket open).
+                    done, _ = await asyncio.wait({call, tab_change}, timeout=min(left, 5.0),
+                                                 return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    tab_change.cancel()
+                if call in done:
+                    try:
+                        response = call.result()
+                    except Exception as ex:
+                        pipe_log(f"  ask_user: the card on {sid[:8]}... failed: {ex!r}")
+                        return None, "moved"
+                    if not _views_chat(session_pool, sid, user_id, chat_id):
+                        # Cancelled by a tab that left the chat, not by the user.
+                        return None, "moved"
+                    return response, None
+                newer.clear()
+                if _agent_card_tab(session_pool, user_id, chat_id, sid) != sid \
+                        or not _views_chat(session_pool, sid, user_id, chat_id):
+                    return None, "moved"
+        finally:
+            call.cancel()
+            try:
+                await sio.emit("events", {"chat_id": chat_id, "message_id": message_id, "data": {
+                    "type": "request:interaction:done", "data": {"interaction_id": interaction_id}}},
+                    to=sid)
+            except Exception:
+                pass
+
+
+async def _ask_agent_card(user_id, chat_id, message_id, own_sid, payload, deadline):
+    """The card's response, shown on whichever tab has the chat, or None at
+    the deadline."""
+    try:
+        from open_webui.socket.main import sio, SESSION_POOL
+    except Exception as ex:
+        pipe_log(f"  ask_user: no Open WebUI sockets here: {ex}")
+        return None
+    while (left := deadline - time.time()) > 0:
+        sid = _agent_card_tab(SESSION_POOL, user_id, chat_id, own_sid)
+        if sid is None:
+            with _chat_tab_signal(chat_id) as ready:
+                wait = left if _CHAT_TABS_TRACKED[0] else min(left, _UNTRACKED_TAB_POLL_S)
+                try:
+                    await asyncio.wait_for(ready.wait(), wait)
+                except asyncio.TimeoutError:
+                    pass
+            continue
+        response, moved = await _card_on_tab(sio, SESSION_POOL, sid, user_id, chat_id,
+                                             message_id, payload, deadline)
+        if moved:
+            if sid == own_sid:
+                own_sid = None
+            continue
+        return response
+    return None
+
+
+async def _answer_agent_question(conn, record: dict, user_id: str, chat_id: str) -> None:
+    qid, key = record["id"], record.get("sessionKey") or ""
+    deadline = (record.get("expiresAtMs") or 0) / 1000 or time.time() + 900
+    payload = _agent_question_payload(record, None)
+    questions = payload["data"]["questions"]
+    turn = _SECRET_ASKERS.get(key)
+    message_id = turn.owui_message_id if turn is not None else _open_writer_message_id(conn, chat_id, key)
+    own_sid = (turn.__metadata__ or {}).get("session_id") if turn is not None else None
+    if not message_id:
+        # A card needs the reply it belongs to: Open WebUI cancels one for a
+        # message the tab does not have. Left to the Control UI.
+        _AGENT_QUESTIONS.pop(qid, None)
+        pipe_log(f"  ask_user: no reply in chat {chat_id[:8]}... streams the run; left to the Control UI")
+        return
+    pipe_log(f"  ask_user: {len(questions)} question(s) in chat {chat_id[:8]}... (question {qid[:12]}...)")
+    response = await _ask_agent_card(user_id, chat_id, message_id, own_sid, payload, deadline)
+    if _AGENT_QUESTIONS.get(qid) is not asyncio.current_task():
+        return
+    del _AGENT_QUESTIONS[qid]
+    if response is None:
+        # The Gateway's timeout ends it and tells the agent.
+        pipe_log("  ask_user: not answered before the question expired")
+        return
+    answers = (_agent_question_answers(questions, response.get("answers"))
+               if isinstance(response, dict) and response.get("status") == "answered" else {})
+    if answers:
+        params = {"id": qid, "answers": {"answers": answers}, "resolvedBy": "openwebui"}
+    else:
+        pipe_log("  ask_user: the card was cancelled")
+        params = {"id": qid, "cancel": True, "resolvedBy": "openwebui"}
+    try:
+        result = await conn.send_request("question.resolve", params, timeout=30)
+        shown = str((result or {}).get("status"))
+    except Exception as ex:
+        shown = f"not resolved ({type(ex).__name__})"
+    pipe_log(f"  ask_user: {shown}")
+
+
+def question_requested(conn, record) -> bool:
+    """`question.requested`: a secret request or an ask_user question."""
+    return secret_request_seen(conn, record) or agent_question_seen(conn, record)
+
+
+def question_resolved(payload) -> None:
+    """`question.resolved`: answered elsewhere, cancelled or expired; the
+    card's or dialog's wait ends and whatever it gets later is dropped."""
+    secret_request_resolved(payload)
+    task = _AGENT_QUESTIONS.pop((payload or {}).get("id"), None)
+    if task is not None:
+        task.cancel()
+
+
 # --- gateway ---------------------------------------------------------------
 GATEWAY_SCOPES = ["operator.admin", "operator.read", "operator.write"]
 # A connection for users not in OWNER_USERS. Without operator.admin the
@@ -3624,8 +4005,13 @@ _OWUI_KEY_USER = re.compile(r"^agent:[^:]+:openwebui-([0-9a-fA-F-]{36})-")
 # ---------------------------------------------------------------------------
 
 class GatewayError(Exception):
-    """Raised when the Gateway WebSocket handshake fails."""
-    pass
+    """Raised when the Gateway WebSocket handshake fails, or a request is
+    refused. `error` is the refusal's error shape ({code, message, details,
+    retryable, retryAfterMs}), when the Gateway sent one."""
+
+    def __init__(self, message: str = "", error: dict | None = None):
+        super().__init__(message)
+        self.error = error or {}
 
 
 # How long to wait for the Gateway's TCP/WS accept before giving up. Mirrors
@@ -4223,6 +4609,14 @@ _ROW_MARKER_TYPE = "_pipe_row"
 # we have", never a coincidence of a short phrase ("OK.", "Done.").
 _WHOLE_TEXT_ANCHOR_CHARS = 200
 _MIN_WHOLE_TEXT_ANCHOR_CHARS = 64
+_LINE_BREAKS_RE = re.compile(r"\n+")
+
+
+def _one_break(text: str) -> str:
+    """`text` with each run of line breaks as one: a claude-cli run's closer
+    joins its messages by one newline, where the stream put the Gateway's
+    two-newline message break (ELI-219)."""
+    return _LINE_BREAKS_RE.sub("\n", text)
 
 
 def _item_delta_text(item_text: str, last_item_text: str, assistant_stream_text: str) -> str:
@@ -4242,6 +4636,14 @@ def _item_delta_text(item_text: str, last_item_text: str, assistant_stream_text:
         return ""
     if item_text.startswith(baseline):
         return item_text[len(baseline):]
+    if _one_break(item_text) == _one_break(baseline):
+        return ""
+    if last_item_text and item_text.endswith("\n" + last_item_text):
+        # The run's whole text, its messages joined by newlines, closing with
+        # the message item already shown: a claude-cli run's closer after a
+        # second message (ELI-219), whose last item can be too short for the
+        # anchors below.
+        return ""
     # Not a prefix extension. If the item still contains the tail of what was
     # already received, it is the cumulative text with something missing
     # from the middle or the start (events lost while the Gateway socket was
@@ -4697,6 +5099,12 @@ class _TurnRenderer:
         # first text gets the break the live stream puts between messages.
         # The Gateway inserts it only inside one run.
         self.run_boundary = False
+        # Text that opens a message item and is, so far, a silent sentinel or
+        # the start of one (`_add_text`).
+        self._held = ""
+        # The run answered with a silent sentinel alone (`flush`): no text is
+        # its reply, not something lost.
+        self.silenced = False
 
     @property
     def received(self) -> str:
@@ -4744,7 +5152,41 @@ class _TurnRenderer:
             self.visible_text += chunk
 
     def _add_text(self, chunk: str) -> str:
-        """Append `chunk` to the run's text; returns it as added."""
+        """Append `chunk` to the run's text; returns it as added. A message
+        item that opens with a silent sentinel is held until it is told from
+        text: a sentinel followed by more text is dropped, and the run's own
+        answer follows (a claude-cli run that answered `NO_REPLY` and went on
+        after its background task reported, ELI-219). A sentinel alone stays
+        out; anything else is shown as it came (`flush` at the run's end)."""
+        if not chunk:
+            return ""
+        last = self.output[-1] if self.output else None
+        if last is None or last.get("type") != "message" or not last["content"][0]["text"]:
+            pending = self._held + chunk
+            lead = pending.lstrip()
+            if any(s.startswith(lead) for s in _SILENT_SENTINELS):
+                self._held = pending
+                return ""
+            self._held = ""
+            for s in _SILENT_SENTINELS:
+                if lead.startswith(s) and lead[len(s):len(s) + 1].isspace():
+                    pipe_log(f"  dropped a leading {s} before the run's text")
+                    pending = lead[len(s):].lstrip()
+                    break
+            chunk = pending
+        return self._append_text(chunk)
+
+    def flush(self) -> str:
+        """The run ended, or a card follows: held text that is not a
+        sentinel is shown after all; returns it as added."""
+        held, self._held = self._held, ""
+        if held.strip() in _SILENT_SENTINELS:
+            self.silenced = True
+        if not held.strip() or held.strip() in _SILENT_SENTINELS:
+            return ""
+        return self._append_text(held)
+
+    def _append_text(self, chunk: str) -> str:
         if not chunk:
             return ""
         if self.run_boundary:
@@ -4858,6 +5300,7 @@ class _TurnRenderer:
                 return events
             if phase == "start":
                 if tcid:
+                    events.append(self.flush())
                     args_str = json.dumps(data.get("args", {}))
                     self._active_tool_args[tcid] = args_str
                     self._active_tool_names[tcid] = name
@@ -5114,6 +5557,10 @@ class _GatewayConnection:
         # its own (ELI-176).
         self._reconnect_now = asyncio.Event()
         self._reconnect_waiters: list = []
+        # Turns waiting through a Gateway that refuses connections (down or
+        # restarting): while there are any, the event loop tries again at its
+        # first backoff step, not its longest.
+        self._turns_awaiting_gateway = 0
         # The Gateway sends a `tick` event every `policy.tickIntervalMs` of
         # hello-ok (30 s, server-maintenance-Wf2jQ0wx.mjs:156); its own client
         # drops a socket that sent no frame for twice that ("tick timeout",
@@ -5169,6 +5616,10 @@ class _GatewayConnection:
         self.gateway_boot_id: str | None = None
         self.gateway_restarts = 0
         self.gateway_version: str | None = None   # hello-ok.server.version
+        # hello-ok.features: what this Gateway offers, checked instead of its
+        # version number (a feature can land in several release lines).
+        self.gateway_methods: frozenset = frozenset()
+        self.gateway_events: frozenset = frozenset()
 
         # Next request id
         self._next_req_id = 1
@@ -5292,8 +5743,11 @@ class _GatewayConnection:
 
     async def _subscribe_messages(self, session_key: str) -> bool:
         try:
-            await self.send_request(
-                "sessions.messages.subscribe", {"key": session_key}, timeout=15
+            # Refused like a run while a Gateway that just started prepares
+            # the agent: given up, the renewed session would get no tool
+            # events until the next reconnect.
+            await _send_when_prepared(
+                self, "sessions.messages.subscribe", {"key": session_key}, timeout=15
             )
             return True
         except Exception as ex:
@@ -5632,23 +6086,51 @@ class _GatewayConnection:
             # be read until its backoff ends, and its next attempt would replace
             # it: the turn's first request then timed out (ELI-176). Have the
             # loop try now, and take that attempt's outcome.
-            waiter = asyncio.get_running_loop().create_future()
-            self._reconnect_waiters.append(waiter)
-            self._reconnect_now.set()
-            await asyncio.wait({waiter, self._event_loop_task}, return_when=asyncio.FIRST_COMPLETED)
-            if not waiter.done():
-                raise GatewayError("gateway connection stopped while reconnecting")
-            error = waiter.result()
-            if error is not None:
-                raise error if isinstance(error, GatewayError) else GatewayError(str(error))
+            await self._await_reconnect()
             return
         async with self._init_lock:
             if self._ws and self._event_loop_task and not self._event_loop_task.done():
                 return
             self._stopped = False
-            await self._connect_and_start()
+            await self._connect_once_started()
             if not self._event_loop_task or self._event_loop_task.done():
                 self._event_loop_task = asyncio.create_task(self._event_loop())
+
+    async def _await_reconnect(self):
+        """Take the event loop's next reconnect outcome (ELI-176). A Gateway
+        that refuses the connection is down or restarting, and this socket was
+        up before, so it is not a wrong GATEWAY_URL: wait through the loop's
+        later attempts, up to GATEWAY_DOWN_WAIT_S, rather than answer the
+        message with the refusal. Any other failure is raised at once."""
+        deadline = time.monotonic() + GATEWAY_DOWN_WAIT_S
+        refusal = None
+        self._turns_awaiting_gateway += 1
+        try:
+            self._reconnect_now.set()
+            while True:
+                waiter = asyncio.get_running_loop().create_future()
+                self._reconnect_waiters.append(waiter)
+                # The loop's first attempt is made at once; later ones at its first step.
+                await asyncio.wait({waiter, self._event_loop_task},
+                                   timeout=None if refusal is None else max(0, deadline - time.monotonic()),
+                                   return_when=asyncio.FIRST_COMPLETED)
+                if not waiter.done():
+                    waiter.cancel()
+                    if self._event_loop_task.done():
+                        raise GatewayError("gateway connection stopped while reconnecting")
+                    raise refusal
+                error = waiter.result()
+                if error is None:
+                    return
+                error = error if isinstance(error, GatewayError) else GatewayError(str(error))
+                if not _gateway_refused(error) or time.monotonic() >= deadline:
+                    raise error
+                if refusal is None:
+                    pipe_log("  the Gateway refuses connections (down or restarting); the message "
+                             f"waits for the reconnect, up to {GATEWAY_DOWN_WAIT_S} s")
+                refusal = error
+        finally:
+            self._turns_awaiting_gateway -= 1
 
     async def send_request(self, method: str, params: dict, timeout: float = 10) -> dict:
         """Send a request and wait for the response."""
@@ -6350,11 +6832,13 @@ class _GatewayConnection:
             # exactly what happens when something answers but isn't a Gateway
             # (a reverse proxy returning 502 on the upgrade, an HTTP server on
             # the port). That is a configuration mistake, and it belongs in the
-            # chat naming the valve, not as an unattributed traceback.
+            # chat naming the valve, not as an unattributed traceback. A refused
+            # connect is marked: a reconnecting turn waits through it.
             raise GatewayError(
                 f"Could not connect to the OpenClaw Gateway at {host}:{port} "
                 f"({type(ex).__name__}: {ex}). Is the Gateway running, and is "
-                "the GATEWAY_URL valve pointing at it?"
+                "the GATEWAY_URL valve pointing at it?",
+                error={"code": GATEWAY_REFUSED_CODE} if _refused_connect(ex) else None,
             )
 
         # Handshake: receive challenge
@@ -6385,13 +6869,16 @@ class _GatewayConnection:
             )
         )))
 
-        resp = json.loads(await asyncio.wait_for(ws.recv(), 10))
+        resp = await _connect_response(ws, "1")
         if not resp.get("ok"):
+            err = resp.get("error")
+            pipe_log(f"  connect rejected: {json.dumps(err)[:500]}")
             raise GatewayError(
                 _explain_connect_rejection(
-                    str(resp.get("error", {}).get("message", "connect failed")),
+                    str((err or {}).get("message", "connect failed")),
                     device_id=(self._ident or {}).get("id"),
-                )
+                ),
+                error=err if isinstance(err, dict) else None,
             )
 
         # Capture device token for future reconnects
@@ -6410,6 +6897,9 @@ class _GatewayConnection:
         self.connection_epoch += 1
         self._thinking_note_shown.clear()
         self.gateway_version = (hello_ok.get("server") or {}).get("version")
+        features = hello_ok.get("features") or {}
+        self.gateway_methods = frozenset(features.get("methods") or ())
+        self.gateway_events = frozenset(features.get("events") or ())
         self._note_gateway_boot((hello_ok.get("server") or {}).get("bootId"))
         pipe_log(
             f"Connected to Gateway (persistent) [epoch {self.connection_epoch}]"
@@ -6534,7 +7024,8 @@ class _GatewayConnection:
                                 GatewayError(
                                     err.get("message")
                                     or err.get("code")
-                                    or "request failed"
+                                    or "request failed",
+                                    error=err if isinstance(err, dict) else None,
                                 )
                             )
                         else:
@@ -6673,6 +7164,27 @@ class _GatewayConnection:
                 except Exception as ex:  # the loop outlives any one failure
                     pipe_log(f"  event gap marking failed: {ex!r}")
 
+    async def _connect_once_started(self):
+        """`_connect_and_start`, connecting again while a Gateway that has
+        just started refuses connections until its startup sidecars run
+        ("gateway starting; retry shortly", details.reason "startup-sidecars"),
+        after the wait it names, as OpenClaw's own clients do
+        (startup-unavailable-D0-EeFjq.mjs, 2026.10.5). Any other failure, or
+        one past STARTUP_REFUSAL_WAIT_S, is raised."""
+        deadline = time.monotonic() + STARTUP_REFUSAL_WAIT_S
+        told = False
+        while True:
+            try:
+                return await self._connect_and_start()
+            except GatewayError as ex:
+                retry_ms = _gateway_starting_retry_ms(ex)
+                if retry_ms is None or self._stopped or time.monotonic() + retry_ms / 1000 > deadline:
+                    raise
+                if not told:
+                    told = True
+                    pipe_log(f"  the Gateway is starting; connecting again as it asks (every {retry_ms} ms)")
+                await asyncio.sleep(retry_ms / 1000)
+
     async def _reconnect(self):
         """Reconnect with exponential backoff.
 
@@ -6683,7 +7195,8 @@ class _GatewayConnection:
         """
         while not self._stopped:
             self._reconnect_attempt += 1
-            delay = min(2 ** (self._reconnect_attempt - 1), self._max_backoff)
+            delay = 1 if self._turns_awaiting_gateway else min(2 ** (self._reconnect_attempt - 1),
+                                                               self._max_backoff)
             pipe_log(f"  reconnect in {delay}s (attempt {self._reconnect_attempt})")
             try:
                 # A turn waiting for the connection ends the wait (ensure_connected).
@@ -6696,7 +7209,7 @@ class _GatewayConnection:
                 self._answer_reconnect_waiters(GatewayError("gateway connection stopped"))
                 return
             try:
-                await self._connect_and_start()
+                await self._connect_once_started()
                 self._answer_reconnect_waiters(None)
                 return
             except Exception as e:
@@ -6772,6 +7285,7 @@ def _history_renderer(messages: list) -> "_TurnRenderer":
     r = _TurnRenderer()
     for payload in _history_events(messages):
         r.feed(payload)
+    r.flush()
     return r
 
 
@@ -7209,7 +7723,122 @@ async def _run_request(conn, method: str, params: dict, *, timeout: float = 10,
                                               else f"run-{uuid.uuid4().hex[:8]}",
                                               method=method, params=params)))
         return None
-    return await target.send_request(method, params, timeout=timeout)
+    return await _send_when_prepared(target, method, params, timeout=timeout)
+
+
+async def _send_when_prepared(conn, method: str, params: dict, *, timeout: float = 10):
+    """`conn.send_request`, sent again while the Gateway refuses it only
+    because it is still preparing the agent after its start, after the wait
+    each refusal names, up to STARTUP_REFUSAL_WAIT_S. Any other refusal the
+    Gateway calls retryable (UNAVAILABLE, `retryable`) is sent again too, up to
+    RETRYABLE_REFUSAL_WAIT_S from the first: right after preparation, 2026.10.5
+    refuses sessions.patch with "Session patch failed unexpectedly. Retry the
+    request." while its session storage gets ready (a log line says so; the
+    refusal itself names no reason and no wait)."""
+    started = time.monotonic()
+    deadline = started + STARTUP_REFUSAL_WAIT_S
+    told = set()
+    while True:
+        try:
+            return await conn.send_request(method, params, timeout=timeout)
+        except GatewayError as ex:
+            retry_ms, why = _startup_refusal_retry_ms(ex), "preparing"
+            if retry_ms is None:
+                retry_ms, why = _retryable_refusal_retry_ms(ex), "retryable"
+                if retry_ms is not None and "retryable-since" not in told:
+                    told.add("retryable-since")
+                    retryable_deadline = time.monotonic() + RETRYABLE_REFUSAL_WAIT_S
+            if retry_ms is None or time.monotonic() + retry_ms / 1000 > (
+                    deadline if why == "preparing" else min(deadline, retryable_deadline)):
+                raise
+            if why not in told:
+                told.add(why)
+                pipe_log(f"  {method}: the Gateway is still preparing the agent after its start; "
+                         f"sending again as it asks (every {retry_ms} ms, up to {STARTUP_REFUSAL_WAIT_S} s)"
+                         if why == "preparing" else
+                         f"  {method}: refused as retryable ({ex}); sending again in {retry_ms} ms, "
+                         f"up to {RETRYABLE_REFUSAL_WAIT_S} s")
+            await asyncio.sleep(retry_ms / 1000)
+
+
+# A Gateway that has just started refuses runs until it has inspected and
+# prepared the agent's database (2026.10.5 and later): `UNAVAILABLE`,
+# `retryable`, `retryAfterMs`, details.code below. The refusal comes before
+# the request's ack and is not kept in the idempotency cache ("client-retry",
+# chat-send-handler-o4Nr7Ej0.mjs:340/428), so the same request, same key, is
+# sent again after the time it names. No event marks the end of preparation.
+STARTUP_REFUSAL_CODE = "agent-database-inspection-pending"
+STARTUP_REFUSAL_WAIT_S = 300
+RETRYABLE_REFUSAL_WAIT_S = 30
+# How long a message waits for a Gateway that refuses connections after it was
+# reached (a restart: the port is closed until the new process listens).
+GATEWAY_DOWN_WAIT_S = 120
+GATEWAY_REFUSED_CODE = "connection-refused"
+
+
+async def _connect_response(ws, req_id: str, timeout: float = 10) -> dict:
+    """The Gateway's response to our connect request: the first `res` frame
+    with its id. Any other frame before it is skipped (and logged): taken as
+    the response, it read as a rejection with no reason ("connect failed")."""
+    deadline = time.monotonic() + timeout
+    while True:
+        frame = json.loads(await asyncio.wait_for(ws.recv(), max(0, deadline - time.monotonic())))
+        if frame.get("type") == "res" and frame.get("id") == req_id:
+            return frame
+        pipe_log(f"  frame before the connect response, skipped: type={frame.get('type')!r} "
+                 f"event={frame.get('event')!r} id={frame.get('id')!r}")
+
+
+def _refused_connect(ex) -> bool:
+    """Every address the host resolved to refused the TCP connect. asyncio
+    raises one OSError for all of them ("Multiple exceptions: ...") when their
+    messages differ, as for localhost's ::1 and 127.0.0.1."""
+    if isinstance(ex, ConnectionRefusedError):
+        return True
+    text = str(ex)
+    return (isinstance(ex, OSError) and text.startswith("Multiple exceptions:")
+            and text.count("[Errno") == text.count(f"[Errno {errno.ECONNREFUSED}]"))
+
+
+def _gateway_refused(ex) -> bool:
+    """A connect the Gateway's host refused: nothing listens on the port."""
+    return isinstance(ex, GatewayError) and ex.error.get("code") == GATEWAY_REFUSED_CODE
+
+
+def _gateway_starting_retry_ms(ex: GatewayError) -> int | None:
+    """The wait before connecting again to a Gateway that refused the connect
+    only because it is still starting, bounded as its own clients bound it
+    (resolveGatewayStartupRetryAfterMs: 100 to 2000 ms, 500 by default)."""
+    err = getattr(ex, "error", None) or {}
+    details = err.get("details") if isinstance(err.get("details"), dict) else {}
+    if err.get("code") != "UNAVAILABLE" or err.get("retryable") is not True \
+            or details.get("reason") != "startup-sidecars":
+        return None
+    retry = err.get("retryAfterMs")
+    retry = int(retry) if isinstance(retry, (int, float)) else 500
+    return min(max(retry, 100), 2000)
+
+
+def _startup_refusal_retry_ms(ex: GatewayError) -> int | None:
+    """The wait the Gateway asks for before sending a refused request again,
+    when it refused it only because it is still preparing after its start."""
+    err = getattr(ex, "error", None) or {}
+    details = err.get("details") if isinstance(err.get("details"), dict) else {}
+    if not err.get("retryable") or details.get("code") != STARTUP_REFUSAL_CODE:
+        return None
+    retry = err.get("retryAfterMs")
+    return int(retry) if isinstance(retry, (int, float)) and retry > 0 else 250
+
+
+def _retryable_refusal_retry_ms(ex: GatewayError) -> int | None:
+    """The wait before sending again a request the Gateway refused as
+    UNAVAILABLE and `retryable` for any other reason: the one it names, else
+    the startup refusal's 250 ms."""
+    err = getattr(ex, "error", None) or {}
+    if err.get("code") != "UNAVAILABLE" or err.get("retryable") is not True:
+        return None
+    retry = err.get("retryAfterMs")
+    return int(retry) if isinstance(retry, (int, float)) and retry > 0 else 250
 
 
 # --- writer ----------------------------------------------------------------
@@ -7274,6 +7903,8 @@ async def _set_turn_meta_now(chat_id: str, message_id: str, meta: dict) -> bool:
     from sqlalchemy.orm.attributes import flag_modified
 
     async with Chats._chat_transaction(chat_id) as (db, chat):
+        if chat is None:
+            return False
         data = chat.chat or {}
         history = data.get("history") or {}
         msg = (history.get("messages") or {}).get(message_id)
@@ -7569,6 +8200,15 @@ if (!window.__ocIntentHook) {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.target && e.target.closest
         && e.target.closest('#chat-input')) mark('send_now');
   }, true);
+  // One click answers every task it cancelled (ELI-198), so a query does not
+  // clear it: a new message, sent with nothing running, does.
+  document.addEventListener('submit', (e) => {
+    const f = e.target;
+    const input = document.querySelector('#chat-input');
+    if (running() || !f || !input || !f.contains(input)) return;
+    const c = chat();
+    if (c) delete window.__ocIntents[c];
+  }, true);
 }
 return true;
 """
@@ -7629,14 +8269,16 @@ def _auto_send_on(valves) -> bool:
 
 
 def _intent_query_js(chat_id: str) -> str:
-    """Read and clear what the page recorded for `chat_id` (see
-    `_INTENT_HOOK_JS`). "none" means the hook is there but saw no click, so
-    the cancel came from elsewhere; null means no hook at all."""
+    """Read what the page recorded for `chat_id` (see `_INTENT_HOOK_JS`).
+    Open WebUI's Stop cancels every task of the chat at once (a reply waiting
+    behind a run and the turn writer holding it), and each asks: the record
+    stays for all of them (ELI-198). "none" means the hook is there but saw
+    no click, so the cancel came from elsewhere; null means no hook at all."""
     return (
         "const c = " + json.dumps(chat_id) + ";"
         "const all = window.__ocIntents;"
         "if (!all) return null;"
-        "const i = all[c]; delete all[c];"
+        "const i = all[c];"
         "return (i && Date.now() - i.t < 60000) ? i.kind : 'none';"
     )
 
@@ -7721,6 +8363,9 @@ class _TurnWriter:
         # Where each run's streamed part starts in the renderer, in adoption
         # order: (run, output index, text length). See `_from_transcript`.
         self.run_marks: list = [(run_id, 0, 0)]
+        # Each run's lifecycle `startedAt` (ms), where seen: it bounds the
+        # run's transcript span (`_history_run_messages`).
+        self.run_started: dict[str, float] = {}
         self.resumes = 0                # resume budget, counted on M (MAX_TURN_RESUMES)
         self.pending_resume = False     # a resume the Gateway refused; sent on the next hello-ok
         self.request: str | None = None  # the user's message M answers, quoted by a resume
@@ -7767,7 +8412,11 @@ class _TurnWriter:
             claim = await _claim_turn_message(self.chat_id, self.user_id, self.message_id,
                                               self.run_id, self.conn.writer_id, takeover=takeover)
             if not claim["claimed"]:
-                pipe_log(f"  turn writer: message {self.message_id[:8]}... is held by another writer")
+                if claim["how"] == "gone":
+                    pipe_log(f"  turn writer: chat {self.chat_id[:8]}... is gone; run "
+                             f"{self.run_id[:24]}... is not written")
+                else:
+                    pipe_log(f"  turn writer: message {self.message_id[:8]}... is held by another writer")
                 return False
             self._claim = claim
             if claim["how"] == "new":
@@ -7810,6 +8459,10 @@ class _TurnWriter:
             return
         try:
             if payload is not None:
+                data = payload.get("data") or {}
+                if payload.get("stream") == "lifecycle" and data.get("phase") == "start" \
+                        and isinstance(data.get("startedAt"), (int, float)) and payload.get("runId"):
+                    self.run_started.setdefault(payload["runId"], data["startedAt"])
                 self.renderer.feed(payload)
         except Exception as ex:
             pipe_log(f"  turn writer: renderer feed failed: {ex}")
@@ -8191,6 +8844,7 @@ class _TurnWriter:
                 pipe_log(f"  turn writer: chat.history failed at the end: {ex!r}")
             if self.wake is not None:
                 self._rebuild_wake(hist)
+                self.renderer.flush()
             else:
                 if hist:
                     self._adopt_recoveries_from(hist.get("messages") or [])
@@ -8199,7 +8853,8 @@ class _TurnWriter:
                 rebuilt = self._from_transcript(hist) if hist else None
                 if rebuilt is not None:
                     self.renderer = rebuilt
-                if not (self._showable() or note):
+                self.renderer.flush()
+                if not self._showable():
                     await self._show_silent_announce(hist)
             if not self.opened:
                 if not (self._showable() or note) or not await self._open_at_end():
@@ -8263,21 +8918,36 @@ class _TurnWriter:
         result = await _child_result(self.conn, child)
         if not result:
             return
-        label = None
-        for m in (hist or {}).get("messages") or []:
-            blocks = m.get("content") if isinstance(m.get("content"), list) else []
-            calls = {b.get("id"): b for b in blocks if isinstance(b, dict) and b.get("type") == "toolcall"}
-            for b in blocks:
-                if (isinstance(b, dict) and b.get("type") == "tool_result"
-                        and child["child_session"] in json.dumps(b.get("content"))
-                        and b.get("tool_use_id") in calls):
-                    label = _spawn_title(calls[b["tool_use_id"]].get("arguments") or {})
+        # The spawn call whose result names the child, in either tool shape
+        # (claude-cli's blocks, or a native run's `toolResult` messages), made
+        # directly or through a deferred-tool wrapper (2026.10).
+        label, args = None, {}
+        for ev in _history_events((hist or {}).get("messages") or []):
+            data = ev.get("data") or {}
+            if ev.get("stream") != "tool":
+                continue
+            if data.get("phase") == "start":
+                call = (_bare_tool_name(data.get("name") or ""), json.dumps(data.get("args") or {}))
+                name, args_str = _deferred_call_view(*call) or call
+                if _is_spawn_tool(name):
+                    args[data.get("toolCallId")] = _json_object(args_str)
+            elif (data.get("toolCallId") in args
+                  and child["child_session"] in json.dumps(data.get("result"))):
+                label = _spawn_title(args[data["toolCallId"]])
         tcid = f"subagent-{child['child_run']}"
         args_str = json.dumps({"label": label or child["child_session"]})
         call = _tool_call_started_event("Sub-agent", tcid, args_str)["item"]
         call["status"] = "completed"
         self.renderer = _TurnRenderer()
         self.renderer.output = [call, _tool_call_result_event(tcid, result)["item"]]
+        if not self.opened:
+            # One card per child run, in a message of its own (ELI-217): 2026.10.5
+            # retries a delivery the parent met with silence under the same run
+            # id, and a retry's reply then lands in the run's message, not over
+            # the card, while a silent one rewrites the same card.
+            self.conn._turn_writers.pop((self.chat_id, self.message_id), None)
+            self.message_id = turn_message_id(self.session_key, tcid, self.chat_id)
+            self.conn._turn_writers[(self.chat_id, self.message_id)] = self
 
     def release(self) -> None:
         """This writer's connection was retired by a newer deploy: end the Open
@@ -8322,7 +8992,7 @@ class _TurnWriter:
         recovery the writer joined late (its first text and card ran before
         the pipe was back) still gets its start back. None (keep what streamed) while a run has not closed, or when
         the transcript covers nothing."""
-        spans = [_history_span_messages(hist, r) for r in self.runs]
+        spans = [_history_span_messages(hist, r, self.run_started.get(r)) for r in self.runs]
         if any(s is None for s in spans):
             return None
         out, text = self.renderer.output, self.renderer.text
@@ -8397,21 +9067,44 @@ class _TurnWriter:
                  f"{intent or 'unknown'}")
         if intent != "stop" or self.closed:
             return
-        aborted = False
-        try:
-            resp = await _run_request(
-                self.conn, RUN_ABORT, {"sessionKey": self.session_key, "runId": self.run_id}, timeout=15)
-            aborted = bool((resp or {}).get("aborted"))
-        except Exception as ex:
-            pipe_log(f"  turn writer: chat.abort failed: {ex}")
-        if not aborted and self.wake and self.wake.get("job"):
+        wake = bool(self.wake and self.wake.get("job"))
+        # A run the agent started (a cron wake) first, by its id: on
+        # 2026.10.5 chat.abort answers `aborted` for it but stops only its
+        # running command, and the run goes on to its end. There the wake
+        # is not bound as one (its run id is not the sessionId).
+        aborted = parse_pipe_run_id(self.run_id) is None and await self._abort_agent_run()
+        if not aborted:
+            try:
+                resp = await _run_request(
+                    self.conn, RUN_ABORT, {"sessionKey": self.session_key, "runId": self.run_id}, timeout=15)
+                aborted = bool((resp or {}).get("aborted"))
+            except Exception as ex:
+                pipe_log(f"  turn writer: chat.abort failed: {ex}")
+        if not aborted and wake:
             await self._cancel_wake_run()
         await self.finalize(stopped=True)
 
+    async def _abort_agent_run(self) -> bool:
+        """Stop a run the agent started by its id: `sessions.abort` with a run id
+        stops that run alone and never clears the session's queue, so turns
+        queued behind the wake stay (2026.10.5 and 2026.10.10, which have no
+        tasks.cancel). On 2026.9 the wake's run id is the sessionId, and it
+        finds no run."""
+        try:
+            res = await self.conn.send_request("sessions.abort", {"key": self.session_key, "runId": self.run_id},
+                                               timeout=15)
+        except Exception as ex:
+            pipe_log(f"  turn writer: sessions.abort for the wake's run failed: {ex}")
+            return False
+        aborted = (res or {}).get("status") == "aborted"
+        if aborted:
+            pipe_log(f"  turn writer: run {self.run_id[:24]}... aborted by its id")
+        return aborted
+
     async def _cancel_wake_run(self) -> None:
-        """Stop a cron wake's run (ELI-192). On 2026.9 its run id is the
-        sessionId, and chat.abort finds no chat run under it: the wake is its
-        job's cron run, which the job's running task cancels."""
+        """Stop a cron wake's run (ELI-192) on 2026.9: chat.abort finds no
+        chat run under its id (the sessionId): the wake is its job's cron
+        run, which the job's running task cancels."""
         job = self.wake["job"]
         try:
             resp = await self.conn.send_request("tasks.list", {"sessionKey": self.session_key, "limit": 100},
@@ -8492,12 +9185,12 @@ async def _transcript_view(conn: "_GatewayConnection", *, session_key: str, chat
     return output, "" if text in _SILENT_SENTINELS else text
 
 
-def _history_span_messages(history: dict, run_id: str) -> list | None:
+def _history_span_messages(history: dict, run_id: str, started_ms: float | None = None) -> list | None:
     """One run's messages in `chat.history`, or None while it may still be
     writing. A closed run ends at its `cli-assistant:<runId>`; a run cut off
     with no closing turn (a crash, an outside kill) ends where the next
     admitted turn (a recovery, a resume) begins."""
-    closed = _history_run_messages(history, run_id)
+    closed = _history_run_messages(history, run_id, started_ms)
     if closed is not None:
         return closed
     messages = (history or {}).get("messages")
@@ -8590,7 +9283,19 @@ def _turn_queue(conn: "_GatewayConnection", sess: str, run: str, parsed: tuple,
     if _is_terminal_event(payload):
         pump.terminal.set()
     pump.queue.put_nowait(("event", payload))
+    if _is_error_event(payload) and parse_pipe_run_id(run) is None:
+        # ELI-217: on 2026.10.5 a run the agent started that errors gets no
+        # settle push (its last is `phase: error`, hasActiveRun still true),
+        # though its row reads failed by its chat error. Its error events read
+        # the row; one still active waits for the next push.
+        spawn_background(_turn_reread_row(conn, sess))
     return True
+
+
+def _is_error_event(payload: dict) -> bool:
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    return payload.get("state") == "error" or (
+        payload.get("stream") == "lifecycle" and data.get("phase") == "error")
 
 
 def _note_child_result(conn: "_GatewayConnection", payload: dict) -> None:
@@ -8858,7 +9563,16 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
             if kind == "event":
                 if writer is not None:
                     await writer.feed(item)
-                continue
+                if not (writer is not None and writer.run_id == run and _ends_on_own_final(run, item)):
+                    continue
+                # Its own final is the settle that may never be pushed: OpenClaw
+                # 2026.10.5 pushes `agent.input.settled` only for a chat.send or
+                # agent call, so a run the Gateway starts itself (a background
+                # command's end notice, heartbeat runner) leaves its last row
+                # `hasActiveRun: true` and goes idle unpushed (ELI-215). After a
+                # clean final the settled row could only finalize, so no row is
+                # waited for.
+                item = None
             # Only the pump of the writer's current run ends it: an interrupted
             # run's pump also gets the session's settle once its recovery has
             # taken M over, and the recovery's own pump may still hold events.
@@ -8883,6 +9597,14 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
                 kind, item = pump.queue.get_nowait()
                 if kind == "event" and item is not None:
                     _turn_queue(conn, sess, run, parsed, item)
+
+
+def _ends_on_own_final(run: str, payload) -> bool:
+    """A run the agent started (no pipe run id) whose chat final came: it
+    ended cleanly, so it is over whatever the session row says. An error or
+    abort still waits for its row (its note, a resume, a recovery)."""
+    return (isinstance(payload, dict) and payload.get("state") == "final"
+            and parse_pipe_run_id(run) is None)
 
 
 def _is_terminal_event(payload: dict) -> bool:
@@ -9173,12 +9895,14 @@ async def _turn_resync(conn: "_GatewayConnection", skip: set = frozenset()) -> N
         conn.row_to_consumers(sess, row, resync=True, read_at=read_at, outside_loop=True)
 
 
-def _history_run_messages(history: dict, run_id: str) -> list | None:
+def _history_run_messages(history: dict, run_id: str, started_ms: float | None = None) -> list | None:
     """One run's messages in `chat.history`: everything after the user
     message that started it, or after the previous run's closing message
     (a run with no user turn, e.g. a sub-agent announce), through its own
     closing message (`_run_closed_by`). None when the run has not closed
-    yet."""
+    yet. A previous run that answered with silence leaves no closing
+    message, so with the run's start time (`started_ms`, its lifecycle
+    start) messages stamped before it are not the run's (ELI-227)."""
     messages = (history or {}).get("messages")
     if not isinstance(messages, list) or not run_id:
         return None
@@ -9190,10 +9914,16 @@ def _history_run_messages(history: dict, run_id: str) -> list | None:
             continue
         start = end
         while start > 0 and (messages[start - 1] or {}).get("role") != "user" \
-                and not _run_closed_by(messages[start - 1]):
+                and not _run_closed_by(messages[start - 1]) \
+                and not _stamped_before(messages[start - 1], started_ms):
             start -= 1
         return messages[start:end + 1]
     return None
+
+
+def _stamped_before(message: dict, started_ms: float | None) -> bool:
+    ts = (message or {}).get("timestamp")
+    return started_ms is not None and isinstance(ts, (int, float)) and ts < started_ms
 
 
 def _relay_output_events(sent: list[dict], current: list[dict]) -> list[dict]:
@@ -10292,8 +11022,9 @@ def _owui_history_rows(chat_id: str):
 # (and "done"), so a `not in (done, failed, cancelled)` test would treat every
 # resting session as active and hang every message. Only these gate the queue.
 _ACTIVE_RUN_STATES = ("active", "running", "streaming", "queued")
-# The Gateway's secret requests are asked in the chat (askuser.py, ELI-96).
-_QUESTION_HOOKS = (secret_request_seen, secret_request_resolved)
+# The Gateway's questions (secret requests, ELI-96; the ask_user tool,
+# ELI-216) are asked in the chat (askuser.py).
+_QUESTION_HOOKS = (question_requested, question_resolved)
 
 
 def _session_active_from_signals(describe_status, list_has_active_run) -> bool:
@@ -10625,7 +11356,7 @@ class Pipe:
         )
         COMPOSER_STATUS_BUTTON: bool = Field(
             default=True,
-            description="Add an OpenClaw 'Status' button to the composer row of "
+            description="Add an OpenClaw 'Claw' button to the composer row of "
                 "OpenClaw chats (it opens the same dialog as the Status Action's "
                 "message button, so that Action must be installed). Installed "
                 "into the page at the start of each turn and when a tab opens an "
@@ -11732,6 +12463,10 @@ class _PipeTurn:
 
                 else:
                     # Normal completion (no cancellation).
+                    released = self.renderer.flush()
+                    if released:
+                        async for chunk in self.show_text(released):
+                            yield chunk
                     async for chunk in self.finish_held_prompt():
                         yield chunk
                     async for chunk in self.finish_held_media():
@@ -12205,6 +12940,11 @@ class _PipeTurn:
             # The error is the reply: nothing to recover, and no
             # "no reply text" note under it.
             await self.maybe_emit_snapshot(force=True)
+        elif not self.aborted and not self.text_yielded and self.renderer.silenced and any(
+                i.get("type") == "function_call" for i in self.renderer.output):
+            # The run said nothing on purpose after its tool calls: the cards
+            # are the reply (ELI-227).
+            pipe_log("  the run answered with silence after its tool cards")
         elif not self.aborted and not self.text_yielded:
             recovered = await self.recover_from_transcript()
             retry_body = _thinking_rejection_retry_body(
@@ -12340,10 +13080,15 @@ class _PipeTurn:
             # and the registry below cannot stand in for it: a run the turn
             # writer holds is not in it, so it would say idle, and a queued
             # message would be sent into the dead socket and lost (ELI-199).
-            # Busy: the waiter is woken again by the reconnect and re-reads.
+            # Wait for the reconnect as a turn that needs the connection
+            # (ensure_connected: the loop tries at once, then every second
+            # through a Gateway that refuses connections), then read again. A
+            # message that reached this check just before the drop was seen
+            # used to wait passively, while the loop backed off to 30 s.
             pipe_log("  active-check: the Gateway socket is reconnecting; "
                      "waiting for it before deciding")
-            return True
+            await self.conn.ensure_connected()
+            return await self._session_run_active()
         return self.conn.active_run_id_for_session(self.session_key) is not None
 
     def await_owner(self) -> None:

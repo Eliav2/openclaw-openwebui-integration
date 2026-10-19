@@ -74,6 +74,7 @@ Manual alternative:
 # --- _prelude --------------------------------------------------------------
 
 import asyncio
+import errno
 import json
 import html
 import os
@@ -569,6 +570,10 @@ async def _claim_turn_message_now(chat_id: str, user_id: str, message_id: str, r
     from sqlalchemy.orm.attributes import flag_modified
 
     async with Chats._chat_transaction(chat_id) as (db, chat):
+        if chat is None:
+            # Deleted in Open WebUI while its session lives on (ELI-218).
+            return {"claimed": False, "how": "gone", "message_id": message_id,
+                    "parent": None, "messages": {}}
         data = chat.chat or {}
         history = data.get("history") or {"messages": {}, "currentId": None}
         msgs = history.setdefault("messages", {})
@@ -742,26 +747,57 @@ def run_message_id(session_key: str, chat_id: str, run_id: str, messages: list |
 # (session-accessor-CX17Bx59.mjs:3343-3347), so only the first wake into a
 # session ever gets one: never end or rebuild a wake from it.
 
+#
+# OpenClaw 2026.10.2+ records the wake's turn differently: no header in the
+# text but the cron provenance ({kind: internal_system, sourceTool: cron,
+# jobId, sourcePromptPrefix}), returned by `chat.history` as role "assistant"
+# (`_is_forwarded_turn`). Such a wake runs under its own run id and closes with
+# its own `cli-assistant:<runId>` (2026.10.3 and 10.5 fixtures), so it is an
+# ordinary agent turn: `shared_run` False, and no sessionId event binds it.
+
 _CRON_PROMPT_RE = re.compile(r"^\[cron:(?P<job>[^\s\]]+)[\s\]]")
 
 
+def _cron_turn_job(m: dict) -> str | None:
+    """The cron job a wake turn names: its provenance's (10.2+), else its
+    prompt's header (9.3, no provenance). None for any other turn."""
+    prov = m.get("provenance") if isinstance(m.get("provenance"), dict) else None
+    if prov:
+        if (prov.get("kind"), prov.get("sourceTool")) != ("internal_system", "cron"):
+            return None
+        hit = _CRON_PROMPT_RE.match(str(prov.get("sourcePromptPrefix") or ""))
+        return prov.get("jobId") or (hit.group("job") if hit else None)
+    hit = _CRON_PROMPT_RE.match(((_history_item(m) or {}).get("text") or "").lstrip())
+    return hit.group("job") if hit else None
+
+
 def wake_turns(messages: list) -> list:
-    """[{key, at, job}] of the cron wake user turns, in transcript order: `key`
-    is the turn id (its `:user` key without the suffix), `at` its commit time
-    (`recordTimestampMs`), `job` the cron job id from its prompt."""
+    """[{key, at, job, shared_run}] of the cron wake turns, in transcript
+    order: `key` is the turn id (its `:user` key without the suffix), `at` its
+    commit time (`recordTimestampMs`), `job` the cron job id, `shared_run`
+    True when the wake runs under the session's id (9.3, ELI-103). Reads
+    `chat.history` as returned or with its roles restored (`_transcript_roles`)."""
     out = []
     for m in messages or []:
-        key = _history_user_run_id(m)
-        if not key or parse_pipe_run_id(key) or m.get("provenance"):
+        if not isinstance(m, dict):
             continue
-        hit = _CRON_PROMPT_RE.match(((_history_item(m) or {}).get("text") or "").lstrip())
-        if not hit:
+        key = _history_user_run_id({**m, "role": "user"} if _is_forwarded_turn(m) else m)
+        if not key or parse_pipe_run_id(key):
+            continue
+        job = _cron_turn_job(m)
+        if not job:
             continue
         meta = m.get("__openclaw") if isinstance(m.get("__openclaw"), dict) else {}
         at = meta.get("recordTimestampMs") or m.get("timestamp")
         out.append({"key": key, "at": at if isinstance(at, (int, float)) else None,
-                    "job": hit.group("job")})
+                    "job": job, "shared_run": not m.get("provenance")})
     return out
+
+
+def _shared_wake_turns(messages: list) -> list:
+    """The wake turns whose wake runs under the session's id: the only ones a
+    sessionId event can belong to."""
+    return [w for w in wake_turns(messages) if w["shared_run"]]
 
 
 def wake_turn_at(messages: list, at_ms: float, bound=frozenset()) -> dict | None:
@@ -770,7 +806,7 @@ def wake_turn_at(messages: list, at_ms: float, bound=frozenset()) -> dict | None
     (`bound`). None while it is not committed yet (the embedded runtime writes
     the user turn without awaiting it, embedded-agent-DNQn_PMM.mjs:5891): the
     caller tries again on the wake's next event."""
-    for turn in reversed(wake_turns(messages)):
+    for turn in reversed(_shared_wake_turns(messages)):
         if turn["at"] is not None and turn["at"] <= at_ms:
             return None if turn["key"] in bound else turn
     return None
@@ -782,7 +818,7 @@ def wake_turn_of_run(messages: list, job: str, start_ms: float, bound=frozenset(
     while it is not committed yet: the embedded runtime writes it after the
     run's first events, so a turn is not looked for before the event (as
     `wake_turn_at` must, knowing no run)."""
-    for turn in reversed(wake_turns(messages)):
+    for turn in reversed(_shared_wake_turns(messages)):
         if turn["job"] == job and turn["at"] is not None and turn["at"] >= start_ms:
             return None if turn["key"] in bound else turn
     return None
@@ -1005,8 +1041,13 @@ _OWUI_KEY_USER = re.compile(r"^agent:[^:]+:openwebui-([0-9a-fA-F-]{36})-")
 # ---------------------------------------------------------------------------
 
 class GatewayError(Exception):
-    """Raised when the Gateway WebSocket handshake fails."""
-    pass
+    """Raised when the Gateway WebSocket handshake fails, or a request is
+    refused. `error` is the refusal's error shape ({code, message, details,
+    retryable, retryAfterMs}), when the Gateway sent one."""
+
+    def __init__(self, message: str = "", error: dict | None = None):
+        super().__init__(message)
+        self.error = error or {}
 
 
 # How long to wait for the Gateway's TCP/WS accept before giving up. Mirrors
@@ -1604,6 +1645,14 @@ _ROW_MARKER_TYPE = "_pipe_row"
 # we have", never a coincidence of a short phrase ("OK.", "Done.").
 _WHOLE_TEXT_ANCHOR_CHARS = 200
 _MIN_WHOLE_TEXT_ANCHOR_CHARS = 64
+_LINE_BREAKS_RE = re.compile(r"\n+")
+
+
+def _one_break(text: str) -> str:
+    """`text` with each run of line breaks as one: a claude-cli run's closer
+    joins its messages by one newline, where the stream put the Gateway's
+    two-newline message break (ELI-219)."""
+    return _LINE_BREAKS_RE.sub("\n", text)
 
 
 def _item_delta_text(item_text: str, last_item_text: str, assistant_stream_text: str) -> str:
@@ -1623,6 +1672,14 @@ def _item_delta_text(item_text: str, last_item_text: str, assistant_stream_text:
         return ""
     if item_text.startswith(baseline):
         return item_text[len(baseline):]
+    if _one_break(item_text) == _one_break(baseline):
+        return ""
+    if last_item_text and item_text.endswith("\n" + last_item_text):
+        # The run's whole text, its messages joined by newlines, closing with
+        # the message item already shown: a claude-cli run's closer after a
+        # second message (ELI-219), whose last item can be too short for the
+        # anchors below.
+        return ""
     # Not a prefix extension. If the item still contains the tail of what was
     # already received, it is the cumulative text with something missing
     # from the middle or the start (events lost while the Gateway socket was
@@ -2078,6 +2135,12 @@ class _TurnRenderer:
         # first text gets the break the live stream puts between messages.
         # The Gateway inserts it only inside one run.
         self.run_boundary = False
+        # Text that opens a message item and is, so far, a silent sentinel or
+        # the start of one (`_add_text`).
+        self._held = ""
+        # The run answered with a silent sentinel alone (`flush`): no text is
+        # its reply, not something lost.
+        self.silenced = False
 
     @property
     def received(self) -> str:
@@ -2125,7 +2188,41 @@ class _TurnRenderer:
             self.visible_text += chunk
 
     def _add_text(self, chunk: str) -> str:
-        """Append `chunk` to the run's text; returns it as added."""
+        """Append `chunk` to the run's text; returns it as added. A message
+        item that opens with a silent sentinel is held until it is told from
+        text: a sentinel followed by more text is dropped, and the run's own
+        answer follows (a claude-cli run that answered `NO_REPLY` and went on
+        after its background task reported, ELI-219). A sentinel alone stays
+        out; anything else is shown as it came (`flush` at the run's end)."""
+        if not chunk:
+            return ""
+        last = self.output[-1] if self.output else None
+        if last is None or last.get("type") != "message" or not last["content"][0]["text"]:
+            pending = self._held + chunk
+            lead = pending.lstrip()
+            if any(s.startswith(lead) for s in _SILENT_SENTINELS):
+                self._held = pending
+                return ""
+            self._held = ""
+            for s in _SILENT_SENTINELS:
+                if lead.startswith(s) and lead[len(s):len(s) + 1].isspace():
+                    pipe_log(f"  dropped a leading {s} before the run's text")
+                    pending = lead[len(s):].lstrip()
+                    break
+            chunk = pending
+        return self._append_text(chunk)
+
+    def flush(self) -> str:
+        """The run ended, or a card follows: held text that is not a
+        sentinel is shown after all; returns it as added."""
+        held, self._held = self._held, ""
+        if held.strip() in _SILENT_SENTINELS:
+            self.silenced = True
+        if not held.strip() or held.strip() in _SILENT_SENTINELS:
+            return ""
+        return self._append_text(held)
+
+    def _append_text(self, chunk: str) -> str:
         if not chunk:
             return ""
         if self.run_boundary:
@@ -2239,6 +2336,7 @@ class _TurnRenderer:
                 return events
             if phase == "start":
                 if tcid:
+                    events.append(self.flush())
                     args_str = json.dumps(data.get("args", {}))
                     self._active_tool_args[tcid] = args_str
                     self._active_tool_names[tcid] = name
@@ -2495,6 +2593,10 @@ class _GatewayConnection:
         # its own (ELI-176).
         self._reconnect_now = asyncio.Event()
         self._reconnect_waiters: list = []
+        # Turns waiting through a Gateway that refuses connections (down or
+        # restarting): while there are any, the event loop tries again at its
+        # first backoff step, not its longest.
+        self._turns_awaiting_gateway = 0
         # The Gateway sends a `tick` event every `policy.tickIntervalMs` of
         # hello-ok (30 s, server-maintenance-Wf2jQ0wx.mjs:156); its own client
         # drops a socket that sent no frame for twice that ("tick timeout",
@@ -2550,6 +2652,10 @@ class _GatewayConnection:
         self.gateway_boot_id: str | None = None
         self.gateway_restarts = 0
         self.gateway_version: str | None = None   # hello-ok.server.version
+        # hello-ok.features: what this Gateway offers, checked instead of its
+        # version number (a feature can land in several release lines).
+        self.gateway_methods: frozenset = frozenset()
+        self.gateway_events: frozenset = frozenset()
 
         # Next request id
         self._next_req_id = 1
@@ -2673,8 +2779,11 @@ class _GatewayConnection:
 
     async def _subscribe_messages(self, session_key: str) -> bool:
         try:
-            await self.send_request(
-                "sessions.messages.subscribe", {"key": session_key}, timeout=15
+            # Refused like a run while a Gateway that just started prepares
+            # the agent: given up, the renewed session would get no tool
+            # events until the next reconnect.
+            await _send_when_prepared(
+                self, "sessions.messages.subscribe", {"key": session_key}, timeout=15
             )
             return True
         except Exception as ex:
@@ -3013,23 +3122,51 @@ class _GatewayConnection:
             # be read until its backoff ends, and its next attempt would replace
             # it: the turn's first request then timed out (ELI-176). Have the
             # loop try now, and take that attempt's outcome.
-            waiter = asyncio.get_running_loop().create_future()
-            self._reconnect_waiters.append(waiter)
-            self._reconnect_now.set()
-            await asyncio.wait({waiter, self._event_loop_task}, return_when=asyncio.FIRST_COMPLETED)
-            if not waiter.done():
-                raise GatewayError("gateway connection stopped while reconnecting")
-            error = waiter.result()
-            if error is not None:
-                raise error if isinstance(error, GatewayError) else GatewayError(str(error))
+            await self._await_reconnect()
             return
         async with self._init_lock:
             if self._ws and self._event_loop_task and not self._event_loop_task.done():
                 return
             self._stopped = False
-            await self._connect_and_start()
+            await self._connect_once_started()
             if not self._event_loop_task or self._event_loop_task.done():
                 self._event_loop_task = asyncio.create_task(self._event_loop())
+
+    async def _await_reconnect(self):
+        """Take the event loop's next reconnect outcome (ELI-176). A Gateway
+        that refuses the connection is down or restarting, and this socket was
+        up before, so it is not a wrong GATEWAY_URL: wait through the loop's
+        later attempts, up to GATEWAY_DOWN_WAIT_S, rather than answer the
+        message with the refusal. Any other failure is raised at once."""
+        deadline = time.monotonic() + GATEWAY_DOWN_WAIT_S
+        refusal = None
+        self._turns_awaiting_gateway += 1
+        try:
+            self._reconnect_now.set()
+            while True:
+                waiter = asyncio.get_running_loop().create_future()
+                self._reconnect_waiters.append(waiter)
+                # The loop's first attempt is made at once; later ones at its first step.
+                await asyncio.wait({waiter, self._event_loop_task},
+                                   timeout=None if refusal is None else max(0, deadline - time.monotonic()),
+                                   return_when=asyncio.FIRST_COMPLETED)
+                if not waiter.done():
+                    waiter.cancel()
+                    if self._event_loop_task.done():
+                        raise GatewayError("gateway connection stopped while reconnecting")
+                    raise refusal
+                error = waiter.result()
+                if error is None:
+                    return
+                error = error if isinstance(error, GatewayError) else GatewayError(str(error))
+                if not _gateway_refused(error) or time.monotonic() >= deadline:
+                    raise error
+                if refusal is None:
+                    pipe_log("  the Gateway refuses connections (down or restarting); the message "
+                             f"waits for the reconnect, up to {GATEWAY_DOWN_WAIT_S} s")
+                refusal = error
+        finally:
+            self._turns_awaiting_gateway -= 1
 
     async def send_request(self, method: str, params: dict, timeout: float = 10) -> dict:
         """Send a request and wait for the response."""
@@ -3731,11 +3868,13 @@ class _GatewayConnection:
             # exactly what happens when something answers but isn't a Gateway
             # (a reverse proxy returning 502 on the upgrade, an HTTP server on
             # the port). That is a configuration mistake, and it belongs in the
-            # chat naming the valve, not as an unattributed traceback.
+            # chat naming the valve, not as an unattributed traceback. A refused
+            # connect is marked: a reconnecting turn waits through it.
             raise GatewayError(
                 f"Could not connect to the OpenClaw Gateway at {host}:{port} "
                 f"({type(ex).__name__}: {ex}). Is the Gateway running, and is "
-                "the GATEWAY_URL valve pointing at it?"
+                "the GATEWAY_URL valve pointing at it?",
+                error={"code": GATEWAY_REFUSED_CODE} if _refused_connect(ex) else None,
             )
 
         # Handshake: receive challenge
@@ -3766,13 +3905,16 @@ class _GatewayConnection:
             )
         )))
 
-        resp = json.loads(await asyncio.wait_for(ws.recv(), 10))
+        resp = await _connect_response(ws, "1")
         if not resp.get("ok"):
+            err = resp.get("error")
+            pipe_log(f"  connect rejected: {json.dumps(err)[:500]}")
             raise GatewayError(
                 _explain_connect_rejection(
-                    str(resp.get("error", {}).get("message", "connect failed")),
+                    str((err or {}).get("message", "connect failed")),
                     device_id=(self._ident or {}).get("id"),
-                )
+                ),
+                error=err if isinstance(err, dict) else None,
             )
 
         # Capture device token for future reconnects
@@ -3791,6 +3933,9 @@ class _GatewayConnection:
         self.connection_epoch += 1
         self._thinking_note_shown.clear()
         self.gateway_version = (hello_ok.get("server") or {}).get("version")
+        features = hello_ok.get("features") or {}
+        self.gateway_methods = frozenset(features.get("methods") or ())
+        self.gateway_events = frozenset(features.get("events") or ())
         self._note_gateway_boot((hello_ok.get("server") or {}).get("bootId"))
         pipe_log(
             f"Connected to Gateway (persistent) [epoch {self.connection_epoch}]"
@@ -3915,7 +4060,8 @@ class _GatewayConnection:
                                 GatewayError(
                                     err.get("message")
                                     or err.get("code")
-                                    or "request failed"
+                                    or "request failed",
+                                    error=err if isinstance(err, dict) else None,
                                 )
                             )
                         else:
@@ -4054,6 +4200,27 @@ class _GatewayConnection:
                 except Exception as ex:  # the loop outlives any one failure
                     pipe_log(f"  event gap marking failed: {ex!r}")
 
+    async def _connect_once_started(self):
+        """`_connect_and_start`, connecting again while a Gateway that has
+        just started refuses connections until its startup sidecars run
+        ("gateway starting; retry shortly", details.reason "startup-sidecars"),
+        after the wait it names, as OpenClaw's own clients do
+        (startup-unavailable-D0-EeFjq.mjs, 2026.10.5). Any other failure, or
+        one past STARTUP_REFUSAL_WAIT_S, is raised."""
+        deadline = time.monotonic() + STARTUP_REFUSAL_WAIT_S
+        told = False
+        while True:
+            try:
+                return await self._connect_and_start()
+            except GatewayError as ex:
+                retry_ms = _gateway_starting_retry_ms(ex)
+                if retry_ms is None or self._stopped or time.monotonic() + retry_ms / 1000 > deadline:
+                    raise
+                if not told:
+                    told = True
+                    pipe_log(f"  the Gateway is starting; connecting again as it asks (every {retry_ms} ms)")
+                await asyncio.sleep(retry_ms / 1000)
+
     async def _reconnect(self):
         """Reconnect with exponential backoff.
 
@@ -4064,7 +4231,8 @@ class _GatewayConnection:
         """
         while not self._stopped:
             self._reconnect_attempt += 1
-            delay = min(2 ** (self._reconnect_attempt - 1), self._max_backoff)
+            delay = 1 if self._turns_awaiting_gateway else min(2 ** (self._reconnect_attempt - 1),
+                                                               self._max_backoff)
             pipe_log(f"  reconnect in {delay}s (attempt {self._reconnect_attempt})")
             try:
                 # A turn waiting for the connection ends the wait (ensure_connected).
@@ -4077,7 +4245,7 @@ class _GatewayConnection:
                 self._answer_reconnect_waiters(GatewayError("gateway connection stopped"))
                 return
             try:
-                await self._connect_and_start()
+                await self._connect_once_started()
                 self._answer_reconnect_waiters(None)
                 return
             except Exception as e:
@@ -4153,6 +4321,7 @@ def _history_renderer(messages: list) -> "_TurnRenderer":
     r = _TurnRenderer()
     for payload in _history_events(messages):
         r.feed(payload)
+    r.flush()
     return r
 
 
@@ -4590,7 +4759,122 @@ async def _run_request(conn, method: str, params: dict, *, timeout: float = 10,
                                               else f"run-{uuid.uuid4().hex[:8]}",
                                               method=method, params=params)))
         return None
-    return await target.send_request(method, params, timeout=timeout)
+    return await _send_when_prepared(target, method, params, timeout=timeout)
+
+
+async def _send_when_prepared(conn, method: str, params: dict, *, timeout: float = 10):
+    """`conn.send_request`, sent again while the Gateway refuses it only
+    because it is still preparing the agent after its start, after the wait
+    each refusal names, up to STARTUP_REFUSAL_WAIT_S. Any other refusal the
+    Gateway calls retryable (UNAVAILABLE, `retryable`) is sent again too, up to
+    RETRYABLE_REFUSAL_WAIT_S from the first: right after preparation, 2026.10.5
+    refuses sessions.patch with "Session patch failed unexpectedly. Retry the
+    request." while its session storage gets ready (a log line says so; the
+    refusal itself names no reason and no wait)."""
+    started = time.monotonic()
+    deadline = started + STARTUP_REFUSAL_WAIT_S
+    told = set()
+    while True:
+        try:
+            return await conn.send_request(method, params, timeout=timeout)
+        except GatewayError as ex:
+            retry_ms, why = _startup_refusal_retry_ms(ex), "preparing"
+            if retry_ms is None:
+                retry_ms, why = _retryable_refusal_retry_ms(ex), "retryable"
+                if retry_ms is not None and "retryable-since" not in told:
+                    told.add("retryable-since")
+                    retryable_deadline = time.monotonic() + RETRYABLE_REFUSAL_WAIT_S
+            if retry_ms is None or time.monotonic() + retry_ms / 1000 > (
+                    deadline if why == "preparing" else min(deadline, retryable_deadline)):
+                raise
+            if why not in told:
+                told.add(why)
+                pipe_log(f"  {method}: the Gateway is still preparing the agent after its start; "
+                         f"sending again as it asks (every {retry_ms} ms, up to {STARTUP_REFUSAL_WAIT_S} s)"
+                         if why == "preparing" else
+                         f"  {method}: refused as retryable ({ex}); sending again in {retry_ms} ms, "
+                         f"up to {RETRYABLE_REFUSAL_WAIT_S} s")
+            await asyncio.sleep(retry_ms / 1000)
+
+
+# A Gateway that has just started refuses runs until it has inspected and
+# prepared the agent's database (2026.10.5 and later): `UNAVAILABLE`,
+# `retryable`, `retryAfterMs`, details.code below. The refusal comes before
+# the request's ack and is not kept in the idempotency cache ("client-retry",
+# chat-send-handler-o4Nr7Ej0.mjs:340/428), so the same request, same key, is
+# sent again after the time it names. No event marks the end of preparation.
+STARTUP_REFUSAL_CODE = "agent-database-inspection-pending"
+STARTUP_REFUSAL_WAIT_S = 300
+RETRYABLE_REFUSAL_WAIT_S = 30
+# How long a message waits for a Gateway that refuses connections after it was
+# reached (a restart: the port is closed until the new process listens).
+GATEWAY_DOWN_WAIT_S = 120
+GATEWAY_REFUSED_CODE = "connection-refused"
+
+
+async def _connect_response(ws, req_id: str, timeout: float = 10) -> dict:
+    """The Gateway's response to our connect request: the first `res` frame
+    with its id. Any other frame before it is skipped (and logged): taken as
+    the response, it read as a rejection with no reason ("connect failed")."""
+    deadline = time.monotonic() + timeout
+    while True:
+        frame = json.loads(await asyncio.wait_for(ws.recv(), max(0, deadline - time.monotonic())))
+        if frame.get("type") == "res" and frame.get("id") == req_id:
+            return frame
+        pipe_log(f"  frame before the connect response, skipped: type={frame.get('type')!r} "
+                 f"event={frame.get('event')!r} id={frame.get('id')!r}")
+
+
+def _refused_connect(ex) -> bool:
+    """Every address the host resolved to refused the TCP connect. asyncio
+    raises one OSError for all of them ("Multiple exceptions: ...") when their
+    messages differ, as for localhost's ::1 and 127.0.0.1."""
+    if isinstance(ex, ConnectionRefusedError):
+        return True
+    text = str(ex)
+    return (isinstance(ex, OSError) and text.startswith("Multiple exceptions:")
+            and text.count("[Errno") == text.count(f"[Errno {errno.ECONNREFUSED}]"))
+
+
+def _gateway_refused(ex) -> bool:
+    """A connect the Gateway's host refused: nothing listens on the port."""
+    return isinstance(ex, GatewayError) and ex.error.get("code") == GATEWAY_REFUSED_CODE
+
+
+def _gateway_starting_retry_ms(ex: GatewayError) -> int | None:
+    """The wait before connecting again to a Gateway that refused the connect
+    only because it is still starting, bounded as its own clients bound it
+    (resolveGatewayStartupRetryAfterMs: 100 to 2000 ms, 500 by default)."""
+    err = getattr(ex, "error", None) or {}
+    details = err.get("details") if isinstance(err.get("details"), dict) else {}
+    if err.get("code") != "UNAVAILABLE" or err.get("retryable") is not True \
+            or details.get("reason") != "startup-sidecars":
+        return None
+    retry = err.get("retryAfterMs")
+    retry = int(retry) if isinstance(retry, (int, float)) else 500
+    return min(max(retry, 100), 2000)
+
+
+def _startup_refusal_retry_ms(ex: GatewayError) -> int | None:
+    """The wait the Gateway asks for before sending a refused request again,
+    when it refused it only because it is still preparing after its start."""
+    err = getattr(ex, "error", None) or {}
+    details = err.get("details") if isinstance(err.get("details"), dict) else {}
+    if not err.get("retryable") or details.get("code") != STARTUP_REFUSAL_CODE:
+        return None
+    retry = err.get("retryAfterMs")
+    return int(retry) if isinstance(retry, (int, float)) and retry > 0 else 250
+
+
+def _retryable_refusal_retry_ms(ex: GatewayError) -> int | None:
+    """The wait before sending again a request the Gateway refused as
+    UNAVAILABLE and `retryable` for any other reason: the one it names, else
+    the startup refusal's 250 ms."""
+    err = getattr(ex, "error", None) or {}
+    if err.get("code") != "UNAVAILABLE" or err.get("retryable") is not True:
+        return None
+    retry = err.get("retryAfterMs")
+    return int(retry) if isinstance(retry, (int, float)) and retry > 0 else 250
 
 
 # --- emit ------------------------------------------------------------------
@@ -4950,7 +5234,7 @@ def _dialog_safe_event_call(event_call, sid, user_id):
 # reply that is streaming into the same tab.
 # ---------------------------------------------------------------------------
 
-_COMPOSER_BUTTON_VERSION = "5"
+_COMPOSER_BUTTON_VERSION = "6"
 
 # The Status Action's function id (install_action.py's FUNCTION_ID; the
 # dialog's own JS calls the same fixed id) and the Pipe's default function id.
@@ -4990,7 +5274,8 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
   // removing it (a layout this snippet does not understand): give up.
   const LOOP_LIMIT = 20;
   const LOOP_WINDOW_MS = 10000;
-  const SPARK_PATH = 'M9.813 15.904 9 18.75l-.813-2.846a4.5 4.5 0 0 0-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 0 0 3.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 0 0 3.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 0 0-3.09 3.09ZM18.259 8.715 18 9.75l-.259-1.035a3.375 3.375 0 0 0-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 0 0 2.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 0 0 2.456 2.456L21.75 6l-1.035.259a3.375 3.375 0 0 0-2.456 2.456ZM16.894 20.567 16.5 21.75l-.394-1.183a2.25 2.25 0 0 0-1.423-1.423L13.5 18.75l1.183-.394a2.25 2.25 0 0 0 1.423-1.423l.394-1.183.394 1.183a2.25 2.25 0 0 0 1.423 1.423l1.183.394-1.183.394a2.25 2.25 0 0 0-1.423 1.423Z';
+  // A paw, drawn in Heroicons' outline style (24x24, round caps), for "Claw".
+  const PAW_PATH = 'M11 6a1.5 2 0 1 1-3 0 1.5 2 0 0 1 3 0ZM16 6a1.5 2 0 1 1-3 0 1.5 2 0 0 1 3 0ZM7 10.5a1.5 1.75 0 1 1-3 0 1.5 1.75 0 0 1 3 0ZM20 10.5a1.5 1.75 0 1 1-3 0 1.5 1.75 0 0 1 3 0ZM12 12.75c-2.25 0-5.25 2.6-5.25 4.875 0 1.45 1.1 2.375 2.55 2.375.95 0 1.7-.45 2.7-.45s1.75.45 2.7.45c1.45 0 2.55-.925 2.55-2.375 0-2.275-3-4.875-5.25-4.875Z';
 
   const state = {
     prefixes: [],
@@ -5239,7 +5524,9 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
     const b = document.createElement('button');
     b.type = 'button';
     b.id = BTN_ID;
-    b.title = 'OpenClaw status';
+    // Shown as "Claw" (ELI-202); the aria-label keeps its old name, which the
+    // page scripts and the tests find the button by.
+    b.title = 'Claw';
     b.setAttribute('aria-label', 'OpenClaw status');
     b.dataset.openclawVersion = CFG.version;
     b.className = 'p-[0.375rem] flex gap-1 items-center text-sm rounded-full '
@@ -5247,11 +5534,11 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
       + 'bg-transparent text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800';
     b.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" '
       + 'stroke-width="1.75" stroke="currentColor" aria-hidden="true" class="size-4">'
-      + '<path stroke-linecap="round" stroke-linejoin="round" d="' + SPARK_PATH + '"/></svg>'
+      + '<path stroke-linecap="round" stroke-linejoin="round" d="' + PAW_PATH + '"/></svg>'
       // Icon-only below `sm`, like Open WebUI's own composer chips: at phone
       // width the chip row's overflow cut the label to "Stat" (ELI-123). The
       // title and aria-label still name it. Both classes ship in Open WebUI's CSS.
-      + '<span class="pr-0.5 hidden sm:inline">Status</span>';
+      + '<span class="pr-0.5 hidden sm:inline">Claw</span>';
     b.addEventListener('click', function (e) {
       e.preventDefault();
       e.stopPropagation();
@@ -6492,7 +6779,7 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
   header.style.flexShrink = '0';
   const title = document.createElement('div');
   title.className = 'text-sm font-semibold';
-  title.textContent = 'OpenClaw Status';
+  title.textContent = 'Claw';
   header.appendChild(title);
   const headerEnd = document.createElement('div');
   headerEnd.className = 'flex items-center gap-3';
@@ -6645,11 +6932,20 @@ _CONTEXT_FILL_JS_TEMPLATE = r"""
   sub.textContent = DATA.provider + (DATA.model ? (' · ' + DATA.model) : '');
   section.appendChild(sub);
 
+  // A compaction the Gateway refused, in its own words (ELI-209).
+  function addNotice() {
+    if (!DATA.notice) return;
+    const notice = S.errorEl(DATA.notice);
+    notice.className += ' mt-2';
+    section.appendChild(notice);
+  }
+
   if (!DATA.context) {
     const empty = document.createElement('div');
     empty.className = 'text-gray-400 dark:text-gray-500 text-xs';
     empty.textContent = 'No context data available for this session yet.';
     section.appendChild(empty);
+    addNotice();
     return;
   }
 
@@ -6680,6 +6976,7 @@ _CONTEXT_FILL_JS_TEMPLATE = r"""
   label.textContent = DATA.context.usedTokens + ' / ' + DATA.context.totalTokens
     + ' tokens · ' + DATA.context.pct + '%';
   section.appendChild(label);
+  addNotice();
 
   if (DATA.goal) {
     const goalWrap = document.createElement('div');
@@ -7743,6 +8040,36 @@ def _spawn_task_of(messages: list) -> str | None:
     return None
 
 
+# A /compact run always ends "done": whether it compacted is only in its
+# reply, the Gateway's "⚙️ Compaction ..." line. These lead a refusal.
+_COMPACT_REFUSALS = ("Compaction failed", "Compaction unavailable")
+
+
+def _compact_reply(messages: list, idempotency_key: str) -> str | None:
+    """The text of the compact run's own reply: the assistant message that
+    carries the run's idempotency key, else the first one after the
+    `/compact` turn (whose key is the run's plus ":user")."""
+    def key_of(m):
+        meta = m.get("__openclaw") if isinstance(m.get("__openclaw"), dict) else {}
+        return m.get("idempotencyKey") or meta.get("idempotencyKey")
+
+    after_ours = None
+    for m in messages or []:
+        if key_of(m) == f"{idempotency_key}:user":
+            after_ours = True
+        elif m.get("role") == "assistant" and (key_of(m) == idempotency_key or after_ours):
+            return "\n".join(_message_text_blocks(m))
+    return None
+
+
+def _compact_refusal(reply: str | None) -> str | None:
+    """The Gateway's reason when its reply says it did not compact, without
+    the leading gear and the trailing context figures."""
+    text = (reply or "").strip().removeprefix("⚙️").strip()
+    head = text.split(" • ")[0].strip().rstrip(".")
+    return head if head.startswith(_COMPACT_REFUSALS) else None
+
+
 # How the drawer reads a sub-agent's run: the Gateway's largest page
 # (CHAT_HISTORY_MAX_ENTRIES), text blocks up to 50000 characters, and a byte
 # budget per read: the newest steps that fit, the rest behind "Show earlier
@@ -7854,6 +8181,28 @@ async def _drawer_parent(conn, session_row: dict, user_id) -> dict | None:
     return {"title": (row.get("label") or row.get("displayName") or "").strip() or key, "childKey": key}
 
 
+async def _previewed_task(conn, child_key: str) -> str | None:
+    """The child's task out of `sessions.preview`, which keeps the spawn
+    message as the model got it. 2026.10.5's `chat.history` shows the bare
+    task with nothing that marks it as the spawn (its display projection
+    strips the envelope), so the history read alone does not find it."""
+    try:
+        resp = await conn.send_request("sessions.preview", dict(keys=[child_key], limit=20, maxChars=2000),
+                                       timeout=5)
+    except Exception as ex:
+        pipe_log(f"[status-action] sessions.preview (drawer task) failed: {ex}")
+        return None
+    return _subagent_task_texts(resp).get(child_key)
+
+
+def _without_bare_task(items: list, task: str | None) -> list:
+    """The drawer's items without a first user turn that is the task the
+    header shows: the spawn message as 2026.10.5's history shows it."""
+    if task and items and items[0].get("kind") == "user" and items[0].get("text", "").strip() == task.strip():
+        return items[1:]
+    return items
+
+
 async def _latest_preview(conn, child_key: str) -> str | None:
     """A running child's newest message as the session list previews it:
     what a claude-cli child has said so far, while its transcript is still
@@ -7867,6 +8216,23 @@ async def _latest_preview(conn, child_key: str) -> str | None:
     row = next((r for r in (resp or {}).get("sessions") or [] if r.get("key") == child_key), {})
     preview = row.get("lastMessagePreview")
     return preview if isinstance(preview, str) and preview.strip() and not _is_spawn_message(preview) else None
+
+
+# The toolbar button's icon, the composer chip's paw (ELI-202); without one
+# Open WebUI draws its default sparkle. A fixed gray stroke on purpose: Open
+# WebUI draws it as an <img>, so currentColor never resolves, and inverts it
+# 80% in dark mode; this gray stays a mid gray in both, like its own icons.
+ICON_URL = (
+    "data:image/svg+xml;charset=utf-8,"
+    "%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%20fill='none'%20"
+    "stroke='%236b7280'%20stroke-width='1.6'%20stroke-linecap='round'%20stroke-linejoin='round'"
+    "%3E%3Cpath%20d='M11%206a1.5%202%200%201%201-3%200%201.5%202%200%200%201%203%200ZM16%206a"
+    "1.5%202%200%201%201-3%200%201.5%202%200%200%201%203%200ZM7%2010.5a1.5%201.75%200%201%201"
+    "-3%200%201.5%201.75%200%200%201%203%200ZM20%2010.5a1.5%201.75%200%201%201-3%200%201.5%20"
+    "1.75%200%200%201%203%200ZM12%2012.75c-2.25%200-5.25%202.6-5.25%204.875%200%201.45%201.1"
+    "%202.375%202.55%202.375.95%200%201.7-.45%202.7-.45s1.75.45%202.7.45c1.45%200%202.55-.925"
+    "%202.55-2.375%200-2.275-3-4.875-5.25-4.875Z'/%3E%3C/svg%3E"
+)
 
 
 class Action:
@@ -7912,6 +8278,7 @@ class Action:
 
     def __init__(self):
         self.valves = self.Valves()
+        self.icon_url = ICON_URL
 
     async def action(self, body: dict, __user__=None, __event_emitter__=None):
         """Dispatches on body["mode"]: the default ("status", or absent --
@@ -7973,7 +8340,7 @@ class Action:
                 chat_model=model if ours else None,
             )
 
-    async def _run_status(self, body: dict, __user__, __event_emitter__, *, show_loading=True):
+    async def _run_status(self, body: dict, __user__, __event_emitter__, *, show_loading=True, notice=None):
         """Opens the dialog at once with every section's title, then fills
         each section on its own the moment its own data is in (ELI-163): a
         slow or failing source shows in its section only.
@@ -8119,6 +8486,7 @@ class Action:
                 "model": session_row.get("model") or "",
                 "context": context_data,
                 "goal": goal_data,
+                "notice": notice,
                 "source": source,
                 "fetchedAt": int(time.time() * 1000),
                 "error": None,
@@ -8416,12 +8784,13 @@ class Action:
         # it's about to finish in a second.
         await __event_emitter__({"type": "execute", "data": {"code": _MODAL_COMPACTING_JS}})
 
+        idempotency_key = f"{ACTION_RUN_PREFIX}compact-{chat_id}-{time.time()}"
         try:
             compact_params = _owui_chat_send_params(
                 session_key=session_key,
                 message="/compact",
                 # ACTION_RUN_PREFIX: the turn path never gives this run a message.
-                idempotency_key=f"{ACTION_RUN_PREFIX}compact-{chat_id}-{time.time()}",
+                idempotency_key=idempotency_key,
                 owui_chat_id=chat_id,
                 owui_user_id=user_id,
             )
@@ -8470,6 +8839,19 @@ class Action:
                 "data": {"code": _render_sections_error_js(f"Compact {status}.")},
             })
             return {"status": "error", "detail": status}
+
+        # The run is done either way; its reply says whether it compacted
+        # (ELI-209). A reply that cannot be read leaves the numbers to speak.
+        try:
+            history = await conn.send_request("chat.history", dict(sessionKey=session_key, limit=10), timeout=8)
+            refusal = _compact_refusal(_compact_reply((history or {}).get("messages"), idempotency_key))
+        except Exception as ex:
+            pipe_log(f"[status-action] compact reply read failed: {ex}")
+            refusal = None
+        if refusal:
+            pipe_log(f"[status-action] compact refused: {refusal}")
+            await self._run_status(body, __user__, __event_emitter__, show_loading=False, notice=refusal)
+            return {"status": "error", "detail": refusal}
 
         pipe_log("[status-action] compact done, refreshing status")
         return await self._run_status(body, __user__, __event_emitter__, show_loading=False)
@@ -8548,9 +8930,11 @@ class Action:
             return {"status": "error", "detail": "sub-agent not found"}
 
         parent = session_row.get("spawnedBy") or session_row.get("parentSessionKey")
-        task = _subagent_row({"key": child_key, **session_row},
-                             _spawn_task_of(messages) or _subagent_tasks(parent).get(child_key))
-        items, dropped = _cap_run_items(_drawer_run_items(messages), budget)
+        task_text = _spawn_task_of(messages) or _subagent_tasks(parent).get(child_key)
+        if task_text is None:
+            task_text = await _previewed_task(conn, child_key)
+        task = _subagent_row({"key": child_key, **session_row}, task_text)
+        items, dropped = _cap_run_items(_without_bare_task(_drawer_run_items(messages), task_text), budget)
         claude_cli = (session_row.get("agentRuntime") or {}).get("id") == "claude-cli"
         note = latest = None
         if claude_cli and task["status"] in _LIVE_SUBAGENT_STATUSES:

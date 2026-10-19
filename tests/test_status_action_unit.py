@@ -23,6 +23,8 @@ install_stubs()
 
 from openclaw_status_action import (  # noqa: E402
     Action,
+    _compact_refusal,
+    _compact_reply,
     _control_ui_session_url,
     _drawer_run_items,
     _get_action_connection,
@@ -239,6 +241,17 @@ class DialogSectionTests(unittest.TestCase):
                 seen = self._page([self._context(pct)])
                 self.assertEqual(seen["bars"], [colour])
                 self.assertIn("34k / 1.0m tokens", seen["context"])
+
+    def test_a_refused_compaction_shows_under_the_numbers(self):
+        fill = _render_context_fill_js({
+            "provider": "anthropic", "model": "claude-opus-5-5",
+            "context": {"usedTokens": "34k", "totalTokens": "1.0m", "pct": 3},
+            "goal": None, "notice": "Compaction failed: 400 refused",
+            "source": "pipe", "fetchedAt": 1, "error": None})
+        seen = self._page([fill])
+        self.assertIn("34k / 1.0m tokens · 3%Compaction failed: 400 refused", seen["context"])
+        self.assertTrue(seen["compact"])
+        self.assertNotIn("Compaction failed", self._page([self._context(3)])["context"])
 
     def test_no_windows_shows_a_note_and_why(self):
         seen = self._page([self._limits([], session_active=True)])
@@ -862,6 +875,7 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
             if method == "chat.send":
                 self.assertEqual(params["message"], "/compact")
                 self.assertEqual(params["deliver"], False)
+                self.sent_keys.append(params["idempotencyKey"])
                 return {"runId": "compact-run-1"}
             if method == "sessions.describe":
                 describe_calls["n"] += 1
@@ -872,6 +886,68 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
                 status = "running" if describe_calls["n"] == 1 else "done"
                 return {"session": {"status": status, "modelProvider": "anthropic",
                                      "model": "claude-sonnet-5"}}
+            if method == "chat.history":
+                return {"messages": self._reply(params, "⚙️ Compacted (15 → 4) • Context 4/200k (0%)")}
+            if method == "usage.status":
+                return {"providers": []}
+            if method == "sessions.list":
+                return {"sessions": []}
+            raise AssertionError(f"unexpected RPC: {method}")
+
+        fake_conn = mock.Mock()
+        fake_conn.active_run_id_for_session = mock.Mock(return_value=None)
+        fake_conn.send_request = mock.AsyncMock(side_effect=fake_send_request)
+
+        with action_gateway(fake_conn), \
+             mock.patch("openclaw_status_action.asyncio.sleep", new=mock.AsyncMock()), \
+             mock.patch("openclaw_status_action.pipe_log") as log:
+            result = await action._run_compact(self.COMPACT_BODY, {"id": "u1"}, emitter)
+
+        self.assertEqual(result["status"], "ok")
+        context_code = next(c for c in _emitted_codes(emitted)
+                            if "getElementById('openclaw-status-section-context')" in c)
+        self.assertIn('"notice": null', context_code)
+        self.assertNotIn("compact reply read failed", "".join(str(c) for c in log.call_args_list))
+        self.assertGreaterEqual(describe_calls["n"], 2)
+        codes = _emitted_codes(emitted)
+        self.assertIn("Compacting", codes[0])
+        self.assertIn("openclaw-status-sections", codes[1])  # skeleton reset, not full re-open
+        # The refresh must reach all three sections again, not just Context.
+        self.assertTrue(any("getElementById('openclaw-status-section-context')" in c for c in codes))
+        self.assertTrue(any("getElementById('openclaw-status-section-limits')" in c for c in codes))
+        self.assertTrue(any("getElementById('openclaw-status-section-subagents')" in c for c in codes))
+        context_code = next(c for c in codes if "getElementById('openclaw-status-section-context')" in c)
+        self.assertIn("anthropic", context_code)
+
+    sent_keys: list
+
+    def _reply(self, params, text):
+        """The compact run's turn and reply as `chat.history` shows them
+        (2026.9.3): both carry the chat.send's idempotency key."""
+        key = self.sent_keys[-1]
+        return [{"role": "user", "content": "/compact", "idempotencyKey": f"{key}:user"},
+                {"role": "assistant", "content": [{"type": "text", "text": text}],
+                 "model": "gateway-injected", "idempotencyKey": key}]
+
+    def setUp(self):
+        self.sent_keys = []
+
+    async def test_a_refused_compaction_shows_the_gateways_reason(self):
+        """ELI-209: the /compact run ends "done" whether or not it
+        compacted; a refusal must show in the dialog, not read as done."""
+        action = Action()
+        emitted = []
+
+        async def fake_send_request(method, params, timeout=5):
+            if method == "chat.send":
+                self.sent_keys.append(params["idempotencyKey"])
+                return {"runId": "compact-run-1"}
+            if method == "sessions.describe":
+                return {"session": {"status": "done", "modelProvider": "anthropic", "model": "claude-sonnet-5",
+                                     "totalTokens": 10, "contextTokens": 200000}}
+            if method == "chat.history":
+                return {"messages": self._reply(params, "⚙️ Compaction failed: Turn prefix summarization failed: "
+                                                        "400 refused • Context 10/200k (0%)")}
             if method == "usage.status":
                 return {"providers": []}
             if method == "sessions.list":
@@ -884,19 +960,13 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
 
         with action_gateway(fake_conn), \
              mock.patch("openclaw_status_action.asyncio.sleep", new=mock.AsyncMock()):
-            result = await action._run_compact(self.COMPACT_BODY, {"id": "u1"}, emitter)
+            result = await action._run_compact(self.COMPACT_BODY, {"id": "u1"}, RecordingEmitter(emitted))
 
-        self.assertEqual(result["status"], "ok")
-        self.assertGreaterEqual(describe_calls["n"], 2)
-        codes = _emitted_codes(emitted)
-        self.assertIn("Compacting", codes[0])
-        self.assertIn("openclaw-status-sections", codes[1])  # skeleton reset, not full re-open
-        # The refresh must reach all three sections again, not just Context.
-        self.assertTrue(any("getElementById('openclaw-status-section-context')" in c for c in codes))
-        self.assertTrue(any("getElementById('openclaw-status-section-limits')" in c for c in codes))
-        self.assertTrue(any("getElementById('openclaw-status-section-subagents')" in c for c in codes))
-        context_code = next(c for c in codes if "getElementById('openclaw-status-section-context')" in c)
-        self.assertIn("anthropic", context_code)
+        reason = "Compaction failed: Turn prefix summarization failed: 400 refused"
+        self.assertEqual(result, {"status": "error", "detail": reason})
+        context_code = next(c for c in _emitted_codes(emitted)
+                            if "getElementById('openclaw-status-section-context')" in c)
+        self.assertIn(json.dumps(reason), context_code)
 
     async def test_timeout_shows_clear_message_not_infinite_spin(self):
         action = Action()
@@ -934,6 +1004,50 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
         codes = _emitted_codes(emitted)
         self.assertIn("timed out", codes[-1])
         self.assertIn("openclaw-status-sections", codes[-1])
+
+
+class CompactReplyTests(unittest.TestCase):
+    """Which reply is the compact run's, and whether it says it compacted."""
+
+    KEY = "owui-action-compact-c1-1.5"
+
+    def test_the_reply_carrying_the_runs_key(self):
+        messages = [
+            {"role": "assistant", "content": [{"type": "text", "text": "an earlier answer"}]},
+            {"role": "user", "content": "/compact", "idempotencyKey": f"{self.KEY}:user"},
+            {"role": "assistant", "content": [{"type": "text", "text": "⚙️ Compacted"}],
+             "__openclaw": {"idempotencyKey": self.KEY}},
+        ]
+        self.assertEqual(_compact_reply(messages, self.KEY), "⚙️ Compacted")
+
+    def test_without_its_key_the_reply_after_the_compact_turn(self):
+        messages = [
+            {"role": "user", "content": "/compact", "__openclaw": {"idempotencyKey": f"{self.KEY}:user"}},
+            {"role": "system", "content": [{"type": "text", "text": "Compaction"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "⚙️ Compaction skipped: nothing to do"}]},
+        ]
+        self.assertEqual(_compact_reply(messages, self.KEY), "⚙️ Compaction skipped: nothing to do")
+
+    def test_another_runs_reply_is_not_it(self):
+        messages = [{"role": "assistant", "content": [{"type": "text", "text": "⚙️ Compaction failed: x"}],
+                     "idempotencyKey": "owui-action-compact-c1-0.5"}]
+        self.assertIsNone(_compact_reply(messages, self.KEY))
+
+    def test_refusals_and_successes(self):
+        cases = {
+            "⚙️ Compaction failed: Turn prefix summarization failed: 400 x • Context 10/200k (0%)":
+                "Compaction failed: Turn prefix summarization failed: 400 x",
+            "⚙️ Compaction unavailable: the previous run is still stopping.":
+                "Compaction unavailable: the previous run is still stopping",
+            "⚙️ Compaction unavailable (missing session id).": "Compaction unavailable (missing session id)",
+            "⚙️ Compacted (15 → 4) • Context 4/200k (0%)": None,
+            "⚙️ Compaction finished (resulting context unknown) • Context ?/200k": None,
+            "⚙️ Compaction skipped: nothing to compact": None,
+            None: None,
+        }
+        for reply, refusal in cases.items():
+            with self.subTest(reply=reply):
+                self.assertEqual(_compact_refusal(reply), refusal)
 
 
 class DrawerRunItemsTests(unittest.TestCase):
@@ -1216,6 +1330,42 @@ class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
         with action_gateway(fake_conn):
             await action._run_subagent_detail({**self.DETAIL_BODY, "opened": True}, {"id": "u1"}, emitter)
         self.assertFalse(any("openDrawer" in c for c in _emitted_codes(emitted)))   # a page refresh
+
+
+    async def test_the_header_task_on_a_history_that_shows_it_bare(self):
+        """OpenClaw 2026.10.5's chat.history shows the spawn message as the
+        bare task, with nothing marking it as the spawn: the header had no
+        task. sessions.preview still has it as the model got it; the bare
+        message is then the header's, not a turn of the run."""
+        action = Action()
+        emitted = []
+        task = "E2E_SLOW:20 E2E_CHILDTASK"
+        wrapped = ("<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\n\n[Subagent Context] You are running as a subagent "
+                   "(depth 1/5). Complete the current [Subagent Task]; inherited conversation is background "
+                   "context, not your assignment.\n\n[Subagent Task]\n\n<<<END_OPENCLAW_INTERNAL_CONTEXT>>>\n\n"
+                   f"{task}\n\n<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\n\nBegin. Execute the assigned task to "
+                   "completion.\n\n<<<END_OPENCLAW_INTERNAL_CONTEXT>>>")
+
+        async def fake_send_request(method, params, timeout=5):
+            if method == "sessions.describe":
+                return {"session": {"status": "done", "startedAt": 1, "endedAt": 2,
+                                     "spawnedBy": "agent:main:parent"}}
+            if method == "chat.history":
+                return {"messages": [{"role": "user", "content": task},
+                                     {"role": "assistant", "content": [{"type": "text", "text": "done it"}]}]}
+            if method == "sessions.preview":
+                self.assertEqual(params["keys"], [self.CHILD])
+                return {"previews": [{"key": self.CHILD, "items": [{"role": "user", "text": wrapped},
+                                                                    {"role": "assistant", "text": "done it"}]}]}
+            raise AssertionError(f"unexpected RPC: {method}")
+
+        with action_gateway(_drawer_conn(fake_send_request)):
+            await action._run_subagent_detail({**self.DETAIL_BODY, "opened": True}, {"id": "u1"},
+                                              RecordingEmitter(emitted))
+        fill = next(c for c in _emitted_codes(emitted) if "S.fillDrawer(DATA)" in c)
+        data = json.loads(fill[fill.index("const DATA = ") + 13:fill.index(";\n", fill.index("const DATA = "))])
+        self.assertEqual(data["task"]["task"], task)
+        self.assertEqual(data["items"], [{"kind": "text", "text": "done it"}])
 
 
 class SubagentProactiveMessageClickTests(unittest.IsolatedAsyncioTestCase):

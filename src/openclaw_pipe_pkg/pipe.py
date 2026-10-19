@@ -9,8 +9,9 @@
 # (and "done"), so a `not in (done, failed, cancelled)` test would treat every
 # resting session as active and hang every message. Only these gate the queue.
 _ACTIVE_RUN_STATES = ("active", "running", "streaming", "queued")
-# The Gateway's secret requests are asked in the chat (askuser.py, ELI-96).
-_QUESTION_HOOKS = (secret_request_seen, secret_request_resolved)
+# The Gateway's questions (secret requests, ELI-96; the ask_user tool,
+# ELI-216) are asked in the chat (askuser.py).
+_QUESTION_HOOKS = (question_requested, question_resolved)
 
 
 def _session_active_from_signals(describe_status, list_has_active_run) -> bool:
@@ -342,7 +343,7 @@ class Pipe:
         )
         COMPOSER_STATUS_BUTTON: bool = Field(
             default=True,
-            description="Add an OpenClaw 'Status' button to the composer row of "
+            description="Add an OpenClaw 'Claw' button to the composer row of "
                 "OpenClaw chats (it opens the same dialog as the Status Action's "
                 "message button, so that Action must be installed). Installed "
                 "into the page at the start of each turn and when a tab opens an "
@@ -1449,6 +1450,10 @@ class _PipeTurn:
 
                 else:
                     # Normal completion (no cancellation).
+                    released = self.renderer.flush()
+                    if released:
+                        async for chunk in self.show_text(released):
+                            yield chunk
                     async for chunk in self.finish_held_prompt():
                         yield chunk
                     async for chunk in self.finish_held_media():
@@ -1922,6 +1927,11 @@ class _PipeTurn:
             # The error is the reply: nothing to recover, and no
             # "no reply text" note under it.
             await self.maybe_emit_snapshot(force=True)
+        elif not self.aborted and not self.text_yielded and self.renderer.silenced and any(
+                i.get("type") == "function_call" for i in self.renderer.output):
+            # The run said nothing on purpose after its tool calls: the cards
+            # are the reply (ELI-227).
+            pipe_log("  the run answered with silence after its tool cards")
         elif not self.aborted and not self.text_yielded:
             recovered = await self.recover_from_transcript()
             retry_body = _thinking_rejection_retry_body(
@@ -2057,10 +2067,15 @@ class _PipeTurn:
             # and the registry below cannot stand in for it: a run the turn
             # writer holds is not in it, so it would say idle, and a queued
             # message would be sent into the dead socket and lost (ELI-199).
-            # Busy: the waiter is woken again by the reconnect and re-reads.
+            # Wait for the reconnect as a turn that needs the connection
+            # (ensure_connected: the loop tries at once, then every second
+            # through a Gateway that refuses connections), then read again. A
+            # message that reached this check just before the drop was seen
+            # used to wait passively, while the loop backed off to 30 s.
             pipe_log("  active-check: the Gateway socket is reconnecting; "
                      "waiting for it before deciding")
-            return True
+            await self.conn.ensure_connected()
+            return await self._session_run_active()
         return self.conn.active_run_id_for_session(self.session_key) is not None
 
     def await_owner(self) -> None:

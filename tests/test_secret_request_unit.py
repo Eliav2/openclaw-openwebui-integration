@@ -33,9 +33,14 @@ def record(qid="q-1", status="pending", **store):
                                            "reason": "to call the example API", **store}}]}
 
 
+QUESTION_METHODS = frozenset({"question.request", "question.resolve", "question.list"})
+QUESTION_EVENTS = frozenset({"question.requested", "question.resolved"})
+
+
 class FakeConn:
-    def __init__(self, version="2026.10.10-beta.1"):
+    def __init__(self, version="2026.10.10-beta.1", methods=QUESTION_METHODS, events=QUESTION_EVENTS):
         self.gateway_version = version
+        self.gateway_methods, self.gateway_events = methods, events
         self.sent = []
 
     def parse_owui_session_key(self, key):
@@ -120,11 +125,25 @@ class SecretRequestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(conn.sent, [("question.resolve", {"id": "q-1", "cancel": True,
                                                            "resolvedBy": "openwebui"})])
 
-    async def test_an_older_gateway_leaves_it_to_the_control_ui(self):
-        """On 2026.9 a stored secret cannot be used by a run (ELI-97): unchanged."""
-        conn, turn = FakeConn("2026.9.3"), FakeTurn(VALUE)
-        self.assertFalse(await self._ask(conn, turn))
-        self.assertEqual((turn.asked, conn.sent), ([], []))
+    async def test_a_gateway_without_the_question_protocol_leaves_it_to_the_control_ui(self):
+        """No `question.resolve` or question events in hello-ok: the Pipe
+        could not answer it, so it is not asked."""
+        for methods, events in ((frozenset(), QUESTION_EVENTS), (QUESTION_METHODS, frozenset()),
+                                (frozenset(), frozenset())):
+            with self.subTest(methods=sorted(methods), events=sorted(events)):
+                conn, turn = FakeConn("2026.10.10-beta.1", methods, events), FakeTurn(VALUE)
+                self.assertFalse(await self._ask(conn, turn))
+                self.assertEqual((turn.asked, conn.sent), ([], []))
+
+    async def test_any_release_line_that_offers_the_protocol_asks_it(self):
+        """The gate is what the Gateway offers, not its version number:
+        2026.10.5 has the store-bound question as 2026.10.10 does."""
+        for version in ("2026.10.5", "2026.9.3", "2026.10.10-beta.1"):
+            with self.subTest(version=version):
+                ocp._SECRET_REQUESTS.clear()
+                conn, turn = FakeConn(version), FakeTurn(VALUE)
+                self.assertTrue(await self._ask(conn, turn), version)
+                self.assertEqual(conn.sent[0][0], "question.resolve")
 
     async def test_a_chat_of_a_user_not_in_owner_users_is_not_asked(self):
         """The store is the owner's: a guest's chat must not write into it."""
@@ -170,11 +189,12 @@ class SecretRequestTests(unittest.IsolatedAsyncioTestCase):
 
     def test_only_the_pipe_asks(self):
         """The Status Action shares the connection code but asks nothing."""
-        self.assertEqual(ocp._QUESTION_HOOKS, (ocp.secret_request_seen, ocp.secret_request_resolved))
+        self.assertEqual(ocp._QUESTION_HOOKS, (ocp.question_requested, ocp.question_resolved))
         with open(os.path.join(HERE, "openclaw_status_action.py"), encoding="utf-8") as fh:
             action = fh.read()
         self.assertIn("_QUESTION_HOOKS = None", action)
         self.assertNotIn("def secret_request_seen", action)
+        self.assertNotIn("def question_requested", action)
 
 
 if __name__ == "__main__":

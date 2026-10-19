@@ -21,7 +21,7 @@ The question renders as Open WebUI's own inline question card, the one its built
 | Question looks like | Shown as |
 | --- | --- |
 | anything else | card with a typed answer |
-| mentions secret, password, api key, token | dialog: a masked password field |
+| asks for a secret, password, api key or token (enter, paste, provide, ...); or mentions one with no `(y/n)` and fewer than two numbered options | dialog: a masked password field |
 | `(y/n)`, or a confirm verb plus `?` | card with Yes / No |
 | two or more numbered options, one per line | card, one row per option |
 | `(multiselect)` or "select all that apply" | card that lists the options by number, with a typed answer |
@@ -39,17 +39,33 @@ Confirmation and multi-select markers are recognised in English, Hebrew and Arab
 
 Answer the card and the run continues in the same reply. The exchange stays in the reply as a collapsible ❓ Ask User card that shows both the question and your answer.
 
+<img src="../img/demos/question-card.gif" alt="A question card in a reply; a click on its first option answers it, and the reply goes on in the same message with the answer acted on" width="800">
+
 While it waits you can reload or switch away and come back:
 
 - **Question card:** the card is shown once, on the tab that views the chat; a reload moves it to the reloaded tab. If it is not answered by Open WebUI's card timeout (4 minutes), or no tab views the chat (for example a client calling the API), the reply ends with the question as plain text.
-- **Secret dialog:** the same as the card: shown once, and a reload moves it to the reloaded tab. If it is not answered within 4 minutes, is cancelled, or no tab views the chat, the reply says the secret was not received, without asking for it: anything typed into the chat is stored in it. The agent is told once that nothing came, so it can ask again (the dialog shows again on a tab with the chat open) or use masked credential entry.
+- **Secret dialog:** the same as the card: shown once, and a reload moves it to the reloaded tab. If it is not answered within 4 minutes, or no tab views the chat, the reply says the secret was not received, without asking for it: anything typed into the chat is stored in it. The agent is told once that nothing came, so it can ask again (the dialog shows again on a tab with the chat open) or use masked credential entry.
+- **Cancel on the secret dialog:** the agent is told you cancelled and nothing was entered, and the ❓ Ask User card says `Cancelled (nothing entered)`.
 - **Status opened while a dialog is open:** Status opened from another tab of the chat, and the Pipe's other page updates, reach the tab with the dialog only after you answer it, so they cannot take the dialog's answer.
 
 If you cancel any other question, or it ends as text, the question stays in the reply as ordinary text with the trigger removed (a JSON form as its numbered questions with their options), so nothing is lost. Answer it with a normal message. Sending a message while the card is open cancels it the same way, and its reply ends finished, with no "Thinking..." left on it.
 
+## Questions from the agent's ask_user tool
+
+OpenClaw's own `ask_user` tool works too, with no agent setup. Its questions (up to three, each with its options) show as the same question card. The option you pick, or what you type in Other, goes back to the agent as the tool's answer. A multi-select question lists its options by number, as above, and each option you name reaches the agent.
+
+The card shows on the newest tab that has the chat open, and it waits for you:
+
+- **No tab open** (you closed it, or your phone slept): the question stays pending. It shows as soon as you open the chat again.
+- **A newer tab opens the chat** (a reload, the chat opened on your phone): the card moves there.
+- **Switching the tab to another chat** does not cancel it; it shows again when you come back.
+- The card has no countdown. The question ends only when you answer, press Cancel (the agent hears that you cancelled), answer it elsewhere (the Control UI; the card closes), or when the tool's own timeout ends it (15 minutes by default, set by the agent).
+
+The Pipe knows a tab has the chat open from the Claw button it adds to the composer (`COMPOSER_STATUS_BUTTON`, on by default). With that valve off, it checks for a tab every few seconds instead.
+
 ## Secrets the agent requests
 
-_Needs OpenClaw 2026.10.10 or later. On an older Gateway the request is left to the Control UI, as before: a secret stored there cannot be used by the agent's runs yet._
+_Needs a Gateway that offers OpenClaw's question protocol (`question.requested` and `question.resolve`; every release the Pipe supports does). A stored `secret` is used by a run only through the Gateway's secret egress proxy (`secrets.egressProxy`), whichever way it was entered._
 
 When the agent asks for a credential with OpenClaw's `secrets` tool (`action: request`), the Pipe shows the same masked dialog on the chat's tab, titled with the secret's name, the agent's reason and the hosts it may be sent to.
 

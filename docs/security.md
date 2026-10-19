@@ -64,7 +64,7 @@ By default every Open WebUI user also acts as the Gateway's owner. If people oth
 
 ## Scripts in your browser
 
-The Status dialog and the composer Status button are JavaScript that the Status Action and the Pipe send into your open Open WebUI page, through Open WebUI's `execute` event. That code runs unsandboxed in the page, with your session, and calls only your own Open WebUI (same origin). It is part of this repo, so you can read it in `src/openclaw_pipe_pkg/action.py` and `src/openclaw_pipe_pkg/composer.py`. Set [`COMPOSER_STATUS_BUTTON`](./configuration.md#composer_status_button) to off to stop delivering the composer button.
+The Status dialog and the composer's Claw button are JavaScript that the Status Action and the Pipe send into your open Open WebUI page, through Open WebUI's `execute` event. That code runs unsandboxed in the page, with your session, and calls only your own Open WebUI (same origin). It is part of this repo, so you can read it in `src/openclaw_pipe_pkg/action.py` and `src/openclaw_pipe_pkg/composer.py`. Set [`COMPOSER_STATUS_BUTTON`](./configuration.md#composer_status_button) to off to stop delivering the composer button.
 
 ## Reporting a vulnerability
 

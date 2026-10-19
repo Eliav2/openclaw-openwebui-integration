@@ -76,8 +76,11 @@ you get the picked options back comma-joined.
 
 ## Passwords and secrets
 
-If the question mentions a secret, a password, an API key, or a token, the
+If the question asks for a secret, a password, an API key, or a token, the
 dialog switches to a masked input automatically. You do not need to do anything.
+A question with numbered options or a `(y/n)` that only mentions one stays a
+normal question with its choices. Asking for the value itself ("paste your API
+key", "enter the password") always gets the masked field.
 
 ## Rules that matter
 

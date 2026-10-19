@@ -12,8 +12,21 @@ whole):
 
 * `exactly: TOKEN` / `exactly TOKEN`  -> replies with TOKEN alone. Covers the
   installer's smoke test ("reply with exactly OK_CONFIG_TEST").
+* `E2E_COMPACT_FAIL` anywhere in a chat -> its compaction's summary request is
+  refused (HTTP 400 `E2E_COMPACT_REFUSED`), so the compaction fails.
 * `Create a concise title`            -> `TITLE` below: the Pipe's own chat-title
   run (the `title-gen` agent), after a chat's second exchange.
+* `E2E_SPAWN_SILENT`                   -> spawns a sub-agent (task `E2E_SILENT_CHILD`,
+                                          label `silent helper`) that answers
+                                          `E2E_SILENT_RESULT done`; the parent answers that
+                                          completion `NO_REPLY` (ELI-217)
+* `E2E_EMPTY_REPLY`                    -> an empty answer: OpenClaw 2026.10 fails
+                                          the run ("Agent couldn't generate a
+                                          response") after its one retry (ELI-217)
+* `E2E_SENTINEL_THEN_ANSWER`           -> says `NO_REPLY` with a harmless tool call,
+                                          then, after its result, answers
+                                          `E2E_LATE_ANSWER SUB-51`: a run that opened
+                                          with a sentinel and answered after all (ELI-219)
 * `E2E_ECHO: any text`                 -> replies with the rest of that line,
   byte for byte (Hebrew, emoji, markup), so a round trip can be exact.
 * `E2E_TOOL_CALL`                      -> first answers with a call to the
@@ -30,7 +43,8 @@ A tool the agent does not offer directly is called through `tool_call`
 is offered: from OpenClaw 2026.10 most tools are deferred behind `tool_search`
 and only a core set is sent as real schemas.
 * `E2E_BG_EXEC`                        -> starts `sleep 25` with `exec` in the
-  background, then replies `E2E_BG_STARTED`.
+  background, then replies `E2E_BG_STARTED`. The Gateway's notice that the
+  command ended (its output `e2e-bg-done`) gets `E2E_BG_NOTICED`.
 * `E2E_BG_AGENT TOKEN`                  -> calls `Agent` (e2e/agent-tool) with
   run_in_background, which answers "Async agent launched", says
   `E2E_BG_AGENT_MID` and runs `exec` in the foreground until the file
@@ -66,11 +80,23 @@ and only a core set is sent as real schemas.
 * `E2E_ASK_SECRET`                     -> asks for a secret: `ASK_SECRET` below,
   which the Pipe asks in Open WebUI's masked dialog. The next message
   answers it, echoed as for `E2E_ASK_SINGLE`.
+* `E2E_ASK_MENTIONS_SECRET`            -> asks `ASK_MENTIONS_SECRET` below: two
+  options in a question that mentions a password, answered as for
+  `E2E_ASK_SINGLE`.
+* `E2E_ASK_SECRET_STEPS`               -> asks `ASK_SECRET_STEPS` below: a request
+  for an API key with numbered steps, which the Pipe asks in the masked
+  dialog; answered as for `E2E_ASK_SINGLE`.
 * `E2E_SECRET_REQUEST NAME`            -> calls `secrets` with action=request for
   NAME (OpenClaw's masked credential entry), then, once the tool result is in,
   replies `E2E_SECRET_RESULT <status>` with the result's first "status".
-* a scene from $FAKE_LLM_SCENES (JSON)  -> scripted multi-step replies for the
-  README screenshots (scripts/screenshots/scenes.json). A scene is picked by a
+* `E2E_ASK_TOOL`                       -> calls OpenClaw's `ask_user` tool with
+  `ASK_TOOL_ARGS` below, then, once the tool result is in, replies
+  `E2E_ASK_TOOL_RESULT <status> Database: <answer>` (the answer when there is one).
+* `E2E_ASK_TOOL_LATER`                 -> the same, after `E2E_ASK_SOON wait-1 ... wait-10`
+  one word a second, so a test can close the tab before the question comes.
+* a scene from $FAKE_LLM_SCENES (JSON files, joined with `:`) -> scripted multi-step replies for the
+  README screenshots (scripts/screenshots/scenes.json) and the docs' demo GIFs
+  (scripts/demos/demos.json, loaded first). A scene is picked by a
   phrase in the user's own message, so the request in a screenshot reads like
   a real one. Step n of a scene answers the request that carries n tool
   results; a step can say something and call a tool in the same message.
@@ -107,6 +133,11 @@ DEFERRED_CALL_TOOLS = ("dispatch_action", "tool_call")
 
 _EXACTLY = re.compile(r"exactly:?\s+([A-Za-z0-9_]{3,})")
 _ECHO = re.compile(r"E2E_ECHO: ([^\n]+)")
+# E2E_ASK_TOOL: one question with two options, as a model calls ask_user.
+ASK_TOOL_ARGS = {"questions": [{"id": "db", "header": "Database", "question": "Which database?",
+                                "options": [{"label": "Postgres", "description": "needs a server"},
+                                            {"label": "SQLite"}]}],
+                 "timeoutSeconds": 300}
 _SECRET_REQUEST = re.compile(r"E2E_SECRET_REQUEST ([A-Z][A-Z0-9_]{2,})")
 # The result's JSON sits inside the tool's text, so its quotes may be escaped.
 _STATUS = re.compile(r'\\?"status\\?":\s*\\?"([a-z_]+)')
@@ -126,6 +157,9 @@ ASK_SINGLE = "OpenClaw needs input:\n\nColor\nWhich color?\n1. Red\n2. Green\n3.
 ASK_MULTI = ("OpenClaw needs input:\n\nToppings (multiselect)\nWhich toppings?\n"
              "1. Cheese\n2. Olives\n3. Mushrooms")
 ASK_SECRET = "OpenClaw needs input:\n\nTest token\nPaste the test API token (password)"
+ASK_SECRET_STEPS = "OpenClaw needs input:\n\nToken\nPaste your API key:\n1. Open Settings\n2. Copy the key"
+ASK_MENTIONS_SECRET = ("OpenClaw needs input:\n\nRouter entry\nOK to add the router-debug entry "
+                       "so W6 can use the password?\n1. Yes\n2. No")
 WAKE_ASK = "E2E_WAKE_ASK_START " + " ".join(f"slow-{i}" for i in range(1, 7)) + "\n\n" + ASK_SINGLE
 
 
@@ -176,11 +210,13 @@ def _harmless_call(offered: list) -> dict | None:
 
 
 def _load_scenes() -> list:
-    path = os.environ.get("FAKE_LLM_SCENES", "")
-    if not path:
-        return []
-    with open(path, encoding="utf-8") as fh:
-        return json.load(fh)["scenes"]
+    """The scenes of every file in $FAKE_LLM_SCENES (paths joined with
+    os.pathsep), in order: the first scene whose phrase matches wins."""
+    scenes = []
+    for path in filter(None, os.environ.get("FAKE_LLM_SCENES", "").split(os.pathsep)):
+        with open(path, encoding="utf-8") as fh:
+            scenes += json.load(fh)["scenes"]
+    return scenes
 
 
 SCENES = _load_scenes()
@@ -211,6 +247,11 @@ def plan_reply(body: dict) -> dict:
     """Return {"text": str}, {"tool": name, "args"?: dict}, or both (text, then
     the call) for one request."""
     messages = body.get("messages") or []
+    # A compaction's summary request for a chat that carries E2E_COMPACT_FAIL:
+    # the model refuses it, so the Gateway's compaction fails (ELI-209).
+    if (any("summarization" in json.dumps(m.get("content")) for m in messages)
+            and "E2E_COMPACT_FAIL" in json.dumps(messages)):
+        return {"http_error": 400, "text": "E2E_COMPACT_REFUSED"}
     # The current turn is the run of user messages after the last assistant
     # reply: the Gateway appends its own context block as a separate user
     # message after the real one, so the last user message alone is not it.
@@ -230,7 +271,13 @@ def plan_reply(body: dict) -> dict:
     # in this turn, before the new one; a run the Gateway resumes after a
     # restart gets its own "[System] ... continue" message after the user's
     # (2026.10.10). So the newest part of the turn that has a scripted answer
-    # is the one answered, else the whole turn.
+    # is the one answered, else the whole turn. A scene comes first: the
+    # Gateway's context block alone, the newest part, would otherwise take the
+    # generic answer to a question before the scene for that answer is seen.
+    for start in range(len(users) - 1, -1, -1):
+        plan = _scene_step("\n".join(users[start:]), len(tool_results), offered)
+        if plan is not None:
+            return plan
     for start in range(len(users) - 1, -1, -1):
         plan = _scripted("\n".join(users[start:]), messages, last_assistant, turn, tool_results, offered)
         if plan is not None:
@@ -269,6 +316,10 @@ def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
         return {"text": ASK_SINGLE}
     if "E2E_ASK_MULTI" in user_text:
         return {"text": ASK_MULTI}
+    if "E2E_ASK_SECRET_STEPS" in user_text:
+        return {"text": ASK_SECRET_STEPS}
+    if "E2E_ASK_MENTIONS_SECRET" in user_text:
+        return {"text": ASK_MENTIONS_SECRET}
     if "E2E_ASK_SECRET" in user_text:
         return {"text": ASK_SECRET}
 
@@ -281,6 +332,13 @@ def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
         if call:
             return call
         return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
+
+    if "E2E_SENTINEL_THEN_ANSWER" in user_text:
+        if tool_results:
+            return {"text": "E2E_LATE_ANSWER SUB-51"}
+        call = _harmless_call(offered)
+        return ({"text": "NO_REPLY", **call} if call
+                else {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"})
 
     if "E2E_TOOL_CALL" in user_text:
         if tool_results:
@@ -343,6 +401,9 @@ def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
             return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
         return {"text": "E2E_HOLD_START", **call}
 
+    if "e2e-bg-done" in user_text:
+        # The run the Gateway starts when E2E_BG_EXEC's command ends (ELI-215).
+        return {"text": "E2E_BG_NOTICED"}
     if "E2E_BG_EXEC" in user_text:
         # One shell command left running in the background, for the Status
         # Action's Background section (ELI-163).
@@ -355,6 +416,19 @@ def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
             if wrapper in offered:
                 return {"tool": wrapper, "args": {"id": "exec", "args": args}}
         return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
+
+    if "E2E_ASK_TOOL" in user_text:
+        later = "E2E_ASK_TOOL_LATER" in user_text
+        if tool_results:
+            result = "\n".join(tool_results)
+            status, line = _STATUS.search(result), re.search(r"Database: [A-Za-z]+", result)
+            return {"text": f"E2E_ASK_TOOL_RESULT {status.group(1) if status else 'none'} "
+                            f"{line.group(0) if line else ''}".rstrip()}
+        call = _call_with("ask_user", ASK_TOOL_ARGS, offered)
+        if call and later:
+            waits = " ".join(f"wait-{i}" for i in range(1, 11))
+            return {"text": f"E2E_ASK_SOON {waits}", "delay": 1.0, **call}
+        return call or {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
 
     m = _SECRET_REQUEST.search(user_text)
     if m:
@@ -371,6 +445,25 @@ def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
             if wrapper in offered:
                 return {"tool": wrapper, "args": {"id": "secrets", "args": args}}
         return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
+
+    if "E2E_EMPTY_REPLY" in user_text:
+        return {"text": ""}
+    if "E2E_SILENT_RESULT" in user_text and "[Internal task completion event]" in user_text:
+        # The parent's turn for the child's completion (the announce): it
+        # stays silent, so the child's result shows only as the Pipe's card.
+        # Only that turn: 2026.10.10 also lists the child's result in the
+        # context of the parent's next user turn ("Child results awaiting
+        # delivery").
+        return {"text": "NO_REPLY"}
+    if "E2E_SILENT_CHILD" in user_text and "[Subagent Task]" in user_text:
+        # The child's own turn only: on 2026.10.5 the parent's later turns
+        # carry its task in a "Recently Completed Subagents" context too.
+        return {"text": "E2E_SILENT_RESULT done"}
+    if "E2E_SPAWN_SILENT" in user_text:
+        if tool_results:
+            return {"text": "E2E_SPAWNED"}
+        return _call_with("sessions_spawn", {"task": "E2E_SILENT_CHILD", "label": "silent helper"}, offered) or {
+            "text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
 
     if "E2E_SPAWN" in user_text:
         # Spawn one sub-agent whose own run is slow, so it is still running
@@ -456,6 +549,10 @@ class Handler(BaseHTTPRequestHandler):
             with open(LOG_PATH, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps({"ts": time.time(), "path": self.path,
                                      "request": body, "reply": plan}) + "\n")
+
+        if plan.get("http_error"):
+            self._json(plan["http_error"], {"error": {"message": plan["text"], "type": "invalid_request_error"}})
+            return
 
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         created = int(time.time())

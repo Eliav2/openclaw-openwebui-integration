@@ -185,6 +185,56 @@ def test_a_single_select_question_is_answered_with_a_click(page):
     assert "E2E_ANSWERED" in reply and "Green" in reply.split("E2E_ANSWERED", 1)[1], reply[-200:]
 
 
+def test_a_question_from_the_ask_user_tool_is_answered_in_the_card(page):
+    """ELI-216: OpenClaw's ask_user tool asks through the Gateway, not the
+    reply text. Its question shows as the card, and the clicked option is
+    the tool's answer to the agent."""
+    capture.new_chat(page)
+    capture.send(page, "E2E_ASK_TOOL")
+    capture.wait_js(page, "() => document.body.innerText.includes('Which database?') "
+                          "&& !!document.querySelector('input[placeholder=\"Type your answer\"]')",
+                    "the ask_user card", TURN_MS)
+    page.locator("section button", has=page.locator("span", has_text="SQLite")).first.click()
+    capture.wait_js(page, _last_reply_done("E2E_ASK_TOOL_RESULT answered Database: SQLite"),
+                    "the reply with the tool's answer", TURN_MS)
+
+
+def _pending_ask_user(chat_id: str):
+    """The chat's pending Gateway question, from `question.list`."""
+    out = subprocess.run(["openclaw", "gateway", "call", "question.list", "--json", "--params", "{}"],
+                         capture_output=True, text=True, timeout=90)
+    assert out.returncode == 0, out.stderr[-1500:]
+    listed = json.loads(out.stdout[out.stdout.find("{"):])
+    return next((q for q in listed.get("questions") or []
+                 if chat_id in (q.get("sessionKey") or "") and q.get("status") == "pending"), None)
+
+
+def test_an_ask_user_question_asked_with_no_tab_open_shows_when_the_chat_is_opened(page):
+    """ELI-216: the question comes after the tab is closed (or the phone
+    sleeps). It stays pending, the card shows when the chat is opened again,
+    and the answer reaches the agent."""
+    capture.new_chat(page)
+    chat_id = capture.send(page, "E2E_ASK_TOOL_LATER")
+    capture.wait_js(page, "() => document.body.innerText.includes('E2E_ASK_SOON')",
+                    "the reply before the question", TURN_MS)
+    page.goto("about:blank")         # the tab is closed: no socket shows the chat
+    deadline = time.time() + 60
+    while not _pending_ask_user(chat_id):
+        assert time.time() < deadline, \
+            "the ask_user question was never pending with no tab open (ended at once, or never asked)"
+        time.sleep(1)
+    # Still pending a while later: nothing gave up on it with no tab open.
+    page.wait_for_timeout(5_000)
+    assert _pending_ask_user(chat_id), "the question was ended while no tab was open"
+    page.goto(f"{capture.BASE}/c/{chat_id}")
+    capture.wait_js(page, "() => document.body.innerText.includes('Which database?') "
+                          "&& !!document.querySelector('input[placeholder=\"Type your answer\"]')",
+                    "the ask_user card on the reopened chat", TURN_MS)
+    page.locator("section button", has=page.locator("span", has_text="SQLite")).first.click()
+    capture.wait_js(page, _last_reply_done("E2E_ASK_TOOL_RESULT answered Database: SQLite"),
+                    "the reply with the tool's answer", TURN_MS)
+
+
 def test_a_question_left_for_a_new_message_ends_its_reply(page):
     """ELI-200: with the question card open, a new message is sent instead
     of an answer. The card goes, the question stays in its reply as text,
@@ -221,6 +271,25 @@ def _secret_dialog_open(page) -> None:
                     "the masked dialog", TURN_MS)
 
 
+def test_cancel_on_the_secret_dialog_tells_the_agent_and_the_card_says_cancelled(page):
+    """A question asking for a secret opens Open WebUI's masked dialog; its
+    Cancel reaches the agent as a cancel, and the reply's Ask User card says
+    cancelled (ELI-189: the agent got "no" and the card said a secret was
+    entered)."""
+    capture.new_chat(page)
+    capture.send(page, "E2E_ASK_SECRET")
+    _secret_dialog_open(page)
+    page.get_by_role("button", name="Cancel", exact=True).click()
+    capture.wait_js(page, "() => !document.querySelector('input.password')",
+                    "the dialog gone after Cancel", 30_000)
+    _wait(page, _last_reply_done("E2E_ANSWER_END"), "the reply to the cancel")
+    reply = page.evaluate(f"() => {capture.LAST_ASSISTANT}.innerText")
+    told = reply.split("E2E_ANSWERED", 1)[1].split("E2E_ANSWER_END", 1)[0].strip()
+    assert "cancel" in told.lower() and told.lower() != "no", f"the agent was told {told!r}"
+    card = _open_card(page, -1, "Ask User")
+    assert "Cancelled" in card and "secret entered" not in card, card[-300:]
+
+
 def test_status_opened_in_another_tab_leaves_the_secret_dialog_its_answer(page):
     """Open WebUI's input dialog and its `execute` event share one callback in
     the tab: an `execute` arriving while the dialog is open took the dialog's
@@ -248,6 +317,30 @@ def test_status_opened_in_another_tab_leaves_the_secret_dialog_its_answer(page):
         page.keyboard.press("Escape")
     finally:
         other.close()
+def test_a_choice_that_mentions_a_password_keeps_its_options(page):
+    """A question with options that mentions a password is a choice, not a
+    secret: the card with its options, never the masked dialog (ELI-196)."""
+    def click_no(pg):
+        assert not pg.query_selector("input.password"), "the masked dialog opened"
+        pg.locator("section button", has=pg.locator("span", has_text="No")).first.click()
+    reply = _answer_question(page, "E2E_ASK_MENTIONS_SECRET", "use the password?", click_no)
+    # Yes / No options answer as "yes" / "no", as a yes/no question does.
+    assert "E2E_ANSWERED no E2E_ANSWER_END" in reply, reply[-200:]
+
+
+def test_a_secret_ask_with_numbered_steps_keeps_the_masked_dialog(page):
+    """Asking for an API key with the steps as a numbered list is still a
+    secret: the masked dialog, never a card whose Other field would put the
+    key in the chat (W3 on ELI-196)."""
+    capture.new_chat(page)
+    capture.send(page, "E2E_ASK_SECRET_STEPS")
+    _wait(page, "() => document.body.innerText.includes('Paste your API key') "
+                "&& (!!document.querySelector('input.password') "
+                "|| !!document.querySelector('input[placeholder=\"Type your answer\"]'))",
+          "the question", TURN_MS)
+    assert page.query_selector("input.password"), "a card instead of the masked dialog"
+    page.get_by_role("button", name="Cancel", exact=True).click()
+    _wait(page, _last_reply_done("E2E_ANSWER_END"), "the reply after the dialog")
 
 
 def test_a_multi_select_question_takes_typed_numbers(page):
@@ -536,6 +629,40 @@ def test_a_queued_reply_stopped_says_its_message_was_not_sent(page):
     assert "BROWSER_SENDSTOP_ANSWER" not in _replies(page)[1]["text"]
 
 
+def test_stop_after_send_now_stops_the_run(page, token):
+    """Stop after Send now (ELI-198): the running reply's run goes on in its
+    message (the turn writer holds it) and the new message waits behind it.
+    Stop cancels both, and both ask the page which button it was; the first
+    to ask took the answer, so the run went on and filled the stopped reply
+    later. The scripted run waits for a file this test writes only after
+    checking that the run is over."""
+    hold_token = f"sn{os.getpid()}_{len(_fake_llm_requests())}"
+    # e2e/fake_llm.py hold_file
+    hold = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{hold_token}")
+    capture.new_chat(page)
+    try:
+        capture.send(page, f"E2E_HOLD {hold_token}")
+        _wait(page, _reply_js(0, "r.text.includes('exec') && !r.done"), "the reply running its command")
+        _type_and_send(page, "E2E_ECHO: BROWSER_STOP_AFTER_SEND_NOW")
+        # The new message's reply waits behind the run, at the Pipe.
+        _wait(page, _reply_js(1, "r.text.includes('Queued') && !r.done"), "the new message's reply queued behind the run")
+        stop = page.locator('button[aria-label="Stop"]')
+        stop.wait_for(timeout=30_000)
+        stop.click()
+        me = capture.api("GET", "/api/v1/auths/", token=token)
+        key = f"agent:main:openwebui-{me['id']}-{_chat_id(page)}"
+        deadline, active = time.monotonic() + 60, True
+        while active and time.monotonic() < deadline:
+            rows = capture.gateway_call("sessions.list", {"search": _chat_id(page), "limit": 5}).get("sessions") or []
+            active = any(r.get("key") == key and r.get("hasActiveRun") for r in rows)
+    finally:
+        open(hold, "w").close()
+    assert not active, "the run went on after Stop: the session still had a running run"
+    history = capture.gateway_call("chat.history", {"sessionKey": key, "limit": 50})
+    assert "E2E_HOLD_END" not in json.dumps(history.get("messages")), "the stopped run still answered"
+    os.remove(hold)
+
+
 def _from(texts: list, word: str) -> list:
     """The reply's words in each text, from `word` on (Open WebUI's status
     line, "Thinking...", can sit above them); texts with none are left out."""
@@ -681,6 +808,37 @@ def test_the_status_dialog_compacts_the_chat(page):
     page.keyboard.press("Escape")
 
 
+def test_a_compaction_the_gateway_refuses_shows_its_error(page):
+    """Status dialog + Compact, refused (ELI-209): the model refuses the
+    summary, so the Gateway's compaction fails and its reply says so. The
+    dialog showed "Compacting…" and then the same numbers, as if it had
+    worked. It says the compaction failed, with the Gateway's reason, and
+    keeps the numbers."""
+    if _openclaw_release() >= (2026, 10):
+        pytest.skip("OpenClaw 2026.10: the dialog has no Compact button for a session created by "
+                    "chat.send (ELI-177, as test_the_status_dialog_compacts_the_chat).")
+    nonce = f"BROWSER_COMPACT_FAIL_{os.getpid()}_{len(_fake_llm_requests())}"
+    capture.new_chat(page)
+    capture.send(page, f"E2E_ECHO: E2E_COMPACT_FAIL {nonce}")
+    _wait(page, _turn_over(nonce), "the reply")
+    _open_status(page)
+    context = "#openclaw-status-section-context"
+    numbers = f"""() => {{ const s = document.querySelector('{context}');
+      return !!s && /\\d+ \\/ 200k tokens/.test(s.innerText); }}"""
+    _wait(page, f"() => ({numbers})() && !!document.querySelector('{context} button')",
+          "the context numbers and the Compact button", 60_000)
+    page.locator(f"{context} button", has_text="Compact").click()
+    _wait(page, f"""() => (window.__dialog || []).some(t => t.includes('Compacting'))
+                     && !document.body.innerText.includes('Compacting…') && ({numbers})()""",
+          "Compacting…, then the dialog back")
+    refused = [r for r in _fake_llm_requests()
+               if r["reply"].get("http_error") and nonce in json.dumps(r["request"])]
+    assert refused, "precondition: the model never refused this chat's summary request"
+    shown = page.locator(context).inner_text()
+    assert "Compaction failed" in shown, f"the dialog shows no failure after a refused compaction: {shown!r}"
+    page.keyboard.press("Escape")
+
+
 def test_the_subagent_drawer_follows_a_running_child_to_its_end(page):
     """Sub-agent drawer: the Status dialog lists the running sub-agent;
     its row opens the drawer, which shows it running and then, with nothing
@@ -785,11 +943,10 @@ def test_a_reply_the_agent_starts_streams_into_the_open_tab_and_asks_there(page,
 def test_stop_on_a_reply_the_agent_starts_stops_its_run(page, token):
     """Stop on a reply the agent started (a cron wake, ELI-192) in the open
     tab: the message ends, and so does the run. Before, the run went on to
-    its end, its text shown nowhere. The scripted wake runs a command that
-    waits for a file this test writes only once the run is over."""
-    if _openclaw_release() >= (2026, 10):
-        pytest.skip("OpenClaw 2026.10: chat.abort by run id does not stop a cron run, and there is no "
-                    "tasks.cancel; the session-wide abort also drops queued turns (ELI-194).")
+    its end, its text shown nowhere. On 2026.9 the wake's cron task is
+    cancelled; from 2026.10.5, which has no tasks.cancel, the run is aborted
+    by its id. The scripted wake runs a command that waits for a file this
+    test writes only once the run is over."""
     hold_token = f"stop{os.getpid()}_{len(_fake_llm_requests())}"
     # e2e/fake_llm.py hold_file
     hold = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{hold_token}")
@@ -944,6 +1101,35 @@ def test_the_generated_title_shows_in_the_open_tab(page, token):
                              f"the chat's saved title is {capture.chat_title(token, chat_id)!r}") from None
 
 
+def _rename_in_sidebar(page, chat_id: str, title: str) -> None:
+    """Rename the chat by a double click on its sidebar entry, as a user does.
+
+    The first click of a double click on the entry of a chat started from the
+    new-chat page navigates to it: the chat page loads it and ends by focusing
+    the message input. Open WebUI moves the focus back to the rename box
+    after a tick, and an Enter in between went to the message input, so the
+    rename stayed unsaved (ELI-220). So the chat is opened first, the load's
+    last step (the message input taking the focus) is awaited, and the
+    double click, a click on the open chat, starts no load."""
+    link = page.locator(f'a[href="/c/{chat_id}"]')
+    with page.expect_response(lambda r: r.request.method == "GET"
+                              and r.url.endswith(f"/api/v1/chats/{chat_id}")):
+        link.click()
+    capture.wait_js(page, "() => !!document.activeElement?.closest('#chat-input')",
+                    "the opened chat to focus its message input", 30_000)
+    link.dblclick()
+    box_id = f"chat-title-input-{chat_id}"
+    capture.wait_js(page, f"() => document.activeElement?.id === {json.dumps(box_id)}",
+                    "the rename box to take the focus", 10_000)
+    box = page.locator(f"#{box_id}")
+    box.fill(title)
+    with page.expect_request(lambda r: r.method == "POST"
+                             and r.url.endswith(f"/api/v1/chats/{chat_id}")) as saved:
+        box.press("Enter")
+    assert title in (saved.value.post_data or ""), saved.value.post_data
+    capture.wait_js(page, _sidebar_js(chat_id, title), "the chosen title in the sidebar", 30_000)
+
+
 def test_a_title_the_user_chose_stays(page, token):
     """A chat renamed in the sidebar keeps its name after the next message:
     the Pipe titles only a chat Open WebUI named by itself (ELI-182: the
@@ -959,12 +1145,7 @@ def test_a_title_the_user_chose_stays(page, token):
     if was_closed:
         page.locator('button[aria-label="Open Sidebar"]').first.click()
     try:
-        page.locator(f'a[href="/c/{chat_id}"]').dblclick()
-        box = page.locator(f"#chat-title-input-{chat_id}")
-        box.wait_for(timeout=10_000)
-        box.fill(chosen)
-        box.press("Enter")
-        capture.wait_js(page, _sidebar_js(chat_id, chosen), "the chosen title in the sidebar", 30_000)
+        _rename_in_sidebar(page, chat_id, chosen)
     finally:
         if was_closed:
             page.locator('button[aria-label="Close Sidebar"]').first.click()

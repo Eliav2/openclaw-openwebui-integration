@@ -64,6 +64,8 @@ async def _set_turn_meta_now(chat_id: str, message_id: str, meta: dict) -> bool:
     from sqlalchemy.orm.attributes import flag_modified
 
     async with Chats._chat_transaction(chat_id) as (db, chat):
+        if chat is None:
+            return False
         data = chat.chat or {}
         history = data.get("history") or {}
         msg = (history.get("messages") or {}).get(message_id)
@@ -359,6 +361,15 @@ if (!window.__ocIntentHook) {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.target && e.target.closest
         && e.target.closest('#chat-input')) mark('send_now');
   }, true);
+  // One click answers every task it cancelled (ELI-198), so a query does not
+  // clear it: a new message, sent with nothing running, does.
+  document.addEventListener('submit', (e) => {
+    const f = e.target;
+    const input = document.querySelector('#chat-input');
+    if (running() || !f || !input || !f.contains(input)) return;
+    const c = chat();
+    if (c) delete window.__ocIntents[c];
+  }, true);
 }
 return true;
 """
@@ -419,14 +430,16 @@ def _auto_send_on(valves) -> bool:
 
 
 def _intent_query_js(chat_id: str) -> str:
-    """Read and clear what the page recorded for `chat_id` (see
-    `_INTENT_HOOK_JS`). "none" means the hook is there but saw no click, so
-    the cancel came from elsewhere; null means no hook at all."""
+    """Read what the page recorded for `chat_id` (see `_INTENT_HOOK_JS`).
+    Open WebUI's Stop cancels every task of the chat at once (a reply waiting
+    behind a run and the turn writer holding it), and each asks: the record
+    stays for all of them (ELI-198). "none" means the hook is there but saw
+    no click, so the cancel came from elsewhere; null means no hook at all."""
     return (
         "const c = " + json.dumps(chat_id) + ";"
         "const all = window.__ocIntents;"
         "if (!all) return null;"
-        "const i = all[c]; delete all[c];"
+        "const i = all[c];"
         "return (i && Date.now() - i.t < 60000) ? i.kind : 'none';"
     )
 
@@ -511,6 +524,9 @@ class _TurnWriter:
         # Where each run's streamed part starts in the renderer, in adoption
         # order: (run, output index, text length). See `_from_transcript`.
         self.run_marks: list = [(run_id, 0, 0)]
+        # Each run's lifecycle `startedAt` (ms), where seen: it bounds the
+        # run's transcript span (`_history_run_messages`).
+        self.run_started: dict[str, float] = {}
         self.resumes = 0                # resume budget, counted on M (MAX_TURN_RESUMES)
         self.pending_resume = False     # a resume the Gateway refused; sent on the next hello-ok
         self.request: str | None = None  # the user's message M answers, quoted by a resume
@@ -557,7 +573,11 @@ class _TurnWriter:
             claim = await _claim_turn_message(self.chat_id, self.user_id, self.message_id,
                                               self.run_id, self.conn.writer_id, takeover=takeover)
             if not claim["claimed"]:
-                pipe_log(f"  turn writer: message {self.message_id[:8]}... is held by another writer")
+                if claim["how"] == "gone":
+                    pipe_log(f"  turn writer: chat {self.chat_id[:8]}... is gone; run "
+                             f"{self.run_id[:24]}... is not written")
+                else:
+                    pipe_log(f"  turn writer: message {self.message_id[:8]}... is held by another writer")
                 return False
             self._claim = claim
             if claim["how"] == "new":
@@ -600,6 +620,10 @@ class _TurnWriter:
             return
         try:
             if payload is not None:
+                data = payload.get("data") or {}
+                if payload.get("stream") == "lifecycle" and data.get("phase") == "start" \
+                        and isinstance(data.get("startedAt"), (int, float)) and payload.get("runId"):
+                    self.run_started.setdefault(payload["runId"], data["startedAt"])
                 self.renderer.feed(payload)
         except Exception as ex:
             pipe_log(f"  turn writer: renderer feed failed: {ex}")
@@ -981,6 +1005,7 @@ class _TurnWriter:
                 pipe_log(f"  turn writer: chat.history failed at the end: {ex!r}")
             if self.wake is not None:
                 self._rebuild_wake(hist)
+                self.renderer.flush()
             else:
                 if hist:
                     self._adopt_recoveries_from(hist.get("messages") or [])
@@ -989,7 +1014,8 @@ class _TurnWriter:
                 rebuilt = self._from_transcript(hist) if hist else None
                 if rebuilt is not None:
                     self.renderer = rebuilt
-                if not (self._showable() or note):
+                self.renderer.flush()
+                if not self._showable():
                     await self._show_silent_announce(hist)
             if not self.opened:
                 if not (self._showable() or note) or not await self._open_at_end():
@@ -1053,21 +1079,36 @@ class _TurnWriter:
         result = await _child_result(self.conn, child)
         if not result:
             return
-        label = None
-        for m in (hist or {}).get("messages") or []:
-            blocks = m.get("content") if isinstance(m.get("content"), list) else []
-            calls = {b.get("id"): b for b in blocks if isinstance(b, dict) and b.get("type") == "toolcall"}
-            for b in blocks:
-                if (isinstance(b, dict) and b.get("type") == "tool_result"
-                        and child["child_session"] in json.dumps(b.get("content"))
-                        and b.get("tool_use_id") in calls):
-                    label = _spawn_title(calls[b["tool_use_id"]].get("arguments") or {})
+        # The spawn call whose result names the child, in either tool shape
+        # (claude-cli's blocks, or a native run's `toolResult` messages), made
+        # directly or through a deferred-tool wrapper (2026.10).
+        label, args = None, {}
+        for ev in _history_events((hist or {}).get("messages") or []):
+            data = ev.get("data") or {}
+            if ev.get("stream") != "tool":
+                continue
+            if data.get("phase") == "start":
+                call = (_bare_tool_name(data.get("name") or ""), json.dumps(data.get("args") or {}))
+                name, args_str = _deferred_call_view(*call) or call
+                if _is_spawn_tool(name):
+                    args[data.get("toolCallId")] = _json_object(args_str)
+            elif (data.get("toolCallId") in args
+                  and child["child_session"] in json.dumps(data.get("result"))):
+                label = _spawn_title(args[data["toolCallId"]])
         tcid = f"subagent-{child['child_run']}"
         args_str = json.dumps({"label": label or child["child_session"]})
         call = _tool_call_started_event("Sub-agent", tcid, args_str)["item"]
         call["status"] = "completed"
         self.renderer = _TurnRenderer()
         self.renderer.output = [call, _tool_call_result_event(tcid, result)["item"]]
+        if not self.opened:
+            # One card per child run, in a message of its own (ELI-217): 2026.10.5
+            # retries a delivery the parent met with silence under the same run
+            # id, and a retry's reply then lands in the run's message, not over
+            # the card, while a silent one rewrites the same card.
+            self.conn._turn_writers.pop((self.chat_id, self.message_id), None)
+            self.message_id = turn_message_id(self.session_key, tcid, self.chat_id)
+            self.conn._turn_writers[(self.chat_id, self.message_id)] = self
 
     def release(self) -> None:
         """This writer's connection was retired by a newer deploy: end the Open
@@ -1112,7 +1153,7 @@ class _TurnWriter:
         recovery the writer joined late (its first text and card ran before
         the pipe was back) still gets its start back. None (keep what streamed) while a run has not closed, or when
         the transcript covers nothing."""
-        spans = [_history_span_messages(hist, r) for r in self.runs]
+        spans = [_history_span_messages(hist, r, self.run_started.get(r)) for r in self.runs]
         if any(s is None for s in spans):
             return None
         out, text = self.renderer.output, self.renderer.text
@@ -1187,21 +1228,44 @@ class _TurnWriter:
                  f"{intent or 'unknown'}")
         if intent != "stop" or self.closed:
             return
-        aborted = False
-        try:
-            resp = await _run_request(
-                self.conn, RUN_ABORT, {"sessionKey": self.session_key, "runId": self.run_id}, timeout=15)
-            aborted = bool((resp or {}).get("aborted"))
-        except Exception as ex:
-            pipe_log(f"  turn writer: chat.abort failed: {ex}")
-        if not aborted and self.wake and self.wake.get("job"):
+        wake = bool(self.wake and self.wake.get("job"))
+        # A run the agent started (a cron wake) first, by its id: on
+        # 2026.10.5 chat.abort answers `aborted` for it but stops only its
+        # running command, and the run goes on to its end. There the wake
+        # is not bound as one (its run id is not the sessionId).
+        aborted = parse_pipe_run_id(self.run_id) is None and await self._abort_agent_run()
+        if not aborted:
+            try:
+                resp = await _run_request(
+                    self.conn, RUN_ABORT, {"sessionKey": self.session_key, "runId": self.run_id}, timeout=15)
+                aborted = bool((resp or {}).get("aborted"))
+            except Exception as ex:
+                pipe_log(f"  turn writer: chat.abort failed: {ex}")
+        if not aborted and wake:
             await self._cancel_wake_run()
         await self.finalize(stopped=True)
 
+    async def _abort_agent_run(self) -> bool:
+        """Stop a run the agent started by its id: `sessions.abort` with a run id
+        stops that run alone and never clears the session's queue, so turns
+        queued behind the wake stay (2026.10.5 and 2026.10.10, which have no
+        tasks.cancel). On 2026.9 the wake's run id is the sessionId, and it
+        finds no run."""
+        try:
+            res = await self.conn.send_request("sessions.abort", {"key": self.session_key, "runId": self.run_id},
+                                               timeout=15)
+        except Exception as ex:
+            pipe_log(f"  turn writer: sessions.abort for the wake's run failed: {ex}")
+            return False
+        aborted = (res or {}).get("status") == "aborted"
+        if aborted:
+            pipe_log(f"  turn writer: run {self.run_id[:24]}... aborted by its id")
+        return aborted
+
     async def _cancel_wake_run(self) -> None:
-        """Stop a cron wake's run (ELI-192). On 2026.9 its run id is the
-        sessionId, and chat.abort finds no chat run under it: the wake is its
-        job's cron run, which the job's running task cancels."""
+        """Stop a cron wake's run (ELI-192) on 2026.9: chat.abort finds no
+        chat run under its id (the sessionId): the wake is its job's cron
+        run, which the job's running task cancels."""
         job = self.wake["job"]
         try:
             resp = await self.conn.send_request("tasks.list", {"sessionKey": self.session_key, "limit": 100},
@@ -1282,12 +1346,12 @@ async def _transcript_view(conn: "_GatewayConnection", *, session_key: str, chat
     return output, "" if text in _SILENT_SENTINELS else text
 
 
-def _history_span_messages(history: dict, run_id: str) -> list | None:
+def _history_span_messages(history: dict, run_id: str, started_ms: float | None = None) -> list | None:
     """One run's messages in `chat.history`, or None while it may still be
     writing. A closed run ends at its `cli-assistant:<runId>`; a run cut off
     with no closing turn (a crash, an outside kill) ends where the next
     admitted turn (a recovery, a resume) begins."""
-    closed = _history_run_messages(history, run_id)
+    closed = _history_run_messages(history, run_id, started_ms)
     if closed is not None:
         return closed
     messages = (history or {}).get("messages")
@@ -1380,7 +1444,19 @@ def _turn_queue(conn: "_GatewayConnection", sess: str, run: str, parsed: tuple,
     if _is_terminal_event(payload):
         pump.terminal.set()
     pump.queue.put_nowait(("event", payload))
+    if _is_error_event(payload) and parse_pipe_run_id(run) is None:
+        # ELI-217: on 2026.10.5 a run the agent started that errors gets no
+        # settle push (its last is `phase: error`, hasActiveRun still true),
+        # though its row reads failed by its chat error. Its error events read
+        # the row; one still active waits for the next push.
+        spawn_background(_turn_reread_row(conn, sess))
     return True
+
+
+def _is_error_event(payload: dict) -> bool:
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    return payload.get("state") == "error" or (
+        payload.get("stream") == "lifecycle" and data.get("phase") == "error")
 
 
 def _note_child_result(conn: "_GatewayConnection", payload: dict) -> None:
@@ -1648,7 +1724,16 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
             if kind == "event":
                 if writer is not None:
                     await writer.feed(item)
-                continue
+                if not (writer is not None and writer.run_id == run and _ends_on_own_final(run, item)):
+                    continue
+                # Its own final is the settle that may never be pushed: OpenClaw
+                # 2026.10.5 pushes `agent.input.settled` only for a chat.send or
+                # agent call, so a run the Gateway starts itself (a background
+                # command's end notice, heartbeat runner) leaves its last row
+                # `hasActiveRun: true` and goes idle unpushed (ELI-215). After a
+                # clean final the settled row could only finalize, so no row is
+                # waited for.
+                item = None
             # Only the pump of the writer's current run ends it: an interrupted
             # run's pump also gets the session's settle once its recovery has
             # taken M over, and the recovery's own pump may still hold events.
@@ -1673,6 +1758,14 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
                 kind, item = pump.queue.get_nowait()
                 if kind == "event" and item is not None:
                     _turn_queue(conn, sess, run, parsed, item)
+
+
+def _ends_on_own_final(run: str, payload) -> bool:
+    """A run the agent started (no pipe run id) whose chat final came: it
+    ended cleanly, so it is over whatever the session row says. An error or
+    abort still waits for its row (its note, a resume, a recovery)."""
+    return (isinstance(payload, dict) and payload.get("state") == "final"
+            and parse_pipe_run_id(run) is None)
 
 
 def _is_terminal_event(payload: dict) -> bool:
@@ -1963,12 +2056,14 @@ async def _turn_resync(conn: "_GatewayConnection", skip: set = frozenset()) -> N
         conn.row_to_consumers(sess, row, resync=True, read_at=read_at, outside_loop=True)
 
 
-def _history_run_messages(history: dict, run_id: str) -> list | None:
+def _history_run_messages(history: dict, run_id: str, started_ms: float | None = None) -> list | None:
     """One run's messages in `chat.history`: everything after the user
     message that started it, or after the previous run's closing message
     (a run with no user turn, e.g. a sub-agent announce), through its own
     closing message (`_run_closed_by`). None when the run has not closed
-    yet."""
+    yet. A previous run that answered with silence leaves no closing
+    message, so with the run's start time (`started_ms`, its lifecycle
+    start) messages stamped before it are not the run's (ELI-227)."""
     messages = (history or {}).get("messages")
     if not isinstance(messages, list) or not run_id:
         return None
@@ -1980,10 +2075,16 @@ def _history_run_messages(history: dict, run_id: str) -> list | None:
             continue
         start = end
         while start > 0 and (messages[start - 1] or {}).get("role") != "user" \
-                and not _run_closed_by(messages[start - 1]):
+                and not _run_closed_by(messages[start - 1]) \
+                and not _stamped_before(messages[start - 1], started_ms):
             start -= 1
         return messages[start:end + 1]
     return None
+
+
+def _stamped_before(message: dict, started_ms: float | None) -> bool:
+    ts = (message or {}).get("timestamp")
+    return started_ms is not None and isinstance(ts, (int, float)) and ts < started_ms
 
 
 def _relay_output_events(sent: list[dict], current: list[dict]) -> list[dict]:
