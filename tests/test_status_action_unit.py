@@ -1218,6 +1218,42 @@ class SubagentDetailTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any("openDrawer" in c for c in _emitted_codes(emitted)))   # a page refresh
 
 
+    async def test_the_header_task_on_a_history_that_shows_it_bare(self):
+        """OpenClaw 2026.10.5's chat.history shows the spawn message as the
+        bare task, with nothing marking it as the spawn: the header had no
+        task. sessions.preview still has it as the model got it; the bare
+        message is then the header's, not a turn of the run."""
+        action = Action()
+        emitted = []
+        task = "E2E_SLOW:20 E2E_CHILDTASK"
+        wrapped = ("<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\n\n[Subagent Context] You are running as a subagent "
+                   "(depth 1/5). Complete the current [Subagent Task]; inherited conversation is background "
+                   "context, not your assignment.\n\n[Subagent Task]\n\n<<<END_OPENCLAW_INTERNAL_CONTEXT>>>\n\n"
+                   f"{task}\n\n<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\n\nBegin. Execute the assigned task to "
+                   "completion.\n\n<<<END_OPENCLAW_INTERNAL_CONTEXT>>>")
+
+        async def fake_send_request(method, params, timeout=5):
+            if method == "sessions.describe":
+                return {"session": {"status": "done", "startedAt": 1, "endedAt": 2,
+                                     "spawnedBy": "agent:main:parent"}}
+            if method == "chat.history":
+                return {"messages": [{"role": "user", "content": task},
+                                     {"role": "assistant", "content": [{"type": "text", "text": "done it"}]}]}
+            if method == "sessions.preview":
+                self.assertEqual(params["keys"], [self.CHILD])
+                return {"previews": [{"key": self.CHILD, "items": [{"role": "user", "text": wrapped},
+                                                                    {"role": "assistant", "text": "done it"}]}]}
+            raise AssertionError(f"unexpected RPC: {method}")
+
+        with action_gateway(_drawer_conn(fake_send_request)):
+            await action._run_subagent_detail({**self.DETAIL_BODY, "opened": True}, {"id": "u1"},
+                                              RecordingEmitter(emitted))
+        fill = next(c for c in _emitted_codes(emitted) if "S.fillDrawer(DATA)" in c)
+        data = json.loads(fill[fill.index("const DATA = ") + 13:fill.index(";\n", fill.index("const DATA = "))])
+        self.assertEqual(data["task"]["task"], task)
+        self.assertEqual(data["items"], [{"kind": "text", "text": "done it"}])
+
+
 class SubagentProactiveMessageClickTests(unittest.IsolatedAsyncioTestCase):
     """A real OWUI toolbar click on an old sub-agent-finished message (written
     by bridge versions before ELI-100; read-only shim `_SUBAGENT_TASK_ID_MARKER_RE`)

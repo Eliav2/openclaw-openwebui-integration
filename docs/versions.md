@@ -7,7 +7,7 @@ Applies to: Pipe, Action, Filter
 | | Minimum | Tested in CI |
 |---|---|---|
 | Open WebUI | 0.12.0 | 0.12.3 |
-| OpenClaw Gateway | 2026.9.3 | 2026.9.3 |
+| OpenClaw Gateway | 2026.9.3 | 2026.10.5 |
 | Python inside Open WebUI (what Open WebUI ships) | 3.11 | 3.11 and 3.12 |
 | Python for `install.py` | 3.10 | 3.10 to 3.13 |
 
@@ -39,7 +39,7 @@ Each row is the full end-to-end suite on one pair, on GitHub's runners. The suit
 | 0.11.1 | 13 of 16 pass (1 skipped) | agent-started replies (two tests); Status CSS classes | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/38641680949) |
 | 0.12.0 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/39003313714) |
 | 0.12.2 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/39003315726) |
-| 0.12.3 | pass | | every pull request |
+| 0.12.3 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/39173684021) |
 
 ### OpenClaw, with Open WebUI 0.12.0
 
@@ -47,8 +47,9 @@ Each row is the full end-to-end suite on one pair, on GitHub's runners. The suit
 | --- | --- | --- | --- |
 | 2026.8.35 | 14 of 17 pass | cron replies (two tests); a guest's reply cut by a Gateway restart did not finish | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/38641688071) |
 | 2026.9.1 | 14 of 17 pass | the same as 2026.8.35 | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/38641691738) |
-| 2026.9.3 | pass | | every pull request |
+| 2026.9.3 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/39173684021) |
 | 2026.10.3 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/38641695395) |
+| 2026.10.5 | pass, 4 tests skipped for known gaps | secret dialog (two tests); sub-agent drawer header; a reply sent right after a Gateway restart | every pull request |
 
 ## Keeping this page true
 

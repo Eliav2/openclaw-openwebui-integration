@@ -277,7 +277,8 @@ def upload_media(name: str, data: bytes) -> None:
         raise RuntimeError(f"media upload failed: {body}")
 
 
-def schedule_wake(session_key: str, message: str, in_s: float) -> None:
+def schedule_wake(session_key: str, message: str, in_s: float) -> str:
+    """Add a one-shot cron wake into the session; its job's id."""
     at = (datetime.datetime.now(datetime.timezone.utc)
           + datetime.timedelta(seconds=in_s)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     # agentId: from OpenClaw 2026.10.10 a job needs its agent named when the
@@ -286,11 +287,8 @@ def schedule_wake(session_key: str, message: str, in_s: float) -> None:
               "sessionTarget": f"session:{session_key}",
               "payload": {"kind": "agentTurn", "message": message},
               "delivery": {"mode": "none"}, "deleteAfterRun": True}
-    out = subprocess.run(["openclaw", "gateway", "call", "cron.add", "--json",
-                          "--params", json.dumps(params)],
-                         capture_output=True, text=True, timeout=90)
-    if out.returncode:
-        raise RuntimeError(f"cron.add failed: {out.stderr[-1500:]}")
+    job = gateway_call("cron.add", params)
+    return (job.get("job") or job).get("id")
 
 
 def gateway_call(method: str, params: dict) -> dict:

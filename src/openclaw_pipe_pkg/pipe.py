@@ -9,8 +9,9 @@
 # (and "done"), so a `not in (done, failed, cancelled)` test would treat every
 # resting session as active and hang every message. Only these gate the queue.
 _ACTIVE_RUN_STATES = ("active", "running", "streaming", "queued")
-# The Gateway's secret requests are asked in the chat (askuser.py, ELI-96).
-_QUESTION_HOOKS = (secret_request_seen, secret_request_resolved)
+# The Gateway's questions (secret requests, ELI-96; the ask_user tool,
+# ELI-216) are asked in the chat (askuser.py).
+_QUESTION_HOOKS = (question_requested, question_resolved)
 
 
 def _session_active_from_signals(describe_status, list_has_active_run) -> bool:
@@ -152,7 +153,12 @@ def _title_is_owui_default(title, chat: dict) -> bool:
 
 async def _set_title_unless_chosen(chat_id: str, title: str) -> bool:
     """Title the chat, under its row lock, unless its title was chosen
-    meanwhile (ELI-182). True when the title was set."""
+    meanwhile (ELI-182). True when the title was set. Never cut short by a
+    cancel (ELI-205)."""
+    return await _uncancellable(_set_title_unless_chosen_now(chat_id, title))
+
+
+async def _set_title_unless_chosen_now(chat_id: str, title: str) -> bool:
     from open_webui.models.chats import Chats
     async with Chats._chat_transaction(chat_id) as (_db, chat):
         if chat is None or not _title_is_owui_default(chat.title, chat.chat):
@@ -605,6 +611,12 @@ class Pipe:
                 async for item in turn_gen:
                     yield item
             return
+        # No `execute` reaches a tab while it shows an input dialog (ELI-195).
+        meta = __metadata__ or {}
+        user_id = (__user__ or {}).get("id")
+        __event_emitter__ = _dialog_safe_emitter(
+            __event_emitter__, user_id, meta.get("chat_id"), meta.get("message_id"))
+        __event_call__ = _dialog_safe_event_call(__event_call__, meta.get("session_id"), user_id)
         # aclosing: when OWUI closes this generator, close the inner one now
         # rather than whenever it is garbage-collected, so its cancel handling
         # runs before the next message arrives.

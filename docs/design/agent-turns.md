@@ -581,7 +581,10 @@ no fourth run is sent. A unit test drives four consecutive 137 rows.
    pipe.py:164, does). If the answer is Stop, it sends `chat.abort` and finalizes M. If the
    answer is Send now or unknown, it keeps writing M to the run's end, and the queued
    message runs after (case 7). One run keeps one message, and the agent turn needs no grace
-   timer. Escape and the Stop button both report as Stop through the same hook.
+   timer. Escape and the Stop button both report as Stop through the same hook. One Stop
+   cancels every task of the chat at once (a reply queued behind the run and the writer
+   holding it), and each asks: the query leaves the page's record in place for all of them,
+   and a new message sent with nothing running clears it (ELI-198).
 9. **Two agent turns back to back.** Each run has its own id and its own M. The second
    anchors under the first (row lock, 2.3), so they chain in run-start order and are never
    variants.

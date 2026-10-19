@@ -143,6 +143,8 @@ class _ComposerWatcher:
 
     async def tick(self, now=None):
         if not self.enabled():
+            for key in self._pairs:
+                _chat_tab_left(*key)
             self._pairs.clear()
             return 0
         now = time.monotonic() if now is None else now
@@ -167,6 +169,7 @@ class _ComposerWatcher:
                     due.append((key, user_id))
         for key in [k for k in self._pairs if k not in live]:
             del self._pairs[key]
+            _chat_tab_left(*key)
         if not due:
             return 0
 
@@ -182,7 +185,12 @@ class _ComposerWatcher:
                 result = "retry"
             if result == "acked":
                 pushed += 1
+                # The tab shows the chat: an ask_user card can go there (askuser.py).
+                _chat_tab_ready(sid, chat_id)
             if st is None:
+                continue
+            if result == "held":
+                st["attempts"] -= 1
                 continue
             if result == "retry" and st["attempts"] < _COMPOSER_WATCH_ATTEMPTS:
                 st["next"] = now + _COMPOSER_WATCH_RETRY_S
@@ -191,7 +199,9 @@ class _ComposerWatcher:
         return pushed
 
     async def _push(self, sid, chat_id, user_id) -> str:
-        """"acked" (the tab ran it), "skip" (not ours to push) or "retry"."""
+        """"acked" (the tab ran it), "skip" (not ours to push), "retry", or
+        "held": the tab shows an input dialog, which an `execute` would take
+        the answer of (ELI-195), so the push waits for it to close."""
         if not user_id:
             return "skip"
         head = await self._chat_head(chat_id)
@@ -210,6 +220,8 @@ class _ComposerWatcher:
         code = (_page_hooks_js(chat_id, _auto_send_on(self.valves_getter()))
                 + _render_composer_button_js(session_id=sid, model_prefixes=prefixes, chat_id=chat_id,
                                              chat_model=model))
+        if _dialog_open_on(sid):
+            return "held"
         acked = await self._call_sid(sid, {
             "chat_id": chat_id,
             "message_id": message_id,
@@ -218,6 +230,7 @@ class _ComposerWatcher:
         return "acked" if acked else "retry"
 
     async def run(self):
+        _CHAT_TABS_TRACKED[0] = True
         last_error = None
         next_liveness = 0.0
         state = "unknown"
@@ -229,6 +242,7 @@ class _ComposerWatcher:
                     state = await self.function_state()
                     if state == "gone":
                         pipe_log("[composer] Pipe function deleted; watcher stops")
+                        _CHAT_TABS_TRACKED[0] = False
                         return
                 if state != "inactive":
                     await self.tick()

@@ -2414,6 +2414,28 @@ async def _drawer_parent(conn, session_row: dict, user_id) -> dict | None:
     return {"title": (row.get("label") or row.get("displayName") or "").strip() or key, "childKey": key}
 
 
+async def _previewed_task(conn, child_key: str) -> str | None:
+    """The child's task out of `sessions.preview`, which keeps the spawn
+    message as the model got it. 2026.10.5's `chat.history` shows the bare
+    task with nothing that marks it as the spawn (its display projection
+    strips the envelope), so the history read alone does not find it."""
+    try:
+        resp = await conn.send_request("sessions.preview", dict(keys=[child_key], limit=20, maxChars=2000),
+                                       timeout=5)
+    except Exception as ex:
+        pipe_log(f"[status-action] sessions.preview (drawer task) failed: {ex}")
+        return None
+    return _subagent_task_texts(resp).get(child_key)
+
+
+def _without_bare_task(items: list, task: str | None) -> list:
+    """The drawer's items without a first user turn that is the task the
+    header shows: the spawn message as 2026.10.5's history shows it."""
+    if task and items and items[0].get("kind") == "user" and items[0].get("text", "").strip() == task.strip():
+        return items[1:]
+    return items
+
+
 async def _latest_preview(conn, child_key: str) -> str | None:
     """A running child's newest message as the session list previews it:
     what a claude-cli child has said so far, while its transcript is still
@@ -2491,6 +2513,9 @@ class Action:
         visually distinct icon. Detected here and redirected
         straight into the same subagent-detail drawer instead of the
         general status dialog, keyed off content rather than mode."""
+        # No `execute` reaches a tab while it shows an input dialog (ELI-195).
+        __event_emitter__ = _dialog_safe_emitter(
+            __event_emitter__, (__user__ or {}).get("id"), body.get("chat_id"), body.get("id"))
         mode = body.get("mode")
         if mode == "compact":
             return await self._run_compact(body, __user__, __event_emitter__)
@@ -3105,9 +3130,11 @@ class Action:
             return {"status": "error", "detail": "sub-agent not found"}
 
         parent = session_row.get("spawnedBy") or session_row.get("parentSessionKey")
-        task = _subagent_row({"key": child_key, **session_row},
-                             _spawn_task_of(messages) or _subagent_tasks(parent).get(child_key))
-        items, dropped = _cap_run_items(_drawer_run_items(messages), budget)
+        task_text = _spawn_task_of(messages) or _subagent_tasks(parent).get(child_key)
+        if task_text is None:
+            task_text = await _previewed_task(conn, child_key)
+        task = _subagent_row({"key": child_key, **session_row}, task_text)
+        items, dropped = _cap_run_items(_without_bare_task(_drawer_run_items(messages), task_text), budget)
         claude_cli = (session_row.get("agentRuntime") or {}).get("id") == "claude-cli"
         note = latest = None
         if claude_cli and task["status"] in _LIVE_SUBAGENT_STATUSES:
