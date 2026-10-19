@@ -1134,21 +1134,44 @@ class _TurnWriter:
                  f"{intent or 'unknown'}")
         if intent != "stop" or self.closed:
             return
-        aborted = False
-        try:
-            resp = await _run_request(
-                self.conn, RUN_ABORT, {"sessionKey": self.session_key, "runId": self.run_id}, timeout=15)
-            aborted = bool((resp or {}).get("aborted"))
-        except Exception as ex:
-            pipe_log(f"  turn writer: chat.abort failed: {ex}")
-        if not aborted and self.wake and self.wake.get("job"):
+        wake = bool(self.wake and self.wake.get("job"))
+        # A run the agent started (a cron wake) first, by its id: on
+        # 2026.10.5 chat.abort answers `aborted` for it but stops only its
+        # running command, and the run goes on to its end. There the wake
+        # is not bound as one (its run id is not the sessionId).
+        aborted = parse_pipe_run_id(self.run_id) is None and await self._abort_agent_run()
+        if not aborted:
+            try:
+                resp = await _run_request(
+                    self.conn, RUN_ABORT, {"sessionKey": self.session_key, "runId": self.run_id}, timeout=15)
+                aborted = bool((resp or {}).get("aborted"))
+            except Exception as ex:
+                pipe_log(f"  turn writer: chat.abort failed: {ex}")
+        if not aborted and wake:
             await self._cancel_wake_run()
         await self.finalize()
 
+    async def _abort_agent_run(self) -> bool:
+        """Stop a run the agent started by its id: `sessions.abort` with a run id
+        stops that run alone and never clears the session's queue, so turns
+        queued behind the wake stay (2026.10.5 and 2026.10.10, which have no
+        tasks.cancel). On 2026.9 the wake's run id is the sessionId, and it
+        finds no run."""
+        try:
+            res = await self.conn.send_request("sessions.abort", {"key": self.session_key, "runId": self.run_id},
+                                               timeout=15)
+        except Exception as ex:
+            pipe_log(f"  turn writer: sessions.abort for the wake's run failed: {ex}")
+            return False
+        aborted = (res or {}).get("status") == "aborted"
+        if aborted:
+            pipe_log(f"  turn writer: run {self.run_id[:24]}... aborted by its id")
+        return aborted
+
     async def _cancel_wake_run(self) -> None:
-        """Stop a cron wake's run (ELI-192). On 2026.9 its run id is the
-        sessionId, and chat.abort finds no chat run under it: the wake is its
-        job's cron run, which the job's running task cancels."""
+        """Stop a cron wake's run (ELI-192) on 2026.9: chat.abort finds no
+        chat run under its id (the sessionId): the wake is its job's cron
+        run, which the job's running task cancels."""
         job = self.wake["job"]
         try:
             resp = await self.conn.send_request("tasks.list", {"sessionKey": self.session_key, "limit": 100},
