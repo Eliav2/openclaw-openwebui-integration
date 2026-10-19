@@ -2147,6 +2147,9 @@ class _TurnRenderer:
         # Text that opens a message item and is, so far, a silent sentinel or
         # the start of one (`_add_text`).
         self._held = ""
+        # The run answered with a silent sentinel alone (`flush`): no text is
+        # its reply, not something lost.
+        self.silenced = False
 
     @property
     def received(self) -> str:
@@ -2222,6 +2225,8 @@ class _TurnRenderer:
         """The run ended, or a card follows: held text that is not a
         sentinel is shown after all; returns it as added."""
         held, self._held = self._held, ""
+        if held.strip() in _SILENT_SENTINELS:
+            self.silenced = True
         if not held.strip() or held.strip() in _SILENT_SENTINELS:
             return ""
         return self._append_text(held)
