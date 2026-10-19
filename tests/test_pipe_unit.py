@@ -832,6 +832,26 @@ class TurnRendererOutputTests(unittest.TestCase):
         texts = [i["content"][0]["text"] for i in r.output if i["type"] == "message"]
         self.assertEqual(texts, [self.ANSWER])
 
+    # ELI-219 again (live chats 9562eda8, 6497a129 on 2026.10.5, Pipe 788ce7c):
+    # the same run with a short answer and no item events. The Gateway puts
+    # its message break ahead of the answer's first delta, and the run's
+    # closer is the catch-all assistant text with the CLI's messages joined by
+    # one newline. The reply read "SUB-51NO_REPLY\nSUB-51".
+    def test_a_closer_joining_the_messages_by_one_newline_is_not_shown_again(self):
+        r = _TurnRenderer()
+        r.feed({"stream": "tool", "data": {"phase": "start", "name": "Agent", "toolCallId": "t1",
+                                           "args": {"run_in_background": True}}})
+        r.feed({"stream": "tool", "data": {"phase": "result", "name": "Agent", "toolCallId": "t1",
+                                           "result": "Async agent launched successfully."}})
+        for delta in ("NO_REPLY", "\n\nSUB", "-51"):
+            r.feed({"stream": "assistant", "data": {"itemId": "cli-assistant:r1", "text": "", "delta": delta}})
+        r.feed({"stream": "assistant", "data": {"assistantMessageIndex": 1, "completedText": "SUB-51"}})
+        r.feed({"stream": "assistant", "data": {"itemId": "cli-assistant:r1", "text": "NO_REPLY\nSUB-51"}})
+        r.flush()
+        self.assertEqual(r.text, "SUB-51")
+        texts = [i["content"][0]["text"] for i in r.output if i["type"] == "message"]
+        self.assertEqual(texts, ["SUB-51"])
+
     def test_a_sentinel_split_across_deltas_stays_out(self):
         r = _TurnRenderer()
         for d in ("NO", "_RE", "PLY"):

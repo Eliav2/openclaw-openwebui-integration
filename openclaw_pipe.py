@@ -4609,6 +4609,14 @@ _ROW_MARKER_TYPE = "_pipe_row"
 # we have", never a coincidence of a short phrase ("OK.", "Done.").
 _WHOLE_TEXT_ANCHOR_CHARS = 200
 _MIN_WHOLE_TEXT_ANCHOR_CHARS = 64
+_LINE_BREAKS_RE = re.compile(r"\n+")
+
+
+def _one_break(text: str) -> str:
+    """`text` with each run of line breaks as one: a claude-cli run's closer
+    joins its messages by one newline, where the stream put the Gateway's
+    two-newline message break (ELI-219)."""
+    return _LINE_BREAKS_RE.sub("\n", text)
 
 
 def _item_delta_text(item_text: str, last_item_text: str, assistant_stream_text: str) -> str:
@@ -4628,6 +4636,8 @@ def _item_delta_text(item_text: str, last_item_text: str, assistant_stream_text:
         return ""
     if item_text.startswith(baseline):
         return item_text[len(baseline):]
+    if _one_break(item_text) == _one_break(baseline):
+        return ""
     if last_item_text and item_text.endswith("\n" + last_item_text):
         # The run's whole text, its messages joined by newlines, closing with
         # the message item already shown: a claude-cli run's closer after a
