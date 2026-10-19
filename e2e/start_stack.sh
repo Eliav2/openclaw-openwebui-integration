@@ -8,7 +8,8 @@
 # installer's own smoke test is the first end-to-end assertion: it fails the
 # script if a real chat completion does not come back through the Gateway.
 #
-# Inputs (env): OWUI_IMAGE, OPENCLAW_VERSION (npm spec, e.g. 2026.9.3 or latest),
+# Inputs (env): OWUI_IMAGE, OPENCLAW_VERSION (npm spec, e.g. 2026.9.3 or latest;
+# replaced by the installed version once npm has it),
 # E2E_LOG_DIR. Writes the credentials the test suite needs to $GITHUB_ENV when
 # running under Actions.
 #
@@ -66,6 +67,13 @@ echo "::group::OpenClaw Gateway (openclaw@$OPENCLAW_VERSION)"
 npm install --global --no-audit --no-fund "openclaw@$OPENCLAW_VERSION" >"$LOG_DIR/npm-install.log" 2>&1 \
   || { cat "$LOG_DIR/npm-install.log"; exit 1; }
 openclaw --version
+# The Gateway reports OPENCLAW_VERSION as its own version when it is set, ahead
+# of its package version, and the Pipe's version gates read that. An npm spec
+# (`latest`) there makes them all take their oldest path (ELI-225), so from
+# here on it is the version npm installed, for this Gateway and the test steps.
+OPENCLAW_VERSION=$(openclaw --version | grep -oE '[0-9]{4}\.[0-9]{1,2}\.[0-9]+(-[0-9A-Za-z.]+)?' | head -1)
+: "${OPENCLAW_VERSION:?openclaw --version printed no version}"
+export OPENCLAW_VERSION
 mkdir -p "$HOME/.openclaw"
 # e2e-think is the one reasoning model: the Gateway accepts a thinking level for
 # it (off to high on 2026.9) and sends it on as `reasoning_effort`, which the
@@ -165,8 +173,9 @@ if [[ -n "${GITHUB_ENV:-}" ]]; then
     echo "E2E_FAKE_LLM_LOG=$FAKE_LLM_LOG"
     echo "GATEWAY_TOKEN=$GATEWAY_TOKEN"
     echo "GATEWAY_URL=$GATEWAY_URL"
+    echo "OPENCLAW_VERSION=$OPENCLAW_VERSION"  # the installed version, for a Gateway a test restarts
   } >>"$GITHUB_ENV"
 else
-  echo "export OWUI_URL=$OWUI_URL OWUI_EMAIL=$OWUI_EMAIL OWUI_PASSWORD=$OWUI_PASSWORD E2E_STACK=1 E2E_GATEWAY_PID_FILE=$GATEWAY_PID_FILE E2E_FAKE_LLM_LOG=$FAKE_LLM_LOG GATEWAY_TOKEN=$GATEWAY_TOKEN GATEWAY_URL=$GATEWAY_URL"
+  echo "export OWUI_URL=$OWUI_URL OWUI_EMAIL=$OWUI_EMAIL OWUI_PASSWORD=$OWUI_PASSWORD E2E_STACK=1 E2E_GATEWAY_PID_FILE=$GATEWAY_PID_FILE E2E_FAKE_LLM_LOG=$FAKE_LLM_LOG GATEWAY_TOKEN=$GATEWAY_TOKEN GATEWAY_URL=$GATEWAY_URL OPENCLAW_VERSION=$OPENCLAW_VERSION"
 fi
 echo "stack ready"

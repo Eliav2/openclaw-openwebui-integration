@@ -28,8 +28,10 @@ The design behind this is in [Agent turns](../design/agent-turns.md).
 | Another session's `sessions_send` into this chat's session | a reply, live |
 | A sub-agent that finishes while its parent is idle | the parent's reply to the result, live |
 | A sub-agent that finishes while its parent is still running | part of the running reply |
+| A command the agent left running in the background that ends | the agent's reply to its result, live, finished when that run ends |
 | A Gateway restart recovery of an interrupted reply | continues that same reply |
 | A heartbeat run | nothing |
+| Any run on the session of a chat you deleted in Open WebUI | nothing: the chat stays deleted |
 
 Heartbeats never get a message: the Gateway hides heartbeat output itself, and heartbeat tool cards in your chat would be noise. A cron job running in an isolated session never reaches the chat either, since it does not run on the chat's session.
 
@@ -50,6 +52,8 @@ To watch a sub-agent while it works, open it from the [Status dialog](./status.m
 - **Stop** aborts the run and finishes the message with what it has.
 - **Send now** (or Enter while the reply runs, with Open WebUI's message queue off) keeps the run going to its end in the same message; your message runs right after it.
 - **A message you send while it streams** is in the chat at once ([`AUTO_SEND_WHILE_RUNNING`](../configuration.md#auto_send_while_running)). The Pipe waits for the run to finish and then sends it as its own reply. It is never mixed into the agent's run.
+
+<img src="../img/demos/send-now.gif" alt="A second message sent while a reply runs waits in Open WebUI's queue; Send now posts it at once, marked queued until the first reply finishes, and then it gets its own reply" width="800">
 
 ## Images, files and questions
 

@@ -18,7 +18,7 @@ install_stubs()
 import openclaw_pipe as ocp  # noqa: E402
 
 
-class ReconnectHandoffTests(unittest.IsolatedAsyncioTestCase):
+class _Reconnecting:
 
     def setUp(self):
         patch = mock.patch.object(ocp, "pipe_log", lambda *a, **k: None)
@@ -42,6 +42,9 @@ class ReconnectHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.conn._event_loop_task = asyncio.ensure_future(self.conn._reconnect())
         self.addCleanup(self.conn._event_loop_task.cancel)
         await asyncio.sleep(0)
+
+
+class ReconnectHandoffTests(_Reconnecting, unittest.IsolatedAsyncioTestCase):
 
     async def test_a_turn_during_a_backoff_takes_the_loops_attempt_at_once(self):
         await self._backing_off()
@@ -71,6 +74,82 @@ class ReconnectHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.conn._event_loop_task.cancel()
         with self.assertRaisesRegex(ocp.GatewayError, "stopped"):
             await asyncio.wait_for(waiting, 2)
+
+
+def refused():
+    return ocp.GatewayError("Could not connect to the OpenClaw Gateway at localhost:18789 "
+                            "(ConnectionRefusedError: [Errno 111] Connection refused).",
+                            error={"code": ocp.GATEWAY_REFUSED_CODE})
+
+
+class GatewayDownTests(_Reconnecting, unittest.IsolatedAsyncioTestCase):
+    """A Gateway that is down or restarting refuses the connection until its
+    new process listens. A turn that finds the socket reconnecting waits
+    through those refusals instead of answering with one."""
+
+    def setUp(self):
+        super().setUp()
+        self.logged, self.delays = [], []
+        patch = mock.patch.object(ocp, "pipe_log", lambda *a, **k: self.logged.append(a[0]))
+        patch.start()
+        self.addCleanup(patch.stop)
+        wait_for = asyncio.wait_for
+
+        async def quick_wait_for(aw, timeout):
+            # The loop's backoff wait: record it, end it at once.
+            if getattr(aw, "__qualname__", "").startswith("Event.wait"):
+                self.delays.append(timeout)
+                timeout = 0
+            return await wait_for(aw, timeout)
+        patch = mock.patch.object(ocp.asyncio, "wait_for", quick_wait_for)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    async def test_a_turn_waits_through_refused_reconnects_for_the_new_gateway(self):
+        self.outcomes = [refused(), refused(), None]
+        await self._backing_off()
+        await self.conn.ensure_connected()
+        self.assertEqual(len(self.connects), 3)
+        self.assertIsNotNone(self.conn._ws)
+        self.assertEqual(len([line for line in self.logged if "refuses connections" in line]), 1)
+
+    async def test_the_loop_tries_again_at_its_first_step_while_a_turn_waits(self):
+        self.outcomes = [refused(), refused(), None]
+        await self._backing_off()
+        await self.conn.ensure_connected()
+        # 30 s before the turn asked; after each refusal, 1 s while it waits.
+        self.assertEqual(self.delays, [30, 1, 1])
+
+    async def test_a_gateway_that_does_not_come_back_fails_the_turn(self):
+        self.outcomes = [refused()] * 1000
+        await self._backing_off()
+        with mock.patch.object(ocp, "GATEWAY_DOWN_WAIT_S", 0):
+            with self.assertRaisesRegex(ocp.GatewayError, "Connection refused"):
+                await self.conn.ensure_connected()
+        self.assertEqual(self.conn._turns_awaiting_gateway, 0)
+
+    async def test_a_refused_connect_is_marked_and_nothing_else_is(self):
+        multi = OSError("Multiple exceptions: [Errno 111] Connect call failed ('::1', 18789, 0, 0), "
+                        "[Errno 111] Connect call failed ('127.0.0.1', 18789)")
+        mixed = OSError("Multiple exceptions: [Errno 99] Cannot assign requested address, "
+                        "[Errno 111] Connect call failed ('127.0.0.1', 18789)")
+        for ex, marked in ((ConnectionRefusedError(111, "Connection refused"), True), (multi, True),
+                           (mixed, False), (OSError(113, "No route to host"), False)):
+            with self.subTest(ex=str(ex)):
+                valves = types.SimpleNamespace(GATEWAY_URL="localhost:18789", GATEWAY_TOKEN="tok",
+                                               AGENT_ID="main")
+                conn = ocp._GatewayConnection(lambda: valves)
+                conn._ensure_identity = lambda _valves: None
+
+                async def connect(*a, ex=ex, **k):
+                    raise ex
+                with mock.patch.object(ocp.websockets, "connect", connect, create=True), \
+                        mock.patch.object(ocp.websockets.exceptions, "WebSocketException",
+                                          type("WebSocketException", (Exception,), {}), create=True):
+                    with self.assertRaises(ocp.GatewayError) as got:
+                        await conn._connect_and_start()
+                self.assertEqual(ocp._gateway_refused(got.exception), marked)
+                self.assertIn("Is the Gateway running", str(got.exception))
 
 
 if __name__ == "__main__":

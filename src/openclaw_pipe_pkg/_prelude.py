@@ -5,6 +5,7 @@
 
 
 import asyncio
+import errno
 import json
 import html
 import os

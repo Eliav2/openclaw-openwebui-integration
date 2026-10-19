@@ -43,7 +43,7 @@ SMALL_PHONE = {**PHONE, "viewport": {"width": 375, "height": 667}}
 TURN_TIMEOUT_MS = 150_000
 
 DENY = [re.compile(p, re.I) for p in (
-    r"\be2e\b", r"\btest(s|ing)?\b", r"\bfake\b", r"\bdemo\b", r"\blorem\b", r"@",
+    r"\be2e(\b|_)", r"\btest(s|ing)?\b", r"\bfake\b", r"\bdemo\b", r"\blorem\b", r"@",
     r"\b[A-Za-z0-9_\-]{32,}\b",
 )]
 

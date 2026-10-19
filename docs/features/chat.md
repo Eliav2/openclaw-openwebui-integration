@@ -14,7 +14,7 @@ Two provider quirks are handled so you never see them:
 - Some runtimes resend the whole reply as one final cumulative frame. The Pipe recognises text it has already shown and drops the repeat, so the answer is never printed twice.
 - Other events carry their text as a whole item rather than as deltas. That text is shown too, not dropped.
 
-Internal scaffolding never reaches the reply: the Sender provenance block (see [the metadata contract](../metadata-contract.md)) and the silent sentinels an agent uses to mean "say nothing" (`NO_REPLY`, `ANNOUNCE_SKIP`) are filtered out.
+Internal scaffolding never reaches the reply: the Sender provenance block (see [the metadata contract](../metadata-contract.md)) and the silent sentinels an agent uses to mean "say nothing" (`NO_REPLY`, `ANNOUNCE_SKIP`) are filtered out, also when the agent says one and then answers after all (a background task that reported later).
 
 Always on.
 
@@ -25,6 +25,8 @@ Always on.
 Tool calls are sent as Responses-API output items, so Open WebUI draws them with its own two-phase tool card: a spinner while the tool runs, the result when it finishes. Nothing is hand-rolled HTML, so the cards match the rest of the UI and survive a reload.
 
 Expand a card to see the arguments the agent passed and the result it got back. Arguments are capped at 3000 characters and results at 8000, so one huge tool result cannot bury the conversation.
+
+<img src="../img/demos/tool-cards.gif" alt="Two tool cards in a reply: each spins while its command runs and turns into a finished card, then the first is opened to its command and output" width="800">
 
 <img src="../img/tool-card-expanded-light.png" alt="A tool card opened: the command it ran and its output" width="320">
 
