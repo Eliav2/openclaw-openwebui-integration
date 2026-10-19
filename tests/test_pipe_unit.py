@@ -2361,11 +2361,22 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         await self._spin()
         self.assertEqual(self.sent, [], "sent while the run's state was unknown")
         self.assertFalse(first.done(), f"the reply ended: {first.result() if first.done() else ''!r}")
+        # It waits as a turn that needs the connection: the loop is asked to
+        # try now, and backs off at its first step while the turn waits.
+        self.assertTrue(self.conn._reconnect_now.is_set())
+        self.assertEqual(self.conn._turns_awaiting_gateway, 1)
+
+        refused = self.ocp.GatewayError("Connection refused", error={"code": self.ocp.GATEWAY_REFUSED_CODE})
+        self.conn._answer_reconnect_waiters(refused)   # the Gateway is still down
+        await self._spin()
+        self.assertFalse(first.done(), "a refused reconnect ended the reply")
 
         self.conn._ws = object()            # reconnected, same Gateway; the run still goes
+        self.conn._answer_reconnect_waiters(None)   # the loop's attempt succeeded
         self.conn._wake_session_waiters()   # the renewed subscriptions wake it (`_subscribe_all`)
         await self._spin()
         self.assertEqual(self.sent, [])
+        self.assertEqual(self.conn._turns_awaiting_gateway, 0)
 
         self._settled(False)
         await self._until_registered("run-1")
@@ -3325,6 +3336,23 @@ class TickWatchTests(unittest.IsolatedAsyncioTestCase):
                 mock.patch("openclaw_pipe._sign_challenge", lambda *a, **k: {}):
             await conn._connect_and_start()
         self.assertEqual(conn._tick_interval_s, 12.0)
+
+    async def test_a_frame_before_the_connect_response_is_not_taken_for_it(self):
+        # Taken as the response, any other frame read as a rejection with no
+        # reason: "**Gateway connection error:** connect failed".
+        conn = _GatewayConnection(lambda: types.SimpleNamespace(
+            GATEWAY_URL="localhost:18789", GATEWAY_TOKEN="tok"))
+        conn._ensure_identity = lambda valves: None
+        conn._ident = {"id": "device-1"}
+        ws = _HandshakeWS()
+        ws._frames.insert(1, json.dumps({"type": "event", "event": "health", "payload": {}}))
+
+        async def fake_connect(_url, **_kw):
+            return ws
+        with mock.patch.object(websockets, "connect", fake_connect, create=True), \
+                mock.patch("openclaw_pipe._sign_challenge", lambda *a, **k: {}):
+            await conn._connect_and_start()
+        self.assertEqual((conn.gateway_boot_id, ws._frames), ("boot-1", []), "the connect response was read")
 
 
 class RetiredConnectionServesItsReplyTests(unittest.IsolatedAsyncioTestCase):
@@ -6268,7 +6296,7 @@ class _HandshakeWS:
         self._frames = [
             json.dumps({"event": "connect.challenge",
                         "payload": {"nonce": "n", "ts": 1}}),
-            json.dumps({"ok": ok, "payload": hello,
+            json.dumps({"type": "res", "id": "1", "ok": ok, "payload": hello,
                         "error": {"message": "connect failed"}}),
         ]
         self.sent = []

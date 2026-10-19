@@ -65,7 +65,7 @@ The Pipe knows a tab has the chat open from the Claw button it adds to the compo
 
 ## Secrets the agent requests
 
-_Needs OpenClaw 2026.10.10 or later. On an older Gateway the request is left to the Control UI, as before: a secret stored there cannot be used by the agent's runs yet._
+_Needs a Gateway that offers OpenClaw's question protocol (`question.requested` and `question.resolve`; every release the Pipe supports does). A stored `secret` is used by a run only through the Gateway's secret egress proxy (`secrets.egressProxy`), whichever way it was entered._
 
 When the agent asks for a credential with OpenClaw's `secrets` tool (`action: request`), the Pipe shows the same masked dialog on the chat's tab, titled with the secret's name, the agent's reason and the hosts it may be sent to.
 
