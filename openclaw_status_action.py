@@ -4985,6 +4985,33 @@ def _background_agents_line(n: int) -> str:
     return f"Waiting on {n} background agent{'' if n == 1 else 's'}"
 
 
+# Live view of the agent's browser (LIVE_VIEW_URL): ids go into the URL as they
+# are, so they must be plain ids.
+_LIVE_VIEW_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def _live_view_url(valves, *, chat_id, message_id, user_id, email, tool_name, args_str):
+    """The embed URL for a reply whose tool call looks like browser use, or None.
+    None when the valve is off, the user is not in LIVE_VIEW_USERS, the tool does
+    not match LIVE_VIEW_TOOLS, or the URL would not be an http(s) URL: Open WebUI
+    renders any other embed string as HTML."""
+    template = (getattr(valves, "LIVE_VIEW_URL", "") or "").strip()
+    if not template or not re.match(r"^https?://", template, re.I):
+        return None
+    if not all(isinstance(v, str) and _LIVE_VIEW_ID.match(v) for v in (chat_id, message_id)):
+        return None
+    users = _parse_owner_users(getattr(valves, "LIVE_VIEW_USERS", "") or "")
+    if users and not _is_owner_user(users, user_id, email):
+        return None
+    try:
+        tools = re.compile(getattr(valves, "LIVE_VIEW_TOOLS", "") or r"(?!)", re.I)
+    except re.error:
+        return None
+    if not tools.search(f"{tool_name or ''} {args_str or ''}"):
+        return None
+    return template.replace("{chat_id}", chat_id).replace("{message_id}", message_id)
+
+
 def _fmt_tokens(n) -> str:
     """Compact token count: 115212 -> '115k', 1000000 -> '1.0m'."""
     try:
@@ -6153,7 +6180,16 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
       body.style.overscrollBehavior = open ? 'contain' : '';
       more.textContent = open ? 'Show less' : 'Show all';
     }
-    more.onclick = function() { state[name] = !state[name]; show(state[name]); };
+    more.onclick = function() {
+      state[name] = !state[name];
+      show(state[name]);
+      if (state[name]) return;
+      // Clamped again, the preview is the text's first lines: a box left
+      // scrolled showed two lines from wherever it was (ELI-236). And if
+      // whatever holds the block scrolled past its top, bring it back.
+      body.scrollTop = 0;
+      wrap.scrollIntoView({ block: 'nearest' });
+    };
     show(!!state[name]);
     wrap.appendChild(more);
     return wrap;
