@@ -753,7 +753,9 @@ def _crash_loop_allows_a_crash() -> bool:
     and 2026.10.10 alike), so a crash test run again soon after the last ones
     has nothing to check (ELI-174). True while one more crash stays under it:
     at most one earlier unclean boot (no completion) in the window, besides
-    the live one. The suite crashes twice, so in one run this is always true."""
+    the live one. The suite crashes three times; e2e/shards.py puts at most
+    two of them on one stack, so in CI this is true at once (ELI-246). A run
+    of the whole file waits here before the third, for up to 5 minutes."""
     db = sqlite3.connect(f"file:{GATEWAY_STATE_DB}?mode=ro", uri=True)
     try:
         started = [r[0] for r in db.execute(
