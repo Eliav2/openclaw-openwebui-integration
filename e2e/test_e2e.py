@@ -424,6 +424,31 @@ def _assert_clean(token: str, chat_id: str, msgs: dict) -> None:
     assert status == 200 and not (tasks or {}).get("task_ids"), f"tasks left: {tasks}"
 
 
+def _status_lines(msg: dict) -> list:
+    return [h.get("description") for h in msg.get("statusHistory") or [] if isinstance(h, dict)]
+
+
+def _assert_ends_like_inline(msg: dict, inline: dict, what: str) -> None:
+    """A reply the Pipe's writer finished ends as an inline reply of the same
+    chat does (ELI-210): with the usage line whenever that one has it, and
+    with no "Stopped" a takeover's cancel left. 2026.10.10 reports a session's
+    tokens only after its first run, so `inline` is a chat's second reply."""
+    lines, ref = _status_lines(msg), _status_lines(inline)
+    usage = lambda ls: any(str(line).startswith("\U0001f9e0") for line in ls)  # noqa: E731
+    assert usage(lines) == usage(ref), f"{what}: {lines}; an inline reply: {ref}"
+    assert "Stopped" not in lines, f"{what}: a Stopped line: {lines}"
+
+
+def test_a_wake_reply_ends_like_an_inline_reply(token):
+    chat_id, _ = _chat_turn(token, "Respond with exactly: E2E_USAGE_CHAT")
+    chat_id, inline = _chat_turn(token, "Respond with exactly: E2E_USAGE_AGAIN", chat_id=chat_id)
+    _schedule_wake(_session_key(token, chat_id), "Reply with exactly: WAKE_USAGE_LINE", 3)
+    msgs = _wait_for(token, chat_id, ["WAKE_USAGE_LINE"])
+    woke = [m for m in msgs.values() if m.get("role") == "assistant" and "WAKE_USAGE_LINE" in (m.get("content") or "")]
+    assert len(woke) == 1, woke
+    _assert_ends_like_inline(woke[0], inline, "the wake's reply")
+
+
 def test_two_cron_wakes_in_a_row_get_one_finished_message_each(token):
     chat_id, _ = _chat_turn(token, "Respond with exactly: E2E_WAKE_CHAT")
     key = _session_key(token, chat_id)
@@ -1069,6 +1094,18 @@ def _run_action(token: str, call) -> list:
 def _section_data(codes: list, element_id: str, index: int = -1) -> dict:
     code = [c for c in codes if f"getElementById('{element_id}')" in c][index]
     return json.loads(re.search(r"const DATA = (.*?);\n", code).group(1))
+
+
+def test_a_subagent_result_ends_like_an_inline_reply(token):
+    if _openclaw_release() < (2026, 10):
+        pytest.skip("OpenClaw 2026.9: a sub-agent's result message never finishes (ELI-138, fixed in 2026.10.3)")
+    chat_id, _ = _chat_turn(token, "Respond with exactly: E2E_USAGE_CHAT")
+    chat_id, inline = _chat_turn(token, "E2E_SPAWN one helper", chat_id=chat_id)
+    assert inline.get("content", "").strip() == "E2E_SPAWNED", inline
+    msgs = _wait_for(token, chat_id, ["E2E_CHILDTASK"])
+    result = [m for m in msgs.values() if m.get("role") == "assistant" and "E2E_CHILDTASK" in (m.get("content") or "")]
+    assert len(result) == 1, result
+    _assert_ends_like_inline(result[0], inline, "the sub-agent's result")
 
 
 def test_the_status_action_lists_a_running_subagent_and_opens_its_drawer(token):
