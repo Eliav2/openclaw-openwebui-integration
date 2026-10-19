@@ -1301,6 +1301,8 @@ class _PipeTurn:
         self.error_shown = ""  # the run's "**Error:**" line, once shown
         self.aborted = False
         self.first_event_arrived = False
+        # The run's last-call usage, from its `chat` final (ELI-177).
+        self.run_usage = None
         # The Gateway acks every chat.send with "started"; one that it queued
         # behind a run (or steered into one) instead gets a lone `chat` final
         # with no message as its first and only event.
@@ -1495,23 +1497,30 @@ class _PipeTurn:
                 _live_replies().pop(live_key, None)
             if self.awaiting_owner:
                 self.conn.stop_awaiting_owner(self.session_key, self.owner_run)
-            # A parked queue now belongs to whoever claims the run; releasing
-            # it here would drop the events it is buffering.
-            if not self.turn.parked:
-                if self.done and not self.aborted and self.our_run_id and not self.handed_over:
-                    # The run ended in this reply. Its trailing `chat` final
-                    # lands after this consumer is gone and must not read as
-                    # "the reply ended before its run" (a handover would
-                    # rewrite the message OWUI is about to save) or as a run
-                    # nobody showed.
-                    self.conn.mark_delivered_live(self.session_key, self.our_run_id)
-                    self.conn.unregister_run_target(self.session_key, self.our_run_id)
-                self.conn.unregister_consumer(self.session_key, self.our_run_id, queue=self.queue)
-                self.turn.run_id = None
-                self.turn.queue = None
+            # The usage line is read while this reply still holds its
+            # consumer: dropping it closes a connection a redeploy retired,
+            # and a request sent then never gets its answer (#157 gate). The
+            # consumer is dropped even when a Stop lands during the read.
             status_lines = []
-            if not self.aborted and self.text_yielded and not self.adopted_run_id and not self.handed_over:
-                status_lines = await _build_usage_status_lines(self.conn, self.session_key)
+            try:
+                if not self.aborted and self.text_yielded and not self.adopted_run_id and not self.handed_over:
+                    status_lines = await _build_usage_status_lines(
+                        self.conn, self.session_key, run_usage=await self.own_run_usage())
+            finally:
+                # A parked queue now belongs to whoever claims the run; releasing
+                # it here would drop the events it is buffering.
+                if not self.turn.parked:
+                    if self.done and not self.aborted and self.our_run_id and not self.handed_over:
+                        # The run ended in this reply. Its trailing `chat` final
+                        # lands after this consumer is gone and must not read as
+                        # "the reply ended before its run" (a handover would
+                        # rewrite the message OWUI is about to save) or as a run
+                        # nobody showed.
+                        self.conn.mark_delivered_live(self.session_key, self.our_run_id)
+                        self.conn.unregister_run_target(self.session_key, self.our_run_id)
+                    self.conn.unregister_consumer(self.session_key, self.our_run_id, queue=self.queue)
+                    self.turn.run_id = None
+                    self.turn.queue = None
             if self.adopted_run_id and not self.aborted:
                 await _emit_status(
                     self.__event_emitter__, "Sending your message…", done=False)
@@ -1678,6 +1687,11 @@ class _PipeTurn:
             yield self.error_shown
             self.done = True
             pipe_log("  lifecycle error -> done")
+        if state == "final" and payload.get("runId") in (None, self.our_run_id):
+            usage = (payload.get("message") or {}).get("usage") \
+                if isinstance(payload.get("message"), dict) else None
+            if _usage_prompt_tokens(usage):
+                self.run_usage = usage
         if state in ("final", "cancelled", "error", "aborted") or aborted_run:
             self.done = True
             pipe_log(f"  payload state='{state}' aborted={aborted_run} -> done")
@@ -2161,6 +2175,23 @@ class _PipeTurn:
         if (row or {}).get("status") in ("failed", "timeout") and row.get("lastRunError"):
             return ("end", f"**Error:** {row['lastRunError']}")
         return ("end", None)
+
+    async def own_run_usage(self) -> dict | None:
+        """This reply's run's last-call usage for its context line: from its
+        `chat` final, else from its own messages in the transcript (the final
+        may come after the run's lifecycle end has ended the reply)."""
+        if self.run_usage or not self.our_run_id:
+            return self.run_usage
+        try:
+            # As long as the usage line's other reads (`_build_usage_status_lines`).
+            hist = await self.conn.session_history(self.session_key, limit=RUN_TEXT_HISTORY_LIMIT, timeout=5)
+        except Exception as ex:
+            pipe_log(f"  usage line: chat.history failed: {ex!r}")
+            return None
+        usage = _history_usage_for_run(hist, self.our_run_id)
+        if not usage:
+            pipe_log("  usage line: the run's messages report no usage; using the session row")
+        return usage
 
     async def recover_from_transcript(self) -> str | None:
         """The run's text read back: by its run id, else by its user text,

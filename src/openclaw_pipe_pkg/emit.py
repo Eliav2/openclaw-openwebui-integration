@@ -141,7 +141,8 @@ def _window_reset_line(w: dict) -> str | None:
     return f"⏱ {bit} (resets in {rel})"
 
 
-async def _build_usage_status_lines(conn, session_key, timeout: float = 5) -> list[str]:
+async def _build_usage_status_lines(conn, session_key, timeout: float = 5,
+                                    run_usage: dict | None = None) -> list[str]:
     """Best-effort final status lines: context window fill (combined with the
     provider's primary/nearest-term rate-limit window on the same line, kept
     deliberately thin -- no reset time), one full detail line per rate-limit
@@ -164,6 +165,12 @@ async def _build_usage_status_lines(conn, session_key, timeout: float = 5) -> li
     just omits that line. They're fetched concurrently (not one after the
     other) so this adds at most one round trip's worth of latency, not two,
     to the moment the status line settles after the reply text is done.
+
+    `run_usage`: the reply's own run's last-call usage. Its prompt tokens are
+    the context fill, over the row's `totalTokens`: OpenClaw 2026.10 writes a
+    session's first totals to its row just after the run ends, so a new
+    chat's first reply found none there, and every later reply read the run
+    before it (ELI-177). The window (`contextTokens`) still comes from the row.
     """
     describe_task = asyncio.ensure_future(
         conn.send_request("sessions.describe", dict(key=session_key), timeout=timeout)
@@ -178,7 +185,7 @@ async def _build_usage_status_lines(conn, session_key, timeout: float = 5) -> li
         session_row = (desc or {}).get("session") or {}
         provider = session_row.get("modelProvider")
         context_tokens = session_row.get("contextTokens")
-        total_tokens = session_row.get("totalTokens")
+        total_tokens = _usage_prompt_tokens(run_usage) or session_row.get("totalTokens")
         if context_tokens and total_tokens is not None:
             pct = round(total_tokens / context_tokens * 100, 1)
             context_bit = f"🧠 {_fmt_tokens(total_tokens)}/{_fmt_tokens(context_tokens)} ({pct:g}%)"
