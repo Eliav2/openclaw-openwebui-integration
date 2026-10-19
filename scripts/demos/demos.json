@@ -300,7 +300,7 @@
         {
           "do": "wait",
           "js": "() => { const a = [...document.querySelectorAll('.chat-assistant')]; return a.length >= 2 && a[0].innerText.includes('The cache is fresh') && a[a.length - 1].innerText.includes(\"You're on main\"); }",
-          "show_ms": 4500
+          "show_ms": 3500
         },
         {
           "do": "wait_reply_done"
@@ -529,7 +529,7 @@
         {
           "do": "wait",
           "js": "() => { const a = [...document.querySelectorAll('.chat-assistant')]; return a.length >= 2 && a[0].innerText.includes('The cache is fresh') && a[a.length - 1].innerText.includes(\"You're on main\"); }",
-          "show_ms": 4500
+          "show_ms": 3500
         },
         {
           "do": "wait_reply_done"
