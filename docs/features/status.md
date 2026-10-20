@@ -100,7 +100,7 @@ The Gateway keeps an ended child in its children list for 30 minutes only, so th
 
 **In-process agents** lists the chat's Claude Code Agent calls, which are not Gateway sessions, as their tool cards show them: running, in the background, returned, cut off or failed. A chat longer than 40 messages shows the calls in its last 40, and says so.
 
-Each row is one line: the sub-agent's spawn label (else the first sentence of its task, cut to 60 characters), its status, and its time, with up to two lines of its latest reply below. The whole task is in its drawer.
+Each row is one line: the sub-agent's spawn label (else the first sentence of its task, cut to 60 characters), its status, and its time, with up to two lines of its latest reply below. The whole task is in its drawer. A sub-agent opened in the moment before its task reaches its transcript shows its session key until it does, then its task, in the open dialog.
 
 ## Sub-agent drawer
 
