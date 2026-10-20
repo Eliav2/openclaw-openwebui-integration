@@ -127,17 +127,16 @@ def stamp(paths: list, same: bool = False) -> None:
 
 
 def posters() -> None:
-    """Each README tile's poster: the last frame of the GIF its <picture> plays."""
-    from PIL import Image, ImageSequence
+    """Each README tile's poster: the first frame of the GIF its <picture> plays (its cover,
+    scripts/demos/record.py), so the still and the animation open on the same picture."""
+    from PIL import Image
     with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as fh:
         pairs = re.findall(r'<source srcset="\./(docs/img/[^"]+\.gif)"[^>]*><img src="\./(docs/img/[^"]+\.jpg)"', fh.read())
     if not pairs:
         raise SystemExit("posters: no <picture> tile in README.md")
     for gif, jpg in pairs:
-        last = None
-        for frame in ImageSequence.Iterator(Image.open(os.path.join(ROOT, gif))):
-            last = frame.convert("RGB").copy()
-        last.save(os.path.join(ROOT, jpg), quality=82, optimize=True, progressive=True)
+        first = Image.open(os.path.join(ROOT, gif)).convert("RGB")
+        first.save(os.path.join(ROOT, jpg), quality=82, optimize=True, progressive=True)
         print(f"wrote {jpg} (from {gif})")
 
 

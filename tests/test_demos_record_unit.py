@@ -55,30 +55,46 @@ class DurationsTests(unittest.TestCase):
         self.assertAlmostEqual(sum(d[10:61]), record.WAIT_HELD_MAX + 5.0)
 
 
-class OpensOnEndTests(unittest.TestCase):
+class CoverTests(unittest.TestCase):
 
-    def test_the_concat_opens_on_the_last_frame_then_plays_from_the_start(self):
-        import tempfile
+    def frames(self):
         r = record.Recorder(_Cdp())
-        r.frames = [(0.0, b"empty chat", True), (1.0, b"typing", False), (2.0, b"the feature", False)]
+        r.frames = [(0.0, b"empty chat", True), (1.0, b"the card", False), (2.0, b"the result", False)]
+        return r
+
+    def concat_files(self, concat):
+        return [Path(line.split("'")[1]).read_bytes() for line in Path(concat).read_text().splitlines()
+                if line.startswith("file")]
+
+    def test_it_opens_on_the_last_frame_then_plays_from_the_start(self):
+        import tempfile
+        r = self.frames()
         with tempfile.TemporaryDirectory() as work:
-            concat, total = r.write(work, opens_on_end=2.0)
-            files = [line.split("'")[1] for line in Path(concat).read_text().splitlines() if line.startswith("file")]
-            self.assertEqual(Path(files[0]).read_bytes(), b"the feature")
-            self.assertEqual(Path(files[1]).read_bytes(), b"empty chat")
+            concat, total = r.write(work, cover=2.0)
+            self.assertEqual(self.concat_files(concat)[:2], [b"the result", b"empty chat"])
             self.assertAlmostEqual(total, 2.0 + sum(r.durations()))
             _, plain = r.write(work)
             self.assertAlmostEqual(plain, sum(r.durations()))
 
-    def test_every_demo_a_readme_tile_plays_opens_on_its_end(self):
+    def test_it_opens_on_the_frame_a_cover_step_marked(self):
+        import tempfile
+        r = self.frames()
+        r.cover = 1
+        with tempfile.TemporaryDirectory() as work:
+            concat, _ = r.write(work, cover=1.0)
+            self.assertEqual(self.concat_files(concat)[:2], [b"the card", b"empty chat"])
+
+    def test_every_demo_a_readme_tile_plays_has_a_cover(self):
         import json
         import re
         root = Path(__file__).resolve().parents[1]
         tiles = set(re.findall(r'<source srcset="\./docs/img/demos/([^"/]+)\.gif"', (root / "README.md").read_text()))
         self.assertTrue(tiles)
         demos = {d["name"]: d for d in json.loads((root / "scripts" / "demos" / "demos.json").read_text())["demos"]}
-        self.assertEqual(sorted(t for t in tiles if not demos.get(t, {}).get("opens_on_end_ms")), [])
-
+        self.assertEqual(sorted(t for t in tiles if not demos.get(t, {}).get("cover_ms")), [])
+        for demo in demos.values():
+            for step in demo["steps"]:
+                self.assertIn(step["do"], record.STEPS, demo["name"])
 
 if __name__ == "__main__":
     unittest.main()

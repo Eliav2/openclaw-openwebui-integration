@@ -1,5 +1,5 @@
 {
-  "_comment": "The docs' demos (record.py writes a GIF, an MP4 and a WebM each). `scenes` are scripted model replies like scripts/screenshots/scenes.json, kept short so each GIF fits in 15 s; the demo stack loads this file first, then scenes.json, so a demo can also use a screenshot scene. `demos` are the recordings: each one's steps run in order (record.py's Demo methods say what each step does). A wait on a running command may set `show_ms`: it plays faster to fit, so the runner's speed never sets the demo's length. The tile-* demos are the README's feature tiles: one feature each, on a task a user would really give, in the same window as the rest. A demo a README tile plays sets `opens_on_end_ms`: it opens on its last frame for that long, then plays from the start, so a still of the tile already shows the feature.",
+  "_comment": "The docs' demos (record.py writes a GIF, an MP4 and a WebM each). `scenes` are scripted model replies like scripts/screenshots/scenes.json, kept short so each GIF fits in 15 s; the demo stack loads this file first, then scenes.json, so a demo can also use a screenshot scene. `demos` are the recordings: each one's steps run in order (record.py's Demo methods say what each step does). A wait on a running command may set `show_ms`: it plays faster to fit, so the runner's speed never sets the demo's length. The tile-* demos are the README's feature tiles: one feature each, on a task a user would really give, in the same window as the rest. A demo a README tile plays sets `cover_ms`: it opens on its cover for that long, then plays from the start, so a still of the tile (and its poster, the GIF's first frame) already shows the feature. The cover is the frame a `cover` step marks, else the last.",
   "scenes": [
     {
       "match": "Write the changelog entry for the hourly view",
@@ -450,7 +450,7 @@
     },
     {
       "name": "status-dialog",
-      "opens_on_end_ms": 1200,
+      "cover_ms": 1200,
       "steps": [
         {
           "do": "record",
@@ -680,7 +680,7 @@
     },
     {
       "name": "tile-tool-cards",
-      "opens_on_end_ms": 1200,
+      "cover_ms": 1200,
       "steps": [
         {
           "do": "type",
@@ -717,7 +717,7 @@
     },
     {
       "name": "tile-question",
-      "opens_on_end_ms": 1200,
+      "cover_ms": 1200,
       "steps": [
         {
           "do": "type",
@@ -730,6 +730,12 @@
         {
           "do": "wait",
           "js": "() => document.body.innerText.includes('Which snapshots should I delete?') && !!document.querySelector('input[placeholder=\"Type your answer\"]')"
+        },
+        {
+          "do": "park"
+        },
+        {
+          "do": "cover"
         },
         {
           "do": "pause",
@@ -753,7 +759,7 @@
     },
     {
       "name": "tile-sub-agents",
-      "opens_on_end_ms": 1200,
+      "cover_ms": 1200,
       "steps": [
         {
           "do": "type",
@@ -785,11 +791,21 @@
         {
           "do": "wait",
           "js": "() => document.body.innerText.includes('fine to tag')",
-          "show_ms": 2500
+          "show_ms": 2000
+        },
+        {
+          "do": "click",
+          "selector": ".chat-assistant >> nth=0 >> [role=button] >> nth=0"
+        },
+        {
+          "do": "scroll_top"
+        },
+        {
+          "do": "cover"
         },
         {
           "do": "pause",
-          "ms": 900
+          "ms": 300
         }
       ]
     }

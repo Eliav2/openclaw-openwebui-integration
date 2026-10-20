@@ -98,6 +98,7 @@ class Recorder:
         self.cdp, self.on = cdp, False
         self.frames: list = []        # (timestamp, jpeg bytes, starts a new segment)
         self._new_segment = True
+        self.cover: int | None = None  # the frame a `cover` step marked; None: the last
         self._acks: set = set()       # in flight; a task nobody holds can be collected
         # Frame ranges of the steps that wait on the stack: (first, end, longest shown s or None).
         self.waits: list = []
@@ -150,20 +151,21 @@ class Recorder:
                     durs[i] = max(durs[i] * show / spent, 0.01)
         return durs
 
-    def write(self, work: str, opens_on_end: float = 0.0) -> tuple[str, float]:
+    def write(self, work: str, cover: float = 0.0) -> tuple[str, float]:
         """The frames as JPEGs and an ffmpeg concat list with their durations (durations()).
-        With `opens_on_end` (s), the recording opens on its last frame for that long and then
-        plays from the start: a still of it (its first frame, a slow load, a link preview)
-        shows the feature, not an empty chat."""
+        With `cover` (s), the recording opens on its cover frame (the one a `cover` step
+        marked, else the last) for that long, then plays from the start: a still of it (its
+        first frame, its poster, a slow load, a link preview) shows the feature, not an empty
+        chat."""
         if not self.frames:
             raise RuntimeError("no frames were recorded")
         lines, total = [], 0.0
-        if opens_on_end > 0:
-            path = os.path.join(work, "end.jpg")
+        if cover > 0:
+            path = os.path.join(work, "cover.jpg")
             with open(path, "wb") as fh:
-                fh.write(self.frames[-1][1])
-            total += opens_on_end
-            lines += [f"file '{path}'", f"duration {opens_on_end:.4f}"]
+                fh.write(self.frames[-1 if self.cover is None else self.cover][1])
+            total += cover
+            lines += [f"file '{path}'", f"duration {cover:.4f}"]
         for (_, png, _), dur, i in zip(self.frames, self.durations(), range(len(self.frames))):
             path = os.path.join(work, f"{i:05d}.jpg")
             with open(path, "wb") as fh:
@@ -316,6 +318,19 @@ class Demo:
     async def pause(self, step: dict) -> None:
         await self.page.wait_for_timeout(step["ms"])
 
+    async def cover(self, step: dict) -> None:
+        """Mark the frame on screen now as the one the recording opens on (`cover_ms`)."""
+        await self.page.wait_for_timeout(300)  # a frame of the settled state reaches the screencast
+        if not self.rec.frames:
+            raise RuntimeError("cover: no frame recorded yet")
+        self.rec.cover = len(self.rec.frames) - 1
+
+    async def scroll_top(self, step: dict) -> None:
+        """Scroll the chat back to its first message, as a reader would."""
+        await self.page.evaluate("() => document.getElementById('messages-container')"
+                                 ".scrollTo({top: 0, behavior: 'smooth'})")
+        await self.page.wait_for_timeout(int(step.get("ms", 700)))
+
     async def keys(self, step: dict) -> None:
         await self.page.evaluate(f"__keys({json.dumps(step['keys'])}, {int(step.get('ms', 900))})")
 
@@ -332,7 +347,7 @@ class Demo:
 
 
 STEPS = {"type", "send", "click", "wait", "wait_reply_done", "wait_children", "park", "pause", "keys", "record",
-         "reload"}
+         "reload", "cover", "scroll_top"}
 
 
 async def new_page(browser, token: str) -> Page:
@@ -391,7 +406,7 @@ async def run_demo(browser, token: str, spec: dict, out: str, host: str) -> dict
         hits = capture.deny_hits(await page.evaluate("() => document.body.innerText"), (host,) if host else ())
         if hits:
             raise AssertionError(f"{spec['name']}: deny-listed text visible: {sorted(set(hits))[:10]}")
-        concat, seconds = rec.write(work, spec.get("opens_on_end_ms", 0) / 1000)
+        concat, seconds = rec.write(work, spec.get("cover_ms", 0) / 1000)
         if seconds > MAX_SECONDS:
             raise AssertionError(f"{spec['name']}: {seconds:.1f} s, over {MAX_SECONDS:.0f} s ({', '.join(steps)})")
         path = os.path.join(out, f"{spec['name']}.gif")
