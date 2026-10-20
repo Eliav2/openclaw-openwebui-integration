@@ -334,17 +334,17 @@ class Demo:
         self.rec.cover = len(self.rec.frames) - 1
 
     async def scroll_top(self, step: dict) -> None:
-        """Jump the chat back up, as a reader would: to its first message, or with `selector`
-        to that element, just under the title bar so nothing scrolls beneath it. A jump, not a
-        smooth scroll, which would repaint every frame."""
-        await self.page.evaluate("""(sel) => {
+        """Jump the chat back up, as a reader would: to its first message, or to the first
+        `selector` element whose text starts with `text`, placed `under_px` below the
+        window's top so it clears the chat's title bar. A jump, not a smooth scroll, which
+        would repaint every frame."""
+        await self.page.evaluate("""([sel, text, under]) => {
             const box = document.getElementById('messages-container');
-            const el = sel && document.querySelector(sel);
+            const el = sel && [...document.querySelectorAll(sel)]
+                .find((e) => !text || e.textContent.trim().startsWith(text));
             if (!el) { box.scrollTo({top: 0}); return; }
-            const bar = document.querySelector('nav');
-            const under = bar ? bar.getBoundingClientRect().bottom : box.getBoundingClientRect().top;
-            box.scrollTo({top: box.scrollTop + el.getBoundingClientRect().top - under - 8});
-        }""", step.get("selector"))
+            box.scrollTo({top: box.scrollTop + el.getBoundingClientRect().top - under});
+        }""", [step.get("selector"), step.get("text"), step.get("under_px", 56)])
         await self.page.wait_for_timeout(int(step.get("ms", 400)))
 
     async def keys(self, step: dict) -> None:

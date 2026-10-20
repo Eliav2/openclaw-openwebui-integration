@@ -295,7 +295,7 @@
         },
         {
           "say": "Nothing blocking. km/h and mph are now right. A unit other than those two returns the raw m/s value without a warning; worth rejecting unknown units later.",
-          "delay": 0.03
+          "delay": 0.1
         }
       ]
     }
@@ -807,7 +807,8 @@
         },
         {
           "do": "scroll_top",
-          "selector": ".chat-assistant [role=button]"
+          "selector": ".chat-assistant *",
+          "text": "View Result"
         },
         {
           "do": "cover"
