@@ -147,11 +147,15 @@ class StatusLabelWidthTests(unittest.TestCase):
 
 class ClawNameTests(unittest.TestCase):
     """ELI-202: the composer chip, its tooltip and the dialog read "Claw", and
-    the chip and the toolbar button show the same paw. The names the page
-    scripts find the buttons by stay: the composer chip's aria-label and the
-    Action's title, which Open WebUI makes the toolbar button's aria-label."""
+    the chip and the toolbar button show the same icon. ELI-231: that icon is a
+    crab claw, not ELI-202's paw. The names the page scripts find the buttons by
+    stay: the composer chip's aria-label and the Action's title, which Open
+    WebUI makes the toolbar button's aria-label."""
 
-    def test_the_buttons_and_the_dialog_say_claw_with_a_paw(self):
+    # ELI-202's paw: four toe pads (elliptical arcs) over a pad
+    PAW_TOE = "M11 6a1.5 2 0 1 1-3 0"
+
+    def test_the_buttons_and_the_dialog_say_claw_with_a_crab_claw(self):
         import inspect
         import re
         import urllib.parse
@@ -159,11 +163,14 @@ class ClawNameTests(unittest.TestCase):
         self.assertIn('<span class="pr-0.5 hidden sm:inline">Claw</span>', code)
         self.assertIn("b.title = 'Claw';", code)
         self.assertIn("b.setAttribute('aria-label', 'OpenClaw status');", code)
-        paw = re.search(r"const PAW_PATH = '([^']+)';", code)
-        self.assertIsNotNone(paw, "the composer chip has no paw")
+        self.assertNotIn(self.PAW_TOE, code, "the composer chip still shows the paw")
+        claw = re.search(r"const CLAW_PATH = '([^']+)';", code)
+        self.assertIsNotNone(claw, "the composer chip has no claw")
+        self.assertIn("d=\"' + CLAW_PATH + '\"", code)
         icon = getattr(openclaw_status_action.Action(), "icon_url", None) or ""
         self.assertTrue(icon.startswith("data:image/svg+xml"), f"the toolbar button has no icon of its own: {icon[:60]!r}")
-        self.assertIn(f"d='{paw.group(1)}'", urllib.parse.unquote(icon))
+        self.assertIn(f"d='{claw.group(1)}'", urllib.parse.unquote(icon))
+        self.assertNotIn(self.PAW_TOE, urllib.parse.unquote(icon), "the toolbar button still shows the paw")
         source = inspect.getsource(openclaw_status_action)
         self.assertIn("title.textContent = 'Claw';", source)
         self.assertIn("title: OpenClaw Status\n", source)

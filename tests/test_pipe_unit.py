@@ -290,6 +290,36 @@ class SessionToolEventTests(unittest.IsolatedAsyncioTestCase):
             phases.append(q.get_nowait()["payload"]["data"]["phase"])
         self.assertEqual(phases, ["start", "result"])
 
+    async def test_a_childs_row_change_wakes_its_parents_child_waiter(self):
+        """ELI-260: an open Status dialog learns of a new child from its row's
+        `sessions.changed`, which names the parent as `spawnedBy` (2026.10)
+        or `parentSessionKey`."""
+        child = "agent:main:subagent:aaaaaaaa-0000-0000-0000-000000000001"
+        conn = _GatewayConnection(lambda: None)
+        for field in ("spawnedBy", "parentSessionKey"):
+            ev = conn.session_child_event(self.SK)
+            conn._on_sessions_changed({"sessionKey": "agent:main:other", "hasActiveRun": True})
+            self.assertFalse(ev.is_set(), "another session's change")
+            conn._on_sessions_changed({"sessionKey": child, field: self.SK, "hasActiveRun": True})
+            self.assertTrue(ev.is_set(), field)
+        ev = conn.session_child_event(self.SK)
+        conn._mark_event_gap()
+        self.assertTrue(ev.is_set(), "a gap may have lost the child's push")
+
+    async def test_a_reply_counts_until_its_consumer_goes_and_its_end_wakes_the_waiters(self):
+        """ELI-260: the Status dialog counts a chat as running while this
+        connection streams a reply for it, whose run the Gateway may not have
+        yet; the reply's end makes the dialog read the chat again."""
+        conn = _GatewayConnection(lambda: None)
+        self.assertFalse(conn.has_reply(self.SK))
+        q = conn.register_consumer(self.SK, "run-1")
+        ev = conn.session_change_event(self.SK)
+        self.assertTrue(conn.has_reply(self.SK))
+        self.assertFalse(conn.has_reply("agent:main:other"))
+        conn.unregister_consumer(self.SK, "run-1", q)
+        self.assertFalse(conn.has_reply(self.SK))
+        self.assertTrue(ev.is_set())
+
     async def test_an_accepted_spawn_is_recorded_in_the_child_index(self):
         """The Status dialog lists a chat's children from this index (state.py),
         not from a read of every session."""
@@ -1850,6 +1880,57 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         await self._spin()
         self.assertTrue(closed, "the retired connection closes once the queued message is served")
 
+    async def test_a_reply_on_a_retired_connection_reads_its_usage_before_the_close(self):
+        """#157 gate (ELI-102, 2026-10-19): a redeploy retired the connection
+        a reply streamed on. The run ended, dropping its consumer closed the
+        socket, and only then did the reply ask chat.history for its usage
+        line: no answer ever comes on a closed socket, so the reply's end
+        waited out the request's timeout and its done:true never landed."""
+        closed = []
+        closed_event = asyncio.Event()
+        hung = []
+        send_request = self.conn.send_request
+
+        async def disconnect():
+            closed.append(True)
+            closed_event.set()
+
+        async def closing_send_request(method, params, timeout=10):
+            await asyncio.sleep(0.02)          # the answer's way back
+            if closed:
+                hung.append(method)
+                await asyncio.Event().wait()   # the socket closed meanwhile: no answer, ever
+            return await send_request(method, params, timeout=timeout)
+        self.conn.disconnect = disconnect
+        self.conn.send_request = closing_send_request
+        self.history = {"messages": [{"role": "assistant", "content": "hi",
+                                      "usage": {"input": 10, "output": 5},
+                                      "__openclaw": {"runId": "run-1"}}]}
+
+        gen = self._reply("hello", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        await self.conn.retire()                         # the redeploy
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "hi"))
+        q.put_nowait({"type": "event", "event": "agent", "payload": {
+            "sessionKey": self.SK, "runId": "run-1", "stream": "lifecycle",
+            "data": {"phase": "end"}}})
+        out = await asyncio.wait_for(first, 2)
+
+        async def rest():
+            nonlocal out
+            async for chunk in gen:
+                out += chunk if isinstance(chunk, str) else ""
+        await asyncio.wait_for(rest(), 2)
+        self.assertIn("hi", out)
+        # The close is a background task the dropped consumer starts.
+        await asyncio.wait_for(closed_event.wait(), 2)
+        self.assertEqual(hung, [], "a request sent after the close")
+        self.assertIn("chat.history", self.rpc, "the reply's usage was read before the close")
+        usage = self.ocp._build_usage_status_lines.await_args.kwargs.get("run_usage")
+        self.assertEqual(usage, {"input": 10, "output": 5})
+
     async def test_a_reply_that_saw_its_run_end_leaves_no_parity_target(self):
         """The inline loop ends on `lifecycle end` and drops its consumer; the
         run's trailing `chat` final arrives after that. Measured live
@@ -2607,9 +2688,12 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         async def usage_rows(*a, **k):
             rows_asked.set()
             await asyncio.Event().wait()   # the Gateway calls, under way when Stop lands
-        patch = mock.patch.object(self.ocp, "_build_usage_status_lines", usage_rows)
-        patch.start()
-        self.addCleanup(patch.stop)
+        # Stopped here, before asyncTearDown stops the class's own patch of the
+        # same name: stopped after it, this one would restore that mock for good.
+        with mock.patch.object(self.ocp, "_build_usage_status_lines", usage_rows):
+            await self._stopped_as_it_ends_with_rows_pending(closed, rows_asked, between_chunks)
+
+    async def _stopped_as_it_ends_with_rows_pending(self, closed, rows_asked, between_chunks):
         reached = asyncio.Event()
 
         async def owui_work():
@@ -4356,6 +4440,53 @@ class UsageStatusLineTests(unittest.IsolatedAsyncioTestCase):
         lines = await _build_usage_status_lines(conn, "agent:main:x")
         self.assertTrue(all("🎯" not in line for line in lines))
 
+    async def test_the_runs_own_usage_fills_the_line_before_the_row_has_totals(self):
+        """OpenClaw 2026.10: a new session's row has its window but no totals
+        yet when the first reply ends; the run's own usage fills the line
+        (ELI-177)."""
+        conn = self._conn(describe_result={"session": {"contextTokens": 200_000}},
+                          usage_result={"providers": []})
+        self.assertEqual(await _build_usage_status_lines(conn, "agent:main:x"), [])
+        usage = {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 15}
+        lines = await _build_usage_status_lines(conn, "agent:main:x", run_usage=usage)
+        self.assertEqual(lines, ["🧠 10/200k (0%)"])
+
+    async def test_the_runs_own_usage_wins_over_the_previous_runs_row(self):
+        conn = self._conn(describe_result={"session": {"contextTokens": 1_000_000, "totalTokens": 500}},
+                          usage_result={"providers": []})
+        usage = {"input": 2, "cacheRead": 114_000, "cacheWrite": 1_210, "output": 40}
+        lines = await _build_usage_status_lines(conn, "agent:main:x", run_usage=usage)
+        self.assertEqual(lines, ["🧠 115k/1.0m (11.5%)"])
+
+
+class RunUsageTests(unittest.TestCase):
+    """The context a run filled, from its own usage (ELI-177)."""
+
+    def test_prompt_tokens_count_as_openclaw_counts_a_rows_total(self):
+        f = openclaw_pipe._usage_prompt_tokens
+        self.assertEqual(f({"input": 3, "cacheRead": 100, "cacheWrite": 7, "output": 9}), 110)
+        self.assertEqual(f({"contextUsage": {"state": "available", "promptTokens": 42}, "input": 3}), 42)
+        self.assertIsNone(f({"contextUsage": {"state": "unavailable"}, "input": 3}))
+        self.assertEqual(f({"totalTokens": 15, "output": 5}), 10)
+        self.assertIsNone(f({"input": 0, "output": 0, "totalTokens": 0}))
+        self.assertIsNone(f(None))
+
+    def test_a_runs_usage_is_found_by_its_id_not_by_position(self):
+        f = openclaw_pipe._history_usage_for_run
+        mine, later = {"input": 10, "output": 5}, {"input": 99, "output": 1}
+        hist = {"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "usage": {"input": 4}, "__openclaw": {"runId": "run-a"}},
+            {"role": "assistant", "usage": mine, "__openclaw": {"runId": "run-a"}},
+            {"role": "assistant", "usage": {"input": 0, "output": 0}, "__openclaw": {"runId": "run-a"}},
+            {"role": "assistant", "usage": later, "__openclaw": {"runId": "run-b"}},
+        ]}
+        self.assertEqual(f(hist, "run-a"), mine)
+        self.assertEqual(f(hist, "run-b"), later)
+        self.assertIsNone(f(hist, "run-c"))
+        cli = {"messages": [{"role": "assistant", "usage": mine, "idempotencyKey": "cli-assistant:run-x"}]}
+        self.assertEqual(f(cli, "run-x"), mine)
+
 
 class MessageSnapshotEmitterTests(unittest.IsolatedAsyncioTestCase):
     async def test_emits_persisted_replace_event(self):
@@ -4510,6 +4641,19 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
     def test_confirmation_for_explicit_yes_no(self):
         f = _parse_text_prompt("OpenClaw needs input:\n\nProceed?\nRun the deploy now? (y/n)")
         self.assertTrue(f["confirm"])
+
+    def test_hebrew_and_arabic_yes_no_questions_are_confirmations(self):
+        """ELI-193: questions.md says the markers work in Hebrew and Arabic,
+        but a Hebrew "(כן/לא)" question got a typed answer, and an Arabic
+        question ends with "؟", not "?"."""
+        for question in ("למחוק את הקובץ? (כן/לא)", "هل أحذف الملف؟ (نعم/لا)", "هل تريد المتابعة؟"):
+            f = _parse_text_prompt(f"OpenClaw needs input:\n\nאישור\n{question}")
+            self.assertEqual((f["confirm"], f["options"]), (True, []), question)
+
+    def test_arabic_multiselect_marker(self):
+        f = _parse_text_prompt("OpenClaw needs input:\n\nإضافات\nاختر كل ما ينطبق\n1. جبن\n2. زيتون")
+        self.assertTrue(f["multi"])
+        self.assertEqual(f["options"], ["جبن", "زيتون"])
 
     def test_confirmation_for_confirm_verb_question(self):
         f = _parse_text_prompt("OpenClaw needs input:\n\nDelete file?\nDelete config.json?")
@@ -7510,6 +7654,10 @@ class _FakeOwuiChat:
                 msgs = fake.chat.chat["history"]["messages"]
                 msgs[message_id] = {**msgs.get(message_id, {}), **message}
                 return fake.chat
+
+            @staticmethod
+            async def get_message_by_id_and_message_id(chat_id, message_id):
+                return copy.deepcopy(fake.chat.chat["history"]["messages"].get(message_id))
         self.upserts = []
         self._chats = Chats
 
@@ -8015,6 +8163,11 @@ class TurnWriterEndTests(_TurnWriterCase):
                 return {"runId": params["idempotencyKey"], "status": "started"}
             if method == "chat.abort":
                 return {"aborted": True}
+            if method == "sessions.describe":
+                return {"session": {"modelProvider": "anthropic", "contextTokens": 1_000_000,
+                                    "totalTokens": 34_000}}
+            if method == "usage.status":
+                return {"providers": []}
             raise AssertionError(method)
         self.conn.send_request = send_request
 
@@ -8074,6 +8227,132 @@ class TurnWriterEndTests(_TurnWriterCase):
         self.assertEqual(self.owui.events("chat:active")[-1]["data"], {"active": False})
         self.assertTrue((await self.task_done(w)).done(), "the Open WebUI task ends with the run")
         self.assertTrue(w.closed)
+
+    USAGE = {"description": "🧠 34k/1.0m (3.4%)", "done": True}
+    LEFT_BY_THE_CANCEL = [{"description": "Thinking...", "done": False},
+                          {"description": "Stopped", "done": True},
+                          {"description": "", "done": True}]
+
+    def handed_writer(self, request=None):
+        """A Send now (or a send from another tab) mid-reply: the reply's
+        request parked its run, saved "Stopped" and an empty line into M's
+        status history (pipe.py `park`, then the reply's end), and handed M to
+        this writer (W5 chat 1ac3323c, message 0cb40f0e)."""
+        shown = _TurnRenderer()
+        shown.feed(_delta("Reading them."))
+        self.owui.msgs()["m1"] = {"id": "m1", "role": "assistant", "parentId": "q1",
+                                  "content": "Reading them.", "done": True,
+                                  "statusHistory": copy.deepcopy(self.LEFT_BY_THE_CANCEL)}
+        return _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
+                           run_id=self.RUN, message_id="m1", takeover=True, renderer=shown,
+                           request=request)
+
+    async def test_a_run_the_writer_finishes_ends_with_the_usage_line(self):
+        """ELI-210 (W5, QA C20): a reply the writer finished (a wake, a
+        sub-agent result, a takeover) had no usage line, which the normal
+        reply always shows after its text. Saved with the message, so a
+        reload keeps it, and sent to open tabs."""
+        w = await self.opened_writer()
+        await w.end({"status": "done", "hasActiveRun": False, "lastRunId": self.RUN})
+        self.assertEqual(self.m()["statusHistory"], [self.USAGE])
+        self.assertEqual(self.owui.events("status")[-1]["data"], self.USAGE)
+
+    async def test_a_first_run_the_writer_finishes_gets_its_usage_from_the_run(self):
+        """ELI-210 on OpenClaw 2026.10: a session's row has no totals yet when
+        its first run ends (ELI-177), so a writer-finished first reply had no
+        usage line. The line comes from the run's own usage, as the inline
+        reply's does."""
+        describe = self.conn.send_request
+
+        async def send_request(method, params, timeout=10):
+            if method == "sessions.describe":
+                return {"session": {"modelProvider": "anthropic", "contextTokens": 200_000}}
+            return await describe(method, params, timeout=timeout)
+        self.conn.send_request = send_request
+        closer = next(m for m in self.history["messages"]
+                      if m.get("idempotencyKey") == f"cli-assistant:{self.RUN}")
+        closer["usage"] = {"input": 10, "cacheRead": 0, "cacheWrite": 0, "output": 5}
+        w = await self.opened_writer()
+        await w.end({"status": "done", "hasActiveRun": False, "lastRunId": self.RUN})
+        usage = {"description": "🧠 10/200k (0%)", "done": True}
+        self.assertEqual(self.m()["statusHistory"], [usage])
+        self.assertEqual(self.owui.events("status")[-1]["data"], usage)
+
+    async def test_a_takeover_that_finished_drops_the_cancels_stopped_line(self):
+        """ELI-210: the run went on after Send now, so the "Stopped" its
+        request saved is wrong: the finished takeover reads like a normal
+        reply, "Thinking..." then the usage line."""
+        w = self.handed_writer()
+        await w.feed(None)
+        await w.end({"status": "done", "hasActiveRun": False, "lastRunId": self.RUN})
+        self.assertEqual(self.m()["statusHistory"],
+                         [{"description": "Thinking...", "done": False}, self.USAGE])
+
+    async def test_a_takeover_waits_for_its_request_before_it_writes_the_status(self):
+        """The cancelled request saves its "Stopped" and empty lines until it
+        ends; a status write before that would be appended to, not final."""
+        request = asyncio.get_running_loop().create_future()
+        w = self.handed_writer(request=request)
+        await w.feed(None)
+        ending = asyncio.ensure_future(
+            w.end({"status": "done", "hasActiveRun": False, "lastRunId": self.RUN}))
+        for _ in range(50):
+            await asyncio.sleep(0)
+        self.assertFalse(ending.done(), "the final write waits for the request")
+        request.set_result(None)
+        await asyncio.wait_for(ending, 1)
+        self.assertEqual(self.m()["statusHistory"][-1], self.USAGE)
+
+    async def test_a_request_still_running_after_the_wait_is_logged(self):
+        """The final write stops waiting for its request after
+        FINAL_STATUS_REQUEST_WAIT_S; a write of the request after it could
+        bring "Stopped" back, so that is logged, not silent."""
+        request = asyncio.get_running_loop().create_future()
+        w = self.handed_writer(request=request)
+        await w.feed(None)
+        logged = []
+        with mock.patch.object(openclaw_pipe, "FINAL_STATUS_REQUEST_WAIT_S", 0.01), \
+                mock.patch.object(openclaw_pipe, "pipe_log", lambda *a, **k: logged.append(a[0])):
+            await w.end({"status": "done", "hasActiveRun": False, "lastRunId": self.RUN})
+        late = [line for line in logged if "request still running after" in line]
+        self.assertEqual(len(late), 1, logged)
+        self.assertIn(w.chat_id[:8], late[0])
+        self.assertIn(w.message_id[:8], late[0])
+        self.assertIn("its own status write may land after this one", late[0])
+        self.assertEqual(self.m()["statusHistory"][-1], self.USAGE)
+        request.set_result(None)
+
+    async def test_a_stop_ends_with_stopped_and_no_usage_line(self):
+        """A real Stop reads as the normal reply's Stop: "Stopped", no usage."""
+        for handed in (False, True):
+            with self.subTest(handed=handed):
+                self.owui.msgs().pop("m1", None)
+                self.sent.clear()
+                if handed:
+                    w = self.handed_writer()
+                    await w.feed(None)
+                    await w.open(takeover=True)
+                else:
+                    w = await self.opened_writer()
+                await self.cancel_from_the_page(w, "stop")
+                history = self.m().get("statusHistory") or []
+                self.assertEqual([h for h in history if h.get("description")][-1],
+                                 {"description": "Stopped", "done": True})
+                self.assertNotIn("🧠", json.dumps(history, ensure_ascii=False))
+
+    async def test_a_handed_over_reply_resumes_with_the_users_request(self):
+        """The writer kept Open WebUI's request task and the user's request
+        in one attribute; a handed-over reply cut off by a Gateway restart
+        quoted the task object instead of the request it continues."""
+        request = asyncio.get_running_loop().create_future()
+        request.set_result(None)
+        w = self.handed_writer(request=request)
+        await w.feed(None)
+        await w.end(self.KILLED)
+        sends = [p for m, p in self.sent if m == "chat.send"]
+        self.assertEqual(len(sends), 1)
+        self.assertIn("check the logs", sends[0]["message"])
+        self.assertNotIn("Future", sends[0]["message"])
 
     def _found_it_says(self, text):
         for m in self.history["messages"]:

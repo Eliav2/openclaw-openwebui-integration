@@ -15,7 +15,7 @@ _The rate limits in this screenshot are sample data._
 
 The Status Action adds a button to the message toolbar. It opens a dialog, titled **Claw**, with five sections: Context, Rate limits, [Background](#background), [Subagents](#sub-agents) and In-process agents.
 
-<img src="../img/toolbar-button-light.png" alt="The Status Action's paw button at the end of a reply's toolbar" width="300">
+<img src="../img/toolbar-button-light.png" alt="The Status Action's crab-claw button at the end of a reply's toolbar" width="300">
 
 The dialog opens at once with every section's title. Each section then reads its own source and fills the moment that source answers, with its own loading, empty and error state, so a slow or failing source shows in its own section only:
 
@@ -31,7 +31,7 @@ _Here the rate limits were held back on purpose, to show it._
 | Subagents | `sessions.list` with `spawnedBy` (the current children, store rows only) and the [child index](#sub-agents); the sub-agents' transcripts (`sessions.preview`) only once the section is open |
 | In-process agents | The chat's last 40 messages (the same read as Background's) |
 
-Each source is read once per open, all at the same time. None grows with the chat: the chat's messages come from Open WebUI's message rows, the 40 newest of the current branch, so a 14 MB chat opens as fast as a new one. Open WebUI saves a reply's tool cards only when the reply ends, so for a reply still running the sections take its calls from the Pipe streaming it, in the same Open WebUI process. Nothing is read while the dialog is closed: closing it tells the Action, which stops following its running sub-agents. In-process agents needs no Gateway, so it fills even when the Gateway cannot be reached.
+Each source is read once per open, all at the same time. None grows with the chat: the chat's messages come from Open WebUI's message rows, the 40 newest of the current branch, so a 14 MB chat opens as fast as a new one. Open WebUI saves a reply's tool cards only when the reply ends, so for a reply still running the sections take its calls from the Pipe streaming it, in the same Open WebUI process. Nothing is read while the dialog is closed: closing it tells the Action, which stops following the chat's run and its running sub-agents. In-process agents needs no Gateway, so it fills even when the Gateway cannot be reached.
 
 Opening the dialog sends a small request, from the toolbar button or the composer's: the chat, the message and the model. Open WebUI's own handler for an Action button uploads every message of the branch first and saves the whole chat again after, which on a big chat over a phone connection takes seconds; the Claw button skips it. The model comes from the page script's delivery, else from the reply's own avatar. The script arrives within about a second of opening a chat; a click before that, or on a reply that is not on an OpenClaw model, goes through Open WebUI's handler as before.
 
@@ -69,18 +69,18 @@ Typing `/compact` in the message box does not compact the session: Open WebUI 0.
 
 ## Background
 
-<img src="../img/status-dialog-background-light.png" alt="The Background section: four station imports running and a daily automation for this chat" width="320">
+<img src="../img/status-dialog-background-light.png" alt="The Background section: four station imports running, each by its title with its command under it, a check that failed with exit 2, and a daily automation for this chat" width="320">
 
 The Background section lists what runs for this chat outside a reply, running first, then the five newest that finished:
 
-- **Commands** left running in the background (`exec` with `background`, or one that outlived its wait), named by the command the chat's tool card shows.
+- **Commands** left running in the background (`exec` with `background`, or one that outlived its wait), named by the title the agent gave the call, with the command's first real step under it while it runs ("python3 ci_wake.py 163", without the `cd ...` before it or an inline script). A command without a title is named by that step. One that exits with a code other than 0 is Failed. Once it ends, the line under it says how: a failure's exit code or the signal that stopped it, and its last line of output ("exit 2 · islands: no such region"). Hover over a command, or tap it, to see the whole command.
 - **Image, Music and Video** jobs.
 - **Automations** that run in this chat: whether one is running, its next run, and its last error when it failed ("Failed 3 times in a row: ...").
 - **Agents**: Claude Code Agent calls started in the background, until the reply they hold open ends. A tap shows the task and the result, as under In-process agents.
 
 Sub-agents are listed under Subagents, not here.
 
-The section reads only when the dialog opens. OpenClaw 2026.10 removed the Gateway's task list (`tasks.list`): there the commands come from the session's process list (`sessions.processes.list`), with a finished one's last line of output under it, and media jobs are not listed (2026.10 has no per-chat list of them). A Gateway with neither list says background commands and media jobs are not available on it, and still lists the chat's automations.
+The section reads only when the dialog opens. OpenClaw 2026.10 removed the Gateway's task list (`tasks.list`): there the commands come from the session's process list (`sessions.processes.list`), and media jobs are not listed (2026.10 has no per-chat list of them). A Gateway with neither list says background commands and media jobs are not available on it, and still lists the chat's automations.
 
 While a background agent holds a reply open, the reply's status row says so, so the chat does not look busy for no reason:
 
@@ -90,7 +90,7 @@ It counts the background agents the reply started and stays until the reply ends
 
 ## Sub-agents
 
-The Subagents section lists every child session this chat's runs spawned, ended ones included, newest first, up to 20 ("20 of N" when there are more). A running one's elapsed time counts up while the dialog is open; one that finishes meanwhile shows its end as soon as the Gateway pushes the change. With none running, the section opens folded and reads the sub-agents' transcripts (their tasks and latest replies) on its first tap:
+The Subagents section lists every child session this chat's runs spawned, ended ones included, newest first, up to 20 ("20 of N" when there are more). A running one's elapsed time counts up while the dialog is open; one that finishes meanwhile shows its end as soon as the Gateway pushes the change, and its last reply once that reaches its transcript (on the claude-cli runtime, just after its run ends). While the chat's own run goes on, including a reply just sent whose run has not started yet, a sub-agent it spawns after the dialog opened shows in it as soon as the Gateway pushes the new child's row, and Context is read again each time the chat's run starts or ends. With none running, the section opens folded and reads the sub-agents' transcripts (their tasks and latest replies) on its first tap:
 
 <img src="../img/status-dialog-folded-light.png" alt="The Status dialog with every section folded, each with its count" width="320">
 
@@ -102,13 +102,13 @@ The Gateway keeps an ended child in its children list for 30 minutes only, so th
 
 **In-process agents** lists the chat's Claude Code Agent calls, which are not Gateway sessions, as their tool cards show them: running, in the background, returned, cut off or failed. A chat longer than 40 messages shows the calls in its last 40, and says so.
 
-Each row is one line: the sub-agent's spawn label (else the first sentence of its task, cut to 60 characters), its status, and its time, with up to two lines of its latest reply below. The whole task is in its drawer.
+Each row is one line: the sub-agent's spawn label (else the first sentence of its task, cut to 60 characters), its status, and its time, with up to two lines of its latest reply below. The whole task is in its drawer. A sub-agent opened in the moment before its task reaches its transcript shows its session key until it does, then its task, in the open dialog.
 
 ## Sub-agent drawer
 
 <img src="../img/subagent-drawer-light.png" alt="A running sub-agent's drawer on a phone: its name, status and time, its model and the chat it came from, the head of its task, then its run so far with a tool card opened and the step it is on" width="320">
 
-Click a sub-agent to open its drawer: a side panel, or on a phone a full-screen sheet with a **‹ Back** button. The top is a short header: the sub-agent's name, its status and its time; its model and the chat it came from (a link; for a sub-agent spawned by another sub-agent, its parent's drawer); and the first two lines of its task, with "Show all".
+Click a sub-agent to open its drawer: a side panel, or on a phone a full-screen sheet with a **‹ Back** button. The top is a short header: the sub-agent's name, its status and its time; its model and the chat it came from (a link; for a sub-agent spawned by another sub-agent, its parent's drawer); and the first two lines of its task, with "Show all". Shown whole, a long task scrolls in its own box of up to 40% of the screen, so the run below it and the close button stay in reach. "Show less" puts the box back at the task's first two lines.
 
 <img src="../img/demos/status-dialog.gif" alt="The Status dialog opened from the composer, two sub-agents running in it; a click on one opens its drawer with its task and its run so far" width="800">
 
@@ -123,9 +123,9 @@ The drawer reads the sub-agent's whole transcript (`chat.history`). A very long 
 
 ## Status button in the composer
 
-The Pipe also adds a **Claw** button, with a paw, to the composer row of OpenClaw chats, right after the OpenClaw Thinking chip (or at the end of the composer's chips when that chip is off). It opens the same dialog through the Status Action, so the Action must be installed.
+The Pipe also adds a **Claw** button, with a crab claw, to the composer row of OpenClaw chats, right after the OpenClaw Thinking chip (or at the end of the composer's chips when that chip is off). It opens the same dialog through the Status Action, so the Action must be installed.
 
-<img src="../img/composer-status-light.png" alt="The Claw button in the composer, a paw next to the integrations button" width="374">
+<img src="../img/composer-status-light.png" alt="The Claw button in the composer, a crab claw next to the integrations button" width="374">
 
 Open WebUI has no extension point for the composer, so the button is put into the page by JavaScript. If a future Open WebUI changes the composer and the anchor is not found, the button simply does not appear. It appears as soon as a tab opens an OpenClaw chat.
 

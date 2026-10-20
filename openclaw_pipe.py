@@ -94,6 +94,7 @@ import contextlib
 import copy
 import functools
 import re
+import shlex
 import signal
 import mimetypes
 import urllib.error
@@ -1488,6 +1489,33 @@ def _background_agents_line(n: int) -> str:
     return f"Waiting on {n} background agent{'' if n == 1 else 's'}"
 
 
+# Live view of the agent's browser (LIVE_VIEW_URL): ids go into the URL as they
+# are, so they must be plain ids.
+_LIVE_VIEW_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def _live_view_url(valves, *, chat_id, message_id, user_id, email, tool_name, args_str):
+    """The embed URL for a reply whose tool call looks like browser use, or None.
+    None when the valve is off, the user is not in LIVE_VIEW_USERS, the tool does
+    not match LIVE_VIEW_TOOLS, or the URL would not be an http(s) URL: Open WebUI
+    renders any other embed string as HTML."""
+    template = (getattr(valves, "LIVE_VIEW_URL", "") or "").strip()
+    if not template or not re.match(r"^https?://", template, re.I):
+        return None
+    if not all(isinstance(v, str) and _LIVE_VIEW_ID.match(v) for v in (chat_id, message_id)):
+        return None
+    users = _parse_owner_users(getattr(valves, "LIVE_VIEW_USERS", "") or "")
+    if users and not _is_owner_user(users, user_id, email):
+        return None
+    try:
+        tools = re.compile(getattr(valves, "LIVE_VIEW_TOOLS", "") or r"(?!)", re.I)
+    except re.error:
+        return None
+    if not tools.search(f"{tool_name or ''} {args_str or ''}"):
+        return None
+    return template.replace("{chat_id}", chat_id).replace("{message_id}", message_id)
+
+
 def _fmt_tokens(n) -> str:
     """Compact token count: 115212 -> '115k', 1000000 -> '1.0m'."""
     try:
@@ -1565,7 +1593,8 @@ def _window_reset_line(w: dict) -> str | None:
     return f"⏱ {bit} (resets in {rel})"
 
 
-async def _build_usage_status_lines(conn, session_key, timeout: float = 5) -> list[str]:
+async def _build_usage_status_lines(conn, session_key, timeout: float = 5,
+                                    run_usage: dict | None = None) -> list[str]:
     """Best-effort final status lines: context window fill (combined with the
     provider's primary/nearest-term rate-limit window on the same line, kept
     deliberately thin -- no reset time), one full detail line per rate-limit
@@ -1588,6 +1617,12 @@ async def _build_usage_status_lines(conn, session_key, timeout: float = 5) -> li
     just omits that line. They're fetched concurrently (not one after the
     other) so this adds at most one round trip's worth of latency, not two,
     to the moment the status line settles after the reply text is done.
+
+    `run_usage`: the reply's own run's last-call usage. Its prompt tokens are
+    the context fill, over the row's `totalTokens`: OpenClaw 2026.10 writes a
+    session's first totals to its row just after the run ends, so a new
+    chat's first reply found none there, and every later reply read the run
+    before it (ELI-177). The window (`contextTokens`) still comes from the row.
     """
     describe_task = asyncio.ensure_future(
         conn.send_request("sessions.describe", dict(key=session_key), timeout=timeout)
@@ -1602,7 +1637,7 @@ async def _build_usage_status_lines(conn, session_key, timeout: float = 5) -> li
         session_row = (desc or {}).get("session") or {}
         provider = session_row.get("modelProvider")
         context_tokens = session_row.get("contextTokens")
-        total_tokens = session_row.get("totalTokens")
+        total_tokens = _usage_prompt_tokens(run_usage) or session_row.get("totalTokens")
         if context_tokens and total_tokens is not None:
             pct = round(total_tokens / context_tokens * 100, 1)
             context_bit = f"🧠 {_fmt_tokens(total_tokens)}/{_fmt_tokens(context_tokens)} ({pct:g}%)"
@@ -1810,7 +1845,7 @@ def _dialog_safe_event_call(event_call, sid, user_id):
 # reply that is streaming into the same tab.
 # ---------------------------------------------------------------------------
 
-_COMPOSER_BUTTON_VERSION = "6"
+_COMPOSER_BUTTON_VERSION = "7"
 
 # The Status Action's function id (install_action.py's FUNCTION_ID; the
 # dialog's own JS calls the same fixed id) and the Pipe's default function id.
@@ -1850,8 +1885,9 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
   // removing it (a layout this snippet does not understand): give up.
   const LOOP_LIMIT = 20;
   const LOOP_WINDOW_MS = 10000;
-  // A paw, drawn in Heroicons' outline style (24x24, round caps), for "Claw".
-  const PAW_PATH = 'M11 6a1.5 2 0 1 1-3 0 1.5 2 0 0 1 3 0ZM16 6a1.5 2 0 1 1-3 0 1.5 2 0 0 1 3 0ZM7 10.5a1.5 1.75 0 1 1-3 0 1.5 1.75 0 0 1 3 0ZM20 10.5a1.5 1.75 0 1 1-3 0 1.5 1.75 0 0 1 3 0ZM12 12.75c-2.25 0-5.25 2.6-5.25 4.875 0 1.45 1.1 2.375 2.55 2.375.95 0 1.7-.45 2.7-.45s1.75.45 2.7.45c1.45 0 2.55-.925 2.55-2.375 0-2.275-3-4.875-5.25-4.875Z';
+  // A crab claw (ELI-231): an open pincer with a tooth on each finger and a
+  // wrist, in Heroicons' outline style (24x24, round caps), for "Claw".
+  const CLAW_PATH = 'M6.3 14.6C4.6 11.7 5.7 7.1 8.7 4.6C10.8 2.8 13.4 2.3 15.6 3.1C14.3 3.7 13.4 4.4 13 5.3L13.9 6.5L12 6.9C11.6 7.5 11.3 8.1 11.2 8.7C11.1 11 12.7 12.9 15.1 12.7C16.4 12.5 17.3 11.9 17.8 11.1L17.1 10L18.6 9.7C18.6 9.2 18.6 8.7 18.5 8.2C20.5 10.2 20.6 13.4 18.9 15.8C17.1 18.3 14.2 18.8 11.6 17.8C9.5 17 7.5 16.1 6.3 14.6ZM7.8 16L5.4 19.6L9.1 21.1L11 17.6';
 
   const state = {
     prefixes: [],
@@ -2110,7 +2146,7 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
       + 'bg-transparent text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800';
     b.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" '
       + 'stroke-width="1.75" stroke="currentColor" aria-hidden="true" class="size-4">'
-      + '<path stroke-linecap="round" stroke-linejoin="round" d="' + PAW_PATH + '"/></svg>'
+      + '<path stroke-linecap="round" stroke-linejoin="round" d="' + CLAW_PATH + '"/></svg>'
       // Icon-only below `sm`, like Open WebUI's own composer chips: at phone
       // width the chip row's overflow cut the label to "Stat" (ELI-123). The
       // title and aria-label still name it. Both classes ship in Open WebUI's CSS.
@@ -2867,6 +2903,7 @@ _MULTI_MARKERS = (
     "(multiselect)", "(multi-select)", "(multi)", "[multiselect]", "[multi]",
     "select all that apply", "choose all that apply", "check all that apply",
     "בחר כמה", "בחירה מרובה", "אפשר לבחור כמה", "בחר את כל",
+    "اختر كل ما ينطبق", "اختيار متعدد", "يمكنك اختيار أكثر من",
 )
 
 
@@ -2897,12 +2934,13 @@ def _parse_text_prompt(prompt_text: str) -> dict:
     # Yes/no only when the prompt clearly reads as binary: a free-text question
     # turned into yes/no loses the real answer. A numbered list is a choice.
     has_options = bool(re.search(r"(?m)^\s*\d+[.)]\s", prompt_text))
-    yn_markers = ("(y/n)", "[y/n]", "y/n?", "yes/no", "(yes/no)")
+    yn_markers = ("(y/n)", "[y/n]", "y/n?", "yes/no", "(yes/no)", "כן/לא", "כן / לא", "نعم/لا", "نعم / لا")
     confirm_verbs = (
         "confirm", "proceed", "overwrite", "are you sure", "do you want",
         "delete", "remove", "בטוח", "האם", "هل تريد",
     )
-    ends_question = message.rstrip().endswith("?") or title.rstrip().endswith("?")
+    # "؟" is the Arabic question mark.
+    ends_question = message.rstrip().endswith(("?", "؟")) or title.rstrip().endswith(("?", "؟"))
     # A secret unless it is clearly a choice (an explicit yes/no marker, or two
     # or more numbered options) and nothing asks for the value itself: a
     # choice that merely mentions a password keeps its answers (ELI-196), but
@@ -5753,6 +5791,9 @@ class _GatewayConnection:
         # The same, set by the next `session.message` (a transcript append)
         # for the session (ELI-164).
         self._session_message_waiters: dict[str, asyncio.Event] = {}
+        # The same, set by the next `sessions.changed` of a session spawned
+        # by the key, a new child among them (ELI-260).
+        self._session_child_waiters: dict[str, asyncio.Event] = {}
         self._tool_events_seen: dict[tuple, bool] = {}
         # (session key, tool call id) -> the task of a spawn call that started
         # and has no result yet (`_spawn_call_task`), for the child index.
@@ -5880,6 +5921,19 @@ class _GatewayConnection:
             # A gap or a fresh subscription: an append may be among the lost.
             for key in list(self._session_message_waiters):
                 self._session_message_waiters.pop(key).set()
+            for key in list(self._session_child_waiters):
+                self._session_child_waiters.pop(key).set()
+
+    def session_child_event(self, session_key: str) -> asyncio.Event:
+        """An Event set by the next `sessions.changed` of a child of
+        `session_key` (its row names it as `spawnedBy` or
+        `parentSessionKey`), a just spawned one included, or by a socket
+        gap. Take it BEFORE listing the children, as with
+        `session_change_event`."""
+        ev = self._session_child_waiters.get(session_key)
+        if ev is None:
+            ev = self._session_child_waiters[session_key] = asyncio.Event()
+        return ev
 
     def session_message_event(self, session_key: str) -> asyncio.Event:
         """An Event set by the next `session.message` for `session_key` (the
@@ -5916,6 +5970,11 @@ class _GatewayConnection:
         if key and "hasActiveRun" in payload:
             self._wake_session_waiters(key)
             self.row_to_consumers(key, payload)
+        parent = payload.get("spawnedBy") or payload.get("parentSessionKey")
+        if parent and parent != key:
+            ev = self._session_child_waiters.pop(parent, None)
+            if ev is not None:
+                ev.set()
         if _TURNS and key and payload.get("hasActiveRun") is False:
             _TURNS.settled(self, key, payload)
         if (payload.get("hasActiveRun") and key
@@ -6315,8 +6374,17 @@ class _GatewayConnection:
         if not consumer.queues or queue is None:
             del self._consumers[key]
             self._release_held(session_key)
+            # Its run may never have started (`has_reply`): waiters re-read.
+            self._wake_session_waiters(session_key)
         pipe_log(f"  unregistered consumer: {key[:60]}...")
         self._close_if_retired_and_idle()
+
+    def has_reply(self, session_key: str) -> bool:
+        """Whether a reply on this connection streams a run of `session_key`.
+        Its consumer is registered before its chat.send, so this holds while
+        the Gateway has no run for it yet (ELI-260); its end wakes the
+        session's `session_change_event`."""
+        return any(c.session_key == session_key for c in self._consumers.values())
 
     def _serving(self) -> bool:
         """Work a retired connection still owes: replies streaming here, and
@@ -7337,6 +7405,63 @@ def _history_text_for_run(history: dict, run_id: str) -> tuple[bool, str | None]
     return False, None
 
 
+def _usage_prompt_tokens(usage) -> int | None:
+    """The context a model call filled, from its `usage`, as OpenClaw counts a
+    session's `totalTokens` (`deriveContextPromptTokens`): the reported
+    `contextUsage`, else input + cacheRead + cacheWrite, else total - output.
+    None when the usage says nothing."""
+    if not isinstance(usage, dict):
+        return None
+    context = usage.get("contextUsage") if isinstance(usage.get("contextUsage"), dict) else {}
+    if context.get("state") == "unavailable":
+        return None
+    if context.get("state") == "available":
+        prompt = context.get("promptTokens")
+        return prompt if isinstance(prompt, (int, float)) and prompt > 0 else None
+    nums = {k: usage.get(k) if isinstance(usage.get(k), (int, float)) else 0
+            for k in ("input", "cacheRead", "cacheWrite", "output")}
+    prompt = nums["input"] + nums["cacheRead"] + nums["cacheWrite"]
+    if prompt > 0:
+        return prompt
+    total = usage.get("totalTokens", usage.get("total"))
+    if isinstance(total, (int, float)) and total - nums["output"] > 0:
+        return total - nums["output"]
+    return None
+
+
+def _history_usage_for_run(history: dict, run_id: str) -> dict | None:
+    """The `usage` of one run's last model call, from its newest assistant
+    message in `chat.history` that reports one. A run's messages carry its id
+    under `__openclaw.runId`, or, for the claude-cli runner's closing message
+    (whose usage is the run's last call), in `cli-assistant:<runId>`."""
+    messages = (history or {}).get("messages")
+    if not isinstance(messages, list) or not run_id:
+        return None
+    wanted = {run_id, f"cli-assistant:{run_id}"}
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
+        ids = {*_idempotency_keys(message), str(meta.get("runId") or ""), str(message.get("runId") or "")}
+        if ids & wanted and _usage_prompt_tokens(message.get("usage")):
+            return message["usage"]
+    return None
+
+
+def _history_latest_prompt_tokens(history: dict) -> int | None:
+    """The context the session's newest model call filled: the prompt tokens
+    of the newest assistant message in `chat.history` that reports a usage."""
+    messages = (history or {}).get("messages")
+    if not isinstance(messages, list):
+        return None
+    for message in reversed(messages):
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            prompt = _usage_prompt_tokens(message.get("usage"))
+            if prompt:
+                return prompt
+    return None
+
+
 def _history_renderer(messages: list) -> "_TurnRenderer":
     """A `_TurnRenderer` fed one run's `chat.history` messages instead of its
     live events, so a run whose events were lost still ends as the same
@@ -7916,6 +8041,27 @@ def _retryable_refusal_retry_ms(ex: GatewayError) -> int | None:
 # Opens tried at a run's end while Open WebUI's DB is locked (ELI-167). Each
 # waits out sqlite's busy_timeout (Open WebUI: 5 s), so 6 is about 30 s.
 OPEN_AT_END_LOCKED_TRIES = 6
+# How long M's final write waits for the request it was handed over from to
+# end (its own status lines are saved until then).
+FINAL_STATUS_REQUEST_WAIT_S = 30
+# What a cancel leaves at the end of a reply's status lines: "Stopped" from
+# `park`, then the reply's empty closing line. Wrong once the run went on in
+# the same message (Send now, or a message sent from another tab).
+_CANCEL_STATUS_TAIL = ("Stopped", "")
+
+
+def _final_status_history(history: list | None, lines: list, stopped: bool) -> tuple[list, list]:
+    """M's status lines when the writer ends it, and the ones it adds: the
+    cancel's tail dropped, then "Stopped" for a Stop, else the usage lines (an
+    empty closing line when there are none, as the inline reply ends)."""
+    kept = [h for h in (history or []) if isinstance(h, dict)]
+    while kept and kept[-1].get("done") is not False and kept[-1].get("description") in _CANCEL_STATUS_TAIL:
+        kept.pop()
+    if stopped:
+        new = [{"description": "Stopped", "done": True}]
+    else:
+        new = [{"description": line, "done": True} for line in lines] or [{"description": "", "done": True}]
+    return kept + new, new
 
 
 def _db_locked(ex: BaseException) -> bool:
@@ -8479,10 +8625,10 @@ class _TurnWriter:
         self.sent_text = ""              # and its text
         # A handover owes M one write: Open WebUI's end-of-stream save of the
         # request writes `done: true` over M, and the orphan reconcile adopts
-        # only `done: false`. `request` is that request's task: the write
+        # only `done: false`. `request_task` is that request's task: the write
         # waits for it to end, so it lands after the save (ELI-115).
         self.handover_owed = renderer is not None
-        self.request = request
+        self.request_task = request
         if renderer is not None:
             # A handed renderer is what the request showed: open tabs hold
             # those items, but under Open WebUI's ids, so an `added` would
@@ -8618,7 +8764,7 @@ class _TurnWriter:
             self.sent_output = copy.deepcopy(output)
             self.sent_text = text
         await _save_response_stream(self.task_id, self.chat_id, self.message_id, text, self.sent_output)
-        if self.handover_owed and (self.request is None or self.request.done()):
+        if self.handover_owed and (self.request_task is None or self.request_task.done()):
             self.handover_owed = False
             await self._persist(done=False, output=output, text=text)
         self._probe_tabs()
@@ -8762,17 +8908,50 @@ class _TurnWriter:
                 self._media_failed.add(directive)
 
     async def _persist(self, *, done: bool, output: list | None = None,
-                       text: str | None = None) -> None:
+                       text: str | None = None, status_history: list | None = None) -> None:
         from open_webui.models.chats import Chats
 
+        message = {"content": self.renderer.text if text is None else text,
+                   "output": output if output is not None else copy.deepcopy(self.renderer.output),
+                   "done": done}
+        if status_history is not None:
+            message["statusHistory"] = status_history
         try:
-            await _owui_upsert_message(
-                self.chat_id, self.message_id,
-                {"content": self.renderer.text if text is None else text,
-                 "output": output if output is not None else copy.deepcopy(self.renderer.output),
-                 "done": done})
+            await _owui_upsert_message(self.chat_id, self.message_id, message)
         except Exception as ex:
             pipe_log(f"  turn writer: persist failed: {ex}")
+
+    async def _persist_final(self, output: list, text: str, stopped: bool,
+                             run_usage: dict | None = None) -> list:
+        """The `done: true` write of M, with its final status lines in the same
+        write: the usage lines of a reply (`_build_usage_status_lines`, as the
+        inline reply ends), or "Stopped" for a Stop (ELI-210). Returns the
+        lines to send to open tabs. `run_usage`: the last run's own usage,
+        for a session whose row has no totals yet (ELI-177).
+
+        After the request M was handed over from has ended: it saves its own
+        status lines into M until then."""
+        from open_webui.models.chats import Chats
+
+        if self.request_task is not None and not self.request_task.done():
+            await asyncio.wait({self.request_task}, timeout=FINAL_STATUS_REQUEST_WAIT_S)
+            if not self.request_task.done():
+                # Its own status write can still land after this one and bring
+                # its "Stopped" back.
+                pipe_log(f"  turn writer: chat {self.chat_id[:8]}... message {self.message_id[:8]}...: "
+                         f"request still running after {FINAL_STATUS_REQUEST_WAIT_S} s; "
+                         f"its own status write may land after this one")
+        lines = [] if stopped else await _build_usage_status_lines(
+            self.conn, self.session_key, run_usage=run_usage)
+        async with self.conn._chat_write_lock(self.chat_id):
+            try:
+                saved = await Chats.get_message_by_id_and_message_id(self.chat_id, self.message_id) or {}
+            except Exception as ex:
+                saved = {}
+                pipe_log(f"  turn writer: reading M's status lines failed: {ex!r}")
+            history, new = _final_status_history(saved.get("statusHistory"), lines, stopped)
+            await self._persist(done=True, output=output, text=text, status_history=history)
+        return new
 
     def adopt(self, run_id: str) -> None:
         """A run that continues M (a pipe resume, or a restart recovery that
@@ -8966,11 +9145,11 @@ class _TurnWriter:
         pipe_log(f"  turn writer: resumed {self.message_id[:8]}... as {self.run_id[:32]}... "
                  f"({self.resumes}/{MAX_TURN_RESUMES})")
 
-    async def finalize(self, note: str | None = None) -> None:
+    async def finalize(self, note: str | None = None, stopped: bool = False) -> None:
         """Write M's last state, `done: true`: from the transcript when every
         run written into M has closed there, else what streamed. A silent
         sentinel is never written; a sentinel-only run that showed tool cards
-        keeps them (condition B)."""
+        keeps them (condition B). `stopped`: the user's Stop ended it."""
         if self.closed:
             return
         self.closed = True
@@ -9007,7 +9186,10 @@ class _TurnWriter:
             if note:
                 text = f"{text}\n\n{note}" if text else note
                 output.append(_turn_note_item(note))
-            await self._persist(done=True, output=output, text=text)
+            # The newest run written into M that reports its usage.
+            run_usage = next(filter(None, (_history_usage_for_run(hist, r) for r in reversed(self.runs))),
+                             None) if hist else None
+            status = await self._persist_final(output, text, stopped, run_usage)
             if self._introduced():
                 # ELI-230: once more, finished, for a tab that lost M and was
                 # not repaired. A tab that has M merges the same content; the
@@ -9023,6 +9205,8 @@ class _TurnWriter:
             emit = await self._emitter()
             await emit({"type": "chat:completion", "data": {"done": True, "content": text,
                                                              "output": output}})
+            for line in status:
+                await emit({"type": "status", "data": line})
             await emit({"type": "chat:active", "data": {"active": False}})
             tools = sum(1 for i in output if i.get("type") == "function_call")
             pipe_log(f"  turn writer: finalized {self.message_id[:8]}... ({len(text)} chars, "
@@ -9232,7 +9416,7 @@ class _TurnWriter:
                 pipe_log(f"  turn writer: chat.abort failed: {ex}")
         if not aborted and wake:
             await self._cancel_wake_run()
-        await self.finalize()
+        await self.finalize(stopped=True)
 
     async def _abort_agent_run(self) -> bool:
         """Stop a run the agent started by its id: `sessions.abort` with a run id
@@ -11513,6 +11697,34 @@ class Pipe:
                 "OpenClaw chat. Turn off to stop delivering it; an already open "
                 "tab keeps it until reload."
         )
+        LIVE_VIEW_URL: str = Field(
+            default="",
+            description="(Optional.) Show the agent's browser live inside a "
+                "reply: when a reply first uses a browser tool, this URL is "
+                "added to it as an embed. {chat_id} and {message_id} are "
+                "replaced with the chat's and the reply's ids. It needs a "
+                "service that serves such a page for the agent's browser. "
+                "Empty: off."
+        )
+        LIVE_VIEW_TOOLS: str = Field(
+            default=(r"^browser\b"
+                     r"|\bbrowser\s+(?:--?\S+\s+)*(?:open|navigate|goto|click|type|press|fill|hover|scroll"
+                     r"|screenshot|snapshot|evaluate|tabs?|focus|close|start)\b"
+                     r"|\bplaywright\b|\bchromium\b|google-chrome|lease\.py own(?![^\"]*--no-record)"),
+            description="Which tool calls count as browser use for "
+                "LIVE_VIEW_URL: a regular expression, case-insensitive, "
+                "searched in the tool's name followed by its arguments. "
+                "The default takes the browser tool, an `openclaw browser` "
+                "command (how the agent drives its browser through exec), "
+                "and commands that run Playwright or Chromium, but not a "
+                "`lease.py own --no-record` run, which is never recorded."
+        )
+        LIVE_VIEW_USERS: str = Field(
+            default="",
+            description="Open WebUI user ids or emails, comma-separated, whose "
+                "replies get LIVE_VIEW_URL. Empty: everyone's, once "
+                "LIVE_VIEW_URL is set."
+        )
         TITLE_GEN_AGENT_ID: str = Field(
             default="title-gen",
             description="Agent id used for background chat-title generation. It must "
@@ -12443,6 +12655,8 @@ class _PipeTurn:
         self.error_shown = ""  # the run's "**Error:**" line, once shown
         self.aborted = False
         self.first_event_arrived = False
+        # The run's last-call usage, from its `chat` final (ELI-177).
+        self.run_usage = None
         # The Gateway acks every chat.send with "started"; one that it queued
         # behind a run (or steered into one) instead gets a lone `chat` final
         # with no message as its first and only event.
@@ -12570,6 +12784,7 @@ class _PipeTurn:
                             events = [a for a in added if isinstance(a, dict)]
                             if phase == "start":
                                 pipe_log(f"  Tool start: {name}")
+                                await self.maybe_show_live_view(name, data.get("args"))
                                 if events and self.pending_media_text:
                                     # The message item ends here, and with it
                                     # any code span a held directive waited on
@@ -12636,23 +12851,30 @@ class _PipeTurn:
                 _live_replies().pop(live_key, None)
             if self.awaiting_owner:
                 self.conn.stop_awaiting_owner(self.session_key, self.owner_run)
-            # A parked queue now belongs to whoever claims the run; releasing
-            # it here would drop the events it is buffering.
-            if not self.turn.parked:
-                if self.done and not self.aborted and self.our_run_id and not self.handed_over:
-                    # The run ended in this reply. Its trailing `chat` final
-                    # lands after this consumer is gone and must not read as
-                    # "the reply ended before its run" (a handover would
-                    # rewrite the message OWUI is about to save) or as a run
-                    # nobody showed.
-                    self.conn.mark_delivered_live(self.session_key, self.our_run_id)
-                    self.conn.unregister_run_target(self.session_key, self.our_run_id)
-                self.conn.unregister_consumer(self.session_key, self.our_run_id, queue=self.queue)
-                self.turn.run_id = None
-                self.turn.queue = None
+            # The usage line is read while this reply still holds its
+            # consumer: dropping it closes a connection a redeploy retired,
+            # and a request sent then never gets its answer (#157 gate). The
+            # consumer is dropped even when a Stop lands during the read.
             status_lines = []
-            if not self.aborted and self.text_yielded and not self.adopted_run_id and not self.handed_over:
-                status_lines = await _build_usage_status_lines(self.conn, self.session_key)
+            try:
+                if not self.aborted and self.text_yielded and not self.adopted_run_id and not self.handed_over:
+                    status_lines = await _build_usage_status_lines(
+                        self.conn, self.session_key, run_usage=await self.own_run_usage())
+            finally:
+                # A parked queue now belongs to whoever claims the run; releasing
+                # it here would drop the events it is buffering.
+                if not self.turn.parked:
+                    if self.done and not self.aborted and self.our_run_id and not self.handed_over:
+                        # The run ended in this reply. Its trailing `chat` final
+                        # lands after this consumer is gone and must not read as
+                        # "the reply ended before its run" (a handover would
+                        # rewrite the message OWUI is about to save) or as a run
+                        # nobody showed.
+                        self.conn.mark_delivered_live(self.session_key, self.our_run_id)
+                        self.conn.unregister_run_target(self.session_key, self.our_run_id)
+                    self.conn.unregister_consumer(self.session_key, self.our_run_id, queue=self.queue)
+                    self.turn.run_id = None
+                    self.turn.queue = None
             if self.adopted_run_id and not self.aborted:
                 await _emit_status(
                     self.__event_emitter__, "Sending your message…", done=False)
@@ -12819,6 +13041,11 @@ class _PipeTurn:
             yield self.error_shown
             self.done = True
             pipe_log("  lifecycle error -> done")
+        if state == "final" and payload.get("runId") in (None, self.our_run_id):
+            usage = (payload.get("message") or {}).get("usage") \
+                if isinstance(payload.get("message"), dict) else None
+            if _usage_prompt_tokens(usage):
+                self.run_usage = usage
         if state in ("final", "cancelled", "error", "aborted") or aborted_run:
             self.done = True
             pipe_log(f"  payload state='{state}' aborted={aborted_run} -> done")
@@ -13303,6 +13530,23 @@ class _PipeTurn:
             return ("end", f"**Error:** {row['lastRunError']}")
         return ("end", None)
 
+    async def own_run_usage(self) -> dict | None:
+        """This reply's run's last-call usage for its context line: from its
+        `chat` final, else from its own messages in the transcript (the final
+        may come after the run's lifecycle end has ended the reply)."""
+        if self.run_usage or not self.our_run_id:
+            return self.run_usage
+        try:
+            # As long as the usage line's other reads (`_build_usage_status_lines`).
+            hist = await self.conn.session_history(self.session_key, limit=RUN_TEXT_HISTORY_LIMIT, timeout=5)
+        except Exception as ex:
+            pipe_log(f"  usage line: chat.history failed: {ex!r}")
+            return None
+        usage = _history_usage_for_run(hist, self.our_run_id)
+        if not usage:
+            pipe_log("  usage line: the run's messages report no usage; using the session row")
+        return usage
+
     async def recover_from_transcript(self) -> str | None:
         """The run's text read back: by its run id, else by its user text,
         which only a run seen here may use. With nothing of it seen, the
@@ -13458,6 +13702,25 @@ class _PipeTurn:
             self.conn.mark_delivered_live(self.session_key, self.our_run_id)
         else:
             self.conn.continue_run_target(self.session_key, self.our_run_id, answer_res.new_run_id)
+
+    async def maybe_show_live_view(self, tool_name, args):
+        """Adds LIVE_VIEW_URL to this reply as an embed, once, at its first
+        browser tool call. Open WebUI saves it with the message."""
+        if getattr(self, "live_view_shown", False) or not self.__event_emitter__:
+            return
+        meta = self.__metadata__ or {}
+        url = _live_view_url(
+            self.pipe.valves, chat_id=self.owui_origin_chat_id, message_id=meta.get("message_id"),
+            user_id=(self.__user__ or {}).get("id"), email=(self.__user__ or {}).get("email"),
+            tool_name=tool_name, args_str=json.dumps(args or {}))
+        if not url:
+            return
+        self.live_view_shown = True
+        try:
+            await self.__event_emitter__({"type": "embeds", "data": {"embeds": [url]}})
+            pipe_log(f"  live view embed added: {url}")
+        except Exception as ex:
+            pipe_log(f"  live view embed failed: {ex!r}")
 
     async def show_text(self, text: str):
         """New run text from the renderer, assistant or item alike, through
