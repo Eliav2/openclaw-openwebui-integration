@@ -150,11 +150,20 @@ class Recorder:
                     durs[i] = max(durs[i] * show / spent, 0.01)
         return durs
 
-    def write(self, work: str) -> tuple[str, float]:
-        """The frames as JPEGs and an ffmpeg concat list with their durations (durations())."""
+    def write(self, work: str, opens_on_end: float = 0.0) -> tuple[str, float]:
+        """The frames as JPEGs and an ffmpeg concat list with their durations (durations()).
+        With `opens_on_end` (s), the recording opens on its last frame for that long and then
+        plays from the start: a still of it (its first frame, a slow load, a link preview)
+        shows the feature, not an empty chat."""
         if not self.frames:
             raise RuntimeError("no frames were recorded")
         lines, total = [], 0.0
+        if opens_on_end > 0:
+            path = os.path.join(work, "end.jpg")
+            with open(path, "wb") as fh:
+                fh.write(self.frames[-1][1])
+            total += opens_on_end
+            lines += [f"file '{path}'", f"duration {opens_on_end:.4f}"]
         for (_, png, _), dur, i in zip(self.frames, self.durations(), range(len(self.frames))):
             path = os.path.join(work, f"{i:05d}.jpg")
             with open(path, "wb") as fh:
@@ -382,7 +391,7 @@ async def run_demo(browser, token: str, spec: dict, out: str, host: str) -> dict
         hits = capture.deny_hits(await page.evaluate("() => document.body.innerText"), (host,) if host else ())
         if hits:
             raise AssertionError(f"{spec['name']}: deny-listed text visible: {sorted(set(hits))[:10]}")
-        concat, seconds = rec.write(work)
+        concat, seconds = rec.write(work, spec.get("opens_on_end_ms", 0) / 1000)
         if seconds > MAX_SECONDS:
             raise AssertionError(f"{spec['name']}: {seconds:.1f} s, over {MAX_SECONDS:.0f} s ({', '.join(steps)})")
         path = os.path.join(out, f"{spec['name']}.gif")

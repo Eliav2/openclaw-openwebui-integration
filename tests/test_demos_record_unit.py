@@ -55,5 +55,30 @@ class DurationsTests(unittest.TestCase):
         self.assertAlmostEqual(sum(d[10:61]), record.WAIT_HELD_MAX + 5.0)
 
 
+class OpensOnEndTests(unittest.TestCase):
+
+    def test_the_concat_opens_on_the_last_frame_then_plays_from_the_start(self):
+        import tempfile
+        r = record.Recorder(_Cdp())
+        r.frames = [(0.0, b"empty chat", True), (1.0, b"typing", False), (2.0, b"the feature", False)]
+        with tempfile.TemporaryDirectory() as work:
+            concat, total = r.write(work, opens_on_end=2.0)
+            files = [line.split("'")[1] for line in Path(concat).read_text().splitlines() if line.startswith("file")]
+            self.assertEqual(Path(files[0]).read_bytes(), b"the feature")
+            self.assertEqual(Path(files[1]).read_bytes(), b"empty chat")
+            self.assertAlmostEqual(total, 2.0 + sum(r.durations()))
+            _, plain = r.write(work)
+            self.assertAlmostEqual(plain, sum(r.durations()))
+
+    def test_every_demo_a_readme_tile_plays_opens_on_its_end(self):
+        import json
+        import re
+        root = Path(__file__).resolve().parents[1]
+        tiles = set(re.findall(r'<source srcset="\./docs/img/demos/([^"/]+)\.gif"', (root / "README.md").read_text()))
+        self.assertTrue(tiles)
+        demos = {d["name"]: d for d in json.loads((root / "scripts" / "demos" / "demos.json").read_text())["demos"]}
+        self.assertEqual(sorted(t for t in tiles if not demos.get(t, {}).get("opens_on_end_ms")), [])
+
+
 if __name__ == "__main__":
     unittest.main()
