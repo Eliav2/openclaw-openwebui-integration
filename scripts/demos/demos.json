@@ -226,7 +226,7 @@
       "match": "before I tag the release",
       "steps": [
         {
-          "say": "I'll have two reviewers go through the two code changes in parallel.",
+          "say": "Two changes went in this week. One reviewer for the cache change:",
           "tool": "sessions_spawn",
           "args": {
             "task": "Review the forecast cache change (src/forecast/cache.py, \"Cache forecasts for ten minutes\") for bugs before the release. Report anything that should block it.",
@@ -234,7 +234,7 @@
           }
         },
         {
-          "say": "",
+          "say": "And one for the wind speed fix:",
           "tool": "sessions_spawn",
           "args": {
             "task": "Review the wind speed fix (src/forecast/units.py, \"Fix wind speed ignoring the km/h setting\") for bugs before the release. Report anything that should block it.",
