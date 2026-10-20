@@ -120,6 +120,24 @@ Type: `bool`. Default: `True`.
 
 Add an OpenClaw 'Claw' button to the composer row of OpenClaw chats (it opens the same dialog as the Status Action's message button, so that Action must be installed). Installed into the page at the start of each turn and when a tab opens an OpenClaw chat. Turn off to stop delivering it; an already open tab keeps it until reload.
 
+### LIVE_VIEW_URL
+
+Type: `str`. Default: empty.
+
+(Optional.) Show the agent's browser live inside a reply: when a reply first uses a browser tool, this URL is added to it as an embed. {chat_id} and {message_id} are replaced with the chat's and the reply's ids. It needs a service that serves such a page for the agent's browser. Empty: off.
+
+### LIVE_VIEW_TOOLS
+
+Type: `str`. Default: `^browser\b|\bbrowser\s+(?:--?\S+\s+)*(?:open|navigate|goto|click|type|press|fill|hover|scroll|screenshot|snapshot|evaluate|tabs?|focus|close|start)\b|\bplaywright\b|\bchromium\b|google-chrome|lease\.py own(?![^\"]*--no-record)`.
+
+Which tool calls count as browser use for LIVE_VIEW_URL: a regular expression, case-insensitive, searched in the tool's name followed by its arguments. The default takes the browser tool, an `openclaw browser` command (how the agent drives its browser through exec), and commands that run Playwright or Chromium, but not a `lease.py own --no-record` run, which is never recorded.
+
+### LIVE_VIEW_USERS
+
+Type: `str`. Default: empty.
+
+Open WebUI user ids or emails, comma-separated, whose replies get LIVE_VIEW_URL. Empty: everyone's, once LIVE_VIEW_URL is set.
+
 ### TITLE_GEN_AGENT_ID
 
 Type: `str`. Default: `title-gen`.

@@ -54,6 +54,20 @@ A tool that was announced but never returned, because the run was cancelled or c
 
 Always on.
 
+## Live view of the agent's browser
+
+<img src="../img/live-view-light.png" alt="A reply that checked a dashboard in a browser: the browser's page shown inside the message, marked live, above the reply's text" width="320">
+
+When a reply first uses a browser tool, the Pipe can add a page to that reply that shows the agent's browser while it works. Open WebUI shows it inside the message, under the reply, and keeps it with the message.
+
+The page comes from a service you run that watches your agent's browser, not from the Pipe: set [`LIVE_VIEW_URL`](../configuration.md#live_view_url) to its address, with `{chat_id}` and `{message_id}` where the chat's and the reply's ids go, for example `https://browser.example.org/embed?chat={chat_id}&message={message_id}`. The service finds the browser that this chat and reply drive and shows it.
+
+Which tool calls count as browser use is [`LIVE_VIEW_TOOLS`](../configuration.md#live_view_tools), a pattern searched in the tool's name and arguments: by default the `browser` tool, `openclaw browser` commands (how the agent drives its browser through exec) and commands that run Playwright or Chromium, but not a `lease.py own --no-record` run, which is never recorded. [`LIVE_VIEW_USERS`](../configuration.md#live_view_users) limits it to some users.
+
+Open WebUI shows the page in a sandboxed frame, as it does every embed, so the page cannot reach Open WebUI or your login. The service itself decides who may see the browser: put it behind your own login.
+
+Off by default. Replies you send get it; replies the agent starts itself do not.
+
 ## Thinking level
 
 With the [thinking filter](../install/thinking-filter.md) installed, a toggle in the composer sets the reasoning level per chat: `default`, `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`.
@@ -112,6 +126,8 @@ After every reply, a status row shows where you stand:
 <img src="../img/usage-goal-light.png" alt="The status rows under a reply, opened: the goal and the context used" width="320">
 
 > 🧠 34k/1.0m (3.5%) · ⏱ 5h 62% left
+
+The context number is what the reply's own run filled, read from that run's usage, so a new chat's first reply has it too.
 
 You get one row per rate-limit window that reports a reset (`⏱ 5h 62% left (resets in 2h13m)`), and a goal line when the session has one (`🎯 Pursuing goal (204/50k)`, with paused, blocked, usage-limited, unmet and achieved variants).
 

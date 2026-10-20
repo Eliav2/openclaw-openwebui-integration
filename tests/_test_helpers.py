@@ -62,9 +62,12 @@ def fresh_child_index():
 def action_gateway(conn, source: str = "pipe", keep_index: bool = False):
     """Patch the Status Action's Gateway lookup to hand out `conn`, as if it
     came from `source` (the Pipe's stashed connection by default). Starts from
-    a fresh child index unless `keep_index`."""
+    a fresh child index unless `keep_index`. A mock `conn` streams no reply
+    unless the test says (`has_reply`)."""
     if not keep_index:
         fresh_child_index()
+    if isinstance(conn, mock.Mock) and "has_reply" not in vars(conn):
+        conn.has_reply = lambda _key: False
     return mock.patch("openclaw_status_action._get_action_connection",
                       new=mock.AsyncMock(return_value=(conn, source)))
 

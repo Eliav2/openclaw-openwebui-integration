@@ -411,6 +411,7 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
         conn = mock.Mock()
         conn.send_request = mock.AsyncMock(side_effect=_list_rpc(rows, previews, []))
         conn.session_change_event = session_change_event
+        conn.session_child_event = lambda key: asyncio.Event()
         with action_gateway(conn):
             opened = asyncio.ensure_future(Action().action(
                 {"chat_id": PARENT_CHAT}, __user__={"id": PARENT_USER}, __event_emitter__=emitter))
@@ -419,6 +420,7 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
             while not opened.done() and CHILD_A not in waiters:
                 await asyncio.sleep(0)
             rows[0] = _child(CHILD_A, "done", startedAt=self.NOW - 1000, endedAt=self.NOW)
+            previews[CHILD_A] = previews[CHILD_A] + [{"role": "assistant", "text": "Done."}]   # its reply
             ev = waiters.pop(CHILD_A, None)
             if ev is not None:
                 ev.set()    # the Gateway pushes the child's settle
@@ -433,6 +435,351 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
         # its own duration, not counting up.
         self.assertEqual(run_page(_DIALOG_PAGE_JS, payload), [{"cells": ["1s"], "timers": 1}])
 
+    async def test_a_child_opened_before_its_task_is_in_its_transcript_is_titled_once_it_is(self):
+        """ELI-253: on 2026.10 the spawn message reaches the child's transcript
+        after the spawn returns. A dialog opened in between, with no task
+        recorded from the spawn call (none is, on a claude-cli Gateway), read
+        no task and titled the running child by its session key for as long
+        as it stayed open. The transcript append is pushed (`session.message`
+        on a transcript subscription); the section refills on it."""
+        import asyncio
+
+        rows = [_child(CHILD_A, "running", startedAt=self.NOW - 1000)]
+        previews = {CHILD_A: []}
+        changes, appends, subscribed, emitted, seen = {}, {}, [], [], []
+
+        conn = mock.Mock()
+        conn.send_request = mock.AsyncMock(side_effect=_list_rpc(rows, previews, []))
+        conn.session_change_event = lambda key: changes.setdefault(key, asyncio.Event())
+        conn.session_message_event = lambda key: appends.setdefault(key, asyncio.Event())
+        conn.session_child_event = lambda key: asyncio.Event()
+        conn.ensure_message_subscription = mock.AsyncMock(side_effect=subscribed.append)
+        real = openclaw_status_action._render_subagents_fill_js
+
+        async def settle():
+            # Let the dialog run until it waits (bounded: a dialog that
+            # never waits on the append still gets checked).
+            for _ in range(2000):
+                await asyncio.sleep(0)
+
+        with action_gateway(conn), mock.patch(
+                "openclaw_status_action._render_subagents_fill_js",
+                side_effect=lambda d: (seen.append(d), real(d))[1]):
+            opened = asyncio.ensure_future(Action().action(
+                {"chat_id": PARENT_CHAT}, __user__={"id": PARENT_USER},
+                __event_emitter__=RecordingEmitter(emitted)))
+            await settle()
+            self.assertEqual(seen[0]["tasks"][0]["title"], CHILD_A)   # the race: no task yet
+            previews[CHILD_A] = [{"role": "user", "text": WRAPPED_103}]
+            ev = appends.pop(CHILD_A, None)
+            if ev is not None:
+                ev.set()    # the Gateway pushes the spawn message's append
+            await settle()
+            titled = [t["title"] for d in seen for t in d["tasks"] if t["status"] == "running"]
+            rows[0] = _child(CHILD_A, "done", startedAt=self.NOW - 1000, endedAt=self.NOW)
+            previews[CHILD_A] = previews[CHILD_A] + [{"role": "assistant", "text": "Done."}]   # its reply
+            ev = changes.pop(CHILD_A, None)
+            if ev is not None:
+                ev.set()    # the child's settle ends the follow
+            await asyncio.wait_for(opened, 5)   # bounds the test only
+
+        self.assertEqual(subscribed, [CHILD_A])
+        self.assertEqual(titled[-1], "Summarise Y.", titled)
+
+    async def test_a_child_spawned_after_the_dialog_opened_is_listed_while_it_stays_open(self):
+        """ELI-260: the dialog followed only the children listed at its open,
+        so with none listed it stopped at once, and a child the chat's run
+        spawned after the open stayed out of it until a reopen. While the
+        chat's own session runs, the dialog follows it, and a new child's
+        row change (pushed with `spawnedBy` naming this chat's session)
+        refills the section."""
+        import asyncio
+
+        rows, parent = [], {"busy": True}
+        changes, spawns, emitted, seen = {}, {}, [], []
+        transcript = {CHILD_A: [{"role": "user", "text": WRAPPED_93}]}
+        listed = _list_rpc(rows, transcript, [])
+
+        async def send_request(method, params, timeout=5):
+            if method == "sessions.describe":
+                return {"session": {"key": PARENT_KEY, "hasActiveRun": parent["busy"]}}
+            return await listed(method, params, timeout)
+
+        conn = mock.Mock()
+        conn.send_request = mock.AsyncMock(side_effect=send_request)
+        conn.session_change_event = lambda key: changes.setdefault(key, asyncio.Event())
+        conn.session_message_event = lambda key: asyncio.Event()
+        conn.session_child_event = lambda key: spawns.setdefault(key, asyncio.Event())
+        conn.ensure_message_subscription = mock.AsyncMock()
+        real = openclaw_status_action._render_subagents_fill_js
+
+        async def settle():
+            for _ in range(2000):
+                await asyncio.sleep(0)
+
+        def push(waiters, key):
+            ev = waiters.pop(key, None)
+            if ev is not None:
+                ev.set()
+
+        with action_gateway(conn), mock.patch(
+                "openclaw_status_action._render_subagents_fill_js",
+                side_effect=lambda d: (seen.append(d), real(d))[1]):
+            opened = asyncio.ensure_future(Action().action(
+                {"chat_id": PARENT_CHAT}, __user__={"id": PARENT_USER},
+                __event_emitter__=RecordingEmitter(emitted)))
+            await settle()
+            self.assertEqual(seen[-1]["tasks"], [])
+            rows.append(_child(CHILD_A, "running", startedAt=self.NOW))
+            push(spawns, PARENT_KEY)    # the Gateway pushes the new child's row
+            await settle()
+            listed_while_open = [t["status"] for t in seen[-1]["tasks"]]
+            following = not opened.done()
+            rows[0] = _child(CHILD_A, "done", startedAt=self.NOW, endedAt=self.NOW + 1000)
+            transcript[CHILD_A] = transcript[CHILD_A] + [{"role": "assistant", "text": "Done."}]   # its reply
+            parent["busy"] = False
+            push(changes, CHILD_A)
+            push(changes, PARENT_KEY)
+            await asyncio.wait_for(opened, 5)   # bounds the test only
+
+        self.assertEqual(listed_while_open, ["running"])
+        self.assertTrue(following)
+        self.assertEqual([t["status"] for t in seen[-1]["tasks"]], ["completed"])
+
+    def _follow_conn(self, rows, describe, previews=None):
+        """A connection whose events are kept per session key, as the real
+        one does: (conn, {kind: {key: Event}})."""
+        import asyncio
+
+        events = {"change": {}, "message": {}, "child": {}}
+        listed = _list_rpc(rows, previews or {}, [])
+
+        async def send_request(method, params, timeout=5):
+            if method == "sessions.describe":
+                return {"session": dict(describe)}
+            return await listed(method, params, timeout)
+
+        conn = mock.Mock()
+        conn.send_request = mock.AsyncMock(side_effect=send_request)
+        conn.session_change_event = lambda key: events["change"].setdefault(key, asyncio.Event())
+        conn.session_message_event = lambda key: events["message"].setdefault(key, asyncio.Event())
+        conn.session_child_event = lambda key: events["child"].setdefault(key, asyncio.Event())
+        conn.ensure_message_subscription = mock.AsyncMock()
+        conn.has_reply = lambda key: False
+        return conn, events
+
+    @staticmethod
+    def _push(waiters, key):
+        ev = waiters.pop(key, None)
+        if ev is not None:
+            ev.set()
+
+    @staticmethod
+    async def _settle():
+        import asyncio
+        for _ in range(2000):
+            await asyncio.sleep(0)
+
+    async def test_a_dialog_opened_before_the_chats_run_starts_follows_it(self):
+        """ELI-260 reopened (QA C27, 1 in 5): opened 0.3 s after a send, the
+        dialog read the chat's session before the Gateway had its run
+        (`hasActiveRun` false; the Pipe's chat.send was still in flight), so
+        it stopped at once and the child the run spawned never showed. The
+        Pipe streaming the reply in this process already has its consumer
+        registered: the dialog follows that reply too."""
+        import asyncio
+
+        rows, describe, reply = [], {"key": PARENT_KEY, "hasActiveRun": False}, {"on": True}
+        transcript = {CHILD_A: [{"role": "user", "text": WRAPPED_93}]}
+        conn, events = self._follow_conn(rows, describe, transcript)
+        conn.has_reply = lambda key: reply["on"] and key == PARENT_KEY
+        emitted, seen = [], []
+        real = openclaw_status_action._render_subagents_fill_js
+        with action_gateway(conn), mock.patch(
+                "openclaw_status_action._render_subagents_fill_js",
+                side_effect=lambda d: (seen.append(d), real(d))[1]):
+            opened = asyncio.ensure_future(Action().action(
+                {"chat_id": PARENT_CHAT}, __user__={"id": PARENT_USER},
+                __event_emitter__=RecordingEmitter(emitted)))
+            await self._settle()
+            describe["hasActiveRun"] = True
+            self._push(events["change"], PARENT_KEY)    # the run starts
+            await self._settle()
+            rows.append(_child(CHILD_A, "running", startedAt=self.NOW))
+            self._push(events["child"], PARENT_KEY)     # it spawns a child
+            await self._settle()
+            listed_while_open = [t["status"] for t in seen[-1]["tasks"]]
+            rows[0] = _child(CHILD_A, "done", startedAt=self.NOW, endedAt=self.NOW + 1000)
+            transcript[CHILD_A] = transcript[CHILD_A] + [{"role": "assistant", "text": "SUB-51"}]   # its reply
+            describe["hasActiveRun"], reply["on"] = False, False
+            self._push(events["change"], CHILD_A)
+            self._push(events["change"], PARENT_KEY)
+            await asyncio.wait_for(opened, 5)   # bounds the test only
+
+        self.assertEqual(listed_while_open, ["running"])
+
+    async def test_a_child_done_in_the_open_dialog_gets_its_result_and_the_chat_its_context(self):
+        """QA C31: a child that ended while the dialog followed it showed Done
+        with no result line, and the dialog stopped there: a claude-cli
+        child's messages reach its transcript after its run settles. Context,
+        read at an open right after a send, had no data yet and never got it.
+        The dialog follows an ended child until its last message is in its
+        row (its transcript append is pushed), and refills Context on each
+        change of the chat's run."""
+        import asyncio
+
+        rows = [_child(CHILD_A, "running", startedAt=self.NOW)]
+        describe = {"key": PARENT_KEY, "hasActiveRun": True}
+        transcript = {CHILD_A: [{"role": "user", "text": WRAPPED_93}]}
+        conn, events = self._follow_conn(rows, describe, transcript)
+        emitted, seen, contexts = [], [], []
+        real = openclaw_status_action._render_subagents_fill_js
+        real_context = openclaw_status_action._render_context_fill_js
+        with action_gateway(conn), mock.patch(
+                "openclaw_status_action._render_subagents_fill_js",
+                side_effect=lambda d: (seen.append(d), real(d))[1]), mock.patch(
+                "openclaw_status_action._render_context_fill_js",
+                side_effect=lambda d: (contexts.append(d), real_context(d))[1]):
+            opened = asyncio.ensure_future(Action().action(
+                {"chat_id": PARENT_CHAT}, __user__={"id": PARENT_USER},
+                __event_emitter__=RecordingEmitter(emitted)))
+            await self._settle()
+            # The chat's run ends with its context known; the child goes on.
+            describe.update(hasActiveRun=False, contextTokens=500_000, totalTokens=101_000)
+            self._push(events["change"], PARENT_KEY)
+            await self._settle()
+            # The child settles before its reply reaches its transcript.
+            rows[0] = _child(CHILD_A, "done", startedAt=self.NOW, endedAt=self.NOW + 1000)
+            self._push(events["change"], CHILD_A)
+            await self._settle()
+            following = not opened.done()
+            transcript[CHILD_A] = transcript[CHILD_A] + [{"role": "assistant", "text": "SUB-51: 17 x 3 = 51"}]   # its reply
+            self._push(events["message"], CHILD_A)      # the reply is appended
+            await asyncio.wait_for(opened, 5)   # bounds the test only
+
+        self.assertTrue(following, "stopped at the child's settle, before its reply")
+        self.assertEqual(seen[-1]["tasks"][0]["terminalSummary"], "SUB-51: 17 x 3 = 51")
+        self.assertEqual(contexts[-1]["context"]["usedTokens"], "101k", contexts[-1])
+        conn.ensure_message_subscription.assert_any_await(CHILD_A)
+
+    async def test_a_childs_result_reads_the_same_in_the_open_dialog_and_a_fresh_open(self):
+        """ELI-264 (QA C32): the Gateway gives a child's last message two ways.
+        `sessions.list` with `includeLastMessage` has it as `lastMessagePreview`,
+        markdown flattened (2026.10.5 session-transcript-title-reader:
+        flattenMarkdown); `sessions.preview` has the transcript's text as
+        written. The open dialog's refills list with the former, a fresh
+        open's list did not, so its tap showed the latter: the same result
+        read "The command cd /config/x ran" in place and "The command
+        `cd /config/x` ran" after a reopen."""
+        import asyncio
+
+        raw, flat = "The command `cd /config/x` ran.", "The command cd /config/x ran."
+        done = _child(CHILD_A, "done", startedAt=self.NOW, endedAt=self.NOW + 1000)
+        rows = [_child(CHILD_A, "running", startedAt=self.NOW)]
+        transcript = {CHILD_A: [{"role": "user", "text": WRAPPED_93}]}
+
+        async def gateway(method, params, timeout=5):
+            # As 2026.10.5 answers: the list's preview only when asked for.
+            if method == "sessions.list":
+                last = params.get("includeLastMessage") and transcript[CHILD_A][-1]["role"] == "assistant"
+                return {"sessions": [dict(r, lastMessagePreview=flat) if last else r for r in rows]}
+            if method == "sessions.describe":
+                return {"session": {"key": PARENT_KEY, "hasActiveRun": False}}
+            return await _list_rpc(rows, transcript, [])(method, params, timeout)
+
+        def connection():
+            conn, events = self._follow_conn(rows, {})
+            conn.send_request = mock.AsyncMock(side_effect=gateway)
+            return conn, events
+
+        seen = []
+        real = openclaw_status_action._render_subagents_fill_js
+        spy = mock.patch("openclaw_status_action._render_subagents_fill_js",
+                         side_effect=lambda d: (seen.append(d), real(d))[1])
+        # In place: open while the child runs, then it ends with its result.
+        conn, events = connection()
+        with action_gateway(conn), spy:
+            opened = asyncio.ensure_future(Action().action(
+                {"chat_id": PARENT_CHAT}, __user__={"id": PARENT_USER}, __event_emitter__=RecordingEmitter([])))
+            await self._settle()
+            rows[0] = done
+            transcript[CHILD_A] = transcript[CHILD_A] + [{"role": "assistant", "text": raw}]
+            self._push(events["change"], CHILD_A)
+            await asyncio.wait_for(opened, 5)   # bounds the test only
+        in_place = seen[-1]["tasks"][0]["terminalSummary"]
+
+        # A fresh open of the same child, then the tap that unfolds it.
+        conn, _events = connection()
+        emitted = []
+        with action_gateway(conn), spy:
+            await Action().action({"chat_id": PARENT_CHAT}, __user__={"id": PARENT_USER},
+                                  __event_emitter__=RecordingEmitter(emitted))
+            await Action().action({"chat_id": PARENT_CHAT, "mode": "subagent-rows", "dialogId": _dialog_id(emitted)},
+                                  __user__={"id": PARENT_USER}, __event_emitter__=RecordingEmitter([]))
+        reopened = seen[-1]["tasks"][0]["terminalSummary"]
+
+        self.assertEqual(in_place, reopened)
+
+    async def test_a_claude_cli_childs_result_reads_the_same_in_place_as_after_a_reopen(self):
+        """ELI-264 on live (QA session 35, 4/4): the open dialog kept "ran
+        `cd /config` and got `SUB-51`" while every reopen read "ran cd /config
+        and got SUB-51". What the dialog gets when a claude-cli child ends:
+        its settle, with nothing in its transcript yet; then the append of its
+        reply (`session.message`), which the transcript read has at once while
+        the list's `lastMessagePreview` (read from the transcript index,
+        reconciled later, and markdown flattened) is still empty; then nothing:
+        the list catches up with no push. The in-place row was filled from the
+        transcript, a reopen from the list."""
+        import asyncio
+
+        raw, flat = "ran `cd /config` and got `SUB-51`", "ran cd /config and got SUB-51"
+        rows = [_child(CHILD_A, "running", startedAt=self.NOW)]
+        transcript = {CHILD_A: [{"role": "user", "text": WRAPPED_93}]}
+        indexed = {"text": None}     # the list's lastMessagePreview, once indexed
+
+        async def gateway(method, params, timeout=5):
+            if method == "sessions.list":
+                last = params.get("includeLastMessage") and indexed["text"]
+                return {"sessions": [dict(r, lastMessagePreview=last) if last else r for r in rows]}
+            if method == "sessions.describe":
+                return {"session": {"key": PARENT_KEY, "hasActiveRun": False}}
+            return await _list_rpc(rows, transcript, [])(method, params, timeout)
+
+        def connection():
+            conn, events = self._follow_conn(rows, {})
+            conn.send_request = mock.AsyncMock(side_effect=gateway)
+            return conn, events
+
+        seen = []
+        real = openclaw_status_action._render_subagents_fill_js
+        spy = mock.patch("openclaw_status_action._render_subagents_fill_js",
+                         side_effect=lambda d: (seen.append(d), real(d))[1])
+        conn, events = connection()
+        with action_gateway(conn), spy:
+            opened = asyncio.ensure_future(Action().action(
+                {"chat_id": PARENT_CHAT}, __user__={"id": PARENT_USER}, __event_emitter__=RecordingEmitter([])))
+            await self._settle()
+            rows[0] = _child(CHILD_A, "done", startedAt=self.NOW, endedAt=self.NOW + 1000)
+            self._push(events["change"], CHILD_A)       # its settle
+            await self._settle()
+            transcript[CHILD_A] = transcript[CHILD_A] + [{"role": "assistant", "text": raw}]
+            self._push(events["message"], CHILD_A)      # its reply's append
+            await asyncio.wait_for(opened, 5)   # bounds the test only
+        in_place = seen[-1]["tasks"][0]["terminalSummary"]
+
+        indexed["text"] = flat      # the list caught up, with no push
+        conn, _events = connection()
+        emitted = []
+        with action_gateway(conn), spy:
+            await Action().action({"chat_id": PARENT_CHAT}, __user__={"id": PARENT_USER},
+                                  __event_emitter__=RecordingEmitter(emitted))
+            await Action().action({"chat_id": PARENT_CHAT, "mode": "subagent-rows", "dialogId": _dialog_id(emitted)},
+                                  __user__={"id": PARENT_USER}, __event_emitter__=RecordingEmitter([]))
+        reopened = seen[-1]["tasks"][0]["terminalSummary"]
+
+        self.assertEqual(in_place, reopened)
+        self.assertEqual(in_place, raw)     # the transcript's text, as the drawer shows it
+
 
 class _WindowGateway:
     """A Gateway's session store as 2026.9.3 lists it: `spawnedBy` returns a
@@ -442,6 +789,9 @@ class _WindowGateway:
     def __init__(self, rows, current=(), fail_spawned_by=False):
         self.rows, self.current, self.fail = rows, set(current), fail_spawned_by
         self.calls = []
+
+    def has_reply(self, _key):
+        return False
 
     async def send_request(self, method, params, timeout=5):
         self.calls.append((method, dict(params)))

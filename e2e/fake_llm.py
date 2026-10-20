@@ -13,8 +13,7 @@ whole):
 * `exactly: TOKEN` / `exactly TOKEN`  -> replies with TOKEN alone. Covers the
   installer's smoke test ("reply with exactly OK_CONFIG_TEST").
 * `E2E_COMPACT_FAIL` anywhere in a chat -> its compaction's summary request is
-  refused (HTTP 400 `E2E_COMPACT_REFUSED`), so the compaction fails.
-* `Create a concise title`            -> `TITLE` below: the Pipe's own chat-title
+  refused (HTTP 400 `E2E_COMPACT_REFUSED`), so the compaction fails.* `Create a concise title`            -> `TITLE` below: the Pipe's own chat-title
   run (the `title-gen` agent), after a chat's second exchange.
 * `E2E_SPAWN_SILENT`                   -> spawns a sub-agent (task `E2E_SILENT_CHILD`,
                                           label `silent helper`) that answers
@@ -54,6 +53,10 @@ and only a core set is sent as real schemas.
   the foreground until the file `hold-TOKEN` next to $FAKE_LLM_LOG exists
   (90 s at most), then replies `E2E_HOLD_END`: a run that goes on until the
   test lets it end, or stops it.
+* `E2E_HOLD_SPAWN TOKEN`                -> `E2E_HOLD TOKEN`, then, once the file
+  exists, spawns the sub-agent `E2E_SPAWN` does and replies `E2E_SPAWNED`: a
+  child that starts when the test says, while the chat's run goes on (ELI-260).
+* `E2E_SPAWN_LONG`                     -> `E2E_SPAWN` with a task 121 lines long.
 * `E2E_SLOW TOKEN`                     -> replies `TOKEN slow-1 ... slow-10`, one
   word a second, so a turn can be queued behind a run that is still going.
   `E2E_SLOW:<n> TOKEN` sends n words instead of 10 (a run that outlasts an
@@ -86,6 +89,8 @@ and only a core set is sent as real schemas.
 * `E2E_ASK_SECRET_STEPS`               -> asks `ASK_SECRET_STEPS` below: a request
   for an API key with numbered steps, which the Pipe asks in the masked
   dialog; answered as for `E2E_ASK_SINGLE`.
+* `E2E_ASK_YES_NO_HE`                  -> asks `ASK_YES_NO_HE` below, a Hebrew
+  yes/no question, answered as for `E2E_ASK_SINGLE`.
 * `E2E_SECRET_REQUEST NAME`            -> calls `secrets` with action=request for
   NAME (OpenClaw's masked credential entry), then, once the tool result is in,
   replies `E2E_SECRET_RESULT <status>` with the result's first "status".
@@ -143,10 +148,17 @@ _SECRET_REQUEST = re.compile(r"E2E_SECRET_REQUEST ([A-Z][A-Z0-9_]{2,})")
 _STATUS = re.compile(r'\\?"status\\?":\s*\\?"([a-z_]+)')
 _BG_AGENT = re.compile(r"E2E_BG_AGENT ([A-Za-z0-9_]{3,})")
 BG_AGENT_TITLE = "E2E background agent"   # E2E_BG_AGENT: the Agent call's description
+# E2E_BG_EXEC's command and the title its exec call gives it (ELI-232).
+BG_EXEC_COMMAND = "sleep 25; echo e2e-bg-done"
+BG_EXEC_TITLE = "E2E background sleep"
 _HOLD = re.compile(r"E2E_HOLD ([A-Za-z0-9_]{3,})")
+_HOLD_SPAWN = re.compile(r"E2E_HOLD_SPAWN ([A-Za-z0-9_]{3,})")
 _SLOW = re.compile(r"E2E_SLOW(?::(\d{1,3}))?\s+([A-Za-z0-9_]{3,})")
 SLOW_WORDS = 10
 SPAWN_TASK = "E2E_SLOW:20 E2E_CHILDTASK"   # the sub-agent's task for E2E_SPAWN
+# E2E_SPAWN_LONG's task: far taller than any screen once shown whole.
+LONG_SPAWN_TASK = SPAWN_TASK + "\n" + "\n".join(
+    f"Step {i}: check the vendor's data plan, its history window and its support terms." for i in range(1, 121))
 TITLE = "🧪 E2E chat title"
 DEPLOY_MID = "E2E_DEPLOY_MID " + " ".join(f"mid-{i}" for i in range(1, 21))
 DEPLOY_END = "E2E_DEPLOY_END " + " ".join(f"end-{i}" for i in range(1, 11))
@@ -160,6 +172,7 @@ ASK_SECRET = "OpenClaw needs input:\n\nTest token\nPaste the test API token (pas
 ASK_SECRET_STEPS = "OpenClaw needs input:\n\nToken\nPaste your API key:\n1. Open Settings\n2. Copy the key"
 ASK_MENTIONS_SECRET = ("OpenClaw needs input:\n\nRouter entry\nOK to add the router-debug entry "
                        "so W6 can use the password?\n1. Yes\n2. No")
+ASK_YES_NO_HE = "OpenClaw needs input:\n\nמחיקה\nלמחוק את הקובץ? (כן/לא)"
 WAKE_ASK = "E2E_WAKE_ASK_START " + " ".join(f"slow-{i}" for i in range(1, 7)) + "\n\n" + ASK_SINGLE
 
 
@@ -322,6 +335,8 @@ def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
         return {"text": ASK_MENTIONS_SECRET}
     if "E2E_ASK_SECRET" in user_text:
         return {"text": ASK_SECRET}
+    if "E2E_ASK_YES_NO_HE" in user_text:
+        return {"text": ASK_YES_NO_HE}
 
     if "session_status" in user_text and "model line" in user_text:
         if tool_results:
@@ -387,6 +402,20 @@ def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
                 return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
             return {"text": say, **call}
         return {"text": "E2E_BG_AGENT_END"}
+    m = _HOLD_SPAWN.search(user_text)
+    if m:
+        gate = hold_file(m.group(1))
+        steps = [("E2E_HOLD_START", "exec", {"command": f"for i in $(seq 450); do [ -e '{gate}' ] && break; "
+                                                       "sleep 0.2; done; echo e2e-hold-released",
+                                            "yieldMs": 100_000}),
+                 ("", "sessions_spawn", {"task": SPAWN_TASK})]
+        if len(tool_results) < len(steps):
+            say, name, args = steps[len(tool_results)]
+            call = _call_with(name, args, offered)
+            if not call:
+                return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
+            return {"text": say, **call} if say else call
+        return {"text": "E2E_SPAWNED"}
     m = _HOLD.search(user_text)
     if m:
         if tool_results:
@@ -409,7 +438,7 @@ def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
         # Action's Background section (ELI-163).
         if tool_results:
             return {"text": "E2E_BG_STARTED"}
-        args = {"command": "sleep 25; echo e2e-bg-done", "background": True}
+        args = {"command": BG_EXEC_COMMAND, "title": BG_EXEC_TITLE, "background": True}
         if "exec" in offered:
             return {"tool": "exec", "args": args}
         for wrapper in DEFERRED_CALL_TOOLS:
@@ -470,7 +499,7 @@ def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
         # while the test reads the Status Action's Subagents section.
         if tool_results:
             return {"text": "E2E_SPAWNED"}
-        args = {"task": SPAWN_TASK}
+        args = {"task": LONG_SPAWN_TASK if "E2E_SPAWN_LONG" in user_text else SPAWN_TASK}
         if "sessions_spawn" in offered:
             return {"tool": "sessions_spawn", "args": args}
         for wrapper in DEFERRED_CALL_TOOLS:

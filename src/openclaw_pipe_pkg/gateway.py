@@ -1767,6 +1767,9 @@ class _GatewayConnection:
         # The same, set by the next `session.message` (a transcript append)
         # for the session (ELI-164).
         self._session_message_waiters: dict[str, asyncio.Event] = {}
+        # The same, set by the next `sessions.changed` of a session spawned
+        # by the key, a new child among them (ELI-260).
+        self._session_child_waiters: dict[str, asyncio.Event] = {}
         self._tool_events_seen: dict[tuple, bool] = {}
         # (session key, tool call id) -> the task of a spawn call that started
         # and has no result yet (`_spawn_call_task`), for the child index.
@@ -1894,6 +1897,19 @@ class _GatewayConnection:
             # A gap or a fresh subscription: an append may be among the lost.
             for key in list(self._session_message_waiters):
                 self._session_message_waiters.pop(key).set()
+            for key in list(self._session_child_waiters):
+                self._session_child_waiters.pop(key).set()
+
+    def session_child_event(self, session_key: str) -> asyncio.Event:
+        """An Event set by the next `sessions.changed` of a child of
+        `session_key` (its row names it as `spawnedBy` or
+        `parentSessionKey`), a just spawned one included, or by a socket
+        gap. Take it BEFORE listing the children, as with
+        `session_change_event`."""
+        ev = self._session_child_waiters.get(session_key)
+        if ev is None:
+            ev = self._session_child_waiters[session_key] = asyncio.Event()
+        return ev
 
     def session_message_event(self, session_key: str) -> asyncio.Event:
         """An Event set by the next `session.message` for `session_key` (the
@@ -1930,6 +1946,11 @@ class _GatewayConnection:
         if key and "hasActiveRun" in payload:
             self._wake_session_waiters(key)
             self.row_to_consumers(key, payload)
+        parent = payload.get("spawnedBy") or payload.get("parentSessionKey")
+        if parent and parent != key:
+            ev = self._session_child_waiters.pop(parent, None)
+            if ev is not None:
+                ev.set()
         if _TURNS and key and payload.get("hasActiveRun") is False:
             _TURNS.settled(self, key, payload)
         if (payload.get("hasActiveRun") and key
@@ -2329,8 +2350,17 @@ class _GatewayConnection:
         if not consumer.queues or queue is None:
             del self._consumers[key]
             self._release_held(session_key)
+            # Its run may never have started (`has_reply`): waiters re-read.
+            self._wake_session_waiters(session_key)
         pipe_log(f"  unregistered consumer: {key[:60]}...")
         self._close_if_retired_and_idle()
+
+    def has_reply(self, session_key: str) -> bool:
+        """Whether a reply on this connection streams a run of `session_key`.
+        Its consumer is registered before its chat.send, so this holds while
+        the Gateway has no run for it yet (ELI-260); its end wakes the
+        session's `session_change_event`."""
+        return any(c.session_key == session_key for c in self._consumers.values())
 
     def _serving(self) -> bool:
         """Work a retired connection still owes: replies streaming here, and
@@ -3349,6 +3379,63 @@ def _history_text_for_run(history: dict, run_id: str) -> tuple[bool, str | None]
                 text = str(fallback.get("replacementText") or "").strip()
         return True, (text if text and text not in _SILENT_SENTINELS else None)
     return False, None
+
+
+def _usage_prompt_tokens(usage) -> int | None:
+    """The context a model call filled, from its `usage`, as OpenClaw counts a
+    session's `totalTokens` (`deriveContextPromptTokens`): the reported
+    `contextUsage`, else input + cacheRead + cacheWrite, else total - output.
+    None when the usage says nothing."""
+    if not isinstance(usage, dict):
+        return None
+    context = usage.get("contextUsage") if isinstance(usage.get("contextUsage"), dict) else {}
+    if context.get("state") == "unavailable":
+        return None
+    if context.get("state") == "available":
+        prompt = context.get("promptTokens")
+        return prompt if isinstance(prompt, (int, float)) and prompt > 0 else None
+    nums = {k: usage.get(k) if isinstance(usage.get(k), (int, float)) else 0
+            for k in ("input", "cacheRead", "cacheWrite", "output")}
+    prompt = nums["input"] + nums["cacheRead"] + nums["cacheWrite"]
+    if prompt > 0:
+        return prompt
+    total = usage.get("totalTokens", usage.get("total"))
+    if isinstance(total, (int, float)) and total - nums["output"] > 0:
+        return total - nums["output"]
+    return None
+
+
+def _history_usage_for_run(history: dict, run_id: str) -> dict | None:
+    """The `usage` of one run's last model call, from its newest assistant
+    message in `chat.history` that reports one. A run's messages carry its id
+    under `__openclaw.runId`, or, for the claude-cli runner's closing message
+    (whose usage is the run's last call), in `cli-assistant:<runId>`."""
+    messages = (history or {}).get("messages")
+    if not isinstance(messages, list) or not run_id:
+        return None
+    wanted = {run_id, f"cli-assistant:{run_id}"}
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
+        ids = {*_idempotency_keys(message), str(meta.get("runId") or ""), str(message.get("runId") or "")}
+        if ids & wanted and _usage_prompt_tokens(message.get("usage")):
+            return message["usage"]
+    return None
+
+
+def _history_latest_prompt_tokens(history: dict) -> int | None:
+    """The context the session's newest model call filled: the prompt tokens
+    of the newest assistant message in `chat.history` that reports a usage."""
+    messages = (history or {}).get("messages")
+    if not isinstance(messages, list):
+        return None
+    for message in reversed(messages):
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            prompt = _usage_prompt_tokens(message.get("usage"))
+            if prompt:
+                return prompt
+    return None
 
 
 def _history_renderer(messages: list) -> "_TurnRenderer":

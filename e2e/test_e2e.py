@@ -75,10 +75,13 @@ def _drive_chat_turn(token: str, prompt: str, model: str = DEFAULT_MODEL) -> dic
 
 
 def _chat_turn(token: str, prompt: str, model: str = DEFAULT_MODEL,
-               chat_id: str | None = None, extra: dict | None = None) -> tuple[str, dict]:
+               chat_id: str | None = None, extra: dict | None = None,
+               created: list | None = None) -> tuple[str, dict]:
     """(chat id, saved assistant message) of one turn in a new persisted chat,
     or of the next turn in `chat_id`. `extra`: more fields of the completion
-    request, as the browser adds them (`filter_ids` for a filter chip turned on)."""
+    request, as the browser adds them (`filter_ids` for a filter chip turned on).
+    `created`: gets a new chat's id as soon as it exists, for a turn run in a
+    thread."""
     now = int(time.time())
     uid, aid = str(uuid.uuid4()), str(uuid.uuid4())
     if chat_id:
@@ -103,9 +106,11 @@ def _chat_turn(token: str, prompt: str, model: str = DEFAULT_MODEL,
         status, saved = _request("POST", f"/api/v1/chats/{chat_id}", {"chat": chat}, token)
         assert status == 200, f"chat update failed: {status} {saved}"
     else:
-        status, created = _request("POST", "/api/v1/chats/new", {"chat": chat}, token)
-        assert status == 200, f"chat create failed: {status} {created}"
-        chat_id = created["id"]
+        status, new = _request("POST", "/api/v1/chats/new", {"chat": chat}, token)
+        assert status == 200, f"chat create failed: {status} {new}"
+        chat_id = new["id"]
+        if created is not None:
+            created.append(chat_id)
 
     # The path to the new user message, as the browser sends it.
     path, at = [], uid
@@ -234,6 +239,17 @@ def test_the_second_exchange_titles_the_chat(token):
 def test_persisted_chat_keeps_the_reply(token):
     msg = _drive_chat_turn(token, "Respond with exactly: E2E_PERSIST_OK")
     assert "E2E_PERSIST_OK" in (msg.get("content") or ""), json.dumps(msg)[:1500]
+
+
+def test_the_first_reply_in_a_new_chat_ends_with_the_usage_line(token):
+    """A new chat's first reply ends with its context line, as every later one
+    does. OpenClaw 2026.10 writes a session's first totals to its row just
+    after the run ends, so the line comes from the run's own usage (ELI-177)."""
+    chat_id, msg = _chat_turn(token, "E2E_ECHO: first reply usage")
+    lines = [h.get("description") for h in msg.get("statusHistory") or [] if isinstance(h, dict)]
+    usage = [line for line in lines if str(line).startswith("\U0001f9e0")]
+    # The fake model reports 10 prompt tokens; the stack's window is 200k.
+    assert usage and usage[-1].startswith("\U0001f9e0 10/200k"), f"chat {chat_id}: {lines}"
 
 
 def test_tool_call_persists_as_a_native_tool_card(token):
@@ -411,6 +427,31 @@ def _assert_clean(token: str, chat_id: str, msgs: dict) -> None:
     assert not open_, f"assistant message(s) left generating: {open_}"
     status, tasks = _request("GET", f"/api/tasks/chat/{chat_id}", token=token)
     assert status == 200 and not (tasks or {}).get("task_ids"), f"tasks left: {tasks}"
+
+
+def _status_lines(msg: dict) -> list:
+    return [h.get("description") for h in msg.get("statusHistory") or [] if isinstance(h, dict)]
+
+
+def _assert_ends_like_inline(msg: dict, inline: dict, what: str) -> None:
+    """A reply the Pipe's writer finished ends as an inline reply of the same
+    chat does (ELI-210): with the usage line whenever that one has it, and
+    with no "Stopped" a takeover's cancel left. 2026.10.10 reports a session's
+    tokens only after its first run, so `inline` is a chat's second reply."""
+    lines, ref = _status_lines(msg), _status_lines(inline)
+    usage = lambda ls: any(str(line).startswith("\U0001f9e0") for line in ls)  # noqa: E731
+    assert usage(lines) == usage(ref), f"{what}: {lines}; an inline reply: {ref}"
+    assert "Stopped" not in lines, f"{what}: a Stopped line: {lines}"
+
+
+def test_a_wake_reply_ends_like_an_inline_reply(token):
+    chat_id, _ = _chat_turn(token, "Respond with exactly: E2E_USAGE_CHAT")
+    chat_id, inline = _chat_turn(token, "Respond with exactly: E2E_USAGE_AGAIN", chat_id=chat_id)
+    _schedule_wake(_session_key(token, chat_id), "Reply with exactly: WAKE_USAGE_LINE", 3)
+    msgs = _wait_for(token, chat_id, ["WAKE_USAGE_LINE"])
+    woke = [m for m in msgs.values() if m.get("role") == "assistant" and "WAKE_USAGE_LINE" in (m.get("content") or "")]
+    assert len(woke) == 1, woke
+    _assert_ends_like_inline(woke[0], inline, "the wake's reply")
 
 
 def test_two_cron_wakes_in_a_row_get_one_finished_message_each(token):
@@ -742,7 +783,9 @@ def _crash_loop_allows_a_crash() -> bool:
     and 2026.10.10 alike), so a crash test run again soon after the last ones
     has nothing to check (ELI-174). True while one more crash stays under it:
     at most one earlier unclean boot (no completion) in the window, besides
-    the live one. The suite crashes twice, so in one run this is always true."""
+    the live one. The suite crashes three times; e2e/shards.py puts at most
+    two of them on one stack, so in CI this is true at once (ELI-246). A run
+    of the whole file waits here before the third, for up to 5 minutes."""
     db = sqlite3.connect(f"file:{GATEWAY_STATE_DB}?mode=ro", uri=True)
     try:
         started = [r[0] for r in db.execute(
@@ -1060,12 +1103,23 @@ def _section_data(codes: list, element_id: str, index: int = -1) -> dict:
     return json.loads(re.search(r"const DATA = (.*?);\n", code).group(1))
 
 
+def test_a_subagent_result_ends_like_an_inline_reply(token):
+    if _openclaw_release() < (2026, 10):
+        pytest.skip("OpenClaw 2026.9: a sub-agent's result message never finishes (ELI-138, fixed in 2026.10.3)")
+    chat_id, _ = _chat_turn(token, "Respond with exactly: E2E_USAGE_CHAT")
+    chat_id, inline = _chat_turn(token, "E2E_SPAWN one helper", chat_id=chat_id)
+    assert inline.get("content", "").strip() == "E2E_SPAWNED", inline
+    msgs = _wait_for(token, chat_id, ["E2E_CHILDTASK"])
+    result = [m for m in msgs.values() if m.get("role") == "assistant" and "E2E_CHILDTASK" in (m.get("content") or "")]
+    assert len(result) == 1, result
+    _assert_ends_like_inline(result[0], inline, "the sub-agent's result")
+
+
 def test_the_status_action_lists_a_running_subagent_and_opens_its_drawer(token):
     chat_id, msg = _chat_turn(token, "E2E_SPAWN one helper")
     assert msg.get("content", "").strip() == "E2E_SPAWNED", msg
     status, me = _request("GET", "/api/v1/auths/", token=token)
     assert status == 200, me
-
     # The dialog stays open while a listed child runs and refills on its
     # pushed change (ELI-127), so this returns once the child is done.
     codes = _run_action(token, lambda a, emit: a.action(
@@ -1073,9 +1127,14 @@ def test_the_status_action_lists_a_running_subagent_and_opens_its_drawer(token):
     data = _section_data(codes, "openclaw-status-section-subagents", 0)
     assert data["error"] is None, data
     assert len(data["tasks"]) == 1, data
-    row = data["tasks"][0]
-    assert row["title"] == SPAWN_TASK, row
-    assert row["status"] == "running", row
+    assert data["tasks"][0]["status"] == "running", data
+    # Titled by its task while it runs: at once, or, opened before its spawn
+    # message reached its transcript (2026.10), once it has (ELI-253).
+    fills = [c for c in codes if "getElementById('openclaw-status-section-subagents')" in c]
+    running = [t for c in fills for t in json.loads(re.search(r"const DATA = (.*?);\n", c).group(1))["tasks"]
+               if t["status"] == "running"]
+    row = running[-1]
+    assert row["title"] == SPAWN_TASK, [t["title"] for t in running]
     assert row["id"] == row["childSessionKey"] and row["id"].startswith("agent:main:subagent:"), row
     assert isinstance(row["startedAt"], int) and row["endedAt"] is None, row
     # Its end shows in the open dialog, and it stays listed (ELI-152).
@@ -1085,10 +1144,12 @@ def test_the_status_action_lists_a_running_subagent_and_opens_its_drawer(token):
     # Reopened, the ended child is still there: the open reads every session.
     codes = _run_action(token, lambda a, emit: a.action(
         {"chat_id": chat_id}, __user__={"id": me["id"]}, __event_emitter__=emit))
-    reopened = _section_data(codes, "openclaw-status-section-subagents")
+    # The open's own fill: the chat may still be running its turn for the
+    # child's result, which the dialog follows and fills again (ELI-260).
+    reopened = _section_data(codes, "openclaw-status-section-subagents", 0)
     assert [(t["id"], t["status"]) for t in reopened["tasks"]] == [(row["id"], "completed")], reopened
     assert reopened["total"] == 1, reopened
-    # Nothing runs, so the section opens folded and its transcripts wait for
+    # No child runs, so the section opens folded and its transcripts wait for
     # the reader's tap (ELI-163); the tap reads them and titles the row.
     assert reopened["pending"] is True, reopened
     assert _section_data(codes, "openclaw-status-section-agents")["agents"] == []
@@ -1119,6 +1180,97 @@ def test_the_status_action_lists_a_running_subagent_and_opens_its_drawer(token):
     assert drawer["items"] and drawer["items"][-1]["kind"] == "text", drawer
     assert drawer["items"][-1]["text"].startswith("E2E_CHILDTASK slow-1"), drawer
     assert drawer["parent"]["chatId"] == chat_id, drawer
+
+
+def test_a_subagent_spawned_after_the_status_dialog_opened_is_listed_while_it_stays_open(token):
+    """ELI-260 (QA C27): opened while the chat's run went on, the dialog
+    listed no child and stopped following, so a child spawned after the open
+    stayed out of it until a reopen."""
+    chat_id, _ = _chat_turn(token, "Respond with exactly: E2E_USAGE_CHAT")
+    key = _session_key(token, chat_id)
+    status, me = _request("GET", "/api/v1/auths/", token=token)
+    assert status == 200, me
+    hold_token = f"c27{uuid.uuid4().hex[:8]}"
+    # e2e/fake_llm.py hold_file
+    hold = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{hold_token}")
+    replies: list = []
+    turn = threading.Thread(target=lambda: replies.append(
+        _chat_turn(token, f"E2E_HOLD_SPAWN {hold_token}", chat_id=chat_id)[1]), daemon=True)
+    turn.start()
+    try:
+        _until("the chat's run to hold", lambda: _gw("sessions.describe", {"key": key})
+               .get("session", {}).get("hasActiveRun"), timeout_s=60, every_s=1)
+
+        async def open_then_spawn(action, emit):
+            async def emit_then_release(evt):
+                await emit(evt)
+                code = (evt.get("data") or {}).get("code") or ""
+                if "getElementById('openclaw-status-section-subagents')" in code:
+                    open(hold, "w").close()     # the run spawns its child now
+            await action.action({"chat_id": chat_id}, __user__={"id": me["id"]},
+                                __event_emitter__=emit_then_release)
+
+        # Returns once nothing is left to follow: the chat's run and the child
+        # are done.
+        codes = _run_action(token, open_then_spawn)
+    finally:
+        open(hold, "w").close()
+        turn.join(TURN_TIMEOUT_S)
+    assert replies and replies[0].get("content", "").strip().endswith("E2E_SPAWNED"), replies
+    assert _section_data(codes, "openclaw-status-section-subagents", 0)["tasks"] == []
+    fills = [c for c in codes if "getElementById('openclaw-status-section-subagents')" in c]
+    statuses = [[t["status"] for t in json.loads(re.search(r"const DATA = (.*?);\n", c).group(1))["tasks"]]
+                for c in fills]
+    assert ["running"] in statuses, statuses
+    assert statuses[-1] == ["completed"], statuses
+
+
+def test_a_subagent_done_in_the_open_status_dialog_shows_its_result_and_the_chats_context(token):
+    """ELI-262 (QA C31): opened right after the chat's first message, the
+    dialog never showed a Context, and once its sub-agent was Done it stopped
+    refreshing, before the child's result line arrived; a reopen showed both."""
+    status, me = _request("GET", "/api/v1/auths/", token=token)
+    assert status == 200, me
+    hold_token = f"c31{uuid.uuid4().hex[:8]}"
+    # e2e/fake_llm.py hold_file
+    hold = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{hold_token}")
+    created, replies = [], []
+    turn = threading.Thread(target=lambda: replies.append(
+        _chat_turn(token, f"E2E_HOLD_SPAWN {hold_token}", created=created)[1]), daemon=True)
+    turn.start()
+    try:
+        _until("the chat to exist", lambda: created, timeout_s=30, every_s=0.2)
+        chat_id = created[0]
+        key = _session_key(token, chat_id)
+        _until("the chat's run to hold", lambda: _gw("sessions.describe", {"key": key})
+               .get("session", {}).get("hasActiveRun"), timeout_s=60, every_s=1)
+
+        async def open_then_spawn(action, emit):
+            async def emit_then_release(evt):
+                await emit(evt)
+                code = (evt.get("data") or {}).get("code") or ""
+                if "getElementById('openclaw-status-section-subagents')" in code:
+                    open(hold, "w").close()     # the run spawns its child now
+            await action.action({"chat_id": chat_id}, __user__={"id": me["id"]},
+                                __event_emitter__=emit_then_release)
+
+        # Returns once nothing is left to follow.
+        codes = _run_action(token, open_then_spawn)
+    finally:
+        open(hold, "w").close()
+        turn.join(TURN_TIMEOUT_S)
+    assert replies and replies[0].get("content", "").strip().endswith("E2E_SPAWNED"), replies
+
+    def fills(element_id):
+        return [json.loads(re.search(r"const DATA = (.*?);\n", c).group(1))
+                for c in codes if f"getElementById('{element_id}')" in c]
+    row = fills("openclaw-status-section-subagents")[-1]["tasks"][0]
+    assert row["status"] == "completed", row
+    assert (row["terminalSummary"] or "").startswith("E2E_CHILDTASK slow-1"), row
+    # Opened while the chat's first run held: Context is read again as the
+    # run goes on, not only at the open.
+    contexts = fills("openclaw-status-section-context")
+    assert len(contexts) > 1 and contexts[-1]["context"], contexts
 
 
 def test_a_subagent_result_the_parent_answers_with_silence_shows_as_its_card(token):
@@ -1270,8 +1422,10 @@ def test_the_status_action_lists_a_background_command(token):
     assert data["error"] is None and data["errors"] == [], data
     assert data["tasksAvailable"] is True, data
     commands = [r for r in data["rows"] if r["kind"] == "Command"]
-    # Titled by the command its tool card ran, not the Gateway's "CLI command".
-    assert [(r["title"], r["status"]) for r in commands] == [("sleep 25; echo e2e-bg-done", "running")], data
+    # Titled by the title its exec call gave it, not the Gateway's "CLI
+    # command" or the command's first words (ELI-232); the command under it.
+    assert [(r["title"], r["status"], r["preview"], r["command"]) for r in commands] == [
+        ("E2E background sleep", "running", "sleep 25", "sleep 25; echo e2e-bg-done")], data
 
 
 def test_the_reply_to_a_background_commands_end_finishes(token):
@@ -2048,3 +2202,59 @@ def test_the_picked_thinking_level_reaches_the_model_and_a_clamp_says_so(token, 
     content = second.get("content") or ""
     assert "This model does not support thinking level 'max', using 'high' instead." in content, content
     assert content.endswith(second_marker), content
+
+
+ELI205_UPSTREAM = "https://github.com/open-webui/open-webui/issues/32741"
+
+
+class Eli205Present(AssertionError):
+    """The cancel probe wedged or locked Open WebUI's DB. Only this fails the
+    drop gate's expected way: a probe that could not run fails it for real."""
+
+
+class ProbeIneffective(AssertionError):
+    """The probe did not produce its precondition (no cancel landed while
+    aiosqlite's thread ran the write), so its result proves nothing."""
+
+
+@pytest.mark.skipif(shutil.which("docker") is None, reason="needs the e2e stack's Open WebUI container")
+@pytest.mark.parametrize("mode", [
+    "shielded",
+    pytest.param("raw", marks=pytest.mark.xfail(strict=True, raises=Eli205Present, reason=(
+        "ELI-205 drop gate: on this Open WebUI a cancelled chat write wedges or locks SQLite "
+        f"({ELI205_UPSTREAM}). An XPASS means the pinned release fixed it: drop the Pipe's "
+        "`_uncancellable` shield and this gate."))),
+])
+def test_a_cancelled_chat_write_leaves_the_database_writable(token, mode):
+    """ELI-205: a Stop cancels a chat message write while aiosqlite's thread
+    runs one of its statements; on an Open WebUI without open-webui#32745
+    the cancelled write never ends and SQLite stays locked. The probe
+    (e2e/owui_cancel_probe.py) makes that window in the Open WebUI container,
+    so the cancel lands there on any machine, up to 60 times: `shielded`
+    (through the Pipe's write) must always pass; `raw` (no shield) shows
+    whether Open WebUI still needs it. A run where no cancel landed in the
+    thread fails as ProbeIneffective, never as a pass."""
+    status, chat = _request("POST", "/api/v1/chats/new", {"chat": {
+        "title": "ELI-205 probe", "messages": [], "history": {"messages": {}}}}, token)
+    assert status == 200, chat
+    here = os.path.dirname(os.path.abspath(__file__))
+    for src, dst in ((os.path.join(here, "owui_cancel_probe.py"), "/tmp/owui_cancel_probe.py"),
+                     (os.path.join(here, "..", "openclaw_pipe.py"), "/tmp/openclaw_pipe_probe.py")):
+        with open(src, "rb") as f:
+            subprocess.run(["docker", "exec", "-i", "owui", "sh", "-c", f"cat > {dst}"], stdin=f,
+                           check=True, capture_output=True, timeout=60)
+    try:
+        out = subprocess.run(["docker", "exec", "-w", "/app/backend", "owui", "python3", "/tmp/owui_cancel_probe.py",
+                              mode, "60", chat["id"], "/tmp/openclaw_pipe_probe.py"],
+                             capture_output=True, text=True, timeout=900)
+    finally:
+        _request("DELETE", f"/api/v1/chats/{chat['id']}", token=token)
+    lines = [ln for ln in out.stdout.splitlines() if ln.startswith("{")]
+    assert lines, f"the probe printed no result: {out.stdout[-500:]} {out.stderr[-1500:]}"
+    result = json.loads(lines[-1])
+    # In the test's output: attempts, and how many cancels landed where.
+    print(f"ELI-205 probe ({mode}): {json.dumps(result)}")
+    if result["bug"] is None or not result["landed"]["in_thread"]:
+        raise ProbeIneffective(result)
+    if result["bug"]:
+        raise Eli205Present(result)

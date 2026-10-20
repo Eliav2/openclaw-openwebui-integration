@@ -17,6 +17,7 @@ Everything here works as soon as the Pipe is installed, except entries marked:
 - [**Native tool cards**](./chat.md#tool-cards): tool calls render as Open WebUI's own two-phase cards, expandable to their input and output
 - [**Sub-agent cards**](./chat.md#sub-agent-cards): a sub-agent the agent starts shows as a card named after it, with the head of its task and whether it started
 - [**Failed tools marked**](./chat.md#failed-tools): failed calls are labelled live, and a call that never returns is closed rather than left spinning
+- [**Live view of the agent's browser**](./chat.md#live-view-of-the-agents-browser): a reply that uses a browser can show that browser live, inside the message, from a service you run
 - [**Questions as cards**](./questions.md) _(needs agent setup)_: agent questions become Open WebUI's question cards (text, yes/no, single choice, multi-select by number), a masked dialog for a secret, and survive a reload
 - [**Per-chat thinking control**](./chat.md#thinking-level) _(separate function)_: a toggle in the composer sets the reasoning level per chat, offering only the levels your models support
 - [**Images and files from the agent**](./chat.md#images-and-files-from-the-agent) _(needs agent setup)_: `MEDIA:` files are uploaded to the Open WebUI Files API and attached natively
@@ -70,7 +71,7 @@ Everything here works as soon as the Pipe is installed, except entries marked:
 | File | Open WebUI type | Purpose |
 | --- | --- | --- |
 | [`openclaw_pipe.py`](../../openclaw_pipe.py) | [Pipe](https://docs.openwebui.com/features/extensibility/plugin/functions/pipe) (manifold) | The chat integration: almost everything above |
-| [`openclaw_status_action.py`](../../openclaw_status_action.py) | [Action](https://docs.openwebui.com/features/extensibility/plugin/functions/action) | The toolbar button (a paw) and the dialog, titled Claw; reuses the Pipe's live connection and device identity, so there is no second pairing |
+| [`openclaw_status_action.py`](../../openclaw_status_action.py) | [Action](https://docs.openwebui.com/features/extensibility/plugin/functions/action) | The toolbar button (a crab claw) and the dialog, titled Claw; reuses the Pipe's live connection and device identity, so there is no second pairing |
 | [`openclaw_thinking_filter.py`](../../openclaw_thinking_filter.py) | [Filter](https://docs.openwebui.com/features/extensibility/plugin/functions/filter) | The per-chat thinking toggle in the composer. Optional, and imports nothing but the standard library and pydantic |
 
 All three are generated from the same `src/openclaw_pipe_pkg/` source fragments. Contributing: [Development](../development.md).

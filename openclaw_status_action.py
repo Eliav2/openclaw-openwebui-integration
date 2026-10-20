@@ -88,6 +88,7 @@ import contextlib
 import copy
 import functools
 import re
+import shlex
 import signal
 import mimetypes
 import urllib.error
@@ -2760,6 +2761,9 @@ class _GatewayConnection:
         # The same, set by the next `session.message` (a transcript append)
         # for the session (ELI-164).
         self._session_message_waiters: dict[str, asyncio.Event] = {}
+        # The same, set by the next `sessions.changed` of a session spawned
+        # by the key, a new child among them (ELI-260).
+        self._session_child_waiters: dict[str, asyncio.Event] = {}
         self._tool_events_seen: dict[tuple, bool] = {}
         # (session key, tool call id) -> the task of a spawn call that started
         # and has no result yet (`_spawn_call_task`), for the child index.
@@ -2887,6 +2891,19 @@ class _GatewayConnection:
             # A gap or a fresh subscription: an append may be among the lost.
             for key in list(self._session_message_waiters):
                 self._session_message_waiters.pop(key).set()
+            for key in list(self._session_child_waiters):
+                self._session_child_waiters.pop(key).set()
+
+    def session_child_event(self, session_key: str) -> asyncio.Event:
+        """An Event set by the next `sessions.changed` of a child of
+        `session_key` (its row names it as `spawnedBy` or
+        `parentSessionKey`), a just spawned one included, or by a socket
+        gap. Take it BEFORE listing the children, as with
+        `session_change_event`."""
+        ev = self._session_child_waiters.get(session_key)
+        if ev is None:
+            ev = self._session_child_waiters[session_key] = asyncio.Event()
+        return ev
 
     def session_message_event(self, session_key: str) -> asyncio.Event:
         """An Event set by the next `session.message` for `session_key` (the
@@ -2923,6 +2940,11 @@ class _GatewayConnection:
         if key and "hasActiveRun" in payload:
             self._wake_session_waiters(key)
             self.row_to_consumers(key, payload)
+        parent = payload.get("spawnedBy") or payload.get("parentSessionKey")
+        if parent and parent != key:
+            ev = self._session_child_waiters.pop(parent, None)
+            if ev is not None:
+                ev.set()
         if _TURNS and key and payload.get("hasActiveRun") is False:
             _TURNS.settled(self, key, payload)
         if (payload.get("hasActiveRun") and key
@@ -3322,8 +3344,17 @@ class _GatewayConnection:
         if not consumer.queues or queue is None:
             del self._consumers[key]
             self._release_held(session_key)
+            # Its run may never have started (`has_reply`): waiters re-read.
+            self._wake_session_waiters(session_key)
         pipe_log(f"  unregistered consumer: {key[:60]}...")
         self._close_if_retired_and_idle()
+
+    def has_reply(self, session_key: str) -> bool:
+        """Whether a reply on this connection streams a run of `session_key`.
+        Its consumer is registered before its chat.send, so this holds while
+        the Gateway has no run for it yet (ELI-260); its end wakes the
+        session's `session_change_event`."""
+        return any(c.session_key == session_key for c in self._consumers.values())
 
     def _serving(self) -> bool:
         """Work a retired connection still owes: replies streaming here, and
@@ -4344,6 +4375,63 @@ def _history_text_for_run(history: dict, run_id: str) -> tuple[bool, str | None]
     return False, None
 
 
+def _usage_prompt_tokens(usage) -> int | None:
+    """The context a model call filled, from its `usage`, as OpenClaw counts a
+    session's `totalTokens` (`deriveContextPromptTokens`): the reported
+    `contextUsage`, else input + cacheRead + cacheWrite, else total - output.
+    None when the usage says nothing."""
+    if not isinstance(usage, dict):
+        return None
+    context = usage.get("contextUsage") if isinstance(usage.get("contextUsage"), dict) else {}
+    if context.get("state") == "unavailable":
+        return None
+    if context.get("state") == "available":
+        prompt = context.get("promptTokens")
+        return prompt if isinstance(prompt, (int, float)) and prompt > 0 else None
+    nums = {k: usage.get(k) if isinstance(usage.get(k), (int, float)) else 0
+            for k in ("input", "cacheRead", "cacheWrite", "output")}
+    prompt = nums["input"] + nums["cacheRead"] + nums["cacheWrite"]
+    if prompt > 0:
+        return prompt
+    total = usage.get("totalTokens", usage.get("total"))
+    if isinstance(total, (int, float)) and total - nums["output"] > 0:
+        return total - nums["output"]
+    return None
+
+
+def _history_usage_for_run(history: dict, run_id: str) -> dict | None:
+    """The `usage` of one run's last model call, from its newest assistant
+    message in `chat.history` that reports one. A run's messages carry its id
+    under `__openclaw.runId`, or, for the claude-cli runner's closing message
+    (whose usage is the run's last call), in `cli-assistant:<runId>`."""
+    messages = (history or {}).get("messages")
+    if not isinstance(messages, list) or not run_id:
+        return None
+    wanted = {run_id, f"cli-assistant:{run_id}"}
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
+        ids = {*_idempotency_keys(message), str(meta.get("runId") or ""), str(message.get("runId") or "")}
+        if ids & wanted and _usage_prompt_tokens(message.get("usage")):
+            return message["usage"]
+    return None
+
+
+def _history_latest_prompt_tokens(history: dict) -> int | None:
+    """The context the session's newest model call filled: the prompt tokens
+    of the newest assistant message in `chat.history` that reports a usage."""
+    messages = (history or {}).get("messages")
+    if not isinstance(messages, list):
+        return None
+    for message in reversed(messages):
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            prompt = _usage_prompt_tokens(message.get("usage"))
+            if prompt:
+                return prompt
+    return None
+
+
 def _history_renderer(messages: list) -> "_TurnRenderer":
     """A `_TurnRenderer` fed one run's `chat.history` messages instead of its
     live events, so a run whose events were lost still ends as the same
@@ -4942,6 +5030,33 @@ def _background_agents_line(n: int) -> str:
     return f"Waiting on {n} background agent{'' if n == 1 else 's'}"
 
 
+# Live view of the agent's browser (LIVE_VIEW_URL): ids go into the URL as they
+# are, so they must be plain ids.
+_LIVE_VIEW_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def _live_view_url(valves, *, chat_id, message_id, user_id, email, tool_name, args_str):
+    """The embed URL for a reply whose tool call looks like browser use, or None.
+    None when the valve is off, the user is not in LIVE_VIEW_USERS, the tool does
+    not match LIVE_VIEW_TOOLS, or the URL would not be an http(s) URL: Open WebUI
+    renders any other embed string as HTML."""
+    template = (getattr(valves, "LIVE_VIEW_URL", "") or "").strip()
+    if not template or not re.match(r"^https?://", template, re.I):
+        return None
+    if not all(isinstance(v, str) and _LIVE_VIEW_ID.match(v) for v in (chat_id, message_id)):
+        return None
+    users = _parse_owner_users(getattr(valves, "LIVE_VIEW_USERS", "") or "")
+    if users and not _is_owner_user(users, user_id, email):
+        return None
+    try:
+        tools = re.compile(getattr(valves, "LIVE_VIEW_TOOLS", "") or r"(?!)", re.I)
+    except re.error:
+        return None
+    if not tools.search(f"{tool_name or ''} {args_str or ''}"):
+        return None
+    return template.replace("{chat_id}", chat_id).replace("{message_id}", message_id)
+
+
 def _fmt_tokens(n) -> str:
     """Compact token count: 115212 -> '115k', 1000000 -> '1.0m'."""
     try:
@@ -5019,7 +5134,8 @@ def _window_reset_line(w: dict) -> str | None:
     return f"⏱ {bit} (resets in {rel})"
 
 
-async def _build_usage_status_lines(conn, session_key, timeout: float = 5) -> list[str]:
+async def _build_usage_status_lines(conn, session_key, timeout: float = 5,
+                                    run_usage: dict | None = None) -> list[str]:
     """Best-effort final status lines: context window fill (combined with the
     provider's primary/nearest-term rate-limit window on the same line, kept
     deliberately thin -- no reset time), one full detail line per rate-limit
@@ -5042,6 +5158,12 @@ async def _build_usage_status_lines(conn, session_key, timeout: float = 5) -> li
     just omits that line. They're fetched concurrently (not one after the
     other) so this adds at most one round trip's worth of latency, not two,
     to the moment the status line settles after the reply text is done.
+
+    `run_usage`: the reply's own run's last-call usage. Its prompt tokens are
+    the context fill, over the row's `totalTokens`: OpenClaw 2026.10 writes a
+    session's first totals to its row just after the run ends, so a new
+    chat's first reply found none there, and every later reply read the run
+    before it (ELI-177). The window (`contextTokens`) still comes from the row.
     """
     describe_task = asyncio.ensure_future(
         conn.send_request("sessions.describe", dict(key=session_key), timeout=timeout)
@@ -5056,7 +5178,7 @@ async def _build_usage_status_lines(conn, session_key, timeout: float = 5) -> li
         session_row = (desc or {}).get("session") or {}
         provider = session_row.get("modelProvider")
         context_tokens = session_row.get("contextTokens")
-        total_tokens = session_row.get("totalTokens")
+        total_tokens = _usage_prompt_tokens(run_usage) or session_row.get("totalTokens")
         if context_tokens and total_tokens is not None:
             pct = round(total_tokens / context_tokens * 100, 1)
             context_bit = f"🧠 {_fmt_tokens(total_tokens)}/{_fmt_tokens(context_tokens)} ({pct:g}%)"
@@ -5264,7 +5386,7 @@ def _dialog_safe_event_call(event_call, sid, user_id):
 # reply that is streaming into the same tab.
 # ---------------------------------------------------------------------------
 
-_COMPOSER_BUTTON_VERSION = "6"
+_COMPOSER_BUTTON_VERSION = "7"
 
 # The Status Action's function id (install_action.py's FUNCTION_ID; the
 # dialog's own JS calls the same fixed id) and the Pipe's default function id.
@@ -5304,8 +5426,9 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
   // removing it (a layout this snippet does not understand): give up.
   const LOOP_LIMIT = 20;
   const LOOP_WINDOW_MS = 10000;
-  // A paw, drawn in Heroicons' outline style (24x24, round caps), for "Claw".
-  const PAW_PATH = 'M11 6a1.5 2 0 1 1-3 0 1.5 2 0 0 1 3 0ZM16 6a1.5 2 0 1 1-3 0 1.5 2 0 0 1 3 0ZM7 10.5a1.5 1.75 0 1 1-3 0 1.5 1.75 0 0 1 3 0ZM20 10.5a1.5 1.75 0 1 1-3 0 1.5 1.75 0 0 1 3 0ZM12 12.75c-2.25 0-5.25 2.6-5.25 4.875 0 1.45 1.1 2.375 2.55 2.375.95 0 1.7-.45 2.7-.45s1.75.45 2.7.45c1.45 0 2.55-.925 2.55-2.375 0-2.275-3-4.875-5.25-4.875Z';
+  // A crab claw (ELI-231): an open pincer with a tooth on each finger and a
+  // wrist, in Heroicons' outline style (24x24, round caps), for "Claw".
+  const CLAW_PATH = 'M6.3 14.6C4.6 11.7 5.7 7.1 8.7 4.6C10.8 2.8 13.4 2.3 15.6 3.1C14.3 3.7 13.4 4.4 13 5.3L13.9 6.5L12 6.9C11.6 7.5 11.3 8.1 11.2 8.7C11.1 11 12.7 12.9 15.1 12.7C16.4 12.5 17.3 11.9 17.8 11.1L17.1 10L18.6 9.7C18.6 9.2 18.6 8.7 18.5 8.2C20.5 10.2 20.6 13.4 18.9 15.8C17.1 18.3 14.2 18.8 11.6 17.8C9.5 17 7.5 16.1 6.3 14.6ZM7.8 16L5.4 19.6L9.1 21.1L11 17.6';
 
   const state = {
     prefixes: [],
@@ -5564,7 +5687,7 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
       + 'bg-transparent text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800';
     b.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" '
       + 'stroke-width="1.75" stroke="currentColor" aria-hidden="true" class="size-4">'
-      + '<path stroke-linecap="round" stroke-linejoin="round" d="' + PAW_PATH + '"/></svg>'
+      + '<path stroke-linecap="round" stroke-linejoin="round" d="' + CLAW_PATH + '"/></svg>'
       // Icon-only below `sm`, like Open WebUI's own composer chips: at phone
       // width the chip row's overflow cut the label to "Stat" (ELI-123). The
       // title and aria-label still name it. Both classes ship in Open WebUI's CSS.
@@ -6093,11 +6216,26 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     more.type = 'button';
     more.dataset.openclawMore = name;
     more.className = 'text-xs text-blue-600 dark:text-blue-400 mt-1';
+    // Shown whole, the text scrolls in a box of at most 40% of the screen:
+    // uncapped, a long task pushed the header, "Show less" and the whole run
+    // below the bottom of the drawer, with nothing to scroll (ELI-201).
     function show(open) {
       body.style.webkitLineClamp = open ? 'unset' : String(lines);
+      body.style.maxHeight = open ? '40vh' : '';
+      body.style.overflowY = open ? 'auto' : 'hidden';
+      body.style.overscrollBehavior = open ? 'contain' : '';
       more.textContent = open ? 'Show less' : 'Show all';
     }
-    more.onclick = function() { state[name] = !state[name]; show(state[name]); };
+    more.onclick = function() {
+      state[name] = !state[name];
+      show(state[name]);
+      if (state[name]) return;
+      // Clamped again, the preview is the text's first lines: a box left
+      // scrolled showed two lines from wherever it was (ELI-236). And if
+      // whatever holds the block scrolled past its top, bring it back.
+      body.scrollTop = 0;
+      wrap.scrollIntoView({ block: 'nearest' });
+    };
     show(!!state[name]);
     wrap.appendChild(more);
     return wrap;
@@ -7221,10 +7359,40 @@ _BACKGROUND_FILL_JS_TEMPLATE = r"""
     S.sectionError('background', DATA.error);
     return;
   }
+  const isLive = function(r) { return r.status === 'running' || r.status === 'queued'; };
+
+  // ELI-256: the Gateway pushes nothing when a background task ends, so
+  // while a row runs the open dialog reads the section again, one ask at a
+  // time, as the drawer follows its child (ELI-155). The fill each ask
+  // brings sets the next; an ask that brought none (failed, or its fill was
+  // lost) tries again; none once the dialog is gone. A read that failed
+  // keeps following and, on a refill, keeps the rows shown (ELI-261): only a
+  // good read with nothing running ends it.
+  const failed = (DATA.errors || []).length > 0;
+  function follow(rows) {
+    clearTimeout(S.bgPoll);
+    S.bgFills = (S.bgFills || 0) + 1;
+    if (!failed && !rows.some(isLive)) return;
+    const wait = S.identity.backgroundPollMs || 5000;
+    function ask() {
+      if (!section.isConnected) return;
+      const fills = S.bgFills;
+      const again = function() {
+        if (S.bgFills === fills) S.bgPoll = setTimeout(ask, wait);
+      };
+      S.askAction({ mode: 'background-rows' }).then(again, again);
+    }
+    S.bgPoll = setTimeout(ask, wait);
+  }
+  if (failed && DATA.refill && S.bgShown) {
+    follow(S.bgShown);
+    return;
+  }
+
   section.innerHTML = '';
   section.className = 'mb-4';
   const rows = DATA.rows || [];
-  const isLive = function(r) { return r.status === 'running' || r.status === 'queued'; };
+  if (!failed) S.bgShown = rows;
   const live = rows.some(isLive);
   const fold = S.collapsible('background', S.countLabel('Background', rows.length, DATA.total || 0), live);
   section.appendChild(fold.wrap);
@@ -7250,11 +7418,37 @@ _BACKGROUND_FILL_JS_TEMPLATE = r"""
                          time: r.status === 'running' ? S.elapsedCell(r.startedAt, null, true) : null,
                          preview: line(r.kind, automationDetail(r)) });
     }
-    return S.listRow({
+    let el = null;
+    el = S.listRow({
       kind: 'openclawBgRow', title: r.title, status: r.status,
       time: S.elapsedCell(r.startedAt, r.endedAt, isLive(r)), preview: line(r.kind, r.preview),
-      open: r.agent ? function() { S.openAgentDetail(r.agent); } : null,
+      open: r.agent ? function() { S.openAgentDetail(r.agent); }
+        : r.command ? function() { toggleCommand(el, r.command); } : null,
     });
+    // ELI-232: the whole command, on hover and on a tap.
+    if (r.command) el.title = r.command;
+    if (r.command && opened[r.command]) showCommand(el, r.command);
+    return el;
+  }
+  // A command shown stays shown when the section is read again (ELI-256).
+  const opened = S.bgCommandsShown = S.bgCommandsShown || {};
+  function toggleCommand(el, command) {
+    const shown = el.querySelectorAll('[data-openclaw-command]')[0];
+    if (shown) {
+      shown.remove();
+      delete opened[command];
+      return;
+    }
+    opened[command] = true;
+    showCommand(el, command);
+  }
+  function showCommand(el, command) {
+    const pre = document.createElement('div');
+    pre.dataset.openclawCommand = '1';
+    pre.className = 'text-xs font-mono text-gray-500 dark:text-gray-400 whitespace-pre-wrap break-all mt-1 '
+      + 'p-1.5 rounded bg-gray-50 dark:bg-gray-800/60';
+    pre.textContent = command;
+    el.appendChild(pre);
   }
 
   (DATA.errors || []).forEach(function(e) { fold.body.appendChild(S.errorEl(e)); });
@@ -7264,6 +7458,7 @@ _BACKGROUND_FILL_JS_TEMPLATE = r"""
   if (!rows.length) fold.body.appendChild(S.noteEl('Nothing in the background for this chat.'));
   rows.forEach(function(r) { fold.body.appendChild(row(r)); });
   S.touchFooter(DATA.fetchedAt, DATA.source);
+  follow(rows);
 })();
 """
 
@@ -7442,13 +7637,18 @@ def _subagent_task_texts(previews_resp):
 def _subagent_row(row, task_text=None, latest=None):
     """One Subagents row out of a child session row. The title is the spawn
     label, else the task's first sentence, else the key; the whole task is
-    the drawer's to show (ELI-155). The preview is the row's own last
-    message when the list read carried it, else `latest` (sessions.preview)."""
+    the drawer's to show (ELI-155). A running child's preview is the row's
+    own last message when the list read carried it (a claude-cli child's
+    text so far is nowhere else), else `latest` (sessions.preview). An ended
+    child's result is `latest` only: the list's copy is flattened markdown,
+    read from a transcript index that catches up after the reply's append
+    with no push, so a row filled from either would read differently in the
+    open dialog and after a reopen (ELI-264)."""
     status = _subagent_status(row.get("status"))
     if status is None and row.get("endedAt"):
         status = "ended"    # a visible spawn's session carries no run status
     live = status in _LIVE_SUBAGENT_STATUSES
-    preview = row.get("lastMessagePreview") or latest
+    preview = (row.get("lastMessagePreview") or latest) if live else latest
     if _is_spawn_message(preview):
         # Just spawned: the newest message is still the task (ELI-119).
         preview = None
@@ -7497,6 +7697,15 @@ async def _lookup_child(conn, key):
         pipe_log(f"[status-action] sessions.list (child {key}) failed: {ex}")
         return None
     return next((r for r in (resp or {}).get("sessions") or [] if r.get("key") == key), None)
+
+
+def _running_row(desc_task):
+    """Whether the session `desc_task` (a done `sessions.describe`) described
+    has a run: its row's `hasActiveRun`, which stays set through a
+    `sessions_yield` gap, unlike its status."""
+    if desc_task.cancelled() or desc_task.exception() is not None:
+        return False
+    return bool(((desc_task.result() or {}).get("session") or {}).get("hasActiveRun"))
 
 
 async def _resolved(value):
@@ -7798,6 +8007,28 @@ async def _read_automations(conn) -> "list | None":
     return (resp or {}).get("jobs") or []
 
 
+async def _background_data(tasks_task, jobs_task, chat_task, session_key: str, source: str) -> dict:
+    """The Background section's fill from its three reads (tasks, automations,
+    Open WebUI's copy of the chat): a failed Gateway read says so in the
+    section and the rest still shows."""
+    errors = []
+    try:
+        tasks = await tasks_task
+    except Exception as ex:
+        pipe_log(f"[status-action] tasks.list failed: {ex}")
+        tasks = []
+        errors.append(f"Could not read background tasks: {ex}")
+    try:
+        jobs = await jobs_task
+    except Exception as ex:
+        pipe_log(f"[status-action] cron.list failed: {ex}")
+        jobs = []
+        errors.append(f"Could not read automations: {ex}")
+    chat = await chat_task
+    data = _background_rows(tasks, jobs, _agent_call_rows(chat), session_key, commands=_exec_commands(chat))
+    return {**data, "errors": errors, "source": source, "fetchedAt": int(time.time() * 1000), "error": None}
+
+
 # ---------------------------------------------------------------------------
 # The Background section (ELI-163): what runs for this chat outside a reply.
 # Read once when the dialog opens, never polled.
@@ -7856,20 +8087,102 @@ def _process_task(process: dict, session_key: str) -> dict:
     exec task whose sourceId is the process (the session its tool card
     names), titled by the Gateway's short name until a card gives the
     command, and a finished one's last line of output as its summary."""
-    lines = [ln for ln in (process.get("tail") or "").splitlines() if ln.strip()]
+    lines = [ln for ln in (_clean_line(ln) for ln in (process.get("tail") or "").splitlines()) if ln]
+    status = _PROCESS_STATUSES.get(process.get("status"), process.get("status"))
+    if status == "completed" and process.get("exitCode") not in (None, 0):
+        status = "failed"    # 2026.10.5 says "completed" for any exit code (ELI-232)
     return {
         "id": process.get("processId"), "kind": "exec", "sourceId": process.get("processId"),
         "sessionKey": session_key, "title": process.get("name") or "",
-        "status": _PROCESS_STATUSES.get(process.get("status"), process.get("status")),
+        "status": status,
         "startedAt": process.get("startedAt"), "endedAt": process.get("endedAt"),
-        "terminalSummary": lines[-1][:200] if lines else None,
+        "terminalSummary": lines[-1] if lines else None,
+        "exitCode": process.get("exitCode"), "exitSignal": process.get("exitSignal"),
     }
 
 
+# A terminal's color and cursor codes, and other control characters.
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|[\x00-\x08\x0b-\x1f\x7f]")
+_LINE_MAX = 120
+
+
+def _clean_line(text: str) -> str:
+    """One line of output as plain text: no terminal codes, one space
+    between words, cut at _LINE_MAX."""
+    line = " ".join(_ANSI_RE.sub("", text or "").split())
+    return line if len(line) <= _LINE_MAX else line[:_LINE_MAX - 1].rstrip() + "…"
+
+
+# ELI-232: how a command without a title reads. Steps that only set up the
+# shell are skipped, wrappers dropped, and an inline script is left out.
+_SETUP_WORDS = {"cd", "pushd", "popd", "export", "set", "unset", "source", ".", "umask", "trap", "shopt",
+                "true", ":", "ulimit", "alias"}
+_WRAPPER_WORDS = {"setsid", "nohup", "exec", "env", "time", "nice", "stdbuf"}
+_SCRIPT_FLAGS = {"-c", "-e", "--eval"}
+_INTERPRETER_RE = re.compile(r"(python[\d.]*|node|bun|deno|perl|ruby|php|bash|sh|zsh|dash)$")
+# A loop or a condition reads by its head: "for n in 142 136 …".
+_COMPOUND_WORDS = {"for", "while", "until", "if", "case", "select"}
+_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+_SHORT_COMMAND_MAX = 80
+
+
+def _short_command(command: str) -> str:
+    """The first command in `command` that does the work, in a few words:
+    `cd /x && python3 -c "..."` reads "python3 -c …". Empty when it only
+    sets up the shell."""
+    lex = shlex.shlex(command or "", posix=True, punctuation_chars="();<>|&\n")
+    lex.whitespace = " \t\r"
+    lex.whitespace_split = True
+    words: list = []
+    cut = False
+    try:
+        for tok in lex:
+            if tok and set(tok) <= set("();<>|&\n"):
+                if words and words[0] not in _SETUP_WORDS:
+                    if tok.startswith("<<"):
+                        cut = True
+                    elif tok.startswith((">", "<")) and words[-1].isdigit() and words[-1] + tok in command:
+                        words.pop()    # 2>/dev/null: the 2 is the redirect's
+                    break
+                words = []
+                if tok.startswith(("<", ">")):
+                    break
+                continue
+            if not words and (_ASSIGNMENT_RE.match(tok) or tok in _WRAPPER_WORDS):
+                continue
+            if not words and tok == "timeout":
+                words.append(tok)
+                continue
+            if words == ["timeout"]:
+                words = []    # its duration
+                continue
+            words.append(tok)
+            if tok in _SCRIPT_FLAGS and len(words) > 1 and _INTERPRETER_RE.match(words[0].rsplit("/", 1)[-1]):
+                cut = True
+                break
+    except ValueError:
+        # An unclosed quote: its first line as written.
+        return _cut((command or "").strip().splitlines()[0] if (command or "").strip() else "", _SHORT_COMMAND_MAX)
+    if not words or words[0] in _SETUP_WORDS:
+        return ""
+    if words[0] in _COMPOUND_WORDS:
+        cut = True
+    if words[0].startswith("/"):
+        words[0] = words[0].rsplit("/", 1)[-1]
+    text = " ".join(shlex.quote(w) if w != shlex.quote(w) and " " in w else w for w in words)
+    return _cut(text + (" …" if cut else ""), _SHORT_COMMAND_MAX)
+
+
+def _cut(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
 def _exec_commands(chat) -> dict:
-    """{exec session id: command} from the chat's own exec tool cards. The
-    Gateway's task for a background command is titled "CLI command"; its
-    sourceId is the session the card's result names."""
+    """{exec session id: {"command", "title"}} from the chat's own exec tool
+    cards. The Gateway's task for a background command is titled "CLI
+    command" (2026.9) or by the command's first words (2026.10); its sourceId
+    is the session the card's result names, and only the card has the
+    title the agent gave the call (ELI-232)."""
     out = {}
     for msg in _owui_branch(chat):
         output = msg.get("output") or []
@@ -7885,9 +8198,12 @@ def _exec_commands(chat) -> dict:
                 args = json.loads(call.get("arguments") or "{}")
             except ValueError:
                 args = {}
-            command = args.get("command") if isinstance(args, dict) else None
+            if not isinstance(args, dict):
+                args = {}
+            command, title = args.get("command"), args.get("title")
             if m and isinstance(command, str) and command.strip():
-                out[m.group(1)] = command.strip()
+                out[m.group(1)] = {"command": command.strip(),
+                                   "title": title.strip() if isinstance(title, str) else ""}
     return out
 
 
@@ -7900,13 +8216,10 @@ def _belongs_to(task: dict, session_key: str) -> bool:
 def _task_row(task: dict, commands: dict) -> dict:
     kind = task.get("kind") or ""
     title = (task.get("title") or "").strip()
-    if kind == "exec":
-        # 2026.9 titles every one "CLI command"; a 2026.10 process has a
-        # short name ("make build"). The card's whole command wins.
-        own = "" if title == "CLI command" else title
-        title = commands.get(task.get("sourceId") or "") or own or "Shell command"
     status = task.get("status")
     live = status in _LIVE_TASK_STATUSES
+    if kind == "exec":
+        return _command_row(task, commands.get(task.get("sourceId") or "") or {}, live)
     return {
         "id": task.get("id") or task.get("taskId"),
         "kind": _BACKGROUND_KINDS.get(kind, "Task"),
@@ -7917,6 +8230,41 @@ def _task_row(task: dict, commands: dict) -> dict:
         # A running command's progress is always "Command running": its chip says so.
         "preview": (None if live and kind == "exec" else task.get("progressSummary") if live
                     else (task.get("error") or task.get("terminalSummary"))),
+    }
+
+
+# 2026.9's summaries of a command, which its status chip already says.
+_GENERIC_COMMAND_SUMMARIES = {"Command running", "Command completed", "Command failed"}
+
+
+def _command_row(task: dict, card: dict, live: bool) -> dict:
+    """A background command (ELI-232). Titled by the title the agent gave
+    the call, else by its first real command. Under it: while it runs, that
+    command when the title is the agent's; once ended, how it ended (a
+    failure's exit code or the signal that stopped it) and its last line of
+    output. The whole command is the row's tap."""
+    command = card.get("command") or ""
+    # 2026.9 titles every one "CLI command"; a 2026.10 process has the
+    # command's first words ("cd /tmp"), all there is without a card.
+    own = (task.get("title") or "").strip()
+    short = _short_command(command or ("" if own == "CLI command" else own))
+    title = card.get("title") or short or "Shell command"
+    if live:
+        preview = short if card.get("title") and short != title else None
+    else:
+        code, signal = task.get("exitCode"), task.get("exitSignal")
+        ended = signal or (f"exit {code}" if code not in (None, 0) else None)
+        said = _clean_line(task.get("error") or task.get("terminalSummary") or "")
+        preview = " · ".join(p for p in (ended, None if said in _GENERIC_COMMAND_SUMMARIES else said) if p) or None
+    return {
+        "id": task.get("id") or task.get("taskId"),
+        "kind": _BACKGROUND_KINDS["exec"],
+        "title": title,
+        "status": task.get("status"),
+        "startedAt": task.get("startedAt") or task.get("createdAt"),
+        "endedAt": None if live else (task.get("endedAt") or task.get("updatedAt")),
+        "preview": preview,
+        "command": command or None,
     }
 
 
@@ -8034,6 +8382,10 @@ _DIALOG_FOLLOW_MAX_S = 900
 # not a held request, so the poll lives exactly as long as the drawer is open
 # and the sub-agent runs (ELI-155).
 _SUBAGENT_POLL_INTERVAL_S = 2.5
+# How often the open dialog reads its Background section again while a row
+# runs: the Gateway pushes nothing when a background task ends (ELI-256).
+# Polled by the page too, so it stops with the dialog.
+_BACKGROUND_POLL_INTERVAL_S = 5
 
 
 def _message_text_blocks(message: dict) -> list:
@@ -8248,20 +8600,20 @@ async def _latest_preview(conn, child_key: str) -> str | None:
     return preview if isinstance(preview, str) and preview.strip() and not _is_spawn_message(preview) else None
 
 
-# The toolbar button's icon, the composer chip's paw (ELI-202); without one
-# Open WebUI draws its default sparkle. A fixed gray stroke on purpose: Open
+# The toolbar button's icon, the composer chip's crab claw (ELI-231); without
+# one Open WebUI draws its default sparkle. A fixed gray stroke on purpose: Open
 # WebUI draws it as an <img>, so currentColor never resolves, and inverts it
 # 80% in dark mode; this gray stays a mid gray in both, like its own icons.
 ICON_URL = (
     "data:image/svg+xml;charset=utf-8,"
     "%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%20fill='none'%20"
     "stroke='%236b7280'%20stroke-width='1.6'%20stroke-linecap='round'%20stroke-linejoin='round'"
-    "%3E%3Cpath%20d='M11%206a1.5%202%200%201%201-3%200%201.5%202%200%200%201%203%200ZM16%206a"
-    "1.5%202%200%201%201-3%200%201.5%202%200%200%201%203%200ZM7%2010.5a1.5%201.75%200%201%201"
-    "-3%200%201.5%201.75%200%200%201%203%200ZM20%2010.5a1.5%201.75%200%201%201-3%200%201.5%20"
-    "1.75%200%200%201%203%200ZM12%2012.75c-2.25%200-5.25%202.6-5.25%204.875%200%201.45%201.1"
-    "%202.375%202.55%202.375.95%200%201.7-.45%202.7-.45s1.75.45%202.7.45c1.45%200%202.55-.925"
-    "%202.55-2.375%200-2.275-3-4.875-5.25-4.875Z'/%3E%3C/svg%3E"
+    "%3E%3Cpath%20d='M6.3%2014.6C4.6%2011.7%205.7%207.1%208.7%204.6C10.8%202.8%2013.4%202.3%2"
+    "015.6%203.1C14.3%203.7%2013.4%204.4%2013%205.3L13.9%206.5L12%206.9C11.6%207.5%2011.3%208"
+    ".1%2011.2%208.7C11.1%2011%2012.7%2012.9%2015.1%2012.7C16.4%2012.5%2017.3%2011.9%2017.8%2"
+    "011.1L17.1%2010L18.6%209.7C18.6%209.2%2018.6%208.7%2018.5%208.2C20.5%2010.2%2020.6%2013."
+    "4%2018.9%2015.8C17.1%2018.3%2014.2%2018.8%2011.6%2017.8C9.5%2017%207.5%2016.1%206.3%2014"
+    ".6ZM7.8%2016L5.4%2019.6L9.1%2021.1L11%2017.6'/%3E%3C/svg%3E"
 )
 
 
@@ -8345,6 +8697,8 @@ class Action:
             return {"status": "ok"}
         if mode == "subagent-rows":
             return await self._run_subagent_rows(body, __user__, __event_emitter__)
+        if mode == "background-rows":
+            return await self._run_background_rows(body, __user__, __event_emitter__)
         if mode is None:
             marker = _SUBAGENT_TASK_ID_MARKER_RE.search(body.get("content") or "")
             if marker:
@@ -8419,6 +8773,7 @@ class Action:
                 "dialogId": dialog_id,
                 "controlUiUrl": _control_ui_session_url(self.valves.CONTROL_UI_URL, session_key),
                 "subagentPollMs": int(_SUBAGENT_POLL_INTERVAL_S * 1000),
+                "backgroundPollMs": int(_BACKGROUND_POLL_INTERVAL_S * 1000),
             }
             await emit(_render_modal_open_js(identity))
         else:
@@ -8452,6 +8807,12 @@ class Action:
             await agents_ready
             return {"status": "error", "detail": str(ex)}
 
+        # The chat's run state and its children, which the open follows while
+        # the chat runs (ELI-260): taken before the reads they guard.
+        def chat_events():
+            return [conn.session_change_event(session_key), conn.session_child_event(session_key)]
+        watched = chat_events()
+
         # Every source at once; each section awaits only its own.
         desc_task = asyncio.ensure_future(
             conn.send_request("sessions.describe", dict(key=session_key), timeout=5))
@@ -8460,9 +8821,13 @@ class Action:
         # session: `spawnedBy` gives the current ones (running, or ended in
         # the last 30 minutes), the child index (state.py) every child the
         # Pipe saw spawned with its last row. A new index is seeded once, from
-        # one full list, after the section's first fill.
+        # one full list, after the section's first fill. With each child's
+        # last message, as the open dialog's refills list them
+        # (`list_children`): the Gateway flattens its markdown there, unlike
+        # the transcript read, so a row read one way at an open and the other
+        # in place would differ (ELI-264).
         current_task = asyncio.ensure_future(conn.send_request(
-            "sessions.list", dict(spawnedBy=session_key, limit=50), timeout=5))
+            "sessions.list", dict(spawnedBy=session_key, limit=50, includeLastMessage=True), timeout=5))
         seed_task = None if _subagent_index_seeded() else asyncio.ensure_future(
             conn.send_request("sessions.list", dict(limit=1000), timeout=30))
         tasks_task = asyncio.ensure_future(_read_background_tasks(conn, session_key))
@@ -8473,13 +8838,14 @@ class Action:
                 "sessions.list", dict(spawnedBy=session_key, limit=50, includeLastMessage=True), timeout=5,
             )
 
-        async def fill_context():
+        async def fill_context(described=None):
             """Also resolves provider/session_row for fill_limits to reuse
             (returned, not re-fetched) -- still reuses emit.py's small
             formatting primitives (_fmt_tokens, _format_goal_line) so
-            wording matches the status line exactly."""
+            wording matches the status line exactly. `described`: a later
+            read of the session than the open's."""
             try:
-                desc = await desc_task
+                desc = await (described or desc_task)
             except Exception as ex:
                 pipe_log(f"[status-action] sessions.describe failed: {ex}")
                 await emit(_render_context_fill_js({"error": f"Could not fetch context: {ex}"}))
@@ -8490,6 +8856,15 @@ class Action:
 
             context_tokens = session_row.get("contextTokens")
             total_tokens = session_row.get("totalTokens")
+            if context_tokens and total_tokens is None:
+                # OpenClaw 2026.10.10 writes no totals to a session's row
+                # after its first run (ELI-223): the newest call's own usage.
+                try:
+                    history = await conn.send_request(
+                        "chat.history", dict(sessionKey=session_key, limit=20), timeout=5)
+                    total_tokens = _history_latest_prompt_tokens(history)
+                except Exception as ex:
+                    pipe_log(f"[status-action] chat.history for the context failed: {ex}")
             context_data = None
             if context_tokens and total_tokens is not None:
                 context_data = {
@@ -8557,33 +8932,25 @@ class Action:
             }))
 
         async def fill_background():
-            errors = []
-            try:
-                tasks = await tasks_task
-            except Exception as ex:
-                pipe_log(f"[status-action] tasks.list failed: {ex}")
-                tasks = []
-                errors.append(f"Could not read background tasks: {ex}")
-            try:
-                jobs = await jobs_task
-            except Exception as ex:
-                pipe_log(f"[status-action] cron.list failed: {ex}")
-                jobs = []
-                errors.append(f"Could not read automations: {ex}")
-            chat = await chat_task
-            data = _background_rows(tasks, jobs, _agent_call_rows(chat), session_key,
-                                    commands=_exec_commands(chat))
-            await emit(_render_background_fill_js({
-                **data, "errors": errors, "source": source,
-                "fetchedAt": int(time.time() * 1000), "error": None,
-            }))
+            await emit(_render_background_fill_js(
+                await _background_data(tasks_task, jobs_task, chat_task, session_key, source)))
 
         # Every child seen so far by key, and what their transcripts told.
         children_seen, task_texts, latest = {}, {}, {}
+        # The listed running children with no task to title them yet.
+        untitled: list = []
+        # Children seen running here, those of them that ended done with
+        # their last message in their row, and those still waiting for it: a
+        # claude-cli child's messages reach its transcript after its run
+        # settles (ELI-262).
+        ran, landed, finishing = set(), set(), []
 
-        async def read_transcripts(keys):
-            """The task and newest message of each of `keys` not read yet."""
-            unread = [k for k in keys if k not in task_texts]
+        async def read_transcripts(keys, again=(), fresh=()):
+            """The task and newest message of each of `keys` not read yet,
+            of each of `again` whose read found no task, and of each of
+            `fresh`."""
+            unread = [k for k in keys if k not in task_texts or k in fresh
+                      or (k in again and task_texts[k] is None)]
             if not unread:
                 return
             try:
@@ -8597,7 +8964,8 @@ class Action:
             texts, newest = _subagent_previews(previews)
             task_texts.update({k: None for k in unread})
             task_texts.update(texts)
-            latest.update(newest)
+            # What each read child said last as of this read, not an earlier one.
+            latest.update({k: newest.get(k) for k in unread})
 
         async def read_children():
             """The current children, then each indexed child they lack: its
@@ -8659,11 +9027,24 @@ class Action:
             shown = sorted(children_seen.values(), key=_subagent_started, reverse=True)[:_SUBAGENT_LIST_CAP]
             running = [r["key"] for r in shown if _subagent_status(r.get("status")) in _LIVE_SUBAGENT_STATUSES]
             pending = at_open and not running and bool(shown)
+            # A running child with no label and no task from its spawn call is
+            # titled by its transcript, which may get its spawn message after
+            # the open: read again until it has.
+            spawned = _subagent_tasks(session_key)
+            want = [r["key"] for r in shown if r["key"] in running and not (r.get("label") or "").strip()
+                    and not spawned.get(r["key"])]
+            waiting = [r["key"] for r in shown if r["key"] in ran and r["key"] not in landed
+                       and _subagent_status(r.get("status")) == "completed"]
             if not pending:
-                await read_transcripts([r["key"] for r in shown])
+                await read_transcripts([r["key"] for r in shown], again=want, fresh=waiting)
+            untitled[:] = [k for k in want if not task_texts.get(k)]
+            tasks = subagent_rows(shown)
+            landed.update(t["id"] for t in tasks if t["id"] in waiting and t["terminalSummary"])
+            finishing[:] = [k for k in waiting if k not in landed]
+            ran.update(running)
             dialog["rows"], dialog["total"] = shown, len(children_seen)
             await emit(_render_subagents_fill_js({
-                "tasks": subagent_rows(shown), "total": len(children_seen), "pending": pending,
+                "tasks": tasks, "total": len(children_seen), "pending": pending,
                 "source": source, "fetchedAt": int(time.time() * 1000), "error": None,
             }))
             return running
@@ -8696,17 +9077,36 @@ class Action:
         # The ticker counts a running child up while the dialog is open, so a
         # child that ends meanwhile must show its end (ELI-127). Hold this
         # request open, as the drawer does, and refill the section on each
-        # pushed change to a listed child's run state, until none is listed,
-        # the page closes the dialog, or the follow's bound passes. Each event
-        # is taken before the read it guards, so no change slips between them.
+        # pushed change to a listed child's run state, until none is listed
+        # and the chat's own run is done, the page closes the dialog, or the
+        # follow's bound passes. A running child with no task yet is titled
+        # once its spawn message reaches its transcript: the section refills
+        # on that append too (ELI-253). The chat's run may spawn a child after
+        # the open: a pushed change to a child of this session, a new one
+        # included, refills the section too (ELI-260). Each
+        # event is taken before the read it guards, so none slips between.
         deadline = time.time() + _DIALOG_FOLLOW_MAX_S
         closed = dialog["closed"]
-        while listed and not closed.is_set():
-            changes = [conn.session_change_event(k) for k in listed]
-            following = listed
-            listed = await fill_subagents(list_children())
-            if not listed or set(listed) - set(following):
-                continue    # none left, or a new child: take its event first
+        subscribed = set()
+        # The chat runs while the Gateway has its run, or while the Pipe in
+        # this process streams a reply whose chat.send has not started one
+        # yet: a dialog opened right after a send (ELI-260).
+        running = _running_row(desc_task) or conn.has_reply(session_key)
+        refill = bool(listed)   # their events are taken only below
+        while not closed.is_set():
+            appending = untitled + finishing
+            for k in [k for k in appending if k not in subscribed]:
+                subscribed.add(k)
+                await conn.ensure_message_subscription(k)
+            changes = watched + [conn.session_change_event(k) for k in listed]
+            changes += [conn.session_message_event(k) for k in appending]
+            if refill:
+                following = listed
+                listed = await fill_subagents(list_children())
+                if set(listed) - set(following) or set(finishing) - set(appending):
+                    continue    # a new child, or one to finish: take its event first
+            if not listed and not running and not finishing:
+                break
             waits = [asyncio.ensure_future(ev.wait()) for ev in changes]
             waits.append(asyncio.ensure_future(closed.wait()))
             try:
@@ -8715,8 +9115,20 @@ class Action:
             finally:
                 for w in waits:
                     w.cancel()
-            if not done:
+            if not done or closed.is_set():
                 break
+            # Read the chat again: its run state, and its context, which a
+            # dialog opened right after a send had none of yet (ELI-262).
+            watched = chat_events()
+            described = asyncio.ensure_future(
+                conn.send_request("sessions.describe", dict(key=session_key), timeout=5))
+            await asyncio.wait([described])
+            if described.exception() is None:
+                await fill_context(described)
+            else:
+                pipe_log(f"[status-action] sessions.describe (follow) failed: {described.exception()}")
+            running = _running_row(described) or conn.has_reply(session_key)
+            refill = True
         return {"status": "ok"}
 
     async def _run_subagent_rows(self, body: dict, __user__, __event_emitter__):
@@ -8750,6 +9162,34 @@ class Action:
             "total": dialog["total"], "pending": False,
             "source": source, "fetchedAt": int(time.time() * 1000), "error": None,
         }))
+        return {"status": "ok"}
+
+    async def _run_background_rows(self, body: dict, __user__, __event_emitter__):
+        """The open dialog's Background section, read again (ELI-256): the
+        page asks every _BACKGROUND_POLL_INTERVAL_S while a row runs, since
+        the Gateway pushes nothing when a background task ends."""
+        chat_id = body.get("chat_id")
+        user_id = (__user__ or {}).get("id") or "unknown"
+
+        async def emit(code):
+            await __event_emitter__({"type": "execute", "data": {"code": code}})
+
+        if not chat_id:
+            return {"status": "error", "detail": "missing chat_id"}
+        session_key = _owui_session_key(self.valves.AGENT_ID, user_id, chat_id)
+        chat_task = asyncio.ensure_future(_load_owui_recent(chat_id, user_id))
+        try:
+            conn, source = await _get_action_connection(lambda: self.valves)
+        except Exception as ex:
+            # No fill: the page keeps the rows it shows and asks again (ELI-261).
+            pipe_log(f"[status-action] background-rows connect failed: {ex}")
+            chat_task.cancel()
+            return {"status": "error", "detail": str(ex)}
+        data = await _background_data(
+            asyncio.ensure_future(_read_background_tasks(conn, session_key)),
+            asyncio.ensure_future(_read_automations(conn)), chat_task, session_key, source)
+        # A refill that failed keeps the rows shown and its follow (ELI-261).
+        await emit(_render_background_fill_js({**data, "refill": True}))
         return {"status": "ok"}
 
     async def _run_compact(self, body: dict, __user__, __event_emitter__):

@@ -53,6 +53,15 @@ EXEC_CARD = [
     {"type": "function_call_output", "id": "o1", "call_id": "c1",
      "output": [{"type": "output_text", "text": "Command still running (session good-lagoon, pid 2816)."}]},
 ]
+# ELI-232: an agent's exec names its purpose in `title`.
+TITLED_COMMAND = ("cd /config/.openclaw/workspace/projects/session-manager && "
+                  "python3 ci_wake.py 163 --sha 2ef4275 > /tmp/w.log 2>&1")
+TITLED_CARD = [
+    {"type": "function_call", "id": "c2", "call_id": "c2", "name": "exec",
+     "arguments": json.dumps({"command": TITLED_COMMAND, "title": "ci_wake for PR 163", "background": True})},
+    {"type": "function_call_output", "id": "o2", "call_id": "c2",
+     "output": [{"type": "output_text", "text": "Command still running (session calm-reef, pid 2817)."}]},
+]
 AGENT_CARD = [
     {"type": "function_call", "id": "a1", "call_id": "a1", "name": "Agent",
      "arguments": json.dumps({"description": "Tax research", "run_in_background": True})},
@@ -64,8 +73,36 @@ AGENT_CARD = [
 def _chat(done=False):
     msgs = {"u": {"id": "u", "parentId": None, "role": "user", "content": "go", "timestamp": 1000},
             "a": {"id": "a", "parentId": "u", "role": "assistant", "timestamp": 1001, "done": done,
-                  "output": EXEC_CARD + AGENT_CARD}}
+                  "output": EXEC_CARD + TITLED_CARD + AGENT_CARD}}
     return {"history": {"currentId": "a", "messages": msgs}}
+
+
+class ShortCommandTests(unittest.TestCase):
+    """ELI-232: a command without a title reads as its first real command."""
+
+    def test_short_commands(self):
+        cases = [
+            ("sleep 25; echo done", "sleep 25"),
+            ("cd /config/.openclaw/workspace/projects/x && python3 ci_wake.py 136", "python3 ci_wake.py 136"),
+            ('cd /tmp; python3 -c "\nimport json;d=json.load(open(\'x\'))\nprint(d)"', "python3 -c …"),
+            ("export GH_CONFIG_DIR=/config/gh; R=Eliav2/x; /config/bin/gh run watch 123 --exit-status",
+             "gh run watch 123 --exit-status"),
+            ("GH_CONFIG_DIR=/config/gh /config/bin/gh pr view 5", "gh pr view 5"),
+            ("cd /tmp && python3 - <<'EOF'\nprint(\"unbalanced)\nEOF", "python3 - …"),
+            ("setsid nohup timeout 60 bin/import-stations north > /tmp/l 2>&1 &", "bin/import-stations north"),
+            ("cd /x\nnode -e 'console.log(1)'", "node -e …"),
+            ("git log --oneline | head -5", "git log --oneline"),
+            ("make build", "make build"),
+            ("cd /r && git -c user.name=bot commit -q -m 'x'", "git -c user.name=bot commit -q -m x"),
+            ("grep -c TODO src/a.py", "grep -c TODO src/a.py"),
+            ("ls /x 2>/dev/null; sleep 2 > /tmp/o", "ls /x"),
+            ("sleep 2 > /tmp/o", "sleep 2"),
+            ("for n in 142 136; do gh pr view $n; done", "for n in 142 136 …"),
+            ("cd /tmp", ""),
+            ("echo 'unbalanced", "echo 'unbalanced"),
+            ("python3 run.py " + "a" * 100, "python3 run.py " + "a" * 64 + "…"),
+        ]
+        self.assertEqual([action._short_command(c) for c, _ in cases], [w for _, w in cases])
 
 
 class RowTests(unittest.TestCase):
@@ -76,15 +113,45 @@ class RowTests(unittest.TestCase):
         return action._background_rows(list(tasks), list(jobs), action._agent_call_rows(chat), KEY,
                                        commands=action._exec_commands(chat))
 
-    def test_a_background_command_is_titled_by_its_command(self):
-        """The Gateway titles it "CLI command"; its sourceId is the exec
+    def test_a_background_command_is_titled_by_its_cards_title(self):
+        """ELI-232: the title the agent gave the exec call, the command's
+        first words under it while it runs, the whole command for a tap.
+        The Gateway titles it "CLI command"; its sourceId is the exec
         session the chat's tool card names."""
+        data = self.rows([_task("exec", "running", title="CLI command", sourceId="calm-reef",
+                                progressSummary="Command running")])
+        cmd = next(r for r in data["rows"] if r["kind"] == "Command")
+        self.assertEqual((cmd["title"], cmd["status"], cmd["preview"], cmd["command"], cmd["endedAt"]),
+                         ("ci_wake for PR 163", "running", "python3 ci_wake.py 163 --sha 2ef4275",
+                          TITLED_COMMAND, None))
+
+    def test_without_a_title_the_command_reads_short(self):
+        """No title on the card: its first real command names it, the whole
+        command still a tap away. Its progress is always "Command running",
+        which its chip says."""
         data = self.rows([_task("exec", "running", title="CLI command", sourceId="good-lagoon",
                                 progressSummary="Command running")])
         cmd = next(r for r in data["rows"] if r["kind"] == "Command")
-        # Its progress is always "Command running", which its chip says.
-        self.assertEqual((cmd["title"], cmd["status"], cmd["preview"], cmd["endedAt"]),
-                         ("sleep 25; echo done", "running", None, None))
+        self.assertEqual((cmd["title"], cmd["preview"], cmd["command"]),
+                         ("sleep 25", None, "sleep 25; echo done"))
+
+    def test_a_finished_command_says_how_it_ended(self):
+        """A failure's exit code and its last line of output, without the
+        terminal's colors; 2026.9's "Command completed" says nothing the
+        chip does not."""
+        failed = action._process_task({"processId": "good-lagoon", "name": "sleep 25;", "status": "failed",
+                                       "startedAt": NOW - 9000, "endedAt": NOW, "exitCode": 2,
+                                       "tail": "building\n\x1b[31mError:\x1b[0m   no   such  file\n\n"}, KEY)
+        killed = action._process_task({"processId": "x", "name": "make", "status": "killed",
+                                       "startedAt": NOW - 9000, "endedAt": NOW, "exitSignal": "SIGTERM"}, KEY)
+        # 2026.10.5 says "completed" whatever the exit code.
+        nonzero = action._process_task({"processId": "z", "name": "ls /nope", "status": "completed",
+                                        "startedAt": NOW - 9500, "endedAt": NOW, "exitCode": 1, "tail": ""}, KEY)
+        data = self.rows([failed, killed, nonzero, _task("exec", "completed", id="t9", sourceId="y", endedAt=NOW,
+                                                         terminalSummary="Command completed")])
+        self.assertEqual([(r["title"], r["status"], r["preview"]) for r in data["rows"] if r["kind"] == "Command"],
+                         [("sleep 25", "failed", "exit 2 · Error: no such file"), ("make", "cancelled", "SIGTERM"),
+                          ("ls /nope", "failed", "exit 1"), ("Shell command", "completed", None)])
 
     def test_kinds_this_section_lists_and_the_ones_it_leaves_to_others(self):
         data = self.rows([
@@ -96,7 +163,7 @@ class RowTests(unittest.TestCase):
         self.assertEqual(sorted((r["kind"], r["status"]) for r in data["rows"]),
                          [("Agent", "running"), ("Command", "completed"), ("Image", "running")])
         done = next(r for r in data["rows"] if r["kind"] == "Command")
-        self.assertEqual((done["title"], done["preview"]), ("Shell command", "Command completed"))
+        self.assertEqual((done["title"], done["preview"]), ("Shell command", None))
 
     def test_running_first_then_the_newest_five_finished(self):
         finished = [_task("exec", "completed", id=f"f{n}", startedAt=NOW - n * 1000, sourceId="")
@@ -233,7 +300,7 @@ class OpenTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(not f.get("error") for f in fills.values()), fills)
         bg = fills["background"]
         self.assertEqual([(r["kind"], r["title"]) for r in bg["rows"]],
-                         [("Command", "sleep 25; echo done"), ("Agent", "Tax research")])
+                         [("Command", "sleep 25"), ("Agent", "Tax research")])
 
     async def test_a_failing_source_leaves_the_other_sections_intact(self):
         """Each source in turn fails; only the sections that read it say so."""
@@ -273,7 +340,7 @@ class OpenTests(unittest.IsolatedAsyncioTestCase):
         calls = []
         _result, emitted = await self._open(_gateway(calls, unknown=("tasks.list",), processes=[
             proc("good-lagoon", "sleep 25;", "running", canStop=True),
-            proc("calm-reef", "ls /nope", "failed", endedAt=NOW - 50_000, exitCode=2,
+            proc("calm-reef", "cd /config/.openclaw/wo", "failed", endedAt=NOW - 50_000, exitCode=2,
                  tail="ls: cannot access '/nope'\n"),
             proc("old-pine", "make build", "killed", startedAt=NOW - 45_000, endedAt=NOW - 40_000),
         ]))
@@ -283,9 +350,9 @@ class OpenTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("sessions.processes.list", calls)
         self.assertEqual([(r["kind"], r["title"], r["status"], r["preview"]) for r in bg["rows"]
                           if r["kind"] == "Command"], [
-            ("Command", "sleep 25; echo done", "running", None),
+            ("Command", "sleep 25", "running", None),
             ("Command", "make build", "cancelled", None),
-            ("Command", "ls /nope", "failed", "ls: cannot access '/nope'"),
+            ("Command", "ci_wake for PR 163", "failed", "exit 2 · ls: cannot access '/nope'"),
         ])
 
     async def test_a_gateway_with_neither_list_says_so_and_still_lists_automations(self):
@@ -316,6 +383,40 @@ class OpenTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(any("Other automations" in t for t in seen["background"]["texts"]))
                 self.assertIsNone(seen["other-automations"]["open"], "no fold of other automations")
 
+    async def test_the_page_reads_the_background_section_again(self):
+        """ELI-256, mode "background-rows": the open dialog's ask reads only
+        the Background section's sources and fills that section alone."""
+        calls, chat_reads, emitted = [], [], []
+        with action_gateway(_gateway(calls)), mock.patch.dict(sys.modules, _owui(chat_reads)):
+            result = await Action().action({"chat_id": CHAT, "mode": "background-rows", "dialogId": "d1"},
+                                           __user__={"id": USER}, __event_emitter__=RecordingEmitter(emitted))
+        self.assertEqual(result, {"status": "ok"})
+        self.assertEqual(collections.Counter(calls), {"tasks.list": 1, "cron.list": 1})
+        self.assertEqual(chat_reads, [CHAT])
+        fills = _fills(emitted)
+        self.assertEqual(sorted(fills), ["background"])
+        self.assertEqual([(r["kind"], r["title"]) for r in fills["background"]["rows"]],
+                         [("Command", "sleep 25"), ("Agent", "Tax research")])
+        self.assertIs(fills["background"]["refill"], True)
+
+    async def test_a_refill_that_could_not_read_leaves_the_section_to_the_page(self):
+        """ELI-261: a failed read is a refill with its error (the page keeps
+        its rows); with no connection nothing is filled at all, so the rows
+        shown stay and the page asks again."""
+        emitted = []
+        with action_gateway(_gateway([], fail=("tasks.list",))), mock.patch.dict(sys.modules, _owui([])):
+            await Action().action({"chat_id": CHAT, "mode": "background-rows", "dialogId": "d1"},
+                                  __user__={"id": USER}, __event_emitter__=RecordingEmitter(emitted))
+        bg = _fills(emitted)["background"]
+        self.assertTrue(bg["refill"] and bg["errors"], bg)
+        emitted = []
+        with mock.patch.object(action, "_get_action_connection", mock.AsyncMock(side_effect=OSError("down"))), \
+                mock.patch.dict(sys.modules, _owui([])):
+            result = await Action().action({"chat_id": CHAT, "mode": "background-rows", "dialogId": "d1"},
+                                           __user__={"id": USER}, __event_emitter__=RecordingEmitter(emitted))
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(_fills(emitted), {})
+
     async def test_closing_the_dialog_stops_its_follow(self):
         """The page tells the Action it was dismissed (mode "status-closed"):
         the open request stops at once and reads nothing more."""
@@ -327,7 +428,7 @@ class OpenTests(unittest.IsolatedAsyncioTestCase):
             async def wait(self):
                 followed.set()
                 await asyncio.Future()
-        conn.session_change_event = lambda _key: _Never()
+        conn.session_change_event = conn.session_child_event = lambda _key: _Never()
         with action_gateway(conn), mock.patch.dict(sys.modules, _owui([])):
             opening = asyncio.ensure_future(Action().action(
                 {"chat_id": CHAT}, __user__={"id": USER}, __event_emitter__=RecordingEmitter(emitted)))
@@ -350,6 +451,10 @@ _BG_PAGE_JS = _FAKE_DOM_JS + r"""
 const fetches = [];
 global.localStorage = { getItem: () => 'tok' };
 global.fetch = (url, opts) => { fetches.push(JSON.parse(opts.body)); return Promise.resolve({}); };
+// Timeouts the steps fire by hand ({"wait": true} fires every pending one).
+const timeouts = new Map();
+global.setTimeout = (fn) => { const id = nextTimer++; timeouts.set(id, fn); return id; };
+global.clearTimeout = (id) => { timeouts.delete(id); };
 run(input.open);
 input.fills.forEach(run);
 const section = (n) => document.getElementById('openclaw-status-section-' + n);
@@ -360,10 +465,19 @@ const out = {};
 for (const step of input.steps || []) {
   if (step.tap) fold(step.tap).children[0].onclick();
   if (step.refill) run(input.fills[step.refill]);
+  if (step.tapRow != null) section('background').walk().filter((e) => e.dataset.openclawBgRow)[step.tapRow].onclick();
   if (step.close) document.getElementById('openclaw-status-modal-root').walk()
     .find((e) => e.tagName === 'BUTTON' && e.textContent === '×').onclick();
+  if (step.wait) {
+    const due = [...timeouts.values()];
+    timeouts.clear();
+    due.forEach((fn) => fn());
+  }
 }
+out.timeouts = timeouts.size;
 for (const n of input.read) out[n] = { open: fold(n) ? fold(n).dataset.open : null, texts: texts(n) };
+if (section('background')) out.hovers = section('background').walk().filter((e) => e.dataset.openclawBgRow)
+  .map((e) => [e.tagName, e.title || null]);
 out.fetches = fetches;
 console.log(JSON.stringify(out));
 """
@@ -397,11 +511,74 @@ class BackgroundPageTests(unittest.TestCase):
                                              "Command · Command running"])
         self.assertEqual(seen["texts"][5:8], ["nightly", "Failed", "Automation · failed 3 times in a row: model 529"])
 
+    def test_a_tap_on_a_command_shows_the_whole_command(self):
+        """ELI-232: the title says what it is for; hover or a tap gives the
+        command itself, and a second tap hides it."""
+        cmd = {**self.CMD, "title": "ci_wake for PR 163", "preview": "python3 ci_wake.py 163",
+               "command": TITLED_COMMAND}
+        shown = self.page([_bg([cmd, self.JOB])], ["background"], [{"tapRow": 0}])
+        self.assertEqual(shown["hovers"], [["BUTTON", TITLED_COMMAND], ["DIV", None]])
+        self.assertEqual(shown["background"]["texts"][1:6],
+                         ["ci_wake for PR 163", "Running", "1m", "Command · python3 ci_wake.py 163", TITLED_COMMAND])
+        hidden = self.page([_bg([cmd])], ["background"], [{"tapRow": 0}, {"tapRow": 0}])
+        self.assertNotIn(TITLED_COMMAND, hidden["background"]["texts"])
+
     def test_folded_when_nothing_runs_and_a_tap_wins_over_a_refill(self):
         idle = _bg([{**self.CMD, "status": "completed", "endedAt": NOW}])
         seen = self.page([idle, _bg([self.CMD])], ["background"], [{"tap": "background"}, {"refill": 1}])
         self.assertEqual(seen["background"]["open"], "true")
         self.assertEqual(self.page([idle], ["background"])["background"]["open"], "false")
+
+    def test_while_a_row_runs_the_open_dialog_reads_the_section_again(self):
+        """ELI-256: the Gateway pushes nothing when a background task ends,
+        and the dialog left open kept its row "Running" until it was opened
+        again. While a row runs the page asks for the section again, one ask
+        at a time; a fill with nothing running stops it, and so does closing
+        the dialog."""
+        modes = lambda seen: [f["mode"] for f in seen["fetches"]]  # noqa: E731
+        done = _bg([{**self.CMD, "status": "completed", "endedAt": NOW}])
+        running = self.page([_bg([self.CMD])], ["background"], [{"wait": True}])
+        self.assertEqual(modes(running), ["background-rows"])
+        self.assertEqual(running["fetches"][0]["dialogId"], "d1")
+        self.assertEqual(running["timeouts"], 0, "a second ask while the first is out")
+        ended = self.page([_bg([self.CMD]), done], ["background"], [{"refill": 1}, {"wait": True}])
+        self.assertEqual(modes(ended), [])
+        self.assertIn("Done", ended["background"]["texts"])
+        closed = self.page([_bg([self.CMD])], [], [{"close": True}, {"wait": True}])
+        self.assertEqual(modes(closed), ["status-closed"])
+        self.assertEqual(self.page([done], [], [{"wait": True}])["fetches"], [])
+
+    GONE = "Could not read background tasks: Session process access changed; refresh the conversation."
+
+    def test_a_refill_that_failed_keeps_the_rows_and_the_follow(self):
+        """ELI-261: on OpenClaw 2026.10.10 a read mid-follow can fail
+        ("Session process access changed"). Its fill had no running row, so
+        the follow ended and the row never turned Done. A failed refill keeps
+        the rows shown and asks again; only a good read with nothing running
+        ends the follow."""
+        modes = lambda seen: [f["mode"] for f in seen["fetches"]]  # noqa: E731
+        failed = _bg([self.JOB], errors=[self.GONE], refill=True)
+        done = _bg([{**self.CMD, "status": "completed", "endedAt": NOW}], refill=True)
+        kept = self.page([_bg([self.CMD]), failed], ["background"], [{"refill": 1}, {"wait": True}])
+        self.assertEqual(modes(kept), ["background-rows"])
+        self.assertEqual(kept["background"]["texts"][1:3], ["sleep 25; echo done", "Running"])
+        self.assertNotIn(self.GONE, kept["background"]["texts"])
+        ended = self.page([_bg([self.CMD]), failed, done], ["background"],
+                          [{"refill": 1}, {"wait": True}, {"refill": 2}, {"wait": True}])
+        self.assertEqual(modes(ended), ["background-rows"])
+        self.assertIn("Done", ended["background"]["texts"])
+        self.assertEqual(ended["timeouts"], 0)
+
+    def test_an_open_whose_read_failed_says_so_and_follows(self):
+        seen = self.page([_bg([], errors=[self.GONE])], ["background"], [{"wait": True}])
+        self.assertIn(self.GONE, seen["background"]["texts"])
+        self.assertEqual([f["mode"] for f in seen["fetches"]], ["background-rows"])
+
+    def test_a_command_shown_stays_shown_when_the_section_is_read_again(self):
+        cmd = {**self.CMD, "command": TITLED_COMMAND}
+        seen = self.page([_bg([cmd]), _bg([{**cmd, "status": "completed", "endedAt": NOW}])], ["background"],
+                         [{"tapRow": 0}, {"refill": 1}])
+        self.assertIn(TITLED_COMMAND, seen["background"]["texts"])
 
     def test_nothing_and_not_available_are_said(self):
         seen = self.page([_bg([], tasksAvailable=False)], ["background"])["background"]

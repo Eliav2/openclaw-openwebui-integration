@@ -432,14 +432,23 @@
       ]
     },
     {
-      "_comment": "ELI-163: four imports left running in the background, for the Status dialog's Background section.",
+      "_comment": "ELI-163: four imports left running in the background, for the Status dialog's Background section. ELI-232: each titled; a check with no title failed before them.",
       "match": "Import the station data for all four regions",
       "steps": [
+        {
+          "say": "Checking the regions first.",
+          "tool": "exec",
+          "args": {
+            "command": "cd bin && ./import-stations --check islands",
+            "background": true
+          }
+        },
         {
           "say": "Starting the four imports in the background.",
           "tool": "exec",
           "args": {
             "command": "bin/import-stations north",
+            "title": "Import the north stations",
             "background": true
           }
         },
@@ -448,6 +457,7 @@
           "tool": "exec",
           "args": {
             "command": "bin/import-stations south",
+            "title": "Import the south stations",
             "background": true
           }
         },
@@ -456,6 +466,7 @@
           "tool": "exec",
           "args": {
             "command": "bin/import-stations coast",
+            "title": "Import the coast stations",
             "background": true
           }
         },
@@ -464,6 +475,7 @@
           "tool": "exec",
           "args": {
             "command": "bin/import-stations mountain",
+            "title": "Import the mountain stations",
             "background": true
           }
         },
@@ -509,6 +521,22 @@
         },
         {
           "say": "Stored WEATHER_API_KEY. The forecast app can call the weather service with it now."
+        }
+      ]
+    },
+    {
+      "match": "Check the forecast dashboard in a browser",
+      "steps": [
+        {
+          "say": "Opening the dashboard in a browser.",
+          "tool": "exec",
+          "args": {
+            "command": "echo 'chromium: dashboard at localhost:8501 loaded, 3 panels'"
+          }
+        },
+        {
+          "say": "The dashboard loads, and all three panels show today's numbers.",
+          "delay": 0.03
         }
       ]
     }
