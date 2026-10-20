@@ -66,7 +66,7 @@ Each sub-agent gets its own card with its task, and its result comes back to the
 
 </td>
 <td width="50%">
-<a href="https://eliav2.github.io/openclaw-openwebui-integration/features/chat#sub-agent-cards"><picture><source srcset="./docs/img/demos/tile-sub-agents.gif" type="image/gif"><img src="./docs/img/tile-sub-agents.jpg" alt="Asked to review the changes before a release, the agent starts two reviewers, each with its own card; one is opened to its task, and the reviews come back as replies" width="100%"></picture></a>
+<a href="https://eliav2.github.io/openclaw-openwebui-integration/features/chat#sub-agent-cards"><picture><source srcset="./docs/img/demos/tile-sub-agents.gif" type="image/gif"><img src="./docs/img/tile-sub-agents.jpg" alt="Asked to review the changes before a release, the agent starts two reviewers, each with its own card, and each review comes back as its own reply" width="100%"></picture></a>
 </td>
 </tr>
 <tr>

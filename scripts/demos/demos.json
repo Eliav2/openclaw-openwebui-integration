@@ -765,7 +765,7 @@
         {
           "do": "type",
           "text": "Review this week's changes before I tag the release.",
-          "key_ms": 15
+          "key_ms": 25
         },
         {
           "do": "send"
@@ -773,26 +773,6 @@
         {
           "do": "wait",
           "js": "() => /sum up when both/.test(document.querySelectorAll('.chat-assistant')[0]?.innerText || '')"
-        },
-        {
-          "do": "pause",
-          "ms": 300
-        },
-        {
-          "do": "click",
-          "selector": ".chat-assistant >> nth=0 >> [role=button] >> nth=0"
-        },
-        {
-          "do": "wait",
-          "js": "() => /Started/.test(document.querySelectorAll('.chat-assistant')[0].innerText)"
-        },
-        {
-          "do": "pause",
-          "ms": 500
-        },
-        {
-          "do": "click",
-          "selector": ".chat-assistant >> nth=0 >> [role=button] >> nth=0"
         },
         {
           "do": "park"
