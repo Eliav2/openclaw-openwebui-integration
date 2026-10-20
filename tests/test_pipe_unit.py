@@ -11938,7 +11938,7 @@ class GapHandoverReplayTests(_RoutingCase):
         self.pipe.valves.AUTO_TITLE = False
         self.pipe.valves.INTERRUPT_GRACE_SECONDS = 0.3
 
-    async def start_reply(self, text="count", message_id=None, intent=None, sends=True):
+    async def start_reply(self, text="count", message_id=None, intent=None, sends=True, request=None):
         """A user turn's request, running until its run is sent (or, for a
         reply that takes over a parked run, until it consumes it)."""
         message_id = message_id or self.STUB
@@ -11950,7 +11950,7 @@ class GapHandoverReplayTests(_RoutingCase):
             return intent
         body = {"model": "openclaw_gateway.main", "messages": [{"role": "user", "content": text}]}
         meta = {"chat_id": self.CHAT, "user_id": self.USER, "message_id": message_id}
-        gen = self.pipe._pipe_impl(body, emitter, __metadata__=meta,
+        gen = self.pipe._pipe_impl(body, emitter, __metadata__=meta, __request__=request,
                                    __event_call__=event_call if intent else None)
         reply = {"gen": gen, "text": "", "items": [], "emitted": emitted, "output": [],
                  "chunks": []}
@@ -12003,6 +12003,51 @@ class GapHandoverReplayTests(_RoutingCase):
         m = self.owui.msgs()[message_id or self.STUB]
         return (m.get("done"), m.get("content"),
                 sum(1 for i in m.get("output") or [] if i.get("type") == "function_call"))
+
+    async def test_the_message_holds_the_tool_cards_before_open_webuis_end_save(self):
+        """ELI-267: until Open WebUI's end-of-reply save the message holds
+        what the Pipe saved at its end, and a chat read that spans that save
+        shows it with nothing live over it. It is the whole reply: Open
+        WebUI's live copy of the output, tool card included, with the text.
+        With no live copy (no request), the text alone, as before."""
+        live = {}
+
+        async def streams(redis, chat_id):
+            return [{"chat_id": chat_id, "message_id": self.STUB, "output": live["reply"]["output"]}]
+        sys.modules["open_webui.tasks"].get_response_streams_by_chat_id = streams
+        at_end_save, end_request = [], self.owui.end_request
+
+        async def end_save(message_id, output):
+            at_end_save.append(copy.deepcopy(self.owui.msgs()[message_id]))
+            await end_request(message_id, output)
+        self.owui.end_request = end_save
+        state = types.SimpleNamespace(redis=None)
+        for request in (types.SimpleNamespace(app=types.SimpleNamespace(state=state)), None):
+            with self.subTest(live_copy=request is not None):
+                self.run, self.history = None, None
+                mid = self.STUB if request is not None else str(uuid.uuid4())
+                live["reply"] = reply = await self.start_reply(message_id=mid, request=request)
+                self.history = _turn_history(run=self.run)
+                for payload in (_delta("Reading them."), _tool("start", tcid="toolu_1"),
+                                _tool("result", tcid="toolu_1"), _delta("\n\nFound it.")):
+                    self.frame(payload)
+                self.frame({"state": "final"}, event="chat")
+                self.settle()
+                await self.ended(reply)
+                saved = at_end_save.pop()
+                kinds = [i.get("type") for i in saved.get("output") or []]
+                replaced = [e["data"]["content"] for e in reply["emitted"] if e.get("type") == "replace"]
+                self.assertFalse(saved.get("done"))
+                if request is not None:
+                    self.assertEqual(saved.get("content"), "Reading them.\n\nFound it.")
+                    self.assertEqual(saved["output"], reply["output"])
+                    self.assertEqual((kinds.count("function_call"), kinds.count("function_call_output")), (1, 1))
+                    self.assertEqual(replaced, [])
+                else:
+                    # The `replace` event is Open WebUI's to save; this
+                    # emitter only records it.
+                    self.assertEqual(kinds, [])
+                    self.assertEqual(replaced, ["Reading them.\n\nFound it."])
 
     async def test_case_1_frames_lost_mid_run(self):
         """A slow client: the Gateway dropped the frames of a whole tool call
