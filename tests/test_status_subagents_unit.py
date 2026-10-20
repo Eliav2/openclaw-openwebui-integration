@@ -637,6 +637,9 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
         def previews_read():
             return [c.args[0] for c in conn.send_request.call_args_list].count("sessions.preview")
 
+        def listed():
+            return [c.args[0] for c in conn.send_request.call_args_list].count("sessions.list")
+
         with action_gateway(conn), mock.patch(
                 "openclaw_status_action._render_subagents_fill_js",
                 side_effect=lambda d: (seen.append(d), real(d))[1]):
@@ -645,12 +648,14 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
                 __event_emitter__=RecordingEmitter(emitted)))
             await self._settle()
             self.assertTrue(seen[-1]["pending"])
-            fills = len(seen)
+            fills, lists = len(seen), listed()
             describe["hasActiveRun"] = False
             self._push(events["change"], PARENT_KEY)    # the chat's run ends
             await asyncio.wait_for(opened, 5)   # bounds the test only
-            self.assertGreater(len(seen), fills)    # the section was refilled
-            self.assertTrue(seen[-1]["pending"])
+            self.assertGreater(listed(), lists)     # the section was read again
+            # Unchanged and still waiting for the tap, so not sent: it would
+            # replace what the page made of it since (ELI-268).
+            self.assertEqual(len(seen), fills)
             self.assertEqual(previews_read(), 0)
             await Action().action({"chat_id": PARENT_CHAT, "mode": "subagent-rows",
                                    "dialogId": _dialog_id(emitted)},

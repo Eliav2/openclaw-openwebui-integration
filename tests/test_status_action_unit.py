@@ -685,9 +685,9 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
         # Two children are running, so the dialog stays open to follow them.
         self.assertEqual(result, "following")
         codes = _emitted_codes(emitted)
-        # open + 5 independent fills + the Subagents re-read that starts the
-        # follow (ELI-127)
-        self.assertEqual(len(codes), 7)
+        # open + 5 independent fills; the Subagents re-read that starts the
+        # follow (ELI-127) found the same rows, so it is not sent (ELI-268)
+        self.assertEqual(len(codes), 6)
 
         context_code = next(c for c in codes if "getElementById('openclaw-status-section-context')" in c)
         self.assertIn("anthropic", context_code)
