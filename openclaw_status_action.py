@@ -4954,6 +4954,21 @@ def _startup_refusal_retry_ms(ex: GatewayError) -> int | None:
     return int(retry) if isinstance(retry, (int, float)) and retry > 0 else 250
 
 
+# 2026.10.5 refuses a model choice with this when the agent's published model
+# catalog owner is missing, not current or has no prepared accounts
+# (preparePublishedModelRuntimeChoice, model-runtime-choice-DiOKFJ9m.mjs). It
+# is INVALID_REQUEST and not `retryable`, but it names its own way out.
+RUNTIME_CATALOG_REFUSAL = "Refresh the model catalog and choose again."
+
+
+def _is_runtime_catalog_refusal(ex: Exception) -> bool:
+    """The Gateway refused a model choice until its model catalog is
+    refreshed (ELI-247)."""
+    err = getattr(ex, "error", None) or {}
+    return isinstance(ex, GatewayError) and (
+        RUNTIME_CATALOG_REFUSAL in str(ex) or RUNTIME_CATALOG_REFUSAL in str(err.get("message") or ""))
+
+
 def _retryable_refusal_retry_ms(ex: GatewayError) -> int | None:
     """The wait before sending again a request the Gateway refused as
     UNAVAILABLE and `retryable` for any other reason: the one it names, else

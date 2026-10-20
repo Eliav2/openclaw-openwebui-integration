@@ -7984,6 +7984,21 @@ def _startup_refusal_retry_ms(ex: GatewayError) -> int | None:
     return int(retry) if isinstance(retry, (int, float)) and retry > 0 else 250
 
 
+# 2026.10.5 refuses a model choice with this when the agent's published model
+# catalog owner is missing, not current or has no prepared accounts
+# (preparePublishedModelRuntimeChoice, model-runtime-choice-DiOKFJ9m.mjs). It
+# is INVALID_REQUEST and not `retryable`, but it names its own way out.
+RUNTIME_CATALOG_REFUSAL = "Refresh the model catalog and choose again."
+
+
+def _is_runtime_catalog_refusal(ex: Exception) -> bool:
+    """The Gateway refused a model choice until its model catalog is
+    refreshed (ELI-247)."""
+    err = getattr(ex, "error", None) or {}
+    return isinstance(ex, GatewayError) and (
+        RUNTIME_CATALOG_REFUSAL in str(ex) or RUNTIME_CATALOG_REFUSAL in str(err.get("message") or ""))
+
+
 def _retryable_refusal_retry_ms(ex: GatewayError) -> int | None:
     """The wait before sending again a request the Gateway refused as
     UNAVAILABLE and `retryable` for any other reason: the one it names, else
@@ -12323,7 +12338,10 @@ class _PipeTurn:
         # waiters (and the next ~60s of same-model messages) skip the RPC
         # entirely. Failure invalidates the cache so nothing sticks. A failure
         # is reported, not retried: a model not allowed or a Gateway timeout
-        # fails the same way twice (ELI-131).
+        # fails the same way twice (ELI-131). The one exception is the refusal
+        # that asks for a model catalog refresh (ELI-247): models.list makes the
+        # agent's catalog owner ready again before it answers, and the patch is
+        # sent once more; a second refusal is reported.
         patch_err = None
         async with self.conn.model_patch_lock(self.session_key):
             if self.conn.model_patch_cached(self.session_key, self.model_override):
@@ -12333,11 +12351,21 @@ class _PipeTurn:
                 )
             else:
                 try:
-                    patch_resp = await _run_request(
-                        self.conn, RUN_PATCH,
-                        dict(key=self.session_key, model=self.model_override),
-                        timeout=10
-                    )
+                    for refreshed in (False, True):
+                        try:
+                            patch_resp = await _run_request(
+                                self.conn, RUN_PATCH,
+                                dict(key=self.session_key, model=self.model_override),
+                                timeout=10
+                            )
+                            break
+                        except GatewayError as refused:
+                            if refreshed or not _is_runtime_catalog_refusal(refused):
+                                raise
+                            pipe_log(f"  model patch refused until the model catalog is refreshed "
+                                     f"({refused}); refreshing it and patching once more")
+                            await self.conn.send_request(
+                                "models.list", dict(agentId=self.pipe.valves.AGENT_ID), timeout=10)
                     if not _model_patch_matches(self.model_override, patch_resp):
                         resolved_model = _resolved_model_key(patch_resp)
                         raise GatewayError(
