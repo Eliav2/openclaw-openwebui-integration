@@ -397,6 +397,25 @@ class OpenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sorted(fills), ["background"])
         self.assertEqual([(r["kind"], r["title"]) for r in fills["background"]["rows"]],
                          [("Command", "sleep 25"), ("Agent", "Tax research")])
+        self.assertIs(fills["background"]["refill"], True)
+
+    async def test_a_refill_that_could_not_read_leaves_the_section_to_the_page(self):
+        """ELI-261: a failed read is a refill with its error (the page keeps
+        its rows); with no connection nothing is filled at all, so the rows
+        shown stay and the page asks again."""
+        emitted = []
+        with action_gateway(_gateway([], fail=("tasks.list",))), mock.patch.dict(sys.modules, _owui([])):
+            await Action().action({"chat_id": CHAT, "mode": "background-rows", "dialogId": "d1"},
+                                  __user__={"id": USER}, __event_emitter__=RecordingEmitter(emitted))
+        bg = _fills(emitted)["background"]
+        self.assertTrue(bg["refill"] and bg["errors"], bg)
+        emitted = []
+        with mock.patch.object(action, "_get_action_connection", mock.AsyncMock(side_effect=OSError("down"))), \
+                mock.patch.dict(sys.modules, _owui([])):
+            result = await Action().action({"chat_id": CHAT, "mode": "background-rows", "dialogId": "d1"},
+                                           __user__={"id": USER}, __event_emitter__=RecordingEmitter(emitted))
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(_fills(emitted), {})
 
     async def test_closing_the_dialog_stops_its_follow(self):
         """The page tells the Action it was dismissed (mode "status-closed"):
@@ -528,6 +547,32 @@ class BackgroundPageTests(unittest.TestCase):
         closed = self.page([_bg([self.CMD])], [], [{"close": True}, {"wait": True}])
         self.assertEqual(modes(closed), ["status-closed"])
         self.assertEqual(self.page([done], [], [{"wait": True}])["fetches"], [])
+
+    GONE = "Could not read background tasks: Session process access changed; refresh the conversation."
+
+    def test_a_refill_that_failed_keeps_the_rows_and_the_follow(self):
+        """ELI-261: on OpenClaw 2026.10.10 a read mid-follow can fail
+        ("Session process access changed"). Its fill had no running row, so
+        the follow ended and the row never turned Done. A failed refill keeps
+        the rows shown and asks again; only a good read with nothing running
+        ends the follow."""
+        modes = lambda seen: [f["mode"] for f in seen["fetches"]]  # noqa: E731
+        failed = _bg([self.JOB], errors=[self.GONE], refill=True)
+        done = _bg([{**self.CMD, "status": "completed", "endedAt": NOW}], refill=True)
+        kept = self.page([_bg([self.CMD]), failed], ["background"], [{"refill": 1}, {"wait": True}])
+        self.assertEqual(modes(kept), ["background-rows"])
+        self.assertEqual(kept["background"]["texts"][1:3], ["sleep 25; echo done", "Running"])
+        self.assertNotIn(self.GONE, kept["background"]["texts"])
+        ended = self.page([_bg([self.CMD]), failed, done], ["background"],
+                          [{"refill": 1}, {"wait": True}, {"refill": 2}, {"wait": True}])
+        self.assertEqual(modes(ended), ["background-rows"])
+        self.assertIn("Done", ended["background"]["texts"])
+        self.assertEqual(ended["timeouts"], 0)
+
+    def test_an_open_whose_read_failed_says_so_and_follows(self):
+        seen = self.page([_bg([], errors=[self.GONE])], ["background"], [{"wait": True}])
+        self.assertIn(self.GONE, seen["background"]["texts"])
+        self.assertEqual([f["mode"] for f in seen["fetches"]], ["background-rows"])
 
     def test_a_command_shown_stays_shown_when_the_section_is_read_again(self):
         cmd = {**self.CMD, "command": TITLED_COMMAND}

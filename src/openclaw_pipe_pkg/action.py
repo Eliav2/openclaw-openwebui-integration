@@ -1479,10 +1479,40 @@ _BACKGROUND_FILL_JS_TEMPLATE = r"""
     S.sectionError('background', DATA.error);
     return;
   }
+  const isLive = function(r) { return r.status === 'running' || r.status === 'queued'; };
+
+  // ELI-256: the Gateway pushes nothing when a background task ends, so
+  // while a row runs the open dialog reads the section again, one ask at a
+  // time, as the drawer follows its child (ELI-155). The fill each ask
+  // brings sets the next; an ask that brought none (failed, or its fill was
+  // lost) tries again; none once the dialog is gone. A read that failed
+  // keeps following and, on a refill, keeps the rows shown (ELI-261): only a
+  // good read with nothing running ends it.
+  const failed = (DATA.errors || []).length > 0;
+  function follow(rows) {
+    clearTimeout(S.bgPoll);
+    S.bgFills = (S.bgFills || 0) + 1;
+    if (!failed && !rows.some(isLive)) return;
+    const wait = S.identity.backgroundPollMs || 5000;
+    function ask() {
+      if (!section.isConnected) return;
+      const fills = S.bgFills;
+      const again = function() {
+        if (S.bgFills === fills) S.bgPoll = setTimeout(ask, wait);
+      };
+      S.askAction({ mode: 'background-rows' }).then(again, again);
+    }
+    S.bgPoll = setTimeout(ask, wait);
+  }
+  if (failed && DATA.refill && S.bgShown) {
+    follow(S.bgShown);
+    return;
+  }
+
   section.innerHTML = '';
   section.className = 'mb-4';
   const rows = DATA.rows || [];
-  const isLive = function(r) { return r.status === 'running' || r.status === 'queued'; };
+  if (!failed) S.bgShown = rows;
   const live = rows.some(isLive);
   const fold = S.collapsible('background', S.countLabel('Background', rows.length, DATA.total || 0), live);
   section.appendChild(fold.wrap);
@@ -1548,25 +1578,7 @@ _BACKGROUND_FILL_JS_TEMPLATE = r"""
   if (!rows.length) fold.body.appendChild(S.noteEl('Nothing in the background for this chat.'));
   rows.forEach(function(r) { fold.body.appendChild(row(r)); });
   S.touchFooter(DATA.fetchedAt, DATA.source);
-
-  // ELI-256: the Gateway pushes nothing when a background task ends, so
-  // while a row runs the open dialog reads the section again, one ask at a
-  // time, as the drawer follows its child (ELI-155). The fill each ask
-  // brings sets the next; an ask that brought none (failed, or its fill was
-  // lost) tries again; none once the dialog is gone.
-  clearTimeout(S.bgPoll);
-  S.bgFills = (S.bgFills || 0) + 1;
-  if (!rows.some(isLive)) return;
-  const wait = S.identity.backgroundPollMs || 5000;
-  function ask() {
-    if (!section.isConnected) return;
-    const fills = S.bgFills;
-    const again = function() {
-      if (S.bgFills === fills) S.bgPoll = setTimeout(ask, wait);
-    };
-    S.askAction({ mode: 'background-rows' }).then(again, again);
-  }
-  S.bgPoll = setTimeout(ask, wait);
+  follow(rows);
 })();
 """
 
@@ -3261,13 +3273,15 @@ class Action:
         try:
             conn, source = await _get_action_connection(lambda: self.valves)
         except Exception as ex:
+            # No fill: the page keeps the rows it shows and asks again (ELI-261).
             pipe_log(f"[status-action] background-rows connect failed: {ex}")
             chat_task.cancel()
-            await emit(_render_section_error_js("background", f"Could not connect: {ex}"))
             return {"status": "error", "detail": str(ex)}
-        await emit(_render_background_fill_js(await _background_data(
+        data = await _background_data(
             asyncio.ensure_future(_read_background_tasks(conn, session_key)),
-            asyncio.ensure_future(_read_automations(conn)), chat_task, session_key, source)))
+            asyncio.ensure_future(_read_automations(conn)), chat_task, session_key, source)
+        # A refill that failed keeps the rows shown and its follow (ELI-261).
+        await emit(_render_background_fill_js({**data, "refill": True}))
         return {"status": "ok"}
 
     async def _run_compact(self, body: dict, __user__, __event_emitter__):
