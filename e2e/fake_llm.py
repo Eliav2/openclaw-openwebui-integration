@@ -32,6 +32,9 @@ whole):
   `session_status` tool (any harmless tool the agent offers, if that one is
   missing), then, once the tool result is in the transcript, replies
   `E2E_TOOL_DONE`. Exercises tool cards end to end.
+* `E2E_TOOL_SAID`                      -> says `E2E_TOOL_SAID_START` and calls a
+  harmless tool, then replies `E2E_TOOL_SAID_END`: a short reply with text on
+  both sides of its tool card.
 * `session_status` + `model line`      -> calls `session_status`, then replies
   with the `Model:` line of its result. Covers the installer's route smoke
   test, which checks that the reply names the model the Gateway actually
@@ -365,6 +368,12 @@ def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
         if call:
             return call
         return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
+
+    if "E2E_TOOL_SAID" in user_text:
+        call = _harmless_call(offered)
+        if not call:
+            return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
+        return {"text": "E2E_TOOL_SAID_END"} if tool_results else {"text": "E2E_TOOL_SAID_START", **call}
 
     if "E2E_DEPLOY_SCENE" in user_text:
         call = _harmless_call(offered)

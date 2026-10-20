@@ -1682,14 +1682,40 @@ async def _emit_message_snapshot(__event_emitter__, content):
 
     Open WebUI 0.12 writes it even while the message is `done: false` (the
     message upsert has no done guard), and its end-of-reply save then sets
-    `content` from `output`, over it. So it shows only when a reply never
-    reaches that save. Probed on 0.12.0 (ELI-160 slice 8).
+    `content` from `output`, over it. So it shows when a reply never reaches
+    that save, and to a chat read that spans it (`_live_output`). Probed on
+    0.12.0 (ELI-160 slice 8).
     """
     if not __event_emitter__ or not content:
         return
     await __event_emitter__(
         {"type": "replace", "data": {"content": content}}
     )
+
+
+async def _live_output(request, chat_id: str | None, message_id: str | None) -> list | None:
+    """Open WebUI's live copy of a streaming reply's `output`: the text and
+    tool cards a chat read shows while the reply streams. None when there is
+    none (no request, a chat that is not saved, the reply not streaming).
+
+    Open WebUI 0.12's chat read (`GET /api/v1/chats/{id}`) takes the saved
+    message, then, a few awaits later, lays this copy over it. The saved
+    message has no `output` until Open WebUI's end-of-reply save, which then
+    drops the copy: a read whose two halves span that save gets the message
+    as saved before it, and nothing live over it (ELI-267). Open WebUI
+    refreshes the copy after each line of the reply it reads, so at the end
+    of the Pipe's stream it holds the whole reply."""
+    if request is None or not chat_id or not message_id:
+        return None
+    try:
+        from open_webui.tasks import get_response_streams_by_chat_id
+        streams = await get_response_streams_by_chat_id(
+            getattr(request.app.state, "redis", None), chat_id)
+    except Exception as ex:
+        pipe_log(f"  live output of {message_id[:8]}...: {ex!r}")
+        return None
+    output = next((s.get("output") for s in streams if s.get("message_id") == message_id), None)
+    return copy.deepcopy(output) if output else None
 
 
 
@@ -13300,16 +13326,16 @@ class _PipeTurn:
                 f"first_event_arrived={self.first_event_arrived} aborted={self.aborted}"
             )
 
-        # Terminal snapshot (ELI-57): the turn's visible text, written to the
-        # message with one `replace`. Open WebUI's own end-of-reply save
-        # overwrites it (`content` from `output`); it shows only when the
-        # reply never reaches that save (Open WebUI stopped mid-reply), until
-        # the orphan reconcile finishes the message. A mid-stream `replace`
-        # freezes the visible stream, so this is sent only at the end, when
-        # no deltas follow. Open WebUI writes it even for a `done: false`
-        # message and with no tab open.
+        # Terminal snapshot (ELI-57): the turn as it stands, written to the
+        # message (`save_end_snapshot`). Open WebUI's own end-of-reply save
+        # overwrites it; it shows when the reply never reaches that save
+        # (Open WebUI stopped mid-reply), until the orphan reconcile finishes
+        # the message, and to a chat read that spans that save (ELI-267). A
+        # mid-stream `replace` freezes the visible stream, so this is sent
+        # only at the end, when no deltas follow. Open WebUI writes it even
+        # for a `done: false` message and with no tab open.
         if not self.aborted and self.text_yielded:
-            await self.maybe_emit_snapshot(force=True)
+            await self.save_end_snapshot()
 
         # Auto-title: generate title after first exchange (best-effort, non-blocking)
         if not self.aborted and self.text_yielded:
@@ -13385,7 +13411,7 @@ class _PipeTurn:
                 pipe_log("  recovered assistant text at final fallback")
                 self.record_visible_chunk(recovered)
                 yield recovered
-                await self.maybe_emit_snapshot(force=True)
+                await self.save_end_snapshot()
             else:
                 # No assistant text and preview recovery came up empty. Surface
                 # the run's REAL terminal state (from the gateway) instead of a
@@ -13407,7 +13433,7 @@ class _PipeTurn:
                 )
                 self.record_visible_chunk(no_response_text)
                 yield no_response_text
-                await self.maybe_emit_snapshot(force=True)
+                await self.save_end_snapshot()
 
     async def _session_run_active(self) -> bool:
         # Fast path: describe exposes a persisted `status`. When it names a
@@ -13610,6 +13636,21 @@ class _PipeTurn:
         await _emit_message_snapshot(self.__event_emitter__, self.visible_message_text)
         self.last_snapshot_text = self.visible_message_text
         self.last_snapshot_time = now
+
+    async def save_end_snapshot(self):
+        """The terminal snapshot: the reply as it stands, saved to its message
+        before Open WebUI's own end-of-reply save. With Open WebUI's live copy
+        of the reply's output, its text and its tool cards in one write, so a
+        chat read that spans that save shows the cards too (ELI-267); with no
+        live copy, the text alone, as a `replace`."""
+        output = await _live_output(self.__request__, self.owui_origin_chat_id, self.owui_message_id)
+        if output is None:
+            await self.maybe_emit_snapshot(force=True)
+            return
+        await _owui_upsert_message(self.owui_origin_chat_id, self.owui_message_id,
+                                   {"content": self.visible_message_text, "output": output})
+        self.last_snapshot_text = self.visible_message_text
+        self.last_snapshot_time = time.time()
 
     async def maybe_answer_user_input(self, prompt_text: str) -> UserInputResult:
         """Ask the user via an OWUI modal and deliver their answer.
