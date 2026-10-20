@@ -13,7 +13,7 @@ IMAGE_BUDGET = 250 * 1024          # each image
 IMAGES_TOTAL_BUDGET = 4 * 1024 * 1024
 DEMOS = IMG / "demos"              # the demos, scripts/demos/record.py: a GIF, an MP4 and a WebM each
 DEMO_BUDGET = 1024 * 1024          # each GIF, as record.py enforces
-DEMOS_TOTAL_BUDGET = 9 * 1024 * 1024   # the docs' demos and the README's feature tiles (tile-*)
+DEMOS_TOTAL_BUDGET = 7 * 1024 * 1024   # the docs' demos and the README's feature tiles (tile-*)
 VIDEO_BUDGET = 1024 * 1024         # each MP4 and WebM, as record.py enforces
 VIDEOS_TOTAL_BUDGET = 8 * 1024 * 1024
 # Contributor and design pages may name issues and internals; user pages may not.
