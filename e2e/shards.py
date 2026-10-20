@@ -70,12 +70,15 @@ SHARDS = {
         f"{BROWSER}::test_a_multi_select_question_takes_typed_numbers",
         f"{BROWSER}::test_continue_on_a_reply_adds_nothing_and_says_why",
         f"{BROWSER}::test_stop_ends_the_reply_where_it_was",
+        f"{BROWSER}::test_a_message_sent_from_a_second_tab_keeps_the_running_reply",
     ],
     # The third crash, sub-agents, background commands, dialogs, reconnect.
     "2": [
         f"{E2E}::test_a_handed_over_reply_reads_not_done_in_the_db_once_its_request_ended",
         f"{E2E}::test_the_status_action_lists_a_running_subagent_and_opens_its_drawer",
         f"{E2E}::test_a_subagent_result_the_parent_answers_with_silence_shows_as_its_card",
+        f"{E2E}::test_a_wake_reply_ends_like_an_inline_reply",
+        f"{E2E}::test_a_subagent_result_ends_like_an_inline_reply",
         f"{E2E}::test_a_reply_that_opens_with_no_reply_and_answers_after_shows_the_answer_once",
         f"{E2E}::test_a_reply_the_agent_starts_that_errors_still_finishes",
         f"{E2E}::test_the_status_action_lists_a_background_command",
