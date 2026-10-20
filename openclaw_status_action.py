@@ -6783,7 +6783,10 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
   // A section that folds (ELI-163): its title with its count, and a chevron.
   // It opens when something in it runs at its first fill and is closed
   // otherwise; a tap wins after that, so a refill leaves it as it is.
-  // `onOpen`: what to fetch the first time it is open (once per dialog).
+  // `onOpen`: what to fetch the first time it is open (once per dialog), and
+  // again when the section is drawn anew still waiting for it while open: the
+  // reader asked already, so a skeleton must not wait for a tap that came
+  // (ELI-268).
   const folds = {};
   const foldFetched = {};
   function collapsible(name, label, live, onOpen) {
@@ -6808,18 +6811,18 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     const body = document.createElement('div');
     body.dataset.openclawFoldBody = name;
     wrap.appendChild(body);
-    function show(open) {
+    function show(open, drawn) {
       body.style.display = open ? 'block' : 'none';
       chevron.innerHTML = open ? ICON.up : ICON.down;
       head.setAttribute('aria-expanded', open ? 'true' : 'false');
       wrap.dataset.open = open ? 'true' : 'false';
-      if (open && onOpen && !foldFetched[name]) {
+      if (open && onOpen && (drawn || !foldFetched[name])) {
         foldFetched[name] = true;
         onOpen();
       }
     }
     head.onclick = function() { folds[name] = !folds[name]; show(folds[name]); };
-    show(folds[name]);
+    show(folds[name], true);
     return { wrap: wrap, body: body };
   }
 
@@ -7974,7 +7977,7 @@ def _dialog_open(user_id: str, session_key: str) -> tuple:
     dialog_id = uuid.uuid4().hex
     dialog = {"user": user_id, "session": session_key, "closed": asyncio.Event(),
               "expires": now + _DIALOG_FOLLOW_MAX_S, "rows": [], "total": 0,
-              "pending": False, "tapped": False}
+              "pending": False, "tapped": False, "subagents_sent": None}
     _open_dialogs[dialog_id] = dialog
     return dialog_id, dialog
 
@@ -9049,9 +9052,15 @@ class Action:
             finishing[:] = [k for k in waiting if k not in landed]
             ran.update(running)
             dialog["rows"], dialog["total"] = shown, len(children_seen)
+            # A refill that would show what the page already has is not sent:
+            # it would replace what the page made of it since, a failed tap's
+            # Retry or the rows the tap loaded (ELI-268).
+            sent = {"tasks": tasks, "total": len(children_seen), "pending": pending}
+            if sent == dialog["subagents_sent"]:
+                return running
+            dialog["subagents_sent"] = sent
             await emit(_render_subagents_fill_js({
-                "tasks": tasks, "total": len(children_seen), "pending": pending,
-                "source": source, "fetchedAt": int(time.time() * 1000), "error": None,
+                **sent, "source": source, "fetchedAt": int(time.time() * 1000), "error": None,
             }))
             return running
 
@@ -9162,12 +9171,13 @@ class Action:
             previews, source = None, "action-own"
         texts, newest = _subagent_previews(previews)
         spawned = _subagent_tasks(dialog["session"])
+        sent = {"tasks": [{**_subagent_row(r, texts.get(r["key"]) or spawned.get(r["key"]), newest.get(r["key"])),
+                           "controlUiUrl": _control_ui_session_url(self.valves.CONTROL_UI_URL, r["key"])}
+                          for r in rows],
+                "total": dialog["total"], "pending": False}
+        dialog["subagents_sent"] = sent
         await emit(_render_subagents_fill_js({
-            "tasks": [{**_subagent_row(r, texts.get(r["key"]) or spawned.get(r["key"]), newest.get(r["key"])),
-                       "controlUiUrl": _control_ui_session_url(self.valves.CONTROL_UI_URL, r["key"])}
-                      for r in rows],
-            "total": dialog["total"], "pending": False,
-            "source": source, "fetchedAt": int(time.time() * 1000), "error": None,
+            **sent, "source": source, "fetchedAt": int(time.time() * 1000), "error": None,
         }))
         return {"status": "ok"}
 
