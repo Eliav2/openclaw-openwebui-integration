@@ -794,11 +794,18 @@
           "show_ms": 2000
         },
         {
+          "do": "scroll_top"
+        },
+        {
           "do": "click",
           "selector": ".chat-assistant >> nth=0 >> [role=button] >> nth=0"
         },
         {
-          "do": "scroll_top"
+          "do": "wait",
+          "js": "() => document.querySelectorAll('.chat-assistant').length >= 3 && !/Started: Review: cache/.test(document.querySelectorAll('.chat-assistant')[0].innerText)"
+        },
+        {
+          "do": "park"
         },
         {
           "do": "cover"

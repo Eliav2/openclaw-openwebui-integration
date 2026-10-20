@@ -326,10 +326,9 @@ class Demo:
         self.rec.cover = len(self.rec.frames) - 1
 
     async def scroll_top(self, step: dict) -> None:
-        """Scroll the chat back to its first message, as a reader would."""
-        await self.page.evaluate("() => document.getElementById('messages-container')"
-                                 ".scrollTo({top: 0, behavior: 'smooth'})")
-        await self.page.wait_for_timeout(int(step.get("ms", 700)))
+        """Jump the chat back to its first message (a smooth scroll repaints every frame)."""
+        await self.page.evaluate("() => document.getElementById('messages-container').scrollTo({top: 0})")
+        await self.page.wait_for_timeout(int(step.get("ms", 400)))
 
     async def keys(self, step: dict) -> None:
         await self.page.evaluate(f"__keys({json.dumps(step['keys'])}, {int(step.get('ms', 900))})")
