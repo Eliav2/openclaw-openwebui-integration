@@ -88,7 +88,7 @@ It counts the background agents the reply started and stays until the reply ends
 
 ## Sub-agents
 
-The Subagents section lists every child session this chat's runs spawned, ended ones included, newest first, up to 20 ("20 of N" when there are more). A running one's elapsed time counts up while the dialog is open; one that finishes meanwhile shows its end as soon as the Gateway pushes the change. While the chat's own run goes on, a sub-agent it spawns after the dialog opened shows in it as soon as the Gateway pushes the new child's row. With none running, the section opens folded and reads the sub-agents' transcripts (their tasks and latest replies) on its first tap:
+The Subagents section lists every child session this chat's runs spawned, ended ones included, newest first, up to 20 ("20 of N" when there are more). A running one's elapsed time counts up while the dialog is open; one that finishes meanwhile shows its end as soon as the Gateway pushes the change, and its last reply once that reaches its transcript (on the claude-cli runtime, just after its run ends). While the chat's own run goes on, including a reply just sent whose run has not started yet, a sub-agent it spawns after the dialog opened shows in it as soon as the Gateway pushes the new child's row, and Context is read again each time the chat's run starts or ends. With none running, the section opens folded and reads the sub-agents' transcripts (their tasks and latest replies) on its first tap:
 
 <img src="../img/status-dialog-folded-light.png" alt="The Status dialog with every section folded, each with its count" width="320">
 

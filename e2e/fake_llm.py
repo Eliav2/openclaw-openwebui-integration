@@ -13,8 +13,7 @@ whole):
 * `exactly: TOKEN` / `exactly TOKEN`  -> replies with TOKEN alone. Covers the
   installer's smoke test ("reply with exactly OK_CONFIG_TEST").
 * `E2E_COMPACT_FAIL` anywhere in a chat -> its compaction's summary request is
-  refused (HTTP 400 `E2E_COMPACT_REFUSED`), so the compaction fails.
-* `Create a concise title`            -> `TITLE` below: the Pipe's own chat-title
+  refused (HTTP 400 `E2E_COMPACT_REFUSED`), so the compaction fails.* `Create a concise title`            -> `TITLE` below: the Pipe's own chat-title
   run (the `title-gen` agent), after a chat's second exchange.
 * `E2E_SPAWN_SILENT`                   -> spawns a sub-agent (task `E2E_SILENT_CHILD`,
                                           label `silent helper`) that answers
