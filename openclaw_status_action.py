@@ -3344,8 +3344,17 @@ class _GatewayConnection:
         if not consumer.queues or queue is None:
             del self._consumers[key]
             self._release_held(session_key)
+            # Its run may never have started (`has_reply`): waiters re-read.
+            self._wake_session_waiters(session_key)
         pipe_log(f"  unregistered consumer: {key[:60]}...")
         self._close_if_retired_and_idle()
+
+    def has_reply(self, session_key: str) -> bool:
+        """Whether a reply on this connection streams a run of `session_key`.
+        Its consumer is registered before its chat.send, so this holds while
+        the Gateway has no run for it yet (ELI-260); its end wakes the
+        session's `session_change_event`."""
+        return any(c.session_key == session_key for c in self._consumers.values())
 
     def _serving(self) -> bool:
         """Work a retired connection still owes: replies streaming here, and
@@ -7694,15 +7703,6 @@ def _running_row(desc_task):
     return bool(((desc_task.result() or {}).get("session") or {}).get("hasActiveRun"))
 
 
-async def _session_running(conn, key):
-    """Whether session `key` has a run now (`_running_row`)."""
-    desc = asyncio.ensure_future(conn.send_request("sessions.describe", dict(key=key), timeout=5))
-    await asyncio.wait([desc])
-    if not desc.cancelled() and desc.exception() is not None:
-        pipe_log(f"[status-action] sessions.describe (run state) failed: {desc.exception()}")
-    return _running_row(desc)
-
-
 async def _resolved(value):
     return value
 
@@ -8829,13 +8829,14 @@ class Action:
                 "sessions.list", dict(spawnedBy=session_key, limit=50, includeLastMessage=True), timeout=5,
             )
 
-        async def fill_context():
+        async def fill_context(described=None):
             """Also resolves provider/session_row for fill_limits to reuse
             (returned, not re-fetched) -- still reuses emit.py's small
             formatting primitives (_fmt_tokens, _format_goal_line) so
-            wording matches the status line exactly."""
+            wording matches the status line exactly. `described`: a later
+            read of the session than the open's."""
             try:
-                desc = await desc_task
+                desc = await (described or desc_task)
             except Exception as ex:
                 pipe_log(f"[status-action] sessions.describe failed: {ex}")
                 await emit(_render_context_fill_js({"error": f"Could not fetch context: {ex}"}))
@@ -8929,11 +8930,18 @@ class Action:
         children_seen, task_texts, latest = {}, {}, {}
         # The listed running children with no task to title them yet.
         untitled: list = []
+        # Children seen running here, those of them that ended done with
+        # their last message in their row, and those still waiting for it: a
+        # claude-cli child's messages reach its transcript after its run
+        # settles (ELI-262).
+        ran, landed, finishing = set(), set(), []
 
-        async def read_transcripts(keys, again=()):
+        async def read_transcripts(keys, again=(), fresh=()):
             """The task and newest message of each of `keys` not read yet,
-            and of each of `again` whose read found no task."""
-            unread = [k for k in keys if k not in task_texts or (k in again and task_texts[k] is None)]
+            of each of `again` whose read found no task, and of each of
+            `fresh`."""
+            unread = [k for k in keys if k not in task_texts or k in fresh
+                      or (k in again and task_texts[k] is None)]
             if not unread:
                 return
             try:
@@ -9015,12 +9023,18 @@ class Action:
             spawned = _subagent_tasks(session_key)
             want = [r["key"] for r in shown if r["key"] in running and not (r.get("label") or "").strip()
                     and not spawned.get(r["key"])]
+            waiting = [r["key"] for r in shown if r["key"] in ran and r["key"] not in landed
+                       and _subagent_status(r.get("status")) == "completed"]
             if not pending:
-                await read_transcripts([r["key"] for r in shown], again=want)
+                await read_transcripts([r["key"] for r in shown], again=want, fresh=waiting)
             untitled[:] = [k for k in want if not task_texts.get(k)]
+            tasks = subagent_rows(shown)
+            landed.update(t["id"] for t in tasks if t["id"] in waiting and t["terminalSummary"])
+            finishing[:] = [k for k in waiting if k not in landed]
+            ran.update(running)
             dialog["rows"], dialog["total"] = shown, len(children_seen)
             await emit(_render_subagents_fill_js({
-                "tasks": subagent_rows(shown), "total": len(children_seen), "pending": pending,
+                "tasks": tasks, "total": len(children_seen), "pending": pending,
                 "source": source, "fetchedAt": int(time.time() * 1000), "error": None,
             }))
             return running
@@ -9064,20 +9078,24 @@ class Action:
         deadline = time.time() + _DIALOG_FOLLOW_MAX_S
         closed = dialog["closed"]
         subscribed = set()
-        running = _running_row(desc_task)
+        # The chat runs while the Gateway has its run, or while the Pipe in
+        # this process streams a reply whose chat.send has not started one
+        # yet: a dialog opened right after a send (ELI-260).
+        running = _running_row(desc_task) or conn.has_reply(session_key)
         refill = bool(listed)   # their events are taken only below
         while not closed.is_set():
-            for k in [k for k in untitled if k not in subscribed]:
+            appending = untitled + finishing
+            for k in [k for k in appending if k not in subscribed]:
                 subscribed.add(k)
                 await conn.ensure_message_subscription(k)
             changes = watched + [conn.session_change_event(k) for k in listed]
-            changes += [conn.session_message_event(k) for k in untitled]
+            changes += [conn.session_message_event(k) for k in appending]
             if refill:
                 following = listed
                 listed = await fill_subagents(list_children())
-                if set(listed) - set(following):
-                    continue    # a new child: take its event first
-            if not listed and not running:
+                if set(listed) - set(following) or set(finishing) - set(appending):
+                    continue    # a new child, or one to finish: take its event first
+            if not listed and not running and not finishing:
                 break
             waits = [asyncio.ensure_future(ev.wait()) for ev in changes]
             waits.append(asyncio.ensure_future(closed.wait()))
@@ -9089,8 +9107,17 @@ class Action:
                     w.cancel()
             if not done or closed.is_set():
                 break
+            # Read the chat again: its run state, and its context, which a
+            # dialog opened right after a send had none of yet (ELI-262).
             watched = chat_events()
-            running = await _session_running(conn, session_key)
+            described = asyncio.ensure_future(
+                conn.send_request("sessions.describe", dict(key=session_key), timeout=5))
+            await asyncio.wait([described])
+            if described.exception() is None:
+                await fill_context(described)
+            else:
+                pipe_log(f"[status-action] sessions.describe (follow) failed: {described.exception()}")
+            running = _running_row(described) or conn.has_reply(session_key)
             refill = True
         return {"status": "ok"}
 

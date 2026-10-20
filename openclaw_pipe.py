@@ -6374,8 +6374,17 @@ class _GatewayConnection:
         if not consumer.queues or queue is None:
             del self._consumers[key]
             self._release_held(session_key)
+            # Its run may never have started (`has_reply`): waiters re-read.
+            self._wake_session_waiters(session_key)
         pipe_log(f"  unregistered consumer: {key[:60]}...")
         self._close_if_retired_and_idle()
+
+    def has_reply(self, session_key: str) -> bool:
+        """Whether a reply on this connection streams a run of `session_key`.
+        Its consumer is registered before its chat.send, so this holds while
+        the Gateway has no run for it yet (ELI-260); its end wakes the
+        session's `session_change_event`."""
+        return any(c.session_key == session_key for c in self._consumers.values())
 
     def _serving(self) -> bool:
         """Work a retired connection still owes: replies streaming here, and
