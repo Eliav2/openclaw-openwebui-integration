@@ -1115,6 +1115,20 @@ def test_the_status_action_lists_a_running_subagent_and_opens_its_drawer(token):
     assert msg.get("content", "").strip() == "E2E_SPAWNED", msg
     status, me = _request("GET", "/api/v1/auths/", token=token)
     assert status == 200, me
+    # On 2026.10 the child's spawn message reaches its transcript after the
+    # spawn returns. Opened before that, the row is titled by the task the
+    # Pipe recorded from the spawn call (ELI-178, unit-tested), but this
+    # Action runs here with its own STATE_DIR, so it has only the transcript
+    # to title from (ELI-250). Open once the transcript holds the task.
+    parent = _session_key(token, chat_id)
+
+    def spawn_written():
+        kids = [r["key"] for r in _gw("sessions.list", {}).get("sessions") or []
+                if r.get("key") != parent and parent in (r.get("spawnedBy"), r.get("parentSessionKey"))]
+        previews = _gw("sessions.preview", {"keys": kids, "limit": 20, "maxChars": 2000}) if kids else {}
+        return any(i.get("role") == "user" and "E2E_CHILDTASK" in (i.get("text") or "")
+                   for p in previews.get("previews") or [] for i in p.get("items") or [])
+    _until("the child's transcript to hold its spawn message", spawn_written, timeout_s=30, every_s=0.2)
 
     # The dialog stays open while a listed child runs and refills on its
     # pushed change (ELI-127), so this returns once the child is done.
