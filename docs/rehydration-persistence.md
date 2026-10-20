@@ -6,7 +6,8 @@ How Open WebUI 0.12 (the minimum) keeps an assistant message while its reply is 
 
 - The streaming handler keeps the in-progress `content` and `output` in `response_streams` (`utils/middleware.py`, `save_current_response_stream`).
 - `GET /api/v1/chats/{id}` overlays that copy onto the message (`routers/chats.py`, `overlay_response_streams`). Measured live on 0.12.0, the GET returned the growing text about every 2 s, so a client that reloads mid-turn is rehydrated by Open WebUI itself.
-- When the reply ends, Open WebUI saves `done: true` with the final `output`: at the end of the streaming handler, or in `save_cancelled_state` when the reply is cancelled (`utils/middleware.py`).
+- When the reply ends, Open WebUI saves `done: true` with the final `output`: at the end of the streaming handler, or in `save_cancelled_state` when the reply is cancelled (`utils/middleware.py`). It then drops the response stream.
+- The GET reads the saved message first and the response stream a few awaits later. A GET whose two reads span the end-of-reply save gets the message as saved before it, with no overlay: on 0.12.3, in about half of the replies hit by six readers, for a few tens of milliseconds (ELI-267). A tab that opens the chat then shows that message.
 
 ## A done:false message cannot be written mid-run
 
@@ -14,7 +15,7 @@ How Open WebUI 0.12 (the minimum) keeps an assistant message while its reply is 
 
 ## What the Pipe still sends
 
-The Pipe sends a forced `replace` event when a reply ends or is stopped (`emit.py`, `_emit_message_snapshot`). It goes through `Chats.upsert_message_to_chat_by_id_and_message_id`, which has no `done` guard, so it is written even while the message is `done: false`. Open WebUI's end-of-reply save then sets `content` from `output` over it. So the snapshot shows only when a reply never reaches that save (Open WebUI stopped mid-reply), until the orphan reconcile finishes the message. Probed on 0.12.0 in CI: after the event the stored message read `done: false`, `content` = the snapshot; after the end-of-reply save, `done: true`, `content` = the `output` text.
+When a reply ends, the Pipe saves the reply as it stands to its message (`pipe.py`, `save_end_snapshot`): its text and Open WebUI's live copy of its `output` (`emit.py`, `_live_output`, read from the response stream), in one `Chats.upsert_message_to_chat_by_id_and_message_id`. That upsert has no `done` guard, so it is written even while the message is `done: false`. Open WebUI's end-of-reply save then writes its own `output` over it. So the snapshot shows when a reply never reaches that save (Open WebUI stopped mid-reply), until the orphan reconcile finishes the message, and to a GET that spans that save, as above. Before ELI-267 it held the text alone, and a tab that opened the chat as a reply ended showed the text without its tool cards. With no live copy (no request, or a chat that is not saved), the Pipe sends the text alone as a `replace` event (`_emit_message_snapshot`), as it does when a reply is stopped. Probed on 0.12.0 in CI: after that event the stored message read `done: false`, `content` = the snapshot; after the end-of-reply save, `done: true`, `content` = the `output` text.
 
 ## The turn writer
 
