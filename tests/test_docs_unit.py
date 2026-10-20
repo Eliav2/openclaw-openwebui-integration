@@ -201,6 +201,32 @@ class DocsLinkTests(unittest.TestCase):
         self.assertEqual(image_size(DEMOS / "hero.gif"), (960, 640))
 
 
+class HiddenExamplesTests(unittest.TestCase):
+    """docs/examples/ describes our own setup, not the Pipe: each page is reachable only
+    through a link in the section it illustrates, and listed nowhere (sidebar, home page,
+    search, llms.txt)."""
+
+    def setUp(self):
+        self.pages = sorted((ROOT / "docs" / "examples").glob("*.md"))
+        self.config = (ROOT / "docs" / ".vitepress" / "config.mts").read_text()
+
+    def test_not_in_the_sidebar_or_the_home_page(self):
+        self.assertTrue(self.pages)
+        self.assertNotRegex(self.config, r'link:\s*"/examples/')
+        self.assertNotIn("examples/", (ROOT / "docs" / "index.md").read_text())
+
+    def test_not_in_search_or_llms_txt(self):
+        self.assertIn('ignoreFiles: ["examples/**"]', self.config)
+        self.assertIn('env.relativePath.startsWith("examples/") ? ""', self.config)
+
+    def test_each_is_linked_from_a_feature_page(self):
+        for page in self.pages:
+            with self.subTest(page=rel(page)):
+                linked = [rel(md) for md in markdown_files() if md.parent.name != "examples"
+                          and any((md.parent / l.split("#")[0]).resolve() == page for l in links(md))]
+                self.assertTrue(linked, f"nothing links {rel(page)}")
+
+
 class DocsWordingTests(unittest.TestCase):
 
     def test_no_em_dash(self):

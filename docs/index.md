@@ -40,10 +40,6 @@ The three functions: the **Pipe** is the chat integration, the **Status Action**
 - [Versions](./versions.md): tested versions, minimums, and what an older release loses.
 - [Security](./security.md): the secrets, the media file server, the agent's privileges, owner users, the scripts in your browser.
 
-## Examples
-
-- [Example: a live browser view](./examples/live-browser-view.md): our own private service, shown as one use of the embed hook; not part of the Pipe and not provided.
-
 ## Contribute
 
 - [Architecture](./architecture.md): how a message travels from Open WebUI to the agent and back, why the Pipe is an async generator, and the repo's file layout.

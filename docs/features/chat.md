@@ -64,7 +64,7 @@ The Pipe ships no such page and no viewer: it only passes the address on. Withou
 - [`LIVE_VIEW_TOOLS`](../configuration.md#live_view_tools): which tool calls add it, a pattern searched in the tool's name and arguments. The default is browser use: the `browser` tool, `openclaw browser` commands (how the agent drives its browser through exec) and commands that run Playwright or Chromium. If your agent starts a browser through a script of its own, add the script to the pattern.
 - [`LIVE_VIEW_USERS`](../configuration.md#live_view_users): limits it to some users.
 
-The valves are named after the use the hook was built for, a live view of the agent's browser, but the page can be anything your service serves for a reply. [Example: a live browser view](../examples/live-browser-view.md) shows our own setup as one such use.
+The valves are named after the use the hook was built for, a live view of the agent's browser, but the page can be anything your service serves for a reply. See [our own setup as one example](../examples/live-browser-view.md).
 
 Open WebUI shows the page in a sandboxed frame, as it does every embed, so the page cannot reach Open WebUI or your login. Your service decides who may see what it shows: put it behind your own login.
 
