@@ -409,7 +409,7 @@ class OpenTests(unittest.IsolatedAsyncioTestCase):
             async def wait(self):
                 followed.set()
                 await asyncio.Future()
-        conn.session_change_event = lambda _key: _Never()
+        conn.session_change_event = conn.session_child_event = lambda _key: _Never()
         with action_gateway(conn), mock.patch.dict(sys.modules, _owui([])):
             opening = asyncio.ensure_future(Action().action(
                 {"chat_id": CHAT}, __user__={"id": USER}, __event_emitter__=RecordingEmitter(emitted)))

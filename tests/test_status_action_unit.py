@@ -1245,6 +1245,7 @@ async def _open_dialog(opening, conn):
 
     conn.session_change_event = lambda _key: _Unchanged()
     conn.session_message_event = lambda _key: _Unchanged()
+    conn.session_child_event = lambda _key: _Unchanged()
     conn.ensure_message_subscription = _subscribe_nothing
     task = asyncio.ensure_future(opening)
     waiting = asyncio.ensure_future(followed.wait())

@@ -1175,6 +1175,49 @@ def test_the_status_action_lists_a_running_subagent_and_opens_its_drawer(token):
     assert drawer["parent"]["chatId"] == chat_id, drawer
 
 
+def test_a_subagent_spawned_after_the_status_dialog_opened_is_listed_while_it_stays_open(token):
+    """ELI-260 (QA C27): opened while the chat's run went on, the dialog
+    listed no child and stopped following, so a child spawned after the open
+    stayed out of it until a reopen."""
+    chat_id, _ = _chat_turn(token, "Respond with exactly: E2E_USAGE_CHAT")
+    key = _session_key(token, chat_id)
+    status, me = _request("GET", "/api/v1/auths/", token=token)
+    assert status == 200, me
+    hold_token = f"c27{uuid.uuid4().hex[:8]}"
+    # e2e/fake_llm.py hold_file
+    hold = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{hold_token}")
+    replies: list = []
+    turn = threading.Thread(target=lambda: replies.append(
+        _chat_turn(token, f"E2E_HOLD_SPAWN {hold_token}", chat_id=chat_id)[1]), daemon=True)
+    turn.start()
+    try:
+        _until("the chat's run to hold", lambda: _gw("sessions.describe", {"key": key})
+               .get("session", {}).get("hasActiveRun"), timeout_s=60, every_s=1)
+
+        async def open_then_spawn(action, emit):
+            async def emit_then_release(evt):
+                await emit(evt)
+                code = (evt.get("data") or {}).get("code") or ""
+                if "getElementById('openclaw-status-section-subagents')" in code:
+                    open(hold, "w").close()     # the run spawns its child now
+            await action.action({"chat_id": chat_id}, __user__={"id": me["id"]},
+                                __event_emitter__=emit_then_release)
+
+        # Returns once nothing is left to follow: the chat's run and the child
+        # are done.
+        codes = _run_action(token, open_then_spawn)
+    finally:
+        open(hold, "w").close()
+        turn.join(TURN_TIMEOUT_S)
+    assert replies and replies[0].get("content", "").strip().endswith("E2E_SPAWNED"), replies
+    assert _section_data(codes, "openclaw-status-section-subagents", 0)["tasks"] == []
+    fills = [c for c in codes if "getElementById('openclaw-status-section-subagents')" in c]
+    statuses = [[t["status"] for t in json.loads(re.search(r"const DATA = (.*?);\n", c).group(1))["tasks"]]
+                for c in fills]
+    assert ["running"] in statuses, statuses
+    assert statuses[-1] == ["completed"], statuses
+
+
 def test_a_subagent_result_the_parent_answers_with_silence_shows_as_its_card(token):
     """The parent answers a sub-agent's completion with NO_REPLY: the chat
     still gets one message, a finished Sub-agent card holding the child's

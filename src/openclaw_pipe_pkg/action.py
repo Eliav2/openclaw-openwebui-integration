@@ -1802,6 +1802,24 @@ async def _lookup_child(conn, key):
     return next((r for r in (resp or {}).get("sessions") or [] if r.get("key") == key), None)
 
 
+def _running_row(desc_task):
+    """Whether the session `desc_task` (a done `sessions.describe`) described
+    has a run: its row's `hasActiveRun`, which stays set through a
+    `sessions_yield` gap, unlike its status."""
+    if desc_task.cancelled() or desc_task.exception() is not None:
+        return False
+    return bool(((desc_task.result() or {}).get("session") or {}).get("hasActiveRun"))
+
+
+async def _session_running(conn, key):
+    """Whether session `key` has a run now (`_running_row`)."""
+    desc = asyncio.ensure_future(conn.send_request("sessions.describe", dict(key=key), timeout=5))
+    await asyncio.wait([desc])
+    if not desc.cancelled() and desc.exception() is not None:
+        pipe_log(f"[status-action] sessions.describe (run state) failed: {desc.exception()}")
+    return _running_row(desc)
+
+
 async def _resolved(value):
     return value
 
@@ -2901,6 +2919,12 @@ class Action:
             await agents_ready
             return {"status": "error", "detail": str(ex)}
 
+        # The chat's run state and its children, which the open follows while
+        # the chat runs (ELI-260): taken before the reads they guard.
+        def chat_events():
+            return [conn.session_change_event(session_key), conn.session_child_event(session_key)]
+        watched = chat_events()
+
         # Every source at once; each section awaits only its own.
         desc_task = asyncio.ensure_future(
             conn.send_request("sessions.describe", dict(key=session_key), timeout=5))
@@ -3146,24 +3170,32 @@ class Action:
         # The ticker counts a running child up while the dialog is open, so a
         # child that ends meanwhile must show its end (ELI-127). Hold this
         # request open, as the drawer does, and refill the section on each
-        # pushed change to a listed child's run state, until none is listed,
-        # the page closes the dialog, or the follow's bound passes. A running
-        # child with no task yet is titled once its spawn message reaches its
-        # transcript: the section refills on that append too (ELI-253). Each
+        # pushed change to a listed child's run state, until none is listed
+        # and the chat's own run is done, the page closes the dialog, or the
+        # follow's bound passes. A running child with no task yet is titled
+        # once its spawn message reaches its transcript: the section refills
+        # on that append too (ELI-253). The chat's run may spawn a child after
+        # the open: a pushed change to a child of this session, a new one
+        # included, refills the section too (ELI-260). Each
         # event is taken before the read it guards, so none slips between.
         deadline = time.time() + _DIALOG_FOLLOW_MAX_S
         closed = dialog["closed"]
         subscribed = set()
-        while listed and not closed.is_set():
+        running = _running_row(desc_task)
+        refill = bool(listed)   # their events are taken only below
+        while not closed.is_set():
             for k in [k for k in untitled if k not in subscribed]:
                 subscribed.add(k)
                 await conn.ensure_message_subscription(k)
-            changes = [conn.session_change_event(k) for k in listed]
+            changes = watched + [conn.session_change_event(k) for k in listed]
             changes += [conn.session_message_event(k) for k in untitled]
-            following = listed
-            listed = await fill_subagents(list_children())
-            if not listed or set(listed) - set(following):
-                continue    # none left, or a new child: take its event first
+            if refill:
+                following = listed
+                listed = await fill_subagents(list_children())
+                if set(listed) - set(following):
+                    continue    # a new child: take its event first
+            if not listed and not running:
+                break
             waits = [asyncio.ensure_future(ev.wait()) for ev in changes]
             waits.append(asyncio.ensure_future(closed.wait()))
             try:
@@ -3172,8 +3204,11 @@ class Action:
             finally:
                 for w in waits:
                     w.cancel()
-            if not done:
+            if not done or closed.is_set():
                 break
+            watched = chat_events()
+            running = await _session_running(conn, session_key)
+            refill = True
         return {"status": "ok"}
 
     async def _run_subagent_rows(self, body: dict, __user__, __event_emitter__):
