@@ -1517,14 +1517,22 @@ _BACKGROUND_FILL_JS_TEMPLATE = r"""
     });
     // ELI-232: the whole command, on hover and on a tap.
     if (r.command) el.title = r.command;
+    if (r.command && opened[r.command]) showCommand(el, r.command);
     return el;
   }
+  // A command shown stays shown when the section is read again (ELI-256).
+  const opened = S.bgCommandsShown = S.bgCommandsShown || {};
   function toggleCommand(el, command) {
     const shown = el.querySelectorAll('[data-openclaw-command]')[0];
     if (shown) {
       shown.remove();
+      delete opened[command];
       return;
     }
+    opened[command] = true;
+    showCommand(el, command);
+  }
+  function showCommand(el, command) {
     const pre = document.createElement('div');
     pre.dataset.openclawCommand = '1';
     pre.className = 'text-xs font-mono text-gray-500 dark:text-gray-400 whitespace-pre-wrap break-all mt-1 '
@@ -1540,6 +1548,25 @@ _BACKGROUND_FILL_JS_TEMPLATE = r"""
   if (!rows.length) fold.body.appendChild(S.noteEl('Nothing in the background for this chat.'));
   rows.forEach(function(r) { fold.body.appendChild(row(r)); });
   S.touchFooter(DATA.fetchedAt, DATA.source);
+
+  // ELI-256: the Gateway pushes nothing when a background task ends, so
+  // while a row runs the open dialog reads the section again, one ask at a
+  // time, as the drawer follows its child (ELI-155). The fill each ask
+  // brings sets the next; an ask that brought none (failed, or its fill was
+  // lost) tries again; none once the dialog is gone.
+  clearTimeout(S.bgPoll);
+  S.bgFills = (S.bgFills || 0) + 1;
+  if (!rows.some(isLive)) return;
+  const wait = S.identity.backgroundPollMs || 5000;
+  function ask() {
+    if (!section.isConnected) return;
+    const fills = S.bgFills;
+    const again = function() {
+      if (S.bgFills === fills) S.bgPoll = setTimeout(ask, wait);
+    };
+    S.askAction({ mode: 'background-rows' }).then(again, again);
+  }
+  S.bgPoll = setTimeout(ask, wait);
 })();
 """
 
@@ -2074,6 +2101,28 @@ async def _read_automations(conn) -> "list | None":
     return (resp or {}).get("jobs") or []
 
 
+async def _background_data(tasks_task, jobs_task, chat_task, session_key: str, source: str) -> dict:
+    """The Background section's fill from its three reads (tasks, automations,
+    Open WebUI's copy of the chat): a failed Gateway read says so in the
+    section and the rest still shows."""
+    errors = []
+    try:
+        tasks = await tasks_task
+    except Exception as ex:
+        pipe_log(f"[status-action] tasks.list failed: {ex}")
+        tasks = []
+        errors.append(f"Could not read background tasks: {ex}")
+    try:
+        jobs = await jobs_task
+    except Exception as ex:
+        pipe_log(f"[status-action] cron.list failed: {ex}")
+        jobs = []
+        errors.append(f"Could not read automations: {ex}")
+    chat = await chat_task
+    data = _background_rows(tasks, jobs, _agent_call_rows(chat), session_key, commands=_exec_commands(chat))
+    return {**data, "errors": errors, "source": source, "fetchedAt": int(time.time() * 1000), "error": None}
+
+
 # ---------------------------------------------------------------------------
 # The Background section (ELI-163): what runs for this chat outside a reply.
 # Read once when the dialog opens, never polled.
@@ -2427,6 +2476,10 @@ _DIALOG_FOLLOW_MAX_S = 900
 # not a held request, so the poll lives exactly as long as the drawer is open
 # and the sub-agent runs (ELI-155).
 _SUBAGENT_POLL_INTERVAL_S = 2.5
+# How often the open dialog reads its Background section again while a row
+# runs: the Gateway pushes nothing when a background task ends (ELI-256).
+# Polled by the page too, so it stops with the dialog.
+_BACKGROUND_POLL_INTERVAL_S = 5
 
 
 def _message_text_blocks(message: dict) -> list:
@@ -2738,6 +2791,8 @@ class Action:
             return {"status": "ok"}
         if mode == "subagent-rows":
             return await self._run_subagent_rows(body, __user__, __event_emitter__)
+        if mode == "background-rows":
+            return await self._run_background_rows(body, __user__, __event_emitter__)
         if mode is None:
             marker = _SUBAGENT_TASK_ID_MARKER_RE.search(body.get("content") or "")
             if marker:
@@ -2812,6 +2867,7 @@ class Action:
                 "dialogId": dialog_id,
                 "controlUiUrl": _control_ui_session_url(self.valves.CONTROL_UI_URL, session_key),
                 "subagentPollMs": int(_SUBAGENT_POLL_INTERVAL_S * 1000),
+                "backgroundPollMs": int(_BACKGROUND_POLL_INTERVAL_S * 1000),
             }
             await emit(_render_modal_open_js(identity))
         else:
@@ -2959,26 +3015,8 @@ class Action:
             }))
 
         async def fill_background():
-            errors = []
-            try:
-                tasks = await tasks_task
-            except Exception as ex:
-                pipe_log(f"[status-action] tasks.list failed: {ex}")
-                tasks = []
-                errors.append(f"Could not read background tasks: {ex}")
-            try:
-                jobs = await jobs_task
-            except Exception as ex:
-                pipe_log(f"[status-action] cron.list failed: {ex}")
-                jobs = []
-                errors.append(f"Could not read automations: {ex}")
-            chat = await chat_task
-            data = _background_rows(tasks, jobs, _agent_call_rows(chat), session_key,
-                                    commands=_exec_commands(chat))
-            await emit(_render_background_fill_js({
-                **data, "errors": errors, "source": source,
-                "fetchedAt": int(time.time() * 1000), "error": None,
-            }))
+            await emit(_render_background_fill_js(
+                await _background_data(tasks_task, jobs_task, chat_task, session_key, source)))
 
         # Every child seen so far by key, and what their transcripts told.
         children_seen, task_texts, latest = {}, {}, {}
@@ -3169,6 +3207,32 @@ class Action:
             "total": dialog["total"], "pending": False,
             "source": source, "fetchedAt": int(time.time() * 1000), "error": None,
         }))
+        return {"status": "ok"}
+
+    async def _run_background_rows(self, body: dict, __user__, __event_emitter__):
+        """The open dialog's Background section, read again (ELI-256): the
+        page asks every _BACKGROUND_POLL_INTERVAL_S while a row runs, since
+        the Gateway pushes nothing when a background task ends."""
+        chat_id = body.get("chat_id")
+        user_id = (__user__ or {}).get("id") or "unknown"
+
+        async def emit(code):
+            await __event_emitter__({"type": "execute", "data": {"code": code}})
+
+        if not chat_id:
+            return {"status": "error", "detail": "missing chat_id"}
+        session_key = _owui_session_key(self.valves.AGENT_ID, user_id, chat_id)
+        chat_task = asyncio.ensure_future(_load_owui_recent(chat_id, user_id))
+        try:
+            conn, source = await _get_action_connection(lambda: self.valves)
+        except Exception as ex:
+            pipe_log(f"[status-action] background-rows connect failed: {ex}")
+            chat_task.cancel()
+            await emit(_render_section_error_js("background", f"Could not connect: {ex}"))
+            return {"status": "error", "detail": str(ex)}
+        await emit(_render_background_fill_js(await _background_data(
+            asyncio.ensure_future(_read_background_tasks(conn, session_key)),
+            asyncio.ensure_future(_read_automations(conn)), chat_task, session_key, source)))
         return {"status": "ok"}
 
     async def _run_compact(self, body: dict, __user__, __event_emitter__):

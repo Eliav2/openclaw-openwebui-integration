@@ -383,6 +383,21 @@ class OpenTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(any("Other automations" in t for t in seen["background"]["texts"]))
                 self.assertIsNone(seen["other-automations"]["open"], "no fold of other automations")
 
+    async def test_the_page_reads_the_background_section_again(self):
+        """ELI-256, mode "background-rows": the open dialog's ask reads only
+        the Background section's sources and fills that section alone."""
+        calls, chat_reads, emitted = [], [], []
+        with action_gateway(_gateway(calls)), mock.patch.dict(sys.modules, _owui(chat_reads)):
+            result = await Action().action({"chat_id": CHAT, "mode": "background-rows", "dialogId": "d1"},
+                                           __user__={"id": USER}, __event_emitter__=RecordingEmitter(emitted))
+        self.assertEqual(result, {"status": "ok"})
+        self.assertEqual(collections.Counter(calls), {"tasks.list": 1, "cron.list": 1})
+        self.assertEqual(chat_reads, [CHAT])
+        fills = _fills(emitted)
+        self.assertEqual(sorted(fills), ["background"])
+        self.assertEqual([(r["kind"], r["title"]) for r in fills["background"]["rows"]],
+                         [("Command", "sleep 25"), ("Agent", "Tax research")])
+
     async def test_closing_the_dialog_stops_its_follow(self):
         """The page tells the Action it was dismissed (mode "status-closed"):
         the open request stops at once and reads nothing more."""
@@ -417,6 +432,10 @@ _BG_PAGE_JS = _FAKE_DOM_JS + r"""
 const fetches = [];
 global.localStorage = { getItem: () => 'tok' };
 global.fetch = (url, opts) => { fetches.push(JSON.parse(opts.body)); return Promise.resolve({}); };
+// Timeouts the steps fire by hand ({"wait": true} fires every pending one).
+const timeouts = new Map();
+global.setTimeout = (fn) => { const id = nextTimer++; timeouts.set(id, fn); return id; };
+global.clearTimeout = (id) => { timeouts.delete(id); };
 run(input.open);
 input.fills.forEach(run);
 const section = (n) => document.getElementById('openclaw-status-section-' + n);
@@ -430,7 +449,13 @@ for (const step of input.steps || []) {
   if (step.tapRow != null) section('background').walk().filter((e) => e.dataset.openclawBgRow)[step.tapRow].onclick();
   if (step.close) document.getElementById('openclaw-status-modal-root').walk()
     .find((e) => e.tagName === 'BUTTON' && e.textContent === '×').onclick();
+  if (step.wait) {
+    const due = [...timeouts.values()];
+    timeouts.clear();
+    due.forEach((fn) => fn());
+  }
 }
+out.timeouts = timeouts.size;
 for (const n of input.read) out[n] = { open: fold(n) ? fold(n).dataset.open : null, texts: texts(n) };
 if (section('background')) out.hovers = section('background').walk().filter((e) => e.dataset.openclawBgRow)
   .map((e) => [e.tagName, e.title || null]);
@@ -484,6 +509,31 @@ class BackgroundPageTests(unittest.TestCase):
         seen = self.page([idle, _bg([self.CMD])], ["background"], [{"tap": "background"}, {"refill": 1}])
         self.assertEqual(seen["background"]["open"], "true")
         self.assertEqual(self.page([idle], ["background"])["background"]["open"], "false")
+
+    def test_while_a_row_runs_the_open_dialog_reads_the_section_again(self):
+        """ELI-256: the Gateway pushes nothing when a background task ends,
+        and the dialog left open kept its row "Running" until it was opened
+        again. While a row runs the page asks for the section again, one ask
+        at a time; a fill with nothing running stops it, and so does closing
+        the dialog."""
+        modes = lambda seen: [f["mode"] for f in seen["fetches"]]  # noqa: E731
+        done = _bg([{**self.CMD, "status": "completed", "endedAt": NOW}])
+        running = self.page([_bg([self.CMD])], ["background"], [{"wait": True}])
+        self.assertEqual(modes(running), ["background-rows"])
+        self.assertEqual(running["fetches"][0]["dialogId"], "d1")
+        self.assertEqual(running["timeouts"], 0, "a second ask while the first is out")
+        ended = self.page([_bg([self.CMD]), done], ["background"], [{"refill": 1}, {"wait": True}])
+        self.assertEqual(modes(ended), [])
+        self.assertIn("Done", ended["background"]["texts"])
+        closed = self.page([_bg([self.CMD])], [], [{"close": True}, {"wait": True}])
+        self.assertEqual(modes(closed), ["status-closed"])
+        self.assertEqual(self.page([done], [], [{"wait": True}])["fetches"], [])
+
+    def test_a_command_shown_stays_shown_when_the_section_is_read_again(self):
+        cmd = {**self.CMD, "command": TITLED_COMMAND}
+        seen = self.page([_bg([cmd]), _bg([{**cmd, "status": "completed", "endedAt": NOW}])], ["background"],
+                         [{"tapRow": 0}, {"refill": 1}])
+        self.assertIn(TITLED_COMMAND, seen["background"]["texts"])
 
     def test_nothing_and_not_available_are_said(self):
         seen = self.page([_bg([], tasksAvailable=False)], ["background"])["background"]
