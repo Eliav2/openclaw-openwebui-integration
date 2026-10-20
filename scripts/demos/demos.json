@@ -247,7 +247,16 @@
       ]
     },
     {
-      "match": "Review the forecast cache change",
+      "match": "worth rejecting unknown units later",
+      "steps": [
+        {
+          "say": "Both reviews are back, and nothing blocks the release: fine to tag. Two follow-ups for later: cap the forecast cache, and reject unknown wind speed units.",
+          "delay": 0.03
+        }
+      ]
+    },
+    {
+      "match": "cache.py, \"Cache forecasts",
       "steps": [
         {
           "say": "",
@@ -264,7 +273,7 @@
       ]
     },
     {
-      "match": "Review the wind speed fix",
+      "match": "units.py, \"Fix wind speed",
       "steps": [
         {
           "say": "",
@@ -276,24 +285,6 @@
         },
         {
           "say": "Nothing blocking. km/h and mph are now right. A unit other than those two returns the raw m/s value without a warning; worth rejecting unknown units later.",
-          "delay": 0.03
-        }
-      ]
-    },
-    {
-      "match": "worth a cap later",
-      "steps": [
-        {
-          "say": "The cache review is back: nothing blocking. Old keys are never evicted, so I'd cap the cache after the release.",
-          "delay": 0.03
-        }
-      ]
-    },
-    {
-      "match": "worth rejecting unknown units later",
-      "steps": [
-        {
-          "say": "The wind speed review is back too: the fix is right. Both changes are fine to tag, with two small follow-ups for later.",
           "delay": 0.03
         }
       ]
