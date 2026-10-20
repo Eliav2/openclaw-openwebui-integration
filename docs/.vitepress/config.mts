@@ -68,11 +68,21 @@ export default defineConfig({
   transformPageData(page) {
     if (page.relativePath === "index.md") Object.assign(page.frontmatter, home);
   },
-  vite: { plugins: [llmstxt()] },
+  // docs/examples/ holds pages about our own setup, not the Pipe: reachable only from the
+  // section that links them, never listed (sidebar, home page, search or llms.txt).
+  vite: { plugins: [llmstxt({ ignoreFiles: ["examples/**"] })] },
   themeConfig: {
     logo: "/logo.svg",
     siteTitle: "OpenClaw for Open WebUI",
-    search: { provider: "local" },
+    search: {
+      provider: "local",
+      options: {
+        _render(src, env, md) {
+          const html = md.render(src, env);
+          return env.relativePath.startsWith("examples/") ? "" : html;
+        },
+      },
+    },
     socialLinks: [{ icon: "github", link: REPO }],
     editLink: { pattern: `${REPO}/edit/main/docs/:path`, text: "Edit this page on GitHub" },
     outline: { level: [2, 3] },
@@ -125,10 +135,6 @@ export default defineConfig({
           { text: "Troubleshooting", link: "/troubleshooting" },
           { text: "Versions", link: "/versions" },
         ],
-      },
-      {
-        text: "Examples",
-        items: [{ text: "Example: a live browser view", link: "/examples/live-browser-view" }],
       },
       {
         text: "Contributing & internals",
