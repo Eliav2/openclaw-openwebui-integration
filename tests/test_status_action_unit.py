@@ -703,6 +703,59 @@ class ActionEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"status": "completed"', subagents_code)
         self.assertNotIn("agent:main:subagent:d", subagents_code)
 
+    async def _context_code(self, describe: dict, history: dict) -> str:
+        """The Context section's fill for a session row and its transcript."""
+        action = Action()
+        emitted = []
+
+        async def fake_send_request(method, params, timeout=5):
+            if method == "sessions.describe":
+                return {"session": describe}
+            if method == "chat.history":
+                return history
+            if method == "usage.status":
+                return {"providers": []}
+            if method == "sessions.list":
+                return {"sessions": []}
+            if method == "tasks.list":
+                return {"tasks": []}
+            if method == "cron.list":
+                return {"jobs": []}
+            return {}
+
+        fake_conn = mock.AsyncMock()
+        fake_conn.send_request = mock.AsyncMock(side_effect=fake_send_request)
+        with mock.patch("openclaw_status_action._get_action_connection",
+                        new=mock.AsyncMock(return_value=(fake_conn, "pipe"))):
+            await _open_dialog(action.action(
+                {"chat_id": "chat-1", "id": "msg-1", "session_id": "sess-1", "model": "x.y"},
+                __user__={"id": "user-1"}, __event_emitter__=RecordingEmitter(emitted),
+            ), fake_conn)
+        return next(c for c in _emitted_codes(emitted)
+                    if "getElementById('openclaw-status-section-context')" in c)
+
+    async def test_a_row_with_no_totals_yet_shows_the_last_runs_usage(self):
+        """ELI-223: OpenClaw 2026.10.10 writes no totals to a session's row
+        after its first run (only after the second), so the dialog had no
+        context numbers and no Compact button. They come from the newest
+        assistant message's usage then, as the reply's usage line does."""
+        history = {"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "older", "usage": {"input": 3, "output": 1}},
+            {"role": "assistant", "content": "hello",
+             "usage": {"input": 10, "cacheRead": 0, "cacheWrite": 0, "output": 5}},
+            {"role": "assistant", "content": "", "usage": {"input": 0, "output": 0}},
+        ]}
+        code = await self._context_code({"modelProvider": "fake", "contextTokens": 200000}, history)
+        self.assertIn('"usedTokens": "10"', code)
+        self.assertIn('"totalTokens": "200k"', code)
+
+    async def test_the_rows_totals_win_over_the_transcript(self):
+        history = {"messages": [{"role": "assistant", "usage": {"input": 10, "output": 5}}]}
+        code = await self._context_code(
+            {"modelProvider": "fake", "contextTokens": 200000, "totalTokens": 34000}, history)
+        self.assertIn('"usedTokens": "34k"', code)
+
     async def test_connect_failure_errors_the_gateway_sections_only(self):
         """Each section the Gateway fills says it could not connect, in its
         own place; In-process agents reads Open WebUI's copy of the chat and

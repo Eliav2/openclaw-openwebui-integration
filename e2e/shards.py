@@ -59,6 +59,7 @@ SHARDS = {
         f"{E2E}::test_a_guest_run_continued_after_a_gateway_crash_stays_without_owner_rights",
         f"{BROWSER}::test_send_streams_the_reply_and_keeps_it",
         f"{BROWSER}::test_a_single_select_question_is_answered_with_a_click",
+        f"{BROWSER}::test_a_hebrew_yes_no_question_gets_yes_and_no",
         f"{BROWSER}::test_a_question_from_the_ask_user_tool_is_answered_in_the_card",
         f"{BROWSER}::test_an_ask_user_question_asked_with_no_tab_open_shows_when_the_chat_is_opened",
         f"{BROWSER}::test_a_question_left_for_a_new_message_ends_its_reply",
@@ -69,12 +70,15 @@ SHARDS = {
         f"{BROWSER}::test_a_multi_select_question_takes_typed_numbers",
         f"{BROWSER}::test_continue_on_a_reply_adds_nothing_and_says_why",
         f"{BROWSER}::test_stop_ends_the_reply_where_it_was",
+        f"{BROWSER}::test_a_message_sent_from_a_second_tab_keeps_the_running_reply",
     ],
     # The third crash, sub-agents, background commands, dialogs, reconnect.
     "2": [
         f"{E2E}::test_a_handed_over_reply_reads_not_done_in_the_db_once_its_request_ended",
         f"{E2E}::test_the_status_action_lists_a_running_subagent_and_opens_its_drawer",
         f"{E2E}::test_a_subagent_result_the_parent_answers_with_silence_shows_as_its_card",
+        f"{E2E}::test_a_wake_reply_ends_like_an_inline_reply",
+        f"{E2E}::test_a_subagent_result_ends_like_an_inline_reply",
         f"{E2E}::test_a_reply_that_opens_with_no_reply_and_answers_after_shows_the_answer_once",
         f"{E2E}::test_a_reply_the_agent_starts_that_errors_still_finishes",
         f"{E2E}::test_the_status_action_lists_a_background_command",
@@ -92,6 +96,7 @@ SHARDS = {
     "3": [
         f"{E2E}::test_a_reply_whose_run_ends_while_owui_is_stopped_is_completed_on_start",
         f"{E2E}::test_a_plain_redeploy_mid_reply_leaves_the_reply_whole",
+        f"{E2E}::test_a_cancelled_chat_write_leaves_the_database_writable",
         f"{BROWSER}::test_a_message_sent_while_a_reply_runs_is_in_the_chat_at_once",
         f"{BROWSER}::test_a_message_queued_behind_a_run_waits_out_a_socket_drop",
     ],
@@ -107,6 +112,7 @@ SHARDS = {
         f"{BROWSER}::test_a_compaction_the_gateway_refuses_shows_its_error",
         f"{BROWSER}::test_the_subagent_drawer_follows_a_running_child_to_its_end",
         f"{BROWSER}::test_the_status_dialog_lists_a_background_agent_while_its_reply_runs",
+        f"{BROWSER}::test_a_background_command_reads_by_its_title_and_a_tap_shows_the_command",
         f"{BROWSER}::test_a_long_task_shown_whole_keeps_the_drawer_closable",
         f"{BROWSER}::test_show_less_puts_a_long_task_back_at_its_first_lines",
         f"{BROWSER}::test_a_reply_the_agent_starts_streams_into_the_open_tab_and_asks_there",
@@ -121,6 +127,7 @@ SHARDS = {
         f"{BROWSER}::test_switching_branches_reaches_the_agent_as_a_branch_switch",
         f"{BROWSER}::test_a_forked_chat_starts_with_the_copied_messages",
         f"{BROWSER}::test_a_cloned_chat_starts_with_the_copied_messages",
+        f"{BROWSER}::test_an_execute_while_the_input_dialog_is_open_leaves_the_dialog_its_answer",
     ],
 }
 

@@ -348,6 +348,20 @@ def test_a_secret_ask_with_numbered_steps_keeps_the_masked_dialog(page):
     _wait(page, _last_reply_done("E2E_ANSWER_END"), "the reply after the dialog")
 
 
+def test_a_hebrew_yes_no_question_gets_yes_and_no(page):
+    """A Hebrew "(כן/לא)" question is a yes/no question: the card offers Yes
+    and No, with no typed answer (ELI-193: it got a typed answer only)."""
+    capture.new_chat(page)
+    capture.send(page, "E2E_ASK_YES_NO_HE")
+    yes = page.locator("section button", has=page.locator("span", has_text="Yes")).first
+    yes.wait_for(timeout=TURN_MS)
+    assert page.evaluate("() => document.body.innerText.includes('למחוק את הקובץ')")
+    yes.click()
+    _wait(page, _last_assistant_js("t.includes('E2E_ANSWER_END')"), "the reply to the answer")
+    reply = page.evaluate(f"() => {capture.LAST_ASSISTANT}.innerText")
+    assert "E2E_ANSWERED yes E2E_ANSWER_END" in reply, reply[-200:]
+
+
 def test_a_multi_select_question_takes_typed_numbers(page):
     """The card lists the options by number; "1, 3" typed and submitted
     reaches the agent as the two options."""
@@ -470,6 +484,29 @@ def _both_answered(page, run: str, answer: str) -> None:
     assert run in again[0]["text"] and answer in again[1]["text"], [r["text"][-80:] for r in again]
 
 
+def _ends_like_the_answer(page, token: str, run: str) -> None:
+    """The running reply (holding `run`), finished by the Pipe's writer after
+    a takeover, ends as the answer to the new message (an inline reply) does
+    (ELI-210): with no "Stopped" from the cancel, and with the usage line
+    whenever the answer has it. On 2026.10 the running reply is its session's
+    first run, whose row has no totals yet: the line comes from the run's own
+    usage (ELI-177). In the saved status lines, and in the status line shown
+    on the reply (the page is reloaded by now)."""
+    saved = capture.api("GET", f"/api/v1/chats/{_chat_id(page)}", token=token)["chat"]["history"]["messages"]
+    replies = [m for m in saved.values() if m.get("role") == "assistant"]
+    held = [m for m in replies if run in (m.get("content") or "")]
+    assert len(held) == 1 and len(replies) == 2, [m.get("content", "")[-80:] for m in replies]
+    answer = next(m for m in replies if m is not held[0])
+    lines, ref = ([h.get("description") for h in m.get("statusHistory") or [] if isinstance(h, dict)]
+                  for m in (held[0], answer))
+    usage = lambda ls: any(str(line).startswith("\U0001f9e0") for line in ls)  # noqa: E731
+    shown = page.evaluate(f"() => {_message_text_js(0)}")
+    assert "Stopped" not in lines, f"a Stopped line: {lines}"
+    assert "Stopped" not in shown, shown[-200:]
+    assert usage(lines) == usage(ref), f"the running reply: {lines}; the answer: {ref}"
+    assert ("\U0001f9e0" in shown) == usage(ref), shown[-200:]
+
+
 def test_a_message_sent_while_a_reply_runs_is_in_the_chat_at_once(page):
     """Sent while busy (AUTO_SEND_WHILE_RUNNING, on by default): the message
     shows in the chat right away, not in Open WebUI's queue above the
@@ -528,8 +565,31 @@ def test_send_now_on_a_queued_message_keeps_the_running_reply(page, token):
         send_now.click()
         _wait(page, f"() => {_user_message_js('BROWSER_SENDNOW_ANSWER')}", "the message in the chat after Send now")
         _both_answered(page, run, "BROWSER_SENDNOW_ANSWER")
+        _ends_like_the_answer(page, token, run)
     finally:
         capture.pipe_valves(token, **old)
+
+
+def test_a_message_sent_from_a_second_tab_keeps_the_running_reply(page, token):
+    """A plain send from another tab (or the phone) on the same chat while
+    tab A streams (ELI-210): the running reply goes on to its end, ends with
+    the usage line like any reply, and the message gets its own answer."""
+    run = _slow("BROWSER_TAB2", 20)
+    capture.new_chat(page)
+    capture.send(page, "E2E_SLOW:20 BROWSER_TAB2")
+    _wait(page, _reply_js(0, "r.text.includes('BROWSER_TAB2 slow-1 slow-2')"), "the reply part way through")
+    other = page.context.new_page()
+    try:
+        other.goto(page.url)
+        other.wait_for_selector("#chat-input", timeout=60_000)
+        _type_and_send(other, "E2E_ECHO: BROWSER_TAB2_ANSWER")
+        _wait(other, _reply_js(-1, "all.length === 2 && all[0].done && r.done"
+                                   " && r.text.includes('BROWSER_TAB2_ANSWER')"), "the answer in the second tab")
+    finally:
+        other.close()
+    _reload(page)
+    _both_answered(page, run, "BROWSER_TAB2_ANSWER")
+    _ends_like_the_answer(page, token, run)
 
 
 def _message_text_js(index: int) -> str:
@@ -740,11 +800,9 @@ def test_the_status_dialog_compacts_the_chat(page):
     """Status dialog + Compact: the composer's Status button opens the dialog
     with this chat's context numbers; Compact shows "Compacting…", the
     session is compacted (its summary request reaches the model), and the
-    dialog comes back with the numbers."""
-    if _openclaw_version() >= (2026, 10, 10):
-        pytest.skip("OpenClaw 2026.10.10: a session's row gets no totals after its first run "
-                    "(only after the second), so the dialog has no context numbers or Compact "
-                    "button yet (ELI-223). 2026.10.5 writes them within seconds.")
+    dialog comes back with the numbers. On OpenClaw 2026.10.10 a new
+    session's row has no totals after its first run: the numbers come from
+    the run's own usage (ELI-223)."""
     nonce = f"BROWSER_COMPACT_{os.getpid()}_{len(_fake_llm_requests())}"
     capture.new_chat(page)
     capture.send(page, f"E2E_ECHO: {nonce}")
@@ -771,9 +829,6 @@ def test_a_compaction_the_gateway_refuses_shows_its_error(page):
     dialog showed "Compacting…" and then the same numbers, as if it had
     worked. It says the compaction failed, with the Gateway's reason, and
     keeps the numbers."""
-    if _openclaw_release() >= (2026, 10):
-        pytest.skip("OpenClaw 2026.10: the dialog has no Compact button for a session created by "
-                    "chat.send (ELI-177, as test_the_status_dialog_compacts_the_chat).")
     nonce = f"BROWSER_COMPACT_FAIL_{os.getpid()}_{len(_fake_llm_requests())}"
     capture.new_chat(page)
     capture.send(page, f"E2E_ECHO: E2E_COMPACT_FAIL {nonce}")
@@ -852,6 +907,32 @@ def test_the_status_dialog_lists_a_background_agent_while_its_reply_runs(page):
         open(gate, "w").close()
     _wait(page, _turn_over("E2E_BG_AGENT_END"), "the reply's end")
     os.remove(gate)
+
+
+BG_EXEC_TITLE, BG_EXEC_COMMAND = "E2E background sleep", "sleep 25; echo e2e-bg-done"   # e2e/fake_llm.py
+
+
+def test_a_background_command_reads_by_its_title_and_a_tap_shows_the_command(page):
+    """ELI-232: a command left running in the background is listed by the
+    title its exec call gave it, its first real command under it, and the
+    whole command on hover and on a tap, not the raw command as its title."""
+    capture.new_chat(page)
+    capture.send(page, "E2E_BG_EXEC")
+    _wait(page, _turn_over("E2E_BG_STARTED"), "the reply that leaves the command running")
+    _open_status(page)
+    section = "#openclaw-status-section-background"
+    _wait(page, f"""() => {{ const s = document.querySelector('{section}');
+                     return !!s && s.innerText.includes({json.dumps(BG_EXEC_TITLE)}); }}""",
+          "the command in the Background section, by its title", 60_000)
+    row = page.locator(f"{section} [data-openclaw-bg-row]", has_text=BG_EXEC_TITLE).first
+    assert "Command · sleep 25" in row.inner_text(), row.inner_text()
+    assert row.get_attribute("title") == BG_EXEC_COMMAND
+    assert row.locator("[data-openclaw-command]").count() == 0
+    row.click()
+    assert row.locator("[data-openclaw-command]").inner_text() == BG_EXEC_COMMAND
+    row.click()
+    assert row.locator("[data-openclaw-command]").count() == 0
+    page.keyboard.press("Escape")
 
 
 # The drawer's close control (× on a wide screen, ‹ Back on a phone) is on
@@ -1443,3 +1524,124 @@ def test_a_cloned_chat_starts_with_the_copied_messages(page):
     first = _first_send_of_copy(page, n, "CLONED")
     assert "this chat is a copy of another chat" in first, first[:300]
     assert f"User: clone source question {n}" in first, first[:600]
+
+
+ELI195_UPSTREAM = "https://github.com/open-webui/open-webui/issues/32742"
+
+
+class Eli195Present(AssertionError):
+    """The dialog's answer never reached the function. Only this fails the
+    drop gate's expected way."""
+
+
+class Eli195ProbeIneffective(AssertionError):
+    """`raw` could not show either way: the probe never got the `execute`
+    under the open dialog, or never replied. A real failure, never the
+    expected one, never a pass."""
+
+
+# A function that asks for input and, a second later, sends an `execute` to
+# the user's tabs while the dialog is open: open-webui#32742's probe. With
+# HOLD it wraps both the way the Pipe does before a turn (pipe.py, ELI-195),
+# from the Pipe file the test copied into the container.
+ELI195_PROBE = '''"""
+title: ELI-195 probe
+"""
+import asyncio
+import importlib.util
+
+HOLD = %s
+
+
+class Pipe:
+    async def pipe(self, body: dict, __user__=None, __metadata__=None,
+                   __event_emitter__=None, __event_call__=None):
+        emit, call = __event_emitter__, __event_call__
+        if HOLD:
+            spec = importlib.util.spec_from_file_location("openclaw_pipe_probe", "/tmp/openclaw_pipe_probe.py")
+            pipe = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(pipe)
+            meta, user_id = __metadata__ or {}, (__user__ or {}).get("id")
+            emit = pipe._dialog_safe_emitter(emit, user_id, meta.get("chat_id"), meta.get("message_id"))
+            call = pipe._dialog_safe_event_call(call, meta.get("session_id"), user_id)
+
+        async def poke():
+            await asyncio.sleep(1)
+            await emit({"type": "execute", "data": {"code": "window.__eli195Poked = true"}})
+            await __event_emitter__({"type": "status", "data": {"description": "execute sent", "done": False}})
+
+        poked = asyncio.create_task(poke())
+        try:
+            value = await asyncio.wait_for(call({"type": "input", "data": {
+                "title": "Probe", "message": "Type anything", "placeholder": "here"}}), 30)
+        except asyncio.TimeoutError:
+            value = "NO ANSWER"
+        await poked
+        return f"got {value!r}"
+'''
+
+
+@pytest.mark.parametrize("mode", [
+    "held",
+    pytest.param("raw", marks=pytest.mark.xfail(strict=True, raises=Eli195Present, reason=(
+        "ELI-195 drop gate: on this Open WebUI an `execute` reaching a tab while its input dialog "
+        f"is open takes the dialog's answer ({ELI195_UPSTREAM}). An XPASS means the pinned release "
+        "fixed it: drop the Pipe's execute hold (emit.py dialog holds) and this gate."))),
+])
+def test_an_execute_while_the_input_dialog_is_open_leaves_the_dialog_its_answer(page, token, mode):
+    """ELI-195: a function's `execute` that reaches a tab while that tab
+    shows an input dialog. The probe produces it every time: it asks, then
+    sends an `execute` a second later; the page must run that `execute` while
+    the dialog is open (or, held, right after it) and the answer must reach
+    the function. `held` (the Pipe's wrappers) must always pass; `raw` shows
+    whether Open WebUI still needs them."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(here, "..", "openclaw_pipe.py"), "rb") as f:
+        subprocess.run(["docker", "exec", "-i", "owui", "sh", "-c", "cat > /tmp/openclaw_pipe_probe.py"], stdin=f,
+                       check=True, capture_output=True, timeout=60)
+    fid = f"eli195_probe_{mode}"
+    capture.api("DELETE", f"/api/v1/functions/id/{fid}/delete", token=token) if any(
+        f.get("id") == fid for f in capture.api("GET", "/api/v1/functions/", token=token)) else None
+    capture.api("POST", "/api/v1/functions/create", {"id": fid, "name": fid, "meta": {"description": fid},
+                                                     "content": ELI195_PROBE % (mode == "held")}, token=token)
+    capture.api("POST", f"/api/v1/functions/id/{fid}/toggle", token=token)
+    try:
+        _eli195_probe(page, mode, fid)
+    except Eli195Present:
+        raise
+    except Exception as ex:
+        if mode == "raw":
+            # Raw has three outcomes only: the bug (Eli195Present), its
+            # absence (a pass), or this.
+            raise Eli195ProbeIneffective(f"{type(ex).__name__}: {ex}") from None
+        raise
+    finally:
+        capture.api("DELETE", f"/api/v1/functions/id/{fid}/delete", token=token)
+
+
+def _eli195_probe(page, mode: str, fid: str) -> None:
+    page.goto(f"{capture.BASE}/?models={fid}")
+    page.wait_for_selector("#chat-input", timeout=60_000)
+    capture.dismiss_popups(page)
+    page.evaluate("() => { window.__eli195Poked = false; }")
+    capture.send(page, "hi")
+    page.get_by_text("Type anything").wait_for(timeout=60_000)
+    # The precondition: the `execute` went out while the dialog is open;
+    # raw, the page also ran it under the dialog; held, it did not.
+    page.get_by_text("execute sent").wait_for(timeout=30_000)
+    assert page.get_by_text("Type anything").is_visible(), "the dialog closed before the execute"
+    if mode == "raw":
+        _wait(page, "() => window.__eli195Poked === true", "the execute while the dialog is open", 30_000)
+    else:
+        assert page.evaluate("() => window.__eli195Poked") is False, "the held execute ran under the dialog"
+    page.locator("input[placeholder=here], textarea[placeholder=here]").first.fill("hello")
+    page.get_by_role("button", name="Confirm", exact=True).click()
+    # The probe always replies `got <answer>`, `got 'NO ANSWER'` after 30 s.
+    _wait(page, _last_assistant_js("t.includes('got ')"), "the probe's reply", 60_000)
+    reply = page.evaluate(f"() => {capture.LAST_ASSISTANT}.innerText")
+    print(f"ELI-195 probe ({mode}): execute ran under the dialog: {mode == 'raw'}; reply: {reply[-80:]!r}")
+    if "got 'hello'" not in reply:
+        raise Eli195Present(reply[-200:])
+    if mode == "held":
+        # Held, the `execute` runs once the dialog is answered.
+        _wait(page, "() => window.__eli195Poked === true", "the held execute after the answer", 30_000)

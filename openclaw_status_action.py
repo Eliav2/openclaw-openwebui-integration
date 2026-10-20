@@ -88,6 +88,7 @@ import contextlib
 import copy
 import functools
 import re
+import shlex
 import signal
 import mimetypes
 import urllib.error
@@ -4387,6 +4388,20 @@ def _history_usage_for_run(history: dict, run_id: str) -> dict | None:
     return None
 
 
+def _history_latest_prompt_tokens(history: dict) -> int | None:
+    """The context the session's newest model call filled: the prompt tokens
+    of the newest assistant message in `chat.history` that reports a usage."""
+    messages = (history or {}).get("messages")
+    if not isinstance(messages, list):
+        return None
+    for message in reversed(messages):
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            prompt = _usage_prompt_tokens(message.get("usage"))
+            if prompt:
+                return prompt
+    return None
+
+
 def _history_renderer(messages: list) -> "_TurnRenderer":
     """A `_TurnRenderer` fed one run's `chat.history` messages instead of its
     live events, so a run whose events were lost still ends as the same
@@ -5341,7 +5356,7 @@ def _dialog_safe_event_call(event_call, sid, user_id):
 # reply that is streaming into the same tab.
 # ---------------------------------------------------------------------------
 
-_COMPOSER_BUTTON_VERSION = "6"
+_COMPOSER_BUTTON_VERSION = "7"
 
 # The Status Action's function id (install_action.py's FUNCTION_ID; the
 # dialog's own JS calls the same fixed id) and the Pipe's default function id.
@@ -5381,8 +5396,9 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
   // removing it (a layout this snippet does not understand): give up.
   const LOOP_LIMIT = 20;
   const LOOP_WINDOW_MS = 10000;
-  // A paw, drawn in Heroicons' outline style (24x24, round caps), for "Claw".
-  const PAW_PATH = 'M11 6a1.5 2 0 1 1-3 0 1.5 2 0 0 1 3 0ZM16 6a1.5 2 0 1 1-3 0 1.5 2 0 0 1 3 0ZM7 10.5a1.5 1.75 0 1 1-3 0 1.5 1.75 0 0 1 3 0ZM20 10.5a1.5 1.75 0 1 1-3 0 1.5 1.75 0 0 1 3 0ZM12 12.75c-2.25 0-5.25 2.6-5.25 4.875 0 1.45 1.1 2.375 2.55 2.375.95 0 1.7-.45 2.7-.45s1.75.45 2.7.45c1.45 0 2.55-.925 2.55-2.375 0-2.275-3-4.875-5.25-4.875Z';
+  // A crab claw (ELI-231): an open pincer with a tooth on each finger and a
+  // wrist, in Heroicons' outline style (24x24, round caps), for "Claw".
+  const CLAW_PATH = 'M6.3 14.6C4.6 11.7 5.7 7.1 8.7 4.6C10.8 2.8 13.4 2.3 15.6 3.1C14.3 3.7 13.4 4.4 13 5.3L13.9 6.5L12 6.9C11.6 7.5 11.3 8.1 11.2 8.7C11.1 11 12.7 12.9 15.1 12.7C16.4 12.5 17.3 11.9 17.8 11.1L17.1 10L18.6 9.7C18.6 9.2 18.6 8.7 18.5 8.2C20.5 10.2 20.6 13.4 18.9 15.8C17.1 18.3 14.2 18.8 11.6 17.8C9.5 17 7.5 16.1 6.3 14.6ZM7.8 16L5.4 19.6L9.1 21.1L11 17.6';
 
   const state = {
     prefixes: [],
@@ -5641,7 +5657,7 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
       + 'bg-transparent text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800';
     b.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" '
       + 'stroke-width="1.75" stroke="currentColor" aria-hidden="true" class="size-4">'
-      + '<path stroke-linecap="round" stroke-linejoin="round" d="' + PAW_PATH + '"/></svg>'
+      + '<path stroke-linecap="round" stroke-linejoin="round" d="' + CLAW_PATH + '"/></svg>'
       // Icon-only below `sm`, like Open WebUI's own composer chips: at phone
       // width the chip row's overflow cut the label to "Stat" (ELI-123). The
       // title and aria-label still name it. Both classes ship in Open WebUI's CSS.
@@ -7342,11 +7358,29 @@ _BACKGROUND_FILL_JS_TEMPLATE = r"""
                          time: r.status === 'running' ? S.elapsedCell(r.startedAt, null, true) : null,
                          preview: line(r.kind, automationDetail(r)) });
     }
-    return S.listRow({
+    let el = null;
+    el = S.listRow({
       kind: 'openclawBgRow', title: r.title, status: r.status,
       time: S.elapsedCell(r.startedAt, r.endedAt, isLive(r)), preview: line(r.kind, r.preview),
-      open: r.agent ? function() { S.openAgentDetail(r.agent); } : null,
+      open: r.agent ? function() { S.openAgentDetail(r.agent); }
+        : r.command ? function() { toggleCommand(el, r.command); } : null,
     });
+    // ELI-232: the whole command, on hover and on a tap.
+    if (r.command) el.title = r.command;
+    return el;
+  }
+  function toggleCommand(el, command) {
+    const shown = el.querySelectorAll('[data-openclaw-command]')[0];
+    if (shown) {
+      shown.remove();
+      return;
+    }
+    const pre = document.createElement('div');
+    pre.dataset.openclawCommand = '1';
+    pre.className = 'text-xs font-mono text-gray-500 dark:text-gray-400 whitespace-pre-wrap break-all mt-1 '
+      + 'p-1.5 rounded bg-gray-50 dark:bg-gray-800/60';
+    pre.textContent = command;
+    el.appendChild(pre);
   }
 
   (DATA.errors || []).forEach(function(e) { fold.body.appendChild(S.errorEl(e)); });
@@ -7948,20 +7982,102 @@ def _process_task(process: dict, session_key: str) -> dict:
     exec task whose sourceId is the process (the session its tool card
     names), titled by the Gateway's short name until a card gives the
     command, and a finished one's last line of output as its summary."""
-    lines = [ln for ln in (process.get("tail") or "").splitlines() if ln.strip()]
+    lines = [ln for ln in (_clean_line(ln) for ln in (process.get("tail") or "").splitlines()) if ln]
+    status = _PROCESS_STATUSES.get(process.get("status"), process.get("status"))
+    if status == "completed" and process.get("exitCode") not in (None, 0):
+        status = "failed"    # 2026.10.5 says "completed" for any exit code (ELI-232)
     return {
         "id": process.get("processId"), "kind": "exec", "sourceId": process.get("processId"),
         "sessionKey": session_key, "title": process.get("name") or "",
-        "status": _PROCESS_STATUSES.get(process.get("status"), process.get("status")),
+        "status": status,
         "startedAt": process.get("startedAt"), "endedAt": process.get("endedAt"),
-        "terminalSummary": lines[-1][:200] if lines else None,
+        "terminalSummary": lines[-1] if lines else None,
+        "exitCode": process.get("exitCode"), "exitSignal": process.get("exitSignal"),
     }
 
 
+# A terminal's color and cursor codes, and other control characters.
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|[\x00-\x08\x0b-\x1f\x7f]")
+_LINE_MAX = 120
+
+
+def _clean_line(text: str) -> str:
+    """One line of output as plain text: no terminal codes, one space
+    between words, cut at _LINE_MAX."""
+    line = " ".join(_ANSI_RE.sub("", text or "").split())
+    return line if len(line) <= _LINE_MAX else line[:_LINE_MAX - 1].rstrip() + "…"
+
+
+# ELI-232: how a command without a title reads. Steps that only set up the
+# shell are skipped, wrappers dropped, and an inline script is left out.
+_SETUP_WORDS = {"cd", "pushd", "popd", "export", "set", "unset", "source", ".", "umask", "trap", "shopt",
+                "true", ":", "ulimit", "alias"}
+_WRAPPER_WORDS = {"setsid", "nohup", "exec", "env", "time", "nice", "stdbuf"}
+_SCRIPT_FLAGS = {"-c", "-e", "--eval"}
+_INTERPRETER_RE = re.compile(r"(python[\d.]*|node|bun|deno|perl|ruby|php|bash|sh|zsh|dash)$")
+# A loop or a condition reads by its head: "for n in 142 136 …".
+_COMPOUND_WORDS = {"for", "while", "until", "if", "case", "select"}
+_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+_SHORT_COMMAND_MAX = 80
+
+
+def _short_command(command: str) -> str:
+    """The first command in `command` that does the work, in a few words:
+    `cd /x && python3 -c "..."` reads "python3 -c …". Empty when it only
+    sets up the shell."""
+    lex = shlex.shlex(command or "", posix=True, punctuation_chars="();<>|&\n")
+    lex.whitespace = " \t\r"
+    lex.whitespace_split = True
+    words: list = []
+    cut = False
+    try:
+        for tok in lex:
+            if tok and set(tok) <= set("();<>|&\n"):
+                if words and words[0] not in _SETUP_WORDS:
+                    if tok.startswith("<<"):
+                        cut = True
+                    elif tok.startswith((">", "<")) and words[-1].isdigit() and words[-1] + tok in command:
+                        words.pop()    # 2>/dev/null: the 2 is the redirect's
+                    break
+                words = []
+                if tok.startswith(("<", ">")):
+                    break
+                continue
+            if not words and (_ASSIGNMENT_RE.match(tok) or tok in _WRAPPER_WORDS):
+                continue
+            if not words and tok == "timeout":
+                words.append(tok)
+                continue
+            if words == ["timeout"]:
+                words = []    # its duration
+                continue
+            words.append(tok)
+            if tok in _SCRIPT_FLAGS and len(words) > 1 and _INTERPRETER_RE.match(words[0].rsplit("/", 1)[-1]):
+                cut = True
+                break
+    except ValueError:
+        # An unclosed quote: its first line as written.
+        return _cut((command or "").strip().splitlines()[0] if (command or "").strip() else "", _SHORT_COMMAND_MAX)
+    if not words or words[0] in _SETUP_WORDS:
+        return ""
+    if words[0] in _COMPOUND_WORDS:
+        cut = True
+    if words[0].startswith("/"):
+        words[0] = words[0].rsplit("/", 1)[-1]
+    text = " ".join(shlex.quote(w) if w != shlex.quote(w) and " " in w else w for w in words)
+    return _cut(text + (" …" if cut else ""), _SHORT_COMMAND_MAX)
+
+
+def _cut(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
 def _exec_commands(chat) -> dict:
-    """{exec session id: command} from the chat's own exec tool cards. The
-    Gateway's task for a background command is titled "CLI command"; its
-    sourceId is the session the card's result names."""
+    """{exec session id: {"command", "title"}} from the chat's own exec tool
+    cards. The Gateway's task for a background command is titled "CLI
+    command" (2026.9) or by the command's first words (2026.10); its sourceId
+    is the session the card's result names, and only the card has the
+    title the agent gave the call (ELI-232)."""
     out = {}
     for msg in _owui_branch(chat):
         output = msg.get("output") or []
@@ -7977,9 +8093,12 @@ def _exec_commands(chat) -> dict:
                 args = json.loads(call.get("arguments") or "{}")
             except ValueError:
                 args = {}
-            command = args.get("command") if isinstance(args, dict) else None
+            if not isinstance(args, dict):
+                args = {}
+            command, title = args.get("command"), args.get("title")
             if m and isinstance(command, str) and command.strip():
-                out[m.group(1)] = command.strip()
+                out[m.group(1)] = {"command": command.strip(),
+                                   "title": title.strip() if isinstance(title, str) else ""}
     return out
 
 
@@ -7992,13 +8111,10 @@ def _belongs_to(task: dict, session_key: str) -> bool:
 def _task_row(task: dict, commands: dict) -> dict:
     kind = task.get("kind") or ""
     title = (task.get("title") or "").strip()
-    if kind == "exec":
-        # 2026.9 titles every one "CLI command"; a 2026.10 process has a
-        # short name ("make build"). The card's whole command wins.
-        own = "" if title == "CLI command" else title
-        title = commands.get(task.get("sourceId") or "") or own or "Shell command"
     status = task.get("status")
     live = status in _LIVE_TASK_STATUSES
+    if kind == "exec":
+        return _command_row(task, commands.get(task.get("sourceId") or "") or {}, live)
     return {
         "id": task.get("id") or task.get("taskId"),
         "kind": _BACKGROUND_KINDS.get(kind, "Task"),
@@ -8009,6 +8125,41 @@ def _task_row(task: dict, commands: dict) -> dict:
         # A running command's progress is always "Command running": its chip says so.
         "preview": (None if live and kind == "exec" else task.get("progressSummary") if live
                     else (task.get("error") or task.get("terminalSummary"))),
+    }
+
+
+# 2026.9's summaries of a command, which its status chip already says.
+_GENERIC_COMMAND_SUMMARIES = {"Command running", "Command completed", "Command failed"}
+
+
+def _command_row(task: dict, card: dict, live: bool) -> dict:
+    """A background command (ELI-232). Titled by the title the agent gave
+    the call, else by its first real command. Under it: while it runs, that
+    command when the title is the agent's; once ended, how it ended (a
+    failure's exit code or the signal that stopped it) and its last line of
+    output. The whole command is the row's tap."""
+    command = card.get("command") or ""
+    # 2026.9 titles every one "CLI command"; a 2026.10 process has the
+    # command's first words ("cd /tmp"), all there is without a card.
+    own = (task.get("title") or "").strip()
+    short = _short_command(command or ("" if own == "CLI command" else own))
+    title = card.get("title") or short or "Shell command"
+    if live:
+        preview = short if card.get("title") and short != title else None
+    else:
+        code, signal = task.get("exitCode"), task.get("exitSignal")
+        ended = signal or (f"exit {code}" if code not in (None, 0) else None)
+        said = _clean_line(task.get("error") or task.get("terminalSummary") or "")
+        preview = " · ".join(p for p in (ended, None if said in _GENERIC_COMMAND_SUMMARIES else said) if p) or None
+    return {
+        "id": task.get("id") or task.get("taskId"),
+        "kind": _BACKGROUND_KINDS["exec"],
+        "title": title,
+        "status": task.get("status"),
+        "startedAt": task.get("startedAt") or task.get("createdAt"),
+        "endedAt": None if live else (task.get("endedAt") or task.get("updatedAt")),
+        "preview": preview,
+        "command": command or None,
     }
 
 
@@ -8340,20 +8491,20 @@ async def _latest_preview(conn, child_key: str) -> str | None:
     return preview if isinstance(preview, str) and preview.strip() and not _is_spawn_message(preview) else None
 
 
-# The toolbar button's icon, the composer chip's paw (ELI-202); without one
-# Open WebUI draws its default sparkle. A fixed gray stroke on purpose: Open
+# The toolbar button's icon, the composer chip's crab claw (ELI-231); without
+# one Open WebUI draws its default sparkle. A fixed gray stroke on purpose: Open
 # WebUI draws it as an <img>, so currentColor never resolves, and inverts it
 # 80% in dark mode; this gray stays a mid gray in both, like its own icons.
 ICON_URL = (
     "data:image/svg+xml;charset=utf-8,"
     "%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%20fill='none'%20"
     "stroke='%236b7280'%20stroke-width='1.6'%20stroke-linecap='round'%20stroke-linejoin='round'"
-    "%3E%3Cpath%20d='M11%206a1.5%202%200%201%201-3%200%201.5%202%200%200%201%203%200ZM16%206a"
-    "1.5%202%200%201%201-3%200%201.5%202%200%200%201%203%200ZM7%2010.5a1.5%201.75%200%201%201"
-    "-3%200%201.5%201.75%200%200%201%203%200ZM20%2010.5a1.5%201.75%200%201%201-3%200%201.5%20"
-    "1.75%200%200%201%203%200ZM12%2012.75c-2.25%200-5.25%202.6-5.25%204.875%200%201.45%201.1"
-    "%202.375%202.55%202.375.95%200%201.7-.45%202.7-.45s1.75.45%202.7.45c1.45%200%202.55-.925"
-    "%202.55-2.375%200-2.275-3-4.875-5.25-4.875Z'/%3E%3C/svg%3E"
+    "%3E%3Cpath%20d='M6.3%2014.6C4.6%2011.7%205.7%207.1%208.7%204.6C10.8%202.8%2013.4%202.3%2"
+    "015.6%203.1C14.3%203.7%2013.4%204.4%2013%205.3L13.9%206.5L12%206.9C11.6%207.5%2011.3%208"
+    ".1%2011.2%208.7C11.1%2011%2012.7%2012.9%2015.1%2012.7C16.4%2012.5%2017.3%2011.9%2017.8%2"
+    "011.1L17.1%2010L18.6%209.7C18.6%209.2%2018.6%208.7%2018.5%208.2C20.5%2010.2%2020.6%2013."
+    "4%2018.9%2015.8C17.1%2018.3%2014.2%2018.8%2011.6%2017.8C9.5%2017%207.5%2016.1%206.3%2014"
+    ".6ZM7.8%2016L5.4%2019.6L9.1%2021.1L11%2017.6'/%3E%3C/svg%3E"
 )
 
 
@@ -8582,6 +8733,15 @@ class Action:
 
             context_tokens = session_row.get("contextTokens")
             total_tokens = session_row.get("totalTokens")
+            if context_tokens and total_tokens is None:
+                # OpenClaw 2026.10.10 writes no totals to a session's row
+                # after its first run (ELI-223): the newest call's own usage.
+                try:
+                    history = await conn.send_request(
+                        "chat.history", dict(sessionKey=session_key, limit=20), timeout=5)
+                    total_tokens = _history_latest_prompt_tokens(history)
+                except Exception as ex:
+                    pipe_log(f"[status-action] chat.history for the context failed: {ex}")
             context_data = None
             if context_tokens and total_tokens is not None:
                 context_data = {
