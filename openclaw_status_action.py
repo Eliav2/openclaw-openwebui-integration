@@ -7973,7 +7973,8 @@ def _dialog_open(user_id: str, session_key: str) -> tuple:
         _open_dialogs.pop(k, None)
     dialog_id = uuid.uuid4().hex
     dialog = {"user": user_id, "session": session_key, "closed": asyncio.Event(),
-              "expires": now + _DIALOG_FOLLOW_MAX_S, "rows": [], "total": 0}
+              "expires": now + _DIALOG_FOLLOW_MAX_S, "rows": [], "total": 0,
+              "pending": False, "tapped": False}
     _open_dialogs[dialog_id] = dialog
     return dialog_id, dialog
 
@@ -9026,7 +9027,12 @@ class Action:
                     children_seen[r["key"]] = r
             shown = sorted(children_seen.values(), key=_subagent_started, reverse=True)[:_SUBAGENT_LIST_CAP]
             running = [r["key"] for r in shown if _subagent_status(r.get("status")) in _LIVE_SUBAGENT_STATUSES]
-            pending = at_open and not running and bool(shown)
+            # Folded at the open, the section stays so until the reader taps
+            # it: a refill while the dialog follows the chat (ELI-260/262)
+            # reads no transcripts the tap has not asked for (ELI-266).
+            pending = ((at_open or dialog["pending"]) and not dialog["tapped"]
+                       and not running and bool(shown))
+            dialog["pending"] = pending
             # A running child with no label and no task from its spawn call is
             # titled by its transcript, which may get its spawn message after
             # the open: read again until it has.
@@ -9145,6 +9151,7 @@ class Action:
         if dialog is None:
             await emit(_render_subagents_fill_js({"error": "This dialog is out of date: open it again."}))
             return {"status": "error", "detail": "unknown dialog"}
+        dialog["tapped"] = True
         rows = dialog["rows"]
         try:
             conn, source = await _get_action_connection(lambda: self.valves)
