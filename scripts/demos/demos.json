@@ -247,25 +247,34 @@
       ]
     },
     {
-      "match": "worth rejecting unknown units later",
+      "match": "task: Review: cache",
       "steps": [
         {
-          "say": "Both reviews are back, and nothing blocks the release: fine to tag. Two follow-ups for later: cap the forecast cache, and reject unknown wind speed units.",
+          "say": "The cache review is back: nothing blocking. Old keys are never evicted, so I'd cap the cache after the release.",
           "delay": 0.03
+        }
+      ]
+    },
+    {
+      "match": "task: Review: wind speed fix",
+      "steps": [
+        {
+          "say": "The wind speed review is back too, and nothing blocks the release: fine to tag. Two follow-ups for later: cap the forecast cache, and reject unknown wind speed units.",
+          "delay": 0.03
+        }
+      ]
+    },
+    {
+      "match": "Review: wind speed fix\n</prompt-data>",
+      "steps": [
+        {
+          "say": "NO_REPLY"
         }
       ]
     },
     {
       "match": "cache.py, \"Cache forecasts",
       "steps": [
-        {
-          "say": "",
-          "tool": "exec",
-          "args": {
-            "command": "cd forecast && cat src/forecast/cache.py",
-            "title": "Read the cache"
-          }
-        },
         {
           "say": "Nothing blocking. Entries expire after 600 seconds as intended. Old keys are never removed, so memory grows with every place looked up; fine at today's size, worth a cap later.",
           "delay": 0.03
