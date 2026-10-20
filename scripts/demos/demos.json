@@ -807,8 +807,8 @@
         },
         {
           "do": "scroll_top",
-          "selector": ".chat-assistant *",
-          "text": "View Result"
+          "selector": ".chat-assistant",
+          "under_px": 46
         },
         {
           "do": "cover"
