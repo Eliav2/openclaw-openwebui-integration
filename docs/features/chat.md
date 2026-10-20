@@ -64,7 +64,7 @@ When a reply first uses a browser tool, the Pipe can add a page to that reply th
 
 The page comes from a service you run that watches your agent's browser, not from the Pipe: set [`LIVE_VIEW_URL`](../configuration.md#live_view_url) to its address, with `{chat_id}` and `{message_id}` where the chat's and the reply's ids go, for example `https://browser.example.org/embed?chat={chat_id}&message={message_id}`. The service finds the browser that this chat and reply drive and shows it.
 
-Which tool calls count as browser use is [`LIVE_VIEW_TOOLS`](../configuration.md#live_view_tools), a pattern searched in the tool's name and arguments: by default the `browser` tool, `openclaw browser` commands (how the agent drives its browser through exec) and commands that run Playwright or Chromium, but not a `lease.py own --no-record` run, which is never recorded. [`LIVE_VIEW_USERS`](../configuration.md#live_view_users) limits it to some users.
+Which tool calls count as browser use is [`LIVE_VIEW_TOOLS`](../configuration.md#live_view_tools), a pattern searched in the tool's name and arguments: by default the `browser` tool, `openclaw browser` commands (how the agent drives its browser through exec) and commands that run Playwright or Chromium. [`LIVE_VIEW_USERS`](../configuration.md#live_view_users) limits it to some users.
 
 Open WebUI shows the page in a sandboxed frame, as it does every embed, so the page cannot reach Open WebUI or your login. The service itself decides who may see the browser: put it behind your own login.
 
