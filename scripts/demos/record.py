@@ -272,9 +272,17 @@ class Demo:
             self.chat_id = (await self.page.evaluate("() => location.pathname")).split("/c/", 1)[1].strip("/")
 
     async def click(self, step: dict) -> None:
+        """Move the cursor to the target and click it; a target that moved meanwhile (a reply
+        arrived above it) is followed, so the click never lands where it was."""
         x, y = await self.point_of(step["selector"])
         await self.move(x, y)
-        await self.page.wait_for_timeout(200)
+        for _ in range(5):
+            await self.page.wait_for_timeout(200)
+            nx, ny = await self.point_of(step["selector"])
+            if abs(nx - x) < 2 and abs(ny - y) < 2:
+                break
+            x, y = nx, ny
+            await self.move(x, y, steps=6)
         await self.page.mouse.click(x, y)
 
     async def waiting(self, step: dict, until) -> None:

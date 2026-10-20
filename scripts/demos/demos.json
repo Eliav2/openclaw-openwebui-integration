@@ -802,6 +802,9 @@
           "show_ms": 2000
         },
         {
+          "do": "wait_reply_done"
+        },
+        {
           "do": "scroll_top"
         },
         {
