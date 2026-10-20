@@ -275,6 +275,57 @@ def test_tool_call_persists_as_a_native_tool_card(token):
     assert "E2E_TOOL_DONE" in json.dumps(output) + (msg.get("content") or ""), dump
 
 
+def test_a_chat_read_as_a_reply_ends_shows_its_tool_cards(token):
+    """A chat opened just as a reply ends shows the reply's tool cards
+    (ELI-267). Open WebUI's chat read takes the saved message, then, a few
+    awaits later, its live copy of a reply still streaming: a read that spans
+    the reply's end save gets the saved message as it was before that save,
+    and nothing live over it. Before that save the message holds what the
+    Pipe saved at its end. Reads from six threads through each reply's end,
+    reply after reply, until reads have landed in that window; each must show
+    the tool card. The reply has text on both sides of its card, so a read of
+    the saved message (the Pipe's whole text, run together) tells itself
+    apart from a live one (Open WebUI's text of the output, an item a line)."""
+    said = ("E2E_TOOL_SAID_START", "E2E_TOOL_SAID_END")   # e2e/fake_llm.py
+    page = _Page(token)
+    in_window, bare = [], []
+    try:
+        for _ in range(12):
+            chat_id, aid = _send_in_chat(token, page, None, "E2E_TOOL_SAID")
+            reads, ended = [], threading.Event()
+
+            def read():
+                while not ended.is_set():
+                    status, got = _request("GET", f"/api/v1/chats/{chat_id}", token=token)
+                    if status == 200:
+                        reads.append(got["chat"]["history"]["messages"][aid])
+                        if reads[-1].get("done") is True:
+                            ended.set()
+
+            threads = [threading.Thread(target=read, daemon=True) for _ in range(6)]
+            for t in threads:
+                t.start()
+            saved_in_time = ended.wait(TURN_TIMEOUT_S)
+            ended.set()
+            for t in threads:
+                t.join()
+            assert saved_in_time, f"chat {chat_id}: the reply was not saved done in {TURN_TIMEOUT_S:.0f}s"
+            # A live read's text is Open WebUI's join of the output (its
+            # `get_output_text`: one item per line); the saved message's whole
+            # text is the Pipe's, run together.
+            saved = [m for m in reads if m.get("done") is False
+                     and all(s in (m.get("content") or "") for s in said) and m.get("content") != "\n".join(said)]
+            in_window += saved
+            bare += [m for m in saved if not _output_calls(m.get("output"))]
+            if len(in_window) >= 3:
+                break
+    finally:
+        page.close()
+    assert in_window, "no read landed between the Pipe's end and Open WebUI's end save in 12 replies"
+    assert not bare, (f"{len(bare)} of {len(in_window)} reads as the reply ended showed its text "
+                      f"with no tool card: {json.dumps(bare[0])[:1500]}")
+
+
 # ── The Status Action's CSS classes exist in Open WebUI's stylesheet (ELI-118)
 # Open WebUI ships a prebuilt Tailwind stylesheet: a class its own source never
 # uses has no rule, and the Action's element silently renders without it (the

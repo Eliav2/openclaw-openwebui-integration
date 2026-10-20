@@ -230,14 +230,40 @@ async def _emit_message_snapshot(__event_emitter__, content):
 
     Open WebUI 0.12 writes it even while the message is `done: false` (the
     message upsert has no done guard), and its end-of-reply save then sets
-    `content` from `output`, over it. So it shows only when a reply never
-    reaches that save. Probed on 0.12.0 (ELI-160 slice 8).
+    `content` from `output`, over it. So it shows when a reply never reaches
+    that save, and to a chat read that spans it (`_live_output`). Probed on
+    0.12.0 (ELI-160 slice 8).
     """
     if not __event_emitter__ or not content:
         return
     await __event_emitter__(
         {"type": "replace", "data": {"content": content}}
     )
+
+
+async def _live_output(request, chat_id: str | None, message_id: str | None) -> list | None:
+    """Open WebUI's live copy of a streaming reply's `output`: the text and
+    tool cards a chat read shows while the reply streams. None when there is
+    none (no request, a chat that is not saved, the reply not streaming).
+
+    Open WebUI 0.12's chat read (`GET /api/v1/chats/{id}`) takes the saved
+    message, then, a few awaits later, lays this copy over it. The saved
+    message has no `output` until Open WebUI's end-of-reply save, which then
+    drops the copy: a read whose two halves span that save gets the message
+    as saved before it, and nothing live over it (ELI-267). Open WebUI
+    refreshes the copy after each line of the reply it reads, so at the end
+    of the Pipe's stream it holds the whole reply."""
+    if request is None or not chat_id or not message_id:
+        return None
+    try:
+        from open_webui.tasks import get_response_streams_by_chat_id
+        streams = await get_response_streams_by_chat_id(
+            getattr(request.app.state, "redis", None), chat_id)
+    except Exception as ex:
+        pipe_log(f"  live output of {message_id[:8]}...: {ex!r}")
+        return None
+    output = next((s.get("output") for s in streams if s.get("message_id") == message_id), None)
+    return copy.deepcopy(output) if output else None
 
 
 

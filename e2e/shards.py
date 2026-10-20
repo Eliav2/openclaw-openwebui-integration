@@ -45,6 +45,7 @@ SHARDS = {
         f"{E2E}::test_persisted_chat_keeps_the_reply",
         f"{E2E}::test_the_first_reply_in_a_new_chat_ends_with_the_usage_line",
         f"{E2E}::test_tool_call_persists_as_a_native_tool_card",
+        f"{E2E}::test_a_chat_read_as_a_reply_ends_shows_its_tool_cards",
         f"{E2E}::test_every_status_action_class_is_in_the_shipped_css",
         f"{E2E}::test_vendored_css_class_list_matches_the_pinned_image",
         f"{E2E}::test_two_cron_wakes_in_a_row_get_one_finished_message_each",
