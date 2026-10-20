@@ -259,7 +259,7 @@
       "match": "task: Review: wind speed fix",
       "steps": [
         {
-          "say": "The wind speed review is back too: nothing blocks the release, fine to tag.",
+          "say": "The wind speed review is back too: nothing blocking.",
           "delay": 0.03
         }
       ]
@@ -268,7 +268,8 @@
       "match": "Review: wind speed fix\n</prompt-data>",
       "steps": [
         {
-          "say": "NO_REPLY"
+          "say": "Both reviews are in and nothing blocks the release: fine to tag.",
+          "delay": 0.03
         }
       ]
     },
@@ -806,7 +807,7 @@
         },
         {
           "do": "scroll_top",
-          "selector": ".chat-assistant"
+          "selector": ".chat-assistant [role=button]"
         },
         {
           "do": "cover"
