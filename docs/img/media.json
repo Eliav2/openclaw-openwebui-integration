@@ -215,13 +215,13 @@
       }
     },
     "demos/tile-question.gif": {
-      "sha": "ea8d9e307998cee7",
+      "sha": "f9a20161c16d932d",
       "groups": {
         "chrome": "86d17ffd5eaebce8"
       }
     },
     "demos/tile-sub-agents.gif": {
-      "sha": "3099f92ca349f116",
+      "sha": "cd1ed8a34e77dfae",
       "groups": {
         "chrome": "86d17ffd5eaebce8"
       }
@@ -372,7 +372,7 @@
       }
     },
     "tile-question.jpg": {
-      "sha": "ae64dd9354f69cb5",
+      "sha": "511cc1d09406eeca",
       "groups": {
         "chrome": "86d17ffd5eaebce8"
       }
@@ -385,7 +385,7 @@
       }
     },
     "tile-sub-agents.jpg": {
-      "sha": "5c4850acb604d1de",
+      "sha": "d4f9d224576e2ecf",
       "groups": {
         "chrome": "86d17ffd5eaebce8"
       }
