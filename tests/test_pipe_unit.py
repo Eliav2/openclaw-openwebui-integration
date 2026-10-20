@@ -4609,6 +4609,19 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
         f = _parse_text_prompt("OpenClaw needs input:\n\nProceed?\nRun the deploy now? (y/n)")
         self.assertTrue(f["confirm"])
 
+    def test_hebrew_and_arabic_yes_no_questions_are_confirmations(self):
+        """ELI-193: questions.md says the markers work in Hebrew and Arabic,
+        but a Hebrew "(כן/לא)" question got a typed answer, and an Arabic
+        question ends with "؟", not "?"."""
+        for question in ("למחוק את הקובץ? (כן/לא)", "هل أحذف الملف؟ (نعم/لا)", "هل تريد المتابعة؟"):
+            f = _parse_text_prompt(f"OpenClaw needs input:\n\nאישור\n{question}")
+            self.assertEqual((f["confirm"], f["options"]), (True, []), question)
+
+    def test_arabic_multiselect_marker(self):
+        f = _parse_text_prompt("OpenClaw needs input:\n\nإضافات\nاختر كل ما ينطبق\n1. جبن\n2. زيتون")
+        self.assertTrue(f["multi"])
+        self.assertEqual(f["options"], ["جبن", "زيتون"])
+
     def test_confirmation_for_confirm_verb_question(self):
         f = _parse_text_prompt("OpenClaw needs input:\n\nDelete file?\nDelete config.json?")
         self.assertTrue(f["confirm"])
