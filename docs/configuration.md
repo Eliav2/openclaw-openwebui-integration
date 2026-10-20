@@ -128,9 +128,9 @@ Type: `str`. Default: empty.
 
 ### LIVE_VIEW_TOOLS
 
-Type: `str`. Default: `^browser\b|\bbrowser\s+(?:--?\S+\s+)*(?:open|navigate|goto|click|type|press|fill|hover|scroll|screenshot|snapshot|evaluate|tabs?|focus|close|start)\b|\bplaywright\b|\bchromium\b|google-chrome|lease\.py own(?![^\"]*--no-record)`.
+Type: `str`. Default: `^browser\b|\bbrowser\s+(?:--?\S+\s+)*(?:open|navigate|goto|click|type|press|fill|hover|scroll|screenshot|snapshot|evaluate|tabs?|focus|close|start)\b|\bplaywright\b|\bchromium\b|google-chrome`.
 
-Which tool calls count as browser use for LIVE_VIEW_URL: a regular expression, case-insensitive, searched in the tool's name followed by its arguments. The default takes the browser tool, an `openclaw browser` command (how the agent drives its browser through exec), and commands that run Playwright or Chromium, but not a `lease.py own --no-record` run, which is never recorded.
+Which tool calls count as browser use for LIVE_VIEW_URL: a regular expression, case-insensitive, searched in the tool's name followed by its arguments. The default takes the browser tool, an `openclaw browser` command (how the agent drives its browser through exec), and commands that run Playwright or Chromium. Add your own wrapper scripts here if your agent starts a browser through one.
 
 ### LIVE_VIEW_USERS
 

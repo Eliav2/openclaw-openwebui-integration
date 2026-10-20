@@ -31,7 +31,7 @@ class LiveViewUrlTests(unittest.TestCase):
         self.assertEqual(live_view_url(), f"https://replay.example/embed?chat={CHAT}&message={MSG}")
 
     def test_browser_use_by_tool_or_by_command(self):
-        for tool, args in (("browser", "{}"), ("exec", '{"command": "python3 lease.py own -- bun shot.ts"}'),
+        for tool, args in (("browser", "{}"), ("exec", '{"command": "google-chrome --headless --screenshot https://x"}'),
                            ("Bash", '{"command": "npx playwright test"}'),
                            ("exec", '{"command": "/usr/bin/chromium --headless"}')):
             with self.subTest(tool=tool, args=args):
@@ -49,14 +49,13 @@ class LiveViewUrlTests(unittest.TestCase):
             ("exec", {"command": "B=x; sleep 15; for i in 1 2; do $B browser press PageDown; done"}),
             ("exec", {"command": "openclaw browser tabs"}),
             ("browser", {"action": "open", "url": "https://x"}),
-            ("exec", {"command": "python3 /config/bin/browser-guard/lease.py own --caller qa -- bun shot.ts"}),
         )
         not_browser_use = (
             ("exec", {"command": "/config/.node_global/bin/openclaw browser --help 2>&1 | head -50"}),
             ("exec", {"command": "cd /config/.openclaw/workspace/projects/browser-replay && git status"}),
             ("exec", {"command": "grep -n frame-ancestors /config/.openclaw/workspace/projects/browser-replay/src/server.ts"}),
-            # a private browser that is never recorded: its embed could only say so
-            ("exec", {"command": "timeout 600 python3 /config/bin/browser-guard/lease.py own --no-record --caller w7-qa -- bun blank_probe.ts"}),
+            # a wrapper script that starts a browser is not known to the default
+            ("exec", {"command": "python3 /opt/tools/lease.py own --caller qa -- bun shot.ts"}),
             ("exec", {"command": "systemctl --user restart browser-replay"}),
             ("exec", {"command": "echo the browser opened fine"}),
         )
@@ -66,6 +65,14 @@ class LiveViewUrlTests(unittest.TestCase):
         for tool, args in not_browser_use:
             with self.subTest(tool=tool, args=args):
                 self.assertIsNone(live_view_url(tool, json.dumps(args)))
+
+    def test_the_default_names_no_setup_of_ours(self):
+        # ELI-265: the default is generic; a deployment's own wrapper goes in its own valve
+        default = Pipe.Valves().LIVE_VIEW_TOOLS
+        self.assertNotIn("lease", default)
+        cmd = json.dumps({"command": "python3 /opt/tools/lease.py own -- bun shot.ts"})
+        self.assertIsNone(live_view_url("exec", cmd))
+        self.assertIsNotNone(live_view_url("exec", cmd, LIVE_VIEW_TOOLS=default + r"|lease\.py own"))
 
     def test_only_the_users_it_is_set_for(self):
         self.assertIsNotNone(live_view_url(user="u-1", LIVE_VIEW_USERS="U-1, someone@example.org"))
