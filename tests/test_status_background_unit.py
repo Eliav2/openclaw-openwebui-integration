@@ -597,6 +597,19 @@ class BackgroundPageTests(unittest.TestCase):
         self.assertEqual(seen["fetches"][0]["dialogId"], "d1")
         self.assertEqual(seen["subagents"]["texts"][0], "Subagents (1)")
 
+    def test_drawn_again_still_waiting_while_open_it_asks_again(self):
+        """ELI-268: a tap whose ask was lost (a dropped phone connection),
+        then the section drawn again still waiting for its rows: the fold is
+        open and was asked once, so a skeleton waited for a tap already made.
+        Folded, drawing it again asks nothing."""
+        pending = action._render_subagents_fill_js({
+            "tasks": [{"id": CHILD, "title": "research", "status": "completed", "startedAt": NOW - 9000,
+                       "endedAt": NOW}], "total": 1, "pending": True, "source": "pipe", "fetchedAt": NOW,
+            "error": None})
+        seen = self.page([pending, pending], ["subagents"], [{"tap": "subagents"}, {"refill": 1}])
+        self.assertEqual([f["mode"] for f in seen["fetches"]], ["subagent-rows", "subagent-rows"])
+        self.assertEqual(self.page([pending, pending], ["subagents"], [{"refill": 1}])["fetches"], [])
+
     def test_closing_the_dialog_tells_the_action(self):
         seen = self.page([], [], [{"close": True}])
         self.assertEqual([(f["mode"], f["dialogId"]) for f in seen["fetches"]], [("status-closed", "d1")])
