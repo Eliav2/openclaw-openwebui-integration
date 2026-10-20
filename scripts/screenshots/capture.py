@@ -131,17 +131,18 @@ def set_title(token: str, chat_id: str, title: str) -> None:
     api("POST", f"/api/v1/chats/{chat_id}", {"chat": {"title": title}}, token)
 
 
-def chat_text(token: str, chat_id: str) -> str:
-    got = api("GET", f"/api/v1/chats/{chat_id}", token=token)
-    return " ".join((m.get("content") or "") for m in got["chat"]["history"]["messages"].values()
-                    if m.get("role") == "assistant" and m.get("done") is True)
-
-
-def wait_api(token: str, chat_id: str, needle: str, timeout_s: float = 180) -> None:
+def wait_api(token: str, chat_id: str, needle: str, timeout_s: float = 180, *, tool_results: int = 0) -> None:
+    """Until a finished reply saved in the chat has `needle`, and with
+    `tool_results` its tool cards: a reply the page shows may still be
+    streaming, and the chat is reloaded from what is saved."""
     deadline = time.time() + timeout_s
     while time.time() < deadline:
-        if needle in chat_text(token, chat_id):
-            return
+        got = api("GET", f"/api/v1/chats/{chat_id}", token=token)
+        for m in got["chat"]["history"]["messages"].values():
+            if m.get("role") != "assistant" or m.get("done") is not True or needle not in (m.get("content") or ""):
+                continue
+            if sum(o.get("type") == "function_call_output" for o in m.get("output") or []) >= tool_results:
+                return
         time.sleep(2)
     raise TimeoutError(f"{needle!r} not in a finished reply of {chat_id} after {timeout_s:.0f}s")
 
@@ -597,8 +598,9 @@ class Scenes:
           return {{x: 0, y: 0, width: innerWidth, height: Math.min(innerHeight, Math.ceil(bottom))}};
         }}"""
         self.s.shot(page, "hero-tool-cards", clip_js=clip)
-        wait_js(page, f"() => {{ const a = {LAST_ASSISTANT}; return a && a.innerText.includes('The build is clean'); }}",
-                "the final answer")
+        # Saved, cards included: the page shows the answer while the run still
+        # streams it, and the next shot reloads this chat (ELI-266).
+        wait_api(self.token, self.hero_chat, "The build is clean", tool_results=3)
         set_title(self.token, self.hero_chat, "Repo changes this week")
 
     def expanded(self, page: Page) -> None:

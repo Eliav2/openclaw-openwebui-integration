@@ -618,6 +618,48 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(listed_while_open, ["running"])
 
+    async def test_a_folded_section_stays_folded_through_a_refill_until_the_tap(self):
+        """ELI-266: opened while the chat's run was ending, with its children
+        done, the section opened folded with its transcripts left for the tap
+        (ELI-163); the run's end refilled it as read, so the tap asked for
+        nothing (the docs' dropped-tap shot timed out on main). The refill
+        keeps it folded; the tap reads the transcripts, once."""
+        import asyncio
+
+        rows = [_child(CHILD_A, "done", startedAt=self.NOW, endedAt=self.NOW + 1000),
+                _child(CHILD_B, "done", startedAt=self.NOW + 1, endedAt=self.NOW + 2000)]
+        describe = {"key": PARENT_KEY, "hasActiveRun": True}
+        previews = {CHILD_A: [{"role": "user", "text": WRAPPED_93}, {"role": "assistant", "text": "X is fine"}]}
+        conn, events = self._follow_conn(rows, describe, previews)
+        emitted, seen = [], []
+        real = openclaw_status_action._render_subagents_fill_js
+
+        def previews_read():
+            return [c.args[0] for c in conn.send_request.call_args_list].count("sessions.preview")
+
+        with action_gateway(conn), mock.patch(
+                "openclaw_status_action._render_subagents_fill_js",
+                side_effect=lambda d: (seen.append(d), real(d))[1]):
+            opened = asyncio.ensure_future(Action().action(
+                {"chat_id": PARENT_CHAT}, __user__={"id": PARENT_USER},
+                __event_emitter__=RecordingEmitter(emitted)))
+            await self._settle()
+            self.assertTrue(seen[-1]["pending"])
+            fills = len(seen)
+            describe["hasActiveRun"] = False
+            self._push(events["change"], PARENT_KEY)    # the chat's run ends
+            await asyncio.wait_for(opened, 5)   # bounds the test only
+            self.assertGreater(len(seen), fills)    # the section was refilled
+            self.assertTrue(seen[-1]["pending"])
+            self.assertEqual(previews_read(), 0)
+            await Action().action({"chat_id": PARENT_CHAT, "mode": "subagent-rows",
+                                   "dialogId": _dialog_id(emitted)},
+                                  __user__={"id": PARENT_USER}, __event_emitter__=RecordingEmitter(emitted))
+
+        self.assertFalse(seen[-1]["pending"])
+        self.assertEqual(previews_read(), 1)
+        self.assertEqual(seen[-1]["tasks"][-1]["terminalSummary"], "X is fine")
+
     async def test_a_child_done_in_the_open_dialog_gets_its_result_and_the_chat_its_context(self):
         """QA C31: a child that ended while the dialog followed it showed Done
         with no result line, and the dialog stopped there: a claude-cli
