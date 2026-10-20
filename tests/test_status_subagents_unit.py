@@ -433,6 +433,55 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
         # its own duration, not counting up.
         self.assertEqual(run_page(_DIALOG_PAGE_JS, payload), [{"cells": ["1s"], "timers": 1}])
 
+    async def test_a_child_opened_before_its_task_is_in_its_transcript_is_titled_once_it_is(self):
+        """ELI-253: on 2026.10 the spawn message reaches the child's transcript
+        after the spawn returns. A dialog opened in between, with no task
+        recorded from the spawn call (none is, on a claude-cli Gateway), read
+        no task and titled the running child by its session key for as long
+        as it stayed open. The transcript append is pushed (`session.message`
+        on a transcript subscription); the section refills on it."""
+        import asyncio
+
+        rows = [_child(CHILD_A, "running", startedAt=self.NOW - 1000)]
+        previews = {CHILD_A: []}
+        changes, appends, subscribed, emitted, seen = {}, {}, [], [], []
+
+        conn = mock.Mock()
+        conn.send_request = mock.AsyncMock(side_effect=_list_rpc(rows, previews, []))
+        conn.session_change_event = lambda key: changes.setdefault(key, asyncio.Event())
+        conn.session_message_event = lambda key: appends.setdefault(key, asyncio.Event())
+        conn.ensure_message_subscription = mock.AsyncMock(side_effect=subscribed.append)
+        real = openclaw_status_action._render_subagents_fill_js
+
+        async def settle():
+            # Let the dialog run until it waits (bounded: a dialog that
+            # never waits on the append still gets checked).
+            for _ in range(2000):
+                await asyncio.sleep(0)
+
+        with action_gateway(conn), mock.patch(
+                "openclaw_status_action._render_subagents_fill_js",
+                side_effect=lambda d: (seen.append(d), real(d))[1]):
+            opened = asyncio.ensure_future(Action().action(
+                {"chat_id": PARENT_CHAT}, __user__={"id": PARENT_USER},
+                __event_emitter__=RecordingEmitter(emitted)))
+            await settle()
+            self.assertEqual(seen[0]["tasks"][0]["title"], CHILD_A)   # the race: no task yet
+            previews[CHILD_A] = [{"role": "user", "text": WRAPPED_103}]
+            ev = appends.pop(CHILD_A, None)
+            if ev is not None:
+                ev.set()    # the Gateway pushes the spawn message's append
+            await settle()
+            titled = [t["title"] for d in seen for t in d["tasks"] if t["status"] == "running"]
+            rows[0] = _child(CHILD_A, "done", startedAt=self.NOW - 1000, endedAt=self.NOW)
+            ev = changes.pop(CHILD_A, None)
+            if ev is not None:
+                ev.set()    # the child's settle ends the follow
+            await asyncio.wait_for(opened, 5)   # bounds the test only
+
+        self.assertEqual(subscribed, [CHILD_A])
+        self.assertEqual(titled[-1], "Summarise Y.", titled)
+
 
 class _WindowGateway:
     """A Gateway's session store as 2026.9.3 lists it: `spawnedBy` returns a
