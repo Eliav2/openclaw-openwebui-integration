@@ -2506,20 +2506,20 @@ async def _latest_preview(conn, child_key: str) -> str | None:
     return preview if isinstance(preview, str) and preview.strip() and not _is_spawn_message(preview) else None
 
 
-# The toolbar button's icon, the composer chip's paw (ELI-202); without one
-# Open WebUI draws its default sparkle. A fixed gray stroke on purpose: Open
+# The toolbar button's icon, the composer chip's crab claw (ELI-231); without
+# one Open WebUI draws its default sparkle. A fixed gray stroke on purpose: Open
 # WebUI draws it as an <img>, so currentColor never resolves, and inverts it
 # 80% in dark mode; this gray stays a mid gray in both, like its own icons.
 ICON_URL = (
     "data:image/svg+xml;charset=utf-8,"
     "%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%20fill='none'%20"
     "stroke='%236b7280'%20stroke-width='1.6'%20stroke-linecap='round'%20stroke-linejoin='round'"
-    "%3E%3Cpath%20d='M11%206a1.5%202%200%201%201-3%200%201.5%202%200%200%201%203%200ZM16%206a"
-    "1.5%202%200%201%201-3%200%201.5%202%200%200%201%203%200ZM7%2010.5a1.5%201.75%200%201%201"
-    "-3%200%201.5%201.75%200%200%201%203%200ZM20%2010.5a1.5%201.75%200%201%201-3%200%201.5%20"
-    "1.75%200%200%201%203%200ZM12%2012.75c-2.25%200-5.25%202.6-5.25%204.875%200%201.45%201.1"
-    "%202.375%202.55%202.375.95%200%201.7-.45%202.7-.45s1.75.45%202.7.45c1.45%200%202.55-.925"
-    "%202.55-2.375%200-2.275-3-4.875-5.25-4.875Z'/%3E%3C/svg%3E"
+    "%3E%3Cpath%20d='M6.3%2014.6C4.6%2011.7%205.7%207.1%208.7%204.6C10.8%202.8%2013.4%202.3%2"
+    "015.6%203.1C14.3%203.7%2013.4%204.4%2013%205.3L13.9%206.5L12%206.9C11.6%207.5%2011.3%208"
+    ".1%2011.2%208.7C11.1%2011%2012.7%2012.9%2015.1%2012.7C16.4%2012.5%2017.3%2011.9%2017.8%2"
+    "011.1L17.1%2010L18.6%209.7C18.6%209.2%2018.6%208.7%2018.5%208.2C20.5%2010.2%2020.6%2013."
+    "4%2018.9%2015.8C17.1%2018.3%2014.2%2018.8%2011.6%2017.8C9.5%2017%207.5%2016.1%206.3%2014"
+    ".6ZM7.8%2016L5.4%2019.6L9.1%2021.1L11%2017.6'/%3E%3C/svg%3E"
 )
 
 
