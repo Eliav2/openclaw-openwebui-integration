@@ -13860,6 +13860,7 @@ class ModelPatchFailureTests(unittest.IsolatedAsyncioTestCase):
 
     asyncSetUp = NoDroppedMessagesTests.asyncSetUp
     asyncTearDown = NoDroppedMessagesTests.asyncTearDown
+    SK = NoDroppedMessagesTests.SK
 
     async def test_a_failed_patch_is_one_rpc_and_an_explained_reply(self):
         self.conn.model_patch_cached = lambda *a, **k: False
@@ -13878,6 +13879,60 @@ class ModelPatchFailureTests(unittest.IsolatedAsyncioTestCase):
             return [c async for c in gen]
         chunks = await asyncio.wait_for(drain(), 5)   # bounds the test only
         self.assertEqual(self.rpc.count("sessions.patch"), 1)
+        self.assertNotIn("chat.send", self.rpc)
+        self.assertIn("Model selection error", "".join(c for c in chunks if isinstance(c, str)))
+
+    RUNTIME_REFUSAL = ("A runtime is not available for anthropic/claude-haiku-5-5. "
+                       "Refresh the model catalog and choose again.")
+
+    async def _patch_refused(self, times):
+        """A reply whose first `times` model patches the Gateway refuses with its
+        runtime-not-available refusal: (chunks, the RPCs in order)."""
+        self.conn.model_patch_cached = lambda *a, **k: False
+        sent, order, refusals = self.conn.send_request, [], [times]
+
+        async def send_request(method, params, timeout=10):
+            order.append(method)
+            if method == "models.list":
+                return {"models": []}
+            if method == "sessions.patch":
+                if refusals[0]:
+                    refusals[0] -= 1
+                    raise GatewayError(self.RUNTIME_REFUSAL)
+                provider, model = params["model"].split("/", 1)
+                return {"resolved": {"modelProvider": provider, "model": model}}
+            return await sent(method, params, timeout)
+        self.conn.send_request = send_request
+        self.pipe.valves.DEFAULT_MODEL = "anthropic/claude-haiku-5-5"
+        gen = NoDroppedMessagesTests._reply(self, "hi", "m1")
+
+        async def drain():
+            return [c async for c in gen]
+        task = asyncio.ensure_future(drain())
+        if times < 2:   # the patch applies and the run starts: end it
+            await NoDroppedMessagesTests._until_registered(self, "run-1")
+            NoDroppedMessagesTests._queue(self, "run-1").put_nowait(
+                NoDroppedMessagesTests._final(self, "run-1"))
+        chunks = await asyncio.wait_for(task, 5)   # bounds the test only
+        return chunks, order
+
+    async def test_a_runtime_refusal_refreshes_the_catalog_and_patches_once_more(self):
+        """ELI-247: 2026.10.5 refuses the patch with "A runtime is not available
+        ... Refresh the model catalog and choose again." when the model's
+        catalog owner is not current (model-runtime-choice-DiOKFJ9m.mjs).
+        models.list re-publishes a failed catalog owner before it answers, and
+        a second patch prepares the choice again from the current owner."""
+        chunks, order = await self._patch_refused(1)
+        patches = [i for i, m in enumerate(order) if m == "sessions.patch"]
+        self.assertEqual(len(patches), 2, order)
+        self.assertIn("models.list", order[patches[0]:patches[1]], order)
+        self.assertIn("chat.send", self.rpc)
+        self.assertNotIn("Model selection error", "".join(c for c in chunks if isinstance(c, str)))
+
+    async def test_a_second_runtime_refusal_is_reported(self):
+        chunks, order = await self._patch_refused(2)
+        self.assertEqual(order.count("sessions.patch"), 2, order)
+        self.assertEqual(order.count("models.list"), 1, order)
         self.assertNotIn("chat.send", self.rpc)
         self.assertIn("Model selection error", "".join(c for c in chunks if isinstance(c, str)))
 
