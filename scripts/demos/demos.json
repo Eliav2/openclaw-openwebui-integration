@@ -259,7 +259,7 @@
       "match": "task: Review: wind speed fix",
       "steps": [
         {
-          "say": "The wind speed review is back too, and nothing blocks the release: fine to tag. Two follow-ups for later: cap the forecast cache, and reject unknown wind speed units.",
+          "say": "The wind speed review is back too: nothing blocks the release, fine to tag.",
           "delay": 0.03
         }
       ]
@@ -787,7 +787,7 @@
         },
         {
           "do": "pause",
-          "ms": 800
+          "ms": 500
         },
         {
           "do": "click",
@@ -799,13 +799,14 @@
         {
           "do": "wait",
           "js": "() => document.body.innerText.includes('fine to tag')",
-          "show_ms": 2000
+          "show_ms": 1500
         },
         {
           "do": "wait_reply_done"
         },
         {
-          "do": "scroll_top"
+          "do": "scroll_top",
+          "selector": ".chat-assistant"
         },
         {
           "do": "cover"

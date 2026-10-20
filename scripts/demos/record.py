@@ -334,8 +334,17 @@ class Demo:
         self.rec.cover = len(self.rec.frames) - 1
 
     async def scroll_top(self, step: dict) -> None:
-        """Jump the chat back to its first message (a smooth scroll repaints every frame)."""
-        await self.page.evaluate("() => document.getElementById('messages-container').scrollTo({top: 0})")
+        """Jump the chat back up, as a reader would: to its first message, or with `selector`
+        to that element, just under the title bar so nothing scrolls beneath it. A jump, not a
+        smooth scroll, which would repaint every frame."""
+        await self.page.evaluate("""(sel) => {
+            const box = document.getElementById('messages-container');
+            const el = sel && document.querySelector(sel);
+            if (!el) { box.scrollTo({top: 0}); return; }
+            const bar = document.querySelector('nav');
+            const under = bar ? bar.getBoundingClientRect().bottom : box.getBoundingClientRect().top;
+            box.scrollTo({top: box.scrollTop + el.getBoundingClientRect().top - under - 8});
+        }""", step.get("selector"))
         await self.page.wait_for_timeout(int(step.get("ms", 400)))
 
     async def keys(self, step: dict) -> None:
