@@ -107,6 +107,7 @@ SHARDS = {
         f"{BROWSER}::test_a_compaction_the_gateway_refuses_shows_its_error",
         f"{BROWSER}::test_the_subagent_drawer_follows_a_running_child_to_its_end",
         f"{BROWSER}::test_the_status_dialog_lists_a_background_agent_while_its_reply_runs",
+        f"{BROWSER}::test_a_background_command_reads_by_its_title_and_a_tap_shows_the_command",
         f"{BROWSER}::test_a_long_task_shown_whole_keeps_the_drawer_closable",
         f"{BROWSER}::test_show_less_puts_a_long_task_back_at_its_first_lines",
         f"{BROWSER}::test_a_reply_the_agent_starts_streams_into_the_open_tab_and_asks_there",

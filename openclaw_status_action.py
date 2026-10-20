@@ -88,6 +88,7 @@ import contextlib
 import copy
 import functools
 import re
+import shlex
 import signal
 import mimetypes
 import urllib.error
@@ -7343,11 +7344,29 @@ _BACKGROUND_FILL_JS_TEMPLATE = r"""
                          time: r.status === 'running' ? S.elapsedCell(r.startedAt, null, true) : null,
                          preview: line(r.kind, automationDetail(r)) });
     }
-    return S.listRow({
+    let el = null;
+    el = S.listRow({
       kind: 'openclawBgRow', title: r.title, status: r.status,
       time: S.elapsedCell(r.startedAt, r.endedAt, isLive(r)), preview: line(r.kind, r.preview),
-      open: r.agent ? function() { S.openAgentDetail(r.agent); } : null,
+      open: r.agent ? function() { S.openAgentDetail(r.agent); }
+        : r.command ? function() { toggleCommand(el, r.command); } : null,
     });
+    // ELI-232: the whole command, on hover and on a tap.
+    if (r.command) el.title = r.command;
+    return el;
+  }
+  function toggleCommand(el, command) {
+    const shown = el.querySelectorAll('[data-openclaw-command]')[0];
+    if (shown) {
+      shown.remove();
+      return;
+    }
+    const pre = document.createElement('div');
+    pre.dataset.openclawCommand = '1';
+    pre.className = 'text-xs font-mono text-gray-500 dark:text-gray-400 whitespace-pre-wrap break-all mt-1 '
+      + 'p-1.5 rounded bg-gray-50 dark:bg-gray-800/60';
+    pre.textContent = command;
+    el.appendChild(pre);
   }
 
   (DATA.errors || []).forEach(function(e) { fold.body.appendChild(S.errorEl(e)); });
@@ -7949,20 +7968,102 @@ def _process_task(process: dict, session_key: str) -> dict:
     exec task whose sourceId is the process (the session its tool card
     names), titled by the Gateway's short name until a card gives the
     command, and a finished one's last line of output as its summary."""
-    lines = [ln for ln in (process.get("tail") or "").splitlines() if ln.strip()]
+    lines = [ln for ln in (_clean_line(ln) for ln in (process.get("tail") or "").splitlines()) if ln]
+    status = _PROCESS_STATUSES.get(process.get("status"), process.get("status"))
+    if status == "completed" and process.get("exitCode") not in (None, 0):
+        status = "failed"    # 2026.10.5 says "completed" for any exit code (ELI-232)
     return {
         "id": process.get("processId"), "kind": "exec", "sourceId": process.get("processId"),
         "sessionKey": session_key, "title": process.get("name") or "",
-        "status": _PROCESS_STATUSES.get(process.get("status"), process.get("status")),
+        "status": status,
         "startedAt": process.get("startedAt"), "endedAt": process.get("endedAt"),
-        "terminalSummary": lines[-1][:200] if lines else None,
+        "terminalSummary": lines[-1] if lines else None,
+        "exitCode": process.get("exitCode"), "exitSignal": process.get("exitSignal"),
     }
 
 
+# A terminal's color and cursor codes, and other control characters.
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|[\x00-\x08\x0b-\x1f\x7f]")
+_LINE_MAX = 120
+
+
+def _clean_line(text: str) -> str:
+    """One line of output as plain text: no terminal codes, one space
+    between words, cut at _LINE_MAX."""
+    line = " ".join(_ANSI_RE.sub("", text or "").split())
+    return line if len(line) <= _LINE_MAX else line[:_LINE_MAX - 1].rstrip() + "…"
+
+
+# ELI-232: how a command without a title reads. Steps that only set up the
+# shell are skipped, wrappers dropped, and an inline script is left out.
+_SETUP_WORDS = {"cd", "pushd", "popd", "export", "set", "unset", "source", ".", "umask", "trap", "shopt",
+                "true", ":", "ulimit", "alias"}
+_WRAPPER_WORDS = {"setsid", "nohup", "exec", "env", "time", "nice", "stdbuf"}
+_SCRIPT_FLAGS = {"-c", "-e", "--eval"}
+_INTERPRETER_RE = re.compile(r"(python[\d.]*|node|bun|deno|perl|ruby|php|bash|sh|zsh|dash)$")
+# A loop or a condition reads by its head: "for n in 142 136 …".
+_COMPOUND_WORDS = {"for", "while", "until", "if", "case", "select"}
+_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+_SHORT_COMMAND_MAX = 80
+
+
+def _short_command(command: str) -> str:
+    """The first command in `command` that does the work, in a few words:
+    `cd /x && python3 -c "..."` reads "python3 -c …". Empty when it only
+    sets up the shell."""
+    lex = shlex.shlex(command or "", posix=True, punctuation_chars="();<>|&\n")
+    lex.whitespace = " \t\r"
+    lex.whitespace_split = True
+    words: list = []
+    cut = False
+    try:
+        for tok in lex:
+            if tok and set(tok) <= set("();<>|&\n"):
+                if words and words[0] not in _SETUP_WORDS:
+                    if tok.startswith("<<"):
+                        cut = True
+                    elif tok.startswith((">", "<")) and words[-1].isdigit() and words[-1] + tok in command:
+                        words.pop()    # 2>/dev/null: the 2 is the redirect's
+                    break
+                words = []
+                if tok.startswith(("<", ">")):
+                    break
+                continue
+            if not words and (_ASSIGNMENT_RE.match(tok) or tok in _WRAPPER_WORDS):
+                continue
+            if not words and tok == "timeout":
+                words.append(tok)
+                continue
+            if words == ["timeout"]:
+                words = []    # its duration
+                continue
+            words.append(tok)
+            if tok in _SCRIPT_FLAGS and len(words) > 1 and _INTERPRETER_RE.match(words[0].rsplit("/", 1)[-1]):
+                cut = True
+                break
+    except ValueError:
+        # An unclosed quote: its first line as written.
+        return _cut((command or "").strip().splitlines()[0] if (command or "").strip() else "", _SHORT_COMMAND_MAX)
+    if not words or words[0] in _SETUP_WORDS:
+        return ""
+    if words[0] in _COMPOUND_WORDS:
+        cut = True
+    if words[0].startswith("/"):
+        words[0] = words[0].rsplit("/", 1)[-1]
+    text = " ".join(shlex.quote(w) if w != shlex.quote(w) and " " in w else w for w in words)
+    return _cut(text + (" …" if cut else ""), _SHORT_COMMAND_MAX)
+
+
+def _cut(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
 def _exec_commands(chat) -> dict:
-    """{exec session id: command} from the chat's own exec tool cards. The
-    Gateway's task for a background command is titled "CLI command"; its
-    sourceId is the session the card's result names."""
+    """{exec session id: {"command", "title"}} from the chat's own exec tool
+    cards. The Gateway's task for a background command is titled "CLI
+    command" (2026.9) or by the command's first words (2026.10); its sourceId
+    is the session the card's result names, and only the card has the
+    title the agent gave the call (ELI-232)."""
     out = {}
     for msg in _owui_branch(chat):
         output = msg.get("output") or []
@@ -7978,9 +8079,12 @@ def _exec_commands(chat) -> dict:
                 args = json.loads(call.get("arguments") or "{}")
             except ValueError:
                 args = {}
-            command = args.get("command") if isinstance(args, dict) else None
+            if not isinstance(args, dict):
+                args = {}
+            command, title = args.get("command"), args.get("title")
             if m and isinstance(command, str) and command.strip():
-                out[m.group(1)] = command.strip()
+                out[m.group(1)] = {"command": command.strip(),
+                                   "title": title.strip() if isinstance(title, str) else ""}
     return out
 
 
@@ -7993,13 +8097,10 @@ def _belongs_to(task: dict, session_key: str) -> bool:
 def _task_row(task: dict, commands: dict) -> dict:
     kind = task.get("kind") or ""
     title = (task.get("title") or "").strip()
-    if kind == "exec":
-        # 2026.9 titles every one "CLI command"; a 2026.10 process has a
-        # short name ("make build"). The card's whole command wins.
-        own = "" if title == "CLI command" else title
-        title = commands.get(task.get("sourceId") or "") or own or "Shell command"
     status = task.get("status")
     live = status in _LIVE_TASK_STATUSES
+    if kind == "exec":
+        return _command_row(task, commands.get(task.get("sourceId") or "") or {}, live)
     return {
         "id": task.get("id") or task.get("taskId"),
         "kind": _BACKGROUND_KINDS.get(kind, "Task"),
@@ -8010,6 +8111,41 @@ def _task_row(task: dict, commands: dict) -> dict:
         # A running command's progress is always "Command running": its chip says so.
         "preview": (None if live and kind == "exec" else task.get("progressSummary") if live
                     else (task.get("error") or task.get("terminalSummary"))),
+    }
+
+
+# 2026.9's summaries of a command, which its status chip already says.
+_GENERIC_COMMAND_SUMMARIES = {"Command running", "Command completed", "Command failed"}
+
+
+def _command_row(task: dict, card: dict, live: bool) -> dict:
+    """A background command (ELI-232). Titled by the title the agent gave
+    the call, else by its first real command. Under it: while it runs, that
+    command when the title is the agent's; once ended, how it ended (a
+    failure's exit code or the signal that stopped it) and its last line of
+    output. The whole command is the row's tap."""
+    command = card.get("command") or ""
+    # 2026.9 titles every one "CLI command"; a 2026.10 process has the
+    # command's first words ("cd /tmp"), all there is without a card.
+    own = (task.get("title") or "").strip()
+    short = _short_command(command or ("" if own == "CLI command" else own))
+    title = card.get("title") or short or "Shell command"
+    if live:
+        preview = short if card.get("title") and short != title else None
+    else:
+        code, signal = task.get("exitCode"), task.get("exitSignal")
+        ended = signal or (f"exit {code}" if code not in (None, 0) else None)
+        said = _clean_line(task.get("error") or task.get("terminalSummary") or "")
+        preview = " · ".join(p for p in (ended, None if said in _GENERIC_COMMAND_SUMMARIES else said) if p) or None
+    return {
+        "id": task.get("id") or task.get("taskId"),
+        "kind": _BACKGROUND_KINDS["exec"],
+        "title": title,
+        "status": task.get("status"),
+        "startedAt": task.get("startedAt") or task.get("createdAt"),
+        "endedAt": None if live else (task.get("endedAt") or task.get("updatedAt")),
+        "preview": preview,
+        "command": command or None,
     }
 
 

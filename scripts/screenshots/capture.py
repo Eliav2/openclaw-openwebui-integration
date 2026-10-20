@@ -768,7 +768,8 @@ class Scenes:
     def background(self, page: Page) -> None:
         """ELI-163: work left running in this chat. #1 the dialog with one
         source held back (the sample rate limits), every other section
-        already filled; #2 Background unfolded with the four imports and the
+        already filled; #2 Background unfolded with the four imports, the
+        failed check before them (ELI-232: a command without a title) and the
         chat's automation, the other sections opened."""
         new_chat(page)
         chat = send(page, "Import the station data for all four regions.")
@@ -799,7 +800,8 @@ class Scenes:
             open_fold(page, "subagents")
             open_fold(page, "agents")
             wait_js(page, f"""() => {{ const t = document.querySelector('{root}').innerText;
-              return /background \\(5\\)/i.test(t) && /Morning forecast chart/.test(t) && /no sub-agents/i.test(t); }}""",
+              return /background \\(6\\)/i.test(t) && /Morning forecast chart/.test(t) && /no sub-agents/i.test(t)
+                && /no such region/.test(t); }}""",
                     "Background with the imports and the automation, every section open", 30_000)
             print("  background: " + json.dumps(page.locator("#openclaw-status-section-background").inner_text()[:600]),
                   flush=True)
