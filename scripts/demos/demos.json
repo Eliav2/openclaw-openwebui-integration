@@ -801,8 +801,8 @@
           "selector": ".chat-assistant >> nth=0 >> [role=button] >> nth=0"
         },
         {
-          "do": "wait",
-          "js": "() => document.querySelectorAll('.chat-assistant').length >= 3 && !/Started: Review: cache/.test(document.querySelectorAll('.chat-assistant')[0].innerText)"
+          "do": "pause",
+          "ms": 500
         },
         {
           "do": "park"
