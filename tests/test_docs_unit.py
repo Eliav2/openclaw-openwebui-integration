@@ -160,7 +160,8 @@ class DocsLinkTests(unittest.TestCase):
                 path = target.partition("#")[0]
                 if path.endswith((".png", ".jpg", ".webp", ".gif")):
                     used.add((md.parent / path).resolve())
-        images = sorted(p for p in IMG.iterdir() if p.is_file())
+        # media.json is the record of what each file shows (MediaFreshTests), not an image.
+        images = sorted(p for p in IMG.iterdir() if p.is_file() and p.name != "media.json")
         demos = sorted(p for p in DEMOS.iterdir() if p.suffix == ".gif")
         videos = sorted(p for p in DEMOS.iterdir() if p.suffix in (".mp4", ".webm"))
         self.assertEqual([p.name for p in images if p.stat().st_size > IMAGE_BUDGET], [])
@@ -312,6 +313,48 @@ class VersionsTests(unittest.TestCase):
                                   (ROOT / name).read_text(), re.M)
                 self.assertIsNotNone(field, f"{name} declares no required_open_webui_version")
                 self.assertEqual({field.group(1)}, minimums)
+
+
+class MediaFreshTests(unittest.TestCase):
+    """Every screenshot and recording was made on the UI as it is now
+    (scripts/media.py, docs/img/media.json): a change to the composer's Claw
+    button, the Status icon or dialog, or the pinned Open WebUI fails here
+    until the files that show it are recorded again."""
+
+    def setUp(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("media", ROOT / "scripts" / "media.py")
+        self.media = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.media)
+
+    def test_every_file_was_recorded_on_the_current_ui(self):
+        self.assertEqual([f"{f}: {why}" for f, why in self.media.stale()], [],
+                         "record them again: python3 scripts/media.py (its docstring says how)")
+
+    def test_a_change_to_a_groups_sources_makes_its_files_stale(self):
+        manifest = self.media.load()
+        manifest["groups"]["status"]["sources"] = ["src/openclaw_pipe_pkg/action.py:_MODAL_COMPACTING_JS"]
+        stale = {f for f, _why in self.media.stale(manifest)}
+        self.assertIn("status-dialog-light.png", stale)
+        self.assertIn("demos/status-dialog.gif", stale)
+        self.assertNotIn("demos/hero.gif", stale)
+
+    def test_stamp_refuses_a_file_that_was_not_recorded_again(self):
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "x-light.png").write_bytes(b"old frame")
+            manifest = {"groups": {"chrome": {"sources": ["e2e/versions.env:OWUI_IMAGE"], "files": "."}},
+                        "files": {"x-light.png": {"sha": "", "groups": {"chrome": "an older ui"}}}}
+            (Path(tmp) / "media.json").write_text(json.dumps(manifest))
+            self.media.IMG, self.media.MANIFEST = tmp, str(Path(tmp) / "media.json")
+            manifest["files"]["x-light.png"]["sha"] = self.media._sha("x-light.png")
+            (Path(tmp) / "media.json").write_text(json.dumps(manifest))
+            with self.assertRaises(SystemExit):
+                self.media.stamp([str(Path(tmp) / "x-light.png")])
+            (Path(tmp) / "x-light.png").write_bytes(b"new frame")
+            self.media.stamp([str(Path(tmp) / "x-light.png")])
+            self.assertEqual(self.media.stale(), [])
 
 
 if __name__ == "__main__":

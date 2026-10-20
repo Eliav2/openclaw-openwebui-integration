@@ -160,6 +160,16 @@ stack). A demo waits on what the page shows, never on time: a reply is done when
 its text is stable and "Thinking…" is gone. Before committing a GIF, look at
 frames from it (`ffmpeg -i x.gif -vf "select=not(mod(n\,40))" -vsync 0 f%02d.png`).
 
+The images can't go stale silently. `docs/img/media.json` records, for every
+file under `docs/img`, fingerprints of the UI it shows: the composer's Claw
+button and the Status icon (every frame), the Status dialog's scripts, and the
+pinned Open WebUI image. When a pull request changes one of them, the docs unit
+tests fail and list the files to record again. Run the two workflows with
+`only` set to those names, put the files from their artifacts in `docs/img`,
+then `uv run --with pillow scripts/media.py posters` if a README tile changed,
+and `python3 scripts/media.py stamp <files>`. `stamp` refuses a file whose bytes
+are the same as before the change.
+
 **CodeQL** runs on Python, JavaScript and the workflows themselves.
 **Dependabot** updates the GitHub Actions and the test tooling weekly.
 

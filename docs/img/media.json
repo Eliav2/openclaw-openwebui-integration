@@ -1,0 +1,418 @@
+{
+  "_comment": "What each file under docs/img shows of this integration's UI, and the fingerprints of those sources when it was recorded. scripts/media.py checks it (the docs unit tests run it) and stamps it; its docstring says how to record again. `files` in a group is a regex on the path under docs/img.",
+  "groups": {
+    "chrome": {
+      "_comment": "In every frame: the composer's Claw button, the reply toolbar's Status icon, Open WebUI itself.",
+      "sources": [
+        "src/openclaw_pipe_pkg/composer.py:_COMPOSER_BUTTON_JS_TEMPLATE",
+        "src/openclaw_pipe_pkg/action.py:ICON_URL",
+        "e2e/versions.env:OWUI_IMAGE"
+      ],
+      "files": "."
+    },
+    "status": {
+      "_comment": "The Status dialog and its sub-agent drawer.",
+      "sources": [
+        "src/openclaw_pipe_pkg/action.py:_*_JS*"
+      ],
+      "files": "^(status-|subagent-drawer|tile-status-dialog|demos/status-dialog\\.)"
+    }
+  },
+  "files": {
+    "agent-turn-light.png": {
+      "sha": "ed0dc0886af47af4",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "background-agent-waiting-light.png": {
+      "sha": "c91a9cf70b83fad5",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "chat-titles-light.png": {
+      "sha": "48ec51036a7ef34e",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "compact-before-light.png": {
+      "sha": "e469927a8c13e1ab",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "composer-status-light.png": {
+      "sha": "bdf7d5516d437b3a",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "demos/failed-tool.gif": {
+      "sha": "e29b37e10c2bf8b6",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "demos/failed-tool.mp4": {
+      "sha": "0227c5392704b387",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "demos/failed-tool.webm": {
+      "sha": "410565b1ff40e732",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "demos/hero.gif": {
+      "sha": "df57644f74991668",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "demos/hero.mp4": {
+      "sha": "2ca6de47851b4077",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "demos/hero.webm": {
+      "sha": "315601194b2d715b",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "demos/question-card.gif": {
+      "sha": "b1844f3446eb45b4",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "demos/question-card.mp4": {
+      "sha": "921cb799f176f5ca",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "demos/question-card.webm": {
+      "sha": "815f6661304a480b",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "demos/reload-mid-reply.gif": {
+      "sha": "e6bcf88aac834407",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "demos/reload-mid-reply.mp4": {
+      "sha": "72bfa11cb111d9b6",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "demos/reload-mid-reply.webm": {
+      "sha": "3951e663449e924f",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "demos/send-now.gif": {
+      "sha": "2f6a038d8e783ed3",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "demos/send-now.mp4": {
+      "sha": "d862883c96831ec3",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "demos/send-now.webm": {
+      "sha": "cc3e634a39d170c9",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "demos/sent-mid-run.gif": {
+      "sha": "35619a14b7ee56f9",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "demos/sent-mid-run.mp4": {
+      "sha": "fc50434b3dfc4526",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "demos/sent-mid-run.webm": {
+      "sha": "6d3e4225666aa9e9",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "demos/status-dialog.gif": {
+      "sha": "efef359acb3ef0bb",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8",
+        "status": "30c4a430896d441a"
+      }
+    },
+    "demos/status-dialog.mp4": {
+      "sha": "c0ff641bc6d2ba9c",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8",
+        "status": "30c4a430896d441a"
+      }
+    },
+    "demos/status-dialog.webm": {
+      "sha": "6c71ce776489e3bc",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8",
+        "status": "30c4a430896d441a"
+      }
+    },
+    "demos/stop.gif": {
+      "sha": "43481931c7280cba",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "demos/stop.mp4": {
+      "sha": "47135006b14e9f76",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "demos/stop.webm": {
+      "sha": "272cc2c83cb7e681",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "demos/streaming.gif": {
+      "sha": "0359dc3117f374cc",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "demos/streaming.mp4": {
+      "sha": "2a5e5759a78aa20d",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "demos/streaming.webm": {
+      "sha": "29784e4026ff2e39",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "demos/tile-question.gif": {
+      "sha": "d3e8034ef1fab17f",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "demos/tile-sub-agents.gif": {
+      "sha": "8b1f98044c67c179",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "demos/tile-tool-cards.gif": {
+      "sha": "4fd4decc125d0409",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "demos/tool-cards.gif": {
+      "sha": "9706fc7bcc194d95",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "demos/tool-cards.mp4": {
+      "sha": "dad9f18cd092c20e",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "demos/tool-cards.webm": {
+      "sha": "064b18d718bd4e1a",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "error-message-light.png": {
+      "sha": "2aeb1cf2e69c4340",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "first-reply-light.png": {
+      "sha": "0c8772ec4fb67a12",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "image-input-light.png": {
+      "sha": "6cda7b895320496d",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "live-view-light.png": {
+      "sha": "27a5780ae74886cd",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "media-turn-light.png": {
+      "sha": "ad31cb44efa5ae1a",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "model-picker-light.png": {
+      "sha": "7c5355c328d40c36",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "question-card-light.png": {
+      "sha": "9b4d9d8e23b215b1",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "secret-request-light.png": {
+      "sha": "069331fe5a8abf47",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "spawn-card-light.png": {
+      "sha": "dd0e119805701ca6",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "status-dialog-background-light.png": {
+      "sha": "204265a376c3a517",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8",
+        "status": "30c4a430896d441a"
+      }
+    },
+    "status-dialog-folded-light.png": {
+      "sha": "0f0cb0283f2f689d",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8",
+        "status": "30c4a430896d441a"
+      }
+    },
+    "status-dialog-light.png": {
+      "sha": "24bc068953ecaa88",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8",
+        "status": "30c4a430896d441a"
+      }
+    },
+    "status-dialog-loading-light.png": {
+      "sha": "cfcc4e1ff29a5651",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8",
+        "status": "30c4a430896d441a"
+      }
+    },
+    "status-dialog-scrolled-light.png": {
+      "sha": "42cebda922a3a202",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8",
+        "status": "30c4a430896d441a"
+      }
+    },
+    "status-subagents-retry-light.png": {
+      "sha": "89b40dedac990afc",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8",
+        "status": "30c4a430896d441a"
+      }
+    },
+    "subagent-drawer-light.png": {
+      "sha": "ec3566dd08e48d9d",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8",
+        "status": "30c4a430896d441a"
+      }
+    },
+    "subagent-result-light.png": {
+      "sha": "87f538182ee30a4c",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "thinking-level-light.png": {
+      "sha": "5026deef7a5d21f8",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "thinking-toggle-light.png": {
+      "sha": "5602893745ecc435",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "tile-question.jpg": {
+      "sha": "3878d5b249185867",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "tile-status-dialog.jpg": {
+      "sha": "2a80af8ba4bcf8bd",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8",
+        "status": "30c4a430896d441a"
+      }
+    },
+    "tile-sub-agents.jpg": {
+      "sha": "2f3b7886f0f1bcb9",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "tile-tool-cards.jpg": {
+      "sha": "c944a85702ffc0ee",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "toolbar-button-light.png": {
+      "sha": "3ad760f29e5a2e84",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "usage-goal-light.png": {
+      "sha": "25364221bc0054a6",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "valves-light.png": {
+      "sha": "afaa9e8ba2916740",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    }
+  }
+}
