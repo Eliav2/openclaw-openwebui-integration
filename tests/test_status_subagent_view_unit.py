@@ -68,8 +68,7 @@ def _page(body: str, payload: dict) -> dict:
 def _rows():
     """A labelled child with a 1,200-character task and an unlabelled one."""
     labelled = _subagent_row({"key": CHILD, "label": "invest-bot: freqtrade head-to-head", "status": "done",
-                              "startedAt": NOW - 65_000, "endedAt": NOW - 5_000,
-                              "lastMessagePreview": LONG_RESULT[:240]}, LONG_TASK)
+                              "startedAt": NOW - 65_000, "endedAt": NOW - 5_000}, LONG_TASK, LONG_RESULT[:240])
     unlabelled = _subagent_row({"key": OTHER, "status": "running", "startedAt": NOW - 30_000,
                                 "lastMessagePreview": "Reading the noise table."}, LONG_TASK)
     return labelled, unlabelled

@@ -7637,13 +7637,18 @@ def _subagent_task_texts(previews_resp):
 def _subagent_row(row, task_text=None, latest=None):
     """One Subagents row out of a child session row. The title is the spawn
     label, else the task's first sentence, else the key; the whole task is
-    the drawer's to show (ELI-155). The preview is the row's own last
-    message when the list read carried it, else `latest` (sessions.preview)."""
+    the drawer's to show (ELI-155). A running child's preview is the row's
+    own last message when the list read carried it (a claude-cli child's
+    text so far is nowhere else), else `latest` (sessions.preview). An ended
+    child's result is `latest` only: the list's copy is flattened markdown,
+    read from a transcript index that catches up after the reply's append
+    with no push, so a row filled from either would read differently in the
+    open dialog and after a reopen (ELI-264)."""
     status = _subagent_status(row.get("status"))
     if status is None and row.get("endedAt"):
         status = "ended"    # a visible spawn's session carries no run status
     live = status in _LIVE_SUBAGENT_STATUSES
-    preview = row.get("lastMessagePreview") or latest
+    preview = (row.get("lastMessagePreview") or latest) if live else latest
     if _is_spawn_message(preview):
         # Just spawned: the newest message is still the task (ELI-119).
         preview = None
@@ -8959,7 +8964,8 @@ class Action:
             texts, newest = _subagent_previews(previews)
             task_texts.update({k: None for k in unread})
             task_texts.update(texts)
-            latest.update(newest)
+            # What each read child said last as of this read, not an earlier one.
+            latest.update({k: newest.get(k) for k in unread})
 
         async def read_children():
             """The current children, then each indexed child they lack: its
