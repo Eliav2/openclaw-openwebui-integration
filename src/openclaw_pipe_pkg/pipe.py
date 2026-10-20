@@ -363,14 +363,15 @@ class Pipe:
             default=(r"^browser\b"
                      r"|\bbrowser\s+(?:--?\S+\s+)*(?:open|navigate|goto|click|type|press|fill|hover|scroll"
                      r"|screenshot|snapshot|evaluate|tabs?|focus|close|start)\b"
-                     r"|\bplaywright\b|\bchromium\b|google-chrome|lease\.py own(?![^\"]*--no-record)"),
+                     r"|\bplaywright\b|\bchromium\b|google-chrome"),
             description="Which tool calls count as browser use for "
                 "LIVE_VIEW_URL: a regular expression, case-insensitive, "
                 "searched in the tool's name followed by its arguments. "
                 "The default takes the browser tool, an `openclaw browser` "
                 "command (how the agent drives its browser through exec), "
-                "and commands that run Playwright or Chromium, but not a "
-                "`lease.py own --no-record` run, which is never recorded."
+                "and commands that run Playwright or Chromium. Add your own "
+                "wrapper scripts here if your agent starts a browser through "
+                "one."
         )
         LIVE_VIEW_USERS: str = Field(
             default="",
