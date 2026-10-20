@@ -396,7 +396,8 @@
       "steps": [
         {
           "do": "type",
-          "text": "Refresh the forecast cache."
+          "text": "Refresh the forecast cache.",
+          "key_ms": 35
         },
         {
           "do": "send"
@@ -407,7 +408,8 @@
         },
         {
           "do": "type",
-          "text": "Which branch am I on?"
+          "text": "Which branch am I on?",
+          "key_ms": 35
         },
         {
           "do": "send"
@@ -437,7 +439,8 @@
           "show_ms": 3500
         },
         {
-          "do": "wait_reply_done"
+          "do": "wait_reply_done",
+          "show_ms": 1000
         },
         {
           "do": "pause",
