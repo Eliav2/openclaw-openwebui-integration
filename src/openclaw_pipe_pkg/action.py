@@ -2936,9 +2936,13 @@ class Action:
         # session: `spawnedBy` gives the current ones (running, or ended in
         # the last 30 minutes), the child index (state.py) every child the
         # Pipe saw spawned with its last row. A new index is seeded once, from
-        # one full list, after the section's first fill.
+        # one full list, after the section's first fill. With each child's
+        # last message, as the open dialog's refills list them
+        # (`list_children`): the Gateway flattens its markdown there, unlike
+        # the transcript read, so a row read one way at an open and the other
+        # in place would differ (ELI-264).
         current_task = asyncio.ensure_future(conn.send_request(
-            "sessions.list", dict(spawnedBy=session_key, limit=50), timeout=5))
+            "sessions.list", dict(spawnedBy=session_key, limit=50, includeLastMessage=True), timeout=5))
         seed_task = None if _subagent_index_seeded() else asyncio.ensure_future(
             conn.send_request("sessions.list", dict(limit=1000), timeout=30))
         tasks_task = asyncio.ensure_future(_read_background_tasks(conn, session_key))

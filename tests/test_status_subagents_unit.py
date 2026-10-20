@@ -660,6 +660,64 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(contexts[-1]["context"]["usedTokens"], "101k", contexts[-1])
         conn.ensure_message_subscription.assert_any_await(CHILD_A)
 
+    async def test_a_childs_result_reads_the_same_in_the_open_dialog_and_a_fresh_open(self):
+        """ELI-264 (QA C32): the Gateway gives a child's last message two ways.
+        `sessions.list` with `includeLastMessage` has it as `lastMessagePreview`,
+        markdown flattened (2026.10.5 session-transcript-title-reader:
+        flattenMarkdown); `sessions.preview` has the transcript's text as
+        written. The open dialog's refills list with the former, a fresh
+        open's list did not, so its tap showed the latter: the same result
+        read "The command cd /config/x ran" in place and "The command
+        `cd /config/x` ran" after a reopen."""
+        import asyncio
+
+        raw, flat = "The command `cd /config/x` ran.", "The command cd /config/x ran."
+        done = _child(CHILD_A, "done", startedAt=self.NOW, endedAt=self.NOW + 1000)
+        rows = [_child(CHILD_A, "running", startedAt=self.NOW)]
+        transcript = {CHILD_A: [{"role": "user", "text": WRAPPED_93}]}
+
+        async def gateway(method, params, timeout=5):
+            # As 2026.10.5 answers: the list's preview only when asked for.
+            if method == "sessions.list":
+                last = params.get("includeLastMessage") and transcript[CHILD_A][-1]["role"] == "assistant"
+                return {"sessions": [dict(r, lastMessagePreview=flat) if last else r for r in rows]}
+            if method == "sessions.describe":
+                return {"session": {"key": PARENT_KEY, "hasActiveRun": False}}
+            return await _list_rpc(rows, transcript, [])(method, params, timeout)
+
+        def connection():
+            conn, events = self._follow_conn(rows, {})
+            conn.send_request = mock.AsyncMock(side_effect=gateway)
+            return conn, events
+
+        seen = []
+        real = openclaw_status_action._render_subagents_fill_js
+        spy = mock.patch("openclaw_status_action._render_subagents_fill_js",
+                         side_effect=lambda d: (seen.append(d), real(d))[1])
+        # In place: open while the child runs, then it ends with its result.
+        conn, events = connection()
+        with action_gateway(conn), spy:
+            opened = asyncio.ensure_future(Action().action(
+                {"chat_id": PARENT_CHAT}, __user__={"id": PARENT_USER}, __event_emitter__=RecordingEmitter([])))
+            await self._settle()
+            rows[0] = done
+            transcript[CHILD_A] = transcript[CHILD_A] + [{"role": "assistant", "text": raw}]
+            self._push(events["change"], CHILD_A)
+            await asyncio.wait_for(opened, 5)   # bounds the test only
+        in_place = seen[-1]["tasks"][0]["terminalSummary"]
+
+        # A fresh open of the same child, then the tap that unfolds it.
+        conn, _events = connection()
+        emitted = []
+        with action_gateway(conn), spy:
+            await Action().action({"chat_id": PARENT_CHAT}, __user__={"id": PARENT_USER},
+                                  __event_emitter__=RecordingEmitter(emitted))
+            await Action().action({"chat_id": PARENT_CHAT, "mode": "subagent-rows", "dialogId": _dialog_id(emitted)},
+                                  __user__={"id": PARENT_USER}, __event_emitter__=RecordingEmitter([]))
+        reopened = seen[-1]["tasks"][0]["terminalSummary"]
+
+        self.assertEqual(in_place, reopened)
+
 
 class _WindowGateway:
     """A Gateway's session store as 2026.9.3 lists it: `spawnedBy` returns a
