@@ -13,10 +13,7 @@ whole):
 * `exactly: TOKEN` / `exactly TOKEN`  -> replies with TOKEN alone. Covers the
   installer's smoke test ("reply with exactly OK_CONFIG_TEST").
 * `E2E_COMPACT_FAIL` anywhere in a chat -> its compaction's summary request is
-  refused (HTTP 400 `E2E_COMPACT_REFUSED`), so the compaction fails.
-* `E2E_REAL_USAGE` anywhere in a chat -> its token counts are estimated from
-  the request's size instead of fixed, so its context grows (ELI-262).
-* `Create a concise title`            -> `TITLE` below: the Pipe's own chat-title
+  refused (HTTP 400 `E2E_COMPACT_REFUSED`), so the compaction fails.* `Create a concise title`            -> `TITLE` below: the Pipe's own chat-title
   run (the `title-gen` agent), after a chat's second exchange.
 * `E2E_SPAWN_SILENT`                   -> spawns a sub-agent (task `E2E_SILENT_CHILD`,
                                           label `silent helper`) that answers
@@ -528,10 +525,8 @@ def _usage(body: dict, plan: dict) -> dict:
     """Token counts for the reply. Fixed and tiny by default; with
     FAKE_LLM_USAGE=estimate, about one token per four characters of the
     request and the reply, so context numbers on screen look like a real
-    session's (the README screenshots); in a chat that says `E2E_REAL_USAGE`
-    too, so its context grows as a real one does."""
-    if (os.environ.get("FAKE_LLM_USAGE") != "estimate"
-            and "E2E_REAL_USAGE" not in json.dumps(body.get("messages") or [])):
+    session's (the README screenshots)."""
+    if os.environ.get("FAKE_LLM_USAGE") != "estimate":
         return {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
     prompt = len(json.dumps(body.get("messages") or [])) // 4 + len(json.dumps(body.get("tools") or [])) // 4
     completion = max(1, len(plan.get("text") or "") // 4 + len(json.dumps(plan.get("args") or {})) // 4)

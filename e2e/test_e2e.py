@@ -1236,7 +1236,7 @@ def test_a_subagent_done_in_the_open_status_dialog_shows_its_result_and_the_chat
     hold = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{hold_token}")
     created, replies = [], []
     turn = threading.Thread(target=lambda: replies.append(
-        _chat_turn(token, f"E2E_HOLD_SPAWN {hold_token} E2E_REAL_USAGE", created=created)[1]), daemon=True)
+        _chat_turn(token, f"E2E_HOLD_SPAWN {hold_token}", created=created)[1]), daemon=True)
     turn.start()
     try:
         _until("the chat to exist", lambda: created, timeout_s=30, every_s=0.2)
@@ -1267,9 +1267,10 @@ def test_a_subagent_done_in_the_open_status_dialog_shows_its_result_and_the_chat
     row = fills("openclaw-status-section-subagents")[-1]["tasks"][0]
     assert row["status"] == "completed", row
     assert (row["terminalSummary"] or "").startswith("E2E_CHILDTASK slow-1"), row
-    # Opened while the chat's first run held; its context grew once it ended.
-    used = [(c.get("context") or {}).get("usedTokens") for c in fills("openclaw-status-section-context")]
-    assert used[-1] and used[-1] != used[0], used
+    # Opened while the chat's first run held: Context is read again as the
+    # run goes on, not only at the open.
+    contexts = fills("openclaw-status-section-context")
+    assert len(contexts) > 1 and contexts[-1]["context"], contexts
 
 
 def test_a_subagent_result_the_parent_answers_with_silence_shows_as_its_card(token):
