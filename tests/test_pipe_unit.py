@@ -290,6 +290,22 @@ class SessionToolEventTests(unittest.IsolatedAsyncioTestCase):
             phases.append(q.get_nowait()["payload"]["data"]["phase"])
         self.assertEqual(phases, ["start", "result"])
 
+    async def test_a_childs_row_change_wakes_its_parents_child_waiter(self):
+        """ELI-260: an open Status dialog learns of a new child from its row's
+        `sessions.changed`, which names the parent as `spawnedBy` (2026.10)
+        or `parentSessionKey`."""
+        child = "agent:main:subagent:aaaaaaaa-0000-0000-0000-000000000001"
+        conn = _GatewayConnection(lambda: None)
+        for field in ("spawnedBy", "parentSessionKey"):
+            ev = conn.session_child_event(self.SK)
+            conn._on_sessions_changed({"sessionKey": "agent:main:other", "hasActiveRun": True})
+            self.assertFalse(ev.is_set(), "another session's change")
+            conn._on_sessions_changed({"sessionKey": child, field: self.SK, "hasActiveRun": True})
+            self.assertTrue(ev.is_set(), field)
+        ev = conn.session_child_event(self.SK)
+        conn._mark_event_gap()
+        self.assertTrue(ev.is_set(), "a gap may have lost the child's push")
+
     async def test_an_accepted_spawn_is_recorded_in_the_child_index(self):
         """The Status dialog lists a chat's children from this index (state.py),
         not from a read of every session."""

@@ -54,6 +54,9 @@ and only a core set is sent as real schemas.
   the foreground until the file `hold-TOKEN` next to $FAKE_LLM_LOG exists
   (90 s at most), then replies `E2E_HOLD_END`: a run that goes on until the
   test lets it end, or stops it.
+* `E2E_HOLD_SPAWN TOKEN`                -> `E2E_HOLD TOKEN`, then, once the file
+  exists, spawns the sub-agent `E2E_SPAWN` does and replies `E2E_SPAWNED`: a
+  child that starts when the test says, while the chat's run goes on (ELI-260).
 * `E2E_SPAWN_LONG`                     -> `E2E_SPAWN` with a task 121 lines long.
 * `E2E_SLOW TOKEN`                     -> replies `TOKEN slow-1 ... slow-10`, one
   word a second, so a turn can be queued behind a run that is still going.
@@ -150,6 +153,7 @@ BG_AGENT_TITLE = "E2E background agent"   # E2E_BG_AGENT: the Agent call's descr
 BG_EXEC_COMMAND = "sleep 25; echo e2e-bg-done"
 BG_EXEC_TITLE = "E2E background sleep"
 _HOLD = re.compile(r"E2E_HOLD ([A-Za-z0-9_]{3,})")
+_HOLD_SPAWN = re.compile(r"E2E_HOLD_SPAWN ([A-Za-z0-9_]{3,})")
 _SLOW = re.compile(r"E2E_SLOW(?::(\d{1,3}))?\s+([A-Za-z0-9_]{3,})")
 SLOW_WORDS = 10
 SPAWN_TASK = "E2E_SLOW:20 E2E_CHILDTASK"   # the sub-agent's task for E2E_SPAWN
@@ -399,6 +403,20 @@ def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
                 return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
             return {"text": say, **call}
         return {"text": "E2E_BG_AGENT_END"}
+    m = _HOLD_SPAWN.search(user_text)
+    if m:
+        gate = hold_file(m.group(1))
+        steps = [("E2E_HOLD_START", "exec", {"command": f"for i in $(seq 450); do [ -e '{gate}' ] && break; "
+                                                       "sleep 0.2; done; echo e2e-hold-released",
+                                            "yieldMs": 100_000}),
+                 ("", "sessions_spawn", {"task": SPAWN_TASK})]
+        if len(tool_results) < len(steps):
+            say, name, args = steps[len(tool_results)]
+            call = _call_with(name, args, offered)
+            if not call:
+                return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
+            return {"text": say, **call} if say else call
+        return {"text": "E2E_SPAWNED"}
     m = _HOLD.search(user_text)
     if m:
         if tool_results:

@@ -411,6 +411,7 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
         conn = mock.Mock()
         conn.send_request = mock.AsyncMock(side_effect=_list_rpc(rows, previews, []))
         conn.session_change_event = session_change_event
+        conn.session_child_event = lambda key: asyncio.Event()
         with action_gateway(conn):
             opened = asyncio.ensure_future(Action().action(
                 {"chat_id": PARENT_CHAT}, __user__={"id": PARENT_USER}, __event_emitter__=emitter))
@@ -450,6 +451,7 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
         conn.send_request = mock.AsyncMock(side_effect=_list_rpc(rows, previews, []))
         conn.session_change_event = lambda key: changes.setdefault(key, asyncio.Event())
         conn.session_message_event = lambda key: appends.setdefault(key, asyncio.Event())
+        conn.session_child_event = lambda key: asyncio.Event()
         conn.ensure_message_subscription = mock.AsyncMock(side_effect=subscribed.append)
         real = openclaw_status_action._render_subagents_fill_js
 
@@ -481,6 +483,64 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(subscribed, [CHILD_A])
         self.assertEqual(titled[-1], "Summarise Y.", titled)
+
+    async def test_a_child_spawned_after_the_dialog_opened_is_listed_while_it_stays_open(self):
+        """ELI-260: the dialog followed only the children listed at its open,
+        so with none listed it stopped at once, and a child the chat's run
+        spawned after the open stayed out of it until a reopen. While the
+        chat's own session runs, the dialog follows it, and a new child's
+        row change (pushed with `spawnedBy` naming this chat's session)
+        refills the section."""
+        import asyncio
+
+        rows, parent = [], {"busy": True}
+        changes, spawns, emitted, seen = {}, {}, [], []
+        listed = _list_rpc(rows, {CHILD_A: [{"role": "user", "text": WRAPPED_93}]}, [])
+
+        async def send_request(method, params, timeout=5):
+            if method == "sessions.describe":
+                return {"session": {"key": PARENT_KEY, "hasActiveRun": parent["busy"]}}
+            return await listed(method, params, timeout)
+
+        conn = mock.Mock()
+        conn.send_request = mock.AsyncMock(side_effect=send_request)
+        conn.session_change_event = lambda key: changes.setdefault(key, asyncio.Event())
+        conn.session_message_event = lambda key: asyncio.Event()
+        conn.session_child_event = lambda key: spawns.setdefault(key, asyncio.Event())
+        conn.ensure_message_subscription = mock.AsyncMock()
+        real = openclaw_status_action._render_subagents_fill_js
+
+        async def settle():
+            for _ in range(2000):
+                await asyncio.sleep(0)
+
+        def push(waiters, key):
+            ev = waiters.pop(key, None)
+            if ev is not None:
+                ev.set()
+
+        with action_gateway(conn), mock.patch(
+                "openclaw_status_action._render_subagents_fill_js",
+                side_effect=lambda d: (seen.append(d), real(d))[1]):
+            opened = asyncio.ensure_future(Action().action(
+                {"chat_id": PARENT_CHAT}, __user__={"id": PARENT_USER},
+                __event_emitter__=RecordingEmitter(emitted)))
+            await settle()
+            self.assertEqual(seen[-1]["tasks"], [])
+            rows.append(_child(CHILD_A, "running", startedAt=self.NOW))
+            push(spawns, PARENT_KEY)    # the Gateway pushes the new child's row
+            await settle()
+            listed_while_open = [t["status"] for t in seen[-1]["tasks"]]
+            following = not opened.done()
+            rows[0] = _child(CHILD_A, "done", startedAt=self.NOW, endedAt=self.NOW + 1000)
+            parent["busy"] = False
+            push(changes, CHILD_A)
+            push(changes, PARENT_KEY)
+            await asyncio.wait_for(opened, 5)   # bounds the test only
+
+        self.assertEqual(listed_while_open, ["running"])
+        self.assertTrue(following)
+        self.assertEqual([t["status"] for t in seen[-1]["tasks"]], ["completed"])
 
 
 class _WindowGateway:

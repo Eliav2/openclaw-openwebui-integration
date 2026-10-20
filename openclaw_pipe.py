@@ -5791,6 +5791,9 @@ class _GatewayConnection:
         # The same, set by the next `session.message` (a transcript append)
         # for the session (ELI-164).
         self._session_message_waiters: dict[str, asyncio.Event] = {}
+        # The same, set by the next `sessions.changed` of a session spawned
+        # by the key, a new child among them (ELI-260).
+        self._session_child_waiters: dict[str, asyncio.Event] = {}
         self._tool_events_seen: dict[tuple, bool] = {}
         # (session key, tool call id) -> the task of a spawn call that started
         # and has no result yet (`_spawn_call_task`), for the child index.
@@ -5918,6 +5921,19 @@ class _GatewayConnection:
             # A gap or a fresh subscription: an append may be among the lost.
             for key in list(self._session_message_waiters):
                 self._session_message_waiters.pop(key).set()
+            for key in list(self._session_child_waiters):
+                self._session_child_waiters.pop(key).set()
+
+    def session_child_event(self, session_key: str) -> asyncio.Event:
+        """An Event set by the next `sessions.changed` of a child of
+        `session_key` (its row names it as `spawnedBy` or
+        `parentSessionKey`), a just spawned one included, or by a socket
+        gap. Take it BEFORE listing the children, as with
+        `session_change_event`."""
+        ev = self._session_child_waiters.get(session_key)
+        if ev is None:
+            ev = self._session_child_waiters[session_key] = asyncio.Event()
+        return ev
 
     def session_message_event(self, session_key: str) -> asyncio.Event:
         """An Event set by the next `session.message` for `session_key` (the
@@ -5954,6 +5970,11 @@ class _GatewayConnection:
         if key and "hasActiveRun" in payload:
             self._wake_session_waiters(key)
             self.row_to_consumers(key, payload)
+        parent = payload.get("spawnedBy") or payload.get("parentSessionKey")
+        if parent and parent != key:
+            ev = self._session_child_waiters.pop(parent, None)
+            if ev is not None:
+                ev.set()
         if _TURNS and key and payload.get("hasActiveRun") is False:
             _TURNS.settled(self, key, payload)
         if (payload.get("hasActiveRun") and key

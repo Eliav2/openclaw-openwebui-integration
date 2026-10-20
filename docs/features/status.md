@@ -29,7 +29,7 @@ _Here the rate limits were held back on purpose, to show it._
 | Subagents | `sessions.list` with `spawnedBy` (the current children, store rows only) and the [child index](#sub-agents); the sub-agents' transcripts (`sessions.preview`) only once the section is open |
 | In-process agents | The chat's last 40 messages (the same read as Background's) |
 
-Each source is read once per open, all at the same time. None grows with the chat: the chat's messages come from Open WebUI's message rows, the 40 newest of the current branch, so a 14 MB chat opens as fast as a new one. Open WebUI saves a reply's tool cards only when the reply ends, so for a reply still running the sections take its calls from the Pipe streaming it, in the same Open WebUI process. Nothing is read while the dialog is closed: closing it tells the Action, which stops following its running sub-agents. In-process agents needs no Gateway, so it fills even when the Gateway cannot be reached.
+Each source is read once per open, all at the same time. None grows with the chat: the chat's messages come from Open WebUI's message rows, the 40 newest of the current branch, so a 14 MB chat opens as fast as a new one. Open WebUI saves a reply's tool cards only when the reply ends, so for a reply still running the sections take its calls from the Pipe streaming it, in the same Open WebUI process. Nothing is read while the dialog is closed: closing it tells the Action, which stops following the chat's run and its running sub-agents. In-process agents needs no Gateway, so it fills even when the Gateway cannot be reached.
 
 Opening the dialog sends a small request, from the toolbar button or the composer's: the chat, the message and the model. Open WebUI's own handler for an Action button uploads every message of the branch first and saves the whole chat again after, which on a big chat over a phone connection takes seconds; the Claw button skips it. The model comes from the page script's delivery, else from the reply's own avatar. The script arrives within about a second of opening a chat; a click before that, or on a reply that is not on an OpenClaw model, goes through Open WebUI's handler as before.
 
@@ -88,7 +88,7 @@ It counts the background agents the reply started and stays until the reply ends
 
 ## Sub-agents
 
-The Subagents section lists every child session this chat's runs spawned, ended ones included, newest first, up to 20 ("20 of N" when there are more). A running one's elapsed time counts up while the dialog is open; one that finishes meanwhile shows its end as soon as the Gateway pushes the change. With none running, the section opens folded and reads the sub-agents' transcripts (their tasks and latest replies) on its first tap:
+The Subagents section lists every child session this chat's runs spawned, ended ones included, newest first, up to 20 ("20 of N" when there are more). A running one's elapsed time counts up while the dialog is open; one that finishes meanwhile shows its end as soon as the Gateway pushes the change. While the chat's own run goes on, a sub-agent it spawns after the dialog opened shows in it as soon as the Gateway pushes the new child's row. With none running, the section opens folded and reads the sub-agents' transcripts (their tasks and latest replies) on its first tap:
 
 <img src="../img/status-dialog-folded-light.png" alt="The Status dialog with every section folded, each with its count" width="320">
 
