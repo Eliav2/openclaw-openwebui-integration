@@ -935,6 +935,26 @@ def test_a_background_command_reads_by_its_title_and_a_tap_shows_the_command(pag
     page.keyboard.press("Escape")
 
 
+def test_a_background_command_that_ends_shows_done_in_the_open_dialog(page):
+    """ELI-256: with the Status dialog left open, a background command that
+    ended kept its row "Running", its timer counting up, until the dialog was
+    closed and opened again. The Gateway pushes nothing when it ends, so the
+    open dialog has to read the section again while a row runs."""
+    capture.new_chat(page)
+    capture.send(page, "E2E_BG_EXEC")
+    _wait(page, _turn_over("E2E_BG_STARTED"), "the reply that leaves the command running")
+    _open_status(page)
+    row = "#openclaw-status-section-background [data-openclaw-bg-row]"
+    has = f"""(want) => {{ const r = [...document.querySelectorAll('{row}')]
+                  .find(e => e.innerText.includes({json.dumps(BG_EXEC_TITLE)}));
+                  return !!r && r.innerText.includes(want); }}"""
+    page.wait_for_function(has, arg="Running", timeout=60_000)
+    # sleep 25: the same dialog, never closed, shows it done.
+    page.wait_for_function(has, arg="Done", timeout=90_000)
+    assert page.locator("#openclaw-status-modal-root").count() == 1
+    page.keyboard.press("Escape")
+
+
 # The drawer's close control (× on a wide screen, ‹ Back on a phone) is on
 # screen and is what a tap at its centre reaches; and the task shown whole
 # scrolls inside its own box, which ends on screen.
