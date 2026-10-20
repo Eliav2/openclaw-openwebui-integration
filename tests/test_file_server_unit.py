@@ -79,10 +79,12 @@ class StaleFileServerReapTests(unittest.TestCase):
         the listen queue until the serving thread takes it. A retry loop with
         short timeouts gave up on that request when a busy runner stalled the
         process, and the server then answered a client already gone (ELI-263).
-        The timeout only bounds a server that never serves."""
+        The timeout only bounds a server that never serves. Its status, not
+        its body: the health file is shared by every process on the host and
+        rewritten by each server start."""
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=30) as resp:
-                return resp.read() == b"ok"
+                return resp.status == 200
         except OSError:
             return False
 
