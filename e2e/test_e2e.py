@@ -1139,10 +1139,12 @@ def test_the_status_action_lists_a_running_subagent_and_opens_its_drawer(token):
     # Reopened, the ended child is still there: the open reads every session.
     codes = _run_action(token, lambda a, emit: a.action(
         {"chat_id": chat_id}, __user__={"id": me["id"]}, __event_emitter__=emit))
-    reopened = _section_data(codes, "openclaw-status-section-subagents")
+    # The open's own fill: the chat may still be running its turn for the
+    # child's result, which the dialog follows and fills again (ELI-260).
+    reopened = _section_data(codes, "openclaw-status-section-subagents", 0)
     assert [(t["id"], t["status"]) for t in reopened["tasks"]] == [(row["id"], "completed")], reopened
     assert reopened["total"] == 1, reopened
-    # Nothing runs, so the section opens folded and its transcripts wait for
+    # No child runs, so the section opens folded and its transcripts wait for
     # the reader's tap (ELI-163); the tap reads them and titles the row.
     assert reopened["pending"] is True, reopened
     assert _section_data(codes, "openclaw-status-section-agents")["agents"] == []
