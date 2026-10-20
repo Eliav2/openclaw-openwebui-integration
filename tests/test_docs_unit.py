@@ -352,6 +352,10 @@ class MediaFreshTests(unittest.TestCase):
             (Path(tmp) / "media.json").write_text(json.dumps(manifest))
             with self.assertRaises(SystemExit):
                 self.media.stamp([str(Path(tmp) / "x-light.png")])
+            self.media.stamp([str(Path(tmp) / "x-light.png")], same=True)
+            self.assertEqual(self.media.stale(), [])
+            manifest["files"]["x-light.png"]["groups"]["chrome"] = "an older ui"
+            (Path(tmp) / "media.json").write_text(json.dumps(manifest))
             (Path(tmp) / "x-light.png").write_bytes(b"new frame")
             self.media.stamp([str(Path(tmp) / "x-light.png")])
             self.assertEqual(self.media.stale(), [])

@@ -11,6 +11,7 @@ tests fail until then (tests/test_docs_unit.py).
 
     python3 scripts/media.py check                 # the stale files, exit 1 if any
     python3 scripts/media.py stamp docs/img/x.png  # after recording x again
+    python3 scripts/media.py stamp --same docs/img/x.png  # recorded again, came out identical
     uv run --with pillow scripts/media.py posters  # the README tiles' posters, from their GIFs
 
 To record again: run the Screenshots and Demos workflows on the branch (Actions,
@@ -18,8 +19,9 @@ To record again: run the Screenshots and Demos workflows on the branch (Actions,
 = next), put the artifacts' files in
 docs/img/ and docs/img/demos/, run `posters` if a tile GIF changed, then `stamp`
 them. `stamp` refuses a file whose bytes did not change since the last stamp
-while its sources did: a recording is never byte-identical, so that file was
-not recorded again.
+while its sources did, as it most likely was not recorded again. A screenshot
+of a state the change did not touch can come out byte-identical: after
+recording it again and comparing, stamp it with `--same`.
 """
 from __future__ import annotations
 
@@ -105,7 +107,7 @@ def stale(manifest: dict | None = None) -> list:
     return out
 
 
-def stamp(paths: list) -> None:
+def stamp(paths: list, same: bool = False) -> None:
     manifest = load()
     now = {g: fingerprint(spec["sources"]) for g, spec in manifest["groups"].items()}
     for p in paths:
@@ -114,8 +116,9 @@ def stamp(paths: list) -> None:
             raise SystemExit(f"stamp: {p} is not an image or recording under docs/img")
         old, sha = manifest["files"].get(rel), _sha(rel)
         groups = {g: now[g] for g in groups_of(manifest, rel)}
-        if old and old["sha"] == sha and old["groups"] != groups:
-            raise SystemExit(f"stamp: {rel} is the same file as before its sources changed: record it again")
+        if old and old["sha"] == sha and old["groups"] != groups and not same:
+            raise SystemExit(f"stamp: {rel} is the same file as before its sources changed: record it again"
+                             " (or pass --same if the new recording came out identical)")
         manifest["files"][rel] = {"sha": sha, "groups": groups}
     manifest["files"] = dict(sorted(manifest["files"].items()))
     with open(MANIFEST, "w", encoding="utf-8") as fh:
@@ -144,8 +147,8 @@ def main(argv: list) -> int:
         for rel, why in found:
             print(f"docs/img/{rel}: {why}")
         return 1 if found else 0
-    if argv[:1] == ["stamp"] and argv[1:]:
-        stamp(argv[1:])
+    if argv[:1] == ["stamp"] and [a for a in argv[1:] if a != "--same"]:
+        stamp([a for a in argv[1:] if a != "--same"], same="--same" in argv[1:])
         return 0
     if argv[:1] == ["posters"]:
         posters()

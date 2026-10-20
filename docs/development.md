@@ -168,7 +168,8 @@ tests fail and list the files to record again. Run the two workflows with
 `only` set to those names, put the files from their artifacts in `docs/img`,
 then `uv run --with pillow scripts/media.py posters` if a README tile changed,
 and `python3 scripts/media.py stamp <files>`. `stamp` refuses a file whose bytes
-are the same as before the change.
+are the same as before the change. A screenshot of a state the change didn't
+touch can come out identical: once you've recorded it again, pass `--same`.
 
 **CodeQL** runs on Python, JavaScript and the workflows themselves.
 **Dependabot** updates the GitHub Actions and the test tooling weekly.
