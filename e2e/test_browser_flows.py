@@ -1576,6 +1576,11 @@ HOLD = %s
 class Pipe:
     async def pipe(self, body: dict, __user__=None, __metadata__=None,
                    __event_emitter__=None, __event_call__=None):
+        # A new chat's tab learns the chat id only when the request returns,
+        # and drops a dialog for a chat it does not show yet: ask in the
+        # chat's second turn, never its first.
+        if sum(m.get("role") == "user" for m in body.get("messages", [])) < 2:
+            return "ready"
         emit, call = __event_emitter__, __event_call__
         if HOLD:
             spec = importlib.util.spec_from_file_location("openclaw_pipe_probe", "/tmp/openclaw_pipe_probe.py")
@@ -1645,6 +1650,8 @@ def _eli195_probe(page, mode: str, fid: str) -> None:
     capture.dismiss_popups(page)
     page.evaluate("() => { window.__eli195Poked = false; }")
     capture.send(page, "hi")
+    _wait(page, _reply_js(-1, "r.done && r.text.includes('ready')"), "the probe's first reply", 60_000)
+    capture.send(page, "ask")
     page.get_by_text("Type anything").wait_for(timeout=60_000)
     # The precondition: the `execute` went out while the dialog is open;
     # raw, the page also ran it under the dialog; held, it did not.
