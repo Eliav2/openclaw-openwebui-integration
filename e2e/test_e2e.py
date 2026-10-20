@@ -75,10 +75,13 @@ def _drive_chat_turn(token: str, prompt: str, model: str = DEFAULT_MODEL) -> dic
 
 
 def _chat_turn(token: str, prompt: str, model: str = DEFAULT_MODEL,
-               chat_id: str | None = None, extra: dict | None = None) -> tuple[str, dict]:
+               chat_id: str | None = None, extra: dict | None = None,
+               created: list | None = None) -> tuple[str, dict]:
     """(chat id, saved assistant message) of one turn in a new persisted chat,
     or of the next turn in `chat_id`. `extra`: more fields of the completion
-    request, as the browser adds them (`filter_ids` for a filter chip turned on)."""
+    request, as the browser adds them (`filter_ids` for a filter chip turned on).
+    `created`: gets a new chat's id as soon as it exists, for a turn run in a
+    thread."""
     now = int(time.time())
     uid, aid = str(uuid.uuid4()), str(uuid.uuid4())
     if chat_id:
@@ -103,9 +106,11 @@ def _chat_turn(token: str, prompt: str, model: str = DEFAULT_MODEL,
         status, saved = _request("POST", f"/api/v1/chats/{chat_id}", {"chat": chat}, token)
         assert status == 200, f"chat update failed: {status} {saved}"
     else:
-        status, created = _request("POST", "/api/v1/chats/new", {"chat": chat}, token)
-        assert status == 200, f"chat create failed: {status} {created}"
-        chat_id = created["id"]
+        status, new = _request("POST", "/api/v1/chats/new", {"chat": chat}, token)
+        assert status == 200, f"chat create failed: {status} {new}"
+        chat_id = new["id"]
+        if created is not None:
+            created.append(chat_id)
 
     # The path to the new user message, as the browser sends it.
     path, at = [], uid
@@ -1218,6 +1223,53 @@ def test_a_subagent_spawned_after_the_status_dialog_opened_is_listed_while_it_st
                 for c in fills]
     assert ["running"] in statuses, statuses
     assert statuses[-1] == ["completed"], statuses
+
+
+def test_a_subagent_done_in_the_open_status_dialog_shows_its_result_and_the_chats_context(token):
+    """ELI-262 (QA C31): opened right after the chat's first message, the
+    dialog never showed a Context, and once its sub-agent was Done it stopped
+    refreshing, before the child's result line arrived; a reopen showed both."""
+    status, me = _request("GET", "/api/v1/auths/", token=token)
+    assert status == 200, me
+    hold_token = f"c31{uuid.uuid4().hex[:8]}"
+    # e2e/fake_llm.py hold_file
+    hold = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{hold_token}")
+    created, replies = [], []
+    turn = threading.Thread(target=lambda: replies.append(
+        _chat_turn(token, f"E2E_HOLD_SPAWN {hold_token} E2E_REAL_USAGE", created=created)[1]), daemon=True)
+    turn.start()
+    try:
+        _until("the chat to exist", lambda: created, timeout_s=30, every_s=0.2)
+        chat_id = created[0]
+        key = _session_key(token, chat_id)
+        _until("the chat's run to hold", lambda: _gw("sessions.describe", {"key": key})
+               .get("session", {}).get("hasActiveRun"), timeout_s=60, every_s=1)
+
+        async def open_then_spawn(action, emit):
+            async def emit_then_release(evt):
+                await emit(evt)
+                code = (evt.get("data") or {}).get("code") or ""
+                if "getElementById('openclaw-status-section-subagents')" in code:
+                    open(hold, "w").close()     # the run spawns its child now
+            await action.action({"chat_id": chat_id}, __user__={"id": me["id"]},
+                                __event_emitter__=emit_then_release)
+
+        # Returns once nothing is left to follow.
+        codes = _run_action(token, open_then_spawn)
+    finally:
+        open(hold, "w").close()
+        turn.join(TURN_TIMEOUT_S)
+    assert replies and replies[0].get("content", "").strip().endswith("E2E_SPAWNED"), replies
+
+    def fills(element_id):
+        return [json.loads(re.search(r"const DATA = (.*?);\n", c).group(1))
+                for c in codes if f"getElementById('{element_id}')" in c]
+    row = fills("openclaw-status-section-subagents")[-1]["tasks"][0]
+    assert row["status"] == "completed", row
+    assert (row["terminalSummary"] or "").startswith("E2E_CHILDTASK slow-1"), row
+    # Opened while the chat's first run held; its context grew once it ended.
+    used = [(c.get("context") or {}).get("usedTokens") for c in fills("openclaw-status-section-context")]
+    assert used[-1] and used[-1] != used[0], used
 
 
 def test_a_subagent_result_the_parent_answers_with_silence_shows_as_its_card(token):

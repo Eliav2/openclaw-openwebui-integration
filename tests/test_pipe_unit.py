@@ -306,6 +306,20 @@ class SessionToolEventTests(unittest.IsolatedAsyncioTestCase):
         conn._mark_event_gap()
         self.assertTrue(ev.is_set(), "a gap may have lost the child's push")
 
+    async def test_a_reply_counts_until_its_consumer_goes_and_its_end_wakes_the_waiters(self):
+        """ELI-260: the Status dialog counts a chat as running while this
+        connection streams a reply for it, whose run the Gateway may not have
+        yet; the reply's end makes the dialog read the chat again."""
+        conn = _GatewayConnection(lambda: None)
+        self.assertFalse(conn.has_reply(self.SK))
+        q = conn.register_consumer(self.SK, "run-1")
+        ev = conn.session_change_event(self.SK)
+        self.assertTrue(conn.has_reply(self.SK))
+        self.assertFalse(conn.has_reply("agent:main:other"))
+        conn.unregister_consumer(self.SK, "run-1", q)
+        self.assertFalse(conn.has_reply(self.SK))
+        self.assertTrue(ev.is_set())
+
     async def test_an_accepted_spawn_is_recorded_in_the_child_index(self):
         """The Status dialog lists a chat's children from this index (state.py),
         not from a read of every session."""

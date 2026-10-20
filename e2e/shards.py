@@ -77,6 +77,7 @@ SHARDS = {
         f"{E2E}::test_a_handed_over_reply_reads_not_done_in_the_db_once_its_request_ended",
         f"{E2E}::test_the_status_action_lists_a_running_subagent_and_opens_its_drawer",
         f"{E2E}::test_a_subagent_spawned_after_the_status_dialog_opened_is_listed_while_it_stays_open",
+        f"{E2E}::test_a_subagent_done_in_the_open_status_dialog_shows_its_result_and_the_chats_context",
         f"{E2E}::test_a_subagent_result_the_parent_answers_with_silence_shows_as_its_card",
         f"{E2E}::test_a_wake_reply_ends_like_an_inline_reply",
         f"{E2E}::test_a_subagent_result_ends_like_an_inline_reply",

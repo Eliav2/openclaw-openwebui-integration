@@ -419,7 +419,8 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
             # the follow, has returned).
             while not opened.done() and CHILD_A not in waiters:
                 await asyncio.sleep(0)
-            rows[0] = _child(CHILD_A, "done", startedAt=self.NOW - 1000, endedAt=self.NOW)
+            rows[0] = _child(CHILD_A, "done", startedAt=self.NOW - 1000, endedAt=self.NOW,
+                             lastMessagePreview="Done.")
             ev = waiters.pop(CHILD_A, None)
             if ev is not None:
                 ev.set()    # the Gateway pushes the child's settle
@@ -475,7 +476,8 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
                 ev.set()    # the Gateway pushes the spawn message's append
             await settle()
             titled = [t["title"] for d in seen for t in d["tasks"] if t["status"] == "running"]
-            rows[0] = _child(CHILD_A, "done", startedAt=self.NOW - 1000, endedAt=self.NOW)
+            rows[0] = _child(CHILD_A, "done", startedAt=self.NOW - 1000, endedAt=self.NOW,
+                             lastMessagePreview="Done.")
             ev = changes.pop(CHILD_A, None)
             if ev is not None:
                 ev.set()    # the child's settle ends the follow
@@ -532,7 +534,8 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
             await settle()
             listed_while_open = [t["status"] for t in seen[-1]["tasks"]]
             following = not opened.done()
-            rows[0] = _child(CHILD_A, "done", startedAt=self.NOW, endedAt=self.NOW + 1000)
+            rows[0] = _child(CHILD_A, "done", startedAt=self.NOW, endedAt=self.NOW + 1000,
+                             lastMessagePreview="Done.")
             parent["busy"] = False
             push(changes, CHILD_A)
             push(changes, PARENT_KEY)
@@ -541,6 +544,121 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(listed_while_open, ["running"])
         self.assertTrue(following)
         self.assertEqual([t["status"] for t in seen[-1]["tasks"]], ["completed"])
+
+    def _follow_conn(self, rows, describe, previews=None):
+        """A connection whose events are kept per session key, as the real
+        one does: (conn, {kind: {key: Event}})."""
+        import asyncio
+
+        events = {"change": {}, "message": {}, "child": {}}
+        listed = _list_rpc(rows, previews or {}, [])
+
+        async def send_request(method, params, timeout=5):
+            if method == "sessions.describe":
+                return {"session": dict(describe)}
+            return await listed(method, params, timeout)
+
+        conn = mock.Mock()
+        conn.send_request = mock.AsyncMock(side_effect=send_request)
+        conn.session_change_event = lambda key: events["change"].setdefault(key, asyncio.Event())
+        conn.session_message_event = lambda key: events["message"].setdefault(key, asyncio.Event())
+        conn.session_child_event = lambda key: events["child"].setdefault(key, asyncio.Event())
+        conn.ensure_message_subscription = mock.AsyncMock()
+        conn.has_reply = lambda key: False
+        return conn, events
+
+    @staticmethod
+    def _push(waiters, key):
+        ev = waiters.pop(key, None)
+        if ev is not None:
+            ev.set()
+
+    @staticmethod
+    async def _settle():
+        import asyncio
+        for _ in range(2000):
+            await asyncio.sleep(0)
+
+    async def test_a_dialog_opened_before_the_chats_run_starts_follows_it(self):
+        """ELI-260 reopened (QA C27, 1 in 5): opened 0.3 s after a send, the
+        dialog read the chat's session before the Gateway had its run
+        (`hasActiveRun` false; the Pipe's chat.send was still in flight), so
+        it stopped at once and the child the run spawned never showed. The
+        Pipe streaming the reply in this process already has its consumer
+        registered: the dialog follows that reply too."""
+        import asyncio
+
+        rows, describe, reply = [], {"key": PARENT_KEY, "hasActiveRun": False}, {"on": True}
+        conn, events = self._follow_conn(rows, describe, {CHILD_A: [{"role": "user", "text": WRAPPED_93}]})
+        conn.has_reply = lambda key: reply["on"] and key == PARENT_KEY
+        emitted, seen = [], []
+        real = openclaw_status_action._render_subagents_fill_js
+        with action_gateway(conn), mock.patch(
+                "openclaw_status_action._render_subagents_fill_js",
+                side_effect=lambda d: (seen.append(d), real(d))[1]):
+            opened = asyncio.ensure_future(Action().action(
+                {"chat_id": PARENT_CHAT}, __user__={"id": PARENT_USER},
+                __event_emitter__=RecordingEmitter(emitted)))
+            await self._settle()
+            describe["hasActiveRun"] = True
+            self._push(events["change"], PARENT_KEY)    # the run starts
+            await self._settle()
+            rows.append(_child(CHILD_A, "running", startedAt=self.NOW))
+            self._push(events["child"], PARENT_KEY)     # it spawns a child
+            await self._settle()
+            listed_while_open = [t["status"] for t in seen[-1]["tasks"]]
+            rows[0] = _child(CHILD_A, "done", startedAt=self.NOW, endedAt=self.NOW + 1000,
+                             lastMessagePreview="SUB-51")
+            describe["hasActiveRun"], reply["on"] = False, False
+            self._push(events["change"], CHILD_A)
+            self._push(events["change"], PARENT_KEY)
+            await asyncio.wait_for(opened, 5)   # bounds the test only
+
+        self.assertEqual(listed_while_open, ["running"])
+
+    async def test_a_child_done_in_the_open_dialog_gets_its_result_and_the_chat_its_context(self):
+        """QA C31: a child that ended while the dialog followed it showed Done
+        with no result line, and the dialog stopped there: a claude-cli
+        child's messages reach its transcript after its run settles. Context,
+        read at an open right after a send, had no data yet and never got it.
+        The dialog follows an ended child until its last message is in its
+        row (its transcript append is pushed), and refills Context on each
+        change of the chat's run."""
+        import asyncio
+
+        rows = [_child(CHILD_A, "running", startedAt=self.NOW)]
+        describe = {"key": PARENT_KEY, "hasActiveRun": True}
+        conn, events = self._follow_conn(rows, describe, {CHILD_A: [{"role": "user", "text": WRAPPED_93}]})
+        emitted, seen, contexts = [], [], []
+        real = openclaw_status_action._render_subagents_fill_js
+        real_context = openclaw_status_action._render_context_fill_js
+        with action_gateway(conn), mock.patch(
+                "openclaw_status_action._render_subagents_fill_js",
+                side_effect=lambda d: (seen.append(d), real(d))[1]), mock.patch(
+                "openclaw_status_action._render_context_fill_js",
+                side_effect=lambda d: (contexts.append(d), real_context(d))[1]):
+            opened = asyncio.ensure_future(Action().action(
+                {"chat_id": PARENT_CHAT}, __user__={"id": PARENT_USER},
+                __event_emitter__=RecordingEmitter(emitted)))
+            await self._settle()
+            # The chat's run ends with its context known; the child goes on.
+            describe.update(hasActiveRun=False, contextTokens=500_000, totalTokens=101_000)
+            self._push(events["change"], PARENT_KEY)
+            await self._settle()
+            # The child settles before its reply reaches its transcript.
+            rows[0] = _child(CHILD_A, "done", startedAt=self.NOW, endedAt=self.NOW + 1000)
+            self._push(events["change"], CHILD_A)
+            await self._settle()
+            following = not opened.done()
+            rows[0] = _child(CHILD_A, "done", startedAt=self.NOW, endedAt=self.NOW + 1000,
+                             lastMessagePreview="SUB-51: 17 x 3 = 51")
+            self._push(events["message"], CHILD_A)      # the reply is appended
+            await asyncio.wait_for(opened, 5)   # bounds the test only
+
+        self.assertTrue(following, "stopped at the child's settle, before its reply")
+        self.assertEqual(seen[-1]["tasks"][0]["terminalSummary"], "SUB-51: 17 x 3 = 51")
+        self.assertEqual(contexts[-1]["context"]["usedTokens"], "101k", contexts[-1])
+        conn.ensure_message_subscription.assert_any_await(CHILD_A)
 
 
 class _WindowGateway:
@@ -551,6 +669,9 @@ class _WindowGateway:
     def __init__(self, rows, current=(), fail_spawned_by=False):
         self.rows, self.current, self.fail = rows, set(current), fail_spawned_by
         self.calls = []
+
+    def has_reply(self, _key):
+        return False
 
     async def send_request(self, method, params, timeout=5):
         self.calls.append((method, dict(params)))
