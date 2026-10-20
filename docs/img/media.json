@@ -158,21 +158,21 @@
       }
     },
     "demos/status-dialog.gif": {
-      "sha": "158495da86b187eb",
+      "sha": "f568354a6f9c66d0",
       "groups": {
         "chrome": "86d17ffd5eaebce8",
         "status": "dc6c39afeefb9806"
       }
     },
     "demos/status-dialog.mp4": {
-      "sha": "2968e986d378f574",
+      "sha": "ee2e548cd0cffab4",
       "groups": {
         "chrome": "86d17ffd5eaebce8",
         "status": "dc6c39afeefb9806"
       }
     },
     "demos/status-dialog.webm": {
-      "sha": "2770c1e1775148dc",
+      "sha": "451ecf15bcc0cd5b",
       "groups": {
         "chrome": "86d17ffd5eaebce8",
         "status": "dc6c39afeefb9806"
@@ -215,19 +215,19 @@
       }
     },
     "demos/tile-question.gif": {
-      "sha": "d3e8034ef1fab17f",
+      "sha": "ea8d9e307998cee7",
       "groups": {
         "chrome": "86d17ffd5eaebce8"
       }
     },
     "demos/tile-sub-agents.gif": {
-      "sha": "8b1f98044c67c179",
+      "sha": "3099f92ca349f116",
       "groups": {
         "chrome": "86d17ffd5eaebce8"
       }
     },
     "demos/tile-tool-cards.gif": {
-      "sha": "4fd4decc125d0409",
+      "sha": "7de3850bef1b8685",
       "groups": {
         "chrome": "86d17ffd5eaebce8"
       }
@@ -372,26 +372,26 @@
       }
     },
     "tile-question.jpg": {
-      "sha": "3878d5b249185867",
+      "sha": "ae64dd9354f69cb5",
       "groups": {
         "chrome": "86d17ffd5eaebce8"
       }
     },
     "tile-status-dialog.jpg": {
-      "sha": "bdab71661a8996a1",
+      "sha": "8a537bfb939d5b06",
       "groups": {
         "chrome": "86d17ffd5eaebce8",
         "status": "dc6c39afeefb9806"
       }
     },
     "tile-sub-agents.jpg": {
-      "sha": "2f3b7886f0f1bcb9",
+      "sha": "5c4850acb604d1de",
       "groups": {
         "chrome": "86d17ffd5eaebce8"
       }
     },
     "tile-tool-cards.jpg": {
-      "sha": "c944a85702ffc0ee",
+      "sha": "ff9746f2df27afe2",
       "groups": {
         "chrome": "86d17ffd5eaebce8"
       }
