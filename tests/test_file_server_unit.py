@@ -73,15 +73,18 @@ class StaleFileServerReapTests(unittest.TestCase):
         except Exception:
             pass
 
-    def _wait_up(self, port, timeout=2.0):
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=0.3)
-                return True
-            except Exception:
-                time.sleep(0.05)
-        return False
+    def _wait_up(self, port):
+        """True once the server answers /health. Its socket is bound and
+        listening before _start_file_server returns, so one request waits in
+        the listen queue until the serving thread takes it. A retry loop with
+        short timeouts gave up on that request when a busy runner stalled the
+        process, and the server then answered a client already gone (ELI-263).
+        The timeout only bounds a server that never serves."""
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=30) as resp:
+                return resp.read() == b"ok"
+        except OSError:
+            return False
 
     def test_second_deploy_reaps_first_and_rebinds_same_port(self):
         # Port 0: a fixed port is shared by every suite on the host, and a
