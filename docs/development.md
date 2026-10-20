@@ -126,6 +126,17 @@ interrupts the running test and ends the run (exit code 3), naming that test
 and the log line: a lock that is never released (ELI-205) would otherwise
 fail every later test at its timeout.
 
+**Drop gates.** Two Open WebUI bugs have Pipe workarounds: an `execute` that
+takes an open input dialog's answer (ELI-195, held by `emit.py`) and a
+cancelled chat write that wedges SQLite (ELI-205, shielded by `turns.py`'s
+`_uncancellable`). Each has a test that produces the bug's precondition itself
+and runs two ways: through the workaround (`held` / `shielded`), which must
+pass on any Open WebUI, and without it (`raw`), marked strict `xfail`. While
+the pinned Open WebUI has the bug, `raw` fails as expected. When a release
+fixes it, `raw` passes and the strict `xfail` fails the run: that is the
+signal to drop the workaround together with its gate. Compat watch runs the
+same suites against `open-webui:latest`, so it shows up there first.
+
 The versions it runs against are pinned in `e2e/versions.env`. Bump them in the
 PR that makes the code work with a new release, together with the matching
 pins in `requirements-dev.txt` and a re-extracted fixture
