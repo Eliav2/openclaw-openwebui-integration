@@ -1,5 +1,5 @@
 {
-  "_comment": "The docs' demos (record.py writes a GIF, an MP4 and a WebM each). `scenes` are scripted model replies like scripts/screenshots/scenes.json, kept short so each GIF fits in 15 s; the demo stack loads this file first, then scenes.json, so a demo can also use a screenshot scene. `demos` are the recordings: each one's steps run in order (record.py's Demo methods say what each step does). A wait on a running command may set `show_ms`: it plays faster to fit, so the runner's speed never sets the demo's length.",
+  "_comment": "The docs' demos (record.py writes a GIF, an MP4 and a WebM each). `scenes` are scripted model replies like scripts/screenshots/scenes.json, kept short so each GIF fits in 15 s; the demo stack loads this file first, then scenes.json, so a demo can also use a screenshot scene. `demos` are the recordings: each one's steps run in order (record.py's Demo methods say what each step does). A wait on a running command may set `show_ms`: it plays faster to fit, so the runner's speed never sets the demo's length. The tile-* demos are the README's feature tiles: one feature each, short loops, the same window as the rest.",
   "scenes": [
     {
       "match": "Write the changelog entry for the hourly view",
@@ -160,6 +160,92 @@
       "steps": [
         {
           "say": "You're on main. It's the only branch so far.",
+          "delay": 0.02
+        }
+      ]
+    },
+    {
+      "match": "Check the forecast app before the release",
+      "steps": [
+        {
+          "say": "Running the type check.",
+          "tool": "exec",
+          "args": {
+            "command": "cd forecast && sleep 1 && python3 -m compileall -q src && echo 'no type errors'",
+            "title": "Run the type check"
+          }
+        },
+        {
+          "say": "Now the tests.",
+          "tool": "exec",
+          "args": {
+            "command": "cd forecast && sleep 1 && echo '24 passed'",
+            "title": "Run the tests"
+          }
+        },
+        {
+          "say": "Ready to ship: no type errors, and all 24 tests pass.",
+          "delay": 0.02
+        }
+      ]
+    },
+    {
+      "match": "תעלה את התצוגה השעתית לסטייג'ינג",
+      "steps": [
+        {
+          "say": "הבנייה עברה בלי שגיאות.\n\nOpenClaw needs input:\nלפרוס עכשיו לסטייג'ינג? (כן/לא)"
+        }
+      ]
+    },
+    {
+      "match": "Refresh the weather cache",
+      "steps": [
+        {
+          "say": "Refreshing the cache from the forecast API.",
+          "tool": "exec",
+          "args": {
+            "command": "cd forecast && sleep 4 && echo cache refreshed",
+            "title": "Refresh the weather cache",
+            "yieldMs": 30000
+          }
+        },
+        {
+          "say": "The cache is fresh: 24 hours for each saved place.",
+          "delay": 0.02
+        }
+      ]
+    },
+    {
+      "match": "Draft a short note to the team",
+      "steps": [
+        {
+          "say": "Here's a draft.\n\nHi all, the hourly view is on staging. The day screen now shows temperature, rain chance and wind for the next 24 hours. Please try it on a small phone and send anything odd to the release thread by Thursday.",
+          "delay": 0.12
+        }
+      ]
+    },
+    {
+      "match": "Send me today's forecast chart",
+      "steps": [
+        {
+          "say": "Here's today's hourly forecast:\nMEDIA:hourly-forecast.png Rain moves in after 3 PM, so take the bike out this morning."
+        }
+      ]
+    },
+    {
+      "_comment": "The Hebrew yes/no tile's answer: the card answers \"yes\". Last, so a longer phrase wins first.",
+      "match": "yes",
+      "steps": [
+        {
+          "say": "פורס.",
+          "tool": "exec",
+          "args": {
+            "command": "cd forecast && sleep 1 && echo deployed to staging",
+            "title": "פריסה לסטייג'ינג"
+          }
+        },
+        {
+          "say": "התצוגה השעתית בסטייג'ינג.",
           "delay": 0.02
         }
       ]
@@ -537,6 +623,221 @@
         {
           "do": "pause",
           "ms": 800
+        }
+      ]
+    },
+    {
+      "name": "tile-tool-cards",
+      "steps": [
+        {
+          "do": "type",
+          "text": "Check the forecast app before the release."
+        },
+        {
+          "do": "send"
+        },
+        {
+          "do": "wait_reply_done",
+          "show_ms": 3000
+        },
+        {
+          "do": "pause",
+          "ms": 400
+        },
+        {
+          "do": "click",
+          "selector": ".chat-assistant >> nth=-1 >> [role=button] >> nth=0"
+        },
+        {
+          "do": "wait",
+          "js": "() => /output/i.test([...document.querySelectorAll('.chat-assistant')].pop().innerText)"
+        },
+        {
+          "do": "park"
+        },
+        {
+          "do": "pause",
+          "ms": 1000
+        }
+      ]
+    },
+    {
+      "name": "tile-question",
+      "steps": [
+        {
+          "do": "type",
+          "text": "תעלה את התצוגה השעתית לסטייג'ינג."
+        },
+        {
+          "do": "send"
+        },
+        {
+          "do": "wait",
+          "js": "() => !!document.querySelector('section button span') && [...document.querySelectorAll('section button span')].some(s => s.textContent.trim() === 'Yes')"
+        },
+        {
+          "do": "pause",
+          "ms": 700
+        },
+        {
+          "do": "click",
+          "selector": "section button:has(span:text-is(\"Yes\")) >> nth=0"
+        },
+        {
+          "do": "park"
+        },
+        {
+          "do": "wait_reply_done"
+        },
+        {
+          "do": "pause",
+          "ms": 1200
+        }
+      ]
+    },
+    {
+      "name": "tile-send-now",
+      "pipe_valves": {
+        "AUTO_SEND_WHILE_RUNNING": false
+      },
+      "steps": [
+        {
+          "do": "type",
+          "text": "Refresh the weather cache."
+        },
+        {
+          "do": "send"
+        },
+        {
+          "do": "wait",
+          "js": "() => !![...document.querySelectorAll('.chat-assistant')].pop()?.querySelector('[role=button] .shimmer')"
+        },
+        {
+          "do": "type",
+          "text": "Which branch am I on?"
+        },
+        {
+          "do": "send"
+        },
+        {
+          "do": "wait",
+          "js": "() => !!document.querySelector('button[aria-label=\"Send now\"]')"
+        },
+        {
+          "do": "pause",
+          "ms": 300
+        },
+        {
+          "do": "click",
+          "selector": "button[aria-label=\"Send now\"] >> nth=0"
+        },
+        {
+          "do": "wait",
+          "js": "() => { const a = [...document.querySelectorAll('.chat-assistant')]; return a.length >= 2 && a[0].innerText.includes('The cache is fresh') && a[a.length - 1].innerText.includes(\"You're on main\"); }",
+          "show_ms": 2000
+        },
+        {
+          "do": "wait_reply_done"
+        },
+        {
+          "do": "pause",
+          "ms": 600
+        }
+      ]
+    },
+    {
+      "name": "tile-sub-agents",
+      "steps": [
+        {
+          "do": "type",
+          "text": "Find out when the forecast cache came in."
+        },
+        {
+          "do": "send"
+        },
+        {
+          "do": "wait",
+          "js": "() => /Cache history/.test([...document.querySelectorAll('.chat-assistant')].pop()?.innerText || '')"
+        },
+        {
+          "do": "wait_reply_done"
+        },
+        {
+          "do": "pause",
+          "ms": 300
+        },
+        {
+          "do": "click",
+          "selector": ".chat-assistant >> nth=-1 >> [role=button] >> nth=0"
+        },
+        {
+          "do": "wait",
+          "js": "() => /Started/.test([...document.querySelectorAll('.chat-assistant')].pop().innerText)"
+        },
+        {
+          "do": "park"
+        },
+        {
+          "do": "pause",
+          "ms": 1400
+        }
+      ]
+    },
+    {
+      "name": "tile-reload",
+      "steps": [
+        {
+          "do": "type",
+          "text": "Draft a short note to the team."
+        },
+        {
+          "do": "send"
+        },
+        {
+          "do": "park"
+        },
+        {
+          "do": "wait",
+          "js": "() => ([...document.querySelectorAll('.chat-assistant')].pop()?.innerText || '').includes('rain chance')"
+        },
+        {
+          "do": "reload"
+        },
+        {
+          "do": "wait",
+          "js": "() => ([...document.querySelectorAll('.chat-assistant')].pop()?.innerText || '').includes('release thread')",
+          "show_ms": 2500
+        },
+        {
+          "do": "pause",
+          "ms": 1000
+        }
+      ]
+    },
+    {
+      "name": "tile-media",
+      "steps": [
+        {
+          "do": "media",
+          "name": "hourly-forecast.png"
+        },
+        {
+          "do": "type",
+          "text": "Send me today's forecast chart."
+        },
+        {
+          "do": "send"
+        },
+        {
+          "do": "park"
+        },
+        {
+          "do": "wait",
+          "js": "() => { const a = [...document.querySelectorAll('.chat-assistant')].pop(); return !!a && a.innerText.includes('bike out') && [...a.querySelectorAll('img')].some(i => i.complete && i.naturalWidth > 0); }"
+        },
+        {
+          "do": "pause",
+          "ms": 1800
         }
       ]
     }

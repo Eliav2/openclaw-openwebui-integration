@@ -300,6 +300,10 @@ class Demo:
     async def wait_children(self, step: dict) -> None:
         await asyncio.to_thread(capture.wait_children_answering, tuple(step["phrases"]))
 
+    async def media(self, step: dict) -> None:
+        """Put the sample chart where a MEDIA:<name> line finds it (no frames)."""
+        await asyncio.to_thread(capture.upload_media, step["name"], capture.forecast_chart_png())
+
     async def park(self, step: dict) -> None:
         """Rest the cursor in empty chat space, where it covers nothing."""
         await self.move(W - 60, 150, steps=20)
@@ -323,7 +327,7 @@ class Demo:
 
 
 STEPS = {"type", "send", "click", "wait", "wait_reply_done", "wait_children", "park", "pause", "keys", "record",
-         "reload"}
+         "reload", "media"}
 
 
 async def new_page(browser, token: str) -> Page:
