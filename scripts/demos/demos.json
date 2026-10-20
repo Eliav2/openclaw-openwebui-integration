@@ -1,5 +1,5 @@
 {
-  "_comment": "The docs' demos (record.py writes a GIF, an MP4 and a WebM each). `scenes` are scripted model replies like scripts/screenshots/scenes.json, kept short so each GIF fits in 15 s; the demo stack loads this file first, then scenes.json, so a demo can also use a screenshot scene. `demos` are the recordings: each one's steps run in order (record.py's Demo methods say what each step does). A wait on a running command may set `show_ms`: it plays faster to fit, so the runner's speed never sets the demo's length. The tile-* demos are the README's feature tiles: one feature each, short loops, the same window as the rest.",
+  "_comment": "The docs' demos (record.py writes a GIF, an MP4 and a WebM each). `scenes` are scripted model replies like scripts/screenshots/scenes.json, kept short so each GIF fits in 15 s; the demo stack loads this file first, then scenes.json, so a demo can also use a screenshot scene. `demos` are the recordings: each one's steps run in order (record.py's Demo methods say what each step does). A wait on a running command may set `show_ms`: it plays faster to fit, so the runner's speed never sets the demo's length. The tile-* demos are the README's feature tiles: one feature each, on a task a user would really give, in the same window as the rest.",
   "scenes": [
     {
       "match": "Write the changelog entry for the hourly view",
@@ -165,88 +165,136 @@
       ]
     },
     {
-      "match": "Check the forecast app before the release",
+      "match": "The forecast API is returning 502s",
       "steps": [
         {
-          "say": "Running the type check.",
+          "say": "Checking the API log first.",
           "tool": "exec",
           "args": {
-            "command": "cd forecast && sleep 1 && python3 -m compileall -q src && echo 'no type errors'",
-            "title": "Run the type check"
+            "command": "tail -n 5 logs/forecast-api.log",
+            "title": "Read the API log"
           }
         },
         {
-          "say": "Now the build.",
+          "say": "It can't write to its cache. Checking how full the cache is.",
           "tool": "exec",
           "args": {
-            "command": "cd forecast && sleep 1 && echo 'build ok'",
-            "title": "Build the app"
+            "command": "du -sh --apparent-size forecast-cache && ls forecast-cache | head -3",
+            "title": "Check the cache size"
           }
         },
         {
-          "say": "Ready to ship: no type errors, and the build is clean.",
+          "say": "The cache volume is full. Hourly snapshots have piled up for ten days, over 1 GB on a 1 GB volume, so the API can't save new forecasts and the proxy turns that into 502s. Deleting the old snapshots will fix it. Want me to do that?",
           "delay": 0.02
         }
       ]
     },
     {
-      "match": "תעלה את התצוגה השעתית",
+      "match": "Clean up the forecast cache",
       "steps": [
         {
-          "say": "הבנייה עברה בלי שגיאות.\n\nOpenClaw needs input:\nלפרוס עכשיו לסטייג'ינג? (כן/לא)"
+          "say": "Here's what's taking the space.",
+          "tool": "exec",
+          "args": {
+            "command": "du -sh --apparent-size forecast-cache/* | sort -h | tail -4",
+            "title": "List the largest files"
+          }
+        },
+        {
+          "say": "Ten days of hourly snapshots, about 100 MB each.\n\nOpenClaw needs input:\n{\"questions\": [{\"id\": \"keep\", \"header\": \"Cache\", \"question\": \"Which snapshots should I delete?\", \"options\": [{\"label\": \"Older than 2 days\", \"description\": \"Keeps today and yesterday. Frees about 850 MB.\"}, {\"label\": \"Older than 7 days\", \"description\": \"Keeps a week. Frees about 230 MB.\"}, {\"label\": \"None\", \"description\": \"Leave the cache as it is.\"}]}]}"
         }
       ]
     },
     {
-      "match": "Refresh the weather cache",
+      "match": "Older than 2 days",
       "steps": [
         {
-          "say": "Refreshing the cache from the forecast API.",
+          "say": "Deleting snapshots older than two days.",
           "tool": "exec",
           "args": {
-            "command": "cd forecast && sleep 4 && echo cache refreshed",
-            "title": "Refresh the weather cache",
-            "yieldMs": 30000
+            "command": "find forecast-cache -name 'hourly-*' -mtime +1 -delete && du -sh --apparent-size forecast-cache",
+            "title": "Delete old snapshots"
           }
         },
         {
-          "say": "The cache is fresh: 24 hours for each saved place.",
+          "say": "Done: the cache is down to about 200 MB, and the API can save new forecasts again.",
           "delay": 0.02
         }
       ]
     },
     {
-      "match": "Draft a short note to the team",
+      "match": "before I tag the release",
       "steps": [
         {
-          "say": "Here's a draft.\n\nHi all, the hourly view is on staging. The day screen now shows temperature, rain chance and wind for the next 24 hours. Please try it on a small phone and send anything odd to the release thread by Thursday.",
-          "delay": 0.12
-        }
-      ]
-    },
-    {
-      "match": "Send me the forecast chart for today",
-      "steps": [
-        {
-          "say": "Here's today's hourly forecast:\nMEDIA:hourly-forecast.png Rain moves in after 3 PM, so take the bike out this morning."
-        }
-      ]
-    },
-    {
-      "_comment": "The Hebrew yes/no tile's answer: the card answers \"yes\". Last, so a longer phrase wins first.",
-      "match": "yes",
-      "steps": [
-        {
-          "say": "פורס.",
-          "tool": "exec",
+          "say": "I'll have two reviewers go through the two code changes in parallel.",
+          "tool": "sessions_spawn",
           "args": {
-            "command": "cd forecast && sleep 1 && echo deployed to staging",
-            "title": "פריסה לסטייג'ינג"
+            "task": "Review the forecast cache change (src/forecast/cache.py, \"Cache forecasts for ten minutes\") for bugs before the release. Report anything that should block it.",
+            "label": "Review: cache"
           }
         },
         {
-          "say": "התצוגה השעתית בסטייג'ינג.",
-          "delay": 0.02
+          "say": "",
+          "tool": "sessions_spawn",
+          "args": {
+            "task": "Review the wind speed fix (src/forecast/units.py, \"Fix wind speed ignoring the km/h setting\") for bugs before the release. Report anything that should block it.",
+            "label": "Review: wind speed fix"
+          }
+        },
+        {
+          "say": "Two reviewers are on it, one per change. I'll sum up when both report back."
+        }
+      ]
+    },
+    {
+      "match": "Review the forecast cache change",
+      "steps": [
+        {
+          "say": "",
+          "tool": "exec",
+          "args": {
+            "command": "cd forecast && cat src/forecast/cache.py",
+            "title": "Read the cache"
+          }
+        },
+        {
+          "say": "Nothing blocking. Entries expire after 600 seconds as intended. Old keys are never removed, so memory grows with every place looked up; fine at today's size, worth a cap later.",
+          "delay": 0.03
+        }
+      ]
+    },
+    {
+      "match": "Review the wind speed fix",
+      "steps": [
+        {
+          "say": "",
+          "tool": "exec",
+          "args": {
+            "command": "cd forecast && git show --format=%s HEAD~2 -- src/forecast/units.py | tail -4",
+            "title": "Read the fix"
+          }
+        },
+        {
+          "say": "Nothing blocking. km/h and mph are now right. A unit other than those two returns the raw m/s value without a warning; worth rejecting unknown units later.",
+          "delay": 0.03
+        }
+      ]
+    },
+    {
+      "match": "worth a cap later",
+      "steps": [
+        {
+          "say": "The cache review is back: nothing blocking. Old keys are never evicted, so I'd cap the cache after the release.",
+          "delay": 0.03
+        }
+      ]
+    },
+    {
+      "match": "worth rejecting unknown units later",
+      "steps": [
+        {
+          "say": "The wind speed review is back too: the fix is right. Both changes are fine to tag, with two small follow-ups for later.",
+          "delay": 0.03
         }
       ]
     }
@@ -631,7 +679,7 @@
       "steps": [
         {
           "do": "type",
-          "text": "Check the forecast app before the release.",
+          "text": "The forecast API is returning 502s. Can you find out why?",
           "key_ms": 25
         },
         {
@@ -639,11 +687,11 @@
         },
         {
           "do": "wait_reply_done",
-          "show_ms": 3000
+          "show_ms": 3500
         },
         {
           "do": "pause",
-          "ms": 400
+          "ms": 300
         },
         {
           "do": "click",
@@ -651,14 +699,14 @@
         },
         {
           "do": "wait",
-          "js": "() => /output/i.test([...document.querySelectorAll('.chat-assistant')].pop().innerText)"
+          "js": "() => /No space left/.test([...document.querySelectorAll('.chat-assistant')].pop().innerText)"
         },
         {
           "do": "park"
         },
         {
           "do": "pause",
-          "ms": 1000
+          "ms": 1600
         }
       ]
     },
@@ -667,7 +715,7 @@
       "steps": [
         {
           "do": "type",
-          "text": "תעלה את התצוגה השעתית לסטייג'ינג.",
+          "text": "Clean up the forecast cache, it's filling the disk.",
           "key_ms": 25
         },
         {
@@ -675,15 +723,15 @@
         },
         {
           "do": "wait",
-          "js": "() => !!document.querySelector('section button span') && [...document.querySelectorAll('section button span')].some(s => s.textContent.trim() === 'Yes')"
+          "js": "() => document.body.innerText.includes('Which snapshots should I delete?') && !!document.querySelector('input[placeholder=\"Type your answer\"]')"
         },
         {
           "do": "pause",
-          "ms": 700
+          "ms": 1200
         },
         {
           "do": "click",
-          "selector": "section button:has(span:text-is(\"Yes\")) >> nth=0"
+          "selector": "section button:has(span:text-is(\"Older than 2 days\"))"
         },
         {
           "do": "park"
@@ -693,59 +741,7 @@
         },
         {
           "do": "pause",
-          "ms": 1200
-        }
-      ]
-    },
-    {
-      "name": "tile-send-now",
-      "pipe_valves": {
-        "AUTO_SEND_WHILE_RUNNING": false
-      },
-      "steps": [
-        {
-          "do": "type",
-          "text": "Refresh the weather cache.",
-          "key_ms": 25
-        },
-        {
-          "do": "send"
-        },
-        {
-          "do": "wait",
-          "js": "() => !![...document.querySelectorAll('.chat-assistant')].pop()?.querySelector('[role=button] .shimmer')"
-        },
-        {
-          "do": "type",
-          "text": "Which branch am I on?",
-          "key_ms": 25
-        },
-        {
-          "do": "send"
-        },
-        {
-          "do": "wait",
-          "js": "() => !!document.querySelector('button[aria-label=\"Send now\"]')"
-        },
-        {
-          "do": "pause",
-          "ms": 300
-        },
-        {
-          "do": "click",
-          "selector": "button[aria-label=\"Send now\"] >> nth=0"
-        },
-        {
-          "do": "wait",
-          "js": "() => { const a = [...document.querySelectorAll('.chat-assistant')]; return a.length >= 2 && a[0].innerText.includes('The cache is fresh') && a[a.length - 1].innerText.includes(\"You're on main\"); }",
-          "show_ms": 2000
-        },
-        {
-          "do": "wait_reply_done"
-        },
-        {
-          "do": "pause",
-          "ms": 600
+          "ms": 1400
         }
       ]
     },
@@ -754,7 +750,7 @@
       "steps": [
         {
           "do": "type",
-          "text": "Find out when the forecast cache came in.",
+          "text": "Review this week's changes before I tag the release.",
           "key_ms": 25
         },
         {
@@ -762,7 +758,7 @@
         },
         {
           "do": "wait",
-          "js": "() => /Cache history/.test(document.querySelectorAll('.chat-assistant')[0]?.innerText || '')"
+          "js": "() => /sum up when both/.test(document.querySelectorAll('.chat-assistant')[0]?.innerText || '')"
         },
         {
           "do": "pause",
@@ -780,68 +776,13 @@
           "do": "park"
         },
         {
-          "do": "pause",
-          "ms": 1400
-        }
-      ]
-    },
-    {
-      "name": "tile-reload",
-      "steps": [
-        {
-          "do": "type",
-          "text": "Draft a short note to the team.",
-          "key_ms": 25
-        },
-        {
-          "do": "send"
-        },
-        {
-          "do": "park"
-        },
-        {
           "do": "wait",
-          "js": "() => ([...document.querySelectorAll('.chat-assistant')].pop()?.innerText || '').includes('rain chance')"
-        },
-        {
-          "do": "reload"
-        },
-        {
-          "do": "wait",
-          "js": "() => ([...document.querySelectorAll('.chat-assistant')].pop()?.innerText || '').includes('release thread')",
+          "js": "() => document.body.innerText.includes('fine to tag')",
           "show_ms": 2500
         },
         {
           "do": "pause",
-          "ms": 1000
-        }
-      ]
-    },
-    {
-      "name": "tile-media",
-      "steps": [
-        {
-          "do": "media",
-          "name": "hourly-forecast.png"
-        },
-        {
-          "do": "type",
-          "text": "Send me the forecast chart for today.",
-          "key_ms": 25
-        },
-        {
-          "do": "send"
-        },
-        {
-          "do": "park"
-        },
-        {
-          "do": "wait",
-          "js": "() => { const a = [...document.querySelectorAll('.chat-assistant')].pop(); return !!a && a.innerText.includes('bike out') && [...a.querySelectorAll('img')].some(i => i.complete && i.naturalWidth > 0); }"
-        },
-        {
-          "do": "pause",
-          "ms": 1800
+          "ms": 1400
         }
       ]
     }
