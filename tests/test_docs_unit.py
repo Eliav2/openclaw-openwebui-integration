@@ -13,7 +13,7 @@ IMAGE_BUDGET = 250 * 1024          # each image
 IMAGES_TOTAL_BUDGET = 4 * 1024 * 1024
 DEMOS = IMG / "demos"              # the demos, scripts/demos/record.py: a GIF, an MP4 and a WebM each
 DEMO_BUDGET = 1024 * 1024          # each GIF, as record.py enforces
-DEMOS_TOTAL_BUDGET = 6 * 1024 * 1024
+DEMOS_TOTAL_BUDGET = 9 * 1024 * 1024   # the docs' demos and the README's feature tiles (tile-*)
 VIDEO_BUDGET = 1024 * 1024         # each MP4 and WebM, as record.py enforces
 VIDEOS_TOTAL_BUDGET = 8 * 1024 * 1024
 # Contributor and design pages may name issues and internals; user pages may not.
@@ -28,16 +28,27 @@ HEADING = re.compile(r"^#{1,6}\s+(.+?)\s*#*\s*$", re.M)
 
 MD_IMAGE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)[^)]*\)")
 IMG_TAG = re.compile(r'<img\b(?:[^>"]|"[^"]*")*>')
+# A README feature tile: a demo GIF in a <picture>, its still poster the <img>, in a table cell
+# that sets the width, so the <img> fills the cell (width="100%").
+PICTURE = re.compile(r"<picture>(.*?)</picture>", re.S)
 PHONE_WIDTH = 320      # a phone shot, as the README shows it
 WIDE_MAX = 800
 
 
 def image_size(path: Path) -> tuple:
-    """(width, height) from the PNG or GIF header."""
-    head = path.read_bytes()[:24]
-    if head[:6] in (b"GIF87a", b"GIF89a"):
-        return int.from_bytes(head[6:8], "little"), int.from_bytes(head[8:10], "little")
-    return int.from_bytes(head[16:20], "big"), int.from_bytes(head[20:24], "big")
+    """(width, height) from the PNG, GIF or JPEG header."""
+    data = path.read_bytes()
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return int.from_bytes(data[6:8], "little"), int.from_bytes(data[8:10], "little")
+    if data[:2] == b"\xff\xd8":
+        i = 2
+        while i + 9 < len(data):
+            marker, length = data[i + 1], int.from_bytes(data[i + 2:i + 4], "big")
+            if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):  # a start-of-frame
+                return int.from_bytes(data[i + 7:i + 9], "big"), int.from_bytes(data[i + 5:i + 7], "big")
+            i += 2 + length
+        raise ValueError(f"{path}: no JPEG frame header")
+    return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
 
 
 def image_width_limit(size: tuple, gif: bool = False) -> tuple:
@@ -172,6 +183,16 @@ class DocsLinkTests(unittest.TestCase):
         bad = []
         for md in markdown_files():
             text = re.sub(r"`[^`\n]*`", "", FENCE.sub("", md.read_text()))
+            for tile in PICTURE.findall(text):
+                gif = re.search(r'<source srcset="([^"]+\.gif)"', tile)
+                poster = IMG_TAG.search(tile)
+                if not gif or not poster or 'width="100%"' not in poster.group(0):
+                    bad.append(f"{rel(md)}: a <picture> is a demo GIF source plus a poster <img width=\"100%\">")
+                    continue
+                g, p = image_size(md.parent / gif.group(1)), image_size(md.parent / re.search(r'\bsrc="([^"]+)"', poster.group(0)).group(1))
+                if g[0] * p[1] != g[1] * p[0]:
+                    bad.append(f"{rel(md)}: {gif.group(1)} {g} and its poster {p} differ in shape")
+            text = PICTURE.sub("", text)
             for _alt, src in MD_IMAGE.findall(text):
                 if not re.match(r"^[a-z]+:", src):
                     bad.append(f"{rel(md)}: {src} is ![...](...), use <img src alt width>")
@@ -195,6 +216,12 @@ class DocsLinkTests(unittest.TestCase):
         self.assertEqual(image_width_limit((1200, 700)), ("wide", 600))
         self.assertEqual(image_width_limit((960, 640), gif=True), ("demo", 800))
         self.assertEqual(image_width_limit((640, 400), gif=True), ("demo", 640))
+
+    def test_image_size_reads_a_jpeg_frame_header(self):
+        posters = sorted(IMG.glob("*.jpg"))
+        for jpg in posters:
+            with self.subTest(jpg=jpg.name):
+                self.assertEqual(image_size(jpg), (960, 640))
 
     def test_image_size_reads_png_and_gif_headers(self):
         self.assertEqual(image_size(IMG / "question-card-light.png"), (780, 1688))
