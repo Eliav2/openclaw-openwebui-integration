@@ -176,21 +176,21 @@
           }
         },
         {
-          "say": "Now the tests.",
+          "say": "Now the build.",
           "tool": "exec",
           "args": {
-            "command": "cd forecast && sleep 1 && echo '24 passed'",
-            "title": "Run the tests"
+            "command": "cd forecast && sleep 1 && echo 'build ok'",
+            "title": "Build the app"
           }
         },
         {
-          "say": "Ready to ship: no type errors, and all 24 tests pass.",
+          "say": "Ready to ship: no type errors, and the build is clean.",
           "delay": 0.02
         }
       ]
     },
     {
-      "match": "תעלה את התצוגה השעתית לסטייג'ינג",
+      "match": "תעלה את התצוגה השעתית",
       "steps": [
         {
           "say": "הבנייה עברה בלי שגיאות.\n\nOpenClaw needs input:\nלפרוס עכשיו לסטייג'ינג? (כן/לא)"
@@ -225,7 +225,7 @@
       ]
     },
     {
-      "match": "Send me today's forecast chart",
+      "match": "Send me the forecast chart for today",
       "steps": [
         {
           "say": "Here's today's hourly forecast:\nMEDIA:hourly-forecast.png Rain moves in after 3 PM, so take the bike out this morning."
@@ -631,7 +631,8 @@
       "steps": [
         {
           "do": "type",
-          "text": "Check the forecast app before the release."
+          "text": "Check the forecast app before the release.",
+          "key_ms": 25
         },
         {
           "do": "send"
@@ -666,7 +667,8 @@
       "steps": [
         {
           "do": "type",
-          "text": "תעלה את התצוגה השעתית לסטייג'ינג."
+          "text": "תעלה את התצוגה השעתית לסטייג'ינג.",
+          "key_ms": 25
         },
         {
           "do": "send"
@@ -703,7 +705,8 @@
       "steps": [
         {
           "do": "type",
-          "text": "Refresh the weather cache."
+          "text": "Refresh the weather cache.",
+          "key_ms": 25
         },
         {
           "do": "send"
@@ -714,7 +717,8 @@
         },
         {
           "do": "type",
-          "text": "Which branch am I on?"
+          "text": "Which branch am I on?",
+          "key_ms": 25
         },
         {
           "do": "send"
@@ -750,17 +754,15 @@
       "steps": [
         {
           "do": "type",
-          "text": "Find out when the forecast cache came in."
+          "text": "Find out when the forecast cache came in.",
+          "key_ms": 25
         },
         {
           "do": "send"
         },
         {
           "do": "wait",
-          "js": "() => /Cache history/.test([...document.querySelectorAll('.chat-assistant')].pop()?.innerText || '')"
-        },
-        {
-          "do": "wait_reply_done"
+          "js": "() => /Cache history/.test(document.querySelectorAll('.chat-assistant')[0]?.innerText || '')"
         },
         {
           "do": "pause",
@@ -768,11 +770,11 @@
         },
         {
           "do": "click",
-          "selector": ".chat-assistant >> nth=-1 >> [role=button] >> nth=0"
+          "selector": ".chat-assistant >> nth=0 >> [role=button] >> nth=0"
         },
         {
           "do": "wait",
-          "js": "() => /Started/.test([...document.querySelectorAll('.chat-assistant')].pop().innerText)"
+          "js": "() => /Started/.test(document.querySelectorAll('.chat-assistant')[0].innerText)"
         },
         {
           "do": "park"
@@ -788,7 +790,8 @@
       "steps": [
         {
           "do": "type",
-          "text": "Draft a short note to the team."
+          "text": "Draft a short note to the team.",
+          "key_ms": 25
         },
         {
           "do": "send"
@@ -823,7 +826,8 @@
         },
         {
           "do": "type",
-          "text": "Send me today's forecast chart."
+          "text": "Send me the forecast chart for today.",
+          "key_ms": 25
         },
         {
           "do": "send"

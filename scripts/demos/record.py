@@ -241,14 +241,14 @@ class Demo:
         return box["x"] + min(box["width"] / 2, 60), box["y"] + box["height"] / 2
 
     async def type(self, step: dict) -> None:
-        """Click into the composer, move the cursor off it, and type."""
+        """Click into the composer, move the cursor off it, and type (`key_ms` a key, a tile types faster)."""
         x, y = await self.point_of("#chat-input")
         await self.move(x, y)
         await self.page.evaluate("document.querySelector('#chat-input').spellcheck = false")
         await self.page.mouse.click(x, y)
         # Off the text, to empty space at the right: never onto a control (a tooltip).
         await self.move(W - 120, y - 110, steps=12)
-        await self.page.keyboard.type(step["text"], delay=TYPE_DELAY_MS)
+        await self.page.keyboard.type(step["text"], delay=step.get("key_ms", TYPE_DELAY_MS))
         await self.page.wait_for_timeout(350)
 
     async def send(self, step: dict) -> None:
