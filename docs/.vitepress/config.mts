@@ -161,6 +161,10 @@ export default defineConfig({
         ],
       },
       {
+        text: "Examples",
+        items: [{ text: "Example: a live browser view", link: "/examples/live-browser-view" }],
+      },
+      {
         text: "Contributing & internals",
         collapsed: true,
         items: [
