@@ -450,7 +450,7 @@
     },
     {
       "name": "status-dialog",
-      "opens_on_end_ms": 2000,
+      "opens_on_end_ms": 1200,
       "steps": [
         {
           "do": "record",
@@ -680,7 +680,7 @@
     },
     {
       "name": "tile-tool-cards",
-      "opens_on_end_ms": 2000,
+      "opens_on_end_ms": 1200,
       "steps": [
         {
           "do": "type",
@@ -717,7 +717,7 @@
     },
     {
       "name": "tile-question",
-      "opens_on_end_ms": 2000,
+      "opens_on_end_ms": 1200,
       "steps": [
         {
           "do": "type",
@@ -753,7 +753,7 @@
     },
     {
       "name": "tile-sub-agents",
-      "opens_on_end_ms": 2000,
+      "opens_on_end_ms": 1200,
       "steps": [
         {
           "do": "type",
@@ -789,7 +789,7 @@
         },
         {
           "do": "pause",
-          "ms": 1400
+          "ms": 900
         }
       ]
     }
