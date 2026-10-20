@@ -328,7 +328,7 @@ class Demo:
 
     async def cover(self, step: dict) -> None:
         """Mark the frame on screen now as the one the recording opens on (`cover_ms`)."""
-        await self.page.wait_for_timeout(300)  # a frame of the settled state reaches the screencast
+        await self.page.wait_for_timeout(int(step.get("ms", 150)))  # a frame of this state reaches the screencast
         if not self.rec.frames:
             raise RuntimeError("cover: no frame recorded yet")
         self.rec.cover = len(self.rec.frames) - 1

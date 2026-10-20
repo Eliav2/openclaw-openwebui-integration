@@ -799,19 +799,24 @@
         },
         {
           "do": "wait",
-          "js": "() => document.body.innerText.includes('fine to tag')",
+          "js": "() => [...document.querySelectorAll('.chat-assistant')].some((a) => /speed review is back too: nothing blocking\\.$/.test(a.innerText.trim().split('\\n').filter(Boolean).slice(-1)[0] || ''))",
           "show_ms": 1500
-        },
-        {
-          "do": "wait_reply_done"
         },
         {
           "do": "scroll_top",
           "selector": ".chat-assistant",
-          "under_px": 46
+          "under_px": 46,
+          "ms": 150
         },
         {
           "do": "cover"
+        },
+        {
+          "do": "wait",
+          "js": "() => document.body.innerText.includes('fine to tag')"
+        },
+        {
+          "do": "wait_reply_done"
         },
         {
           "do": "pause",
