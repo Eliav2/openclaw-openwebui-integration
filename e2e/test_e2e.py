@@ -1086,9 +1086,14 @@ def test_the_status_action_lists_a_running_subagent_and_opens_its_drawer(token):
     data = _section_data(codes, "openclaw-status-section-subagents", 0)
     assert data["error"] is None, data
     assert len(data["tasks"]) == 1, data
-    row = data["tasks"][0]
-    assert row["title"] == SPAWN_TASK, row
-    assert row["status"] == "running", row
+    assert data["tasks"][0]["status"] == "running", data
+    # Titled by its task while it runs: at once, or, opened before its spawn
+    # message reached its transcript (2026.10), once it has (ELI-253).
+    fills = [c for c in codes if "getElementById('openclaw-status-section-subagents')" in c]
+    running = [t for c in fills for t in json.loads(re.search(r"const DATA = (.*?);\n", c).group(1))["tasks"]
+               if t["status"] == "running"]
+    row = running[-1]
+    assert row["title"] == SPAWN_TASK, [t["title"] for t in running]
     assert row["id"] == row["childSessionKey"] and row["id"].startswith("agent:main:subagent:"), row
     assert isinstance(row["startedAt"], int) and row["endedAt"] is None, row
     # Its end shows in the open dialog, and it stays listed (ELI-152).

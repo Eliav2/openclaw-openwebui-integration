@@ -8672,10 +8672,13 @@ class Action:
 
         # Every child seen so far by key, and what their transcripts told.
         children_seen, task_texts, latest = {}, {}, {}
+        # The listed running children with no task to title them yet.
+        untitled: list = []
 
-        async def read_transcripts(keys):
-            """The task and newest message of each of `keys` not read yet."""
-            unread = [k for k in keys if k not in task_texts]
+        async def read_transcripts(keys, again=()):
+            """The task and newest message of each of `keys` not read yet,
+            and of each of `again` whose read found no task."""
+            unread = [k for k in keys if k not in task_texts or (k in again and task_texts[k] is None)]
             if not unread:
                 return
             try:
@@ -8751,8 +8754,15 @@ class Action:
             shown = sorted(children_seen.values(), key=_subagent_started, reverse=True)[:_SUBAGENT_LIST_CAP]
             running = [r["key"] for r in shown if _subagent_status(r.get("status")) in _LIVE_SUBAGENT_STATUSES]
             pending = at_open and not running and bool(shown)
+            # A running child with no label and no task from its spawn call is
+            # titled by its transcript, which may get its spawn message after
+            # the open: read again until it has.
+            spawned = _subagent_tasks(session_key)
+            want = [r["key"] for r in shown if r["key"] in running and not (r.get("label") or "").strip()
+                    and not spawned.get(r["key"])]
             if not pending:
-                await read_transcripts([r["key"] for r in shown])
+                await read_transcripts([r["key"] for r in shown], again=want)
+            untitled[:] = [k for k in want if not task_texts.get(k)]
             dialog["rows"], dialog["total"] = shown, len(children_seen)
             await emit(_render_subagents_fill_js({
                 "tasks": subagent_rows(shown), "total": len(children_seen), "pending": pending,
@@ -8789,12 +8799,19 @@ class Action:
         # child that ends meanwhile must show its end (ELI-127). Hold this
         # request open, as the drawer does, and refill the section on each
         # pushed change to a listed child's run state, until none is listed,
-        # the page closes the dialog, or the follow's bound passes. Each event
-        # is taken before the read it guards, so no change slips between them.
+        # the page closes the dialog, or the follow's bound passes. A running
+        # child with no task yet is titled once its spawn message reaches its
+        # transcript: the section refills on that append too (ELI-253). Each
+        # event is taken before the read it guards, so none slips between.
         deadline = time.time() + _DIALOG_FOLLOW_MAX_S
         closed = dialog["closed"]
+        subscribed = set()
         while listed and not closed.is_set():
+            for k in [k for k in untitled if k not in subscribed]:
+                subscribed.add(k)
+                await conn.ensure_message_subscription(k)
             changes = [conn.session_change_event(k) for k in listed]
+            changes += [conn.session_message_event(k) for k in untitled]
             following = listed
             listed = await fill_subagents(list_children())
             if not listed or set(listed) - set(following):

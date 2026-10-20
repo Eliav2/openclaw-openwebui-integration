@@ -1173,6 +1173,10 @@ class DrawerRunItemsTests(unittest.TestCase):
                                  [(c["id"], c["name"]) for c in cards])
 
 
+async def _subscribe_nothing(_key):
+    return None
+
+
 async def _open_dialog(opening, conn):
     """Run a status dialog Action until it returns, or until it holds open
     to follow listed sub-agents that never change (ELI-127); then stop it,
@@ -1187,6 +1191,8 @@ async def _open_dialog(opening, conn):
             await asyncio.Future()
 
     conn.session_change_event = lambda _key: _Unchanged()
+    conn.session_message_event = lambda _key: _Unchanged()
+    conn.ensure_message_subscription = _subscribe_nothing
     task = asyncio.ensure_future(opening)
     waiting = asyncio.ensure_future(followed.wait())
     await asyncio.wait([task, waiting], return_when=asyncio.FIRST_COMPLETED)
