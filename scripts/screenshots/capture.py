@@ -882,7 +882,14 @@ class Scenes:
             box.click()
             page.keyboard.type("/claude", delay=40)
             wait_js(page, "() => document.body.innerText.includes('Claude login: status')", "the prompts in the / menu", 30_000)
-            self.s.shot(page, "claude-login-prompts")
+            # The menu and the composer under it, not the empty page around them.
+            clip = """() => {
+              const box = document.getElementById('message-input-container').getBoundingClientRect();
+              const menu = [...document.querySelectorAll('div')].filter((d) => d.innerText.startsWith('Prompts')
+                && d.innerText.includes('Claude login: status')).pop().getBoundingClientRect();
+              return {x: 0, y: menu.top - 24, width: innerWidth, height: box.bottom + 24 - (menu.top - 24)};
+            }"""
+            self.s.shot(page, "claude-login-prompts", clip_js=clip)
             page.keyboard.press("Control+A")
             page.keyboard.press("Backspace")
         finally:
