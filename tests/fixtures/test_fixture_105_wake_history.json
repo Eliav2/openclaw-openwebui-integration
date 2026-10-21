@@ -1,7 +1,7 @@
 {
  "source": "chat.history (limit 600) of the live gate's cron-wake chat on OpenClaw 2026.10.5, claude-cli haiku, gate run gate-07d6fe6-shell-subset1 (ELI-211)",
  "openclaw_version": "2026.10.5",
- "sessionKey": "agent:main:openwebui-2d206eab-acac-4945-bd2f-7e8b6365de8c-75eaae0c-529d-43ab-8430-f0fedfe23aa8",
+ "sessionKey": "agent:main:openwebui-00000000-0000-4000-8000-0000000000a1-75eaae0c-529d-43ab-8430-f0fedfe23aa8",
  "sessionId": "35aecd82-d631-4e78-a828-3ab97ae62ca4",
  "lastRunId": "991d75cd-a10d-4671-8a2a-61273d93a7df",
  "messages": [
@@ -32,7 +32,7 @@
   },
   {
    "role": "user",
-   "content": "Conversation info (untrusted metadata):\n```json\n{\n  \"chat_id\": \"75eaae0c-529d-43ab-8430-f0fedfe23aa8\",\n  \"source\": \"openwebui\",\n  \"user_id\": \"2d206eab-acac-4945-bd2f-7e8b6365de8c\"\n}\n```\n\nReply with exactly: READY",
+   "content": "Conversation info (untrusted metadata):\n```json\n{\n  \"chat_id\": \"75eaae0c-529d-43ab-8430-f0fedfe23aa8\",\n  \"source\": \"openwebui\",\n  \"user_id\": \"00000000-0000-4000-8000-0000000000a1\"\n}\n```\n\nReply with exactly: READY",
    "timestamp": 1792366156548,
    "__openclaw": {
     "id": "f4579014-5006-429f-8c44-980a9e941654",
@@ -90,7 +90,7 @@
    "timestamp": 1792366183247,
    "provenance": {
     "kind": "internal_system",
-    "sourceSessionKey": "agent:main:openwebui-2d206eab-acac-4945-bd2f-7e8b6365de8c-75eaae0c-529d-43ab-8430-f0fedfe23aa8",
+    "sourceSessionKey": "agent:main:openwebui-00000000-0000-4000-8000-0000000000a1-75eaae0c-529d-43ab-8430-f0fedfe23aa8",
     "sourceTool": "cron",
     "sourcePromptPrefix": "[cron:8a33deee-b3bd-4a03-bcb6-92e50525c5e7 selftest-eli100-gate-75eaae0c]",
     "jobId": "8a33deee-b3bd-4a03-bcb6-92e50525c5e7",
@@ -113,7 +113,7 @@
    },
    "senderLabel": "Forwarded from Automation",
    "senderSession": {
-    "sessionKey": "agent:main:openwebui-2d206eab-acac-4945-bd2f-7e8b6365de8c-75eaae0c-529d-43ab-8430-f0fedfe23aa8",
+    "sessionKey": "agent:main:openwebui-00000000-0000-4000-8000-0000000000a1-75eaae0c-529d-43ab-8430-f0fedfe23aa8",
     "agentId": "main",
     "label": "Automation"
    }

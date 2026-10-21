@@ -33,8 +33,8 @@ CHILD = "agent:main:subagent:aaaaaaaa-0000-0000-0000-000000000001"
 OTHER = "agent:main:subagent:bbbbbbbb-0000-0000-0000-000000000002"
 NOW = 1_783_790_100_000
 
-# Eliav's sub-agent, shortened: a 1,200-character prompt as its task.
-LONG_TASK = ("Repo: private GitHub repo example/invest-bot (gh: GH_CONFIG_DIR=/config/gh; the local clone "
+# A real sub-agent, shortened: a 1,200-character prompt as its task.
+LONG_TASK = ("Repo: private GitHub repo example/invest-bot (gh: GH_CONFIG_DIR=/home/user/.config/gh; the local clone "
              "is STALE with no commits: re-clone into your scratchpad). Workflow "
              ".github/workflows/bench.yml, code in experiments/bench/. ") + "Goal: a head-to-head, net of fees. " * 31
 LONG_RESULT = "Now rewriting run.sh and the workflow into a two-phase matrix. Polling. " * 14
