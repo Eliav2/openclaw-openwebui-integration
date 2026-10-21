@@ -277,7 +277,7 @@ class AskReplyEndedWhileDownTests(_EndedWhileDownCase):
 
     REAL = {"d0f0c6ff-9968-40f6-bbd9-b3b4418c048e": CHAT,
             "a8351886-2ab5-4acf-8752-1ac1612d64c3": M,
-            "2d206eab-acac-4945-bd2f-7e8b6365de8c": USER}
+            "00000000-0000-4000-8000-0000000000a1": USER}
     END = "You chose Blue ASK-END-5f270568"
 
     def setUp(self):

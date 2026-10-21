@@ -45,18 +45,18 @@ class LiveViewUrlTests(unittest.TestCase):
         # ELI-248: on the claude-cli runtime the agent drives its browser with exec
         # running `openclaw browser <verb>`; no tool is called "browser" there
         browser_use = (
-            ("exec", {"command": "B=/config/.node_global/bin/openclaw; $B browser --json open https://en.wikipedia.org/wiki/Octopus 2>&1 | tail -20"}),
+            ("exec", {"command": "B=/opt/openclaw/bin/openclaw; $B browser --json open https://en.wikipedia.org/wiki/Octopus 2>&1 | tail -20"}),
             ("exec", {"command": "B=x; sleep 15; for i in 1 2; do $B browser press PageDown; done"}),
             ("exec", {"command": "openclaw browser tabs"}),
             ("browser", {"action": "open", "url": "https://x"}),
         )
         not_browser_use = (
-            ("exec", {"command": "/config/.node_global/bin/openclaw browser --help 2>&1 | head -50"}),
-            ("exec", {"command": "cd /config/.openclaw/workspace/projects/browser-replay && git status"}),
-            ("exec", {"command": "grep -n frame-ancestors /config/.openclaw/workspace/projects/browser-replay/src/server.ts"}),
+            ("exec", {"command": "/opt/openclaw/bin/openclaw browser --help 2>&1 | head -50"}),
+            ("exec", {"command": "cd /home/user/.openclaw/workspace/projects/browser-tools && git status"}),
+            ("exec", {"command": "grep -n frame-ancestors /home/user/.openclaw/workspace/projects/browser-tools/src/server.ts"}),
             # a wrapper script that starts a browser is not known to the default
             ("exec", {"command": "python3 /opt/tools/lease.py own --caller qa -- bun shot.ts"}),
-            ("exec", {"command": "systemctl --user restart browser-replay"}),
+            ("exec", {"command": "systemctl --user restart browser-tools"}),
             ("exec", {"command": "echo the browser opened fine"}),
         )
         for tool, args in browser_use:

@@ -716,11 +716,11 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
         flattenMarkdown); `sessions.preview` has the transcript's text as
         written. The open dialog's refills list with the former, a fresh
         open's list did not, so its tap showed the latter: the same result
-        read "The command cd /config/x ran" in place and "The command
-        `cd /config/x` ran" after a reopen."""
+        read "The command cd /home/user/x ran" in place and "The command
+        `cd /home/user/x` ran" after a reopen."""
         import asyncio
 
-        raw, flat = "The command `cd /config/x` ran.", "The command cd /config/x ran."
+        raw, flat = "The command `cd /home/user/x` ran.", "The command cd /home/user/x ran."
         done = _child(CHILD_A, "done", startedAt=self.NOW, endedAt=self.NOW + 1000)
         rows = [_child(CHILD_A, "running", startedAt=self.NOW)]
         transcript = {CHILD_A: [{"role": "user", "text": WRAPPED_93}]}

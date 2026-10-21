@@ -11,7 +11,7 @@
   },
   {
    "role": "user",
-   "content": "Conversation info (untrusted metadata):\n```json\n{\n  \"chat_id\": \"d0f0c6ff-9968-40f6-bbd9-b3b4418c048e\",\n  \"source\": \"openwebui\",\n  \"user_id\": \"2d206eab-acac-4945-bd2f-7e8b6365de8c\"\n}\n```\n\nThis is a test. First use the Bash tool 2 times, one call at a time, waiting for each: `python3 -c 'import time; time.sleep(15); print(\"pre-1\")'`, `python3 -c 'import time; time.sleep(15); print(\"pre-2\")'`. Then ask me which colour I prefer: that reply must be exactly these lines and nothing else:\nOpenClaw needs input:\nColour 390661\nWhich colour do you prefer?\n1. Red\n2. Blue\n3. Green\nAfter I answer, use the Bash tool 4 times, one call at a time, waiting for each: `python3 -c 'import time; time.sleep(30); print(\"post-1\")'`, `python3 -c 'import time; time.sleep(30); print(\"post-2\")'`, `python3 -c 'import time; time.sleep(30); print(\"post-3\")'`, `python3 -c 'import time; time.sleep(30); print(\"post-4\")'`. Then reply with exactly: You chose <the colour> ASK-END-5f270568. Use no other tools.",
+   "content": "Conversation info (untrusted metadata):\n```json\n{\n  \"chat_id\": \"d0f0c6ff-9968-40f6-bbd9-b3b4418c048e\",\n  \"source\": \"openwebui\",\n  \"user_id\": \"00000000-0000-4000-8000-0000000000a1\"\n}\n```\n\nThis is a test. First use the Bash tool 2 times, one call at a time, waiting for each: `python3 -c 'import time; time.sleep(15); print(\"pre-1\")'`, `python3 -c 'import time; time.sleep(15); print(\"pre-2\")'`. Then ask me which colour I prefer: that reply must be exactly these lines and nothing else:\nOpenClaw needs input:\nColour 390661\nWhich colour do you prefer?\n1. Red\n2. Blue\n3. Green\nAfter I answer, use the Bash tool 4 times, one call at a time, waiting for each: `python3 -c 'import time; time.sleep(30); print(\"post-1\")'`, `python3 -c 'import time; time.sleep(30); print(\"post-2\")'`, `python3 -c 'import time; time.sleep(30); print(\"post-3\")'`, `python3 -c 'import time; time.sleep(30); print(\"post-4\")'`. Then reply with exactly: You chose <the colour> ASK-END-5f270568. Use no other tools.",
    "timestamp": 1791961564096,
    "__openclaw": {
     "importedFrom": "claude-cli"
@@ -98,7 +98,7 @@
   },
   {
    "role": "user",
-   "content": "Conversation info (untrusted metadata):\n```json\n{\n  \"chat_id\": \"d0f0c6ff-9968-40f6-bbd9-b3b4418c048e\",\n  \"source\": \"openwebui\",\n  \"user_id\": \"2d206eab-acac-4945-bd2f-7e8b6365de8c\"\n}\n```\n\nBlue",
+   "content": "Conversation info (untrusted metadata):\n```json\n{\n  \"chat_id\": \"d0f0c6ff-9968-40f6-bbd9-b3b4418c048e\",\n  \"source\": \"openwebui\",\n  \"user_id\": \"00000000-0000-4000-8000-0000000000a1\"\n}\n```\n\nBlue",
    "timestamp": 1791961599957,
    "__openclaw": {
     "importedFrom": "claude-cli"

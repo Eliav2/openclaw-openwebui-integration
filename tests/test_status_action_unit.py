@@ -487,7 +487,7 @@ class ActionOwnConnectionWritesNothingTests(unittest.IsolatedAsyncioTestCase):
     with no Pipe connection in the process, it raises nothing and writes
     nothing: no turn, no chat.send, no Open WebUI write."""
 
-    USER = "2d206eab-acac-4945-bd2f-7e8b6365de8c"
+    USER = "00000000-0000-4000-8000-0000000000a1"
     CHAT = "0abe9bde-9b86-4ef3-8a46-a3a98ed9410a"
     READ_ONLY = {"sessions.subscribe", "sessions.messages.subscribe", "sessions.list",
                  "cron.list", "chat.history"}
@@ -1545,7 +1545,7 @@ class ControlUiLinkTests(unittest.IsolatedAsyncioTestCase):
 
     BASE = "https://claw.example.com/"
     CHAT = "56b98d09-f3b7-4e4f-b2bb-688ce63bfa53"
-    USER = "2d206eab-acac-4945-bd2f-7e8b6365de8c"
+    USER = "00000000-0000-4000-8000-0000000000a1"
 
     def test_the_session_url(self):
         key = _owui_session_key("main", self.USER, self.CHAT)

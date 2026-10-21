@@ -54,7 +54,7 @@ EXEC_CARD = [
      "output": [{"type": "output_text", "text": "Command still running (session good-lagoon, pid 2816)."}]},
 ]
 # ELI-232: an agent's exec names its purpose in `title`.
-TITLED_COMMAND = ("cd /config/.openclaw/workspace/projects/session-manager && "
+TITLED_COMMAND = ("cd /home/user/.openclaw/workspace/projects/session-manager && "
                   "python3 ci_wake.py 163 --sha 2ef4275 > /tmp/w.log 2>&1")
 TITLED_CARD = [
     {"type": "function_call", "id": "c2", "call_id": "c2", "name": "exec",
@@ -83,11 +83,11 @@ class ShortCommandTests(unittest.TestCase):
     def test_short_commands(self):
         cases = [
             ("sleep 25; echo done", "sleep 25"),
-            ("cd /config/.openclaw/workspace/projects/x && python3 ci_wake.py 136", "python3 ci_wake.py 136"),
+            ("cd /home/user/.openclaw/workspace/projects/x && python3 ci_wake.py 136", "python3 ci_wake.py 136"),
             ('cd /tmp; python3 -c "\nimport json;d=json.load(open(\'x\'))\nprint(d)"', "python3 -c …"),
-            ("export GH_CONFIG_DIR=/config/gh; R=Eliav2/x; /config/bin/gh run watch 123 --exit-status",
+            ("export GH_CONFIG_DIR=/home/user/.config/gh; R=Eliav2/x; /usr/local/bin/gh run watch 123 --exit-status",
              "gh run watch 123 --exit-status"),
-            ("GH_CONFIG_DIR=/config/gh /config/bin/gh pr view 5", "gh pr view 5"),
+            ("GH_CONFIG_DIR=/home/user/.config/gh /usr/local/bin/gh pr view 5", "gh pr view 5"),
             ("cd /tmp && python3 - <<'EOF'\nprint(\"unbalanced)\nEOF", "python3 - …"),
             ("setsid nohup timeout 60 bin/import-stations north > /tmp/l 2>&1 &", "bin/import-stations north"),
             ("cd /x\nnode -e 'console.log(1)'", "node -e …"),
@@ -340,7 +340,7 @@ class OpenTests(unittest.IsolatedAsyncioTestCase):
         calls = []
         _result, emitted = await self._open(_gateway(calls, unknown=("tasks.list",), processes=[
             proc("good-lagoon", "sleep 25;", "running", canStop=True),
-            proc("calm-reef", "cd /config/.openclaw/wo", "failed", endedAt=NOW - 50_000, exitCode=2,
+            proc("calm-reef", "cd /home/user/.openclaw", "failed", endedAt=NOW - 50_000, exitCode=2,
                  tail="ls: cannot access '/nope'\n"),
             proc("old-pine", "make build", "killed", startedAt=NOW - 45_000, endedAt=NOW - 40_000),
         ]))

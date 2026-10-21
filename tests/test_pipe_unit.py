@@ -6265,11 +6265,11 @@ class MediaDirectiveDoubledFilenameTests(unittest.IsolatedAsyncioTestCase):
     `MEDIA:`, and a glued copy of the same directive is dropped.
     """
 
-    BASE = "https://homeassistant.tail25faa5.ts.net:18791"
+    BASE = "https://pipe.example.invalid:18791"
     F = "baseline-test2-0102-1785351819.png"
     MALFORMED = (f"![{F}MEDIA:{F}]"
-                 f"(https://homeassistant.tail25faa5.ts.net:18791/{F}MEDIA:{F})")
-    CORRECT = f"![{F}](https://homeassistant.tail25faa5.ts.net:18791/{F})"
+                 f"(https://pipe.example.invalid:18791/{F}MEDIA:{F})")
+    CORRECT = f"![{F}](https://pipe.example.invalid:18791/{F})"
 
     def _stream(self, catch_all_baseline):
         """Replay the turn through the pipe's real assistant-stream helpers.
@@ -7060,7 +7060,7 @@ class TurnIdentityTests(unittest.TestCase):
 
     CHAT = "0abe9bde-9b86-4ef3-8a46-a3a98ed9410a"
     M = "8acdce95-1111-4222-8333-444455556666"
-    KEY = f"agent:main:openwebui-2d206eab-acac-4945-bd2f-7e8b6365de8c-{CHAT}"
+    KEY = f"agent:main:openwebui-00000000-0000-4000-8000-0000000000a1-{CHAT}"
 
     def test_the_replys_own_run_names_its_message(self):
         run = pipe_run_id(self.CHAT, self.M)
@@ -7470,7 +7470,7 @@ class HelloSubscribeSnapshotTests(unittest.IsolatedAsyncioTestCase):
     the subscriber and then lists (sessions-subscriptions-CeMquS--.mjs:21-36).
     Its reply is the snapshot of the runs already active."""
 
-    USER = "2d206eab-acac-4945-bd2f-7e8b6365de8c"
+    USER = "00000000-0000-4000-8000-0000000000a1"
     CHAT = "0c5d682c-afaa-44f9-99a9-ada05599c997"
 
     def setUp(self):
@@ -7528,7 +7528,7 @@ class RecoveryLinkTests(unittest.TestCase):
 
     CHAT = "0c5d682c-afaa-44f9-99a9-ada05599c997"
     M = "7371727a-1373-4108-9650-13b909f067b7"
-    KEY = f"agent:main:openwebui-2d206eab-acac-4945-bd2f-7e8b6365de8c-{CHAT}"
+    KEY = f"agent:main:openwebui-00000000-0000-4000-8000-0000000000a1-{CHAT}"
     SRC = f"msg-{CHAT}-{M}-1791851610.194554"
     REC = "f2445aa8-aeda-47d8-af7b-cf853aae34e6"
 
@@ -8857,7 +8857,7 @@ class _RoutingCase(unittest.IsolatedAsyncioTestCase):
     """A connection wired to a fake Open WebUI chat, fed events and session
     pushes the way the receive loop feeds them."""
 
-    USER = "2d206eab-acac-4945-bd2f-7e8b6365de8c"
+    USER = "00000000-0000-4000-8000-0000000000a1"
     CHAT = "24c342e4-50fa-442e-9b93-c215ed135f3a"
     RUN = "agent-run-1"
     REC = "8f27e4c8-ed9a-4acf-9df1-992ee2f4e801"
@@ -12741,7 +12741,7 @@ class SessionIdRunTests(_RoutingCase):
             "idempotencyKey": f"{key}:user", "timestamp": at - 150,
             "__openclaw": {"idempotencyKey": f"{key}:user", "recordTimestampMs": at}})
 
-    def queued_turn(self, text="[manager] status?"):
+    def queued_turn(self, text="status?"):
         """A chat.send queued behind the wake: committed at admission."""
         run = pipe_run_id(self.CHAT, "efe80f6a-ffb4-48eb-a044-f9b99d2e4fe6")
         at = self.tick()
