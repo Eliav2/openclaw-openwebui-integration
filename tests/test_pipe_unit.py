@@ -491,6 +491,23 @@ class HistoryRunRebuildTests(unittest.TestCase):
         self.assertIsNone(_history_run_messages({"messages": messages[:3]}, run))
         self.assertIsNone(_history_span_messages({"messages": messages[:3]}, run))
 
+    def test_a_run_a_second_announce_was_steered_into_keeps_both_replies(self):
+        """Two sub-agents ended together (ELI-271, E2E chat e211d6c7 on
+        2026.10.5): the second announce was steered into the first's run, so
+        that one run wrote two replies, each closing-looking ("stop"). The
+        rebuild kept only the second and replaced the streamed first with it."""
+        spawn, announce, settle = "msg-c-1-1.0", "announce:v1:agent:main:subagent:a:r1", "announce:settle"
+        reply = lambda run, text: {"role": "assistant", "stopReason": "stop",  # noqa: E731
+                                   "__openclaw": {"runId": run}, "content": [{"type": "text", "text": text}]}
+        messages = [{"role": "user", "content": "spawn twins", "idempotencyKey": f"{spawn}:user"},
+                    reply(spawn, "SPAWNED"), reply(announce, "A heard."), reply(announce, "B heard.")]
+        for label, hist in (("newest run", messages), ("the settle turn follows", messages + [reply(settle, "ok")])):
+            with self.subTest(label):
+                span = _history_span_messages({"messages": hist}, announce)
+                self.assertEqual([m["content"][0]["text"] for m in span], ["A heard.", "B heard."])
+                r = _history_renderer(span)
+                self.assertEqual(r.text, "A heard.\n\nB heard.")
+
 
 def _turn_history(stub_id="stub-1", *, run="msg-c-stub-1-1.0", closed=True,
                   text="check the logs", later=False):

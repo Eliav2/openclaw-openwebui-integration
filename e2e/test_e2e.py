@@ -1166,6 +1166,32 @@ def test_a_subagent_result_ends_like_an_inline_reply(token):
     _assert_ends_like_inline(result[0], inline, "the sub-agent's result")
 
 
+def test_two_subagent_results_that_land_together_both_stay_in_the_chat(token):
+    """Twin sub-agents end about a second apart, so the second one's result
+    lands while the parent still streams its answer to the first. 2026.10
+    steers it into that run: one run, two replies. The chat kept only the
+    second until the end (ELI-271)."""
+    if _openclaw_release() < (2026, 10):
+        pytest.skip("OpenClaw 2026.9: a sub-agent's result message never finishes (ELI-138, fixed in 2026.10.3)")
+    chat_id, inline = _chat_turn(token, "E2E_SPAWN_TWINS")
+    assert inline.get("content", "").strip() == "E2E_TWINS_SPAWNED", inline
+    _wait_for(token, chat_id, ["E2E_TWIN_B_HEARD"])
+    deadline = time.time() + WAKE_TIMEOUT_S
+    while time.time() < deadline:   # the parent's last turn ends too
+        msgs = _chat_messages(token, chat_id)
+        if all(m.get("done") is True for m in msgs.values() if m.get("role") == "assistant"):
+            break
+        time.sleep(2)
+    for _ in range(2):   # and a later read (a reload) shows the same
+        msgs = _chat_messages(token, chat_id)
+        text = "\n".join(m.get("content") or "" for m in msgs.values() if m.get("role") == "assistant")
+        for twin in "AB":
+            reply = f"E2E_TWIN_{twin}_HEARD heard-1 heard-2 heard-3 heard-4 heard-5 heard-6"
+            assert text.count(reply) == 1, f"{twin}'s reply: {text!r}"
+        assert "heard-6E2E" not in text, f"two replies run together: {text!r}"
+        time.sleep(3)
+
+
 def test_the_status_action_lists_a_running_subagent_and_opens_its_drawer(token):
     chat_id, msg = _chat_turn(token, "E2E_SPAWN one helper")
     assert msg.get("content", "").strip() == "E2E_SPAWNED", msg
