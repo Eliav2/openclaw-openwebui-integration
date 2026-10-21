@@ -35,4 +35,4 @@ Security problems go through [SECURITY.md](./SECURITY.md), not a public issue.
 3. Add or update a test for what you changed, and update the docs if users see it.
 4. Make sure the commands above pass. CI runs them too, plus the end-to-end suite.
 
-By contributing you agree that your work is released under the [MIT License](./LICENSE), and to follow the [Code of Conduct](./CODE_OF_CONDUCT.md).
+By contributing you agree that your work is released under the [MIT License](./LICENSE).
