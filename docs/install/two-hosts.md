@@ -11,7 +11,7 @@ Valves: [`GATEWAY_URL`](../configuration.md#gateway_url), [`OWUI_BASE_URL`](../c
 | Piece | Runs on |
 |---|---|
 | The Pipe, the Status Action, the thinking filter | Inside the Open WebUI backend |
-| The agent, its skills, the `openclaw` CLI, the `claude-cli-usage` plugin | The Gateway host |
+| The agent, its skills, the `openclaw` CLI, the `claude-cli-usage` and `claude-login` plugins | The Gateway host |
 | `install.py`, `install_action.py`, `install_filter.py` | Any machine that can reach Open WebUI's URL |
 
 The installers only talk to Open WebUI's REST API. They never connect to the Gateway; the Pipe does, from inside Open WebUI. So the one network path the integration needs is **from the Open WebUI backend to the Gateway**, on the Gateway's port (`18789` by default).

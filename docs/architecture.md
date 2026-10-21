@@ -99,7 +99,7 @@ openclaw-openwebui-integration/
 ├── install_filter.py           # Same, for the thinking Filter
 ├── test_*.py                   # Unit + integration test suites (see Development)
 ├── e2e/                        # End-to-end stack: fake model, real Gateway and Open WebUI, pinned versions
-├── gateway-plugins/            # claude-cli-usage: rate limits for a Claude-CLI-only Gateway
+├── gateway-plugins/            # Optional Gateway plugins for a Claude CLI login: rate limits, /claude_login
 ├── skills/                     # The two agent skills (questions, media)
 ├── scripts/                    # Auxiliary scripts (OWUI API client, live verifiers, screenshots)
 ├── docs/                       # These docs; design notes in docs/design/

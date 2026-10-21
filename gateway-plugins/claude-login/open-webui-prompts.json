@@ -1,0 +1,17 @@
+[
+  {
+    "command": "claude_login",
+    "name": "Claude login: get sign-in link",
+    "content": "/claude_login "
+  },
+  {
+    "command": "claude_login_code",
+    "name": "Claude login: submit code",
+    "content": "/claude_login {{code}}"
+  },
+  {
+    "command": "claude_login_status",
+    "name": "Claude login: status",
+    "content": "/claude_login status"
+  }
+]
