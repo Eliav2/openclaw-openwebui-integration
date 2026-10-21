@@ -2,6 +2,7 @@ import { existsSync, statSync } from "node:fs";
 import path from "node:path";
 import { defineConfig } from "vitepress";
 import llmstxt from "vitepress-plugin-llms";
+import { withMermaid } from "vitepress-plugin-mermaid";
 
 // The docs site: docs/ is its source, and every page stays plain Markdown that also reads on
 // github.com. GitHub Pages serves it under the repo's name; DOCS_BASE=/ builds it for a host
@@ -87,7 +88,8 @@ const home = {
   ],
 };
 
-export default defineConfig({
+// withMermaid renders ```mermaid blocks (the Architecture diagram) as SVG, in the site's light or dark theme.
+export default withMermaid(defineConfig({
   title: "OpenClaw for Open WebUI",
   description: "Chat with your OpenClaw agents from Open WebUI and watch them work: tool calls as cards, questions as dialogs, sub-agents in a live panel.",
   base,
@@ -105,6 +107,9 @@ export default defineConfig({
   // docs/examples/ holds pages about our own setup, not the Pipe: reachable only from the
   // section that links them, never listed (sidebar, home page, search or llms.txt).
   vite: { plugins: [llmstxt({ ignoreFiles: ["examples/**"] })] },
+  // The plugin switches to Mermaid's dark theme in dark mode. SVG text labels, not HTML ones: the
+  // docs' paragraph styles would make an HTML label taller than Mermaid measured it, clipping its last line.
+  mermaid: { theme: "neutral", fontFamily: "Inter, ui-sans-serif, system-ui, sans-serif", htmlLabels: false, flowchart: { htmlLabels: false } },
   themeConfig: {
     logo: "/logo.svg",
     siteTitle: "OpenClaw for Open WebUI",
@@ -185,4 +190,4 @@ export default defineConfig({
     ],
     footer: { message: "Released under the MIT License.", copyright: "Docs source: docs/ in the repo" },
   },
-});
+}));
