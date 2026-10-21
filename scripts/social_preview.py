@@ -28,7 +28,7 @@ LOGO = os.path.join(ROOT, "docs", "public", "logo.svg")
 OUT = os.path.join(ROOT, "docs", "img", "social-preview.png")
 FRAME_FROM_END = 8   # the reply is finished and the cursor has settled
 SIDEBAR = 44         # Open WebUI's icon rail, left of the chat
-TAGLINE = "Chat with your agents on your phone and watch them work: tool calls, questions and sub-agents as real UI."
+TAGLINE = "Chat with your OpenClaw agents from Open WebUI and watch them work: tool calls as cards, questions as dialogs, sub-agents in a live panel."
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;800&display=swap" rel="stylesheet">

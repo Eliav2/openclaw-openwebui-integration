@@ -8,8 +8,7 @@
   <img src="./docs/img/demos/hero.gif" alt="A question typed in Open WebUI and sent; the agent's reply streams in, with a tool card for each command it runs, then a short summary" width="800">
 </p>
 
-Chat with your [OpenClaw](https://github.com/openclaw/openclaw) agents from Open WebUI, on your phone, and watch them work.
-Tool calls, questions and sub-agents show up as real UI, not text.
+Chat with your [OpenClaw](https://github.com/openclaw/openclaw) agents from Open WebUI and watch them work: tool calls as cards, questions as dialogs, sub-agents in a live panel.
 It connects to your running Gateway over its native protocol; it is not an agent itself.
 
 ## Install in 30 seconds

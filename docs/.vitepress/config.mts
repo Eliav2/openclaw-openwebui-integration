@@ -69,7 +69,7 @@ const home = {
   hero: {
     name: "OpenClaw for Open WebUI",
     text: "Watch your agents work",
-    tagline: "Chat with your agents on your phone and watch them work: tool calls, questions and sub-agents show up as real UI, not text.",
+    tagline: "Chat with your OpenClaw agents from Open WebUI and watch them work: tool calls as cards, questions as dialogs, sub-agents in a live panel.",
     image: { src: "/logo.svg", alt: "The crab claw" },
     actions: [
       { theme: "brand", text: "Get started", link: "/install/quickstart" },
@@ -89,7 +89,7 @@ const home = {
 
 export default defineConfig({
   title: "OpenClaw for Open WebUI",
-  description: "Chat with your OpenClaw agents from Open WebUI: live tool cards, questions as dialogs, status, sub-agents.",
+  description: "Chat with your OpenClaw agents from Open WebUI and watch them work: tool calls as cards, questions as dialogs, sub-agents in a live panel.",
   base,
   cleanUrls: true,
   head: [["link", { rel: "icon", type: "image/svg+xml", href: `${base}logo.svg` }]],
