@@ -60,6 +60,12 @@ and only a core set is sent as real schemas.
   exists, spawns the sub-agent `E2E_SPAWN` does and replies `E2E_SPAWNED`: a
   child that starts when the test says, while the chat's run goes on (ELI-260).
 * `E2E_SPAWN_LONG`                     -> `E2E_SPAWN` with a task 121 lines long.
+* `E2E_SPAWN_TWINS`                    -> spawns two sub-agents, `E2E_TWIN_A` and
+  `E2E_TWIN_B`, then replies `E2E_TWINS_SPAWNED`. A answers at once
+  (`E2E_TWIN_A_RESULT`), B about a second later, and the parent answers each
+  announce with
+  `E2E_TWIN_A_HEARD heard-1 ... heard-6` at 0.4 s a word: the twins end
+  together, so one announce lands while the other's reply streams (ELI-271).
 * `E2E_SLOW TOKEN`                     -> replies `TOKEN slow-1 ... slow-10`, one
   word a second, so a turn can be queued behind a run that is still going.
   `E2E_SLOW:<n> TOKEN` sends n words instead of 10 (a run that outlasts an
@@ -501,6 +507,26 @@ def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
         if tool_results:
             return {"text": "E2E_SPAWNED"}
         return _call_with("sessions_spawn", {"task": "E2E_SILENT_CHILD", "label": "silent helper"}, offered) or {
+            "text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
+
+    if "E2E_TWIN" in user_text and "[Subagent Task]" in user_text:
+        # A answers at once, B about a second later.
+        if "E2E_TWIN_A" in user_text:
+            return {"text": "E2E_TWIN_A_RESULT"}
+        return {"text": "E2E_TWIN_B_RESULT b-1 b-2 b-3 b-4", "delay": 0.3}
+    event = user_text.rfind("[Internal task completion event]")
+    if event >= 0 and "E2E_TWIN_" in user_text[event:]:
+        # The parent's turn for one twin's result: the one its completion
+        # event carries (the context also lists every child's). Slow, so
+        # the other twin's announce lands while it streams (ELI-271).
+        twin = re.search(r"E2E_TWIN_([AB])_RESULT", user_text[event:]).group(1)
+        return {"text": f"E2E_TWIN_{twin}_HEARD " + " ".join(f"heard-{i}" for i in range(1, 7)), "delay": 0.4}
+    if "E2E_SPAWN_TWINS" in user_text:
+        twins = [("E2E_TWIN_A", "twin a"), ("E2E_TWIN_B", "twin b")]
+        if len(tool_results) >= len(twins):
+            return {"text": "E2E_TWINS_SPAWNED"}
+        task, label = twins[len(tool_results)]
+        return _call_with("sessions_spawn", {"task": task, "label": label}, offered) or {
             "text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
 
     if "E2E_SPAWN" in user_text:

@@ -45,7 +45,7 @@ A sub-agent's own session is not a chat, so nothing is written for it directly. 
 <img src="../img/subagent-result-light.png" alt="The parent's first reply, then its reply to the sub-agent's result, with no message from you in between" width="320">
 
 - **Parent idle:** the Gateway hands the result to the parent as a new run. That run is an ordinary reply in the chat, and it usually quotes or summarises the result.
-- **Parent still running:** the result is steered into the running parent run, and shows up in the reply you are already watching.
+- **Parent still running:** the result is steered into the running parent run, and shows up in the reply you are already watching. That includes the parent's answer to an earlier sub-agent's result: when two sub-agents finish together, both answers stay in that one reply, a blank line apart.
 - **Parent answers with silence** (`NO_REPLY`): you still get the result, as one **Sub-agent** card labelled with the name the parent gave it when it spawned it, or the first sentence of its task. Expand the card to read the result. On OpenClaw 2026.10 the Gateway counts that silence as a failed reply: the card carries its error ("Agent couldn't generate a response") below it, and the Gateway retries the delivery later. A retry adds no second card; one the parent answers aloud is a reply of its own.
 
 To watch a sub-agent while it works, open it from the [Status dialog](./status.md#sub-agents).
