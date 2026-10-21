@@ -869,6 +869,34 @@ class Scenes:
         self.s.shot(page, "model-picker")
         page.keyboard.press("Escape")
 
+    def claude_login_prompts(self, page: Page) -> None:
+        """The optional claude-login extra's Open WebUI prompts, in the composer's / menu."""
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..",
+                            "gateway-plugins", "claude-login", "open-webui-prompts.json")
+        with open(path, encoding="utf-8") as fh:
+            prompts = json.load(fh)
+        made = [api("POST", "/api/v1/prompts/create", p, token=self.token) for p in prompts]
+        try:
+            new_chat(page)
+            box = page.locator("#chat-input")
+            box.click()
+            page.keyboard.type("/claude", delay=40)
+            wait_js(page, "() => document.body.innerText.includes('Claude login: status')", "the prompts in the / menu", 30_000)
+            # The menu and the composer under it, not the empty page around them.
+            clip = """() => {
+              const box = document.getElementById('message-input-container').getBoundingClientRect();
+              const menu = [...document.querySelectorAll('div')].filter((d) => d.innerText.startsWith('Prompts')
+                && d.innerText.includes('Claude login: status')).pop().getBoundingClientRect();
+              return {x: 0, y: menu.top - 24, width: innerWidth, height: box.bottom + 24 - (menu.top - 24)};
+            }"""
+            self.s.shot(page, "claude-login-prompts", clip_js=clip)
+            page.keyboard.press("Control+A")
+            page.keyboard.press("Backspace")
+        finally:
+            for p in made:
+                if p and p.get("id"):
+                    api("DELETE", f"/api/v1/prompts/id/{p['id']}/delete", token=self.token)
+
     def thinking(self, page: Page) -> None:
         attach_filter(self.token, MODEL, "openclaw_thinking")
         # A new chat: over a long one the menu shares the screen with either
@@ -1322,6 +1350,7 @@ def main(argv=None) -> int:
                 small.context.close()
             shooter.run("background-agent-waiting", scenes.background_agent, page)
             shooter.run("model-picker", scenes.model_picker, page)
+            shooter.run("claude-login-prompts", scenes.claude_login_prompts, page)
             shooter.run("agent-turn", scenes.agent_turn, page)
             shooter.run("media-turn", scenes.media_turn, page)
             shooter.run("failed-tool-live", scenes.failed_tool_live, page)

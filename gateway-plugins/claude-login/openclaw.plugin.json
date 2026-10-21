@@ -1,0 +1,12 @@
+{
+  "id": "claude-login",
+  "name": "Claude CLI login",
+  "description": "Chat command /claude_login: re-login the Claude CLI without an LLM turn.",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false
+  }
+}
