@@ -1,0 +1,60 @@
+name: Bug report
+description: Something in the integration doesn't work as it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please check [Troubleshooting](https://eliav2.github.io/openclaw-openwebui-integration/troubleshooting) first, it covers the common setup problems.
+        A security problem? Report it privately instead: see [SECURITY.md](https://github.com/Eliav2/openclaw-openwebui-integration/blob/main/SECURITY.md).
+  - type: input
+    id: pipe-version
+    attributes:
+      label: Pipe version
+      description: The `version:` line at the top of `openclaw_pipe.py`, also shown in Admin Panel > Functions.
+      placeholder: "0.7.0"
+    validations:
+      required: true
+  - type: input
+    id: owui-version
+    attributes:
+      label: Open WebUI version
+      description: Settings > About in Open WebUI.
+      placeholder: "0.12.3"
+    validations:
+      required: true
+  - type: input
+    id: openclaw-version
+    attributes:
+      label: OpenClaw version
+      description: "`openclaw --version` on the Gateway host."
+      placeholder: "2026.10.5"
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead. A screenshot helps.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Pick OpenClaw · Default
+        2. Send ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        The `[openclaw-pipe]` lines from the Open WebUI log around the problem, e.g. `docker logs --since 30m open-webui 2>&1 | grep '\[openclaw-pipe\]'`. Gateway log lines help too if the Gateway is involved.
+        Remove tokens, keys and anything private before you paste.
+      render: text
+    validations:
+      required: true

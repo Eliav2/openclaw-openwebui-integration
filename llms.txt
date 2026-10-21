@@ -1,6 +1,6 @@
 # OpenClaw for Open WebUI
 
-> Connects a running OpenClaw Gateway to Open WebUI, so its agents' tool calls, questions and sub-agents show up as real UI in the chat. Three Open WebUI functions: a Pipe (the chat), a Status Action (context, rate limits, sub-agents) and a thinking filter. Every page below is plain Markdown in this repo; start at docs/index.md.
+> Chat with your OpenClaw agents from Open WebUI and watch them work: tool calls as cards, questions as dialogs, sub-agents in a live panel. It connects to a running OpenClaw Gateway with three Open WebUI functions: a Pipe (the chat), a Status Action (context, rate limits, sub-agents) and a thinking filter. Every page below is plain Markdown in this repo; start at docs/index.md.
 
 ## Start
 
