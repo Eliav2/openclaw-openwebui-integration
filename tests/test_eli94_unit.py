@@ -266,7 +266,7 @@ class EndedWhileDownTests(_EndedWhileDownCase):
 
 
 class AskReplyEndedWhileDownTests(_EndedWhileDownCase):
-    """#21 round, ask-rebuild (2026-10-14 07:06-07:08Z, chat d0f0c6ff, message
+    """#21 round, ask-rebuild (2026-10-14 07:06-07:08Z, message
     a8351886): the question was answered Blue from the card, then Open WebUI
     restarted during the answer run's tools. The startup reconcile rewrote the
     reply from the transcript as 6 Bash cards and "You chose Blue ...": the

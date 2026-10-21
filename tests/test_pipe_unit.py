@@ -363,7 +363,7 @@ class SessionToolEventTests(unittest.IsolatedAsyncioTestCase):
 
 def _cli_history(run_id="run-9"):
     """A run as claude-cli imports it into `chat.history` (shapes measured
-    2026-10-12 on session 0abe9bde): imported assistant messages with text /
+    2026-10-12): imported assistant messages with text /
     toolcall / tool_result blocks, then the closing `cli-assistant:<runId>`
     message that repeats all of the run's text."""
     imported = {"importedFrom": "claude-cli"}
@@ -412,7 +412,7 @@ class HistoryRunRebuildTests(unittest.TestCase):
 
     @staticmethod
     def _two_text_blocks(closer=True):
-        """Restart window 2026-10-13 11:26Z (chat 89bb045d, run msg-89bb045d-...):
+        """A Gateway restart window, 2026-10-13:
         a preamble, five Bash calls, the answer. The Gateway's closing message
         joins the two text blocks with a blank line; the live stream carried it
         as the second message item "\n\nUSER-DONE-9e127db9" (read from OWUI)."""
@@ -492,7 +492,7 @@ class HistoryRunRebuildTests(unittest.TestCase):
         self.assertIsNone(_history_span_messages({"messages": messages[:3]}, run))
 
     def test_a_run_a_second_announce_was_steered_into_keeps_both_replies(self):
-        """Two sub-agents ended together (ELI-271, E2E chat e211d6c7 on
+        """Two sub-agents ended together (ELI-271, an E2E chat on
         2026.10.5): the second announce was steered into the first's run, so
         that one run wrote two replies, each closing-looking ("stop"). The
         rebuild kept only the second and replaced the streamed first with it."""
@@ -512,7 +512,7 @@ class HistoryRunRebuildTests(unittest.TestCase):
 def _turn_history(stub_id="stub-1", *, run="msg-c-stub-1-1.0", closed=True,
                   text="check the logs", later=False):
     """A turn as the Gateway stores a `chat.send` on claude-cli (measured
-    2026-10-12, session 1b877b13): the user message keyed `<runId>:user`,
+    2026-10-12): the user message keyed `<runId>:user`,
     the copy the runtime imports behind its metadata envelope, the imported
     assistant messages, then the closing `cli-assistant:<runId>`."""
     imported = {"importedFrom": "claude-cli"}
@@ -1682,7 +1682,7 @@ class ParkedCancelTests(unittest.IsolatedAsyncioTestCase):
 class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
     """Drive real reply generators through OWUI's ways of ending a response.
 
-    Incident 2026-10-11 (chat 0abe9bde): "count to 1500", Send now "test" at
+    Incident 2026-10-11: "count to 1500", Send now "test" at
     184, Send now "another test" at 720. Lines 185-244 vanished in the gap
     between the cancel and the next reply registering; the second interrupt
     arrived as a generator close, which skipped the cancel handler, so "test"
@@ -1827,7 +1827,7 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
             "reason": "chat.run.started" if active else "chat.run.settled"})
 
     async def test_message_waits_for_the_pushed_settle_not_a_timer(self):
-        """ELI-88 (2026-10-12, chat 0abe9bde): a message sent while a
+        """ELI-88 (2026-10-12): a message sent while a
         73-minute claude-cli run was going sat in the pipe's queue until the
         queue's 30-minute ceiling released it into the still-running run; the
         Gateway queued it there and claude-cli dropped it. It must wait until
@@ -1861,7 +1861,7 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("hi there", out)
 
     async def test_queued_message_survives_a_redeploy_retiring_its_connection(self):
-        """ELI-172 (2026-10-17, chat 78624cb0): a message typed at 12:03:56Z
+        """ELI-172 (2026-10-17): a message typed at 12:03:56Z
         queued behind a running run. A deploy at 12:14:58Z retired the
         connection the message waited on; it kept serving the in-flight run
         and closed when that run ended (12:30:44Z), the very settle the
@@ -1984,7 +1984,7 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         return out, items
 
     async def test_one_owui_message_invoked_twice_is_sent_once(self):
-        """ELI-82 (2026-10-14 11:02Z, chat 56b98d09, message 5819edee): Open
+        """ELI-82 (2026-10-14): Open
         WebUI called the pipe twice for the same reply, same messages. The
         second call queued behind the first call's own run, then sent the
         user's text again as a new run once it settled. The agent answered
@@ -2074,7 +2074,7 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         return out
 
     async def test_a_run_refused_before_it_starts_shows_its_error(self):
-        """ELI-139 (2026-10-15, chat 2af17834): a message with "/model are"
+        """ELI-139 (2026-10-15): a message with "/model are"
         in its text made the Gateway refuse the run as an inline model
         directive. Its only event was a chat `state: "error"` carrying the
         reason, and the reply said "(This turn produced no reply text.)"."""
@@ -2091,7 +2091,7 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
                 tool("result", result="Started: QA 17x3")]
 
     async def test_a_run_that_answers_with_silence_after_its_card_keeps_the_card_alone(self):
-        """ELI-227 (live chat 0a13a1d4 on 2026.10.5): the reply started a
+        """ELI-227 (OpenClaw 2026.10.5): the reply started a
         background sub-agent with sessions_spawn and answered NO_REPLY. The
         message read "(This turn produced no reply text.)" under the card."""
         gen = self._reply("start one", "m1")
@@ -2211,7 +2211,7 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         return [int(t) for t in text.split() if t.isdigit()]
 
     async def test_socket_drop_mid_reply_posts_no_second_copy(self):
-        """2026-10-12, chat 98891cbb: the pipe's Gateway socket dropped for 1s
+        """2026-10-12: the pipe's Gateway socket dropped for 1s
         mid-count. The closing catch-all (the WHOLE reply) no longer started
         with what had arrived, so all of it was appended again: 3816
         duplicates. Now only what follows the received text is new. This
@@ -2570,7 +2570,7 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         return closed
 
     async def test_a_reply_interrupted_while_queued_ends_once_its_message_is_sent(self):
-        """ELI-188 (QA C7): Send twice while a reply runs. The 2nd reply,
+        """ELI-188: Send twice while a reply runs. The 2nd reply,
         cancelled while it waited, kept "Queued: waiting..." and no text
         forever; its message was answered in the 3rd reply. It must say so,
         once the 3rd reply really sent it, not before."""
@@ -4694,7 +4694,7 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
         its options or Yes/No, and what was typed reached the agent as a
         plain answer it echoed into the chat."""
         f = _parse_text_prompt("OpenClaw needs input:\n\nRouter entry\nOK to add the router-debug "
-                               "entry so W6 can use the password?\n1. Yes\n2. No")
+                               "entry so the deploy can use the password?\n1. Yes\n2. No")
         self.assertEqual((f["secret"], f["options"]), (False, ["Yes", "No"]))
         f = _parse_text_prompt("OpenClaw needs input:\n\nTokens\nRotate the API token now? (y/n)")
         self.assertEqual((f["secret"], f["confirm"]), (False, True))
@@ -4703,7 +4703,7 @@ class UserInputPromptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((f["secret"], f["confirm"], f["options"]), (True, False, []))
 
     def test_a_secret_ask_keeps_the_masked_field_whatever_else_it_has(self):
-        """W3 on #137: asking for the value wins over steps written as a
+        """Review of #137: asking for the value wins over steps written as a
         numbered list, a confirm verb, or options under Codex's "may show
         your reply" warning; a key typed into the card's Other field would
         land in the chat."""
@@ -4975,7 +4975,7 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sio.emits[0][1]["data"], {
             "type": "request:interaction:done", "data": {"interaction_id": interaction_id}})
 
-    # ELI-58 live repro (2026-10-13, chat c83d7eb7, pipe cb5a7cb): the card was
+    # ELI-58 repro (2026-10-13): the card was
     # pending, the user reloaded the chat. OWUI's call on the gone socket timed
     # out only after 240 s, and the re-fire then went to the user's FIRST
     # socket in SESSION_POOL (another tab, another worker's client), so the
@@ -5048,7 +5048,7 @@ class NativeAskUserCardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(answer, "a")
         self.assertEqual(sent, ["sid-new"])
 
-    # ELI-142 live (2026-10-15, chat ed98cbd2): after an Open WebUI restart the
+    # ELI-142 (2026-10-15): after an Open WebUI restart the
     # tab's socket stayed in SESSION_POOL while the page, in a reconnect storm,
     # never showed the card. Each call ended in OWUI's 240 s timeout and the
     # pipe re-showed the card: four timeouts, about 20 minutes of an open
@@ -7524,7 +7524,7 @@ class HelloSubscribeSnapshotTests(unittest.IsolatedAsyncioTestCase):
 
 class RecoveryLinkTests(unittest.TestCase):
     """ELI-100 rule E and the active run behind a snapshot without ids, on the
-    shape of the M3-crash transcript (2026-10-13 00:33Z, chat 0c5d682c)."""
+    shape of the M3-crash transcript (2026-10-13)."""
 
     CHAT = "0c5d682c-afaa-44f9-99a9-ada05599c997"
     M = "7371727a-1373-4108-9650-13b909f067b7"
@@ -7573,7 +7573,7 @@ class RecoveryLinkTests(unittest.TestCase):
                          turn_message_id(self.KEY, other, self.CHAT))
 
     def test_the_transcript_cannot_name_the_active_run(self):
-        """Why no message is opened from the transcript (manager note 1): a
+        """Why no message is opened from the transcript (a review note): a
         queued follow-up runs with NO transcript turn (M3-crash: 04351f67 ran
         after recovery f2445aa8 and left nothing, checked live). So 'run R
         still active' and 'R failed unclosed, queued follow-up F active' are
@@ -8204,7 +8204,7 @@ class TurnWriterEndTests(_TurnWriterCase):
         return task
 
     async def test_an_announce_after_a_silent_parent_does_not_take_the_parents_card(self):
-        """ELI-227 (live chat 0a13a1d4 on 2026.10.5): the parent spawned a
+        """ELI-227 (OpenClaw 2026.10.5): the parent spawned a
         sub-agent and answered NO_REPLY, which leaves no closing message in
         the transcript. The announce run has no user turn either, so its span
         ran back to the parent's sessions_spawn call: its message showed that
@@ -8254,7 +8254,7 @@ class TurnWriterEndTests(_TurnWriterCase):
         """A Send now (or a send from another tab) mid-reply: the reply's
         request parked its run, saved "Stopped" and an empty line into M's
         status history (pipe.py `park`, then the reply's end), and handed M to
-        this writer (W5 chat 1ac3323c, message 0cb40f0e)."""
+        this writer."""
         shown = _TurnRenderer()
         shown.feed(_delta("Reading them."))
         self.owui.msgs()["m1"] = {"id": "m1", "role": "assistant", "parentId": "q1",
@@ -8265,7 +8265,7 @@ class TurnWriterEndTests(_TurnWriterCase):
                            request=request)
 
     async def test_a_run_the_writer_finishes_ends_with_the_usage_line(self):
-        """ELI-210 (W5, QA C20): a reply the writer finished (a wake, a
+        """ELI-210: a reply the writer finished (a wake, a
         sub-agent result, a takeover) had no usage line, which the normal
         reply always shows after its text. Saved with the message, so a
         reload keeps it, and sent to open tabs."""
@@ -8436,7 +8436,7 @@ class TurnWriterEndTests(_TurnWriterCase):
         self.assertEqual(w.resumes, 1)
 
     async def test_a_row_of_another_run_resumes_only_that_run(self):
-        """ELI-159 (manager chat 56b98d09, 2026-10-16 07:36:55): one settled
+        """ELI-159 (2026-10-16 07:36:55): one settled
         row reached two writers of the session, 3df09ca2's (its run killed
         at 07:33) and f93028bc's (sessions_send run ad4cc4fc, killed after
         2 s). Both resumed; the second chat.send became a follow-up of the
@@ -8529,8 +8529,7 @@ class TurnWriterEndTests(_TurnWriterCase):
         self.assertTrue(w.closed)
 
     def _aborted_transcript(self, text="Reading them."):
-        """An aborted claude-cli run as the Gateway stores it (chat 0abe9bde,
-        run 64028b9f, 2026-10-14 05:37:25): chat.abort writes the streamed
+        """An aborted claude-cli run as the Gateway stores it (2026-10-14): chat.abort writes the streamed
         text as a gateway-injected message, the CLI then writes its own
         aborted closer with the same text, and none of the run's tool calls
         is ever imported."""
@@ -8688,7 +8687,7 @@ class TurnWriterEndTests(_TurnWriterCase):
 
 
 class ResumeRequestReviewTests(_TurnWriterCase):
-    """Review 2af1 of #20 at bbbcc17 (projects/review-pr20/test_review_pr20.py):
+    """A review of #20:
     the request a resume quotes (893bac8) must survive a re-created writer,
     a long request, its own rule lines, a metadata block and attachments."""
 
@@ -9179,7 +9178,7 @@ class AgentTurnRoutingTests(_RoutingCase):
                          "lines 1-10 are reply 1's; 26-30 are what the transcript adds")
 
     async def test_handover_after_an_owui_restart_takes_the_stub_its_run_id_names(self):
-        """2026-10-12 23:29Z, chat 0abe9bde (fails on main 787a471, where it
+        """2026-10-12 23:29Z (fails on main 787a471, where it
         was `test_relay_writes_into_the_stub_its_run_id_names_when_history_fails`):
         Open WebUI was OOM-restarted mid-turn, so no request and no target
         remain. chat.history failed with an empty TimeoutError, and main's
@@ -10048,7 +10047,7 @@ class InlineRewriteWiringTests(unittest.TestCase):
 
 
 class SupersededLoadTests(unittest.IsolatedAsyncioTestCase):
-    """ELI-102 (chat 56b98d09, bubble d04f9254, 2026-10-13 01:52:57Z): a turn
+    """ELI-102 (2026-10-13 01:52:57Z): a turn
     an older load of the Function admitted met that load's retired connection
     and was lost as "gateway connection retired". The current load serves it."""
 
@@ -11076,7 +11075,7 @@ class RunSpanTests(unittest.TestCase):
     """A run's messages in chat.history never include another run's."""
 
     def test_an_announce_run_without_a_user_turn_does_not_take_the_parents_card(self):
-        """Live gate 2026-10-13 (chat a72bba4c): a sub-agent announce run
+        """A gate run, 2026-10-13: a sub-agent announce run
         (`announce:v1:...`) has no `<id>:user` turn. Its span ran back to the
         parent run's user message and took the parent's sessions_spawn card
         and closing message, so the announce message showed a card it never
@@ -11284,7 +11283,7 @@ class EventGapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(q.get_nowait()["type"], "_pipe_gap")
 
 class NeedsInputMarkerTests(unittest.IsolatedAsyncioTestCase):
-    """ELI-107 (2026-10-14 02:07Z, chat 0abe9bde): a report that QUOTED a
+    """ELI-107 (2026-10-14 02:07Z): a report that QUOTED a
     needs-input block in a fenced code block, after 48 tool calls, was held
     as a live prompt from the fence on: nothing more streamed, the card's
     first call failed (the turn came from an API session, no socket), and
@@ -11672,7 +11671,7 @@ class InlineOwnerRuleTests(unittest.IsolatedAsyncioTestCase):
         self.assert_no_call_left_for_open_webui(items)
 
     async def test_a_settled_row_read_before_the_kill_reaches_the_reply_still_decides(self):
-        """ELI-159 (manager chat 56b98d09, 2026-10-16): claude-cli was
+        """ELI-159 (2026-10-16): claude-cli was
         OOM-killed at 07:33:14 and the reply handed 3df09ca2 over at 07:33:26.
         The settled push had come in between, when no pump was there to take
         it, so the writer waited for the session's next settle, another run's
@@ -12107,8 +12106,8 @@ class GapHandoverReplayTests(_RoutingCase):
     def _nums(a, b):
         return "".join(f"{i}\n" for i in range(a, b + 1))
 
-    async def test_the_98891cbb_shape_a_drop_right_after_the_send(self):
-        """2026-10-12, chat 98891cbb: the socket dropped right after the reply
+    async def test_a_drop_right_after_the_send(self):
+        """2026-10-12: the socket dropped right after the reply
         registered, so lines 1-3 never arrived. The message gets the whole
         run once, from the writer. The request, which showed nothing, leaves
         it alone: no partial save into the writer's message, no transcript
@@ -12674,8 +12673,8 @@ class SessionIdRunTests(_RoutingCase):
     runId = sessionId (run-executor.runtime-ro-4Z0fM.mjs:499): the id names no
     single wake, and the row stays hasActiveRun:false while a wake runs.
 
-    Live 2026-10-13, chat 0abe9bde, pipe 62b9927: a wake ran 03:02:39-03:26:39Z.
-    The writer opened 96b8c998 = uuid5(key:sessionId). At 03:13:46Z a manager
+    2026-10-13, pipe 62b9927: a wake ran 03:02:39-03:26:39Z.
+    The writer opened 96b8c998 = uuid5(key:sessionId). At 03:13:46Z a user
     message queued behind the wake pushed a settle row (lastRunId = the previous
     user turn), which ended the wake's writer 13 minutes early. On main 787a471
     the next wake (03:34Z) got the first wake's tail instead of its own text.
@@ -12729,7 +12728,7 @@ class SessionIdRunTests(_RoutingCase):
         self.jobs = [{"id": self.JOB, "sessionTarget": f"session:{self.key}",
                       "state": {"runningAtMs": self.tick()}}]
 
-    def wake_turn(self, key, text="Wake (worker ELI-100): deploy finished.", started=False):
+    def wake_turn(self, key, text="Wake: deploy finished.", started=False):
         """The cron executor marks its job running (unless `started` already),
         then commits the wake's user turn before the CLI starts."""
         at = self.tick()
@@ -13008,7 +13007,7 @@ class SessionIdRunTests(_RoutingCase):
         self.assertEqual(second["content"], "Second wake. All done.")
 
     async def test_a_transcript_without_the_wakes_tool_calls_never_replaces_its_cards(self):
-        """Gate 2026-10-13 (a3bfac2, wake-then-user, chat 6ad6778d): with a
+        """Gate 2026-10-13 (a3bfac2, wake-then-user): with a
         user turn queued behind it, the wake's claude-cli session was never
         imported; chat.history held its text but none of its 4 tool calls. A
         rebuild from that window must keep the cards that streamed, whatever
@@ -13042,7 +13041,7 @@ class SessionIdRunTests(_RoutingCase):
         self.assertEqual(m["content"], "WQ-DONE")
 
     async def test_a_wake_that_failed_before_its_turn_opens_nothing_and_its_retry_gets_its_own(self):
-        """Gate 2026-10-13 (two-wakes, chat 5327e981): job b fired while wake a
+        """Gate 2026-10-13 (two-wakes): job b fired while wake a
         ran. Cron admission compares the session entry with its snapshot
         (isolated-agent-C_VaOV3U.mjs:885-889, any field but label, pinnedAt,
         updatedAt) and threw CronSessionLifecycleClaimError "changed while
@@ -13377,7 +13376,7 @@ class SessionIdRunTests(_RoutingCase):
                                turn_message_id(self.key, self.W2, self.CHAT): "Second wake."})
 
     async def stray_judged_while_the_next_wake_runs(self, after_final, *, cron_events=True):
-        """W1's repro (ELI-181): every wake leaves a trailing sessionId event
+        """The repro (ELI-181): every wake leaves a trailing sessionId event
         after its final, judged stray on a pump of its own. Judging it awaits
         cron.list; wake two runs meanwhile, into that pump's queue. The
         judgment returns stray, the pump ends, and wake two's events went
@@ -13625,7 +13624,7 @@ class GatewayOwnerNeverRecoversTests(_RoutingCase):
 
 
 class MediaDirectiveCodeAwareTests(unittest.IsolatedAsyncioTestCase):
-    """ELI-111 (2026-10-14, chat 0abe9bde, message 442ecfa3): a report that
+    """ELI-111 (2026-10-14): a report that
     quoted media directives in inline code had one of them, inside a
     double-backtick span, rendered as an image with a line break inserted.
     The grammar matched the directive anywhere. Like the ask marker since

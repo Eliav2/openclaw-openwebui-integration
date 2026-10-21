@@ -1260,7 +1260,7 @@ def test_the_status_action_lists_a_running_subagent_and_opens_its_drawer(token):
 
 
 def test_a_subagent_spawned_after_the_status_dialog_opened_is_listed_while_it_stays_open(token):
-    """ELI-260 (QA C27): opened while the chat's run went on, the dialog
+    """ELI-260: opened while the chat's run went on, the dialog
     listed no child and stopped following, so a child spawned after the open
     stayed out of it until a reopen."""
     chat_id, _ = _chat_turn(token, "Respond with exactly: E2E_USAGE_CHAT")
@@ -1303,7 +1303,7 @@ def test_a_subagent_spawned_after_the_status_dialog_opened_is_listed_while_it_st
 
 
 def test_a_subagent_done_in_the_open_status_dialog_shows_its_result_and_the_chats_context(token):
-    """ELI-262 (QA C31): opened right after the chat's first message, the
+    """ELI-262: opened right after the chat's first message, the
     dialog never showed a Context, and once its sub-agent was Done it stopped
     refreshing, before the child's result line arrived; a reopen showed both."""
     status, me = _request("GET", "/api/v1/auths/", token=token)

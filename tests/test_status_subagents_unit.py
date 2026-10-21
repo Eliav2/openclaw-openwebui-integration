@@ -581,7 +581,7 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
 
     async def test_a_dialog_opened_before_the_chats_run_starts_follows_it(self):
-        """ELI-260 reopened (QA C27, 1 in 5): opened 0.3 s after a send, the
+        """ELI-260 reopened (1 in 5): opened 0.3 s after a send, the
         dialog read the chat's session before the Gateway had its run
         (`hasActiveRun` false; the Pipe's chat.send was still in flight), so
         it stopped at once and the child the run spawned never showed. The
@@ -666,7 +666,7 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen[-1]["tasks"][-1]["terminalSummary"], "X is fine")
 
     async def test_a_child_done_in_the_open_dialog_gets_its_result_and_the_chat_its_context(self):
-        """QA C31: a child that ended while the dialog followed it showed Done
+        """A child that ended while the dialog followed it showed Done
         with no result line, and the dialog stopped there: a claude-cli
         child's messages reach its transcript after its run settles. Context,
         read at an open right after a send, had no data yet and never got it.
@@ -710,7 +710,7 @@ class FinishedWhileOpenTests(unittest.IsolatedAsyncioTestCase):
         conn.ensure_message_subscription.assert_any_await(CHILD_A)
 
     async def test_a_childs_result_reads_the_same_in_the_open_dialog_and_a_fresh_open(self):
-        """ELI-264 (QA C32): the Gateway gives a child's last message two ways.
+        """ELI-264: the Gateway gives a child's last message two ways.
         `sessions.list` with `includeLastMessage` has it as `lastMessagePreview`,
         markdown flattened (2026.10.5 session-transcript-title-reader:
         flattenMarkdown); `sessions.preview` has the transcript's text as
@@ -947,7 +947,7 @@ class ChildIndexTests(unittest.IsolatedAsyncioTestCase):
             {"key": PARENT_KEY, "status": "running"},
             # A visible spawn (`visible: true`): no run status, but ended.
             _child("agent:main:dashboard:dddddddd-0000-0000-0000-000000000004", None,
-                   label="W1: engine", startedAt=1500, endedAt=1800),
+                   label="engine review", startedAt=1500, endedAt=1800),
         ]
         gw = _WindowGateway(rows)
         data = (await self._open(gw))[-1]
@@ -955,7 +955,7 @@ class ChildIndexTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([(t["id"][-4:], t["status"]) for t in data["tasks"]],
                          [("0002", "failed"), ("0004", "ended"), ("0001", "completed")])
         self.assertEqual(data["tasks"][0]["error"], "provider 529")
-        self.assertEqual(data["tasks"][1]["title"], "W1: engine")
+        self.assertEqual(data["tasks"][1]["title"], "engine review")
         self.assertEqual(data["total"], 3)
 
     def test_the_pipe_records_the_task_an_accepted_spawn_was_given(self):

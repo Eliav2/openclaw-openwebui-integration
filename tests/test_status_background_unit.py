@@ -35,7 +35,7 @@ CHILD = "agent:main:subagent:aaaaaaaa-0000-0000-0000-000000000001"
 
 
 # What the 9.3 Gateway answers, as the probe recorded it
-# (projects/session-manager/eli163/probe-9.3.json), trimmed.
+# (a probe on 9.3), trimmed.
 def _task(kind, status, **kw):
     return {"id": f"t-{kind}-{status}", "kind": kind, "runtime": "cli", "status": status,
             "sessionKey": KEY, "ownerKey": KEY, "createdAt": NOW - 60_000, "startedAt": NOW - 60_000, **kw}
@@ -54,7 +54,7 @@ EXEC_CARD = [
      "output": [{"type": "output_text", "text": "Command still running (session good-lagoon, pid 2816)."}]},
 ]
 # ELI-232: an agent's exec names its purpose in `title`.
-TITLED_COMMAND = ("cd /home/user/.openclaw/workspace/projects/session-manager && "
+TITLED_COMMAND = ("cd /home/user/.openclaw/workspace/projects/ci && "
                   "python3 ci_wake.py 163 --sha 2ef4275 > /tmp/w.log 2>&1")
 TITLED_CARD = [
     {"type": "function_call", "id": "c2", "call_id": "c2", "name": "exec",

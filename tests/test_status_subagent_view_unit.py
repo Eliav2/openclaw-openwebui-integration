@@ -34,7 +34,7 @@ OTHER = "agent:main:subagent:bbbbbbbb-0000-0000-0000-000000000002"
 NOW = 1_783_790_100_000
 
 # A real sub-agent, shortened: a 1,200-character prompt as its task.
-LONG_TASK = ("Repo: private GitHub repo example/invest-bot (gh: GH_CONFIG_DIR=/home/user/.config/gh; the local clone "
+LONG_TASK = ("Repo: private GitHub repo example/trade-bot (gh: GH_CONFIG_DIR=/home/user/.config/gh; the local clone "
              "is STALE with no commits: re-clone into your scratchpad). Workflow "
              ".github/workflows/bench.yml, code in experiments/bench/. ") + "Goal: a head-to-head, net of fees. " * 31
 LONG_RESULT = "Now rewriting run.sh and the workflow into a two-phase matrix. Polling. " * 14
@@ -67,7 +67,7 @@ def _page(body: str, payload: dict) -> dict:
 
 def _rows():
     """A labelled child with a 1,200-character task and an unlabelled one."""
-    labelled = _subagent_row({"key": CHILD, "label": "invest-bot: freqtrade head-to-head", "status": "done",
+    labelled = _subagent_row({"key": CHILD, "label": "trade-bot: freqtrade head-to-head", "status": "done",
                               "startedAt": NOW - 65_000, "endedAt": NOW - 5_000}, LONG_TASK, LONG_RESULT[:240])
     unlabelled = _subagent_row({"key": OTHER, "status": "running", "startedAt": NOW - 30_000,
                                 "lastMessagePreview": "Reading the noise table."}, LONG_TASK)
@@ -85,13 +85,13 @@ class TitleTests(unittest.TestCase):
 
     def test_a_labelled_child_is_titled_with_its_label(self):
         labelled, _ = _rows()
-        self.assertEqual(labelled["title"], "invest-bot: freqtrade head-to-head")
+        self.assertEqual(labelled["title"], "trade-bot: freqtrade head-to-head")
         self.assertEqual(labelled["task"], LONG_TASK)    # the drawer's Task section
 
     def test_an_unlabelled_child_gets_its_tasks_first_sentence_cut_to_60(self):
         _, unlabelled = _rows()
         self.assertLessEqual(len(unlabelled["title"]), 60)
-        self.assertTrue(unlabelled["title"].startswith("Repo: private GitHub repo example/invest-bot"),
+        self.assertTrue(unlabelled["title"].startswith("Repo: private GitHub repo example/trade-bot"),
                         unlabelled["title"])
         self.assertTrue(unlabelled["title"].endswith("…"), unlabelled["title"])
 
@@ -117,7 +117,7 @@ console.log(JSON.stringify(byData(section, 'openclawRow').map((row) => ({
 }))));
 """, {"open": _render_modal_open_js(IDENTITY), "fill": _section(_rows())})
         one_line = {"whiteSpace": "nowrap", "textOverflow": "ellipsis", "lineClamp": None}
-        self.assertEqual(seen[0]["title"], ["invest-bot: freqtrade head-to-head", one_line])
+        self.assertEqual(seen[0]["title"], ["trade-bot: freqtrade head-to-head", one_line])
         self.assertEqual(seen[0]["chip"], "Done")
         self.assertEqual(seen[0]["preview"], "2")
         self.assertLessEqual(len(seen[1]["title"][0]), 60)
@@ -165,7 +165,7 @@ console.log(JSON.stringify({
         self.assertIn("re-clone", seen["header"])                  # the task, clamped
         self.assertEqual(seen["task"]["lineClamp"], "2")
         self.assertNotIn("two-phase matrix", seen["header"])       # the reply is the run's
-        self.assertIn("invest-bot: freqtrade head-to-head", seen["header"])
+        self.assertIn("trade-bot: freqtrade head-to-head", seen["header"])
         self.assertIn("claude-opus-5-5 · from Investing upkeep", seen["header"])
         self.assertEqual(seen["title"], {"whiteSpace": "nowrap", "textOverflow": "ellipsis", "lineClamp": None})
         self.assertEqual(seen["chip"], "Done")
