@@ -1537,11 +1537,11 @@ process.stdout.write(JSON.stringify(f ? f.textContent : null));
 
 
 class ControlUiLinkTests(unittest.IsolatedAsyncioTestCase):
-    """ELI-141 (Eliav, 2026-10-15): the Status dialog links to this session in
+    """ELI-141 (2026-10-15): the Status dialog links to this session in
     the OpenClaw Control UI, and the sub-agent drawer to the child's. The
     route is the Control UI's short-id form, `/chat/<agent>/<hex of the key's
     trailing UUID>`, which its `sessions.resolve {shortId}` maps back to the
-    key (checked live on 9.3 for chat 56b98d09)."""
+    key (checked on 9.3)."""
 
     BASE = "https://claw.example.com/"
     CHAT = "56b98d09-f3b7-4e4f-b2bb-688ce63bfa53"

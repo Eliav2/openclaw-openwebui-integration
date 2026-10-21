@@ -160,7 +160,7 @@ class AskUserToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(tabs.removed_from("sid-own"))
 
     async def test_asked_with_no_tab_open_it_waits_and_shows_when_a_tab_opens_the_chat(self):
-        """Eliav asks, closes the tab (or the phone sleeps), comes back later:
+        """The user asks, closes the tab (or the phone sleeps), comes back later:
         the question is still there to answer."""
         conn, tabs = FakeConn(), Tabs(self)
         self.ask(conn, turn=FakeTurn("sid-gone"))

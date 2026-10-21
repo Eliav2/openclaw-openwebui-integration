@@ -180,7 +180,7 @@ ASK_MULTI = ("OpenClaw needs input:\n\nToppings (multiselect)\nWhich toppings?\n
 ASK_SECRET = "OpenClaw needs input:\n\nTest token\nPaste the test API token (password)"
 ASK_SECRET_STEPS = "OpenClaw needs input:\n\nToken\nPaste your API key:\n1. Open Settings\n2. Copy the key"
 ASK_MENTIONS_SECRET = ("OpenClaw needs input:\n\nRouter entry\nOK to add the router-debug entry "
-                       "so W6 can use the password?\n1. Yes\n2. No")
+                       "so the deploy can use the password?\n1. Yes\n2. No")
 ASK_YES_NO_HE = "OpenClaw needs input:\n\nמחיקה\nלמחוק את הקובץ? (כן/לא)"
 WAKE_ASK = "E2E_WAKE_ASK_START " + " ".join(f"slow-{i}" for i in range(1, 7)) + "\n\n" + ASK_SINGLE
 

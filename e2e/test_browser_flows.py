@@ -336,7 +336,7 @@ def test_a_choice_that_mentions_a_password_keeps_its_options(page):
 def test_a_secret_ask_with_numbered_steps_keeps_the_masked_dialog(page):
     """Asking for an API key with the steps as a numbered list is still a
     secret: the masked dialog, never a card whose Other field would put the
-    key in the chat (W3 on ELI-196)."""
+    key in the chat (ELI-196)."""
     capture.new_chat(page)
     capture.send(page, "E2E_ASK_SECRET_STEPS")
     _wait(page, "() => document.body.innerText.includes('Paste your API key') "
@@ -978,7 +978,7 @@ DRAWER_CLOSABLE = """() => {
 @pytest.mark.parametrize("screen", ["desktop", "phone"])
 def test_a_long_task_shown_whole_keeps_the_drawer_closable(page, token, screen):
     """Sub-agent drawer, "Show all" on a long task (ELI-201): the task grew
-    with no cap, past the bottom of the screen, and Eliav could not close the
+    with no cap, past the bottom of the screen, and the user could not close the
     drawer. Shown whole, it scrolls in its own box and the close control
     stays in reach."""
     view = page if screen == "desktop" else capture.signed_in_page(page.context.browser, token, capture.SMALL_PHONE)
