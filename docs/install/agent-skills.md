@@ -1,3 +1,5 @@
+# Agent skills
+
 Two features need your agent to know a convention: asking you a question as a dialog, and sending you an image or file. Two skills in this repo teach it both; install them on the Gateway host.
 
 Applies to: Pipe

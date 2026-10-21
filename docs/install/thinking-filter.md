@@ -1,3 +1,5 @@
+# Thinking control
+
 The thinking filter adds a per-chat thinking control to the composer, so you can set how hard the agent thinks before answering, chat by chat. It is an optional, separate function: install it, then attach it to your OpenClaw models.
 
 Applies to: Filter, Pipe

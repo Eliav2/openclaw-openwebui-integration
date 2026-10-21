@@ -1,3 +1,5 @@
+# The installer
+
 `install.py` installs, updates, repairs and health-checks the Pipe through Open WebUI's REST API, so it needs your Open WebUI admin email and password. If you'd rather not give a script those, use the [manual install](./manual.md): same result.
 
 Applies to: Pipe

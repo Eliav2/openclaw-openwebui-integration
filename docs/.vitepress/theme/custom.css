@@ -1,0 +1,16 @@
+/* One accent: the crab claw's red-orange. */
+:root {
+  --vp-c-brand-1: #c9452a;
+  --vp-c-brand-2: #e4572e;
+  --vp-c-brand-3: #e4572e;
+  --vp-c-brand-soft: rgba(228, 87, 46, 0.14);
+}
+.dark {
+  --vp-c-brand-1: #f0805f;
+  --vp-c-brand-2: #e86b47;
+  --vp-c-brand-3: #e4572e;
+  --vp-c-brand-soft: rgba(228, 87, 46, 0.16);
+}
+
+/* The home page's list of every page, below the feature cards. */
+.VPHome .vp-doc { margin-top: 48px; }

@@ -1,3 +1,5 @@
+# Manual install
+
 Install the Pipe by pasting one file into Open WebUI's admin panel and setting a few valves. No script and no credentials shared; you end up where the installer would have left you.
 
 Applies to: Pipe

@@ -1,0 +1,68 @@
+name: Docs site
+
+# The VitePress site built from docs/ (ELI-234). Every pull request that touches the docs builds
+# it: the build fails on a dead internal link. A push to main also deploys it to GitHub Pages,
+# https://eliav2.github.io/openclaw-openwebui-integration/ (Settings > Pages > Source: GitHub Actions).
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - docs/**
+      - README.md
+      - package.json
+      - bun.lock
+      - .github/workflows/docs.yml
+  push:
+    branches: [main]
+    paths:
+      - docs/**
+      - package.json
+      - bun.lock
+      - .github/workflows/docs.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+
+      - run: bun install --frozen-lockfile
+
+      - name: Build (fails on a dead link)
+        run: bun run docs:build
+
+      - name: The agent files are there
+        run: |
+          for f in llms.txt llms-full.txt index.html install/quickstart.md; do
+            test -s "docs/.vitepress/dist/$f" || { echo "missing $f"; exit 1; }
+          done
+
+      - uses: actions/upload-pages-artifact@v5
+        if: github.event_name != 'pull_request'
+        with:
+          path: docs/.vitepress/dist
+
+  deploy:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

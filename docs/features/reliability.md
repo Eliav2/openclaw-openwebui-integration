@@ -1,3 +1,5 @@
+# Reliability
+
 What keeps a reply whole when things go wrong: one self-healing connection, messages that queue instead of colliding, replies that survive a reload or a restart of either side, a Stop that really stops, and redeploys that leave nothing behind.
 
 Applies to: Pipe

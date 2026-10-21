@@ -16,7 +16,7 @@ A user-visible feature is anything a user sees, sets or runs: something in the c
 
 1. **`docs/features/index.md`:** its bullet, linking to its section.
 2. **Its page:** the section in `docs/features/` (or `docs/install/` for setup) that describes it, with its valves linked to `docs/configuration.md#<valve>`. `docs/configuration.md` is generated from the Valves classes: run `python3 build.py --all` after changing a valve.
-3. **The README's "What you get":** only when the feature is headline-level. Its image then also goes in the README's "In pictures".
+3. **The README's "What you get":** only when the feature is headline-level, as a bullet linking to its page on the docs site. The README stays short: details live on the site (`docs/`), and a new page goes in the site's sidebar in `docs/.vitepress/config.mts` (see [Development](docs/development.md#the-docs-site)).
 4. **Its screenshot:** a scene in `scripts/screenshots/scenes.json` and `capture.py`, taken by the Screenshots workflow, committed to `docs/img/` and shown next to its description as `<img src="..." alt="..." width="...">`, never `![alt](path)`: github.com shows an image without a width across the whole page. Width by kind: a phone shot 320, a strip (3x wider than tall) half its pixel width, a wide desktop shot half its pixel width up to 800. A feature with nothing on screen shows real log or command output as a code block instead.
 5. **`docs/versions.md`:** when the feature needs a newer Open WebUI or OpenClaw than the minimums.
 

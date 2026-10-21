@@ -1,7 +1,9 @@
+# Chat
+
 What a reply looks like in the chat: live text, the agent's tool calls as real cards, failures marked, images and files both ways, a usage line under each reply, and chat titles. Everything here works as soon as the Pipe is installed, except where a section says otherwise.
 
 Applies to: Pipe (the thinking level also needs the thinking filter)
-Valves: `USE_OWUI_FILES`, `OWUI_BASE_URL`, `OWUI_API_KEY`, `ENABLE_FILE_SERVER`, `FILE_SERVER_BASE_URL`, `AUTO_TITLE`, `TITLE_GEN_AGENT_ID`
+Valves: `USE_OWUI_FILES`, `OWUI_BASE_URL`, `OWUI_API_KEY`, `ENABLE_FILE_SERVER`, `FILE_SERVER_BASE_URL`, `AUTO_TITLE`, `TITLE_GEN_AGENT_ID`, `LIVE_VIEW_URL`, `LIVE_VIEW_TOOLS`, `LIVE_VIEW_USERS`
 
 ## Streaming
 
@@ -56,17 +58,19 @@ A tool that was announced but never returned, because the run was cancelled or c
 
 Always on.
 
-## Live view of the agent's browser
+## Embed your own page in tool-using replies
 
-<img src="../img/live-view-light.png" alt="A reply that checked a dashboard in a browser: the browser's page shown inside the message, marked live, above the reply's text" width="320">
+A hook for a page you serve yourself. When a reply first makes a tool call that matches a pattern, the Pipe adds your page's address to that reply as an embed. Open WebUI shows it inside the message, under the reply, and keeps it with the message.
 
-When a reply first uses a browser tool, the Pipe can add a page to that reply that shows the agent's browser while it works. Open WebUI shows it inside the message, under the reply, and keeps it with the message.
+The Pipe ships no such page and no viewer: it only passes the address on. Without a service of your own behind that address, there is nothing to show.
 
-The page comes from a service you run that watches your agent's browser, not from the Pipe: set [`LIVE_VIEW_URL`](../configuration.md#live_view_url) to its address, with `{chat_id}` and `{message_id}` where the chat's and the reply's ids go, for example `https://browser.example.org/embed?chat={chat_id}&message={message_id}`. The service finds the browser that this chat and reply drive and shows it.
+- [`LIVE_VIEW_URL`](../configuration.md#live_view_url): your page's address, with `{chat_id}` and `{message_id}` where the chat's and the reply's ids go, for example `https://viewer.example.org/embed?chat={chat_id}&message={message_id}`. The two ids are all your service gets to know which reply it is showing.
+- [`LIVE_VIEW_TOOLS`](../configuration.md#live_view_tools): which tool calls add it, a pattern searched in the tool's name and arguments. The default is browser use: the `browser` tool, `openclaw browser` commands (how the agent drives its browser through exec) and commands that run Playwright or Chromium. If your agent starts a browser through a script of its own, add the script to the pattern.
+- [`LIVE_VIEW_USERS`](../configuration.md#live_view_users): limits it to some users.
 
-Which tool calls count as browser use is [`LIVE_VIEW_TOOLS`](../configuration.md#live_view_tools), a pattern searched in the tool's name and arguments: by default the `browser` tool, `openclaw browser` commands (how the agent drives its browser through exec) and commands that run Playwright or Chromium. [`LIVE_VIEW_USERS`](../configuration.md#live_view_users) limits it to some users.
+The valves are named after the use the hook was built for, a live view of the agent's browser, but the page can be anything your service serves for a reply. See [our own setup as one example](../examples/live-browser-view.md).
 
-Open WebUI shows the page in a sandboxed frame, as it does every embed, so the page cannot reach Open WebUI or your login. The service itself decides who may see the browser: put it behind your own login.
+Open WebUI shows the page in a sandboxed frame, as it does every embed, so the page cannot reach Open WebUI or your login. Your service decides who may see what it shows: put it behind your own login.
 
 Off by default. Replies you send get it; replies the agent starts itself do not.
 

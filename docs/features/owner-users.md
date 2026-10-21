@@ -1,3 +1,5 @@
+# Owner users
+
 By default every Open WebUI user talks to your agent as the Gateway's owner. If people other than you can sign in to Open WebUI, list yourself in `OWNER_USERS` so everyone else's chats run without owner rights.
 
 Applies to: Pipe, Action

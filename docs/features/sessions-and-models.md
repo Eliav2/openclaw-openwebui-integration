@@ -1,3 +1,5 @@
+# Sessions and models
+
 Each Open WebUI chat is one stable OpenClaw session, so the agent remembers the conversation, and the model picker lists the models your Gateway actually has. Pick one per chat, or pick OpenClaw · Default to use the agent's own model.
 
 Applies to: Pipe

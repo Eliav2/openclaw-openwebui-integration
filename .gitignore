@@ -20,3 +20,6 @@ venv/
 # Never commit real OWUI_EMAIL/OWUI_PASSWORD/GATEWAY_TOKEN values.
 .env.local
 
+node_modules/
+docs/.vitepress/cache/
+docs/.vitepress/dist/

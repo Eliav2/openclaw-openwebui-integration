@@ -177,6 +177,26 @@ E2E_SHARD=2 uv run --with-requirements requirements-dev.txt pytest -v e2e/test_e
 
 ---
 
+## The docs site
+
+`docs/` is the source of the docs site, [eliav2.github.io/openclaw-openwebui-integration](https://eliav2.github.io/openclaw-openwebui-integration/), built with [VitePress](https://vitepress.dev). Pages stay plain Markdown that also reads on github.com:
+
+- Every page starts with a `# Title`, then its one-line summary.
+- Images are `<img src alt width>` tags, as the docs test requires. Callouts are GitHub's `> [!NOTE]` form, which VitePress renders too.
+- Link to other pages by their relative `.md` path. A link to a file outside `docs/` (a function, `SECURITY.md`, `skills/`) works on GitHub as it is; the site points it at the file on GitHub.
+- No Vue components or VitePress-only syntax in a page. The home page's hero and feature cards live in `docs/.vitepress/config.mts`, so `docs/index.md` stays a plain list on GitHub.
+- A new page goes in the sidebar in `docs/.vitepress/config.mts`.
+
+Run it locally with [bun](https://bun.sh):
+
+```bash
+bun install
+bun run docs:dev     # live preview at http://localhost:5173/openclaw-openwebui-integration/
+bun run docs:build   # what CI runs; fails on a dead internal link
+```
+
+The build also writes `llms.txt`, `llms-full.txt` and a raw `.md` next to every page, for agents. The `Docs site` workflow builds every pull request that touches the docs and deploys `main` to GitHub Pages.
+
 ## Driving the integration over the API
 
 You can send messages through the integration as if using the OWUI frontend by calling

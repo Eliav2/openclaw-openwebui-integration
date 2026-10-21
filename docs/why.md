@@ -1,3 +1,5 @@
+# Why this exists
+
 Why this integration exists, what the Gateway's native protocol gives you that a text-in, text-out API cannot, and when OpenClaw's built-in `/v1` endpoint is the better choice.
 
 Applies to: Pipe, Action, Filter

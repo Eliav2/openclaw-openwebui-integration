@@ -54,7 +54,22 @@ def image_width_limit(size: tuple, gif: bool = False) -> tuple:
 
 
 def markdown_files() -> list:
-    return [ROOT / "README.md"] + sorted((ROOT / "docs").rglob("*.md"))
+    """README and every docs page; not the site's build output and cache under docs/.vitepress."""
+    return [ROOT / "README.md"] + sorted(p for p in (ROOT / "docs").rglob("*.md") if ".vitepress" not in p.parts)
+
+
+SITE = "https://eliav2.github.io/openclaw-openwebui-integration/"
+
+
+def site_page(url: str):
+    """The docs/ page a docs-site URL serves (clean URLs: /features/ is features/index.md), or None."""
+    path = url[len(SITE):].partition("#")[0].rstrip("/")
+    if path.endswith((".txt", ".md")):
+        return ROOT / "docs" / path if path.endswith(".md") else None
+    for cand in (ROOT / "docs" / f"{path}.md", ROOT / "docs" / path / "index.md"):
+        if cand.exists():
+            return cand
+    return ROOT / "docs" / f"{path or 'index'}.md"
 
 
 def rel(p: Path) -> str:
@@ -100,6 +115,30 @@ class DocsLinkTests(unittest.TestCase):
                 elif frag and dest.suffix == ".md" and frag not in anchors(dest):
                     broken.append(f"{rel(md)}: {target} (no such heading)")
         self.assertEqual(broken, [])
+
+    def test_every_link_into_the_docs_site_names_a_page_and_heading(self):
+        """The README links to the site, not to docs/: each link must still name a page that
+        exists and a heading on it, so a renamed page or section breaks here, not for a reader."""
+        broken = []
+        for md in markdown_files():
+            for target in links(md):
+                if not target.startswith(SITE):
+                    continue
+                page, frag = site_page(target), target.partition("#")[2]
+                if page is None:
+                    continue    # llms.txt and llms-full.txt, which the build writes
+                if not page.exists():
+                    broken.append(f"{rel(md)}: {target} (no {rel(page)})")
+                elif frag and frag not in anchors(page):
+                    broken.append(f"{rel(md)}: {target} (no such heading)")
+        self.assertEqual(broken, [])
+
+    def test_site_page_maps_clean_urls(self):
+        self.assertEqual(site_page(SITE + "features/"), ROOT / "docs" / "features" / "index.md")
+        self.assertEqual(site_page(SITE + "install/quickstart#before-you-start"),
+                         ROOT / "docs" / "install" / "quickstart.md")
+        self.assertEqual(site_page(SITE), ROOT / "docs" / "index.md")
+        self.assertIsNone(site_page(SITE + "llms.txt"))
 
     def test_every_image_exists_fits_its_budget_and_is_used(self):
         used = set()
@@ -152,6 +191,32 @@ class DocsLinkTests(unittest.TestCase):
         self.assertEqual(image_size(DEMOS / "hero.gif"), (960, 640))
 
 
+class HiddenExamplesTests(unittest.TestCase):
+    """docs/examples/ describes our own setup, not the Pipe: each page is reachable only
+    through a link in the section it illustrates, and listed nowhere (sidebar, home page,
+    search, llms.txt)."""
+
+    def setUp(self):
+        self.pages = sorted((ROOT / "docs" / "examples").glob("*.md"))
+        self.config = (ROOT / "docs" / ".vitepress" / "config.mts").read_text()
+
+    def test_not_in_the_sidebar_or_the_home_page(self):
+        self.assertTrue(self.pages)
+        self.assertNotRegex(self.config, r'link:\s*"/examples/')
+        self.assertNotIn("examples/", (ROOT / "docs" / "index.md").read_text())
+
+    def test_not_in_search_or_llms_txt(self):
+        self.assertIn('ignoreFiles: ["examples/**"]', self.config)
+        self.assertIn('env.relativePath.startsWith("examples/") ? ""', self.config)
+
+    def test_each_is_linked_from_a_feature_page(self):
+        for page in self.pages:
+            with self.subTest(page=rel(page)):
+                linked = [rel(md) for md in markdown_files() if md.parent.name != "examples"
+                          and any((md.parent / l.split("#")[0]).resolve() == page for l in links(md))]
+                self.assertTrue(linked, f"nothing links {rel(page)}")
+
+
 class DocsWordingTests(unittest.TestCase):
 
     def test_no_em_dash(self):
@@ -173,8 +238,8 @@ class DocsWordingTests(unittest.TestCase):
 
 
 class VersionsTests(unittest.TestCase):
-    """The versions the README and docs/versions.md call tested are the
-    ones CI pins in e2e/versions.env."""
+    """The versions docs/versions.md calls tested are the ones CI pins in
+    e2e/versions.env. The README leaves versions to that page."""
 
     def setUp(self):
         env = dict(line.split("=", 1) for line in (ROOT / "e2e" / "versions.env").read_text().splitlines()
@@ -188,7 +253,7 @@ class VersionsTests(unittest.TestCase):
         return rows[0]
 
     def test_tested_versions_match_ci(self):
-        for path in (ROOT / "README.md", ROOT / "docs" / "versions.md"):
+        for path in (ROOT / "docs" / "versions.md",):
             with self.subTest(rel(path)):
                 self.assertIn(self.owui, self._row(path, "Open WebUI"))
                 self.assertIn(self.openclaw, self._row(path, "OpenClaw Gateway"))
@@ -199,8 +264,8 @@ class VersionsTests(unittest.TestCase):
         must be the documented minimum: lower lets a release the Pipe breaks
         on install it (spinning tool cards, missing agent replies)."""
         minimums = {self._row(path, "Open WebUI").split("|")[2].strip()
-                    for path in (ROOT / "README.md", ROOT / "docs" / "versions.md")}
-        self.assertEqual(len(minimums), 1, f"README and versions.md disagree: {minimums}")
+                    for path in (ROOT / "docs" / "versions.md",)}
+        self.assertEqual(len(minimums), 1, f"versions.md states no single minimum: {minimums}")
         tested = tuple(int(x) for x in self.owui.split("."))
         self.assertLessEqual(tuple(int(x) for x in next(iter(minimums)).split(".")), tested,
                              "the minimum is above the version CI tests")
