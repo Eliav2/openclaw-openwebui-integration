@@ -9,7 +9,7 @@ Valves: `USE_OWUI_FILES`, `OWUI_BASE_URL`, `OWUI_API_KEY`, `ENABLE_FILE_SERVER`,
 
 Text appears token by token as the Gateway sends it, so a long answer starts showing at once instead of landing in one block at the end.
 
-<img src="../img/streaming-light.png" alt="A reply part-way through: its first paragraph written, the rest still coming" width="320">
+<img src="../img/demos/streaming.gif" alt="A reply streaming in word by word: a changelog entry for the hourly view, paragraph by paragraph" width="800">
 
 Two provider quirks are handled so you never see them:
 
@@ -22,15 +22,11 @@ Always on.
 
 ## Tool cards
 
-<img src="../img/hero-tool-cards-light.png" alt="A reply mid-run: two finished tool cards and one still running" width="320">
-
 Tool calls are sent as Responses-API output items, so Open WebUI draws them with its own two-phase tool card: a spinner while the tool runs, the result when it finishes. Nothing is hand-rolled HTML, so the cards match the rest of the UI and survive a reload.
 
 Expand a card to see the arguments the agent passed and the result it got back. Arguments are capped at 3000 characters and results at 8000, so one huge tool result cannot bury the conversation.
 
 <img src="../img/demos/tool-cards.gif" alt="Two tool cards in a reply: each spins while its command runs and turns into a finished card, then the first is opened to its command and output" width="800">
-
-<img src="../img/tool-card-expanded-light.png" alt="A tool card opened: the command it ran and its output" width="320">
 
 A call that arrives without a tool-call id still shows: it falls back to a Markdown `<details type="tool_calls">` card rather than disappearing. The status row under the message says "Thinking..." for the whole run and does not repeat each call: the cards already show what is running, and Open WebUI saves every status change by rewriting the whole chat, so one per call made long chats slow.
 
@@ -50,7 +46,7 @@ Always on.
 
 ## Failed tools
 
-<img src="../img/failed-tool-live-light.png" alt="A reply streaming: a read card marked with a cross because the file is missing, and an exec card still running" width="320">
+<img src="../img/demos/failed-tool.gif" alt="A reply where the read of a missing deploy script fails and its card is marked failed, the build runs and finishes, then the failed card is opened to its path and error" width="800">
 
 A tool call that fails gets its card renamed to `<name> ❌` the moment the result arrives, on any card, not only the last one. The mark is part of the saved message, so it is still there after a reload. The expanded output opens with a `❌ tool call failed` line, so the reason is visible once you open the card.
 

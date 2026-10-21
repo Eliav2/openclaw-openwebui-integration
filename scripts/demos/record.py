@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Record the docs' demo GIFs from a running screenshot stack.
+"""Record the docs' demos from a running screenshot stack: a GIF, an MP4 and a WebM each.
 
 Each demo in demos.json is a short scripted session in a desktop Chromium:
 real Open WebUI, the installed Pipe and Action, a real Gateway and the
@@ -7,7 +7,10 @@ scripted model, so every run shows the same replies and leaves nothing in a
 real account. The page is captured with the DevTools screencast at 2x while
 a drawn cursor, a ripple on each click and a badge for each key make the
 steps easy to follow; ffmpeg then encodes the frames, with their real
-timing, into one light-theme GIF per demo.
+timing, into one light-theme recording per demo, three ways: a GIF for
+github.com (the Markdown shows it) and a muted MP4 and WebM at the capture's
+full 2x resolution, sharp text at a fraction of the GIF's size, which the docs
+site plays instead of the GIF (docs/.vitepress/config.mts).
 
     python3 scripts/demos/record.py --out docs/img/demos [--only hero,send-now]
 
@@ -40,6 +43,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 W, H = 960, 640            # CSS pixels; frames are captured at 2x and the GIF is W wide
 MAX_SECONDS = 15.0
 MAX_BYTES = 1024 * 1024
+MAX_VIDEO_BYTES = 1024 * 1024    # each of the MP4 and the WebM
+# While a step waits on the stack (the scripted model, a command), a frame the page holds longer
+# than this is dead time: the screen did not change, it only took that long on this runner.
+WAIT_HELD_MAX = 0.4
 TYPE_DELAY_MS = 45
 
 # The drawn cursor, the click ripple and the key badge: page elements that
@@ -89,9 +96,12 @@ class Recorder:
 
     def __init__(self, cdp):
         self.cdp, self.on = cdp, False
-        self.frames: list = []        # (timestamp, png bytes, starts a new segment)
+        self.frames: list = []        # (timestamp, jpeg bytes, starts a new segment)
         self._new_segment = True
+        self.cover: int | None = None  # the frame a `cover` step marked; None: the last
         self._acks: set = set()       # in flight; a task nobody holds can be collected
+        # Frame ranges of the steps that wait on the stack: (first, end, longest shown s or None).
+        self.waits: list = []
         cdp.on("Page.screencastFrame", self._frame)
 
     def _frame(self, ev) -> None:
@@ -113,7 +123,9 @@ class Recorder:
         await self.cdp.send("Page.stopScreencast")
 
     async def start(self) -> None:
-        await self.cdp.send("Page.startScreencast", {"format": "png", "maxWidth": W * 2, "maxHeight": H * 2,
+        # JPEG at high quality: at 2x, PNG frames took long enough to encode that the page ran slower.
+        await self.cdp.send("Page.startScreencast", {"format": "jpeg", "quality": 92,
+                                                     "maxWidth": W * 2, "maxHeight": H * 2,
                                                      "everyNthFrame": 1})
 
     def record(self, on: bool) -> None:
@@ -121,25 +133,61 @@ class Recorder:
             self._new_segment = True
         self.on = on
 
-    def write(self, work: str) -> tuple[str, float]:
-        """The frames as PNGs and an ffmpeg concat list with their real
-        durations; a pause in the recording shows as a 0.1 s cut."""
+    def durations(self) -> list:
+        """Each frame's time on screen: its real timing, except while a step waits on the stack.
+        There a frame held past WAIT_HELD_MAX is cut to it (nothing moved), and a wait with a
+        `show_ms` plays faster to fit it, so how fast this runner is never sets the length. A
+        pause in the recording shows as a 0.1 s cut."""
+        durs = []
+        for i, (ts, _, _) in enumerate(self.frames):
+            nxt = self.frames[i + 1] if i + 1 < len(self.frames) else None
+            durs.append(0.1 if nxt is None or nxt[2] else max(nxt[0] - ts, 0.01))
+        for first, end, show in self.waits:
+            for i in range(first, min(end, len(durs))):
+                durs[i] = min(durs[i], WAIT_HELD_MAX)
+            spent = sum(durs[first:end])
+            if show and spent > show:
+                for i in range(first, min(end, len(durs))):
+                    durs[i] = max(durs[i] * show / spent, 0.01)
+        return durs
+
+    def write(self, work: str, cover: float = 0.0) -> tuple[str, float]:
+        """The frames as JPEGs and an ffmpeg concat list with their durations (durations()).
+        With `cover` (s), the recording opens on its cover frame (the one a `cover` step
+        marked, else the last) for that long, then plays from the start: a still of it (its
+        first frame, its poster, a slow load, a link preview) shows the feature, not an empty
+        chat."""
         if not self.frames:
             raise RuntimeError("no frames were recorded")
         lines, total = [], 0.0
-        for i, (ts, png, _) in enumerate(self.frames):
-            path = os.path.join(work, f"{i:05d}.png")
+        if cover > 0:
+            path = os.path.join(work, "cover.jpg")
+            with open(path, "wb") as fh:
+                fh.write(self.frames[-1 if self.cover is None else self.cover][1])
+            total += cover
+            lines += [f"file '{path}'", f"duration {cover:.4f}"]
+        for (_, png, _), dur, i in zip(self.frames, self.durations(), range(len(self.frames))):
+            path = os.path.join(work, f"{i:05d}.jpg")
             with open(path, "wb") as fh:
                 fh.write(png)
-            nxt = self.frames[i + 1] if i + 1 < len(self.frames) else None
-            dur = 0.1 if nxt is None or nxt[2] else max(nxt[0] - ts, 0.01)
             total += dur
             lines += [f"file '{path}'", f"duration {dur:.4f}"]
-        lines.append(f"file '{os.path.join(work, f'{len(self.frames) - 1:05d}.png')}'")
+        lines.append(f"file '{os.path.join(work, f'{len(self.frames) - 1:05d}.jpg')}'")
         concat = os.path.join(work, "concat.txt")
         with open(concat, "w") as fh:
             fh.write("\n".join(lines) + "\n")
         return concat, total
+
+
+def jpeg_size(jpeg: bytes) -> str:
+    """WxH from a JPEG's frame header (SOF0/SOF2)."""
+    i = 2
+    while i + 9 < len(jpeg):
+        marker, length = jpeg[i + 1], int.from_bytes(jpeg[i + 2:i + 4], "big")
+        if marker in (0xC0, 0xC2):
+            return f"{int.from_bytes(jpeg[i + 7:i + 9], 'big')}x{int.from_bytes(jpeg[i + 5:i + 7], 'big')}"
+        i += 2 + length
+    return "?"
 
 
 def ffmpeg() -> str:
@@ -155,6 +203,34 @@ def encode(concat: str, out: str, fps: int = 20, colors: int = 128) -> int:
     subprocess.run([ffmpeg(), "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", concat,
                     "-vf", vf, "-loop", "0", out], check=True)
     return os.path.getsize(out)
+
+
+def encode_video(concat: str, out: str, crf: int) -> int:
+    """One muted video at the capture's 2x size (sharp text); the codec follows the extension.
+    Every frame is kept at its real timing, padded to an even size for yuv420p."""
+    vf = "fps=30,pad=ceil(iw/2)*2:ceil(ih/2)*2,format=yuv420p"
+    codec = (["-c:v", "libx264", "-preset", "slow", "-tune", "stillimage", "-crf", str(crf),
+              "-movflags", "+faststart"] if out.endswith(".mp4") else
+             ["-c:v", "libvpx-vp9", "-b:v", "0", "-crf", str(crf + 10), "-row-mt", "1",
+              "-deadline", "good", "-cpu-used", "2"])
+    subprocess.run([ffmpeg(), "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", concat,
+                    "-vf", vf, "-an", *codec, out], check=True)
+    return os.path.getsize(out)
+
+
+def encode_videos(concat: str, base: str) -> dict:
+    """The MP4 and the WebM next to the GIF, each under MAX_VIDEO_BYTES: the quality steps
+    down until it fits."""
+    sizes = {}
+    for ext in ("mp4", "webm"):
+        path = f"{base}.{ext}"
+        for crf in (24, 28, 32):
+            sizes[ext] = encode_video(concat, path, crf)
+            if sizes[ext] <= MAX_VIDEO_BYTES:
+                break
+        else:
+            raise AssertionError(f"{os.path.basename(path)}: {sizes[ext]} bytes, over {MAX_VIDEO_BYTES}")
+    return sizes
 
 
 class Demo:
@@ -176,14 +252,14 @@ class Demo:
         return box["x"] + min(box["width"] / 2, 60), box["y"] + box["height"] / 2
 
     async def type(self, step: dict) -> None:
-        """Click into the composer, move the cursor off it, and type."""
+        """Click into the composer, move the cursor off it, and type (`key_ms` a key, a tile types faster)."""
         x, y = await self.point_of("#chat-input")
         await self.move(x, y)
         await self.page.evaluate("document.querySelector('#chat-input').spellcheck = false")
         await self.page.mouse.click(x, y)
         # Off the text, to empty space at the right: never onto a control (a tooltip).
         await self.move(W - 120, y - 110, steps=12)
-        await self.page.keyboard.type(step["text"], delay=TYPE_DELAY_MS)
+        await self.page.keyboard.type(step["text"], delay=step.get("key_ms", TYPE_DELAY_MS))
         await self.page.wait_for_timeout(350)
 
     async def send(self, step: dict) -> None:
@@ -196,18 +272,41 @@ class Demo:
             self.chat_id = (await self.page.evaluate("() => location.pathname")).split("/c/", 1)[1].strip("/")
 
     async def click(self, step: dict) -> None:
+        """Move the cursor to the target and click it; a target that moved meanwhile (a reply
+        arrived above it) is followed, so the click never lands where it was."""
         x, y = await self.point_of(step["selector"])
         await self.move(x, y)
-        await self.page.wait_for_timeout(200)
+        for _ in range(5):
+            await self.page.wait_for_timeout(200)
+            nx, ny = await self.point_of(step["selector"])
+            if abs(nx - x) < 2 and abs(ny - y) < 2:
+                break
+            x, y = nx, ny
+            await self.move(x, y, steps=6)
         await self.page.mouse.click(x, y)
 
+    async def waiting(self, step: dict, until) -> None:
+        """Run a wait on the stack, its frames marked for durations()."""
+        first = len(self.rec.frames)
+        try:
+            await until
+        finally:
+            show = step.get("show_ms")
+            self.rec.waits.append((first, len(self.rec.frames), show / 1000 if show else None))
+
     async def wait(self, step: dict) -> None:
+        await self.waiting(step, self._wait(step))
+
+    async def wait_reply_done(self, step: dict) -> None:
+        await self.waiting(step, self._wait_reply_done(step))
+
+    async def _wait(self, step: dict) -> None:
         try:
             await self.page.wait_for_function(step["js"], timeout=step.get("timeout_ms", 150_000), polling=100)
         except Exception as ex:
             raise TimeoutError(f"waiting for {step['js'][:120]}: {ex}") from None
 
-    async def wait_reply_done(self, step: dict) -> None:
+    async def _wait_reply_done(self, step: dict) -> None:
         last, stable, deadline = "", 0, time.monotonic() + step.get("timeout_ms", 150_000) / 1000
         while stable < 4:
             if time.monotonic() > deadline:
@@ -227,14 +326,44 @@ class Demo:
     async def pause(self, step: dict) -> None:
         await self.page.wait_for_timeout(step["ms"])
 
+    async def cover(self, step: dict) -> None:
+        """Mark the frame on screen now as the one the recording opens on (`cover_ms`)."""
+        await self.page.wait_for_timeout(int(step.get("ms", 150)))  # a frame of this state reaches the screencast
+        if not self.rec.frames:
+            raise RuntimeError("cover: no frame recorded yet")
+        self.rec.cover = len(self.rec.frames) - 1
+
+    async def scroll_top(self, step: dict) -> None:
+        """Jump the chat back up, as a reader would: to its first message, or to the first
+        `selector` element whose text starts with `text`, placed `under_px` below the
+        window's top so it clears the chat's title bar. A jump, not a smooth scroll, which
+        would repaint every frame."""
+        await self.page.evaluate("""([sel, text, under]) => {
+            const box = document.getElementById('messages-container');
+            const el = sel && [...document.querySelectorAll(sel)]
+                .find((e) => !text || e.textContent.trim().startsWith(text));
+            if (!el) { box.scrollTo({top: 0}); return; }
+            box.scrollTo({top: box.scrollTop + el.getBoundingClientRect().top - under});
+        }""", [step.get("selector"), step.get("text"), step.get("under_px", 56)])
+        await self.page.wait_for_timeout(int(step.get("ms", 400)))
+
     async def keys(self, step: dict) -> None:
         await self.page.evaluate(f"__keys({json.dumps(step['keys'])}, {int(step.get('ms', 900))})")
 
     async def record(self, step: dict) -> None:
         self.rec.record(step["on"])
 
+    async def reload(self, step: dict) -> None:
+        """Reload the page (the key badge says so first), then wait for the chat."""
+        await self.page.evaluate("__keys(['⟳ Reload'], 1200)")
+        await self.page.wait_for_timeout(700)
+        await self.page.reload()
+        await self.page.wait_for_selector("#chat-input", timeout=60_000)
+        await self.move(self.x, self.y, steps=1)
 
-STEPS = {"type", "send", "click", "wait", "wait_reply_done", "wait_children", "park", "pause", "keys", "record"}
+
+STEPS = {"type", "send", "click", "wait", "wait_reply_done", "wait_children", "park", "pause", "keys", "record",
+         "reload", "cover", "scroll_top"}
 
 
 async def new_page(browser, token: str) -> Page:
@@ -278,26 +407,35 @@ async def run_demo(browser, token: str, spec: dict, out: str, host: str) -> dict
         first = spec["steps"][0] if spec["steps"] else {}
         rec.record(not (first.get("do") == "record" and first.get("on") is False))
         await page.wait_for_timeout(500)
+        starts = []
         for step in spec["steps"]:
             if step["do"] not in STEPS:
                 raise ValueError(f"{spec['name']}: unknown step {step['do']!r}")
+            starts.append((step["do"], len(rec.frames)))
             await getattr(demo, step["do"])(step)
         await rec.stop()
+        # Where the length goes: each step's seconds as the recording shows them.
+        durs = rec.durations() if rec.frames else []
+        bounds = [i for _, i in starts] + [len(durs)]
+        steps = [f"{do} {sum(durs[a:b]):.1f}" for (do, _), a, b in zip(starts, bounds, bounds[1:])
+                 if sum(durs[a:b]) >= 0.5]
         hits = capture.deny_hits(await page.evaluate("() => document.body.innerText"), (host,) if host else ())
         if hits:
             raise AssertionError(f"{spec['name']}: deny-listed text visible: {sorted(set(hits))[:10]}")
-        concat, seconds = rec.write(work)
+        concat, seconds = rec.write(work, spec.get("cover_ms", 0) / 1000)
         if seconds > MAX_SECONDS:
-            raise AssertionError(f"{spec['name']}: {seconds:.1f} s, over {MAX_SECONDS:.0f} s")
+            raise AssertionError(f"{spec['name']}: {seconds:.1f} s, over {MAX_SECONDS:.0f} s ({', '.join(steps)})")
         path = os.path.join(out, f"{spec['name']}.gif")
         size = encode(concat, path)
         if size > MAX_BYTES:
             size = encode(concat, path, fps=12, colors=96)
         if size > MAX_BYTES:
             raise AssertionError(f"{spec['name']}: {size} bytes, over {MAX_BYTES}")
+        videos = encode_videos(concat, os.path.join(out, spec["name"]))
         shutil.rmtree(work)
         return {"name": spec["name"], "path": path, "seconds": round(seconds, 1), "kb": round(size / 1024),
-                "frames": len(rec.frames), "chat": demo.chat_id}
+                "mp4_kb": round(videos["mp4"] / 1024), "webm_kb": round(videos["webm"] / 1024),
+                "frames": len(rec.frames), "frame_px": jpeg_size(rec.frames[-1][1]), "steps": steps, "chat": demo.chat_id}
     except Exception:
         print(f"  frames kept in {work}", flush=True)
         await page.screenshot(path=os.path.join(work, "failed.png"))
@@ -318,7 +456,9 @@ async def main_async(out: str, only: set | None) -> int:
     if host.lower() in "openclaw":
         host = ""  # a host named like the product would match every page
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch()
+        # The screencast sends frames at CSS-pixel size whatever the context's device scale; this
+        # flag makes them 2x (1920x1280), which keeps the videos' text sharp.
+        browser = await pw.chromium.launch(args=["--force-device-scale-factor=2"])
         try:
             for spec in demos:
                 if only and spec["name"] not in only:

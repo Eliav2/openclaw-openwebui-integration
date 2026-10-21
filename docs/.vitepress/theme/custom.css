@@ -14,3 +14,7 @@
 
 /* The home page's list of every page, below the feature cards. */
 .VPHome .vp-doc { margin-top: 48px; }
+
+/* A demo recording: as wide as its column allows, rounded like the screenshots' frame. */
+.vp-doc video.demo { display: block; max-width: 100%; height: auto; margin: 16px auto; border-radius: 8px;
+  border: 1px solid var(--vp-c-divider); }

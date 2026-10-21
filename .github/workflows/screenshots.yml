@@ -21,6 +21,10 @@ on:
         description: Comma-separated shot names (empty = all)
         type: string
         default: ""
+      openclaw_version:
+        description: 'openclaw npm spec (empty = pinned; "next" for shots that need a newer Gateway, e.g. secret-request)'
+        type: string
+        default: ""
   push:
     # A fix branch merged onto this one, to see the fix in the real UI.
     branches: ["verify/**"]
@@ -60,6 +64,7 @@ jobs:
           FAKE_LLM_DEFAULT: Sure.
           FAKE_LLM_USAGE: estimate
         with:
+          openclaw_version: ${{ inputs.openclaw_version }}
           log_dir: ${{ runner.temp }}/logs
 
       - name: Install Chromium for Playwright

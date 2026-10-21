@@ -11,9 +11,11 @@ ROOT = Path(__file__).resolve().parents[1]
 IMG = ROOT / "docs" / "img"
 IMAGE_BUDGET = 250 * 1024          # each image
 IMAGES_TOTAL_BUDGET = 4 * 1024 * 1024
-DEMOS = IMG / "demos"              # the demo GIFs, scripts/demos/record.py
+DEMOS = IMG / "demos"              # the demos, scripts/demos/record.py: a GIF, an MP4 and a WebM each
 DEMO_BUDGET = 1024 * 1024          # each GIF, as record.py enforces
-DEMOS_TOTAL_BUDGET = 3 * 1024 * 1024
+DEMOS_TOTAL_BUDGET = 7 * 1024 * 1024   # the docs' demos and the README's feature tiles (tile-*)
+VIDEO_BUDGET = 1024 * 1024         # each MP4 and WebM, as record.py enforces
+VIDEOS_TOTAL_BUDGET = 8 * 1024 * 1024
 # Contributor and design pages may name issues and internals; user pages may not.
 INTERNAL_OK = {"docs/architecture.md", "docs/development.md", "docs/metadata-contract.md",
                "docs/rehydration-persistence.md"}
@@ -26,16 +28,27 @@ HEADING = re.compile(r"^#{1,6}\s+(.+?)\s*#*\s*$", re.M)
 
 MD_IMAGE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)[^)]*\)")
 IMG_TAG = re.compile(r'<img\b(?:[^>"]|"[^"]*")*>')
+# A README feature tile: a demo GIF in a <picture>, its still poster the <img>, in a table cell
+# that sets the width, so the <img> fills the cell (width="100%").
+PICTURE = re.compile(r"<picture>(.*?)</picture>", re.S)
 PHONE_WIDTH = 320      # a phone shot, as the README shows it
 WIDE_MAX = 800
 
 
 def image_size(path: Path) -> tuple:
-    """(width, height) from the PNG or GIF header."""
-    head = path.read_bytes()[:24]
-    if head[:6] in (b"GIF87a", b"GIF89a"):
-        return int.from_bytes(head[6:8], "little"), int.from_bytes(head[8:10], "little")
-    return int.from_bytes(head[16:20], "big"), int.from_bytes(head[20:24], "big")
+    """(width, height) from the PNG, GIF or JPEG header."""
+    data = path.read_bytes()
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return int.from_bytes(data[6:8], "little"), int.from_bytes(data[8:10], "little")
+    if data[:2] == b"\xff\xd8":
+        i = 2
+        while i + 9 < len(data):
+            marker, length = data[i + 1], int.from_bytes(data[i + 2:i + 4], "big")
+            if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):  # a start-of-frame
+                return int.from_bytes(data[i + 7:i + 9], "big"), int.from_bytes(data[i + 5:i + 7], "big")
+            i += 2 + length
+        raise ValueError(f"{path}: no JPEG frame header")
+    return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
 
 
 def image_width_limit(size: tuple, gif: bool = False) -> tuple:
@@ -147,11 +160,20 @@ class DocsLinkTests(unittest.TestCase):
                 path = target.partition("#")[0]
                 if path.endswith((".png", ".jpg", ".webp", ".gif")):
                     used.add((md.parent / path).resolve())
-        images = sorted(p for p in IMG.iterdir() if p.is_file())
-        demos = sorted(p for p in DEMOS.iterdir() if p.is_file())
+        # media.json is the record of what each file shows (MediaFreshTests), not an image.
+        images = sorted(p for p in IMG.iterdir() if p.is_file() and p.name != "media.json")
+        demos = sorted(p for p in DEMOS.iterdir() if p.suffix == ".gif")
+        videos = sorted(p for p in DEMOS.iterdir() if p.suffix in (".mp4", ".webm"))
         self.assertEqual([p.name for p in images if p.stat().st_size > IMAGE_BUDGET], [])
         self.assertLessEqual(sum(p.stat().st_size for p in images), IMAGES_TOTAL_BUDGET)
-        self.assertEqual([p.name for p in demos if p.suffix != ".gif" or p.stat().st_size > DEMO_BUDGET], [])
+        self.assertEqual([p.name for p in DEMOS.iterdir() if p.suffix not in (".gif", ".mp4", ".webm")], [])
+        self.assertEqual([p.name for p in demos if p.stat().st_size > DEMO_BUDGET], [])
+        self.assertEqual([p.name for p in videos if p.stat().st_size > VIDEO_BUDGET], [])
+        self.assertLessEqual(sum(p.stat().st_size for p in videos), VIDEOS_TOTAL_BUDGET)
+        # The site plays a demo's video in place of its GIF: both formats, next to a GIF a page shows.
+        stems = {p.stem for p in videos}
+        self.assertEqual(sorted(f"{s}: {ext}" for s in stems for ext in ("gif", "mp4", "webm")
+                                if not (DEMOS / f"{s}.{ext}").exists()), [])
         self.assertLessEqual(sum(p.stat().st_size for p in demos), DEMOS_TOTAL_BUDGET)
         self.assertEqual([rel(p) for p in images + demos if p.resolve() not in used], [],
                          "images in docs/img that no page uses")
@@ -162,6 +184,16 @@ class DocsLinkTests(unittest.TestCase):
         bad = []
         for md in markdown_files():
             text = re.sub(r"`[^`\n]*`", "", FENCE.sub("", md.read_text()))
+            for tile in PICTURE.findall(text):
+                gif = re.search(r'<source srcset="([^"]+\.gif)"', tile)
+                poster = IMG_TAG.search(tile)
+                if not gif or not poster or 'width="100%"' not in poster.group(0):
+                    bad.append(f"{rel(md)}: a <picture> is a demo GIF source plus a poster <img width=\"100%\">")
+                    continue
+                g, p = image_size(md.parent / gif.group(1)), image_size(md.parent / re.search(r'\bsrc="([^"]+)"', poster.group(0)).group(1))
+                if g[0] * p[1] != g[1] * p[0]:
+                    bad.append(f"{rel(md)}: {gif.group(1)} {g} and its poster {p} differ in shape")
+            text = PICTURE.sub("", text)
             for _alt, src in MD_IMAGE.findall(text):
                 if not re.match(r"^[a-z]+:", src):
                     bad.append(f"{rel(md)}: {src} is ![...](...), use <img src alt width>")
@@ -185,6 +217,12 @@ class DocsLinkTests(unittest.TestCase):
         self.assertEqual(image_width_limit((1200, 700)), ("wide", 600))
         self.assertEqual(image_width_limit((960, 640), gif=True), ("demo", 800))
         self.assertEqual(image_width_limit((640, 400), gif=True), ("demo", 640))
+
+    def test_image_size_reads_a_jpeg_frame_header(self):
+        posters = sorted(IMG.glob("*.jpg"))
+        for jpg in posters:
+            with self.subTest(jpg=jpg.name):
+                self.assertEqual(image_size(jpg), (960, 640))
 
     def test_image_size_reads_png_and_gif_headers(self):
         self.assertEqual(image_size(IMG / "question-card-light.png"), (780, 1688))
@@ -275,6 +313,52 @@ class VersionsTests(unittest.TestCase):
                                   (ROOT / name).read_text(), re.M)
                 self.assertIsNotNone(field, f"{name} declares no required_open_webui_version")
                 self.assertEqual({field.group(1)}, minimums)
+
+
+class MediaFreshTests(unittest.TestCase):
+    """Every screenshot and recording was made on the UI as it is now
+    (scripts/media.py, docs/img/media.json): a change to the composer's Claw
+    button, the Status icon or dialog, or the pinned Open WebUI fails here
+    until the files that show it are recorded again."""
+
+    def setUp(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("media", ROOT / "scripts" / "media.py")
+        self.media = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.media)
+
+    def test_every_file_was_recorded_on_the_current_ui(self):
+        self.assertEqual([f"{f}: {why}" for f, why in self.media.stale()], [],
+                         "record them again: python3 scripts/media.py (its docstring says how)")
+
+    def test_a_change_to_a_groups_sources_makes_its_files_stale(self):
+        manifest = self.media.load()
+        manifest["groups"]["status"]["sources"] = ["src/openclaw_pipe_pkg/action.py:_MODAL_COMPACTING_JS"]
+        stale = {f for f, _why in self.media.stale(manifest)}
+        self.assertIn("status-dialog-light.png", stale)
+        self.assertIn("demos/status-dialog.gif", stale)
+        self.assertNotIn("demos/hero.gif", stale)
+
+    def test_stamp_refuses_a_file_that_was_not_recorded_again(self):
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "x-light.png").write_bytes(b"old frame")
+            manifest = {"groups": {"chrome": {"sources": ["e2e/versions.env:OWUI_IMAGE"], "files": "."}},
+                        "files": {"x-light.png": {"sha": "", "groups": {"chrome": "an older ui"}}}}
+            (Path(tmp) / "media.json").write_text(json.dumps(manifest))
+            self.media.IMG, self.media.MANIFEST = tmp, str(Path(tmp) / "media.json")
+            manifest["files"]["x-light.png"]["sha"] = self.media._sha("x-light.png")
+            (Path(tmp) / "media.json").write_text(json.dumps(manifest))
+            with self.assertRaises(SystemExit):
+                self.media.stamp([str(Path(tmp) / "x-light.png")])
+            self.media.stamp([str(Path(tmp) / "x-light.png")], same=True)
+            self.assertEqual(self.media.stale(), [])
+            manifest["files"]["x-light.png"]["groups"]["chrome"] = "an older ui"
+            (Path(tmp) / "media.json").write_text(json.dumps(manifest))
+            (Path(tmp) / "x-light.png").write_bytes(b"new frame")
+            self.media.stamp([str(Path(tmp) / "x-light.png")])
+            self.assertEqual(self.media.stale(), [])
 
 
 if __name__ == "__main__":
