@@ -12,6 +12,7 @@ upstream footprint, so it can only do what any other v4 client can do.
 
 ```mermaid
 flowchart TB
+  user["Browser or phone"]
   subgraph owui["Open WebUI"]
     pipe["openclaw_pipe<br>(OWUI Pipe)"]
     renders["OWUI renders:<br>text streaming<br>native tool cards<br>status updates<br>media links"]
@@ -20,7 +21,10 @@ flowchart TB
   subgraph gateway["OpenClaw Gateway"]
     agents["Agent(s)"]
   end
-  owui <-->|"WS (v4)<br>stream=assistant<br>stream=tool<br>stream=item<br>stream=lifecycle"| gateway
+  user <-->|chat| owui
+  pipe <-->|"WebSocket<br>(Gateway protocol v4)"| gateway
+  classDef ours fill:#e4572e,stroke:#c9452a,color:#ffffff
+  class pipe ours
 ```
 
 The integration:
@@ -34,6 +38,8 @@ The integration:
    - `stream="tool"` → tool call → **yielded** as a native Responses-API
      output item, so OWUI renders a two-phase tool card (spinner while
      running, result on finish) instead of hand-built HTML
+   - `stream="item"` → the assistant text of a finished item → only the part
+     not already shown is **yielded**, so no reply text is lost or doubled
    - `stream="lifecycle"` → end signal → **done**
 
 Because the integration is an **async generator** (uses `yield` instead of `return`),
