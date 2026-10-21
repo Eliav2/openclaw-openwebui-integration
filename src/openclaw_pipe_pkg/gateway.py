@@ -3475,6 +3475,7 @@ def _history_events(messages: list):
     text = ""                 # what the events so far said
     run_text = False          # this run carried text before its closer
     tool_since_text = False   # the Gateway's `sawToolUseSinceText`
+    reply_ended = False       # a reply of this run ended since the last text
     for message in messages:
         if not isinstance(message, dict):
             continue
@@ -3499,8 +3500,9 @@ def _history_events(messages: list):
                 continue
             kind = block.get("type")
             if kind == "text" and block.get("text") and role == "assistant":
-                lead = _message_boundary_separator(text, block["text"]) if tool_since_text else ""
-                text, tool_since_text = text + lead + block["text"], False
+                lead = (_message_boundary_separator(text, block["text"])
+                        if tool_since_text or reply_ended else "")
+                text, tool_since_text, reply_ended = text + lead + block["text"], False, False
                 run_text = run_text or bool(block["text"].strip())
                 yield {"stream": "assistant", "data": {"delta": lead + block["text"]}}
             elif kind in ("toolcall", "toolCall") and block.get("id") and role == "assistant":
@@ -3511,6 +3513,10 @@ def _history_events(messages: list):
             elif kind == "tool_result" and block.get("tool_use_id"):
                 yield _history_tool_result(block["tool_use_id"], block.get("name"),
                                            block.get("content"), block.get("is_error"))
+        # A reply on the Gateway's own runtime ended here. More text in the
+        # same span answers a message steered into the run (ELI-271): a new
+        # reply, not the end of this one's sentence.
+        reply_ended = reply_ended or bool(_run_closed_by(message))
 
 
 def _history_tool_result(tool_call_id: str, name, content, is_error) -> dict:

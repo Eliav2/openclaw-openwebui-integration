@@ -2210,10 +2210,15 @@ def _history_run_messages(history: dict, run_id: str, started_ms: float | None =
     """One run's messages in `chat.history`: everything after the user
     message that started it, or after the previous run's closing message
     (a run with no user turn, e.g. a sub-agent announce), through its own
-    closing message (`_run_closed_by`). None when the run has not closed
-    yet. A previous run that answered with silence leaves no closing
+    last closing message (`_run_closed_by`). None when the run has not
+    closed yet. A previous run that answered with silence leaves no closing
     message, so with the run's start time (`started_ms`, its lifecycle
-    start) messages stamped before it are not the run's (ELI-227)."""
+    start) messages stamped before it are not the run's (ELI-227).
+
+    A run the Gateway steered a message into (a second sub-agent's announce
+    while the first one's run streams) answers it in the same run: each of
+    its replies then looks like a closing message, and the walk back goes
+    past them to the previous run's (ELI-271)."""
     messages = (history or {}).get("messages")
     if not isinstance(messages, list) or not run_id:
         return None
@@ -2225,7 +2230,7 @@ def _history_run_messages(history: dict, run_id: str, started_ms: float | None =
             continue
         start = end
         while start > 0 and (messages[start - 1] or {}).get("role") != "user" \
-                and not _run_closed_by(messages[start - 1]) \
+                and _run_closed_by(messages[start - 1]) in (None, run_id) \
                 and not _stamped_before(messages[start - 1], started_ms):
             start -= 1
         return messages[start:end + 1]
