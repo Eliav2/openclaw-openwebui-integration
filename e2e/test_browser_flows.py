@@ -491,19 +491,32 @@ def _ends_like_the_answer(page, token: str, run: str) -> None:
     whenever the answer has it. On 2026.10 the running reply is its session's
     first run, whose row has no totals yet: the line comes from the run's own
     usage (ELI-177). In the saved status lines, and in the status line shown
-    on the reply (the page is reloaded by now)."""
-    saved = capture.api("GET", f"/api/v1/chats/{_chat_id(page)}", token=token)["chat"]["history"]["messages"]
-    replies = [m for m in saved.values() if m.get("role") == "assistant"]
-    held = [m for m in replies if run in (m.get("content") or "")]
-    assert len(held) == 1 and len(replies) == 2, [m.get("content", "")[-80:] for m in replies]
-    answer = next(m for m in replies if m is not held[0])
-    lines, ref = ([h.get("description") for h in m.get("statusHistory") or [] if isinstance(h, dict)]
-                  for m in (held[0], answer))
+    on the reply by a page loaded after that save.
+
+    Open WebUI saves the running reply done as soon as the new message goes
+    in, so "both replies done" can hold before the writer's last write (the
+    status lines). A page loaded in between never shows them: their event
+    lands while loadChat still assigns what it fetched, ELI-230's window
+    (ELI-274). So the saved lines are waited for, then the page reloaded."""
     usage = lambda ls: any(str(line).startswith("\U0001f9e0") for line in ls)  # noqa: E731
-    shown = page.evaluate(f"() => {_message_text_js(0)}")
+    deadline = time.time() + TURN_MS / 1000
+    while True:
+        saved = capture.api("GET", f"/api/v1/chats/{_chat_id(page)}", token=token)["chat"]["history"]["messages"]
+        replies = [m for m in saved.values() if m.get("role") == "assistant"]
+        held = [m for m in replies if run in (m.get("content") or "")]
+        assert len(held) == 1 and len(replies) == 2, [m.get("content", "")[-80:] for m in replies]
+        answer = next(m for m in replies if m is not held[0])
+        lines, ref = ([h.get("description") for h in m.get("statusHistory") or [] if isinstance(h, dict)]
+                      for m in (held[0], answer))
+        if ("Stopped" not in lines and usage(lines) == usage(ref)) or time.time() > deadline:
+            break
+        time.sleep(1)
     assert "Stopped" not in lines, f"a Stopped line: {lines}"
-    assert "Stopped" not in shown, shown[-200:]
     assert usage(lines) == usage(ref), f"the running reply: {lines}; the answer: {ref}"
+    _reload(page)
+    _wait(page, _reply_js(-1, "all.length === 2 && all[0].done && r.done"), "both replies after a reload", 60_000)
+    shown = page.evaluate(f"() => {_message_text_js(0)}")
+    assert "Stopped" not in shown, shown[-200:]
     assert ("\U0001f9e0" in shown) == usage(ref), shown[-200:]
 
 
