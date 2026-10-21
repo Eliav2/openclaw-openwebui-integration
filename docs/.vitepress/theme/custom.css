@@ -18,3 +18,12 @@
 /* A demo recording: as wide as its column allows, rounded like the screenshots' frame. */
 .vp-doc video.demo { display: block; max-width: 100%; height: auto; margin: 16px auto; border-radius: 8px;
   border: 1px solid var(--vp-c-divider); }
+
+/* Mermaid diagrams: an edge label sits on its arrow; give it the page background in either theme
+   (Mermaid's light theme leaves it transparent, so the line ran through the text). */
+.vp-doc .mermaid .edgeLabel rect,
+.vp-doc .mermaid .labelBkg {
+  fill: var(--vp-c-bg) !important;
+  background-color: var(--vp-c-bg) !important;
+  opacity: 1 !important;
+}
