@@ -8,7 +8,7 @@ Applies to: Pipe, Action, Filter
 
 I built this because I wanted OpenClaw on my phone.
 
-OpenClaw's built-in chat UI was never somewhere I wanted to hold a long conversation, least of all on mobile. Open WebUI is polished and mobile-first. It feels like using ChatGPT or Claude, and I wanted that same experience for my own agents. So I built this, used it daily for a few months, and I'm now sharing it.
+OpenClaw's Control UI never worked for me there: long chats felt awkward, the multi-session view wasn't stable, and every Gateway restart drove me crazy. Open WebUI is polished and mobile-first, like ChatGPT or Claude, and I wanted that for my own agents. So I built this, used it daily for a few months, and decided to share it.
 
 ## The connection is the difference
 

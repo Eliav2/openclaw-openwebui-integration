@@ -10,21 +10,17 @@ upstream footprint, so it can only do what any other v4 client can do.
 
 ## How it works
 
-```
-┌──────────────────────┐       WS (v4)        ┌──────────────────┐
-│   Open Web UI        │ ◄──────────────────► │  OpenClaw        │
-│                      │   stream=assistant   │  Gateway         │
-│  ┌────────────────┐  │   stream=tool        │                  │
-│  │ openclaw_pipe  │──┤   stream=item        │  ┌────────────┐  │
-│  │ (OWUI Pipe)    │  │   stream=lifecycle   │  │ Agent(s)   │  │
-│  └────────────────┘  │                      │  └────────────┘  │
-│                      │                      │                  │
-│  OWUI renders:       │                      └──────────────────┘
-│   • Text streaming   │
-│   • Native tool cards│
-│   • Status updates   │
-│   • Media links      │
-└──────────────────────┘
+```mermaid
+flowchart TB
+  subgraph owui["Open WebUI"]
+    pipe["openclaw_pipe<br>(OWUI Pipe)"]
+    renders["OWUI renders:<br>text streaming<br>native tool cards<br>status updates<br>media links"]
+    pipe -->|yields| renders
+  end
+  subgraph gateway["OpenClaw Gateway"]
+    agents["Agent(s)"]
+  end
+  owui <-->|"WS (v4)<br>stream=assistant<br>stream=tool<br>stream=item<br>stream=lifecycle"| gateway
 ```
 
 The integration:
