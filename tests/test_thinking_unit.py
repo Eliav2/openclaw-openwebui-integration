@@ -92,7 +92,7 @@ class BuildTests(unittest.TestCase):
             if m:
                 meta.setdefault(m.group(1), m.group(2).strip())
         self.assertEqual(meta.get("title"), "OpenClaw Thinking")
-        self.assertEqual(meta.get("version"), "0.7.0")
+        self.assertEqual(meta.get("version"), "1.0.0")
         self.assertTrue(meta.get("description"))
         self.assertNotIn("requirements", meta, "stdlib plus pydantic only")
 
