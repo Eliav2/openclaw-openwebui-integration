@@ -208,6 +208,10 @@ bun run docs:build   # what CI runs; fails on a dead internal link
 
 The build also writes `llms.txt`, `llms-full.txt` and a raw `.md` next to every page, for agents. A demo is a GIF in the Markdown (what github.com shows); when `scripts/demos/record.py` wrote its MP4 and WebM next to it, the site plays that muted, looping video instead, at twice the GIF's resolution. The `Docs site` workflow builds every pull request that touches the docs and deploys `main` to GitHub Pages.
 
+The repository's social preview, the card a link to the repo shows, is `docs/img/social-preview.png`. `scripts/social_preview.py` makes it from the hero demo's last frame; run it again after recording the hero, then upload the file in the repository's Settings > General > Social preview.
+
+<img src="./img/social-preview.png" alt="The social preview: the claw logo, OpenClaw for Open WebUI and a one-line tagline, next to a finished reply with two tool cards" width="640">
+
 ## Driving the integration over the API
 
 You can send messages through the integration as if using the OWUI frontend by calling

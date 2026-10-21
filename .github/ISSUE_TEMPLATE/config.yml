@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Docs
+    url: https://eliav2.github.io/openclaw-openwebui-integration/
+    about: Install, configuration and features. Most questions are answered here.
+  - name: Troubleshooting
+    url: https://eliav2.github.io/openclaw-openwebui-integration/troubleshooting
+    about: Common problems and where the logs are.
+  - name: Security problem
+    url: https://github.com/Eliav2/openclaw-openwebui-integration/security/advisories/new
+    about: Report a vulnerability privately, not in a public issue.
