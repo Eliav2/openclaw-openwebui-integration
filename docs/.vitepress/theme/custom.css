@@ -27,3 +27,7 @@
   background-color: var(--vp-c-bg) !important;
   opacity: 1 !important;
 }
+
+/* Our part of a diagram (Mermaid classDef "ours"): white text on the logo's orange, in both themes. */
+.vp-doc .mermaid .ours text,
+.vp-doc .mermaid .ours tspan { fill: #ffffff !important; }
