@@ -826,6 +826,49 @@ def _tool_call_started_event(name: str, tool_call_id: str, args_str: str) -> dic
 PIPE_NOTE_STREAM = "pipe_note"
 _NOTE_ITEM_PREFIX = "msg_note_"
 
+# The Gateway's own context compaction, shown as a note of the reply
+# (ELI-283): "compacting" while it runs, then the same note as a collapsed
+# block. On claude-cli the event says only start/end and whether it
+# completed; `tokensBefore` is added by the Pipe (`with_compaction_tokens`).
+COMPACTION_STREAM = "compaction"
+COMPACTING_NOTE = "🧹 _Compacting context…_"
+COMPACTION_FAILED_NOTE = "🧹 _Context compaction did not complete: the conversation goes on uncompacted._"
+# An end the Gateway reports with an outcome (its own agent; claude-cli says
+# only whether it completed): nothing to compact yet, or stopped.
+COMPACTION_SKIPPED_NOTE = "🧹 _Context compaction skipped: nothing to compact yet._"
+COMPACTION_STOPPED_NOTE = "🧹 _Context compaction stopped._"
+COMPACTED_BODY = ("Older messages in this conversation were summarized to free up the model's "
+                  "context. The agent continues from that summary plus the most recent messages; "
+                  "everything stays visible here.")
+
+
+def _compacted_note(tokens_before) -> str:
+    was = f" · was ~{_fmt_tokens(tokens_before)} tokens" if isinstance(tokens_before, int) \
+        and tokens_before > 0 else ""
+    return (f"<details>\n<summary>🧹 Context compacted{was}</summary>\n\n"
+            f"{COMPACTED_BODY}\n</details>")
+
+
+async def with_compaction_tokens(conn, session_key: str, payload: dict) -> dict:
+    """`payload`, a compaction start the Gateway sent without a size, with the
+    session's last known context fill as `tokensBefore`: the row's
+    `totalTokens`, which OpenClaw writes after each run, so it is the fill
+    before this run and only near the size compacted. Any failure leaves the
+    note without a size."""
+    data = payload.get("data") or {}
+    if payload.get("stream") != COMPACTION_STREAM or data.get("phase") != "start" \
+            or "tokensBefore" in data or not session_key:
+        return payload
+    try:
+        desc = await conn.send_request("sessions.describe", {"key": session_key}, timeout=3)
+        total = ((desc or {}).get("session") or {}).get("totalTokens")
+    except Exception as ex:
+        pipe_log(f"  compaction: no context size ({type(ex).__name__})")
+        return payload
+    if not isinstance(total, int):
+        return payload
+    return {**payload, "data": {**data, "tokensBefore": total}}
+
 
 def _tool_call_result_event(tool_call_id: str, result_str: str) -> dict:
     """Complete a tool call announced by `_tool_call_started_event`.
@@ -1158,6 +1201,11 @@ class _TurnRenderer:
         # The run answered with a silent sentinel alone (`flush`): no text is
         # its reply, not something lost.
         self.silenced = False
+        # Compactions seen, and the note and context size of the one still
+        # running (`_compaction_note`).
+        self._compactions = 0
+        self._compaction_note_id: str | None = None
+        self._compaction_before = None
 
     @property
     def received(self) -> str:
@@ -1261,6 +1309,31 @@ class _TurnRenderer:
         last["content"][0]["text"] += chunk
         return chunk
 
+    def _compaction_note(self, run_id: str, data: dict) -> dict | None:
+        """The note (`PIPE_NOTE_STREAM` data) a compaction event makes: a start
+        opens one, its end replaces it. Its id counts the run's compactions,
+        so every renderer fed the run names the same one alike. An end with
+        no start (it came before this reply did) still shows how it ended."""
+        phase = data.get("phase")
+        if phase not in ("start", "end"):
+            return None
+        nid = self._compaction_note_id
+        if nid is None:
+            self._compactions += 1
+            tag = hashlib.sha1(run_id.encode()).hexdigest()[:8]
+            nid = f"{_NOTE_ITEM_PREFIX}compaction_{tag}_{self._compactions}"
+            self._compaction_before = None
+        if phase == "start":
+            self._compaction_note_id = nid
+            self._compaction_before = data.get("tokensBefore")
+            return {"id": nid, "text": COMPACTING_NOTE}
+        self._compaction_note_id = None
+        if data.get("completed") is True:
+            return {"id": nid, "text": _compacted_note(self._compaction_before)}
+        return {"id": nid, "text": {"skipped": COMPACTION_SKIPPED_NOTE,
+                                    "aborted": COMPACTION_STOPPED_NOTE}.get(data.get("outcome"),
+                                                                           COMPACTION_FAILED_NOTE)}
+
     def _tool_item(self, name: str, tcid: str, args_str: str, events: list) -> dict:
         """The call's card, opened (and its start event added to `events`)
         the first time the call is seen, by its start or, when that was
@@ -1347,6 +1420,13 @@ class _TurnRenderer:
                 item_delta = _suppress_already_shown(item_delta, self.visible_text)
                 if item_delta:
                     events.append(self._add_text(item_delta))
+
+        if stream == COMPACTION_STREAM:
+            note = self._compaction_note(payload.get("runId") or "", data)
+            if note is None:
+                return events
+            events.append(self.flush())
+            stream, data = PIPE_NOTE_STREAM, note
 
         if stream == PIPE_NOTE_STREAM:
             nid, text = data.get("id"), data.get("text")

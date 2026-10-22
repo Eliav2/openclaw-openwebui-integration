@@ -1,7 +1,7 @@
 {
   "id": "screenshot-sample-usage",
   "name": "Screenshot sample usage",
-  "description": "Test-only: answers claudeCliUsage.status with fixed sample rate-limit windows, so the screenshot stack's Status dialog has bars to show, and adds a sample Agent tool that answers like Claude Code's background Agent call. Never install this on a real Gateway.",
+  "description": "Test-only: answers claudeCliUsage.status with fixed sample rate-limit windows, so the screenshot stack's Status dialog has bars to show, and adds a sample Agent tool that answers like Claude Code's background Agent call. It also reports a sample context compaction after a scene reads its build log. Never install this on a real Gateway.",
   "activation": {
     "onStartup": true
   },

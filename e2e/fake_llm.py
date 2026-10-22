@@ -35,6 +35,9 @@ whole):
 * `E2E_TOOL_SAID`                      -> says `E2E_TOOL_SAID_START` and calls a
   harmless tool, then replies `E2E_TOOL_SAID_END`: a short reply with text on
   both sides of its tool card.
+* `E2E_COMPACT_MARK TOKEN`             -> says `E2E_COMPACT_BEFORE TOKEN` and calls
+  `e2e_compact` (e2e/agent-tool), after which the run reports a context
+  compaction, then replies `E2E_COMPACT_AFTER TOKEN`.
 * `session_status` + `model line`      -> calls `session_status`, then replies
   with the `Model:` line of its result. Covers the installer's route smoke
   test, which checks that the reply names the model the Gateway actually
@@ -385,6 +388,18 @@ def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
         if not call:
             return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
         return {"text": "E2E_TOOL_SAID_END"} if tool_results else {"text": "E2E_TOOL_SAID_START", **call}
+
+    m = re.search(r"E2E_COMPACT_MARK (\S+)", user_text)
+    if m:
+        # The run reports a compaction after the e2e_compact call
+        # (e2e/agent-tool), as a claude-cli run does when Claude Code
+        # compacts (ELI-283).
+        if tool_results:
+            return {"text": f"E2E_COMPACT_AFTER {m.group(1)}"}
+        call = _call("e2e_compact", offered)
+        if not call:
+            return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
+        return {"text": f"E2E_COMPACT_BEFORE {m.group(1)}", **call}
 
     if "E2E_DEPLOY_SCENE" in user_text:
         call = _harmless_call(offered)
