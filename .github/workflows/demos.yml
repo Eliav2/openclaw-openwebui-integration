@@ -4,7 +4,7 @@ name: Demos
 # as the Screenshots workflow: real Open WebUI, this integration as installed
 # by its own installers, a real OpenClaw Gateway and the scripted model, with
 # the demos' own scenes loaded before the screenshots' ones. Desktop Chromium,
-# light theme only, each at most 15 s, as a GIF (github.com, at most 1 MB) and an
+# light theme only, each at most 15 s (a demo can set "max_seconds"), as a GIF (github.com, at most 1 MB) and an
 # MP4 and a WebM (the docs site, at most 1 MB each). Run it by hand after a UI
 # change; the files come back as an artifact to review, and the ones that are
 # kept get committed under docs/img/demos/.
