@@ -433,7 +433,8 @@ def opened_card_clip(message_js: str) -> str:
 
 CARDS_STATE = f"""() => {{
   const a = {LAST_ASSISTANT}; if (!a) return null;
-  return {{done: a.querySelectorAll('[role=button] .text-emerald-500').length,
+  // a finished card has the green check, or the red X when its call failed (ELI-278)
+  return {{done: a.querySelectorAll('[role=button] .text-emerald-500, [role=button] .text-red-500').length,
           active: a.querySelectorAll('[role=button] .shimmer').length}};
 }}"""
 
