@@ -12,7 +12,13 @@ tests fail until then (tests/test_docs_unit.py).
     python3 scripts/media.py check                 # the stale files, exit 1 if any
     python3 scripts/media.py stamp docs/img/x.png  # after recording x again
     python3 scripts/media.py stamp --same docs/img/x.png  # recorded again, came out identical
+    python3 scripts/media.py stamp --manual docs/img/x.gif  # a recording made by hand, never by CI
     uv run --with pillow scripts/media.py posters  # the README tiles' posters, from their GIFs
+
+A file marked `"manual": true` in media.json was recorded by hand, on a real setup
+(docs/development.md says how), so no workflow can record it again. A change to its
+sources does not fail the docs unit tests; `check` lists it as a note instead, for the
+next person who records it.
 
 To record again: run the Screenshots and Demos workflows on the branch (Actions,
 "Run workflow", `only` = the stale names; secret-request needs `openclaw_version`
@@ -100,6 +106,8 @@ def stale(manifest: dict | None = None) -> list:
         if entry is None:
             out.append((rel, "not in docs/img/media.json"))
             continue
+        if entry.get("manual"):
+            continue    # recorded by hand: manual_stale() lists it
         changed = [g for g in groups_of(manifest, rel) if entry["groups"].get(g) != now[g]]
         if changed:
             out.append((rel, "recorded before a change to " + ", ".join(changed)))
@@ -107,7 +115,19 @@ def stale(manifest: dict | None = None) -> list:
     return out
 
 
-def stamp(paths: list, same: bool = False) -> None:
+def manual_stale(manifest: dict | None = None) -> list:
+    """(file, reason) for the hand-recorded files whose sources changed after they were recorded."""
+    manifest = manifest or load()
+    now = {g: fingerprint(spec["sources"]) for g, spec in manifest["groups"].items()}
+    out = []
+    for rel, entry in manifest["files"].items():
+        changed = [g for g in groups_of(manifest, rel) if entry["groups"].get(g) != now[g]]
+        if entry.get("manual") and changed and rel in media_files():
+            out.append((rel, "recorded by hand before a change to " + ", ".join(changed)))
+    return out
+
+
+def stamp(paths: list, same: bool = False, manual: bool = False) -> None:
     manifest = load()
     now = {g: fingerprint(spec["sources"]) for g, spec in manifest["groups"].items()}
     for p in paths:
@@ -119,7 +139,7 @@ def stamp(paths: list, same: bool = False) -> None:
         if old and old["sha"] == sha and old["groups"] != groups and not same:
             raise SystemExit(f"stamp: {rel} is the same file as before its sources changed: record it again"
                              " (or pass --same if the new recording came out identical)")
-        manifest["files"][rel] = {"sha": sha, "groups": groups}
+        manifest["files"][rel] = {"sha": sha, "groups": groups, **({"manual": True} if manual or (old or {}).get("manual") else {})}
     manifest["files"] = dict(sorted(manifest["files"].items()))
     with open(MANIFEST, "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=2)
@@ -145,9 +165,12 @@ def main(argv: list) -> int:
         found = stale()
         for rel, why in found:
             print(f"docs/img/{rel}: {why}")
+        for rel, why in manual_stale():
+            print(f"note: docs/img/{rel}: {why}")
         return 1 if found else 0
-    if argv[:1] == ["stamp"] and [a for a in argv[1:] if a != "--same"]:
-        stamp([a for a in argv[1:] if a != "--same"], same="--same" in argv[1:])
+    flags = ("--same", "--manual")
+    if argv[:1] == ["stamp"] and [a for a in argv[1:] if a not in flags]:
+        stamp([a for a in argv[1:] if a not in flags], same="--same" in argv[1:], manual="--manual" in argv[1:])
         return 0
     if argv[:1] == ["posters"]:
         posters()

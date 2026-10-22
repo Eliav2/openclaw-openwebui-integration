@@ -66,7 +66,7 @@ The Pipe ships no such page and no viewer: it only passes the address on. Withou
 
 The valves are named after the use the hook was built for, a live view of the agent's browser, but the page can be anything your service serves for a reply. See [our own setup as one example](../examples/live-browser-view.md).
 
-<img src="../img/demos/live-browser.gif" alt="A question to look up a mountain's height. The reply gets a waiting note, then the agent's browser appears live inside the message while it types a search, opens a result and scrolls the article, and the reply finishes with the answer" width="800">
+<img src="../img/demos/live-browser.gif" alt="A request to find the cutest kitten picture on Google. The reply gets a waiting note, then the agent's browser appears live inside the message with the image results, and the agent clicks one; the reply finishes with a short reason for the pick and the picture itself" width="800">
 
 Our own setup, as one example: the agent's browser, live inside the reply that started it. The viewer behind it is a private service of ours, not part of the Pipe.
 
