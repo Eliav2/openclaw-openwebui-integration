@@ -7,6 +7,10 @@ Applies to: Pipe (`LIVE_VIEW_URL`, `LIVE_VIEW_TOOLS`, `LIVE_VIEW_USERS`).
 > [!IMPORTANT]
 > This is our own setup, shown as an example. The browser recorder and viewer on this page are a private service we run for our agents. They are not part of the Pipe, not in this repo and not provided. The Pipe only adds the address you give it to a reply; to get something like this, you build and run the service yourself.
 
+<img src="../img/demos/live-browser.gif" alt="A question to look up a mountain's height. The reply gets a waiting note, then the agent's browser appears live inside the message while it types a search, opens a result and scrolls the article, and the reply finishes with the answer" width="800">
+
+The recording is made on the docs' demo stack, where a small stand-in page plays the part of our viewer and streams a real headless browser the same way.
+
 <img src="../img/live-view-light.png" alt="A reply that checked a dashboard in a browser: the browser's page shown inside the message, marked live, above the reply's text" width="320">
 
 ## What it does
