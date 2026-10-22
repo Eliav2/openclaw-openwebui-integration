@@ -66,7 +66,12 @@ and only a core set is sent as real schemas.
   announce with
   `E2E_TWIN_A_HEARD heard-1 ... heard-6` at 0.4 s a word: the twins end
   together, so one announce lands while the other's reply streams (ELI-271).
-* `E2E_SLOW TOKEN`                     -> replies `TOKEN slow-1 ... slow-10`, one
+* `E2E_SPAWN_CLEANUP`                  -> spawns two sub-agents with cleanup
+  "delete": `E2E_CLEAN_OK` answers `E2E_CLEAN_OK_DONE`, `E2E_CLEAN_FAIL`'s
+  model call fails with HTTP 402 `E2E_CLEAN_BILLING: balance too low`. Then
+  replies `E2E_CLEANUP_SPAWNED`. The Gateway deletes both sessions seconds
+  after each child ends (ELI-276, ELI-277).
+* `E2E_SLOW TOKEN`                    -> replies `TOKEN slow-1 ... slow-10`, one
   word a second, so a turn can be queued behind a run that is still going.
   `E2E_SLOW:<n> TOKEN` sends n words instead of 10 (a run that outlasts an
   Open WebUI stop).
@@ -521,6 +526,17 @@ def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
         # the other twin's announce lands while it streams (ELI-271).
         twin = re.search(r"E2E_TWIN_([AB])_RESULT", user_text[event:]).group(1)
         return {"text": f"E2E_TWIN_{twin}_HEARD " + " ".join(f"heard-{i}" for i in range(1, 7)), "delay": 0.4}
+    if "E2E_CLEAN_" in user_text and "[Subagent Task]" in user_text:
+        if "E2E_CLEAN_FAIL" in user_text:
+            return {"http_error": 402, "text": "E2E_CLEAN_BILLING: balance too low"}
+        return {"text": "E2E_CLEAN_OK_DONE"}
+    if "E2E_SPAWN_CLEANUP" in user_text:
+        children = [("E2E_CLEAN_OK", "clean ok"), ("E2E_CLEAN_FAIL", "clean fail")]
+        if len(tool_results) >= len(children):
+            return {"text": "E2E_CLEANUP_SPAWNED"}
+        task, label = children[len(tool_results)]
+        return _call_with("sessions_spawn", {"task": task, "label": label, "cleanup": "delete"}, offered) or {
+            "text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
     if "E2E_SPAWN_TWINS" in user_text:
         twins = [("E2E_TWIN_A", "twin a"), ("E2E_TWIN_B", "twin b")]
         if len(tool_results) >= len(twins):

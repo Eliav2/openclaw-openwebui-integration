@@ -1022,10 +1022,10 @@ def _spawn_result_view(args_str: str, result_str: str) -> tuple[str, bool]:
 
 
 def _spawned_child(payload: dict):
-    """(parent session key, child session key) of a tool event that is an
-    accepted spawn's result, else None: what the child index records. On
-    2026.10 the wrapper's nested call carries the spawn itself; the wrapper's
-    own envelope is read too."""
+    """(parent session key, child session key, run id or None) of a tool
+    event that is an accepted spawn's result, else None: what the child index
+    records. On 2026.10 the wrapper's nested call carries the spawn itself;
+    the wrapper's own envelope is read too."""
     data = payload.get("data") or {}
     if payload.get("stream") != "tool" or data.get("phase") != "result" or data.get("isError") is True:
         return None
@@ -1041,11 +1041,12 @@ def _spawned_child(payload: dict):
     child = receipt.get("childSessionKey")
     if receipt.get("status") != "accepted" or not isinstance(child, str) or not child or not parent:
         return None
-    return parent, child
+    run_id = receipt.get("runId")
+    return parent, child, run_id if isinstance(run_id, str) and run_id else None
 
 
-def _spawn_call_task(payload: dict) -> str | None:
-    """The task a tool event's spawn call was given (the call itself, or the
+def _spawn_call_args(payload: dict) -> dict | None:
+    """The arguments of a tool event's spawn call (the call itself, or the
     one a deferred-tool wrapper makes), from its start event; else None."""
     data = payload.get("data") or {}
     if payload.get("stream") != "tool" or data.get("phase") != "start":
@@ -1054,10 +1055,7 @@ def _spawn_call_task(payload: dict) -> str | None:
     view = _deferred_call_view(name, args_str)
     if view:
         name, args_str = view
-    if not _is_spawn_tool(name):
-        return None
-    task = str(_json_object(args_str).get("task") or "").strip()
-    return task or None
+    return _json_object(args_str) if _is_spawn_tool(name) else None
 
 
 def _tool_call_error_relabel_event(name: str, tool_call_id: str, args_str: str) -> dict:
@@ -1774,9 +1772,13 @@ class _GatewayConnection:
         # by the key, a new child among them (ELI-260).
         self._session_child_waiters: dict[str, asyncio.Event] = {}
         self._tool_events_seen: dict[tuple, bool] = {}
-        # (session key, tool call id) -> the task of a spawn call that started
-        # and has no result yet (`_spawn_call_task`), for the child index.
-        self._spawn_tasks: dict[tuple, str] = {}
+        # (session key, tool call id) -> the arguments of a spawn call that
+        # started and has no result yet (`_spawn_call_args`), for the child index.
+        self._spawn_args: dict[tuple, dict] = {}
+        # Child session key -> the run its spawn started, and the children
+        # whose failed run's own error is recorded (`_record_child_end`).
+        self._spawn_runs: dict[str, str] = {}
+        self._child_errors_read: set[str] = set()
 
     async def _subscribe_all(self) -> None:
         """Renew this socket's subscriptions: the session index
@@ -1858,23 +1860,32 @@ class _GatewayConnection:
         return True
 
     def _spawn_seen(self, payload: dict):
-        """(parent, child, task or None) of an accepted spawn's result event,
-        else None. The task is the one the call's start event carried: the
-        receipt has none, and the child's transcript may not hold it yet."""
+        """(parent, child, task or None, run fields or None) of an accepted
+        spawn's result event, else None. The task and the label are the ones
+        the call's start event carried: the receipt has neither, and the
+        child's transcript may not hold the task yet. The run fields are its
+        run id and label, which give the child its row once a cleanup
+        "delete" removed its session (ELI-276)."""
         data = payload.get("data") or {}
         call = (payload.get("sessionKey"), data.get("toolCallId"))
-        task = _spawn_call_task(payload)
-        if task:
-            self._spawn_tasks[call] = task
-            if len(self._spawn_tasks) > 200:
-                for stale in list(self._spawn_tasks)[:100]:
-                    self._spawn_tasks.pop(stale, None)
+        args = _spawn_call_args(payload)
+        if args is not None:
+            self._spawn_args[call] = args
+            if len(self._spawn_args) > 200:
+                for stale in list(self._spawn_args)[:100]:
+                    self._spawn_args.pop(stale, None)
             return None
         if data.get("phase") != "result":
             return None
-        task = self._spawn_tasks.pop(call, None)
+        args = self._spawn_args.pop(call, None) or {}
         spawned = _spawned_child(payload)
-        return (*spawned, task) if spawned else None
+        if not spawned:
+            return None
+        parent, child, run_id = spawned
+        task = str(args.get("task") or "").strip() or None
+        label = str(args.get("label") or "").strip()
+        run = {"runId": run_id, **({"label": label} if label else {})} if run_id else None
+        return parent, child, task, run
 
     def session_change_event(self, session_key: str) -> asyncio.Event:
         """An Event set by the next pushed change to `session_key`'s run state
@@ -1954,12 +1965,44 @@ class _GatewayConnection:
             ev = self._session_child_waiters.pop(parent, None)
             if ev is not None:
                 ev.set()
+            if key and _subagent_ended(payload) and self.parse_owui_session_key(parent):
+                spawn_background(self._record_child_end(parent, key, {**payload, "key": key}))
         if _TURNS and key and payload.get("hasActiveRun") is False:
             _TURNS.settled(self, key, payload)
         if (payload.get("hasActiveRun") and key
                 and key not in self._message_subscriptions
                 and self.parse_owui_session_key(key)):
             spawn_background(self.ensure_message_subscription(key))
+
+    async def _record_child_end(self, parent: str, child: str, row: dict) -> None:
+        """Keep a chat's child as it ended, for the Status dialog: a child
+        spawned with cleanup "delete" has no session seconds later, and the
+        dialog listed only children it could still read (ELI-276). A failed
+        run's own error is recorded too, read from the run while the Gateway
+        still holds it: the row's `lastRunError` is a canned summary chosen
+        by the error's class, which can hide what the provider said (ELI-277)."""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, functools.partial(_subagent_remember, parent, rows=[row]))
+        if row.get("status") not in ("failed", "timeout") or child in self._child_errors_read:
+            return
+        run_id = self._spawn_runs.get(child) or ((await loop.run_in_executor(
+            None, _subagent_runs, parent)).get(child) or {}).get("runId")
+        if not run_id:
+            return
+        try:
+            ended = await self.send_request("agent.wait", {"runId": run_id, "timeoutMs": 0}, timeout=5)
+        except Exception as ex:
+            pipe_log(f"[subagents] agent.wait {run_id} failed: {ex}")
+            return
+        if (ended or {}).get("status") == "timeout":
+            return   # not over on the run's side yet: the next push asks again
+        self._child_errors_read.add(child)
+        if len(self._child_errors_read) > 2000:
+            self._child_errors_read.clear()
+        error = (ended or {}).get("error")
+        if isinstance(error, str) and error.strip():
+            await loop.run_in_executor(None, functools.partial(
+                _subagent_remember, parent, runs={child: {"error": error.strip()[:2000]}}))
 
     def row_to_consumers(self, session_key: str, row: dict, resync: bool = False,
                          read_at: float | None = None, outside_loop: bool = False) -> None:
@@ -2498,9 +2541,15 @@ class _GatewayConnection:
         spawned = self._spawn_seen(payload) if payload.get("stream") == "tool" else None
         if spawned:
             # The Status dialog's child index (state.py), off the loop.
-            parent, child, task = spawned
+            parent, child, task, run = spawned
+            if run:
+                self._spawn_runs[child] = run["runId"]
+                if len(self._spawn_runs) > 2000:
+                    for stale in list(self._spawn_runs)[:1000]:
+                        self._spawn_runs.pop(stale, None)
             asyncio.get_running_loop().run_in_executor(None, functools.partial(
-                _subagent_remember, parent, keys=[child], tasks={child: task} if task else None))
+                _subagent_remember, parent, keys=[child], tasks={child: task} if task else None,
+                runs={child: run} if run else None))
 
         # ── Shadow render ──
         # Feed every event of a run we're tracking into its shadow

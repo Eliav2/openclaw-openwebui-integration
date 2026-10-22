@@ -255,8 +255,12 @@ def _write_json_file(path, data):
 # flock. Parents untouched for 180 days are dropped, and each keeps its 200
 # newest children. `tasks`: the task each spawn call was given, by child key,
 # which titles the child before its transcript holds the spawn message (on
-# 2026.10 that is written after the spawn returns, ELI-178). `seeded`: children
-# spawned before this file existed were folded in once, from one full list.
+# 2026.10 that is written after the spawn returns, ELI-178). `runs`: each
+# spawn's run id and label, by child key. A child spawned with cleanup
+# "delete" has no session once its run is done, so its row comes from its run
+# (`agent.wait`), and so does a failed child's real error (ELI-276, ELI-277).
+# `seeded`: children spawned before this file existed were folded in once,
+# from one full list.
 # ---------------------------------------------------------------------------
 
 _SUBAGENT_INDEX_NAME = "subagent-children.json"
@@ -264,7 +268,14 @@ _SUBAGENT_INDEX_KEEP_MS = 180 * 86400 * 1000
 _SUBAGENT_INDEX_PER_PARENT = 200
 # What a Subagents row needs of a child session's row.
 _SUBAGENT_SNAPSHOT_KEYS = ("key", "label", "status", "startedAt", "createdAt", "updatedAt", "endedAt",
-                           "lastRunError", "spawnedBy", "parentSessionKey")
+                           "lastRunError", "spawnedBy", "parentSessionKey", "gone")
+
+
+def _subagent_ended(row) -> bool:
+    """A child session row (or `sessions.changed` push) whose run is over:
+    the row to keep, since a cleanup "delete" removes the session seconds
+    later (ELI-276)."""
+    return (row or {}).get("status") not in (None, "running", "queued") and row.get("hasActiveRun") is not True
 
 
 def _subagent_index_path():
@@ -303,8 +314,9 @@ def _subagent_index_update(change) -> None:
                                                               or (children[k] or {}).get("createdAt")
                                                               or now))
                     entry["children"] = {k: children[k] for k in newest[:_SUBAGENT_INDEX_PER_PARENT]}
-                if entry.get("tasks"):
-                    entry["tasks"] = {k: t for k, t in entry["tasks"].items() if k in entry["children"]}
+                for field in ("tasks", "runs"):
+                    if entry.get(field):
+                        entry[field] = {k: t for k, t in entry[field].items() if k in entry["children"]}
             _write_json_file(path, index)
     except Exception as ex:
         pipe_log(f"[subagents] could not update the child index: {ex}")
@@ -322,20 +334,41 @@ def _subagent_tasks(parent) -> dict:
     return dict(entry.get("tasks") or {})
 
 
-def _subagent_remember(parent, rows=(), keys=(), tasks=None) -> None:
+def _subagent_runs(parent) -> dict:
+    """{child key: {"runId", "label", "error"}} of `parent`'s spawns: the run
+    each was started with, and that run's own error once read."""
+    entry = _subagent_index_read()["parents"].get(parent) or {}
+    return dict(entry.get("runs") or {})
+
+
+def _subagent_record(child) -> dict | None:
+    """What the index holds of one child, under whichever parent spawned it:
+    {"parent", "row" (or None), "task", "run"}; None for a child it never saw."""
+    for parent, entry in _subagent_index_read()["parents"].items():
+        if child in (entry.get("children") or {}):
+            return {"parent": parent, "row": entry["children"][child],
+                    "task": (entry.get("tasks") or {}).get(child),
+                    "run": (entry.get("runs") or {}).get(child) or {}}
+    return None
+
+
+def _subagent_remember(parent, rows=(), keys=(), tasks=None, runs=None) -> None:
     """Record `parent`'s children: `keys` seen spawned, `rows` as just read,
-    `tasks` {child key: the task its spawn call was given}."""
-    rows, keys, tasks = list(rows), list(keys), dict(tasks or {})
-    if not parent or not (rows or keys or tasks):
+    `tasks` {child key: the task its spawn call was given}, `runs` {child
+    key: fields of its run}, merged into what is kept."""
+    rows, keys, tasks, runs = list(rows), list(keys), dict(tasks or {}), dict(runs or {})
+    if not parent or not (rows or keys or tasks or runs):
         return
 
     def change(index):
         entry = index["parents"].setdefault(parent, {"at": 0, "children": {}})
         entry["at"] = int(time.time() * 1000)
-        for key in [*keys, *tasks]:
+        for key in [*keys, *tasks, *runs]:
             entry["children"].setdefault(key, None)
         if tasks:
             entry.setdefault("tasks", {}).update(tasks)
+        for key, fields in runs.items():
+            entry.setdefault("runs", {}).setdefault(key, {}).update(fields)
         for row in rows:
             entry["children"][row["key"]] = {k: row[k] for k in _SUBAGENT_SNAPSHOT_KEYS if row.get(k) is not None}
     _subagent_index_update(change)
@@ -2016,10 +2049,10 @@ def _spawn_result_view(args_str: str, result_str: str) -> tuple[str, bool]:
 
 
 def _spawned_child(payload: dict):
-    """(parent session key, child session key) of a tool event that is an
-    accepted spawn's result, else None: what the child index records. On
-    2026.10 the wrapper's nested call carries the spawn itself; the wrapper's
-    own envelope is read too."""
+    """(parent session key, child session key, run id or None) of a tool
+    event that is an accepted spawn's result, else None: what the child index
+    records. On 2026.10 the wrapper's nested call carries the spawn itself;
+    the wrapper's own envelope is read too."""
     data = payload.get("data") or {}
     if payload.get("stream") != "tool" or data.get("phase") != "result" or data.get("isError") is True:
         return None
@@ -2035,11 +2068,12 @@ def _spawned_child(payload: dict):
     child = receipt.get("childSessionKey")
     if receipt.get("status") != "accepted" or not isinstance(child, str) or not child or not parent:
         return None
-    return parent, child
+    run_id = receipt.get("runId")
+    return parent, child, run_id if isinstance(run_id, str) and run_id else None
 
 
-def _spawn_call_task(payload: dict) -> str | None:
-    """The task a tool event's spawn call was given (the call itself, or the
+def _spawn_call_args(payload: dict) -> dict | None:
+    """The arguments of a tool event's spawn call (the call itself, or the
     one a deferred-tool wrapper makes), from its start event; else None."""
     data = payload.get("data") or {}
     if payload.get("stream") != "tool" or data.get("phase") != "start":
@@ -2048,10 +2082,7 @@ def _spawn_call_task(payload: dict) -> str | None:
     view = _deferred_call_view(name, args_str)
     if view:
         name, args_str = view
-    if not _is_spawn_tool(name):
-        return None
-    task = str(_json_object(args_str).get("task") or "").strip()
-    return task or None
+    return _json_object(args_str) if _is_spawn_tool(name) else None
 
 
 def _tool_call_error_relabel_event(name: str, tool_call_id: str, args_str: str) -> dict:
@@ -2768,9 +2799,13 @@ class _GatewayConnection:
         # by the key, a new child among them (ELI-260).
         self._session_child_waiters: dict[str, asyncio.Event] = {}
         self._tool_events_seen: dict[tuple, bool] = {}
-        # (session key, tool call id) -> the task of a spawn call that started
-        # and has no result yet (`_spawn_call_task`), for the child index.
-        self._spawn_tasks: dict[tuple, str] = {}
+        # (session key, tool call id) -> the arguments of a spawn call that
+        # started and has no result yet (`_spawn_call_args`), for the child index.
+        self._spawn_args: dict[tuple, dict] = {}
+        # Child session key -> the run its spawn started, and the children
+        # whose failed run's own error is recorded (`_record_child_end`).
+        self._spawn_runs: dict[str, str] = {}
+        self._child_errors_read: set[str] = set()
 
     async def _subscribe_all(self) -> None:
         """Renew this socket's subscriptions: the session index
@@ -2852,23 +2887,32 @@ class _GatewayConnection:
         return True
 
     def _spawn_seen(self, payload: dict):
-        """(parent, child, task or None) of an accepted spawn's result event,
-        else None. The task is the one the call's start event carried: the
-        receipt has none, and the child's transcript may not hold it yet."""
+        """(parent, child, task or None, run fields or None) of an accepted
+        spawn's result event, else None. The task and the label are the ones
+        the call's start event carried: the receipt has neither, and the
+        child's transcript may not hold the task yet. The run fields are its
+        run id and label, which give the child its row once a cleanup
+        "delete" removed its session (ELI-276)."""
         data = payload.get("data") or {}
         call = (payload.get("sessionKey"), data.get("toolCallId"))
-        task = _spawn_call_task(payload)
-        if task:
-            self._spawn_tasks[call] = task
-            if len(self._spawn_tasks) > 200:
-                for stale in list(self._spawn_tasks)[:100]:
-                    self._spawn_tasks.pop(stale, None)
+        args = _spawn_call_args(payload)
+        if args is not None:
+            self._spawn_args[call] = args
+            if len(self._spawn_args) > 200:
+                for stale in list(self._spawn_args)[:100]:
+                    self._spawn_args.pop(stale, None)
             return None
         if data.get("phase") != "result":
             return None
-        task = self._spawn_tasks.pop(call, None)
+        args = self._spawn_args.pop(call, None) or {}
         spawned = _spawned_child(payload)
-        return (*spawned, task) if spawned else None
+        if not spawned:
+            return None
+        parent, child, run_id = spawned
+        task = str(args.get("task") or "").strip() or None
+        label = str(args.get("label") or "").strip()
+        run = {"runId": run_id, **({"label": label} if label else {})} if run_id else None
+        return parent, child, task, run
 
     def session_change_event(self, session_key: str) -> asyncio.Event:
         """An Event set by the next pushed change to `session_key`'s run state
@@ -2948,12 +2992,44 @@ class _GatewayConnection:
             ev = self._session_child_waiters.pop(parent, None)
             if ev is not None:
                 ev.set()
+            if key and _subagent_ended(payload) and self.parse_owui_session_key(parent):
+                spawn_background(self._record_child_end(parent, key, {**payload, "key": key}))
         if _TURNS and key and payload.get("hasActiveRun") is False:
             _TURNS.settled(self, key, payload)
         if (payload.get("hasActiveRun") and key
                 and key not in self._message_subscriptions
                 and self.parse_owui_session_key(key)):
             spawn_background(self.ensure_message_subscription(key))
+
+    async def _record_child_end(self, parent: str, child: str, row: dict) -> None:
+        """Keep a chat's child as it ended, for the Status dialog: a child
+        spawned with cleanup "delete" has no session seconds later, and the
+        dialog listed only children it could still read (ELI-276). A failed
+        run's own error is recorded too, read from the run while the Gateway
+        still holds it: the row's `lastRunError` is a canned summary chosen
+        by the error's class, which can hide what the provider said (ELI-277)."""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, functools.partial(_subagent_remember, parent, rows=[row]))
+        if row.get("status") not in ("failed", "timeout") or child in self._child_errors_read:
+            return
+        run_id = self._spawn_runs.get(child) or ((await loop.run_in_executor(
+            None, _subagent_runs, parent)).get(child) or {}).get("runId")
+        if not run_id:
+            return
+        try:
+            ended = await self.send_request("agent.wait", {"runId": run_id, "timeoutMs": 0}, timeout=5)
+        except Exception as ex:
+            pipe_log(f"[subagents] agent.wait {run_id} failed: {ex}")
+            return
+        if (ended or {}).get("status") == "timeout":
+            return   # not over on the run's side yet: the next push asks again
+        self._child_errors_read.add(child)
+        if len(self._child_errors_read) > 2000:
+            self._child_errors_read.clear()
+        error = (ended or {}).get("error")
+        if isinstance(error, str) and error.strip():
+            await loop.run_in_executor(None, functools.partial(
+                _subagent_remember, parent, runs={child: {"error": error.strip()[:2000]}}))
 
     def row_to_consumers(self, session_key: str, row: dict, resync: bool = False,
                          read_at: float | None = None, outside_loop: bool = False) -> None:
@@ -3492,9 +3568,15 @@ class _GatewayConnection:
         spawned = self._spawn_seen(payload) if payload.get("stream") == "tool" else None
         if spawned:
             # The Status dialog's child index (state.py), off the loop.
-            parent, child, task = spawned
+            parent, child, task, run = spawned
+            if run:
+                self._spawn_runs[child] = run["runId"]
+                if len(self._spawn_runs) > 2000:
+                    for stale in list(self._spawn_runs)[:1000]:
+                        self._spawn_runs.pop(stale, None)
             asyncio.get_running_loop().run_in_executor(None, functools.partial(
-                _subagent_remember, parent, keys=[child], tasks={child: task} if task else None))
+                _subagent_remember, parent, keys=[child], tasks={child: task} if task else None,
+                runs={child: run} if run else None))
 
         # ── Shadow render ──
         # Feed every event of a run we're tracking into its shadow
@@ -7672,6 +7754,34 @@ def _subagent_task_texts(previews_resp):
     return out
 
 
+def _run_error_text(error):
+    """A run's error as `agent.wait` gives it, readable: a provider's JSON
+    error body becomes "<status>: <message>"."""
+    text = str(error or "").strip()
+    try:
+        body = json.loads(text) if text.startswith("{") else None
+    except ValueError:
+        body = None
+    if isinstance(body, dict):
+        inner = body.get("error")
+        message = inner.get("message") if isinstance(inner, dict) else inner
+        if isinstance(message, str) and message.strip():
+            status = body.get("status") or (inner.get("code") if isinstance(inner, dict) else None)
+            text = f"{status}: {message.strip()}" if status else message.strip()
+    return text[:500] or None
+
+
+def _subagent_error(run_error, summary):
+    """A failed child's error line: what its run reported first, then the
+    Gateway's `lastRunError`. That one is canned copy picked by the error's
+    class (a 402 billing error read "needs a short break", a 400 "not
+    supported with this account" read "model was not found"), so on its own
+    it can name the wrong cause (ELI-277)."""
+    if run_error and summary and run_error not in summary:
+        return f"{run_error} (Gateway: {summary})"
+    return run_error or summary
+
+
 def _subagent_row(row, task_text=None, latest=None):
     """One Subagents row out of a child session row. The title is the spawn
     label, else the task's first sentence, else the key; the whole task is
@@ -7683,8 +7793,11 @@ def _subagent_row(row, task_text=None, latest=None):
     with no push, so a row filled from either would read differently in the
     open dialog and after a reopen (ELI-264)."""
     status = _subagent_status(row.get("status"))
-    if status is None and row.get("endedAt"):
-        status = "ended"    # a visible spawn's session carries no run status
+    if status is None and (row.get("endedAt") or row.get("gone")):
+        # A visible spawn's session carries no run status; a child whose
+        # session is gone and whose end was not recorded ended unread.
+        status = "ended"
+    run_error = _run_error_text(row.get("runError"))
     live = status in _LIVE_SUBAGENT_STATUSES
     preview = (row.get("lastMessagePreview") or latest) if live else latest
     if _is_spawn_message(preview):
@@ -7697,7 +7810,7 @@ def _subagent_row(row, task_text=None, latest=None):
         "status": status,
         "progressSummary": preview if live else None,
         "terminalSummary": preview if not live else None,
-        "error": row.get("lastRunError"),
+        "error": _subagent_error(run_error, row.get("lastRunError")),
         "childSessionKey": row["key"],
         "startedAt": row.get("startedAt"),
         # An ended child's duration stops at its last update when the
@@ -7724,7 +7837,31 @@ def _subagent_final(row):
     if not row:
         return False
     status = _subagent_status(row.get("status"))
-    return status not in _LIVE_SUBAGENT_STATUSES and bool(status or row.get("endedAt"))
+    return status not in _LIVE_SUBAGENT_STATUSES and bool(status or row.get("endedAt") or row.get("gone"))
+
+
+# `agent.wait` statuses, as a session row's (ELI-276).
+_RUN_WAIT_STATUSES = {"ok": "done", "error": "failed", "aborted": "killed"}
+
+
+async def _ended_child_row(conn, parent, key, run):
+    """The row of a child whose session is gone (spawned with cleanup
+    "delete"), from its run while the Gateway still holds it, else a bare
+    row that says it ended. Every child the agent ran stays listed."""
+    row = {"key": key, "spawnedBy": parent, "gone": True,
+           **({"label": run["label"]} if run.get("label") else {})}
+    if run.get("runId"):
+        try:
+            ended = await conn.send_request("agent.wait", dict(runId=run["runId"], timeoutMs=0), timeout=5)
+        except Exception as ex:
+            pipe_log(f"[status-action] agent.wait (child {key}) failed: {ex}")
+            ended = None
+        status = _RUN_WAIT_STATUSES.get((ended or {}).get("status"))
+        if status:
+            row.update(status=status, startedAt=ended.get("startedAt"), endedAt=ended.get("endedAt"))
+            if ended.get("error"):
+                row["runError"] = ended["error"]
+    return row
 
 
 async def _lookup_child(conn, key):
@@ -9018,13 +9155,21 @@ class Action:
             except Exception as ex:
                 error, current = ex, []
             rows = {r["key"]: r for r in current}
-            stale = [k for k, snap in known.items() if k not in rows and not _subagent_final(snap)]
-            found = [r for r in await asyncio.gather(*(_lookup_child(conn, k) for k in stale[:_SUBAGENT_LIST_CAP]))
-                     if r]
-            rows.update({r["key"]: r for r in found})
+            stale = [k for k, snap in known.items() if k not in rows and not _subagent_final(snap)][:_SUBAGENT_LIST_CAP]
+            looked = await asyncio.gather(*(_lookup_child(conn, k) for k in stale))
+            found = [r for r in looked if r]
+            # A recorded child no lookup finds has no session any more: its
+            # row comes from its run (ELI-276). Not when the list itself
+            # failed, which says nothing about the session.
+            runs = _subagent_runs(session_key)
+            gone = [] if error is not None else await asyncio.gather(*(
+                _ended_child_row(conn, session_key, k, runs.get(k) or {})
+                for k, r in zip(stale, looked) if not r))
+            rows.update({r["key"]: r for r in [*found, *gone]})
             rows.update({k: snap for k, snap in known.items() if k not in rows and snap})
-            if current or found:
-                _subagent_remember(session_key, rows=current + found)
+            if current or found or gone:
+                _subagent_remember(session_key, rows=current + found + gone,
+                                   runs={r["key"]: {"error": r["runError"]} for r in gone if r.get("runError")})
             if error is not None and not rows:
                 raise error
             return {"sessions": list(rows.values())}
@@ -9060,9 +9205,11 @@ class Action:
                 pipe_log(f"[status-action] sessions.list (children) failed: {ex}")
                 await emit(_render_subagents_fill_js({"error": f"Could not fetch subagents: {ex}"}))
                 return []
+            runs = _subagent_runs(session_key)
             for r in (children_resp or {}).get("sessions") or []:
                 if _is_child_of(r, session_key):
-                    children_seen[r["key"]] = r
+                    run_error = (runs.get(r["key"]) or {}).get("error")
+                    children_seen[r["key"]] = {**r, "runError": run_error} if run_error else r
             shown = sorted(children_seen.values(), key=_subagent_started, reverse=True)[:_SUBAGENT_LIST_CAP]
             running = [r["key"] for r in shown if _subagent_status(r.get("status")) in _LIVE_SUBAGENT_STATUSES]
             # Folded at the open, the section stays so until the reader taps
@@ -9445,11 +9592,19 @@ class Action:
             return {"status": "error", "detail": str(ex)}
 
         session_row = (desc_resp or {}).get("session") or {}
+        record = _subagent_record(child_key)
+        gone = not session_row and record is not None
+        if gone:
+            # Its session was removed when it ended (cleanup "delete"): what
+            # the child index kept of it is all there is (ELI-276).
+            session_row = {"spawnedBy": record["parent"], "gone": True, **(record["row"] or {})}
         if not session_row:
             await __event_emitter__({"type": "execute", "data": {
                 "code": _render_drawer_error_js("Sub-agent not found.", child_key)
             }})
             return {"status": "error", "detail": "sub-agent not found"}
+        if record and record["run"].get("error"):
+            session_row = {**session_row, "runError": record["run"]["error"]}
 
         parent = session_row.get("spawnedBy") or session_row.get("parentSessionKey")
         task_text = _spawn_task_of(messages) or _subagent_tasks(parent).get(child_key)
@@ -9466,6 +9621,10 @@ class Action:
             note, latest = "cli-running", await _latest_preview(conn, child_key)
         elif claude_cli and task["status"] == "cancelled":
             note = "cli-stopped"   # stopped before it ended: nothing of it was saved
+        note_text = None
+        if gone:
+            note, note_text = "gone", ("Its session was removed when it ended (spawned with cleanup"
+                                       " \"delete\"), so its run is no longer kept.")
         parent = await _drawer_parent(conn, session_row, parent_for) if parent_for is not False else None
 
         await __event_emitter__({"type": "execute", "data": {"code": _render_drawer_fill_js({
@@ -9475,7 +9634,7 @@ class Action:
             "parent": parent,
             "items": items,
             "earlier": {"count": dropped, "more": not whole} if dropped or not whole else None,
-            "note": note, "latest": latest,
+            "note": note, "noteText": note_text, "latest": latest,
             "source": source, "fetchedAt": int(time.time() * 1000), "error": None,
         })}})
         return {"status": "ok"}

@@ -346,6 +346,30 @@ class SubagentDrawerTests(unittest.IsolatedAsyncioTestCase):
         _result, emitted, _conn = await self._drawer(CHILD_A, send_request)
         self.assertEqual(self._fill(emitted)["task"]["error"], "provider 529")
 
+    async def test_a_deleted_child_opens_from_what_was_recorded(self):
+        """A child spawned with cleanup "delete" has no session once it ended
+        (ELI-276): the drawer shows the row and task the index kept, says why
+        its run is not there, and leads the error with the run's own (ELI-277)."""
+        fresh_child_index()
+        ended = _child(CHILD_A, "failed", startedAt=1, endedAt=2, lastRunError="needs a short break")
+        openclaw_status_action._subagent_remember(PARENT_KEY, rows=[ended], tasks={CHILD_A: "Research X."},
+                                                  runs={CHILD_A: {"runId": "r1", "error": "402: balance too low"}})
+
+        async def send_request(method, params, timeout=5):
+            if method == "sessions.describe":
+                return {"session": None}
+            if method == "chat.history":
+                return {"messages": []}
+            raise AssertionError(f"unexpected RPC: {method}")
+
+        result, emitted, _conn = await self._drawer(CHILD_A, send_request, keep_index=True)
+        self.assertEqual(result["status"], "ok")
+        data = self._fill(emitted)
+        self.assertEqual((data["task"]["status"], data["task"]["task"]), ("failed", "Research X."))
+        self.assertEqual(data["task"]["error"], "402: balance too low (Gateway: needs a short break)")
+        self.assertEqual(data["note"], "gone")
+        self.assertIn("cleanup", data["noteText"])
+
     async def test_an_unknown_child_says_so(self):
         async def send_request(method, params, timeout=5):
             if method == "sessions.describe":
@@ -833,8 +857,9 @@ class _WindowGateway:
     parent's children that run or ended in the last 30 minutes only
     (`current`), `search` matches keys, and no filter returns every row."""
 
-    def __init__(self, rows, current=(), fail_spawned_by=False):
+    def __init__(self, rows, current=(), fail_spawned_by=False, runs=None):
         self.rows, self.current, self.fail = rows, set(current), fail_spawned_by
+        self.runs = runs or {}   # `agent.wait` by run id; a run it no longer holds waits out
         self.calls = []
 
     def has_reply(self, _key):
@@ -851,6 +876,8 @@ class _WindowGateway:
             if "search" in params:
                 return {"sessions": [r for r in self.rows if params["search"] in r["key"]]}
             return {"sessions": list(self.rows)}
+        if method == "agent.wait":
+            return self.runs.get(params["runId"], {"status": "timeout"})
         return await _list_rpc([], {}, [])(method, params, timeout)
 
     def full_reads(self):
@@ -958,6 +985,35 @@ class ChildIndexTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data["tasks"][1]["title"], "engine review")
         self.assertEqual(data["total"], 3)
 
+    async def test_a_child_whose_session_was_deleted_stays_listed(self):
+        """A child spawned with cleanup "delete" is removed seconds after it
+        ends, and a lookup by its key finds nothing. It was dropped, so the
+        dialog listed only the children still there (ELI-276). Now its row
+        comes from its run while the Gateway holds that, else it is listed
+        as ended."""
+        openclaw_status_action._subagent_remember(PARENT_KEY, keys=[CHILD_A, CHILD_B], runs={
+            CHILD_A: {"runId": "r1", "label": "clean ok"}, CHILD_B: {"runId": "r2"}})
+        gw = _WindowGateway([], runs={"r1": {"status": "ok", "startedAt": 1000, "endedAt": 1100}})
+        tasks = {t["id"]: t for t in (await self._open(gw))[-1]["tasks"]}
+        self.assertEqual({k: (t["status"], t["title"]) for k, t in tasks.items()},
+                         {CHILD_A: ("completed", "clean ok"), CHILD_B: ("ended", CHILD_B)})
+        self.assertEqual(tasks[CHILD_A]["endedAt"], 1100)
+        # The run's row is kept: the next open asks nothing of it.
+        gw2 = _WindowGateway([])
+        await self._open(gw2)
+        self.assertNotIn("r1", [p.get("runId") for m, p in gw2.calls if m == "agent.wait"])
+
+    async def test_a_failed_child_leads_with_its_runs_own_error(self):
+        """`lastRunError` is canned copy chosen by the error's class: a 402
+        billing error read "short break" (ELI-277)."""
+        openclaw_status_action._subagent_remember(
+            PARENT_KEY, rows=[_child(CHILD_A, "failed", startedAt=1, endedAt=2,
+                                     lastRunError="The AI service needs a short break.")],
+            runs={CHILD_A: {"runId": "r1", "error": "fake returned a billing error | 402"}})
+        seen = await self._open(_WindowGateway([]))
+        self.assertEqual(seen[-1]["tasks"][0]["error"],
+                         "fake returned a billing error | 402 (Gateway: The AI service needs a short break.)")
+
     def test_the_pipe_records_the_task_an_accepted_spawn_was_given(self):
         """The receipt carries no task: the call's start event does, called
         directly or through 2026.10's `dispatch_action` wrapper."""
@@ -974,11 +1030,11 @@ class ChildIndexTests(unittest.IsolatedAsyncioTestCase):
                 seen = [conn._spawn_seen({"sessionKey": PARENT_KEY, "stream": "tool", "data": {
                     "phase": phase, "name": name, "toolCallId": "t", **extra}})
                     for phase, extra in (("start", {"args": call_args}), ("result", {"result": result}))]
-                self.assertEqual(seen, [None, (PARENT_KEY, CHILD_A, "Research X and report.")])
+                self.assertEqual(seen, [None, (PARENT_KEY, CHILD_A, "Research X and report.", {"runId": "r1"})])
         conn = openclaw_status_action._GatewayConnection(lambda: types.SimpleNamespace())
         self.assertEqual(conn._spawn_seen({"sessionKey": PARENT_KEY, "stream": "tool", "data": {
             "phase": "result", "name": "sessions_spawn", "toolCallId": "t", "result": receipt}}),
-            (PARENT_KEY, CHILD_A, None), "a result whose start was missed still records the child")
+            (PARENT_KEY, CHILD_A, None, {"runId": "r1"}), "a result whose start was missed still records the child")
 
     def test_the_pipe_records_an_accepted_spawn(self):
         receipt = {"status": "accepted", "childSessionKey": CHILD_A, "runId": "r1"}
@@ -987,10 +1043,68 @@ class ChildIndexTests(unittest.IsolatedAsyncioTestCase):
                               {"content": [{"type": "text", "text": json.dumps(receipt)}]})):
             payload = {"sessionKey": PARENT_KEY, "runId": "r", "stream": "tool",
                        "data": {"phase": "result", "name": name, "toolCallId": "t", "result": result}}
-            self.assertEqual(openclaw_status_action._spawned_child(payload), (PARENT_KEY, CHILD_A))
+            self.assertEqual(openclaw_status_action._spawned_child(payload), (PARENT_KEY, CHILD_A, "r1"))
         refused = {"sessionKey": PARENT_KEY, "stream": "tool", "data": {
             "phase": "result", "name": "sessions_spawn", "result": json.dumps({"status": "forbidden"})}}
         self.assertIsNone(openclaw_status_action._spawned_child(refused))
+
+
+OWUI_PARENT = "agent:main:openwebui-" + "u" * 36 + "-" + "c" * 36
+
+
+class ChildEndTests(unittest.IsolatedAsyncioTestCase):
+    """The Pipe keeps a chat's child as it ended, from the Gateway's push, and
+    a failed run's own error: once a cleanup "delete" removed the session,
+    neither can be read (ELI-276, ELI-277)."""
+
+    def setUp(self):
+        fresh_child_index()
+        # Only a chat of this Pipe's (an agent:<AGENT_ID>:openwebui-<user>-<chat> key) is kept.
+        self.conn = openclaw_status_action._GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"))
+        self.waits = []
+        self.conn.send_request = mock.AsyncMock(side_effect=lambda m, p, timeout=5: self.waits.pop(0))
+
+    async def test_a_child_of_another_channel_is_not_kept(self):
+        started = []
+        with mock.patch("openclaw_status_action.spawn_background", side_effect=started.append):
+            self.conn._on_sessions_changed({"sessionKey": CHILD_A, "spawnedBy": "agent:main:telegram:direct:1",
+                                            "status": "done", "hasActiveRun": False})
+        self.assertEqual(started, [])
+
+    def _push(self, status, **kw):
+        started = []
+        with mock.patch("openclaw_status_action.spawn_background", side_effect=started.append):
+            self.conn._on_sessions_changed({"sessionKey": CHILD_A, "spawnedBy": OWUI_PARENT, "status": status,
+                                            "hasActiveRun": status == "running", **kw})
+        return started
+
+    async def test_an_ended_childs_row_is_kept_from_its_push(self):
+        self.assertEqual(self._push("running", startedAt=1), [])
+        for c in self._push("done", startedAt=1, endedAt=2):
+            await c
+        row = openclaw_status_action._subagent_children(OWUI_PARENT)[CHILD_A]
+        self.assertEqual((row["status"], row["endedAt"]), ("done", 2))
+        self.conn.send_request.assert_not_called()   # a run that worked has no error to read
+
+    async def test_a_failed_runs_own_error_is_kept(self):
+        self.conn._spawn_runs[CHILD_A] = "r1"
+        self.waits = [{"status": "timeout"},
+                      {"status": "error", "error": '{"status":400,"error":{"message":"not supported"}}'}]
+        for _ in range(2):   # the run had not ended on its side at the first push
+            for c in self._push("failed", startedAt=1, endedAt=2, lastRunError="This model was not found."):
+                await c
+        self.assertEqual(openclaw_status_action._subagent_runs(OWUI_PARENT)[CHILD_A]["error"],
+                         '{"status":400,"error":{"message":"not supported"}}')
+        for c in self._push("failed", startedAt=1, endedAt=2):
+            await c
+        self.assertEqual(self.conn.send_request.await_count, 2)   # read once
+
+    def test_a_json_error_body_reads_as_its_message(self):
+        text = openclaw_status_action._run_error_text
+        self.assertEqual(text('{"type":"error","status":400,"error":{"message":"The model is not supported."}}'),
+                         "400: The model is not supported.")
+        self.assertEqual(text("plain | 402"), "plain | 402")
+        self.assertIsNone(text(None))
 
 
 def _card(call_id, name, args, result=None):

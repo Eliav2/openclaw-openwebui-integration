@@ -59,8 +59,12 @@ def _write_json_file(path, data):
 # flock. Parents untouched for 180 days are dropped, and each keeps its 200
 # newest children. `tasks`: the task each spawn call was given, by child key,
 # which titles the child before its transcript holds the spawn message (on
-# 2026.10 that is written after the spawn returns, ELI-178). `seeded`: children
-# spawned before this file existed were folded in once, from one full list.
+# 2026.10 that is written after the spawn returns, ELI-178). `runs`: each
+# spawn's run id and label, by child key. A child spawned with cleanup
+# "delete" has no session once its run is done, so its row comes from its run
+# (`agent.wait`), and so does a failed child's real error (ELI-276, ELI-277).
+# `seeded`: children spawned before this file existed were folded in once,
+# from one full list.
 # ---------------------------------------------------------------------------
 
 _SUBAGENT_INDEX_NAME = "subagent-children.json"
@@ -68,7 +72,14 @@ _SUBAGENT_INDEX_KEEP_MS = 180 * 86400 * 1000
 _SUBAGENT_INDEX_PER_PARENT = 200
 # What a Subagents row needs of a child session's row.
 _SUBAGENT_SNAPSHOT_KEYS = ("key", "label", "status", "startedAt", "createdAt", "updatedAt", "endedAt",
-                           "lastRunError", "spawnedBy", "parentSessionKey")
+                           "lastRunError", "spawnedBy", "parentSessionKey", "gone")
+
+
+def _subagent_ended(row) -> bool:
+    """A child session row (or `sessions.changed` push) whose run is over:
+    the row to keep, since a cleanup "delete" removes the session seconds
+    later (ELI-276)."""
+    return (row or {}).get("status") not in (None, "running", "queued") and row.get("hasActiveRun") is not True
 
 
 def _subagent_index_path():
@@ -107,8 +118,9 @@ def _subagent_index_update(change) -> None:
                                                               or (children[k] or {}).get("createdAt")
                                                               or now))
                     entry["children"] = {k: children[k] for k in newest[:_SUBAGENT_INDEX_PER_PARENT]}
-                if entry.get("tasks"):
-                    entry["tasks"] = {k: t for k, t in entry["tasks"].items() if k in entry["children"]}
+                for field in ("tasks", "runs"):
+                    if entry.get(field):
+                        entry[field] = {k: t for k, t in entry[field].items() if k in entry["children"]}
             _write_json_file(path, index)
     except Exception as ex:
         pipe_log(f"[subagents] could not update the child index: {ex}")
@@ -126,20 +138,41 @@ def _subagent_tasks(parent) -> dict:
     return dict(entry.get("tasks") or {})
 
 
-def _subagent_remember(parent, rows=(), keys=(), tasks=None) -> None:
+def _subagent_runs(parent) -> dict:
+    """{child key: {"runId", "label", "error"}} of `parent`'s spawns: the run
+    each was started with, and that run's own error once read."""
+    entry = _subagent_index_read()["parents"].get(parent) or {}
+    return dict(entry.get("runs") or {})
+
+
+def _subagent_record(child) -> dict | None:
+    """What the index holds of one child, under whichever parent spawned it:
+    {"parent", "row" (or None), "task", "run"}; None for a child it never saw."""
+    for parent, entry in _subagent_index_read()["parents"].items():
+        if child in (entry.get("children") or {}):
+            return {"parent": parent, "row": entry["children"][child],
+                    "task": (entry.get("tasks") or {}).get(child),
+                    "run": (entry.get("runs") or {}).get(child) or {}}
+    return None
+
+
+def _subagent_remember(parent, rows=(), keys=(), tasks=None, runs=None) -> None:
     """Record `parent`'s children: `keys` seen spawned, `rows` as just read,
-    `tasks` {child key: the task its spawn call was given}."""
-    rows, keys, tasks = list(rows), list(keys), dict(tasks or {})
-    if not parent or not (rows or keys or tasks):
+    `tasks` {child key: the task its spawn call was given}, `runs` {child
+    key: fields of its run}, merged into what is kept."""
+    rows, keys, tasks, runs = list(rows), list(keys), dict(tasks or {}), dict(runs or {})
+    if not parent or not (rows or keys or tasks or runs):
         return
 
     def change(index):
         entry = index["parents"].setdefault(parent, {"at": 0, "children": {}})
         entry["at"] = int(time.time() * 1000)
-        for key in [*keys, *tasks]:
+        for key in [*keys, *tasks, *runs]:
             entry["children"].setdefault(key, None)
         if tasks:
             entry.setdefault("tasks", {}).update(tasks)
+        for key, fields in runs.items():
+            entry.setdefault("runs", {}).setdefault(key, {}).update(fields)
         for row in rows:
             entry["children"][row["key"]] = {k: row[k] for k in _SUBAGENT_SNAPSHOT_KEYS if row.get(k) is not None}
     _subagent_index_update(change)
