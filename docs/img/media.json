@@ -92,22 +92,25 @@
       }
     },
     "demos/live-browser.gif": {
-      "sha": "973044c1b6460609",
+      "sha": "45799c9196bdbfe4",
       "groups": {
         "chrome": "86d17ffd5eaebce8"
-      }
+      },
+      "manual": true
     },
     "demos/live-browser.mp4": {
-      "sha": "7cddb1ce004234eb",
+      "sha": "4eef79a331982f1d",
       "groups": {
         "chrome": "86d17ffd5eaebce8"
-      }
+      },
+      "manual": true
     },
     "demos/live-browser.webm": {
-      "sha": "e726c1293c7af546",
+      "sha": "b5b190d41324c30a",
       "groups": {
         "chrome": "86d17ffd5eaebce8"
-      }
+      },
+      "manual": true
     },
     "demos/question-card.gif": {
       "sha": "b1844f3446eb45b4",

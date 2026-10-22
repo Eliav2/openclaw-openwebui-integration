@@ -155,13 +155,32 @@ demos add `scripts/demos/demos.json`). `capture.py` takes the stills;
 `scripts/demos/record.py` records each demo in `demos.json` with the DevTools
 screencast at 2x, a drawn cursor, a ripple on each click and a badge for each
 key, then encodes it with ffmpeg into a light GIF, 960 px wide, at most 15 s (a
-demo that needs longer sets `max_seconds`) and 1 MB. The `live-browser` demo
-also starts `scripts/demos/live_browser.py`, a stand-in for the live view's page
-(a headless Chromium browsing a small local site, streamed into the reply), and
-sets `LIVE_VIEW_URL` to it. Both fail when a page shows deny-listed text (words that give away a test
+demo that needs longer sets `max_seconds`) and 1 MB. Both fail when a page shows deny-listed text (words that give away a test
 stack). A demo waits on what the page shows, never on time: a reply is done when
 its text is stable and "Thinking…" is gone. Before committing a GIF, look at
 frames from it (`ffmpeg -i x.gif -vf "select=not(mod(n\,40))" -vsync 0 f%02d.png`).
+
+One recording is not made by CI: `docs/img/demos/live-browser.*`, the live view of the agent's browser
+(docs/examples/live-browser-view.md). It needs a real agent, Google's real results and a live view
+service behind a login, so it is a real chat on a real setup, recorded by hand and marked
+`"manual": true` in `docs/img/media.json`. To record it again, on a machine where the Pipe's
+`LIVE_VIEW_URL` is set for your account:
+
+```sh
+OWUI_URL=http://localhost:8080 OWUI_TOKEN=<your Open WebUI token> \
+  uv run --with-requirements requirements-browser.txt --with imageio-ffmpeg==0.6.0 --with pillow \
+  python scripts/demos/record_live.py record --work /tmp/live-browser --folder QA \
+  --viewer-origin <the live view's origin> --viewer-header 'Name: value'   # its login, if it has one
+python scripts/demos/record_live.py encode --work /tmp/live-browser --out docs/img/demos \
+  --cut 6-27=3,27-49=4.5,57-95=2.5   # play the waiting stretches faster; the docstring says how
+python3 scripts/media.py stamp --manual docs/img/demos/live-browser.{gif,mp4,webm}
+```
+
+`record` makes one new chat in your Open WebUI (put in the `--folder` folder, so it is
+not among your own chats), types the request and keeps every frame. Look at the frames before encoding: the
+run is real, so it varies. Take another run when the browser shows a signed-in account, a stray tab or
+the viewer's own address. `encode` refuses a recording whose chat text shows a deny-listed word or an
+email address, or whose frames show a Google account's avatar. Delete the chat afterwards.
 
 The images can't go stale silently. `docs/img/media.json` records, for every
 file under `docs/img`, fingerprints of the UI it shows: the composer's Claw

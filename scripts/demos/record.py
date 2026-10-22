@@ -38,7 +38,6 @@ from playwright.async_api import Page, async_playwright
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "screenshots"))
 import capture  # noqa: E402
-import live_browser  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 W, H = 960, 640            # CSS pixels; frames are captured at 2x and the GIF is W wide
@@ -397,11 +396,6 @@ async def run_demo(browser, token: str, spec: dict, out: str, host: str) -> dict
     page = await new_page(browser, token)
     work = tempfile.mkdtemp(prefix=f"demo-{spec['name']}-")
     valves = dict(spec.get("pipe_valves") or {})
-    live = None
-    if spec.get("live_browser"):
-        # LIVE_VIEW_URL's page and the browser behind it: a stand-in for our private viewer.
-        live = await live_browser.LiveBrowser(browser).start()
-        valves["LIVE_VIEW_URL"] = live.embed_url()
     old = capture.pipe_valves(token, **valves) if valves else None
     try:
         await open_new_chat(page)
@@ -451,8 +445,6 @@ async def run_demo(browser, token: str, spec: dict, out: str, host: str) -> dict
     finally:
         if old is not None:
             capture.pipe_valves(token, **old)
-        if live is not None:
-            await live.stop()
         await page.context.close()
 
 
