@@ -38,7 +38,7 @@ class StandInTests(unittest.TestCase):
         self.assertEqual(headers["access-control-allow-origin"], "*")
         text = body.decode()
         self.assertIn("iframe:height", text)
-        self.assertIn("Waiting for this message", text)
+        self.assertIn("Waiting for the browser", text)
         self.assertIn("LIVE", text)
         self.assertNotIn("@WAIT@", text)
         self.assertNotIn("@HOST@", text)

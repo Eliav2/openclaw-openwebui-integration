@@ -28,7 +28,7 @@ import urllib.parse
 PORT = 18991                 # fixed: the scene's command names it
 SITE_HOST = "peakatlas.example"   # what the tab list shows; the site itself is local
 WAIT_MS = 3000               # the embed's waiting note, before the browser is up
-VIEW = (640, 400)            # the browser tab, CSS pixels
+VIEW = (520, 330)            # the browser tab, CSS pixels: small enough that the reply, the frame and the composer all fit
 FRAME_EVERY = 0.12           # seconds between screen frames
 
 PEAK = ("Mount Kilimanjaro", "5,895 m (19,341 ft)", "Tanzania")
@@ -82,10 +82,11 @@ EMBED = """<!doctype html><meta charset=utf-8><title>Agent browser</title><style
  :root { --fg: #15161c; --muted: #6a6d7c; --line: #e6e7ee; --live: #e5484d; --live-soft: #fdecec; }
  * { box-sizing: border-box; }
  body { margin: 0 2px; padding: 2px 0 4px; font: 13px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--fg); }
- #note { color: var(--muted); font-size: 12px; margin: 0 0 4px; display: flex; align-items: center; gap: 8px; min-height: 18px; }
- .spin { width: 13px; height: 13px; border: 2px solid var(--line); border-top-color: var(--muted); border-radius: 50%; animation: s .8s linear infinite; }
+ #note { color: var(--muted); font-size: 12px; margin: 0 0 4px; }
+ #note.wait { display: flex; align-items: center; gap: 10px; font-size: 15px; color: var(--fg); padding: 10px 12px; border: 1px dashed var(--line); border-radius: 8px; }
+ #spin { flex: none; width: 16px; height: 16px; border: 2px solid var(--line); border-top-color: #5157f5; border-radius: 50%; animation: s .9s linear infinite; }
  @keyframes s { to { transform: rotate(360deg); } }
- #frame { max-width: 480px; } #screen { display: block; width: 100%; height: auto; border: 1px solid var(--line); border-radius: 8px; }
+ #frame { max-width: 380px; } #screen { display: block; width: 100%; height: auto; border: 1px solid var(--line); border-radius: 8px; }
  #tabs { list-style: none; margin: 4px 0 0; padding: 0; font-size: 12px; color: var(--fg); }
  .live { display: inline-flex; align-items: center; gap: 5px; color: var(--live); background: var(--live-soft); border-radius: 999px;
    padding: 1px 8px 1px 7px; font-size: 11px; font-weight: 700; letter-spacing: .04em; }
@@ -94,13 +95,13 @@ EMBED = """<!doctype html><meta charset=utf-8><title>Agent browser</title><style
  .ended { border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; font-size: 11px; color: var(--muted); }
  a { color: #5157f5; }
 </style>
-<div id=note><span class=spin></span><span id=msg></span></div>
+<div id=note class=wait><span id=spin></span><span id=msg></span></div>
 <div id=frame hidden><img id=screen alt="The agent's browser tab, live"></div>
 <ul id=tabs></ul>
 <script>
 const t0 = Date.now(), WAIT = @WAIT@, host = "@HOST@", EVERY = @EVERY@;
 const $ = (s) => document.querySelector(s);
-const fmt = (ms) => { const s = Math.floor(ms / 1000); return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); };
+const waited = (ms) => Math.floor(ms / 1000) + " s";
 const opened = new Date().toISOString().slice(11, 16);
 let asked = false, ended = false, n = 0;
 const size = () => parent.postMessage({type: "iframe:height", height: document.documentElement.scrollHeight}, "*");
@@ -117,9 +118,9 @@ async function tick() {
   if (!asked && Date.now() - t0 >= WAIT) { asked = true; await api("/start"); frame(); }
   if (asked) s = await api("/state");
   if (s.phase === "idle") {
-    $("#msg").textContent = "Waiting for this message's browser… " + fmt(Date.now() - t0);
+    $("#msg").textContent = "Waiting for the browser… " + waited(Date.now() - t0);
   } else {
-    $("#note").textContent = "Agent browser";
+    $("#note").className = ""; $("#note").textContent = "Agent browser";
     const badge = s.phase === "done" ? "<span class=ended>ended</span>" : "<span class=live>LIVE</span>";
     $("#tabs").innerHTML = "<li>" + badge + " " + opened + " " + host + s.path + ' <a href="#" onclick="return false">replay</a></li>';
   }
