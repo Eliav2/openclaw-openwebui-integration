@@ -898,6 +898,53 @@ def test_the_subagent_drawer_follows_a_running_child_to_its_end(page):
     assert "E2E_CHILDTASK" in page.locator("#openclaw-drawer-root").inner_text()
 
 
+def test_subagents_whose_sessions_were_deleted_stay_listed_with_their_errors(page, token):
+    """ELI-276, ELI-277: sub-agents spawned with cleanup "delete" lose their
+    sessions seconds after they end, and the Status dialog listed none of
+    them. A failed one's error read the Gateway's canned copy for its class
+    ("needs a short break" for a 402 billing error). Both stay listed after
+    the delete, the failed one with what its run reported, and its drawer
+    opens and says why its run is not there."""
+    capture.new_chat(page)
+    capture.send(page, "E2E_SPAWN_CLEANUP")
+    _wait(page, _turn_over("E2E_CLEANUP_SPAWNED"), "the parent's reply")
+    me = capture.api("GET", "/api/v1/auths/", token=token)
+    key = f"agent:main:openwebui-{me['id']}-{_chat_id(page)}"
+
+    def ran(task):
+        return any(task in json.dumps(r["request"]) and "[Subagent Task]" in json.dumps(r["request"])
+                   for r in _fake_llm_requests())
+    deadline = time.monotonic() + 90
+    while time.monotonic() < deadline and not (ran("E2E_CLEAN_OK") and ran("E2E_CLEAN_FAIL") and not (
+            capture.gateway_call("sessions.list", {"spawnedBy": key, "limit": 10}).get("sessions"))):
+        time.sleep(1)
+    assert ran("E2E_CLEAN_OK") and ran("E2E_CLEAN_FAIL"), "precondition: a child never reached the model"
+    assert not capture.gateway_call("sessions.list", {"spawnedBy": key, "limit": 10}).get("sessions"), \
+        "precondition: the Gateway kept a child's session"
+
+    _open_status(page)
+    # Nothing runs, so the section opens folded, its count in its title.
+    _wait(page, f"""() => {{ const f = document.querySelector('{capture.STATUS_ROOT} [data-openclaw-fold=subagents]');
+                     return !!f && /subagents \\(2\\)/i.test(f.innerText); }}""",
+          "both deleted sub-agents counted in the Status dialog", 60_000)
+    capture.open_fold(page, "subagents")
+    section = "#openclaw-status-section-subagents"
+    _wait(page, f"""() => {{ const s = document.querySelector('{section}');
+                     return !!s && s.innerText.includes('clean ok') && s.innerText.includes('clean fail'); }}""",
+          "both deleted sub-agents listed", 60_000)
+    shown = page.locator(section).inner_text()
+    # The run's own error (the Gateway's text for the provider's 402), then
+    # the canned summary it picked for the row.
+    assert "returned a billing error" in shown and "| 402 (Gateway: " in shown, shown
+    page.locator(f"{section} button", has_text="clean fail").first.click()
+    page.wait_for_selector("#openclaw-drawer-root", timeout=30_000)
+    _wait(page, """() => { const c = document.getElementById('openclaw-drawer-chip');
+                     const r = document.getElementById('openclaw-drawer-root');
+                     return !!c && c.textContent === 'Failed' && r.innerText.includes('removed when it ended'); }""",
+          "the deleted child's drawer, failed, saying why its run is gone", 30_000)
+    assert "returned a billing error" in page.locator("#openclaw-drawer-root").inner_text()
+
+
 BG_AGENT_TITLE = "E2E background agent"   # e2e/fake_llm.py BG_AGENT_TITLE
 
 
