@@ -914,6 +914,65 @@ def _kill_and_restart_gateway(sig: int = 9, while_down=None) -> None:
 STARTUP_REFUSAL = "has not completed startup inspection"
 
 
+# ELI-275: after an unclean stop the Gateway prepares each agent's database in
+# the background from its listener bind and refuses sessions requests until
+# the agent is ready ("recovered after background inspection"). The Pipe meets
+# that window either as a refusal, or as its first request after the
+# reconnect (`sessions.subscribe`) sent while main was preparing and answered
+# once it was ready: which one is the Gateway's own race (run 39657547929).
+WS_RES = r"⇄ res [✓✗] (\S+) (\d+)ms"
+
+
+def _parse_log_time(t: str) -> float:
+    from datetime import datetime
+    return datetime.fromisoformat(t).timestamp()
+
+
+def _preparation_window(log_path: str, start: int, since: float) -> dict:
+    """What the relaunched Gateway logged about its startup preparation, from
+    its stdout (`log_path` from `start`) and its JSON log file: the methods it
+    refused while preparing, when main was ready, and the first request it
+    answered after the relaunch (`since`), sent and answered times."""
+    with open(log_path, errors="replace") as f:
+        f.seek(start)
+        out = f.read()
+    refused = sorted({m.group(1) for line in out.splitlines() if STARTUP_REFUSAL in line
+                      for m in [re.search(r"res ✗ (\S+)", line)] if m})
+    files = re.findall(r"\[gateway\] log file: (\S+)", out)
+    seen = {"refused": refused, "log_file": files[-1] if files else None, "main_ready": None, "first": None}
+    if not files or not os.path.exists(files[-1]):
+        return seen
+    with open(files[-1], errors="replace") as f:
+        for line in f:
+            try:
+                entry = json.loads(line)
+                at = _parse_log_time(entry["time"])
+            except (ValueError, KeyError, TypeError):
+                continue
+            if at < since:
+                continue
+            text = json.dumps(entry, ensure_ascii=False)
+            if (seen["main_ready"] is None and "recovered after background inspection" in text
+                    and re.search(r'agentId\\?"\s*:\s*\\?"main', text)):
+                seen["main_ready"] = at
+            m = re.search(WS_RES, str(entry.get("message") or ""))
+            if m:
+                sent = at - int(m.group(2)) / 1000
+                if seen["first"] is None or sent < seen["first"]["sent"]:
+                    seen["first"] = {"method": m.group(1), "sent": sent, "answered": at}
+    return seen
+
+
+def _met_the_preparation(seen: dict) -> str | None:
+    """How the Pipe met the Gateway's startup preparation, or None."""
+    if seen["refused"]:
+        return "refused"
+    first, ready = seen["first"], seen["main_ready"]
+    if first and ready and first["sent"] < ready <= first["answered"]:
+        return "overlap"
+    return None
+
+
 # The Pipe's line for a message waiting through a refused reconnect.
 GATEWAY_DOWN_WAIT = "the Gateway refuses connections (down or restarting)"
 
@@ -941,6 +1000,7 @@ def test_a_message_sent_while_the_gateway_restarts_gets_its_reply(token):
     _until("the Gateway to be gone", lambda: not any(_alive(p) for p in pids), timeout_s=60)
     log_path = os.path.join(os.path.dirname(GATEWAY_PID_FILE), "gateway-after-restart.log")
     start = os.path.getsize(log_path) if os.path.exists(log_path) else 0
+    relaunched_at = time.time()
     with concurrent.futures.ThreadPoolExecutor(1) as pool:
         turn = pool.submit(_chat_turn, token, "Respond with exactly: E2E_DURING_RESTART", chat_id=chat_id)
         def relaunch():
@@ -965,14 +1025,14 @@ def test_a_message_sent_while_the_gateway_restarts_gets_its_reply(token):
     assert STARTUP_REFUSAL not in content, f"the startup refusal shown as the reply: {content[:300]!r}"
     assert content.strip() == "E2E_DURING_RESTART", f"the reply: {content[:300]!r}"
     _until("the Gateway to finish starting", _gateway_up, timeout_s=180, every_s=2)
-    with open(log_path, errors="replace") as f:
-        f.seek(start)
-        refused = sorted({m.group(1) for line in f if STARTUP_REFUSAL in line
-                          for m in [re.search(r"res ✗ (\S+)", line)] if m})
+    seen = _preparation_window(log_path, start, relaunched_at)
     if _openclaw_release() >= (2026, 10):
-        # The startup window: the Gateway refused the message or the
-        # transcript subscriptions the Pipe renews on connect.
-        assert refused, "the Gateway refused nothing while it was preparing: that window was not tested"
+        # The startup window: the Gateway refused the message or a transcript
+        # subscription the Pipe renews on connect, or the Pipe's first request
+        # was sent while main was preparing and answered once it was ready.
+        met = _met_the_preparation(seen)
+        print(f"ELI-275 preparation window: {met} {json.dumps(seen)}")
+        assert met, f"the Pipe did not meet the Gateway's startup preparation: that window was not tested ({seen})"
     # A renewal given up would leave the chat without tool events until the
     # next reconnect; the Gateway logs a renewal only when it is refused.
     gave_up = [line for line in _pipe_log_since(since).splitlines()
