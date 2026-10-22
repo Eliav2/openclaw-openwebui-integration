@@ -533,48 +533,6 @@ class Shooter:
                 print(f"  (debug capture failed: {dex})")
 
 
-LIVE_VIEW_PAGE = """<!doctype html><meta charset=utf-8><style>
- body { margin: 0 2px; font: 12px system-ui, sans-serif; color: #6b6b76; }
- .shot { border: 1px solid #e3e3e8; border-radius: 8px; overflow: hidden; color: #1b1b1f; margin: 4px 0; }
- .bar { background: #f1f1f4; padding: 6px 10px; border-bottom: 1px solid #e3e3e8; }
- .page { padding: 12px; }
- h1 { font-size: 15px; margin: 0 0 10px; }
- .panels { display: flex; gap: 8px; }
- .panel { flex: 1; border: 1px solid #e3e3e8; border-radius: 6px; padding: 8px; }
- .panel b { display: block; font-size: 18px; }
- .live { color: #fff; background: #d33; border-radius: 4px; padding: 0 6px; font-weight: 700; font-size: 11px; }
-</style>
-<div>Agent browser</div>
-<div class=shot><div class=bar>localhost:8501</div><div class=page><h1>Forecast dashboard</h1>
- <div class=panels><div class=panel>High<b>24°</b></div><div class=panel>Rain<b>10%</b></div><div class=panel>Wind<b>12 km/h</b></div></div>
-</div></div>
-<div><span class=live>LIVE</span> localhost:8501 &middot; <a href=#>replay</a></div>
-<script>parent.postMessage({type: "iframe:height", height: document.documentElement.scrollHeight}, "*")</script>
-"""
-
-
-def live_view_page():
-    """A stand-in for the live view service, on a free local port."""
-    import http.server
-    import threading
-
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):
-            body = LIVE_VIEW_PAGE.encode()
-            self.send_response(200)
-            self.send_header("content-type", "text/html; charset=utf-8")
-            self.send_header("content-length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, *args):
-            pass
-
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    return server
-
-
 # ── Scenes ──────────────────────────────────────────────────────────
 
 class Scenes:
@@ -967,32 +925,6 @@ class Scenes:
         }"""
         self.s.shot(page, "first-reply", clip_js=clip)
 
-    def live_view(self, page: Page) -> None:
-        """LIVE_VIEW_URL: a reply that uses a browser gets the live view of it
-        as an embed. A small local page stands in for the service that shows
-        the agent's browser (browser-replay serves the real one)."""
-        server = live_view_page()
-        old = pipe_valves(self.token, LIVE_VIEW_URL=f"http://127.0.0.1:{server.server_port}/embed"
-                                                     "?chat={chat_id}&message={message_id}")
-        try:
-            new_chat(page)
-            chat = send(page, "Check the forecast dashboard in a browser, please.")
-            wait_js(page, f"""() => {{ const a = {LAST_ASSISTANT};
-                     return a && a.innerText.includes('all three panels') && !a.innerText.includes('Thinking')
-                       && document.querySelectorAll('button[aria-label="Copy"]').length > 0; }}""", "the finished reply")
-            frame = f"{LAST_ASSISTANT}.querySelector('iframe')"
-            wait_js(page, f"() => {{ const f = {frame}; return f && f.getBoundingClientRect().height > 150; }}",
-                    "the live view in the reply, at its own height")
-            src = page.evaluate(f"() => {frame}.src")
-            if f"chat={chat}" not in src:
-                raise RuntimeError(f"the embed is not this chat's: {src}")
-            set_title(self.token, chat, "Dashboard check")
-            page.evaluate(f"() => {frame}.scrollIntoView({{block: 'center'}})")
-            self.s.shot(page, "live-view")
-        finally:
-            pipe_valves(self.token, **old)
-            server.shutdown()
-
     def failed_tool_live(self, page: Page) -> None:
         """A tool that failed, shown while the reply is still streaming: a
         `read` of a file that isn't there, then a long `exec` still running."""
@@ -1354,7 +1286,6 @@ def main(argv=None) -> int:
             shooter.run("agent-turn", scenes.agent_turn, page)
             shooter.run("media-turn", scenes.media_turn, page)
             shooter.run("failed-tool-live", scenes.failed_tool_live, page)
-            shooter.run("live-view", scenes.live_view, page)
             shooter.run("first-reply", scenes.first_reply, page)
             shooter.run("streaming", scenes.streaming_and_reload, page)
             shooter.run("usage-goal", scenes.usage_goal, page)
