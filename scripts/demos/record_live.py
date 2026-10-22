@@ -10,6 +10,7 @@ guard never asks CI to rebuild them (docs/development.md says how to re-record).
     OWUI_URL=http://localhost:8080 OWUI_TOKEN=<an Open WebUI token> \\
       python3 scripts/demos/record_live.py record --work /tmp/live-browser \\
         [--folder QA] [--viewer-header 'CF-Access-Client-Id: ...'] [--model openclaw_gateway.default]
+    python3 scripts/demos/record_live.py still --work /tmp/live-view-still [same options as record]
     python3 scripts/demos/record_live.py encode --work /tmp/live-browser --out docs/img/demos \\
         [--cut 6-42=4,62-118=2.5]
 
@@ -189,6 +190,50 @@ def purple(path: str) -> bool:
     return sum(1 for r, g, b in px if abs(r - 120) < 30 and abs(g - 65) < 30 and abs(b - 195) < 30) > 12
 
 
+async def still_run(a) -> None:
+    """The docs' phone screenshot of the same run: one new chat in a phone-sized page, a PNG every
+    1.5 s while the live view is up. Pick the best by eye (docs/img/live-view-light.png)."""
+    token = os.environ["OWUI_TOKEN"]
+    viewer = headers(a.viewer_header or [])
+    os.makedirs(a.work, exist_ok=True)
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        ctx = await browser.new_context(**capture.PHONE, locale="en-US", timezone_id="UTC", color_scheme="light",
+                                        storage_state={"cookies": [], "origins": [{"origin": capture.BASE, "localStorage": [
+                                            {"name": "token", "value": token}, {"name": "theme", "value": "light"}]}]})
+        await ctx.add_init_script(AVATAR_MASK)
+        if viewer:
+            origin = re.sub(r"^(https?://[^/]+).*$", r"\1", a.viewer_origin)
+
+            async def add(route):
+                await route.continue_(headers={**route.request.headers, **viewer})
+            await ctx.route(f"{origin}/**", add)
+        page = await ctx.new_page()
+        await record.open_new_chat(page)
+        await page.click("#chat-input")
+        await page.keyboard.type(a.prompt, delay=5)
+        await page.click("#send-message-button")      # on a phone Enter adds a line
+        await page.wait_for_function("() => /^\\/c\\/[0-9a-f-]+/.test(location.pathname)", timeout=60_000)
+        chat = (await page.evaluate("() => location.pathname")).split("/c/", 1)[1].strip("/")
+        if a.folder:
+            await put_in_folder(token, chat, a.folder)
+        await page.wait_for_function(LIVE_VIEW_UP, timeout=240_000, polling=100)
+        for n in range(80):
+            if await page.evaluate(REPLY_WITH_PICTURE):
+                break
+            await page.evaluate("() => { const a = [...document.querySelectorAll('.chat-assistant')].pop();"
+                                " const f = a && a.querySelector('iframe'); if (f) f.scrollIntoView({block: 'center'}); }")
+            await page.wait_for_timeout(300)
+            await page.screenshot(path=os.path.join(a.work, f"s{n:03d}.png"))
+            await page.wait_for_timeout(1200)
+        text = await page.evaluate("() => (document.getElementById('messages-container') || document.body).innerText")
+        with open(os.path.join(a.work, "text.txt"), "w") as fh:
+            fh.write(text)
+        await ctx.close()
+        await browser.close()
+    print(f"chat {chat}, stills in {a.work}")
+
+
 def encode_run(a) -> None:
     with open(os.path.join(a.work, "frames.json")) as fh:
         meta = json.load(fh)
@@ -242,6 +287,12 @@ def main(argv=None) -> int:
     r.add_argument("--folder", help="put the chat in this Open WebUI folder")
     r.add_argument("--viewer-header", action="append", help="'Name: value' sent to the live view's origin")
     r.add_argument("--viewer-origin", help="the live view page's origin, with --viewer-header")
+    st = sub.add_parser("still")
+    st.add_argument("--work", required=True)
+    st.add_argument("--prompt", default=PROMPT)
+    st.add_argument("--folder", help="put the chat in this Open WebUI folder")
+    st.add_argument("--viewer-header", action="append", help="'Name: value' sent to the live view's origin")
+    st.add_argument("--viewer-origin", help="the live view page's origin, with --viewer-header")
     e = sub.add_parser("encode")
     e.add_argument("--work", required=True)
     e.add_argument("--out", default="docs/img/demos")
@@ -253,6 +304,8 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     if a.cmd == "record":
         asyncio.run(record_run(a))
+    elif a.cmd == "still":
+        asyncio.run(still_run(a))
     else:
         encode_run(a)
     return 0

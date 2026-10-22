@@ -523,22 +523,6 @@
           "say": "Stored WEATHER_API_KEY. The forecast app can call the weather service with it now."
         }
       ]
-    },
-    {
-      "match": "Check the forecast dashboard in a browser",
-      "steps": [
-        {
-          "say": "Opening the dashboard in a browser.",
-          "tool": "exec",
-          "args": {
-            "command": "echo 'chromium: dashboard at localhost:8501 loaded, 3 panels'"
-          }
-        },
-        {
-          "say": "The dashboard loads, and all three panels show today's numbers.",
-          "delay": 0.03
-        }
-      ]
     }
   ]
 }

@@ -176,6 +176,12 @@ python scripts/demos/record_live.py encode --work /tmp/live-browser --out docs/i
 python3 scripts/media.py stamp --manual docs/img/demos/live-browser.{gif,mp4,webm}
 ```
 
+The phone screenshot beside it, `docs/img/live-view-light.png`, comes from a second run of the same
+request in a phone-sized page: `record_live.py still --work /tmp/live-view-still` (same options as `record`)
+saves a PNG every 1.5 s while the live view is up, and you pick the frame with the results and the LIVE badge.
+Check the corner of the viewer for the account's avatar and paint it white (it sits on a white header), then
+`python3 scripts/media.py stamp --manual docs/img/live-view-light.png`.
+
 `record` makes one new chat in your Open WebUI (put in the `--folder` folder, so it is
 not among your own chats), types the request and keeps every frame. Look at the frames before encoding: the
 run is real, so it varies. Take another run when the browser shows a signed-in account, a stray tab or

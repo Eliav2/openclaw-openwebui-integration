@@ -11,7 +11,7 @@ Applies to: Pipe (`LIVE_VIEW_URL`, `LIVE_VIEW_TOOLS`, `LIVE_VIEW_USERS`).
 
 This is a real run, recorded by hand on our setup: the agent, Google's results and the live view are the real ones. The waiting stretches are sped up.
 
-<img src="../img/live-view-light.png" alt="A reply that checked a dashboard in a browser: the browser's page shown inside the message, marked live, above the reply's text" width="320">
+<img src="../img/live-view-light.png" alt="A phone screen: the request to find the cutest kitten picture on Google, and the agent's browser shown live inside the reply, marked LIVE, with Google's image results for a cute kitten above the agent's note that it is grabbing the cutest one" width="320">
 
 ## What it does
 

@@ -296,10 +296,11 @@
       }
     },
     "live-view-light.png": {
-      "sha": "27a5780ae74886cd",
+      "sha": "a7be2c5dac5cb709",
       "groups": {
         "chrome": "86d17ffd5eaebce8"
-      }
+      },
+      "manual": true
     },
     "media-turn-light.png": {
       "sha": "ad31cb44efa5ae1a",
