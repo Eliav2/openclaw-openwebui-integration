@@ -764,6 +764,13 @@ def _open_card(page, reply: int, row: str) -> str:
     return page.evaluate(f"() => [...document.querySelectorAll('.chat-assistant')].at({reply}).innerText")
 
 
+_CARD_ICONS_JS = """() => [...[...document.querySelectorAll('.chat-assistant')][0]
+    .querySelectorAll('[role=button]')].map(b => {
+        const icon = b.querySelector('.text-red-500, .text-emerald-500');
+        return icon ? (icon.matches('.text-red-500') ? 'red' : 'green') : null;
+    })"""
+
+
 def test_tool_cards_show_running_failed_and_done(page):
     """Tool cards: a failed call shows ❌ as soon as it fails; a long call
     shows running, below the text the reply wrote before it, then done; each
@@ -786,6 +793,8 @@ def test_tool_cards_show_running_failed_and_done(page):
     assert failed_live, f"the failed read never showed ❌ while the reply ran: {shown}"
     final = states[-1]
     assert final["rows"] == ["View Result from read ❌", "View Result from exec"] and not final["running"], shown[-1]
+    # The failed card has the red X, the other the green check (ELI-278).
+    assert page.evaluate(_CARD_ICONS_JS) == ["red", "green"], page.evaluate(_CARD_ICONS_JS)
 
     assert "e2e-cards-slept" in _open_card(page, 0, "View Result from exec")
     assert "tool call failed" in _open_card(page, 0, "View Result from read")
@@ -796,6 +805,7 @@ def test_tool_cards_show_running_failed_and_done(page):
                          ".querySelectorAll('[role=button]').length")
     text = _replies(page)[0]["text"]
     assert rows == 2 and "read ❌" in text and "View Result from exec" in text, text[-200:]
+    assert page.evaluate(_CARD_ICONS_JS) == ["red", "green"], page.evaluate(_CARD_ICONS_JS)
 
 
 def _open_status(page) -> None:

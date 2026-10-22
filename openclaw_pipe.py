@@ -5111,13 +5111,14 @@ def _spawn_call_task(payload: dict) -> str | None:
 
 
 def _tool_call_error_relabel_event(name: str, tool_call_id: str, args_str: str) -> dict:
-    """Re-announce a failed call's `function_call` item with ❌ in its name.
+    """Re-announce a failed call's `function_call` item as failed, with ❌ in
+    its name.
 
-    The card's collapsed row shows `attributes.name` and nothing else about
-    outcome: its status icon is chosen by `isDone` alone, with no failure
-    branch (`ToolCallDisplay.svelte:136`), so a red icon is unreachable
-    without patching OWUI. The name is the only outcome-carrying field we
-    control, and it renders through `Markdown`, so an emoji survives.
+    Open WebUI (0.11.1 on) draws the card's red X for an item whose status is
+    "failed" (`ToolCallDisplay.svelte` `isError`), the status it gives its own
+    failed tools; with "in_progress" or "completed" the card shows the green
+    check of a call that worked (ELI-278). The ❌ in the name says it in the
+    collapsed row's text too.
 
     The event is the start event again, same id and arguments: both of OWUI's
     reducers replace an `output_item.added` item that has the id of one they
@@ -5128,7 +5129,9 @@ def _tool_call_error_relabel_event(name: str, tool_call_id: str, args_str: str) 
     the tab ignores it (ELI-124). (`response.output_item.done` replaces by
     position in the backend, which the pipe cannot know.)
     """
-    return _tool_call_started_event(f"{name} {TOOL_ERROR_MARK}", tool_call_id, args_str)
+    event = _tool_call_started_event(f"{name} {TOOL_ERROR_MARK}", tool_call_id, args_str)
+    event["item"]["status"] = "failed"
+    return event
 
 
 def _tool_error_banner(result_str: str) -> str:
@@ -5447,7 +5450,7 @@ class _TurnRenderer:
                 if tcid:
                     self._tool_results.add(tcid)
                     item = self._tool_item(card_name, tcid, card_args, events)
-                    item["status"] = "completed"
+                    item["status"] = "failed" if failed else "completed"
                     if failed:
                         item["name"] = f"{card_name} {TOOL_ERROR_MARK}"
                         events.append(_tool_call_error_relabel_event(card_name, tcid, card_args))

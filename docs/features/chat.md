@@ -48,7 +48,7 @@ Always on.
 
 <img src="../img/demos/failed-tool.gif" alt="A reply where the read of a missing deploy script fails and its card is marked failed, the build runs and finishes, then the failed card is opened to its path and error" width="800">
 
-A tool call that fails gets its card renamed to `<name> ❌` the moment the result arrives, on any card, not only the last one. The mark is part of the saved message, so it is still there after a reload. The expanded output opens with a `❌ tool call failed` line, so the reason is visible once you open the card.
+A tool call that fails gets Open WebUI's red X in place of the green check, and its card renamed to `<name> ❌`, the moment the result arrives, on any card, not only the last one. The mark is part of the saved message, so it is still there after a reload. The expanded output opens with a `❌ tool call failed` line, so the reason is visible once you open the card.
 
 A tool that was announced but never returned, because the run was cancelled or crashed, is closed at the end of the reply with "(no result -- the run ended first)". When the run was cut by a restart and will continue, the note reads "(interrupted -- the reply continues when the run resumes)" instead. A card left spinning forever looks exactly like a hung UI, so it is never left that way.
 

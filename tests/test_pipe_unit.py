@@ -3137,10 +3137,9 @@ class NativeToolItemTests(unittest.TestCase):
 class ToolErrorIndicationTests(unittest.TestCase):
     """A failed tool call must LOOK failed.
 
-    OWUI's card picks its status icon from `isDone` alone -- spinner, green
-    check, or wrench, with no failure branch (`ToolCallDisplay.svelte:136`) --
-    so the only outcome-carrying field we control is the name shown in the
-    collapsed row, plus the Output text behind it.
+    OWUI's card shows the red X for an item whose status is "failed"
+    (`ToolCallDisplay.svelte` `isError`, 0.11.1 on, ELI-278); the name shown
+    in the collapsed row carries a ❌, and the Output text says why.
 
     ELI-75: the previous shape here (`response.output_item.done`) looked
     correct by inspection but was dead code in OWUI's own event handler -- see
@@ -3152,7 +3151,9 @@ class ToolErrorIndicationTests(unittest.TestCase):
         """The start event again, under the same id: both of OWUI's reducers
         replace an added item whose id they already hold (ELI-124)."""
         ev = _tool_call_error_relabel_event("Bash", "call-1", '{"command": "ls"}')
-        self.assertEqual(ev, _tool_call_started_event("Bash ❌", "call-1", '{"command": "ls"}'))
+        started = _tool_call_started_event("Bash ❌", "call-1", '{"command": "ls"}')
+        started["item"]["status"] = "failed"
+        self.assertEqual(ev, started)
         self.assertEqual(ev["type"], "response.output_item.added")
 
     def test_relabel_marks_the_name(self):
@@ -14064,6 +14065,22 @@ class LiveToolErrorMarkTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(call["arguments"], json.dumps({"command": "ls"}))
             out = next(i for i in output if i.get("type") == "function_call_output")
             self.assertTrue(out["output"][0]["text"].startswith(f"{TOOL_ERROR_MARK} tool call failed"))
+
+    async def test_a_failed_call_is_failed_not_completed(self):
+        """ELI-278: a failed call's card showed a green check next to its ❌:
+        its item said "completed". Open WebUI (0.11.1 on) draws the red X for
+        a `function_call` whose status is "failed" (`ToolCallDisplay.svelte`
+        `isError`), the status it gives its own failed tools
+        (`middleware.py` `_is_tool_result_error`)."""
+        saved, live = await self._run([
+            self._tool("start", "t1"), self._failed("t1"),
+            self._tool("start", "t2"), self._tool("result", "t2", result="ok"),
+            self._failed("t3")])
+        for label, output in (("saved", saved), ("live", live)):
+            with self.subTest(label):
+                failed = {i.get("call_id") or i.get("id"): i.get("status") == "failed"
+                          for i in output if i.get("type") == "function_call"}
+                self.assertEqual(failed, {"t1": True, "t2": False, "t3": True})
 
 
 class MediaDirectiveLineBreakTests(unittest.IsolatedAsyncioTestCase):
