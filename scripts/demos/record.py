@@ -38,10 +38,11 @@ from playwright.async_api import Page, async_playwright
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "screenshots"))
 import capture  # noqa: E402
+import live_browser  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 W, H = 960, 640            # CSS pixels; frames are captured at 2x and the GIF is W wide
-MAX_SECONDS = 15.0
+MAX_SECONDS = 15.0         # a demo that needs longer says so: "max_seconds" in its spec
 MAX_BYTES = 1024 * 1024
 MAX_VIDEO_BYTES = 1024 * 1024    # each of the MP4 and the WebM
 # While a step waits on the stack (the scripted model, a command), a frame the page holds longer
@@ -395,7 +396,13 @@ async def open_new_chat(page: Page) -> None:
 async def run_demo(browser, token: str, spec: dict, out: str, host: str) -> dict:
     page = await new_page(browser, token)
     work = tempfile.mkdtemp(prefix=f"demo-{spec['name']}-")
-    old = capture.pipe_valves(token, **spec["pipe_valves"]) if spec.get("pipe_valves") else None
+    valves = dict(spec.get("pipe_valves") or {})
+    live = None
+    if spec.get("live_browser"):
+        # LIVE_VIEW_URL's page and the browser behind it: a stand-in for our private viewer.
+        live = await live_browser.LiveBrowser(browser).start()
+        valves["LIVE_VIEW_URL"] = live.embed_url()
+    old = capture.pipe_valves(token, **valves) if valves else None
     try:
         await open_new_chat(page)
         rec = Recorder(await page.context.new_cdp_session(page))
@@ -423,8 +430,9 @@ async def run_demo(browser, token: str, spec: dict, out: str, host: str) -> dict
         if hits:
             raise AssertionError(f"{spec['name']}: deny-listed text visible: {sorted(set(hits))[:10]}")
         concat, seconds = rec.write(work, spec.get("cover_ms", 0) / 1000)
-        if seconds > MAX_SECONDS:
-            raise AssertionError(f"{spec['name']}: {seconds:.1f} s, over {MAX_SECONDS:.0f} s ({', '.join(steps)})")
+        limit = spec.get("max_seconds", MAX_SECONDS)
+        if seconds > limit:
+            raise AssertionError(f"{spec['name']}: {seconds:.1f} s, over {limit:.0f} s ({', '.join(steps)})")
         path = os.path.join(out, f"{spec['name']}.gif")
         size = encode(concat, path)
         if size > MAX_BYTES:
@@ -443,6 +451,8 @@ async def run_demo(browser, token: str, spec: dict, out: str, host: str) -> dict
     finally:
         if old is not None:
             capture.pipe_valves(token, **old)
+        if live is not None:
+            await live.stop()
         await page.context.close()
 
 

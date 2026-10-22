@@ -154,8 +154,11 @@ model serving real-looking scenes (`scripts/screenshots/scenes.json`; the
 demos add `scripts/demos/demos.json`). `capture.py` takes the stills;
 `scripts/demos/record.py` records each demo in `demos.json` with the DevTools
 screencast at 2x, a drawn cursor, a ripple on each click and a badge for each
-key, then encodes it with ffmpeg into a light GIF, 960 px wide, at most 15 s and
-1 MB. Both fail when a page shows deny-listed text (words that give away a test
+key, then encodes it with ffmpeg into a light GIF, 960 px wide, at most 15 s (a
+demo that needs longer sets `max_seconds`) and 1 MB. The `live-browser` demo
+also starts `scripts/demos/live_browser.py`, a stand-in for the live view's page
+(a headless Chromium browsing a small local site, streamed into the reply), and
+sets `LIVE_VIEW_URL` to it. Both fail when a page shows deny-listed text (words that give away a test
 stack). A demo waits on what the page shows, never on time: a reply is done when
 its text is stable and "Thinking…" is gone. Before committing a GIF, look at
 frames from it (`ffmpeg -i x.gif -vf "select=not(mod(n\,40))" -vsync 0 f%02d.png`).

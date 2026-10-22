@@ -298,6 +298,24 @@
           "delay": 0.1
         }
       ]
+    },
+    {
+      "match": "Look up the height of Mount Kilimanjaro",
+      "steps": [
+        {
+          "say": "Opening Peak Atlas in a browser.",
+          "tool": "exec",
+          "args": {
+            "command": "curl -sf --max-time 120 http://127.0.0.1:18991/done || sleep 12",
+            "title": "Look it up on Peak Atlas",
+            "yieldMs": 130000
+          }
+        },
+        {
+          "say": "Mount Kilimanjaro is **5,895 m** (19,341 ft) high, according to Peak Atlas. The summit, Uhuru Peak, is in Tanzania.",
+          "delay": 0.05
+        }
+      ]
     }
   ],
   "demos": [
@@ -801,6 +819,38 @@
         {
           "do": "pause",
           "ms": 300
+        }
+      ]
+    },
+    {
+      "name": "live-browser",
+      "live_browser": true,
+      "max_seconds": 25,
+      "pipe_valves": {
+        "LIVE_VIEW_TOOLS": "127\\.0\\.0\\.1:18991"
+      },
+      "steps": [
+        {
+          "do": "type",
+          "text": "Look up the height of Mount Kilimanjaro on Peak Atlas."
+        },
+        {
+          "do": "send"
+        },
+        {
+          "do": "wait",
+          "js": "() => { const a = [...document.querySelectorAll('.chat-assistant')].pop(); const f = a && a.querySelector('iframe'); return !!f && f.getBoundingClientRect().height > 250; }"
+        },
+        {
+          "do": "wait",
+          "js": "() => /5,895 m/.test(([...document.querySelectorAll('.chat-assistant')].pop() || {innerText: ''}).innerText)"
+        },
+        {
+          "do": "park"
+        },
+        {
+          "do": "pause",
+          "ms": 1800
         }
       ]
     }

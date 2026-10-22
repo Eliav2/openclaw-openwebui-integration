@@ -91,6 +91,24 @@
         "chrome": "86d17ffd5eaebce8"
       }
     },
+    "demos/live-browser.gif": {
+      "sha": "973044c1b6460609",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "demos/live-browser.mp4": {
+      "sha": "7cddb1ce004234eb",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
+    "demos/live-browser.webm": {
+      "sha": "e726c1293c7af546",
+      "groups": {
+        "chrome": "86d17ffd5eaebce8"
+      }
+    },
     "demos/question-card.gif": {
       "sha": "b1844f3446eb45b4",
       "groups": {

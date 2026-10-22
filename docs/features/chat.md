@@ -66,6 +66,10 @@ The Pipe ships no such page and no viewer: it only passes the address on. Withou
 
 The valves are named after the use the hook was built for, a live view of the agent's browser, but the page can be anything your service serves for a reply. See [our own setup as one example](../examples/live-browser-view.md).
 
+<img src="../img/demos/live-browser.gif" alt="A question to look up a mountain's height. The reply gets a waiting note, then the agent's browser appears live inside the message while it types a search, opens a result and scrolls the article, and the reply finishes with the answer" width="800">
+
+Our own setup, as one example: the agent's browser, live inside the reply that started it. The viewer behind it is a private service of ours, not part of the Pipe.
+
 Open WebUI shows the page in a sandboxed frame, as it does every embed, so the page cannot reach Open WebUI or your login. Your service decides who may see what it shows: put it behind your own login.
 
 Off by default. Replies you send get it; replies the agent starts itself do not.
