@@ -147,6 +147,8 @@ Always on.
 
 ## Context compaction
 
+<img src="../img/compaction-note-light.png" alt="A reply with a tool card, then the collapsed Context compacted block, then the answer" width="320">
+
 When the Gateway compacts the session in the middle of a reply (it summarizes older messages so the conversation fits the model's context window), the reply says so where it happened. While it runs, the reply shows "🧹 Compacting context…"; when it is done, that line becomes a collapsed block, "🧹 Context compacted", with the context size before it when the Gateway knows it. Open it for what compaction means: the agent continues from a summary of the older messages plus the most recent ones. Everything stays visible in the chat. A compaction that fails says so instead, and the conversation goes on uncompacted; one the Gateway skips (nothing old enough to summarize yet) or that you stop says that.
 
 The block is part of the saved reply, so it is still there after a reload.
