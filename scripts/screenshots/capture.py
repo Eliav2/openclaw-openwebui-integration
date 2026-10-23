@@ -987,7 +987,8 @@ class Scenes:
         collapsed "Context compacted" block, then the answer."""
         new_chat(page)
         chat = send(page, "Go through this week's build logs and tell me how the builds went.")
-        wait_js(page, last_text_has("Context compacted", "every build passed"), "the reply after the compaction")
+        wait_js(page, last_text_has("Context compacted", "5m55s", "🧠"), "the finished reply after the compaction")
+        park_mouse(page)
         set_title(self.token, chat, "Build week review")
         self.s.shot(page, "compaction-note", selector=".chat-assistant >> nth=-1")
 
