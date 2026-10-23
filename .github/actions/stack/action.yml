@@ -31,9 +31,24 @@ runs:
         echo "OPENCLAW_VERSION=${IN_OPENCLAW_VERSION:-$OPENCLAW_VERSION}" >> "$GITHUB_ENV"
         echo "Open WebUI: ${IN_OWUI_IMAGE:-$OWUI_IMAGE} / OpenClaw: openclaw@${IN_OPENCLAW_VERSION:-$OPENCLAW_VERSION}"
 
+    # The Node range comes from the openclaw package being installed (its
+    # engines.node), so a release that raises it doesn't break the stack. The
+    # runner's own Node only runs `npm view` here.
+    - name: Resolve the Node range openclaw needs
+      id: node
+      shell: bash
+      run: |
+        range=$(npm view "openclaw@$OPENCLAW_VERSION" engines.node)
+        [ -n "$range" ] || { echo "openclaw@$OPENCLAW_VERSION declares no engines.node"; exit 1; }
+        echo "openclaw@$OPENCLAW_VERSION needs Node $range"
+        echo "range=$range" >> "$GITHUB_OUTPUT"
+
     - uses: actions/setup-node@v7
       with:
-        node-version: 24
+        node-version: ${{ steps.node.outputs.range }}
+        # The newest Node in the range, not whichever one the runner image
+        # happens to cache.
+        check-latest: true
 
     # npm's download cache for the openclaw install, keyed on the exact version
     # (e2e/versions.env; a calendar version, 2026.x). A moving spec such as
