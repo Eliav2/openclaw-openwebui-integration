@@ -32,6 +32,7 @@ class CompactionNoteTests(unittest.TestCase):
     def test_a_start_shows_compacting_and_its_end_replaces_it(self):
         r = ocp._TurnRenderer()
         r.feed({"stream": "assistant", "data": {"delta": "before"}})
+        # A size shows only when the Gateway itself sends one.
         [started] = [e for e in r.feed(compaction("start", tokensBefore=182_000)) if e]
         self.assertEqual(started["type"], "response.output_item.added")
         self.assertEqual(texts(r), ["before", ocp.COMPACTING_NOTE])
@@ -116,38 +117,6 @@ class CompactionNoteTests(unittest.TestCase):
         rebuilt.output = [{"type": "message", "id": "msg_t", "content": []}]
         ocp._keep_pipe_notes(streamed.output, rebuilt)
         self.assertEqual(rebuilt.output[0]["id"], streamed.output[0]["id"])
-
-
-class FakeConn:
-    def __init__(self, row=None, fail=False):
-        self.row, self.fail, self.sent = row, fail, []
-
-    async def send_request(self, method, params, timeout=10):
-        self.sent.append((method, params))
-        if self.fail:
-            raise TimeoutError()
-        return {"session": self.row}
-
-
-class TokensBeforeTests(unittest.IsolatedAsyncioTestCase):
-
-    async def test_a_start_gets_the_rows_context_fill(self):
-        conn = FakeConn({"totalTokens": 150_000})
-        out = await ocp.with_compaction_tokens(conn, KEY, compaction("start"))
-        self.assertEqual(out["data"]["tokensBefore"], 150_000)
-        self.assertEqual(conn.sent, [("sessions.describe", {"key": KEY})])
-
-    async def test_only_a_compaction_start_asks(self):
-        conn = FakeConn({"totalTokens": 1})
-        for payload in (compaction("end", completed=True), {"stream": "assistant", "data": {}},
-                        compaction("start", tokensBefore=5)):
-            self.assertIs(await ocp.with_compaction_tokens(conn, KEY, payload), payload)
-        self.assertEqual(conn.sent, [])
-
-    async def test_a_failed_lookup_leaves_the_event_as_it_was(self):
-        payload = compaction("start")
-        self.assertIs(await ocp.with_compaction_tokens(FakeConn(fail=True), KEY, payload), payload)
-        self.assertIs(await ocp.with_compaction_tokens(FakeConn({}), KEY, payload), payload)
 
 
 if __name__ == "__main__":
