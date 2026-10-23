@@ -777,9 +777,16 @@ GATEWAY_PID_FILE = os.environ.get("E2E_GATEWAY_PID_FILE", "")
 
 
 def _alive(pid: int) -> bool:
+    """Any thread of `pid` is still running. After a SIGKILL the main thread
+    turns zombie first, while the others still hold the process's files: the
+    Gateway's port then still accepts a connect, which a reconnect meets as a
+    connection closed mid-handshake rather than a refusal (ELI-300). Gone means
+    a zombie with no other thread left."""
     try:
         with open(f"/proc/{pid}/stat") as f:
-            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+            if f.read().rsplit(")", 1)[1].split()[0] != "Z":
+                return True
+        return len(os.listdir(f"/proc/{pid}/task")) > 1
     except OSError:
         return False
 
