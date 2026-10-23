@@ -202,9 +202,10 @@ touch can come out identical: once you've recorded it again, pass `--same`.
 **CodeQL** runs on Python, JavaScript and the workflows themselves.
 **Dependabot** updates the GitHub Actions and the test tooling weekly.
 
-To run the E2E stack on your own Linux machine (Docker, Node 24 and uv needed;
-it installs `openclaw` globally and writes `~/.openclaw/openclaw.json`, so use a
-throwaway VM or container, never a host running a real Gateway):
+To run the E2E stack on your own Linux machine (Docker, uv and a Node in the
+range the pinned `openclaw` declares, `npm view openclaw@$OPENCLAW_VERSION
+engines.node`; it installs `openclaw` globally and writes
+`~/.openclaw/openclaw.json`, so use a throwaway VM or container, never a host running a real Gateway):
 
 ```bash
 set -a; . e2e/versions.env; set +a
