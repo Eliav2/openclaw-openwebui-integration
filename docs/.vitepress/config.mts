@@ -1,4 +1,4 @@
-import { existsSync, statSync } from "node:fs";
+import { copyFileSync, existsSync, statSync } from "node:fs";
 import path from "node:path";
 import { defineConfig } from "vitepress";
 import llmstxt from "vitepress-plugin-llms";
@@ -10,6 +10,14 @@ import { withMermaid } from "vitepress-plugin-mermaid";
 const REPO = "https://github.com/Eliav2/openclaw-openwebui-integration";
 const base = process.env.DOCS_BASE ?? "/openclaw-openwebui-integration/";
 const DOCS = path.resolve(__dirname, "..");
+
+// The social card: a link to any page shows it (Open Graph and Twitter tags, below). Its tags need
+// absolute URLs, so the site's address is fixed here; a preview host sets SITE_URL.
+const SITE_URL = (process.env.SITE_URL ?? "https://eliav2.github.io/openclaw-openwebui-integration").replace(/\/$/, "");
+const SITE_TITLE = "OpenClaw for Open WebUI";
+const TAGLINE = "Chat with your OpenClaw agents from Open WebUI and watch them work: tool calls as cards, questions as dialogs, sub-agents in a live panel.";
+const CARD = { file: "social-preview.png", width: 1280, height: 640,
+  alt: "OpenClaw for Open WebUI: the claw logo, the tagline and a finished reply with two tool cards" };
 
 // A link to a file outside docs/ (the functions, SECURITY.md, skills/) works on GitHub, where
 // the whole repo is there. On the site it points at the file on GitHub instead.
@@ -70,7 +78,7 @@ const home = {
   hero: {
     name: "OpenClaw for Open WebUI",
     text: "Watch your agents work",
-    tagline: "Chat with your OpenClaw agents from Open WebUI and watch them work: tool calls as cards, questions as dialogs, sub-agents in a live panel.",
+    tagline: TAGLINE,
     image: { src: "/logo.svg", alt: "The crab claw" },
     actions: [
       { theme: "brand", text: "Get started", link: "/install/quickstart" },
@@ -90,8 +98,8 @@ const home = {
 
 // withMermaid renders ```mermaid blocks (the Architecture diagram) as SVG, in the site's light or dark theme.
 export default withMermaid(defineConfig({
-  title: "OpenClaw for Open WebUI",
-  description: "Chat with your OpenClaw agents from Open WebUI and watch them work: tool calls as cards, questions as dialogs, sub-agents in a live panel.",
+  title: SITE_TITLE,
+  description: TAGLINE,
   base,
   cleanUrls: true,
   head: [["link", { rel: "icon", type: "image/svg+xml", href: `${base}logo.svg` }]],
@@ -100,6 +108,38 @@ export default withMermaid(defineConfig({
       repoLinks(md);
       demoVideos(md);
     },
+  },
+  // The card's image is docs/img/social-preview.png (the repository's own social preview, one
+  // file): served at the site root so its address never depends on a page.
+  buildEnd(config) {
+    copyFileSync(path.join(DOCS, "img", CARD.file), path.join(config.outDir, CARD.file));
+  },
+  // Open Graph and Twitter tags on every page, from the page's own title and description
+  // (its frontmatter `description`, else the site's tagline).
+  transformHead({ pageData }) {
+    const rel = pageData.relativePath.replace(/\.md$/, "").replace(/(^|\/)index$/, "$1");
+    const home = rel === "";
+    const title = home || !pageData.title ? SITE_TITLE : `${pageData.title} | ${SITE_TITLE}`;
+    const description = pageData.frontmatter.description || pageData.description || TAGLINE;
+    const image = `${SITE_URL}/${CARD.file}`;
+    const meta = (attr, name, content) => ["meta", { [attr]: name, content: String(content) }];
+    return [
+      meta("property", "og:type", home ? "website" : "article"),
+      meta("property", "og:site_name", SITE_TITLE),
+      meta("property", "og:title", title),
+      meta("property", "og:description", description),
+      meta("property", "og:url", `${SITE_URL}/${rel}`),
+      meta("property", "og:image", image),
+      meta("property", "og:image:type", "image/png"),
+      meta("property", "og:image:width", CARD.width),
+      meta("property", "og:image:height", CARD.height),
+      meta("property", "og:image:alt", CARD.alt),
+      meta("name", "twitter:card", "summary_large_image"),
+      meta("name", "twitter:title", title),
+      meta("name", "twitter:description", description),
+      meta("name", "twitter:image", image),
+      meta("name", "twitter:image:alt", CARD.alt),
+    ];
   },
   transformPageData(page) {
     if (page.relativePath === "index.md") Object.assign(page.frontmatter, home);

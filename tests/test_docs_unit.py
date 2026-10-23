@@ -255,6 +255,27 @@ class HiddenExamplesTests(unittest.TestCase):
                 self.assertTrue(linked, f"nothing links {rel(page)}")
 
 
+class SocialCardTests(unittest.TestCase):
+    """Every docs page carries Open Graph and Twitter tags for the card a shared link shows
+    (docs/.vitepress/config.mts): the repository's social preview, served from the site root."""
+
+    def setUp(self):
+        self.config = (ROOT / "docs" / ".vitepress" / "config.mts").read_text()
+
+    def test_the_card_image_is_1280_by_640(self):
+        self.assertEqual(image_size(IMG / "social-preview.png"), (1280, 640))
+        self.assertIn('file: "social-preview.png", width: 1280, height: 640', self.config)
+
+    def test_the_tags_a_card_needs(self):
+        for tag in ("og:title", "og:description", "og:url", "og:site_name", "og:type", "og:image",
+                    "og:image:width", "og:image:height", "og:image:alt",
+                    "twitter:card", "twitter:image"):
+            with self.subTest(tag=tag):
+                self.assertIn(f'"{tag}"', self.config)
+        self.assertIn('"summary_large_image"', self.config)
+        self.assertRegex(self.config, r'SITE_URL = \(process\.env\.SITE_URL \?\? "https://')
+
+
 class DocsWordingTests(unittest.TestCase):
 
     def test_no_em_dash(self):
