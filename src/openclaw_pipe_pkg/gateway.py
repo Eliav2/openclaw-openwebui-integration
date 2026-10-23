@@ -829,7 +829,10 @@ _NOTE_ITEM_PREFIX = "msg_note_"
 # The Gateway's own context compaction, shown as a note of the reply
 # (ELI-283): "compacting" while it runs, then the same note as a collapsed
 # block. On claude-cli the event says only start/end and whether it
-# completed; `tokensBefore` is added by the Pipe (`with_compaction_tokens`).
+# completed, so the block shows a size only when the Gateway sends one
+# (`tokensBefore`). The session's `totalTokens` is not a stand-in: it is the
+# fill when the last run ended, and one run can grow 112k -> 473k before the
+# CLI compacts.
 COMPACTION_STREAM = "compaction"
 COMPACTING_NOTE = "🧹 _Compacting context…_"
 COMPACTION_FAILED_NOTE = "🧹 _Context compaction did not complete: the conversation goes on uncompacted._"
@@ -847,27 +850,6 @@ def _compacted_note(tokens_before) -> str:
         and tokens_before > 0 else ""
     return (f"<details>\n<summary>🧹 Context compacted{was}</summary>\n\n"
             f"{COMPACTED_BODY}\n</details>")
-
-
-async def with_compaction_tokens(conn, session_key: str, payload: dict) -> dict:
-    """`payload`, a compaction start the Gateway sent without a size, with the
-    session's last known context fill as `tokensBefore`: the row's
-    `totalTokens`, which OpenClaw writes after each run, so it is the fill
-    before this run and only near the size compacted. Any failure leaves the
-    note without a size."""
-    data = payload.get("data") or {}
-    if payload.get("stream") != COMPACTION_STREAM or data.get("phase") != "start" \
-            or "tokensBefore" in data or not session_key:
-        return payload
-    try:
-        desc = await conn.send_request("sessions.describe", {"key": session_key}, timeout=3)
-        total = ((desc or {}).get("session") or {}).get("totalTokens")
-    except Exception as ex:
-        pipe_log(f"  compaction: no context size ({type(ex).__name__})")
-        return payload
-    if not isinstance(total, int):
-        return payload
-    return {**payload, "data": {**data, "tokensBefore": total}}
 
 
 def _tool_call_result_event(tool_call_id: str, result_str: str) -> dict:

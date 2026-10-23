@@ -1424,7 +1424,6 @@ class _PipeTurn:
                         # (ELI-147).
                         if stream == COMPACTION_STREAM:
                             pipe_log(f"  Compaction: phase={phase} completed={data.get('completed')}")
-                            payload = await with_compaction_tokens(self.conn, self.session_key, payload)
                         if stream in ("assistant", "item", "tool", PIPE_NOTE_STREAM, COMPACTION_STREAM):
                             added = self.renderer.feed(payload)
                             for text in (a for a in added if isinstance(a, str)):
