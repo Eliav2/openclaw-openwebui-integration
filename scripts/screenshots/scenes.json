@@ -536,7 +536,7 @@
           }
         },
         {
-          "say": "This week's builds: 41 runs, 3 failures, all on Tuesday from the flaky radar-tile test. Since Wednesday's retry fix every build passed, and the average build time went from 6m40s to 5m55s.",
+          "say": "This week's builds: 41 runs, 3 failures, all on Tuesday from the flaky radar-tile check. Since Wednesday's retry fix every build passed, and the average build time went from 6m40s to 5m55s.",
           "delay": 0.03
         }
       ]
