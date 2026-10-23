@@ -887,10 +887,13 @@ def test_a_compaction_mid_reply_shows_in_the_reply(page):
     block = f"""() => {{
       const replies = document.querySelectorAll('.chat-assistant');
       const last = replies[replies.length - 1];
-      if (!last || ![...last.querySelectorAll('summary')].some(s => s.innerText.includes('Context compacted')))
-        return false;
+      if (!last) return false;
+      // Open WebUI draws <details> as its own collapsible, not a native
+      // <summary>: closed, it shows the title and hides the body.
       const t = last.innerText, at = t.indexOf('Context compacted');
-      return t.indexOf('E2E_COMPACT_BEFORE {nonce}') < at && at < t.indexOf('E2E_COMPACT_AFTER {nonce}');
+      return at >= 0 && !t.includes('Older messages in this conversation were summarized')
+        && t.indexOf('E2E_COMPACT_BEFORE {nonce}') >= 0
+        && t.indexOf('E2E_COMPACT_BEFORE {nonce}') < at && at < t.indexOf('E2E_COMPACT_AFTER {nonce}');
     }}"""
     _wait(page, block, "a collapsed 'Context compacted' block between the reply's text")
     page.reload()
