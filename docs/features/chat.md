@@ -145,6 +145,20 @@ The data comes from `sessions.describe` and `usage.status`, fetched together. It
 
 Always on.
 
+## Context compaction
+
+<img src="../img/compaction-note-light.png" alt="A reply with a tool card, then the collapsed Context compacted block, then the answer" width="320">
+
+When the Gateway compacts the session in the middle of a reply (it summarizes older messages so the conversation fits the model's context window), the reply says so where it happened. While it runs, the reply shows "🧹 Compacting context…"; when it is done, that line becomes a collapsed block, "🧹 Context compacted", with the context size before it when the Gateway knows it. Open it for what compaction means: the agent continues from a summary of the older messages plus the most recent ones. Everything stays visible in the chat. A compaction that fails says so instead, and the conversation goes on uncompacted; one the Gateway skips (nothing old enough to summarize yet) or that you stop says that.
+
+The block is part of the saved reply, so it is still there after a reload.
+
+The size is the session's context fill from the run before (read with `sessions.describe`), so it is close to, not exactly, what was compacted. The Gateway does not report the summary text, so the block cannot show it.
+
+Only a compaction the Gateway reports is marked. On OpenClaw's own agent, the one it runs to recover after the model rejected a request as too long reports nothing, so that one has no block.
+
+Always on.
+
 ## Chat titles
 
 The chat names itself with a short title and an emoji. When you send your second message, the Pipe titles the chat from the first exchange (your first message and the first reply). The new title shows at once in the open tab's header and sidebar, with no reload.

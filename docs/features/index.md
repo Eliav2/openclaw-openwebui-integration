@@ -23,6 +23,7 @@ Everything here works as soon as the Pipe is installed, except entries marked:
 - [**Images and files from the agent**](./chat.md#images-and-files-from-the-agent) _(needs agent setup)_: `MEDIA:` files are uploaded to the Open WebUI Files API and attached natively
 - [**Image input**](./chat.md#images-you-attach): images you attach are forwarded to the agent
 - [**Usage and goal line**](./chat.md#usage-and-goal-line): context, rate-limit and goal state under every reply
+- [**Context compaction marked**](./chat.md#context-compaction): when the Gateway compacts the session mid-reply, the reply shows a collapsed "Context compacted" block where it happened
 - [**Chat titles**](./chat.md#chat-titles): chats name themselves, on a separate agent so it never queues behind your conversation
 
 ## Sessions and models

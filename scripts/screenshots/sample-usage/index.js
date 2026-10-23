@@ -13,10 +13,17 @@
 //   starts a sub-agent in the background. The stack's model runs on the native
 //   runtime, which has no such tool, and the Pipe's "Waiting on 1 background
 //   agent" line keys on that answer.
+// - A context compaction mid-reply (ELI-283): after a tool call that reads
+//   COMPACT_AFTER, the run reports one on its `compaction` stream, as a
+//   claude-cli run does when Claude Code compacts. The native runtime sends
+//   none a scene can bring about.
 import { readFileSync } from "node:fs";
+import { emitAgentEvent } from "openclaw/plugin-sdk/agent-harness-runtime";
 
 const HOUR = 3_600_000;
 const DELAY_FILE = "/tmp/openclaw-screenshot-usage-delay-ms";
+const COMPACT_AFTER = "ci/build-logs/this-week.log";
+const compacted = new Set();
 
 export function sampleSnapshot(now = Date.now()) {
   return {
@@ -41,7 +48,7 @@ function delayMs() {
 export default {
   id: "screenshot-sample-usage",
   name: "Screenshot sample usage",
-  description: "Test-only: claudeCliUsage.status with fixed sample rate-limit windows, and a sample Agent tool.",
+  description: "Test-only: claudeCliUsage.status with fixed sample rate-limit windows, a sample Agent tool, and a sample compaction.",
   register(api) {
     api.registerGatewayMethod(
       "claudeCliUsage.status",
@@ -70,6 +77,13 @@ export default {
           : `Report: ${params.description} is done.`;
         return { content: [{ type: "text", text }] };
       },
+    });
+    api.on("after_tool_call", (event, ctx) => {
+      const runId = event.runId ?? ctx?.runId;
+      if (!runId || compacted.has(runId) || !JSON.stringify(event.params ?? {}).includes(COMPACT_AFTER)) return;
+      compacted.add(runId);
+      emitAgentEvent({ runId, stream: "compaction", data: { phase: "start", backend: "sample" } });
+      emitAgentEvent({ runId, stream: "compaction", data: { phase: "end", completed: true, backend: "sample" } });
     });
   },
 };

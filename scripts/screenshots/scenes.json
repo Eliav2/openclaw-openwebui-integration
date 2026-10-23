@@ -523,6 +523,24 @@
           "say": "Stored WEATHER_API_KEY. The forecast app can call the weather service with it now."
         }
       ]
+    },
+    {
+      "_comment": "ELI-283: reading this log makes the sample plugin (sample-usage) report a context compaction, so the reply shows the Context compacted block between the read and the answer.",
+      "match": "build logs and tell me how the builds went",
+      "steps": [
+        {
+          "say": "Reading this week's build log.",
+          "tool": "exec",
+          "args": {
+            "command": "echo 'ci/build-logs/this-week.log: 41 runs, 3 failed'",
+            "title": "This week's build log"
+          }
+        },
+        {
+          "say": "This week's builds: 41 runs, 3 failures, all on Tuesday from the flaky radar-tile check. Since Wednesday's retry fix every build passed, and the average build time went from 6m40s to 5m55s.",
+          "delay": 0.03
+        }
+      ]
     }
   ]
 }

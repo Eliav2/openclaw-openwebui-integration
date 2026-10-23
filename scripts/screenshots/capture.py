@@ -981,6 +981,17 @@ class Scenes:
         }}"""
         self.s.shot(page, "usage-goal", clip_js=clip, text_selector=".chat-assistant >> nth=-1")
 
+    def compaction_note(self, page: Page) -> None:
+        """A context compaction in the middle of a reply (the sample plugin
+        reports one after the scene reads its build log): the read, the
+        collapsed "Context compacted" block, then the answer."""
+        new_chat(page)
+        chat = send(page, "Go through this week's build logs and tell me how the builds went.")
+        wait_js(page, last_text_has("Context compacted", "5m55s", "🧠"), "the finished reply after the compaction")
+        park_mouse(page)
+        set_title(self.token, chat, "Build week review")
+        self.s.shot(page, "compaction-note", selector=".chat-assistant >> nth=-1")
+
     def compact(self, page: Page) -> None:
         """The Status dialog's context section with its Compact pill, on the
         hero chat (three tool calls of history). No "after" shot: right after
@@ -1290,6 +1301,7 @@ def main(argv=None) -> int:
             shooter.run("first-reply", scenes.first_reply, page)
             shooter.run("streaming", scenes.streaming_and_reload, page)
             shooter.run("usage-goal", scenes.usage_goal, page)
+            shooter.run("compaction-note", scenes.compaction_note, page)
             shooter.run("subagent-result", scenes.subagent_result, page)
             if scenes.spawn_chat:
                 shooter.run("spawn-card", scenes.spawn_card, page)

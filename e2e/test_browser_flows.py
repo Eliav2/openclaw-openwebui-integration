@@ -874,6 +874,32 @@ def test_a_compaction_the_gateway_refuses_shows_its_error(page):
     page.keyboard.press("Escape")
 
 
+def test_a_compaction_mid_reply_shows_in_the_reply(page):
+    """The run reports a context compaction in the middle of the reply
+    (ELI-283; the stack's e2e_compact tool makes it, as Claude Code's
+    compaction does on claude-cli): the reply shows a collapsed "Context
+    compacted" block where it happened, between the text before and after
+    it, and keeps it after a reload."""
+    nonce = f"BROWSER_COMPACT_{os.getpid()}_{len(_fake_llm_requests())}"
+    capture.new_chat(page)
+    capture.send(page, f"E2E_COMPACT_MARK {nonce}")
+    _wait(page, _turn_over(f"E2E_COMPACT_AFTER {nonce}"), "the reply")
+    block = f"""() => {{
+      const replies = document.querySelectorAll('.chat-assistant');
+      const last = replies[replies.length - 1];
+      if (!last) return false;
+      // Open WebUI draws <details> as its own collapsible, not a native
+      // <summary>: closed, it shows the title and hides the body.
+      const t = last.innerText, at = t.indexOf('Context compacted');
+      return at >= 0 && !t.includes('Older messages in this conversation were summarized')
+        && t.indexOf('E2E_COMPACT_BEFORE {nonce}') >= 0
+        && t.indexOf('E2E_COMPACT_BEFORE {nonce}') < at && at < t.indexOf('E2E_COMPACT_AFTER {nonce}');
+    }}"""
+    _wait(page, block, "a collapsed 'Context compacted' block between the reply's text")
+    page.reload()
+    _wait(page, block, "the block again after a reload")
+
+
 def test_the_subagent_drawer_follows_a_running_child_to_its_end(page):
     """Sub-agent drawer: the Status dialog lists the running sub-agent;
     its row opens the drawer, which shows it running and then, with nothing

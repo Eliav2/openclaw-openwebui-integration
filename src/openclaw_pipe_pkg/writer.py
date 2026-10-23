@@ -696,6 +696,7 @@ class _TurnWriter:
                 if payload.get("stream") == "lifecycle" and data.get("phase") == "start" \
                         and isinstance(data.get("startedAt"), (int, float)) and payload.get("runId"):
                     self.run_started.setdefault(payload["runId"], data["startedAt"])
+                payload = await with_compaction_tokens(self.conn, self.session_key, payload)
                 self.renderer.feed(payload)
         except Exception as ex:
             pipe_log(f"  turn writer: renderer feed failed: {ex}")
