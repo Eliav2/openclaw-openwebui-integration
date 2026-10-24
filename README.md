@@ -88,7 +88,7 @@ With the Status Action installed, one click shows context used, rate limits and 
 
 - **[Talk to it while it works](https://eliav2.github.io/openclaw-openwebui-integration/features/reliability#messages-sent-while-the-agent-works):** a message sent mid-run does not cut the run off, and gets its own answer.
 - **[Survives reloads and restarts](https://eliav2.github.io/openclaw-openwebui-integration/features/reliability#gateway-restarts):** reload the page or restart Open WebUI or the Gateway, and the reply finishes in the same message.
-- **[Replies the agent starts](https://eliav2.github.io/openclaw-openwebui-integration/features/agent-turns):** cron jobs, heartbeats and sub-agent results reply in the chat, live.
+- **[Replies the agent starts](https://eliav2.github.io/openclaw-openwebui-integration/features/agent-turns):** cron jobs and sub-agent results reply in the chat, live.
 - **[Every Gateway model](https://eliav2.github.io/openclaw-openwebui-integration/features/sessions-and-models#model-picker):** the model picker lists the models your Gateway allows, one session per chat.
 
 ## Docs
