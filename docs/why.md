@@ -20,7 +20,7 @@ That is the reason the rest is possible. A text-in, text-out API can carry the a
 - the [questions](./features/questions.md) it stops to ask you;
 - the [files and images](./features/chat.md) it emits;
 - the [sub-agents](./features/status.md) it starts;
-- the [replies it writes on its own](./features/agent-turns.md), from a cron job, a heartbeat or a finished sub-agent.
+- the [replies it writes on its own](./features/agent-turns.md), from a cron job or a finished sub-agent.
 
 The [feature list](./features/index.md) has everything.
 

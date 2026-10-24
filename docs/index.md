@@ -28,7 +28,7 @@ The three functions: the **Pipe** is the chat integration, the **Status Action**
   - [Questions](./features/questions.md): question cards and the secret dialog, which kind you get, what happens on a reconnect, and secrets the agent requests.
   - [Status](./features/status.md): the Status dialog, Compact, the sub-agent list and drawer, the composer button.
   - [Sessions and models](./features/sessions-and-models.md): one session per chat, the model picker, its size cap, `DEFAULT_MODEL`.
-  - [Replies from the agent](./features/agent-turns.md): replies with no message from you: cron jobs, heartbeats, `sessions_send`, sub-agent results.
+  - [Replies from the agent](./features/agent-turns.md): replies with no message from you: cron jobs, `sessions_send`, sub-agent results.
   - [Reliability](./features/reliability.md): the connection, queueing, reload and restart safety, recovery, Stop and Send now, redeploys, background tasks, errors.
   - [Owner users](./features/owner-users.md): `OWNER_USERS`, for an Open WebUI that people other than you sign in to.
 - [Configuration](./configuration.md): every valve of the three functions, generated from the code.

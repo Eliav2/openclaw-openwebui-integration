@@ -91,7 +91,7 @@ const home = {
     { title: "Questions as dialogs", details: "When the agent asks, you get a card with options or a secret field, not a wall of text.", link: "/features/questions" },
     { title: "Status", details: "Context used, rate limits, background work and sub-agents, one tap from the chat.", link: "/features/status" },
     { title: "Every Gateway model", details: "The model picker lists the models your Gateway allows, one session per chat.", link: "/features/sessions-and-models" },
-    { title: "Replies from the agent", details: "Cron jobs, heartbeats and sub-agent results reply in the chat, live.", link: "/features/agent-turns" },
+    { title: "Replies from the agent", details: "Cron jobs and sub-agent results reply in the chat, live.", link: "/features/agent-turns" },
     { title: "Survives restarts", details: "Reloads, reconnects and Gateway restarts keep the reply and pick it up again.", link: "/features/reliability" },
   ],
 };
