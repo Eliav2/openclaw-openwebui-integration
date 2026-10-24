@@ -900,6 +900,46 @@ def test_a_compaction_mid_reply_shows_in_the_reply(page):
     _wait(page, block, "the block again after a reload")
 
 
+TAKEOVER_LINK = "https://takeover.e2e.invalid/control/E2eTakeoverSession0001"   # e2e/fake_llm.py
+
+
+@pytest.fixture
+def control_link_pattern(token):
+    """CONTROL_LINK_PATTERN set to match e2e/fake_llm.py's takeover link, then put back."""
+    fid = capture.MODEL.split(".", 1)[0]
+    before = capture.api("GET", f"/api/v1/functions/id/{fid}/valves", token=token) or {}
+    capture.api("POST", f"/api/v1/functions/id/{fid}/valves/update",
+                {**before, "CONTROL_LINK_PATTERN": r"https://takeover\.e2e\.invalid/control/\w+"}, token)
+    yield
+    capture.api("POST", f"/api/v1/functions/id/{fid}/valves/update", before, token)
+
+
+def test_a_takeover_link_shows_in_the_reply_while_its_run_waits(page, control_link_pattern):
+    """ELI-318: the agent hands its browser to the user with a link printed
+    by a command and waits. The link shows in the reply as "Take control" while
+    the run waits, in the page itself (not in a sandboxed embed, where the
+    takeover page and an expired sign-in's login page refuse to load), opens
+    in a new tab, and stays after the run ends and a reload."""
+    token = f"t{os.getpid()}_{len(_fake_llm_requests())}"
+    hold = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{token}")   # fake_llm hold_file
+    link = f"a[href={json.dumps(TAKEOVER_LINK)}]"
+    capture.new_chat(page)
+    try:
+        capture.send(page, f"E2E_TAKEOVER {token}")
+        _wait(page, f"() => !!document.querySelector('{link}')", "the Take control link while the run waits")
+        assert not _replies(page)[0]["done"], "the reply ended before the link showed"
+        anchor = page.locator(link)
+        assert anchor.count() == 1, anchor.count()
+        assert "Take control" in anchor.inner_text(), anchor.inner_text()
+        assert anchor.get_attribute("target") == "_blank", anchor.evaluate("a => a.outerHTML")
+    finally:
+        open(hold, "w").close()
+    _wait(page, _turn_over("E2E_TAKEOVER_END"), "the reply's end")
+    _reload(page)
+    _wait(page, f"() => document.querySelectorAll('{link}').length === 1", "the link after a reload")
+    os.remove(hold)
+
+
 def test_the_subagent_drawer_follows_a_running_child_to_its_end(page):
     """Sub-agent drawer: the Status dialog lists the running sub-agent;
     its row opens the drawer, which shows it running and then, with nothing

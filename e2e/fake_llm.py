@@ -59,6 +59,10 @@ and only a core set is sent as real schemas.
   the foreground until the file `hold-TOKEN` next to $FAKE_LLM_LOG exists
   (90 s at most), then replies `E2E_HOLD_END`: a run that goes on until the
   test lets it end, or stops it.
+* `E2E_TAKEOVER TOKEN`                  -> says `E2E_TAKEOVER_START` and runs
+  `exec` printing TAKEOVER_LINK (a takeover page's link), then runs `exec` in
+  the foreground until the file `hold-TOKEN` exists (90 s at most), then
+  replies `E2E_TAKEOVER_END` (ELI-318).
 * `E2E_HOLD_SPAWN TOKEN`                -> `E2E_HOLD TOKEN`, then, once the file
   exists, spawns the sub-agent `E2E_SPAWN` does and replies `E2E_SPAWNED`: a
   child that starts when the test says, while the chat's run goes on (ELI-260).
@@ -169,6 +173,9 @@ BG_AGENT_TITLE = "E2E background agent"   # E2E_BG_AGENT: the Agent call's descr
 BG_EXEC_COMMAND = "sleep 25; echo e2e-bg-done"
 BG_EXEC_TITLE = "E2E background sleep"
 _HOLD = re.compile(r"E2E_HOLD ([A-Za-z0-9_]{3,})")
+_TAKEOVER = re.compile(r"E2E_TAKEOVER ([A-Za-z0-9_]{3,})")
+# E2E_TAKEOVER's link: what the stack's CONTROL_LINK_PATTERN matches (ELI-318).
+TAKEOVER_LINK = "https://takeover.e2e.invalid/control/E2eTakeoverSession0001"
 _HOLD_SPAWN = re.compile(r"E2E_HOLD_SPAWN ([A-Za-z0-9_]{3,})")
 _SLOW = re.compile(r"E2E_SLOW(?::(\d{1,3}))?\s+([A-Za-z0-9_]{3,})")
 SLOW_WORDS = 10
@@ -451,6 +458,21 @@ def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
                 return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
             return {"text": say, **call} if say else call
         return {"text": "E2E_SPAWNED"}
+    m = _TAKEOVER.search(user_text)
+    if m:
+        # A takeover (ELI-318): a command prints the page's link, then the run
+        # waits for the person, like `takeover open` does.
+        gate = hold_file(m.group(1))
+        steps = [("E2E_TAKEOVER_START", {"command": f"echo {TAKEOVER_LINK}"}),
+                 ("", {"command": f"for i in $(seq 450); do [ -e '{gate}' ] && break; "
+                                  "sleep 0.2; done; echo e2e-takeover-ended", "yieldMs": 100_000})]
+        if len(tool_results) < len(steps):
+            say, args = steps[len(tool_results)]
+            call = _call_with("exec", args, offered)
+            if not call:
+                return {"text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
+            return {"text": say, **call} if say else call
+        return {"text": "E2E_TAKEOVER_END"}
     m = _HOLD.search(user_text)
     if m:
         if tool_results:
