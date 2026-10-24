@@ -115,6 +115,7 @@ SHARDS = {
         f"{BROWSER}::test_the_status_dialog_compacts_the_chat",
         f"{BROWSER}::test_a_compaction_the_gateway_refuses_shows_its_error",
         f"{BROWSER}::test_a_compaction_mid_reply_shows_in_the_reply",
+        f"{BROWSER}::test_a_takeover_link_shows_in_the_reply_while_its_run_waits",
         f"{BROWSER}::test_the_subagent_drawer_follows_a_running_child_to_its_end",
         f"{BROWSER}::test_subagents_whose_sessions_were_deleted_stay_listed_with_their_errors",
         f"{BROWSER}::test_the_status_dialog_lists_a_background_agent_while_its_reply_runs",

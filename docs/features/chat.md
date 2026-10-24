@@ -3,7 +3,7 @@
 What a reply looks like in the chat: live text, the agent's tool calls as real cards, failures marked, images and files both ways, a usage line under each reply, and chat titles. Everything here works as soon as the Pipe is installed, except where a section says otherwise.
 
 Applies to: Pipe (the thinking level also needs the thinking filter)
-Valves: `USE_OWUI_FILES`, `OWUI_BASE_URL`, `OWUI_API_KEY`, `ENABLE_FILE_SERVER`, `FILE_SERVER_BASE_URL`, `AUTO_TITLE`, `TITLE_GEN_AGENT_ID`, `LIVE_VIEW_URL`, `LIVE_VIEW_TOOLS`, `LIVE_VIEW_USERS`
+Valves: `USE_OWUI_FILES`, `OWUI_BASE_URL`, `OWUI_API_KEY`, `ENABLE_FILE_SERVER`, `FILE_SERVER_BASE_URL`, `AUTO_TITLE`, `TITLE_GEN_AGENT_ID`, `LIVE_VIEW_URL`, `LIVE_VIEW_TOOLS`, `LIVE_VIEW_USERS`, `CONTROL_LINK_PATTERN`
 
 ## Streaming
 
@@ -73,6 +73,16 @@ Our own setup, as one example: the agent's browser, live inside the reply that s
 Open WebUI shows the page in a sandboxed frame, as it does every embed, so the page cannot reach Open WebUI or your login. Your service decides who may see what it shows: put it behind your own login.
 
 Off by default. Replies you send get it; replies the agent starts itself do not.
+
+## A link to take over from the agent
+
+For a step only you can do, a login, a CAPTCHA or a 2FA code, the agent can hand you a page of your own service that lets you do it, then wait for you. Set [`CONTROL_LINK_PATTERN`](../configuration.md#control_link_pattern) to a pattern that matches that page's address, and when a tool result has one, the reply gets a **Take control** link right under that tool's card, while the agent waits. The link opens in a new tab. It is part of the saved message, and each link is added once per chat, however often the waiting command repeats it.
+
+It is a link and not an embed on purpose. Open WebUI shows an embed in a sandboxed frame, and a page that takes input usually refuses to load inside one. A login page does too, so an embed would stay blank once your sign-in expired, with no way to sign in again from the chat. Opened as its own tab, the page gets its normal sign-in.
+
+The Pipe only shows the link. Your service decides who may open the page: put it behind your own login.
+
+Off by default.
 
 ## Thinking level
 

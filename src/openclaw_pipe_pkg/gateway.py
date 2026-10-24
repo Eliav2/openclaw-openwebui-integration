@@ -825,6 +825,9 @@ def _tool_call_started_event(name: str, tool_call_id: str, args_str: str) -> dic
 # note, so the same note again replaces it.
 PIPE_NOTE_STREAM = "pipe_note"
 _NOTE_ITEM_PREFIX = "msg_note_"
+# A tool result's takeover link (CONTROL_LINK_PATTERN), as a note (ELI-318).
+CONTROL_LINK_NOTE = ("**[Take control ↗]({link})**: the agent is waiting for you to do a step in "
+                     "its browser. It opens in a new tab; press End there when you are done.")
 
 # The Gateway's own context compaction, shown as a note of the reply
 # (ELI-283): "compacting" while it runs, then the same note as a collapsed
@@ -1834,6 +1837,9 @@ class _GatewayConnection:
         # by the key, a new child among them (ELI-260).
         self._session_child_waiters: dict[str, asyncio.Event] = {}
         self._tool_events_seen: dict[tuple, bool] = {}
+        # (session key, link) of each "Take control" link already added to a
+        # reply (`_control_link_note`): a waiting command returns it on every poll.
+        self._control_links_shown: dict[tuple, bool] = {}
         # (session key, tool call id) -> the arguments of a spawn call that
         # started and has no result yet (`_spawn_call_args`), for the child index.
         self._spawn_args: dict[tuple, dict] = {}
@@ -1920,6 +1926,39 @@ class _GatewayConnection:
             for stale in list(self._tool_events_seen)[:2000]:
                 self._tool_events_seen.pop(stale, None)
         return True
+
+    def _control_link_note(self, payload: dict) -> dict | None:
+        """The note that adds a "Take control" link to a reply, for a tool
+        result in one of this Pipe's chats whose text has a match of
+        CONTROL_LINK_PATTERN (ELI-318), else None. A page that hands the
+        agent's browser to the user (a takeover) refuses to run framed in
+        Open WebUI's sandboxed embed, and an expired sign-in's login page
+        refuses framing too, so the link goes in the reply's text, where Open
+        WebUI's own page renders it and opens it as a page of its own. Once
+        per link and chat."""
+        data = payload.get("data") or {}
+        session = payload.get("sessionKey") or ""
+        if payload.get("stream") != "tool" or data.get("phase") != "result" or not payload.get("runId"):
+            return None
+        pattern = (getattr(self._valves(), "CONTROL_LINK_PATTERN", "") or "").strip()
+        if not pattern or not self.parse_owui_session_key(session):
+            return None
+        try:
+            found = re.search(pattern, _tool_result_text(data.get("result", {})))
+        except re.error as ex:
+            pipe_log(f"  CONTROL_LINK_PATTERN is not a valid regular expression: {ex}")
+            return None
+        link = found.group(0).strip() if found else ""
+        if not re.fullmatch(r"https?://[^\s()<>\[\]]+", link) or (session, link) in self._control_links_shown:
+            return None
+        self._control_links_shown[(session, link)] = True
+        if len(self._control_links_shown) > 2000:
+            for stale in list(self._control_links_shown)[:1000]:
+                self._control_links_shown.pop(stale, None)
+        pipe_log(f"  control link added: {link}")
+        nid = f"{_NOTE_ITEM_PREFIX}control_{hashlib.sha256(link.encode()).hexdigest()[:12]}"
+        return {"sessionKey": session, "runId": payload["runId"], "stream": PIPE_NOTE_STREAM,
+                "data": {"id": nid, "text": CONTROL_LINK_NOTE.format(link=link)}}
 
     def _spawn_seen(self, payload: dict):
         """(parent, child, task or None, run fields or None) of an accepted
@@ -2596,10 +2635,18 @@ class _GatewayConnection:
     async def dispatch_run_event(self, msg: dict) -> None:
         """One `agent` or `chat` event of a run: its shadow render, then its
         live reply, its turn writer, or nowhere. The receive loop's path for
-        every run event, and the Pipe's for its own notes (ELI-197)."""
+        every run event, and the Pipe's for its own notes (ELI-197). A tool
+        result with a takeover link is followed by its note (ELI-318)."""
         payload = msg.get("payload", {})
         if payload.get("stream") == "tool" and not self._first_tool_event(payload):
             return
+        await self._dispatch_run_event(msg)
+        note = self._control_link_note(payload)
+        if note is not None:
+            await self._dispatch_run_event({"type": "event", "event": "agent", "payload": note})
+
+    async def _dispatch_run_event(self, msg: dict) -> None:
+        payload = msg.get("payload", {})
         spawned = self._spawn_seen(payload) if payload.get("stream") == "tool" else None
         if spawned:
             # The Status dialog's child index (state.py), off the loop.

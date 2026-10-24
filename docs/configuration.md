@@ -138,6 +138,12 @@ Type: `str`. Default: empty.
 
 Open WebUI user ids or emails, comma-separated, whose replies get LIVE_VIEW_URL. Empty: everyone's, once LIVE_VIEW_URL is set.
 
+### CONTROL_LINK_PATTERN
+
+Type: `str`. Default: empty.
+
+(Optional.) A link the agent hands you to take over from it, such as a page that lets you drive its browser for a login or a CAPTCHA: a regular expression searched in each tool result. Its first match, an http(s) URL, is added to the reply as a "Take control" link that opens in a new tab, once per link and chat. Empty: off.
+
 ### TITLE_GEN_AGENT_ID
 
 Type: `str`. Default: `title-gen`.
