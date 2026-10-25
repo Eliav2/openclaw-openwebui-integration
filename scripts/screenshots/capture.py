@@ -1219,7 +1219,9 @@ class Scenes:
     def admin_valves(self, page: Page) -> None:
         """The Pipe's valves in the admin panel, from Owner Users down."""
         page.goto(f"{BASE}/admin/functions")
-        row = page.locator('div[role="button"]', has_text="OpenClaw Gateway").first
+        # The row is a div.group with the function's link and its Valves button (a role=button div up to 0.12.3).
+        link = page.locator('a[href*="/admin/functions/edit"]', has_text="OpenClaw Gateway").first
+        row = link.locator('xpath=ancestor::div[contains(concat(" ", normalize-space(@class), " "), " group ")][1]')
         row.locator('button[aria-label="Valves"]').click()
         dialog = page.locator('div[role="dialog"][aria-modal="true"]').last
         owner = dialog.get_by_text("Owner Users", exact=True).first

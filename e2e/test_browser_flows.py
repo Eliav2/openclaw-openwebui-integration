@@ -1753,10 +1753,9 @@ class Pipe:
 
 @pytest.mark.parametrize("mode", [
     "held",
-    pytest.param("raw", marks=pytest.mark.xfail(strict=True, raises=Eli195Present, reason=(
-        "ELI-195 drop gate: on this Open WebUI an `execute` reaching a tab while its input dialog "
-        f"is open takes the dialog's answer ({ELI195_UPSTREAM}). An XPASS means the pinned release "
-        "fixed it: drop the Pipe's execute hold (emit.py dialog holds) and this gate."))),
+    # Open WebUI 0.12.4 fixed it (the raw mode XPASSed on v0.12.4, 2026-10-25). The Pipe's hold stays
+    # while 0.12.3 is a rollback target; then drop the hold (emit.py dialog holds) and this mode.
+    "raw",
 ])
 def test_an_execute_while_the_input_dialog_is_open_leaves_the_dialog_its_answer(page, token, mode):
     """ELI-195: a function's `execute` that reaches a tab while that tab
