@@ -28,6 +28,7 @@ from playwright.sync_api import sync_playwright  # noqa: E402
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts", "screenshots"))
 import capture  # noqa: E402
+from owui_version import has_fix_0_12_4  # noqa: E402
 
 TURN_MS = 120_000
 
@@ -38,6 +39,11 @@ def _openclaw_version() -> tuple:
     m = re.search(r"(\d{4})\.(\d{1,2})\.(\d+)", out.stdout)
     assert m, f"no version in {out.stdout!r} {out.stderr[-300:]!r}"
     return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+
+def _openclaw_release() -> tuple:
+    """(year, month) of the Gateway the stack installed."""
+    return _openclaw_version()[:2]
 
 
 @pytest.fixture(scope="module")
@@ -259,7 +265,13 @@ def test_a_question_left_for_a_new_message_ends_its_reply(page):
     """ELI-200: with the question card open, a new message is sent instead
     of an answer. The card goes, the question stays in its reply as text,
     and that reply is finished: no "Thinking..." left on it, also after a
-    reload; the new message gets its own answer."""
+    reload; the new message gets its own answer. Skipped on the OpenClaw 2026.10 lane while
+    Open WebUI lacks the ELI-205 fix (0.12.4): see below."""
+    if _openclaw_release() >= (2026, 10) and not has_fix_0_12_4():
+        pytest.skip("OpenClaw 2026.10 lane on Open WebUI before 0.12.4: this flow's Stop lands as the "
+                    "reply ends, so Open WebUI's own end-of-reply save is cancelled mid-transaction and "
+                    "keeps the SQLite lock, and every later test in the job fails (ELI-205, "
+                    "https://linear.app/eliavb/issue/ELI-205).")
     capture.new_chat(page)
     capture.send(page, "E2E_ASK_SINGLE")
     capture.wait_js(page, "() => document.body.innerText.includes('Which color?') "
@@ -1753,9 +1765,12 @@ class Pipe:
 
 @pytest.mark.parametrize("mode", [
     "held",
-    # Open WebUI 0.12.4 fixed it (the raw mode XPASSed on v0.12.4, 2026-10-25). The Pipe's hold stays
-    # while 0.12.3 is a rollback target; then drop the hold (emit.py dialog holds) and this mode.
-    "raw",
+    # Fixed upstream in 0.12.4 (open-webui#32744): the raw mode is expected to fail only on older
+    # releases, and to pass from 0.12.4 on.
+    pytest.param("raw", marks=pytest.mark.xfail(not has_fix_0_12_4(), strict=True, raises=Eli195Present, reason=(
+        "ELI-195 drop gate: on this Open WebUI an `execute` reaching a tab while its input dialog "
+        f"is open takes the dialog's answer ({ELI195_UPSTREAM}). An XPASS means the pinned release "
+        "fixed it: drop the Pipe's execute hold (emit.py dialog holds) and this gate."))),
 ])
 def test_an_execute_while_the_input_dialog_is_open_leaves_the_dialog_its_answer(page, token, mode):
     """ELI-195: a function's `execute` that reaches a tab while that tab

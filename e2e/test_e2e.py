@@ -30,6 +30,8 @@ import uuid
 
 import pytest
 
+from owui_version import has_fix_0_12_4
+
 pytestmark = pytest.mark.skipif(
     os.environ.get("E2E_STACK") != "1",
     reason="end-to-end stack not running (set E2E_STACK=1; see .github/workflows/ci.yml)",
@@ -2364,9 +2366,13 @@ class ProbeIneffective(AssertionError):
 @pytest.mark.skipif(shutil.which("docker") is None, reason="needs the e2e stack's Open WebUI container")
 @pytest.mark.parametrize("mode", [
     "shielded",
-    # Open WebUI 0.12.4 fixed it (the raw mode XPASSed on v0.12.4, 2026-10-25). The Pipe's
-    # `_uncancellable` shield stays while 0.12.3 is a rollback target; then drop it and this mode.
-    "raw",
+    # Fixed upstream in 0.12.4 (open-webui#32617, which keeps the SQLite connection when the
+    # cancelled task's error is a CancelledError): the raw mode is expected to fail only on older
+    # releases, and to pass from 0.12.4 on.
+    pytest.param("raw", marks=pytest.mark.xfail(not has_fix_0_12_4(), strict=True, raises=Eli205Present, reason=(
+        "ELI-205 drop gate: on this Open WebUI a cancelled chat write wedges or locks SQLite "
+        f"({ELI205_UPSTREAM}). An XPASS means the pinned release fixed it: drop the Pipe's "
+        "`_uncancellable` shield and this gate."))),
 ])
 def test_a_cancelled_chat_write_leaves_the_database_writable(token, mode):
     """ELI-205: a Stop cancels a chat message write while aiosqlite's thread

@@ -8,9 +8,9 @@ Applies to: Pipe, Action, Filter
 
 | | Minimum | Tested in CI |
 |---|---|---|
-| Open WebUI | 0.12.0 | 0.12.4 |
+| Open WebUI | 0.12.0 | 0.12.3 |
 | OpenClaw Gateway | 2026.9.3 | 2026.10.5 |
-| Python inside Open WebUI (what Open WebUI ships) | 3.11 | 3.11 and 3.12 (0.12.4 ships 3.12) |
+| Python inside Open WebUI (what Open WebUI ships) | 3.11 | 3.11 and 3.12 |
 | Python for `install.py` | 3.10 | 3.10 to 3.13 |
 
 The "Tested in CI" versions are the ones the end-to-end suite runs on for every pull request (`e2e/versions.env`). The minimums come from the same suite run once on each older release; the results are below.
@@ -42,7 +42,6 @@ Each row is the full end-to-end suite on one pair, on GitHub's runners. The suit
 | 0.12.0 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/39003313714) |
 | 0.12.2 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/39003315726) |
 | 0.12.3 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/39173684021) |
-| 0.12.4 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/40178235128) |
 
 ### OpenClaw, with Open WebUI 0.12.0
 
