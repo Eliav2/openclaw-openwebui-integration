@@ -41,6 +41,94 @@ class LiveViewUrlTests(unittest.TestCase):
             with self.subTest(tool=tool, args=args):
                 self.assertIsNone(live_view_url(tool, args))
 
+    def test_only_a_real_browser_launch_shows_the_card(self):
+        # 248 of 269 live-view cards on one deployment over a week had no browser behind them.
+        # The default matched "playwright"/"chromium" anywhere in any tool's arguments: a file being
+        # written, a message, a heredoc body, a grep. A card means the agent starts or drives a browser.
+        launches = (
+            ("browser", {"action": "open", "url": "https://x"}),
+            ("exec", {"command": "openclaw browser --json open https://example.org"}),
+            ("exec", {"command": "B=/opt/openclaw/bin/openclaw; $B browser screenshot t3"}),
+            ("exec", {"command": "google-chrome --headless --screenshot https://x"}),
+            ("exec", {"command": "cd app && /usr/bin/chromium --headless --dump-dom https://x"}),
+            ("Bash", {"command": "npx playwright test e2e/login.spec.ts"}),
+            ("exec", {"command": "uv run --with playwright==1.64.0 python shot.py https://x out.png"}),
+        )
+        mentions = (
+            ("Write", {"file_path": "/tmp/run.py", "content": "from playwright.sync_api import sync_playwright\n"}),
+            ("Edit", {"file_path": "src/owners.ts", "old_string": "chromium", "new_string": "chrome"}),
+            ("Read", {"file_path": "notes/playwright-tips.md"}),
+            ("message", {"action": "send", "message": "The chromium run passed, 3 of 3"}),
+            ("sessions_send", {"sessionKey": "s", "message": "Use playwright for the shot"}),
+            ("web_search", {"query": "playwright webapp-testing skill"}),
+            ("exec", {"command": "cat > run.sh <<'EOF'\n# browser test with playwright\nEOF"}),
+            ("Bash", {"command": "grep -n 'pytest\\|playwright' .github/workflows/*.yml"}),
+            ("exec", {"command": "echo 'chromium is down' >> notes.txt"}),
+        )
+        for tool, args in launches:
+            with self.subTest(tool=tool, args=args):
+                self.assertIsNotNone(live_view_url(tool, json.dumps(args)))
+        for tool, args in mentions:
+            with self.subTest(tool=tool, args=args):
+                self.assertIsNone(live_view_url(tool, json.dumps(args)))
+
+    def test_a_browser_word_counts_only_in_command_position(self):
+        launches = (
+            "FOO=1 chromium --headless https://x",
+            "cd /tmp && chrome --headless https://x",
+            "sleep 1; google-chrome --headless https://x",
+            "ls | xargs echo; chromium https://x",
+            "echo ok || chromium https://x",
+            "x=$(chromium --headless --dump-dom https://x)",
+            "timeout 60 chromium --headless https://x",
+            "nohup env DISPLAY=:1 chromium https://x &",
+            "for i in 1 2; do $B browser press PageDown; done",
+            "bunx playwright screenshot https://x out.png",
+            "playwright codegen https://x",
+        )
+        not_launches = (
+            "grep chromium notes.txt",
+            "ls chromium/",
+            "cat <<EOF\nchromium https://x\nEOF",
+            "echo chromium --headless",
+            "echo \"npx playwright test\"",
+            "git commit -m 'run playwright test in CI'",
+            "python3 -c 'import playwright'",
+            "npx playwright install",
+            "openclaw browser --help | head -50",
+            "pip install playwright",
+            "google-chrome --version",
+            "/usr/bin/chromium --help",
+            "openclaw browser screenshot --help",
+            "command -v chromium",
+            "which google-chrome",
+            "pkill chromium",
+        )
+        for cmd in launches:
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(live_view_url("exec", json.dumps({"command": cmd})))
+        for cmd in not_launches:
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(live_view_url("exec", json.dumps({"command": cmd})))
+
+    def test_only_the_command_argument_is_judged(self):
+        # a launch quoted in another argument of a command tool is still not a launch
+        self.assertIsNone(live_view_url("exec", json.dumps({"command": "ls", "note": "chromium --headless"})))
+        # and an argument string that is no JSON object leaves only the tool's name
+        self.assertIsNone(live_view_url("exec", "chromium --headless"))
+        self.assertIsNotNone(live_view_url("browser", "not json"))
+
+    def test_the_valve_still_widens_the_default_in_command_position_only(self):
+        default = Pipe.Valves().LIVE_VIEW_TOOLS
+        valve = default + r"|lease\.py own"
+        for cmd in ("python3 /opt/tools/lease.py own --caller qa -- bun shot.ts",
+                    "cd /srv && python3 /opt/tools/lease.py own -- bun shot.ts"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(live_view_url("exec", json.dumps({"command": cmd}), LIVE_VIEW_TOOLS=valve))
+        for cmd in ("grep -n 'lease.py own' notes.md", "cat > x <<'EOF'\nlease.py own\nEOF"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(live_view_url("exec", json.dumps({"command": cmd}), LIVE_VIEW_TOOLS=valve))
+
     def test_the_default_on_real_tool_calls(self):
         # ELI-248: on the claude-cli runtime the agent drives its browser with exec
         # running `openclaw browser <verb>`; no tool is called "browser" there
