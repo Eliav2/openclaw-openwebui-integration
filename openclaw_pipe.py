@@ -1413,6 +1413,24 @@ def _gateway_image_blocks(message) -> list[dict]:
     ]
 
 
+def _history_image_blocks_for_run(history: dict, run_id: str) -> list[dict]:
+    """The Gateway image blocks of one run's assistant messages in
+    `chat.history`, in order. The Gateway attaches a run's managed images to
+    its stored message; the live `chat` final and `session.message` carry
+    only the text (measured 2026-10-25, ELI-322)."""
+    messages = (history or {}).get("messages")
+    if not isinstance(messages, list) or not run_id:
+        return []
+    blocks = []
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
+        if run_id in (meta.get("runId"), message.get("runId")):
+            blocks += _gateway_image_blocks(message)
+    return blocks
+
+
 def _gateway_image_fname(block: dict) -> str:
     """A unique bare file name for an image block, with its type's extension."""
     stem = os.path.splitext(os.path.basename(str(block.get("alt") or "")))[0]
@@ -11721,6 +11739,15 @@ def _thinking_rejection_retry_body(body, recovered, resolved_thinking):
 # while the page and its queued message survive (ELI-95).
 _SEND_NOW_HOLD_S = 120.0
 
+# The agent stream a Codex-runtime run reports its items on, an image its
+# image tool made among them.
+CODEX_ITEM_STREAM = "codex_app_server.item"
+# How long, and how often, a reply whose run made images reads the
+# transcript for them once the run ended (ELI-322): measured live, they
+# land there about 0.9 s after the run's final.
+_RUN_IMAGES_WAIT_S = 10.0
+_RUN_IMAGES_POLL_S = 0.5
+
 
 async def _current_load(pipe, request):
     """The Pipe of the load Open WebUI serves now, when `pipe` belongs to an
@@ -12995,10 +13022,14 @@ class _PipeTurn:
         # directive whose filename is still arriving.
         self.pending_prompt_text = ""
         self.pending_media_text = ""
-        # The final message's Gateway `image` blocks, shown after the text,
-        # unless a MEDIA: directive of this reply already showed its images.
-        self.final_images = []
+        # Whether a MEDIA: directive of this reply showed its images; the
+        # run's Gateway image blocks are shown only when none did.
         self.media_shown = False
+        # The session's `chat.history` once the run ended, read once.
+        self.end_history = None
+        # Images the run's Codex image tool made: the Gateway attaches them
+        # to the run's stored message only after its final (ELI-322).
+        self.images_made = 0
         self.last_snapshot_text = ""
         self.last_snapshot_time = 0.0
         self.snapshot_interval_s = 1.0
@@ -13084,6 +13115,9 @@ class _PipeTurn:
                         # --- Run text and tool cards ---
                         # One renderer reads them, the one a turn writer uses
                         # (ELI-147).
+                        if (stream == CODEX_ITEM_STREAM and phase == "completed"
+                                and data.get("type") == "imageGeneration"):
+                            self.images_made += 1
                         if stream == COMPACTION_STREAM:
                             pipe_log(f"  Compaction: phase={phase} completed={data.get('completed')}")
                         if stream in ("assistant", "item", "tool", PIPE_NOTE_STREAM, COMPACTION_STREAM):
@@ -13367,7 +13401,6 @@ class _PipeTurn:
                 if isinstance(payload.get("message"), dict) else None
             if _usage_prompt_tokens(usage):
                 self.run_usage = usage
-            self.final_images = _gateway_image_blocks(payload.get("message"))
         if state in ("final", "cancelled", "error", "aborted") or aborted_run:
             self.done = True
             pipe_log(f"  payload state='{state}' aborted={aborted_run} -> done")
@@ -13504,17 +13537,41 @@ class _PipeTurn:
             self.text_yielded = True
             self.pending_media_text = ""
 
+    async def run_end_history(self, fresh: bool = False) -> dict:
+        """The session's `chat.history` once the run ended, read once for
+        the run's images and its usage line (`fresh`: read again)."""
+        if self.end_history is None or fresh:
+            # As long as the usage line's other reads (`_build_usage_status_lines`).
+            self.end_history = await self.conn.session_history(
+                self.session_key, limit=RUN_TEXT_HISTORY_LIMIT, timeout=5)
+        return self.end_history
+
     async def finish_final_images(self):
-        """Show the images the final message carries as Gateway `image`
-        blocks (an agent's own image tool), which the text never names
-        (ELI-322). A reply that showed MEDIA: directives already has its
-        images: the Gateway may list those as blocks too, so they are not
-        shown twice."""
-        blocks, self.final_images = self.final_images, []
-        if not blocks:
+        """Show the images the run's stored messages carry as Gateway
+        `image` blocks (an agent's own image tool), which the text never
+        names (ELI-322). A reply that showed MEDIA: directives already has
+        its images: the Gateway may list those as blocks too, so they are
+        not shown twice."""
+        if self.media_shown or self.handed_over or not self.our_run_id:
             return
-        if self.media_shown:
-            pipe_log(f"  {len(blocks)} gateway image block(s) skipped: the text showed MEDIA:")
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        try:
+            blocks = _history_image_blocks_for_run(await self.run_end_history(), self.our_run_id)
+            # The Gateway attaches the images the run made to its stored
+            # message about a second after the run's final, with no event
+            # that carries them: read until they are there, bounded.
+            while len(blocks) < self.images_made and loop.time() - start < _RUN_IMAGES_WAIT_S:
+                await asyncio.sleep(_RUN_IMAGES_POLL_S)
+                blocks = _history_image_blocks_for_run(
+                    await self.run_end_history(fresh=True), self.our_run_id)
+        except Exception as ex:
+            pipe_log(f"  run images: chat.history failed: {ex!r}")
+            return
+        if self.images_made:
+            pipe_log(f"  run made {self.images_made} image(s); {len(blocks)} stored after "
+                     f"{(loop.time() - start) * 1000:.0f} ms")
+        if not blocks:
             return
         shown = await _gateway_images_text(
             blocks, valves=self.pipe.valves, __request__=self.__request__,
@@ -13880,8 +13937,7 @@ class _PipeTurn:
         if self.run_usage or not self.our_run_id:
             return self.run_usage
         try:
-            # As long as the usage line's other reads (`_build_usage_status_lines`).
-            hist = await self.conn.session_history(self.session_key, limit=RUN_TEXT_HISTORY_LIMIT, timeout=5)
+            hist = await self.run_end_history()
         except Exception as ex:
             pipe_log(f"  usage line: chat.history failed: {ex!r}")
             return None

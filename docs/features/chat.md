@@ -119,7 +119,7 @@ Because the URL is same-origin, it works over HTTPS with no mixed-content blocki
 
 The directive is recognised even when streaming splits it mid-prefix or mid-filename, and one still buffered when the run ends is flushed, not dropped. A directive inside a code block is left alone, and writing "the MEDIA: fix" in ordinary prose does not turn the next word into a broken image link.
 
-Some agents make images with their own tool and never write a `MEDIA:` line: an OpenAI model on the Codex runtime is one. The Gateway then attaches the images to the reply's final message. In a reply to your message, the Pipe fetches each one from the Gateway with `GATEWAY_TOKEN` and shows it under the text the same way as a `MEDIA:` file. A reply that already showed `MEDIA:` files does not show them a second time. An image the Pipe cannot fetch is named in the reply, not dropped.
+Some agents make images with their own tool and never write a `MEDIA:` line: an OpenAI model on the Codex runtime is one. The Gateway then attaches the images to the reply's stored message, about a second after the reply ends. In a reply to your message, the Pipe reads them from there, waiting up to 10 seconds for images the agent's tool made. It fetches each one from the Gateway with `GATEWAY_TOKEN` and shows it under the text the same way as a `MEDIA:` file. A reply that already showed `MEDIA:` files does not show them a second time. An image the Pipe cannot fetch is named in the reply, not dropped.
 
 The upload uses your own login from the request. `OWUI_API_KEY` is only needed if uploads fail with an auth error, or for replies the agent starts on its own (see [Replies the agent starts](./agent-turns.md#images-files-and-questions)).
 
