@@ -1616,11 +1616,125 @@ def _background_agents_line(n: int) -> str:
 _LIVE_VIEW_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
+# Words a shell command can start with that are not the command: loop and
+# condition keywords, and wrappers that run what follows. An assignment
+# (`FOO=1 cmd`) is skipped the same way.
+_SHELL_LEAD_WORDS = frozenset({"do", "then", "else", "elif", "if", "while", "until", "!", "{", "(",
+                               "time", "env", "nohup", "setsid", "sudo", "exec"})
+_SHELL_WRAPPER_WITH_ARG = frozenset({"timeout"})   # `timeout 60 cmd`: one more word to skip
+_ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_HEREDOC = re.compile(r"<<(-?)[ \t]*(?:'([^'\n]+)'|\"([^\"\n]+)\"|\\?([A-Za-z0-9_.-]+))")
+
+
+def _command_position(segment: str) -> str:
+    """`segment` from its command on: leading keywords, wrappers, their options
+    and `VAR=value` assignments skipped. "" when nothing is left."""
+    words = segment.split()
+    i = 0
+    while i < len(words):
+        w = words[i]
+        if w in _SHELL_LEAD_WORDS or _ENV_ASSIGNMENT.match(w):
+            i += 1
+        elif w in _SHELL_WRAPPER_WITH_ARG:
+            i += 2
+        elif i and words[i - 1] in _SHELL_LEAD_WORDS and w.startswith("-"):
+            i += 1   # an option of a wrapper: `sudo -E`, `env -i`
+        else:
+            break
+    return " ".join(words[i:])
+
+
+def _command_segments(command: str) -> list[str]:
+    """The commands a shell line runs, each from its command word on: a line is
+    split at `;` `&&` `||` `|` a lone `&`, newlines, `$(` and backticks, outside
+    quotes. Quoted text is emptied and heredoc bodies are dropped, so a browser
+    word in a string, a grep pattern or a script being written is not a
+    command."""
+    segments: list[str] = []
+    cur: list[str] = []
+    pending: list[tuple[str, bool]] = []   # heredocs whose bodies start after this line
+    quote = ""
+    i, n = 0, len(command)
+
+    def cut():
+        segment = _command_position("".join(cur))
+        cur.clear()
+        if segment:
+            segments.append(segment)
+
+    while i < n:
+        ch = command[i]
+        if quote:
+            if ch == "\\" and quote == '"':
+                i += 2
+                continue
+            if ch == quote:
+                cur.append(quote * 2)
+                quote = ""
+            i += 1
+            continue
+        if ch == "\\":
+            i += 2
+            continue
+        if ch in "'\"":
+            quote = ch
+            i += 1
+            continue
+        if ch == "<" and command.startswith("<<", i) and not command.startswith("<<<", i):
+            m = _HEREDOC.match(command, i)
+            if m:
+                pending.append((m.group(2) or m.group(3) or m.group(4), m.group(1) == "-"))
+                i = m.end()
+                continue
+        if ch == "\n":
+            cut()
+            i += 1
+            while pending:
+                delim, strip = pending.pop(0)
+                while i < n:
+                    end = command.find("\n", i)
+                    line = command[i:n if end < 0 else end]
+                    i = n if end < 0 else end + 1
+                    if (line.lstrip("\t") if strip else line) == delim:
+                        break
+            continue
+        if ch in ";|`" or command.startswith("$(", i) or ch in "()":
+            cut()
+            i += 2 if command.startswith(("||", "$("), i) else 1
+            continue
+        if ch == "&":
+            redirect = (cur and cur[-1][-1:] in "<>") or command.startswith("&>", i)
+            if not redirect:
+                cut()
+                i += 2 if command.startswith("&&", i) else 1
+                continue
+        cur.append(ch)
+        i += 1
+    cut()
+    return segments
+
+
+def _tool_command(args_str) -> str:
+    """The `command` argument of a tool call given as a JSON object; "" when
+    there is none."""
+    try:
+        args = json.loads(args_str or "")
+    except (TypeError, ValueError):
+        return ""
+    command = args.get("command") if isinstance(args, dict) else None
+    return command if isinstance(command, str) else ""
+
+
 def _live_view_url(valves, *, chat_id, message_id, user_id, email, tool_name, args_str):
-    """The embed URL for a reply whose tool call looks like browser use, or None.
-    None when the valve is off, the user is not in LIVE_VIEW_USERS, the tool does
-    not match LIVE_VIEW_TOOLS, or the URL would not be an http(s) URL: Open WebUI
-    renders any other embed string as HTML."""
+    """The embed URL for a reply whose tool call really starts or drives a
+    browser, or None. None when the valve is off, the user is not in
+    LIVE_VIEW_USERS, the call does not match LIVE_VIEW_TOOLS, or the URL would
+    not be an http(s) URL: Open WebUI renders any other embed string as HTML.
+
+    LIVE_VIEW_TOOLS is searched in the tool's name and in each command of the
+    call's `command` argument, from its command word on. Nothing else about the
+    call is read: a file being written, a message or a query that names a
+    browser is no browser use."""
     template = (getattr(valves, "LIVE_VIEW_URL", "") or "").strip()
     if not template or not re.match(r"^https?://", template, re.I):
         return None
@@ -1633,7 +1747,8 @@ def _live_view_url(valves, *, chat_id, message_id, user_id, email, tool_name, ar
         tools = re.compile(getattr(valves, "LIVE_VIEW_TOOLS", "") or r"(?!)", re.I)
     except re.error:
         return None
-    if not tools.search(f"{tool_name or ''} {args_str or ''}"):
+    command = _tool_command(args_str)
+    if not any(tools.search(c) for c in [tool_name or "", *(_command_segments(command) if command else [])]):
         return None
     return template.replace("{chat_id}", chat_id).replace("{message_id}", message_id)
 
@@ -12037,17 +12152,24 @@ class Pipe:
         )
         LIVE_VIEW_TOOLS: str = Field(
             default=(r"^browser\b"
-                     r"|\bbrowser\s+(?:--?\S+\s+)*(?:open|navigate|goto|click|type|press|fill|hover|scroll"
-                     r"|screenshot|snapshot|evaluate|tabs?|focus|close|start)\b"
-                     r"|\bplaywright\b|\bchromium\b|google-chrome"),
+                     r"|^(?:\S*openclaw\S*|\$\{?\w+\}?)\s+browser\s+(?:--?\S+\s+)*(?:open|navigate|goto|click|type"
+                     r"|press|fill|hover|scroll|screenshot|snapshot|evaluate|tabs?|focus|close|start)\b"
+                     r"|^(?:\S*/)?(?:chromium(?:-browser)?|google-chrome(?:-stable)?|chrome)(?=\s|$)"
+                     r"|^(?:(?:npx|bunx|pnpm\s+(?:dlx|exec)|bun\s+x)\s+(?:-\S+\s+)*)?playwright"
+                     r"\s+(?:test|screenshot|open|codegen)\b"
+                     r"|^uv\s+run\b.*--with[ =]playwright\b"),
             description="Which tool calls count as browser use for "
                 "LIVE_VIEW_URL: a regular expression, case-insensitive, "
-                "searched in the tool's name followed by its arguments. "
-                "The default takes the browser tool, an `openclaw browser` "
-                "command (how the agent drives its browser through exec), "
-                "and commands that run Playwright or Chromium. Add your own "
-                "wrapper scripts here if your agent starts a browser through "
-                "one."
+                "searched in the tool's name and in each command of its "
+                "`command` argument (from the command word on, so a word "
+                "inside a quoted string, a heredoc or a file being written "
+                "never counts). The default takes the browser tool, "
+                "`openclaw browser` commands (how the agent drives its "
+                "browser through exec), Chromium or Chrome started as a "
+                "command, `playwright test|screenshot|open|codegen` and "
+                "`uv run --with playwright`. Add your own wrapper scripts "
+                "here if your agent starts a browser through one: they are "
+                "matched the same way, in command position."
         )
         LIVE_VIEW_USERS: str = Field(
             default="",

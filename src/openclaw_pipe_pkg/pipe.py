@@ -370,17 +370,24 @@ class Pipe:
         )
         LIVE_VIEW_TOOLS: str = Field(
             default=(r"^browser\b"
-                     r"|\bbrowser\s+(?:--?\S+\s+)*(?:open|navigate|goto|click|type|press|fill|hover|scroll"
-                     r"|screenshot|snapshot|evaluate|tabs?|focus|close|start)\b"
-                     r"|\bplaywright\b|\bchromium\b|google-chrome"),
+                     r"|^(?:\S*openclaw\S*|\$\{?\w+\}?)\s+browser\s+(?:--?\S+\s+)*(?:open|navigate|goto|click|type"
+                     r"|press|fill|hover|scroll|screenshot|snapshot|evaluate|tabs?|focus|close|start)\b"
+                     r"|^(?:\S*/)?(?:chromium(?:-browser)?|google-chrome(?:-stable)?|chrome)(?=\s|$)"
+                     r"|^(?:(?:npx|bunx|pnpm\s+(?:dlx|exec)|bun\s+x)\s+(?:-\S+\s+)*)?playwright"
+                     r"\s+(?:test|screenshot|open|codegen)\b"
+                     r"|^uv\s+run\b.*--with[ =]playwright\b"),
             description="Which tool calls count as browser use for "
                 "LIVE_VIEW_URL: a regular expression, case-insensitive, "
-                "searched in the tool's name followed by its arguments. "
-                "The default takes the browser tool, an `openclaw browser` "
-                "command (how the agent drives its browser through exec), "
-                "and commands that run Playwright or Chromium. Add your own "
-                "wrapper scripts here if your agent starts a browser through "
-                "one."
+                "searched in the tool's name and in each command of its "
+                "`command` argument (from the command word on, so a word "
+                "inside a quoted string, a heredoc or a file being written "
+                "never counts). The default takes the browser tool, "
+                "`openclaw browser` commands (how the agent drives its "
+                "browser through exec), Chromium or Chrome started as a "
+                "command, `playwright test|screenshot|open|codegen` and "
+                "`uv run --with playwright`. Add your own wrapper scripts "
+                "here if your agent starts a browser through one: they are "
+                "matched the same way, in command position."
         )
         LIVE_VIEW_USERS: str = Field(
             default="",
