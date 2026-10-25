@@ -7804,8 +7804,15 @@ def _history_events(messages: list):
     Text after a tool call is joined to the text before it with the separator
     the Gateway's live stream inserts there (`sawToolUseSinceText`), so the
     rebuild equals what streamed (it streams as "\n\n<text>"), and a
-    preamble is not glued to the answer."""
+    preamble is not glued to the answer.
+
+    A reply the agent sent with its `message` tool is stored as a
+    delivery-mirror message, and a run that ends on such a send (`final: true`)
+    gets one more assistant message with the same text as its record (no
+    `cli-assistant:` key). That text is already in the reply: it is shown once
+    (ELI-324)."""
     text = ""                 # what the events so far said
+    sent_by_tool: set[str] = set()   # texts the agent's `message` tool already delivered
     run_text = False          # this run carried text before its closer
     tool_since_text = False   # the Gateway's `sawToolUseSinceText`
     reply_ended = False       # a reply of this run ended since the last text
@@ -7833,6 +7840,10 @@ def _history_events(messages: list):
                 continue
             kind = block.get("type")
             if kind == "text" and block.get("text") and role == "assistant":
+                if _is_message_tool_mirror(message):
+                    sent_by_tool.add(block["text"].strip())
+                elif block["text"].strip() in sent_by_tool:
+                    continue
                 lead = (_message_boundary_separator(text, block["text"])
                         if tool_since_text or reply_ended else "")
                 text, tool_since_text, reply_ended = text + lead + block["text"], False, False
@@ -7868,6 +7879,12 @@ def _message_boundary_separator(previous: str, nxt: str) -> str:
     trailing = len(previous[-2:]) - len(previous[-2:].rstrip("\n"))
     leading = len(nxt[:2]) - len(nxt[:2].lstrip("\n"))
     return "\n" * max(0, 2 - trailing - leading)
+
+
+def _is_message_tool_mirror(message) -> bool:
+    """The transcript copy of a reply the agent sent with its `message` tool:
+    its `idempotencyKey` is `<runId>:message-tool:<id>:<call>`."""
+    return any(":message-tool:" in k for k in _idempotency_keys(message))
 
 
 def _is_closing_message(message) -> bool:
