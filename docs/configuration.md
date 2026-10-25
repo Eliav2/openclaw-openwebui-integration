@@ -128,7 +128,7 @@ Type: `str`. Default: empty.
 
 ### LIVE_VIEW_TOOLS
 
-Type: `str`. Default: `^browser\b|^(?:\S*openclaw\S*|\$\{?\w+\}?)\s+browser\s+(?:--?\S+\s+)*(?:open|navigate|goto|click|type|press|fill|hover|scroll|screenshot|snapshot|evaluate|tabs?|focus|close|start)\b|^(?:\S*/)?(?:chromium(?:-browser)?|google-chrome(?:-stable)?|chrome)(?=\s|$)|^(?:(?:npx|bunx|pnpm\s+(?:dlx|exec)|bun\s+x)\s+(?:-\S+\s+)*)?playwright\s+(?:test|screenshot|open|codegen)\b|^uv\s+run\b.*--with[ =]playwright\b`.
+Type: `str`. Default: `^browser\b|^(?:\S*openclaw\S*|\$\{?\w+\}?)\s+browser\s+(?:--?\S+\s+)*(?:open|navigate|goto|click|type|press|fill|hover|scroll|screenshot|snapshot|evaluate|tabs?|focus|close|start)\b(?!.*\s--help\b)|^(?:\S*/)?(?:chromium(?:-browser)?|google-chrome(?:-stable)?|chrome)(?=\s|$)(?!.*\s--(?:version|help)\b)|^(?:(?:npx|bunx|pnpm\s+(?:dlx|exec)|bun\s+x)\s+(?:-\S+\s+)*)?playwright\s+(?:test|screenshot|open|codegen)\b|^uv\s+run\b.*--with[ =]playwright\b`.
 
 Which tool calls count as browser use for LIVE_VIEW_URL: a regular expression, case-insensitive, searched in the tool's name and in each command of its `command` argument (from the command word on, so a word inside a quoted string, a heredoc or a file being written never counts). The default takes the browser tool, `openclaw browser` commands (how the agent drives its browser through exec), Chromium or Chrome started as a command, `playwright test|screenshot|open|codegen` and `uv run --with playwright`. Add your own wrapper scripts here if your agent starts a browser through one: they are matched the same way, in command position.
 

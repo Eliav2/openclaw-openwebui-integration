@@ -12153,8 +12153,8 @@ class Pipe:
         LIVE_VIEW_TOOLS: str = Field(
             default=(r"^browser\b"
                      r"|^(?:\S*openclaw\S*|\$\{?\w+\}?)\s+browser\s+(?:--?\S+\s+)*(?:open|navigate|goto|click|type"
-                     r"|press|fill|hover|scroll|screenshot|snapshot|evaluate|tabs?|focus|close|start)\b"
-                     r"|^(?:\S*/)?(?:chromium(?:-browser)?|google-chrome(?:-stable)?|chrome)(?=\s|$)"
+                     r"|press|fill|hover|scroll|screenshot|snapshot|evaluate|tabs?|focus|close|start)\b(?!.*\s--help\b)"
+                     r"|^(?:\S*/)?(?:chromium(?:-browser)?|google-chrome(?:-stable)?|chrome)(?=\s|$)(?!.*\s--(?:version|help)\b)"
                      r"|^(?:(?:npx|bunx|pnpm\s+(?:dlx|exec)|bun\s+x)\s+(?:-\S+\s+)*)?playwright"
                      r"\s+(?:test|screenshot|open|codegen)\b"
                      r"|^uv\s+run\b.*--with[ =]playwright\b"),
