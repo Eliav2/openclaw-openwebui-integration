@@ -11721,6 +11721,11 @@ def _thinking_rejection_retry_body(body, recovered, resolved_thinking):
 # while the page and its queued message survive (ELI-95).
 _SEND_NOW_HOLD_S = 120.0
 
+# How long a reply whose run ended on its lifecycle `end` waits for the run's
+# trailing `chat` final, the one event that carries the message's image
+# blocks (ELI-322). The text is already shown; only the reply's end waits.
+_TRAILING_FINAL_WAIT_S = 10.0
+
 
 async def _current_load(pipe, request):
     """The Pipe of the load Open WebUI serves now, when `pipe` belongs to an
@@ -12999,6 +13004,8 @@ class _PipeTurn:
         # unless a MEDIA: directive of this reply already showed its images.
         self.final_images = []
         self.media_shown = False
+        self.final_seen = False
+        self.ended_on_lifecycle = False
         self.last_snapshot_text = ""
         self.last_snapshot_time = 0.0
         self.snapshot_interval_s = 1.0
@@ -13162,6 +13169,7 @@ class _PipeTurn:
                         yield chunk
                     async for chunk in self.finish_held_media():
                         yield chunk
+                    await self.await_trailing_final()
                     async for chunk in self.finish_final_images():
                         yield chunk
                     async for chunk in self.close_open_cards():
@@ -13354,7 +13362,7 @@ class _PipeTurn:
     async def on_completion(self, payload, stream, phase, state, err, aborted_run):
         """The run's end signals and the error lines they show."""
         if stream == "lifecycle" and phase == "end":
-            self.done = True
+            self.done = self.ended_on_lifecycle = True
             pipe_log("  lifecycle end -> done")
         elif err:
             self.error_shown = f"\n\n**Error:** {err}"
@@ -13367,6 +13375,7 @@ class _PipeTurn:
                 if isinstance(payload.get("message"), dict) else None
             if _usage_prompt_tokens(usage):
                 self.run_usage = usage
+            self.final_seen = True
             self.final_images = _gateway_image_blocks(payload.get("message"))
         if state in ("final", "cancelled", "error", "aborted") or aborted_run:
             self.done = True
@@ -13503,6 +13512,31 @@ class _PipeTurn:
             yield resolved
             self.text_yielded = True
             self.pending_media_text = ""
+
+    async def await_trailing_final(self):
+        """A run ends on its lifecycle `end`, and its `chat` final, which
+        carries the message's image blocks, lands after it (ELI-322): read
+        the run's queue a moment longer for that final."""
+        if (not self.ended_on_lifecycle or self.final_seen or self.error_shown
+                or self.aborted or self.handed_over or not self.our_run_id):
+            return
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        while (remaining := start + _TRAILING_FINAL_WAIT_S - loop.time()) > 0:
+            try:
+                msg = await asyncio.wait_for(self.queue.get(), remaining)
+            except asyncio.TimeoutError:
+                break
+            payload = msg.get("payload") if isinstance(msg, dict) else None
+            if (isinstance(payload, dict) and msg.get("event") == "chat"
+                    and payload.get("state") == "final"
+                    and payload.get("runId") in (None, self.our_run_id)):
+                self.final_seen = True
+                self.final_images = _gateway_image_blocks(payload.get("message"))
+                pipe_log(f"  trailing final after {(loop.time() - start) * 1000:.0f} ms, "
+                         f"{len(self.final_images)} image block(s)")
+                return
+        pipe_log(f"  no trailing final within {_TRAILING_FINAL_WAIT_S:g}s")
 
     async def finish_final_images(self):
         """Show the images the final message carries as Gateway `image`

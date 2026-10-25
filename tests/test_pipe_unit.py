@@ -1934,6 +1934,7 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         q.put_nowait({"type": "event", "event": "agent", "payload": {
             "sessionKey": self.SK, "runId": "run-1", "stream": "lifecycle",
             "data": {"phase": "end"}}})
+        q.put_nowait(self._final("run-1"))               # the run's trailing final
         out = await asyncio.wait_for(first, 2)
 
         async def rest():
@@ -2836,8 +2837,29 @@ class GatewayImageBlockTests(unittest.IsolatedAsyncioTestCase):
         await self._until_registered("run-1")
         q = self._queue("run-1")
         q.put_nowait(self._delta("run-1", text))
+        # The run ends on its lifecycle end; the final with the message's
+        # blocks lands after it, as it does live.
+        q.put_nowait(self._lifecycle_end("run-1"))
         q.put_nowait(self._final_with("run-1", *blocks))
         return await self._collect(first, gen)
+
+    def _lifecycle_end(self, run_id):
+        return {"type": "event", "event": "agent", "payload": {
+            "sessionKey": self.SK, "runId": run_id,
+            "stream": "lifecycle", "data": {"phase": "end"}}}
+
+    async def test_a_final_that_never_comes_ends_the_reply_after_the_wait(self):
+        gen = self._reply("draw a plant playing guitar", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "Here it is."))
+        q.put_nowait(self._lifecycle_end("run-1"))
+        with mock.patch.object(self.ocp, "_TRAILING_FINAL_WAIT_S", 0.05), \
+             mock.patch.object(self.ocp, "_fetch_gateway_media") as fetch:
+            out, _ = await self._collect(first, gen)
+        fetch.assert_not_called()
+        self.assertEqual(out, "Here it is.")
 
     async def test_an_image_block_is_fetched_uploaded_and_shown(self):
         media_dir = self._media_dir()
