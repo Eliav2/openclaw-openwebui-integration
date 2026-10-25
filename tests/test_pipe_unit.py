@@ -2879,6 +2879,67 @@ class GatewayImageBlockTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.rpc.count("chat.history"), 1,
                          "one read serves the images and the usage line")
 
+    def _image_made(self, run_id):
+        return {"type": "event", "event": "agent", "payload": {
+            "sessionKey": self.SK, "runId": run_id, "stream": "codex_app_server.item",
+            "data": {"phase": "completed", "itemId": "exec-1", "type": "imageGeneration"}}}
+
+    def _attached_late(self, reads_before):
+        """The run's stored message gets its image block only after
+        `reads_before` chat.history reads, as live: about 0.9 s after the
+        final."""
+        reads = []
+        send_request = self.conn.send_request
+
+        async def late(method, params, timeout=10):
+            if method == "chat.history":
+                reads.append(1)
+                self._stored("run-1", *([self.BLOCK] if len(reads) > reads_before else []))
+            return await send_request(method, params, timeout=timeout)
+        self.conn.send_request = late
+        return reads
+
+    async def test_an_image_the_run_made_is_read_once_it_is_attached(self):
+        self._media_dir()
+        reads = self._attached_late(2)
+        gen = self._reply("draw a cactus", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._image_made("run-1"))
+        q.put_nowait(self._delta("run-1", "Here it is."))
+        q.put_nowait(self._lifecycle_end("run-1"))
+        q.put_nowait(self._final("run-1"))
+        with mock.patch.object(self.ocp, "_RUN_IMAGES_POLL_S", 0.01), \
+             mock.patch.object(self.ocp, "_fetch_gateway_media", return_value=b"PNG") as fetch, \
+             mock.patch.object(self.ocp, "_upload_owui_file",
+                               return_value={"id": "f1", "meta": {"content_type": "image/png"}}):
+            out, _ = await self._collect(first, gen)
+        fetch.assert_called_once()
+        self.assertEqual(len(reads), 3)
+        self.assertIn("](/api/v1/files/f1/content)", out)
+
+    async def test_an_image_never_attached_ends_the_reply_after_the_wait(self):
+        reads = self._attached_late(10 ** 6)
+        gen = self._reply("draw a cactus", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._image_made("run-1"))
+        q.put_nowait(self._delta("run-1", "Here it is."))
+        q.put_nowait(self._lifecycle_end("run-1"))
+        with mock.patch.object(self.ocp, "_RUN_IMAGES_POLL_S", 0.01), \
+             mock.patch.object(self.ocp, "_RUN_IMAGES_WAIT_S", 0.1):
+            out, _ = await self._collect(first, gen)
+        self.assertEqual(out, "Here it is.")
+        self.assertGreater(len(reads), 2)
+
+    async def test_a_run_that_made_no_image_reads_the_transcript_once(self):
+        reads = self._attached_late(10 ** 6)
+        out, _ = await self._turn("Here it is.")
+        self.assertEqual(out, "Here it is.")
+        self.assertEqual(len(reads), 1)
+
     async def test_another_runs_image_is_not_shown(self):
         self._stored("run-0", self.BLOCK)
         with mock.patch.object(self.ocp, "_fetch_gateway_media") as fetch:
