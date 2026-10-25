@@ -1392,6 +1392,77 @@ async def _resolve_media_text(text, *, valves, __request__=None, __event_emitter
     return resolved, handled
 
 
+# Where the Gateway serves media a reply carries as `image` blocks (an
+# agent's own image tool, e.g. Codex image generation). It needs the Gateway
+# token, which the browser does not have, so the Pipe fetches it (ELI-322).
+_GATEWAY_MEDIA_PREFIX = "/api/chat/media/outgoing/"
+_GATEWAY_MEDIA_MAX_BYTES = 50 * 1024 * 1024
+_SAFE_FNAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _gateway_image_blocks(message) -> list[dict]:
+    """The `image` blocks of a final assistant message that point at the
+    Gateway's media route, in order."""
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return []
+    return [
+        block for block in content
+        if isinstance(block, dict) and block.get("type") == "image"
+        and isinstance(block.get("url"), str) and block["url"].startswith(_GATEWAY_MEDIA_PREFIX)
+    ]
+
+
+def _gateway_image_fname(block: dict) -> str:
+    """A unique bare file name for an image block, with its type's extension."""
+    stem = os.path.splitext(os.path.basename(str(block.get("alt") or "")))[0]
+    stem = _SAFE_FNAME_RE.sub("-", stem).strip("-.")[:60] or "image"
+    ext = mimetypes.guess_extension(block.get("mimeType") or "") or ".png"
+    return f"{stem}-{uuid.uuid4().hex[:8]}{ext}"
+
+
+def _fetch_gateway_media(gateway_url: str, token: str, path: str) -> bytes:
+    """GET one media path from the Gateway's HTTP server, with its token."""
+    host, port = _parse_gateway_url(gateway_url)
+    req = urllib.request.Request(
+        f"http://{host}:{port}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        raw = resp.read(_GATEWAY_MEDIA_MAX_BYTES + 1)
+    if len(raw) > _GATEWAY_MEDIA_MAX_BYTES:
+        raise RuntimeError(f"media over {_GATEWAY_MEDIA_MAX_BYTES} bytes")
+    return raw
+
+
+async def _gateway_images_text(blocks, *, valves, __request__=None, __event_emitter__=None) -> str:
+    """Show a final message's Gateway image blocks the way a MEDIA: directive
+    is shown: each image is fetched into the media dir, then resolved by
+    `_resolve_media_text` (Open WebUI's files, else the file server). An
+    image that cannot be fetched is named in the text, never dropped
+    silently."""
+    lines = []
+    for block in blocks:
+        fname = _gateway_image_fname(block)
+        try:
+            raw = await asyncio.to_thread(
+                _fetch_gateway_media, valves.GATEWAY_URL, valves.GATEWAY_TOKEN, block["url"])
+            os.makedirs(MEDIA_DIR, exist_ok=True)
+            with open(os.path.join(MEDIA_DIR, fname), "wb") as f:
+                f.write(raw)
+        except Exception as ex:
+            pipe_log(f"  gateway image fetch failed for {block['url']}: {ex!r}")
+            lines.append(f"_(an image could not be loaded: {block.get('alt') or 'image'})_")
+            continue
+        lines.append(f"MEDIA:{fname}")
+    if not lines:
+        return ""
+    text = "\n\n" + "\n\n".join(lines) + "\n"
+    resolved, _handled = await _resolve_media_text(
+        text, valves=valves, __request__=__request__, __event_emitter__=__event_emitter__)
+    return resolved
+
+
 # Anchor for finding a file server left behind by a *previous* deploy of this
 # same function (same class of issue as P33/P36/gateway._reap_stale_gateway_
 # connection: OWUI's function loader execs each redeploy into a brand-new
@@ -12924,6 +12995,10 @@ class _PipeTurn:
         # directive whose filename is still arriving.
         self.pending_prompt_text = ""
         self.pending_media_text = ""
+        # The final message's Gateway `image` blocks, shown after the text,
+        # unless a MEDIA: directive of this reply already showed its images.
+        self.final_images = []
+        self.media_shown = False
         self.last_snapshot_text = ""
         self.last_snapshot_time = 0.0
         self.snapshot_interval_s = 1.0
@@ -13086,6 +13161,8 @@ class _PipeTurn:
                     async for chunk in self.finish_held_prompt():
                         yield chunk
                     async for chunk in self.finish_held_media():
+                        yield chunk
+                    async for chunk in self.finish_final_images():
                         yield chunk
                     async for chunk in self.close_open_cards():
                         yield chunk
@@ -13290,6 +13367,7 @@ class _PipeTurn:
                 if isinstance(payload.get("message"), dict) else None
             if _usage_prompt_tokens(usage):
                 self.run_usage = usage
+            self.final_images = _gateway_image_blocks(payload.get("message"))
         if state in ("final", "cancelled", "error", "aborted") or aborted_run:
             self.done = True
             pipe_log(f"  payload state='{state}' aborted={aborted_run} -> done")
@@ -13425,6 +13503,27 @@ class _PipeTurn:
             yield resolved
             self.text_yielded = True
             self.pending_media_text = ""
+
+    async def finish_final_images(self):
+        """Show the images the final message carries as Gateway `image`
+        blocks (an agent's own image tool), which the text never names
+        (ELI-322). A reply that showed MEDIA: directives already has its
+        images: the Gateway may list those as blocks too, so they are not
+        shown twice."""
+        blocks, self.final_images = self.final_images, []
+        if not blocks:
+            return
+        if self.media_shown:
+            pipe_log(f"  {len(blocks)} gateway image block(s) skipped: the text showed MEDIA:")
+            return
+        shown = await _gateway_images_text(
+            blocks, valves=self.pipe.valves, __request__=self.__request__,
+            __event_emitter__=self.__event_emitter__)
+        if shown:
+            pipe_log(f"  showed {len(blocks)} gateway image block(s)")
+            self.record_visible_chunk(shown)
+            yield shown
+            self.text_yielded = True
 
     async def close_open_cards(self):
         """Answer every tool card the run left open."""
@@ -14014,6 +14113,7 @@ class _PipeTurn:
             )
             if handled:
                 pipe_log("  resolved MEDIA: directive")
+                self.media_shown = True
                 # A writer that takes this reply over shows the same image.
                 self.conn.note_turn_rewrite(self.owui_origin_chat_id, self.owui_message_id,
                                             text, resolved)
@@ -14039,5 +14139,6 @@ class _PipeTurn:
             ctx=self.assistant_stream_text[self.fence_item_start:],
         )
         if handled:
+            self.media_shown = True
             self.conn.note_turn_rewrite(self.owui_origin_chat_id, self.owui_message_id, held, resolved)
         return resolved
