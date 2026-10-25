@@ -28,6 +28,7 @@ from playwright.sync_api import sync_playwright  # noqa: E402
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts", "screenshots"))
 import capture  # noqa: E402
+from owui_version import has_fix_0_12_4  # noqa: E402
 
 TURN_MS = 120_000
 
@@ -204,6 +205,26 @@ def test_a_question_from_the_ask_user_tool_is_answered_in_the_card(page):
                     "the reply with the tool's answer", TURN_MS)
 
 
+def test_a_reload_while_a_question_waits_shows_one_card_and_the_answer_still_arrives(page):
+    """Open WebUI 0.12.4 ("questions survive reconnects"): the page is
+    reloaded while the ask_user question is open. The card comes back once
+    (no duplicate), and the click still reaches the run."""
+    capture.new_chat(page)
+    chat_id = capture.send(page, "E2E_ASK_TOOL")
+    card = "() => document.body.innerText.includes('Which database?') " \
+           "&& !!document.querySelector('input[placeholder=\"Type your answer\"]')"
+    capture.wait_js(page, card, "the ask_user card", TURN_MS)
+    _reload(page)
+    assert chat_id in page.url
+    capture.wait_js(page, card, "the ask_user card after the reload", TURN_MS)
+    page.wait_for_timeout(3_000)
+    cards = page.evaluate("() => document.querySelectorAll('input[placeholder=\"Type your answer\"]').length")
+    assert cards == 1, f"{cards} question cards after the reload"
+    page.locator("section button", has=page.locator("span", has_text="SQLite")).first.click()
+    capture.wait_js(page, _last_reply_done("E2E_ASK_TOOL_RESULT answered Database: SQLite"),
+                    "the reply with the tool's answer", TURN_MS)
+
+
 def _pending_ask_user(chat_id: str):
     """The chat's pending Gateway question, from `question.list`."""
     out = subprocess.run(["openclaw", "gateway", "call", "question.list", "--json", "--params", "{}"],
@@ -244,12 +265,12 @@ def test_a_question_left_for_a_new_message_ends_its_reply(page):
     """ELI-200: with the question card open, a new message is sent instead
     of an answer. The card goes, the question stays in its reply as text,
     and that reply is finished: no "Thinking..." left on it, also after a
-    reload; the new message gets its own answer. Unskip on the next lane
-    when ELI-205 is fixed upstream."""
-    if _openclaw_release() >= (2026, 10):
-        pytest.skip("OpenClaw 2026.10 lane: this flow's Stop lands as the reply ends, so Open WebUI's "
-                    "own end-of-reply save is cancelled mid-transaction and keeps the SQLite lock, "
-                    "and every later test in the job fails (ELI-205, "
+    reload; the new message gets its own answer. Skipped on the OpenClaw 2026.10 lane while
+    Open WebUI lacks the ELI-205 fix (0.12.4): see below."""
+    if _openclaw_release() >= (2026, 10) and not has_fix_0_12_4():
+        pytest.skip("OpenClaw 2026.10 lane on Open WebUI before 0.12.4: this flow's Stop lands as the "
+                    "reply ends, so Open WebUI's own end-of-reply save is cancelled mid-transaction and "
+                    "keeps the SQLite lock, and every later test in the job fails (ELI-205, "
                     "https://linear.app/eliavb/issue/ELI-205).")
     capture.new_chat(page)
     capture.send(page, "E2E_ASK_SINGLE")
@@ -1744,7 +1765,9 @@ class Pipe:
 
 @pytest.mark.parametrize("mode", [
     "held",
-    pytest.param("raw", marks=pytest.mark.xfail(strict=True, raises=Eli195Present, reason=(
+    # Fixed upstream in 0.12.4 (open-webui#32744): the raw mode is expected to fail only on older
+    # releases, and to pass from 0.12.4 on.
+    pytest.param("raw", marks=pytest.mark.xfail(not has_fix_0_12_4(), strict=True, raises=Eli195Present, reason=(
         "ELI-195 drop gate: on this Open WebUI an `execute` reaching a tab while its input dialog "
         f"is open takes the dialog's answer ({ELI195_UPSTREAM}). An XPASS means the pinned release "
         "fixed it: drop the Pipe's execute hold (emit.py dialog holds) and this gate."))),
