@@ -63,6 +63,7 @@ SHARDS = {
         f"{BROWSER}::test_a_hebrew_yes_no_question_gets_yes_and_no",
         f"{BROWSER}::test_a_question_from_the_ask_user_tool_is_answered_in_the_card",
         f"{BROWSER}::test_an_ask_user_question_asked_with_no_tab_open_shows_when_the_chat_is_opened",
+        f"{BROWSER}::test_a_reload_while_a_question_waits_shows_one_card_and_the_answer_still_arrives",
         f"{BROWSER}::test_a_question_left_for_a_new_message_ends_its_reply",
         f"{BROWSER}::test_cancel_on_the_secret_dialog_tells_the_agent_and_the_card_says_cancelled",
         f"{BROWSER}::test_status_opened_in_another_tab_leaves_the_secret_dialog_its_answer",

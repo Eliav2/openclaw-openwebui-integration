@@ -40,11 +40,6 @@ def _openclaw_version() -> tuple:
     return int(m.group(1)), int(m.group(2)), int(m.group(3))
 
 
-def _openclaw_release() -> tuple:
-    """(year, month) of the Gateway the stack installed."""
-    return _openclaw_version()[:2]
-
-
 @pytest.fixture(scope="module")
 def token():
     return capture.signin()
@@ -204,6 +199,26 @@ def test_a_question_from_the_ask_user_tool_is_answered_in_the_card(page):
                     "the reply with the tool's answer", TURN_MS)
 
 
+def test_a_reload_while_a_question_waits_shows_one_card_and_the_answer_still_arrives(page):
+    """Open WebUI 0.12.4 ("questions survive reconnects"): the page is
+    reloaded while the ask_user question is open. The card comes back once
+    (no duplicate), and the click still reaches the run."""
+    capture.new_chat(page)
+    chat_id = capture.send(page, "E2E_ASK_TOOL")
+    card = "() => document.body.innerText.includes('Which database?') " \
+           "&& !!document.querySelector('input[placeholder=\"Type your answer\"]')"
+    capture.wait_js(page, card, "the ask_user card", TURN_MS)
+    _reload(page)
+    assert chat_id in page.url
+    capture.wait_js(page, card, "the ask_user card after the reload", TURN_MS)
+    page.wait_for_timeout(3_000)
+    cards = page.evaluate("() => document.querySelectorAll('input[placeholder=\"Type your answer\"]').length")
+    assert cards == 1, f"{cards} question cards after the reload"
+    page.locator("section button", has=page.locator("span", has_text="SQLite")).first.click()
+    capture.wait_js(page, _last_reply_done("E2E_ASK_TOOL_RESULT answered Database: SQLite"),
+                    "the reply with the tool's answer", TURN_MS)
+
+
 def _pending_ask_user(chat_id: str):
     """The chat's pending Gateway question, from `question.list`."""
     out = subprocess.run(["openclaw", "gateway", "call", "question.list", "--json", "--params", "{}"],
@@ -244,13 +259,7 @@ def test_a_question_left_for_a_new_message_ends_its_reply(page):
     """ELI-200: with the question card open, a new message is sent instead
     of an answer. The card goes, the question stays in its reply as text,
     and that reply is finished: no "Thinking..." left on it, also after a
-    reload; the new message gets its own answer. Unskip on the next lane
-    when ELI-205 is fixed upstream."""
-    if _openclaw_release() >= (2026, 10):
-        pytest.skip("OpenClaw 2026.10 lane: this flow's Stop lands as the reply ends, so Open WebUI's "
-                    "own end-of-reply save is cancelled mid-transaction and keeps the SQLite lock, "
-                    "and every later test in the job fails (ELI-205, "
-                    "https://linear.app/eliavb/issue/ELI-205).")
+    reload; the new message gets its own answer."""
     capture.new_chat(page)
     capture.send(page, "E2E_ASK_SINGLE")
     capture.wait_js(page, "() => document.body.innerText.includes('Which color?') "

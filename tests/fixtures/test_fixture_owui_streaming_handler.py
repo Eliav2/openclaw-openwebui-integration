@@ -10,7 +10,8 @@ Re-extracted 2026-10-11 from the running 0.12.0 container
 git tag). Re-checked 2026-10-17 against 0.12.2 and 0.12.3 (the 0.12.3 PyPI
 wheel's `utils/response.py`, byte-identical to the v0.12.3 tag): 0.12.3 moved
 the function from `middleware.py` to `response.py`, with no change in its
-code (AST-equal, `scripts/check_owui_fixture.py`). Changes since the previous
+code (AST-equal, `scripts/check_owui_fixture.py`). Re-checked 2026-10-25
+against the v0.12.4 tag: AST-equal again. Changes since the previous
 0.11.3 copy:
 
 - 0.11.4: the `response.output_item.added` dedup now matches on `call_id`
