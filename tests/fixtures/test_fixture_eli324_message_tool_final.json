@@ -1,0 +1,187 @@
+{
+ "sessionKey": "agent:main:openwebui-2d206eab-acac-4945-bd2f-7e8b6365de8c-02347f1c-dc34-4d41-8c10-84a88c995a77",
+ "sessionId": "91f6f7df-97a5-4125-a944-d16bf6b8600b",
+ "messages": [
+  {
+   "role": "assistant",
+   "content": "[QA ELI-324 run 3] Reply by calling the message tool once: message(action=send, final=true, message=\"QA-SENT-TEXT-GAMMA this is the sent text\"). After the tool returns, end your turn with exactly the text: Delivered.",
+   "timestamp": 1792955817754,
+   "idempotencyKey": "1d72c285-4234-42d7-b757-2078e861cf22:user",
+   "provenance": {
+    "kind": "inter_session",
+    "sourceSessionKey": "agent:main:openwebui-2d206eab-acac-4945-bd2f-7e8b6365de8c-81e70fa3-8772-40e2-85cf-de3878ce50ac",
+    "sourceChannel": "webchat",
+    "sourceTool": "sessions_send"
+   },
+   "__openclaw": {
+    "senderIsOwner": false,
+    "id": "fa289edb-9fa9-431f-90da-acb71e29b5c4",
+    "idempotencyKey": "1d72c285-4234-42d7-b757-2078e861cf22:user",
+    "recordTimestampMs": 1792955818338,
+    "transcriptPosition": {
+     "source": "KQQFup_MFpLYZVPpT1nnXnGtrD4DDF1UjDLwQk1qn_I",
+     "rawSeq": 9
+    },
+    "seq": 9,
+    "importedFrom": "claude-cli",
+    "externalId": "dc7ba503-0c80-439e-9928-cc6f3398a35f",
+    "cliSessionId": "2509c43f-d03f-480d-bbee-a683e39048bd"
+   },
+   "senderLabel": "Forwarded from main",
+   "senderSession": {
+    "sessionKey": "agent:main:openwebui-2d206eab-acac-4945-bd2f-7e8b6365de8c-81e70fa3-8772-40e2-85cf-de3878ce50ac",
+    "agentId": "main"
+   }
+  },
+  {
+   "role": "assistant",
+   "content": [
+    {
+     "type": "toolcall",
+     "id": "toolu_016GuWDRF3oNn4RK1rsxjBKb",
+     "name": "mcp__openclaw__message",
+     "caller": {
+      "type": "direct"
+     },
+     "arguments": {
+      "action": "send",
+      "final": true,
+      "message": "QA-SENT-TEXT-GAMMA this is the sent text"
+     }
+    },
+    {
+     "tool_use_id": "toolu_016GuWDRF3oNn4RK1rsxjBKb",
+     "type": "tool_result",
+     "content": [
+      {
+       "type": "text",
+       "text": "Sent visible reply to the current source conversation via internal-ui."
+      }
+     ],
+     "name": "mcp__openclaw__message"
+    }
+   ],
+   "api": "anthropic-messages",
+   "provider": "claude-cli",
+   "model": "claude-haiku-5-5",
+   "stopReason": "tool_use",
+   "usage": {
+    "input": 2,
+    "output": 118,
+    "cacheRead": 106534,
+    "cacheWrite": 601
+   },
+   "timestamp": 1792955821760,
+   "__openclaw": {
+    "id": "2800e96f-695e-47cc-a7e6-512e813a4459",
+    "importedFrom": "claude-cli",
+    "cliSessionId": "2509c43f-d03f-480d-bbee-a683e39048bd",
+    "externalId": "2800e96f-695e-47cc-a7e6-512e813a4459"
+   }
+  },
+  {
+   "role": "assistant",
+   "content": [
+    {
+     "type": "text",
+     "text": "QA-SENT-TEXT-GAMMA this is the sent text"
+    }
+   ],
+   "api": "openclaw-transcript",
+   "provider": "openclaw",
+   "model": "delivery-mirror",
+   "usage": {
+    "input": 0,
+    "output": 0,
+    "totalTokens": 0,
+    "cacheRead": 0,
+    "cacheWrite": 0,
+    "cost": {
+     "input": 0,
+     "output": 0,
+     "cacheRead": 0,
+     "cacheWrite": 0,
+     "total": 0
+    }
+   },
+   "stopReason": "stop",
+   "timestamp": 1792955821812,
+   "idempotencyKey": "1d72c285-4234-42d7-b757-2078e861cf22:message-tool:f5XP-2j0LfGn8SSPnXc3clOV:mcp-4c6d493e-5d05-4ac3-8806-d3ebe994b9a6",
+   "__openclaw": {
+    "runId": "1d72c285-4234-42d7-b757-2078e861cf22",
+    "id": "a41fc39b-a89a-4514-bf06-a8a6bd2369fc",
+    "idempotencyKey": "1d72c285-4234-42d7-b757-2078e861cf22:message-tool:f5XP-2j0LfGn8SSPnXc3clOV:mcp-4c6d493e-5d05-4ac3-8806-d3ebe994b9a6",
+    "recordTimestampMs": 1792955821824,
+    "transcriptPosition": {
+     "source": "KQQFup_MFpLYZVPpT1nnXnGtrD4DDF1UjDLwQk1qn_I",
+     "rawSeq": 10
+    },
+    "seq": 10
+   }
+  },
+  {
+   "role": "assistant",
+   "content": [
+    {
+     "type": "text",
+     "text": "Delivered."
+    }
+   ],
+   "api": "anthropic-messages",
+   "provider": "claude-cli",
+   "model": "claude-haiku-5-5",
+   "stopReason": "end_turn",
+   "usage": {
+    "input": 2,
+    "output": 7,
+    "cacheRead": 107135,
+    "cacheWrite": 168
+   },
+   "timestamp": 1792955822844,
+   "__openclaw": {
+    "id": "b6a7a0a5-35cd-47b4-b1cb-f52c35824ed7",
+    "importedFrom": "claude-cli",
+    "cliSessionId": "2509c43f-d03f-480d-bbee-a683e39048bd",
+    "externalId": "b6a7a0a5-35cd-47b4-b1cb-f52c35824ed7"
+   }
+  },
+  {
+   "role": "assistant",
+   "content": [
+    {
+     "type": "text",
+     "text": "QA-SENT-TEXT-GAMMA this is the sent text"
+    }
+   ],
+   "api": "cli",
+   "provider": "anthropic",
+   "model": "claude-haiku-5-5",
+   "usage": {
+    "input": 2,
+    "output": 7,
+    "totalTokens": 107312,
+    "cacheRead": 107135,
+    "cacheWrite": 168,
+    "cost": {
+     "input": 0,
+     "output": 0,
+     "cacheRead": 0,
+     "cacheWrite": 0,
+     "total": 0
+    }
+   },
+   "stopReason": "stop",
+   "timestamp": 1792955823203,
+   "__openclaw": {
+    "runId": "1d72c285-4234-42d7-b757-2078e861cf22",
+    "id": "6ba07105-6e01-4bcb-bcd2-824652ea2d44",
+    "recordTimestampMs": 1792955823215,
+    "transcriptPosition": {
+     "source": "KQQFup_MFpLYZVPpT1nnXnGtrD4DDF1UjDLwQk1qn_I",
+     "rawSeq": 11
+    },
+    "seq": 11
+   }
+  }
+ ]
+}
