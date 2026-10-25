@@ -359,6 +359,77 @@ async def _resolve_media_text(text, *, valves, __request__=None, __event_emitter
     return resolved, handled
 
 
+# Where the Gateway serves media a reply carries as `image` blocks (an
+# agent's own image tool, e.g. Codex image generation). It needs the Gateway
+# token, which the browser does not have, so the Pipe fetches it (ELI-322).
+_GATEWAY_MEDIA_PREFIX = "/api/chat/media/outgoing/"
+_GATEWAY_MEDIA_MAX_BYTES = 50 * 1024 * 1024
+_SAFE_FNAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _gateway_image_blocks(message) -> list[dict]:
+    """The `image` blocks of a final assistant message that point at the
+    Gateway's media route, in order."""
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return []
+    return [
+        block for block in content
+        if isinstance(block, dict) and block.get("type") == "image"
+        and isinstance(block.get("url"), str) and block["url"].startswith(_GATEWAY_MEDIA_PREFIX)
+    ]
+
+
+def _gateway_image_fname(block: dict) -> str:
+    """A unique bare file name for an image block, with its type's extension."""
+    stem = os.path.splitext(os.path.basename(str(block.get("alt") or "")))[0]
+    stem = _SAFE_FNAME_RE.sub("-", stem).strip("-.")[:60] or "image"
+    ext = mimetypes.guess_extension(block.get("mimeType") or "") or ".png"
+    return f"{stem}-{uuid.uuid4().hex[:8]}{ext}"
+
+
+def _fetch_gateway_media(gateway_url: str, token: str, path: str) -> bytes:
+    """GET one media path from the Gateway's HTTP server, with its token."""
+    host, port = _parse_gateway_url(gateway_url)
+    req = urllib.request.Request(
+        f"http://{host}:{port}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        raw = resp.read(_GATEWAY_MEDIA_MAX_BYTES + 1)
+    if len(raw) > _GATEWAY_MEDIA_MAX_BYTES:
+        raise RuntimeError(f"media over {_GATEWAY_MEDIA_MAX_BYTES} bytes")
+    return raw
+
+
+async def _gateway_images_text(blocks, *, valves, __request__=None, __event_emitter__=None) -> str:
+    """Show a final message's Gateway image blocks the way a MEDIA: directive
+    is shown: each image is fetched into the media dir, then resolved by
+    `_resolve_media_text` (Open WebUI's files, else the file server). An
+    image that cannot be fetched is named in the text, never dropped
+    silently."""
+    lines = []
+    for block in blocks:
+        fname = _gateway_image_fname(block)
+        try:
+            raw = await asyncio.to_thread(
+                _fetch_gateway_media, valves.GATEWAY_URL, valves.GATEWAY_TOKEN, block["url"])
+            os.makedirs(MEDIA_DIR, exist_ok=True)
+            with open(os.path.join(MEDIA_DIR, fname), "wb") as f:
+                f.write(raw)
+        except Exception as ex:
+            pipe_log(f"  gateway image fetch failed for {block['url']}: {ex!r}")
+            lines.append(f"_(an image could not be loaded: {block.get('alt') or 'image'})_")
+            continue
+        lines.append(f"MEDIA:{fname}")
+    if not lines:
+        return ""
+    text = "\n\n" + "\n\n".join(lines) + "\n"
+    resolved, _handled = await _resolve_media_text(
+        text, valves=valves, __request__=__request__, __event_emitter__=__event_emitter__)
+    return resolved
+
+
 # Anchor for finding a file server left behind by a *previous* deploy of this
 # same function (same class of issue as P33/P36/gateway._reap_stale_gateway_
 # connection: OWUI's function loader execs each redeploy into a brand-new

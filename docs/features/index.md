@@ -21,7 +21,7 @@ Everything here works as soon as the Pipe is installed, except entries marked:
 - [**Take-over link**](./chat.md#a-link-to-take-over-from-the-agent): when the agent hands you a page to do a step yourself (a login, a CAPTCHA) and waits, the reply gets a Take control link that opens it in a new tab
 - [**Questions as cards**](./questions.md) _(needs agent setup)_: agent questions become Open WebUI's question cards (text, yes/no, single choice, multi-select by number), a masked dialog for a secret, and survive a reload
 - [**Per-chat thinking control**](./chat.md#thinking-level) _(separate function)_: a toggle in the composer sets the reasoning level per chat, offering only the levels your models support
-- [**Images and files from the agent**](./chat.md#images-and-files-from-the-agent) _(needs agent setup)_: `MEDIA:` files are uploaded to the Open WebUI Files API and attached natively
+- [**Images and files from the agent**](./chat.md#images-and-files-from-the-agent) _(needs agent setup)_: `MEDIA:` files, and images an agent's own image tool made, are uploaded to the Open WebUI Files API and attached natively
 - [**Image input**](./chat.md#images-you-attach): images you attach are forwarded to the agent
 - [**Usage and goal line**](./chat.md#usage-and-goal-line): context, rate-limit and goal state under every reply
 - [**Context compaction marked**](./chat.md#context-compaction): when the Gateway compacts the session mid-reply, the reply shows a collapsed "Context compacted" block where it happened

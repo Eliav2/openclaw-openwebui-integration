@@ -1346,6 +1346,10 @@ class _PipeTurn:
         # directive whose filename is still arriving.
         self.pending_prompt_text = ""
         self.pending_media_text = ""
+        # The final message's Gateway `image` blocks, shown after the text,
+        # unless a MEDIA: directive of this reply already showed its images.
+        self.final_images = []
+        self.media_shown = False
         self.last_snapshot_text = ""
         self.last_snapshot_time = 0.0
         self.snapshot_interval_s = 1.0
@@ -1508,6 +1512,8 @@ class _PipeTurn:
                     async for chunk in self.finish_held_prompt():
                         yield chunk
                     async for chunk in self.finish_held_media():
+                        yield chunk
+                    async for chunk in self.finish_final_images():
                         yield chunk
                     async for chunk in self.close_open_cards():
                         yield chunk
@@ -1712,6 +1718,7 @@ class _PipeTurn:
                 if isinstance(payload.get("message"), dict) else None
             if _usage_prompt_tokens(usage):
                 self.run_usage = usage
+            self.final_images = _gateway_image_blocks(payload.get("message"))
         if state in ("final", "cancelled", "error", "aborted") or aborted_run:
             self.done = True
             pipe_log(f"  payload state='{state}' aborted={aborted_run} -> done")
@@ -1847,6 +1854,27 @@ class _PipeTurn:
             yield resolved
             self.text_yielded = True
             self.pending_media_text = ""
+
+    async def finish_final_images(self):
+        """Show the images the final message carries as Gateway `image`
+        blocks (an agent's own image tool), which the text never names
+        (ELI-322). A reply that showed MEDIA: directives already has its
+        images: the Gateway may list those as blocks too, so they are not
+        shown twice."""
+        blocks, self.final_images = self.final_images, []
+        if not blocks:
+            return
+        if self.media_shown:
+            pipe_log(f"  {len(blocks)} gateway image block(s) skipped: the text showed MEDIA:")
+            return
+        shown = await _gateway_images_text(
+            blocks, valves=self.pipe.valves, __request__=self.__request__,
+            __event_emitter__=self.__event_emitter__)
+        if shown:
+            pipe_log(f"  showed {len(blocks)} gateway image block(s)")
+            self.record_visible_chunk(shown)
+            yield shown
+            self.text_yielded = True
 
     async def close_open_cards(self):
         """Answer every tool card the run left open."""
@@ -2436,6 +2464,7 @@ class _PipeTurn:
             )
             if handled:
                 pipe_log("  resolved MEDIA: directive")
+                self.media_shown = True
                 # A writer that takes this reply over shows the same image.
                 self.conn.note_turn_rewrite(self.owui_origin_chat_id, self.owui_message_id,
                                             text, resolved)
@@ -2461,5 +2490,6 @@ class _PipeTurn:
             ctx=self.assistant_stream_text[self.fence_item_start:],
         )
         if handled:
+            self.media_shown = True
             self.conn.note_turn_rewrite(self.owui_origin_chat_id, self.owui_message_id, held, resolved)
         return resolved
