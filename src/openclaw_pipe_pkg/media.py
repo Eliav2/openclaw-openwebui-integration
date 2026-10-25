@@ -380,6 +380,24 @@ def _gateway_image_blocks(message) -> list[dict]:
     ]
 
 
+def _history_image_blocks_for_run(history: dict, run_id: str) -> list[dict]:
+    """The Gateway image blocks of one run's assistant messages in
+    `chat.history`, in order. The Gateway attaches a run's managed images to
+    its stored message; the live `chat` final and `session.message` carry
+    only the text (measured 2026-10-25, ELI-322)."""
+    messages = (history or {}).get("messages")
+    if not isinstance(messages, list) or not run_id:
+        return []
+    blocks = []
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
+        if run_id in (meta.get("runId"), message.get("runId")):
+            blocks += _gateway_image_blocks(message)
+    return blocks
+
+
 def _gateway_image_fname(block: dict) -> str:
     """A unique bare file name for an image block, with its type's extension."""
     stem = os.path.splitext(os.path.basename(str(block.get("alt") or "")))[0]

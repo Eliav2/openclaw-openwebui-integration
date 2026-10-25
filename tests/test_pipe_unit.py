@@ -1934,7 +1934,6 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         q.put_nowait({"type": "event", "event": "agent", "payload": {
             "sessionKey": self.SK, "runId": "run-1", "stream": "lifecycle",
             "data": {"phase": "end"}}})
-        q.put_nowait(self._final("run-1"))               # the run's trailing final
         out = await asyncio.wait_for(first, 2)
 
         async def rest():
@@ -2793,10 +2792,13 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
 
 class GatewayImageBlockTests(unittest.IsolatedAsyncioTestCase):
     """ELI-322 (2026-10-25): GPT-6 on the Codex runtime made an image with
-    its own image tool. The Gateway put it on the final message as an
-    `image` block pointing at its media route, the text never named it, and
-    the reply showed only the text. Real reply generators, through the
-    harness of `NoDroppedMessagesTests`."""
+    its own image tool, and the reply showed only the text. The Gateway
+    attaches such an image to the run's stored message as an `image` block
+    pointing at its media route; the live `chat` final and `session.message`
+    carry only the text (captured live with eli322_image_events_probe.py).
+    Real reply generators, through the harness of `NoDroppedMessagesTests`,
+    with the events in their live order: lifecycle end, then a text-only
+    final."""
 
     SK = None
     asyncSetUp = NoDroppedMessagesTests.asyncSetUp
@@ -2804,24 +2806,30 @@ class GatewayImageBlockTests(unittest.IsolatedAsyncioTestCase):
     _reply = NoDroppedMessagesTests._reply
     _queue = NoDroppedMessagesTests._queue
     _delta = NoDroppedMessagesTests._delta
+    _final = NoDroppedMessagesTests._final
     _until_registered = NoDroppedMessagesTests._until_registered
     _collect = staticmethod(NoDroppedMessagesTests._collect)
 
-    # The image block of that reply's final message, as the Gateway sent it.
+    # The image block of that run's stored message, as chat.history returned it.
     BLOCK = {
         "type": "image",
-        "artifactId": "artifact_managed_image_c67be76f-4594-470b-ba29-827eaeb1fb06",
+        "artifactId": "artifact_managed_image_68dbed25-cf2c-438d-b82e-4f39c206d52e",
         "url": "/api/chat/media/outgoing/agent%3Amain%3Aopenwebui-u1-chat-1/"
-               "c67be76f-4594-470b-ba29-827eaeb1fb06/full",
-        "alt": "codex-image-generation-2---b11dbeb3-42cb-4c4f-b626-64adf658e68e.png",
-        "mimeType": "image/png", "width": 1254, "height": 1254, "sizeBytes": 2441039,
+               "68dbed25-cf2c-438d-b82e-4f39c206d52e/full",
+        "alt": "codex-image-generation-2---05e44654-900b-456e-b597-185a71329378.png",
+        "mimeType": "image/png", "width": 1254, "height": 1254, "sizeBytes": 2064532,
     }
 
-    def _final_with(self, run_id, *blocks):
-        return {"type": "event", "event": "chat", "payload": {
-            "sessionKey": self.SK, "runId": run_id, "state": "final",
-            "message": {"role": "assistant", "content": [
-                {"type": "text", "text": "Here it is."}, *blocks]}}}
+    def _stored(self, run_id, *blocks):
+        self.history = {"messages": [
+            {"role": "user", "content": "draw a cactus"},
+            {"role": "assistant", "content": [{"type": "text", "text": "Here it is."}, *blocks],
+             "__openclaw": {"runId": run_id, "runTerminal": True}}]}
+
+    def _lifecycle_end(self, run_id):
+        return {"type": "event", "event": "agent", "payload": {
+            "sessionKey": self.SK, "runId": run_id,
+            "stream": "lifecycle", "data": {"phase": "end"}}}
 
     def _media_dir(self):
         media_dir = tempfile.mkdtemp()
@@ -2831,41 +2839,22 @@ class GatewayImageBlockTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(patch.stop)
         return media_dir
 
-    async def _turn(self, text, *blocks):
-        gen = self._reply("draw a plant playing guitar", "m1")
+    async def _turn(self, text):
+        gen = self._reply("draw a cactus", "m1")
         first = asyncio.ensure_future(gen.__anext__())
         await self._until_registered("run-1")
         q = self._queue("run-1")
         q.put_nowait(self._delta("run-1", text))
-        # The run ends on its lifecycle end; the final with the message's
-        # blocks lands after it, as it does live.
         q.put_nowait(self._lifecycle_end("run-1"))
-        q.put_nowait(self._final_with("run-1", *blocks))
+        q.put_nowait(self._final("run-1"))
         return await self._collect(first, gen)
 
-    def _lifecycle_end(self, run_id):
-        return {"type": "event", "event": "agent", "payload": {
-            "sessionKey": self.SK, "runId": run_id,
-            "stream": "lifecycle", "data": {"phase": "end"}}}
-
-    async def test_a_final_that_never_comes_ends_the_reply_after_the_wait(self):
-        gen = self._reply("draw a plant playing guitar", "m1")
-        first = asyncio.ensure_future(gen.__anext__())
-        await self._until_registered("run-1")
-        q = self._queue("run-1")
-        q.put_nowait(self._delta("run-1", "Here it is."))
-        q.put_nowait(self._lifecycle_end("run-1"))
-        with mock.patch.object(self.ocp, "_TRAILING_FINAL_WAIT_S", 0.05), \
-             mock.patch.object(self.ocp, "_fetch_gateway_media") as fetch:
-            out, _ = await self._collect(first, gen)
-        fetch.assert_not_called()
-        self.assertEqual(out, "Here it is.")
-
-    async def test_an_image_block_is_fetched_uploaded_and_shown(self):
+    async def test_a_stored_image_block_is_fetched_uploaded_and_shown(self):
         media_dir = self._media_dir()
         self.pipe.valves.GATEWAY_URL = "localhost:18789"
         self.pipe.valves.GATEWAY_TOKEN = "gw-token"
         self.pipe.valves.OWUI_API_KEY = "owui-key"
+        self._stored("run-1", self.BLOCK)
         uploads = []
 
         def upload(path, base_url, token):
@@ -2875,41 +2864,52 @@ class GatewayImageBlockTests(unittest.IsolatedAsyncioTestCase):
 
         with mock.patch.object(self.ocp, "_fetch_gateway_media", return_value=b"PNG") as fetch, \
              mock.patch.object(self.ocp, "_upload_owui_file", upload):
-            out, _ = await self._turn("Here it is.", self.BLOCK)
+            out, _ = await self._turn("Here it is.")
 
         fetch.assert_called_once_with("localhost:18789", "gw-token", self.BLOCK["url"])
         self.assertEqual(len(uploads), 1)
         fname, raw, token = uploads[0]
         self.assertEqual((raw, token), (b"PNG", "owui-key"))
-        self.assertRegex(fname, r"^codex-image-generation-2---b11dbeb3-[0-9a-f-]+-[0-9a-f]{8}\.png$")
+        self.assertRegex(fname, r"^codex-image-generation-2---05e44654-[0-9a-f-]+-[0-9a-f]{8}\.png$")
         self.assertTrue(os.path.isfile(os.path.join(media_dir, fname)))
         self.assertTrue(out.startswith("Here it is."))
         self.assertIn(f"![{fname}](/api/v1/files/f1/content)", out)
         self.assertIn({"type": "files", "data": {"files": [
             {"id": "f1", "meta": {"content_type": "image/png"}}]}}, self.emitted)
+        self.assertEqual(self.rpc.count("chat.history"), 1,
+                         "one read serves the images and the usage line")
+
+    async def test_another_runs_image_is_not_shown(self):
+        self._stored("run-0", self.BLOCK)
+        with mock.patch.object(self.ocp, "_fetch_gateway_media") as fetch:
+            out, _ = await self._turn("Here it is.")
+        fetch.assert_not_called()
+        self.assertEqual(out, "Here it is.")
 
     async def test_a_reply_that_showed_media_directives_shows_no_blocks(self):
         """The Gateway may list a MEDIA: directive's file as a block too: the
         directive already showed it, so it is not shown twice."""
         self._media_dir()
+        self._stored("run-1", self.BLOCK)
         with mock.patch.object(self.ocp, "_fetch_gateway_media") as fetch, \
              mock.patch.object(self.ocp, "_resolve_media_text",
                                mock.AsyncMock(return_value=("![a.png](/x)", True))):
-            out, _ = await self._turn("Here it is.\nMEDIA:a.png\n", self.BLOCK)
+            out, _ = await self._turn("Here it is.\nMEDIA:a.png\n")
         fetch.assert_not_called()
         self.assertEqual(out.count("!["), 1)
 
     async def test_an_image_that_cannot_be_fetched_is_named_not_dropped(self):
         self._media_dir()
+        self._stored("run-1", self.BLOCK)
         with mock.patch.object(self.ocp, "_fetch_gateway_media",
                                side_effect=urllib.error.URLError("refused")):
-            out, _ = await self._turn("Here it is.", self.BLOCK)
+            out, _ = await self._turn("Here it is.")
         self.assertIn(f"an image could not be loaded: {self.BLOCK['alt']}", out)
 
-    async def test_a_final_without_image_blocks_adds_nothing(self):
+    async def test_a_block_outside_the_media_route_is_ignored(self):
+        self._stored("run-1", {"type": "image", "url": "https://elsewhere.example/x.png"})
         with mock.patch.object(self.ocp, "_fetch_gateway_media") as fetch:
-            out, _ = await self._turn("Here it is.",
-                                      {"type": "image", "url": "https://elsewhere.example/x.png"})
+            out, _ = await self._turn("Here it is.")
         fetch.assert_not_called()
         self.assertEqual(out, "Here it is.")
 

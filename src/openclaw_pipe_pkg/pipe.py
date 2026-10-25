@@ -72,11 +72,6 @@ def _thinking_rejection_retry_body(body, recovered, resolved_thinking):
 # while the page and its queued message survive (ELI-95).
 _SEND_NOW_HOLD_S = 120.0
 
-# How long a reply whose run ended on its lifecycle `end` waits for the run's
-# trailing `chat` final, the one event that carries the message's image
-# blocks (ELI-322). The text is already shown; only the reply's end waits.
-_TRAILING_FINAL_WAIT_S = 10.0
-
 
 async def _current_load(pipe, request):
     """The Pipe of the load Open WebUI serves now, when `pipe` belongs to an
@@ -1351,12 +1346,11 @@ class _PipeTurn:
         # directive whose filename is still arriving.
         self.pending_prompt_text = ""
         self.pending_media_text = ""
-        # The final message's Gateway `image` blocks, shown after the text,
-        # unless a MEDIA: directive of this reply already showed its images.
-        self.final_images = []
+        # Whether a MEDIA: directive of this reply showed its images; the
+        # run's Gateway image blocks are shown only when none did.
         self.media_shown = False
-        self.final_seen = False
-        self.ended_on_lifecycle = False
+        # The session's `chat.history` once the run ended, read once.
+        self.end_history = None
         self.last_snapshot_text = ""
         self.last_snapshot_time = 0.0
         self.snapshot_interval_s = 1.0
@@ -1520,7 +1514,6 @@ class _PipeTurn:
                         yield chunk
                     async for chunk in self.finish_held_media():
                         yield chunk
-                    await self.await_trailing_final()
                     async for chunk in self.finish_final_images():
                         yield chunk
                     async for chunk in self.close_open_cards():
@@ -1713,7 +1706,7 @@ class _PipeTurn:
     async def on_completion(self, payload, stream, phase, state, err, aborted_run):
         """The run's end signals and the error lines they show."""
         if stream == "lifecycle" and phase == "end":
-            self.done = self.ended_on_lifecycle = True
+            self.done = True
             pipe_log("  lifecycle end -> done")
         elif err:
             self.error_shown = f"\n\n**Error:** {err}"
@@ -1726,8 +1719,6 @@ class _PipeTurn:
                 if isinstance(payload.get("message"), dict) else None
             if _usage_prompt_tokens(usage):
                 self.run_usage = usage
-            self.final_seen = True
-            self.final_images = _gateway_image_blocks(payload.get("message"))
         if state in ("final", "cancelled", "error", "aborted") or aborted_run:
             self.done = True
             pipe_log(f"  payload state='{state}' aborted={aborted_run} -> done")
@@ -1864,42 +1855,29 @@ class _PipeTurn:
             self.text_yielded = True
             self.pending_media_text = ""
 
-    async def await_trailing_final(self):
-        """A run ends on its lifecycle `end`, and its `chat` final, which
-        carries the message's image blocks, lands after it (ELI-322): read
-        the run's queue a moment longer for that final."""
-        if (not self.ended_on_lifecycle or self.final_seen or self.error_shown
-                or self.aborted or self.handed_over or not self.our_run_id):
-            return
-        loop = asyncio.get_running_loop()
-        start = loop.time()
-        while (remaining := start + _TRAILING_FINAL_WAIT_S - loop.time()) > 0:
-            try:
-                msg = await asyncio.wait_for(self.queue.get(), remaining)
-            except asyncio.TimeoutError:
-                break
-            payload = msg.get("payload") if isinstance(msg, dict) else None
-            if (isinstance(payload, dict) and msg.get("event") == "chat"
-                    and payload.get("state") == "final"
-                    and payload.get("runId") in (None, self.our_run_id)):
-                self.final_seen = True
-                self.final_images = _gateway_image_blocks(payload.get("message"))
-                pipe_log(f"  trailing final after {(loop.time() - start) * 1000:.0f} ms, "
-                         f"{len(self.final_images)} image block(s)")
-                return
-        pipe_log(f"  no trailing final within {_TRAILING_FINAL_WAIT_S:g}s")
+    async def run_end_history(self) -> dict:
+        """The session's `chat.history` once the run ended, read once for
+        the run's images and its usage line."""
+        if self.end_history is None:
+            # As long as the usage line's other reads (`_build_usage_status_lines`).
+            self.end_history = await self.conn.session_history(
+                self.session_key, limit=RUN_TEXT_HISTORY_LIMIT, timeout=5)
+        return self.end_history
 
     async def finish_final_images(self):
-        """Show the images the final message carries as Gateway `image`
-        blocks (an agent's own image tool), which the text never names
-        (ELI-322). A reply that showed MEDIA: directives already has its
-        images: the Gateway may list those as blocks too, so they are not
-        shown twice."""
-        blocks, self.final_images = self.final_images, []
-        if not blocks:
+        """Show the images the run's stored messages carry as Gateway
+        `image` blocks (an agent's own image tool), which the text never
+        names (ELI-322). A reply that showed MEDIA: directives already has
+        its images: the Gateway may list those as blocks too, so they are
+        not shown twice."""
+        if self.media_shown or self.handed_over or not self.our_run_id:
             return
-        if self.media_shown:
-            pipe_log(f"  {len(blocks)} gateway image block(s) skipped: the text showed MEDIA:")
+        try:
+            blocks = _history_image_blocks_for_run(await self.run_end_history(), self.our_run_id)
+        except Exception as ex:
+            pipe_log(f"  run images: chat.history failed: {ex!r}")
+            return
+        if not blocks:
             return
         shown = await _gateway_images_text(
             blocks, valves=self.pipe.valves, __request__=self.__request__,
@@ -2265,8 +2243,7 @@ class _PipeTurn:
         if self.run_usage or not self.our_run_id:
             return self.run_usage
         try:
-            # As long as the usage line's other reads (`_build_usage_status_lines`).
-            hist = await self.conn.session_history(self.session_key, limit=RUN_TEXT_HISTORY_LIMIT, timeout=5)
+            hist = await self.run_end_history()
         except Exception as ex:
             pipe_log(f"  usage line: chat.history failed: {ex!r}")
             return None
