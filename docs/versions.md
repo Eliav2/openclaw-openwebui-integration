@@ -42,6 +42,7 @@ Each row is the full end-to-end suite on one pair, on GitHub's runners. The suit
 | 0.12.0 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/39003313714) |
 | 0.12.2 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/39003315726) |
 | 0.12.3 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/39173684021) |
+| 0.12.4 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/40178235128) |
 
 ### OpenClaw, with Open WebUI 0.12.0
 
