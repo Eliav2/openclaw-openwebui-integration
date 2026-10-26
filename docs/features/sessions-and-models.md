@@ -36,6 +36,25 @@ The agent still remembers the replaced messages; the note tells it which ones th
 
 For a clean start, open a new chat.
 
+## Several models side by side
+
+Open WebUI can send one message to several models at once and show the replies next to each other. Each OpenClaw model gets its own session, so the replies run together, each on the model it is labelled with, and none sees the others' answers:
+
+```text
+agent:{AGENT_ID}:openwebui-{user_id}-{chat_id}       first model (the chat's own session)
+agent:{AGENT_ID}:openwebui-{user_id}-{chat_id}-m1    second model
+agent:{AGENT_ID}:openwebui-{user_id}-{chat_id}-m2    third model
+```
+
+- **Place decides the session.** The first OpenClaw model you pick uses the chat's own session, so a chat that never had two models is unchanged. Models from other providers in the same message do not take a session of the Pipe's, and one OpenClaw model next to another provider's keeps the chat's own session.
+- **Try Again on one reply** goes to that model's session only; the agent there gets the usual note that its earlier answer is gone.
+- **Going on after you pick a reply:** with one model selected, your next message continues in the session that gave the reply you picked. With several selected again, each session is told what the picked reply said in full, since it was written elsewhere. The same goes for a reply from another provider.
+- **A model added later** gets the chat so far with its first message, the way a cloned chat does.
+
+Why not one session with the replies queued? That is what the Pipe did before: the replies waited for each other, each saw the earlier ones, and every message set the session's model, so all of them ran on whichever model was set last. Separate sessions cost one session (and its memory of the chat) per model column, and the sessions drift apart as you go on; the Status button shows the chat's own session.
+
+**Merge responses** is not handled: Open WebUI sends that request without the chat, so it runs in a throwaway session and the merged answer is not saved by Open WebUI either.
+
 ## Model picker
 
 <img src="../img/model-picker-light.png" alt="The model dropdown open: OpenClaw · Default, then the models discovered from the Gateway" width="320">

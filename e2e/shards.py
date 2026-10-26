@@ -96,6 +96,8 @@ SHARDS = {
         f"{E2E}::test_a_message_sent_while_the_pipe_waits_to_reconnect_gets_its_reply",
         f"{E2E}::test_a_media_line_from_the_agent_is_uploaded_attached_and_linked",
         f"{E2E}::test_the_picked_thinking_level_reaches_the_model_and_a_clamp_says_so",
+        f"{E2E}::test_two_pipe_models_side_by_side_answer_in_their_own_sessions",
+        f"{E2E}::test_a_pipe_model_next_to_another_provider_keeps_the_chats_session",
     ],
     # Open WebUI stopped and redeployed mid-reply, then the queue flows.
     "3": [
@@ -137,6 +139,7 @@ SHARDS = {
         f"{BROWSER}::test_a_forked_chat_starts_with_the_copied_messages",
         f"{BROWSER}::test_a_cloned_chat_starts_with_the_copied_messages",
         f"{BROWSER}::test_an_execute_while_the_input_dialog_is_open_leaves_the_dialog_its_answer",
+        f"{BROWSER}::test_one_message_to_two_models_is_answered_by_each_without_a_note",
     ],
 }
 

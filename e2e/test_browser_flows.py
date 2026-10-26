@@ -1831,3 +1831,33 @@ def _eli195_probe(page, mode: str, fid: str) -> None:
     if mode == "held":
         # Held, the `execute` runs once the dialog is answered.
         _wait(page, "() => window.__eli195Poked === true", "the held execute after the answer", 30_000)
+
+
+def test_one_message_to_two_models_is_answered_by_each_without_a_note(page, token):
+    """Several models side by side (ELI-329): the message goes to each model in
+    its own session. Neither gets a Regenerate note, and Try Again on one reply
+    reaches the agent as a Regenerate for that model only."""
+    n = os.getpid()
+    models = capture.api("GET", "/api/models", token=token)["data"]
+    echo = next(m["id"] for m in models
+                if m["id"].startswith("openclaw_gateway.") and m["id"].endswith("/e2e-echo"))
+    page.goto(f"{capture.BASE}/?models={capture.MODEL},{echo}")
+    page.wait_for_selector("#chat-input", timeout=60_000)
+    capture.dismiss_popups(page)
+    capture.send(page, f"E2E_ECHO: MULTI_{n}")
+    both = (f"() => ({STOP_GONE})() && (() => {{ const all = ({REPLIES})(); return all.length === 2 && "
+            f"all.every(r => r.done && r.text.includes('MULTI_{n}')); }})()")
+    _wait(page, both, "both models' replies")
+    sent = _to_model(f"MULTI_{n}")
+    assert len(sent) == 2, sent
+    assert all("[Open WebUI:" not in t for t in sent), sent
+    # Try Again on the second reply.
+    page.locator(".chat-assistant").last.hover()
+    page.locator('button[aria-label="Regenerate"]').last.click()
+    page.get_by_text("Try Again", exact=True).click()
+    _wait(page, f"() => ({STOP_GONE})() && /\\b2\\s*\\/\\s*2\\b/.test(document.body.innerText)",
+          "the second answer (2/2)")
+    _wait(page, _last_reply_done(f"MULTI_{n}"), "the regenerated reply")
+    sent = _to_model(f"MULTI_{n}")
+    assert len(sent) == 3 and "the user asked for a new answer" in sent[-1], sent
+    assert "[Open WebUI:" not in sent[0] + sent[1], sent
