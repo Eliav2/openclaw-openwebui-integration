@@ -98,6 +98,7 @@ SHARDS = {
         f"{E2E}::test_the_picked_thinking_level_reaches_the_model_and_a_clamp_says_so",
         f"{E2E}::test_two_pipe_models_side_by_side_answer_in_their_own_sessions",
         f"{E2E}::test_a_pipe_model_next_to_another_provider_keeps_the_chats_session",
+        f"{E2E}::test_two_pipe_models_side_by_side_run_at_the_same_time",
     ],
     # Open WebUI stopped and redeployed mid-reply, then the queue flows.
     "3": [
