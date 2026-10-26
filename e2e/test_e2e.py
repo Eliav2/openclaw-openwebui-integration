@@ -2574,3 +2574,39 @@ def test_a_pipe_model_next_to_another_provider_keeps_the_chats_session(token):
             "ENABLE_OPENAI_API": False, "OPENAI_API_BASE_URLS": [], "OPENAI_API_KEYS": [],
             "OPENAI_API_CONFIGS": {}}, token)
         _request("GET", "/api/models?refresh=true", token=token)
+
+
+def _fake_llm_arrivals(marker: str) -> list:
+    """(arrival time, model) of every request the fake model got whose newest
+    turn holds `marker`, oldest first."""
+    out = []
+    with open(os.environ["E2E_FAKE_LLM_LOG"], encoding="utf-8") as f:
+        for line in f:
+            rec = json.loads(line)
+            req = rec.get("request") or {}
+            messages = req.get("messages") or []
+            last = max((i for i, m in enumerate(messages) if m.get("role") == "assistant"
+                        and not m.get("tool_calls")), default=-1)
+            text = "\n".join(_content_text(m.get("content")) for m in messages[last + 1:]
+                             if m.get("role") == "user")
+            if marker in text:
+                out.append((rec["ts"], req.get("model")))
+    return out
+
+
+def test_two_pipe_models_side_by_side_run_at_the_same_time(token):
+    """Each model's run takes ~12 s (one word a second). Run one after the
+    other, the second would reach the model about 12 s after the first."""
+    first, second = _model_ids(token)
+    marker = f"E2E_PAR_{uuid.uuid4().hex[:6]}"
+    t0 = time.time()
+    chat_id, uid, done = _side_by_side(token, f"E2E_SLOW:12 {marker}", [first, second])
+    elapsed = time.time() - t0
+    assert all(marker in done[i]["content"] for i in (0, 1)), done
+    arrivals = _fake_llm_arrivals(marker)
+    assert len(arrivals) == 2 and {m for _, m in arrivals} == {"e2e-default", "e2e-echo"}, arrivals
+    gap = abs(arrivals[0][0] - arrivals[1][0])
+    assert gap < 6, f"the second model reached the fake {gap:.1f}s after the first: they ran one after the other"
+    # Both ran inside one run's time, not two.
+    assert elapsed < 24, f"both replies took {elapsed:.0f}s"
+    _request("DELETE", f"/api/v1/chats/{chat_id}", token=token)

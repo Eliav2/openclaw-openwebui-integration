@@ -127,6 +127,35 @@ class PipeAndPipeModelsTests(MultiModelBase):
         self.assertEqual(sorted(self.patches), sorted([
             (_key(0), "anthropic/claude-haiku-5-5"), (_key(1), "anthropic/claude-opus-5-5")]))
 
+    async def test_both_models_are_sent_before_either_reply_ends(self):
+        """The replies run side by side: the second model's message reaches the
+        Gateway while the first is still running, not after it ends."""
+        self.message("u1", "user", None, "pick one")
+        models = [HAIKU, OPUS]
+        bodies = {HAIKU: "a1", OPUS: "b1"}
+        gens = []
+        for model, reply in bodies.items():
+            meta = {"chat_id": CHAT, "user_id": USER, "message_id": reply, "user_message_id": "u1",
+                    "user_message": {"id": "u1", "parentId": None, "models": models}}
+
+            async def emitter(event):
+                pass
+
+            gen = self.pipe._pipe_impl({"model": model, "messages": [{"role": "user", "content": "pick one"}]},
+                                       emitter, __metadata__=meta)
+            gens.append((gen, asyncio.ensure_future(gen.__anext__())))
+        for _ in range(600):
+            if len(self.sends) == 2:
+                break
+            await asyncio.sleep(0.005)
+        # Neither reply has ended, and both messages are already at the Gateway.
+        self.assertEqual(len(self.sends), 2, "the second model waited for the first to end")
+        self.assertEqual({s["session"] for s in self.sends}, {_key(0), _key(1)})
+        for _, first in gens:
+            self.assertFalse(first.done())
+            first.cancel()
+        await asyncio.gather(*[f for _, f in gens], return_exceptions=True)
+
     async def test_a_second_pipe_model_is_not_taken_for_a_regenerate(self):
         self.message("u1", "user", None, "pick one")
         models = [HAIKU, OPUS]
