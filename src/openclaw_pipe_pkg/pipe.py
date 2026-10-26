@@ -1370,6 +1370,12 @@ class _PipeTurn:
         # Images the run's Codex image tool made: the Gateway attaches them
         # to the run's stored message only after its final (ELI-322).
         self.images_made = 0
+        # Files the reply named by path (a `MEDIA:/path` line, or an
+        # assistant event's `mediaUrls` when the Gateway already took the
+        # line out): the Gateway stores each as an image block of the run's
+        # message, also after its final (ELI-328).
+        self.gateway_media: set[str] = set()
+        self.event_media: set[str] = set()   # bare names and URLs of `mediaUrls`, shown once
         self.last_snapshot_text = ""
         self.last_snapshot_time = 0.0
         self.snapshot_interval_s = 1.0
@@ -1465,6 +1471,17 @@ class _PipeTurn:
                             for text in (a for a in added if isinstance(a, str)):
                                 async for chunk in self.show_text(text):
                                     yield chunk
+                        if stream == "assistant":
+                            # The `MEDIA:` lines the Gateway took out of the
+                            # text (ELI-328): a path is the run's stored
+                            # block, a bare name or URL is shown as its line.
+                            for url in _event_media_urls(data):
+                                if _is_gateway_media_name(url):
+                                    self.gateway_media.add(url)
+                                elif url not in self.event_media:
+                                    self.event_media.add(url)
+                                    async for chunk in self.show_text(f"\nMEDIA:{url}\n"):
+                                        yield chunk
 
                         # --- Tool call events ---
                         # The cards come from `_TurnRenderer`, the same code a
@@ -1888,36 +1905,46 @@ class _PipeTurn:
 
     async def finish_final_images(self):
         """Show the images the run's stored messages carry as Gateway
-        `image` blocks (an agent's own image tool), which the text never
-        names (ELI-322). A reply that showed MEDIA: directives already has
-        its images: the Gateway may list those as blocks too, so they are
-        not shown twice."""
-        if self.media_shown or self.handed_over or not self.our_run_id:
+        `image` blocks: an agent's own image tool's (ELI-322), and each file
+        the reply named by path (ELI-328), whatever the model. A reply that
+        showed bare-name MEDIA: directives already has those images, so the
+        blocks are read for it only when it also named a path."""
+        if (self.media_shown and not self.gateway_media) or self.handed_over or not self.our_run_id:
             return
         loop = asyncio.get_running_loop()
         start = loop.time()
+        expected = self.images_made + len(self.gateway_media)
+        names = {os.path.basename(p) for p in self.gateway_media}
+
+        def stored(hist):
+            # A file the Gateway could not store is an `attachment_error`
+            # block instead; only those of the paths named here count.
+            return (_history_image_blocks_for_run(hist, self.our_run_id),
+                    [e for e in _history_media_errors_for_run(hist, self.our_run_id)
+                     if os.path.basename(e) in names])
         try:
-            blocks = _history_image_blocks_for_run(await self.run_end_history(), self.our_run_id)
-            # The Gateway attaches the images the run made to its stored
-            # message about a second after the run's final, with no event
-            # that carries them: read until they are there, bounded.
-            while len(blocks) < self.images_made and loop.time() - start < _RUN_IMAGES_WAIT_S:
+            blocks, errors = stored(await self.run_end_history())
+            # The Gateway attaches the run's images to its stored message
+            # about a second after the run's final, with no event that
+            # carries them: read until they are there, bounded.
+            while len(blocks) + len(errors) < expected and loop.time() - start < _RUN_IMAGES_WAIT_S:
                 await asyncio.sleep(_RUN_IMAGES_POLL_S)
-                blocks = _history_image_blocks_for_run(
-                    await self.run_end_history(fresh=True), self.our_run_id)
+                blocks, errors = stored(await self.run_end_history(fresh=True))
         except Exception as ex:
             pipe_log(f"  run images: chat.history failed: {ex!r}")
             return
-        if self.images_made:
-            pipe_log(f"  run made {self.images_made} image(s); {len(blocks)} stored after "
-                     f"{(loop.time() - start) * 1000:.0f} ms")
-        if not blocks:
+        if expected:
+            pipe_log(f"  run made {self.images_made} image(s) and named {len(self.gateway_media)} "
+                     f"file(s); {len(blocks)} stored after {(loop.time() - start) * 1000:.0f} ms")
+        missing = _unstored_gateway_media(sorted(self.gateway_media),
+                                          len(blocks) - self.images_made, errors)
+        if not blocks and not missing:
             return
         shown = await _gateway_images_text(
             blocks, valves=self.pipe.valves, __request__=self.__request__,
-            __event_emitter__=self.__event_emitter__)
+            __event_emitter__=self.__event_emitter__, missing=missing)
         if shown:
-            pipe_log(f"  showed {len(blocks)} gateway image block(s)")
+            pipe_log(f"  showed {len(blocks)} gateway image block(s), {len(missing)} missing")
             self.record_visible_chunk(shown)
             yield shown
             self.text_yielded = True
@@ -2500,20 +2527,7 @@ class _PipeTurn:
         self.text_yielded = True
         shown_as = text
         if "MEDIA:" in text:
-            resolved, handled = await _resolve_media_text(
-                text,
-                valves=self.pipe.valves,
-                __request__=self.__request__,
-                __event_emitter__=self.__event_emitter__,
-                ctx=self.assistant_stream_text[self.fence_item_start:],
-            )
-            if handled:
-                pipe_log("  resolved MEDIA: directive")
-                self.media_shown = True
-                # A writer that takes this reply over shows the same image.
-                self.conn.note_turn_rewrite(self.owui_origin_chat_id, self.owui_message_id,
-                                            text, resolved)
-                shown_as = resolved
+            shown_as = await self.settle_held_media(text)
         # The raw text sets the code state of what follows (ELI-111).
         self.assistant_stream_text += text
         self.record_visible_chunk(shown_as)
@@ -2526,15 +2540,23 @@ class _PipeTurn:
     async def settle_held_media(self, held: str) -> str:
         """Text `_advance_media_buffer` held, once its message item ends:
         resolved as a whole, a directive quoted in code left as text
-        (ELI-111), and recorded for a writer that takes the reply over."""
+        (ELI-111), and recorded for a writer that takes the reply over. A
+        directive naming a path is taken out: its image is the run's stored
+        block, shown when the run ends (ELI-328)."""
+        ctx = self.assistant_stream_text[self.fence_item_start:]
+        text, paths = _take_gateway_media(held, ctx)
+        self.gateway_media.update(paths)
         resolved, handled = await _resolve_media_text(
-            held,
+            text,
             valves=self.pipe.valves,
             __request__=self.__request__,
             __event_emitter__=self.__event_emitter__,
-            ctx=self.assistant_stream_text[self.fence_item_start:],
+            ctx=ctx,
         )
         if handled:
+            pipe_log("  resolved MEDIA: directive")
             self.media_shown = True
+        if resolved != held:
+            # A writer that takes this reply over shows the same.
             self.conn.note_turn_rewrite(self.owui_origin_chat_id, self.owui_message_id, held, resolved)
         return resolved

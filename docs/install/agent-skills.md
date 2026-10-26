@@ -11,14 +11,14 @@ The integration provides the mechanism, but nothing tells your model it exists, 
 | Feature | The agent must | Otherwise |
 |---|---|---|
 | [Ask-user dialog](../features/questions.md) | Start a line with `OpenClaw needs input:` | It calls its own ask tool, which never reaches you here |
-| [Send an image or file](../features/chat.md) | Emit `MEDIA:<bare-filename>` | An absolute path silently drops, with no image and no error |
+| [Send an image or file](../features/chat.md) | Emit `MEDIA:<path>` | It describes the file instead of showing it |
 
 ## The two skills
 
 They live in [`skills/`](../../skills):
 
 - [`openclaw-owui-ask-user`](../../skills/openclaw-owui-ask-user/SKILL.md): ask the user a question that pops a real dialog in Open WebUI, using the `OpenClaw needs input:` marker.
-- [`openclaw-owui-media`](../../skills/openclaw-owui-media/SKILL.md): show an image or file in the chat by emitting a `MEDIA:` line with a bare filename.
+- [`openclaw-owui-media`](../../skills/openclaw-owui-media/SKILL.md): show an image or file in the chat by emitting a `MEDIA:` line with the file's path on the Gateway host, or a bare filename.
 
 ## Install them
 

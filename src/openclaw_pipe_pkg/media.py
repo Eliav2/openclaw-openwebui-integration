@@ -199,7 +199,9 @@ def _replace_media(text: str, directives, replacement) -> str:
     out, pos = "", 0
     for start, end, fname in directives:
         rest = text[end:]
-        out += text[pos:start] + replacement(fname) + ("\n" if rest.strip() else "")
+        shown = replacement(fname)
+        # A directive taken out (ELI-328) leaves no line of its own.
+        out += text[pos:start] + shown + ("\n" if rest.strip() and shown else "")
         pos = end + len(rest) - len(rest.lstrip())
     return out + text[pos:]
 
@@ -218,8 +220,42 @@ def _resolve_media(text, base_url=None, ctx=""):
     if not directives:
         return text, False
     # Prefer HTTPS URL over base64 data URI (base64 breaks OWUI streaming parser).
+    # A directive that is a URL already is one.
     return _replace_media(text, directives,
-                          lambda fname: f"![{fname}]({base_url.rstrip('/')}/{fname})"), True
+                          lambda fname: f"![{os.path.basename(fname)}]({fname})" if _is_media_url(fname)
+                          else f"![{fname}]({base_url.rstrip('/')}/{fname})"), True
+
+
+def _is_media_url(fname: str) -> bool:
+    return fname.startswith(("https://", "http://"))
+
+
+def _is_gateway_media_name(fname: str) -> bool:
+    """A directive naming a path, not a bare file name or a URL: the Gateway
+    resolves it on its own host and stores the file as an `image` block of
+    the run's message (ELI-328). The Pipe cannot read that path, and the
+    file server never had it."""
+    return "/" in fname and not _is_media_url(fname)
+
+
+def _event_media_urls(data) -> list[str]:
+    """The `mediaUrls` of an assistant event: on the Gateway's own runtime
+    (DeepSeek, Grok, GPT...) the Gateway takes a reply's `MEDIA:` lines out
+    of its text and sends their files here instead (measured 2026-10-26,
+    ELI-328). claude-cli runs keep the lines in the text."""
+    urls = data.get("mediaUrls") if isinstance(data, dict) else None
+    return [u.strip() for u in urls if isinstance(u, str) and u.strip()] if isinstance(urls, list) else []
+
+
+def _take_gateway_media(text: str, ctx: str = "") -> tuple[str, list[str]]:
+    """(`text` without its path `MEDIA:` directives, their paths). The image
+    comes from the run's stored blocks once the run ends (`_gateway_images_text`);
+    the directive line itself is not shown. `ctx`: as for `_media_scan`."""
+    directives, _hold = _media_scan(text, ctx)
+    paths = [d for d in directives if _is_gateway_media_name(d[2])]
+    if not paths:
+        return text, []
+    return _replace_media(text, paths, lambda _fname: ""), [fname for _s, _e, fname in paths]
 
 
 def _extract_request_bearer(__request__):
@@ -398,6 +434,35 @@ def _history_image_blocks_for_run(history: dict, run_id: str) -> list[dict]:
     return blocks
 
 
+def _history_media_errors_for_run(history: dict, run_id: str) -> list[str]:
+    """The labels (file names) of the `attachment_error` blocks of one run's
+    assistant messages: a reply's media file the Gateway could not store,
+    e.g. a path that does not exist (seen live: code `file-not-found`)."""
+    labels = []
+    for message in (history or {}).get("messages") or []:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
+        if run_id not in (meta.get("runId"), message.get("runId")):
+            continue
+        for block in message.get("content") if isinstance(message.get("content"), list) else []:
+            attachment = block.get("attachment") if isinstance(block, dict) else None
+            if block.get("type") == "attachment_error" and isinstance(attachment, dict):
+                labels.append(str(attachment.get("label") or ""))
+    return labels
+
+
+def _unstored_gateway_media(paths, blocks: int, errors: list[str]) -> list[str]:
+    """The names of the path directives in `paths` that have no stored image
+    yet: each one the Gateway reported it could not store (`errors`, by file
+    name), then, while fewer than `blocks` arrived for the rest, the last of
+    those. Empty once every path is accounted for."""
+    names = [os.path.basename(p) for p in paths]
+    failed = [n for n in names if n in {os.path.basename(e) for e in errors if e}]
+    rest = [n for n in names if n not in failed]
+    return failed + rest[max(0, blocks):]
+
+
 def _gateway_image_fname(block: dict) -> str:
     """A unique bare file name for an image block, with its type's extension."""
     stem = os.path.splitext(os.path.basename(str(block.get("alt") or "")))[0]
@@ -420,13 +485,15 @@ def _fetch_gateway_media(gateway_url: str, token: str, path: str) -> bytes:
     return raw
 
 
-async def _gateway_images_text(blocks, *, valves, __request__=None, __event_emitter__=None) -> str:
+async def _gateway_images_text(blocks, *, valves, __request__=None, __event_emitter__=None,
+                               missing=()) -> str:
     """Show a final message's Gateway image blocks the way a MEDIA: directive
     is shown: each image is fetched into the media dir, then resolved by
     `_resolve_media_text` (Open WebUI's files, else the file server). An
     image that cannot be fetched is named in the text, never dropped
-    silently."""
-    lines = []
+    silently, and so is each of `missing`, a file the reply named that the
+    Gateway never stored."""
+    lines = [f"_(an image could not be loaded: {name})_" for name in missing]
     for block in blocks:
         fname = _gateway_image_fname(block)
         try:
