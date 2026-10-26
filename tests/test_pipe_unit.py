@@ -2974,6 +2974,83 @@ class GatewayImageBlockTests(unittest.IsolatedAsyncioTestCase):
         fetch.assert_not_called()
         self.assertEqual(out, "Here it is.")
 
+    # ELI-328 (2026-10-26): a reply naming its image by path, on any model.
+    # Measured live (QA chat 303242f3): DeepSeek's `MEDIA:/abs/x.png` line
+    # never reaches the text, the assistant event carries it as `mediaUrls`;
+    # Haiku's (claude-cli) streams as text. Either way the Gateway stores the
+    # file as an image block of the run's message about a second later.
+    PATH = "/config/.openclaw/media/tool-image-generation/qa-media-probe-eli.png"
+
+    def _media_event(self, run_id, text, urls):
+        return {"type": "event", "event": "agent", "payload": {
+            "sessionKey": self.SK, "runId": run_id, "stream": "assistant",
+            "data": {"text": text, "delta": text, "mediaUrls": urls}}}
+
+    async def _events(self, *events):
+        gen = self._reply("show the image", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        for event in events:
+            q.put_nowait(event)
+        q.put_nowait(self._lifecycle_end("run-1"))
+        q.put_nowait(self._final("run-1"))
+        with mock.patch.object(self.ocp, "_RUN_IMAGES_POLL_S", 0.01), \
+             mock.patch.object(self.ocp, "_RUN_IMAGES_WAIT_S", 0.3), \
+             mock.patch.object(self.ocp, "_fetch_gateway_media", return_value=b"PNG") as fetch, \
+             mock.patch.object(self.ocp, "_upload_owui_file",
+                               return_value={"id": "f1", "meta": {"content_type": "image/png"}}):
+            out, _ = await self._collect(first, gen)
+        return out, fetch
+
+    async def test_a_path_in_media_urls_waits_for_its_stored_block(self):
+        self._media_dir()
+        reads = self._attached_late(2)
+        out, fetch = await self._events(self._media_event("run-1", "Here it is.", [self.PATH]))
+        fetch.assert_called_once()
+        self.assertEqual(len(reads), 3, "read until the block is stored")
+        self.assertTrue(out.startswith("Here it is."))
+        self.assertIn("](/api/v1/files/f1/content)", out)
+        self.assertNotIn("MEDIA:", out)
+
+    async def test_a_path_directive_in_the_text_shows_the_stored_block_not_a_link(self):
+        """The file server never had a path: its link was a broken image."""
+        self._media_dir()
+        self._attached_late(1)
+        out, fetch = await self._events(self._delta("run-1", f"Here it is.\nMEDIA:{self.PATH}\n"))
+        fetch.assert_called_once()
+        self.assertNotIn("MEDIA:", out)
+        self.assertNotIn(":18791", out)
+        self.assertNotIn(self.PATH, out)
+        self.assertEqual(out.count("!["), 1)
+        self.assertIn("](/api/v1/files/f1/content)", out)
+
+    async def test_a_path_the_gateway_could_not_store_is_named(self):
+        self.history = {"messages": [
+            {"role": "user", "content": "show the image"},
+            {"role": "assistant", "__openclaw": {"runId": "run-1"}, "content": [
+                {"type": "text", "text": "Here it is."},
+                {"type": "attachment_error", "attachment": {
+                    "code": "file-not-found", "kind": "image", "label": "qa-media-probe-eli.png"}}]}]}
+        out, fetch = await self._events(self._media_event("run-1", "Here it is.", [self.PATH]))
+        fetch.assert_not_called()
+        self.assertIn("an image could not be loaded: qa-media-probe-eli.png", out)
+
+    async def test_a_path_never_stored_is_named_after_the_wait(self):
+        out, fetch = await self._events(self._media_event("run-1", "Here it is.", [self.PATH]))
+        fetch.assert_not_called()
+        self.assertIn("an image could not be loaded: qa-media-probe-eli.png", out)
+
+    async def test_a_bare_name_in_media_urls_is_shown_as_its_directive(self):
+        """The wrapper's bare name, on a model whose line the Gateway took out."""
+        media_dir = self._media_dir()
+        with open(os.path.join(media_dir, "file-1.png"), "wb") as f:
+            f.write(b"PNG")
+        out, fetch = await self._events(self._media_event("run-1", "Here it is.", ["file-1.png"]))
+        fetch.assert_not_called()
+        self.assertIn("![file-1.png](/api/v1/files/f1/content)", out)
+        self.assertEqual(out.count("!["), 1)
+
 
 class CloseUnsentReplyTests(unittest.IsolatedAsyncioTestCase):
     """`_close_unsent_reply` (ELI-188): the interrupted reply's last write."""
@@ -8122,6 +8199,93 @@ class TurnWriterTabRepairTests(_TurnWriterCase):
         self.assertEqual(self.owui.events("chat:messages"), [])
 
 
+class MediaDirectiveKindTests(unittest.TestCase):
+    """ELI-328: which `MEDIA:` directives the file server can show."""
+
+    def test_a_url_directive_is_its_own_image(self):
+        out, handled = openclaw_pipe._resolve_media("See:\nMEDIA:https://example.com/a/cat.png\n",
+                                                    base_url="http://fs:18791")
+        self.assertTrue(handled)
+        self.assertIn("![cat.png](https://example.com/a/cat.png)", out)
+        self.assertNotIn("fs:18791", out)
+
+    def test_a_path_directive_is_taken_out_and_named(self):
+        text, paths = openclaw_pipe._take_gateway_media("Here.\nMEDIA:/tmp/a.png\nMEDIA:b.png\nBye.")
+        self.assertEqual(paths, ["/tmp/a.png"])
+        self.assertEqual(text, "Here.\nMEDIA:b.png\nBye.")
+
+    def test_a_path_in_code_is_text(self):
+        text = "Use `MEDIA:/tmp/a.png` like this."
+        self.assertEqual(openclaw_pipe._take_gateway_media(text), (text, []))
+
+    def test_unstored_paths(self):
+        f = openclaw_pipe._unstored_gateway_media
+        self.assertEqual(f(["/a/x.png"], 1, []), [])
+        self.assertEqual(f(["/a/x.png"], 0, []), ["x.png"])
+        self.assertEqual(f(["/a/x.png", "/a/y.png"], 1, ["y.png"]), ["y.png"])
+
+
+class TurnWriterImageTests(_TurnWriterCase):
+    """ELI-328: a turn the writer shows (an image tool's completion turn, a
+    background run) shows its images as the inline reply does: the runs'
+    stored Gateway image blocks, for a file named by path on any model."""
+
+    PATH = "/config/.openclaw/media/tool-image-generation/x.png"
+    BLOCK = {"type": "image", "url": "/api/chat/media/outgoing/s/1/full", "alt": "x.png",
+             "mimeType": "image/png"}
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.reads = []
+
+        async def history(session_key, limit=None, **kw):
+            self.reads.append(1)
+            blocks = [self.BLOCK] if len(self.reads) > 1 else []
+            return {"messages": [{"role": "assistant", "__openclaw": {"runId": "agent-run-1"},
+                                  "content": [{"type": "text", "text": "Done."}, *blocks]}]}
+        self.conn.session_history = history
+        self.shown = mock.AsyncMock(return_value="\n\n![x.png](/api/v1/files/f1/content)\n")
+        for name, value in (("_gateway_images_text", self.shown), ("_RUN_IMAGES_POLL_S", 0.01)):
+            patch = mock.patch.object(openclaw_pipe, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def _final_message(self):
+        return self.owui.msgs()["m1"]
+
+    async def test_a_path_in_media_urls_shows_the_stored_block(self):
+        w = self.writer()
+        await w.feed({"stream": "assistant", "data": {"delta": "Done.", "mediaUrls": [self.PATH]}})
+        await w.finalize()
+        self.assertEqual(len(self.reads), 2, "read again until the block is stored")
+        (blocks,), kw = self.shown.call_args
+        self.assertEqual((blocks, kw["missing"]), ([self.BLOCK], []))
+        m = self._final_message()
+        self.assertTrue(m["done"])
+        self.assertEqual(m["content"], "Done.\n\n![x.png](/api/v1/files/f1/content)")
+
+    async def test_a_path_directive_is_taken_out_of_the_text(self):
+        w = self.writer()
+        await w.feed(_delta(f"Done.\nMEDIA:{self.PATH}\n"))
+        await w.finalize()
+        self.assertNotIn("MEDIA:", self._final_message()["content"])
+        self.assertIn("![x.png]", self._final_message()["content"])
+
+    async def test_a_reply_that_is_only_an_image_is_still_written(self):
+        w = self.writer()
+        await w.feed({"stream": "assistant", "data": {"delta": "", "mediaUrls": [self.PATH]}})
+        self.assertFalse(w.opened, "nothing showable streamed")
+        await w.finalize()
+        self.assertIn("![x.png]", self._final_message()["content"])
+
+    async def test_a_run_that_named_no_file_reads_the_transcript_once(self):
+        w = self.writer()
+        await w.feed(_delta("Done."))
+        await w.finalize()
+        self.assertEqual(len(self.reads), 1)
+        self.shown.assert_not_called()
+
+
 class TurnWriterLockedDbTests(_TurnWriterCase):
     """ELI-167: Open WebUI's sqlite write lock held past its busy_timeout
     (5 s, WAL, BEGIN IMMEDIATE) when a run opens its message. The open waits
@@ -10227,8 +10391,10 @@ class InlineRewriteWiringTests(unittest.TestCase):
         send = ask.index("RUN_SEND")
         self.assertLess(ask.index("conn.register_consumer(self.session_key, idempotency_key)"), send)
         self.assertLess(ask.index("conn.continue_run_target(self.session_key, self.our_run_id, idempotency_key"), send)
-        self.assertGreaterEqual(src.count("conn.note_turn_rewrite("), 4,
-                                "2 MEDIA sites, 1 answered card, 1 fallback prompt")
+        self.assertGreaterEqual(src.count("conn.note_turn_rewrite("), 3,
+                                "1 MEDIA site (settle_held_media, also for streamed text), "
+                                "1 answered card, 1 fallback prompt")
+        self.assertIn("await self.settle_held_media(text)", src.split("async def show_text", 1)[1])
         self.assertIn("thinking=self.resolved_thinking", src.split("conn.register_run_target(")[1][:200])
 
 

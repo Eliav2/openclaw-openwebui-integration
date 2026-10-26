@@ -613,6 +613,12 @@ class _TurnWriter:
             # replace each one in place, by index (ELI-158).
             self.sent_output = [{"type": "_shown_by_request"} for _ in renderer.output]
         self._media_failed: set = set()  # MEDIA directives that did not resolve
+        # As the inline reply keeps them (ELI-328): files named by path, which
+        # are the runs' stored image blocks, the bare names and URLs of an
+        # assistant event's `mediaUrls`, and the images a Codex tool made.
+        self.gateway_media: set[str] = set()
+        self.event_media: list[str] = []
+        self.images_made = 0
         self._emit = None
         self._done = asyncio.Event()
         # Two pumps feed one writer when a recovery continues M; only one may
@@ -696,6 +702,15 @@ class _TurnWriter:
                 if payload.get("stream") == "lifecycle" and data.get("phase") == "start" \
                         and isinstance(data.get("startedAt"), (int, float)) and payload.get("runId"):
                     self.run_started.setdefault(payload["runId"], data["startedAt"])
+                if payload.get("stream") == "assistant":
+                    for url in _event_media_urls(data):
+                        if _is_gateway_media_name(url):
+                            self.gateway_media.add(url)
+                        elif url not in self.event_media:
+                            self.event_media.append(url)
+                elif (payload.get("stream") == CODEX_ITEM_STREAM and data.get("phase") == "completed"
+                      and data.get("type") == "imageGeneration"):
+                    self.images_made += 1
                 self.renderer.feed(payload)
         except Exception as ex:
             pipe_log(f"  turn writer: renderer feed failed: {ex}")
@@ -872,6 +887,12 @@ class _TurnWriter:
             return
         for directive in _media_directives(text, final):
             if directive in self._media_failed:
+                continue
+            fname = directive[len(_MEDIA_TRIGGER):].strip()
+            if _is_gateway_media_name(fname):
+                # Its image is the run's stored block, shown as M ends (ELI-328).
+                self.gateway_media.add(fname)
+                self.conn.note_turn_rewrite(self.chat_id, self.message_id, directive, "")
                 continue
             try:
                 shown, handled = await _resolve_media_text(
@@ -1152,14 +1173,21 @@ class _TurnWriter:
                 if not self._showable():
                     await self._show_silent_announce(hist)
             _keep_pipe_notes(streamed, self.renderer)
+            # A run whose reply is only an image has no text to show.
+            blocks, missing = await self._stored_media(hist)
             if not self.opened:
-                if not (self._showable() or note) or not await self._open_at_end():
+                if not (self._showable() or note or blocks or missing or self.event_media) \
+                        or not await self._open_at_end():
                     return
             output, text = await self._view(final=True)
             output = [i for i in output if not _is_sentinel_message_item(i)]
             text = text.strip()
             if text in _SILENT_SENTINELS:
                 text = ""
+            images = (await self._media_text(blocks, missing)).strip()
+            if images:
+                text = f"{text}\n\n{images}" if text else images
+                output.append(_turn_note_item(images))
             if note:
                 text = f"{text}\n\n{note}" if text else note
                 output.append(_turn_note_item(note))
@@ -1190,6 +1218,60 @@ class _TurnWriter:
                      f"{tools} tool card(s), {len(self.runs)} run(s))")
         finally:
             self._done.set()
+
+    async def _stored_media(self, hist: dict | None) -> tuple[list, list]:
+        """(image blocks, names of files never stored) of the runs written
+        into M, as the inline reply reads them (`finish_final_images`): the
+        Gateway attaches a run's images to its stored message after the
+        run's final, so a run that made or named some is read again until
+        they are there, bounded (ELI-328)."""
+        for _s, _e, fname in _media_scan(self.renderer.text)[0]:
+            if _is_gateway_media_name(fname):
+                self.gateway_media.add(fname)
+        names = {os.path.basename(p) for p in self.gateway_media}
+        expected = self.images_made + len(self.gateway_media)
+
+        def stored(h):
+            blocks, errors = [], []
+            for run in self.runs:
+                blocks += _history_image_blocks_for_run(h, run)
+                errors += [e for e in _history_media_errors_for_run(h, run)
+                           if os.path.basename(e) in names]
+            return blocks, errors
+        blocks, errors = stored(hist)
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        while len(blocks) + len(errors) < expected and loop.time() - start < _RUN_IMAGES_WAIT_S:
+            await asyncio.sleep(_RUN_IMAGES_POLL_S)
+            try:
+                hist = await self.conn.session_history(self.session_key, limit=RUN_HISTORY_LIMIT)
+            except Exception as ex:
+                pipe_log(f"  turn writer: chat.history for the run's images failed: {ex!r}")
+                break
+            blocks, errors = stored(hist)
+        if expected:
+            pipe_log(f"  turn writer: runs made {self.images_made} image(s) and named "
+                     f"{len(self.gateway_media)} file(s); {len(blocks)} stored")
+        return blocks, _unstored_gateway_media(sorted(self.gateway_media),
+                                               len(blocks) - self.images_made, errors)
+
+    async def _media_text(self, blocks: list, missing: list) -> str:
+        """M's images as the inline reply shows them: the stored blocks, then
+        each bare name or URL of an assistant event's `mediaUrls`."""
+        try:
+            emit = await self._emitter()
+            text = await _gateway_images_text(blocks, valves=self.conn._valves(),
+                                              __event_emitter__=emit, missing=missing) \
+                if blocks or missing else ""
+            if self.event_media:
+                shown, _handled = await _resolve_media_text(
+                    "\n".join(f"MEDIA:{u}" for u in self.event_media) + "\n",
+                    valves=self.conn._valves(), __event_emitter__=emit)
+                text = f"{text}\n\n{shown}"
+        except Exception as ex:
+            pipe_log(f"  turn writer: the run's images could not be shown: {ex!r}")
+            return ""
+        return text
 
     async def _open_at_end(self) -> bool:
         """The run is over and no event is left to retry a locked open on, so

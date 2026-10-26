@@ -1,40 +1,38 @@
 ---
 name: "openclaw-owui-media"
-description: "Show an image or file in the Open WebUI chat by emitting a MEDIA: line with a bare filename."
+description: "Show an image or file in the Open WebUI chat by emitting a MEDIA: line with the file's absolute path on the Gateway host, or a bare filename."
 ---
 
 # Sending an image or file to Open WebUI
 
 The OpenClaw ⇄ Open WebUI pipe can attach a file to your reply so it renders
-inline in the chat.
+inline in the chat. Any model can do it; no shell is needed.
 
 ## How to send
 
-Put the file in the pipe's media directory, then emit a line containing only:
+Emit a line containing only `MEDIA:` and the file's absolute path on the
+Gateway host, where you run:
 
 ```
-MEDIA:diagram.png
+MEDIA:/home/me/output/chart.png
 ```
 
-The pipe uploads it through Open WebUI's own Files API and attaches it to your
-message. The user sees the image inline, not a link.
+That is all. The Gateway stores the file with your reply, and the pipe fetches
+it from there and shows it inline once your reply ends. Use this when a tool
+told you where it saved a file (an image tool, a screenshot).
 
-## The one rule that breaks people
+## Bare filenames
 
-**Use a bare filename. Never an absolute path.**
+A bare filename works too, for a file already in the pipe's media directory:
 
 ```
-MEDIA:chart.png                     correct
-MEDIA:/home/me/output/chart.png     silently drops
+MEDIA:chart.png
 ```
 
-OpenClaw and Open WebUI usually run as separate containers with no shared
-filesystem, so a path that is valid where you are running means nothing to the
-pipe. A path-shaped `MEDIA:` line produces no image and no error, which makes it
-very hard to notice you got it wrong.
-
-If your deployment ships a helper script for uploading, use it: it puts the file
-where the pipe can see it and prints the exact line to emit.
+If your deployment ships an upload helper script, it puts the file there and
+prints that exact line. It is optional: use it only if you have a shell and
+want the image to show while you are still writing. Otherwise use the absolute
+path.
 
 ## Notes
 
@@ -42,4 +40,7 @@ where the pipe can see it and prints the exact line to emit.
 - The filename needs an extension, otherwise the pipe treats it as ordinary
   prose. This is deliberate, so that writing about `MEDIA:` in a sentence does
   not turn the next word into a broken image.
+- A `MEDIA:` line in a code block is left alone.
+- An image the Gateway could not store (a path that does not exist on its host)
+  is named in the reply, not dropped.
 - Ordinary text can sit before and after the line, it is left alone.
