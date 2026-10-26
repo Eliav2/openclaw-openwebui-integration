@@ -2534,6 +2534,20 @@ async def _session_list_active(conn: "_GatewayConnection", session_key: str,
 ORPHAN_HISTORY_TIMEOUT_S = 60
 
 
+def _stub_session_key(conn: "_GatewayConnection", agent_id: str, user_id: str, chat_id: str,
+                      stub_id: str) -> str:
+    """The session a reply stub's run is in: the chat's own, or the column of
+    another model answering next to it (ELI-329), found from the history
+    line that holds the reply."""
+    column = 0
+    try:
+        state_dir = _state_dir(getattr(conn._valves(), "STATE_DIR", ""))
+        column = _history_column_of(state_dir, chat_id, [stub_id]) or 0
+    except Exception as ex:
+        pipe_log(f"  orphan stub {stub_id[:8]}...: no column ({ex!r}); using the chat's session")
+    return _owui_session_key(agent_id, user_id, chat_id, column)
+
+
 async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
                           chat_id: str, stub_id: str, *, wait: bool = True) -> str:
     """Finish one orphaned reply stub from its run in the transcript. A run
@@ -2559,7 +2573,7 @@ async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
                 return "skip"
             return await _adopt_turn_message(
                 conn, chat_id=chat_id, user_id=chat.user_id, message_id=stub_id,
-                session_key=_owui_session_key(agent_id, chat.user_id, chat_id),
+                session_key=_stub_session_key(conn, agent_id, chat.user_id, chat_id, stub_id),
                 meta=stub.get("meta") or {})
         # Open WebUI stamps the task id of the request that will fill a stub
         # on it just before it starts that task. With none, no request has
@@ -2572,7 +2586,7 @@ async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
             return "skip"
         if await _owui_chat_has_live_task(chat_id):
             return "skip"  # a live request owns it
-        session_key = _owui_session_key(agent_id, chat.user_id, chat_id)
+        session_key = _stub_session_key(conn, agent_id, chat.user_id, chat_id, stub_id)
         changed = conn.session_change_event(session_key)
         try:
             hist = await conn.session_history(session_key, limit=RUN_HISTORY_LIMIT,

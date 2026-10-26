@@ -959,7 +959,14 @@ class _PipeTurn:
             self.chat_id = f"owui-{uuid.uuid4().hex[:12]}"
             pipe_log("WARNING: no chat_id in metadata, generated random:", self.chat_id)
 
-        self.session_key = _owui_session_key(self.pipe.valves.AGENT_ID, user_id, self.chat_id)
+        # Several models picked for one message: each Pipe model's reply runs
+        # in its own session, so they do not queue behind one another or share
+        # one model override (ELI-329).
+        state_dir = _state_dir(getattr(self.pipe.valves, "STATE_DIR", ""))
+        self.column = await _reply_column(state_dir, self.owui_origin_chat_id, self.body.get("model"),
+                                    self.__metadata__ or {})
+        self.session_key = _owui_session_key(self.pipe.valves.AGENT_ID, user_id, self.chat_id,
+                                             self.column)
         pipe_log(f"Session key: {self.session_key}")
 
         if self.turn is None:
@@ -972,8 +979,8 @@ class _PipeTurn:
         # says so first (ELI-183). Not for the thinking-retry recursion, whose
         # texts already went out once.
         history_prefix = "" if self._send_texts else await _history_prefix(
-            self.conn, _state_dir(getattr(self.pipe.valves, "STATE_DIR", "")),
-            self.owui_origin_chat_id, self.session_key, self.__metadata__ or {}, messages)
+            self.conn, state_dir, self.owui_origin_chat_id, self.session_key,
+            self.__metadata__ or {}, messages, self.column, self.body.get("model"))
         self.turn.unsent = (list(self._send_texts) if self._send_texts
                             else [history_prefix + self.text])
         meta = self.__metadata__ or {}

@@ -315,8 +315,12 @@ async def _recover_turn_text(conn, session_key: str, user_text: str) -> str | No
     return text
 
 
-def _owui_session_key(agent_id: str, user_id: str, chat_id: str) -> str:
-    return f"agent:{agent_id}:openwebui-{user_id}-{chat_id}"
+def _owui_session_key(agent_id: str, user_id: str, chat_id: str, column: int = 0) -> str:
+    """The chat's session. Column 0 is the chat's own; a model answering next
+    to another Pipe model in a multi-model chat gets column `n` (ELI-329),
+    which `parse_owui_session_key` still maps to the same chat."""
+    key = f"agent:{agent_id}:openwebui-{user_id}-{chat_id}"
+    return f"{key}-m{column}" if column else key
 
 
 def _session_thinking_ladder(desc: dict) -> list | None:

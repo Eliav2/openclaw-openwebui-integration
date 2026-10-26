@@ -50,6 +50,7 @@ class FakeRows:
         self.tree = tree
         self.origin_id = origin
         self.reads = 0
+        self.idx = {}   # {reply id: place of its model among the picked ones}
 
     async def parent(self, message_id):
         self.reads += 1
@@ -59,6 +60,15 @@ class FakeRows:
     async def text(self, message_id):
         row = self.tree.get(message_id)
         return row[2] if row else None
+
+    async def model_idx(self, message_id):
+        return self.idx.get(message_id)
+
+    async def message(self, message_id):
+        row = self.tree.get(message_id)
+        if row is None:
+            return None, None, None
+        return row[0], row[2], row[3] if len(row) > 3 else None
 
     async def origin(self):
         return self.origin_id

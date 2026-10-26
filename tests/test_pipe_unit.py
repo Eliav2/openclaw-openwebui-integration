@@ -680,6 +680,30 @@ class OrphanStubReconcileTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self._stub()["content"], "Reading them.\n\nFound it.")
         self.assertIs(self._stub()["done"], True)
 
+    async def test_a_reply_answered_in_a_model_column_is_finished_from_that_session(self):
+        """ELI-329: the second model of a multi-model chat has its own session."""
+        import tempfile
+        state = tempfile.mkdtemp()
+        self.conn._valves = lambda: types.SimpleNamespace(AGENT_ID="main", STATE_DIR=state)
+        sk1 = openclaw_pipe._owui_session_key("main", self.USER, self.CHAT, 1)
+        asked = []
+        real = self.conn.send_request
+
+        async def send_request(method, params, timeout=10):
+            asked.append(params.get("sessionKey") or params.get("key"))
+            if method == "sessions.list":
+                return {"sessions": [{"key": sk1, "hasActiveRun": False}]}
+            return await real(method, params, timeout)
+        self.conn.send_request = send_request
+        for column, tail in ((0, ["u1", "other-reply"]), (1, ["u1", self.STUB])):
+            openclaw_pipe._history_line_write(
+                state, openclaw_pipe._history_line_id(self.CHAT, column), {"tail": tail})
+        self.history, self.active = _turn_history(), False
+        await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB)
+        self.assertIn(sk1, asked)
+        self.assertNotIn(self.sk, asked)
+        self.assertIs(self._stub()["done"], True)
+
     async def test_a_gone_writers_message_is_adopted_even_with_another_task_in_the_chat(self):
         self._stub()["meta"] = {"openclaw_writer": "1:gone", "openclaw_run": "agent-run-1"}
         self.live_task = True

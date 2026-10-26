@@ -2407,3 +2407,170 @@ def test_a_cancelled_chat_write_leaves_the_database_writable(token, mode):
         raise ProbeIneffective(result)
     if result["bug"]:
         raise Eli205Present(result)
+
+
+# ── Several models side by side (ELI-329) ───────────────────────────────────
+# One message sent to several models makes Open WebUI call the Pipe once per
+# model, together, for the same chat. These tests send it the way the browser
+# does (one assistant message per model under the user message, one request
+# carrying `message_ids`) and read back what Open WebUI saved and what each
+# OpenClaw session was given.
+
+def _model_ids(token: str) -> tuple[str, str]:
+    """Two different Pipe models of the stack: the default and e2e-echo."""
+    status, body = _request("GET", "/api/models", token=token)
+    ids = [m["id"] for m in body["data"]]
+    routed = next(i for i in ids if i.startswith("openclaw_gateway.") and i.endswith("/e2e-echo"))
+    return DEFAULT_MODEL, routed
+
+
+def _side_by_side(token: str, prompt: str, models: list, chat_id: str | None = None,
+                  parent: str | None = None, regenerate: str | None = None) -> tuple[str, str, dict]:
+    """The browser's send to `models`: (chat id, user message id, {model index:
+    saved assistant message}) once every reply is done. `parent` is the reply
+    the new message follows. `regenerate`: the user message id to answer again
+    with `models[0]` alone (Try Again on one reply)."""
+    now = int(time.time())
+    if chat_id:
+        status, got = _request("GET", f"/api/v1/chats/{chat_id}", token=token)
+        assert status == 200, got
+        chat = got["chat"]
+    else:
+        chat = {"title": "New Chat", "models": models, "history": {"messages": {}, "currentId": None},
+                "messages": [], "files": [], "tags": [], "timestamp": now * 1000}
+    msgs = chat["history"]["messages"]
+    if regenerate:
+        uid = regenerate
+        user = msgs[uid]
+    else:
+        uid = str(uuid.uuid4())
+        user = {"id": uid, "parentId": parent, "childrenIds": [], "role": "user", "content": prompt,
+                "timestamp": now, "models": models}
+        msgs[uid] = user
+        if parent:
+            msgs[parent]["childrenIds"].append(uid)
+    replies = []
+    for idx, model in enumerate(models):
+        rid = str(uuid.uuid4())
+        msgs[rid] = {"id": rid, "parentId": uid, "childrenIds": [], "role": "assistant", "content": "",
+                     "model": model, "modelIdx": idx, "timestamp": now, "done": False}
+        user["childrenIds"].append(rid)
+        replies.append((model, rid, idx))
+    chat["history"]["currentId"] = replies[0][1]
+    if chat_id:
+        status, saved = _request("POST", f"/api/v1/chats/{chat_id}", {"chat": chat}, token)
+        assert status == 200, saved
+    else:
+        status, new = _request("POST", "/api/v1/chats/new", {"chat": chat}, token)
+        assert status == 200, new
+        chat_id = new["id"]
+    path, at = [], uid
+    while at:
+        m = msgs[at]
+        path.insert(0, {"role": m["role"], "content": m["content"]})
+        at = m.get("parentId")
+    status, ack = _request("POST", "/api/chat/completions", {
+        "model": replies[0][0], "messages": path, "stream": True, "chat_id": chat_id,
+        "id": replies[0][1],
+        "message_ids": [{"model_id": m, "message_id": r, "modelIdx": i} for m, r, i in replies],
+        "session_id": f"e2e-{uuid.uuid4().hex[:8]}", "parent_id": user.get("parentId"),
+        "user_message": user,
+    }, token)
+    assert status == 200, f"completion request failed: {status} {ack}"
+    deadline = time.time() + TURN_TIMEOUT_S
+    done: dict = {}
+    while time.time() < deadline and len(done) < len(replies):
+        status, got = _request("GET", f"/api/v1/chats/{chat_id}", token=token)
+        assert status == 200, got
+        for _, rid, idx in replies:
+            if got["chat"]["history"]["messages"].get(rid, {}).get("done"):
+                done[idx] = got["chat"]["history"]["messages"][rid]
+        time.sleep(1.5)
+    assert len(done) == len(replies), f"replies not all done in {TURN_TIMEOUT_S:.0f}s: {sorted(done)}"
+    return chat_id, uid, done
+
+
+def _session_texts(key: str) -> list:
+    """The text of every user turn the Gateway session holds, oldest first."""
+    out = []
+    for m in _gw("chat.history", {"sessionKey": key, "limit": 100}).get("messages") or []:
+        if m.get("role") == "user":
+            out.append(_content_text(m.get("content")))
+    return out
+
+
+def _turns_in(key: str, marker: str) -> int:
+    return sum(marker in t for t in _session_texts(key))
+
+
+def test_two_pipe_models_side_by_side_answer_in_their_own_sessions(token):
+    first, second = _model_ids(token)
+    marker = f"E2E_MM_{uuid.uuid4().hex[:6]}"
+    chat_id, uid, done = _side_by_side(token, f"Respond with exactly: {marker}", [first, second])
+    # Both replies came back whole, on their own message: nothing crossed or overwritten.
+    assert [done[i]["content"].strip() for i in (0, 1)] == [marker, marker], done
+    assert done[0]["model"] == first and done[1]["model"] == second
+    key = _session_key(token, chat_id)
+    # Each model ran in a session of its own, as a plain send: no Regenerate note.
+    for k in (key, key + "-m1"):
+        texts = [t for t in _session_texts(k) if marker in t]
+        assert len(texts) == 1, (k, _session_texts(k))
+        assert "[Open WebUI:" not in texts[0], texts[0]
+    # ... and on its own model, which one session shared before.
+    served = {_model_for(key), _model_for(key + "-m1")}
+    assert served == {"e2e-default", "e2e-echo"}, served
+
+    # The user picks the second model's reply and goes on with that model alone.
+    follow = f"E2E_MM_FOLLOW_{uuid.uuid4().hex[:6]}"
+    _, uid2, done2 = _side_by_side(token, f"Respond with exactly: {follow}", [second],
+                                   chat_id=chat_id, parent=done[1]["id"])
+    assert done2[0]["content"].strip() == follow
+    assert _turns_in(key + "-m1", follow) == 1 and _turns_in(key, follow) == 0
+    assert "[Open WebUI:" not in "".join(t for t in _session_texts(key + "-m1") if follow in t)
+
+    # Try Again on the first model's reply: only that session hears of it.
+    again = _side_by_side(token, "", [first], chat_id=chat_id, regenerate=uid)
+    assert again[2][0]["content"].strip() == marker
+    texts = [t for t in _session_texts(key) if marker in t]
+    assert len(texts) == 2 and "new answer" in texts[1], texts
+    assert _turns_in(key + "-m1", marker) == 1
+    _request("DELETE", f"/api/v1/chats/{chat_id}", token=token)
+
+
+def _model_for(key: str) -> str:
+    """The model a session's runs were served by, from the Gateway's session row."""
+    row = _session_row(key)
+    return str(row.get("model") or row.get("modelOverride") or "").split("/")[-1]
+
+
+def test_a_pipe_model_next_to_another_provider_keeps_the_chats_session(token):
+    pipe_model, _ = _model_ids(token)
+    status, cfg = _request("GET", "/openai/config", token=token)
+    assert status == 200, cfg
+    status, got = _request("POST", "/openai/config/update", {
+        "ENABLE_OPENAI_API": True, "OPENAI_API_BASE_URLS": ["http://127.0.0.1:18999/v1"],
+        "OPENAI_API_KEYS": ["e2e"], "OPENAI_API_CONFIGS": {"0": {"enable": True}}}, token)
+    assert status == 200, got
+    try:
+        status, body = _request("GET", "/api/models?refresh=true", token=token)
+        other = next((m["id"] for m in body["data"] if not m["id"].startswith("openclaw_")), None)
+        assert other, f"the other provider's model is not listed: {[m['id'] for m in body['data']]}"
+        # Long enough that a 60-character quote of it would not be the reply.
+        marker = f"E2E_MM_OTHER_{uuid.uuid4().hex[:6]}_" + "long_" * 30
+        chat_id, uid, done = _side_by_side(token, f"Respond with exactly: {marker}", [pipe_model, other])
+        assert done[0]["content"].strip() == marker and done[1]["content"].strip(), done
+        key = _session_key(token, chat_id)
+        texts = [t for t in _session_texts(key) if marker in t]
+        assert len(texts) == 1 and "[Open WebUI:" not in texts[0], texts
+        # Going on from the other provider's reply tells the agent what it said.
+        follow = f"E2E_MM_OTHER_FOLLOW_{uuid.uuid4().hex[:6]}"
+        _side_by_side(token, f"Respond with exactly: {follow}", [pipe_model], chat_id=chat_id,
+                      parent=done[1]["id"])
+        sent = [t for t in _session_texts(key) if follow in t]
+        assert len(sent) == 1 and done[1]["content"].strip() in sent[0], sent
+        _request("DELETE", f"/api/v1/chats/{chat_id}", token=token)
+    finally:
+        _request("POST", "/openai/config/update", {
+            "ENABLE_OPENAI_API": False, "OPENAI_API_BASE_URLS": [], "OPENAI_API_KEYS": [],
+            "OPENAI_API_CONFIGS": {}}, token)
+        _request("GET", "/api/models?refresh=true", token=token)

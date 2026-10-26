@@ -89,7 +89,7 @@ openclaw-openwebui-integration/
 │       ├── emit.py                  # Event emission / tool-card formatting helpers
 │       ├── media.py                  # MEDIA: directive handling, OWUI Files API upload, file server
 │       ├── models.py                  # Dynamic model discovery, cached list, fallback list
-│       ├── history.py                 # Edit/Regenerate/branch notes and the copied messages of a cloned chat
+│       ├── history.py                 # Edit/Regenerate/branch notes, the copied messages of a cloned chat, and a multi-model chat's session columns
 │       ├── identity.py                 # Ed25519 device identity load/generate/persist
 │       ├── state.py                     # STATE_DIR read/write helpers
 │       ├── thinking.py                  # Thinking levels and clamping, shared by the Pipe and the Filter
