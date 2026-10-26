@@ -4602,8 +4602,12 @@ async def _recover_turn_text(conn, session_key: str, user_text: str) -> str | No
     return text
 
 
-def _owui_session_key(agent_id: str, user_id: str, chat_id: str) -> str:
-    return f"agent:{agent_id}:openwebui-{user_id}-{chat_id}"
+def _owui_session_key(agent_id: str, user_id: str, chat_id: str, column: int = 0) -> str:
+    """The chat's session. Column 0 is the chat's own; a model answering next
+    to another Pipe model in a multi-model chat gets column `n` (ELI-329),
+    which `parse_owui_session_key` still maps to the same chat."""
+    key = f"agent:{agent_id}:openwebui-{user_id}-{chat_id}"
+    return f"{key}-m{column}" if column else key
 
 
 def _session_thinking_ladder(desc: dict) -> list | None:
@@ -10922,6 +10926,20 @@ async def _session_list_active(conn: "_GatewayConnection", session_key: str,
 ORPHAN_HISTORY_TIMEOUT_S = 60
 
 
+def _stub_session_key(conn: "_GatewayConnection", agent_id: str, user_id: str, chat_id: str,
+                      stub_id: str) -> str:
+    """The session a reply stub's run is in: the chat's own, or the column of
+    another model answering next to it (ELI-329), found from the history
+    line that holds the reply."""
+    column = 0
+    try:
+        state_dir = _state_dir(getattr(conn._valves(), "STATE_DIR", ""))
+        column = _history_column_of(state_dir, chat_id, [stub_id]) or 0
+    except Exception as ex:
+        pipe_log(f"  orphan stub {stub_id[:8]}...: no column ({ex!r}); using the chat's session")
+    return _owui_session_key(agent_id, user_id, chat_id, column)
+
+
 async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
                           chat_id: str, stub_id: str, *, wait: bool = True) -> str:
     """Finish one orphaned reply stub from its run in the transcript. A run
@@ -10947,7 +10965,7 @@ async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
                 return "skip"
             return await _adopt_turn_message(
                 conn, chat_id=chat_id, user_id=chat.user_id, message_id=stub_id,
-                session_key=_owui_session_key(agent_id, chat.user_id, chat_id),
+                session_key=_stub_session_key(conn, agent_id, chat.user_id, chat_id, stub_id),
                 meta=stub.get("meta") or {})
         # Open WebUI stamps the task id of the request that will fill a stub
         # on it just before it starts that task. With none, no request has
@@ -10960,7 +10978,7 @@ async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
             return "skip"
         if await _owui_chat_has_live_task(chat_id):
             return "skip"  # a live request owns it
-        session_key = _owui_session_key(agent_id, chat.user_id, chat_id)
+        session_key = _stub_session_key(conn, agent_id, chat.user_id, chat_id, stub_id)
         changed = conn.session_change_event(session_key)
         try:
             hist = await conn.session_history(session_key, limit=RUN_HISTORY_LIMIT,
@@ -11541,6 +11559,13 @@ async def _discover_models_with_source(valves) -> tuple[list[dict], str]:
 # Open WebUI can call the Pipe twice for one reply (ELI-82); the second call
 # must send the same text, so the line keeps the last reply id and what was
 # put before its message.
+#
+# Several models at once (ELI-329): Open WebUI calls the Pipe once per model,
+# together, for the same user message. Each Pipe model's reply gets its own
+# session ("column", see `_owui_session_key`) with its own line, so the replies
+# neither queue behind one another nor take each other for a Regenerate. A
+# column's session has not seen what the others said: when the user goes on
+# from another model's reply, the note carries that reply in full.
 # ---------------------------------------------------------------------------
 
 HISTORY_TAIL_MAX = 64
@@ -11550,9 +11575,78 @@ HISTORY_SEED_MAX_CHARS = 32_000
 HISTORY_QUOTE_CHARS = 60
 HISTORY_LINE_DIR = "history-line"
 HISTORY_LINE_KEEP_S = 180 * 86400
+# Most Pipe models one message can go to side by side.
+MULTI_MODEL_COLUMNS_MAX = 16
+# One reply carried whole into another column's session.
+HISTORY_REPLY_MAX_CHARS = 8_000
 _history_line_pruned = False
 
 _DETAILS_BLOCK = re.compile(r"<details\b[^>]*>.*?</details>", re.S | re.I)
+
+
+def _history_line_id(chat_id: str, column: int = 0) -> str:
+    """The name of a session's line file: the chat's id, then `-m<column>`."""
+    return f"{chat_id}-m{column}" if column else chat_id
+
+
+def _pipe_model_column(model, models, model_idx=None) -> tuple[int, int]:
+    """(column, how many Pipe models) of a request: `models` is the list the
+    user picked for the message (Open WebUI's `user_message.models`) and
+    `model` the one this request is for. A model is the Pipe's when it shares
+    `model`'s function id, so models of other providers take no column. The
+    same model picked twice is told apart by `model_idx`, the place of the
+    reply's model in `models`."""
+    if not (isinstance(model, str) and "." in model and isinstance(models, list)):
+        return 0, 1
+    prefix = model.split(".", 1)[0] + "."
+    ours = [m for m in models if isinstance(m, str) and m.startswith(prefix)]
+    if len(ours) < 2 or model not in ours:
+        return 0, 1
+    if isinstance(model_idx, int) and 0 <= model_idx < len(models) and models[model_idx] == model:
+        column = len([m for m in models[:model_idx] if isinstance(m, str) and m.startswith(prefix)])
+    else:
+        column = ours.index(model)
+    return min(column, MULTI_MODEL_COLUMNS_MAX - 1), len(ours)
+
+
+def _history_column_of(state_dir: str, chat_id: str, ids) -> int | None:
+    """The column whose line holds one of the message `ids`, if any: where a
+    reply the user goes on from was answered. Columns are made in order, so
+    the first one without a line is the last."""
+    ids = [i for i in ids if i]
+    for column in range(MULTI_MODEL_COLUMNS_MAX):
+        path = _history_line_path(state_dir, _history_line_id(chat_id, column))
+        if column and not os.path.exists(path):
+            break
+        tail = _history_line_read(state_dir, _history_line_id(chat_id, column))["tail"]
+        if any(i in tail for i in ids):
+            return column
+    return None
+
+
+async def _reply_column(state_dir: str, chat_id: str | None, model, metadata: dict) -> int:
+    """The column (session) this request's reply belongs to. With several Pipe
+    models picked it is the model's place among them. Otherwise the column
+    that holds the message it follows, so going on from the second model's
+    reply continues that model's session; a chat that never had more than one
+    column is always column 0."""
+    um = metadata.get("user_message") if isinstance(metadata.get("user_message"), dict) else {}
+    models = um.get("models")
+    model_idx = None
+    if chat_id and isinstance(models, list) and models.count(model) > 1 and metadata.get("message_id"):
+        # The same model twice: the reply's column in Open WebUI says which.
+        try:
+            model_idx = await _owui_history_rows(chat_id).model_idx(metadata["message_id"])
+        except Exception as ex:
+            pipe_log(f"[history] chat {chat_id[:8]}: no column index for the reply: {ex!r}")
+    column, count = _pipe_model_column(model, models, model_idx)
+    if count > 1:
+        return column
+    if chat_id:
+        found = _history_column_of(state_dir, chat_id, [metadata.get("user_message_id"), um.get("parentId")])
+        if found is not None:
+            return found
+    return 0
 
 
 def _history_line_path(state_dir: str, chat_id: str) -> str:
@@ -11635,6 +11729,26 @@ class _OwuiHistoryRows:
         row = await self._row(message_id, "content")
         return None if row is None else _coerce_text(row[0])
 
+    async def model_idx(self, message_id: str) -> int | None:
+        """The place of a reply's model among the models picked for its
+        message (side by side), kept on the reply in the chat row."""
+        from sqlalchemy import select
+        from open_webui.internal.db import get_async_db_context
+        from open_webui.models.chats import Chat
+
+        async with get_async_db_context() as db:
+            row = (await db.execute(
+                select(Chat.chat["history"]["messages"][message_id]["modelIdx"].as_integer())
+                .where(Chat.id == self.chat_id))).first()
+        return row[0] if row and row[0] is not None else None
+
+    async def message(self, message_id: str) -> tuple:
+        """(role, text, model id) of a message; role None when it has no row."""
+        row = await self._row(message_id, "role", "content", "model_id")
+        if row is None:
+            return None, None, None
+        return row[0], _coerce_text(row[1]), row[2]
+
     async def origin(self) -> str | None:
         """The chat this one was cloned or forked from, if any."""
         from sqlalchemy import select
@@ -11698,9 +11812,41 @@ def _messages(n: int) -> str:
     return f"{n} message" + ("" if n == 1 else "s")
 
 
-async def _history_note(change: dict, rows) -> str:
+async def _shown_in_full(shown: list, rows) -> str:
+    """The messages the chat now shows, whole (each cut at
+    `HISTORY_REPLY_MAX_CHARS`, all of them at `HISTORY_SEED_MAX_CHARS`)."""
+    entries, used = [], 0
+    for mid in shown:
+        role, text, _ = await rows.message(mid)
+        text = _DETAILS_BLOCK.sub("", text or "").strip()
+        if role not in ("user", "assistant") or not text:
+            continue
+        if len(text) > HISTORY_REPLY_MAX_CHARS:
+            text = text[:HISTORY_REPLY_MAX_CHARS - 1].rstrip() + "…"
+        entry = f"{'User' if role == 'user' else 'Assistant'}: {text}"
+        if used + len(entry) + 2 > HISTORY_SEED_MAX_CHARS:
+            break
+        entries.append(entry)
+        used += len(entry) + 2
+    return "\n\n".join(entries)
+
+
+async def _shown_from_other_model(shown: list, rows, model_prefix: str | None) -> bool:
+    """Whether the chat now shows a reply of a model that is not the Pipe's:
+    the agent has never seen it."""
+    for mid in shown:
+        role, _, model_id = await rows.message(mid)
+        if role == "assistant" and model_id and model_prefix and not model_id.startswith(model_prefix):
+            return True
+    return False
+
+
+async def _history_note(change: dict, rows, in_full: bool = False) -> str:
     """The short note put before the message when the chat no longer shows
-    what the agent remembers (about 50 tokens: counts plus two short quotes)."""
+    what the agent remembers (about 50 tokens: counts plus two short quotes).
+    `in_full`: the user went on from a reply written in another session
+    (several models side by side), so a branch switch carries what the chat
+    now shows whole."""
     kind, replaced, shown = change["kind"], change["replaced"], change["shown"]
     if kind == "regenerate":
         after = f" and the {_messages(len(replaced) - 1)} after it" if len(replaced) > 1 else ""
@@ -11718,15 +11864,23 @@ async def _history_note(change: dict, rows) -> str:
                 f"The message below follows what is left.]")
     first_old = _history_quote(await rows.text(replaced[0]))
     first_new = _history_quote(await rows.text(shown[0]))
+    if in_full:
+        whole = await _shown_in_full(shown, rows)
+        if whole:
+            return (f"[Open WebUI: the chat shows answers of several models side by side and the user "
+                    f"went on from another one. {_messages(len(replaced))} from {first_old} on are no "
+                    f"longer shown; it now shows {_messages(len(shown))} from {first_new} on, here in "
+                    f"full:]\n\n{whole}\n\n[End of those messages. The user's new message follows.]")
     return (f"[Open WebUI: the user switched to another branch of the chat. {_messages(len(replaced))} "
             f"from {first_old} on are no longer shown; it now shows {_messages(len(shown))} from "
             f"{first_new} on, then the message below.]")
 
 
-def _history_seed(messages: list) -> str:
+def _history_seed(messages: list, side_by_side: bool = False) -> str:
     """The copied messages of a cloned chat, for its first message: newest
     first while they fit in `HISTORY_SEED_MAX_CHARS`, tool-call details left
-    out. Empty when there is nothing to copy."""
+    out. Empty when there is nothing to copy. `side_by_side`: the session is
+    a new model column of a chat that went on without it, not a copy."""
     entries = []
     for m in messages:
         role = m.get("role")
@@ -11747,9 +11901,12 @@ def _history_seed(messages: list) -> str:
         used += len(entry) + 2
     left_out = len(entries) - len(kept)
     cut = f"; the oldest {_messages(left_out)} are left out to fit" if left_out else ""
-    return ("[Open WebUI: this chat is a copy of another chat. You have not seen its earlier "
-            f"messages, so here they are{cut}:]\n\n" + "\n\n".join(reversed(kept))
-            + "\n\n[End of the copied messages. The user's new message follows.]")
+    why = ("this chat shows answers of several models side by side, and you are one of them. "
+           "You have not seen its earlier messages" if side_by_side
+           else "this chat is a copy of another chat. You have not seen its earlier messages")
+    return (f"[Open WebUI: {why}, so here they are{cut}:]\n\n" + "\n\n".join(reversed(kept))
+            + f"\n\n[End of the {'earlier' if side_by_side else 'copied'} messages. "
+            "The user's new message follows.]")
 
 
 async def _gateway_has_session(conn, session_key: str) -> bool:
@@ -11763,26 +11920,42 @@ async def _gateway_has_session(conn, session_key: str) -> bool:
 
 
 async def _history_prefix(conn, state_dir: str, chat_id: str | None, session_key: str,
-                          metadata: dict, messages: list) -> str:
+                          metadata: dict, messages: list, column: int = 0, model=None) -> str:
     """What to put before this request's message so the agent's memory matches
-    the chat (see above): "" on a normal send. Updates the chat's line."""
+    the chat (see above): "" on a normal send. Updates the session's line
+    (`column`: which of the chat's sessions this reply is in)."""
     user_id = metadata.get("user_message_id")
     reply_id = metadata.get("message_id")
     if not (chat_id and user_id and reply_id):
         return ""   # not a user's turn in a saved chat (e.g. a scheduled turn)
-    line = _history_line_read(state_dir, chat_id)
+    line_id = _history_line_id(chat_id, column)
+    line = _history_line_read(state_dir, line_id)
     if line.get("reply") == reply_id:
         return line.get("prefix") or ""   # Open WebUI's second call for this reply
     rows = _owui_history_rows(chat_id)
-    user_parent = ((metadata.get("user_message") or {}).get("parentId")
-                   if isinstance(metadata.get("user_message"), dict) else None)
+    um = metadata.get("user_message") if isinstance(metadata.get("user_message"), dict) else {}
+    user_parent = um.get("parentId")
     prefix = ""
     try:
         change = await _history_change(line["tail"], user_id, reply_id, rows, user_parent)
         if change["kind"]:
-            prefix = await _history_note(change, rows) + "\n\n"
+            in_full = False
+            if change["kind"] == "branch":
+                # The agent has not seen the reply the user went on from when
+                # it was written in another session or by another provider.
+                prefixed = isinstance(model, str) and "." in model
+                in_full = (len(um.get("models") or []) > 1 or await _shown_from_other_model(
+                    change["shown"], rows, model.split(".", 1)[0] + "." if prefixed else None))
+            prefix = await _history_note(change, rows, in_full) + "\n\n"
             pipe_log(f"[history] chat {chat_id[:8]}: {change['kind']}, {len(change['replaced'])} "
                      f"replaced, {len(change['shown'])} shown")
+        elif not line["tail"] and len(messages) > 1 and column \
+                and not await _gateway_has_session(conn, session_key):
+            seed = _history_seed(messages[:-1], side_by_side=True)
+            if seed:
+                prefix = seed + "\n\n"
+                pipe_log(f"[history] chat {chat_id[:8]}: new model column {column}, "
+                         f"seeding {len(seed)} chars")
         elif not line["tail"] and len(messages) > 1 and await rows.origin() \
                 and not await _gateway_has_session(conn, session_key):
             seed = _history_seed(messages[:-1])
@@ -11792,7 +11965,7 @@ async def _history_prefix(conn, state_dir: str, chat_id: str | None, session_key
     except Exception as ex:
         pipe_log(f"[history] chat {chat_id[:8]}: could not compare with the line: {ex!r}")
         return ""
-    _history_line_write(state_dir, chat_id, {"tail": change["tail"], "reply": reply_id,
+    _history_line_write(state_dir, line_id, {"tail": change["tail"], "reply": reply_id,
                                              "prefix": prefix})
     return prefix
 
@@ -12758,7 +12931,14 @@ class _PipeTurn:
             self.chat_id = f"owui-{uuid.uuid4().hex[:12]}"
             pipe_log("WARNING: no chat_id in metadata, generated random:", self.chat_id)
 
-        self.session_key = _owui_session_key(self.pipe.valves.AGENT_ID, user_id, self.chat_id)
+        # Several models picked for one message: each Pipe model's reply runs
+        # in its own session, so they do not queue behind one another or share
+        # one model override (ELI-329).
+        state_dir = _state_dir(getattr(self.pipe.valves, "STATE_DIR", ""))
+        self.column = await _reply_column(state_dir, self.owui_origin_chat_id, self.body.get("model"),
+                                    self.__metadata__ or {})
+        self.session_key = _owui_session_key(self.pipe.valves.AGENT_ID, user_id, self.chat_id,
+                                             self.column)
         pipe_log(f"Session key: {self.session_key}")
 
         if self.turn is None:
@@ -12771,8 +12951,8 @@ class _PipeTurn:
         # says so first (ELI-183). Not for the thinking-retry recursion, whose
         # texts already went out once.
         history_prefix = "" if self._send_texts else await _history_prefix(
-            self.conn, _state_dir(getattr(self.pipe.valves, "STATE_DIR", "")),
-            self.owui_origin_chat_id, self.session_key, self.__metadata__ or {}, messages)
+            self.conn, state_dir, self.owui_origin_chat_id, self.session_key,
+            self.__metadata__ or {}, messages, self.column, self.body.get("model"))
         self.turn.unsent = (list(self._send_texts) if self._send_texts
                             else [history_prefix + self.text])
         meta = self.__metadata__ or {}
