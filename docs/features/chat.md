@@ -139,6 +139,14 @@ Only that inline base64 form is handled, because Open WebUI does not send plain 
 
 Always on.
 
+## Voice calls
+
+When you talk to the agent in Open WebUI's voice mode, Open WebUI marks each spoken message as part of a voice call. The Pipe puts one short note before it that tells the agent the reply will be read aloud: answer in your language, in a few short spoken sentences, with no markdown, lists, tables, code, links or emoji, and with numbers and times said the way you would say them. A message you type in the same chat carries nothing, so the agent goes back to normal answers.
+
+The note is not shown in the chat. Turning your speech into text and reading the reply back are Open WebUI's own settings (Admin Settings, Audio), not the Pipe's.
+
+Always on.
+
 ## Usage and goal line
 
 After every reply, a status row shows where you stand:

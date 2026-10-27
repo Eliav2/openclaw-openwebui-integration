@@ -356,6 +356,19 @@ async def _history_note(change: dict, rows, in_full: bool = False) -> str:
             f"{first_new} on, then the message below.]")
 
 
+def _voice_note(metadata) -> str:
+    """The note put before a message the user spoke into an Open WebUI voice
+    call (`features.voice`): the reply is read aloud, so it must be short
+    spoken sentences with no markup. "" for every other message."""
+    features = metadata.get("features") if isinstance(metadata, dict) else None
+    if not (isinstance(features, dict) and features.get("voice") is True):
+        return ""
+    return ("[Open WebUI voice call: your reply will be read aloud. Answer in the user's language, "
+            "in one to three short spoken sentences unless they ask for more. Plain speech only: "
+            "no markdown, lists, tables, code, links or emoji. Say numbers and times the way you "
+            "would say them out loud.]\n\n")
+
+
 def _history_seed(messages: list, side_by_side: bool = False) -> str:
     """The copied messages of a cloned chat, for its first message: newest
     first while they fit in `HISTORY_SEED_MAX_CHARS`, tool-call details left
