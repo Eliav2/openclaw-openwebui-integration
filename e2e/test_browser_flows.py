@@ -1490,6 +1490,41 @@ def _shown_titles(page, chat_id: str) -> str:
         'a[href="/c/{chat_id}"]')].map(a => a.innerText.trim())}})""")
 
 
+@pytest.fixture
+def title_events(page):
+    """The `chat:title` events the open tab's socket receives, as
+    (seconds since the test began, chat id, title), for a failure message: a
+    title that never shows is either an event that never came or one the tab
+    did not act on, and only this tells the two apart."""
+    seen, began = [], time.time()
+
+    def on_frame(payload):
+        text = payload if isinstance(payload, str) else payload.decode("utf-8", "replace")
+        if '"chat:title"' not in text:
+            return
+        chat = re.search(r'"chat_id":"([^"]*)"', text)
+        title = re.search(r'"type":"chat:title","data":"((?:[^"\\]|\\.)*)"', text)
+        seen.append((round(time.time() - began, 2), chat and chat.group(1), title and title.group(1)))
+
+    def on_socket(ws):
+        ws.on("framereceived", on_frame)
+
+    page.on("websocket", on_socket)
+    yield seen
+    page.remove_listener("websocket", on_socket)
+
+
+def _wait_for_title(page, token, chat_id: str, title: str, what: str, timeout_ms: int, events: list) -> None:
+    """Wait until the open tab shows `title`; on a timeout, fail with what the
+    tab shows, what is saved, and the `chat:title` events the socket received."""
+    try:
+        capture.wait_js(page, _titles_js(chat_id, title), what, timeout_ms)
+    except TimeoutError as ex:
+        raise AssertionError(f"{ex}; the tab shows {_shown_titles(page, chat_id)}, "
+                             f"the chat's saved title is {capture.chat_title(token, chat_id)!r}, "
+                             f"chat:title events received: {events}") from None
+
+
 def _auto_title_decision(chat_id: str, since: str) -> str:
     """The Pipe's auto-title decision for the chat, from its log: read as the
     lines come (Open WebUI's stdout), until the decision line."""
@@ -1506,16 +1541,12 @@ def _auto_title_decision(chat_id: str, since: str) -> str:
         proc.wait()
 
 
-def test_the_generated_title_shows_in_the_open_tab(page, token):
+def test_the_generated_title_shows_in_the_open_tab(page, token, title_events):
     """After the second exchange the Pipe titles the chat, and the open tab
     shows the new title at once, in the sidebar and the browser tab, with no
     reload (ELI-182: it showed only after a reload)."""
     chat_id = _two_exchanges(page, "BROWSER_TITLE_ONE", "BROWSER_TITLE_TWO")
-    try:
-        capture.wait_js(page, _titles_js(chat_id, E2E_TITLE), "the generated title in the open tab", TURN_MS)
-    except TimeoutError as ex:
-        raise AssertionError(f"{ex}; the tab shows {_shown_titles(page, chat_id)}, "
-                             f"the chat's saved title is {capture.chat_title(token, chat_id)!r}") from None
+    _wait_for_title(page, token, chat_id, E2E_TITLE, "the generated title in the open tab", TURN_MS, title_events)
 
 
 SIDEBAR_OPEN_JS = """() => { const s = document.getElementById('sidebar');
@@ -1564,7 +1595,7 @@ def _rename_in_sidebar(page, chat_id: str, title: str) -> None:
     capture.wait_js(page, _sidebar_js(chat_id, title), "the chosen title in the sidebar", 30_000)
 
 
-def test_a_title_the_user_chose_stays(page, token):
+def test_a_title_the_user_chose_stays(page, token, title_events):
     """A chat renamed in the sidebar keeps its name after the next message:
     the Pipe titles only a chat Open WebUI named by itself (ELI-182: the
     rename was replaced by the generated title)."""
@@ -1573,7 +1604,7 @@ def test_a_title_the_user_chose_stays(page, token):
     chat_id = capture.send(page, f"E2E_ECHO: {first}")
     _wait(page, _turn_over(first), "the first reply")
     # Open WebUI's own first title (its first message), before renaming over it.
-    capture.wait_js(page, _titles_js(chat_id, first), "Open WebUI's first title", 60_000)
+    _wait_for_title(page, token, chat_id, first, "Open WebUI's first title", 60_000, title_events)
     # The sidebar is where a user renames a chat; open it if it is closed.
     was_closed = page.locator('button[aria-label="Open Sidebar"]').first.is_visible()
     if was_closed:
