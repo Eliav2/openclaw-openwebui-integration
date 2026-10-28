@@ -76,12 +76,12 @@ class MultiModelBase(unittest.IsolatedAsyncioTestCase):
     def message(self, reply_id, role, parent, text="", model=None):
         self.tree[reply_id] = (role, parent, text, model)
 
-    async def call(self, model, models, user, reply, text, parent=None):
+    async def call(self, model, models, user, reply, text, parent=None, extra_meta=None):
         """One Open WebUI call to the Pipe, answered with 'ok from <reply>'.
         Returns once the reply finished."""
         body = {"model": model, "messages": [{"role": "user", "content": text}]}
         meta = {"chat_id": CHAT, "user_id": USER, "message_id": reply, "user_message_id": user,
-                "user_message": {"id": user, "parentId": parent, "models": models}}
+                "user_message": {"id": user, "parentId": parent, "models": models}, **(extra_meta or {})}
 
         async def emitter(event):
             pass

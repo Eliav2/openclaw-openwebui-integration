@@ -982,7 +982,7 @@ class _PipeTurn:
             self.conn, state_dir, self.owui_origin_chat_id, self.session_key,
             self.__metadata__ or {}, messages, self.column, self.body.get("model"))
         self.turn.unsent = (list(self._send_texts) if self._send_texts
-                            else [history_prefix + self.text])
+                            else [history_prefix + _voice_note(self.__metadata__) + self.text])
         meta = self.__metadata__ or {}
         if self.owui_origin_chat_id and meta.get("message_id"):
             self.turn.reply = {"chat_id": self.owui_origin_chat_id, "user_id": user_id,

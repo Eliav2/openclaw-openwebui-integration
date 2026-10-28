@@ -2610,3 +2610,22 @@ def test_two_pipe_models_side_by_side_run_at_the_same_time(token):
     # Both ran inside one run's time, not two.
     assert elapsed < 24, f"both replies took {elapsed:.0f}s"
     _request("DELETE", f"/api/v1/chats/{chat_id}", token=token)
+
+
+# ── Voice calls (ELI-335) ────────────────────────────────────────────────────
+# Open WebUI's voice mode sends each spoken message with `features.voice`.
+
+def test_a_spoken_message_reaches_the_agent_with_the_voice_note_and_a_typed_one_does_not(token):
+    marker = f"E2E_VOICE_{uuid.uuid4().hex[:6]}"
+    chat_id, msg = _chat_turn(token, f"E2E_ECHO: {marker}", extra={"features": {"voice": True}})
+    assert marker in msg["content"], msg
+    key = _session_key(token, chat_id)
+    spoken = [t for t in _session_texts(key) if marker in t]
+    assert len(spoken) == 1, _session_texts(key)
+    assert spoken[0].startswith("[Open WebUI voice call:"), spoken[0]
+    assert spoken[0].endswith(f"E2E_ECHO: {marker}"), spoken[0]
+    typed_marker = f"{marker}_TYPED"
+    _chat_turn(token, f"E2E_ECHO: {typed_marker}", chat_id=chat_id)
+    typed = [t for t in _session_texts(key) if typed_marker in t]
+    assert typed == [f"E2E_ECHO: {typed_marker}"], typed
+    _request("DELETE", f"/api/v1/chats/{chat_id}", token=token)
