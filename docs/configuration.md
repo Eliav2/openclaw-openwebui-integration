@@ -144,6 +144,30 @@ Type: `str`. Default: empty.
 
 (Optional.) A link the agent hands you to take over from it, such as a page that lets you drive its browser for a login or a CAPTCHA: a regular expression searched in each tool result. Its first match, an http(s) URL, is added to the reply as a "Take control" link that opens in a new tab, once per link and chat. Empty: off.
 
+### SYNC_SLASH_COMMANDS
+
+Type: `bool`. Default: `False`.
+
+Offer the Gateway's slash commands in Open WebUI's / menu: each becomes a Workspace Prompt that every user can see, kept in sync with the Gateway. A prompt you made yourself is never changed: a command with the same name is skipped. Turning this off deletes the prompts the sync made. The Gateway still refuses an owner-only command from a user who is not the owner.
+
+### SLASH_COMMANDS_EXCLUDE
+
+Type: `str`. Default: `stop,new,reset,model,status,compact`.
+
+Slash commands not to offer as prompts, comma-separated. Of the defaults, Open WebUI runs /status, /compact and /model itself when you send them alone, so they never reach OpenClaw; /stop has the Stop button; /new and /reset would reset the session under an open chat.
+
+### PROMPT_PREFIX
+
+Type: `str`. Default: empty.
+
+Put this in front of every synced prompt's command, for example oc_ to show /oc_status and keep them together in the menu. Empty: the command is the Gateway's own name.
+
+### SYNC_INTERVAL_MIN
+
+Type: `int`. Default: `30`.
+
+How often, in minutes, to check the Gateway for changed commands, at most. A check is one small request, made in the background after a message. A page load and the Gateway's own change notice also start one.
+
 ### TITLE_GEN_AGENT_ID
 
 Type: `str`. Default: `title-gen`.

@@ -856,6 +856,32 @@ class Scenes:
                 if p and p.get("id"):
                     api("DELETE", f"/api/v1/prompts/id/{p['id']}/delete", token=self.token)
 
+    def slash_commands(self, page: Page) -> None:
+        """SYNC_SLASH_COMMANDS: the Gateway's commands as prompts in the composer's / menu."""
+        old = pipe_valves(self.token, SYNC_SLASH_COMMANDS=True)
+        try:
+            new_chat(page)  # a page load lists the models, which starts the sync
+            deadline = time.time() + 120
+            while not any(p.get("command") == "help" for p in api("GET", "/api/v1/prompts/", token=self.token) or []):
+                if time.time() > deadline:
+                    raise TimeoutError("the synced /help prompt")
+                time.sleep(1)
+            new_chat(page)
+            page.locator("#chat-input").click()
+            page.keyboard.type("/s", delay=40)
+            wait_js(page, """() => [...document.querySelectorAll('#suggestions-container button span:first-child')]
+                     .some(s => s.innerText.trim() === 'session')""", "/session in the / menu", 30_000)
+            clip = """() => {
+              const box = document.getElementById('message-input-container').getBoundingClientRect();
+              const menu = document.getElementById('suggestions-container').getBoundingClientRect();
+              return {x: 0, y: menu.top - 24, width: innerWidth, height: box.bottom + 24 - (menu.top - 24)};
+            }"""
+            self.s.shot(page, "slash-commands", clip_js=clip)
+            page.keyboard.press("Control+A")
+            page.keyboard.press("Backspace")
+        finally:
+            pipe_valves(self.token, **old)
+
     def thinking(self, page: Page) -> None:
         attach_filter(self.token, MODEL, "openclaw_thinking")
         # A new chat: over a long one the menu shares the screen with either
@@ -1298,6 +1324,7 @@ def main(argv=None) -> int:
             shooter.run("background-agent-waiting", scenes.background_agent, page)
             shooter.run("model-picker", scenes.model_picker, page)
             shooter.run("claude-login-prompts", scenes.claude_login_prompts, page)
+            shooter.run("slash-commands", scenes.slash_commands, page)
             shooter.run("agent-turn", scenes.agent_turn, page)
             shooter.run("media-turn", scenes.media_turn, page)
             shooter.run("failed-tool-live", scenes.failed_tool_live, page)

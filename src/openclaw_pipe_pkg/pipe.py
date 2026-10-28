@@ -12,6 +12,8 @@ _ACTIVE_RUN_STATES = ("active", "running", "streaming", "queued")
 # The Gateway's questions (secret requests, ELI-96; the ask_user tool,
 # ELI-216) are asked in the chat (askuser.py).
 _QUESTION_HOOKS = (question_requested, question_resolved)
+# Slash commands mirrored into Open WebUI's Prompts (slash_prompts.py).
+_SLASH_PROMPTS_HOOK = _slash_prompts_on_metadata_changed
 
 
 def _session_active_from_signals(describe_status, list_has_active_run) -> bool:
@@ -404,6 +406,39 @@ class Pipe:
                 "reply as a \"Take control\" link that opens in a new tab, once "
                 "per link and chat. Empty: off."
         )
+        SYNC_SLASH_COMMANDS: bool = Field(
+            default=False,
+            description="Offer the Gateway's slash commands in Open WebUI's / "
+                "menu: each becomes a Workspace Prompt that every user can "
+                "see, kept in sync with the Gateway. A prompt you made "
+                "yourself is never changed: a command with the same name is "
+                "skipped. Turning this off deletes the prompts the sync made. "
+                "The Gateway still refuses an owner-only command from a user "
+                "who is not the owner."
+        )
+        SLASH_COMMANDS_EXCLUDE: str = Field(
+            default="stop,new,reset,model,status,compact",
+            description="Slash commands not to offer as prompts, "
+                "comma-separated. Of the defaults, Open WebUI runs /status, "
+                "/compact and /model itself when you send them alone, so they "
+                "never reach OpenClaw; /stop has the Stop button; /new and "
+                "/reset would reset the session under an open chat."
+        )
+        PROMPT_PREFIX: str = Field(
+            default="",
+            description="Put this in front of every synced prompt's command, "
+                "for example oc_ to show /oc_status and keep them together in "
+                "the menu. Empty: the command is the Gateway's own name."
+        )
+        SYNC_INTERVAL_MIN: int = Field(
+            default=30,
+            description="How often, in minutes, to check the Gateway for "
+                "changed commands, at most. A check is one small request, made "
+                "in the background after a message. A page load and the "
+                "Gateway's own change notice also start one.",
+            ge=1,
+            le=1440
+        )
         TITLE_GEN_AGENT_ID: str = Field(
             default="title-gen",
             description="Agent id used for background chat-title generation. It must "
@@ -431,6 +466,8 @@ class Pipe:
         _ensure_composer_watcher(lambda: self.valves)
         # ...and the earliest point to finish replies a restart orphaned.
         _ensure_orphan_reconcile(lambda: self.valves)
+        # ...and to mirror the Gateway's slash commands into Prompts.
+        _ensure_slash_prompts(lambda: self.valves, force=True)
         models, source = await _discover_models_with_source(self.valves)
 
         # Apply safety cap
@@ -665,6 +702,8 @@ class Pipe:
                 async for item in turn_gen:
                     yield item
             return
+        # Compares a timestamp; a due check runs in the background.
+        _ensure_slash_prompts(lambda: self.valves)
         # No `execute` reaches a tab while it shows an input dialog (ELI-195).
         meta = __metadata__ or {}
         user_id = (__user__ or {}).get("id")

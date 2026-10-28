@@ -55,6 +55,8 @@ In Open WebUI, go to Workspace > Prompts, choose **Import JSON** among the page'
 
 <img src="../img/claude-login-prompts-light.png" alt="The composer's / menu filtered to the three Claude login prompts" width="320">
 
+With [slash commands in the / menu](../features/chat.md#slash-commands-as-prompts) on, `/claude_login` is in the menu without this import. Imported, your `/claude_login` prompt is kept and the synced one skipped; the other two are only in this file.
+
 Imported prompts belong to the user who imports them. Share them in each prompt's access settings if another owner should see them too.
 
 ## Renew the login

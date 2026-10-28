@@ -2652,6 +2652,9 @@ _TURNS = None
 # (askuser.py, ELI-96), set by pipe.py. None in the Status Action, which asks
 # nothing; only the connection that writes turns asks, so a question is asked once.
 _QUESTION_HOOKS = None
+# The Pipe's handler for `chat.metadata.changed` (slash_prompts.py), set by
+# pipe.py. None in the Status Action, which syncs nothing.
+_SLASH_PROMPTS_HOOK = None
 
 
 class _GatewayConnection:
@@ -4398,6 +4401,10 @@ class _GatewayConnection:
                 # Both are folded into one path below, first copy wins.
                 if msg.get("type") == "event" and msg.get("event") == "sessions.changed":
                     self._on_sessions_changed(msg.get("payload") or {})
+                    continue
+                if msg.get("type") == "event" and msg.get("event") == "chat.metadata.changed":
+                    if _SLASH_PROMPTS_HOOK and self.writes_turns:
+                        _SLASH_PROMPTS_HOOK(msg.get("payload") or {})
                     continue
                 if msg.get("type") == "event" and msg.get("event") == "shutdown":
                     self._on_shutdown(msg.get("payload") or {})
