@@ -1,0 +1,36 @@
+name: PR media
+
+# A PR that changes what users see shows its Before and After images in its
+# description (AGENTS.md, "Docs and screenshots ship with the feature"). The
+# logic and its file list are in scripts/pr_media.py. It runs again when the
+# description is edited or a label changes, so adding the images or the
+# `no-visual-change` label turns it green without a new push.
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: pr-media-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  images:
+    name: Before and After images
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Changed files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --jq '.[].filename' > "$RUNNER_TEMP/files.txt"
+
+      - name: Images in the description
+        run: python3 scripts/pr_media.py --event "$GITHUB_EVENT_PATH" --files "$RUNNER_TEMP/files.txt"

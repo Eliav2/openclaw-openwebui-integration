@@ -4,7 +4,14 @@
 
 ## How it was tested
 
-<!-- The tests you added or ran, and what you checked by hand. Before/after screenshots for UI changes. -->
+<!-- The tests you added or ran, and what you checked by hand. -->
+
+## Before / After
+
+<!-- A UI change: one Before and After pair from the Screenshots workflow, light theme, as
+<img src="..." alt="..." width="320"> tags (a phone shot is 320 wide). The PR media check fails a PR
+that touches the UI without an image. Nothing on screen changes: delete this section and add the
+label no-visual-change. -->
 
 - [ ] `uv run --with-requirements requirements-dev.txt pytest -q` passes
 - [ ] Built files rebuilt with `python3 build.py --all` if `src/` changed
