@@ -16,7 +16,10 @@
 # created, by command and prompt id. The sync only ever updates or deletes a
 # prompt in the ledger whose id still matches; a prompt someone made by hand
 # with the same command is left alone and the command skipped. A lost ledger
-# deletes nothing.
+# deletes nothing. Each Pipe Function has its own ledger, so a second copy
+# of the Pipe, its sync off, does not delete the first copy's prompts; one
+# lock file for all copies keeps their syncs from running at once. A prompt
+# an admin turned off in the Workspace stays the sync's, and stays off.
 #
 # Cost: the Gateway's `chat.metadata` carries the command list and a
 # revision; asked with `ifRevision` it answers `unchanged: true` and nothing
@@ -27,26 +30,37 @@
 # Turning the valve off deletes the prompts in the ledger.
 # ---------------------------------------------------------------------------
 
-_SLASH_PROMPTS_LEDGER_NAME = "slash-command-prompts.json"
+_SLASH_PROMPTS_LEDGER_NAME = "slash-command-prompts.json"  # before the ledger was per Function
+_SLASH_PROMPTS_LOCK_NAME = "slash-command-prompts.lock"
 _SLASH_PROMPTS_TAG = "openclaw"
 _SLASH_PROMPT_NAME_MAX = 120
 # Open WebUI's prompt editor accepts these in a command; the backend checks nothing.
 _SLASH_PROMPT_CMD_BAD = re.compile(r"[^A-Za-z0-9_-]")
 # A push right after a check is folded into a check this long after it.
 _SLASH_PROMPTS_PUSH_SETTLE_S = 2.0
+# How a Gateway older than 2026.10 refuses `chat.metadata`'s params
+# (2026.9.3: "invalid chat.metadata params: at root: unexpected property
+# 'includeModels'"), or one without the method at all.
+_SLASH_PROMPTS_OLD_GATEWAY = re.compile(
+    r"unexpected property '(?:includeModels|ifRevision)'|unknown method:? chat\.metadata\b")
+# Once a Gateway refused them, how long `commands.list` is used before
+# `chat.metadata` is tried again (the Gateway may have been upgraded).
+_SLASH_PROMPTS_LEGACY_RETRY_S = 24 * 3600
 
 _slash_prompts_lock = asyncio.Lock()
 _slash_prompts_state = {
     # When the last check ran (monotonic), and whether one is queued behind it.
     "checked_at": None,
     "pending": False,
+    # A `_slash_prompts_run` loop is going (between its checks too).
+    "running": False,
     # The settings the last check ran with; a change runs a full sync at once.
     "settings": None,
     # Whether the ledger is known to be empty (so a disabled sync has nothing to delete).
     "ledger_empty": None,
     "valves": None,
-    # The Gateway predates `chat.metadata`'s `ifRevision` (before 2026.10).
-    "legacy": False,
+    # When the Gateway last refused `chat.metadata`'s `ifRevision` (before 2026.10), monotonic.
+    "legacy_at": None,
 }
 
 
@@ -96,7 +110,8 @@ def _slash_prompt_for(cmd: dict, prefix: str) -> "dict | None":
         "name": description or f"OpenClaw /{name}",
         "content": " ".join(parts) + " ",
         "tags": [_SLASH_PROMPTS_TAG],
-        "meta": {"openclaw": {"command": name, "source": cmd.get("source") or ""}},
+        "meta": {"openclaw": {"command": name, "source": cmd.get("source") or "",
+                              "function": _slash_prompts_owner()}},
     }
 
 
@@ -163,12 +178,26 @@ def _slash_prompts_plan(wanted: list, existing: dict, owned: dict) -> dict:
     return plan
 
 
+def _slash_prompts_owner() -> str:
+    """This Pipe Function, as Open WebUI loads it: `function_<id>`."""
+    return _SLASH_PROMPT_CMD_BAD.sub("_", _function_module_prefix(__name__))
+
+
 def _slash_prompts_ledger_path():
-    return os.path.join(_state_dir(), _SLASH_PROMPTS_LEDGER_NAME)
+    return os.path.join(_state_dir(), f"slash-command-prompts.{_slash_prompts_owner()}.json")
 
 
 def _slash_prompts_ledger_read() -> dict:
-    data = _read_json_file(_slash_prompts_ledger_path())
+    path = _slash_prompts_ledger_path()
+    old = os.path.join(_state_dir(), _SLASH_PROMPTS_LEDGER_NAME)
+    if not os.path.exists(path) and os.path.exists(old):
+        # The ledger from before it was per Function: the first copy to sync
+        # takes it, under the lock, so its prompts stay owned.
+        try:
+            os.replace(old, path)
+        except OSError as ex:
+            pipe_log(f"[slash prompts] could not take over {old}: {ex!r}")
+    data = _read_json_file(path)
     if not isinstance(data, dict) or not isinstance(data.get("prompts"), dict):
         return {"revision": None, "settings": None, "prompts": {}}
     return data
@@ -203,9 +232,27 @@ class _OwuiPromptStore:
         return self._owner
 
     async def list(self) -> dict:
-        rows = await _owui_call(self._prompts.get_prompts) or []
-        return {r.command: {"id": r.id, "name": r.name, "content": r.content, "tags": r.tags or []}
+        """Every prompt, turned off ones too: `get_prompts` leaves those out,
+        but their command is still taken (it is unique across both)."""
+        try:
+            from open_webui.internal.db import get_async_db_context
+            from open_webui.models.prompts import Prompt
+            from sqlalchemy import select
+        except ImportError:
+            rows = await _owui_call(self._prompts.get_prompts) or []
+        else:
+            async with get_async_db_context() as session:
+                rows = (await session.execute(select(Prompt))).scalars().all()
+        return {r.command: {"id": r.id, "name": r.name, "content": r.content, "tags": r.tags or [],
+                            "active": getattr(r, "is_active", True) is not False}
                 for r in rows}
+
+    async def find(self, command: str) -> "dict | None":
+        """The prompt with `command`, whoever made it: {"id", "user_id", "meta"}."""
+        row = await _owui_call(self._prompts.get_prompt_by_command, command)
+        if row is None:
+            return None
+        return {"id": row.id, "user_id": row.user_id, "meta": row.meta or {}}
 
     def _form_for(self, want: dict):
         return self._form(command=want["command"], name=want["name"], content=want["content"],
@@ -257,6 +304,8 @@ async def _slash_prompts_apply(store, plan: dict, ledger: dict, save=None) -> bo
         except Exception as ex:
             pipe_log(f"[slash prompts] add /{want['command']} failed: {ex!r}")
             pid = None
+        if not pid:
+            pid = await _slash_prompts_half_added(store, want)
         if pid:
             owned[want["command"]] = pid
             save()
@@ -272,24 +321,56 @@ async def _slash_prompts_apply(store, plan: dict, ledger: dict, save=None) -> bo
     return ok
 
 
+async def _slash_prompts_half_added(store, want: dict) -> "str | None":
+    """The id of the prompt a failed add left behind, now recorded and written
+    again; None when there is none.
+
+    Open WebUI commits the prompt row before its read grant and first
+    version, so an add can fail with the row in place. The command had no
+    prompt when the plan was made, and the lock keeps other syncs out, so a
+    row this sync's owner made with this Function's mark is that add's."""
+    mark = want["meta"]["openclaw"]
+    try:
+        row = await store.find(want["command"])
+        if row is None or row.get("user_id") != await store.owner_id():
+            return None
+        theirs = (row.get("meta") or {}).get("openclaw") or {}
+        if (theirs.get("command"), theirs.get("function")) != (mark["command"], mark["function"]):
+            return None
+        # Writing it again sets the grant and the version the add did not.
+        if not await store.update(row["id"], want):
+            return None
+    except Exception as ex:
+        pipe_log(f"[slash prompts] could not check /{want['command']} after its add failed: {ex!r}")
+        return None
+    pipe_log(f"[slash prompts] /{want['command']}: recorded the prompt its failed add left")
+    return row["id"]
+
+
+def _slash_prompts_legacy() -> bool:
+    at = _slash_prompts_state.get("legacy_at")
+    return at is not None and time.monotonic() - at < _SLASH_PROMPTS_LEGACY_RETRY_S
+
+
 async def _slash_prompts_fetch(conn, agent_id: str, revision) -> "tuple[list | None, str | None]":
     """The Gateway's commands and their revision; (None, revision) when the
     revision is unchanged.
 
     A Gateway older than 2026.10 takes neither `includeModels` nor
     `ifRevision`: there the full list comes from `commands.list` and the
-    revision is its hash, so an unchanged list still writes nothing."""
-    if not _slash_prompts_state.get("legacy"):
+    revision is its hash, so an unchanged list still writes nothing. Any
+    other refusal (a wrong AGENT_ID, say) is an error, not an older Gateway."""
+    if not _slash_prompts_legacy():
         params = {"agentId": agent_id, "includeModels": False}
         if revision:
             params["ifRevision"] = revision
         try:
             resp = await conn.send_request("chat.metadata", params, timeout=30)
         except GatewayError as ex:
-            if "invalid" not in str(ex).lower():
+            if not _SLASH_PROMPTS_OLD_GATEWAY.search(str(ex)):
                 raise
             pipe_log(f"[slash prompts] chat.metadata refused its params ({ex}); using commands.list")
-            _slash_prompts_state["legacy"] = True
+            _slash_prompts_state["legacy_at"] = time.monotonic()
         else:
             if resp.get("unchanged"):
                 return None, resp.get("revision") or revision
@@ -308,29 +389,38 @@ async def _slash_prompts_fetch(conn, agent_id: str, revision) -> "tuple[list | N
 
 async def _slash_prompts_sync(valves, conn_getter, store=None) -> str:
     """One check. Returns what it did, for the log and the tests: "busy",
-    "unchanged", "synced", "partial", "removed", "off" or "error"."""
+    "unchanged", "synced", "partial", "removed", "off" or "error".
+
+    A "busy" check leaves `pending` set, so the run that holds the lock, or
+    `_slash_prompts_run` after its settle delay, checks again."""
     if _slash_prompts_lock.locked():
+        _slash_prompts_state["pending"] = True
         return "busy"
     async with _slash_prompts_lock:
         lock_file = None
         try:
-            import fcntl
-            lock_file = open(_slashprompts_lock_path(), "a")
             try:
-                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                return "busy"  # another Open WebUI worker is syncing
-        except ImportError:
-            pass
-        try:
+                import fcntl
+            except ImportError:
+                fcntl = None
+            if fcntl is not None:
+                lock_file = open(_slash_prompts_lock_path(), "a")
+                try:
+                    fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    # Another Open WebUI worker, or another copy of the Pipe, is syncing.
+                    _slash_prompts_state["pending"] = True
+                    return "busy"
+            # A trigger from here on is not covered by this check.
+            _slash_prompts_state["pending"] = False
             return await _slash_prompts_sync_locked(valves, conn_getter, store)
         finally:
             if lock_file is not None:
                 lock_file.close()
 
 
-def _slashprompts_lock_path():
-    return _slash_prompts_ledger_path() + ".lock"
+def _slash_prompts_lock_path():
+    return os.path.join(_state_dir(), _SLASH_PROMPTS_LOCK_NAME)
 
 
 async def _slash_prompts_sync_locked(valves, conn_getter, store) -> str:
@@ -390,18 +480,25 @@ async def _slash_prompts_sync_locked(valves, conn_getter, store) -> str:
 
 
 async def _slash_prompts_run(valves_getter) -> None:
-    """A check, and one more if a trigger arrived while it ran."""
-    while True:
-        _slash_prompts_state["pending"] = False
-        _slash_prompts_state["checked_at"] = time.monotonic()
-        try:
-            await _slash_prompts_sync(valves_getter(),
-                                      lambda: _get_gateway_connection(valves_getter))
-        except Exception as ex:
-            pipe_log(f"[slash prompts] check failed: {ex!r}")
-        if not _slash_prompts_state["pending"]:
-            return
-        await asyncio.sleep(_SLASH_PROMPTS_PUSH_SETTLE_S)
+    """A check, and one more if a trigger arrived while it ran or another
+    worker held the lock. One per process: a trigger meanwhile only sets
+    `pending`."""
+    state = _slash_prompts_state
+    state["running"] = True
+    try:
+        while True:
+            state["checked_at"] = time.monotonic()
+            try:
+                await _slash_prompts_sync(valves_getter(),
+                                          lambda: _get_gateway_connection(valves_getter))
+            except Exception as ex:
+                pipe_log(f"[slash prompts] check failed: {ex!r}")
+                state["pending"] = False
+            if not state["pending"]:
+                return
+            await asyncio.sleep(_SLASH_PROMPTS_PUSH_SETTLE_S)
+    finally:
+        state["running"] = False
 
 
 def _slash_prompts_inside_owui() -> bool:
@@ -427,7 +524,10 @@ def _ensure_slash_prompts_now(valves_getter, force: bool) -> None:
     state["valves"] = valves_getter
     valves = valves_getter()
     enabled = bool(getattr(valves, "SYNC_SLASH_COMMANDS", False))
-    if not enabled and state["ledger_empty"]:
+    if enabled:
+        # Known again once a check runs: another worker's sync may fill the ledger.
+        state["ledger_empty"] = None
+    elif state["ledger_empty"]:
         return
     settings = (enabled, _slash_prompts_settings(valves))
     due = force or settings != state["settings"] or state["checked_at"] is None
@@ -437,12 +537,17 @@ def _ensure_slash_prompts_now(valves_getter, force: bool) -> None:
     if not due:
         return
     state["settings"] = settings
-    if _slash_prompts_lock.locked():
+    if state["running"] or _slash_prompts_lock.locked():
         state["pending"] = True
         return
     if not _slash_prompts_inside_owui():
         return
-    spawn_background(_slash_prompts_run(valves_getter))
+    state["running"] = True  # before the task starts, so a second trigger cannot start another
+    try:
+        spawn_background(_slash_prompts_run(valves_getter))
+    except BaseException:
+        state["running"] = False
+        raise
 
 
 def _slash_prompts_on_metadata_changed(payload: dict) -> None:
