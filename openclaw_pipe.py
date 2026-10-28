@@ -8709,6 +8709,12 @@ def _owui_request_task(task_id: str | None):
         return None
     return (getattr(sys.modules.get("open_webui.tasks"), "tasks", None) or {}).get(task_id)
 
+# What the Gateway words a claude-cli turn that exits 0 with no final text as
+# (cli-runner `createCliFailoverError(..., "empty_response")`). On a turn another
+# session sent with `sessions_send` the agent often ends silent on purpose
+# (NO_REPLY) and the Gateway still fails the run with this text (ELI-336).
+EMPTY_RESPONSE_ERROR = "CLI backend returned an empty response."
+
 TURN_CUT_OFF_NOTE = ("_(This reply was cut off: the run was interrupted again after "
                      f"{MAX_TURN_RESUMES} attempts to continue it.)_")
 
@@ -9549,10 +9555,24 @@ class _TurnWriter:
         if turn_owner(row, stop_notice_before) == "pipe":
             note = TURN_CUT_OFF_NOTE
         elif (row or {}).get("status") in ("failed", "timeout") and row.get("lastRunError"):
-            note = f"**Error:** {row['lastRunError']}"
+            if not (row["lastRunError"].strip() == EMPTY_RESPONSE_ERROR and await self._run_is_inter_session()):
+                note = f"**Error:** {row['lastRunError']}"
         if note is None and await self._ask_question():
             return
         await self.finalize(note)
+
+    async def _run_is_inter_session(self) -> bool:
+        """True when this run answers another session's `sessions_send` (provenance
+        `inter_session`), not a person's message."""
+        try:
+            hist = await self.conn.session_history(self.session_key, limit=RUN_HISTORY_LIMIT)
+        except Exception as ex:
+            pipe_log(f"  turn writer: chat.history failed reading the run's source: {ex!r}")
+            return False
+        for m in (hist or {}).get("messages") or []:
+            if _history_user_run_id(m) == self.run_id:
+                return (m.get("provenance") or {}).get("kind") == "inter_session"
+        return False
 
     async def _ask_question(self) -> bool:
         """A run that ends with a question asks it as the inline reply does:
