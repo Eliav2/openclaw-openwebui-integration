@@ -128,6 +128,7 @@ SHARDS = {
         f"{BROWSER}::test_a_background_command_that_ends_shows_done_in_the_open_dialog",
         f"{BROWSER}::test_a_long_task_shown_whole_keeps_the_drawer_closable",
         f"{BROWSER}::test_show_less_puts_a_long_task_back_at_its_first_lines",
+        f"{BROWSER}::test_slash_commands_show_in_the_slash_menu_and_go_when_turned_off",
         f"{BROWSER}::test_a_reply_the_agent_starts_streams_into_the_open_tab_and_asks_there",
         f"{BROWSER}::test_stop_on_a_reply_the_agent_starts_stops_its_run",
         f"{BROWSER}::test_a_tab_that_loads_the_chat_as_the_agent_starts_a_reply_shows_it",
