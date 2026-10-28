@@ -1,4 +1,4 @@
-# ------------------------------------------------------------------
+# ------------------------------------------------------------------ 
 # BUILD FRAGMENT -- do not edit the built openclaw_status_action.py directly.
 # Source of truth: src/openclaw_pipe_pkg/action.py + build.py
 # ------------------------------------------------------------------
