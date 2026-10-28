@@ -8788,6 +8788,41 @@ class TurnWriterEndTests(_TurnWriterCase):
         self.assertIn("429 rate limited", self.m()["content"])
         self.assertNotIn("chat.send", [m for m, _ in self.sent])
 
+    EMPTY = "CLI backend returned an empty response."
+
+    def _user_turn_from(self, provenance):
+        """Make the run's `<run>:user` turn come from `provenance` (None: a person)."""
+        for m in self.history["messages"]:
+            if m.get("idempotencyKey") == f"{self.RUN}:user":
+                if provenance:
+                    m["provenance"] = provenance
+                else:
+                    m.pop("provenance", None)
+
+    async def test_a_silent_inter_session_turn_shows_no_error(self):
+        """ELI-336 (2026-10-28 01:57): a turn the manager sent with sessions_send
+        ended with NO_REPLY on purpose. claude-cli exited 0 with no final text and
+        the Gateway failed the run as an empty response; the reply showed it."""
+        self._user_turn_from({"kind": "inter_session", "sourceTool": "sessions_send",
+                              "sourceSessionKey": "agent:main:openwebui-u-other"})
+        w = await self.opened_writer()
+        await w.end({"status": "failed", "lastRunError": self.EMPTY, "hasActiveRun": False})
+        self.assertIs(self.m()["done"], True)
+        self.assertNotIn("empty response", self.m()["content"])
+        self.assertNotIn("Error", self.m()["content"])
+
+    async def test_an_empty_response_to_a_person_is_still_shown(self):
+        self._user_turn_from(None)
+        w = await self.opened_writer()
+        await w.end({"status": "failed", "lastRunError": self.EMPTY, "hasActiveRun": False})
+        self.assertIn(self.EMPTY, self.m()["content"])
+
+    async def test_another_error_on_an_inter_session_turn_is_still_shown(self):
+        self._user_turn_from({"kind": "inter_session", "sourceTool": "sessions_send"})
+        w = await self.opened_writer()
+        await w.end({"status": "failed", "lastRunError": "429 rate limited", "hasActiveRun": False})
+        self.assertIn("429 rate limited", self.m()["content"])
+
     async def test_a_running_row_keeps_the_message_open_for_the_recovery(self):
         w = await self.opened_writer()
         await w.end({"status": "running", "hasActiveRun": True})
