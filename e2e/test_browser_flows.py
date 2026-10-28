@@ -1216,14 +1216,7 @@ def _prompts(token: str) -> dict:
 
 
 def _wait_prompts(token: str, ok, what: str, timeout_s: float = 120) -> dict:
-    deadline = time.time() + timeout_s
-    while True:
-        prompts = _prompts(token)
-        if ok(prompts):
-            return prompts
-        if time.time() > deadline:
-            raise AssertionError(f"{what}: prompts are {sorted(prompts)}")
-        time.sleep(1)
+    return capture.poll(lambda: _prompts(token), ok, what, timeout_s)
 
 
 def _slash_menu_js(command: str) -> str:
@@ -1237,6 +1230,9 @@ def test_slash_commands_show_in_the_slash_menu_and_go_when_turned_off(page, toke
     the same command left as it was. Picking one puts the command in the
     composer and sending it runs it. Turned off, the synced prompts go and
     the hand-made one stays."""
+    # The hand-made prompt takes a command the Gateway has, so the sync has one to skip.
+    gateway = capture.gateway_call("commands.list", {"agentId": "main", "scope": "text"})["commands"]
+    assert "whoami" in {c.get("name") for c in gateway}, "precondition: the Gateway has no /whoami"
     mine = capture.api("POST", "/api/v1/prompts/create",
                        {"command": "whoami", "name": "Mine", "content": "my own text"}, token)
     old = capture.pipe_valves(token, SYNC_SLASH_COMMANDS=True)
@@ -1247,6 +1243,10 @@ def test_slash_commands_show_in_the_slash_menu_and_go_when_turned_off(page, toke
         for left_out in ("stop", "new", "status", "compact"):
             assert left_out not in prompts, sorted(prompts)
         assert prompts["whoami"]["content"] == "my own text", prompts["whoami"]
+        # Skipped, not taken over: not the sync's (it marks its own), and the same row.
+        assert prompts["whoami"]["id"] == mine["id"], prompts["whoami"]
+        assert not (prompts["whoami"].get("meta") or {}).get("openclaw"), prompts["whoami"]
+        assert prompts["help"]["meta"]["openclaw"]["command"] == "help", prompts["help"]
         assert prompts["help"]["content"].strip() == "/help", prompts["help"]
         capture.new_chat(page)
         page.locator("#chat-input").click()

@@ -147,6 +147,18 @@ def wait_api(token: str, chat_id: str, needle: str, timeout_s: float = 180, *, t
     raise TimeoutError(f"{needle!r} not in a finished reply of {chat_id} after {timeout_s:.0f}s")
 
 
+def poll(fetch, ok, what: str, timeout_s: float = 120, every_s: float = 1):
+    """`fetch()` until `ok` holds for what it returned, which is returned."""
+    deadline = time.time() + timeout_s
+    while True:
+        got = fetch()
+        if ok(got):
+            return got
+        if time.time() > deadline:
+            raise TimeoutError(f"{what}: still {got!r:.500} after {timeout_s:.0f}s")
+        time.sleep(every_s)
+
+
 def wait_children_answering(phrases: tuple, timeout_s: float = 120) -> None:
     """Until the scripted model has answered each sub-agent's request that
     carries its tool result (step 1 of its scene): read from the fake model's
@@ -861,11 +873,8 @@ class Scenes:
         old = pipe_valves(self.token, SYNC_SLASH_COMMANDS=True)
         try:
             new_chat(page)  # a page load lists the models, which starts the sync
-            deadline = time.time() + 120
-            while not any(p.get("command") == "help" for p in api("GET", "/api/v1/prompts/", token=self.token) or []):
-                if time.time() > deadline:
-                    raise TimeoutError("the synced /help prompt")
-                time.sleep(1)
+            poll(lambda: api("GET", "/api/v1/prompts/", token=self.token) or [],
+                 lambda ps: any(p.get("command") == "help" for p in ps), "the synced /help prompt")
             new_chat(page)
             page.locator("#chat-input").click()
             page.keyboard.type("/s", delay=40)
