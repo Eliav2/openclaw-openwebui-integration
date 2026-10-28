@@ -224,6 +224,18 @@ class SyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(self.ledger()["prompts"]), {"status", "skill"})
         self.assertEqual(store.rows["status"]["id"], "p1")  # its own, not skipped
 
+    async def test_each_add_is_on_disk_before_the_next_write(self):
+        store, conn = FakeStore(), FakeConn([STATUS, SKILL])
+        seen = []
+        orig = store.add
+
+        async def add(want):
+            seen.append(dict(self.ledger()["prompts"]))
+            return await orig(want)
+        store.add = add
+        await self.sync(store, conn)
+        self.assertEqual(seen, [{}, {"status": "p1"}])
+
     async def test_a_command_the_gateway_dropped_is_deleted(self):
         store, conn = FakeStore(), FakeConn([STATUS, SKILL])
         await self.sync(store, conn)

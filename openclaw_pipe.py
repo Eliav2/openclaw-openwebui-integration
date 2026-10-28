@@ -12391,11 +12391,13 @@ class _OwuiPromptStore:
         return bool(await _owui_call(self._prompts.delete_prompt_by_id, prompt_id))
 
 
-async def _slash_prompts_apply(store, plan: dict, ledger: dict) -> bool:
-    """Write `plan` to Open WebUI, recording each success in the ledger as
-    it lands (a prompt added but not recorded would be skipped as someone
-    else's forever after). True when every write succeeded."""
+async def _slash_prompts_apply(store, plan: dict, ledger: dict, save=None) -> bool:
+    """Write `plan` to Open WebUI, recording each add and delete in the
+    ledger file (`save`) as it lands: a prompt added but not recorded, by a
+    restart mid-sync say, would be skipped as someone else's forever after.
+    True when every write succeeded."""
     owned = ledger["prompts"]
+    save = save or (lambda: None)
     ok = True
     for cmd in plan["forget"]:
         owned.pop(cmd, None)
@@ -12407,6 +12409,7 @@ async def _slash_prompts_apply(store, plan: dict, ledger: dict) -> bool:
             done = False
         if done:
             owned.pop(cmd, None)
+            save()
         else:
             ok = False
     for want in plan["add"]:
@@ -12417,6 +12420,7 @@ async def _slash_prompts_apply(store, plan: dict, ledger: dict) -> bool:
             pid = None
         if pid:
             owned[want["command"]] = pid
+            save()
         else:
             ok = False
     for pid, want in plan["update"]:
@@ -12504,7 +12508,7 @@ async def _slash_prompts_sync_locked(valves, conn_getter, store) -> str:
             pipe_log(f"[slash prompts] could not read Open WebUI's prompts: {ex!r}")
             return "error"
         plan = _slash_prompts_plan([], existing, dict(ledger["prompts"]))
-        ok = await _slash_prompts_apply(store, plan, ledger)
+        ok = await _slash_prompts_apply(store, plan, ledger, lambda: _slash_prompts_ledger_write(ledger))
         ledger["revision"] = None
         ledger["settings"] = None
         _slash_prompts_ledger_write(ledger)
@@ -12529,7 +12533,9 @@ async def _slash_prompts_sync_locked(valves, conn_getter, store) -> str:
         return "error"
     wanted = _slash_prompts_wanted(commands, settings)
     plan = _slash_prompts_plan(wanted, existing, dict(ledger["prompts"]))
-    ok = await _slash_prompts_apply(store, plan, ledger)
+    # Not a complete sync until the end: a restart mid-way runs it in full again.
+    ledger["revision"] = None
+    ok = await _slash_prompts_apply(store, plan, ledger, lambda: _slash_prompts_ledger_write(ledger))
     ledger["settings"] = settings
     # Only a complete sync records the revision; otherwise the next check
     # runs in full and retries what failed.
