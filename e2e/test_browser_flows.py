@@ -1525,6 +1525,32 @@ def _wait_for_title(page, token, chat_id: str, title: str, what: str, timeout_ms
                              f"chat:title events received: {events}") from None
 
 
+def _wait_for_title_event(page, token, chat_id: str, title: str, what: str, timeout_ms: int, events: list) -> tuple:
+    """Wait for the `chat:title` event that names `title` for the chat, the
+    signal Open WebUI sends when it titles a chat, then for the tab to act on
+    it. Returns the event, so a test can show the path it relies on ran: a
+    title that was already there when the wait began would pass a plain look
+    at the tab without Open WebUI having sent one."""
+    def seen():
+        return next((e for e in events if e[1] == chat_id and e[2] and title in e[2]), None)
+
+    deadline = time.time() + timeout_ms / 1000
+    while not seen() and time.time() < deadline:
+        page.wait_for_timeout(100)
+    if not seen():
+        raise AssertionError(f"no chat:title event naming {title!r} for chat {chat_id} within {timeout_ms} ms ({what}); "
+                             f"the tab shows {_shown_titles(page, chat_id)}, "
+                             f"the chat's saved title is {capture.chat_title(token, chat_id)!r}, "
+                             f"chat:title events received: {events}")
+    event = seen()
+    try:
+        capture.wait_js(page, _titles_js(chat_id, title), f"the tab to show {what}", 10_000)
+    except TimeoutError as ex:
+        raise AssertionError(f"{ex}; the chat:title event came at {event[0]} s but the tab shows "
+                             f"{_shown_titles(page, chat_id)}") from None
+    return event
+
+
 def _auto_title_decision(chat_id: str, since: str) -> str:
     """The Pipe's auto-title decision for the chat, from its log: read as the
     lines come (Open WebUI's stdout), until the decision line."""
@@ -1603,8 +1629,12 @@ def test_a_title_the_user_chose_stays(page, token, title_events):
     capture.new_chat(page)
     chat_id = capture.send(page, f"E2E_ECHO: {first}")
     _wait(page, _turn_over(first), "the first reply")
-    # Open WebUI's own first title (its first message), before renaming over it.
-    _wait_for_title(page, token, chat_id, first, "Open WebUI's first title", 60_000, title_events)
+    # Open WebUI's own first title (its first message), before renaming over it:
+    # the test is about a rename that outlives a later title, so the title it
+    # renames over must have been sent by Open WebUI, not assumed.
+    early = _wait_for_title_event(page, token, chat_id, first, "Open WebUI's first title", 60_000, title_events)
+    assert capture.chat_title(token, chat_id) == early[2], (
+        f"the chat:title event {early} does not match the saved title {capture.chat_title(token, chat_id)!r}")
     # The sidebar is where a user renames a chat; open it if it is closed.
     was_closed = page.locator('button[aria-label="Open Sidebar"]').first.is_visible()
     if was_closed:
