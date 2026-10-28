@@ -554,6 +554,7 @@ class Scenes:
         self.hero_chat: str | None = None
         self.spawn_chat: str | None = None
         self.background_chat: str | None = None
+        self.long_chat: str | None = None
 
     def hero(self, page: Page) -> None:
         """#1 hero-tool-cards mid-run, then #5 tool-card-expanded once done."""
@@ -682,6 +683,7 @@ class Scenes:
         chat = send(page, "Benchmark the forecasters against our baseline")
         wait_js(page, last_text_has("Two sub-agents are on it"), "the parent's reply")
         set_title(self.token, chat, "Forecaster benchmark")
+        self.long_chat = chat
         # The parent's replies to each result: both sub-agents have ended.
         wait_api(self.token, chat, "The benchmark is back", 240)
         wait_api(self.token, chat, "only station 4 changed", 240)
@@ -737,6 +739,39 @@ class Scenes:
         self.s.shot(page, "subagents-unlabelled-drawer", text_selector="#openclaw-drawer-root")
         back_to_dialog(page)
         page.keyboard.press("Escape")
+
+    def drawer_long_parent(self, page: Page) -> None:
+        """The labelled sub-agent's drawer, with the Control UI link on, under
+        a parent chat whose title runs past 60 characters: the line holding
+        the model, the parent and the link, on a phone. A shot for a PR's
+        Before and After, not one the docs show."""
+        fid = "openclaw_status_action"
+        before = api("GET", f"/api/v1/functions/id/{fid}/valves", token=self.token) or {}
+        api("POST", f"/api/v1/functions/id/{fid}/valves/update",
+            {**before, "CONTROL_UI_URL": "https://openclaw.example.com"}, self.token)
+        try:
+            set_title(self.token, self.long_chat,
+                      "Forecaster benchmark against the pre-registered baseline, all stations")
+            page.locator('button[aria-label="OpenClaw status"]').click()
+            root = STATUS_ROOT
+            wait_js(page, f"""() => /subagents \\(2\\)/i.test((document.querySelector('{root}') || {{}}).innerText || '')""",
+                    "the status dialog", 60_000)
+            open_fold(page, "subagents")
+            rows = f"{root} #openclaw-status-section-subagents [data-openclaw-row]"
+            page.locator(rows).filter(has_text="pre-registered baseline").first.click()
+            page.wait_for_selector("#openclaw-drawer-root", timeout=30_000)
+            wait_js(page, """() => { const m = document.getElementById('openclaw-drawer-meta');
+                     return !!m && /all stations/.test(m.innerText) && !!m.querySelector('a[target=_blank]'); }""",
+                    "the drawer's meta line with the parent and the link", 60_000)
+            print("  meta line: " + json.dumps(page.evaluate("""() => {
+              const m = document.getElementById('openclaw-drawer-meta'), a = m.querySelector('a[target=_blank]');
+              const r = el => { const b = el.getBoundingClientRect(); return [Math.round(b.left), Math.round(b.right)]; };
+              return {row: r(m), link: r(a), viewport: innerWidth}; }""")), flush=True)
+            self.s.shot(page, "drawer-long-parent", text_selector="#openclaw-drawer-root")
+            back_to_dialog(page)
+            page.keyboard.press("Escape")
+        finally:
+            api("POST", f"/api/v1/functions/id/{fid}/valves/update", before, self.token)
 
     def background(self, page: Page) -> None:
         """ELI-163: work left running in this chat. #1 the dialog with one
@@ -1325,6 +1360,8 @@ def main(argv=None) -> int:
                 shooter.run("secret-request", scenes.secret_request, page)
             shooter.run("status-dialog", scenes.status_and_drawer, page)
             shooter.run("subagents-long", scenes.subagents_long, page)
+            if scenes.long_chat:
+                shooter.run("drawer-long-parent", scenes.drawer_long_parent, page)
             shooter.run("status-background", scenes.background, page)
             if scenes.background_chat:
                 small = signed_in_page(browser, token, SMALL_PHONE)
