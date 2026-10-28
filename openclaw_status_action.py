@@ -6871,10 +6871,17 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     const meta = document.getElementById('openclaw-drawer-meta');
     if (meta) {
       meta.innerHTML = '';
-      if (root.__texts.model) meta.appendChild(document.createTextNode(root.__texts.model));
+      // Model and parent shrink to an ellipsis; the Control UI link beside
+      // them keeps its width, so a long parent name on a phone cannot
+      // clip it off the line.
+      const info = oneLine(document.createElement('span'));
+      info.dataset.openclawMetaInfo = '1';
+      info.style.flex = '0 1 auto';
+      meta.appendChild(info);
+      if (root.__texts.model) info.appendChild(document.createTextNode(root.__texts.model));
       const parent = root.__parent;
       if (parent && parent.title) {
-        meta.appendChild(document.createTextNode((root.__texts.model ? ' · ' : '') + 'from '));
+        info.appendChild(document.createTextNode((root.__texts.model ? ' · ' : '') + 'from '));
         let link;
         if (parent.chatId) {
           link = document.createElement('a');
@@ -6889,11 +6896,12 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
         link.dataset.openclawParent = '1';
         link.className = 'underline';
         link.textContent = parent.title;
-        meta.appendChild(link);
+        info.appendChild(link);
       }
       if (root.__controlUiUrl) {
         const link = controlUiLink(root.__controlUiUrl);
         link.style.marginLeft = '8px';
+        link.style.flexShrink = '0';
         meta.appendChild(link);
       }
     }
@@ -7066,7 +7074,9 @@ _MODAL_OPEN_JS_TEMPLATE = r"""
     const meta = document.createElement('div');
     meta.id = 'openclaw-drawer-meta';
     meta.className = 'text-xs text-gray-500 dark:text-gray-400 mt-1';
-    oneLine(meta);
+    meta.style.display = 'flex';
+    meta.style.alignItems = 'baseline';
+    meta.style.minWidth = '0';
     header.appendChild(meta);
     const taskHead = document.createElement('div');
     taskHead.id = 'openclaw-drawer-task';

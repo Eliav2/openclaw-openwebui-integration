@@ -181,6 +181,34 @@ console.log(JSON.stringify({
         self.assertEqual(wide["width"], "min(480px, 92vw)")
         self.assertIn("×", wide["buttons"])
 
+    def test_a_long_parent_name_never_clips_the_control_ui_link(self):
+        # On a phone the parent's name filled the one nowrap line and the
+        # "Open in OpenClaw" link after it was cut off: now only the model
+        # and parent shrink, and the link sits outside them at full width.
+        labelled, _ = _rows()
+        seen = _page(r"""
+run(input.drawer);
+run(input.fill);
+const meta = document.getElementById('openclaw-drawer-meta');
+const info = byData(meta, 'openclawMetaInfo')[0];
+const link = meta.children.find((e) => e.tagName === 'A' && e.textContent.includes('Open in OpenClaw'));
+console.log(JSON.stringify({
+  meta: {display: meta.style.display, whiteSpace: meta.style.whiteSpace || null, overflow: meta.style.overflow || null},
+  info: info ? {text: info.textContent, whiteSpace: info.style.whiteSpace, overflow: info.style.overflow,
+                textOverflow: info.style.textOverflow, minWidth: info.style.minWidth} : null,
+  link: link ? {inInfo: info.walk().includes(link), flexShrink: link.style.flexShrink} : null,
+}));
+""", {"width": 390, "open": _render_modal_open_js(IDENTITY),
+      "drawer": _render_drawer_open_js({**labelled, "kind": "child",
+                                         "controlUiUrl": "https://claw.example.com/chat/main/aa"}),
+      "fill": _fill(CHILD, {**labelled, "model": "claude-opus-5-5"},
+                    parent={"title": "Investment Bot Options Research and Long-Term Planning " * 3, "chatId": "c"})})
+        self.assertEqual(seen["meta"], {"display": "flex", "whiteSpace": None, "overflow": None})
+        self.assertTrue(seen["info"]["text"].startswith("claude-opus-5-5 · from Investment Bot"))
+        self.assertEqual({k: seen["info"][k] for k in ("whiteSpace", "overflow", "textOverflow", "minWidth")},
+                         {"whiteSpace": "nowrap", "overflow": "hidden", "textOverflow": "ellipsis", "minWidth": "0"})
+        self.assertEqual(seen["link"], {"inInfo": False, "flexShrink": "0"})
+
     def test_show_all_on_the_task_survives_a_refill(self):
         labelled, _ = _rows()
         seen = _page(r"""
