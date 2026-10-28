@@ -3,7 +3,7 @@
 What a reply looks like in the chat: live text, the agent's tool calls as real cards, failures marked, images and files both ways, a usage line under each reply, and chat titles. Everything here works as soon as the Pipe is installed, except where a section says otherwise.
 
 Applies to: Pipe (the thinking level also needs the thinking filter)
-Valves: `USE_OWUI_FILES`, `OWUI_BASE_URL`, `OWUI_API_KEY`, `ENABLE_FILE_SERVER`, `FILE_SERVER_BASE_URL`, `AUTO_TITLE`, `TITLE_GEN_AGENT_ID`, `LIVE_VIEW_URL`, `LIVE_VIEW_TOOLS`, `LIVE_VIEW_USERS`, `CONTROL_LINK_PATTERN`
+Valves: `USE_OWUI_FILES`, `OWUI_BASE_URL`, `OWUI_API_KEY`, `ENABLE_FILE_SERVER`, `FILE_SERVER_BASE_URL`, `AUTO_TITLE`, `TITLE_GEN_AGENT_ID`, `LIVE_VIEW_URL`, `LIVE_VIEW_TOOLS`, `LIVE_VIEW_USERS`, `CONTROL_LINK_PATTERN`, `SYNC_SLASH_COMMANDS`, `SLASH_COMMANDS_EXCLUDE`, `PROMPT_PREFIX`, `SYNC_INTERVAL_MIN`
 
 ## Streaming
 
@@ -146,6 +146,24 @@ When you talk to the agent in Open WebUI's voice mode, Open WebUI marks each spo
 The note is not shown in the chat. Turning your speech into text and reading the reply back are Open WebUI's own settings (Admin Settings, Audio), not the Pipe's.
 
 Always on.
+
+## Slash commands as prompts
+
+Open WebUI's `/` menu has a fixed Commands section of its own, and a Prompts section that lists your Workspace Prompts. With [`SYNC_SLASH_COMMANDS`](../configuration.md#sync_slash_commands) on, the Pipe adds one prompt per slash command your Gateway offers (built-in commands, skills and plugin commands), so typing `/` in a chat shows them next to your own prompts, each with its description.
+
+<img src="../img/slash-commands-light.png" alt="The composer's / menu listing OpenClaw commands as prompts, each with its description" width="320">
+
+Picking one puts the command in the message box, for example `/help`; send it as it is or type more after it. A command with a required argument asks for it first, in Open WebUI's small input form (`/skill` asks for the skill's name). Optional arguments are typed after the command.
+
+- **Who sees them:** every user. The Gateway does not say which commands are owner-only, so it still decides when one is sent: a user who is not the owner (see [Owner users](./owner-users.md)) gets the Gateway's refusal, as when typing the command by hand.
+- **Your own prompts are safe:** the Pipe changes and deletes only the prompts it made. A prompt you made with the same command keeps it, and that command is skipped. The prompts it made carry the `openclaw` tag in Workspace, Prompts.
+- **Left out:** the commands in [`SLASH_COMMANDS_EXCLUDE`](../configuration.md#slash_commands_exclude). The default leaves out `/status`, `/compact` and `/model`, which Open WebUI runs itself when sent alone, so they never reach OpenClaw (use the [Status dialog](./status.md#compact) to compact); `/stop`, which the Stop button does; and `/new` and `/reset`, which would reset the session under an open chat.
+- **Names:** a prompt's command is the Gateway's own name. [`PROMPT_PREFIX`](../configuration.md#prompt_prefix), for example `oc_`, puts them together in the menu as `/oc_help`; the command sent is still `/help`.
+- **Staying in sync:** a page load checks the Gateway, and so does the first message after [`SYNC_INTERVAL_MIN`](../configuration.md#sync_interval_min) minutes (default 30); the Gateway's own notice that its commands changed starts a check at once. A check is one small request in the background, and a message never waits for it. A command the Gateway no longer has loses its prompt.
+- **Editing them in Workspace:** a change you make to a prompt the Pipe made is overwritten the next time the Gateway's commands (or these valves) change. A prompt you delete comes back only then too, not at the next check; to keep a command out of the menu, add it to `SLASH_COMMANDS_EXCLUDE`. A prompt you turn off stays off, and the Pipe keeps it up to date.
+- **Turning it off** deletes the prompts the Pipe made, on the next page load or message; turning it on again adds them back at once. Each copy of the Pipe keeps its own list of the prompts it made, so turning it off in one copy leaves another copy's prompts alone.
+
+Valves: [`SYNC_SLASH_COMMANDS`](../configuration.md#sync_slash_commands) (off), [`SLASH_COMMANDS_EXCLUDE`](../configuration.md#slash_commands_exclude) (default `stop,new,reset,model,status,compact`), [`PROMPT_PREFIX`](../configuration.md#prompt_prefix) (empty), [`SYNC_INTERVAL_MIN`](../configuration.md#sync_interval_min) (default 30).
 
 ## Usage and goal line
 

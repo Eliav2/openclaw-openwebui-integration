@@ -130,7 +130,7 @@ Type: `str`. Default: empty.
 
 Type: `str`. Default: `^browser\b|^(?:\S*openclaw\S*|\$\{?\w+\}?)\s+browser\s+(?:--?\S+\s+)*(?:open|navigate|goto|click|type|press|fill|hover|scroll|screenshot|snapshot|evaluate|tabs?|focus|close|start)\b(?!.*\s--help\b)|^(?:\S*/)?(?:chromium(?:-browser)?|google-chrome(?:-stable)?|chrome)(?=\s|$)(?!.*\s--(?:version|help)\b)|^(?:(?:npx|bunx|pnpm\s+(?:dlx|exec)|bun\s+x)\s+(?:-\S+\s+)*)?playwright\s+(?:test|screenshot|open|codegen)\b|^uv\s+run\b.*--with[ =]playwright\b`.
 
-Which tool calls count as browser use for LIVE_VIEW_URL: a regular expression, case-insensitive, searched in the tool's name and in each command of its `command` argument (from the command word on, so a word inside a quoted string, a heredoc or a file being written never counts). The default takes the browser tool, `openclaw browser` commands (how the agent drives its browser through exec), Chromium or Chrome started as a command, `playwright test|screenshot|open|codegen` and `uv run --with playwright`. Add your own wrapper scripts here if your agent starts a browser through one: they are matched the same way, in command position.
+Which tool calls count as browser use for LIVE_VIEW_URL: a regular expression, case-insensitive, searched in the tool's name and in each command of its `command` argument (from the command word on, so a word inside a quoted string, a heredoc or a file being written never counts). The default takes the browser tool, `openclaw browser` commands (how the agent drives its browser through exec), Chromium or Chrome started as a command, Playwright's CLI running its open, codegen or screenshot command or its runner, and `uv run --with playwright`. Add your own wrapper scripts here if your agent starts a browser through one: they are matched the same way, in command position.
 
 ### LIVE_VIEW_USERS
 
@@ -143,6 +143,30 @@ Open WebUI user ids or emails, comma-separated, whose replies get LIVE_VIEW_URL.
 Type: `str`. Default: empty.
 
 (Optional.) A link the agent hands you to take over from it, such as a page that lets you drive its browser for a login or a CAPTCHA: a regular expression searched in each tool result. Its first match, an http(s) URL, is added to the reply as a "Take control" link that opens in a new tab, once per link and chat. Empty: off.
+
+### SYNC_SLASH_COMMANDS
+
+Type: `bool`. Default: `False`.
+
+Offer the Gateway's slash commands in Open WebUI's / menu: each becomes a Workspace Prompt that every user can see, kept in sync with the Gateway. A prompt you made yourself is never changed: a command with the same name is skipped. Turning this off deletes the prompts the sync made. The Gateway still refuses an owner-only command from a user who is not the owner.
+
+### SLASH_COMMANDS_EXCLUDE
+
+Type: `str`. Default: `stop,new,reset,model,status,compact`.
+
+Slash commands not to offer as prompts, comma-separated. Of the defaults, Open WebUI runs /status, /compact and /model itself when you send them alone, so they never reach OpenClaw; /stop has the Stop button; /new and /reset would reset the session under an open chat.
+
+### PROMPT_PREFIX
+
+Type: `str`. Default: empty.
+
+Put this in front of every synced prompt's command, for example oc_ to show /oc_status and keep them together in the menu. Empty: the command is the Gateway's own name.
+
+### SYNC_INTERVAL_MIN
+
+Type: `int`. Default: `30`.
+
+How often, in minutes, to check the Gateway for changed commands, at most. A check is one small request, made in the background after a message. A page load and the Gateway's own change notice also start one.
 
 ### TITLE_GEN_AGENT_ID
 

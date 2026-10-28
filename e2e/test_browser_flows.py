@@ -1210,6 +1210,63 @@ def test_show_less_puts_a_long_task_back_at_its_first_lines(page, token):
     assert verdict == "ok", verdict
 
 
+def _prompts(token: str) -> dict:
+    """Open WebUI's Workspace Prompts, by command."""
+    return {p["command"]: p for p in capture.api("GET", "/api/v1/prompts/", token=token) or []}
+
+
+def _wait_prompts(token: str, ok, what: str, timeout_s: float = 120) -> dict:
+    return capture.poll(lambda: _prompts(token), ok, what, timeout_s)
+
+
+def _slash_menu_js(command: str) -> str:
+    return (f"() => [...document.querySelectorAll('#suggestions-container button span:first-child')]"
+            f".some(s => s.innerText.trim() === {json.dumps(command)})")
+
+
+def test_slash_commands_show_in_the_slash_menu_and_go_when_turned_off(page, token):
+    """SYNC_SLASH_COMMANDS: the Gateway's commands show in the composer's /
+    menu as prompts, excluded ones left out and a prompt someone made with
+    the same command left as it was. Picking one puts the command in the
+    composer and sending it runs it. Turned off, the synced prompts go and
+    the hand-made one stays."""
+    # The hand-made prompt takes a command the Gateway has, so the sync has one to skip.
+    gateway = capture.gateway_call("commands.list", {"agentId": "main", "scope": "text"})["commands"]
+    assert "whoami" in {c.get("name") for c in gateway}, "precondition: the Gateway has no /whoami"
+    mine = capture.api("POST", "/api/v1/prompts/create",
+                       {"command": "whoami", "name": "Mine", "content": "my own text"}, token)
+    old = capture.pipe_valves(token, SYNC_SLASH_COMMANDS=True)
+    try:
+        _reload(page)  # a page load lists the models, which starts a sync
+        prompts = _wait_prompts(token, lambda p: "help" in p, "the synced /help prompt")
+        # Open WebUI runs a lone /status or /compact itself: excluded by default.
+        for left_out in ("stop", "new", "status", "compact"):
+            assert left_out not in prompts, sorted(prompts)
+        assert prompts["whoami"]["content"] == "my own text", prompts["whoami"]
+        # Skipped, not taken over: not the sync's (it marks its own), and the same row.
+        assert prompts["whoami"]["id"] == mine["id"], prompts["whoami"]
+        assert not (prompts["whoami"].get("meta") or {}).get("openclaw"), prompts["whoami"]
+        assert prompts["help"]["meta"]["openclaw"]["command"] == "help", prompts["help"]
+        assert prompts["help"]["content"].strip() == "/help", prompts["help"]
+        capture.new_chat(page)
+        page.locator("#chat-input").click()
+        page.keyboard.type("/hel", delay=20)
+        _wait(page, _slash_menu_js("help"), "/help in the / menu", 30_000)
+        page.locator("#suggestions-container button", has=page.locator("span", has_text=re.compile(r"^help$"))).first.click()
+        _wait(page, "() => document.querySelector('#chat-input').innerText.trim() === '/help'",
+              "the command in the composer", 30_000)
+        page.locator("#send-message-button").click()
+        _wait(page, _last_assistant_js("t.includes('/commands for full list')"), "the /help reply")
+    finally:
+        capture.pipe_valves(token, **old)
+        try:
+            _reload(page)
+            prompts = _wait_prompts(token, lambda p: "help" not in p, "the synced prompts removed")
+            assert prompts.get("whoami", {}).get("content") == "my own text", sorted(prompts)
+        finally:
+            capture.api("DELETE", f"/api/v1/prompts/id/{mine['id']}/delete", token=token)
+
+
 def _chat_id(page) -> str:
     m = re.search(r"/c/([0-9a-f-]{36})", page.url)
     assert m, f"no chat id in {page.url}"
