@@ -758,7 +758,9 @@ class Scenes:
                     "the status dialog", 60_000)
             open_fold(page, "subagents")
             rows = f"{root} #openclaw-status-section-subagents [data-openclaw-row]"
-            page.locator(rows).filter(has_text="pre-registered baseline").first.click()
+            wait_js(page, f"""() => [...document.querySelectorAll('{rows}')].some(r => /noise table/i.test(r.innerText))""",
+                    "the unfolded sub-agents", 60_000)
+            page.locator(rows).filter(has_text="Forecaster benchmark").first.click()
             page.wait_for_selector("#openclaw-drawer-root", timeout=30_000)
             wait_js(page, """() => { const m = document.getElementById('openclaw-drawer-meta');
                      return !!m && /all stations/.test(m.innerText) && !!m.querySelector('a[target=_blank]'); }""",
