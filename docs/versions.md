@@ -8,7 +8,7 @@ Applies to: Pipe, Action, Filter
 
 | | Minimum | Tested in CI |
 |---|---|---|
-| Open WebUI | 0.12.0 | 0.12.3 |
+| Open WebUI | 0.12.0 | 0.12.5 |
 | OpenClaw Gateway | 2026.9.3 | 2026.10.5 |
 | Python inside Open WebUI (what Open WebUI ships) | 3.11 | 3.11 and 3.12 |
 | Python for `install.py` | 3.10 | 3.10 to 3.13 |
@@ -42,6 +42,7 @@ Each row is the full end-to-end suite on one pair, on GitHub's runners. The suit
 | 0.12.0 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/39003313714) |
 | 0.12.2 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/39003315726) |
 | 0.12.3 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/39173684021) |
+| 0.12.5 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/40881528739) |
 
 ### OpenClaw, with Open WebUI 0.12.0
 
