@@ -24,7 +24,7 @@ A PR that changes how something already documented behaves (a fix included) corr
 
 One screenshot per scene, in the light theme: no dark copies, in the docs or anywhere else.
 
-A PR with a visual change shows one Before and After pair in its description, light theme, from the Screenshots workflow. When the change unfolds over time (streaming, the queue, Stop, cards, the drawer), the After may be one light GIF from the Demos workflow (a demo in `scripts/demos/demos.json`) instead of a still; the Before stays one still. A static change keeps the still pair, and a backend change shows no images.
+A PR with a visual change shows one Before and After pair in its description, light theme, from the Screenshots workflow. When the change unfolds over time (streaming, the queue, Stop, cards, the drawer), the After may be one light GIF from the Demos workflow (a demo in `scripts/demos/demos.json`) instead of a still; the Before stays one still. A static change keeps the still pair, and a backend change shows no images. Upload the pair with `gh pr create --attach` or `gh pr edit <n> --attach` so the description shows GitHub asset URLs; never commit Before/After images, push them to a side branch, or link a branch's `raw.githubusercontent.com` URL (it breaks when the branch is deleted). gh rewrites only `![alt](./file.png)` references; for an `<img>` tag, put the uploaded asset URL in `src`. Docs images stay committed in `docs/img/`; a PR that changes one attaches it too instead of linking the branch copy.
 
 A feature that is best seen moving can also show a demo GIF on its page: a demo in `scripts/demos/demos.json`, recorded by the Demos workflow into `docs/img/demos/` (light theme, 960 px wide, at most 15 s and 1 MB), shown as an `<img>` at most 800 wide.
 
