@@ -1,7 +1,7 @@
 # Class names defined by Open WebUI's shipped stylesheet (every CSS file
 # its index page links). Regenerate on every Open WebUI bump:
 #   python3 scripts/owui_css.py dump http://localhost:8080
-# ref: v0.12.3
+# ref: v0.12.5
 ![background-image:none]
 !bg-gray-50/40
 !bg-transparent
@@ -13,6 +13,7 @@
 !border-transparent
 !h-6
 !h-[1.375rem]
+!items-start
 !leading-snug
 !max-w-[80rem]
 !max-w-none
@@ -61,6 +62,7 @@
 -right-0.5
 -right-1
 -right-1.5
+-right-[3px]
 -rotate-45
 -rotate-90
 -scale-x-100
@@ -76,6 +78,7 @@
 -top-12
 -top-3
 -top-7
+-top-[3px]
 -translate-x-1
 -translate-x-1/2
 -translate-x-[0.5px]
@@ -132,9 +135,11 @@ bg-black/10
 bg-black/20
 bg-black/40
 bg-black/45
+bg-black/5
 bg-black/60
 bg-black/80
 bg-black/[0.025]
+bg-black/[0.02]
 bg-black/[0.035]
 bg-black/[0.03]
 bg-blue-100
@@ -143,10 +148,12 @@ bg-blue-300
 bg-blue-300/10
 bg-blue-500
 bg-blue-500/20
+bg-blue-600
 bg-blue-700
 bg-center
 bg-clip-padding
 bg-cover
+bg-current
 bg-cyan-100
 bg-cyan-300
 bg-cyan-500
@@ -157,6 +164,7 @@ bg-gradient-to-t
 bg-gray-100
 bg-gray-100/40
 bg-gray-100/50
+bg-gray-100/70
 bg-gray-100/80
 bg-gray-200
 bg-gray-200/50
@@ -166,6 +174,7 @@ bg-gray-200/80
 bg-gray-300
 bg-gray-300/10
 bg-gray-400
+bg-gray-400/70
 bg-gray-50
 bg-gray-50/40
 bg-gray-50/50
@@ -258,8 +267,8 @@ border-b-2
 border-b-[1.5px]
 border-b-gray-800
 border-black
-border-black/15
 border-black/5
+border-black/[0.06]
 border-blue-500
 border-collapse
 border-dashed
@@ -308,6 +317,7 @@ border-sky-500
 border-t
 border-t-[1.5px]
 border-transparent
+border-transparent!
 border-white
 border-y
 border-yellow-500
@@ -316,6 +326,7 @@ bottom-1
 bottom-3
 bottom-8
 bottom-9
+bottom-[0.3125rem]
 bottom-full
 break-all
 break-normal
@@ -325,6 +336,7 @@ chat-user
 cm-editor
 cm-focused
 cm-gutters
+cm-placeholder
 cm-scroller
 codespan
 col-span-2
@@ -384,6 +396,7 @@ dark:bg-gray-100
 dark:bg-gray-100/10
 dark:bg-gray-100/5
 dark:bg-gray-200
+dark:bg-gray-300/70
 dark:bg-gray-400
 dark:bg-gray-400/5
 dark:bg-gray-500
@@ -401,13 +414,13 @@ dark:bg-gray-800/50
 dark:bg-gray-800/60
 dark:bg-gray-800/80
 dark:bg-gray-850
+dark:bg-gray-850/40
 dark:bg-gray-850/50
 dark:bg-gray-850/60
 dark:bg-gray-850/80
 dark:bg-gray-850/90
 dark:bg-gray-850/95
 dark:bg-gray-900
-dark:bg-gray-900/30
 dark:bg-gray-900/50
 dark:bg-gray-900/60
 dark:bg-gray-900/80
@@ -506,7 +519,6 @@ dark:border-red-900/60
 dark:border-sky-500/20
 dark:border-white
 dark:border-white/10
-dark:border-white/15
 dark:border-white/5
 dark:border-white/8
 dark:border-white/[0.025]
@@ -527,22 +539,29 @@ dark:divide-gray-850
 dark:divide-gray-850/60
 dark:divide-white/[0.03]
 dark:enabled:hover:text-gray-100
+dark:fill-[color-mix(in_srgb,var(--color-gray-900),white_4%)]
 dark:fill-gray-300
+dark:fill-white/8
 dark:focus-visible:outline-gray-500
 dark:focus-within:bg-gray-850
 dark:focus-within:bg-gray-900
+dark:focus-within:bg-white/4
 dark:focus-within:border-blue-500
 dark:focus:bg-gray-800
 dark:focus:bg-gray-850
 dark:focus:border-blue-500
+dark:focus:border-gray-500
 dark:focus:ring-gray-600
 dark:focus:text-gray-100
 dark:from-gray-900
 dark:from-gray-900/90
 dark:from-gray-950
+dark:group-focus-within/setting-row:text-white
 dark:group-hover/item:text-white
+dark:group-hover/setting-row:text-white
 dark:group-hover:bg-gray-900
 dark:group-hover:bg-white/10
+dark:group-hover:fill-white/4
 dark:group-hover:text-gray-100
 dark:group-hover:text-gray-200
 dark:group-hover:text-gray-300
@@ -579,6 +598,7 @@ dark:hover:bg-white/10
 dark:hover:bg-white/12
 dark:hover:bg-white/4
 dark:hover:bg-white/5
+dark:hover:bg-white/[0.04]
 dark:hover:bg-white/[0.06]
 dark:hover:border-gray-800
 dark:hover:disabled:bg-transparent
@@ -644,6 +664,8 @@ dark:text-red-500
 dark:text-sky-300
 dark:text-teal-400
 dark:text-white
+dark:text-white/10
+dark:text-white/25
 dark:text-white/50
 dark:text-white/60
 dark:text-white/80
@@ -713,8 +735,11 @@ excel-col-hdr
 excel-num
 excel-row-num
 fade-in-token
+fill-black/5
 fill-gray-300
+fill-gray-50
 fill-red-500
+fill-transparent
 fill-yellow-300
 filter
 first-letter:capitalize
@@ -734,6 +759,7 @@ flex-wrap
 float-right
 focus-ring
 focus-visible:outline
+focus-visible:outline-1
 focus-visible:outline-2
 focus-visible:outline-gray-400
 focus-visible:outline-none
@@ -743,8 +769,8 @@ focus-visible:ring-2
 focus-visible:ring-gray-400
 focus-visible:underline
 focus-within:-outline-offset-2
-focus-within:bg-gray-100/60
 focus-within:bg-gray-50
+focus-within:bg-gray-50/40
 focus-within:border-blue-400
 focus-within:border-gray-100
 focus-within:border-gray-200
@@ -761,6 +787,7 @@ focus:bg-gray-50
 focus:bg-transparent
 focus:bg-white
 focus:border-blue-400
+focus:border-gray-400
 focus:dark:outline-gray-200!
 focus:font-medium
 focus:left-2
@@ -774,7 +801,6 @@ focus:py-2
 focus:ring-0
 focus:ring-1
 focus:ring-2
-focus:ring-blue-400/20
 focus:ring-gray-300
 focus:ring-white/50
 focus:rounded-lg
@@ -804,6 +830,7 @@ gap-0
 gap-0.5
 gap-1
 gap-1.5
+gap-1.75
 gap-2
 gap-2.5
 gap-3
@@ -830,10 +857,12 @@ grid-cols-1
 grid-cols-10
 grid-cols-2
 grid-cols-7
+grid-cols-[1.75rem_minmax(0,1fr)_3.5rem_1.75rem]
 grid-cols-[144px_minmax(0,1fr)]
 grid-cols-[1fr_auto]
 grid-cols-[20px_minmax(0,1fr)]
 grid-cols-[52px_repeat(7,1fr)]
+grid-cols-[6rem_minmax(0,1fr)_3rem]
 grid-cols-[7rem_minmax(0,1fr)]
 grid-cols-[7rem_minmax(0,1fr)_auto]
 grid-cols-[auto_1fr]
@@ -842,16 +871,25 @@ grid-cols-[minmax(0,1fr)]
 grid-cols-[minmax(0,1fr)_minmax(0,1fr)_1.5rem]
 grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]
 grid-cols-[minmax(0,1fr)_minmax(0,8rem)]
+grid-cols-[repeat(auto-fill,minmax(min(160px,100%),1fr))]
+grid-cols-[repeat(auto-fill,minmax(min(94px,calc((100%_-_0.5rem)/2)),1fr))]
 grid-flow-col
 group
+group-focus-visible:opacity-100
+group-focus-within/item:opacity-100
+group-focus-within/setting-row:text-gray-900
 group-focus-within:opacity-100
 group-focus-within:opacity-60
+group-has-[button[id$=-control]:disabled]/setting-row:cursor-not-allowed
+group-has-[button[id$=-control]:enabled]/setting-row:cursor-pointer
 group-hover/item:opacity-100
 group-hover/item:text-gray-600
+group-hover/setting-row:text-gray-900
 group-hover:bg-black/10
 group-hover:bg-black/40
 group-hover:bg-gray-100
 group-hover:block
+group-hover:fill-black/[0.02]
 group-hover:flex
 group-hover:hidden
 group-hover:inline
@@ -875,6 +913,7 @@ group/header
 group/item
 group/prompt
 group/setting
+group/setting-row
 grow
 h-0
 h-0.5
@@ -883,9 +922,12 @@ h-1.5
 h-1/2
 h-10
 h-11
+h-15
+h-17
 h-2
 h-2.5
 h-20
+h-26
 h-3
 h-3.5
 h-32
@@ -895,6 +937,7 @@ h-40
 h-48
 h-5
 h-6
+h-60
 h-7
 h-72
 h-8
@@ -907,6 +950,7 @@ h-[100dvh]
 h-[2.5rem]
 h-[22rem]
 h-[26px]
+h-[3.875rem]
 h-[5px]
 h-[60vh]
 h-[70vh]
@@ -917,10 +961,14 @@ h-[calc(100dvh-4rem)]
 h-[min(36rem,70dvh)]
 h-[min(54rem,calc(100dvh-4rem))]
 h-auto
+h-dvh
 h-fit
 h-full
 h-px
 h-screen
+has-[[role^=menuitem]:focus-visible]:-outline-offset-2
+has-[[role^=menuitem]:focus-visible]:outline-2
+has-[[role^=menuitem]:focus-visible]:outline-blue-500
 hidden
 high-contrast
 hljs
@@ -1019,7 +1067,6 @@ inline-flex
 input-prose
 input-prose-sm
 inset-0
-inset-1
 inset-x-0
 inset-x-2.5
 inset-y-0
@@ -1059,6 +1106,7 @@ leading-snug
 leading-tight
 left-0
 left-1
+left-1.5
 left-1/2
 left-3
 left-4
@@ -1129,7 +1177,6 @@ max-h-[22rem]
 max-h-[24rem]
 max-h-[25vh]
 max-h-[28rem]
-max-h-[32rem]
 max-h-[45dvh]
 max-h-[50dvh]
 max-h-[50vh]
@@ -1144,11 +1191,14 @@ max-h-[calc(100dvh-1.5rem)]
 max-h-[calc(100dvh-2rem)]
 max-h-[calc(100dvh-3rem)]
 max-h-[calc(100dvh-4rem)]
+max-h-[calc(100dvh-6rem)]
 max-h-[min(15rem,calc(100vh-4rem))]
 max-h-[min(17.5rem,calc(100vh-1.5rem))]
+max-h-[min(28rem,calc(100dvh-12rem))]
 max-h-dvh
 max-h-fit
 max-h-full
+max-w-12
 max-w-24
 max-w-28
 max-w-2xl
@@ -1170,6 +1220,7 @@ max-w-[10rem]
 max-w-[11.25rem]
 max-w-[11rem]
 max-w-[12.5rem]
+max-w-[12rem]
 max-w-[16rem]
 max-w-[18rem]
 max-w-[35%]
@@ -1189,8 +1240,10 @@ max-w-[9.375rem]
 max-w-[9.5rem]
 max-w-[90%]
 max-w-[9rem]
+max-w-[calc(100%-1.75rem)]
 max-w-[calc(100%-1rem)]
 max-w-[calc(100%-2.25rem)]
+max-w-[calc(100%-2rem)]
 max-w-[calc(100%-4.5rem)]
 max-w-[calc(100vw-1.5rem)]
 max-w-[calc(100vw-1rem)]
@@ -1235,6 +1288,7 @@ md:max-w-[calc(100%-var(--sidebar-width))]
 md:mb-0
 md:min-h-0
 md:ml-0
+md:mt-1
 md:overflow-visible
 md:overflow-x-hidden
 md:overflow-y-auto
@@ -1253,8 +1307,8 @@ md:static
 md:text-lg
 md:top-8
 md:w-[15rem]
-md:w-[calc(100%-0.5rem)]
 md:w-full
+me-0.5
 me-2
 mention
 message-listitem
@@ -1264,7 +1318,6 @@ min-h-12
 min-h-16
 min-h-20
 min-h-24
-min-h-32
 min-h-4
 min-h-40
 min-h-5
@@ -1319,9 +1372,11 @@ min-w-[9.375rem]
 min-w-[var(--width)]
 min-w-fit
 min-w-full
+min-w-px
 ml-0.5
 ml-1
 ml-1.5
+ml-12
 ml-2
 ml-3
 ml-5
@@ -1342,7 +1397,9 @@ mr-3
 mr-6
 mr-[1.5625rem]
 mr-auto
+ms-1
 ms-2
+ms-7
 ms-auto
 mt-0.5
 mt-1
@@ -1395,6 +1452,7 @@ opacity-25
 opacity-30
 opacity-35
 opacity-40
+opacity-45
 opacity-50
 opacity-55
 opacity-60
@@ -1412,7 +1470,9 @@ outline-blue-500/50
 outline-gray-200
 outline-hidden
 outline-none
+outline-none!
 outline-offset-2
+outline-offset-4
 overflow-auto
 overflow-clip
 overflow-hidden
@@ -1464,6 +1524,7 @@ pl-0
 pl-0.5
 pl-1
 pl-1.5
+pl-12
 pl-2
 pl-2.5
 pl-3
@@ -1473,6 +1534,7 @@ pl-5
 pl-8
 pl-[0.0625rem]
 pl-[26px]
+pl-[4.875rem]
 place-items-center
 placeholder-gray-400
 placeholder-gray-800
@@ -1504,6 +1566,7 @@ prose
 prose-sm
 ps-2
 ps-2.5
+ps-4
 ps-6
 pt-0
 pt-0.5
@@ -1541,6 +1604,7 @@ px-4.5
 px-5
 px-5.5
 px-6
+px-7
 px-8
 px-[0.3125rem]
 px-[0.4375rem]
@@ -1653,6 +1717,7 @@ shadow
 shadow-[0_16px_40px_-28px_rgba(0,0,0,0.55)]
 shadow-lg
 shadow-md
+shadow-none
 shadow-sm
 shadow-xl
 shadow-xs
@@ -1709,8 +1774,12 @@ sm:flex-row
 sm:gap-2
 sm:gap-7
 sm:grid-cols-2
+sm:grid-cols-[1.75rem_minmax(0,1fr)_4rem_7rem_1.75rem]
+sm:grid-cols-[10rem_minmax(0,1fr)_3.5rem]
 sm:grid-cols-[8rem_minmax(0,1fr)]
 sm:grid-cols-[8rem_minmax(0,1fr)_auto]
+sm:group-focus-within:opacity-100
+sm:group-hover:opacity-100
 sm:h-48
 sm:inline
 sm:items-center
@@ -1718,11 +1787,13 @@ sm:items-start
 sm:justify-between
 sm:justify-center
 sm:left-10
+sm:max-w-80
 sm:max-w-[13rem]
 sm:max-w-[55%]
 sm:max-w-[9.375rem]
 sm:max-w-md
 sm:mx-2.5
+sm:opacity-0
 sm:p-4
 sm:p-6
 sm:pb-10
@@ -1732,6 +1803,7 @@ sm:shrink-0
 sm:space-x-6
 sm:text-2xl
 sm:top-10
+sm:w-56
 sm:w-[45%]
 sm:w-auto
 snap-center
@@ -1789,6 +1861,7 @@ text-[0.78125rem]
 text-[0.7rem]
 text-[0.8125rem]
 text-[0.9375rem]
+text-[10px]
 text-[11px]
 text-amber-500
 text-amber-600
@@ -1796,6 +1869,8 @@ text-amber-700
 text-amber-900
 text-base
 text-black
+text-black/10
+text-black/25
 text-black/50
 text-black/60
 text-black/80
@@ -1893,6 +1968,7 @@ translate-x-0.5
 translate-x-2.5
 translate-y-0.5
 translate-y-1
+translate-y-1/2
 translate-y-6
 translate-y-[0.0625rem]
 translate-y-[0.5px]
@@ -1914,10 +1990,12 @@ via-white
 via-white/50
 visible
 w-0
+w-0.5
 w-1
 w-1.5
 w-1/2
 w-10
+w-12
 w-14
 w-16
 w-2
@@ -1928,6 +2006,7 @@ w-24
 w-28
 w-3
 w-3.5
+w-3/4
 w-32
 w-36
 w-4
@@ -1973,6 +2052,7 @@ w-[var(--sidebar-width)]
 w-fit
 w-full
 w-max
+w-px
 w-screen
 w3
 whitespace-normal
@@ -1982,7 +2062,6 @@ whitespace-pre-line
 whitespace-pre-wrap
 will-change-transform
 wrap-anywhere
-xl:grid-cols-4
 z-0
 z-10
 z-20

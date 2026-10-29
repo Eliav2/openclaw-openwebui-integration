@@ -2,19 +2,19 @@
  "owui_version": null,
  "templates": [
   {
-   "chunk": "_app/immutable/chunks/BjRGu3Y4.js",
-   "template": "<button class=\"bg-white hover:bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-white dark:hover:bg-gray-800 transition rounded-full p-[0.3125rem]\"><svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"currentColor\" class=\"size-5\"><path fill-rule=\"evenodd\" d=\"M2.25 12c0-5.385 4.365-9.75 9.75-9.75s9.75 4.365 9.75 9.75-4.365 9.75-9.75 9.75S2.25 17.385 2.25 12zm6-2.438c0-.724.588-1.312 1.313-1.312h4.874c.725 0 1.313.588 1.313 1.313v4.874c0 .725-.588 1.313-1.313 1.313H9.564a1.312 1.312 0 01-1.313-1.313V9.564z\" clip-rule=\"evenodd\"></path></svg></button>"
-  },
-  {
-   "chunk": "_app/immutable/chunks/BjRGu3Y4.js",
-   "template": "<button type=\"button\" class=\"p-3 rounded-full bg-gray-50 dark:bg-gray-900\"><svg class=\"size-5\" viewBox=\"0 0 20 20\" fill=\"currentColor\" aria-hidden=\"true\"><rect x=\"4\" y=\"4\" width=\"12\" height=\"12\" rx=\"2\"></rect></svg></button>"
-  },
-  {
-   "chunk": "_app/immutable/chunks/D1XkYf1e.js",
+   "chunk": "_app/immutable/chunks/CYex4BXv.js",
    "template": "<button class=\"nb-btn text-[0.6rem] svelte-1wcdx53\"> </button> <button class=\"nb-btn text-[0.6rem] svelte-1wcdx53\"> </button>"
   },
   {
-   "chunk": "_app/immutable/nodes/26.D8gjFWss.js",
+   "chunk": "_app/immutable/chunks/BwPFp-FS.js",
+   "template": "<button class=\"bg-white hover:bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-white dark:hover:bg-gray-800 transition rounded-full p-[0.3125rem]\"><svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"currentColor\" class=\"size-5\"><path fill-rule=\"evenodd\" d=\"M2.25 12c0-5.385 4.365-9.75 9.75-9.75s9.75 4.365 9.75 9.75-4.365 9.75-9.75 9.75S2.25 17.385 2.25 12zm6-2.438c0-.724.588-1.312 1.313-1.312h4.874c.725 0 1.313.588 1.313 1.313v4.874c0 .725-.588 1.313-1.313 1.313H9.564a1.312 1.312 0 01-1.313-1.313V9.564z\" clip-rule=\"evenodd\"></path></svg></button>"
+  },
+  {
+   "chunk": "_app/immutable/chunks/BwPFp-FS.js",
+   "template": "<button type=\"button\" class=\"p-3 rounded-full bg-gray-50 dark:bg-gray-900\"><svg class=\"size-5\" viewBox=\"0 0 20 20\" fill=\"currentColor\" aria-hidden=\"true\"><rect x=\"4\" y=\"4\" width=\"12\" height=\"12\" rx=\"2\"></rect></svg></button>"
+  },
+  {
+   "chunk": "_app/immutable/nodes/26.dcOvGhrx.js",
    "template": "<button class=\"bg-white hover:bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-white dark:hover:bg-gray-800 transition rounded-full size-7 flex items-center justify-center\"><svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"currentColor\" class=\"size-4\"><path fill-rule=\"evenodd\" d=\"M2.25 12c0-5.385 4.365-9.75 9.75-9.75s9.75 4.365 9.75 9.75-4.365 9.75-9.75 9.75S2.25 17.385 2.25 12zm6-2.438c0-.724.588-1.312 1.313-1.312h4.874c.725 0 1.313.588 1.313 1.313v4.874c0 .725-.588 1.313-1.313 1.313H9.564a1.312 1.312 0 01-1.313-1.313V9.564z\" clip-rule=\"evenodd\"></path></svg></button>"
   }
  ]
