@@ -65,7 +65,7 @@ runs:
       with:
         python-version: "3.11"
 
-    - uses: astral-sh/setup-uv@v10.3.0
+    - uses: astral-sh/setup-uv@v10.3.2
 
     - name: Start the stack and install the integration
       shell: bash

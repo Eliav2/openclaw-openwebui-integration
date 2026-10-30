@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v10.3.0
+      - uses: astral-sh/setup-uv@v10.3.2
 
       - name: Ruff (correctness rules, see ruff.toml)
         run: uvx ruff@0.17.0 check --output-format github .
@@ -59,7 +59,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - uses: astral-sh/setup-uv@v10.3.0
+      - uses: astral-sh/setup-uv@v10.3.2
 
       # Runs the vendored Open WebUI frontend reducer for the live-order tests.
       - uses: oven-sh/setup-bun@v2
