@@ -495,12 +495,9 @@ def _saved_replies(page, token: str) -> list:
     return [m for m in saved.values() if m.get("role") == "assistant"]
 
 
-def _both_answered(page, token: str, run: str, answer: str) -> None:
-    """The running reply went on to its end in its own message, nothing cut,
-    and the new message got its own answer, with none of the run in it; the
-    same after a reload. Open WebUI draws the running reply finished as soon
-    as the new message goes in, while it is still being written, so it is
-    judged once the new message's answer, which waits for the run, is done.
+def _saved_whole(page, token: str, run: str) -> None:
+    """Wait for the running reply (holding `run`) to be saved whole and done,
+    before a reload.
 
     The new message goes once the run is over at the Gateway, while the
     Pipe's writer still reads the run's transcript to save the running
@@ -510,21 +507,29 @@ def _both_answered(page, token: str, run: str, answer: str) -> None:
     two one after the other: one that reads the reply before the save and
     the copies after it (the writer drops its copy once saved) gets it cut,
     and the page, with no task left on the chat, shows it cut and finished
-    (ELI-274's window, for the reply's text). So the reply is waited for as
-    saved, whole and done (a mid-turn copy is never done), then the page
-    reloaded."""
-    _wait(page, _reply_js(-1, "all.length === 2 && all[0].done && r.done"), "both replies done")
-    first, second = _replies(page)
-    assert first["text"].count(run) == 1, f"the running reply was cut or doubled: {first['text'][-120:]!r}"
-    assert answer in second["text"] and "slow-" not in second["text"], second["text"]
+    (ELI-274's window, for the reply's text). A mid-turn copy is never done."""
     deadline = time.time() + TURN_MS / 1000
     while True:
         replies = _saved_replies(page, token)
         if any(m.get("done") and run in (m.get("content") or "") for m in replies):
-            break
+            return
         assert time.time() < deadline, (
             f"the running reply was never saved whole: {[((m.get('content') or '')[-80:], m.get('done')) for m in replies]}")
         time.sleep(0.5)
+
+
+def _both_answered(page, token: str, run: str, answer: str) -> None:
+    """The running reply went on to its end in its own message, nothing cut,
+    and the new message got its own answer, with none of the run in it; the
+    same after a reload. Open WebUI draws the running reply finished as soon
+    as the new message goes in, while it is still being written, so it is
+    judged once the new message's answer, which waits for the run, is done.
+    The reload waits for the reply's save (`_saved_whole`)."""
+    _wait(page, _reply_js(-1, "all.length === 2 && all[0].done && r.done"), "both replies done")
+    first, second = _replies(page)
+    assert first["text"].count(run) == 1, f"the running reply was cut or doubled: {first['text'][-120:]!r}"
+    assert answer in second["text"] and "slow-" not in second["text"], second["text"]
+    _saved_whole(page, token, run)
     _reload(page)
     _wait(page, _reply_js(-1, "all.length === 2 && all[0].done && r.done"), "both replies after a reload", 60_000)
     again = _replies(page)
@@ -646,6 +651,7 @@ def test_a_message_sent_from_a_second_tab_keeps_the_running_reply(page, token):
                                    " && r.text.includes('BROWSER_TAB2_ANSWER')"), "the answer in the second tab")
     finally:
         other.close()
+    _saved_whole(page, token, run)
     _reload(page)
     _both_answered(page, token, run, "BROWSER_TAB2_ANSWER")
     _ends_like_the_answer(page, token, run)
