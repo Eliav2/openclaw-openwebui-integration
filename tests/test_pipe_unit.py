@@ -7995,6 +7995,13 @@ class _FakeOwuiChat:
         async def save_response_stream(redis, task_id, chat_id, message_id, content, output):
             fake.streams.append((task_id, message_id, content, copy.deepcopy(output)))
 
+        # Each mid-turn copy dropped: (task_id, events emitted so far, the
+        # saved messages then).
+        self.cleared = []
+
+        async def clear_response_stream(redis, task_id):
+            fake.cleared.append((task_id, len(fake.emits), copy.deepcopy(fake.msgs())))
+
         async def create_task(redis, coroutine, id=None, task_id=None):
             task_id = task_id or f"task-{len(fake.tasks) + 1}"
             fake.tasks[task_id] = (id, asyncio.ensure_future(coroutine))
@@ -8015,6 +8022,7 @@ class _FakeOwuiChat:
                 "open_webui.socket.main": self.socket_main,
                 "open_webui.tasks": mod("open_webui.tasks", create_task=create_task,
                                         save_response_stream=save_response_stream,
+                                        clear_response_stream=clear_response_stream,
                                         tasks=self.request_tasks),
                 "open_webui.main": mod("open_webui.main", app=types.SimpleNamespace(
                     state=types.SimpleNamespace(redis=None))),
@@ -8212,15 +8220,69 @@ class TurnWriterTabRepairTests(_TurnWriterCase):
         self.assertEqual((m["content"], m["done"]), ("Hello", True))
         self.assertEqual(final["messages"]["a1"], {"id": "a1", "childrenIds": ["m1"]})
 
-    async def test_a_message_taken_over_is_neither_probed_nor_sent_again(self):
-        """A pipe run's own stub: Open WebUI introduced it, tabs load it."""
+    async def test_a_message_taken_over_is_not_probed(self):
+        """A pipe run's own stub: Open WebUI introduced it, tabs load it. Its
+        end sends it finished (ELI-340), but as M alone: the parent's link is
+        in every saved copy, and the view stays where it is."""
         w = _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
                         run_id="agent-run-1", message_id="a1", takeover=True)
         await w.feed(_delta("Hello"))
         await self.spin()
         await w.finalize()
         self.assertEqual(self.probes(), [])
-        self.assertEqual(self.owui.events("chat:messages"), [])
+        (final,) = self.owui.events("chat:messages")
+        self.assertEqual(set(final["data"]["messages"]), {"a1"})
+        self.assertIsNone(final["data"]["currentId"], "a taken-over M can have later messages under it")
+
+
+class TurnWriterLoadAcrossTheSaveTests(_TurnWriterCase):
+    """ELI-340: a tab that loads the chat across M's final save reads the row
+    before the save and no mid-turn copy after it, and shows M cut, also once
+    the run is over. The end saves M whole, drops the copy, then sends M
+    finished to the chat's room, which a loading page keeps over what it
+    fetched."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.conn.session_history = mock.AsyncMock(return_value={"messages": []})
+
+    async def test_the_copy_is_dropped_after_the_whole_save_then_m_is_sent_finished(self):
+        shown = _TurnRenderer()
+        shown.feed(_delta("slow-1 slow-2"))
+        await self.owui.end_request("m1", copy.deepcopy(shown.output))
+        w = _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
+                        run_id="agent-run-1", message_id="m1", takeover=True, renderer=shown)
+        await w.feed(None)
+        await w.feed(_delta(" slow-3"))
+        self.assertEqual(self.owui.msgs()["m1"]["content"], "slow-1 slow-2", "the handover's write: M cut")
+        await w.finalize()
+        (cleared,) = [c for c in self.owui.cleared if c[0] == w.task_id]
+        _, at, saved = cleared
+        self.assertEqual((saved["m1"]["content"], saved["m1"]["done"]), ("slow-1 slow-2 slow-3", True),
+                         "the copy goes only once the row holds the whole reply")
+        events = [d for e, d, room in self.owui.emits if e == "events"]
+        rooms = [room for e, d, room in self.owui.emits if e == "events"]
+        kinds = [d["data"]["type"] for d in events]
+        pushes = [i for i, d in enumerate(events) if d["data"]["type"] == "chat:messages"]
+        self.assertTrue(pushes, "M is sent finished")
+        push = pushes[-1]
+        self.assertGreaterEqual(push, at, "after the copy is dropped")
+        self.assertLess(push, kinds.index("chat:completion"))
+        sent = events[push]
+        self.assertTrue(sent["shared"])
+        m = sent["data"]["data"]["messages"]["m1"]
+        self.assertEqual((m["content"], m["done"]), ("slow-1 slow-2 slow-3", True))
+        self.assertEqual(sent["message_id"], "m1")
+        self.assertEqual(rooms[push], f"chat:{self.CHAT}", "to the chat room, where a loading tab already is")
+
+    async def test_an_inserted_message_is_sent_with_its_parent_and_view(self):
+        w = self.writer()
+        await w.feed(_delta("Hello"))
+        await w.finalize()
+        self.assertTrue(any(c[0] == w.task_id for c in self.owui.cleared))
+        final = self.owui.events("chat:messages")[-1]
+        self.assertEqual(final["data"]["currentId"], "m1")
+        self.assertEqual(final["data"]["messages"]["a1"], {"id": "a1", "childrenIds": ["m1"]})
 
 
 class MediaDirectiveKindTests(unittest.TestCase):

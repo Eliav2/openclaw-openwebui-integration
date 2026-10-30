@@ -77,7 +77,8 @@ async def _set_turn_meta_now(chat_id: str, message_id: str, meta: dict) -> bool:
         return True
 
 
-async def _introduce_turn_message(chat_id: str, user_id: str, messages: dict, current_id: str) -> None:
+async def _introduce_turn_message(chat_id: str, user_id: str, messages: dict, current_id: str | None,
+                                  message_id: str | None = None) -> None:
     """Show a newly claimed message in every open tab of the chat without a
     reload: the shared `chat:messages` event to room `chat:<id>`, which the
     page merges and moves its view to (Open WebUI emits the same for its own
@@ -85,7 +86,7 @@ async def _introduce_turn_message(chat_id: str, user_id: str, messages: dict, cu
     from open_webui.socket.main import sio
 
     await sio.emit("events", {
-        "chat_id": chat_id, "message_id": current_id, "user_id": user_id, "shared": True,
+        "chat_id": chat_id, "message_id": message_id or current_id, "user_id": user_id, "shared": True,
         "data": {"type": "chat:messages", "data": {"messages": messages, "currentId": current_id}},
     }, room=f"chat:{chat_id}")
 
@@ -157,6 +158,19 @@ async def _save_response_stream(task_id, chat_id, message_id, text: str, output:
         await save_response_stream(_owui_redis(), task_id, chat_id, message_id, text, output)
     else:
         await save_response_stream(_owui_redis(), task_id, chat_id, message_id, output)
+
+
+async def _clear_response_stream(task_id: str | None) -> None:
+    """Drop the mid-turn copy of `task_id`'s message, once its row is saved
+    whole: a GET from then on reads the row alone."""
+    if not task_id:
+        return
+    try:
+        from open_webui.tasks import clear_response_stream
+
+        await clear_response_stream(_owui_redis(), task_id)
+    except Exception as ex:
+        pipe_log(f"  turn writer: clearing the response stream failed: {ex!r}")
 
 
 def _owui_request_task(task_id: str | None):
@@ -957,6 +971,26 @@ class _TurnWriter:
             await self._persist(done=True, output=output, text=text, status_history=history)
         return new
 
+    async def _push_final(self, text: str, output: list) -> None:
+        """M finished, as a shared `chat:messages` to the chat's room. Only for
+        a message this writer inserted does it carry the parent's link and move
+        the view to M (ELI-230: a tab that lost M). A taken-over M is in every
+        saved copy of the chat already, and can have later messages under it:
+        the page would replace the parent's children with M alone, or show M
+        as the end of the chat."""
+        if not self._claim or self.message_id not in self._claim["messages"]:
+            return
+        message = {**self._claim["messages"][self.message_id],
+                    "content": text, "output": output, "done": True}
+        new = self._introduced()
+        try:
+            await _introduce_turn_message(
+                self.chat_id, self.user_id,
+                _turn_message_patch(self.message_id, self._claim["parent"] if new else None, message),
+                self.message_id if new else None, self.message_id)
+        except Exception as ex:
+            pipe_log(f"  turn writer: final push failed: {ex!r}")
+
     def adopt(self, run_id: str) -> None:
         """A run that continues M (a pipe resume, or a restart recovery that
         rule E maps here) is written into the same message."""
@@ -1215,18 +1249,15 @@ class _TurnWriter:
             run_usage = next(filter(None, (_history_usage_for_run(hist, r) for r in reversed(self.runs))),
                              None) if hist else None
             status = await self._persist_final(output, text, stopped, run_usage)
-            if self._introduced():
-                # ELI-230: once more, finished, for a tab that lost M and was
-                # not repaired. A tab that has M merges the same content; the
-                # completion right after it ends M as before.
-                message = {**self._claim["messages"][self.message_id],
-                           "content": text, "output": output, "done": True}
-                try:
-                    await _introduce_turn_message(
-                        self.chat_id, self.user_id,
-                        _turn_message_patch(self.message_id, self._claim["parent"], message), self.message_id)
-                except Exception as ex:
-                    pipe_log(f"  turn writer: final introduce failed: {ex!r}")
+            # ELI-340: the saved row is whole now, so drop the mid-turn copy a
+            # GET lays over it, then send M finished to every tab of the chat.
+            # A tab that loaded the chat across the save read the row before
+            # it and found no copy after it: it shows M cut. Its load began
+            # before this push, which it keeps over what it fetched (Open
+            # WebUI's loadChat and refreshChat keep live updates); a tab that
+            # shows M already merges the same content.
+            await _clear_response_stream(self.task_id)
+            await self._push_final(text, output)
             emit = await self._emitter()
             await emit({"type": "chat:completion", "data": {"done": True, "content": text,
                                                              "output": output}})

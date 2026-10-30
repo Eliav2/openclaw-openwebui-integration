@@ -657,6 +657,57 @@ def test_a_message_sent_from_a_second_tab_keeps_the_running_reply(page, token):
     _ends_like_the_answer(page, token, run)
 
 
+def _taken_over(page, token: str) -> None:
+    """Wait for the Pipe's writer to hold the running reply: its handover
+    write, the reply saved as it stood then and not done."""
+    deadline = time.time() + TURN_MS / 1000
+    while not any((m.get("meta") or {}).get("openclaw_writer") and m.get("done") is False
+                  for m in _saved_replies(page, token)):
+        assert time.time() < deadline, "the Pipe's writer never took the running reply over"
+        time.sleep(0.2)
+
+
+def test_a_tab_that_loads_the_chat_across_the_running_replys_save_shows_it_whole(page, token):
+    """A tab that loads the chat while the Pipe's writer saves the running
+    reply (ELI-340): its chat GET read the reply before the save and found no
+    mid-turn copy after it. Here every load of the reloaded tab is answered
+    with the chat as it was before the save, and only once the reply is saved
+    whole. The tab shows the whole reply, done, without another reload."""
+    run = _slow("BROWSER_ACROSS", 12)
+    capture.new_chat(page)
+    capture.send(page, "E2E_SLOW:12 BROWSER_ACROSS")
+    _wait(page, _reply_js(0, "r.text.includes('BROWSER_ACROSS slow-1 slow-2')"), "the reply part way through")
+    other = page.context.new_page()
+    try:
+        other.goto(page.url)
+        other.wait_for_selector("#chat-input", timeout=60_000)
+        _type_and_send(other, "E2E_ECHO: BROWSER_ACROSS_ANSWER")
+        _taken_over(page, token)
+        held, holding = [], [True]
+        chat_get = f"**/api/v1/chats/{_chat_id(page)}"
+
+        def hold(route):
+            if holding[0]:
+                held.append((route, route.fetch()))
+            else:
+                route.continue_()
+        page.route(chat_get, hold)
+        page.reload()
+        deadline = time.time() + 30
+        while not held:
+            assert time.time() < deadline, "the reloaded tab never asked for the chat"
+            page.wait_for_timeout(50)
+        _saved_whole(page, token, run)
+        holding[0] = False
+        for route, response in held:
+            route.fulfill(response=response)
+        page.wait_for_selector("#chat-input", timeout=60_000)
+        _wait(page, _reply_js(0, f"r.done && r.text.includes({json.dumps(run)})"),
+              "the running reply whole and done in the tab that loaded across its save", 30_000)
+    finally:
+        other.close()
+
+
 def _message_text_js(index: int) -> str:
     """Reply `index`'s whole message as shown: its status line too."""
     return (f"(() => {{ const a = [...document.querySelectorAll('.chat-assistant')].at({index}); "
