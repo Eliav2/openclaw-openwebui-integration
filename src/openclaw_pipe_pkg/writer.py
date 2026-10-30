@@ -926,26 +926,32 @@ class _TurnWriter:
                 self._media_failed.add(directive)
 
     async def _persist(self, *, done: bool, output: list | None = None,
-                       text: str | None = None, status_history: list | None = None) -> None:
-        from open_webui.models.chats import Chats
-
+                       text: str | None = None, status_history: list | None = None) -> bool:
+        """Write M. Whether Open WebUI saved it: its upsert returns the chat
+        row, or None without raising when the save failed (ELI-90)."""
         message = {"content": self.renderer.text if text is None else text,
                    "output": output if output is not None else copy.deepcopy(self.renderer.output),
                    "done": done}
         if status_history is not None:
             message["statusHistory"] = status_history
         try:
-            await _owui_upsert_message(self.chat_id, self.message_id, message)
+            row = await _owui_upsert_message(self.chat_id, self.message_id, message)
         except Exception as ex:
             pipe_log(f"  turn writer: persist failed: {ex}")
+            return False
+        if row is None:
+            pipe_log(f"  turn writer: persist failed: chat {self.chat_id[:8]}... not saved")
+            return False
+        return True
 
     async def _persist_final(self, output: list, text: str, stopped: bool,
-                             run_usage: dict | None = None) -> list:
+                             run_usage: dict | None = None) -> tuple[list, bool]:
         """The `done: true` write of M, with its final status lines in the same
         write: the usage lines of a reply (`_build_usage_status_lines`, as the
         inline reply ends), or "Stopped" for a Stop (ELI-210). Returns the
-        lines to send to open tabs. `run_usage`: the last run's own usage,
-        for a session whose row has no totals yet (ELI-177).
+        lines to send to open tabs, and whether the row reads back finished.
+        `run_usage`: the last run's own usage, for a session whose row has no
+        totals yet (ELI-177).
 
         After the request M was handed over from has ended: it saves its own
         status lines into M until then."""
@@ -968,8 +974,15 @@ class _TurnWriter:
                 saved = {}
                 pipe_log(f"  turn writer: reading M's status lines failed: {ex!r}")
             history, new = _final_status_history(saved.get("statusHistory"), lines, stopped)
-            await self._persist(done=True, output=output, text=text, status_history=history)
-        return new
+            whole = await self._persist(done=True, output=output, text=text, status_history=history)
+            if whole:
+                try:
+                    row = await Chats.get_message_by_id_and_message_id(self.chat_id, self.message_id) or {}
+                    whole = row.get("done") is True
+                except Exception as ex:
+                    whole = False
+                    pipe_log(f"  turn writer: reading M back failed: {ex!r}")
+        return new, whole
 
     async def _push_final(self, text: str, output: list) -> None:
         """M finished, as a shared `chat:messages` to the chat's room. Only for
@@ -1248,7 +1261,7 @@ class _TurnWriter:
             # The newest run written into M that reports its usage.
             run_usage = next(filter(None, (_history_usage_for_run(hist, r) for r in reversed(self.runs))),
                              None) if hist else None
-            status = await self._persist_final(output, text, stopped, run_usage)
+            status, saved = await self._persist_final(output, text, stopped, run_usage)
             # ELI-340: the saved row is whole now, so drop the mid-turn copy a
             # GET lays over it, then send M finished to every tab of the chat.
             # A tab that loaded the chat across the save read the row before
@@ -1256,8 +1269,14 @@ class _TurnWriter:
             # before this push, which it keeps over what it fetched (Open
             # WebUI's loadChat and refreshChat keep live updates); a tab that
             # shows M already merges the same content.
-            await _clear_response_stream(self.task_id)
-            await self._push_final(text, output)
+            # A save that failed leaves the copy: it is then the only place a
+            # GET still finds the whole reply.
+            if saved:
+                await _clear_response_stream(self.task_id)
+                await self._push_final(text, output)
+            else:
+                pipe_log(f"  turn writer: chat {self.chat_id[:8]}... message {self.message_id[:8]}...: "
+                         f"FINAL SAVE FAILED; keeping the mid-turn copy, M is not sent finished")
             emit = await self._emitter()
             await emit({"type": "chat:completion", "data": {"done": True, "content": text,
                                                              "output": output}})

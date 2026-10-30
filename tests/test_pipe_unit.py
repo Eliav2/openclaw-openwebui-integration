@@ -8284,6 +8284,41 @@ class TurnWriterLoadAcrossTheSaveTests(_TurnWriterCase):
         self.assertEqual(final["data"]["currentId"], "m1")
         self.assertEqual(final["data"]["messages"]["a1"], {"id": "a1", "childrenIds": ["m1"]})
 
+    async def failed_final_save(self, fail):
+        """M's run ends while Open WebUI's final save of M fails as `fail` does:
+        the copy is the only whole reply left, so it stays, and M is not sent
+        finished over it."""
+        shown = _TurnRenderer()
+        shown.feed(_delta("slow-1 slow-2"))
+        await self.owui.end_request("m1", copy.deepcopy(shown.output))
+        w = _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
+                        run_id="agent-run-1", message_id="m1", takeover=True, renderer=shown)
+        await w.feed(None)
+        await w.feed(_delta(" slow-3"))
+        pushed = len(self.owui.events("chat:messages"))
+        chats = self.owui._chats
+        real = chats.upsert_message_to_chat_by_id_and_message_id
+
+        async def upsert(chat_id, message_id, message):
+            if "statusHistory" in message:       # the final save
+                return await fail()
+            return await real(chat_id, message_id, message)
+        with mock.patch.object(chats, "upsert_message_to_chat_by_id_and_message_id", upsert):
+            await w.finalize()
+        self.assertEqual(self.owui.msgs()["m1"]["content"], "slow-1 slow-2", "the final save failed")
+        self.assertEqual([c for c in self.owui.cleared if c[0] == w.task_id], [], "the copy stays")
+        self.assertEqual(len(self.owui.events("chat:messages")), pushed, "M is not sent finished")
+
+    async def test_a_final_save_that_raises_keeps_the_copy(self):
+        async def fail():
+            raise sqlite3.OperationalError("database is locked")
+        await self.failed_final_save(fail)
+
+    async def test_a_final_save_that_returns_none_keeps_the_copy(self):
+        async def fail():
+            return None          # Open WebUI's upsert when its write failed (ELI-90)
+        await self.failed_final_save(fail)
+
 
 class MediaDirectiveKindTests(unittest.TestCase):
     """ELI-328: which `MEDIA:` directives the file server can show."""
