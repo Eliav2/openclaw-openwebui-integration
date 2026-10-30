@@ -43,10 +43,30 @@ class WhatCountsAsAnImage(unittest.TestCase):
         self.assertTrue(pr_media.has_image("## Before / After\n\n" + IMG))
         self.assertTrue(pr_media.has_image("<IMG SRC=x width=320>"))
 
-    def test_no_body_or_markdown_image_does_not(self):
+    def test_no_body_or_plain_link_does_not(self):
         self.assertFalse(pr_media.has_image(None))
         self.assertFalse(pr_media.has_image(""))
-        self.assertFalse(pr_media.has_image("![after](https://example.com/after.png)"))
+        self.assertFalse(pr_media.has_image("See [the shot](https://example.com/after.png)."))
+
+    def test_a_markdown_image_counts(self):
+        # gh --attach rewrites ![alt](./file.png) into a user-attachments URL.
+        self.assertTrue(pr_media.has_image("![after](https://github.com/user-attachments/assets/abc-123)"))
+        self.assertTrue(pr_media.has_image("![before](./before.jpg)\n![after](./after.jpg)"))
+        self.assertTrue(pr_media.has_image("![](https://example.com/a.png)"))
+
+    def test_a_markdown_image_in_a_comment_or_code_does_not(self):
+        self.assertFalse(pr_media.has_image("<!-- Use ![after](./after.png) -->"))
+        self.assertFalse(pr_media.has_image("Write `![after](./after.png)` for an image."))
+        self.assertFalse(pr_media.has_image("```md\n![after](./after.png)\n```\n"))
+        self.assertFalse(pr_media.has_image("~~~\n![after](./after.png)\n~~~"))
+
+    def test_branch_links_are_found_outside_comments_and_code(self):
+        raw = "![a](https://raw.githubusercontent.com/o/r/pr-media/1/a.png)"
+        self.assertEqual(pr_media.branch_links(raw), ["raw.githubusercontent.com"])
+        self.assertEqual(pr_media.branch_links("![a](https://github.com/o/r/blob/b/a.png?raw=true)"),
+                         ["?raw=true", "github.com/o/r/blob/"])
+        self.assertEqual(pr_media.branch_links("![a](https://github.com/user-attachments/assets/abc)"), [])
+        self.assertEqual(pr_media.branch_links("<!-- " + raw + " -->"), [])
 
     def test_an_img_in_a_comment_or_code_does_not(self):
         self.assertFalse(pr_media.has_image("<!-- Before/after as " + IMG + " -->"))
@@ -88,6 +108,16 @@ class FromTheEvent(unittest.TestCase):
         self.assertEqual(self.run_main(IMG, [], DRAWER), 0)
         self.assertEqual(self.run_main(None, [pr_media.SKIP_LABEL], DRAWER), 0)
         self.assertEqual(self.run_main(None, [], ["README.md"]), 0)
+        self.assertEqual(self.run_main("![after](https://github.com/user-attachments/assets/abc)", [], DRAWER), 0)
+
+    def test_a_branch_link_warns_but_does_not_fail(self):
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = self.run_main("![a](https://raw.githubusercontent.com/o/r/b/a.png)", [], DRAWER)
+        self.assertEqual(rc, 0)
+        self.assertIn("::warning", out.getvalue())
 
 
 if __name__ == "__main__":

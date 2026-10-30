@@ -4,8 +4,10 @@
 AGENTS.md: a PR with a visual change shows a Before and After pair in its
 description, from the Screenshots workflow. This is the check for it: when the
 PR's diff touches a file that draws the UI (VISUAL below) or an image under
-docs/img/, its description needs an `<img>` tag. Tags inside an HTML comment
-or a code span do not count, so the PR template's own hints never pass it.
+docs/img/, its description needs an image: an `<img>` tag or a markdown image
+`![alt](url)` (`gh --attach` rewrites markdown images into GitHub asset URLs).
+Images inside an HTML comment, a code span or a fenced block do not count, so
+the PR template's own hints never pass it.
 
 The label `no-visual-change` skips the check, for a change to one of those
 files that nothing on screen shows (a refactor, a log line).
@@ -39,7 +41,8 @@ VISUAL_DIRS = ("docs/img/",)
 _COMMENT = re.compile(r"<!--.*?-->", re.S)
 _FENCE = re.compile(r"^(```|~~~).*?^\1[^\n]*$", re.S | re.M)
 _CODE_SPAN = re.compile(r"(`+)(?!`).+?(?<!`)\1(?!`)", re.S)
-_IMG = re.compile(r"<img\b", re.I)
+_IMG = re.compile(r"<img\b|!\[[^\]]*\]\([^)\s]+[^)]*\)", re.I)
+_BRANCH_LINK = re.compile(r"raw\.githubusercontent\.com|github\.com/[^\s\"')]*/blob/|[?&]raw=true", re.I)
 
 
 def visual_files(paths) -> list:
@@ -48,12 +51,21 @@ def visual_files(paths) -> list:
 
 
 def has_image(body: str | None) -> bool:
-    """Whether the description shows an image: an `<img` tag outside HTML
-    comments, fenced code blocks and code spans."""
+    """Whether the description shows an image: an `<img` tag or a markdown
+    `![alt](url)` image outside HTML comments, fenced code blocks and code spans."""
+    return bool(_IMG.search(_visible(body)))
+
+
+def _visible(body: str | None) -> str:
     text = _COMMENT.sub("", body or "")
     text = _FENCE.sub("", text)
-    text = _CODE_SPAN.sub("", text)
-    return bool(_IMG.search(text))
+    return _CODE_SPAN.sub("", text)
+
+
+def branch_links(body: str | None) -> list:
+    """Image links that point at a branch (raw.githubusercontent.com, blob/,
+    raw=true): they break when the branch is deleted, so gh --attach is the way."""
+    return sorted(set(_BRANCH_LINK.findall(_visible(body))))
 
 
 def check(paths, body: str | None, labels) -> str | None:
@@ -65,8 +77,8 @@ def check(paths, body: str | None, labels) -> str | None:
         return None
     return ("This PR changes what users see (" + ", ".join(touched[:5])
             + (", ..." if len(touched) > 5 else "") + ") but its description has no image.\n"
-            "Add a Before and After pair from the Screenshots workflow as <img src=\"...\" width=\"...\"> "
-            "tags (AGENTS.md, \"Docs and screenshots ship with the feature\"), or, when nothing "
+            "Add a Before and After pair from the Screenshots workflow, uploaded with gh pr edit --attach "
+            "(AGENTS.md, \"Docs and screenshots ship with the feature\"), or, when nothing "
             f"on screen changes, add the label `{SKIP_LABEL}`.")
 
 
@@ -81,6 +93,9 @@ def main(argv=None) -> int:
         paths = [line.strip() for line in fh if line.strip()]
     labels = [lb["name"] for lb in pr.get("labels") or []]
     why = check(paths, pr.get("body"), labels)
+    if branch_links(pr.get("body")):
+        print("::warning title=Image linked from a branch::an image points at a branch "
+              "(raw.githubusercontent.com, blob/ or raw=true) and breaks when it is deleted; upload with gh --attach")
     if why:
         print(f"::error title=No Before and After images::{why.splitlines()[0]}")
         print(why)

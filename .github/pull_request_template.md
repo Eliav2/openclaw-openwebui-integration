@@ -9,7 +9,8 @@
 ## Before / After
 
 <!-- A UI change: one Before and After pair from the Screenshots workflow, light theme, as
-<img src="..." alt="..." width="320"> tags (a phone shot is 320 wide). The PR media check fails a PR
+<img src="..." alt="..." width="320"> tags or ![alt](./file.png) images (a phone shot is 320 wide), uploaded with
+gh pr edit --attach. The PR media check fails a PR
 that touches the UI without an image. Nothing on screen changes: delete this section and add the
 label no-visual-change. -->
 
