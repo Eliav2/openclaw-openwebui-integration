@@ -489,16 +489,47 @@ def test_stop_ends_the_reply_where_it_was(page):
     assert [r["text"] for r in _replies(page)] == [stopped["text"], second["text"]]
 
 
-def _both_answered(page, run: str, answer: str) -> None:
+def _saved_replies(page, token: str) -> list:
+    """The chat's assistant messages as saved, in no set order."""
+    saved = capture.api("GET", f"/api/v1/chats/{_chat_id(page)}", token=token)["chat"]["history"]["messages"]
+    return [m for m in saved.values() if m.get("role") == "assistant"]
+
+
+def _saved_whole(page, token: str, run: str) -> None:
+    """Wait for the running reply (holding `run`) to be saved whole and done,
+    before a reload.
+
+    The new message goes once the run is over at the Gateway, while the
+    Pipe's writer still reads the run's transcript to save the running
+    reply, so its answer can be done, on the page, before that save. Until
+    then a load gets the saved reply (cut, as saved at the takeover) with the
+    writer's mid-turn copy laid over it, but Open WebUI's chat GET reads the
+    two one after the other: one that reads the reply before the save and
+    the copies after it (the writer drops its copy once saved) gets it cut,
+    and the page, with no task left on the chat, shows it cut and finished
+    (ELI-274's window, for the reply's text). A mid-turn copy is never done."""
+    deadline = time.time() + TURN_MS / 1000
+    while True:
+        replies = _saved_replies(page, token)
+        if any(m.get("done") and run in (m.get("content") or "") for m in replies):
+            return
+        assert time.time() < deadline, (
+            f"the running reply was never saved whole: {[((m.get('content') or '')[-80:], m.get('done')) for m in replies]}")
+        time.sleep(0.5)
+
+
+def _both_answered(page, token: str, run: str, answer: str) -> None:
     """The running reply went on to its end in its own message, nothing cut,
     and the new message got its own answer, with none of the run in it; the
     same after a reload. Open WebUI draws the running reply finished as soon
     as the new message goes in, while it is still being written, so it is
-    judged once the new message's answer, which waits for the run, is done."""
+    judged once the new message's answer, which waits for the run, is done.
+    The reload waits for the reply's save (`_saved_whole`)."""
     _wait(page, _reply_js(-1, "all.length === 2 && all[0].done && r.done"), "both replies done")
     first, second = _replies(page)
     assert first["text"].count(run) == 1, f"the running reply was cut or doubled: {first['text'][-120:]!r}"
     assert answer in second["text"] and "slow-" not in second["text"], second["text"]
+    _saved_whole(page, token, run)
     _reload(page)
     _wait(page, _reply_js(-1, "all.length === 2 && all[0].done && r.done"), "both replies after a reload", 60_000)
     again = _replies(page)
@@ -522,8 +553,7 @@ def _ends_like_the_answer(page, token: str, run: str) -> None:
     usage = lambda ls: any(str(line).startswith("\U0001f9e0") for line in ls)  # noqa: E731
     deadline = time.time() + TURN_MS / 1000
     while True:
-        saved = capture.api("GET", f"/api/v1/chats/{_chat_id(page)}", token=token)["chat"]["history"]["messages"]
-        replies = [m for m in saved.values() if m.get("role") == "assistant"]
+        replies = _saved_replies(page, token)
         held = [m for m in replies if run in (m.get("content") or "")]
         assert len(held) == 1 and len(replies) == 2, [m.get("content", "")[-80:] for m in replies]
         answer = next(m for m in replies if m is not held[0])
@@ -541,7 +571,7 @@ def _ends_like_the_answer(page, token: str, run: str) -> None:
     assert ("\U0001f9e0" in shown) == usage(ref), shown[-200:]
 
 
-def test_a_message_sent_while_a_reply_runs_is_in_the_chat_at_once(page):
+def test_a_message_sent_while_a_reply_runs_is_in_the_chat_at_once(page, token):
     """Sent while busy (AUTO_SEND_WHILE_RUNNING, on by default): the message
     shows in the chat right away, not in Open WebUI's queue above the
     composer, while the reply is still being written; that reply is not
@@ -555,10 +585,10 @@ def test_a_message_sent_while_a_reply_runs_is_in_the_chat_at_once(page):
                 f" && !document.querySelector('button path[d=\"{capture.SEND_NOW_ICON}\"]')"
                 f" && ({_reply_js(0, '!r.text.includes(' + json.dumps(run) + ')')})()",
           "the new message in the chat while the first reply is still being written")
-    _both_answered(page, run, "BROWSER_BUSY_ANSWER")
+    _both_answered(page, token, run, "BROWSER_BUSY_ANSWER")
 
 
-def test_a_message_queued_behind_a_run_waits_out_a_socket_drop(page):
+def test_a_message_queued_behind_a_run_waits_out_a_socket_drop(page, token):
     """ELI-199: a message waits behind a run the Pipe keeps going in its own
     reply, and the Pipe's Gateway socket drops (1006, the Gateway itself
     stays up). The message must wait for the reconnect and then for the run,
@@ -578,7 +608,7 @@ def test_a_message_queued_behind_a_run_waits_out_a_socket_drop(page):
     # A word in flight during the drop can be missing from the running reply
     # until its end, which the Pipe writes from the run's transcript.
     _wait(page, _reply_js(0, f"r.text.includes({json.dumps(run)})"), "the running reply whole", 30_000)
-    _both_answered(page, run, "BROWSER_DROP_ANSWER")
+    _both_answered(page, token, run, "BROWSER_DROP_ANSWER")
 
 
 def test_send_now_on_a_queued_message_keeps_the_running_reply(page, token):
@@ -598,7 +628,7 @@ def test_send_now_on_a_queued_message_keeps_the_running_reply(page, token):
             "the message went into the chat with auto-send off"
         send_now.click()
         _wait(page, f"() => {_user_message_js('BROWSER_SENDNOW_ANSWER')}", "the message in the chat after Send now")
-        _both_answered(page, run, "BROWSER_SENDNOW_ANSWER")
+        _both_answered(page, token, run, "BROWSER_SENDNOW_ANSWER")
         _ends_like_the_answer(page, token, run)
     finally:
         capture.pipe_valves(token, **old)
@@ -621,8 +651,9 @@ def test_a_message_sent_from_a_second_tab_keeps_the_running_reply(page, token):
                                    " && r.text.includes('BROWSER_TAB2_ANSWER')"), "the answer in the second tab")
     finally:
         other.close()
+    _saved_whole(page, token, run)
     _reload(page)
-    _both_answered(page, run, "BROWSER_TAB2_ANSWER")
+    _both_answered(page, token, run, "BROWSER_TAB2_ANSWER")
     _ends_like_the_answer(page, token, run)
 
 
@@ -735,7 +766,7 @@ def _reload_mid(page, reply: int, word: str, full: str) -> tuple:
     return before, after
 
 
-def test_a_reload_mid_reply_shows_the_answer_so_far_and_keeps_going(page):
+def test_a_reload_mid_reply_shows_the_answer_so_far_and_keeps_going(page, token):
     """Reload mid-reply: after the reload the reply shows the answer so far,
     from its first word, and keeps growing to its end, in one message. Twice:
     a plain reply (Open WebUI keeps its mid-turn copy itself), then a reply the
@@ -762,7 +793,7 @@ def test_a_reload_mid_reply_shows_the_answer_so_far_and_keeps_going(page):
     before, after = _reload_mid(page, 0, "BROWSER_RELOAD", full)
     assert len(after[0]) >= len(before), (
         f"the reload lost words the reply had shown: before {before[-60:]!r}, after {after[0][-60:]!r}")
-    _both_answered(page, full, "BROWSER_RELOAD_ANSWER")
+    _both_answered(page, token, full, "BROWSER_RELOAD_ANSWER")
 
 
 def _turn_over(needle: str) -> str:
