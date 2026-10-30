@@ -237,6 +237,49 @@ class SecretRequestTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("def question_requested", action)
 
 
+class RetiredConnectionTests(unittest.IsolatedAsyncioTestCase):
+    """A deploy retires the previous load's connection but keeps it open while
+    it streams a run. The Gateway sends every connected client its own copy of
+    `question.requested`, so a retired connection that still handled it asked
+    the same question a second time (ELI-341): after a guest secret request was
+    cancelled, the second cancel failed with a GatewayError."""
+
+    async def play(self, conn, frames):
+        frames = list(frames)
+
+        class ScriptedWS:
+            async def recv(self_):
+                if frames:
+                    return json.dumps(frames.pop(0))
+                conn._stopped = True
+                raise asyncio.CancelledError
+        conn._ws = ScriptedWS()
+        await conn._event_loop()
+
+    async def test_a_question_is_handled_by_the_live_connection_only(self):
+        requested = {"type": "event", "event": "question.requested", "payload": record()}
+        resolved = {"type": "event", "event": "question.resolved",
+                    "payload": {"id": "q-1", "status": "cancelled"}}
+        seen, gone = mock.Mock(), mock.Mock()
+        live = ocp._GatewayConnection(lambda: None)
+        retired = ocp._GatewayConnection(lambda: None)
+        retired._retired = True   # what retire() sets while a run is still streaming here
+        with mock.patch.object(ocp, "_QUESTION_HOOKS", (seen, gone)):
+            for conn in (retired, live):   # one copy of each frame per connection
+                await self.play(conn, [requested, resolved])
+        self.assertEqual(seen.call_args_list, [mock.call(live, record())])
+        self.assertEqual(gone.call_args_list, [mock.call({"id": "q-1", "status": "cancelled"})])
+
+    async def test_a_retired_connection_syncs_no_slash_prompts(self):
+        frame = {"type": "event", "event": "chat.metadata.changed", "payload": {"commandsChanged": True}}
+        hook = mock.Mock()
+        retired = ocp._GatewayConnection(lambda: None)
+        retired._retired = True
+        with mock.patch.object(ocp, "_SLASH_PROMPTS_HOOK", hook):
+            await self.play(retired, [frame])
+        self.assertEqual(hook.call_args_list, [])
+
+
 class NoteItemTests(unittest.TestCase):
     """A note item (ELI-229) through `_TurnRenderer`, the one renderer the
     live reply and a turn writer share."""

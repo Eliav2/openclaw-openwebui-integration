@@ -2650,7 +2650,8 @@ class _Consumer:
 _TURNS = None
 # The Pipe's handlers for `question.requested` / `question.resolved`
 # (askuser.py, ELI-96), set by pipe.py. None in the Status Action, which asks
-# nothing; only the connection that writes turns asks, so a question is asked once.
+# nothing; only the live connection that writes turns asks (`handles_hooks`),
+# so a question is asked once.
 _QUESTION_HOOKS = None
 # The Pipe's handler for `chat.metadata.changed` (slash_prompts.py), set by
 # pipe.py. None in the Status Action, which syncs nothing.
@@ -4056,6 +4057,15 @@ class _GatewayConnection:
         except Exception as e:
             pipe_log(f"  /stop fallback failed: {e}")
 
+    @property
+    def handles_hooks(self) -> bool:
+        """Whether this connection hands the Gateway's question and slash
+        prompt events to the Pipe. The Gateway sends every connected client its
+        own copy, so only the connection that writes turns does, and not a
+        retired one that stays open for a run it still streams: the newer
+        deploy's connection gets the same event (ELI-341)."""
+        return self.writes_turns and not self._retired
+
     async def retire(self):
         """Step down in favor of a newer deploy's connection.
 
@@ -4403,7 +4413,7 @@ class _GatewayConnection:
                     self._on_sessions_changed(msg.get("payload") or {})
                     continue
                 if msg.get("type") == "event" and msg.get("event") == "chat.metadata.changed":
-                    if _SLASH_PROMPTS_HOOK and self.writes_turns:
+                    if _SLASH_PROMPTS_HOOK and self.handles_hooks:
                         _SLASH_PROMPTS_HOOK(msg.get("payload") or {})
                     continue
                 if msg.get("type") == "event" and msg.get("event") == "shutdown":
@@ -4411,7 +4421,7 @@ class _GatewayConnection:
                     continue
                 if msg.get("type") == "event" and msg.get("event") in ("question.requested",
                                                                      "question.resolved"):
-                    if _QUESTION_HOOKS and self.writes_turns:
+                    if _QUESTION_HOOKS and self.handles_hooks:
                         seen, resolved = _QUESTION_HOOKS
                         if msg["event"] == "question.requested":
                             seen(self, msg.get("payload") or {})
