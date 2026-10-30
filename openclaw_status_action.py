@@ -2651,7 +2651,9 @@ _TURNS = None
 # The Pipe's handlers for `question.requested` / `question.resolved`
 # (askuser.py, ELI-96), set by pipe.py. None in the Status Action, which asks
 # nothing; only the live connection that writes turns asks (`handles_hooks`),
-# so a question is asked once.
+# so a question is asked once. `question.resolved` also reaches a retired
+# connection (`writes_turns` only): it cancels by id in its own module's
+# registry, so a question asked before a deploy is still cancelled.
 _QUESTION_HOOKS = None
 # The Pipe's handler for `chat.metadata.changed` (slash_prompts.py), set by
 # pipe.py. None in the Status Action, which syncs nothing.
@@ -4059,11 +4061,13 @@ class _GatewayConnection:
 
     @property
     def handles_hooks(self) -> bool:
-        """Whether this connection hands the Gateway's question and slash
-        prompt events to the Pipe. The Gateway sends every connected client its
-        own copy, so only the connection that writes turns does, and not a
-        retired one that stays open for a run it still streams: the newer
-        deploy's connection gets the same event (ELI-341)."""
+        """Whether this connection hands the Gateway's `question.requested`
+        and `chat.metadata.changed` events to the Pipe. The Gateway sends every
+        connected client its own copy, so only the connection that writes turns
+        does, and not a retired one that stays open for a run it still streams:
+        the newer deploy's connection gets the same event (ELI-341).
+        `question.resolved` is not gated by this: it also goes to a retired
+        connection, whose module may hold the question."""
         return self.writes_turns and not self._retired
 
     async def retire(self):
@@ -4419,14 +4423,17 @@ class _GatewayConnection:
                 if msg.get("type") == "event" and msg.get("event") == "shutdown":
                     self._on_shutdown(msg.get("payload") or {})
                     continue
-                if msg.get("type") == "event" and msg.get("event") in ("question.requested",
-                                                                     "question.resolved"):
+                if msg.get("type") == "event" and msg.get("event") == "question.requested":
                     if _QUESTION_HOOKS and self.handles_hooks:
-                        seen, resolved = _QUESTION_HOOKS
-                        if msg["event"] == "question.requested":
-                            seen(self, msg.get("payload") or {})
-                        else:
-                            resolved(msg.get("payload") or {})
+                        _QUESTION_HOOKS[0](self, msg.get("payload") or {})
+                    continue
+                if msg.get("type") == "event" and msg.get("event") == "question.resolved":
+                    # Retired connections too: a question asked before a deploy
+                    # is held by the previous load's module, which only its own
+                    # connection reaches. Each copy pops the id from its own
+                    # registry, so delivering twice cancels nothing twice.
+                    if _QUESTION_HOOKS and self.writes_turns:
+                        _QUESTION_HOOKS[1](msg.get("payload") or {})
                     continue
                 if msg.get("type") == "event" and msg.get("event") == "session.message":
                     self._on_session_message(msg.get("payload") or {})

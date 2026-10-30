@@ -256,19 +256,31 @@ class RetiredConnectionTests(unittest.IsolatedAsyncioTestCase):
         conn._ws = ScriptedWS()
         await conn._event_loop()
 
-    async def test_a_question_is_handled_by_the_live_connection_only(self):
+    async def test_a_question_is_asked_by_the_live_connection_only(self):
         requested = {"type": "event", "event": "question.requested", "payload": record()}
-        resolved = {"type": "event", "event": "question.resolved",
-                    "payload": {"id": "q-1", "status": "cancelled"}}
         seen, gone = mock.Mock(), mock.Mock()
         live = ocp._GatewayConnection(lambda: None)
         retired = ocp._GatewayConnection(lambda: None)
         retired._retired = True   # what retire() sets while a run is still streaming here
         with mock.patch.object(ocp, "_QUESTION_HOOKS", (seen, gone)):
-            for conn in (retired, live):   # one copy of each frame per connection
-                await self.play(conn, [requested, resolved])
+            for conn in (retired, live):   # one copy of the frame per connection
+                await self.play(conn, [requested])
         self.assertEqual(seen.call_args_list, [mock.call(live, record())])
+        self.assertEqual(gone.call_args_list, [])
+
+    async def test_a_retired_connection_still_hands_over_a_resolved_question(self):
+        """A question asked before a deploy is held by the previous load's
+        module, which only the retired connection reaches: it must still hear
+        that the question was answered elsewhere, cancelled or expired."""
+        resolved = {"type": "event", "event": "question.resolved",
+                    "payload": {"id": "q-1", "status": "cancelled"}}
+        seen, gone = mock.Mock(), mock.Mock()
+        retired = ocp._GatewayConnection(lambda: None)
+        retired._retired = True
+        with mock.patch.object(ocp, "_QUESTION_HOOKS", (seen, gone)):
+            await self.play(retired, [resolved])
         self.assertEqual(gone.call_args_list, [mock.call({"id": "q-1", "status": "cancelled"})])
+        self.assertEqual(seen.call_args_list, [])
 
     async def test_a_retired_connection_syncs_no_slash_prompts(self):
         frame = {"type": "event", "event": "chat.metadata.changed", "payload": {"commandsChanged": True}}
