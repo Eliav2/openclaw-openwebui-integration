@@ -3982,15 +3982,17 @@ async def _cancel_guest_secret_request(conn, record: dict, name: str) -> None:
     """Cancel a secret request made in a guest's chat and say so in the reply
     of the run that asked, as a note of its own (ELI-229)."""
     qid = record["id"]
+    # Out of the registry before the request, as the owner path does: the
+    # Gateway broadcasts `question.resolved` right behind its answer, and
+    # `secret_request_resolved` would cancel this task before it says so.
+    if _SECRET_REQUESTS.get(qid) is asyncio.current_task():
+        del _SECRET_REQUESTS[qid]
     try:
         result = await conn.send_request("question.resolve", {"id": qid, "cancel": True,
                                                                "resolvedBy": "openwebui"}, timeout=30)
         shown = str((result or {}).get("status"))
     except Exception as ex:
         shown = f"not cancelled ({type(ex).__name__})"
-    finally:
-        if _SECRET_REQUESTS.get(qid) is asyncio.current_task():
-            del _SECRET_REQUESTS[qid]
     pipe_log(f"  secret request: {name} in a chat of a user not in OWNER_USERS: {shown}")
     payload = {"sessionKey": record.get("sessionKey") or "", "stream": PIPE_NOTE_STREAM,
                "data": {"id": f"{_NOTE_ITEM_PREFIX}secret_{qid}", "text": GUEST_SECRET_NOTE.format(name=name)}}

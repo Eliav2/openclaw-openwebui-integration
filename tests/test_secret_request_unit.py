@@ -169,6 +169,29 @@ class SecretRequestTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("needs the owner", payload["data"]["text"])
         self.assertNotIn("q-1", ocp._SECRET_REQUESTS)
 
+    async def test_the_cancel_still_says_so_when_the_gateway_reports_it_resolved_first(self):
+        """The Gateway answers `question.resolve` and broadcasts
+        `question.resolved` back to back, so both frames can reach the receive
+        loop in one step: the event handler runs before the task awaiting the
+        answer resumes. Its note still has to reach the reply, or a fast run
+        finishes without it (the guest-secret E2E, PR 241 CI attempt 1)."""
+        class RacingConn(FakeConn):
+            async def send_request(self, method, params, timeout=10):
+                self.sent.append((method, json.loads(json.dumps(params))))
+                answer = asyncio.get_running_loop().create_future()
+                answer.set_result({"status": "cancelled"})
+                # The receive loop delivers the response, then handles the
+                # event in the same step, before this task resumes.
+                ocp.secret_request_resolved({"id": params["id"], "status": "cancelled"})
+                await asyncio.sleep(0)
+                return await answer
+        conn, turn = RacingConn(), FakeTurn(VALUE)
+        with mock.patch.object(ocp, "_sender_is_owner", mock.AsyncMock(return_value=False)):
+            await self._ask(conn, turn)
+        [msg] = conn.dispatched
+        self.assertEqual(msg["payload"]["data"]["id"], "msg_note_secret_q-1")
+        self.assertIn("needs the owner", msg["payload"]["data"]["text"])
+
     async def test_answered_elsewhere_ends_the_wait_and_sends_nothing(self):
         conn = FakeConn()
         never = asyncio.get_running_loop().create_future()
