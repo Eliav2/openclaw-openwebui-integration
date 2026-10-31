@@ -546,7 +546,7 @@
       "match": "Ship forecast-app 1.4 to production",
       "steps": [
         {
-          "say": "Tests are green on 1.4. Deploying it now.",
+          "say": "The 1.4 build is green. Deploying it now.",
           "tool": "deploy_release",
           "args": {
             "version": "1.4.0",
