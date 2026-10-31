@@ -115,7 +115,8 @@ class PluginApprovalTests(unittest.IsolatedAsyncioTestCase):
         q = card["data"]["questions"][0]
         self.assertEqual(q["header"], "Apply Gmail triage")
         self.assertEqual(q["question"], "Archive 12 messages? (Tool: gmail_apply, Plugin: gmail)")
-        self.assertEqual([o["label"] for o in q["options"]], ["Allow once", "Always allow", "Deny"])
+        self.assertEqual([o["label"] for o in q["options"]], ["Deny", "Allow once", "Always allow"],
+                         "Open WebUI tags the first option Recommended: Deny, not an allow")
         self.assertFalse(q["allow_other"], "a typed answer is not a decision")
         tabs.answer("sid-own", picked("Allow once"))
         await self.finished()
@@ -127,7 +128,7 @@ class PluginApprovalTests(unittest.IsolatedAsyncioTestCase):
         tabs.open("sid-own")
         self.ask(conn, rec=record(allowed=["allow-once"]), turn=FakeTurn())
         q = (await tabs.card_on("sid-own"))["data"]["data"]["questions"][0]
-        self.assertEqual([o["label"] for o in q["options"]], ["Allow once", "Deny"])
+        self.assertEqual([o["label"] for o in q["options"]], ["Deny", "Allow once"])
         tabs.answer("sid-own", picked("Always allow"))   # not offered: no such decision
         await self.finished()
         self.assertEqual(conn.sent[0][1]["decision"], "deny")

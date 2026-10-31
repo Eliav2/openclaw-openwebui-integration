@@ -38,8 +38,10 @@
 
 PLUGIN_APPROVAL_METHODS = ("plugin.approval.resolve",)
 PLUGIN_APPROVAL_EVENTS = ("plugin.approval.requested", "plugin.approval.resolved")
-# The card's options, in this order, for the decisions a request allows.
-PLUGIN_APPROVAL_CHOICES = (("allow-once", "Allow once"), ("allow-always", "Always allow"), ("deny", "Deny"))
+# The card's options, in this order, for the decisions a request allows. Deny
+# first: Open WebUI tags the card's first option "Recommended", and that
+# belongs on the fail-closed answer, not on letting the tool run.
+PLUGIN_APPROVAL_CHOICES = (("deny", "Deny"), ("allow-once", "Allow once"), ("allow-always", "Always allow"))
 _PLUGIN_APPROVAL_QID = "approval"
 GUEST_APPROVAL_NOTE = "_The agent asked to use `{tool}`. That needs the owner's approval; it was denied here._"
 # approval id -> the task asking it
@@ -59,8 +61,8 @@ def _plugin_approval_decisions(request: dict) -> list[str]:
     adds it too: plugin-approval-canonical-decisions-*.mjs)."""
     known = [d for d, _ in PLUGIN_APPROVAL_CHOICES]
     raw = request.get("allowedDecisions") if isinstance(request, dict) else None
-    picked = [d for d in known if isinstance(raw, list) and d in raw] or known
-    return picked if "deny" in picked else picked + ["deny"]
+    allowed = [d for d in known if isinstance(raw, list) and d in raw] or known
+    return ["deny"] + [d for d in allowed if d != "deny"]
 
 
 def _plugin_approval_payload(record) -> dict | None:

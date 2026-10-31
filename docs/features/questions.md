@@ -84,9 +84,9 @@ What you type goes straight to the Gateway's secret store (`question.resolve`). 
 
 _Needs a Gateway that offers OpenClaw's plugin approvals (`plugin.approval.requested` and `plugin.approval.resolve`; every release the Pipe supports does)._
 
-A plugin can hold a tool call until someone allows it: its `before_tool_call` hook returns `requireApproval`. The Pipe asks you in the chat with the same question card: the plugin's title, what it wants to do, the tool and the plugin, and one row per decision the plugin allows: **Allow once**, **Always allow** (when offered) and **Deny**.
+A plugin can hold a tool call until someone allows it: its `before_tool_call` hook returns `requireApproval`. The Pipe asks you in the chat with the same question card: the plugin's title, what it wants to do, the tool and the plugin, and one row per decision the plugin allows: **Deny**, **Allow once** and **Always allow** (when offered). Deny is listed first, so it is the option the card tags Recommended.
 
-<img src="../img/plugin-approval-light.png" alt="A plugin approval as a question card: Deploy to production, what the deploy does, and the rows Allow once, Always allow and Deny" width="320">
+<img src="../img/plugin-approval-light.png" alt="A plugin approval as a question card: Deploy to production, what the deploy does, and the rows Deny (tagged Recommended), Allow once and Always allow" width="320">
 
 Your pick goes back to the Gateway (`plugin.approval.resolve`) and the tool call runs or is blocked. The card is shown like an ask_user question: on the newest tab that has the chat open, moved to a reloaded tab, and kept until it is answered.
 

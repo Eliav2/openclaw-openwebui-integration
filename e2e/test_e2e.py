@@ -2237,7 +2237,7 @@ def test_a_plugin_approval_is_asked_in_the_chat_and_allowing_runs_the_tool(token
         ack_id, card = _approval_card(page)
         assert card["header"] == "E2E guarded action", card
         assert card["question"].startswith("Allow the e2e_guarded tool to run?"), card
-        assert [o["label"] for o in card["options"]] == ["Allow once", "Always allow", "Deny"], card
+        assert [o["label"] for o in card["options"]] == ["Deny", "Allow once", "Always allow"], card
         page.answer(ack_id, _picked("Allow once"))
         _wait_for(token, chat_id, ["E2E_APPROVAL_RESULT ran"])
     finally:
