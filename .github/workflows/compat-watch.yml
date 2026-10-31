@@ -68,7 +68,7 @@ jobs:
   recovered:
     name: Close tracking issue
     needs: [e2e-latest, fixture-upstream]
-    if: success() && github.event_name == 'schedule'
+    if: success() && github.event_name == 'schedule' && github.run_attempt == 1
     runs-on: ubuntu-latest
     permissions:
       contents: read

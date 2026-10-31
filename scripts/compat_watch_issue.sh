@@ -25,7 +25,9 @@ gh_write() {
   fi
 }
 
-existing=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
+# GitHub search matches substrings, so keep only the issue whose title is exactly ours.
+existing=$(T="$title" gh issue list --state open --limit 100 --search "in:title \"$title\"" \
+  --json number,title --jq 'map(select(.title == env.T))[0].number // empty')
 
 case "$mode" in
   fail)
