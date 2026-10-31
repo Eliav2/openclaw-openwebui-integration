@@ -13298,7 +13298,14 @@ async def _channel_run_text(conn, session_key: str, run_id: str, queue) -> "tupl
         if kind == _ROW_MARKER_TYPE:
             row = msg.get("row") or {}
             if row.get("hasActiveRun") is False and (msg.get("resync") or row.get("lastRunId") == run_id):
-                hist = await conn.session_history(session_key, limit=10)
+                try:
+                    hist = await conn.session_history(session_key, limit=10)
+                except Exception as ex:
+                    # A reconnect right at the end: the streamed text is the
+                    # reply (the run is over), or there is none to post.
+                    pipe_log(f"[channels] follow-up {run_id[:24]}: transcript unreadable ({ex!r}); "
+                             "using the streamed text")
+                    return ("started", text) if text else ("failed", None)
                 found, whole = _history_text_for_run(hist, run_id)
                 return ("started", whole or text) if (found or text) else ("failed", None)
             continue

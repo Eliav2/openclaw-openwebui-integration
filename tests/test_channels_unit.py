@@ -367,6 +367,17 @@ class RunTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(got, ("failed", None))
         self.assertEqual(conn.queues, {})
 
+    async def test_an_unreadable_transcript_at_the_end_keeps_the_streamed_reply(self):
+        settle = {"type": openclaw_pipe._ROW_MARKER_TYPE, "row": {"hasActiveRun": False, "lastRunId": "chanfollow-x"}}
+        conn = FakeRunConn("started", [delta("Boo"), delta("ked."), settle])
+        conn.session_history = mock.AsyncMock(side_effect=openclaw_pipe.GatewayError("reconnecting"))
+        got = await asyncio.wait_for(_channel_run(conn, "k", "m", "chanfollow-x", owner=True), 2)
+        self.assertEqual(got, ("started", "Booked."))
+        quiet = FakeRunConn("started", [settle])
+        quiet.session_history = mock.AsyncMock(side_effect=openclaw_pipe.GatewayError("reconnecting"))
+        got = await asyncio.wait_for(_channel_run(quiet, "k", "m", "chanfollow-x", owner=True), 2)
+        self.assertEqual(got, ("failed", None))
+
     async def test_a_failed_run_gives_no_text(self):
         conn = FakeRunConn("started", [delta("[sk"), {"payload": {"state": "error"}}])
         self.assertEqual(await _channel_run(conn, "k", "m", "chanfollow-x", owner=True), ("failed", None))
