@@ -1261,6 +1261,47 @@ class Scenes:
         set_title(self.token, chat, "Afternoon forecast")
         self.s.shot(page, "image-input")
 
+    def channel_thread(self, page: Page) -> None:
+        """A channel: a mention answered in its thread, then a message in that
+        thread with no mention, from another user, answered too."""
+        old = pipe_valves(self.token, CHANNEL_THREAD_DEBOUNCE_S=0)
+        try:
+            email, password = "dana@example.org", "e2e-dana-" + BASE[-4:]
+            try:
+                api("POST", "/api/v1/auths/add", {"name": "Dana", "email": email, "password": password,
+                                                  "role": "user"}, self.token)
+            except RuntimeError:
+                pass  # there from an earlier run
+            dana = api("POST", "/api/v1/auths/signin", {"email": email, "password": password})["token"]
+            grants = [{"principal_type": "user", "principal_id": "*", "permission": p} for p in ("read", "write")]
+            cid = api("POST", "/api/v1/channels/create", {"name": "weekend-trip", "access_grants": grants},
+                      self.token)["id"]
+
+            def post(token, text, parent=None):
+                body = {"content": text, **({"parent_id": parent} if parent else {})}
+                return api("POST", f"/api/v1/channels/{cid}/messages/post", body, token)["id"]
+
+            def answers():
+                msgs = api("GET", f"/api/v1/channels/{cid}/messages/{root}/thread?limit=50", token=self.token) or []
+                return [m for m in msgs if (m.get("meta") or {}).get("model_id") and (m.get("meta") or {}).get("done")
+                        and m.get("content")]
+
+            post(dana, "Saturday or Sunday for the boat trip? I'm free both days after 10.")
+            root = post(self.token, f"<@M:{MODEL}|OpenClaw> which of the two works for everyone, given Noa's train?")
+            poll(answers, lambda a: len(a) >= 1, "the answer in the thread", TURN_TIMEOUT_MS / 1000)
+            post(dana, "Perfect, Saturday it is. And what should we bring?", root)
+            poll(answers, lambda a: len(a) >= 2, "the answer to the follow-up", TURN_TIMEOUT_MS / 1000)
+            page.goto(f"{BASE}/channels/{cid}")
+            page.wait_for_selector("#chat-input", timeout=60_000)
+            dismiss_popups(page)
+            page.locator("button", has_text="Replies").first.click()
+            wait_js(page, f"() => [...document.querySelectorAll('[id^=message-{root}-]')]"
+                          ".some(el => el.innerText.includes('the kiosk on the pier'))", "the thread")
+            park_mouse(page)
+            self.s.shot(page, "channel-thread")
+        finally:
+            pipe_valves(self.token, **old)
+
     def thinking_level(self, page: Page) -> None:
         """The thinking level, a per-user valve of the filter, with its choices.
         A <select>'s native popup is not in a headless screenshot, so the same
@@ -1396,6 +1437,8 @@ def main(argv=None) -> int:
             if scenes.hero_chat:
                 dpage = signed_in_page(browser, token, DESKTOP)
                 shooter.run("toolbar-button", scenes.toolbar, dpage)
+            cpage = signed_in_page(browser, token, DESKTOP)
+            shooter.run("channel-thread", scenes.channel_thread, cpage)
         finally:
             browser.close()
     print(f"\n{len(shooter.written)} images written")

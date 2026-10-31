@@ -972,6 +972,8 @@ class _PipeTurn:
             )
 
         _ensure_orphan_reconcile(lambda: self.pipe.valves)
+        # Follows the channel threads again after an Open WebUI restart.
+        _ensure_channel_watcher(lambda: self.pipe.valves)
         await _emit_status(self.__event_emitter__, "Thinking...", done=False)
         self.channel_id = _channel_id_of((self.__metadata__ or {}).get("chat_id"))
         self.channel_commit = None

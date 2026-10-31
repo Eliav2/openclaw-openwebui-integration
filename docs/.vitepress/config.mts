@@ -199,6 +199,7 @@ export default withMermaid(defineConfig({
           { text: "Replies from the agent", link: "/features/agent-turns" },
           { text: "Reliability", link: "/features/reliability" },
           { text: "Owner users", link: "/features/owner-users" },
+          { text: "Channels", link: "/features/channels" },
         ],
       },
       {

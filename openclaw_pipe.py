@@ -13041,7 +13041,8 @@ def _channel_state_path(state_dir) -> str:
 def _channel_state(state_dir):
     """The channel state, read and written back under an flock:
     {"channels": {cid: {"cursor": ns}},
-     "threads": {root: {"channel", "cursor", "judged", "active", "model_id", "model_name"}}}"""
+     "threads": {root: {"channel", "cursor", "judged", "active", "model_id", "model_name",
+                        "function"}}}"""
     path = _channel_state_path(state_dir)
     with open(path + ".lock", "a") as lock:
         try:
@@ -13170,6 +13171,7 @@ async def _channel_mention_context(state_dir: str, channel_id: str, reply_messag
         with _channel_state(state_dir) as st:
             t = st["threads"].setdefault(root, {})
             t.update(channel=channel_id, model_id=model_id, model_name=model_name,
+                     function=_composer_own_function_id(),
                      cursor=max(t.get("cursor", 0), upto), judged=max(t.get("judged", 0), upto),
                      active=time.time_ns())
             if not thread:
@@ -13336,7 +13338,10 @@ class _ChannelWatcher:
         state_dir = _state_dir(getattr(valves, "STATE_DIR", ""))
         idle = float(getattr(valves, "CHANNEL_THREAD_IDLE_HOURS", 24) or 24)
         debounce_ns = int(float(getattr(valves, "CHANNEL_THREAD_DEBOUNCE_S", 15) or 0) * 1e9)
-        followed = _channel_followed(state_dir, idle, self.now())
+        # Only this Pipe function's threads: another copy of the Pipe (its own
+        # AGENT_ID) follows the threads its model was mentioned in.
+        followed = {r: t for r, t in _channel_followed(state_dir, idle, self.now()).items()
+                    if t.get("function") == self.function_id}
         if not followed:
             return None
         by_channel = {}
@@ -14406,6 +14411,8 @@ class _PipeTurn:
             )
 
         _ensure_orphan_reconcile(lambda: self.pipe.valves)
+        # Follows the channel threads again after an Open WebUI restart.
+        _ensure_channel_watcher(lambda: self.pipe.valves)
         await _emit_status(self.__event_emitter__, "Thinking...", done=False)
         self.channel_id = _channel_id_of((self.__metadata__ or {}).get("chat_id"))
         self.channel_commit = None

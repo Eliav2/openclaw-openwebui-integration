@@ -468,6 +468,17 @@ class WatcherTests(ChannelCase):
         await self.tick(w)
         self.assertEqual(w.handled, [])
 
+    async def test_another_copy_of_the_pipe_leaves_this_copys_threads_alone(self):
+        self.follow(at=5, function="openclaw_gateway_private")
+        self.chan.messages = [msg("a", 10, parent=ROOT)]
+        w = self.watcher(100)
+        w.function_id = "openclaw_gateway"
+        self.assertIsNone(await self.tick(w))
+        self.assertEqual(w.handled, [])
+        w.function_id = "openclaw_gateway_private"
+        await self.tick(w)
+        self.assertEqual(w.handled, [(ROOT, ["a"])])
+
     async def test_an_idle_thread_is_no_longer_followed(self):
         self.follow(at=0)
         w = self.watcher(25 * 3600)
@@ -553,7 +564,7 @@ class MentionTurnTests(ChannelCase):
         self.assertIn(f"Alice ({ALICE}): @OpenClaw book it", send["message"])
         self.assertNotIn("Alice: @OpenClaw book it", send["message"])  # Open WebUI's own wrapping
         self.assertEqual(self.state()["threads"][ROOT]["cursor"], 3 * S)
-        self.assertEqual(self.watchers, [1])
+        self.assertTrue(self.watchers)
 
     async def test_a_channel_gets_no_chat_page_hooks_and_no_composer_button(self):
         await self.turn()
