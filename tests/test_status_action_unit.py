@@ -406,6 +406,7 @@ class ElapsedTickTests(unittest.TestCase):
 class GetActionConnectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_reuses_pipe_connection_when_stashed(self):
         fake_conn = mock.AsyncMock()
+        fake_conn.endpoint_moved = mock.Mock(return_value=False)
         fake_module = types.SimpleNamespace(_openclaw_gateway_connection_v1=fake_conn)
         # `import open_webui.socket.main` requires the parent packages to
         # also resolve via sys.modules -- patching only the leaf module
