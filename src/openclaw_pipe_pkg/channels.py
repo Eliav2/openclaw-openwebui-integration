@@ -47,12 +47,15 @@ _CHANNEL_JUDGE_CONTEXT_CHARS = 15000
 _CHANNEL_WATCH_ATTR = "_openclaw_channel_watcher_v1"
 _CHANNEL_MENTION_RE = re.compile(r"<@([A-Z]):([^|>]+)(?:\|[^>]+)?>")
 
+# `{name}` is the model's name in the channel. The Gateway takes at most 400
+# characters here; the thread goes in `selectionContext`.
 _CHANNEL_JUDGE_QUESTION = (
-    "Should Claw, the assistant in this shared thread, answer the NEW message(s) in the selected "
-    "text? YES if they ask the assistant something, name it, or follow up on its last answer with "
-    "a question. NO if the people talk to each other, acknowledge or react. If unsure, NO. "
-    "Reply exactly YES or NO."
+    "Classify, don't answer: should the assistant {name} reply to the NEW message(s) in the "
+    "selection? YES if they ask or name it, or ask nobody in particular something it could answer "
+    "(times, prices, routes, weather, facts). NO if addressed to another person by name, or people "
+    "acknowledge, react or chat. If unsure, NO. Reply exactly YES or NO."
 )
+_CHANNEL_JUDGE_NAME_MAX = 30
 _CHANNEL_FOLLOW_NOTE = (
     "You follow this channel thread. Answer the newest message(s) above only if they are meant "
     "for you: they ask you something, name you, or follow up on your last answer. If the people "
@@ -301,17 +304,24 @@ async def _channel_mention_context(state_dir: str, channel_id: str, reply_messag
 
 # --- the judge and the follow-up turn -----------------------------------------------
 
-async def _channel_judge(conn, session_key: str, tail: str, *, owner: bool) -> "bool | None":
+def _channel_judge_question(name) -> str:
+    name = (name or "").strip()[:_CHANNEL_JUDGE_NAME_MAX]
+    return _CHANNEL_JUDGE_QUESTION.format(name=name).replace("assistant  reply", "assistant reply")
+
+
+async def _channel_judge(conn, session_key: str, tail: str, *, owner: bool,
+                         name: str = "") -> "bool | None":
     """YES/NO from the Gateway's utility model (`sessions.companion.ask`), or
     None when there is no judge right now (no utility model, rate limited,
-    an error, a timeout). Never retried: a refusal means the full turn
+    an error, a timeout, the Side chat already answering a question in
+    this session). Never retried: a refusal means the full turn
     decides instead, so the judge never competes with the Control UI's Side
     chat for its shared rate limit."""
     target = conn if owner else await _get_restricted_connection(conn._valves)
     try:
         r = await asyncio.wait_for(target.send_request(
             "sessions.companion.ask",
-            {"sessionKey": session_key, "question": _CHANNEL_JUDGE_QUESTION,
+            {"sessionKey": session_key, "question": _channel_judge_question(name),
              "selectionContext": tail[-_CHANNEL_JUDGE_CONTEXT_CHARS:]},
             timeout=_CHANNEL_JUDGE_TIMEOUT_S), _CHANNEL_JUDGE_TIMEOUT_S + 1)
     except Exception as ex:
@@ -440,7 +450,7 @@ async def _channel_follow_up(conn, valves, state_dir: str, root: str, thread: di
         old = [_channel_line(m, names) for m in tail_msgs if m["id"] not in new_ids]
         new = [_channel_line(m, names) for m in pending]
         tail = "Thread so far:\n" + "\n".join(old) + "\n\nNEW message(s):\n" + "\n".join(new)
-        verdict = await _channel_judge(conn, key, tail, owner=owner)
+        verdict = await _channel_judge(conn, key, tail, owner=owner, name=thread.get("model_name") or "")
 
     def mark(**fields):
         with _channel_state(state_dir) as st:

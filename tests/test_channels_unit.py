@@ -414,6 +414,7 @@ class FollowUpTests(ChannelCase):
 
     async def test_no_judge_falls_back_to_the_full_turn_and_never_asks_again(self):
         for err in (Exception("utility model unavailable"), Exception("question limit reached"),
+                    Exception("UNAVAILABLE: Side chat is answering another question"),
                     asyncio.TimeoutError()):
             self.posted.clear()
             self.follow(at=2)  # a fresh thread each time
@@ -447,6 +448,10 @@ class FollowUpTests(ChannelCase):
         (method, params), = [r for r in conn.requests if r[0] != "sessions.list"]
         self.assertEqual(method, "sessions.companion.ask")
         self.assertLessEqual(len(params["question"]), 400)
+        self.assertIn("the assistant OpenClaw reply", params["question"])  # the model's name, not ours
+        long = openclaw_pipe._channel_judge_question("x" * 500)
+        self.assertLessEqual(len(long), 400)
+        self.assertIn("should the assistant reply", openclaw_pipe._channel_judge_question(""))
         self.assertIn("and for 4 people?", params["selectionContext"])
         self.assertLessEqual(len(params["selectionContext"]), 16000)
 
