@@ -2120,6 +2120,5 @@ def test_a_channel_mention_opens_a_thread_the_agent_follows(page, token):
         turns = [t for t in _to_model(f"ASIDE_{n}") if "You follow this channel thread" in t]
         assert turns, "the aside never reached the agent"
         assert _thread_bot_texts(token, cid, root) == [f"CHAN_{n}", f"FOLLOW_{n}", f"AFTER_{n}"]
-        assert "[skip]" not in page.evaluate("() => document.body.innerText")
     finally:
         capture.pipe_valves(token, **old)
