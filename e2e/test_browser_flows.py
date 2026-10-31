@@ -205,6 +205,19 @@ def test_a_question_from_the_ask_user_tool_is_answered_in_the_card(page):
                     "the reply with the tool's answer", TURN_MS)
 
 
+def test_a_plugin_approval_is_allowed_from_the_card_and_the_tool_runs(page):
+    """A plugin holds a tool call for approval: the chat shows the card with
+    the plugin's title and its decisions, and "Allow once" runs the tool."""
+    capture.new_chat(page)
+    capture.send(page, "E2E_APPROVAL")
+    capture.wait_js(page, "() => document.body.innerText.includes('E2E guarded action') "
+                          "&& document.body.innerText.includes('Allow the e2e_guarded tool to run?') "
+                          "&& document.body.innerText.includes('Always allow')",
+                    "the approval card", TURN_MS)
+    page.locator("section button", has=page.locator("span", has_text="Allow once")).first.click()
+    capture.wait_js(page, _last_reply_done("E2E_APPROVAL_RESULT ran"), "the reply after the tool ran", TURN_MS)
+
+
 def test_a_reload_while_a_question_waits_shows_one_card_and_the_answer_still_arrives(page):
     """Open WebUI 0.12.4 ("questions survive reconnects"): the page is
     reloaded while the ask_user question is open. The card comes back once

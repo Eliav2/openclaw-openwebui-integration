@@ -9,6 +9,10 @@
 // compaction (a start and a completed end on its `compaction` stream), the
 // events claude-cli's runs send when Claude Code compacts. The native runtime
 // sends none for a compaction a test can bring about, so this stands in for it.
+//
+// And `e2e_guarded`, a tool whose every call asks for a plugin approval (a
+// `before_tool_call` hook's `requireApproval`), the way a plugin guards a
+// sensitive action. It answers "E2E_GUARDED_RAN" only when the call is allowed.
 import { emitAgentEvent } from "openclaw/plugin-sdk/agent-harness-runtime";
 
 // Runs that already reported theirs: a call made through the deferred
@@ -52,6 +56,26 @@ export default {
         return { content: [{ type: "text", text: "compaction reported" }] };
       },
     });
+    api.registerTool({
+      name: "e2e_guarded",
+      description: "Test-only: a tool that needs a plugin approval before it runs.",
+      parameters: { type: "object", properties: {} },
+      async execute() {
+        return { content: [{ type: "text", text: "E2E_GUARDED_RAN" }] };
+      },
+    });
+    api.on(
+      "before_tool_call",
+      () => ({
+        requireApproval: {
+          title: "E2E guarded action",
+          description: "Allow the e2e_guarded tool to run?",
+          severity: "warning",
+          timeoutMs: 120_000,
+        },
+      }),
+      { matcher: ["e2e_guarded"], priority: 50 },
+    );
     api.on("after_tool_call", (event, ctx) => {
       const runId = event.runId ?? ctx?.runId;
       if (!runId || !isCompactCall(event) || reported.has(runId)) return;
