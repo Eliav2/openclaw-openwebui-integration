@@ -2279,6 +2279,29 @@ def test_stop_while_a_plugin_approval_waits_takes_the_card_away(token):
         page.close()
 
 
+def test_an_approval_that_expires_takes_the_card_away_and_a_late_answer_is_harmless(token):
+    """The approval's own timeout ends it: the tool call is blocked, the card
+    leaves the tab, and an answer that still arrives for it changes nothing
+    (the next message in the chat runs)."""
+    page = _Page(token)
+    try:
+        chat_id, _ = _send_in_chat(token, page, None, "E2E_APPROVAL_SHORT")
+        page.join(chat_id)
+        ack_id, card_call = page.wait("the approval card", lambda: page.call_of_type("request:user_input"), 60)
+        interaction = card_call["data"]["data"]["interaction_id"]
+        _wait_for(token, chat_id, ["E2E_APPROVAL_RESULT blocked"])
+        assert any((e.get("data") or {}).get("type") == "request:interaction:done"
+                   and (e["data"].get("data") or {}).get("interaction_id") == interaction
+                   for _, e in page.events), "the card stayed on the tab after the approval expired"
+        page.answer(ack_id, _picked("Allow once"))     # too late
+        _, next_id = _send_in_chat(token, page, chat_id, "Respond with exactly: E2E_AFTER_APPROVAL")
+        msgs = _wait_for(token, chat_id, ["E2E_AFTER_APPROVAL"])
+        assert (msgs[next_id].get("content") or "").strip() == "E2E_AFTER_APPROVAL", msgs[next_id]
+        assert "E2E_APPROVAL_RESULT ran" not in json.dumps(msgs), "a late answer ran the tool"
+    finally:
+        page.close()
+
+
 def test_a_guest_cannot_approve_a_plugin_approval(token, guest_token, owner_users_set):
     """Only the owner approves. A guest's run goes over the connection
     without operator.admin, so the Gateway refuses the run's approval request

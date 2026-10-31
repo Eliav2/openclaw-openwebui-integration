@@ -35,12 +35,28 @@ def record(aid="plugin:1", allowed=None, key=KEY):
             "expiresAtMs": int((ocp.time.time() + 120) * 1000)}
 
 
+U, C = "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"
+CHANNEL_KEY = "agent:main:openwebui:channel:chan-1:thread:root-1"
+
+
 class ApprovalConn(FakeConn):
-    def __init__(self):
+    def __init__(self, agent_id="main"):
         super().__init__()
+        self.agent_id = agent_id
         self.gateway_version = "2026.10.6"
         self.gateway_methods = frozenset({"plugin.approval.resolve", "question.resolve"})
         self.gateway_events = frozenset({"plugin.approval.requested", "plugin.approval.resolved"})
+
+
+    def _valves(self):
+        return types.SimpleNamespace(AGENT_ID=self.agent_id)
+
+    def parse_owui_session_key(self, key):
+        """KEY is the fixture chat of this Pipe copy's agent; any other key
+        goes through the real parser, which matches on AGENT_ID."""
+        if key == KEY:
+            return ("user-1", "chat-1") if self.agent_id == "main" else None
+        return ocp._GatewayConnection.parse_owui_session_key(self, key)
 
 
 def picked(option):
@@ -157,6 +173,60 @@ class PluginApprovalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(conn.sent, [])
         self.assertTrue(tabs.removed_from("sid-own"))
 
+    async def test_the_cards_text_carries_the_requests_detail_cut_at_600_characters(self):
+        rec = record()
+        rec["request"]["detail"] = "x" * 700
+        conn, tabs = ApprovalConn(), Tabs(self)
+        tabs.open("sid-own")
+        self.ask(conn, rec=rec, turn=FakeTurn())
+        q = (await tabs.card_on("sid-own"))["data"]["data"]["questions"][0]
+        self.assertTrue(q["question"].endswith("\n\n" + "x" * 600), q["question"][-40:])
+        self.assertEqual(len(q["question"].split("\n\n")[1]), 600)
+        approvals()["plugin:1"].cancel()
+
+    async def test_an_answer_too_late_for_an_expired_approval_is_harmless(self):
+        """The Gateway has dropped the approval: resolve fails, and the Pipe
+        logs it and goes on."""
+        conn, tabs = ApprovalConn(), Tabs(self)
+
+        async def expired(method, params, timeout=10):
+            raise RuntimeError("unknown or expired approval id")
+        conn.send_request = expired
+        tabs.open("sid-own")
+        self.ask(conn, turn=FakeTurn())
+        await tabs.card_on("sid-own")
+        task = approvals()["plugin:1"]
+        tabs.answer("sid-own", picked("Allow once"))
+        await asyncio.wait_for(task, 2)     # no exception out of the task
+        self.assertIsNone(task.exception())
+        self.assertEqual(approvals(), {})
+
+    async def test_a_channel_thread_of_this_agent_is_denied_at_once_without_a_card(self):
+        conn, tabs = ApprovalConn(), Tabs(self)
+        tabs.open("sid-own")
+        self.assertTrue(self.ask(conn, rec=record(key=CHANNEL_KEY)))
+        await self.finished()
+        self.assertEqual(tabs.sio.calls, [])
+        self.assertEqual(conn.sent, [("plugin.approval.resolve", {"id": "plugin:1", "decision": "deny"})])
+
+    async def test_only_this_pipe_copys_sessions_are_ever_touched(self):
+        """A second Pipe copy (another AGENT_ID) sees the same broadcast. It
+        resolves and denies nothing for this agent's sessions, and this one
+        nothing for its: no card, no resolve, no note."""
+        mine = f"agent:main:openwebui-{U}-{C}"
+        theirs = f"agent:other:openwebui-{U}-{C}"
+        for conn_agent, key in (
+                ("other", mine), ("main", theirs),
+                ("other", CHANNEL_KEY), ("main", "agent:other:openwebui:channel:chan-1:thread:root-1"),
+                ("main", "agent:main:subagent:abc"), ("main", "agent:main:main"), ("main", "")):
+            conn, tabs = ApprovalConn(conn_agent), Tabs(self)
+            tabs.open("sid-own")
+            with self.subTest(conn=conn_agent, key=key):
+                self.assertFalse(self.ask(conn, rec=record(key=key)))
+                for _ in range(20):
+                    await asyncio.sleep(0)
+                self.assertEqual((conn.sent, conn.dispatched, tabs.sio.calls, approvals()), ([], [], [], {}))
+
     async def test_a_guests_chat_gets_no_card_the_request_is_denied_and_the_reply_says_so(self):
         conn, tabs = ApprovalConn(), Tabs(self)
         tabs.open("sid-own")
@@ -172,7 +242,7 @@ class PluginApprovalTests(unittest.IsolatedAsyncioTestCase):
     def test_requests_not_from_a_chat_are_left_alone(self):
         """A sub-agent's or a channel thread's session has no chat to ask in."""
         conn = ApprovalConn()
-        for key in ("agent:main:subagent:abc", "agent:main:openwebui:channel:c1:thread:m1", ""):
+        for key in ("agent:main:subagent:abc", "agent:main:openwebui:channel:c1:threadless", ""):
             self.assertFalse(self.ask(conn, rec=record(key=key)))
         self.assertEqual(approvals(), {})
 

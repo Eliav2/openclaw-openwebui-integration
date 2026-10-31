@@ -98,6 +98,7 @@ SHARDS = {
         f"{E2E}::test_a_plugin_approval_is_asked_in_the_chat_and_allowing_runs_the_tool",
         f"{E2E}::test_a_denied_plugin_approval_keeps_the_tool_from_running",
         f"{E2E}::test_stop_while_a_plugin_approval_waits_takes_the_card_away",
+        f"{E2E}::test_an_approval_that_expires_takes_the_card_away_and_a_late_answer_is_harmless",
         f"{E2E}::test_a_guest_cannot_approve_a_plugin_approval",
         f"{E2E}::test_a_message_sent_while_the_pipe_waits_to_reconnect_gets_its_reply",
         f"{E2E}::test_a_media_line_from_the_agent_is_uploaded_attached_and_linked",

@@ -84,7 +84,7 @@ What you type goes straight to the Gateway's secret store (`question.resolve`). 
 
 _Needs a Gateway that offers OpenClaw's plugin approvals (`plugin.approval.requested` and `plugin.approval.resolve`; every release the Pipe supports does)._
 
-A plugin can hold a tool call until someone allows it: its `before_tool_call` hook returns `requireApproval`. The Pipe asks you in the chat with the same question card: the plugin's title, what it wants to do, the tool and the plugin, and one row per decision the plugin allows: **Deny**, **Allow once** and **Always allow** (when offered). Deny is listed first, so it is the option the card tags Recommended.
+A plugin can hold a tool call until someone allows it: its `before_tool_call` hook returns `requireApproval`. The Pipe asks you in the chat with the same question card: the plugin's title, what it wants to do (and the extra detail it gives, the first 600 characters), the tool and the plugin, and one row per decision the plugin allows: **Deny**, **Allow once** and **Always allow** (when offered). Deny is listed first, so it is the option the card tags Recommended.
 
 <img src="../img/plugin-approval-light.png" alt="A plugin approval as a question card: Deploy to production, what the deploy does, and the rows Deny (tagged Recommended), Allow once and Always allow" width="320">
 
@@ -93,7 +93,9 @@ Your pick goes back to the Gateway (`plugin.approval.resolve`) and the tool call
 - **Cancel:** the same as Deny.
 - **Answered elsewhere** (the Control UI, `/approve`), **expired** (the plugin's timeout, 2 minutes by default), or **Stop:** the card closes and the agent gets that outcome.
 - **A user not in `OWNER_USERS`:** never asked. A run the guest sends cannot request an approval (the Gateway refuses it for lack of the `operator.approvals` scope), so the tool call is blocked. Should a request still come from a guest's chat, the Pipe denies it at once and the reply says it needs the owner's approval.
-- **Sub-agents and channel threads:** not asked in Open WebUI. Answer them in the Control UI, or they end at the plugin's timeout.
+- **Channel threads:** denied at once, with no card: a thread is shared and has no place for one, and left pending it would stand still until the plugin's timeout (up to 10 minutes). The agent is told the call was denied and says so in the thread.
+- **Sub-agents:** not asked in Open WebUI. The parent's turn is already waiting on them; answer in the Control UI, or the approval ends at the plugin's timeout.
+- **Other agents' sessions:** the Pipe only answers approvals for sessions of its own `AGENT_ID` (its chats and channel threads). It never resolves anyone else's, and a second Pipe set to another agent never touches these.
 
 Without this, a webchat run had nowhere to send the request, and the tool call failed at once with `Plugin approval unavailable (no approval route)`. The Pipe's connection now tells the Gateway that it shows plugin approvals (the `plugin-approvals` client capability; it already holds the scope). No re-pairing is needed. While the Pipe is connected, the Gateway counts it as a place to ask for every plugin approval, as it does an open Control UI: an approval from another channel that nobody answers waits for its timeout instead of failing at once.
 

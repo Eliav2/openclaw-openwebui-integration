@@ -123,7 +123,7 @@ and only a core set is sent as real schemas.
   `ASK_TOOL_ARGS` below, then, once the tool result is in, replies
   `E2E_ASK_TOOL_RESULT <status> Database: <answer>` (the answer when there is one).
 * `E2E_APPROVAL`                       -> calls `e2e_guarded` (e2e/agent-tool), whose
-  call needs a plugin approval, then replies `E2E_APPROVAL_RESULT ran` when the
+  call needs a plugin approval (`E2E_APPROVAL_SHORT`: one that expires in 6 s), then replies `E2E_APPROVAL_RESULT ran` when the
   tool ran, else `E2E_APPROVAL_RESULT blocked: <the result's error>`.
 * `E2E_ASK_TOOL_LATER`                 -> the same, after `E2E_ASK_SOON wait-1 ... wait-10`
   one word a second, so a test can close the tab before the question comes.
@@ -529,7 +529,8 @@ def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
             # The tool's failure is JSON in the result's text: its "error".
             error = re.search(r'\\?"error\\?":\s*\\?"([^"\\]+)', result)
             return {"text": f"E2E_APPROVAL_RESULT blocked: {error.group(1) if error else result[:200]}"}
-        return _call_with("e2e_guarded", {}, offered) or {
+        args = {"label": "short"} if "E2E_APPROVAL_SHORT" in user_text else {}
+        return _call_with("e2e_guarded", args, offered) or {
             "text": f"E2E_NO_TOOL_OFFERED: {sorted(n for n in offered if n)}"}
 
     if "E2E_ASK_TOOL" in user_text:

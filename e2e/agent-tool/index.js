@@ -59,19 +59,20 @@ export default {
     api.registerTool({
       name: "e2e_guarded",
       description: "Test-only: a tool that needs a plugin approval before it runs.",
-      parameters: { type: "object", properties: {} },
+      parameters: { type: "object", properties: { label: { type: "string" } } },
       async execute() {
         return { content: [{ type: "text", text: "E2E_GUARDED_RAN" }] };
       },
     });
     api.on(
       "before_tool_call",
-      () => ({
+      (event) => ({
         requireApproval: {
           title: "E2E guarded action",
           description: "Allow the e2e_guarded tool to run?",
           severity: "warning",
-          timeoutMs: 120_000,
+          // label "short": a call whose approval expires within seconds.
+          timeoutMs: event.params?.label === "short" ? 6_000 : 120_000,
         },
       }),
       { matcher: ["e2e_guarded"], priority: 50 },

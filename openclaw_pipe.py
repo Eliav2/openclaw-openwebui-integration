@@ -4393,13 +4393,23 @@ def question_resolved(payload) -> None:
 # `plugin.approval.resolved` (answered in the Control UI or with /approve,
 # expired, or cancelled by Stop) takes the card off the screen.
 #
-# Only the owner approves. A request in a guest's chat (a user not in
-# OWNER_USERS) is denied at once with a note in the reply, as a guest's secret
-# request is cancelled: left pending, it would wait out the approval's timeout
-# with the guest's reply on "Thinking", and an approval from the Control UI
-# would run the tool for a guest. A request from a session that is not a chat
-# (a sub-agent, a channel thread) gets no card here; the Control UI answers it,
-# or its timeout does.
+# Only the owner approves, and only for sessions this Pipe copy owns: its own
+# chats (`agent:<AGENT_ID>:openwebui-<user>-<chat>`) and channel threads
+# (`agent:<AGENT_ID>:openwebui:channel:...`), matched by the AGENT_ID valve. A
+# request for any other session (another agent's, another channel's, a
+# sub-agent's) is never answered here, so a second Pipe copy on another agent
+# cannot touch this one's approvals, nor this one theirs.
+# - A guest's chat (a user not in OWNER_USERS) is denied at once with a note in
+#   the reply, as a guest's secret request is cancelled: left pending, it
+#   would wait out the approval's timeout with the guest's reply on
+#   "Thinking", and an approval from the Control UI would run the tool for a
+#   guest.
+# - A channel thread has no question card and is shared by everyone in it, so
+#   it is denied at once too: left pending, the thread would stand still for
+#   the approval's timeout (up to 10 minutes). The agent gets the denial and
+#   says so in the thread, which carries only its own text.
+# - A sub-agent's session gets no card here: its parent's turn already waits
+#   on it, and the Control UI (or the timeout) answers it.
 
 PLUGIN_APPROVAL_METHODS = ("plugin.approval.resolve",)
 PLUGIN_APPROVAL_EVENTS = ("plugin.approval.requested", "plugin.approval.resolved")
@@ -4409,6 +4419,7 @@ PLUGIN_APPROVAL_EVENTS = ("plugin.approval.requested", "plugin.approval.resolved
 PLUGIN_APPROVAL_CHOICES = (("deny", "Deny"), ("allow-once", "Allow once"), ("allow-always", "Always allow"))
 _PLUGIN_APPROVAL_QID = "approval"
 GUEST_APPROVAL_NOTE = "_The agent asked to use `{tool}`. That needs the owner's approval; it was denied here._"
+_PLUGIN_APPROVAL_DETAIL_CHARS = 600
 # approval id -> the task asking it
 _PLUGIN_APPROVALS: dict = {}
 
@@ -4447,6 +4458,9 @@ def _plugin_approval_payload(record) -> dict | None:
         facts.append("Severity: critical")
     if facts:
         text = f"{text} ({', '.join(facts)})"
+    detail = str(request.get("detail") or "").strip()
+    if detail:
+        text = f"{text}\n\n{detail[:_PLUGIN_APPROVAL_DETAIL_CHARS]}"
     labels = dict(PLUGIN_APPROVAL_CHOICES)
     options = [{"label": labels[d], "description": ""} for d in _plugin_approval_decisions(request)]
     question = {"id": _PLUGIN_APPROVAL_QID, "header": title, "question": text,
@@ -4467,17 +4481,31 @@ def _plugin_approval_decision(response, allowed: list[str]) -> str:
     return "deny"
 
 
+def _plugin_approval_session(conn, key: str) -> tuple | None:
+    """What this Pipe copy makes of a request's session: ("chat", user id,
+    chat id), ("channel",), or None for a session it does not own (another
+    agent's, a sub-agent's, anything else)."""
+    parsed = conn.parse_owui_session_key(key or "")   # matches AGENT_ID
+    if parsed:
+        return ("chat", *parsed)
+    agent_id = getattr(conn._valves(), "AGENT_ID", None)
+    m = _CHANNEL_KEY_RE.match(key or "")
+    if agent_id and m and m.group(1) == agent_id:
+        return ("channel",)
+    return None
+
+
 def plugin_approval_requested(conn, record) -> bool:
-    """`plugin.approval.requested`: ask an approval requested in an Open WebUI
-    chat. False for anything else."""
+    """`plugin.approval.requested`: ask, or deny, an approval requested in a
+    session this Pipe copy owns. False for anything else."""
     if not isinstance(record, dict) or not record.get("id") or record["id"] in _PLUGIN_APPROVALS:
         return False
     if _plugin_approval_payload(record) is None or not _plugin_approvals_offered(conn):
         return False
-    parsed = conn.parse_owui_session_key((record.get("request") or {}).get("sessionKey") or "")
-    if not parsed:
+    session = _plugin_approval_session(conn, (record.get("request") or {}).get("sessionKey") or "")
+    if not session:
         return False
-    _PLUGIN_APPROVALS[record["id"]] = spawn_background(_answer_plugin_approval(conn, record, *parsed))
+    _PLUGIN_APPROVALS[record["id"]] = spawn_background(_answer_plugin_approval(conn, record, *session))
     return True
 
 
@@ -4486,6 +4514,8 @@ def plugin_approval_resolved(payload) -> None:
     the card's wait ends."""
     task = _PLUGIN_APPROVALS.pop((payload or {}).get("id"), None)
     if task is not None:
+        pipe_log(f"  plugin approval: resolved elsewhere ({(payload or {}).get('decision')} by "
+                 f"{(payload or {}).get('resolvedBy')})")
         task.cancel()
 
 
@@ -4498,30 +4528,35 @@ async def _resolve_plugin_approval(conn, approval_id: str, decision: str) -> str
         return f"not resolved ({type(ex).__name__}: {str(ex)[:120]})"
 
 
-async def _deny_guest_plugin_approval(conn, record: dict, tool: str) -> None:
-    """Deny an approval requested in a guest's chat and say so in the reply of
-    the run that asked."""
+async def _deny_plugin_approval(conn, record: dict, tool: str, why: str, note: str | None) -> None:
+    """Deny an approval at once, and say so in the reply of the run that asked
+    when `note` is given."""
     approval_id, request = record["id"], record.get("request") or {}
     # Out of the registry before the request: `plugin.approval.resolved`
     # follows the answer and would cancel this task before it says so.
     if _PLUGIN_APPROVALS.get(approval_id) is asyncio.current_task():
         del _PLUGIN_APPROVALS[approval_id]
     shown = await _resolve_plugin_approval(conn, approval_id, "deny")
-    pipe_log(f"  plugin approval: {tool} in a chat of a user not in OWNER_USERS: {shown}")
+    pipe_log(f"  plugin approval: {tool} in {why}: {shown}")
+    if note is None:
+        return
     payload = {"sessionKey": request.get("sessionKey") or "", "stream": PIPE_NOTE_STREAM,
-               "data": {"id": f"{_NOTE_ITEM_PREFIX}approval_{approval_id}",
-                        "text": GUEST_APPROVAL_NOTE.format(tool=tool)}}
+               "data": {"id": f"{_NOTE_ITEM_PREFIX}approval_{approval_id}", "text": note.format(tool=tool)}}
     if request.get("runId"):
         payload["runId"] = request["runId"]
     await conn.dispatch_run_event({"type": "event", "event": "agent", "payload": payload})
 
 
-async def _answer_plugin_approval(conn, record: dict, user_id: str, chat_id: str) -> None:
+async def _answer_plugin_approval(conn, record: dict, kind: str, user_id: str = "", chat_id: str = "") -> None:
     approval_id, request = record["id"], record.get("request") or {}
     key = request.get("sessionKey") or ""
     tool = str(request.get("toolName") or request.get("title") or "a tool")
+    if kind == "channel":
+        await _deny_plugin_approval(conn, record, tool, "a channel thread (no card there)", None)
+        return
     if not await _sender_is_owner(conn, key):
-        await _deny_guest_plugin_approval(conn, record, tool)
+        await _deny_plugin_approval(conn, record, tool, "a chat of a user not in OWNER_USERS",
+                                    GUEST_APPROVAL_NOTE)
         return
     deadline = (record.get("expiresAtMs") or 0) / 1000 or time.time() + 120
     payload = _plugin_approval_payload(record)
