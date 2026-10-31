@@ -2072,9 +2072,9 @@ def _thread_bot_texts(token, cid, root) -> list:
 def test_a_channel_mention_opens_a_thread_the_agent_follows(page, token):
     """In a channel: a mention gets its answer in a thread, and the agent then
     follows that thread. A message there meant for it gets an answer with no
-    mention; one the people say to each other gets none (the judge says NO)
-    and reaches the agent with its next turn; an answer of `[skip]` posts
-    nothing."""
+    mention; one the people say to each other gets none (the judge says NO,
+    or with no judge the turn answers `[skip]`) and reaches the agent; an
+    answer of `[skip]` posts nothing."""
     n = os.getpid()
     old = capture.pipe_valves(token, CHANNEL_THREAD_DEBOUNCE_S=0)
     try:
@@ -2094,8 +2094,10 @@ def test_a_channel_mention_opens_a_thread_the_agent_follows(page, token):
         replies = page.locator("button", has_text="Replies")
         replies.first.wait_for(timeout=TURN_MS)
         replies.first.click()
+        # The echo repeats the user's token: its answer is the second message
+        # in the thread that shows it.
         in_thread = (lambda needle: f"() => [...document.querySelectorAll('[id^=\"message-{root}-\"]')]"
-                     f".some(el => el.innerText.includes({json.dumps(needle)}))")
+                     f".filter(el => el.innerText.includes({json.dumps(needle)})).length >= 2")
         _wait(page, in_thread(f"CHAN_{n}"), "the thread reply to the mention")
         sent = _to_model(f"CHAN_{n}")[-1]
         assert f"CONTEXT_{n}" in sent and f"({me['id']})" in sent, sent
@@ -2105,16 +2107,16 @@ def test_a_channel_mention_opens_a_thread_the_agent_follows(page, token):
 
         post(f"ASIDE_{n} E2E_ASIDE see you at lunch", root)
         capture.poll(lambda: [r for r in _fake_llm_requests() if f"ASIDE_{n}" in json.dumps(r["request"])],
-                     bool, "the judge's question about the aside")
+                     bool, "the judge's question or the turn about the aside")
         post(f"SKIPMARK_{n}\nE2E_ECHO: [skip]", root)
         capture.poll(lambda: _to_model(f"SKIPMARK_{n}"), bool, "the turn that answers [skip]")
         post(f"E2E_ECHO: AFTER_{n}", root)
         _wait(page, in_thread(f"AFTER_{n}"), "the next answer")
 
-        # The aside got no turn of its own (the judge's question is no turn),
-        # and came with the next one.
+        # The aside reached the agent in a turn (its own, answered [skip], or
+        # the next one), and nothing was posted for it.
         turns = [t for t in _to_model(f"ASIDE_{n}") if "You follow this channel thread" in t]
-        assert turns and all(f"SKIPMARK_{n}" in t for t in turns), turns
+        assert turns, "the aside never reached the agent"
         assert _thread_bot_texts(token, cid, root) == [f"CHAN_{n}", f"FOLLOW_{n}", f"AFTER_{n}"]
         assert "[skip]" not in page.evaluate("() => document.body.innerText")
     finally:
