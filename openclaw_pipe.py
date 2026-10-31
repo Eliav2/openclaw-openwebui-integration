@@ -6017,6 +6017,11 @@ class _GatewayConnection:
         self._identity_name = identity_name
         self.requests_only = requests_only
         self._ws: websockets.WebSocketClientProtocol | None = None
+        # (host, port, tls) the socket was last opened for: `endpoint_moved`
+        # compares it with the valve. A connection a valve change replaced
+        # keeps dialling it (`_pinned_endpoint`) and never the new one.
+        self._endpoint: tuple[str, int, bool] | None = None
+        self._pinned_endpoint: tuple[str, int, bool] | None = None
         self._event_loop_task: asyncio.Task | None = None
         self._init_lock = asyncio.Lock()
 
@@ -6680,6 +6685,19 @@ class _GatewayConnection:
         `session_change_event` waiter (`_subscribe_all`)."""
         return (self._ws is None and not self._stopped and self._event_loop_task is not None
                 and not self._event_loop_task.done())
+
+    def endpoint_moved(self) -> bool:
+        """The GATEWAY_URL valve names another endpoint than this connection
+        was opened for (host, port or ws to wss). `ensure_connected` keeps a
+        live socket, so the caller that owns the connection swaps it
+        (`_replace_moved_connection`). A valve that no longer parses counts as
+        moved: the new connection's attempt then fails naming the valve."""
+        if self._endpoint is None:
+            return False
+        try:
+            return _parse_gateway_url(self._valves().GATEWAY_URL) != self._endpoint
+        except GatewayError:
+            return True
 
     async def ensure_connected(self):
         """Ensure the WS connection is up; connect/reconnect if needed."""
@@ -7490,7 +7508,7 @@ class _GatewayConnection:
     async def _connect_and_start(self):
         """Connect, handshake, and start the event loop task."""
         valves = self._valves()
-        host, port, tls = _parse_gateway_url(valves.GATEWAY_URL)
+        host, port, tls = self._pinned_endpoint or _parse_gateway_url(valves.GATEWAY_URL)
         ws_url = f"{'wss' if tls else 'ws'}://{host}:{port}"
         token = valves.GATEWAY_TOKEN
 
@@ -7592,6 +7610,7 @@ class _GatewayConnection:
             pipe_log(f"Device token captured: {self._device_token[:20]}...")
 
         self._ws = ws
+        self._endpoint = (host, port, tls)
         self._frame_seq = None  # frame seq counts per socket
         tick_ms = (hello_ok.get("policy") or {}).get("tickIntervalMs")
         if isinstance(tick_ms, (int, float)) and tick_ms > 0:
@@ -8317,19 +8336,44 @@ def _remember_gateway_connection(conn: _GatewayConnection) -> None:
     setattr(_owui_socket_main, _STALE_CONN_ATTR, conn)
 
 
+async def _replace_moved_connection(old: _GatewayConnection, make) -> _GatewayConnection:
+    """Connect `make()` to the endpoint the GATEWAY_URL valve names now, then
+    retire `old`: replies it already streams finish on it, and it never
+    dials the new endpoint (`_pinned_endpoint`). `old` is retired only after
+    the new connection is up, so a mistyped valve fails the message naming
+    the valve and leaves the working connection alone."""
+    new = make()
+    await new.ensure_connected()
+    old._pinned_endpoint = old._endpoint
+    try:
+        await _retire_stale_connection(old)
+        _retired_connections.append(old)
+    except Exception as ex:
+        pipe_log(f"  failed to retire the connection to the old Gateway endpoint (non-fatal): {ex}")
+    pipe_log(f"  GATEWAY_URL changed: now connected to {new._endpoint[0]}:{new._endpoint[1]}"
+             f"{' (TLS)' if new._endpoint[2] else ''}")
+    return new
+
+
 async def _get_gateway_connection(valves_getter) -> _GatewayConnection:
-    """Get or create the singleton Gateway connection."""
+    """Get or create the singleton Gateway connection. A GATEWAY_URL change
+    replaces it (`_replace_moved_connection`)."""
     global _gateway_connection
-    if _gateway_connection is not None:
-        await _gateway_connection.ensure_connected()
-        return _gateway_connection
-    async with _gateway_init_lock:
-        if _gateway_connection is not None:
-            await _gateway_connection.ensure_connected()
-            return _gateway_connection
-        await _reap_stale_gateway_connection()
-        conn = _GatewayConnection(valves_getter)
+    conn = _gateway_connection
+    if conn is not None and not conn.endpoint_moved():
         await conn.ensure_connected()
+        return conn
+    async with _gateway_init_lock:
+        conn = _gateway_connection
+        if conn is None:
+            await _reap_stale_gateway_connection()
+            conn = _GatewayConnection(valves_getter)
+            await conn.ensure_connected()
+        elif not conn.endpoint_moved():
+            await conn.ensure_connected()
+            return conn
+        else:
+            conn = await _replace_moved_connection(conn, lambda: _GatewayConnection(valves_getter))
         _gateway_connection = conn
         _remember_gateway_connection(conn)
         return conn
@@ -8350,19 +8394,27 @@ _restricted_connection: "_GatewayConnection | None" = None
 _restricted_init_lock = asyncio.Lock()
 
 
+def _new_restricted_connection(valves_getter) -> "_GatewayConnection":
+    return _GatewayConnection(valves_getter, writes_turns=False, scopes=RESTRICTED_SCOPES,
+                              identity_name="identity-restricted", requests_only=True)
+
+
 async def _get_restricted_connection(valves_getter) -> "_GatewayConnection":
     """The connection for non-owner users' run requests: read + write scopes,
-    identity `identity-restricted.json`, requests only."""
+    identity `identity-restricted.json`, requests only. A GATEWAY_URL change
+    replaces it (`_replace_moved_connection`)."""
     global _restricted_connection
     async with _restricted_init_lock:
-        if _restricted_connection is None:
-            conn = _GatewayConnection(valves_getter, writes_turns=False, scopes=RESTRICTED_SCOPES,
-                                      identity_name="identity-restricted", requests_only=True)
+        conn = _restricted_connection
+        if conn is None:
+            conn = _new_restricted_connection(valves_getter)
             await conn.ensure_connected()
-            _restricted_connection = conn
-            return conn
-    await _restricted_connection.ensure_connected()
-    return _restricted_connection
+        elif conn.endpoint_moved():
+            conn = await _replace_moved_connection(conn, lambda: _new_restricted_connection(valves_getter))
+        else:
+            await conn.ensure_connected()
+        _restricted_connection = conn
+        return conn
 
 
 async def _owui_call(fn, *args):

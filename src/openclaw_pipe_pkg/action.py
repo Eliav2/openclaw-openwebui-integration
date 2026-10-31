@@ -44,22 +44,30 @@ async def _get_action_connection(valves_getter):
     try:
         import open_webui.socket.main as _owui_socket_main
         pipe_conn = getattr(_owui_socket_main, _STALE_CONN_ATTR, None)
-        if pipe_conn is not None:
+        # A Pipe connection opened for an earlier GATEWAY_URL is not reused: the
+        # Pipe replaces it on its next message.
+        if pipe_conn is not None and not pipe_conn.endpoint_moved():
             await pipe_conn.ensure_connected()
             return pipe_conn, "pipe"
     except Exception as ex:
         pipe_log(f"[status-action] could not reuse Pipe connection: {ex}")
 
     global _action_fallback_connection
-    if _action_fallback_connection is None:
-        async with _action_fallback_lock:
-            if _action_fallback_connection is None:
-                conn = _GatewayConnection(valves_getter)
-                await conn.ensure_connected()
-                _action_fallback_connection = conn
-                return conn, "action-own"
-    await _action_fallback_connection.ensure_connected()
-    return _action_fallback_connection, "action-own"
+    conn = _action_fallback_connection
+    if conn is not None and not conn.endpoint_moved():
+        await conn.ensure_connected()
+        return conn, "action-own"
+    async with _action_fallback_lock:
+        conn = _action_fallback_connection
+        if conn is None:
+            conn = _GatewayConnection(valves_getter)
+            await conn.ensure_connected()
+        elif conn.endpoint_moved():
+            conn = await _replace_moved_connection(conn, lambda: _GatewayConnection(valves_getter))
+        else:
+            await conn.ensure_connected()
+        _action_fallback_connection = conn
+        return conn, "action-own"
 
 
 # ---------------------------------------------------------------------------
