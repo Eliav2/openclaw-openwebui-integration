@@ -61,7 +61,7 @@ The Action needs the same Python packages as the Pipe, `websockets` and `cryptog
 
 ## Rate limits from a Claude CLI login
 
-Rate limits come from the Gateway's `usage.status`. On a Gateway whose only Anthropic credential is a Claude CLI login, recent OpenClaw versions (2026.9.1 and later) report no Anthropic windows there. The Action then falls back to the optional [`gateway-plugins/claude-cli-usage`](../../gateway-plugins/claude-cli-usage) Gateway plugin, which serves the 5h and weekly windows read-only from the Claude CLI login. It never refreshes, writes or copies that login's token.
+Rate limits come from the Gateway's `usage.status`. On a Gateway whose only Anthropic credential is a Claude CLI login, recent OpenClaw versions (2026.9.1 and later) report no Anthropic windows there. The Action then falls back to the optional [`gateway-plugins/claude-cli-usage`](../../gateway-plugins/claude-cli-usage) Gateway plugin, which serves the weekly window (and the 5h window on plans that have one) read-only from the Claude CLI login. It never refreshes, writes or copies that login's token.
 
 The plugin runs inside the Gateway, so it goes on the **Gateway host**. Its folder holds an OpenClaw plugin manifest (`openclaw.plugin.json`, id `claude-cli-usage`) that starts with the Gateway, and adds the Gateway method `claudeCliUsage.status`. It finds the login in `CLAUDE_CONFIG_DIR`, or `~/.claude` when that is unset.
 
