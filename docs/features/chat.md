@@ -147,6 +147,20 @@ The note is not shown in the chat. Turning your speech into text and reading the
 
 Always on.
 
+## What the composer toggles do
+
+Open WebUI's web search, code interpreter, tools and integrations toggles do not change what the agent sees. The agent uses the tools your OpenClaw Gateway gives it, and nothing Open WebUI adds on top.
+
+Open WebUI offers those capabilities to a model as tools in the request. The Pipe forwards the text of your last message and any images you attach, and nothing else from the request, so the offered tools never run and the agent never hears of them. The code interpreter's instructions to the model are dropped the same way, and so are the tools Open WebUI offers on every request, such as notes and calendar. A toggle left on is harmless: the agent's prompt is the same with it on or off.
+
+Two settings do reach the agent: the [thinking level](#thinking-level), and voice mode (see [Voice calls](#voice-calls)).
+
+To give the agent web search, a shell or other tools, set them up on the Gateway, not in the composer. The agent's own tool calls then show up as [tool cards](#tool-cards).
+
+Checked against Open WebUI 0.12.5, by comparing what Open WebUI sent with what the agent's session recorded, with each toggle on.
+
+Always on.
+
 ## Slash commands as prompts
 
 Open WebUI's `/` menu has a fixed Commands section of its own, and a Prompts section that lists your Workspace Prompts. With [`SYNC_SLASH_COMMANDS`](../configuration.md#sync_slash_commands) on, the Pipe adds one prompt per slash command your Gateway offers (built-in commands, skills and plugin commands), so typing `/` in a chat shows them next to your own prompts, each with its description.
