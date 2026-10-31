@@ -49,3 +49,37 @@ test("without a profile the credentials file is the fallback label", async () =>
   assert.equal(snap.plan, "Pro");
   assert.equal(snap.windows[0].usedPercent, 4);
 });
+
+test("a re-login with another account does not keep the old cached plan", async () => {
+  const fresh = await import("./index.js?relogin");
+  const calls = [];
+  const login = (token) => writeFileSync(path.join(dir, ".credentials.json"), JSON.stringify({
+    claudeAiOauth: { accessToken: token, expiresAt: Date.now() + 3600_000, subscriptionType: "pro" },
+  }));
+  login("token-a");
+  const a = await fresh.getClaudeCliUsage({ fetchFn: fakeFetch({ organization: { plan_display_name: "Ultra" } }, calls), now: 1e12 });
+  login("token-b");
+  const b = await fresh.getClaudeCliUsage({ fetchFn: fakeFetch({ organization: { plan_display_name: "Pro" } }, calls), now: 1e12 + 120_000 });
+  assert.equal(a.plan, "Ultra");
+  assert.equal(b.plan, "Pro");
+  assert.equal(calls.filter((u) => u.endsWith("/profile")).length, 2);
+});
+
+test("the profile request starts while the usage request is still in flight", async () => {
+  const fresh = await import("./index.js?parallel");
+  let profileStarted;
+  const profileSeen = new Promise((r) => { profileStarted = r; });
+  let startedBeforeUsageDone = false;
+  const fetchFn = async (url) => {
+    if (url.endsWith("/profile")) {
+      profileStarted();
+      return new Response(JSON.stringify({ organization: { plan_display_name: "Ultra" } }));
+    }
+    // a slow usage answer: the profile request must have started by the time it finishes
+    startedBeforeUsageDone = await Promise.race([profileSeen.then(() => true), new Promise((r) => setTimeout(() => r(false), 200))]);
+    return new Response(JSON.stringify(USAGE));
+  };
+  const snap = await fresh.getClaudeCliUsage({ fetchFn, now: 1e12 });
+  assert.equal(startedBeforeUsageDone, true);
+  assert.equal(snap.plan, "Ultra");
+});

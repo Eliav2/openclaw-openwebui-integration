@@ -11,6 +11,7 @@
 // This reads Claude CLI's current access token READ-ONLY and never refreshes,
 // writes, or copies it. If the token is expired it reports that and waits for
 // Claude CLI to refresh it on its own next run.
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -25,7 +26,8 @@ const CACHE_TTL_MS = 60_000;
 let cached = null; // { at, snapshot }
 // The plan changes rarely; asking for it every few hours is enough.
 const PLAN_TTL_MS = 6 * 3600_000;
-let cachedPlan = null; // { at, plan }
+// Keyed on a hash of the access token: another login (or a token refresh) asks again.
+let cachedPlan = null; // { key, at, plan }
 
 function credentialsPath() {
   const dir = process.env.CLAUDE_CONFIG_DIR?.trim() || path.join(os.homedir(), ".claude");
@@ -83,7 +85,8 @@ export function profilePlanLabel(profile) {
 }
 
 async function fetchPlan(oauth, headers, fetchFn, now) {
-  if (cachedPlan && now - cachedPlan.at < PLAN_TTL_MS) return cachedPlan.plan;
+  const key = createHash("sha256").update(oauth.accessToken).digest("hex");
+  if (cachedPlan?.key === key && now - cachedPlan.at < PLAN_TTL_MS) return cachedPlan.plan;
   let plan;
   try {
     const res = await fetchFn(PROFILE_URL, { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
@@ -92,7 +95,7 @@ async function fetchPlan(oauth, headers, fetchFn, now) {
   } catch {
     // the profile is only a label; the windows matter more
   }
-  if (plan) cachedPlan = { at: now, plan };
+  if (plan) cachedPlan = { key, at: now, plan };
   return plan ?? planLabel(oauth);
 }
 
@@ -116,13 +119,16 @@ async function fetchSnapshot(fetchFn = fetch, now = Date.now()) {
     "anthropic-version": "2023-06-01",
     "anthropic-beta": "oauth-2025-04-20",
   };
+  // Both requests start together: two 8 s timeouts in a row would pass the
+  // caller's 10 s budget and lose the windows. fetchPlan never rejects.
+  const planPromise = fetchPlan(oauth, headers, fetchFn, now);
   const res = await fetchFn(USAGE_URL, { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
   if (!res.ok) {
     await res.body?.cancel().catch(() => {});
     return { ...base, windows: [], error: `Anthropic usage HTTP ${res.status}` };
   }
   const windows = buildWindows(await res.json());
-  const plan = await fetchPlan(oauth, headers, fetchFn, now);
+  const plan = await planPromise;
   return { ...base, windows, ...(plan ? { plan } : {}) };
 }
 
