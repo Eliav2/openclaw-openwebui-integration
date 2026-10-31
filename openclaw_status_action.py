@@ -2669,6 +2669,12 @@ _QUESTION_HOOKS = None
 # The Pipe's handler for `chat.metadata.changed` (slash_prompts.py), set by
 # pipe.py. None in the Status Action, which syncs nothing.
 _SLASH_PROMPTS_HOOK = None
+# The Pipe's handlers for `plugin.approval.requested` / `.resolved`
+# (approvals.py), set by pipe.py. None in the Status Action: its connection
+# does not declare the plugin-approvals cap, so the Gateway never counts it as
+# a client that shows approvals. Gated like `_QUESTION_HOOKS`.
+_APPROVAL_HOOKS = None
+PLUGIN_APPROVAL_CAP = "plugin-approvals"
 
 
 class _GatewayConnection:
@@ -4088,6 +4094,17 @@ class _GatewayConnection:
         except Exception as e:
             pipe_log(f"  /stop fallback failed: {e}")
 
+    def _connect_caps(self) -> list:
+        """The caps the connect frame declares. "plugin-approvals" only on a
+        connection that writes turns and holds operator.admin: with it the
+        Gateway counts this connection as one that shows plugin approvals
+        (approvals.py), which only the Pipe's own does. The restricted
+        connection could not resolve one anyway (no operator.approvals)."""
+        caps = ["tool-events"]
+        if _APPROVAL_HOOKS and self.writes_turns and "operator.admin" in self.scopes:
+            caps.append(PLUGIN_APPROVAL_CAP)
+        return caps
+
     @property
     def handles_hooks(self) -> bool:
         """Whether this connection hands the Gateway's `question.requested`
@@ -4259,7 +4276,7 @@ class _GatewayConnection:
                 device=signed,
                 locale="en-US",
                 userAgent="openclaw-owui-pipe/1.0",
-                caps=["tool-events"]
+                caps=self._connect_caps()
             )
         )))
 
@@ -4466,6 +4483,15 @@ class _GatewayConnection:
                     # registry, so delivering twice cancels nothing twice.
                     if _QUESTION_HOOKS and self.writes_turns:
                         _QUESTION_HOOKS[1](msg.get("payload") or {})
+                    continue
+                if msg.get("type") == "event" and msg.get("event") == "plugin.approval.requested":
+                    if _APPROVAL_HOOKS and self.handles_hooks:
+                        _APPROVAL_HOOKS[0](self, msg.get("payload") or {})
+                    continue
+                if msg.get("type") == "event" and msg.get("event") == "plugin.approval.resolved":
+                    # Retired connections too, as for `question.resolved`.
+                    if _APPROVAL_HOOKS and self.writes_turns:
+                        _APPROVAL_HOOKS[1](msg.get("payload") or {})
                     continue
                 if msg.get("type") == "event" and msg.get("event") == "session.message":
                     self._on_session_message(msg.get("payload") or {})

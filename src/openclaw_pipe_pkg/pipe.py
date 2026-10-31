@@ -12,6 +12,8 @@ _ACTIVE_RUN_STATES = ("active", "running", "streaming", "queued")
 # The Gateway's questions (secret requests, ELI-96; the ask_user tool,
 # ELI-216) are asked in the chat (askuser.py).
 _QUESTION_HOOKS = (question_requested, question_resolved)
+# Plugin approvals are asked in the chat (approvals.py).
+_APPROVAL_HOOKS = (plugin_approval_requested, plugin_approval_resolved)
 # Slash commands mirrored into Open WebUI's Prompts (slash_prompts.py).
 _SLASH_PROMPTS_HOOK = _slash_prompts_on_metadata_changed
 

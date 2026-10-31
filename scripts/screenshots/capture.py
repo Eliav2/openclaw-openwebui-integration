@@ -621,6 +621,17 @@ class Scenes:
         self.s.shot(page, "secret-request")
         page.get_by_role("button", name="Cancel").click()
 
+    def plugin_approval(self, page: Page) -> None:
+        """The card for a tool call a plugin holds for approval."""
+        new_chat(page)
+        chat = send(page, "Ship forecast-app 1.4 to production")
+        wait_js(page, "() => { const t = document.body.innerText; return t.includes('Deploy to production') "
+                      "&& t.includes('Allow once') && t.includes('Always allow'); }",
+                "the approval card")
+        set_title(self.token, chat, "Ship forecast-app 1.4")
+        self.s.shot(page, "plugin-approval")
+        page.locator("section button", has=page.locator("span", has_text="Deny")).first.click()
+
     def status_and_drawer(self, page: Page) -> None:
         """#3 status-dialog with two running sub-agents, #4 subagent-drawer."""
         new_chat(page)
@@ -1404,6 +1415,7 @@ def main(argv=None) -> int:
             shooter.run("question-card", scenes.question, page)
             if gateway_release() >= (2026, 10, 10):
                 shooter.run("secret-request", scenes.secret_request, page)
+            shooter.run("plugin-approval", scenes.plugin_approval, page)
             shooter.run("status-dialog", scenes.status_and_drawer, page)
             shooter.run("subagents-long", scenes.subagents_long, page)
             if scenes.long_chat:

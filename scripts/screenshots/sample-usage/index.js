@@ -17,6 +17,8 @@
 //   COMPACT_AFTER, the run reports one on its `compaction` stream, as a
 //   claude-cli run does when Claude Code compacts. The native runtime sends
 //   none a scene can bring about.
+// - A `deploy_release` tool that a `before_tool_call` hook holds for a plugin
+//   approval, as a plugin guards a sensitive action, for the approval card.
 import { readFileSync } from "node:fs";
 import { emitAgentEvent } from "openclaw/plugin-sdk/agent-harness-runtime";
 
@@ -78,6 +80,26 @@ export default {
         return { content: [{ type: "text", text }] };
       },
     });
+    api.registerTool({
+      name: "deploy_release",
+      description: "Deploy a release of the forecast app.",
+      parameters: { type: "object", properties: { version: { type: "string" }, target: { type: "string" } } },
+      async execute(_id, params) {
+        return { content: [{ type: "text", text: `Deployed ${params.version ?? "the release"} to ${params.target ?? "production"}.` }] };
+      },
+    });
+    api.on(
+      "before_tool_call",
+      (event) => ({
+        requireApproval: {
+          title: "Deploy to production",
+          description: `Deploy forecast-app ${event.params?.version ?? ""} to production? Users see it at once.`,
+          severity: "warning",
+          timeoutMs: 600_000,
+        },
+      }),
+      { matcher: ["deploy_release"], priority: 50 },
+    );
     api.on("after_tool_call", (event, ctx) => {
       const runId = event.runId ?? ctx?.runId;
       if (!runId || compacted.has(runId) || !JSON.stringify(event.params ?? {}).includes(COMPACT_AFTER)) return;

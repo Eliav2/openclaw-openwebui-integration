@@ -2212,6 +2212,112 @@ def test_a_cancelled_ask_user_card_lets_the_agent_go_on_at_once(token):
         page.close()
 
 
+# ── A plugin approval (a tool call a plugin's hook holds for approval) ──────
+# e2e/agent-tool's `e2e_guarded` asks for one on every call; the fake model's
+# E2E_APPROVAL calls it and says whether it ran.
+
+def _approval_card(page) -> tuple:
+    ack_id, call = page.wait("the approval card", lambda: page.call_of_type("request:user_input"), 60)
+    return ack_id, call["data"]["data"]["questions"][0]
+
+
+def _picked(option: str) -> dict:
+    return {"status": "answered", "answers": {"approval": {"type": "option", "label": option}}}
+
+
+def test_a_plugin_approval_is_asked_in_the_chat_and_allowing_runs_the_tool(token):
+    """A plugin approval made in an owner's chat shows Open WebUI's question
+    card with the plugin's title and the decisions it allows, and "Allow
+    once" runs the tool (without the Pipe it failed at once: "no approval
+    route")."""
+    page = _Page(token)
+    try:
+        chat_id, _ = _send_in_chat(token, page, None, "E2E_APPROVAL")
+        page.join(chat_id)
+        ack_id, card = _approval_card(page)
+        assert card["header"] == "E2E guarded action", card
+        assert card["question"].startswith("Allow the e2e_guarded tool to run?"), card
+        assert [o["label"] for o in card["options"]] == ["Deny", "Allow once", "Always allow"], card
+        page.answer(ack_id, _picked("Allow once"))
+        _wait_for(token, chat_id, ["E2E_APPROVAL_RESULT ran"])
+    finally:
+        page.close()
+
+
+def test_a_denied_plugin_approval_keeps_the_tool_from_running(token):
+    page = _Page(token)
+    try:
+        chat_id, _ = _send_in_chat(token, page, None, "E2E_APPROVAL")
+        page.join(chat_id)
+        ack_id, _ = _approval_card(page)
+        page.answer(ack_id, _picked("Deny"))
+        msgs = _wait_for(token, chat_id, ["E2E_APPROVAL_RESULT blocked"])
+        assert "no approval route" not in json.dumps(msgs), msgs
+    finally:
+        page.close()
+
+
+def test_stop_while_a_plugin_approval_waits_takes_the_card_away(token):
+    """Stop ends the run, the Gateway cancels its approval, and the card
+    leaves the tab instead of waiting for an answer nobody needs."""
+    page = _Page(token)
+    try:
+        chat_id, aid = _send_in_chat(token, page, None, "E2E_APPROVAL")
+        page.join(chat_id)
+        _, card_call = page.wait("the approval card", lambda: page.call_of_type("request:user_input"), 60)
+        interaction = card_call["data"]["data"]["interaction_id"]
+        # What the page's Stop button does.
+        status, body = _request("POST", f"/api/tasks/chat/{chat_id}/stop", token=token)
+        assert status == 200, f"stop failed: {status} {body}"
+
+        def withdrawn():
+            return any((e.get("data") or {}).get("type") == "request:interaction:done"
+                       and ((e["data"].get("data") or {}).get("interaction_id") == interaction)
+                       for _, e in page.events)
+        page.wait("the card to leave the tab", withdrawn, 60)
+    finally:
+        page.close()
+
+
+def test_an_approval_that_expires_takes_the_card_away_and_a_late_answer_is_harmless(token):
+    """The approval's own timeout ends it: the tool call is blocked, the card
+    leaves the tab, and an answer that still arrives for it changes nothing
+    (the next message in the chat runs)."""
+    page = _Page(token)
+    try:
+        chat_id, _ = _send_in_chat(token, page, None, "E2E_APPROVAL_SHORT")
+        page.join(chat_id)
+        ack_id, card_call = page.wait("the approval card", lambda: page.call_of_type("request:user_input"), 60)
+        interaction = card_call["data"]["data"]["interaction_id"]
+        _wait_for(token, chat_id, ["E2E_APPROVAL_RESULT blocked"])
+        assert any((e.get("data") or {}).get("type") == "request:interaction:done"
+                   and (e["data"].get("data") or {}).get("interaction_id") == interaction
+                   for _, e in page.events), "the card stayed on the tab after the approval expired"
+        page.answer(ack_id, _picked("Allow once"))     # too late
+        _, next_id = _send_in_chat(token, page, chat_id, "Respond with exactly: E2E_AFTER_APPROVAL")
+        msgs = _wait_for(token, chat_id, ["E2E_AFTER_APPROVAL"])
+        assert (msgs[next_id].get("content") or "").strip() == "E2E_AFTER_APPROVAL", msgs[next_id]
+        assert "E2E_APPROVAL_RESULT ran" not in json.dumps(msgs), "a late answer ran the tool"
+    finally:
+        page.close()
+
+
+def test_a_guest_cannot_approve_a_plugin_approval(token, guest_token, owner_users_set):
+    """Only the owner approves. A guest's run goes over the connection
+    without operator.admin, so the Gateway refuses the run's approval request
+    ("missing scope: operator.approvals"): the tool does not run and the
+    guest's tab gets no card."""
+    page = _Page(guest_token)
+    try:
+        chat_id, aid = _send_in_chat(guest_token, page, None, "E2E_APPROVAL")
+        page.join(chat_id)
+        msgs = _wait_for(guest_token, chat_id, ["E2E_APPROVAL_RESULT blocked"])
+        assert "E2E_APPROVAL_RESULT ran" not in json.dumps(msgs), msgs
+        assert page.call_of_type("request:user_input") is None, "the guest's tab got the approval card"
+    finally:
+        page.close()
+
+
 # ── ELI-176: a message right after a Gateway restart ───────────────────────
 
 def _pipe_log_since(since: str) -> str:
