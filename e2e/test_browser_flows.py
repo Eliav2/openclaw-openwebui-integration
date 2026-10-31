@@ -2095,9 +2095,11 @@ def test_a_channel_mention_opens_a_thread_the_agent_follows(page, token):
         replies.first.wait_for(timeout=TURN_MS)
         replies.first.click()
         # The echo repeats the user's token: its answer is the second message
-        # in the thread that shows it.
-        in_thread = (lambda needle: f"() => [...document.querySelectorAll('[id^=\"message-{root}-\"]')]"
-                     f".filter(el => el.innerText.includes({json.dumps(needle)})).length >= 2")
+        # in the thread that shows it. One message can render as two elements
+        # with the same id, so messages are counted by id.
+        in_thread = (lambda needle: "() => new Set([...document.querySelectorAll("
+                     f"'[id^=\"message-{root}-\"]')].filter(el => el.innerText.includes({json.dumps(needle)}))"
+                     ".map(el => el.id)).size >= 2")
         _wait(page, in_thread(f"CHAN_{n}"), "the thread reply to the mention")
         sent = _to_model(f"CHAN_{n}")[-1]
         assert f"CONTEXT_{n}" in sent and f"({me['id']})" in sent, sent
