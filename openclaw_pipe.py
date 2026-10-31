@@ -12929,6 +12929,8 @@ _CHANNEL_SKIP = "[skip]"
 _CHANNEL_STATE_FILE = "channel-threads.json"
 _CHANNEL_POLL_S = 2.0
 _CHANNEL_JUDGE_TIMEOUT_S = 10.0
+_CHANNEL_IDLE_WAIT_S = 1800.0   # a follow-up waits at most this long for the thread's run to end
+_CHANNEL_RUN_TIMEOUT_S = 1800.0  # and for its own run's end
 _CHANNEL_JUDGE_TAIL = 12
 _CHANNEL_JUDGE_CONTEXT_CHARS = 15000
 _CHANNEL_WATCH_ATTR = "_openclaw_channel_watcher_v1"
@@ -13153,6 +13155,10 @@ async def _channel_mention_context(state_dir: str, channel_id: str, reply_messag
     with _channel_state(state_dir) as st:
         thread = dict(st["threads"].get(root) or {})
         chan_cursor = (st["channels"].get(channel_id) or {}).get("cursor", 0)
+    if reply_message_id and thread.get("reply_id") == reply_message_id and thread.get("text"):
+        # Open WebUI called the Pipe again for the same reply: the same text,
+        # so the Pipe follows the run the first call started.
+        return {"root": root, "text": thread["text"], "commit": lambda: None, "messages": 0}
     if thread:
         msgs = await _channel_rows(channel_id, parent_id=root, after_ns=thread.get("cursor", 0), upto_ns=upto)
         title = "Thread messages since your last turn"
@@ -13171,7 +13177,7 @@ async def _channel_mention_context(state_dir: str, channel_id: str, reply_messag
         with _channel_state(state_dir) as st:
             t = st["threads"].setdefault(root, {})
             t.update(channel=channel_id, model_id=model_id, model_name=model_name,
-                     function=_composer_own_function_id(),
+                     function=_composer_own_function_id(), reply_id=reply_message_id, text=text,
                      cursor=max(t.get("cursor", 0), upto), judged=max(t.get("judged", 0), upto),
                      active=time.time_ns())
             if not thread:
@@ -13210,55 +13216,93 @@ async def _channel_judge(conn, session_key: str, tail: str, *, owner: bool) -> "
 
 
 async def _channel_run(conn, session_key: str, message: str, idempotency_key: str,
-                       *, owner: bool) -> "tuple[str, str | None]":
+                       *, owner: bool, still_needed=None) -> "tuple[str, str | None]":
     """Run one follow-up turn and wait for its final text. Returns
     ("started", text) for the watcher that got the turn, ("taken", None)
-    when another one already sent this key, ("failed", None) otherwise."""
-    queue = conn.register_consumer(session_key, idempotency_key)
-    run_id = idempotency_key
-    try:
+    when another one already sent this key, ("covered", None) when a turn
+    that ran meanwhile (a mention) already carried the messages, and
+    ("failed", None) otherwise."""
+    # As a chat message does: wait for the session's run to end before
+    # sending, under the per-session send lock. A send into a running turn
+    # (a mention in the same thread) is merged into it and never ends.
+    async with conn.send_section(session_key):
+        waited = time.monotonic()
+        while True:
+            changed = conn.session_change_event(session_key)
+            active = await _session_list_active(conn, session_key, missing=False)
+            if active is None:
+                pipe_log("[channels] follow-up: the Gateway cannot say whether the thread is busy; not sent")
+                return "failed", None
+            if not active:
+                break
+            left = _CHANNEL_IDLE_WAIT_S - (time.monotonic() - waited)
+            if left <= 0:
+                pipe_log("[channels] follow-up: the thread stayed busy; not sent")
+                return "failed", None
+            try:
+                await asyncio.wait_for(changed.wait(), left)
+            except asyncio.TimeoutError:
+                pass
+        if still_needed is not None and not still_needed():
+            pipe_log("[channels] follow-up: a turn meanwhile already carried these messages")
+            return "covered", None
+        queue = conn.register_consumer(session_key, idempotency_key)
+        run_id = idempotency_key
         try:
             resp = await _run_request(conn, RUN_SEND, dict(
                 sessionKey=session_key, message=message, idempotencyKey=idempotency_key),
                 timeout=30, owner=owner)
         except Exception as ex:
+            conn.unregister_consumer(session_key, run_id, queue=queue)
             pipe_log(f"[channels] follow-up send failed: {ex}")
             return "failed", None
         # Only the first sender of a key gets "started"; another gets
         # "in_flight" (or the finished run's status) for the same run.
         if (resp or {}).get("status") != "started":
+            conn.unregister_consumer(session_key, run_id, queue=queue)
             pipe_log(f"[channels] follow-up {idempotency_key[:24]} is {(resp or {}).get('status')}: not mine")
             return "taken", None
         if resp.get("runId") and resp["runId"] != run_id:
             conn.unregister_consumer(session_key, run_id, queue=queue)
             run_id = resp["runId"]
             queue = conn.register_consumer(session_key, run_id)
-        text = ""
-        while True:
-            msg = await queue.get()
-            kind = msg.get("type")
-            if kind == _RESTART_MARKER_TYPE:
-                return "failed", None
-            if kind == _ROW_MARKER_TYPE:
-                row = msg.get("row") or {}
-                if row.get("hasActiveRun") is False and (msg.get("resync") or row.get("lastRunId") == run_id):
-                    hist = await conn.session_history(session_key, limit=10)
-                    found, whole = _history_text_for_run(hist, run_id)
-                    return ("started", whole or text) if (found or text) else ("failed", None)
-                continue
-            payload = msg.get("payload") or {}
-            data = payload.get("data") or {}
-            if payload.get("stream") == "assistant":
-                text += data.get("delta") or ""
-            if payload.get("stream") == "lifecycle" and data.get("phase") == "error":
-                return "failed", None
-            if payload.get("state") in ("error", "aborted"):
-                return "failed", None
-            if payload.get("state") == "final":
-                final = _coerce_text(payload.get("message")) if payload.get("message") else ""
-                return "started", final or text
+    try:
+        return await asyncio.wait_for(_channel_run_text(conn, session_key, run_id, queue),
+                                      _CHANNEL_RUN_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        pipe_log(f"[channels] follow-up {run_id[:24]} sent no end in {_CHANNEL_RUN_TIMEOUT_S:.0f} s; not posted")
+        return "failed", None
     finally:
         conn.unregister_consumer(session_key, run_id)
+
+
+async def _channel_run_text(conn, session_key: str, run_id: str, queue) -> "tuple[str, str | None]":
+    """The run's final text from its events, as `_generate_title_text` reads
+    a title run."""
+    text = ""
+    while True:
+        msg = await queue.get()
+        kind = msg.get("type")
+        if kind == _RESTART_MARKER_TYPE:
+            return "failed", None
+        if kind == _ROW_MARKER_TYPE:
+            row = msg.get("row") or {}
+            if row.get("hasActiveRun") is False and (msg.get("resync") or row.get("lastRunId") == run_id):
+                hist = await conn.session_history(session_key, limit=10)
+                found, whole = _history_text_for_run(hist, run_id)
+                return ("started", whole or text) if (found or text) else ("failed", None)
+            continue
+        payload = msg.get("payload") or {}
+        data = payload.get("data") or {}
+        if payload.get("stream") == "assistant":
+            text += data.get("delta") or ""
+        if payload.get("stream") == "lifecycle" and data.get("phase") == "error":
+            return "failed", None
+        if payload.get("state") in ("error", "aborted"):
+            return "failed", None
+        if payload.get("state") == "final":
+            final = _coerce_text(payload.get("message")) if payload.get("message") else ""
+            return "started", final or text
 
 
 async def _channel_follow_up(conn, valves, state_dir: str, root: str, thread: dict, pending: list,
@@ -13299,10 +13343,15 @@ async def _channel_follow_up(conn, valves, state_dir: str, root: str, thread: di
         return "judged-no"
     limit = int(getattr(valves, "CHANNEL_CONTEXT_LIMIT", 50) or 50)
     text = _channel_block(since, names, limit, "Thread messages since your last turn") + "\n\n" + _CHANNEL_FOLLOW_NOTE
-    status, final = await _channel_run(conn, key, text, f"chanfollow-{newest['id']}", owner=owner)
-    if status == "taken":
+    def still_needed():
+        with _channel_state(state_dir) as st:
+            return (st["threads"].get(root) or {}).get("cursor", 0) < newest["created_at"]
+
+    status, final = await _channel_run(conn, key, text, f"chanfollow-{newest['id']}", owner=owner,
+                                       still_needed=still_needed)
+    if status in ("taken", "covered"):
         mark(judged=newest["created_at"])
-        return "taken"
+        return status
     if status == "failed":
         mark(judged=newest["created_at"])
         return "failed"
@@ -13924,6 +13973,8 @@ class Pipe:
         _ensure_composer_watcher(lambda: self.valves)
         # ...and the earliest point to finish replies a restart orphaned.
         _ensure_orphan_reconcile(lambda: self.valves)
+        # ...and to follow the channel threads again.
+        _ensure_channel_watcher(lambda: self.valves)
         # ...and to mirror the Gateway's slash commands into Prompts.
         _ensure_slash_prompts(lambda: self.valves, force=True)
         models, source = await _discover_models_with_source(self.valves)

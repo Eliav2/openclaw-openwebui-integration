@@ -64,7 +64,7 @@ So **anyone who can chat with the Pipe can drive that agent**, with everything t
 
 By default every Open WebUI user also acts as the Gateway's owner. If people other than you can sign in, set [`OWNER_USERS`](./configuration.md#owner_users): see [Owner users](./features/owner-users.md).
 
-In channels, the agent's answers and what it was told are visible to everyone in the thread, its turns start with the agent's workspace files (its private memory too), and the Pipe asks the Gateway's utility model about a thread's last messages. To keep a private agent out of channels, give channels their own copy of the Pipe with its own `AGENT_ID`: see [Channels](./features/channels.md#privacy).
+In channels, the agent's answers and what it was told are visible to everyone in the thread, its turns start with the agent's workspace files (its private memory too), and the Pipe sends a thread's last messages (up to 15,000 characters) to the Gateway's utility model to ask whether they are meant for the agent. To keep a private agent out of channels, give channels their own copy of the Pipe with its own `AGENT_ID`: see [Channels](./features/channels.md#privacy).
 
 ## Scripts in your browser
 

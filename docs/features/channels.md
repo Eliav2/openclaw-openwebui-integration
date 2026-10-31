@@ -23,7 +23,7 @@ Each message is one line, `[HH:MM] Name (user id): text`, oldest first. At most 
 After answering, the agent follows the thread. When someone writes there without mentioning it:
 
 1. The Pipe waits [`CHANNEL_THREAD_DEBOUNCE_S`](../configuration.md#channel_thread_debounce_s) seconds (15 by default) for more messages, so a burst gets one decision and at most one answer.
-2. It asks a short question of your Gateway's utility model: are the new messages meant for the agent? The question goes with the thread's last few messages (see [Privacy](#privacy)).
+2. It asks a short question of your Gateway's utility model: are the new messages meant for the agent? The question goes with the thread's last 12 messages and the new ones, at most 15,000 characters (see [Privacy](#privacy)).
 3. **Yes:** the agent gets a turn with the thread's new messages. It may still decide they were not for it and answer `[skip]`, and then nothing is posted. **No:** nothing runs, and the messages reach the agent with its next turn in that thread. **No utility model, or it is busy or fails:** the agent gets the turn and decides itself. The question is never asked twice.
 
 When unsure, the agent stays silent. A mention always gets an answer.
@@ -42,12 +42,12 @@ Without owner rights is not a sandbox: the agent can still run commands and read
 
 - **One agent.** Channel threads run on the Pipe's [`AGENT_ID`](../configuration.md#agent_id), the same agent as your chats. OpenClaw starts each of its sessions with that agent's workspace files, so a channel's turns can see the agent's private memory (for example `MEMORY.md`) and may quote it to everyone in the channel.
 - **A thread is shared.** Everything the agent says in a thread, and everything it was told there, is visible to everyone who can read the thread.
-- **The utility model sees the thread.** The relevance question sends the thread's last few messages to the model your Gateway uses as its utility model, which may be another provider than your agent's.
+- **The utility model sees the thread.** The relevance question sends the thread's last 12 messages and the new ones (at most 15,000 characters, names and user ids included) to the model your Gateway uses as its utility model, which may be another provider than your agent's.
 
-To keep your private memory out of channels, give channels their own agent: install a second copy of the Pipe with its own [`AGENT_ID`](../configuration.md#agent_id), an agent with its own workspace, and mention that copy's model in channels. Each copy follows its own threads.
+To keep your private memory out of channels, give channels their own agent: install a second copy of the Pipe with its own [`AGENT_ID`](../configuration.md#agent_id), an agent with its own workspace, and mention that copy's model in channels. Each copy follows its own threads. This does not stop anyone from mentioning the first copy's model in a channel: limit who may use that model in Open WebUI (its access settings) to the people who may see that agent's memory.
 
 ## Limits
 
-- The Pipe follows threads only while it is loaded: after Open WebUI restarts, it resumes following at its first reply (in any chat or channel).
+- The Pipe follows threads only while it is loaded: after Open WebUI restarts, it resumes when someone opens Open WebUI (it loads the model list) or the Pipe replies anywhere.
 - Only Open WebUI's thread mode is supported (`CHANNEL_MODEL_RESPONSE_MODE=thread`, the default).
 - After updating from a version without channel threads, each channel's conversation with the agent starts fresh once: the earlier per-user channel sessions are left as they were and no longer used.

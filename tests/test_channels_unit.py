@@ -238,6 +238,15 @@ class MentionContextTests(ChannelCase):
         self.assertIn("unmentioned note", ctx["text"])
         self.assertNotIn(": @OpenClaw a", ctx["text"])
 
+    async def test_a_second_call_for_the_same_reply_sends_the_same_text(self):
+        self.chan.messages = [msg("talk", 1, user=BOB, text="dinner?"), msg(ROOT, 2, text="@OpenClaw book"),
+                              msg("ph", 3, parent=ROOT, bot=True)]
+        first = await _channel_mention_context(self.tmp, CID, "ph", MODEL, 50)
+        first["commit"]()
+        again = await _channel_mention_context(self.tmp, CID, "ph", MODEL, 50)
+        self.assertEqual(again["text"], first["text"])
+        self.assertEqual(again["root"], ROOT)
+
     async def test_a_mention_in_a_followed_thread_sends_the_thread_since_the_last_turn(self):
         self.follow(at=2)
         self.chan.messages = [msg(ROOT, 1), msg("t-old", 2, parent=ROOT, text="seen"),
@@ -255,11 +264,22 @@ class FakeRunConn:
     """A Gateway connection for one follow-up run: the chat.send answer, then
     the run's events into the registered queue."""
 
-    def __init__(self, status="started", events=(), companion=None):
+    def __init__(self, status="started", events=(), companion=None, active=()):
         self.status, self.events, self.companion = status, list(events), companion
+        self.active = list(active)  # hasActiveRun answers, in order; then idle
         self.requests = []
         self._valves = lambda: types.SimpleNamespace(OWNER_USERS="", AGENT_ID="main")
         self.queues = {}
+        self.changed = asyncio.Event()
+
+    def send_section(self, key):
+        return _AsyncNull()
+
+    def session_change_event(self, key):
+        self.changed = asyncio.Event()
+        if self.active:  # the next read sees the next state
+            self.changed.set()
+        return self.changed
 
     def register_consumer(self, key, run_id):
         q = asyncio.Queue()
@@ -275,6 +295,12 @@ class FakeRunConn:
             if isinstance(self.companion, Exception):
                 raise self.companion
             return {"answer": self.companion}
+        if method == "sessions.list":
+            if self.active and isinstance(self.active[0], Exception):
+                raise self.active.pop(0)
+            busy = self.active.pop(0) if self.active else False
+            return {"sessions": [{"key": k, "hasActiveRun": busy}
+                                 for k in ("k", _channel_session_key("main", CID, ROOT))]}
         if method == "chat.send":
             if self.status == "started":
                 q = self.queues[params["idempotencyKey"]]
@@ -287,7 +313,16 @@ class FakeRunConn:
         return {"messages": []}
 
     def methods(self):
-        return [m for m, _ in self.requests]
+        """The requests, without the idle checks before a send."""
+        return [m for m, _ in self.requests if m != "sessions.list"]
+
+
+class _AsyncNull:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
 
 
 def delta(t):
@@ -306,6 +341,31 @@ class RunTests(unittest.IsolatedAsyncioTestCase):
             dup = FakeRunConn(other)
             got = await asyncio.wait_for(_channel_run(dup, "k", "m", "chanfollow-x", owner=True), 2)
             self.assertEqual(got, ("taken", None), other)
+
+    async def test_a_busy_thread_is_waited_for_before_the_send(self):
+        conn = FakeRunConn("started", [final("Sure")], active=[True, True, False])
+        self.assertEqual(await asyncio.wait_for(
+            _channel_run(conn, "k", "m", "chanfollow-x", owner=True), 2), ("started", "Sure"))
+        methods = [m for m, _ in conn.requests]
+        self.assertEqual(methods, ["sessions.list", "sessions.list", "sessions.list", "chat.send"])
+
+    async def test_a_turn_that_meanwhile_carried_the_messages_means_no_send(self):
+        conn = FakeRunConn("started", [final("Sure")], active=[True, False])
+        got = await _channel_run(conn, "k", "m", "chanfollow-x", owner=True, still_needed=lambda: False)
+        self.assertEqual(got, ("covered", None))
+        self.assertNotIn("chat.send", [m for m, _ in conn.requests])
+
+    async def test_no_send_when_the_gateway_cannot_say_whether_the_thread_is_busy(self):
+        conn = FakeRunConn("started", [final("Sure")], active=[Exception("down")])
+        self.assertEqual(await _channel_run(conn, "k", "m", "chanfollow-x", owner=True), ("failed", None))
+        self.assertNotIn("chat.send", [m for m, _ in conn.requests])
+
+    async def test_a_run_that_never_ends_gives_up_instead_of_hanging(self):
+        conn = FakeRunConn("started", [delta("Half")])
+        with mock.patch.object(openclaw_pipe, "_CHANNEL_RUN_TIMEOUT_S", 0.05):
+            got = await asyncio.wait_for(_channel_run(conn, "k", "m", "chanfollow-x", owner=True), 2)
+        self.assertEqual(got, ("failed", None))
+        self.assertEqual(conn.queues, {})
 
     async def test_a_failed_run_gives_no_text(self):
         conn = FakeRunConn("started", [delta("[sk"), {"payload": {"state": "error"}}])
@@ -356,6 +416,7 @@ class FollowUpTests(ChannelCase):
         for err in (Exception("utility model unavailable"), Exception("question limit reached"),
                     asyncio.TimeoutError()):
             self.posted.clear()
+            self.follow(at=2)  # a fresh thread each time
             conn = FakeRunConn("started", [final("[skip]")], companion=err)
             self.assertEqual(await self.follow_up(conn), "skip")
             self.assertEqual(conn.methods(), ["sessions.companion.ask", "chat.send"], err)
@@ -383,7 +444,7 @@ class FollowUpTests(ChannelCase):
     async def test_the_judge_only_asks_and_never_starts_a_turn_in_the_thread(self):
         conn = FakeRunConn("started", companion="NO")
         await self.follow_up(conn)
-        (method, params), = conn.requests
+        (method, params), = [r for r in conn.requests if r[0] != "sessions.list"]
         self.assertEqual(method, "sessions.companion.ask")
         self.assertLessEqual(len(params["question"]), 400)
         self.assertIn("and for 4 people?", params["selectionContext"])
@@ -397,7 +458,7 @@ class FollowUpTests(ChannelCase):
         with mock.patch.object(openclaw_pipe, "_get_restricted_connection",
                                mock.AsyncMock(return_value=restricted)):
             self.assertEqual(await self.follow_up(conn), "posted")
-        self.assertEqual([m for m, _ in conn.requests if m != "chat.send"], [])
+        self.assertEqual([m for m in conn.methods() if m != "chat.send"], [])
         self.assertIn("sessions.companion.ask", restricted.methods())
 
 

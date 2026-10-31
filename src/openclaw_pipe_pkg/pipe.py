@@ -485,6 +485,8 @@ class Pipe:
         _ensure_composer_watcher(lambda: self.valves)
         # ...and the earliest point to finish replies a restart orphaned.
         _ensure_orphan_reconcile(lambda: self.valves)
+        # ...and to follow the channel threads again.
+        _ensure_channel_watcher(lambda: self.valves)
         # ...and to mirror the Gateway's slash commands into Prompts.
         _ensure_slash_prompts(lambda: self.valves, force=True)
         models, source = await _discover_models_with_source(self.valves)
