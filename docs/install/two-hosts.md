@@ -24,6 +24,14 @@ It is resolved by the Open WebUI backend, which is not necessarily the same netw
 
 If the Pipe can't reach that address, a chat shows an `**Error:**` line instead of a reply, and the model picker shows a built-in example list ("Gateway not reached") instead of your models. Check `GATEWAY_URL` and `GATEWAY_TOKEN`, and that the Gateway accepts connections on that address from the Open WebUI host.
 
+### Open WebUI in a container, Gateway on the host
+
+If Open WebUI runs in Docker and the Gateway runs on the machine around it, `localhost` and `127.0.0.1` in `GATEWAY_URL` point at the container itself, so the connection is refused even though the Gateway answers in your browser. The Pipe's error says so when it sees it runs in a container.
+
+1. Start the Open WebUI container with `--add-host=host.docker.internal:host-gateway` (Docker Desktop on macOS and Windows already provides the name).
+2. Set `GATEWAY_URL` to `host.docker.internal:18789`, or to the host's LAN address.
+3. Set `gateway.bind` to `lan` in the OpenClaw config and restart the Gateway. The default, `loopback`, accepts connections only from the host itself, and a container is not the host.
+
 ## Open WebUI's own address
 
 The installer asks for the Open WebUI URL as you reach it (`OWUI_URL`), and by default also writes it into the Pipe's [`OWUI_BASE_URL`](../configuration.md#owui_base_url) valve. The Pipe uses that valve to call Open WebUI's own API (to attach images and files), and it is resolved by the Open WebUI backend, not by your browser.

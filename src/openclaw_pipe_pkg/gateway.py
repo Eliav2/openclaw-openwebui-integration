@@ -3173,7 +3173,8 @@ class _GatewayConnection:
             raise GatewayError(
                 f"Could not connect to the OpenClaw Gateway at {host}:{port} "
                 f"({type(ex).__name__}: {ex}). Is the Gateway running, and is "
-                "the GATEWAY_URL valve pointing at it?",
+                "the GATEWAY_URL valve pointing at it?"
+                + (_container_loopback_hint(host) if _refused_connect(ex) else ""),
                 error={"code": GATEWAY_REFUSED_CODE} if _refused_connect(ex) else None,
             )
 
@@ -4159,6 +4160,29 @@ async def _connect_response(ws, req_id: str, timeout: float = 10) -> dict:
             return frame
         pipe_log(f"  frame before the connect response, skipped: type={frame.get('type')!r} "
                  f"event={frame.get('event')!r} id={frame.get('id')!r}")
+
+
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]"})
+
+
+def _in_container() -> bool:
+    """Open WebUI runs in a Docker or Podman container."""
+    return os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
+
+
+def _container_loopback_hint(host: str) -> str:
+    """Why a loopback Gateway address is refused from inside a container: there
+    localhost is the container itself, not the machine the Gateway runs on."""
+    if host not in _LOOPBACK_HOSTS and not host.startswith("127."):
+        return ""
+    if not _in_container():
+        return ""
+    return (" Open WebUI runs in a container here, and inside a container "
+            f"{host} is the container itself, not the machine the Gateway runs on. "
+            "Point GATEWAY_URL at the host (host.docker.internal:18789, started with "
+            "--add-host=host.docker.internal:host-gateway, or the host's LAN address) "
+            "and set gateway.bind to lan in the OpenClaw config so the Gateway "
+            "listens on it.")
 
 
 def _refused_connect(ex) -> bool:
