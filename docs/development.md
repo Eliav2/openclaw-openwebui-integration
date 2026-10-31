@@ -146,7 +146,8 @@ pins in `requirements-dev.txt` and a re-extracted fixture
 stack against `open-webui:latest` and `openclaw@latest`, and the fixture
 against upstream's latest release and `main`. A scheduled failure opens or
 updates one tracking issue, so a breaking upstream release is visible before
-the pins are bumped.
+the pins are bumped; the next green scheduled run closes it
+(`scripts/compat_watch_issue.sh`).
 
 **Screenshots and Demos** (`.github/workflows/screenshots.yml` and
 `demos.yml`, by hand): the docs' images, from the E2E stack with the scripted
