@@ -61,6 +61,21 @@ runs:
         path: ~/.npm
         key: npm-openclaw-${{ runner.os }}-${{ env.OPENCLAW_VERSION }}
 
+    # Anonymous pulls from ghcr.io share a rate limit across the runners'
+    # addresses, and one hit fails the job ("toomanyrequests" pulling the
+    # pinned image, main run 41043447904). An authenticated pull is counted
+    # per account. The job's own token is enough for a public image; the
+    # calling workflow grants `packages: read`.
+    - name: Log in to ghcr.io
+      if: ${{ startsWith(env.OWUI_IMAGE, 'ghcr.io/') }}
+      shell: bash
+      env:
+        TOKEN: ${{ github.token }}
+        ACTOR: ${{ github.actor }}
+      run: |
+        printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin \
+          || echo "::warning::docker login ghcr.io failed; pulling $OWUI_IMAGE anonymously"
+
     - uses: actions/setup-python@v7
       with:
         python-version: "3.11"
