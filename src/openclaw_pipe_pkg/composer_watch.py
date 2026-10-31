@@ -40,8 +40,15 @@ _COMPOSER_WATCH_LIVENESS_S = 30.0
 
 # Stashed on `open_webui.socket.main` (OWUI's own stable module, see
 # `_STALE_CONN_ATTR` in gateway.py for why) so a redeploy can cancel the
-# previous deploy's watcher task instead of leaving two running.
+# previous deploy's watcher task instead of leaving two running. One slot per
+# Pipe function (`_composer_watch_slot`): a second copy of the Pipe runs its
+# own watcher and must not cancel the first copy's.
 _COMPOSER_WATCH_ATTR = "_openclaw_composer_watcher_v1"
+
+
+def _composer_watch_slot(function_id) -> str:
+    """The attribute on OWUI's socket module holding `function_id`'s watcher."""
+    return f"{_COMPOSER_WATCH_ATTR}_{function_id}" if function_id else _COMPOSER_WATCH_ATTR
 
 _composer_watcher_task = None
 
@@ -286,16 +293,18 @@ def _ensure_composer_watcher(valves_getter):
         except Exception:
             return None
         _composer_note_model()
-        stale = getattr(_owui_socket_main, _COMPOSER_WATCH_ATTR, None)
+        function_id = _composer_own_function_id()
+        slot = _composer_watch_slot(function_id)
+        stale = getattr(_owui_socket_main, slot, None)
         if stale is not None and stale is not _composer_watcher_task:
             try:
                 stale.cancel()
             except Exception:
                 pass
         watcher = _ComposerWatcher(valves_getter, lambda: list(_composer_known_prefixes),
-                                   function_id=_composer_own_function_id())
+                                   function_id=function_id)
         _composer_watcher_task = asyncio.get_running_loop().create_task(watcher.run())
-        setattr(_owui_socket_main, _COMPOSER_WATCH_ATTR, _composer_watcher_task)
+        setattr(_owui_socket_main, slot, _composer_watcher_task)
         return _composer_watcher_task
     except Exception as ex:
         pipe_log(f"[composer] could not start the watcher: {ex}")
