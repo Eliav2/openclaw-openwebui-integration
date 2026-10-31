@@ -502,20 +502,23 @@ class Shooter:
     def wanted(self, name: str) -> bool:
         return not self.only or name in self.only
 
-    def check_text(self, page: Page, name: str, selector: str | None) -> None:
-        hits = deny_hits(visible_text(page, selector), (self.host,))
+    def check_text(self, page: Page, name: str, selector: str | None, allow: tuple = ()) -> None:
+        text = visible_text(page, selector)
+        for ok in allow:  # text a scene shows on purpose, such as a channel's "@OpenClaw" mention
+            text = text.replace(ok, "")
+        hits = deny_hits(text, (self.host,))
         if hits:
             raise AssertionError(f"{name}: deny-listed text visible: {sorted(set(hits))[:10]}")
 
     def shot(self, page: Page, name: str, *, selector: str | None = None,
-             clip_js: str | None = None, text_selector: str | None = None) -> None:
+             clip_js: str | None = None, text_selector: str | None = None, allow: tuple = ()) -> None:
         """The viewport, one element, or a JS-computed clip, as <name>-light.png."""
         # A toast from another chat's reply is never the subject of a shot.
         page.evaluate("""() => { if (document.getElementById('shot-no-toasts')) return;
           const s = document.createElement('style'); s.id = 'shot-no-toasts';
           s.textContent = '[data-sonner-toaster], section[aria-label^="Notifications"] { display: none !important; }';
           document.head.appendChild(s); }""")
-        self.check_text(page, name, text_selector or selector)
+        self.check_text(page, name, text_selector or selector, allow)
         path = os.path.join(self.out, f"{name}-light.png")
         if selector:
             page.locator(selector).first.screenshot(path=path, animations="disabled")
@@ -1298,7 +1301,7 @@ class Scenes:
             wait_js(page, f"() => [...document.querySelectorAll('[id^=message-{root}-]')]"
                           ".some(el => el.innerText.includes('the kiosk on the pier'))", "the thread")
             park_mouse(page)
-            self.s.shot(page, "channel-thread")
+            self.s.shot(page, "channel-thread", allow=("@OpenClaw",))
         finally:
             pipe_valves(self.token, **old)
 
