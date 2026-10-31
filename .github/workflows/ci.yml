@@ -41,6 +41,7 @@ jobs:
         run: |
           for f in gateway-plugins/*/index.js e2e/agent-tool/index.js; do node --check "$f" && echo "ok $f"; done
           for f in gateway-plugins/*/*.json e2e/agent-tool/*.json; do python3 -m json.tool "$f" >/dev/null && echo "ok $f"; done
+          node --test gateway-plugins/*/*.test.js
 
   test:
     name: Unit (py${{ matrix.python-version }})

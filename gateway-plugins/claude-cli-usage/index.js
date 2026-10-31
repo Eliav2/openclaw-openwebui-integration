@@ -1,5 +1,5 @@
 // Gateway RPC `claudeCliUsage.status`: Claude subscription rate-limit windows
-// (5h / weekly) for setups whose only Anthropic credential is the Claude CLI
+// (weekly, plus 5h on plans that have one) for setups whose only Anthropic credential is the Claude CLI
 // login.
 //
 // Why this exists: OpenClaw 2026.9.1 (openclaw#129052) stopped resolving the
@@ -16,12 +16,17 @@ import os from "node:os";
 import path from "node:path";
 
 const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
+const PROFILE_URL = "https://api.anthropic.com/api/oauth/profile";
 const FETCH_TIMEOUT_MS = 8000;
 // The usage endpoint rate-limits aggressively; one fetch per minute is plenty
 // for a dialog a human opens by hand.
 const CACHE_TTL_MS = 60_000;
 
 let cached = null; // { at, snapshot }
+// The plan changes rarely; asking for it every few hours is enough.
+const PLAN_TTL_MS = 6 * 3600_000;
+// Keyed on the access token: another login (or a token refresh) asks again.
+let cachedPlan = null; // { key, at, plan }
 
 function credentialsPath() {
   const dir = process.env.CLAUDE_CONFIG_DIR?.trim() || path.join(os.homedir(), ".claude");
@@ -62,6 +67,9 @@ export function buildWindows(data) {
   return windows;
 }
 
+// The credentials file's subscriptionType is written at login and can be
+// stale or coarse ("pro" on a Max 20x / Ultra account), so the label comes from
+// the account profile when it can, and from the file only as a fallback.
 function planLabel(oauth) {
   const base = typeof oauth.subscriptionType === "string" ? oauth.subscriptionType.trim() : "";
   if (!base) return undefined;
@@ -70,7 +78,27 @@ function planLabel(oauth) {
   return tier ? `${label} (${tier})` : label;
 }
 
-async function fetchSnapshot(fetchFn = fetch) {
+export function profilePlanLabel(profile) {
+  const name = profile?.organization?.plan_display_name;
+  return typeof name === "string" && name.trim() ? name.trim() : undefined;
+}
+
+async function fetchPlan(oauth, headers, fetchFn, now) {
+  const key = oauth.accessToken; // in-memory cache key only; never returned or logged
+  if (cachedPlan?.key === key && now - cachedPlan.at < PLAN_TTL_MS) return cachedPlan.plan;
+  let plan;
+  try {
+    const res = await fetchFn(PROFILE_URL, { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+    if (res.ok) plan = profilePlanLabel(await res.json());
+    else await res.body?.cancel().catch(() => {});
+  } catch {
+    // the profile is only a label; the windows matter more
+  }
+  if (plan) cachedPlan = { key, at: now, plan };
+  return plan ?? planLabel(oauth);
+}
+
+async function fetchSnapshot(fetchFn = fetch, now = Date.now()) {
   const base = { provider: "anthropic", displayName: "Claude", source: "claude-cli" };
   let oauth;
   try {
@@ -83,29 +111,31 @@ async function fetchSnapshot(fetchFn = fetch) {
     return { ...base, windows: [], error: "Claude CLI token expired; it refreshes on Claude CLI's next run" };
   }
 
-  const res = await fetchFn(USAGE_URL, {
-    headers: {
-      Authorization: `Bearer ${oauth.accessToken}`,
-      Accept: "application/json",
-      "User-Agent": "openclaw",
-      "anthropic-version": "2023-06-01",
-      "anthropic-beta": "oauth-2025-04-20",
-    },
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-  });
+  const headers = {
+    Authorization: `Bearer ${oauth.accessToken}`,
+    Accept: "application/json",
+    "User-Agent": "openclaw",
+    "anthropic-version": "2023-06-01",
+    "anthropic-beta": "oauth-2025-04-20",
+  };
+  // Both requests start together: two 8 s timeouts in a row would pass the
+  // caller's 10 s budget and lose the windows. fetchPlan never rejects.
+  const planPromise = fetchPlan(oauth, headers, fetchFn, now);
+  const res = await fetchFn(USAGE_URL, { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
   if (!res.ok) {
     await res.body?.cancel().catch(() => {});
     return { ...base, windows: [], error: `Anthropic usage HTTP ${res.status}` };
   }
-  const plan = planLabel(oauth);
-  return { ...base, windows: buildWindows(await res.json()), ...(plan ? { plan } : {}) };
+  const windows = buildWindows(await res.json());
+  const plan = await planPromise;
+  return { ...base, windows, ...(plan ? { plan } : {}) };
 }
 
 export async function getClaudeCliUsage({ fetchFn, now = Date.now() } = {}) {
   if (cached && now - cached.at < CACHE_TTL_MS) return cached.snapshot;
   let snapshot;
   try {
-    snapshot = await fetchSnapshot(fetchFn);
+    snapshot = await fetchSnapshot(fetchFn, now);
   } catch (err) {
     snapshot = { provider: "anthropic", displayName: "Claude", source: "claude-cli", windows: [], error: String(err?.message ?? err) };
   }
