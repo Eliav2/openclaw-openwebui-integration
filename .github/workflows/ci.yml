@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  packages: read  # pull the Open WebUI image from ghcr.io authenticated (.github/actions/stack)
 
 concurrency:
   # One run per PR/branch; a new push cancels the stale run. Pushes to main

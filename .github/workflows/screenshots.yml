@@ -38,6 +38,7 @@ on:
 
 permissions:
   contents: read
+  packages: read  # pull the Open WebUI image from ghcr.io authenticated (.github/actions/stack)
 
 jobs:
   screenshots:

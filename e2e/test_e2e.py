@@ -2130,10 +2130,15 @@ def test_a_requested_secret_is_entered_in_a_masked_dialog_and_kept_out_of_the_ch
         assert any(e.get("name") == name for e in listed.get("entries") or []), listed
         # The scan reads the right files: the request (its name) is in the
         # transcript, the chat and the model's context.
+        # A string message, so pytest prints every place it scanned and its
+        # count, not a dict cut at "...": a one-off miss on the transcript
+        # (run 41141834849) left no record of which files were read.
         found = _hits(name)
+        scanned = json.dumps(found, indent=1)
         for place in ("owui /app/backend/data/webui.db", "model requests"):
-            assert found.get(place) or found.get(place + "-wal"), found
-        assert any(v for k, v in found.items() if k.startswith("transcript")), found
+            assert found.get(place) or found.get(place + "-wal"), f"{place} lacks {name}: {scanned}"
+        assert any(v for k, v in found.items() if k.startswith("transcript")), (
+            f"no transcript holds {name}: {scanned}")
         hits = _hits(value)
         assert hits and set(hits.values()) == {0}, {k: v for k, v in hits.items() if v}
         assert value not in json.dumps(msgs)
