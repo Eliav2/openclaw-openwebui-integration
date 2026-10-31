@@ -363,6 +363,22 @@ class Pipe:
                 "OpenClaw chat. Turn off to stop delivering it; an already open "
                 "tab keeps it until reload."
         )
+        CHANNEL_THREAD_DEBOUNCE_S: float = Field(
+            default=15,
+            description="Channels: after a new message in a thread the agent "
+                "follows, wait this many seconds for more before deciding whether "
+                "to answer, so a burst of messages gets one reply. 0: decide at once."
+        )
+        CHANNEL_THREAD_IDLE_HOURS: float = Field(
+            default=24,
+            description="Channels: stop following a thread after this many hours "
+                "without a message. A new mention follows it again."
+        )
+        CHANNEL_CONTEXT_LIMIT: int = Field(
+            default=50,
+            description="Channels: at most this many messages go to the agent with "
+                "one turn (the newest ones); the turn says how many were left out."
+        )
         LIVE_VIEW_URL: str = Field(
             default="",
             description="(Optional.) Show the agent's browser live inside a "
@@ -469,6 +485,8 @@ class Pipe:
         _ensure_composer_watcher(lambda: self.valves)
         # ...and the earliest point to finish replies a restart orphaned.
         _ensure_orphan_reconcile(lambda: self.valves)
+        # ...and to follow the channel threads again.
+        _ensure_channel_watcher(lambda: self.valves)
         # ...and to mirror the Gateway's slash commands into Prompts.
         _ensure_slash_prompts(lambda: self.valves, force=True)
         models, source = await _discover_models_with_source(self.valves)
@@ -956,8 +974,13 @@ class _PipeTurn:
             )
 
         _ensure_orphan_reconcile(lambda: self.pipe.valves)
+        # Follows the channel threads again after an Open WebUI restart.
+        _ensure_channel_watcher(lambda: self.pipe.valves)
         await _emit_status(self.__event_emitter__, "Thinking...", done=False)
-        if self.pipe.valves.COMPOSER_STATUS_BUTTON and not self._initial_visible_text:
+        self.channel_id = _channel_id_of((self.__metadata__ or {}).get("chat_id"))
+        self.channel_commit = None
+        if (self.pipe.valves.COMPOSER_STATUS_BUTTON and not self._initial_visible_text
+                and not self.channel_id):
             # Cheap and idempotent: installs the composer Status button in the
             # tabs showing this chat (a no-op where it is already there). Once
             # per turn: the thinking-retry recursion skips it.
@@ -1005,10 +1028,27 @@ class _PipeTurn:
         # in its own session, so they do not queue behind one another or share
         # one model override (ELI-329).
         state_dir = _state_dir(getattr(self.pipe.valves, "STATE_DIR", ""))
-        self.column = await _reply_column(state_dir, self.owui_origin_chat_id, self.body.get("model"),
-                                    self.__metadata__ or {})
-        self.session_key = _owui_session_key(self.pipe.valves.AGENT_ID, user_id, self.chat_id,
-                                             self.column)
+        if self.channel_id:
+            # A channel mention: the session is the thread's (see channels.py),
+            # and the turn's text is what the agent has not seen there yet.
+            # (The thinking retry sends its first texts again, so only the
+            # thread and the commit come from here then.)
+            self.column = 0
+            ctx = await _channel_mention_context(
+                state_dir, self.channel_id, (self.__metadata__ or {}).get("message_id"),
+                self.body.get("model") or "",
+                int(getattr(self.pipe.valves, "CHANNEL_CONTEXT_LIMIT", 50) or 50))
+            self.channel_root, self.channel_commit = ctx["root"], ctx["commit"]
+            if not self._send_texts:
+                self.text = ctx["text"]
+                pipe_log(f"Channel mention: thread {ctx['root'][:8]}, {ctx['messages']} message(s) sent")
+            self.session_key = _channel_session_key(self.pipe.valves.AGENT_ID, self.channel_id,
+                                                    self.channel_root)
+        else:
+            self.column = await _reply_column(state_dir, self.owui_origin_chat_id, self.body.get("model"),
+                                        self.__metadata__ or {})
+            self.session_key = _owui_session_key(self.pipe.valves.AGENT_ID, user_id, self.chat_id,
+                                                 self.column)
         pipe_log(f"Session key: {self.session_key}")
 
         if self.turn is None:
@@ -1020,17 +1060,17 @@ class _PipeTurn:
         # Regenerate, a branch switch) or is a copy it never saw, the message
         # says so first (ELI-183). Not for the thinking-retry recursion, whose
         # texts already went out once.
-        history_prefix = "" if self._send_texts else await _history_prefix(
+        history_prefix = "" if self._send_texts or self.channel_id else await _history_prefix(
             self.conn, state_dir, self.owui_origin_chat_id, self.session_key,
             self.__metadata__ or {}, messages, self.column, self.body.get("model"))
         self.turn.unsent = (list(self._send_texts) if self._send_texts
                             else [history_prefix + _voice_note(self.__metadata__) + self.text])
         meta = self.__metadata__ or {}
-        if self.owui_origin_chat_id and meta.get("message_id"):
+        if self.owui_origin_chat_id and meta.get("message_id") and not self.channel_id:
             self.turn.reply = {"chat_id": self.owui_origin_chat_id, "user_id": user_id,
                                "message_id": meta["message_id"],
                                "request_task_id": meta.get("task_id")}
-        if self.owui_origin_chat_id and self.__event_emitter__:
+        if self.owui_origin_chat_id and self.__event_emitter__ and not self.channel_id:
             # Lets a later cancel ask the page whether it was Stop or Send
             # now, and sends a message queued while this reply runs at once
             # (AUTO_SEND_WHILE_RUNNING). Idempotent in the page; fire-and-forget.
@@ -1343,6 +1383,12 @@ class _PipeTurn:
                 self.conn.note_reply_sent(self.session_key, reply_id, self.our_run_id,
                                      "\n\n".join(t for t in self.sent_texts if t))
                 self.turn.unsent = []
+                if self.channel_commit is not None:
+                    # The Gateway has the turn: the agent saw these messages,
+                    # and it now follows the thread.
+                    self.channel_commit()
+                    self.channel_commit = None
+                    _ensure_channel_watcher(lambda: self.pipe.valves)
                 _end_unsent_replies(self.conn, self.turn.waiting, sent=True)
                 self.turn.waiting = []
                 self.turn.run_id = self.our_run_id

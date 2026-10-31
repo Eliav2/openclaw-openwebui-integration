@@ -38,6 +38,11 @@ Everything here works as soon as the Pipe is installed, except entries marked:
 - [**Picker size cap**](./sessions-and-models.md#picker-size-cap): keeps the picker from flooding with every model the Gateway knows
 - [**Owner users**](./owner-users.md): only the users you list act with the Gateway owner's rights
 
+## In channels
+
+- [**Threads in channels**](./channels.md#a-mention-opens-a-thread): a mention in an Open WebUI channel gets its answer in a thread, one session shared by everyone in it, with what was said before the mention
+- [**Following a thread**](./channels.md#following-the-thread): the agent answers a message in its thread that is meant for it without a new mention, and stays out of the rest
+
 ## Status
 
 - [**Status dialog**](./status.md#the-status-dialog) _(separate function)_: context, rate limits, background work and sub-agents, fetched live on demand, each section on its own, from the message toolbar or the composer

@@ -26,6 +26,10 @@ whole):
                                           then, after its result, answers
                                           `E2E_LATE_ANSWER SUB-51`: a run that opened
                                           with a sentinel and answered after all (ELI-219)
+* The channel judge's question (`Reply exactly YES or NO`) -> `NO` when its
+  new messages carry `E2E_ASIDE`, else `YES`; a channel thread's turn whose
+  newest message carries `E2E_ASIDE` -> `[skip]` (the stack has no utility
+  model, so the judge may not be asked at all).
 * `E2E_ECHO: any text`                 -> replies with the rest of that line,
   byte for byte (Hebrew, emoji, markup), so a round trip can be exact.
 * `E2E_TOOL_CALL`                      -> first answers with a call to the
@@ -284,6 +288,12 @@ def plan_reply(body: dict) -> dict:
     """Return {"text": str}, {"tool": name, "args"?: dict}, or both (text, then
     the call) for one request."""
     messages = body.get("messages") or []
+    # The Pipe's channel judge (`sessions.companion.ask`): its new messages
+    # come after "NEW message(s):".
+    whole = json.dumps(messages)
+    if "Reply exactly YES or NO" in whole:
+        new = whole.rsplit("NEW message(s):", 1)[-1]
+        return {"text": "NO" if "E2E_ASIDE" in new else "YES"}
     # A compaction's summary request for a chat that carries E2E_COMPACT_FAIL:
     # the model refuses it, so the Gateway's compaction fails (ELI-209).
     if (any("summarization" in json.dumps(m.get("content")) for m in messages)
@@ -299,6 +309,11 @@ def plan_reply(body: dict) -> dict:
     )
     turn = messages[last_assistant + 1:]
     users = [_text_of(m.get("content")) for m in turn if m.get("role") == "user"]
+    joined = "\n".join(users)
+    if "You follow this channel thread" in joined:
+        lines = [ln for ln in joined.splitlines() if ln.startswith("[")]
+        if lines and "E2E_ASIDE" in lines[-1]:
+            return {"text": "[skip]"}
     tool_results = [_text_of(m.get("content")) for m in turn if m.get("role") == "tool"]
     offered = [
         (t.get("function") or {}).get("name")

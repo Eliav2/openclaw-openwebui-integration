@@ -138,6 +138,7 @@ docker run -d --name owui --network host \
   -e ENABLE_OLLAMA_API=false \
   -e ENABLE_OPENAI_API=false \
   -e OFFLINE_MODE=true \
+  -e ENABLE_CHANNELS=true \
   "$OWUI_IMAGE" >/dev/null
 wait_for "Open WebUI" 300 curl -fsS "$OWUI_URL/health" \
   || { docker logs --tail 100 owui; exit 1; }

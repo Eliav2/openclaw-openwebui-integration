@@ -2,6 +2,24 @@
   "_comment": "Scripted model replies for the README screenshots (capture.py). A scene is picked by a phrase from the user's own message; step n answers the request that carries n tool results. Child scenes come first: a sub-agent's prompt can quote its parent's request.",
   "scenes": [
     {
+      "match": "which of the two works for everyone",
+      "steps": [
+        {
+          "say": "Saturday. Noa's train gets in at 9:40, so the 11:00 boat works for all three of you; on Sunday the first boat leaves at 9:00, before she arrives.",
+          "delay": 0.02
+        }
+      ]
+    },
+    {
+      "match": "what should we bring",
+      "steps": [
+        {
+          "say": "Sunscreen, a light jacket for the way back (it gets windy after 15:00), and cash: the kiosk on the pier takes no cards.",
+          "delay": 0.02
+        }
+      ]
+    },
+    {
       "match": "PR #12 has the report and the CSVs",
       "steps": [
         {

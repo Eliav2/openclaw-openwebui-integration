@@ -2061,3 +2061,64 @@ def test_one_message_to_two_models_is_answered_by_each_without_a_note(page, toke
     sent = _to_model(f"MULTI_{n}")
     assert len(sent) == 3 and "the user asked for a new answer" in sent[-1], sent
     assert "[Open WebUI:" not in sent[0] + sent[1], sent
+
+
+def _thread_bot_texts(token, cid, root) -> list:
+    msgs = capture.api("GET", f"/api/v1/channels/{cid}/messages/{root}/thread?limit=100", token=token) or []
+    return [m["content"] for m in sorted(msgs, key=lambda m: m["created_at"])
+            if (m.get("meta") or {}).get("model_id") and m.get("id") != root]
+
+
+def test_a_channel_mention_opens_a_thread_the_agent_follows(page, token):
+    """In a channel: a mention gets its answer in a thread, and the agent then
+    follows that thread. A message there meant for it gets an answer with no
+    mention; one the people say to each other gets none (the judge says NO,
+    or with no judge the turn answers `[skip]`) and reaches the agent; an
+    answer of `[skip]` posts nothing."""
+    n = os.getpid()
+    old = capture.pipe_valves(token, CHANNEL_THREAD_DEBOUNCE_S=0)
+    try:
+        me = capture.api("GET", "/api/v1/auths/", token=token)
+        cid = capture.api("POST", "/api/v1/channels/create", {"name": f"e2e-{n}"}, token)["id"]
+
+        def post(text, parent=None):
+            body = {"content": text, **({"parent_id": parent} if parent else {})}
+            return capture.api("POST", f"/api/v1/channels/{cid}/messages/post", body, token)["id"]
+
+        capture.api("POST", f"/api/v1/channels/{cid}/messages/post",
+                    {"content": f"CONTEXT_{n} anyone around?"}, token)
+        root = post(f"<@M:{capture.MODEL}|OpenClaw> E2E_ECHO: CHAN_{n}")
+        page.goto(f"{capture.BASE}/channels/{cid}")
+        page.wait_for_selector("#chat-input", timeout=60_000)
+        capture.dismiss_popups(page)
+        replies = page.locator("button", has_text="Replies")
+        replies.first.wait_for(timeout=TURN_MS)
+        replies.first.click()
+        # The echo repeats the user's token: its answer is the second message
+        # in the thread that shows it. One message can render as two elements
+        # with the same id, so messages are counted by id.
+        in_thread = (lambda needle: "() => new Set([...document.querySelectorAll("
+                     f"'[id^=\"message-{root}-\"]')].filter(el => el.innerText.includes({json.dumps(needle)}))"
+                     ".map(el => el.id)).size >= 2")
+        _wait(page, in_thread(f"CHAN_{n}"), "the thread reply to the mention")
+        sent = _to_model(f"CHAN_{n}")[-1]
+        assert f"CONTEXT_{n}" in sent and f"({me['id']})" in sent, sent
+
+        post(f"E2E_ECHO: FOLLOW_{n}", root)
+        _wait(page, in_thread(f"FOLLOW_{n}"), "the answer to a thread message with no mention")
+
+        post(f"ASIDE_{n} E2E_ASIDE see you at lunch", root)
+        capture.poll(lambda: [r for r in _fake_llm_requests() if f"ASIDE_{n}" in json.dumps(r["request"])],
+                     bool, "the judge's question or the turn about the aside")
+        post(f"SKIPMARK_{n}\nE2E_ECHO: [skip]", root)
+        capture.poll(lambda: _to_model(f"SKIPMARK_{n}"), bool, "the turn that answers [skip]")
+        post(f"E2E_ECHO: AFTER_{n}", root)
+        _wait(page, in_thread(f"AFTER_{n}"), "the next answer")
+
+        # The aside reached the agent in a turn (its own, answered [skip], or
+        # the next one), and nothing was posted for it.
+        turns = [t for t in _to_model(f"ASIDE_{n}") if "You follow this channel thread" in t]
+        assert turns, "the aside never reached the agent"
+        assert _thread_bot_texts(token, cid, root) == [f"CHAN_{n}", f"FOLLOW_{n}", f"AFTER_{n}"]
+    finally:
+        capture.pipe_valves(token, **old)

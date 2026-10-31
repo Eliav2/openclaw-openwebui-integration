@@ -645,6 +645,23 @@ class EnsureWatcherTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         self.assertTrue(stale.cancelled())
 
+    async def test_a_second_pipe_copy_keeps_the_first_copys_watcher(self):
+        # Each copy of the Pipe is its own OWUI function, loaded as its own
+        # module with its own watcher: starting one must cancel only an
+        # earlier load of the same function, never the other copy's watcher.
+        fake_owui(self, SESSION_POOL={})
+        with mock.patch.object(openclaw_pipe, "_composer_own_function_id",
+                               return_value="openclaw_gateway"):
+            first = _ensure_composer_watcher(lambda: Pipe.Valves())
+        self.addCleanup(first.cancel)
+        openclaw_pipe._composer_watcher_task = None  # the second copy's own module state
+        with mock.patch.object(openclaw_pipe, "_composer_own_function_id",
+                               return_value="openclaw_gateway_restricted"):
+            second = _ensure_composer_watcher(lambda: Pipe.Valves())
+        self.assertIsNot(first, second)
+        await asyncio.sleep(0)
+        self.assertFalse(first.cancelled())
+
     async def test_disabled_valve_does_not_start(self):
         fake_owui(self, SESSION_POOL={})
         valves = Pipe.Valves()

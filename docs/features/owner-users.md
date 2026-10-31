@@ -25,6 +25,8 @@ A secret the agent asks for (its `secrets` tool) goes into the owner's secret st
 
 On a loopback Gateway the second device pairs silently. On a remote one, approve it like the first, see [Device pairing](../install/pairing.md). The `DEVICE_IDENTITY` valve names only the main identity; the second one always has its own file.
 
+In [channels](./channels.md#who-has-which-rights), every turn runs over that connection when the valve is set, yours too: a channel thread is one session shared by everyone in it.
+
 ## What the agent still learns
 
 The agent still learns who is writing. The Gateway accepts the "Conversation info (untrusted metadata)" block (chat id, user id) only from an admin connection, so for these users the Pipe puts the same block at the start of the message text, which is where the Gateway would have put it. A command such as `/stop` is sent as typed, without the block.
