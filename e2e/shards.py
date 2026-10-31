@@ -144,6 +144,7 @@ SHARDS = {
         f"{BROWSER}::test_a_cloned_chat_starts_with_the_copied_messages",
         f"{BROWSER}::test_an_execute_while_the_input_dialog_is_open_leaves_the_dialog_its_answer",
         f"{BROWSER}::test_one_message_to_two_models_is_answered_by_each_without_a_note",
+        f"{BROWSER}::test_a_channel_mention_opens_a_thread_the_agent_follows",
     ],
 }
 

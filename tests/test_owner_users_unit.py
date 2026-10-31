@@ -120,10 +120,11 @@ class NoRunRequestBypassesTheRouterTests(unittest.TestCase):
 
     def test_every_run_request_call_site_is_routed(self):
         """The places that start, steer or end a run: the 11 in PHASE-B-PLAN.md
-        and the writer's question-card answer (#21)."""
+        the writer's question-card answer (#21), and a channel thread's
+        follow-up turn."""
         calls = [f"{name}:{n.lineno}" for name, tree in self._trees() for n in ast.walk(tree)
                  if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "_run_request"]
-        self.assertEqual(len(calls), 12, calls)
+        self.assertEqual(len(calls), 13, calls)
 
 
 

@@ -81,6 +81,9 @@ mkdir -p "$HOME/.openclaw"
 #
 # e2e/agent-tool adds an `Agent` tool that answers like Claude Code's.
 #
+# The utility model is the default one: the Pipe's channel judge asks it
+# (`sessions.companion.ask`), and the fake model answers that question.
+#
 # No heartbeat, dreaming or weekly skill review: a job the Gateway schedules
 # itself can come due mid-suite and hold a clean stop's drain for minutes
 # (test_the_stack_gateway_schedules_no_work_of_its_own).
@@ -101,6 +104,7 @@ cat >"$HOME/.openclaw/openclaw.json" <<EOF
   "agents": {
     "defaults": {
       "model": {"primary": "fake/e2e-default"},
+      "utilityModel": "fake/e2e-default",
       "heartbeat": {"agentId": "main", "every": "0m"},
       "systemAgent": {"agentId": "main"}
     },
@@ -138,6 +142,7 @@ docker run -d --name owui --network host \
   -e ENABLE_OLLAMA_API=false \
   -e ENABLE_OPENAI_API=false \
   -e OFFLINE_MODE=true \
+  -e ENABLE_CHANNELS=true \
   "$OWUI_IMAGE" >/dev/null
 wait_for "Open WebUI" 300 curl -fsS "$OWUI_URL/health" \
   || { docker logs --tail 100 owui; exit 1; }

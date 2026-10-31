@@ -41,6 +41,8 @@ ADMIN_ONLY_SEND_FIELDS = (
     "originatingThreadId",
 )
 _OWUI_KEY_USER = re.compile(r"^agent:[^:]+:openwebui-([0-9a-fA-F-]{36})-")
+# An Open WebUI channel thread's session (channels.py).
+_CHANNEL_KEY_RE = re.compile(r"^agent:([^:]+):openwebui:channel:([^:]+):thread:([^:]+)$")
 
 
 # ---------------------------------------------------------------------------
@@ -4110,6 +4112,10 @@ async def _sender_is_owner(conn, session_key: str) -> bool:
     owners = _parse_owner_users(raw)
     if not owners:
         return True
+    if _CHANNEL_KEY_RE.match(session_key or ""):
+        # A channel thread is shared: every turn in it goes out restricted,
+        # the owner's too, so its tool list never changes between turns.
+        return False
     m = _OWUI_KEY_USER.match(session_key or "")
     if not m:
         return False

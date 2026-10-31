@@ -120,6 +120,24 @@ Type: `bool`. Default: `True`.
 
 Add an OpenClaw 'Claw' button to the composer row of OpenClaw chats (it opens the same dialog as the Status Action's message button, so that Action must be installed). Installed into the page at the start of each turn and when a tab opens an OpenClaw chat. Turn off to stop delivering it; an already open tab keeps it until reload.
 
+### CHANNEL_THREAD_DEBOUNCE_S
+
+Type: `float`. Default: `15`.
+
+Channels: after a new message in a thread the agent follows, wait this many seconds for more before deciding whether to answer, so a burst of messages gets one reply. 0: decide at once.
+
+### CHANNEL_THREAD_IDLE_HOURS
+
+Type: `float`. Default: `24`.
+
+Channels: stop following a thread after this many hours without a message. A new mention follows it again.
+
+### CHANNEL_CONTEXT_LIMIT
+
+Type: `int`. Default: `50`.
+
+Channels: at most this many messages go to the agent with one turn (the newest ones); the turn says how many were left out.
+
 ### LIVE_VIEW_URL
 
 Type: `str`. Default: empty.
