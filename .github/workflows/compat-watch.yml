@@ -5,7 +5,8 @@ name: Compat watch
 # against what upstream ships *next*, and checks the vendored Open WebUI
 # handler against upstream's main branch, so a breaking release shows up here
 # before a user hits it. On a scheduled failure it opens (or comments on) one
-# tracking issue instead of failing silently.
+# tracking issue instead of failing silently, and the next green scheduled run
+# closes it (scripts/compat_watch_issue.sh).
 
 on:
   schedule:
@@ -54,20 +55,28 @@ jobs:
     if: failure() && github.event_name == 'schedule'
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       issues: write
     steps:
+      - uses: actions/checkout@v7
       - env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          title="Compat watch: upstream Open WebUI or OpenClaw broke the integration"
-          body="The scheduled compat watch failed: $RUN_URL
+        run: scripts/compat_watch_issue.sh fail
 
-          It runs the end-to-end stack against \`open-webui:latest\` + \`openclaw@latest\` and checks the vendored Open WebUI handler against upstream. The pinned CI lane is unaffected until \`e2e/versions.env\` is bumped; the logs artifact on the run has the Gateway, Open WebUI and fake-model logs."
-          existing=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
-          if [ -n "$existing" ]; then
-            gh issue comment "$existing" --body "Still failing: $RUN_URL"
-          else
-            gh issue create --title "$title" --body "$body"
-          fi
+  recovered:
+    name: Close tracking issue
+    needs: [e2e-latest, fixture-upstream]
+    if: success() && github.event_name == 'schedule' && github.run_attempt == 1
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: scripts/compat_watch_issue.sh ok
