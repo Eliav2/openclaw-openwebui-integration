@@ -6190,32 +6190,48 @@ class GatewayUrlParsingTests(unittest.TestCase):
     bare ValueError that escaped pipe()'s `except GatewayError` entirely."""
 
     def test_plain_host_port(self):
-        self.assertEqual(_parse_gateway_url("localhost:18789"), ("localhost", 18789))
+        self.assertEqual(_parse_gateway_url("localhost:18789"), ("localhost", 18789, False))
 
     def test_host_only_uses_default_port(self):
-        self.assertEqual(_parse_gateway_url("gw.local"), ("gw.local", 18789))
+        self.assertEqual(_parse_gateway_url("gw.local"), ("gw.local", 18789, False))
 
     def test_whitespace_is_tolerated(self):
-        self.assertEqual(_parse_gateway_url("  gw.local:18789 "), ("gw.local", 18789))
+        self.assertEqual(_parse_gateway_url("  gw.local:18789 "), ("gw.local", 18789, False))
 
-    def test_schemes_are_stripped_not_rejected(self):
-        for raw in ("http://gw.local:18789", "https://gw.local:18789",
-                    "ws://gw.local:18789", "wss://gw.local:18789"):
+    def test_every_scheme_is_accepted(self):
+        for raw, tls in (("http://gw.local:18789", False), ("https://gw.local:18789", True),
+                         ("ws://gw.local:18789", False), ("wss://gw.local:18789", True),
+                         ("WSS://gw.local:18789", True)):
             with self.subTest(raw=raw):
-                self.assertEqual(_parse_gateway_url(raw), ("gw.local", 18789))
+                self.assertEqual(_parse_gateway_url(raw), ("gw.local", 18789, tls))
+
+    def test_tls_without_a_port_means_443(self):
+        for raw in ("wss://gw.local", "https://gw.local", "wss://gw.local/"):
+            with self.subTest(raw=raw):
+                self.assertEqual(_parse_gateway_url(raw), ("gw.local", 443, True))
+        self.assertEqual(_parse_gateway_url("wss://[::1]"), ("[::1]", 443, True))
+
+    def test_tls_keeps_an_explicit_port(self):
+        self.assertEqual(_parse_gateway_url("wss://gw.local:8443"), ("gw.local", 8443, True))
+        self.assertEqual(_parse_gateway_url("wss://[::1]:8443"), ("[::1]", 8443, True))
+
+    def test_plain_without_a_port_is_still_18789(self):
+        for raw in ("gw.local", "ws://gw.local", "http://gw.local"):
+            with self.subTest(raw=raw):
+                self.assertEqual(_parse_gateway_url(raw), ("gw.local", 18789, False))
 
     def test_scheme_without_port_falls_back_to_default(self):
         # Previously: int("//gw.local") -> ValueError, uncaught.
-        self.assertEqual(_parse_gateway_url("http://gw.local"), ("gw.local", 18789))
+        self.assertEqual(_parse_gateway_url("http://gw.local"), ("gw.local", 18789, False))
 
     def test_trailing_path_and_query_are_dropped(self):
         # Previously: int("8443/") -> ValueError, uncaught.
-        self.assertEqual(_parse_gateway_url("https://gw.local:8443/"), ("gw.local", 8443))
-        self.assertEqual(_parse_gateway_url("gw.local:8443/api?x=1"), ("gw.local", 8443))
+        self.assertEqual(_parse_gateway_url("https://gw.local:8443/"), ("gw.local", 8443, True))
+        self.assertEqual(_parse_gateway_url("gw.local:8443/api?x=1"), ("gw.local", 8443, False))
 
     def test_never_yields_a_scheme_as_the_hostname(self):
         # The exact old bug: hostname would come back as "http".
-        host, _ = _parse_gateway_url("http://gw.local:18789")
+        host, _, _ = _parse_gateway_url("http://gw.local:18789")
         self.assertNotIn(host, ("http", "https", "ws", "wss"))
 
     def test_empty_raises_gateway_error_naming_the_valve(self):
@@ -6233,10 +6249,10 @@ class GatewayUrlParsingTests(unittest.TestCase):
 
     def test_ipv6_must_be_bracketed_and_is_kept_bracketed(self):
         """websockets needs the brackets in the URL, so they are preserved."""
-        self.assertEqual(_parse_gateway_url("[::1]:18789"), ("[::1]", 18789))
-        self.assertEqual(_parse_gateway_url("[::1]"), ("[::1]", 18789))
-        self.assertEqual(_parse_gateway_url("[fe80::1]"), ("[fe80::1]", 18789))
-        self.assertEqual(_parse_gateway_url("http://[::1]:18789"), ("[::1]", 18789))
+        self.assertEqual(_parse_gateway_url("[::1]:18789"), ("[::1]", 18789, False))
+        self.assertEqual(_parse_gateway_url("[::1]"), ("[::1]", 18789, False))
+        self.assertEqual(_parse_gateway_url("[fe80::1]"), ("[fe80::1]", 18789, False))
+        self.assertEqual(_parse_gateway_url("http://[::1]:18789"), ("[::1]", 18789, False))
 
     def test_bare_ipv6_is_rejected_rather_than_silently_misparsed(self):
         """Regression guard: rpartition(":") reads "::1" as host ":" port 1 --
@@ -6257,7 +6273,7 @@ class GatewayUrlParsingTests(unittest.TestCase):
                 with self.assertRaises(GatewayError) as cm:
                     _parse_gateway_url(raw)
                 self.assertIn("65535", str(cm.exception))
-        self.assertEqual(_parse_gateway_url("host:65535"), ("host", 65535))
+        self.assertEqual(_parse_gateway_url("host:65535"), ("host", 65535, False))
 
     def test_unsupported_scheme_is_rejected_clearly(self):
         with self.assertRaises(GatewayError) as cm:
@@ -6424,7 +6440,7 @@ class ReviewFollowupRegressionTests(unittest.TestCase):
                     _parse_gateway_url(raw)
                 self.assertIn("brackets", str(cm.exception))
         # real IPv6 still works
-        self.assertEqual(_parse_gateway_url("[fe80::1]:18789"), ("[fe80::1]", 18789))
+        self.assertEqual(_parse_gateway_url("[fe80::1]:18789"), ("[fe80::1]", 18789, False))
 
     def test_multi_colon_non_ipv6_is_not_called_ipv6(self):
         with self.assertRaises(GatewayError) as cm:

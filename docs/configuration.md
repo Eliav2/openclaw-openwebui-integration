@@ -16,7 +16,7 @@ File: `openclaw_pipe.py`.
 
 Type: `str`. Default: `localhost:18789`.
 
-Required. Your OpenClaw Gateway as host:port -- no http:// or ws:// prefix. Example: 192.168.1.10:18789. It must be reachable from the Open WebUI backend, which is not necessarily the same network as your browser.
+Required. Your OpenClaw Gateway as host:port, for example 192.168.1.10:18789. Use a wss:// prefix for a Gateway behind a TLS proxy, for example wss://gateway.example.ts.net (port 443 unless you give one). A ws:// or http:// prefix is accepted and means the same as none. It must be reachable from the Open WebUI backend, which is not necessarily the same network as your browser.
 
 ### GATEWAY_TOKEN
 
@@ -184,7 +184,7 @@ The Action reuses the Pipe's Gateway connection when the Pipe has one. These val
 
 Type: `str`. Default: `localhost:18789`.
 
-Copy this exactly from the Pipe's valves. Gateway as host:port, no http:// or ws:// prefix, e.g. 192.168.1.10:18789. Used only when this Action has to open its own connection instead of reusing the Pipe's.
+Copy this exactly from the Pipe's valves. Gateway as host:port, e.g. 192.168.1.10:18789, or with a wss:// prefix for a Gateway behind a TLS proxy. Used only when this Action has to open its own connection instead of reusing the Pipe's.
 
 ### GATEWAY_TOKEN
 

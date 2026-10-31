@@ -1126,8 +1126,8 @@ def _explain_connect_rejection(message: str, *, device_id: str | None = None) ->
     return message
 
 
-def _parse_gateway_url(raw: str) -> tuple[str, int]:
-    """Parse the GATEWAY_URL valve into (host, port).
+def _parse_gateway_url(raw: str) -> tuple[str, int, bool]:
+    """Parse the GATEWAY_URL valve into (host, port, tls).
 
     The valve wants a bare ``host:port`` -- but it renders as a text box that
     looks exactly like a URL field, so pasting ``http://host:18789`` is the
@@ -1140,10 +1140,14 @@ def _parse_gateway_url(raw: str) -> tuple[str, int]:
                               pipe()'s ``except GatewayError`` and surfaces as
                               an unattributed error naming no valve
 
-    So: accept a scheme and strip it (being liberal costs three lines and kills
-    the whole failure class), and raise a GatewayError naming the valve for
-    anything still unparseable, so it lands in the one handler that prints
-    nicely into the chat.
+    So: accept a scheme (being liberal costs three lines and kills the whole
+    failure class), and raise a GatewayError naming the valve for anything
+    still unparseable, so it lands in the one handler that prints nicely into
+    the chat.
+
+    The scheme is not just stripped: ``wss://`` and ``https://`` set ``tls``, so
+    a Gateway behind a TLS proxy (``tailscale serve``, a reverse proxy) can be
+    reached. Without a port, TLS means 443 and plain means 18789.
     """
     value = (raw or "").strip()
     if not value:
@@ -1151,6 +1155,7 @@ def _parse_gateway_url(raw: str) -> tuple[str, int]:
             "The GATEWAY_URL valve is empty. Set it to your OpenClaw Gateway "
             "as host:port, for example localhost:18789."
         )
+    tls = False
     if "://" in value:
         scheme, _, value = value.partition("://")
         if scheme.lower() not in ("ws", "wss", "http", "https"):
@@ -1158,6 +1163,10 @@ def _parse_gateway_url(raw: str) -> tuple[str, int]:
                 f"GATEWAY_URL has an unsupported scheme '{scheme}://'. Use a "
                 "bare host:port, for example localhost:18789."
             )
+        tls = scheme.lower() in ("wss", "https")
+    # A TLS endpoint without a port is the https port. The plain default is the
+    # Gateway's own.
+    default_port = "443" if tls else "18789"
     # Drop any path/query a pasted URL dragged along ("host:8443/" -> "host:8443").
     value = value.split("/", 1)[0].split("?", 1)[0]
 
@@ -1188,7 +1197,7 @@ def _parse_gateway_url(raw: str) -> tuple[str, int]:
                 "[::1]:18789."
             )
         host = addr + "]"
-        port_str = rest[1:] if rest.startswith(":") else (rest or "18789")
+        port_str = rest[1:] if rest.startswith(":") else (rest or default_port)
     elif value.count(":") > 1:
         # More than one colon and no brackets. If it parses as IPv6, say so;
         # otherwise it is something like "host:80:90" or a pasted URL with
@@ -1211,7 +1220,7 @@ def _parse_gateway_url(raw: str) -> tuple[str, int]:
     else:
         host, sep, port_str = value.rpartition(":")
         if not sep:
-            host, port_str = value, "18789"
+            host, port_str = value, default_port
 
     if not host or host == "[]":
         raise GatewayError(
@@ -1229,7 +1238,7 @@ def _parse_gateway_url(raw: str) -> tuple[str, int]:
             f"GATEWAY_URL {raw!r} has port {port}, which is outside 1-65535. "
             "The OpenClaw Gateway default is 18789."
         )
-    return host, port
+    return host, port, tls
 
 
 # Budget for reading back an interrupted turn's tail. `chat.history` honors
@@ -4152,7 +4161,8 @@ class _GatewayConnection:
     async def _connect_and_start(self):
         """Connect, handshake, and start the event loop task."""
         valves = self._valves()
-        host, port = _parse_gateway_url(valves.GATEWAY_URL)
+        host, port, tls = _parse_gateway_url(valves.GATEWAY_URL)
+        ws_url = f"{'wss' if tls else 'ws'}://{host}:{port}"
         token = valves.GATEWAY_TOKEN
 
         if not token:
@@ -4166,7 +4176,7 @@ class _GatewayConnection:
         self._ensure_identity(valves)
 
         # Connect
-        pipe_log(f"Connecting to ws://{host}:{port}")
+        pipe_log(f"Connecting to {ws_url}")
         # Bounded, and every failure converted to GatewayError. The conversion
         # is the load-bearing part: pipe() only has an `except GatewayError`
         # around this, so anything else escapes the generator and OWUI renders
@@ -4178,7 +4188,7 @@ class _GatewayConnection:
         # if you tune either.
         try:
             ws = await asyncio.wait_for(
-                websockets.connect(f"ws://{host}:{port}", ping_interval=None,
+                websockets.connect(ws_url, ping_interval=None,
                                    max_size=GATEWAY_WS_MAX_SIZE),
                 timeout=_GATEWAY_CONNECT_TIMEOUT_S,
             )
@@ -9101,9 +9111,10 @@ class Action:
         GATEWAY_URL: str = Field(
             default="localhost:18789",
             description="Copy this exactly from the Pipe's valves. Gateway as "
-                        "host:port, no http:// or ws:// prefix, e.g. "
-                        "192.168.1.10:18789. Used only when this Action has to "
-                        "open its own connection instead of reusing the Pipe's."
+                        "host:port, e.g. 192.168.1.10:18789, or with a wss:// "
+                        "prefix for a Gateway behind a TLS proxy. Used only "
+                        "when this Action has to open its own connection "
+                        "instead of reusing the Pipe's."
         )
         GATEWAY_TOKEN: str = Field(
             default="",

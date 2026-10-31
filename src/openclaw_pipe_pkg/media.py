@@ -473,9 +473,9 @@ def _gateway_image_fname(block: dict) -> str:
 
 def _fetch_gateway_media(gateway_url: str, token: str, path: str) -> bytes:
     """GET one media path from the Gateway's HTTP server, with its token."""
-    host, port = _parse_gateway_url(gateway_url)
+    host, port, tls = _parse_gateway_url(gateway_url)
     req = urllib.request.Request(
-        f"http://{host}:{port}{path}",
+        f"{'https' if tls else 'http'}://{host}:{port}{path}",
         headers={"Authorization": f"Bearer {token}"},
     )
     with urllib.request.urlopen(req, timeout=30) as resp:

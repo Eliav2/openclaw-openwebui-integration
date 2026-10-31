@@ -2811,9 +2811,10 @@ class Action:
         GATEWAY_URL: str = Field(
             default="localhost:18789",
             description="Copy this exactly from the Pipe's valves. Gateway as "
-                        "host:port, no http:// or ws:// prefix, e.g. "
-                        "192.168.1.10:18789. Used only when this Action has to "
-                        "open its own connection instead of reusing the Pipe's."
+                        "host:port, e.g. 192.168.1.10:18789, or with a wss:// "
+                        "prefix for a Gateway behind a TLS proxy. Used only "
+                        "when this Action has to open its own connection "
+                        "instead of reusing the Pipe's."
         )
         GATEWAY_TOKEN: str = Field(
             default="",
