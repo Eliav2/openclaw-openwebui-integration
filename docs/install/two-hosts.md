@@ -18,7 +18,7 @@ The installers only talk to Open WebUI's REST API. They never connect to the Gat
 
 ## The Gateway address
 
-Set [`GATEWAY_URL`](../configuration.md#gateway_url) (installer: `GATEWAY_URL` or `--gateway-url`) to the Gateway as `host:port`, with no `http://` or `ws://` prefix. For example `192.168.1.10:18789`.
+Set [`GATEWAY_URL`](../configuration.md#gateway_url) (installer: `GATEWAY_URL` or `--gateway-url`) to the Gateway as `host:port`, for example `192.168.1.10:18789`. A Gateway behind a TLS proxy takes a `wss://` prefix, see [below](#gateway-behind-a-tls-proxy).
 
 It is resolved by the Open WebUI backend, which is not necessarily the same network as your browser, nor as the machine you run the installer on. The default, `localhost:18789`, only works when the Gateway runs on the same host as the Open WebUI backend.
 
@@ -31,6 +31,14 @@ If Open WebUI runs in Docker and the Gateway runs on the machine around it, `loc
 1. Start the Open WebUI container with `--add-host=host.docker.internal:host-gateway` (Docker Desktop on macOS and Windows already provides the name).
 2. Set `GATEWAY_URL` to `host.docker.internal:18789`, or to the host's LAN address.
 3. Set `gateway.bind` to `lan` in the OpenClaw config and restart the Gateway. The default, `loopback`, accepts connections only from the host itself, and a container is not the host.
+
+### Gateway behind a TLS proxy
+
+If a proxy terminates TLS in front of the Gateway (for example `tailscale serve`, or a reverse proxy), give `GATEWAY_URL` a `wss://` prefix: `wss://openclaw.example.ts.net`. Without a port, `wss://` means 443; add one (`wss://host:8443`) when the proxy listens elsewhere. `https://` works the same way.
+
+The Pipe checks the proxy's certificate against the Open WebUI container's trusted CAs, so a public certificate (Let's Encrypt, or the ones Tailscale issues) works as it is. A self-signed one needs its CA in the container, for example through `SSL_CERT_FILE`.
+
+A `ws://` or `http://` prefix, or none, connects without TLS. The Gateway's HTTP media is fetched over the same scheme, `https://` for `wss://`.
 
 ## Open WebUI's own address
 

@@ -51,7 +51,7 @@ The wizard prompts for everything it needs. Press Enter to accept a default show
 | Open WebUI base URL | `http://localhost:8080` | The URL you open Open WebUI at, from this machine |
 | Open WebUI admin email | | Your admin login |
 | Open WebUI admin password | | Your admin password |
-| OpenClaw gateway address (host:port) | `localhost:18789` | The Gateway as seen from the Open WebUI backend, no `http://` or `ws://` |
+| OpenClaw gateway address (host:port) | `localhost:18789` | The Gateway as seen from the Open WebUI backend. Behind a TLS proxy, `wss://host` |
 | OpenClaw gateway token | | `gateway.auth.token` from your OpenClaw config |
 | OpenClaw agent id | `main` | Leave as `main` unless your Gateway defines other agents |
 

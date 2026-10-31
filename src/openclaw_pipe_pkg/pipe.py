@@ -222,9 +222,11 @@ class Pipe:
     class Valves(BaseModel):
         GATEWAY_URL: str = Field(
             default="localhost:18789",
-            description="Required. Your OpenClaw Gateway as host:port -- no "
-                "http:// or ws:// prefix. Example: 192.168.1.10:18789. It must "
-                "be reachable from the Open WebUI backend, which is not "
+            description="Required. Your OpenClaw Gateway as host:port, for example "
+                "192.168.1.10:18789. Use a wss:// prefix for a Gateway behind "
+                "a TLS proxy, for example wss://gateway.example.ts.net (port "
+                "443 unless you give one). A ws:// or http:// prefix is "
+                "accepted and means the same as none. It must be reachable from the Open WebUI backend, which is not "
                 "necessarily the same network as your browser."
         )
         GATEWAY_TOKEN: str = Field(
