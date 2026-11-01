@@ -25,6 +25,7 @@ Below the minimums the chat itself still works, but some features break (the tab
 | Replies the agent starts (cron jobs, sub-agent results, restart recovery) | Open WebUI 0.12.0 | 0.11.1 and older: the reply is never written to the chat. The writer needs the chat row lock 0.12 added |
 | Status dialog styling | Open WebUI 0.12.0 | Older releases lack a few of its CSS classes: slightly different spacing and text size, nothing missing |
 | Status button in the composer on chat open | Open WebUI 0.12.0 | Appears after the next reply instead |
+| A reply that finishes while a tab is loading the chat | Open WebUI 0.12.4 | 0.12.0 to 0.12.3: that tab can show the reply cut until it is reloaded. Those releases replace what reached the page during a load with what the load fetched; 0.12.4 keeps it |
 | Cron replies, and finishing a reply a Gateway restart cut off | OpenClaw 2026.9.3 | 2026.9.1 and older: a cron run in the chat's session is not recognised, so its reply is never shown; and in the restart test, a reply cut by a Gateway restart did not finish |
 | Rate limits for a Gateway that only has a Claude CLI login | The `claude-cli-usage` Gateway plugin | OpenClaw 2026.9.1 and later report no Anthropic windows for that login; the dialog says so ([Status button](./install/status-action.md)) |
 

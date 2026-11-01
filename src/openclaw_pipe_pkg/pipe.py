@@ -902,6 +902,9 @@ class _PipeTurn:
         self.session_thinking_ladder = None
         self.session_model_key = None
         self.session_runtime = None
+        # (model key, ladder) this turn last filed in the ladder cache: the
+        # queue wait probes every 1.5 s, and filing reads and writes a file.
+        self._ladder_recorded = None
 
         # --- Short-circuit OWUI background tasks ---
         # image_prompt_generation and function_calling are skipped too: both already have a documented, silent OWUI-side
@@ -2304,9 +2307,11 @@ class _PipeTurn:
             ladder = _session_thinking_ladder(desc)
             if ladder:
                 self.session_thinking_ladder = ladder
-                _record_thinking_ladder(
-                    ladder, model_key=self.session_model_key,
-                    state_dir=getattr(self.pipe.valves, "STATE_DIR", ""))
+                if (self.session_model_key, ladder) != self._ladder_recorded:
+                    self._ladder_recorded = (self.session_model_key, ladder)
+                    _record_thinking_ladder(
+                        ladder, model_key=self.session_model_key,
+                        state_dir=getattr(self.pipe.valves, "STATE_DIR", ""))
             if row.get("activeRunId") or status in _ACTIVE_RUN_STATES:
                 return True
         except Exception as ex:

@@ -685,11 +685,18 @@ def test_a_tab_that_loads_the_chat_across_the_running_replys_save_shows_it_whole
     reply (ELI-340): its chat GET read the reply before the save and found no
     mid-turn copy after it. Here every load of the reloaded tab is answered
     with the chat as it was before the save, and only once the reply is saved
-    whole. The tab shows the whole reply, done, without another reload."""
-    run = _slow("BROWSER_ACROSS", 12)
+    whole. The tab shows the whole reply, done, without another reload.
+
+    The run waits on a file (E2E_HOLD) until the reloaded tab's GET is held,
+    so that GET is answered from before the save by construction, not by a
+    timing window that a fast run could close (review on #244)."""
+    hold_token = f"across{os.getpid()}_{len(_fake_llm_requests())}"
+    # e2e/fake_llm.py hold_file
+    hold = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{hold_token}")
+    run = "E2E_HOLD_END"
     capture.new_chat(page)
-    capture.send(page, "E2E_SLOW:12 BROWSER_ACROSS")
-    _wait(page, _reply_js(0, "r.text.includes('BROWSER_ACROSS slow-1 slow-2')"), "the reply part way through")
+    capture.send(page, f"E2E_HOLD {hold_token}")
+    _wait(page, _reply_js(0, "r.text.includes('exec') && !r.done"), "the reply running its command")
     other = page.context.new_page()
     try:
         other.goto(page.url)
@@ -710,6 +717,9 @@ def test_a_tab_that_loads_the_chat_across_the_running_replys_save_shows_it_whole
         while not held:
             assert time.time() < deadline, "the reloaded tab never asked for the chat"
             page.wait_for_timeout(50)
+        # The precondition: the held GET read the reply while it still ran.
+        assert run not in held[0][1].text(), "the held chat GET already had the whole reply"
+        open(hold, "w").close()
         _saved_whole(page, token, run)
         holding[0] = False
         for route, response in held:
@@ -718,7 +728,9 @@ def test_a_tab_that_loads_the_chat_across_the_running_replys_save_shows_it_whole
         _wait(page, _reply_js(0, f"r.done && r.text.includes({json.dumps(run)})"),
               "the running reply whole and done in the tab that loaded across its save", 30_000)
     finally:
+        open(hold, "w").close()
         other.close()
+    os.remove(hold)
 
 
 def _message_text_js(index: int) -> str:
