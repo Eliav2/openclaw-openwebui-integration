@@ -25,11 +25,12 @@ The three functions: the **Pipe** is the chat integration, the **Status Action**
 - [Why this exists](./why.md): the native protocol versus a text API, and the full comparison with OpenClaw's `/v1` endpoint.
 - [Features](./features/index.md): the full feature list, each line linking to its page.
   - [Chat](./features/chat.md): streaming, tool cards, tool failures, image input, media, the status line, auto-title, embedding your own page in a reply.
-  - [Questions](./features/questions.md): question cards and the secret dialog, which kind you get, what happens on a reconnect, and secrets the agent requests.
+  - [Questions](./features/questions.md): question cards and the secret dialog, which kind you get, what happens on a reconnect, secrets the agent requests, and plugin approvals asked in the chat.
   - [Status](./features/status.md): the Status dialog, Compact, the sub-agent list and drawer, the composer button.
   - [Sessions and models](./features/sessions-and-models.md): one session per chat, the model picker, its size cap, `DEFAULT_MODEL`.
   - [Replies from the agent](./features/agent-turns.md): replies with no message from you: cron jobs, `sessions_send`, sub-agent results.
   - [Reliability](./features/reliability.md): the connection, queueing, reload and restart safety, recovery, Stop and Send now, redeploys, background tasks, errors.
+  - [Channels](./features/channels.md): a mention in an Open WebUI channel opens a thread, one session for everyone in it, and the agent follows it.
   - [Owner users](./features/owner-users.md): `OWNER_USERS`, for an Open WebUI that people other than you sign in to.
 - [Configuration](./configuration.md): every valve of the three functions, generated from the code.
 - [Metadata contract](./metadata-contract.md): the Sender and Conversation info blocks every message carries, their stability guarantees, and how an agent should read them.
