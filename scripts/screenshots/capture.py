@@ -496,6 +496,7 @@ class Shooter:
         self.out, self.only = out, only
         self.failures: list = []
         self.written: list = []
+        self.quiet = False   # running a scene only as another one's prerequisite
         self.host = socket.gethostname()
         os.makedirs(os.path.join(out, "debug"), exist_ok=True)
 
@@ -519,6 +520,9 @@ class Shooter:
           s.textContent = '[data-sonner-toaster], section[aria-label^="Notifications"] { display: none !important; }';
           document.head.appendChild(s); }""")
         self.check_text(page, name, text_selector or selector, allow)
+        if self.quiet:
+            print(f"  skipped {name} (not selected)", flush=True)
+            return
         path = os.path.join(self.out, f"{name}-light.png")
         if selector:
             page.locator(selector).first.screenshot(path=path, animations="disabled")
@@ -529,11 +533,17 @@ class Shooter:
         self.written.append(path)
         print(f"  wrote {path}", flush=True)
 
-    def run(self, name: str, fn, *args) -> None:
-        if not self.wanted(name):
+    def run(self, name: str, fn, *args, needed_by: tuple = ()) -> None:
+        """Run scene `name`. A scene that others build on (`needed_by`) also
+        runs when only they are selected (`--only`), without writing its own
+        images: they are not what was asked for."""
+        prerequisite = not self.wanted(name) and any(self.wanted(n) for n in needed_by)
+        if not self.wanted(name) and not prerequisite:
             return
-        print(f"[{name}]", flush=True)
+        print(f"[{name}]" + (" (for " + ", ".join(n for n in needed_by if self.wanted(n)) + ")"
+                             if prerequisite else ""), flush=True)
         page = args[0]
+        self.quiet = prerequisite
         try:
             fn(*args)
         except Exception as ex:
@@ -547,6 +557,8 @@ class Shooter:
                     fh.write(page.content())
             except Exception as dex:
                 print(f"  (debug capture failed: {dex})")
+        finally:
+            self.quiet = False
 
 
 # ── Scenes ──────────────────────────────────────────────────────────
@@ -1407,20 +1419,23 @@ def main(argv=None) -> int:
         browser = pw.chromium.launch()
         try:
             page = signed_in_page(browser, token, PHONE)
-            shooter.run("hero-tool-cards", scenes.hero, page)
+            shooter.run("hero-tool-cards", scenes.hero, page,
+                        needed_by=("tool-card-expanded", "composer-status", "thinking-level",
+                                   "compact-before", "toolbar-button"))
             if scenes.hero_chat:
                 shooter.run("tool-card-expanded", scenes.expanded, page)
                 shooter.run("composer-status", scenes.composer_status, page)
-                shooter.run("thinking-toggle", scenes.thinking, page)
+            # Makes its own chat; thinking-level needs the filter it attaches.
+            shooter.run("thinking-toggle", scenes.thinking, page, needed_by=("thinking-level",))
             shooter.run("question-card", scenes.question, page)
             if gateway_release() >= (2026, 10, 10):
                 shooter.run("secret-request", scenes.secret_request, page)
             shooter.run("plugin-approval", scenes.plugin_approval, page)
             shooter.run("status-dialog", scenes.status_and_drawer, page)
-            shooter.run("subagents-long", scenes.subagents_long, page)
+            shooter.run("subagents-long", scenes.subagents_long, page, needed_by=("drawer-long-parent",))
             if scenes.long_chat:
                 shooter.run("drawer-long-parent", scenes.drawer_long_parent, page)
-            shooter.run("status-background", scenes.background, page)
+            shooter.run("status-background", scenes.background, page, needed_by=("status-dialog-scrolled",))
             if scenes.background_chat:
                 small = signed_in_page(browser, token, SMALL_PHONE)
                 shooter.run("status-dialog-scrolled", scenes.background_scrolled, small)
@@ -1436,7 +1451,7 @@ def main(argv=None) -> int:
             shooter.run("streaming", scenes.streaming_and_reload, page)
             shooter.run("usage-goal", scenes.usage_goal, page)
             shooter.run("compaction-note", scenes.compaction_note, page)
-            shooter.run("subagent-result", scenes.subagent_result, page)
+            shooter.run("subagent-result", scenes.subagent_result, page, needed_by=("spawn-card",))
             if scenes.spawn_chat:
                 shooter.run("spawn-card", scenes.spawn_card, page)
             shooter.run("error-message", scenes.error_message, page)
