@@ -1033,7 +1033,8 @@ def clamp_to_ladder(level, ladder):
 GATEWAY_SCOPES = ["operator.admin", "operator.read", "operator.write"]
 # A connection for users not in OWNER_USERS. Without operator.admin the
 # Gateway does not record its turns as the owner's, and the agent withholds
-# owner-only tools from them. read: history, sessions, models, usage and the
+# owner-only tools from them. Not a sandbox: the tools the Gateway's policy
+# gives non-owner turns (often exec and read) stay available. read: history, sessions, models, usage and the
 # event subscriptions. write: send, abort and the model override.
 RESTRICTED_SCOPES = ["operator.read", "operator.write"]
 

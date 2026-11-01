@@ -40,7 +40,7 @@ Directory inside the Open WebUI container where the device identity and Gateway 
 
 Type: `str`. Default: empty.
 
-Open WebUI user ids or emails, comma-separated, whose chats act with full owner rights on the Gateway. Leave empty and every user acts as the owner (the old behaviour). When set, everyone else talks to the Gateway over a separate connection with read and write access only, so the agent withholds owner-only tools (automations, outbound messaging, sessions admin, terminal) from their turns. Use it whenever someone other than the Gateway's owner can sign in to Open WebUI.
+Open WebUI user ids or emails, comma-separated, whose chats act with full owner rights on the Gateway. Leave empty and every user acts as the owner (the old behaviour). When set, everyone else talks to the Gateway over a separate connection with read and write access only, so their turns lose the owner-only tools (such as automations and messages on your other channels). This is not a sandbox: they keep every tool your OpenClaw tool policy allows non-owner turns, which can include running commands and reading files. Use it whenever someone other than the Gateway's owner can sign in to Open WebUI.
 
 ### AGENT_ID
 

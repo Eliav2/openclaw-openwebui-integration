@@ -7,7 +7,7 @@ Valves: `OWNER_USERS`
 
 ## When to set it
 
-OpenClaw gives owner turns tools that act on your whole setup: scheduling automations, sending messages on your other channels, managing sessions, the terminal. With the valve empty (the default, and the behaviour before it existed), every Open WebUI user gets those.
+OpenClaw gives owner turns tools that act on your whole setup, such as scheduling automations and sending messages on your other channels. With the valve empty (the default, and the behaviour before it existed), every Open WebUI user gets those.
 
 <img src="../img/valves-light.png" alt="The Pipe's valves in the admin panel, with the Owner Users field" width="320">
 
@@ -37,6 +37,8 @@ The block stays labelled untrusted, and a user can type a look-alike block, so t
 
 ## What it does not do
 
-This is not a sandbox. Everything an agent turn may do without owner rights stays available to every user, which can include reading other sessions and the agent's memory, depending on your OpenClaw tool policy. Restrict those in OpenClaw if your users should not see each other's chats. More in [Security](../security.md).
+This is not a sandbox. Everything an agent turn may do without owner rights stays available to every user. Which tools those are is up to your OpenClaw version and tool policy, and by default it can include running commands, reading the agent's workspace (its memory too) and listing other sessions. What they lose are the tools that need the owner, such as automations and messages on your other channels.
+
+To keep other users away from your agent's commands, files and memory, give them their own agent: install a second copy of the Pipe with its own [`AGENT_ID`](../configuration.md#agent_id), an agent with its own workspace and a narrow tool policy, and limit who may use each copy's model in Open WebUI (its access settings). Keep `OWNER_USERS` set on both copies. More in [Security](../security.md#the-agents-privileges).
 
 Leave the valve empty to keep the old behaviour.
