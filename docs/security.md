@@ -58,11 +58,11 @@ How media works: [Chat features](./features/chat.md).
 
 ## The agent's privileges
 
-The integration runs inside the Open WebUI backend and holds the Gateway credentials. It talks to the Gateway with the configured agent's privileges, on a connection that asks for the `operator.admin`, `operator.read` and `operator.write` scopes.
+The integration runs inside the Open WebUI backend and holds the Gateway credentials. It talks to the Gateway with the configured agent's privileges, on a main connection that asks for the `operator.admin`, `operator.read` and `operator.write` scopes. With [`OWNER_USERS`](./configuration.md#owner_users) set, the turns of users not on the list go over a second connection without `operator.admin`.
 
-So **anyone who can chat with the Pipe can drive that agent**, with everything that agent may do: run commands, read and write files, use its tools. Scope [`AGENT_ID`](./configuration.md#agent_id) accordingly: point it at an agent whose tools and workspace you are happy for every Open WebUI user to use.
+So **anyone who can chat with the Pipe can drive that agent**, with everything that agent may do: run commands, read and write files, use its tools. `OWNER_USERS` takes away only the tools that need the owner, such as automations and messages on your other channels; commands and files stay, as far as your OpenClaw tool policy allows non-owner turns. Scope [`AGENT_ID`](./configuration.md#agent_id) accordingly: point it at an agent whose tools and workspace you are happy for every Open WebUI user to use.
 
-By default every Open WebUI user also acts as the Gateway's owner. If people other than you can sign in, set [`OWNER_USERS`](./configuration.md#owner_users): see [Owner users](./features/owner-users.md).
+By default every Open WebUI user also acts as the Gateway's owner. If people other than you can sign in, set `OWNER_USERS`: see [Owner users](./features/owner-users.md).
 
 In channels, the agent's answers and what it was told are visible to everyone in the thread, its turns start with the agent's workspace files (its private memory too), and the Pipe sends a thread's last messages (up to 15,000 characters) to the Gateway's utility model to ask whether they are meant for the agent. To keep a private agent out of channels, give channels their own copy of the Pipe with its own `AGENT_ID`: see [Channels](./features/channels.md#privacy).
 

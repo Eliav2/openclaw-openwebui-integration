@@ -13,6 +13,7 @@ on:
       - package.json
       - bun.lock
       - .github/workflows/docs.yml
+      - scripts/check_site_anchors.py
   push:
     branches: [main]
     paths:
@@ -20,6 +21,7 @@ on:
       - package.json
       - bun.lock
       - .github/workflows/docs.yml
+      - scripts/check_site_anchors.py
 
 permissions:
   contents: read
@@ -41,6 +43,9 @@ jobs:
 
       - name: Build (fails on a dead link)
         run: bun run docs:build
+
+      - name: Every heading link lands on a heading
+        run: python3 scripts/check_site_anchors.py docs/.vitepress/dist
 
       - name: The agent files are there
         run: |

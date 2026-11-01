@@ -4586,7 +4586,8 @@ async def _answer_plugin_approval(conn, record: dict, kind: str, user_id: str = 
 GATEWAY_SCOPES = ["operator.admin", "operator.read", "operator.write"]
 # A connection for users not in OWNER_USERS. Without operator.admin the
 # Gateway does not record its turns as the owner's, and the agent withholds
-# owner-only tools from them. read: history, sessions, models, usage and the
+# owner-only tools from them. Not a sandbox: the tools the Gateway's policy
+# gives non-owner turns (often exec and read) stay available. read: history, sessions, models, usage and the
 # event subscriptions. write: send, abort and the model override.
 RESTRICTED_SCOPES = ["operator.read", "operator.write"]
 
@@ -14023,10 +14024,12 @@ class Pipe:
                 "chats act with full owner rights on the Gateway. Leave empty "
                 "and every user acts as the owner (the old behaviour). When set, "
                 "everyone else talks to the Gateway over a separate connection "
-                "with read and write access only, so the agent withholds "
-                "owner-only tools (automations, outbound messaging, sessions "
-                "admin, terminal) from their turns. Use it whenever someone "
-                "other than the Gateway's owner can sign in to Open WebUI."
+                "with read and write access only, so their turns lose the "
+                "owner-only tools (such as automations and messages on your "
+                "other channels). This is not a sandbox: they keep every tool "
+                "your OpenClaw tool policy allows non-owner turns, which can "
+                "include running commands and reading files. Use it whenever "
+                "someone other than the Gateway's owner can sign in to Open WebUI."
         )
         AGENT_ID: str = Field(
             default="main",
