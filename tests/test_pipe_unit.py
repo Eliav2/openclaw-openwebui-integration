@@ -3354,6 +3354,14 @@ class TurnRendererTests(unittest.TestCase):
         r.feed({"stream": "assistant", "data": {"delta": "\n\nSecond."}})
         self.assertEqual(r.text, "First.\n\nSecond.")
 
+    def test_a_pipe_note_between_two_replies_does_not_hide_the_break(self):
+        r = _TurnRenderer()
+        self._reply(r, "run-1:1", "First.")
+        r.feed({"stream": openclaw_pipe.PIPE_NOTE_STREAM,
+                "data": {"id": f"{openclaw_pipe._NOTE_ITEM_PREFIX}compaction_x_1", "text": "Compacted."}})
+        self._reply(r, "run-1:2", "Second.")
+        self.assertEqual(r.text, "First.\n\nSecond.")
+
     def test_a_card_between_two_replies_adds_no_break_of_its_own(self):
         r = _TurnRenderer()
         self._reply(r, "run-1:1", "Checking.")

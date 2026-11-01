@@ -5842,13 +5842,14 @@ class _TurnRenderer:
         between them but the Gateway's `itemId` changing: it needs the break
         the transcript rebuild puts there (`_history_events`), or the two run
         together ("heard-6E2E_TWIN_B", ELI-271 on a sub-agent's announce
-        steered into a running reply). A card between them has its own break."""
+        steered into a running reply). A card between them has its own break;
+        a Pipe note (a compaction) is no reply and is looked past."""
         if not isinstance(item_id, str) or not item_id:
             return
         previous, self._assistant_item_id = self._assistant_item_id, item_id
-        last = self.output[-1] if self.output else None
-        if (previous and previous != item_id and last is not None and last.get("type") == "message"
-                and not str(last.get("id", "")).startswith(_NOTE_ITEM_PREFIX)):
+        last = next((i for i in reversed(self.output)
+                     if not str(i.get("id", "")).startswith(_NOTE_ITEM_PREFIX)), None)
+        if previous and previous != item_id and last is not None and last.get("type") == "message":
             self.run_boundary = True
 
     def _add(self, chunk: str) -> None:
