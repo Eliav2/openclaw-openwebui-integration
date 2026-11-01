@@ -1420,11 +1420,13 @@ def main(argv=None) -> int:
         try:
             page = signed_in_page(browser, token, PHONE)
             shooter.run("hero-tool-cards", scenes.hero, page,
-                        needed_by=("tool-card-expanded", "composer-status", "thinking-toggle"))
+                        needed_by=("tool-card-expanded", "composer-status", "thinking-level",
+                                   "compact-before", "toolbar-button"))
             if scenes.hero_chat:
                 shooter.run("tool-card-expanded", scenes.expanded, page)
                 shooter.run("composer-status", scenes.composer_status, page)
-                shooter.run("thinking-toggle", scenes.thinking, page)
+            # Makes its own chat; thinking-level needs the filter it attaches.
+            shooter.run("thinking-toggle", scenes.thinking, page, needed_by=("thinking-level",))
             shooter.run("question-card", scenes.question, page)
             if gateway_release() >= (2026, 10, 10):
                 shooter.run("secret-request", scenes.secret_request, page)
@@ -1449,7 +1451,7 @@ def main(argv=None) -> int:
             shooter.run("streaming", scenes.streaming_and_reload, page)
             shooter.run("usage-goal", scenes.usage_goal, page)
             shooter.run("compaction-note", scenes.compaction_note, page)
-            shooter.run("subagent-result", scenes.subagent_result, page)
+            shooter.run("subagent-result", scenes.subagent_result, page, needed_by=("spawn-card",))
             if scenes.spawn_chat:
                 shooter.run("spawn-card", scenes.spawn_card, page)
             shooter.run("error-message", scenes.error_message, page)

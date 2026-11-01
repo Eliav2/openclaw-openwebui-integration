@@ -41,16 +41,18 @@ VISUAL = (
 VISUAL_DIRS = ("docs/img/",)
 
 _COMMENT = re.compile(r"<!--.*?-->", re.S)
-# A fence line: up to three spaces, then three or more backticks or tildes,
-# then the rest (the info string on an opening line, CommonMark 4.5).
-_FENCE_LINE = re.compile(r" {0,3}(`{3,}|~{3,})(.*)")
+# A fence line: indentation and list markers (a fence can open inside a list
+# item), then three or more backticks or tildes, then the rest (the info
+# string on an opening line, CommonMark 4.5).
+_FENCE_LINE = re.compile(r"[ \t]*(?:(?:[-+*]|\d{1,9}[.)])[ \t]+)*(`{3,}|~{3,})(.*)")
 _CODE_SPAN = re.compile(r"(`+)(?!`).+?(?<!`)\1(?!`)", re.S)
 # Only an image a PR page can show: a complete tag or markdown image whose
 # source is an absolute http(s) URL, as `gh pr edit --attach` writes. A
 # relative path in a posted description was never uploaded, and `<img` alone
 # (no src, no closing `>`) shows nothing.
-_IMG = re.compile(r"<img\b[^>]*?\bsrc\s*=\s*[\"']?https?://[^\s\"'>]+[^>]*>"
-                  r"|!\[[^\]]*\]\(\s*<?https?://[^\s)>]+>?(?:\s+[\"'][^\"']*[\"'])?\s*\)", re.I)
+_TITLE = r"""(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?"""
+_IMG = re.compile(r"<img(?=\s)[^>]*?\ssrc\s*=\s*[\"']?https?://[^\s\"'>]+[^>]*>"
+                  r"|!\[[^\]]*\]\(\s*<?https?://[^\s)>]+>?" + _TITLE + r"\s*\)", re.I)
 _BRANCH_LINK = re.compile(r"raw\.githubusercontent\.com|github\.com/[^\s\"')]*/blob/|[?&]raw=true", re.I)
 
 

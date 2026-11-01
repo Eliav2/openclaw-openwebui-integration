@@ -61,6 +61,20 @@ class WhatCountsAsAnImage(unittest.TestCase):
         self.assertFalse(pr_media.has_image("<img src=\"https://example.com/a.png\""))
         self.assertFalse(pr_media.has_image("<img src=x width=320>"))
 
+    def test_a_src_must_be_the_src_attribute(self):
+        # PR #257 review: data-src matched, though the tag shows nothing.
+        self.assertFalse(pr_media.has_image('<img data-src="https://example.com/a.png" alt=x>'))
+        self.assertTrue(pr_media.has_image('<img alt=x src="https://example.com/a.png">'))
+        self.assertTrue(pr_media.has_image('<img\n  src="https://example.com/a.png"\n  width="320">'))
+
+    def test_markdown_image_titles_in_any_delimiter(self):
+        for title in ('"user\'s view"', "'say \"hi\"'", "(a note)"):
+            self.assertTrue(pr_media.has_image(f"![after](https://example.com/a.png {title})"), title)
+
+    def test_a_fence_inside_a_list_item_is_a_fence(self):
+        self.assertTrue(pr_media.has_image("- ```text\n  code\n  ```\n\n![a](https://example.com/a.png)"))
+        self.assertFalse(pr_media.has_image("1. ```md\n   ![a](https://example.com/a.png)\n   ```"))
+
     def test_a_fence_closes_only_on_a_matching_line(self):
         # PR #238 review: a shorter run inside a longer fence closed it early.
         body = "````markdown\n` ```oops`\n```\n" + "![after](https://example.com/a.png)\n````\n"

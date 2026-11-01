@@ -98,12 +98,27 @@ class PrerequisiteScenes(unittest.TestCase):
         run_all()
         self.assertEqual(self.ran, [])
 
-    def test_the_real_entry_points_declare_their_prerequisites(self):
+    def test_every_guarded_scene_is_declared_by_the_scene_that_makes_its_input(self):
+        """Each scene run under `if scenes.<input>:` names, in `needed_by` of
+        the scene that produces <input>, so `--only` on it alone runs that
+        scene first. The producers of the inputs are listed here."""
         with open(os.path.join(ROOT, "scripts", "screenshots", "capture.py"), encoding="utf-8") as fh:
             src = fh.read()
-        self.assertIn('needed_by=("drawer-long-parent",)', src)
-        self.assertIn('needed_by=("status-dialog-scrolled",)', src)
-        self.assertIn('"tool-card-expanded", "composer-status", "thinking-toggle"', src)
+        main = src[src.index("scenes = Scenes(token, shooter)"):]
+        producers = {"hero_chat": "hero-tool-cards", "long_chat": "subagents-long",
+                     "background_chat": "status-background", "spawn_chat": "subagent-result"}
+        import re
+        for attr, producer in producers.items():
+            m = re.search(r'shooter\.run\("%s",[^\n]*?(?:\n[^\n]*?)?needed_by=\(([^)]*)\)' % re.escape(producer), main)
+            self.assertTrue(m, f"{producer} declares needed_by")
+            declared = set(re.findall(r'"([^"]+)"', m.group(1)))
+            guarded = set()
+            for g in re.finditer(r"if scenes\.%s:\n((?:[ ]{16,}[^\n]*\n)+)" % attr, main):
+                guarded |= set(re.findall(r'shooter\.run\("([^"]+)"', g.group(1)))
+            self.assertTrue(guarded, f"scenes guarded by {attr}")
+            self.assertEqual(guarded - declared, set(), f"{producer} must list them in needed_by")
+        # thinking-level also needs the filter thinking-toggle attaches
+        self.assertRegex(main, r'"thinking-toggle", scenes\.thinking, page, needed_by=\("thinking-level",\)')
 
 
 if __name__ == "__main__":
