@@ -41,7 +41,7 @@ class WhichFilesAreVisual(unittest.TestCase):
 class WhatCountsAsAnImage(unittest.TestCase):
     def test_an_img_tag_counts(self):
         self.assertTrue(pr_media.has_image("## Before / After\n\n" + IMG))
-        self.assertTrue(pr_media.has_image("<IMG SRC=x width=320>"))
+        self.assertTrue(pr_media.has_image("<IMG SRC=https://example.com/a.png width=320>"))
 
     def test_no_body_or_plain_link_does_not(self):
         self.assertFalse(pr_media.has_image(None))
@@ -51,8 +51,26 @@ class WhatCountsAsAnImage(unittest.TestCase):
     def test_a_markdown_image_counts(self):
         # gh --attach rewrites ![alt](./file.png) into a user-attachments URL.
         self.assertTrue(pr_media.has_image("![after](https://github.com/user-attachments/assets/abc-123)"))
-        self.assertTrue(pr_media.has_image("![before](./before.jpg)\n![after](./after.jpg)"))
         self.assertTrue(pr_media.has_image("![](https://example.com/a.png)"))
+
+    def test_image_syntax_that_shows_nothing_does_not(self):
+        # PR #238 review: a path never uploaded, or a tag with no source, passed.
+        self.assertFalse(pr_media.has_image("![before](./before.jpg)\n![after](./after.jpg)"))
+        self.assertFalse(pr_media.has_image("![after](docs/img/after.png)"))
+        self.assertFalse(pr_media.has_image("<img alt=after width=320>"))
+        self.assertFalse(pr_media.has_image("<img src=\"https://example.com/a.png\""))
+        self.assertFalse(pr_media.has_image("<img src=x width=320>"))
+
+    def test_a_fence_closes_only_on_a_matching_line(self):
+        # PR #238 review: a shorter run inside a longer fence closed it early.
+        body = "````markdown\n` ```oops`\n```\n" + "![after](https://example.com/a.png)\n````\n"
+        self.assertFalse(pr_media.has_image(body))
+        self.assertFalse(pr_media.has_image("~~~\n```\n![a](https://example.com/a.png)\n~~~"))
+        self.assertFalse(pr_media.has_image("```\n```not-a-close\n![a](https://example.com/a.png)\n```"))
+        self.assertTrue(pr_media.has_image("````\ncode\n`````  \n![a](https://example.com/a.png)"))
+
+    def test_an_unclosed_fence_hides_the_rest(self):
+        self.assertFalse(pr_media.has_image("```md\n![after](https://example.com/a.png)\n"))
 
     def test_a_markdown_image_in_a_comment_or_code_does_not(self):
         self.assertFalse(pr_media.has_image("<!-- Use ![after](./after.png) -->"))

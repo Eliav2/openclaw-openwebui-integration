@@ -4,8 +4,10 @@
 AGENTS.md: a PR with a visual change shows a Before and After pair in its
 description, from the Screenshots workflow. This is the check for it: when the
 PR's diff touches a file that draws the UI (VISUAL below) or an image under
-docs/img/, its description needs an image: an `<img>` tag or a markdown image
-`![alt](url)` (`gh --attach` rewrites markdown images into GitHub asset URLs).
+docs/img/, its description needs an image: an `<img src=...>` tag or a markdown
+image `![alt](url)` whose source is an http(s) URL (`gh pr edit --attach`
+rewrites markdown images into GitHub asset URLs; a relative path left in the
+posted description was never uploaded).
 Images inside an HTML comment, a code span or a fenced block do not count, so
 the PR template's own hints never pass it.
 
@@ -39,9 +41,16 @@ VISUAL = (
 VISUAL_DIRS = ("docs/img/",)
 
 _COMMENT = re.compile(r"<!--.*?-->", re.S)
-_FENCE = re.compile(r"^(```|~~~).*?^\1[^\n]*$", re.S | re.M)
+# A fence line: up to three spaces, then three or more backticks or tildes,
+# then the rest (the info string on an opening line, CommonMark 4.5).
+_FENCE_LINE = re.compile(r" {0,3}(`{3,}|~{3,})(.*)")
 _CODE_SPAN = re.compile(r"(`+)(?!`).+?(?<!`)\1(?!`)", re.S)
-_IMG = re.compile(r"<img\b|!\[[^\]]*\]\([^)\s]+[^)]*\)", re.I)
+# Only an image a PR page can show: a complete tag or markdown image whose
+# source is an absolute http(s) URL, as `gh pr edit --attach` writes. A
+# relative path in a posted description was never uploaded, and `<img` alone
+# (no src, no closing `>`) shows nothing.
+_IMG = re.compile(r"<img\b[^>]*?\bsrc\s*=\s*[\"']?https?://[^\s\"'>]+[^>]*>"
+                  r"|!\[[^\]]*\]\(\s*<?https?://[^\s)>]+>?(?:\s+[\"'][^\"']*[\"'])?\s*\)", re.I)
 _BRANCH_LINK = re.compile(r"raw\.githubusercontent\.com|github\.com/[^\s\"')]*/blob/|[?&]raw=true", re.I)
 
 
@@ -58,8 +67,26 @@ def has_image(body: str | None) -> bool:
 
 def _visible(body: str | None) -> str:
     text = _COMMENT.sub("", body or "")
-    text = _FENCE.sub("", text)
+    text = _strip_fences(text)
     return _CODE_SPAN.sub("", text)
+
+
+def _strip_fences(text: str) -> str:
+    """`text` without its fenced code blocks. A block closes only on a line of
+    the same character, at least as long as the opening run, with nothing but
+    whitespace after it; an unclosed block runs to the end (CommonMark 4.5)."""
+    out, opened = [], None
+    for line in text.splitlines(keepends=True):
+        m = _FENCE_LINE.fullmatch(line.rstrip("\r\n"))
+        if opened is None:
+            # A backtick fence's info string cannot hold a backtick.
+            if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
+                opened = m.group(1)
+            else:
+                out.append(line)
+        elif m and m.group(1)[0] == opened[0] and len(m.group(1)) >= len(opened) and not m.group(2).strip():
+            opened = None
+    return "".join(out)
 
 
 def branch_links(body: str | None) -> list:
