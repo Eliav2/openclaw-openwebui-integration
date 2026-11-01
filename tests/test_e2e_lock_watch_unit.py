@@ -36,6 +36,50 @@ class LockLineTests(unittest.TestCase):
         self.assertEqual(watch._state["cleared"], [("e2e/x.py::test_y", LINE.strip())])
 
 
+class ShutdownTests(unittest.TestCase):
+    """A lock line read just before the session ends: its verdict lands before the exit code is set."""
+
+    def setUp(self):
+        watch._state.update(test="e2e/x.py::test_last", line=None, during=None, cleared=[], proc=None)
+
+    def test_a_wedge_found_while_the_session_ends_still_sets_the_exit_code(self):
+        import threading
+        import time
+        stop = threading.Event()
+        interrupted = []
+
+        class Proc:
+            stdout = iter([LINE])
+            def kill(self): pass
+            def wait(self): pass
+            def poll(self): return 0
+
+        def slow_check():
+            stop.set()          # the session ends while the check waits
+            time.sleep(0.2)
+            return True
+        orig = (watch.subprocess.Popen, watch._still_locked, watch._thread.interrupt_main)
+        watch.subprocess.Popen = lambda *a, **kw: Proc()
+        watch._on_lock_line.__defaults__ = (slow_check,)
+        watch._thread.interrupt_main = lambda: interrupted.append(1)
+        try:
+            t = threading.Thread(target=watch._follow, args=(stop,))
+            t.start()
+            t.join(5)
+        finally:
+            watch.subprocess.Popen, _, watch._thread.interrupt_main = orig
+            watch._on_lock_line.__defaults__ = (orig[1],)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(watch._state["during"], "e2e/x.py::test_last")
+        self.assertEqual(interrupted, [])   # no interrupt into a finished session
+
+        class Session:
+            exitstatus = 0
+        session = Session()
+        watch.pytest_sessionfinish(session, 0)
+        self.assertEqual(session.exitstatus, 3)
+
+
 class StillLockedTests(unittest.TestCase):
     """_still_locked runs its check in the container; here the same check runs on a local file."""
 

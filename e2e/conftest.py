@@ -69,7 +69,8 @@ def _follow(stop: threading.Event) -> None:
         _state["proc"] = proc
         for line in proc.stdout:
             if LOCKED in line and _state["line"] is None and _on_lock_line(line):
-                _thread.interrupt_main()
+                if not stop.is_set():   # the tests are over: the exit code alone reports it
+                    _thread.interrupt_main()
                 proc.kill()
                 return
         proc.wait()
@@ -106,6 +107,9 @@ def _owui_lock_watch():
     proc = _state.get("proc")
     if proc is not None and proc.poll() is None:
         proc.kill()
+    # A check of a line from the last test may still run: wait for its verdict,
+    # so pytest_sessionfinish sees a wedge it found.
+    watcher.join(LOCK_WAIT_S + 30)
 
 
 def pytest_runtest_logstart(nodeid, location):
