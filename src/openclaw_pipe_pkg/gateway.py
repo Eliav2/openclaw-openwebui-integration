@@ -4274,11 +4274,16 @@ def _container_loopback_hint(host: str, port: int, tls: bool = False) -> str:
         return ""
     if not _in_container():
         return ""
-    address = f"{'wss://' if tls else ''}host.docker.internal:{port}"
-    return (" Open WebUI runs in a container here. Unless it uses host networking "
-            f"(--network host, where this refusal means nothing listens on {host}:{port}), "
-            f"{host} inside it is the container itself, not the machine the Gateway runs on. "
-            f"Point GATEWAY_URL at the host ({address}, started with "
+    where = (" Open WebUI runs in a container here. Unless it uses host networking "
+             f"(--network host, where this refusal means nothing listens on {host}:{port}), "
+             f"{host} inside it is the container itself, not the machine the Gateway runs on.")
+    if tls:
+        # host.docker.internal would not match the proxy's certificate, and
+        # gateway.bind does not move a proxy that listens on loopback.
+        return (where + " A wss:// address names the TLS proxy: point GATEWAY_URL at a "
+                "host name its certificate covers and that the container can reach, with "
+                "the proxy listening there.")
+    return (where + f" Point GATEWAY_URL at the host (host.docker.internal:{port}, started with "
             "--add-host=host.docker.internal:host-gateway, or the host's LAN address) "
             "and have the Gateway listen there: gateway.bind lan in the OpenClaw config "
             "listens on every interface, so firewall the port on a host the internet can "

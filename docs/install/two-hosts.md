@@ -40,7 +40,7 @@ A Gateway behind `tailscale serve` must keep the `loopback` bind (OpenClaw refus
 
 If a proxy terminates TLS in front of the Gateway (for example `tailscale serve`, or a reverse proxy), give `GATEWAY_URL` a `wss://` prefix: `wss://openclaw.example.ts.net`. Without a port, `wss://` means 443; add one (`wss://host:8443`) when the proxy listens elsewhere. `https://` works the same way.
 
-The Pipe checks the proxy's certificate against the Open WebUI container's trusted CAs, so a public certificate (Let's Encrypt, or the ones Tailscale issues) works as it is. A self-signed one needs its CA in the container, for example through `SSL_CERT_FILE`.
+The Pipe checks that the proxy's certificate is issued for the host name in `GATEWAY_URL` and signed by a CA the Open WebUI container trusts, so a public certificate (Let's Encrypt, or the ones Tailscale issues) works as it is. A self-signed one needs its CA in the container, for example through `SSL_CERT_FILE`.
 
 A `ws://` or `http://` prefix, or none, connects without TLS. The Gateway's HTTP media is fetched over the same scheme, `https://` for `wss://`.
 

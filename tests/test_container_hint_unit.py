@@ -61,7 +61,14 @@ class ContainerLoopbackHintTests(unittest.TestCase):
         # PR #246 review: localhost:19000 was pointed at host.docker.internal:18789.
         self.assertIn("host.docker.internal:19000", str(refused_message("localhost:19000", in_container=True)))
         self.assertNotIn(":18789", str(refused_message("localhost:19000", in_container=True)))
-        self.assertIn("wss://host.docker.internal:8443", str(refused_message("wss://localhost:8443", in_container=True)))
+
+    def test_a_tls_address_is_told_to_name_the_proxy_by_its_certificate(self):
+        # PR #256 review: host.docker.internal would not match the proxy's
+        # certificate, and gateway.bind does not move a loopback proxy.
+        text = str(refused_message("wss://localhost:8443", in_container=True))
+        self.assertIn("certificate covers", text)
+        self.assertNotIn("host.docker.internal", text)
+        self.assertNotIn("gateway.bind", text)
 
     def test_the_hint_names_the_caveats_of_its_advice(self):
         # PR #246 review: host networking shares localhost, lan listens on every
