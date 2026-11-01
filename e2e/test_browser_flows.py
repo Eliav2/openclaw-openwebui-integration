@@ -692,7 +692,7 @@ def test_a_tab_that_loads_the_chat_across_the_running_replys_save_shows_it_whole
     timing window that a fast run could close (review on #244)."""
     hold_token = f"across{os.getpid()}_{len(_fake_llm_requests())}"
     # e2e/fake_llm.py hold_file
-    hold = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{hold_token}")
+    gate = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{hold_token}")
     run = "E2E_HOLD_END"
     capture.new_chat(page)
     capture.send(page, f"E2E_HOLD {hold_token}")
@@ -719,7 +719,7 @@ def test_a_tab_that_loads_the_chat_across_the_running_replys_save_shows_it_whole
             page.wait_for_timeout(50)
         # The precondition: the held GET read the reply while it still ran.
         assert run not in held[0][1].text(), "the held chat GET already had the whole reply"
-        open(hold, "w").close()
+        open(gate, "w").close()
         _saved_whole(page, token, run)
         holding[0] = False
         for route, response in held:
@@ -728,9 +728,9 @@ def test_a_tab_that_loads_the_chat_across_the_running_replys_save_shows_it_whole
         _wait(page, _reply_js(0, f"r.done && r.text.includes({json.dumps(run)})"),
               "the running reply whole and done in the tab that loaded across its save", 30_000)
     finally:
-        open(hold, "w").close()
+        open(gate, "w").close()
         other.close()
-    os.remove(hold)
+    os.remove(gate)
 
 
 def _message_text_js(index: int) -> str:
