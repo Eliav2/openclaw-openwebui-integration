@@ -25,6 +25,7 @@ Everything here works as soon as the Pipe is installed, except entries marked:
 - [**Images and files from the agent**](./chat.md#images-and-files-from-the-agent) _(needs agent setup)_: `MEDIA:` files, and images an agent's own image tool made, are uploaded to the Open WebUI Files API and attached natively
 - [**Image input**](./chat.md#images-you-attach): images you attach are forwarded to the agent
 - [**Voice calls**](./chat.md#voice-calls): a message you speak in Open WebUI's voice mode reaches the agent with a note that the reply will be read aloud, so it answers in short spoken sentences without markup
+- [**Composer toggles**](./chat.md#what-the-composer-toggles-do): Open WebUI's web search, code interpreter, tools and integrations toggles do not reach the agent, which uses only the tools your Gateway gives it
 - [**Slash commands in the / menu**](./chat.md#slash-commands-as-prompts): the Gateway's slash commands as prompts in Open WebUI's `/` menu, kept in sync, without touching your own prompts
 - [**Usage and goal line**](./chat.md#usage-and-goal-line): context, rate-limit and goal state under every reply
 - [**Context compaction marked**](./chat.md#context-compaction): when the Gateway compacts the session mid-reply, the reply shows a collapsed "Context compacted" block where it happened
