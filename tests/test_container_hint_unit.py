@@ -57,6 +57,21 @@ class ContainerLoopbackHintTests(unittest.TestCase):
                 self.assertIn("gateway.bind", text)
                 self.assertEqual(ex.error["code"], ocp.GATEWAY_REFUSED_CODE)
 
+    def test_the_hint_keeps_the_valves_port_and_scheme(self):
+        # PR #246 review: localhost:19000 was pointed at host.docker.internal:18789.
+        self.assertIn("host.docker.internal:19000", str(refused_message("localhost:19000", in_container=True)))
+        self.assertNotIn(":18789", str(refused_message("localhost:19000", in_container=True)))
+        self.assertIn("wss://host.docker.internal:8443", str(refused_message("wss://localhost:8443", in_container=True)))
+
+    def test_the_hint_names_the_caveats_of_its_advice(self):
+        # PR #246 review: host networking shares localhost, lan listens on every
+        # interface, and tailscale serve needs the loopback bind.
+        text = str(refused_message("localhost:18789", in_container=True))
+        self.assertIn("--network host", text)
+        self.assertIn("every interface", text)
+        self.assertIn("firewall", text)
+        self.assertIn("tailscale serve keeps its loopback bind", text)
+
     def test_no_hint_outside_a_container(self):
         self.assertNotIn("container", str(refused_message("localhost:18789", in_container=False)))
 

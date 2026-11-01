@@ -4248,7 +4248,7 @@ class _GatewayConnection:
                 f"Could not connect to the OpenClaw Gateway at {host}:{port} "
                 f"({type(ex).__name__}: {ex}). Is the Gateway running, and is "
                 "the GATEWAY_URL valve pointing at it?"
-                + (_container_loopback_hint(host) if _refused_connect(ex) else ""),
+                + (_container_loopback_hint(host, port, tls) if _refused_connect(ex) else ""),
                 error={"code": GATEWAY_REFUSED_CODE} if _refused_connect(ex) else None,
             )
 
@@ -5291,19 +5291,26 @@ def _in_container() -> bool:
     return os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
 
 
-def _container_loopback_hint(host: str) -> str:
+def _container_loopback_hint(host: str, port: int, tls: bool = False) -> str:
     """Why a loopback Gateway address is refused from inside a container: there
-    localhost is the container itself, not the machine the Gateway runs on."""
+    localhost is the container itself, not the machine the Gateway runs on.
+    The suggested address keeps the valve's port and scheme. `gateway.bind lan`
+    listens on every interface (0.0.0.0), and `tailscale serve` needs the
+    loopback bind, so neither is suggested without its caveat."""
     if host not in _LOOPBACK_HOSTS and not host.startswith("127."):
         return ""
     if not _in_container():
         return ""
-    return (" Open WebUI runs in a container here, and inside a container "
-            f"{host} is the container itself, not the machine the Gateway runs on. "
-            "Point GATEWAY_URL at the host (host.docker.internal:18789, started with "
+    address = f"{'wss://' if tls else ''}host.docker.internal:{port}"
+    return (" Open WebUI runs in a container here. Unless it uses host networking "
+            f"(--network host, where this refusal means nothing listens on {host}:{port}), "
+            f"{host} inside it is the container itself, not the machine the Gateway runs on. "
+            f"Point GATEWAY_URL at the host ({address}, started with "
             "--add-host=host.docker.internal:host-gateway, or the host's LAN address) "
-            "and set gateway.bind to lan in the OpenClaw config so the Gateway "
-            "listens on it.")
+            "and have the Gateway listen there: gateway.bind lan in the OpenClaw config "
+            "listens on every interface, so firewall the port on a host the internet can "
+            "reach. A Gateway behind tailscale serve keeps its loopback bind: set "
+            "GATEWAY_URL to its wss:// address instead.")
 
 
 def _refused_connect(ex) -> bool:

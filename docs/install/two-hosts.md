@@ -30,7 +30,11 @@ If Open WebUI runs in Docker and the Gateway runs on the machine around it, `loc
 
 1. Start the Open WebUI container with `--add-host=host.docker.internal:host-gateway` (Docker Desktop on macOS and Windows already provides the name).
 2. Set `GATEWAY_URL` to `host.docker.internal:18789`, or to the host's LAN address.
-3. Set `gateway.bind` to `lan` in the OpenClaw config and restart the Gateway. The default, `loopback`, accepts connections only from the host itself, and a container is not the host.
+3. Set `gateway.bind` to `lan` in the OpenClaw config and restart the Gateway. The default, `loopback`, accepts connections only from the host itself, and a container is not the host. `lan` listens on every interface of the host, not only the one Docker uses: on a host the internet can reach, firewall the Gateway's port, or bind it to the Docker bridge address alone (`gateway.bind` `custom` with `gateway.customBindHost`, for example `172.17.0.1`). Authentication still applies either way.
+
+A container started with `--network host` shares the host's network, so `localhost` there is the host: a refused connection then means the Gateway is not running or not listening on that port.
+
+A Gateway behind `tailscale serve` must keep the `loopback` bind (OpenClaw refuses to start otherwise). Point `GATEWAY_URL` at its `wss://` address instead, see [below](#gateway-behind-a-tls-proxy).
 
 ### Gateway behind a TLS proxy
 
