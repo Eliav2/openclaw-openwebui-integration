@@ -126,7 +126,9 @@ def run_wizard(cfg: Config, *, need_gateway: bool) -> Config:
         console.print(
             "  [dim]Open WebUI connects to this address, so it must work from "
             "where Open WebUI runs. In Docker, localhost is the container: use "
-            "host.docker.internal:18789 or the host's LAN address.[/dim]"
+            "host.docker.internal:18789 or the host's LAN address, and set "
+            "gateway.bind on the Gateway so it listens there (see the docs' "
+            "Two hosts page: lan listens on every interface).[/dim]"
         )
         cfg.gateway_url = Prompt.ask(
             "OpenClaw gateway address (host:port)", default=cfg.gateway_url
