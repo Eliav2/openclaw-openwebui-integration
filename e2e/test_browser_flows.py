@@ -683,13 +683,19 @@ def _taken_over(page, token: str) -> None:
 def test_a_tab_that_loads_the_chat_across_the_running_replys_save_shows_it_whole(page, token):
     """A tab that loads the chat while the Pipe's writer saves the running
     reply (ELI-340): its chat GET read the reply before the save and found no
-    mid-turn copy after it. Here every load of the reloaded tab is answered
-    with the chat as it was before the save, and only once the reply is saved
-    whole. The tab shows the whole reply, done, without another reload.
+    mid-turn copy after it. Here the reloaded tab's GETs that read the chat
+    before the save are held, and answered with it only once the reply is
+    saved whole. The tab shows the whole reply, done, without another reload.
 
-    The run waits on a file (E2E_HOLD) until the reloaded tab's GET is held,
-    so that GET is answered from before the save by construction, not by a
-    timing window that a fast run could close (review on #244)."""
+    The run waits on a file (E2E_HOLD) until the tab's GETs are held, so they
+    are answered from before the save by construction, not by a timing window
+    that a fast run could close (review on #244). The tab makes two: its load,
+    and the refresh it makes once Open WebUI has put it in the chat's room.
+    The second is also what proves the room is joined, so the writer's push
+    reaches the tab; a join that came after the push would leave a tab that
+    no event reaches. A GET the tab makes after the save reads the saved
+    reply, as it would on a real server, and is answered from it: replaying a
+    stale response to it made the test fail whenever the join came late."""
     hold_token = f"across{os.getpid()}_{len(_fake_llm_requests())}"
     # e2e/fake_llm.py hold_file
     gate = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{hold_token}")
@@ -698,43 +704,48 @@ def test_a_tab_that_loads_the_chat_across_the_running_replys_save_shows_it_whole
     capture.send(page, f"E2E_HOLD {hold_token}")
     _wait(page, _reply_js(0, "r.text.includes('exec') && !r.done"), "the reply running its command")
     other = page.context.new_page()
+    chat_get = f"**/api/v1/chats/{_chat_id(page)}"
+    held, holding = [], [True]
+
+    def hold(route):
+        if holding[0]:
+            held.append((route, route.fetch()))
+        else:
+            route.continue_()
     try:
         other.goto(page.url)
         other.wait_for_selector("#chat-input", timeout=60_000)
         _type_and_send(other, "E2E_ECHO: BROWSER_ACROSS_ANSWER")
         _taken_over(page, token)
-        held, phase = [], ["hold"]
-        chat_get = f"**/api/v1/chats/{_chat_id(page)}"
-
-        def hold(route):
-            if phase[0] == "hold":
-                held.append((route, route.fetch()))
-            elif phase[0] == "stale":
-                # A GET that came in after the gate opened must not fetch the
-                # saved reply either: the tab is to load the stale one.
-                route.fulfill(response=held[0][1])
-            else:
-                route.continue_()
         page.route(chat_get, hold)
         page.reload()
         deadline = time.time() + 30
-        while not held:
-            assert time.time() < deadline, "the reloaded tab never asked for the chat"
+        while len(held) < 2:
+            assert time.time() < deadline, (
+                f"the reloaded tab made {len(held)} chat GET(s), not its load and the refresh it makes "
+                f"on joining the chat's room")
             page.wait_for_timeout(50)
-        # The precondition: the held GET read the reply while it still ran.
-        assert run not in held[0][1].text(), "the held chat GET already had the whole reply"
+        # The precondition: both read the reply while it still ran.
+        assert all(run not in response.text() for _, response in held), \
+            "a held chat GET already had the whole reply"
         open(gate, "w").close()
         _saved_whole(page, token, run)
-        phase[0] = "stale"
-        for route, _response in held:
-            route.fulfill(response=held[0][1])
+        holding[0] = False
+        # A GET that came in after the gate opened may have read the saved
+        # reply: it is held back until the tab shows the whole reply without it.
+        stale = [(r, resp) for r, resp in held if run not in resp.text()]
+        saved = [(r, resp) for r, resp in held if run in resp.text()]
+        for route, response in stale:
+            route.fulfill(response=response)
         page.wait_for_selector("#chat-input", timeout=60_000)
-        phase[0] = "fresh"
         _wait(page, _reply_js(0, f"r.done && r.text.includes({json.dumps(run)})"),
               "the running reply whole and done in the tab that loaded across its save", 30_000)
+        for route, response in saved:
+            route.fulfill(response=response)
     finally:
         open(gate, "w").close()
         other.close()
+        page.unroute(chat_get, hold)
     os.remove(gate)
 
 
