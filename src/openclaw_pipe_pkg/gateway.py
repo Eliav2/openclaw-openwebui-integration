@@ -403,7 +403,7 @@ _LADDER_CACHE_LOCK = threading.Lock()
 
 
 def _record_thinking_ladder(levels, model_key=None, authoritative=False,
-                             state_dir: str = "") -> None:
+                             state_dir: str = "") -> bool:
     """Fold a ladder we just saw into the cache, both as a union and per model.
 
     Two different consumers, two different needs, one file:
@@ -422,6 +422,10 @@ def _record_thinking_ladder(levels, model_key=None, authoritative=False,
 
     Best-effort by design: a failed write costs a stale dropdown and one more
     rejected turn, and must never affect the message being sent.
+
+    Returns True when the cache holds this ladder afterwards (written, or
+    already current) and False when the write failed, so a caller that
+    de-duplicates on it can retry after a failure.
     """
     known = [lv for lv in (levels or []) if lv in LEVEL_RANKS]
     path = _ladder_cache_path(state_dir)
@@ -455,12 +459,12 @@ def _record_thinking_ladder(levels, model_key=None, authoritative=False,
                     model_changed = True
 
         if merged == have and not model_changed:
-            return
+            return True
         payload = {"levels": merged, "updated": int(time.time())}
         if models:
             payload["models"] = models
         if not _write_json_file(path, payload):
-            return
+            return False
     if merged != have:
         pipe_log(f"thinking ladder cache updated: {merged}")
     if model_changed:
@@ -468,6 +472,7 @@ def _record_thinking_ladder(levels, model_key=None, authoritative=False,
             f"thinking ladder for {model_key}: {known} "
             f"({'stated by gateway' if authoritative else 'observed'})"
         )
+    return True
 
 
 def _read_model_thinking_ladder(model_key, state_dir: str = ""):

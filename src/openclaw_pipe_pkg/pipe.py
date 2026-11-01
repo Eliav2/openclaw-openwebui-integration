@@ -2308,10 +2308,12 @@ class _PipeTurn:
             if ladder:
                 self.session_thinking_ladder = ladder
                 if (self.session_model_key, ladder) != self._ladder_recorded:
-                    self._ladder_recorded = (self.session_model_key, ladder)
-                    _record_thinking_ladder(
-                        ladder, model_key=self.session_model_key,
-                        state_dir=getattr(self.pipe.valves, "STATE_DIR", ""))
+                    # Marked only once the cache holds it, so a failed write
+                    # is retried by the next probe instead of skipped.
+                    if _record_thinking_ladder(
+                            ladder, model_key=self.session_model_key,
+                            state_dir=getattr(self.pipe.valves, "STATE_DIR", "")):
+                        self._ladder_recorded = (self.session_model_key, ladder)
             if row.get("activeRunId") or status in _ACTIVE_RUN_STATES:
                 return True
         except Exception as ex:

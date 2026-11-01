@@ -703,12 +703,16 @@ def test_a_tab_that_loads_the_chat_across_the_running_replys_save_shows_it_whole
         other.wait_for_selector("#chat-input", timeout=60_000)
         _type_and_send(other, "E2E_ECHO: BROWSER_ACROSS_ANSWER")
         _taken_over(page, token)
-        held, holding = [], [True]
+        held, phase = [], ["hold"]
         chat_get = f"**/api/v1/chats/{_chat_id(page)}"
 
         def hold(route):
-            if holding[0]:
+            if phase[0] == "hold":
                 held.append((route, route.fetch()))
+            elif phase[0] == "stale":
+                # A GET that came in after the gate opened must not fetch the
+                # saved reply either: the tab is to load the stale one.
+                route.fulfill(response=held[0][1])
             else:
                 route.continue_()
         page.route(chat_get, hold)
@@ -721,10 +725,11 @@ def test_a_tab_that_loads_the_chat_across_the_running_replys_save_shows_it_whole
         assert run not in held[0][1].text(), "the held chat GET already had the whole reply"
         open(gate, "w").close()
         _saved_whole(page, token, run)
-        holding[0] = False
-        for route, response in held:
-            route.fulfill(response=response)
+        phase[0] = "stale"
+        for route, _response in held:
+            route.fulfill(response=held[0][1])
         page.wait_for_selector("#chat-input", timeout=60_000)
+        phase[0] = "fresh"
         _wait(page, _reply_js(0, f"r.done && r.text.includes({json.dumps(run)})"),
               "the running reply whole and done in the tab that loaded across its save", 30_000)
     finally:

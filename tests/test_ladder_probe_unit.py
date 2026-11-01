@@ -5,6 +5,7 @@ minutes, and filing reads and writes the ladder cache file on the event loop
 
 Run: uv run --with-requirements requirements-dev.txt pytest -q tests/test_ladder_probe_unit.py
 """
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -40,11 +41,16 @@ class LadderFiledOncePerTurn(unittest.IsolatedAsyncioTestCase):
         turn.conn = types.SimpleNamespace(send_request=send_request)
         return turn
 
-    async def probe(self, turn, *answers):
+    async def probe(self, turn, *answers, results=()):
         filed = []
         self.answers = list(answers)
-        with mock.patch.object(ocp, "_record_thinking_ladder",
-                               lambda levels, model_key=None, **k: filed.append((model_key, list(levels)))):
+        outcomes = iter(results)
+
+        def record(levels, model_key=None, **k):
+            filed.append((model_key, list(levels)))
+            return next(outcomes, True)
+
+        with mock.patch.object(ocp, "_record_thinking_ladder", record):
             for _ in answers:
                 self.assertTrue(await turn._session_run_active())
         return filed
@@ -63,6 +69,18 @@ class LadderFiledOncePerTurn(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(filed, [("anthropic/opus", ["off", "high"]),
                                  ("anthropic/opus", ["off", "low", "high"]),
                                  ("anthropic/sonnet", ["off", "low", "high"])])
+
+    async def test_a_failed_write_is_retried_by_the_next_probe(self):
+        turn = self.turn()
+        filed = await self.probe(turn, *[describe()] * 4, results=(False, False, True))
+        self.assertEqual(filed, [("anthropic/opus", ["off", "high"])] * 3)
+
+    async def test_the_recorder_reports_failure_and_unchanged(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertTrue(ocp._record_thinking_ladder(["off", "high"], model_key="m", state_dir=d))
+            self.assertTrue(ocp._record_thinking_ladder(["off", "high"], model_key="m", state_dir=d))
+            with mock.patch.object(ocp, "_write_json_file", return_value=False):
+                self.assertFalse(ocp._record_thinking_ladder(["off", "low", "high"], model_key="m", state_dir=d))
 
 
 if __name__ == "__main__":
