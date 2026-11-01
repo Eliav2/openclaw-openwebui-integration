@@ -1457,6 +1457,8 @@ class _TurnWriter:
         the transcript covers nothing."""
         spans = [_history_span_messages(hist, r, self.run_started.get(r)) for r in self.runs]
         if any(s is None for s in spans):
+            pipe_log(f"  turn writer: the transcript does not show {self.message_id[:8]}...'s "
+                     f"{len(self.runs)} run(s) closed; keeping what streamed")
             return None
         out, text = self.renderer.output, self.renderer.text
         starts = {run: (o, t) for run, o, t in self.run_marks}
