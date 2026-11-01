@@ -4,9 +4,13 @@ run only one shard's tests when E2E_SHARD is set (ELI-246, at the end).
 A task cancelled inside one of Open WebUI's DB writes can keep SQLite's write
 lock for good (ELI-205): every write after it fails, so each later test waited
 out its whole timeout for a reply that could not come (20 tests x 60 s on run
-39136858463). A thread follows Open WebUI's log while the tests run; the
-moment a line says "database is locked" it interrupts the test that is
-running, and the run ends naming that test and the line.
+39136858463). A thread follows Open WebUI's log while the tests run. When a
+line says "database is locked", it asks the database for its write lock from
+another process, waiting up to LOCK_WAIT_S. Still locked: it interrupts the
+test that is running, and the run ends naming that test and the line. Free: the
+lock was contention that cleared (two writers at once; the busy one gave up),
+not a wedge. The test it hit fails on its own if it lost a write, the run goes
+on, and the summary lists every such line.
 """
 
 import _thread
@@ -20,11 +24,40 @@ import pytest
 
 CONTAINER = "owui"
 LOCKED = "database is locked"
+DB = "/app/backend/data/webui.db"
+# How long the check waits for the write lock: twice Open WebUI's own busy
+# timeout (5 s), so a writer that held it as long as Open WebUI allows is done.
+LOCK_WAIT_S = 10
 # How soon the follower looks again after `docker logs -f` ends, which it does
 # whenever a test stops or restarts Open WebUI.
 RESTART_POLL_S = 1.0
 
-_state = {"test": "(between tests)", "line": None, "during": None}
+_state = {"test": "(between tests)", "line": None, "during": None, "cleared": []}
+
+_CHECK = (f"import sqlite3; c = sqlite3.connect({DB!r}, timeout={LOCK_WAIT_S}); "
+          "c.execute('BEGIN IMMEDIATE'); c.rollback(); print('free')")
+
+
+def _still_locked() -> bool:
+    """Whether another process still cannot take the database's write lock
+    after waiting LOCK_WAIT_S. A check that cannot run counts as locked: the
+    run ends as it did before this check existed."""
+    try:
+        out = subprocess.run(["docker", "exec", CONTAINER, "python3", "-c", _CHECK],
+                             capture_output=True, text=True, timeout=LOCK_WAIT_S + 20)
+    except Exception:
+        return True
+    return out.returncode != 0 or out.stdout.strip() != "free"
+
+
+def _on_lock_line(line: str, still_locked=_still_locked) -> bool:
+    """Handle one "database is locked" line. True: a wedge, end the run."""
+    line, test = line.strip()[:300], _state["test"]
+    if still_locked():
+        _state["line"], _state["during"] = line, test
+        return True
+    _state["cleared"].append((test, line))
+    return False
 
 
 def _follow(stop: threading.Event) -> None:
@@ -35,8 +68,7 @@ def _follow(stop: threading.Event) -> None:
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
         _state["proc"] = proc
         for line in proc.stdout:
-            if LOCKED in line and _state["line"] is None:
-                _state["line"], _state["during"] = line.strip()[:300], _state["test"]
+            if LOCKED in line and _state["line"] is None and _on_lock_line(line):
                 _thread.interrupt_main()
                 proc.kill()
                 return
@@ -46,8 +78,19 @@ def _follow(stop: threading.Event) -> None:
 
 
 def _reason() -> str:
-    return (f"Open WebUI's database is locked (ELI-205), so every later test would time out. "
-            f"Running: {_state['during']}. Log: {_state['line']}")
+    return (f"Open WebUI's database is locked (ELI-205) and still was {LOCK_WAIT_S} s later, "
+            f"so every later test would time out. Running: {_state['during']}. Log: {_state['line']}")
+
+
+def pytest_terminal_summary(terminalreporter):
+    cleared = _state["cleared"]
+    if not cleared:
+        return
+    terminalreporter.section("Open WebUI database lock that cleared")
+    terminalreporter.write_line(f"{len(cleared)} \"{LOCKED}\" line(s); another process could write "
+                                f"within {LOCK_WAIT_S} s each time, so the run went on:")
+    for test, line in cleared:
+        terminalreporter.write_line(f"  {test}: {line}")
 
 
 @pytest.fixture(scope="session", autouse=True)

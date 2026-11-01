@@ -122,9 +122,12 @@ for the Gateway's crash-loop window). The openclaw download and Playwright's
 Chromium are cached, keyed on their exact versions.
 
 If Open WebUI logs `database is locked` during an E2E run, `e2e/conftest.py`
-interrupts the running test and ends the run (exit code 3), naming that test
-and the log line: a lock that is never released (ELI-205) would otherwise
-fail every later test at its timeout.
+asks the database for its write lock from another process, waiting up to 10 s.
+Still locked: it interrupts the running test and ends the run (exit code 3),
+naming that test and the log line, since a lock that is never released
+(ELI-205) would fail every later test at its timeout. Free: it was two writers
+at once and the lock cleared; the run goes on, and its summary lists the line
+under "Open WebUI database lock that cleared".
 
 **Drop gates.** Two Open WebUI bugs have Pipe workarounds: an `execute` that
 takes an open input dialog's answer (ELI-195, held by `emit.py`) and a
