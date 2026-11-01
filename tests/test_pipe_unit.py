@@ -3322,6 +3322,56 @@ class TurnRendererTests(unittest.TestCase):
         r.feed({"stream": "assistant", "data": {"text": "Hello world"}})
         self.assertEqual(r.visible_text, "Hello world")
 
+    def _reply(self, r, item, *words):
+        for n, word in enumerate(words):
+            data = {"delta": word, "itemId": item}
+            if n == 0:
+                data["text"] = word
+            r.feed({"stream": "assistant", "data": data})
+
+    def test_a_second_reply_of_one_run_starts_on_a_new_paragraph(self):
+        """A sub-agent's announce steered into a run that is still answering
+        the first one is answered as a second reply (`itemId` `<id>:2`): the
+        streamed text must break there as the transcript rebuild does, or a
+        turn that finalizes from what streamed saves "heard-6E2E_TWIN_B"."""
+        r = _TurnRenderer()
+        self._reply(r, "run-1:1", "E2E_TWIN_A_HEARD", " heard-1")
+        self._reply(r, "run-1:2", "E2E_TWIN_B_HEARD", " heard-1")
+        self.assertEqual(r.text, "E2E_TWIN_A_HEARD heard-1\n\nE2E_TWIN_B_HEARD heard-1")
+        self.assertEqual(r.visible_text, r.text)
+        self.assertEqual([i["content"][0]["text"] for i in r.output], [r.text])
+        reply = lambda text: {"role": "assistant", "stopReason": "stop",  # noqa: E731
+                              "__openclaw": {"runId": "announce:a"}, "content": [{"type": "text", "text": text}]}
+        rebuilt = _history_renderer([reply("E2E_TWIN_A_HEARD heard-1"), reply("E2E_TWIN_B_HEARD heard-1")])
+        self.assertEqual(r.text, rebuilt.text)
+
+    def test_one_reply_and_replies_without_an_item_id_stay_as_they_came(self):
+        r = _TurnRenderer()
+        self._reply(r, "run-1:1", "One", " reply", " in", " pieces")
+        self.assertEqual(r.text, "One reply in pieces")
+        r = _TurnRenderer()   # a claude-cli run: no `itemId`, its own breaks inside the delta
+        r.feed({"stream": "assistant", "data": {"delta": "First."}})
+        r.feed({"stream": "assistant", "data": {"delta": "\n\nSecond."}})
+        self.assertEqual(r.text, "First.\n\nSecond.")
+
+    def test_a_pipe_note_between_two_replies_does_not_hide_the_break(self):
+        r = _TurnRenderer()
+        self._reply(r, "run-1:1", "First.")
+        r.feed({"stream": openclaw_pipe.PIPE_NOTE_STREAM,
+                "data": {"id": f"{openclaw_pipe._NOTE_ITEM_PREFIX}compaction_x_1", "text": "Compacted."}})
+        self._reply(r, "run-1:2", "Second.")
+        self.assertEqual(r.text, "First.\n\nSecond.")
+
+    def test_a_card_between_two_replies_adds_no_break_of_its_own(self):
+        r = _TurnRenderer()
+        self._reply(r, "run-1:1", "Checking.")
+        r.feed({"stream": "tool", "data": {"phase": "start", "name": "Bash",
+                                           "toolCallId": "t1", "args": {"cmd": "ls"}}})
+        r.feed({"stream": "tool", "data": {"phase": "result", "name": "Bash",
+                                           "toolCallId": "t1", "result": "ok"}})
+        self._reply(r, "run-1:2", "Done.")
+        self.assertEqual(r.text, "Checking.Done.")
+
     def test_filters_sender_metadata(self):
         r = _TurnRenderer()
         r.feed({"stream": "assistant", "data": {"delta": "Sender (untrusted metadata) ..."}})

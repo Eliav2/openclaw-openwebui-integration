@@ -5771,6 +5771,9 @@ class _TurnRenderer:
         self.text = ""
         self.output: list[dict] = []
         self._assistant_stream_text = ""
+        # The Gateway numbers a run's replies (`itemId` `<id>:1`, `:2`...): a
+        # message steered into a run is answered as a reply of its own.
+        self._assistant_item_id: str | None = None
         self._last_item_text = ""
         self._active_tool_args: dict[str, str] = {}
         # A result may carry no tool name (claude-cli's `tool_result`).
@@ -5833,6 +5836,21 @@ class _TurnRenderer:
         self.output, self.text = kept, self.text[cut:]
         self.visible_text = self.text
         return True
+
+    def _mark_new_reply(self, item_id) -> None:
+        """A second reply of one run starts right after the first, with nothing
+        between them but the Gateway's `itemId` changing: it needs the break
+        the transcript rebuild puts there (`_history_events`), or the two run
+        together ("heard-6E2E_TWIN_B", ELI-271 on a sub-agent's announce
+        steered into a running reply). A card between them has its own break;
+        a Pipe note (a compaction) is no reply and is looked past."""
+        if not isinstance(item_id, str) or not item_id:
+            return
+        previous, self._assistant_item_id = self._assistant_item_id, item_id
+        last = next((i for i in reversed(self.output)
+                     if not str(i.get("id", "")).startswith(_NOTE_ITEM_PREFIX)), None)
+        if previous and previous != item_id and last is not None and last.get("type") == "message":
+            self.run_boundary = True
 
     def _add(self, chunk: str) -> None:
         if chunk:
@@ -5972,7 +5990,6 @@ class _TurnRenderer:
         stream = payload.get("stream")
         name = data.get("name", "")
         phase = data.get("phase", "")
-
         if stream == "assistant":
             raw_delta = data.get("delta")
             if raw_delta:
@@ -5994,6 +6011,7 @@ class _TurnRenderer:
                     pipe_log("  filtered metadata block")
                     return events
                 self._assistant_stream_text += delta
+                self._mark_new_reply(data.get("itemId"))
                 events.append(self._add_text(delta))
 
         if stream == "item":
@@ -10384,6 +10402,8 @@ class _TurnWriter:
         the transcript covers nothing."""
         spans = [_history_span_messages(hist, r, self.run_started.get(r)) for r in self.runs]
         if any(s is None for s in spans):
+            pipe_log(f"  turn writer: the transcript does not show {self.message_id[:8]}...'s "
+                     f"{len(self.runs)} run(s) closed; keeping what streamed")
             return None
         out, text = self.renderer.output, self.renderer.text
         starts = {run: (o, t) for run, o, t in self.run_marks}
