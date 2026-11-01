@@ -97,6 +97,13 @@ const home = {
 };
 
 // withMermaid renders ```mermaid blocks (the Architecture diagram) as SVG, in the site's light or dark theme.
+// Heading ids as github.com makes them (github-slugger): lowercase, every character that is not a
+// letter, digit, mark, `_`, `-` or space dropped, spaces to hyphens. VitePress's own slugify turns
+// `_` and `'` into hyphens, so `#owner_users` or `#the-agents-privileges` would work on GitHub and
+// land nowhere on the site. scripts/check_site_anchors.py checks the built site.
+const githubSlug = (s: string) =>
+  s.trim().toLowerCase().replace(/[^\p{L}\p{M}\p{N}\p{Pc}\- ]/gu, "").replace(/ /g, "-");
+
 export default withMermaid(defineConfig({
   title: SITE_TITLE,
   description: TAGLINE,
@@ -104,6 +111,7 @@ export default withMermaid(defineConfig({
   cleanUrls: true,
   head: [["link", { rel: "icon", type: "image/svg+xml", href: `${base}logo.svg` }]],
   markdown: {
+    anchor: { slugify: githubSlug },
     config(md) {
       repoLinks(md);
       demoVideos(md);
