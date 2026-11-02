@@ -911,6 +911,19 @@ class ClaudeCliUsageFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"label": "Prepaid balance"', limits_code)
         self.assertIn('"value": "$0.00"', limits_code)
 
+    async def test_budget_and_unlabelled_billing_rows_are_kept(self):
+        entry = {"provider": "xai", "displayName": "Grok", "windows": [], "billing": [
+            {"type": "budget", "label": "Monthly cap", "used": 3.5, "limit": 10, "unit": "USD"},
+            {"type": "spend", "amount": 1.25, "unit": "USD"},
+            {"type": "balance", "amount": 120, "unit": "credits"},
+            {"type": "budget", "used": "n/a", "limit": 10, "unit": "USD"},
+        ]}
+        _, limits_code = await self._run({"providers": [entry]}, AssertionError("no fallback"), provider="xai")
+        self.assertIn('{"label": "Monthly cap", "value": "$3.50 of $10.00"}', limits_code)
+        self.assertIn('{"label": "Spend", "value": "$1.25"}', limits_code)
+        self.assertIn('{"label": "Balance", "value": "120 credits"}', limits_code)
+        self.assertNotIn("n/a", limits_code)
+
     async def test_an_entry_with_nothing_to_say_keeps_the_generic_note(self):
         bare = {"provider": "xai", "displayName": "SuperGrok", "windows": []}
         _, limits_code = await self._run({"providers": [bare]}, AssertionError("no fallback"), provider="xai")

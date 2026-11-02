@@ -1731,13 +1731,30 @@ def _limits_windows_for(usage, provider) -> list:
     return windows_data
 
 
-def _billing_value(row) -> str:
-    amount, unit = row.get("amount"), row.get("unit")
-    if not isinstance(amount, (int, float)) or isinstance(amount, bool):
-        return ""
+_BILLING_LABELS = {"balance": "Balance", "spend": "Spend", "budget": "Budget"}
+
+
+def _billing_number(value, unit) -> str:
     if unit == "USD":
-        return f"${amount:,.2f}"
-    return f"{amount:g} {unit}" if unit else f"{amount:g}"
+        return f"${value:,.2f}"
+    return f"{value:g} {unit}" if unit else f"{value:g}"
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _billing_value(row) -> str:
+    """A `usage.status` billing row's figure: "$0.00" for a balance or spend,
+    "$3.50 of $10.00" for a budget. Empty when the row carries no number."""
+    unit = row.get("unit")
+    if row.get("type") == "budget":
+        used, limit = row.get("used"), row.get("limit")
+        if _is_number(used) and _is_number(limit):
+            return f"{_billing_number(used, unit)} of {_billing_number(limit, unit)}"
+        return ""
+    amount = row.get("amount")
+    return _billing_number(amount, unit) if _is_number(amount) else ""
 
 
 def _limits_entry_for(usage, provider):
@@ -1752,8 +1769,9 @@ def _limits_entry_for(usage, provider):
         billing = []
         for b in p.get("billing") or []:
             value = _billing_value(b)
-            if b.get("label") and value:
-                billing.append({"label": b["label"], "value": value})
+            label = b.get("label") or _BILLING_LABELS.get(b.get("type"))
+            if label and value:
+                billing.append({"label": label, "value": value})
         plan, summary = p.get("plan") or None, p.get("summary") or None
         if not (plan or summary or billing):
             return None
