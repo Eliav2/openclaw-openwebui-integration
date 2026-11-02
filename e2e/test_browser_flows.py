@@ -1618,8 +1618,13 @@ def title_events(page):
     """The `chat:title` events the open tab's socket receives, as
     (seconds since the test began, chat id, title), for a failure message: a
     title that never shows is either an event that never came or one the tab
-    did not act on, and only this tells the two apart."""
+    did not act on, and only this tells the two apart. The tab's sockets
+    opening and closing are in the list too, as (seconds, "socket", "opened
+    #n" or "closed #n"): Open WebUI sends the title once, to the sockets in
+    the user's room, so a socket that was down when it went out never gets
+    it (ELI-345: a title that never came, once in about 320 runs)."""
     seen, began = [], time.time()
+    opened = [0]
 
     def on_frame(payload):
         text = payload if isinstance(payload, str) else payload.decode("utf-8", "replace")
@@ -1630,7 +1635,11 @@ def title_events(page):
         seen.append((round(time.time() - began, 2), chat and chat.group(1), title and title.group(1)))
 
     def on_socket(ws):
+        opened[0] += 1
+        number = opened[0]
+        seen.append((round(time.time() - began, 2), "socket", f"opened #{number}"))
         ws.on("framereceived", on_frame)
+        ws.on("close", lambda _ws: seen.append((round(time.time() - began, 2), "socket", f"closed #{number}")))
 
     page.on("websocket", on_socket)
     yield seen
