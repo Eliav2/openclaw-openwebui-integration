@@ -30,6 +30,7 @@ import uuid
 
 import pytest
 
+import transcript_scan
 from owui_version import has_fix_0_12_4
 
 pytestmark = pytest.mark.skipif(
@@ -277,7 +278,15 @@ def test_tool_call_persists_as_a_native_tool_card(token):
     assert "E2E_TOOL_DONE" in json.dumps(output) + (msg.get("content") or ""), dump
 
 
-def test_a_chat_read_as_a_reply_ends_shows_its_tool_cards(token):
+# How many replies the test below spends looking for its window, which is a few
+# awaits long. A reply puts a read in it 4 times in 10 (400 replies with six
+# readers on the E2E stack, under CPU load), so 12 replies without one were
+# about 1 run in 600 (CI: 1 of 242 since Open WebUI 0.12.5), and the test stops
+# at its third read anyway: a cap of 40 is only paid by a run that is unlucky.
+WINDOW_REPLIES = 40
+
+
+def test_a_chat_read_as_a_reply_ends_shows_its_tool_cards(token, record_testsuite_property):
     """A chat opened just as a reply ends shows the reply's tool cards
     (ELI-267). Open WebUI's chat read takes the saved message, then, a few
     awaits later, its live copy of a reply still streaming: a read that spans
@@ -287,12 +296,15 @@ def test_a_chat_read_as_a_reply_ends_shows_its_tool_cards(token):
     reply after reply, until reads have landed in that window; each must show
     the tool card. The reply has text on both sides of its card, so a read of
     the saved message (the Pipe's whole text, run together) tells itself
-    apart from a live one (Open WebUI's text of the output, an item a line)."""
+    apart from a live one (Open WebUI's text of the output, an item a line).
+    The junit record has how many replies it took and how many reads landed."""
     said = ("E2E_TOOL_SAID_START", "E2E_TOOL_SAID_END")   # e2e/fake_llm.py
     page = _Page(token)
     in_window, bare = [], []
+    replies = read_count = 0
     try:
-        for _ in range(12):
+        for _ in range(WINDOW_REPLIES):
+            replies += 1
             chat_id, aid = _send_in_chat(token, page, None, "E2E_TOOL_SAID")
             reads, ended = [], threading.Event()
 
@@ -315,6 +327,7 @@ def test_a_chat_read_as_a_reply_ends_shows_its_tool_cards(token):
             # A live read's text is Open WebUI's join of the output (its
             # `get_output_text`: one item per line); the saved message's whole
             # text is the Pipe's, run together.
+            read_count += len(reads)
             saved = [m for m in reads if m.get("done") is False
                      and all(s in (m.get("content") or "") for s in said) and m.get("content") != "\n".join(said)]
             in_window += saved
@@ -323,7 +336,10 @@ def test_a_chat_read_as_a_reply_ends_shows_its_tool_cards(token):
                 break
     finally:
         page.close()
-    assert in_window, "no read landed between the Pipe's end and Open WebUI's end save in 12 replies"
+    record_testsuite_property("tool_card_window_replies", replies)
+    record_testsuite_property("tool_card_window_reads", len(in_window))
+    assert in_window, (f"no read landed between the Pipe's end and Open WebUI's end save in {replies} replies "
+                       f"({read_count} reads)")
     assert not bare, (f"{len(bare)} of {len(in_window)} reads as the reply ended showed its text "
                       f"with no tool card: {json.dumps(bare[0])[:1500]}")
 
@@ -2078,18 +2094,33 @@ def test_a_plain_redeploy_mid_reply_leaves_the_reply_whole(token, redeploy):
 
 # ── ELI-96: a secret the agent requests is entered in a masked dialog ──────
 
+AGENTS_DIR = os.path.expanduser("~/.openclaw/agents")
+
+# Open WebUI's database as one read transaction sees it, run in its container
+# (see e2e/transcript_scan.py for why a live database is not read file by file).
+_OWUI_DB_SNAPSHOT = """
+import os, sqlite3, sys, tempfile
+source = sqlite3.connect("file:/app/backend/data/webui.db?mode=ro", uri=True, timeout=30)
+path = os.path.join(tempfile.mkdtemp(), "webui.db")
+target = sqlite3.connect(path)
+source.backup(target)
+target.close()
+sys.stdout.buffer.write(open(path, "rb").read())
+"""
+
+
 def _hits(needle: str) -> dict:
-    """How often `needle` shows up, by place: Open WebUI's database (with its
-    WAL) and backend log (the Pipe logs there), the Gateway's logs, the fake
-    model's request log (the model's context) and the session transcripts
-    (`.jsonl` up to 2026.9, the agent databases from 2026.10). The secret
-    store itself (the state database) is where the value belongs, so it is
-    not read."""
+    """How often `needle` shows up, by place: Open WebUI's database and backend
+    log (the Pipe logs there), the Gateway's logs, the fake model's request log
+    (the model's context) and each session transcript (`.jsonl` up to 2026.9,
+    one agent database each from 2026.10). The secret store itself (the state
+    database) is where the value belongs, so it is not read."""
     raw = needle.encode()
     hits = {}
-    for path in ("/app/backend/data/webui.db", "/app/backend/data/webui.db-wal"):
-        out = subprocess.run(["docker", "exec", "owui", "cat", path], capture_output=True, timeout=60)
-        hits[f"owui {path}"] = out.stdout.count(raw)
+    out = subprocess.run(["docker", "exec", "owui", "python3", "-c", _OWUI_DB_SNAPSHOT],
+                         capture_output=True, timeout=120)
+    assert out.returncode == 0, f"Open WebUI's database could not be read: {out.stderr.decode()[-500:]}"
+    hits["owui webui.db"] = out.stdout.count(raw)
     out = subprocess.run(["docker", "logs", "owui"], capture_output=True, timeout=60)
     hits["owui backend log (Pipe log)"] = (out.stdout + out.stderr).count(raw)
     log_dir = os.environ.get("E2E_LOG_DIR", "")
@@ -2097,18 +2128,36 @@ def _hits(needle: str) -> dict:
              "gateway file log": os.environ.get("E2E_GATEWAY_LOG")
              or time.strftime("/tmp/openclaw/openclaw-%Y-%m-%d.log"),
              "model requests": os.environ.get("E2E_FAKE_LLM_LOG", "")}
-    for root, _, names in os.walk(os.path.expanduser("~/.openclaw/agents")):
-        for n in names:
-            if n.endswith(".jsonl") or n.startswith("openclaw-agent.sqlite"):
-                files[f"transcript {n}"] = os.path.join(root, n)
     for place, path in files.items():
         if path and os.path.isfile(path):
             with open(path, "rb") as fh:
-                hits[place] = hits.get(place, 0) + fh.read().count(raw)
+                hits[place] = fh.read().count(raw)
+    for name, found in transcript_scan.transcript_hits(AGENTS_DIR, raw).items():
+        hits[f"transcript {name}"] = found["count"]
     return hits
 
 
-def test_a_requested_secret_is_entered_in_a_masked_dialog_and_kept_out_of_the_chat(token):
+def _transcript_report(needle: str) -> str:
+    """Every transcript file the scan reads, how it was read and what is in it,
+    for a failure message: a miss shows whether the file was there, empty, or
+    only lacked the string."""
+    return json.dumps(transcript_scan.transcript_hits(AGENTS_DIR, needle.encode()), indent=1)
+
+
+def _wait_for_transcript(text: str, timeout_s: float = 30) -> float:
+    """Seconds until some transcript holds `text`, which the scans below need
+    in it: they read the run's finished transcript, so its last message has to
+    be written. Polls the state, not the clock."""
+    began = time.time()
+    while not any(f["count"] for f in transcript_scan.transcript_hits(AGENTS_DIR, text.encode()).values()):
+        assert time.time() - began < timeout_s, (
+            f"no transcript holds {text!r} {timeout_s:.0f} s after the reply showed it: "
+            f"{_transcript_report(text)}")
+        time.sleep(0.25)
+    return time.time() - began
+
+
+def test_a_requested_secret_is_entered_in_a_masked_dialog_and_kept_out_of_the_chat(token, record_testsuite_property):
     """The agent's `secrets` request shows Open WebUI's masked input dialog
     on the chat's tab. The value typed there goes to the Gateway's secret
     store, the agent gets "stored", and the value is nowhere else: not in
@@ -2128,17 +2177,21 @@ def test_a_requested_secret_is_entered_in_a_masked_dialog_and_kept_out_of_the_ch
         msgs = _wait_for(token, chat_id, ["E2E_SECRET_RESULT stored"])
         listed = _gw("secrets.store.list", {})
         assert any(e.get("name") == name for e in listed.get("entries") or []), listed
+        # The scans read the run's finished transcript, so its last message
+        # (the reply the chat just showed) has to be in it. The seconds waited
+        # go in the junit record (the Gateway writes the last message a few
+        # seconds after the reply shows it).
+        record_testsuite_property("secret_scan_transcript_wait_s", round(_wait_for_transcript("E2E_SECRET_RESULT stored"), 2))
         # The scan reads the right files: the request (its name) is in the
         # transcript, the chat and the model's context.
         # A string message, so pytest prints every place it scanned and its
-        # count, not a dict cut at "...": a one-off miss on the transcript
-        # (run 41141834849) left no record of which files were read.
+        # count, not a dict cut at "...".
         found = _hits(name)
         scanned = json.dumps(found, indent=1)
-        for place in ("owui /app/backend/data/webui.db", "model requests"):
-            assert found.get(place) or found.get(place + "-wal"), f"{place} lacks {name}: {scanned}"
+        for place in ("owui webui.db", "model requests"):
+            assert found.get(place), f"{place} lacks {name}: {scanned}"
         assert any(v for k, v in found.items() if k.startswith("transcript")), (
-            f"no transcript holds {name}: {scanned}")
+            f"no transcript holds {name}: {scanned}\n{_transcript_report(name)}")
         hits = _hits(value)
         assert hits and set(hits.values()) == {0}, {k: v for k, v in hits.items() if v}
         assert value not in json.dumps(msgs)
