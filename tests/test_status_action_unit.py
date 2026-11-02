@@ -258,6 +258,38 @@ class DialogSectionTests(unittest.TestCase):
         self.assertIn("Rate limits", seen["limits"])
         self.assertIn("No rate-limit data available right now (a response is in progress).", seen["limits"])
 
+    @staticmethod
+    def _limits_entry(entry, windows=()):
+        return _render_limits_fill_js({"provider": "xai", "windows": list(windows), "entry": entry,
+                                       "sessionActive": False, "source": "pipe",
+                                       "fetchedAt": 1, "error": None})
+
+    def test_a_provider_without_windows_shows_its_plan_summary_and_billing(self):
+        entry = {"name": "SuperGrok", "plan": "SuperGrok", "summary": "Included usage omitted",
+                 "billing": [{"label": "Prepaid balance", "value": "$0.00"}]}
+        seen = self._page([self._limits_entry(entry)])
+        self.assertIn("SuperGrok · Included usage omitted", seen["limits"])
+        self.assertIn("Prepaid balance$0.00", seen["limits"])
+        self.assertNotIn("No rate-limit data", seen["limits"])
+
+    def test_a_provider_entry_without_a_summary_shows_name_and_plan(self):
+        entry = {"name": "Grok", "plan": "Heavy", "summary": None, "billing": []}
+        seen = self._page([self._limits_entry(entry)])
+        self.assertIn("Grok · Heavy", seen["limits"])
+
+    def test_windows_win_over_the_entry(self):
+        entry = {"name": "Codex", "plan": "Plus", "summary": "Included usage omitted",
+                 "billing": [{"label": "Credits", "value": "12 credits"}]}
+        window = {"label": "5h", "usedPercent": 50, "resetIn": None, "resetAtMs": None}
+        seen = self._page([self._limits_entry(entry, [window])])
+        self.assertIn("5h50% used", seen["limits"])
+        self.assertNotIn("Included usage omitted", seen["limits"])
+        self.assertNotIn("Credits", seen["limits"])
+
+    def test_no_entry_keeps_the_generic_note(self):
+        seen = self._page([self._limits_entry(None)])
+        self.assertIn("No rate-limit data available right now.", seen["limits"])
+
     def test_windows_show_without_the_note(self):
         seen = self._page([self._limits([{"label": "5h", "usedPercent": 50, "resetIn": None,
                                            "resetAtMs": None}])])
@@ -819,13 +851,13 @@ class ClaudeCliUsageFallbackTests(unittest.IsolatedAsyncioTestCase):
     Claude-CLI-only setup; the Rate Limits section falls back to the
     companion plugin's claudeCliUsage.status."""
 
-    async def _run(self, usage_status, cli_usage):
+    async def _run(self, usage_status, cli_usage, provider="anthropic"):
         emitted = []
         emitter = RecordingEmitter(emitted)
 
         async def fake_send_request(method, params, timeout=5):
             if method == "sessions.describe":
-                return {"session": {"modelProvider": "anthropic", "model": "claude-opus-5-5"}}
+                return {"session": {"modelProvider": provider, "model": "claude-opus-5-5"}}
             if method == "usage.status":
                 return usage_status
             if method == "sessions.list":
@@ -865,6 +897,28 @@ class ClaudeCliUsageFallbackTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("claudeCliUsage.status", methods)
         self.assertIn('"usedPercent": 72', limits_code)
+
+    XAI_ENTRY = {"provider": "xai", "displayName": "SuperGrok", "windows": [], "plan": "SuperGrok",
+                 "billing": [{"type": "balance", "label": "Prepaid balance", "amount": 0, "unit": "USD"}],
+                 "summary": "Included usage omitted"}
+
+    async def test_a_provider_with_a_plan_but_no_windows_is_reported(self):
+        methods, limits_code = await self._run({"providers": [self.XAI_ENTRY]}, AssertionError("no fallback"),
+                                               provider="xai")
+        self.assertNotIn("claudeCliUsage.status", methods)
+        self.assertIn('"summary": "Included usage omitted"', limits_code)
+        self.assertIn('"name": "SuperGrok"', limits_code)
+        self.assertIn('"label": "Prepaid balance"', limits_code)
+        self.assertIn('"value": "$0.00"', limits_code)
+
+    async def test_an_entry_with_nothing_to_say_keeps_the_generic_note(self):
+        bare = {"provider": "xai", "displayName": "SuperGrok", "windows": []}
+        _, limits_code = await self._run({"providers": [bare]}, AssertionError("no fallback"), provider="xai")
+        self.assertIn('"entry": null', limits_code)
+
+    async def test_no_provider_entry_has_no_entry(self):
+        _, limits_code = await self._run({"providers": []}, AssertionError("no fallback"), provider="xai")
+        self.assertIn('"entry": null', limits_code)
 
     async def test_gateway_without_plugin_keeps_empty_note(self):
         methods, limits_code = await self._run(

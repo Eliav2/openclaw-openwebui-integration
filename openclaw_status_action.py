@@ -7756,7 +7756,30 @@ _LIMITS_FILL_JS_TEMPLATE = r"""
     return;
   }
 
-  if (DATA.windows.length === 0) {
+  if (DATA.windows.length === 0 && DATA.entry) {
+    // The provider answered with a plan but no usage windows (xAI SuperGrok,
+    // ELI-327): its own words instead of the generic note.
+    const E = DATA.entry;
+    const parts = [E.name];
+    if (E.plan && E.plan !== E.name) parts.push(E.plan);
+    if (E.summary) parts.push(E.summary);
+    const head = document.createElement('div');
+    head.className = 'text-xs text-gray-600 dark:text-gray-300';
+    head.textContent = parts.join(' · ');
+    section.appendChild(head);
+    E.billing.forEach(function(b) {
+      const row = document.createElement('div');
+      row.className = 'mt-2 flex items-center justify-between text-xs '
+        + 'text-gray-600 dark:text-gray-300';
+      const labelEl = document.createElement('span');
+      labelEl.textContent = b.label;
+      const valueEl = document.createElement('span');
+      valueEl.textContent = b.value;
+      row.appendChild(labelEl);
+      row.appendChild(valueEl);
+      section.appendChild(row);
+    });
+  } else if (DATA.windows.length === 0) {
     const note = document.createElement('div');
     note.className = 'text-xs text-gray-400 dark:text-gray-500';
     note.textContent = 'No rate-limit data available right now'
@@ -8126,6 +8149,37 @@ def _limits_windows_for(usage, provider) -> list:
             })
         break
     return windows_data
+
+
+def _billing_value(row) -> str:
+    amount, unit = row.get("amount"), row.get("unit")
+    if not isinstance(amount, (int, float)) or isinstance(amount, bool):
+        return ""
+    if unit == "USD":
+        return f"${amount:,.2f}"
+    return f"{amount:g} {unit}" if unit else f"{amount:g}"
+
+
+def _limits_entry_for(usage, provider):
+    """What the active provider's `usage.status` entry says when it has no
+    usable windows (xAI SuperGrok answers a plan, a summary such as "Included
+    usage omitted" and billing rows only): its name, plan, summary and billing
+    rows for the Rate Limits section. None when there is no entry, or it has
+    none of plan, summary and billing to show."""
+    for p in (usage or {}).get("providers", []):
+        if p.get("provider") != provider:
+            continue
+        billing = []
+        for b in p.get("billing") or []:
+            value = _billing_value(b)
+            if b.get("label") and value:
+                billing.append({"label": b["label"], "value": value})
+        plan, summary = p.get("plan") or None, p.get("summary") or None
+        if not (plan or summary or billing):
+            return None
+        return {"name": p.get("displayName") or plan or provider, "plan": plan,
+                "summary": summary, "billing": billing}
+    return None
 
 
 async def _claude_cli_usage_windows(conn) -> list:
@@ -9538,6 +9592,8 @@ class Action:
             await emit(_render_limits_fill_js({
                 "provider": provider,
                 "windows": windows_data,
+                # Only read when there are no windows (the Rate limits section).
+                "entry": None if windows_data else _limits_entry_for(usage, provider),
                 # Only used to word the empty-windows note -- a live run is
                 # the one confirmed case (2026-07-11 live debugging) where
                 # usage.status can transiently report zero windows for the
