@@ -1336,7 +1336,30 @@ _LIMITS_FILL_JS_TEMPLATE = r"""
     return;
   }
 
-  if (DATA.windows.length === 0) {
+  if (DATA.windows.length === 0 && DATA.entry) {
+    // The provider answered with a plan but no usage windows (xAI SuperGrok,
+    // ELI-327): its own words instead of the generic note.
+    const E = DATA.entry;
+    const parts = [E.name];
+    if (E.plan && E.plan !== E.name) parts.push(E.plan);
+    if (E.summary) parts.push(E.summary);
+    const head = document.createElement('div');
+    head.className = 'text-xs text-gray-600 dark:text-gray-300';
+    head.textContent = parts.join(' · ');
+    section.appendChild(head);
+    E.billing.forEach(function(b) {
+      const row = document.createElement('div');
+      row.className = 'mt-2 flex items-center justify-between text-xs '
+        + 'text-gray-600 dark:text-gray-300';
+      const labelEl = document.createElement('span');
+      labelEl.textContent = b.label;
+      const valueEl = document.createElement('span');
+      valueEl.textContent = b.value;
+      row.appendChild(labelEl);
+      row.appendChild(valueEl);
+      section.appendChild(row);
+    });
+  } else if (DATA.windows.length === 0) {
     const note = document.createElement('div');
     note.className = 'text-xs text-gray-400 dark:text-gray-500';
     note.textContent = 'No rate-limit data available right now'
@@ -1706,6 +1729,55 @@ def _limits_windows_for(usage, provider) -> list:
             })
         break
     return windows_data
+
+
+_BILLING_LABELS = {"balance": "Balance", "spend": "Spend", "budget": "Budget"}
+
+
+def _billing_number(value, unit) -> str:
+    if unit == "USD":
+        return f"${value:,.2f}"
+    return f"{value:g} {unit}" if unit else f"{value:g}"
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _billing_value(row) -> str:
+    """A `usage.status` billing row's figure: "$0.00" for a balance or spend,
+    "$3.50 of $10.00" for a budget. Empty when the row carries no number."""
+    unit = row.get("unit")
+    if row.get("type") == "budget":
+        used, limit = row.get("used"), row.get("limit")
+        if _is_number(used) and _is_number(limit):
+            return f"{_billing_number(used, unit)} of {_billing_number(limit, unit)}"
+        return ""
+    amount = row.get("amount")
+    return _billing_number(amount, unit) if _is_number(amount) else ""
+
+
+def _limits_entry_for(usage, provider):
+    """What the active provider's `usage.status` entry says when it has no
+    usable windows (xAI SuperGrok answers a plan, a summary such as "Included
+    usage omitted" and billing rows only): its name, plan, summary and billing
+    rows for the Rate Limits section. None when there is no entry, or it has
+    none of plan, summary and billing to show."""
+    for p in (usage or {}).get("providers", []):
+        if p.get("provider") != provider:
+            continue
+        billing = []
+        for b in p.get("billing") or []:
+            value = _billing_value(b)
+            label = b.get("label") or _BILLING_LABELS.get(b.get("type"))
+            if label and value:
+                billing.append({"label": label, "value": value})
+        plan, summary = p.get("plan") or None, p.get("summary") or None
+        if not (plan or summary or billing):
+            return None
+        return {"name": p.get("displayName") or plan or provider, "plan": plan,
+                "summary": summary, "billing": billing}
+    return None
 
 
 async def _claude_cli_usage_windows(conn) -> list:
@@ -3118,6 +3190,8 @@ class Action:
             await emit(_render_limits_fill_js({
                 "provider": provider,
                 "windows": windows_data,
+                # Only read when there are no windows (the Rate limits section).
+                "entry": None if windows_data else _limits_entry_for(usage, provider),
                 # Only used to word the empty-windows note -- a live run is
                 # the one confirmed case (2026-07-11 live debugging) where
                 # usage.status can transiently report zero windows for the
