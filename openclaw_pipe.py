@@ -15064,7 +15064,17 @@ class _PipeTurn:
                     pipe_log(f"  chat.history for the sent run failed: {ex!r}")
                     break
                 found = _stub_turn(hist, reply_id, "")
-                if found is None or found["closed"] or not await self._session_run_active():
+                if found is None or found["closed"]:
+                    break
+                if not await self._session_run_active():
+                    # The run's closing message can land between the read
+                    # above and this check: read the turn once more, and
+                    # keep the earlier one only if that read gives nothing.
+                    try:
+                        hist = await self.conn.session_history(self.session_key, limit=RUN_HISTORY_LIMIT)
+                        found = _stub_turn(hist, reply_id, "") or found
+                    except Exception as ex:
+                        pipe_log(f"  chat.history after the run ended failed: {ex!r}")
                     break
                 rechecks = await self._wait_for_session_change(changed, rechecks)
             if found is not None:

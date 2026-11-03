@@ -2187,6 +2187,84 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sent, ["check the logs"], "the same message ran twice")
         self.assertEqual(out2, "Reading them.\n\nFound it.")
 
+    async def test_a_second_call_renders_the_reply_written_between_the_read_and_the_idle_check(self):
+        """CodeRabbit on #270: the duplicate-reply wait read the turn, then asked
+        whether the session was idle. The run's closing message written between
+        the two left the snapshot without it, and the second call replaced the
+        first answer with that partial reply. The turn is read again once the
+        session reads idle."""
+        gen1 = self._reply("check the logs", "m1")
+        first1 = asyncio.ensure_future(gen1.__anext__())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "Reading them.\n\nFound it."))
+        q.put_nowait(self._final("run-1"))
+        await self._collect(first1, gen1)
+        # The user turn is written, the run is not closed in the transcript yet.
+        self.history = {"messages": self._sent_history(self.keys[0])["messages"][:3]}
+        self.active = True
+
+        read, send_request = {"history": 0}, self.conn.send_request
+
+        async def write_after_the_read(method, params, timeout=10):
+            if method == "sessions.describe" and read["history"] == 1:
+                # The run ends: its closing message lands after the read above.
+                self.history = self._sent_history(self.keys[0])
+                self.active = False
+            if method == "chat.history":
+                read["history"] += 1
+            return await send_request(method, params, timeout)
+        self.conn.send_request = write_after_the_read
+
+        gen2 = self._reply("check the logs", "m1")
+        out2, _ = await asyncio.wait_for(
+            self._collect(asyncio.ensure_future(gen2.__anext__()), gen2), 5)
+        self.assertEqual(self.sent, ["check the logs"], "the same message ran twice")
+        self.assertEqual(out2, "Reading them.\n\nFound it.")
+
+    @staticmethod
+    async def _drain(gen):
+        return [c async for c in gen]
+
+    async def test_a_second_call_keeps_its_snapshot_when_the_read_after_the_idle_check_gives_nothing(self):
+        """The read after the idle check only improves the snapshot: when it
+        fails, or finds no turn, the earlier turn is rendered and the message
+        is not sent again."""
+        for n, outcome in enumerate(("fails", "no turn")):
+            mid = f"m{n}"
+            gen1 = self._reply("check the logs", mid)
+            first1 = asyncio.ensure_future(gen1.__anext__())
+            await self._until_registered(f"run-{n + 1}")
+            q = self._queue(f"run-{n + 1}")
+            q.put_nowait(self._delta(f"run-{n + 1}", "Reading them.\n\nFound it."))
+            q.put_nowait(self._final(f"run-{n + 1}"))
+            await self._collect(first1, gen1)
+            # The first answer is closed in the transcript, the Gateway still counts the run active.
+            self.history = self._sent_history(self.keys[n])
+            self.active = True
+            read, send_request = {"history": 0}, self.conn.send_request
+
+            async def second_read_gives_nothing(method, params, timeout=10, read=read, outcome=outcome):
+                if method == "sessions.describe":
+                    self.active = False
+                if method == "chat.history":
+                    read["history"] += 1
+                    if read["history"] == 2:
+                        if outcome == "fails":
+                            raise self.ocp.GatewayError("chat.history timed out")
+                        return {"messages": []}
+                return await send_request(method, params, timeout)
+            # Not closed, so the wait reaches the idle check and the second read.
+            self.history = {"messages": self.history["messages"][:3]}
+            self.conn.send_request = second_read_gives_nothing
+            try:
+                gen2 = self._reply("check the logs", mid)
+                with self.subTest(outcome):
+                    await asyncio.wait_for(self._drain(gen2), 5)
+            finally:
+                self.conn.send_request = send_request
+            self.assertEqual(len(self.sent), n + 1, f"{outcome}: the message was sent again")
+
     async def test_a_second_call_with_new_text_is_sent(self):
         """A second call for the same reply with different input is not a
         repeat (two such calls in the logs continue a reply after a tool)."""
