@@ -307,6 +307,25 @@ class SessionToolEventTests(unittest.IsolatedAsyncioTestCase):
         conn._mark_event_gap()
         self.assertTrue(ev.is_set(), "a gap may have lost the child's push")
 
+    async def test_any_push_for_a_session_wakes_its_waiters_not_only_one_with_run_state(self):
+        """2026.10.10 announces a cron wake's idle with `reason: cron-binding`,
+        `status: done` and no `hasActiveRun`. A waiter woken only by a push
+        with that field never read the row again (a queued message stayed
+        queued). Its consumers still get a row only when the push carries run
+        state."""
+        conn = _GatewayConnection(lambda: None)
+        seen = []
+        conn.row_to_consumers = lambda key, payload, *a, **k: seen.append(payload)
+        ev = conn.session_change_event(self.SK)
+        conn._on_sessions_changed({"sessionKey": "agent:main:other", "reason": "cron-binding", "status": "done"})
+        conn._on_sessions_changed({"reason": "cron-bindings-loaded"})
+        self.assertFalse(ev.is_set(), "another session's change, or one that names no session")
+        conn._on_sessions_changed({"sessionKey": self.SK, "reason": "cron-binding", "status": "done"})
+        self.assertTrue(ev.is_set())
+        self.assertEqual(seen, [], "no run state in it: nothing for the replies to apply")
+        conn._on_sessions_changed({"sessionKey": self.SK, "hasActiveRun": False, "status": "done"})
+        self.assertEqual(len(seen), 1)
+
     async def test_a_reply_counts_until_its_consumer_goes_and_its_end_wakes_the_waiters(self):
         """ELI-260: the Status dialog counts a chat as running while this
         connection streams a reply for it, whose run the Gateway may not have
@@ -1727,7 +1746,6 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.aborts = []
         self.active = False
         self.run_ended_at = None
-        self.describe_fails = False
         self.runtime = None
         self.keys = []
         self.history = {}
@@ -1749,8 +1767,6 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
                 self.aborts.append(params)
                 return {"aborted": True}
             if method == "sessions.describe":
-                if self.describe_fails:
-                    raise self.ocp.GatewayError("describe failed")
                 row = {"status": "running" if self.active else "done",
                        "agentRuntime": {"id": self.runtime}}
                 if self.active and self.run_ended_at:
@@ -1902,81 +1918,88 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
             out += chunk if isinstance(chunk, str) else ""
         self.assertIn("hi there", out)
 
-    async def test_a_run_the_gateway_ended_but_still_counts_is_read_again_without_a_push(self):
-        """2026.10.10, a cron wake that streamed into the chat: its row carries
-        `endedAt` and the turn writer finalized the reply, yet `sessions.describe`
-        and `sessions.list` kept saying running / hasActiveRun for as long as
-        the Gateway lived, because the clearing of that flag pushes no further
-        `sessions.changed` (the one at the end is sent while it is still set).
-        A message queued behind the wake never left the queue. A row that
-        names an end time but still counts as active is read again on a short
-        backoff, and the message goes out the moment the Gateway says idle. A
-        run with no end time is still waited for on its push alone."""
+    def _gateway_push(self, **fields):
+        """A `sessions.changed` for the chat's session, with exactly these fields."""
+        self.conn._on_sessions_changed({"sessionKey": self.SK, **fields})
+
+    async def test_a_message_queued_behind_a_wake_leaves_on_the_push_that_announces_the_idle(self):
+        """OpenClaw 2026.10.10, recorded with `lifecycle-map.mjs` in the
+        upstream drafts: a cron wake's last push, `phase: end`, still says
+        `hasActiveRun: true` and the row names `endedAt`. The idle follows in
+        a push with `reason: cron-binding` and `status: done` and NO
+        `hasActiveRun` field (on 2026.10.8 the end push already says false).
+        The queue woke only on pushes that carry `hasActiveRun`, so it never
+        looked again and a message queued behind the wake stayed queued until
+        the Gateway restarted. Any push for the session wakes the waiter; the
+        row it reads decides. No clock is involved."""
         self.run_ended_at = 1793702659908
         self.active = True
-        with mock.patch.object(self.ocp, "ENDED_RUN_RECHECK_S", (0.01, 0.02)):
-            gen = self._reply("hello", "m1")
-            first = asyncio.ensure_future(gen.__anext__())
-            await self._spin()
-            self.assertEqual(self.sent, [])
-            self.assertTrue(any("Queued: waiting" in str(e) for e in self.emitted))
-            reads = self.rpc.count("sessions.describe")
-            await asyncio.sleep(0.15)
-            self.assertGreater(self.rpc.count("sessions.describe"), reads + 2, "an ended run is read again")
-            self.assertEqual(self.sent, [], "sent while the Gateway still counted the run")
+        gen = self._reply("hello", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._spin()
+        self.assertEqual(self.sent, [])
+        self.assertTrue(any("Queued: waiting" in str(e) for e in self.emitted))
 
-            self.active = False         # cleared on the Gateway, nothing pushed
-            await self._until_registered("run-1")
-            self.assertEqual(self.sent, ["hello"])
-            q = self._queue("run-1")
-            q.put_nowait(self._delta("run-1", "hi there"))
-            q.put_nowait(self._final("run-1"))
-            out = await asyncio.wait_for(first, 5)
-            async for chunk in gen:
-                out += chunk if isinstance(chunk, str) else ""
-            self.assertIn("hi there", out)
+        self._gateway_push(phase="end", runId="wake-1", hasActiveRun=True, status="running")
+        await self._spin()
+        self.assertEqual(self.sent, [], "the end push still counts the run")
 
-    async def test_the_ended_run_is_still_read_again_when_a_describe_fails(self):
-        """The end time seen by the last successful describe stays: a failed
-        describe falls back to `sessions.list`, and that must not drop the
-        timed read-again, or a flag cleared without a push is never seen."""
+        self.active = False                       # cleared on the Gateway
+        self._gateway_push(reason="cron-binding", status="done")
+        await self._spin()
+        self.assertEqual(self.sent, ["hello"], "left on the push that carries no hasActiveRun")
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "hi there"))
+        q.put_nowait(self._final("run-1"))
+        out = await asyncio.wait_for(first, 5)
+        async for chunk in gen:
+            out += chunk if isinstance(chunk, str) else ""
+        self.assertIn("hi there", out)
+
+    async def test_a_row_that_looks_ended_is_not_released_while_the_gateway_counts_a_run(self):
+        """ELI-88: the release decision stays with the Gateway's own flag. A
+        run admitted but not started (recorded right after `chat.send`) shows
+        the PREVIOUS run's `endedAt`, no run id and `status: running`, the very
+        fields of a wake's stale flag, so a rule built on them (an end time, no
+        run id, nothing started since) would send into the starting run, where
+        claude-cli drops the message. However many pushes arrive, nothing is
+        sent until the Gateway says idle."""
         self.run_ended_at = 1793702659908
         self.active = True
-        with mock.patch.object(self.ocp, "ENDED_RUN_RECHECK_S", (0.01, 0.02)):
-            gen = self._reply("hello", "m1")
-            first = asyncio.ensure_future(gen.__anext__())
+        gen = self._reply("hello", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._spin()
+        reads = self.rpc.count("sessions.describe")
+        for push in ({"reason": "participants", "hasActiveRun": True, "status": "running"},
+                     {"reason": "send", "hasActiveRun": True, "status": "running"},
+                     {"reason": "cron-binding", "status": "running"},
+                     {"phase": "start", "runId": "r2", "hasActiveRun": True, "status": "running"}):
+            self._gateway_push(**push)
             await self._spin()
-            self.assertEqual(self.sent, [])
-            self.describe_fails = True      # from here the list probe alone answers
-            lists = self.rpc.count("sessions.list")
-            await asyncio.sleep(0.15)
-            self.assertGreater(self.rpc.count("sessions.list"), lists + 2, "read again through the list")
-            self.assertEqual(self.sent, [])
-            self.active = False
-            await self._until_registered("run-1")
-            self.assertEqual(self.sent, ["hello"])
-            q = self._queue("run-1")
-            q.put_nowait(self._delta("run-1", "hi there"))
-            q.put_nowait(self._final("run-1"))
-            out = await asyncio.wait_for(first, 5)
-            async for chunk in gen:
-                out += chunk if isinstance(chunk, str) else ""
-            self.assertIn("hi there", out)
+            self.assertEqual(self.sent, [], push)
+        self.assertEqual(self.rpc.count("sessions.describe"), reads + 4, "one read per push, nothing sent")
+        self.active = False
+        self._gateway_push(reason="agent.input.settled", hasActiveRun=False, status="done")
+        await self._until_registered("run-1")
+        self.assertEqual(self.sent, ["hello"])
+        first.cancel()
+        await asyncio.gather(first, return_exceptions=True)
 
-    async def test_a_running_run_without_an_end_time_is_not_polled(self):
-        """The counterpart: ELI-88 stays. Only a row that names an end time is
-        read again on a timer; a run still going waits for its push."""
+    async def test_a_push_for_another_session_does_not_read(self):
+        """Waking on every push of the session is not waking on every push: the
+        queue of one chat does not read the Gateway for another chat's change."""
         self.active = True
-        with mock.patch.object(self.ocp, "ENDED_RUN_RECHECK_S", (0.01, 0.02)):
-            gen = self._reply("hello", "m1")
-            first = asyncio.ensure_future(gen.__anext__())
-            await self._spin()
-            reads = self.rpc.count("sessions.describe")
-            await asyncio.sleep(0.15)
-            self.assertEqual(self.rpc.count("sessions.describe"), reads)
-            self.assertEqual(self.sent, [])
-            first.cancel()
-            await asyncio.gather(first, return_exceptions=True)
+        gen = self._reply("hello", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._spin()
+        reads = self.rpc.count("sessions.describe")
+        self.conn._on_sessions_changed({"sessionKey": "agent:main:other", "reason": "cron-binding", "status": "done"})
+        self.conn._on_sessions_changed({"reason": "cron-bindings-loaded"})
+        await self._spin()
+        self.assertEqual(self.rpc.count("sessions.describe"), reads)
+        first.cancel()
+        await asyncio.gather(first, return_exceptions=True)
 
     async def test_queued_message_survives_a_redeploy_retiring_its_connection(self):
         """ELI-172 (2026-10-17): a message typed at 12:03:56Z
@@ -2152,12 +2175,12 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sent, ["check the logs"])
         self.assertIn("Found it.", out2)
 
-    async def test_a_second_call_follows_an_ended_run_the_gateway_still_counts_active(self):
-        """The duplicate-reply wait takes the same timed re-read as the queue
-        (2026.10.10): the first run's row names `endedAt` but still counts as
-        active, the flag clears with no `sessions.changed`. The second call
-        must read the session again on the backoff, not wait on a push that
-        never comes, and still not send the text again."""
+    async def test_a_second_call_follows_an_ended_run_until_the_push_that_announces_the_idle(self):
+        """The duplicate-reply wait wakes like the queue (2026.10.10): the first
+        run's row names `endedAt` and the end push still says `hasActiveRun:
+        true`; the idle comes in a push with no `hasActiveRun` (`cron-binding`).
+        The second call must read again on that push, and still not send the
+        text again."""
         gen1 = self._reply("check the logs", "m1")
         first1 = asyncio.ensure_future(gen1.__anext__())
         await self._until_registered("run-1")
@@ -2170,20 +2193,20 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.run_ended_at = 1793702659908
         self.active = True
 
-        with mock.patch.object(self.ocp, "ENDED_RUN_RECHECK_S", (0.01, 0.02)):
-            gen2 = self._reply("check the logs", "m1")
-            first2 = asyncio.ensure_future(gen2.__anext__())
-            await self._spin()
-            self.assertFalse(first2.done(), "the second call waits for the run")
-            reads = self.rpc.count("sessions.describe")
-            await asyncio.sleep(0.15)
-            self.assertGreater(self.rpc.count("sessions.describe"), reads + 2,
-                               "an ended run is read again by the duplicate-reply wait")
-            self.assertFalse(first2.done())
+        gen2 = self._reply("check the logs", "m1")
+        first2 = asyncio.ensure_future(gen2.__anext__())
+        await self._spin()
+        self.assertFalse(first2.done(), "the second call waits for the run")
+        self._gateway_push(phase="end", runId="run-1", hasActiveRun=True, status="running")
+        await self._spin()
+        self.assertFalse(first2.done(), "the end push still counts the run")
 
-            self.active = False         # cleared on the Gateway, nothing pushed
-            self.history = self._sent_history(self.keys[0])
-            out2, _ = await asyncio.wait_for(self._collect(first2, gen2), 5)
+        self.active = False                       # cleared on the Gateway
+        self.history = self._sent_history(self.keys[0])
+        self._gateway_push(reason="cron-binding", status="done")
+        await self._spin()
+        self.assertTrue(first2.done(), "read again on the push that carries no hasActiveRun")
+        out2, _ = await asyncio.wait_for(self._collect(first2, gen2), 5)
         self.assertEqual(self.sent, ["check the logs"], "the same message ran twice")
         self.assertEqual(out2, "Reading them.\n\nFound it.")
 
