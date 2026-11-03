@@ -320,7 +320,8 @@ class SessionToolEventTests(unittest.IsolatedAsyncioTestCase):
         conn._on_sessions_changed({"sessionKey": "agent:main:other", "reason": "cron-binding", "status": "done"})
         conn._on_sessions_changed({"reason": "cron-bindings-loaded"})
         self.assertFalse(ev.is_set(), "another session's change, or one that names no session")
-        conn._on_sessions_changed({"sessionKey": self.SK, "reason": "cron-binding", "status": "done"})
+        conn._on_sessions_changed({"sessionKey": self.SK, "reason": "cron-binding", "status": "done",
+                                   "session": {"status": "done", "hasActiveRun": False, "activeRunIds": []}})
         self.assertTrue(ev.is_set())
         self.assertEqual(seen, [], "no run state in it: nothing for the replies to apply")
         conn._on_sessions_changed({"sessionKey": self.SK, "hasActiveRun": False, "status": "done"})
@@ -1927,7 +1928,8 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         upstream drafts: a cron wake's last push, `phase: end`, still says
         `hasActiveRun: true` and the row names `endedAt`. The idle follows in
         a push with `reason: cron-binding` and `status: done` and NO
-        `hasActiveRun` field (on 2026.10.8 the end push already says false).
+        top-level `hasActiveRun` (only its nested `session` row says false; on
+        2026.10.8 the end push already says false).
         The queue woke only on pushes that carry `hasActiveRun`, so it never
         looked again and a message queued behind the wake stayed queued until
         the Gateway restarted. Any push for the session wakes the waiter; the
@@ -1945,7 +1947,8 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sent, [], "the end push still counts the run")
 
         self.active = False                       # cleared on the Gateway
-        self._gateway_push(reason="cron-binding", status="done")
+        self._gateway_push(reason="cron-binding", status="done",
+                            session={"status": "done", "hasActiveRun": False, "activeRunIds": []})
         await self._spin()
         self.assertEqual(self.sent, ["hello"], "left on the push that carries no hasActiveRun")
         await self._until_registered("run-1")
@@ -2203,7 +2206,8 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
 
         self.active = False                       # cleared on the Gateway
         self.history = self._sent_history(self.keys[0])
-        self._gateway_push(reason="cron-binding", status="done")
+        self._gateway_push(reason="cron-binding", status="done",
+                            session={"status": "done", "hasActiveRun": False, "activeRunIds": []})
         await self._spin()
         self.assertTrue(first2.done(), "read again on the push that carries no hasActiveRun")
         out2, _ = await asyncio.wait_for(self._collect(first2, gen2), 5)
