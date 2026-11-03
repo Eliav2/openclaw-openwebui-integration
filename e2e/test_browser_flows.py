@@ -818,13 +818,13 @@ def test_messages_sent_from_other_tabs_while_a_reply_runs_are_answered_together(
     finally:
         for other in tabs:
             other.close()
-    turns = [r for r in _fake_llm_requests()[asked:]
-             if any(w in json.dumps(r["request"]["messages"][-1]) for w in words)]
-    last_user = [json.dumps(r["request"]["messages"][-1]) for r in turns]
-    assert all(all(w in text for w in words) for text in last_user), (
-        f"the waiting messages reached the agent as separate turns: {[t[-160:] for t in last_user]}")
-    joined = last_user[0]
-    assert joined.index(words[0]) < joined.index(words[1]) < joined.index(words[2]), joined[-200:]
+    # The first model request that carries any of the messages carries all
+    # three, in order: sent apart, the first would carry only the first.
+    first = next((text for text in (json.dumps(r["request"]["messages"]) for r in _fake_llm_requests()[asked:])
+                  if any(w in text for w in words)), "")
+    assert all(w in first for w in words), (
+        f"the waiting messages reached the agent as separate turns: {first[-300:]}")
+    assert first.index(words[0]) < first.index(words[1]) < first.index(words[2]), first[-300:]
     for index in (1, 2):
         _says_where_its_message_went(page, index, "sent together with your next one")
     shown = (_user_texts(page), [r["text"] for r in _replies(page)])

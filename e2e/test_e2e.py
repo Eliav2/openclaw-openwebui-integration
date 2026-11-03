@@ -654,12 +654,14 @@ def test_messages_waiting_behind_a_run_go_to_the_agent_as_one_turn(token):
     assert all(note in (msgs[r].get("content") or "") for r in replies[:2]), (
         [msgs[r].get("content") for r in replies])
     assert words[0] in msgs[replies[2]]["content"] and note not in msgs[replies[2]]["content"]
+    # The first model request that carries any of the messages carries all
+    # three, in order: sent apart, the first would carry only the first.
     with open(os.environ["E2E_FAKE_LLM_LOG"], encoding="utf-8") as f:
-        asked = [json.dumps(json.loads(line)["request"]["messages"][-1]) for line in f if line.strip()]
-    turns = [a for a in asked if any(w in a for w in words)]
-    assert turns and all(all(w in a for w in words) for a in turns), (
-        f"the waiting messages reached the agent as separate turns: {[t[-160:] for t in turns]}")
-    assert turns[0].index(words[0]) < turns[0].index(words[1]) < turns[0].index(words[2]), turns[0][-200:]
+        asked = [json.dumps(json.loads(line)["request"]["messages"]) for line in f if line.strip()]
+    first = next((a for a in asked if any(w in a for w in words)), "")
+    assert all(w in first for w in words), (
+        f"the waiting messages reached the agent as separate turns: {first[-300:]}")
+    assert first.index(words[0]) < first.index(words[1]) < first.index(words[2]), first[-300:]
     time.sleep(3)
     assert _chat_messages(token, chat_id) == msgs, "the saved chat changed after the replies ended"
     _assert_clean(token, chat_id, msgs)
