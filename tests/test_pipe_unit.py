@@ -3249,6 +3249,60 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(statuses[-1]["done"])
         self.assertEqual(closed, [])
 
+    def _record_publishes(self):
+        """The replies `_publish_chat_finished` was called for."""
+        published = []
+
+        async def publish(chat_id, message_id, user_id, text=None):
+            published.append((chat_id, message_id, user_id))
+        patch = mock.patch.object(self.ocp, "_publish_chat_finished", publish)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return published
+
+    async def _ended_reply(self):
+        task, out = self._owui_request("hello", "m1")
+        await self._until_registered("run-1")
+        self._queue("run-1").put_nowait(self._delta("run-1", "hi"))
+        self._queue("run-1").put_nowait(self._final("run-1"))
+        await asyncio.wait_for(task, 30)
+        await self._spin()
+
+    async def test_a_reply_that_ended_in_its_request_publishes_chat_finished(self):
+        """PUBLISH_CHAT_FINISHED: once the request of a reply that ended in it
+        is over (Open WebUI's own save of the message done), the reply is
+        published once."""
+        published = self._record_publishes()
+        self.pipe.valves.PUBLISH_CHAT_FINISHED = True
+        await self._ended_reply()
+        self.assertEqual(published, [("chat-1", "m1", "u1")])
+
+    async def test_no_chat_finished_when_the_valve_is_off(self):
+        published = self._record_publishes()
+        await self._ended_reply()
+        self.assertEqual(published, [])
+
+    async def test_a_cancelled_request_publishes_no_chat_finished(self):
+        """A Stop cancels the request: nothing finished to tell."""
+        published = self._record_publishes()
+        self._record_status_closes()
+        self.pipe.valves.PUBLISH_CHAT_FINISHED = True
+        at_end = asyncio.Event()
+
+        async def owui_end_work():
+            at_end.set()
+            await asyncio.Event().wait()
+        task, out = self._owui_request("hello", "m1", after_stream=owui_end_work)
+        await self._until_registered("run-1")
+        self._queue("run-1").put_nowait(self._delta("run-1", "hi"))
+        self._queue("run-1").put_nowait(self._final("run-1"))
+        await asyncio.wait_for(at_end.wait(), 30)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        await self._spin()
+        self.assertEqual(published, [])
+
 
 class GatewayImageBlockTests(unittest.IsolatedAsyncioTestCase):
     """ELI-322 (2026-10-25): GPT-6 on the Codex runtime made an image with
@@ -8607,6 +8661,140 @@ class TurnWriterOpenTests(_TurnWriterCase):
         self.assertFalse(await w.open())
         self.assertEqual(set(self.owui.msgs()), {"q1", "a1"})
 
+
+class TurnWriterChatFinishedTests(_TurnWriterCase):
+    """PUBLISH_CHAT_FINISHED: the turn writer publishes Open WebUI's
+    `chat.finished` once M's final save reads back whole (handed-over
+    replies and agent turns, which Open WebUI's own event misses or
+    announces too early), with source `openclaw-pipe`."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.valves = types.SimpleNamespace(AGENT_ID="main", PUBLISH_CHAT_FINISHED=True)
+        self.conn = _GatewayConnection(lambda: self.valves)
+        self.conn.session_history = mock.AsyncMock(return_value={"messages": []})
+        self.published = []
+
+        async def publish(chat_id, message_id, user_id, text=None):
+            self.published.append((chat_id, message_id, user_id, text))
+        p = mock.patch.object(openclaw_pipe, "_publish_chat_finished", publish)
+        p.start()
+        self.addCleanup(p.stop)
+
+    async def test_the_final_save_publishes_once(self):
+        w = self.writer()
+        await w.feed(_delta("Hello"))
+        await w.finalize()
+        await w.finalize()
+        self.assertEqual(self.published, [(self.CHAT, "m1", self.USER, "Hello")])
+
+    async def test_a_failed_final_save_publishes_nothing(self):
+        w = self.writer()
+        await w.feed(_delta("Hello"))
+        w._persist_final = mock.AsyncMock(return_value=([], False))
+        await w.finalize()
+        self.assertEqual(self.published, [])
+
+    async def test_a_stopped_reply_publishes_nothing(self):
+        w = self.writer()
+        await w.feed(_delta("Hello"))
+        await w.finalize(stopped=True)
+        self.assertEqual(self.published, [])
+
+    async def test_nothing_when_the_valve_is_off(self):
+        self.valves.PUBLISH_CHAT_FINISHED = False
+        w = self.writer()
+        await w.feed(_delta("Hello"))
+        await w.finalize()
+        self.assertEqual(self.published, [])
+
+
+class PublishChatFinishedTests(unittest.IsolatedAsyncioTestCase):
+    """`_publish_chat_finished`: the event as Open WebUI's middleware shapes
+    it (`publish_chat_finished_event`), through `publish_event` with a
+    request on Open WebUI's app, for a saved chat's finished message only."""
+
+    async def asyncSetUp(self):
+        self.app = types.SimpleNamespace(state=types.SimpleNamespace())
+        self.calls = []
+        self.message = {"id": "m1", "model": "openclaw_gateway.main", "done": True, "content": "saved text"}
+        test = self
+
+        async def publish_event(request, event, **kw):
+            test.calls.append((request, event, kw))
+
+        class Chats:
+            @staticmethod
+            async def get_message_by_id_and_message_id(chat_id, message_id):
+                return dict(test.message)
+
+            @staticmethod
+            async def get_chat_title_by_id(chat_id):
+                return "Trip plan"
+
+        class Users:
+            @staticmethod
+            async def get_user_by_id(user_id):
+                return {"id": user_id, "name": "U", "role": "user"}
+
+        class Config:
+            @staticmethod
+            async def get(key):
+                return {"webui.url": "https://chat.example/"}.get(key)
+
+        class Request:
+            def __init__(self, scope):
+                self.scope, self.app = scope, scope["app"]
+
+        def mod(name, **attrs):
+            m = types.ModuleType(name)
+            m.__dict__.update(attrs)
+            return m
+        p = mock.patch.dict(sys.modules, {
+            "open_webui": mod("open_webui"), "open_webui.main": mod("open_webui.main", app=self.app),
+            "open_webui.events": mod("open_webui.events", publish_event=publish_event,
+                                     EVENTS=types.SimpleNamespace(CHAT_FINISHED="chat.finished")),
+            "open_webui.models": mod("open_webui.models"),
+            "open_webui.models.chats": mod("open_webui.models.chats", Chats=Chats),
+            "open_webui.models.users": mod("open_webui.models.users", Users=Users),
+            "open_webui.models.config": mod("open_webui.models.config", Config=Config),
+            "open_webui.utils": mod("open_webui.utils"),
+            "open_webui.utils.chat_id": mod("open_webui.utils.chat_id",
+                                            is_saved_chat_id=lambda c: bool(c) and ":" not in c),
+            "starlette": mod("starlette"), "starlette.requests": mod("starlette.requests", Request=Request)})
+        p.start()
+        self.addCleanup(p.stop)
+
+    async def test_the_event_as_the_middleware_shapes_it(self):
+        await openclaw_pipe._publish_chat_finished("c1", "m1", "u1", "the reply")
+        (request, event, kw), = self.calls
+        self.assertIs(request.app, self.app, "the sinks and event functions read request.app")
+        self.assertEqual(event, "chat.finished")
+        self.assertEqual(kw["source"], "openclaw-pipe")
+        self.assertEqual((kw["subject_id"], kw["subject_type"], kw["message"]), ("c1", "chat", "Trip plan"))
+        self.assertEqual(kw["actor"]["id"], "u1")
+        self.assertEqual(kw["data"], {"user_id": "u1", "chat_id": "c1", "message_id": "m1",
+                                      "model_id": "openclaw_gateway.main", "title": "Trip plan",
+                                      "url": "https://chat.example/c/c1", "message": "the reply"})
+
+    async def test_without_text_the_saved_message_is_sent(self):
+        await openclaw_pipe._publish_chat_finished("c1", "m1", "u1")
+        self.assertEqual(self.calls[0][2]["data"]["message"], "saved text")
+
+    async def test_an_unfinished_message_is_not_published(self):
+        self.message["done"] = False
+        await openclaw_pipe._publish_chat_finished("c1", "m1", "u1")
+        self.assertEqual(self.calls, [])
+
+    async def test_a_temporary_chat_is_not_published(self):
+        await openclaw_pipe._publish_chat_finished("local:c1", "m1", "u1")
+        self.assertEqual(self.calls, [])
+
+    async def test_a_failing_publish_is_logged_not_raised(self):
+        async def boom(*a, **k):
+            raise RuntimeError("sink down")
+        sys.modules["open_webui.events"].publish_event = boom
+        await openclaw_pipe._publish_chat_finished("c1", "m1", "u1", "x")
 
 
 def _delta(text):

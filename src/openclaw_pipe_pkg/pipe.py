@@ -369,6 +369,16 @@ class Pipe:
                 "Uses a fast model; best-effort, non-blocking. Never replaces a title "
                 "the user chose."
         )
+        PUBLISH_CHAT_FINISHED: bool = Field(
+            default=False,
+            description="Publish Open WebUI's 'chat.finished' event when an OpenClaw reply "
+                "is saved, for every reply the Pipe writes (also cron, sub-agent and "
+                "other agent turns), with source 'openclaw-pipe'. Event functions "
+                "(such as a push notifier), event webhooks and notification "
+                "targets receive it. Open WebUI's own 'chat.finished' still fires "
+                "when the chat request ends, which for OpenClaw can be before the "
+                "reply does, so a consumer that gets both should keep this one."
+        )
         COMPOSER_STATUS_BUTTON: bool = Field(
             default=True,
             description="Add an OpenClaw 'Claw' button to the composer row of "
@@ -798,6 +808,13 @@ class Pipe:
                 if ((turn.status_open or _task.cancelled()) and not turn.parked
                         and not turn.handed_over and turn.reply):
                     spawn_background(_close_reply_status(turn.reply))
+                # A reply that ended in its request is saved by Open WebUI now;
+                # a handed-over one is published by its turn writer instead.
+                elif (not _task.cancelled() and _task.exception() is None and not turn.parked
+                        and not turn.handed_over and turn.reply
+                        and getattr(self.valves, "PUBLISH_CHAT_FINISHED", False)):
+                    r = turn.reply
+                    spawn_background(_publish_chat_finished(r["chat_id"], r["message_id"], r["user_id"]))
             request.add_done_callback(_request_ended)
         try:
             async with contextlib.aclosing(self._pipe_turn(

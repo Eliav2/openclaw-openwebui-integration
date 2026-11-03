@@ -114,6 +114,12 @@ Type: `bool`. Default: `True`.
 
 Auto-generate a chat title after the first exchange (like native OWUI). Uses a fast model; best-effort, non-blocking. Never replaces a title the user chose.
 
+### PUBLISH_CHAT_FINISHED
+
+Type: `bool`. Default: `False`.
+
+Publish Open WebUI's 'chat.finished' event when an OpenClaw reply is saved, for every reply the Pipe writes (also cron, sub-agent and other agent turns), with source 'openclaw-pipe'. Event functions (such as a push notifier), event webhooks and notification targets receive it. Open WebUI's own 'chat.finished' still fires when the chat request ends, which for OpenClaw can be before the reply does, so a consumer that gets both should keep this one.
+
 ### COMPOSER_STATUS_BUTTON
 
 Type: `bool`. Default: `True`.
