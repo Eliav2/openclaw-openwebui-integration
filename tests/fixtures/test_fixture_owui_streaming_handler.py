@@ -1,5 +1,5 @@
-"""Verbatim extraction of Open WebUI 0.13.0's
-`handle_responses_streaming_event` (`open_webui/utils/response.py`),
+"""Verbatim extraction of Open WebUI 0.12.3's
+`handle_responses_streaming_event` (`open_webui/utils/response.py:381-742`),
 used only to pin our event-emitting tests to OWUI's actual behavior instead of
 our belief about it (see ELI-75: a docstring-inferred belief about this exact
 function was wrong for months).
@@ -11,9 +11,8 @@ git tag). Re-checked 2026-10-17 against 0.12.2 and 0.12.3 (the 0.12.3 PyPI
 wheel's `utils/response.py`, byte-identical to the v0.12.3 tag): 0.12.3 moved
 the function from `middleware.py` to `response.py`, with no change in its
 code (AST-equal, `scripts/check_owui_fixture.py`). Re-checked 2026-10-25
-against the v0.12.4 tag: AST-equal again; and against v0.12.5. Re-extracted
-2026-11-03 from the v0.13.0 tag (`scripts/check_owui_fixture.py --ref v0.13.0
---print-upstream`). Changes since the previous 0.11.3 copy:
+against the v0.12.4 tag: AST-equal again. Changes since the previous
+0.11.3 copy:
 
 - 0.11.4: the `response.output_item.added` dedup now matches on `call_id`
   only when the existing item has the same `type`. A `function_call_output`
@@ -25,9 +24,6 @@ against the v0.12.4 tag: AST-equal again; and against v0.12.5. Re-extracted
   rather than -1.
 - 0.12.0: a bare `{"type": "error"}` event is handled and returned as
   `{'error': data}` metadata.
-- 0.13.0: `response.incomplete` ends the response like `response.completed`
-  (same arm: final output, usage). The Pipe never sends Responses events of
-  its own, so this changes nothing it emits.
 
 History: the copy before 0.11.3 was pinned to 0.11.0, where
 `response.output_item.added` appended unconditionally; 0.11.1 rewrote it to
@@ -372,7 +368,7 @@ def handle_responses_streaming_event(
 
         return current_output, None
 
-    elif event_type in ('response.completed', 'response.incomplete'):
+    elif event_type == 'response.completed':
         # State Machine Event: Completed
         response_data = data.get('response', {})
         final_output = response_data.get('output')

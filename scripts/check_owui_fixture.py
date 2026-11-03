@@ -31,6 +31,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURE = ROOT / "tests" / "fixtures" / "test_fixture_owui_streaming_handler.py"
+# The pinned release's copy (above) is the one the tests run. A release whose handler changed gets its
+# own copy next to it (..._v0_13_0.py for v0.13.0), so the compat watch can match "latest" and "main" while CI
+# stays on the pin. A ref passes when any copy matches.
+FIXTURES = sorted(FIXTURE.parent.glob("test_fixture_owui_streaming_handler*.py"))
 FUNCTION = "handle_responses_streaming_event"
 # 0.12.3 moved the handler from middleware.py to response.py.
 UPSTREAM = ("https://raw.githubusercontent.com/open-webui/open-webui/{ref}/"
@@ -86,19 +90,20 @@ def main() -> int:
         print(f"{FUNCTION} not found in open-webui@{args.ref} ({', '.join(MODULES)})", file=sys.stderr)
         return 2
     up_node, up_text = up
-    try:
-        fx_node, fx_text = find_function(FIXTURE.read_text(), str(FIXTURE))
-    except LookupError as exc:
-        print(exc, file=sys.stderr)
-        return 2
-
     if args.print_upstream:
         print(up_text)
         return 0
 
-    if normalized(up_node) == normalized(fx_node):
-        print(f"OK: vendored {FUNCTION} matches Open WebUI {args.ref}")
-        return 0
+    for path in FIXTURES:
+        try:
+            fx_node, fx_text = find_function(path.read_text(), str(path))
+        except LookupError as exc:
+            print(exc, file=sys.stderr)
+            return 2
+        if normalized(up_node) == normalized(fx_node):
+            print(f"OK: vendored {FUNCTION} ({path.name}) matches Open WebUI {args.ref}")
+            return 0
+    fx_text = find_function(FIXTURE.read_text(), str(FIXTURE))[1]
 
     print(f"DRIFT: vendored {FUNCTION} differs from Open WebUI {args.ref}.\n"
           f"Re-extract it (python3 scripts/check_owui_fixture.py --ref {args.ref} "

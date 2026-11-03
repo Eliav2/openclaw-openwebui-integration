@@ -100,12 +100,14 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
-      - name: Vendored handler matches the pinned Open WebUI
+      - name: Vendored handler matches the pinned and the next Open WebUI
         # The tool-card tests are only as true as this copy of upstream's code.
         run: |
           set -a; . e2e/versions.env; set +a
-          python3 scripts/check_owui_fixture.py --ref "$OWUI_REF"
-          python3 scripts/check_owui_frontend_fixture.py --ref "$OWUI_REF"
+          for ref in "$OWUI_REF" ${OWUI_NEXT_REF:+"$OWUI_NEXT_REF"}; do
+            python3 scripts/check_owui_fixture.py --ref "$ref"
+            python3 scripts/check_owui_frontend_fixture.py --ref "$ref"
+          done
 
   secrets:
     name: Secret scan
@@ -142,3 +144,16 @@ jobs:
     with:
       lane: next
       openclaw_version: next
+
+  e2e-owui-next:
+    # The Open WebUI release we are moving to (OWUI_NEXT_IMAGE in
+    # e2e/versions.env), on the pinned Gateway. Blocking, like E2E next: the
+    # pinned lane stays on what the live install runs, and this one shows the
+    # code also works on the upgrade. Drop it (or point it at the following
+    # release) once OWUI_IMAGE moves.
+    name: E2E OWUI next
+    needs: [lint, test]
+    uses: ./.github/workflows/e2e.yml
+    with:
+      lane: owui-next
+      owui_image: next
