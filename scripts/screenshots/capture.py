@@ -1254,7 +1254,7 @@ class Scenes:
         self._both_persisted(page)
 
     QUEUED = ("Is staging on the same commit?", "How long did the last rebuild take?",
-              "Post the summary in the forecast channel when it's done.")
+              "Post the summary in the forecast channel when done.")
 
     def _queued_together(self, page: Page, name: str) -> None:
         """Three messages sent from other tabs while the rebuild runs: they
