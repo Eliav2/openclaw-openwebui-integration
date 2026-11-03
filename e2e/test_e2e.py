@@ -639,14 +639,23 @@ def test_messages_waiting_behind_a_run_go_to_the_agent_as_one_turn(token):
     chat_id, _ = _chat_turn(token, "Respond with exactly: E2E_JOIN_CHAT")
     words = [f"E2E_JOIN_{w}_{uuid.uuid4().hex[:6]}" for w in ("A", "B", "C")]
     key = _session_key(token, chat_id)
-    _post_turn(token, chat_id, "E2E_SLOW:12 E2E_JOIN_RUN")
-    _until("the slow reply's run", lambda: _gw("sessions.describe", {"key": key})
-           .get("session", {}).get("hasActiveRun"), timeout_s=60, every_s=0.5)
-    replies = []
-    for word in words:
-        replies.append(_post_turn(token, chat_id, f"E2E_ECHO: {word}"))
-        time.sleep(0.5)  # three sends, in this order, as a person types them
-    msgs = _wait_for(token, chat_id, ["slow-12", words[0]])
+    hold_token = f"join{uuid.uuid4().hex[:8]}"
+    # e2e/fake_llm.py hold_file: the run goes on until the test lets it end.
+    gate = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{hold_token}")
+    _post_turn(token, chat_id, f"E2E_HOLD {hold_token}")
+    try:
+        _until("the held run", lambda: _gw("sessions.describe", {"key": key})
+               .get("session", {}).get("hasActiveRun"), timeout_s=60, every_s=0.5)
+        replies = []
+        for word in words:
+            replies.append(_post_turn(token, chat_id, f"E2E_ECHO: {word}"))
+            # In this order: each one's request is running before the next is sent.
+            _until(f"{word}'s request running", lambda n=len(replies): len(
+                (_request("GET", f"/api/tasks/chat/{chat_id}", token=token)[1] or {}).get("task_ids") or []) >= n + 1,
+                timeout_s=60, every_s=0.2)
+    finally:
+        open(gate, "w").close()
+    msgs = _wait_for(token, chat_id, ["E2E_HOLD_END", words[0]])
     _until("every reply done", lambda: all(
         _chat_messages(token, chat_id)[r].get("done") for r in replies))
     msgs = _chat_messages(token, chat_id)
@@ -665,6 +674,7 @@ def test_messages_waiting_behind_a_run_go_to_the_agent_as_one_turn(token):
     time.sleep(3)
     assert _chat_messages(token, chat_id) == msgs, "the saved chat changed after the replies ended"
     _assert_clean(token, chat_id, msgs)
+    os.remove(gate)
 
 
 # ── Owner users (OWNER_USERS) ─────────────────────────────────────────────────

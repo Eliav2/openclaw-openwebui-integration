@@ -5219,12 +5219,11 @@ def _extract_image_attachments(raw_content) -> list:
     return attachments
 
 
-def _numbered_attachments(attachments: list) -> list:
-    """`attachments` for one chat.send. Images of several messages sent
-    together are numbered in order (image-1, image-2, ...), as each message
-    names its own by its position and two can share a name."""
-    names = [a.get("fileName") for a in attachments]
-    if len(set(names)) == len(names):
+def _numbered_attachments(attachments: list, *, combined: bool) -> list:
+    """`attachments` for one chat.send. The images of several messages sent
+    together (`combined`) are numbered in order, image-1, image-2, ...: each
+    message names its own by its position in it, so two can share a name."""
+    if not combined:
         return attachments
     out = []
     for n, a in enumerate(attachments, 1):
@@ -9321,6 +9320,9 @@ def _keep_pipe_notes(streamed: list, renderer: "_TurnRenderer") -> None:
 REPLY_SENT_WITH_NEXT_NOTE = ("_(This message was sent together with your next one: "
                              "the answer is in the next reply.)_")
 REPLY_NOT_SENT_NOTE = "_(Stopped: this message was not sent to the agent.)_"
+# ... or the send that was to carry it failed: the next reply shows the error.
+REPLY_SEND_FAILED_NOTE = ("_(This message was to go together with your next one, "
+                          "which could not be sent: see the next reply.)_")
 
 
 async def _close_reply_status(ref: dict) -> None:
@@ -9387,12 +9389,14 @@ async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str) 
         pipe_log(f"  reply {message_id[:8]}...: closing note failed: {ex!r}")
 
 
-def _end_unsent_replies(conn: "_GatewayConnection", refs: list, *, sent: bool) -> None:
+def _end_unsent_replies(conn: "_GatewayConnection", refs: list, *, sent: bool,
+                        note: str | None = None) -> None:
     """End each reply in `refs` (see `_close_unsent_reply`) in the background:
-    its message went out with a later one (`sent`), or was dropped."""
+    its message went out with a later one (`sent`), or was dropped; `note`
+    says something else instead."""
+    note = note or (REPLY_SENT_WITH_NEXT_NOTE if sent else REPLY_NOT_SENT_NOTE)
     for ref in refs:
-        spawn_background(_close_unsent_reply(
-            conn, ref, REPLY_SENT_WITH_NEXT_NOTE if sent else REPLY_NOT_SENT_NOTE))
+        spawn_background(_close_unsent_reply(conn, ref, note))
 
 
 # Open WebUI cancels a response identically for Stop and for Send now (both
@@ -15122,18 +15126,25 @@ class _PipeTurn:
                 return
         self.register_target()
 
+    def end_waiting_replies_unsent(self) -> None:
+        """The send that was to carry the messages of `turn.waiting` failed:
+        those replies say so, pointing at this one's error."""
+        _end_unsent_replies(self.conn, self.turn.waiting, sent=False, note=REPLY_SEND_FAILED_NOTE)
+        self.turn.waiting = []
+
     def hand_on(self) -> bool:
         """Hand this reply's message to the newest reply of the session that
         waits to send, if there is one: it sends both as one turn, and ends
         this reply with `REPLY_SENT_WITH_NEXT_NOTE` once it did (or with the
         not-sent note, on a Stop), as for a reply interrupted while queued
         (ELI-188). Its messages go before that reply's own, after any handed
-        to it earlier."""
+        to it earlier. Not when a waiting reply asks for another thinking
+        level: one send has one level, and the messages keep their order."""
         self.conn.drop_send_waiter(self.session_key, self)
         waiters = self.conn.send_waiters(self.session_key)
         mine = self.turn.reply["message_id"]
         later = next((w for w in reversed(waiters) if w.turn.reply["message_id"] != mine), None)
-        if later is None:
+        if later is None or any(w.requested_thinking != self.requested_thinking for w in waiters):
             return False
         at_text = getattr(later, "handed_texts", 0)
         at_image = getattr(later, "handed_images", 0)
@@ -15244,7 +15255,8 @@ class _PipeTurn:
                         idempotency_key=idempotency_key,
                         owui_chat_id=self.owui_origin_chat_id,
                         owui_user_id=self.owui_origin_user_id,
-                        attachments=_numbered_attachments(self.turn.attachments),
+                        attachments=_numbered_attachments(
+                            self.turn.attachments, combined=len(self.turn.unsent) > 1),
                         thinking=self.resolved_thinking,
                     ),
                     timeout=30
@@ -15253,12 +15265,14 @@ class _PipeTurn:
                 self.conn.unregister_consumer(self.session_key, idempotency_key, queue=self.queue)
                 await _emit_status(self.__event_emitter__, "", done=True)
                 yield "**Timeout:** Gateway did not respond to chat.send"
+                self.end_waiting_replies_unsent()
                 self.ended = True
                 return
             except Exception as e:
                 self.conn.unregister_consumer(self.session_key, idempotency_key, queue=self.queue)
                 await _emit_status(self.__event_emitter__, "", done=True)
                 yield f"**Error sending message:** {e}"
+                self.end_waiting_replies_unsent()
                 self.ended = True
                 return
             self.our_run_id = send_resp.get("runId") or idempotency_key

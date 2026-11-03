@@ -794,16 +794,18 @@ def _user_texts(page) -> list:
 
 def test_messages_sent_from_other_tabs_while_a_reply_runs_are_answered_together(page, token):
     """Three messages sent from three other tabs while a reply runs wait
-    behind its run, and nobody cancels them. Once it ends they go to the
-    agent as one turn, in the order sent: three user messages in the chat,
-    the first two replies saying their message went with the next, the last
-    one answering; the same after a reload."""
-    run = _slow("BROWSER_JOIN", 20)
+    behind its run. Once it ends they go to the agent as one turn, in the
+    order sent: three user messages in the chat, the first two replies
+    saying their message went with the next, the last one answering; the
+    same after a reload."""
     words = [f"BROWSER_JOIN_{w}_{os.getpid()}" for w in ("A", "B", "C")]
     asked = len(_fake_llm_requests())
+    hold_token = f"join{os.getpid()}_{asked}"
+    # e2e/fake_llm.py hold_file: the run goes on until the test lets it end.
+    gate = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{hold_token}")
     capture.new_chat(page)
-    capture.send(page, "E2E_SLOW:20 BROWSER_JOIN")
-    _wait(page, _reply_js(0, "r.text.includes('BROWSER_JOIN slow-1 slow-2')"), "the reply part way through")
+    capture.send(page, f"E2E_HOLD {hold_token}")
+    _wait(page, _reply_js(0, "r.text.includes('exec') && !r.done"), "the reply running its command")
     tabs = []
     try:
         for word in words:
@@ -813,9 +815,12 @@ def test_messages_sent_from_other_tabs_while_a_reply_runs_are_answered_together(
             other.wait_for_selector("#chat-input", timeout=60_000)
             _type_and_send(other, f"E2E_ECHO: {word}")
             _wait(page, f"() => {_user_message_js(word)}", f"{word} in the chat")
+        _wait(page, f"() => {_message_text_js(-1)}.includes('Queued: waiting')", "the last message waiting")
+        open(gate, "w").close()
         _wait(page, _reply_js(-1, f"all.length === 4 && all.every(a => a.done) && r.text.includes({json.dumps(words[0])})"),
-              "the last message's reply answering all three", TURN_MS * 2)
+              "the last message's reply answering all three")
     finally:
+        open(gate, "w").close()
         for other in tabs:
             other.close()
     # The first model request that carries any of the messages carries all
@@ -828,10 +833,11 @@ def test_messages_sent_from_other_tabs_while_a_reply_runs_are_answered_together(
     for index in (1, 2):
         _says_where_its_message_went(page, index, "sent together with your next one")
     shown = (_user_texts(page), [r["text"] for r in _replies(page)])
-    _saved_whole(page, token, run)
+    _saved_whole(page, token, "E2E_HOLD_END")
     _reload(page)
     _wait(page, _reply_js(-1, "all.length === 4 && all.every(a => a.done)"), "the four replies after a reload", 60_000)
     assert (_user_texts(page), [r["text"] for r in _replies(page)]) == shown, "the chat changed on a reload"
+    os.remove(gate)
 
 
 def test_a_queued_reply_stopped_says_its_message_was_not_sent(page):

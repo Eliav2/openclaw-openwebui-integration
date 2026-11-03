@@ -1301,18 +1301,25 @@ class _PipeTurn:
                 return
         self.register_target()
 
+    def end_waiting_replies_unsent(self) -> None:
+        """The send that was to carry the messages of `turn.waiting` failed:
+        those replies say so, pointing at this one's error."""
+        _end_unsent_replies(self.conn, self.turn.waiting, sent=False, note=REPLY_SEND_FAILED_NOTE)
+        self.turn.waiting = []
+
     def hand_on(self) -> bool:
         """Hand this reply's message to the newest reply of the session that
         waits to send, if there is one: it sends both as one turn, and ends
         this reply with `REPLY_SENT_WITH_NEXT_NOTE` once it did (or with the
         not-sent note, on a Stop), as for a reply interrupted while queued
         (ELI-188). Its messages go before that reply's own, after any handed
-        to it earlier."""
+        to it earlier. Not when a waiting reply asks for another thinking
+        level: one send has one level, and the messages keep their order."""
         self.conn.drop_send_waiter(self.session_key, self)
         waiters = self.conn.send_waiters(self.session_key)
         mine = self.turn.reply["message_id"]
         later = next((w for w in reversed(waiters) if w.turn.reply["message_id"] != mine), None)
-        if later is None:
+        if later is None or any(w.requested_thinking != self.requested_thinking for w in waiters):
             return False
         at_text = getattr(later, "handed_texts", 0)
         at_image = getattr(later, "handed_images", 0)
@@ -1423,7 +1430,8 @@ class _PipeTurn:
                         idempotency_key=idempotency_key,
                         owui_chat_id=self.owui_origin_chat_id,
                         owui_user_id=self.owui_origin_user_id,
-                        attachments=_numbered_attachments(self.turn.attachments),
+                        attachments=_numbered_attachments(
+                            self.turn.attachments, combined=len(self.turn.unsent) > 1),
                         thinking=self.resolved_thinking,
                     ),
                     timeout=30
@@ -1432,12 +1440,14 @@ class _PipeTurn:
                 self.conn.unregister_consumer(self.session_key, idempotency_key, queue=self.queue)
                 await _emit_status(self.__event_emitter__, "", done=True)
                 yield "**Timeout:** Gateway did not respond to chat.send"
+                self.end_waiting_replies_unsent()
                 self.ended = True
                 return
             except Exception as e:
                 self.conn.unregister_consumer(self.session_key, idempotency_key, queue=self.queue)
                 await _emit_status(self.__event_emitter__, "", done=True)
                 yield f"**Error sending message:** {e}"
+                self.end_waiting_replies_unsent()
                 self.ended = True
                 return
             self.our_run_id = send_resp.get("runId") or idempotency_key

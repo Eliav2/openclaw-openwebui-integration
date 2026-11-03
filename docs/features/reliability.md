@@ -45,7 +45,7 @@ Several messages that wait behind the same run go out together, as one turn, whe
 
 <img src="../img/queued-together-light.png" alt="Three messages sent while the cache rebuild ran: the first two replies say their message went with the next one, the last reply answers all three" width="320">
 
-Whether a run is active comes from the Gateway: `sessions.describe`, confirmed against `sessions.list`'s `hasActiveRun`, which holds across several Open WebUI processes. A parent that is paused waiting on a sub-agent counts as busy, not finished. The wait ends when the Gateway pushes that the run settled, with no polling and no time limit. A per-session send lock means two messages released at the same moment cannot merge into one run.
+Whether a run is active comes from the Gateway: `sessions.describe`, confirmed against `sessions.list`'s `hasActiveRun`, which holds across several Open WebUI processes. A parent that is paused waiting on a sub-agent counts as busy, not finished. The wait ends when the Gateway pushes that the run settled, with no polling and no time limit. A per-session send lock keeps two sends from reaching the Gateway at the same moment, where it would fold the second into the first run and its reply would show nothing.
 
 Open WebUI sometimes calls the Pipe twice for the same reply. The second call does not send your message again: it follows the run the first call started and ends with that run's answer, so the agent never answers the same message twice and the real answer is never replaced.
 

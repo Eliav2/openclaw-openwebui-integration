@@ -1288,6 +1288,12 @@ class Scenes:
         page.reload()
         page.wait_for_selector("#chat-input", timeout=60_000)
         wait_js(page, last_text_has("the summary is in the forecast channel"), "the answer after a reload", 60_000)
+        # The rebuild runs 20 s: a tab slow enough to send after it ended
+        # gets a reply of its own, which is not this scene.
+        noted = page.evaluate("""() => [...document.querySelectorAll('.chat-assistant')].slice(-3, -1)
+          .map(a => a.innerText.includes('sent together with your next one'))""")
+        if noted != [True, True]:
+            raise RuntimeError(f"the three messages did not go out together: {noted}")
         # To the bottom, where Open WebUI hides its scroll-down arrow.
         page.evaluate("() => { const c = document.getElementById('messages-container'); "
                       "if (c) c.scrollTop = c.scrollHeight; }")

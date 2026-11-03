@@ -639,12 +639,11 @@ def _extract_image_attachments(raw_content) -> list:
     return attachments
 
 
-def _numbered_attachments(attachments: list) -> list:
-    """`attachments` for one chat.send. Images of several messages sent
-    together are numbered in order (image-1, image-2, ...), as each message
-    names its own by its position and two can share a name."""
-    names = [a.get("fileName") for a in attachments]
-    if len(set(names)) == len(names):
+def _numbered_attachments(attachments: list, *, combined: bool) -> list:
+    """`attachments` for one chat.send. The images of several messages sent
+    together (`combined`) are numbered in order, image-1, image-2, ...: each
+    message names its own by its position in it, so two can share a name."""
+    if not combined:
         return attachments
     out = []
     for n, a in enumerate(attachments, 1):

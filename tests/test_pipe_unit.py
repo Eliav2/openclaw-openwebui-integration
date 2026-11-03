@@ -1734,6 +1734,8 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         async def send_request(method, params, timeout=10):
             self.rpc.append(method)
             if method == "chat.send":
+                if getattr(self, "send_fails", None):
+                    raise self.send_fails
                 n["run"] += 1
                 self.sent.append(params.get("message"))
                 self.sent_images.append([(a["fileName"], a["content"]) for a in params.get("attachments") or []])
@@ -1784,7 +1786,7 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         for p in self.patches:
             p.stop()
 
-    def _reply(self, text, msg_id, intent=None, image=None, chat="chat-1"):
+    def _reply(self, text, msg_id, intent=None, image=None, chat="chat-1", thinking=None):
         """`image`: base64 data of a PNG attached to the message."""
         self.emitted = getattr(self, "emitted", [])
 
@@ -1800,6 +1802,8 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image}"}}]
         body = {"model": "openclaw_gateway.default",
                 "messages": [{"role": "user", "content": content}]}
+        if thinking:
+            body["reasoning_effort"] = thinking
         meta = {"chat_id": chat, "user_id": "u1", "message_id": msg_id}
         return self.pipe._pipe_impl(body, emitter, __metadata__=meta,
                                     __event_call__=event_call if intent else None)
@@ -2732,7 +2736,7 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         await rest
         await r3.aclose()
         self.assertEqual(self.sent, ["count", "test\n\nanother test"])
-        self.assertEqual(self.sent_images, [[], [("image-2.png", "QUFB")]])
+        self.assertEqual(self.sent_images, [[], [("image-1.png", "QUFB")]])
 
     async def _waiting_replies(self, *specs):
         """Start a reply per (text, msg_id, image) that waits behind the
@@ -2851,6 +2855,38 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sorted(closed), [("m2", self.ocp.REPLY_NOT_SENT_NOTE),
                                           ("m3", self.ocp.REPLY_NOT_SENT_NOTE)])
         self.assertEqual(self.sent, [])
+
+    async def test_waiting_messages_with_other_thinking_levels_go_apart(self):
+        """One send has one thinking level: a waiting message that asks for
+        another level is not joined, so each is answered at its own."""
+        self.active = True
+        reads = []
+        for text, mid, level in (("a", "m2", "low"), ("b", "m3", "high")):
+            r = self._reply(text, mid, thinking=level)
+            reads.append(asyncio.ensure_future(self._drain(r)))
+            await self._spin()
+        self._settled(False)
+        await self._until_registered("run-2")
+        self.assertEqual(self.sent, ["a", "b"])
+        for task in reads:
+            task.cancel()
+
+    async def test_a_failed_joint_send_tells_the_handed_on_replies(self):
+        """The send that was to carry a handed-on message fails: its reply
+        shows the error, and the reply that handed its message on says so
+        instead of staying blank."""
+        closed = self._record_closes()
+        self.active = True
+        reads = await self._waiting_replies(("a", "m2", None), ("b", "m3", None))
+        self.send_fails = RuntimeError("gateway said no")
+        self._settled(False)
+        out = await asyncio.wait_for(reads[1][1], 30)
+        self.assertIn("Error sending message", out)
+        for _ in range(200):
+            if closed:
+                break
+            await asyncio.sleep(0.005)
+        self.assertEqual(closed, [("m2", self.ocp.REPLY_SEND_FAILED_NOTE)])
 
     async def test_a_stop_while_messages_wait_drops_them_all(self):
         """Stop while messages wait behind a run (nothing joined yet): each
