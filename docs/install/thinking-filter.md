@@ -12,7 +12,7 @@ A thinking control in the composer's integrations menu:
 
 <img src="../img/thinking-toggle-light.png" alt="The thinking control in the composer's integrations menu" width="320">
 
-Turn it on for a chat and pick a level in **Chat Controls** → **Valves**. The levels, what `default` and `off` mean, and how a level a model doesn't support is handled: [Chat](../features/chat.md).
+Turn it on for a chat and pick a level in **Valves**: under **Model controls**, the sliders button next to the model's name (Open WebUI 0.13), or in **Chat Controls** (0.12). The levels, what `default` and `off` mean, and how a level a model doesn't support is handled: [Chat](../features/chat.md).
 
 ## Install with the installer
 
@@ -68,7 +68,7 @@ Picking another model in the chat switches the toggle off again: Open WebUI rese
 
 The Pipe should be installed first. The filter's level dropdown is filled from a cache the Pipe writes, `STATE_DIR/thinking-ladders.json`, with the levels it has seen your models support. Before the Pipe has run once, the dropdown falls back to the five levels every observed provider supports: `off`, `minimal`, `low`, `medium`, `high`.
 
-<img src="../img/thinking-level-light.png" alt="The level choices in Chat Controls > Valves" width="320">
+<img src="../img/thinking-level-light.png" alt="The level choices in Valves" width="320">
 
 The dropdown is baked in when Open WebUI loads the filter. So after the Pipe has completed a first chat with a given model, reload or re-save the filter function (**Admin Panel** → **Functions** → `openclaw_thinking` → **Save**) to pick up the real levels. Otherwise it keeps showing the fallback list until the next reload.
 
@@ -78,7 +78,7 @@ The filter looks for the cache in the `OPENCLAW_BRIDGE_STATE_DIR` environment va
 
 - [`priority`](../configuration.md#priority): filter execution order, lower runs earlier (default `0`).
 - [`override_advanced_params`](../configuration.md#override_advanced_params): on by default. Decides who wins when both this filter and Open WebUI's own Advanced Params reasoning effort are set; turn it off to let Advanced Params own the value and use the toggle only to enable thinking.
-- [`level`](../configuration.md#level): a per-user valve, the level you pick in **Chat Controls** → **Valves**.
+- [`level`](../configuration.md#level): a per-user valve, the level you pick in **Valves** (under **Model controls**, or **Chat Controls** before Open WebUI 0.13).
 
 ## Uninstalling
 
