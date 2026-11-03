@@ -8,12 +8,12 @@ Applies to: Pipe, Action, Filter
 
 | | Minimum | Tested in CI |
 |---|---|---|
-| Open WebUI | 0.12.0 | 0.12.5 |
+| Open WebUI | 0.12.0 | 0.12.5 and 0.13.0 |
 | OpenClaw Gateway | 2026.9.3 | 2026.10.5 |
 | Python inside Open WebUI (what Open WebUI ships) | 3.11 | 3.11 and 3.12 |
 | Python for `install.py` | 3.10 | 3.10 to 3.13 |
 
-The "Tested in CI" versions are the ones the end-to-end suite runs on for every pull request (`e2e/versions.env`). The minimums come from the same suite run once on each older release; the results are below.
+The "Tested in CI" versions are the ones the end-to-end suite runs on for every pull request (`e2e/versions.env`). For Open WebUI that is two blocking lanes: the pinned release, and the next one an upgrade moves to. The minimums come from the same suite run once on each older release; the results are below.
 
 Below the minimums the chat itself still works, but some features break (the table below). The worst cases: on Open WebUI 0.11.0 and older, tool cards keep spinning; on Open WebUI 0.11.1, and on OpenClaw 2026.9.1 or older, cron replies never appear.
 
@@ -43,7 +43,8 @@ Each row is the full end-to-end suite on one pair, on GitHub's runners. The suit
 | 0.12.0 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/39003313714) |
 | 0.12.2 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/39003315726) |
 | 0.12.3 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/39173684021) |
-| 0.12.5 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/40881528739) |
+| 0.12.5 | pass (on OpenClaw 2026.10.5) | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/41660465558) |
+| 0.13.0 | pass (on OpenClaw 2026.10.5) | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/41660471297) |
 
 ### OpenClaw, with Open WebUI 0.12.0
 

@@ -88,7 +88,7 @@ Off by default.
 
 With the [thinking filter](../install/thinking-filter.md) installed, a toggle in the composer sets the reasoning level per chat: `default`, `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`.
 
-<img src="../img/thinking-level-light.png" alt="The thinking level in Chat Controls > Valves, its choices listed: default, off, minimal, low, medium, high" width="320">
+<img src="../img/thinking-level-light.png" alt="The thinking level in Valves, its choices listed: default, off, minimal, low, medium, high" width="320">
 
 - `default` is not a level, it is the absence of one. No `thinking` field is sent, and the agent's own setting applies.
 - `off` is an explicit instruction not to think, and it does override the agent's setting.

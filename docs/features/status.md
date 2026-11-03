@@ -127,7 +127,7 @@ The drawer reads the sub-agent's whole transcript (`chat.history`). A very long 
 
 ## Status button in the composer
 
-The Pipe also adds a **Claw** button, with a crab claw, to the composer row of OpenClaw chats, right after the OpenClaw Thinking chip (or at the end of the composer's chips when that chip is off). It opens the same dialog through the Status Action, so the Action must be installed.
+The Pipe also adds a **Claw** button, with a crab claw, to the composer row of OpenClaw chats, right after the OpenClaw Thinking chip (or at the end of the composer's chips when that chip is off). When the chips leave no room for it, on a narrow phone, it sits right after the integrations button instead, so it is never scrolled out of sight. It opens the same dialog through the Status Action, so the Action must be installed.
 
 <img src="../img/composer-status-light.png" alt="The Claw button in the composer, a crab claw next to the integrations button" width="374">
 

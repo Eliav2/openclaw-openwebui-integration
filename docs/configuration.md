@@ -252,6 +252,6 @@ When on, the level picked here wins over Open WebUI's own Advanced Params reason
 
 ### level
 
-Type: `str`. Default: `default`. Per user: each user sets it in **Chat Controls > Valves**, from only the levels your models support ([Thinking control](./install/thinking-filter.md)).
+Type: `str`. Default: `default`. Per user: each user sets it in **Valves** (Open WebUI 0.13: Model controls, next to the model's name; 0.12: Chat Controls), from only the levels your models support ([Thinking control](./install/thinking-filter.md)).
 
 How hard the agent thinks before answering. 'default' sends nothing and leaves the agent's own configured level alone. Levels a model does not support are clamped down, and the chat says so.

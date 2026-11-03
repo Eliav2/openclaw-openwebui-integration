@@ -1061,7 +1061,13 @@ class Scenes:
         send(page, "Start with the build.")
         wait_js(page, last_text_has("Next is the staging deploy script"), "the reply")
         set_title(self.token, chat, "Hourly view to staging")
-        page.locator(".chat-assistant").last.get_by_text(re.compile(r"\d+(\.\d+)?[km]/\d+(\.\d+)?[km]")).first.click()
+        # Open the status history. From Open WebUI 0.13 a transparent "Toggle status history"
+        # button lies over the status line and takes the click.
+        toggle = page.locator(".chat-assistant").last.locator('button[aria-label="Toggle status history"]')
+        if toggle.count():
+            toggle.first.click()
+        else:
+            page.locator(".chat-assistant").last.get_by_text(re.compile(r"\d+(\.\d+)?[km]/\d+(\.\d+)?[km]")).first.click()
         wait_js(page, "() => document.body.innerText.includes('🎯')", "the goal row", 60_000)
         print("  status rows: " + json.dumps(page.evaluate(f"() => {LAST_ASSISTANT}.innerText")[:400]), flush=True)
         clip = f"""() => {{
@@ -1391,14 +1397,18 @@ class Scenes:
         element is drawn as a list (size = its option count)."""
         page.goto(f"{BASE}/c/{self.hero_chat}")
         page.wait_for_selector("#chat-input")
-        page.locator('button[aria-label="Controls"]').click()
+        # Open WebUI 0.13 moved Valves from the Controls panel at the top of the chat into the
+        # Model controls popover next to the composer's model name.
+        top = page.locator('button[aria-label="Controls"]')
+        (top if top.count() else page.locator('button[aria-label="Model controls"]')).first.click()
         page.locator('button[aria-expanded]', has_text="Valves").first.click()
         page.locator('select:has(option[value="functions"])').first.select_option("functions")
         page.locator('select:has(option[value="openclaw_thinking"])').first.select_option("openclaw_thinking")
         box = page.locator(".chat-control-valves")
         box.wait_for(timeout=30_000)
         if not box.locator("select").count():
-            box.get_by_role("button", name="Default").first.click()  # Default -> Custom shows the field
+            # Default -> Custom shows the field. Open WebUI 0.13's popover gives it role=menuitem.
+            box.locator("button", has_text="Default").first.click()
         sel = box.locator("select").first
         sel.wait_for(timeout=30_000)
         print("  levels: " + json.dumps(sel.evaluate("s => [...s.options].map(o => o.value)")), flush=True)
@@ -1410,7 +1420,11 @@ class Scenes:
           return {x: 0, y: Math.max(0, r.top - 60), width: innerWidth, height: Math.min(r.height + 120, innerHeight)};
         }"""
         self.s.shot(page, "thinking-level", clip_js=clip, text_selector=".chat-control-valves")
-        page.locator('button[aria-label="Close"]').first.click()
+        close = page.locator('button[aria-label="Close"]')
+        if close.count():
+            close.first.click()
+        else:
+            page.keyboard.press("Escape")
 
     def admin_valves(self, page: Page) -> None:
         """The Pipe's valves in the admin panel, from Owner Users down."""

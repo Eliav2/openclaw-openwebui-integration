@@ -26,7 +26,12 @@
 #     and removes it everywhere else;
 #   * places it right after the "OpenClaw Thinking" filter chip, or at the end
 #     of the composer's chip group when that chip is off; when neither anchor
-#     exists it shows nothing;
+#     exists it shows nothing. The chip row scrolls sideways when it is full:
+#     a button that does not fit whole there moves to the end of the left
+#     group (after Integrations), which never scrolls. Open WebUI 0.13 added a
+#     Model controls button on the right, which leaves a 375 px phone's chip
+#     row 25 px narrower. It goes back to the chip row once the window is
+#     wider than when it moved;
 #   * on click POSTs to the Status Action with the same body shape the dialog's
 #     own Compact button uses, so the existing Action flow opens the real
 #     dialog. The body is built from what the page already has: the chat's
@@ -56,7 +61,7 @@
 # reply that is streaming into the same tab.
 # ---------------------------------------------------------------------------
 
-_COMPOSER_BUTTON_VERSION = "7"
+_COMPOSER_BUTTON_VERSION = "9"
 
 # The Status Action's function id (install_action.py's FUNCTION_ID; the
 # dialog's own JS calls the same fixed id) and the Pipe's default function id.
@@ -112,6 +117,11 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
     timer: null,
     busy: false,
     inserts: [],
+    // The window width at which the button last did not fit in the chip row;
+    // up to that width it sits in the left group instead.
+    narrowAt: 0,
+    resizeObserver: null,
+    watched: null,
     warned: {},
     dead: false,
   };
@@ -372,27 +382,93 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
 
   // {parent, after}: insert right after `after` inside `parent`, or at the end
   // of `parent` when `after` is null. null when no known anchor is on screen.
-  function findSlot() {
+  // The composer's button row: [left group: More, Integrations] [chip row,
+  // scrolls] [model, send].
+  function composerRow() {
     const integ = document.getElementById('integration-menu-button');
     const form = integ ? integ.closest('form') : null;
-    if (!form) return null;
-    const imgs = form.querySelectorAll('img[alt]');
+    const row = integ ? integ.closest('div.justify-between') : null;
+    if (!form || !row || !form.contains(row)) return null;
+    return { integ: integ, form: form, row: row, chips: row.querySelector(':scope > div.flex-1') };
+  }
+
+  // The left group, which never scrolls: the row's child holding Integrations.
+  function leftSlot(c) {
+    let g = c.integ;
+    while (g && g.parentElement !== c.row) g = g.parentElement;
+    return g && g !== c.chips ? { parent: g, after: null, left: true } : null;
+  }
+
+  // {parent, after}: insert right after `after` inside `parent`, or at the end
+  // of `parent` when `after` is null. null when no known anchor is on screen.
+  function findSlot() {
+    const c = composerRow();
+    if (!c) return null;
+    if (state.narrowAt && window.innerWidth <= state.narrowAt) return leftSlot(c);
+    const imgs = c.form.querySelectorAll('img[alt]');
     for (let i = 0; i < imgs.length; i++) {
       if (imgs[i].getAttribute('alt') !== CFG.thinkingChipLabel) continue;
       const chip = imgs[i].closest('button');
       const wrap = chip ? chip.parentElement : null;
-      if (wrap && wrap.parentElement && form.contains(wrap.parentElement)) {
+      if (wrap && wrap.parentElement && c.form.contains(wrap.parentElement)) {
         return { parent: wrap.parentElement, after: wrap };
       }
     }
     // The chip is only rendered while the filter is on. Fall back to the end
     // of the chip group the composer always renders next to it.
-    const row = integ.closest('div.justify-between');
-    if (!row || !form.contains(row)) return null;
-    const chips = row.querySelector(':scope > div.flex-1');
-    const groups = chips ? chips.querySelectorAll(':scope > div.shrink-0') : [];
+    const groups = c.chips ? c.chips.querySelectorAll(':scope > div.shrink-0') : [];
     if (groups.length) return { parent: groups[groups.length - 1], after: null };
     return null;
+  }
+
+  // Placed in the chip row but cut off by its scroll box: from now on, up to
+  // this width, the left group.
+  function checkFits(btn) {
+    const c = composerRow();
+    if (!c || !c.chips || typeof btn.getBoundingClientRect !== 'function') return;
+    let a = btn.parentElement;
+    while (a && a !== c.chips) a = a.parentElement;
+    if (!a) return;
+    const r = btn.getBoundingClientRect();
+    const box = c.chips.getBoundingClientRect();
+    if (r.width === 0) return;
+    if (r.left < box.left - 0.5 || r.right > box.right + 0.5) {
+      state.narrowAt = window.innerWidth;
+      // Now, not on the next ensure(): a clipped button must not stay on
+      // screen for a debounce.
+      const s = leftSlot(c);
+      if (s) s.parent.appendChild(btn);
+      return;
+    }
+    watchChips(c.chips, btn);
+  }
+
+  // The chip row can get narrower without a childList change (the model's
+  // name fills in, a font loads): check again whenever its size changes.
+  function watchChips(chips, btn) {
+    if (typeof ResizeObserver !== 'function') return;
+    if (!state.resizeObserver) {
+      state.resizeObserver = new ResizeObserver(function () {
+        const b = document.getElementById(BTN_ID);
+        if (b) checkFits(b);
+      });
+    }
+    if (state.watched === chips) return;
+    state.resizeObserver.disconnect();
+    state.resizeObserver.observe(chips);
+    state.resizeObserver.observe(btn);
+    state.watched = chips;
+  }
+
+  // Wider than where the button stopped fitting: try the chip row again.
+  // Narrower: ensure() checks the fit. Moves a width change causes are not
+  // the composer fighting the button, so they don't count toward LOOP_LIMIT.
+  function onResize() {
+    if (state.narrowAt && window.innerWidth > state.narrowAt) {
+      state.narrowAt = 0;
+      state.inserts = [];
+    }
+    schedule();
   }
 
   function removeAll() {
@@ -424,7 +500,10 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
     const placed = btn && (slot.after
       ? slot.after.nextElementSibling === btn
       : slot.parent.lastElementChild === btn);
-    if (placed) return;
+    if (placed) {
+      checkFits(btn);
+      return;
+    }
     const now = Date.now();
     state.inserts = state.inserts.filter(function (t) { return now - t < LOOP_WINDOW_MS; });
     state.inserts.push(now);
@@ -437,6 +516,7 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
     if (!btn) btn = makeButton();
     if (slot.after) slot.after.insertAdjacentElement('afterend', btn);
     else slot.parent.appendChild(btn);
+    checkFits(btn);
   }
 
   function schedule() {
@@ -453,6 +533,10 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
     if (state.timer) clearTimeout(state.timer);
     state.timer = null;
     window.removeEventListener('popstate', schedule);
+    window.removeEventListener('resize', onResize);
+    if (state.resizeObserver) state.resizeObserver.disconnect();
+    state.resizeObserver = null;
+    state.watched = null;
     document.removeEventListener('click', onToolbarClick, true);
     try { removeAll(); } catch (e) { /* page is going away */ }
   }
@@ -469,7 +553,7 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
         return {
           version: CFG.version, chatId: chatId, prefixes: state.prefixes.slice(),
           cached: chatId ? state.cache[chatId] || null : null, dead: state.dead,
-          slot: !!findSlot(), buttons: document.querySelectorAll('#' + BTN_ID).length,
+          slot: !!findSlot(), narrowAt: state.narrowAt, buttons: document.querySelectorAll('#' + BTN_ID).length,
           inserts: state.inserts.length,
         };
       },
@@ -479,6 +563,7 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
     state.observer = new MutationObserver(schedule);
     state.observer.observe(document.body, { childList: true, subtree: true });
     window.addEventListener('popstate', schedule);
+    window.addEventListener('resize', onResize);
     document.addEventListener('click', onToolbarClick, true);
     configure(CFG);
   } catch (e) {

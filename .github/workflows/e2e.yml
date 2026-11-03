@@ -9,7 +9,7 @@ on:
   workflow_call:
     inputs:
       owui_image:
-        description: Open WebUI image (empty = the pinned one in e2e/versions.env)
+        description: Open WebUI image (empty = the pinned one in e2e/versions.env, "next" = OWUI_NEXT_IMAGE there)
         type: string
         default: ""
       openclaw_version:
@@ -23,7 +23,7 @@ on:
   workflow_dispatch:
     inputs:
       owui_image:
-        description: Open WebUI image (empty = pinned)
+        description: Open WebUI image (empty = pinned, "next" = OWUI_NEXT_IMAGE)
         type: string
         default: ""
       openclaw_version:

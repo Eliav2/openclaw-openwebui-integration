@@ -144,6 +144,41 @@ class StatusLabelWidthTests(unittest.TestCase):
         self.assertIn('<span class="pr-0.5 hidden sm:inline">Claw</span>', code)
         self.assertIn("b.setAttribute('aria-label', 'OpenClaw status');", code)
 
+    def test_a_button_cut_off_by_the_chip_row_moves_to_the_left_group(self):
+        """Open WebUI 0.13's Model controls button leaves a 375 px chip row too
+        narrow for the Thinking chip and the button: the button moves after
+        Integrations (the left group, which never scrolls) up to that width,
+        and back to the chip row once the window is wider."""
+        code = _render_composer_button_js()
+        self.assertIn("if (state.narrowAt && window.innerWidth <= state.narrowAt) return leftSlot(c);", code)
+        self.assertIn("state.narrowAt = window.innerWidth;", code)
+        self.assertIn("window.addEventListener('resize', onResize);", code)
+        self.assertIn("window.removeEventListener('resize', onResize);", code)
+
+    def test_a_cut_off_button_moves_at_once_and_a_narrower_chip_row_is_checked_again(self):
+        """The move happens in the same task as the check, not on the next
+        debounced ensure(), so a clipped button is never left on screen; and a
+        ResizeObserver on the chip row catches it narrowing without a childList
+        change (the model's name filling in)."""
+        code = _render_composer_button_js()
+        fits = code[code.index("function checkFits(btn)"):code.index("function onResize()")]
+        self.assertIn("if (s) s.parent.appendChild(btn);", fits)
+        self.assertNotIn("schedule()", fits)
+        self.assertIn("state.resizeObserver.observe(chips);", fits)
+        self.assertIn("if (state.resizeObserver) state.resizeObserver.disconnect();", code)
+
+    def test_a_resize_checks_the_fit_and_its_moves_do_not_count_as_a_fight(self):
+        """Narrowing a window where the button fitted checks it again; widening
+        past where it stopped fitting clears the insert count, so dragging the
+        width does not reach LOOP_LIMIT and remove the button until reload."""
+        code = _render_composer_button_js()
+        on = code[code.index("function onResize()"):code.index("function removeAll()")]
+        self.assertIn("if (state.narrowAt && window.innerWidth > state.narrowAt) {", on)
+        self.assertIn("state.narrowAt = 0;", on)
+        self.assertIn("state.inserts = [];", on)
+        self.assertEqual(on.count("schedule();"), 1)
+        self.assertLess(on.index("}\n    schedule();"), len(on))
+
 
 class ClawNameTests(unittest.TestCase):
     """ELI-202: the composer chip, its tooltip and the dialog read "Claw", and
@@ -783,6 +818,80 @@ globalThis.fetch = function () { return Promise.reject(new Error('no fetch expec
 """
 
 
+# The composer row with boxes: [left group with Integrations] [chip row > chip
+# group]. ResizeObserver records its callback, so a test can narrow the chip
+# row and fire it the way the browser would.
+_NODE_FIT_HARNESS = r"""
+const code = require('fs').readFileSync(process.argv[2], 'utf8');
+globalThis.window = globalThis;
+window.innerWidth = 375;
+window.addEventListener = function () {};
+window.removeEventListener = function () {};
+globalThis.location = { pathname: '/c/chat-1' };
+globalThis.localStorage = { getItem: function () { return 'tok'; } };
+globalThis.MutationObserver = class { observe() {} disconnect() {} };
+let resized = null;
+const observed = [];
+globalThis.ResizeObserver = class {
+  constructor(cb) { resized = cb; }
+  observe(el) { observed.push(el); }
+  disconnect() { observed.length = 0; }
+};
+const rects = { chips: { left: 40, right: 100, width: 60 }, button: { left: 50, right: 78, width: 28 } };
+class El {
+  constructor(tag, rect) { this.tagName = tag.toUpperCase(); this.children = []; this.parent = null;
+                           this.dataset = {}; this.attrs = {}; this.id = ''; this.rect = rect; }
+  get parentElement() { return this.parent; }
+  setAttribute(k, v) { this.attrs[k] = v; }
+  getAttribute(k) { return this.attrs[k]; }
+  addEventListener() {}
+  appendChild(c) { if (c.parent) c.remove(); c.parent = this; this.children.push(c); return c; }
+  remove() { if (this.parent) this.parent.children = this.parent.children.filter((x) => x !== this);
+             this.parent = null; }
+  get lastElementChild() { return this.children[this.children.length - 1] || null; }
+  getBoundingClientRect() { return rects[this.rect || 'button']; }
+  set innerHTML(v) {}
+}
+const row = new El('div');
+const left = row.appendChild(new El('div'));
+const integ = left.appendChild(new El('button'));
+const chips = row.appendChild(new El('div', 'chips'));
+const group = chips.appendChild(new El('div', 'chips'));
+const form = { querySelectorAll: function () { return []; }, contains: function () { return true; } };
+integ.closest = function (sel) { return sel === 'form' ? form : row; };
+row.querySelector = function () { return chips; };
+chips.querySelectorAll = function () { return [group]; };
+const BTN = 'openclaw-composer-status-button';
+function button() {
+  for (const g of [left, group]) for (const c of g.children) if (c.id === BTN) return c;
+  return null;
+}
+globalThis.document = {
+  body: { appendChild: function () {} },
+  documentElement: { classList: { contains: function () { return false; } } },
+  getElementById: function (id) { return id === 'integration-menu-button' ? integ : id === BTN ? button() : null; },
+  querySelectorAll: function (sel) { const b = button(); return b && sel === '#' + BTN ? [b] : []; },
+  createElement: function (t) { return new El(t); },
+  addEventListener: function () {},
+  removeEventListener: function () {},
+};
+globalThis.fetch = function () { return Promise.reject(new Error('no fetch expected')); };
+(async function () {
+  await new Function('return (async () => { ' + code + ' })()')();
+  const api = window.__openclawComposerBtn;
+  api.ensure();
+  const before = button().parent === group ? 'chips' : 'left';
+  const watched = observed.includes(chips);
+  rects.chips = { left: 40, right: 60, width: 20 };  // the model's name filled in: no DOM change
+  if (resized) resized([]);
+  console.log(JSON.stringify({
+    before: before, watched: watched,
+    after: button().parent === left ? 'left' : 'chips', narrowAt: api.debug().narrowAt,
+  }));
+  process.exit(0);
+})().catch(function (e) { console.log('ERR ' + e); process.exit(1); });
+"""
+
 @unittest.skipUnless(shutil.which("node"), "node not installed")
 class SnippetUnderNodeTests(unittest.TestCase):
     def _write(self, text, suffix):
@@ -817,6 +926,14 @@ class SnippetUnderNodeTests(unittest.TestCase):
         # A page that already shows an older button (the clipped label of
         # ELI-123) gets the new one, once.
         self.assertEqual(self._slot("2"), {"oldKept": False, "versions": [_COMPOSER_BUTTON_VERSION]})
+
+    def test_a_chip_row_that_narrows_without_a_dom_change_moves_the_button_left(self):
+        snippet = self._write(_render_composer_button_js(chat_id="chat-1"), ".js")
+        harness = self._write(_NODE_FIT_HARNESS, ".cjs")
+        proc = subprocess.run(["node", harness, snippet], capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(json.loads(proc.stdout.strip().splitlines()[-1]),
+                         {"before": "chips", "watched": True, "after": "left", "narrowAt": 375})
 
     def test_a_button_of_this_version_is_kept(self):
         self.assertEqual(self._slot(_COMPOSER_BUTTON_VERSION),

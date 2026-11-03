@@ -241,7 +241,7 @@ def _valve_lines(valves: list, per_user: bool = False) -> list:
     lines = []
     for name, typ, default, desc in valves:
         shown = "empty" if default == "" else f"`{default}`"
-        where = (" Per user: each user sets it in **Chat Controls > Valves**, from only the "
+        where = (" Per user: each user sets it in **Valves** (Open WebUI 0.13: Model controls, next to the model's name; 0.12: Chat Controls), from only the "
                  "levels your models support ([Thinking control](./install/thinking-filter.md))."
                  if per_user else "")
         lines += ["", f"### {name}", "", f"Type: `{typ}`. Default: {shown}.{where}", "",

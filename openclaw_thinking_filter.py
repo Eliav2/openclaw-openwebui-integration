@@ -59,7 +59,8 @@ Installation
    writes reasoning_effort, which other pipes may interpret differently.
 
 Then open a chat, click the Thinking toggle under the message box, and pick a
-level in Chat Controls > Valves.
+level in Valves: under Model controls next to the model's name (Open WebUI
+0.13), or in Chat Controls (0.12).
 """
 
 # ==========================================================================

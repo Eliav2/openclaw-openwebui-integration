@@ -15,6 +15,7 @@ Usage:
   python3 scripts/check_owui_fixture.py --ref v0.12.0
   python3 scripts/check_owui_fixture.py --ref main   # what the next release ships
   python3 scripts/check_owui_fixture.py --ref v0.12.0 --print-upstream  # re-extract
+  python3 scripts/check_owui_fixture.py --ref v0.12.5 --copy pinned  # CI: the copy the tests run
 
 Exit status: 0 match, 1 drift, 2 could not fetch or find the handler.
 """
@@ -31,6 +32,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURE = ROOT / "tests" / "fixtures" / "test_fixture_owui_streaming_handler.py"
+# The pinned release's copy (above) is the one the tests run. A release whose handler changed gets its
+# own copy next to it (..._v0_13_0.py for v0.13.0), so the compat watch can match "latest" and "main" while CI
+# stays on the pin. CI checks each copy against its own ref (--copy pinned / next); the compat watch
+# passes a ref when any copy matches.
+FIXTURES = sorted(FIXTURE.parent.glob("test_fixture_owui_streaming_handler*.py"))
+
+
+def versioned_suffix(ref: str) -> str:
+    return "_" + ref.replace(".", "_")
 FUNCTION = "handle_responses_streaming_event"
 # 0.12.3 moved the handler from middleware.py to response.py.
 UPSTREAM = ("https://raw.githubusercontent.com/open-webui/open-webui/{ref}/"
@@ -56,12 +66,36 @@ def normalized(node: ast.AST) -> str:
     return ast.dump(node, annotate_fields=True, include_attributes=False)
 
 
+def copies_to_check(ref: str, which: str) -> list[Path] | str:
+    """The copies a ref is checked against, or why the check cannot run.
+    "pinned": only the unversioned copy, the one the tests run (and no copy
+    may be versioned for the pinned ref: that copy should have replaced it).
+    "next": the ref's own versioned copy, else the unversioned one.
+    "any": every copy (the compat watch, on latest and main)."""
+    own = [p for p in FIXTURES if p != FIXTURE and p.stem.endswith(versioned_suffix(ref))]
+    if which == "pinned":
+        if own:
+            return (f"{own[0].name} is for the pinned {ref}: move it into {FIXTURE.name} "
+                    "(the copy the tests run) and delete it")
+        return [FIXTURE]
+    if which == "next":
+        return own or [FIXTURE]
+    return FIXTURES
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--ref", required=True, help="Open WebUI git ref (tag, branch, sha)")
     parser.add_argument("--print-upstream", action="store_true",
                         help="print the upstream function source and exit")
+    parser.add_argument("--copy", choices=("any", "pinned", "next"), default="any",
+                        help="pinned: only the copy the tests run; next: the ref's own copy, else "
+                             "that one; any: every copy (default, the compat watch)")
     args = parser.parse_args()
+    copies = copies_to_check(args.ref, args.copy)
+    if isinstance(copies, str):
+        print(copies, file=sys.stderr)
+        return 1
 
     up = None
     for module in MODULES:
@@ -86,19 +120,20 @@ def main() -> int:
         print(f"{FUNCTION} not found in open-webui@{args.ref} ({', '.join(MODULES)})", file=sys.stderr)
         return 2
     up_node, up_text = up
-    try:
-        fx_node, fx_text = find_function(FIXTURE.read_text(), str(FIXTURE))
-    except LookupError as exc:
-        print(exc, file=sys.stderr)
-        return 2
-
     if args.print_upstream:
         print(up_text)
         return 0
 
-    if normalized(up_node) == normalized(fx_node):
-        print(f"OK: vendored {FUNCTION} matches Open WebUI {args.ref}")
-        return 0
+    for path in copies:
+        try:
+            fx_node, fx_text = find_function(path.read_text(), str(path))
+        except LookupError as exc:
+            print(exc, file=sys.stderr)
+            return 2
+        if normalized(up_node) == normalized(fx_node):
+            print(f"OK: vendored {FUNCTION} ({path.name}) matches Open WebUI {args.ref}")
+            return 0
+    fx_text = find_function(copies[0].read_text(), str(copies[0]))[1]
 
     print(f"DRIFT: vendored {FUNCTION} differs from Open WebUI {args.ref}.\n"
           f"Re-extract it (python3 scripts/check_owui_fixture.py --ref {args.ref} "
