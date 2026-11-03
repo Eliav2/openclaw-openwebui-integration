@@ -1727,6 +1727,7 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.aborts = []
         self.active = False
         self.run_ended_at = None
+        self.describe_fails = False
         self.runtime = None
         self.keys = []
         self.history = {}
@@ -1748,6 +1749,8 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
                 self.aborts.append(params)
                 return {"aborted": True}
             if method == "sessions.describe":
+                if self.describe_fails:
+                    raise self.ocp.GatewayError("describe failed")
                 row = {"status": "running" if self.active else "done",
                        "agentRuntime": {"id": self.runtime}}
                 if self.active and self.run_ended_at:
@@ -1923,6 +1926,33 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.sent, [], "sent while the Gateway still counted the run")
 
             self.active = False         # cleared on the Gateway, nothing pushed
+            await self._until_registered("run-1")
+            self.assertEqual(self.sent, ["hello"])
+            q = self._queue("run-1")
+            q.put_nowait(self._delta("run-1", "hi there"))
+            q.put_nowait(self._final("run-1"))
+            out = await asyncio.wait_for(first, 5)
+            async for chunk in gen:
+                out += chunk if isinstance(chunk, str) else ""
+            self.assertIn("hi there", out)
+
+    async def test_the_ended_run_is_still_read_again_when_a_describe_fails(self):
+        """The end time seen by the last successful describe stays: a failed
+        describe falls back to `sessions.list`, and that must not drop the
+        timed read-again, or a flag cleared without a push is never seen."""
+        self.run_ended_at = 1793702659908
+        self.active = True
+        with mock.patch.object(self.ocp, "ENDED_RUN_RECHECK_S", (0.01, 0.02)):
+            gen = self._reply("hello", "m1")
+            first = asyncio.ensure_future(gen.__anext__())
+            await self._spin()
+            self.assertEqual(self.sent, [])
+            self.describe_fails = True      # from here the list probe alone answers
+            lists = self.rpc.count("sessions.list")
+            await asyncio.sleep(0.15)
+            self.assertGreater(self.rpc.count("sessions.list"), lists + 2, "read again through the list")
+            self.assertEqual(self.sent, [])
+            self.active = False
             await self._until_registered("run-1")
             self.assertEqual(self.sent, ["hello"])
             q = self._queue("run-1")

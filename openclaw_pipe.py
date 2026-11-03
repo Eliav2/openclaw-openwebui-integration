@@ -14747,7 +14747,7 @@ class _PipeTurn:
         # (model key, ladder) this turn last filed in the ladder cache: the
         # queue wait probes every 1.5 s, and filing reads and writes a file.
         self._ladder_recorded = None
-        # The last session read named the end of a run it still counts as active.
+        # The last successful `sessions.describe` named the end of a run (a failed one leaves it).
         self._active_row_ended = False
 
         # --- Short-circuit OWUI background tasks ---
@@ -16210,7 +16210,6 @@ class _PipeTurn:
                 await self.save_end_snapshot()
 
     async def _session_run_active(self) -> bool:
-        self._active_row_ended = False
         # Fast path: describe exposes a persisted `status`. When it names a
         # live run state we're done. But describe.status flips to 'done'
         # during a subagent-yield gap (the run is only suspended and will
