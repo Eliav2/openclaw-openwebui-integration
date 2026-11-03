@@ -2152,6 +2152,41 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sent, ["check the logs"])
         self.assertIn("Found it.", out2)
 
+    async def test_a_second_call_follows_an_ended_run_the_gateway_still_counts_active(self):
+        """The duplicate-reply wait takes the same timed re-read as the queue
+        (2026.10.10): the first run's row names `endedAt` but still counts as
+        active, the flag clears with no `sessions.changed`. The second call
+        must read the session again on the backoff, not wait on a push that
+        never comes, and still not send the text again."""
+        gen1 = self._reply("check the logs", "m1")
+        first1 = asyncio.ensure_future(gen1.__anext__())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "Reading them.\n\nFound it."))
+        q.put_nowait(self._final("run-1"))
+        await self._collect(first1, gen1)
+        # The user turn is written, the run is not closed in the transcript yet.
+        self.history = {"messages": self._sent_history(self.keys[0])["messages"][:3]}
+        self.run_ended_at = 1793702659908
+        self.active = True
+
+        with mock.patch.object(self.ocp, "ENDED_RUN_RECHECK_S", (0.01, 0.02)):
+            gen2 = self._reply("check the logs", "m1")
+            first2 = asyncio.ensure_future(gen2.__anext__())
+            await self._spin()
+            self.assertFalse(first2.done(), "the second call waits for the run")
+            reads = self.rpc.count("sessions.describe")
+            await asyncio.sleep(0.15)
+            self.assertGreater(self.rpc.count("sessions.describe"), reads + 2,
+                               "an ended run is read again by the duplicate-reply wait")
+            self.assertFalse(first2.done())
+
+            self.active = False         # cleared on the Gateway, nothing pushed
+            self.history = self._sent_history(self.keys[0])
+            out2, _ = await asyncio.wait_for(self._collect(first2, gen2), 5)
+        self.assertEqual(self.sent, ["check the logs"], "the same message ran twice")
+        self.assertEqual(out2, "Reading them.\n\nFound it.")
+
     async def test_a_second_call_with_new_text_is_sent(self):
         """A second call for the same reply with different input is not a
         repeat (two such calls in the logs continue a reply after a tool)."""
