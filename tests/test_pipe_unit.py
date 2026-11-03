@@ -1726,6 +1726,8 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.rpc = []
         self.aborts = []
         self.active = False
+        self.run_ended_at = None
+        self.describe_fails = False
         self.runtime = None
         self.keys = []
         self.history = {}
@@ -1747,8 +1749,13 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
                 self.aborts.append(params)
                 return {"aborted": True}
             if method == "sessions.describe":
-                return {"session": {"status": "running" if self.active else "done",
-                                    "agentRuntime": {"id": self.runtime}}}
+                if self.describe_fails:
+                    raise self.ocp.GatewayError("describe failed")
+                row = {"status": "running" if self.active else "done",
+                       "agentRuntime": {"id": self.runtime}}
+                if self.active and self.run_ended_at:
+                    row["endedAt"] = self.run_ended_at
+                return {"session": row}
             if method == "sessions.list":
                 return {"sessions": [{"key": self.SK, "hasActiveRun": self.active}]}
             return {}
@@ -1894,6 +1901,82 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         async for chunk in gen:
             out += chunk if isinstance(chunk, str) else ""
         self.assertIn("hi there", out)
+
+    async def test_a_run_the_gateway_ended_but_still_counts_is_read_again_without_a_push(self):
+        """2026.10.10, a cron wake that streamed into the chat: its row carries
+        `endedAt` and the turn writer finalized the reply, yet `sessions.describe`
+        and `sessions.list` kept saying running / hasActiveRun for as long as
+        the Gateway lived, because the clearing of that flag pushes no further
+        `sessions.changed` (the one at the end is sent while it is still set).
+        A message queued behind the wake never left the queue. A row that
+        names an end time but still counts as active is read again on a short
+        backoff, and the message goes out the moment the Gateway says idle. A
+        run with no end time is still waited for on its push alone."""
+        self.run_ended_at = 1793702659908
+        self.active = True
+        with mock.patch.object(self.ocp, "ENDED_RUN_RECHECK_S", (0.01, 0.02)):
+            gen = self._reply("hello", "m1")
+            first = asyncio.ensure_future(gen.__anext__())
+            await self._spin()
+            self.assertEqual(self.sent, [])
+            self.assertTrue(any("Queued: waiting" in str(e) for e in self.emitted))
+            reads = self.rpc.count("sessions.describe")
+            await asyncio.sleep(0.15)
+            self.assertGreater(self.rpc.count("sessions.describe"), reads + 2, "an ended run is read again")
+            self.assertEqual(self.sent, [], "sent while the Gateway still counted the run")
+
+            self.active = False         # cleared on the Gateway, nothing pushed
+            await self._until_registered("run-1")
+            self.assertEqual(self.sent, ["hello"])
+            q = self._queue("run-1")
+            q.put_nowait(self._delta("run-1", "hi there"))
+            q.put_nowait(self._final("run-1"))
+            out = await asyncio.wait_for(first, 5)
+            async for chunk in gen:
+                out += chunk if isinstance(chunk, str) else ""
+            self.assertIn("hi there", out)
+
+    async def test_the_ended_run_is_still_read_again_when_a_describe_fails(self):
+        """The end time seen by the last successful describe stays: a failed
+        describe falls back to `sessions.list`, and that must not drop the
+        timed read-again, or a flag cleared without a push is never seen."""
+        self.run_ended_at = 1793702659908
+        self.active = True
+        with mock.patch.object(self.ocp, "ENDED_RUN_RECHECK_S", (0.01, 0.02)):
+            gen = self._reply("hello", "m1")
+            first = asyncio.ensure_future(gen.__anext__())
+            await self._spin()
+            self.assertEqual(self.sent, [])
+            self.describe_fails = True      # from here the list probe alone answers
+            lists = self.rpc.count("sessions.list")
+            await asyncio.sleep(0.15)
+            self.assertGreater(self.rpc.count("sessions.list"), lists + 2, "read again through the list")
+            self.assertEqual(self.sent, [])
+            self.active = False
+            await self._until_registered("run-1")
+            self.assertEqual(self.sent, ["hello"])
+            q = self._queue("run-1")
+            q.put_nowait(self._delta("run-1", "hi there"))
+            q.put_nowait(self._final("run-1"))
+            out = await asyncio.wait_for(first, 5)
+            async for chunk in gen:
+                out += chunk if isinstance(chunk, str) else ""
+            self.assertIn("hi there", out)
+
+    async def test_a_running_run_without_an_end_time_is_not_polled(self):
+        """The counterpart: ELI-88 stays. Only a row that names an end time is
+        read again on a timer; a run still going waits for its push."""
+        self.active = True
+        with mock.patch.object(self.ocp, "ENDED_RUN_RECHECK_S", (0.01, 0.02)):
+            gen = self._reply("hello", "m1")
+            first = asyncio.ensure_future(gen.__anext__())
+            await self._spin()
+            reads = self.rpc.count("sessions.describe")
+            await asyncio.sleep(0.15)
+            self.assertEqual(self.rpc.count("sessions.describe"), reads)
+            self.assertEqual(self.sent, [])
+            first.cancel()
+            await asyncio.gather(first, return_exceptions=True)
 
     async def test_queued_message_survives_a_redeploy_retiring_its_connection(self):
         """ELI-172 (2026-10-17): a message typed at 12:03:56Z
@@ -2068,6 +2151,119 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         out2, _ = await self._collect(asyncio.ensure_future(gen2.__anext__()), gen2)
         self.assertEqual(self.sent, ["check the logs"])
         self.assertIn("Found it.", out2)
+
+    async def test_a_second_call_follows_an_ended_run_the_gateway_still_counts_active(self):
+        """The duplicate-reply wait takes the same timed re-read as the queue
+        (2026.10.10): the first run's row names `endedAt` but still counts as
+        active, the flag clears with no `sessions.changed`. The second call
+        must read the session again on the backoff, not wait on a push that
+        never comes, and still not send the text again."""
+        gen1 = self._reply("check the logs", "m1")
+        first1 = asyncio.ensure_future(gen1.__anext__())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "Reading them.\n\nFound it."))
+        q.put_nowait(self._final("run-1"))
+        await self._collect(first1, gen1)
+        # The user turn is written, the run is not closed in the transcript yet.
+        self.history = {"messages": self._sent_history(self.keys[0])["messages"][:3]}
+        self.run_ended_at = 1793702659908
+        self.active = True
+
+        with mock.patch.object(self.ocp, "ENDED_RUN_RECHECK_S", (0.01, 0.02)):
+            gen2 = self._reply("check the logs", "m1")
+            first2 = asyncio.ensure_future(gen2.__anext__())
+            await self._spin()
+            self.assertFalse(first2.done(), "the second call waits for the run")
+            reads = self.rpc.count("sessions.describe")
+            await asyncio.sleep(0.15)
+            self.assertGreater(self.rpc.count("sessions.describe"), reads + 2,
+                               "an ended run is read again by the duplicate-reply wait")
+            self.assertFalse(first2.done())
+
+            self.active = False         # cleared on the Gateway, nothing pushed
+            self.history = self._sent_history(self.keys[0])
+            out2, _ = await asyncio.wait_for(self._collect(first2, gen2), 5)
+        self.assertEqual(self.sent, ["check the logs"], "the same message ran twice")
+        self.assertEqual(out2, "Reading them.\n\nFound it.")
+
+    async def test_a_second_call_renders_the_reply_written_between_the_read_and_the_idle_check(self):
+        """CodeRabbit on #270: the duplicate-reply wait read the turn, then asked
+        whether the session was idle. The run's closing message written between
+        the two left the snapshot without it, and the second call replaced the
+        first answer with that partial reply. The turn is read again once the
+        session reads idle."""
+        gen1 = self._reply("check the logs", "m1")
+        first1 = asyncio.ensure_future(gen1.__anext__())
+        await self._until_registered("run-1")
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "Reading them.\n\nFound it."))
+        q.put_nowait(self._final("run-1"))
+        await self._collect(first1, gen1)
+        # The user turn is written, the run is not closed in the transcript yet.
+        self.history = {"messages": self._sent_history(self.keys[0])["messages"][:3]}
+        self.active = True
+
+        read, send_request = {"history": 0}, self.conn.send_request
+
+        async def write_after_the_read(method, params, timeout=10):
+            if method == "sessions.describe" and read["history"] == 1:
+                # The run ends: its closing message lands after the read above.
+                self.history = self._sent_history(self.keys[0])
+                self.active = False
+            if method == "chat.history":
+                read["history"] += 1
+            return await send_request(method, params, timeout)
+        self.conn.send_request = write_after_the_read
+
+        gen2 = self._reply("check the logs", "m1")
+        out2, _ = await asyncio.wait_for(
+            self._collect(asyncio.ensure_future(gen2.__anext__()), gen2), 5)
+        self.assertEqual(self.sent, ["check the logs"], "the same message ran twice")
+        self.assertEqual(out2, "Reading them.\n\nFound it.")
+
+    @staticmethod
+    async def _drain(gen):
+        return [c async for c in gen]
+
+    async def test_a_second_call_keeps_its_snapshot_when_the_read_after_the_idle_check_gives_nothing(self):
+        """The read after the idle check only improves the snapshot: when it
+        fails, or finds no turn, the earlier turn is rendered and the message
+        is not sent again."""
+        for n, outcome in enumerate(("fails", "no turn")):
+            mid = f"m{n}"
+            gen1 = self._reply("check the logs", mid)
+            first1 = asyncio.ensure_future(gen1.__anext__())
+            await self._until_registered(f"run-{n + 1}")
+            q = self._queue(f"run-{n + 1}")
+            q.put_nowait(self._delta(f"run-{n + 1}", "Reading them.\n\nFound it."))
+            q.put_nowait(self._final(f"run-{n + 1}"))
+            await self._collect(first1, gen1)
+            # The first answer is closed in the transcript, the Gateway still counts the run active.
+            self.history = self._sent_history(self.keys[n])
+            self.active = True
+            read, send_request = {"history": 0}, self.conn.send_request
+
+            async def second_read_gives_nothing(method, params, timeout=10, read=read, outcome=outcome):
+                if method == "sessions.describe":
+                    self.active = False
+                if method == "chat.history":
+                    read["history"] += 1
+                    if read["history"] == 2:
+                        if outcome == "fails":
+                            raise self.ocp.GatewayError("chat.history timed out")
+                        return {"messages": []}
+                return await send_request(method, params, timeout)
+            # Not closed, so the wait reaches the idle check and the second read.
+            self.history = {"messages": self.history["messages"][:3]}
+            self.conn.send_request = second_read_gives_nothing
+            try:
+                gen2 = self._reply("check the logs", mid)
+                with self.subTest(outcome):
+                    await asyncio.wait_for(self._drain(gen2), 5)
+            finally:
+                self.conn.send_request = send_request
+            self.assertEqual(len(self.sent), n + 1, f"{outcome}: the message was sent again")
 
     async def test_a_second_call_with_new_text_is_sent(self):
         """A second call for the same reply with different input is not a
