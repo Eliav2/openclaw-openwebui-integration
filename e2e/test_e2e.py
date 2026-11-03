@@ -638,9 +638,10 @@ def test_messages_waiting_behind_a_run_go_to_the_agent_as_one_turn(token):
     next, and the saved chat stays that way."""
     chat_id, _ = _chat_turn(token, "Respond with exactly: E2E_JOIN_CHAT")
     words = [f"E2E_JOIN_{w}_{uuid.uuid4().hex[:6]}" for w in ("A", "B", "C")]
+    key = _session_key(token, chat_id)
     _post_turn(token, chat_id, "E2E_SLOW:12 E2E_JOIN_RUN")
-    _until("the slow reply under way", lambda: any(
-        "E2E_JOIN_RUN slow-2" in (m.get("content") or "") for m in _chat_messages(token, chat_id).values()))
+    _until("the slow reply's run", lambda: _gw("sessions.describe", {"key": key})
+           .get("session", {}).get("hasActiveRun"), timeout_s=60, every_s=0.5)
     replies = []
     for word in words:
         replies.append(_post_turn(token, chat_id, f"E2E_ECHO: {word}"))
