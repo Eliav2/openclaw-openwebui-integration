@@ -1288,7 +1288,11 @@ class Scenes:
         page.reload()
         page.wait_for_selector("#chat-input", timeout=60_000)
         wait_js(page, last_text_has("the summary is in the forecast channel"), "the answer after a reload", 60_000)
-        page.evaluate(f"() => {LAST_ASSISTANT}.scrollIntoView({{block: 'end'}})")
+        # To the bottom, where Open WebUI hides its scroll-down arrow.
+        page.evaluate("() => { const c = document.getElementById('messages-container'); "
+                      "if (c) c.scrollTop = c.scrollHeight; }")
+        wait_js(page, "() => { const c = document.getElementById('messages-container'); "
+                      "return !c || c.scrollHeight - c.scrollTop - c.clientHeight < 4; }", "the chat at its bottom", 10_000)
         park_mouse(page)
         self.s.shot(page, name)
 

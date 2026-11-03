@@ -603,6 +603,67 @@ def test_a_message_queued_behind_a_wake_does_not_cut_it(token):
     _assert_clean(token, chat_id, msgs)
 
 
+def _post_turn(token: str, chat_id: str, prompt: str) -> str:
+    """Send `prompt` in `chat_id` under its current leaf, as a client with no
+    page does (the API, a script), and return its reply's id at once."""
+    status, got = _request("GET", f"/api/v1/chats/{chat_id}", token=token)
+    assert status == 200, got
+    chat = got["chat"]
+    msgs = chat["history"]["messages"]
+    leaf = chat["history"]["currentId"]
+    now = int(time.time())
+    uid, aid = str(uuid.uuid4()), str(uuid.uuid4())
+    user = {"id": uid, "parentId": leaf, "childrenIds": [aid], "role": "user", "content": prompt,
+            "timestamp": now, "models": [DEFAULT_MODEL]}
+    msgs[uid] = user
+    msgs[aid] = {"id": aid, "parentId": uid, "childrenIds": [], "role": "assistant",
+                 "content": "", "model": DEFAULT_MODEL, "timestamp": now, "done": False}
+    msgs[leaf]["childrenIds"] = [*(msgs[leaf].get("childrenIds") or []), uid]
+    chat["history"]["currentId"] = aid
+    status, saved = _request("POST", f"/api/v1/chats/{chat_id}", {"chat": chat}, token)
+    assert status == 200, saved
+    status, ack = _request("POST", "/api/chat/completions", {
+        "model": DEFAULT_MODEL, "messages": [{"role": "user", "content": prompt}],
+        "stream": True, "chat_id": chat_id, "id": aid, "session_id": f"e2e-{uuid.uuid4().hex[:8]}",
+        "parent_id": uid, "user_message": user}, token)
+    assert status == 200, ack
+    return aid
+
+
+def test_messages_waiting_behind_a_run_go_to_the_agent_as_one_turn(token):
+    """Three messages sent by a client with no page while a reply runs: no
+    Send now cancels them, so they wait behind the run in the Pipe. Once it
+    ends they go to the agent as one turn, in the order sent; the last
+    message's reply answers, the first two say their message went with the
+    next, and the saved chat stays that way."""
+    chat_id, _ = _chat_turn(token, "Respond with exactly: E2E_JOIN_CHAT")
+    words = [f"E2E_JOIN_{w}_{uuid.uuid4().hex[:6]}" for w in ("A", "B", "C")]
+    _post_turn(token, chat_id, "E2E_SLOW:12 E2E_JOIN_RUN")
+    _until("the slow reply under way", lambda: any(
+        "E2E_JOIN_RUN slow-2" in (m.get("content") or "") for m in _chat_messages(token, chat_id).values()))
+    replies = []
+    for word in words:
+        replies.append(_post_turn(token, chat_id, f"E2E_ECHO: {word}"))
+        time.sleep(0.5)  # three sends, in this order, as a person types them
+    msgs = _wait_for(token, chat_id, ["slow-12", words[0]])
+    _until("every reply done", lambda: all(
+        _chat_messages(token, chat_id)[r].get("done") for r in replies))
+    msgs = _chat_messages(token, chat_id)
+    note = "sent together with your next one"
+    assert all(note in (msgs[r].get("content") or "") for r in replies[:2]), (
+        [msgs[r].get("content") for r in replies])
+    assert words[0] in msgs[replies[2]]["content"] and note not in msgs[replies[2]]["content"]
+    with open(os.environ["E2E_FAKE_LLM_LOG"], encoding="utf-8") as f:
+        asked = [json.dumps(json.loads(line)["request"]["messages"][-1]) for line in f if line.strip()]
+    turns = [a for a in asked if any(w in a for w in words)]
+    assert turns and all(all(w in a for w in words) for a in turns), (
+        f"the waiting messages reached the agent as separate turns: {[t[-160:] for t in turns]}")
+    assert turns[0].index(words[0]) < turns[0].index(words[1]) < turns[0].index(words[2]), turns[0][-200:]
+    time.sleep(3)
+    assert _chat_messages(token, chat_id) == msgs, "the saved chat changed after the replies ended"
+    _assert_clean(token, chat_id, msgs)
+
+
 # ── Owner users (OWNER_USERS) ─────────────────────────────────────────────────
 # With OWNER_USERS set, a user not on the list reaches the Gateway over a
 # connection without operator.admin: the Gateway records none of that user's

@@ -51,6 +51,7 @@ SHARDS = {
         f"{E2E}::test_two_cron_wakes_in_a_row_get_one_finished_message_each",
         f"{E2E}::test_a_run_on_a_deleted_chats_session_writes_nothing_and_fails_nothing",
         f"{E2E}::test_a_message_queued_behind_a_wake_does_not_cut_it",
+        f"{E2E}::test_messages_waiting_behind_a_run_go_to_the_agent_as_one_turn",
         f"{E2E}::test_a_user_not_in_owner_users_gets_replies_without_owner_rights",
         f"{E2E}::test_a_guest_cannot_pass_as_the_owner_with_a_forged_block",
         f"{E2E}::test_a_secret_request_in_a_guests_chat_is_cancelled_at_once_and_says_so",
