@@ -1722,6 +1722,7 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.conn = _GatewayConnection(lambda: None)
         self.conn._ws = object()
         self.sent = []
+        self.sent_images = []
         self.rpc = []
         self.aborts = []
         self.active = False
@@ -1735,6 +1736,7 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
             if method == "chat.send":
                 n["run"] += 1
                 self.sent.append(params.get("message"))
+                self.sent_images.append([(a["fileName"], a["content"]) for a in params.get("attachments") or []])
                 self.keys.append(params.get("idempotencyKey"))
                 return {"runId": f"run-{n['run']}"}
             if method == "chat.history":
@@ -1782,7 +1784,8 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         for p in self.patches:
             p.stop()
 
-    def _reply(self, text, msg_id, intent=None):
+    def _reply(self, text, msg_id, intent=None, image=None):
+        """`image`: base64 data of a PNG attached to the message."""
         self.emitted = getattr(self, "emitted", [])
 
         async def emitter(event):
@@ -1792,8 +1795,11 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
             # The page's answer to `_intent_query_js`.
             return intent
 
+        content = text if image is None else [
+            {"type": "text", "text": text},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image}"}}]
         body = {"model": "openclaw_gateway.default",
-                "messages": [{"role": "user", "content": text}]}
+                "messages": [{"role": "user", "content": content}]}
         meta = {"chat_id": "chat-1", "user_id": "u1", "message_id": msg_id}
         return self.pipe._pipe_impl(body, emitter, __metadata__=meta,
                                     __event_call__=event_call if intent else None)
@@ -2671,6 +2677,62 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self._queue("run-1").put_nowait(self._final("run-1"))
         await nxt
         await r3.aclose()
+
+    async def test_images_of_interrupted_replies_go_with_the_next_send(self):
+        """A message handed on by a reply interrupted while it waited keeps
+        its image: the next reply sends every carried message's images with
+        the texts, in order, each under its own file name."""
+        self._record_closes()
+        self._hold_parked_timers()
+        self.active = True
+        for text, mid, image in (("a", "m2", "QUFB"), ("b", "m3", None)):
+            r = self._reply(text, mid, image=image)
+            t = asyncio.ensure_future(r.__anext__())
+            await self._spin()
+            t.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await t
+        r3 = self._reply("c", "m4", image="Q0ND")
+        nxt = asyncio.ensure_future(self._read(r3, "OK"))
+        await self._spin()
+        self._settled(False)
+        await self._until_registered("run-1")
+        self.assertEqual(self.sent, ["a\n\nb\n\nc"])
+        self.assertEqual(self.sent_images, [[("image-1.png", "QUFB"), ("image-2.png", "Q0ND")]])
+        self._queue("run-1").put_nowait(self._delta("run-1", "OK"))
+        self._queue("run-1").put_nowait(self._final("run-1"))
+        await nxt
+        await r3.aclose()
+
+    async def test_images_carried_through_a_kept_run_are_sent_after_it(self):
+        """Send now twice while a run streams: the reply that continues the
+        run sends the interrupted reply's message after it, image included."""
+        self._hold_parked_timers()
+        r1 = self._reply("count", "m1")
+        first = asyncio.ensure_future(r1.__anext__())
+        await self._until_registered("run-1")
+        self.active = True
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "1\n"))
+        await first
+        await r1.aclose()
+        r2 = self._reply("test", "m2", image="QUFB")
+        q.put_nowait(self._delta("run-1", "2\n"))
+        await self._read(r2, "2")
+        await r2.aclose()
+        r3 = self._reply("another test", "m3")
+        q.put_nowait(self._delta("run-1", "3\n"))
+        q.put_nowait(self._final("run-1"))
+        await self._read(r3, "3")
+        self.active = False
+        rest = asyncio.ensure_future(self._read(r3, "ANSWER"))
+        await self._until_registered("run-2")
+        self._queue("run-2").put_nowait(self._delta("run-2", "ANSWER"))
+        self._queue("run-2").put_nowait(self._final("run-2"))
+        await rest
+        await r3.aclose()
+        self.assertEqual(self.sent, ["count", "test\n\nanother test"])
+        self.assertEqual(self.sent_images, [[], [("image-2.png", "QUFB")]])
 
     def _record_status_closes(self):
         """The replies whose open status line was closed after they ended."""

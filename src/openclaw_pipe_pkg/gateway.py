@@ -639,6 +639,20 @@ def _extract_image_attachments(raw_content) -> list:
     return attachments
 
 
+def _numbered_attachments(attachments: list) -> list:
+    """`attachments` for one chat.send. Images of several messages sent
+    together are numbered in order (image-1, image-2, ...), as each message
+    names its own by its position and two can share a name."""
+    names = [a.get("fileName") for a in attachments]
+    if len(set(names)) == len(names):
+        return attachments
+    out = []
+    for n, a in enumerate(attachments, 1):
+        ext = mimetypes.guess_extension(a.get("mimeType") or "") or ".png"
+        out.append({**a, "fileName": f"image-{n}{ext}"})
+    return out
+
+
 def _item_assistant_text(data: dict) -> str:
     """Return visible assistant text carried by item/preamble events."""
     kind = str(data.get("kind", "")).strip().lower()
@@ -2823,7 +2837,8 @@ class _GatewayConnection:
                             grace_s: float, send_stop: bool,
                             run_text: dict | None = None, settle=None,
                             reply: dict | None = None,
-                            waiting: list | None = None) -> None:
+                            waiting: list | None = None,
+                            attachments: list | None = None) -> None:
         """Hand a cancelled reply's unfinished business to the next message.
 
         OWUI cancels a response the same way for Stop and for Send now /
@@ -2835,7 +2850,8 @@ class _GatewayConnection:
           the run emits (including ones queued but not yet shown) is buffered
           rather than dropped;
         * `carried` holds user messages the cancelled reply had accepted but
-          not yet sent to the Gateway, oldest first;
+          not yet sent to the Gateway, oldest first, and `attachments` their
+          images;
         * `run_text` holds the run's text dedup baselines up to the cut
           ({"received", "stream", "item"}). The run's closing events repeat
           its WHOLE text; a claimer that starts from empty baselines takes all
@@ -2880,6 +2896,7 @@ class _GatewayConnection:
                 previous["task"].cancel()
             previous["resolved"].set()
             carried = list(previous["carried"]) + list(carried)
+            attachments = list(previous["attachments"]) + list(attachments or [])
             waiting = list(previous["waiting"]) + [
                 r for r in (waiting or []) if r not in previous["waiting"]]
             if previous["queue"] is not None and previous["queue"] is not queue:
@@ -2897,6 +2914,7 @@ class _GatewayConnection:
             self.mark_delivered_live(session_key, run_id)
 
         entry = {"run_id": run_id, "queue": queue, "carried": list(carried),
+                 "attachments": list(attachments or []),
                  "send_stop": send_stop, "task": None,
                  "resolved": asyncio.Event(), "run_text": run_text, "reply": reply,
                  "waiting": list(waiting or [])}
@@ -3025,8 +3043,9 @@ class _GatewayConnection:
         (`_INTENT_QUERY_TIMEOUT_S`), and it always runs to its end in the
         background, so this needs no bound of its own (ELI-95).
 
-        Returns {"run_id", "queue", "carried", "waiting"}; the caller now
-        owns the run, its buffered queue, the carried messages and the
+        Returns {"run_id", "queue", "carried", "attachments", "waiting"}; the
+        caller now owns the run, its buffered queue, the carried messages
+        (and their images) and the
         replies waiting for them.
         """
         entry = self._pending_cancel_aborts.get(session_key)
@@ -3046,6 +3065,7 @@ class _GatewayConnection:
         self._keep_in_own_message(session_key, entry)
         return {"run_id": entry["run_id"], "queue": entry["queue"],
                 "carried": list(entry["carried"]),
+                "attachments": list(entry["attachments"]),
                 "waiting": list(entry["waiting"]),
                 "run_text": entry.get("run_text")}
 

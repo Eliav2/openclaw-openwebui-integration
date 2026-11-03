@@ -5219,6 +5219,20 @@ def _extract_image_attachments(raw_content) -> list:
     return attachments
 
 
+def _numbered_attachments(attachments: list) -> list:
+    """`attachments` for one chat.send. Images of several messages sent
+    together are numbered in order (image-1, image-2, ...), as each message
+    names its own by its position and two can share a name."""
+    names = [a.get("fileName") for a in attachments]
+    if len(set(names)) == len(names):
+        return attachments
+    out = []
+    for n, a in enumerate(attachments, 1):
+        ext = mimetypes.guess_extension(a.get("mimeType") or "") or ".png"
+        out.append({**a, "fileName": f"image-{n}{ext}"})
+    return out
+
+
 def _item_assistant_text(data: dict) -> str:
     """Return visible assistant text carried by item/preamble events."""
     kind = str(data.get("kind", "")).strip().lower()
@@ -7403,7 +7417,8 @@ class _GatewayConnection:
                             grace_s: float, send_stop: bool,
                             run_text: dict | None = None, settle=None,
                             reply: dict | None = None,
-                            waiting: list | None = None) -> None:
+                            waiting: list | None = None,
+                            attachments: list | None = None) -> None:
         """Hand a cancelled reply's unfinished business to the next message.
 
         OWUI cancels a response the same way for Stop and for Send now /
@@ -7415,7 +7430,8 @@ class _GatewayConnection:
           the run emits (including ones queued but not yet shown) is buffered
           rather than dropped;
         * `carried` holds user messages the cancelled reply had accepted but
-          not yet sent to the Gateway, oldest first;
+          not yet sent to the Gateway, oldest first, and `attachments` their
+          images;
         * `run_text` holds the run's text dedup baselines up to the cut
           ({"received", "stream", "item"}). The run's closing events repeat
           its WHOLE text; a claimer that starts from empty baselines takes all
@@ -7460,6 +7476,7 @@ class _GatewayConnection:
                 previous["task"].cancel()
             previous["resolved"].set()
             carried = list(previous["carried"]) + list(carried)
+            attachments = list(previous["attachments"]) + list(attachments or [])
             waiting = list(previous["waiting"]) + [
                 r for r in (waiting or []) if r not in previous["waiting"]]
             if previous["queue"] is not None and previous["queue"] is not queue:
@@ -7477,6 +7494,7 @@ class _GatewayConnection:
             self.mark_delivered_live(session_key, run_id)
 
         entry = {"run_id": run_id, "queue": queue, "carried": list(carried),
+                 "attachments": list(attachments or []),
                  "send_stop": send_stop, "task": None,
                  "resolved": asyncio.Event(), "run_text": run_text, "reply": reply,
                  "waiting": list(waiting or [])}
@@ -7605,8 +7623,9 @@ class _GatewayConnection:
         (`_INTENT_QUERY_TIMEOUT_S`), and it always runs to its end in the
         background, so this needs no bound of its own (ELI-95).
 
-        Returns {"run_id", "queue", "carried", "waiting"}; the caller now
-        owns the run, its buffered queue, the carried messages and the
+        Returns {"run_id", "queue", "carried", "attachments", "waiting"}; the
+        caller now owns the run, its buffered queue, the carried messages
+        (and their images) and the
         replies waiting for them.
         """
         entry = self._pending_cancel_aborts.get(session_key)
@@ -7626,6 +7645,7 @@ class _GatewayConnection:
         self._keep_in_own_message(session_key, entry)
         return {"run_id": entry["run_id"], "queue": entry["queue"],
                 "carried": list(entry["carried"]),
+                "attachments": list(entry["attachments"]),
                 "waiting": list(entry["waiting"]),
                 "run_text": entry.get("run_text")}
 
@@ -13978,7 +13998,9 @@ class _TurnState:
     own Open WebUI message ({chat_id, user_id, message_id, request_task_id});
     `waiting` are the earlier replies, cancelled before they sent their
     message, whose messages are among `unsent`: each is ended with a note
-    once those messages are sent, or dropped (ELI-188). `status_open`: the
+    once those messages are sent, or dropped (ELI-188). `attachments` are
+    the images of the `unsent` messages, oldest first, sent with them.
+    `status_open`: the
     last status line the reply showed is not done yet; `handed_over`: the
     turn writer took the reply's message over.
     """
@@ -13990,6 +14012,7 @@ class _TurnState:
     status_open: bool = False
     handed_over: bool = False
     unsent: list = field(default_factory=list)
+    attachments: list = field(default_factory=list)
     run_id: str | None = None
     queue: object = None
     run_text: dict | None = None
@@ -14533,7 +14556,7 @@ class Pipe:
     async def _pipe_impl(self, body, __event_emitter__, __event_call__=None,
                    __user__=None, __metadata__=None, __request__=None,
                    __task__=None, __task_body__=None, _initial_visible_text="",
-                   _send_texts=None, _waiting=None):
+                   _send_texts=None, _waiting=None, _send_attachments=None):
         """One reply: runs `_pipe_turn`, and makes sure a cancel or close at
         ANY point hands what the reply still owes to the next message (see
         `park_cancelled_turn`) instead of dropping it.
@@ -14547,7 +14570,8 @@ class Pipe:
 
         `_send_texts` replaces this request's own text as what to send, for
         the recursions that send messages carried over from earlier replies;
-        `_waiting` are the replies those messages came from (`_TurnState`).
+        `_waiting` are the replies those messages came from (`_TurnState`),
+        `_send_attachments` the images that go with them.
         """
         turn = _TurnState(waiting=list(_waiting or []))
         emitter = None
@@ -14578,7 +14602,7 @@ class Pipe:
                 __request__=__request__, __task__=__task__,
                 __task_body__=__task_body__,
                 _initial_visible_text=_initial_visible_text,
-                _send_texts=_send_texts, turn=turn,
+                _send_texts=_send_texts, _send_attachments=_send_attachments, turn=turn,
             )) as turn_gen:
                 async for item in turn_gen:
                     yield item
@@ -14599,6 +14623,7 @@ class Pipe:
                 turn.conn.park_cancelled_turn(
                     turn.session_key, turn.run_id, turn.queue, turn.unsent,
                     float(getattr(self.valves, "INTERRUPT_GRACE_SECONDS", 0) or 0),
+                    attachments=turn.attachments,
                     send_stop=self.valves.SEND_STOP_ON_CANCEL,
                     run_text=turn.run_text,
                     settle=functools.partial(
@@ -14611,7 +14636,7 @@ class Pipe:
     async def _pipe_turn(self, body, __event_emitter__, __event_call__=None,
                    __user__=None, __metadata__=None, __request__=None,
                    __task__=None, __task_body__=None, _initial_visible_text="",
-                   _send_texts=None, turn=None):
+                   _send_texts=None, _send_attachments=None, turn=None):
         """Uses a shared persistent WS connection; no per-message reconnect,
         no global lock, and no 60s timeout.
 
@@ -14624,7 +14649,8 @@ class Pipe:
         """
         state = _PipeTurn(
             self, body, __event_emitter__, __event_call__, __user__, __metadata__,
-            __request__, __task__, __task_body__, _initial_visible_text, _send_texts, turn)
+            __request__, __task__, __task_body__, _initial_visible_text, _send_texts, turn,
+            _send_attachments)
         async with contextlib.aclosing(state.run()) as items:
             async for item in items:
                 yield item
@@ -14638,7 +14664,7 @@ class _PipeTurn:
 
     def __init__(self, pipe, body, __event_emitter__, __event_call__, __user__,
                  __metadata__, __request__, __task__, __task_body__,
-                 _initial_visible_text, _send_texts, turn):
+                 _initial_visible_text, _send_texts, turn, _send_attachments=None):
         # The agent was told an unanswered secret never came (once per reply).
         self.secret_not_received_sent = False
         self.pipe = pipe
@@ -14652,6 +14678,7 @@ class _PipeTurn:
         self.__task_body__ = __task_body__
         self._initial_visible_text = _initial_visible_text
         self._send_texts = _send_texts
+        self._send_attachments = _send_attachments
         self.turn = turn
         self.ended = False
 
@@ -14856,6 +14883,8 @@ class _PipeTurn:
             self.__metadata__ or {}, messages, self.column, self.body.get("model"))
         self.turn.unsent = (list(self._send_texts) if self._send_texts
                             else [history_prefix + _voice_note(self.__metadata__) + self.text])
+        self.turn.attachments = (list(self._send_attachments or []) if self._send_texts
+                                 else list(self.image_attachments))
         meta = self.__metadata__ or {}
         if self.owui_origin_chat_id and meta.get("message_id") and not self.channel_id:
             self.turn.reply = {"chat_id": self.owui_origin_chat_id, "user_id": user_id,
@@ -14874,6 +14903,7 @@ class _PipeTurn:
         # What actually went out in this turn's chat.send, for the
         # thinking-rejection retry to send again.
         self.sent_texts = list(self.turn.unsent)
+        self.sent_attachments = list(self.turn.attachments)
 
         # A cancel of this session's previous response that arrived just
         # before this message is OWUI's "Send now" / interrupt, not a Stop:
@@ -14889,6 +14919,7 @@ class _PipeTurn:
             self.turn.waiting = claimed.get("waiting", []) + self.turn.waiting
             if claimed["carried"]:
                 self.turn.unsent = claimed["carried"] + self.turn.unsent
+                self.turn.attachments = claimed.get("attachments", []) + self.turn.attachments
                 pipe_log(
                     f"  carrying {len(claimed['carried'])} unsent message(s) "
                     "from the cancelled reply"
@@ -15148,7 +15179,7 @@ class _PipeTurn:
                             idempotency_key=idempotency_key,
                             owui_chat_id=self.owui_origin_chat_id,
                             owui_user_id=self.owui_origin_user_id,
-                            attachments=self.image_attachments,
+                            attachments=_numbered_attachments(self.turn.attachments),
                             thinking=self.resolved_thinking,
                         ),
                         timeout=30
@@ -15171,9 +15202,11 @@ class _PipeTurn:
                     self.conn.unregister_consumer(self.session_key, idempotency_key, queue=self.queue)
                     self.queue = self.conn.register_consumer(self.session_key, self.our_run_id)
                 self.sent_texts = list(self.turn.unsent)
+                self.sent_attachments = list(self.turn.attachments)
                 self.conn.note_reply_sent(self.session_key, reply_id, self.our_run_id,
                                      "\n\n".join(t for t in self.sent_texts if t))
                 self.turn.unsent = []
+                self.turn.attachments = []
                 if self.channel_commit is not None:
                     # The Gateway has the turn: the agent saw these messages,
                     # and it now follows the thread.
@@ -15682,6 +15715,7 @@ class _PipeTurn:
         self.conn.park_cancelled_turn(
             self.session_key, self.our_run_id, self.queue, self.turn.unsent, grace_s,
             send_stop=self.pipe.valves.SEND_STOP_ON_CANCEL,
+            attachments=self.turn.attachments,
             run_text={"received": self.renderer.received,
                       "stream": self.assistant_stream_text,
                       "item": self.renderer.last_item},
@@ -15881,6 +15915,7 @@ class _PipeTurn:
             # owns the terminal snapshot, usage lines and auto-title. Seeding
             # it with what streamed so far keeps that snapshot complete.
             send_texts = list(self.turn.unsent)
+            send_attachments = list(self.turn.attachments)
             pipe_log(
                 f"  adopted run {self.adopted_run_id[:20]}... finished; sending "
                 f"{len(send_texts)} queued message(s)"
@@ -15893,6 +15928,7 @@ class _PipeTurn:
             # if it is cancelled.
             waiting, self.turn.waiting = self.turn.waiting, []
             self.turn.unsent = []
+            self.turn.attachments = []
             async with contextlib.aclosing(self.pipe._pipe_impl(
                 self.body, self.__event_emitter__,
                 __event_call__=self.__event_call__, __user__=self.__user__,
@@ -15900,6 +15936,7 @@ class _PipeTurn:
                 __task__=self.__task__, __task_body__=self.__task_body__,
                 _initial_visible_text=self.visible_message_text,
                 _send_texts=send_texts, _waiting=waiting,
+                _send_attachments=send_attachments,
             )) as continuation:
                 async for item in continuation:
                     yield item
@@ -15941,6 +15978,7 @@ class _PipeTurn:
                     __task__=self.__task__, __task_body__=self.__task_body__,
                     _initial_visible_text=self.visible_message_text,
                     _send_texts=self.sent_texts,
+                    _send_attachments=self.sent_attachments,
                 )) as again:
                     async for item in again:
                         yield item
@@ -16029,6 +16067,7 @@ class _PipeTurn:
                     __task__=self.__task__, __task_body__=self.__task_body__,
                     _initial_visible_text=self.visible_message_text,
                     _send_texts=self.sent_texts,
+                    _send_attachments=self.sent_attachments,
                 )) as retry:
                     async for item in retry:
                         yield item
