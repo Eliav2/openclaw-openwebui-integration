@@ -43,6 +43,8 @@ A message from another tab or device, or one sent during a run you did not start
 
 Several messages that wait behind the same run go out together, as one turn, when it ends: the agent reads them in the order you sent them, a blank line apart, with every image attached to any of them. The answer appears under the last one, and the replies of the earlier ones say their message was sent together with the next. A message you send once that turn has started waits for it and is answered on its own. The same holds for a message handed on by [Send now](#send-now). One message sent while the agent works, then another while it answers the first, are two turns: the first had already gone out.
 
+<img src="../img/queued-together-light.png" alt="Three messages sent while the cache rebuild ran: the first two replies say their message went with the next one, the last reply answers all three" width="320">
+
 Whether a run is active comes from the Gateway: `sessions.describe`, confirmed against `sessions.list`'s `hasActiveRun`, which holds across several Open WebUI processes. A parent that is paused waiting on a sub-agent counts as busy, not finished. The wait ends when the Gateway pushes that the run settled, with no polling and no time limit. A per-session send lock means two messages released at the same moment cannot merge into one run.
 
 Open WebUI sometimes calls the Pipe twice for the same reply. The second call does not send your message again: it follows the run the first call started and ends with that run's answer, so the agent never answers the same message twice and the real answer is never replaced.
