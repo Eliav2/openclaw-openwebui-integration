@@ -71,7 +71,7 @@ stack_down() {
       (( ${#left[@]} )) || break
       sleep 1
     done
-    (( ${#left[@]} )) && kill -KILL "${left[@]}" 2>/dev/null || true
+    if (( ${#left[@]} )); then kill -KILL "${left[@]}" 2>/dev/null || true; fi
   fi
   docker rm -f owui >/dev/null 2>&1 || true
   rm -f "${STACK_PID_FILES[@]}"
