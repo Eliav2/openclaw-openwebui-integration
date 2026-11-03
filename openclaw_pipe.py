@@ -14346,7 +14346,11 @@ class Pipe:
                 "(such as a push notifier), event webhooks and notification "
                 "targets receive it. Open WebUI's own 'chat.finished' still fires "
                 "when the chat request ends, which for OpenClaw can be before the "
-                "reply does, so a consumer that gets both should keep this one."
+                "reply does, so a consumer that gets both should keep this one. A "
+                "user with an Open WebUI notification target (Settings > "
+                "Notifications) that has 'chat.finished' on gets both, so two "
+                "notifications per OpenClaw reply. The event's data holds the full "
+                "reply text in 'message'."
         )
         COMPOSER_STATUS_BUTTON: bool = Field(
             default=True,
