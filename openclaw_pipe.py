@@ -5219,6 +5219,19 @@ def _extract_image_attachments(raw_content) -> list:
     return attachments
 
 
+def _numbered_attachments(attachments: list, *, combined: bool) -> list:
+    """`attachments` for one chat.send. The images of several messages sent
+    together (`combined`) are numbered in order, image-1, image-2, ...: each
+    message names its own by its position in it, so two can share a name."""
+    if not combined:
+        return attachments
+    out = []
+    for n, a in enumerate(attachments, 1):
+        ext = mimetypes.guess_extension(a.get("mimeType") or "") or ".png"
+        out.append({**a, "fileName": f"image-{n}{ext}"})
+    return out
+
+
 def _item_assistant_text(data: dict) -> str:
     """Return visible assistant text carried by item/preamble events."""
     kind = str(data.get("kind", "")).strip().lower()
@@ -6298,6 +6311,10 @@ class _GatewayConnection:
         # A retired connection stays up for them as it does for consumers:
         # closing it would leave the waiter with no settle push, ever (ELI-172).
         self._open_send_sections = 0
+        # Per session, the replies waiting in `send_section` for a run to
+        # settle that may send their message together with a later one,
+        # oldest first (`send_waiters`).
+        self._send_waiters: dict[str, list] = {}
 
         # Cancelled turns parked until they are claimed or released, by
         # session key (`park_cancelled_turn`). An immediate chat.abort on a
@@ -7061,6 +7078,19 @@ class _GatewayConnection:
             self._open_send_sections -= 1
             self._close_if_retired_and_idle()
 
+    def send_waiters(self, session_key: str) -> list:
+        """The replies of `session_key` waiting to send, oldest first. A
+        reply released when the run settles hands its message to the newest
+        one, so messages that queued up behind one run go out as one turn."""
+        return self._send_waiters.setdefault(session_key, [])
+
+    def drop_send_waiter(self, session_key: str, waiter) -> None:
+        waiters = self._send_waiters.get(session_key)
+        if waiters and waiter in waiters:
+            waiters.remove(waiter)
+            if not waiters:
+                del self._send_waiters[session_key]
+
     MODEL_PATCH_CACHE_TTL_S = 60.0
 
     def model_patch_lock(self, session_key: str) -> asyncio.Lock:
@@ -7403,7 +7433,8 @@ class _GatewayConnection:
                             grace_s: float, send_stop: bool,
                             run_text: dict | None = None, settle=None,
                             reply: dict | None = None,
-                            waiting: list | None = None) -> None:
+                            waiting: list | None = None,
+                            attachments: list | None = None) -> None:
         """Hand a cancelled reply's unfinished business to the next message.
 
         OWUI cancels a response the same way for Stop and for Send now /
@@ -7415,7 +7446,8 @@ class _GatewayConnection:
           the run emits (including ones queued but not yet shown) is buffered
           rather than dropped;
         * `carried` holds user messages the cancelled reply had accepted but
-          not yet sent to the Gateway, oldest first;
+          not yet sent to the Gateway, oldest first, and `attachments` their
+          images;
         * `run_text` holds the run's text dedup baselines up to the cut
           ({"received", "stream", "item"}). The run's closing events repeat
           its WHOLE text; a claimer that starts from empty baselines takes all
@@ -7460,6 +7492,7 @@ class _GatewayConnection:
                 previous["task"].cancel()
             previous["resolved"].set()
             carried = list(previous["carried"]) + list(carried)
+            attachments = list(previous["attachments"]) + list(attachments or [])
             waiting = list(previous["waiting"]) + [
                 r for r in (waiting or []) if r not in previous["waiting"]]
             if previous["queue"] is not None and previous["queue"] is not queue:
@@ -7477,6 +7510,7 @@ class _GatewayConnection:
             self.mark_delivered_live(session_key, run_id)
 
         entry = {"run_id": run_id, "queue": queue, "carried": list(carried),
+                 "attachments": list(attachments or []),
                  "send_stop": send_stop, "task": None,
                  "resolved": asyncio.Event(), "run_text": run_text, "reply": reply,
                  "waiting": list(waiting or [])}
@@ -7605,8 +7639,9 @@ class _GatewayConnection:
         (`_INTENT_QUERY_TIMEOUT_S`), and it always runs to its end in the
         background, so this needs no bound of its own (ELI-95).
 
-        Returns {"run_id", "queue", "carried", "waiting"}; the caller now
-        owns the run, its buffered queue, the carried messages and the
+        Returns {"run_id", "queue", "carried", "attachments", "waiting"}; the
+        caller now owns the run, its buffered queue, the carried messages
+        (and their images) and the
         replies waiting for them.
         """
         entry = self._pending_cancel_aborts.get(session_key)
@@ -7626,6 +7661,7 @@ class _GatewayConnection:
         self._keep_in_own_message(session_key, entry)
         return {"run_id": entry["run_id"], "queue": entry["queue"],
                 "carried": list(entry["carried"]),
+                "attachments": list(entry["attachments"]),
                 "waiting": list(entry["waiting"]),
                 "run_text": entry.get("run_text")}
 
@@ -9284,6 +9320,9 @@ def _keep_pipe_notes(streamed: list, renderer: "_TurnRenderer") -> None:
 REPLY_SENT_WITH_NEXT_NOTE = ("_(This message was sent together with your next one: "
                              "the answer is in the next reply.)_")
 REPLY_NOT_SENT_NOTE = "_(Stopped: this message was not sent to the agent.)_"
+# ... or the send that was to carry it failed: the next reply shows the error.
+REPLY_SEND_FAILED_NOTE = ("_(This message was to go together with your next one, "
+                          "which could not be sent: see the next reply.)_")
 
 
 async def _close_reply_status(ref: dict) -> None:
@@ -9350,12 +9389,14 @@ async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str) 
         pipe_log(f"  reply {message_id[:8]}...: closing note failed: {ex!r}")
 
 
-def _end_unsent_replies(conn: "_GatewayConnection", refs: list, *, sent: bool) -> None:
+def _end_unsent_replies(conn: "_GatewayConnection", refs: list, *, sent: bool,
+                        note: str | None = None) -> None:
     """End each reply in `refs` (see `_close_unsent_reply`) in the background:
-    its message went out with a later one (`sent`), or was dropped."""
+    its message went out with a later one (`sent`), or was dropped; `note`
+    says something else instead."""
+    note = note or (REPLY_SENT_WITH_NEXT_NOTE if sent else REPLY_NOT_SENT_NOTE)
     for ref in refs:
-        spawn_background(_close_unsent_reply(
-            conn, ref, REPLY_SENT_WITH_NEXT_NOTE if sent else REPLY_NOT_SENT_NOTE))
+        spawn_background(_close_unsent_reply(conn, ref, note))
 
 
 # Open WebUI cancels a response identically for Stop and for Send now (both
@@ -13978,7 +14019,9 @@ class _TurnState:
     own Open WebUI message ({chat_id, user_id, message_id, request_task_id});
     `waiting` are the earlier replies, cancelled before they sent their
     message, whose messages are among `unsent`: each is ended with a note
-    once those messages are sent, or dropped (ELI-188). `status_open`: the
+    once those messages are sent, or dropped (ELI-188). `attachments` are
+    the images of the `unsent` messages, oldest first, sent with them.
+    `status_open`: the
     last status line the reply showed is not done yet; `handed_over`: the
     turn writer took the reply's message over.
     """
@@ -13990,6 +14033,7 @@ class _TurnState:
     status_open: bool = False
     handed_over: bool = False
     unsent: list = field(default_factory=list)
+    attachments: list = field(default_factory=list)
     run_id: str | None = None
     queue: object = None
     run_text: dict | None = None
@@ -14533,7 +14577,7 @@ class Pipe:
     async def _pipe_impl(self, body, __event_emitter__, __event_call__=None,
                    __user__=None, __metadata__=None, __request__=None,
                    __task__=None, __task_body__=None, _initial_visible_text="",
-                   _send_texts=None, _waiting=None):
+                   _send_texts=None, _waiting=None, _send_attachments=None):
         """One reply: runs `_pipe_turn`, and makes sure a cancel or close at
         ANY point hands what the reply still owes to the next message (see
         `park_cancelled_turn`) instead of dropping it.
@@ -14547,7 +14591,8 @@ class Pipe:
 
         `_send_texts` replaces this request's own text as what to send, for
         the recursions that send messages carried over from earlier replies;
-        `_waiting` are the replies those messages came from (`_TurnState`).
+        `_waiting` are the replies those messages came from (`_TurnState`),
+        `_send_attachments` the images that go with them.
         """
         turn = _TurnState(waiting=list(_waiting or []))
         emitter = None
@@ -14578,7 +14623,7 @@ class Pipe:
                 __request__=__request__, __task__=__task__,
                 __task_body__=__task_body__,
                 _initial_visible_text=_initial_visible_text,
-                _send_texts=_send_texts, turn=turn,
+                _send_texts=_send_texts, _send_attachments=_send_attachments, turn=turn,
             )) as turn_gen:
                 async for item in turn_gen:
                     yield item
@@ -14599,6 +14644,7 @@ class Pipe:
                 turn.conn.park_cancelled_turn(
                     turn.session_key, turn.run_id, turn.queue, turn.unsent,
                     float(getattr(self.valves, "INTERRUPT_GRACE_SECONDS", 0) or 0),
+                    attachments=turn.attachments,
                     send_stop=self.valves.SEND_STOP_ON_CANCEL,
                     run_text=turn.run_text,
                     settle=functools.partial(
@@ -14611,7 +14657,7 @@ class Pipe:
     async def _pipe_turn(self, body, __event_emitter__, __event_call__=None,
                    __user__=None, __metadata__=None, __request__=None,
                    __task__=None, __task_body__=None, _initial_visible_text="",
-                   _send_texts=None, turn=None):
+                   _send_texts=None, _send_attachments=None, turn=None):
         """Uses a shared persistent WS connection; no per-message reconnect,
         no global lock, and no 60s timeout.
 
@@ -14624,7 +14670,8 @@ class Pipe:
         """
         state = _PipeTurn(
             self, body, __event_emitter__, __event_call__, __user__, __metadata__,
-            __request__, __task__, __task_body__, _initial_visible_text, _send_texts, turn)
+            __request__, __task__, __task_body__, _initial_visible_text, _send_texts, turn,
+            _send_attachments)
         async with contextlib.aclosing(state.run()) as items:
             async for item in items:
                 yield item
@@ -14638,7 +14685,7 @@ class _PipeTurn:
 
     def __init__(self, pipe, body, __event_emitter__, __event_call__, __user__,
                  __metadata__, __request__, __task__, __task_body__,
-                 _initial_visible_text, _send_texts, turn):
+                 _initial_visible_text, _send_texts, turn, _send_attachments=None):
         # The agent was told an unanswered secret never came (once per reply).
         self.secret_not_received_sent = False
         self.pipe = pipe
@@ -14652,6 +14699,7 @@ class _PipeTurn:
         self.__task_body__ = __task_body__
         self._initial_visible_text = _initial_visible_text
         self._send_texts = _send_texts
+        self._send_attachments = _send_attachments
         self.turn = turn
         self.ended = False
 
@@ -14856,6 +14904,8 @@ class _PipeTurn:
             self.__metadata__ or {}, messages, self.column, self.body.get("model"))
         self.turn.unsent = (list(self._send_texts) if self._send_texts
                             else [history_prefix + _voice_note(self.__metadata__) + self.text])
+        self.turn.attachments = (list(self._send_attachments or []) if self._send_texts
+                                 else list(self.image_attachments))
         meta = self.__metadata__ or {}
         if self.owui_origin_chat_id and meta.get("message_id") and not self.channel_id:
             self.turn.reply = {"chat_id": self.owui_origin_chat_id, "user_id": user_id,
@@ -14874,6 +14924,7 @@ class _PipeTurn:
         # What actually went out in this turn's chat.send, for the
         # thinking-rejection retry to send again.
         self.sent_texts = list(self.turn.unsent)
+        self.sent_attachments = list(self.turn.attachments)
 
         # A cancel of this session's previous response that arrived just
         # before this message is OWUI's "Send now" / interrupt, not a Stop:
@@ -14889,6 +14940,7 @@ class _PipeTurn:
             self.turn.waiting = claimed.get("waiting", []) + self.turn.waiting
             if claimed["carried"]:
                 self.turn.unsent = claimed["carried"] + self.turn.unsent
+                self.turn.attachments = claimed.get("attachments", []) + self.turn.attachments
                 pipe_log(
                     f"  carrying {len(claimed['carried'])} unsent message(s) "
                     "from the cancelled reply"
@@ -15058,133 +15110,196 @@ class _PipeTurn:
             # NOTE: do NOT prepend a `/queue followup` directive here: the
             # Gateway does not strip it from a device chat.send, so it leaks
             # verbatim into the delivered message.
-            async with self.conn.send_section(self.session_key):
-                # Wait for the Gateway to push that the run settled
-                # (`sessions.changed`, see `session_change_event`), re-reading
-                # the authoritative state after each change. No poll, no
-                # settle window and no ceiling (ELI-88): a ceiling releases a
-                # message into a run that is still going, where the Gateway
-                # queues it and claude-cli drops it. A
-                # resume that starts right after a settle is caught after the
-                # send instead (see `enqueued_not_started`). Stop cancels this
-                # wait like any other.
-                ever_active = False
-                while True:
-                    changed = self.conn.session_change_event(self.session_key)
-                    if not await self._session_run_active():
-                        break
-                    if not ever_active:
-                        ever_active = True
-                        pipe_log("Session has an active run (gateway-authoritative); "
-                                 "queueing behind it")
-                        await _emit_status(
-                            self.__event_emitter__,
-                            "Queued: waiting for the current run to finish…",
-                            done=False,
-                        )
-                    await changed.wait()
-                if ever_active:
-                    pipe_log("  active run settled; sending queued message as its own run")
+            # Messages that wait behind the same run go out together: a reply
+            # released when it settles hands its message to the newest one
+            # still waiting (`hand_on`), which sends them all as one turn.
+            joins = self._send_texts is None and bool(self.turn.reply) and not self.channel_id
+            if joins:
+                self.conn.send_waiters(self.session_key).append(self)
+            try:
+                async for item in self.wait_and_send(reply_id):
+                    yield item
+            finally:
+                if joins:
+                    self.conn.drop_send_waiter(self.session_key, self)
+            if self.ended:
+                return
+        self.register_target()
 
-                # --- Send this message as its own fresh run (still holding the lock
-                #     so the next waiter observes our run before deciding to send) ---
-                # The OWUI message id in the run id ties the run to the reply
-                # it streams into, so a reply orphaned by an Open WebUI restart
-                # is matched to its run by identity (ELI-90, `_stub_turn`).
-                idempotency_key = (pipe_run_id(self.chat_id, reply_id) if reply_id
-                                   else f"msg-{self.chat_id}-{time.time()}")
-                # Fit the requested level to what this session's model actually
-                # supports. The dropdown is a union across models, so a level that
-                # is real for one model can be unavailable here. Clamping is
-                # downward only and always explained: silently answering at a level
-                # other than the one asked for is worse than a short note, and
-                # silently erroring out is worse still.
-                #
-                # A ladder the Gateway STATED (by rejecting a send) beats the one
-                # describe reported, because describe answers this question without
-                # a model catalog and overreports for catalog-gated models. This is
-                # what makes the rejection cost one turn per model instead of one
-                # turn every turn.
-                #
-                # Look up by `model_override` (the runtime-namespaced routing key,
-                # e.g. "claude-cli/claude-opus-5") before `session_model_key` (the
-                # vendor key describe resolves it to, e.g. "anthropic/claude-opus-5"
-                # -- see `_RUNTIME_PROVIDER_NAMESPACES`). The Gateway's rejection
-                # text names the model by its routing key, so that is where
-                # `_record_thinking_ladder` files the authoritative entry; reading
-                # back under the vendor key alone missed it every time and repeated
-                # the same round-trip rejection (and its note) on every turn.
-                _state_dir_valve = getattr(self.pipe.valves, "STATE_DIR", "")
-                effective_ladder = (_read_model_thinking_ladder(self.model_override, _state_dir_valve)
-                                    or _read_model_thinking_ladder(self.session_model_key, _state_dir_valve)
-                                    or self.session_thinking_ladder)
-                self.resolved_thinking, thinking_note = clamp_to_ladder(
-                    self.requested_thinking, effective_ladder)
-                # Held until `visible_message_text` exists below (it isn't defined
-                # yet at this point in the turn) so the note that streams here also
-                # ends up in the forced terminal snapshot -- otherwise it shows
-                # while streaming and is gone after a reload.
-                self.pending_clamp_note = ""
-                if thinking_note:
-                    pipe_log(f"thinking: {thinking_note}")
-                    # Logged every time, shown once: the dropdown keeps the level
-                    # selected, so an unchanged mismatch would otherwise stamp the
-                    # same italic line above every answer in the chat.
-                    if self.conn.should_announce_thinking_note(self.session_key, thinking_note):
-                        self.pending_clamp_note = f"_{thinking_note}_\n\n"
-                        yield self.pending_clamp_note
-                # Listen before sending: the run's first events can arrive
-                # before chat.send returns, and with no consumer they would go
-                # to the turn writer, which takes this reply's message over
-                # while the reply still streams. The run id is the idempotency
-                # key.
-                self.queue = self.conn.register_consumer(self.session_key, idempotency_key)
-                try:
-                    send_resp = await _run_request(
-                        self.conn, RUN_SEND,
-                        _owui_chat_send_params(
-                            session_key=self.session_key,
-                            message="\n\n".join(t for t in self.turn.unsent if t),
-                            idempotency_key=idempotency_key,
-                            owui_chat_id=self.owui_origin_chat_id,
-                            owui_user_id=self.owui_origin_user_id,
-                            attachments=self.image_attachments,
-                            thinking=self.resolved_thinking,
-                        ),
-                        timeout=30
+    def end_waiting_replies_unsent(self) -> None:
+        """The send that was to carry the messages of `turn.waiting` failed:
+        those replies say so, pointing at this one's error."""
+        _end_unsent_replies(self.conn, self.turn.waiting, sent=False, note=REPLY_SEND_FAILED_NOTE)
+        self.turn.waiting = []
+
+    def hand_on(self) -> bool:
+        """Hand this reply's message to the newest reply of the session that
+        waits to send, if there is one: it sends both as one turn, and ends
+        this reply with `REPLY_SENT_WITH_NEXT_NOTE` once it did (or with the
+        not-sent note, on a Stop), as for a reply interrupted while queued
+        (ELI-188). Its messages go before that reply's own, after any handed
+        to it earlier. Not when a waiting reply asks for another thinking
+        level: one send has one level, and the messages keep their order."""
+        self.conn.drop_send_waiter(self.session_key, self)
+        waiters = self.conn.send_waiters(self.session_key)
+        mine = self.turn.reply["message_id"]
+        later = next((w for w in reversed(waiters) if w.turn.reply["message_id"] != mine), None)
+        if later is None or any(w.requested_thinking != self.requested_thinking for w in waiters):
+            return False
+        at_text = getattr(later, "handed_texts", 0)
+        at_image = getattr(later, "handed_images", 0)
+        later.turn.unsent[at_text:at_text] = self.turn.unsent
+        later.turn.attachments[at_image:at_image] = self.turn.attachments
+        later.handed_texts = at_text + len(self.turn.unsent)
+        later.handed_images = at_image + len(self.turn.attachments)
+        later.turn.waiting = later.turn.waiting + self.turn.waiting + [self.turn.reply]
+        pipe_log(f"  {len(self.turn.unsent)} queued message(s) go with a later one "
+                 f"(reply {later.turn.reply['message_id'][:8]}...)")
+        self.turn.unsent, self.turn.attachments, self.turn.waiting = [], [], []
+        return True
+
+    async def wait_and_send(self, reply_id):
+        """Wait for the session's run to settle, then send this reply's
+        messages as their own run (ELI-56), or hand them on (`hand_on`)."""
+        async with self.conn.send_section(self.session_key):
+            # Wait for the Gateway to push that the run settled
+            # (`sessions.changed`, see `session_change_event`), re-reading
+            # the authoritative state after each change. No poll, no
+            # settle window and no ceiling (ELI-88): a ceiling releases a
+            # message into a run that is still going, where the Gateway
+            # queues it and claude-cli drops it. A
+            # resume that starts right after a settle is caught after the
+            # send instead (see `enqueued_not_started`). Stop cancels this
+            # wait like any other.
+            ever_active = False
+            while True:
+                changed = self.conn.session_change_event(self.session_key)
+                if not await self._session_run_active():
+                    break
+                if not ever_active:
+                    ever_active = True
+                    pipe_log("Session has an active run (gateway-authoritative); "
+                             "queueing behind it")
+                    await _emit_status(
+                        self.__event_emitter__,
+                        "Queued: waiting for the current run to finish…",
+                        done=False,
                     )
-                except asyncio.TimeoutError:
-                    self.conn.unregister_consumer(self.session_key, idempotency_key, queue=self.queue)
-                    await _emit_status(self.__event_emitter__, "", done=True)
-                    yield "**Timeout:** Gateway did not respond to chat.send"
-                    self.ended = True
-                    return
-                except Exception as e:
-                    self.conn.unregister_consumer(self.session_key, idempotency_key, queue=self.queue)
-                    await _emit_status(self.__event_emitter__, "", done=True)
-                    yield f"**Error sending message:** {e}"
-                    self.ended = True
-                    return
-                self.our_run_id = send_resp.get("runId") or idempotency_key
-                pipe_log(f"Captured runId: {self.our_run_id}")
-                if self.our_run_id != idempotency_key:
-                    self.conn.unregister_consumer(self.session_key, idempotency_key, queue=self.queue)
-                    self.queue = self.conn.register_consumer(self.session_key, self.our_run_id)
-                self.sent_texts = list(self.turn.unsent)
-                self.conn.note_reply_sent(self.session_key, reply_id, self.our_run_id,
-                                     "\n\n".join(t for t in self.sent_texts if t))
-                self.turn.unsent = []
-                if self.channel_commit is not None:
-                    # The Gateway has the turn: the agent saw these messages,
-                    # and it now follows the thread.
-                    self.channel_commit()
-                    self.channel_commit = None
-                    _ensure_channel_watcher(lambda: self.pipe.valves)
-                _end_unsent_replies(self.conn, self.turn.waiting, sent=True)
-                self.turn.waiting = []
-                self.turn.run_id = self.our_run_id
-                self.turn.queue = self.queue
-                self.turn.run_text = None
+                await changed.wait()
+            if ever_active:
+                pipe_log("  active run settled; sending queued message as its own run")
+            if self in self.conn.send_waiters(self.session_key) and self.hand_on():
+                await _emit_status(self.__event_emitter__, "", done=True)
+                self.ended = True
+                return
+
+            # --- Send this message as its own fresh run (still holding the lock
+            #     so the next waiter observes our run before deciding to send) ---
+            # The OWUI message id in the run id ties the run to the reply
+            # it streams into, so a reply orphaned by an Open WebUI restart
+            # is matched to its run by identity (ELI-90, `_stub_turn`).
+            idempotency_key = (pipe_run_id(self.chat_id, reply_id) if reply_id
+                               else f"msg-{self.chat_id}-{time.time()}")
+            # Fit the requested level to what this session's model actually
+            # supports. The dropdown is a union across models, so a level that
+            # is real for one model can be unavailable here. Clamping is
+            # downward only and always explained: silently answering at a level
+            # other than the one asked for is worse than a short note, and
+            # silently erroring out is worse still.
+            #
+            # A ladder the Gateway STATED (by rejecting a send) beats the one
+            # describe reported, because describe answers this question without
+            # a model catalog and overreports for catalog-gated models. This is
+            # what makes the rejection cost one turn per model instead of one
+            # turn every turn.
+            #
+            # Look up by `model_override` (the runtime-namespaced routing key,
+            # e.g. "claude-cli/claude-opus-5") before `session_model_key` (the
+            # vendor key describe resolves it to, e.g. "anthropic/claude-opus-5"
+            # -- see `_RUNTIME_PROVIDER_NAMESPACES`). The Gateway's rejection
+            # text names the model by its routing key, so that is where
+            # `_record_thinking_ladder` files the authoritative entry; reading
+            # back under the vendor key alone missed it every time and repeated
+            # the same round-trip rejection (and its note) on every turn.
+            _state_dir_valve = getattr(self.pipe.valves, "STATE_DIR", "")
+            effective_ladder = (_read_model_thinking_ladder(self.model_override, _state_dir_valve)
+                                or _read_model_thinking_ladder(self.session_model_key, _state_dir_valve)
+                                or self.session_thinking_ladder)
+            self.resolved_thinking, thinking_note = clamp_to_ladder(
+                self.requested_thinking, effective_ladder)
+            # Held until `visible_message_text` exists below (it isn't defined
+            # yet at this point in the turn) so the note that streams here also
+            # ends up in the forced terminal snapshot -- otherwise it shows
+            # while streaming and is gone after a reload.
+            self.pending_clamp_note = ""
+            if thinking_note:
+                pipe_log(f"thinking: {thinking_note}")
+                # Logged every time, shown once: the dropdown keeps the level
+                # selected, so an unchanged mismatch would otherwise stamp the
+                # same italic line above every answer in the chat.
+                if self.conn.should_announce_thinking_note(self.session_key, thinking_note):
+                    self.pending_clamp_note = f"_{thinking_note}_\n\n"
+                    yield self.pending_clamp_note
+            # Listen before sending: the run's first events can arrive
+            # before chat.send returns, and with no consumer they would go
+            # to the turn writer, which takes this reply's message over
+            # while the reply still streams. The run id is the idempotency
+            # key.
+            self.queue = self.conn.register_consumer(self.session_key, idempotency_key)
+            try:
+                send_resp = await _run_request(
+                    self.conn, RUN_SEND,
+                    _owui_chat_send_params(
+                        session_key=self.session_key,
+                        message="\n\n".join(t for t in self.turn.unsent if t),
+                        idempotency_key=idempotency_key,
+                        owui_chat_id=self.owui_origin_chat_id,
+                        owui_user_id=self.owui_origin_user_id,
+                        attachments=_numbered_attachments(
+                            self.turn.attachments, combined=len(self.turn.unsent) > 1),
+                        thinking=self.resolved_thinking,
+                    ),
+                    timeout=30
+                )
+            except asyncio.TimeoutError:
+                self.conn.unregister_consumer(self.session_key, idempotency_key, queue=self.queue)
+                await _emit_status(self.__event_emitter__, "", done=True)
+                yield "**Timeout:** Gateway did not respond to chat.send"
+                self.end_waiting_replies_unsent()
+                self.ended = True
+                return
+            except Exception as e:
+                self.conn.unregister_consumer(self.session_key, idempotency_key, queue=self.queue)
+                await _emit_status(self.__event_emitter__, "", done=True)
+                yield f"**Error sending message:** {e}"
+                self.end_waiting_replies_unsent()
+                self.ended = True
+                return
+            self.our_run_id = send_resp.get("runId") or idempotency_key
+            pipe_log(f"Captured runId: {self.our_run_id}")
+            if self.our_run_id != idempotency_key:
+                self.conn.unregister_consumer(self.session_key, idempotency_key, queue=self.queue)
+                self.queue = self.conn.register_consumer(self.session_key, self.our_run_id)
+            self.sent_texts = list(self.turn.unsent)
+            self.sent_attachments = list(self.turn.attachments)
+            self.conn.note_reply_sent(self.session_key, reply_id, self.our_run_id,
+                                 "\n\n".join(t for t in self.sent_texts if t))
+            self.turn.unsent = []
+            self.turn.attachments = []
+            if self.channel_commit is not None:
+                # The Gateway has the turn: the agent saw these messages,
+                # and it now follows the thread.
+                self.channel_commit()
+                self.channel_commit = None
+                _ensure_channel_watcher(lambda: self.pipe.valves)
+            _end_unsent_replies(self.conn, self.turn.waiting, sent=True)
+            self.turn.waiting = []
+            self.turn.run_id = self.our_run_id
+            self.turn.queue = self.queue
+            self.turn.run_text = None
+
+    def register_target(self):
+        """After admission: tie the run to this reply's message."""
         # Tell the persistent connection which OWUI message this run streams
         # into, so a turn writer continues that message from a shadow renderer
         # if this inline turn ends before the run does (cancel, close, a
@@ -15682,6 +15797,7 @@ class _PipeTurn:
         self.conn.park_cancelled_turn(
             self.session_key, self.our_run_id, self.queue, self.turn.unsent, grace_s,
             send_stop=self.pipe.valves.SEND_STOP_ON_CANCEL,
+            attachments=self.turn.attachments,
             run_text={"received": self.renderer.received,
                       "stream": self.assistant_stream_text,
                       "item": self.renderer.last_item},
@@ -15881,6 +15997,7 @@ class _PipeTurn:
             # owns the terminal snapshot, usage lines and auto-title. Seeding
             # it with what streamed so far keeps that snapshot complete.
             send_texts = list(self.turn.unsent)
+            send_attachments = list(self.turn.attachments)
             pipe_log(
                 f"  adopted run {self.adopted_run_id[:20]}... finished; sending "
                 f"{len(send_texts)} queued message(s)"
@@ -15893,6 +16010,7 @@ class _PipeTurn:
             # if it is cancelled.
             waiting, self.turn.waiting = self.turn.waiting, []
             self.turn.unsent = []
+            self.turn.attachments = []
             async with contextlib.aclosing(self.pipe._pipe_impl(
                 self.body, self.__event_emitter__,
                 __event_call__=self.__event_call__, __user__=self.__user__,
@@ -15900,6 +16018,7 @@ class _PipeTurn:
                 __task__=self.__task__, __task_body__=self.__task_body__,
                 _initial_visible_text=self.visible_message_text,
                 _send_texts=send_texts, _waiting=waiting,
+                _send_attachments=send_attachments,
             )) as continuation:
                 async for item in continuation:
                     yield item
@@ -15941,6 +16060,7 @@ class _PipeTurn:
                     __task__=self.__task__, __task_body__=self.__task_body__,
                     _initial_visible_text=self.visible_message_text,
                     _send_texts=self.sent_texts,
+                    _send_attachments=self.sent_attachments,
                 )) as again:
                     async for item in again:
                         yield item
@@ -16029,6 +16149,7 @@ class _PipeTurn:
                     __task__=self.__task__, __task_body__=self.__task_body__,
                     _initial_visible_text=self.visible_message_text,
                     _send_texts=self.sent_texts,
+                    _send_attachments=self.sent_attachments,
                 )) as retry:
                     async for item in retry:
                         yield item

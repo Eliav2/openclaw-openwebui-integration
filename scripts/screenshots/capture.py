@@ -1253,6 +1253,63 @@ class Scenes:
         self._both_answered(page)
         self._both_persisted(page)
 
+    QUEUED = ("Is staging on the same commit?", "How long did the last rebuild take?",
+              "Post the summary in the forecast channel when done.")
+
+    def _queued_together(self, page: Page, name: str) -> None:
+        """Three messages sent from other tabs while the rebuild runs: they
+        wait behind it and go to the agent as one turn. The first two
+        replies say their message went with the next; the last answers all
+        three."""
+        new_chat(page)
+        chat = send(page, "Rebuild the forecast cache.")
+        wait_js(page, f"() => {{ const s = ({CARDS_STATE})(); return s && s.active >= 1; }}", "the running rebuild card")
+        set_title(self.token, chat, "Cache rebuild, three questions")
+        tabs = []
+        try:
+            for text in self.QUEUED:
+                other = page.context.new_page()
+                tabs.append(other)
+                other.goto(page.url)
+                other.wait_for_selector("#chat-input", timeout=60_000)
+                other.locator("#chat-input").click()
+                other.keyboard.type(text, delay=5)
+                other.locator("#send-message-button").click()
+                wait_js(page, f"() => [...document.querySelectorAll('.user-message')]"
+                              f".some(m => m.innerText.includes({json.dumps(text)}))", f"{text!r} in the chat")
+            wait_js(page, last_text_has("the summary is in the forecast channel"),
+                    "the answer to all three", 180_000)
+            wait_js(page, f"() => {{ const m = {LAST_ASSISTANT}.closest('[id^=message-]'); "
+                          "return m && m.querySelector('button[aria-label=\"Copy\"]'); }",
+                    "the answer finished", 60_000)
+        finally:
+            for other in tabs:
+                other.close()
+        page.reload()
+        page.wait_for_selector("#chat-input", timeout=60_000)
+        wait_js(page, last_text_has("the summary is in the forecast channel"), "the answer after a reload", 60_000)
+        # The rebuild runs 20 s: a tab slow enough to send after it ended
+        # gets a reply of its own, which is not this scene.
+        noted = page.evaluate("""() => [...document.querySelectorAll('.chat-assistant')].slice(-3, -1)
+          .map(a => a.innerText.includes('sent together with your next one'))""")
+        if noted != [True, True]:
+            raise RuntimeError(f"the three messages did not go out together: {noted}")
+        # To the bottom, where Open WebUI hides its scroll-down arrow.
+        page.evaluate("() => { const c = document.getElementById('messages-container'); "
+                      "if (c) c.scrollTop = c.scrollHeight; }")
+        wait_js(page, "() => { const c = document.getElementById('messages-container'); "
+                      "return !c || c.scrollHeight - c.scrollTop - c.clientHeight < 4; }", "the chat at its bottom", 10_000)
+        park_mouse(page)
+        self.s.shot(page, name)
+
+    def queued_together(self, page: Page) -> None:
+        self._queued_together(page, "queued-together")
+
+    def queued_together_desktop(self, page: Page) -> None:
+        """The same, at desktop width, for a pull request's Before/After
+        (not shown in the docs)."""
+        self._queued_together(page, "queued-together-desktop")
+
     def send_now(self, page: Page) -> None:
         """AUTO_SEND_WHILE_RUNNING off: Open WebUI queues the message; Send
         now on it lets the running reply finish, then the new message gets
@@ -1458,6 +1515,7 @@ def main(argv=None) -> int:
             shooter.run("chat-titles", scenes.chat_titles, page)
             shooter.run("stop", scenes.stop, page)
             shooter.run("message-sent-mid-run", scenes.sent_mid_run, page)
+            shooter.run("queued-together", scenes.queued_together, page)
             shooter.run("send-now", scenes.send_now, page)
             shooter.run("image-input", scenes.image_input, page)
             shooter.run("valves", scenes.admin_valves, page)
@@ -1469,6 +1527,8 @@ def main(argv=None) -> int:
                 shooter.run("toolbar-button", scenes.toolbar, dpage)
             cpage = signed_in_page(browser, token, DESKTOP)
             shooter.run("channel-thread", scenes.channel_thread, cpage)
+            qpage = signed_in_page(browser, token, DESKTOP)
+            shooter.run("queued-together-desktop", scenes.queued_together_desktop, qpage)
         finally:
             browser.close()
     print(f"\n{len(shooter.written)} images written")

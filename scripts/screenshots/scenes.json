@@ -424,6 +424,42 @@
       ]
     },
     {
+      "match": "same commit?\n\nHow long did the last rebuild take?",
+      "steps": [
+        {
+          "say": "Yes, staging is on the same commit as main. The last rebuild took 4 minutes, and the summary is in the forecast channel now.",
+          "delay": 0.03
+        }
+      ]
+    },
+    {
+      "match": "Is staging on the same commit?",
+      "steps": [
+        {
+          "say": "Yes, staging is on the same commit as main.",
+          "delay": 0.03
+        }
+      ]
+    },
+    {
+      "match": "How long did the last rebuild take?",
+      "steps": [
+        {
+          "say": "The last rebuild took 4 minutes.",
+          "delay": 0.03
+        }
+      ]
+    },
+    {
+      "match": "Post the summary in the forecast channel",
+      "steps": [
+        {
+          "say": "Done: the summary is in the forecast channel.",
+          "delay": 0.03
+        }
+      ]
+    },
+    {
       "match": "Which branch is this on?",
       "steps": [
         {

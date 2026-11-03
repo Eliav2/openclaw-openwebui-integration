@@ -339,6 +339,9 @@ def _keep_pipe_notes(streamed: list, renderer: "_TurnRenderer") -> None:
 REPLY_SENT_WITH_NEXT_NOTE = ("_(This message was sent together with your next one: "
                              "the answer is in the next reply.)_")
 REPLY_NOT_SENT_NOTE = "_(Stopped: this message was not sent to the agent.)_"
+# ... or the send that was to carry it failed: the next reply shows the error.
+REPLY_SEND_FAILED_NOTE = ("_(This message was to go together with your next one, "
+                          "which could not be sent: see the next reply.)_")
 
 
 async def _close_reply_status(ref: dict) -> None:
@@ -405,12 +408,14 @@ async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str) 
         pipe_log(f"  reply {message_id[:8]}...: closing note failed: {ex!r}")
 
 
-def _end_unsent_replies(conn: "_GatewayConnection", refs: list, *, sent: bool) -> None:
+def _end_unsent_replies(conn: "_GatewayConnection", refs: list, *, sent: bool,
+                        note: str | None = None) -> None:
     """End each reply in `refs` (see `_close_unsent_reply`) in the background:
-    its message went out with a later one (`sent`), or was dropped."""
+    its message went out with a later one (`sent`), or was dropped; `note`
+    says something else instead."""
+    note = note or (REPLY_SENT_WITH_NEXT_NOTE if sent else REPLY_NOT_SENT_NOTE)
     for ref in refs:
-        spawn_background(_close_unsent_reply(
-            conn, ref, REPLY_SENT_WITH_NEXT_NOTE if sent else REPLY_NOT_SENT_NOTE))
+        spawn_background(_close_unsent_reply(conn, ref, note))
 
 
 # Open WebUI cancels a response identically for Stop and for Send now (both

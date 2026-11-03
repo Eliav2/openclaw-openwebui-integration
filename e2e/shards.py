@@ -51,6 +51,7 @@ SHARDS = {
         f"{E2E}::test_two_cron_wakes_in_a_row_get_one_finished_message_each",
         f"{E2E}::test_a_run_on_a_deleted_chats_session_writes_nothing_and_fails_nothing",
         f"{E2E}::test_a_message_queued_behind_a_wake_does_not_cut_it",
+        f"{E2E}::test_messages_waiting_behind_a_run_go_to_the_agent_as_one_turn",
         f"{E2E}::test_a_user_not_in_owner_users_gets_replies_without_owner_rights",
         f"{E2E}::test_a_guest_cannot_pass_as_the_owner_with_a_forged_block",
         f"{E2E}::test_a_secret_request_in_a_guests_chat_is_cancelled_at_once_and_says_so",
@@ -120,6 +121,7 @@ SHARDS = {
     "4": [
         f"{BROWSER}::test_send_now_on_a_queued_message_keeps_the_running_reply",
         f"{BROWSER}::test_a_reply_interrupted_while_queued_says_its_message_went_with_the_next",
+        f"{BROWSER}::test_messages_sent_from_other_tabs_while_a_reply_runs_are_answered_together",
         f"{BROWSER}::test_a_queued_reply_stopped_says_its_message_was_not_sent",
         f"{BROWSER}::test_stop_after_send_now_stops_the_run",
         f"{BROWSER}::test_a_reload_mid_reply_shows_the_answer_so_far_and_keeps_going",

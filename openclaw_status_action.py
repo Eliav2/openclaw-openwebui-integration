@@ -1666,6 +1666,19 @@ def _extract_image_attachments(raw_content) -> list:
     return attachments
 
 
+def _numbered_attachments(attachments: list, *, combined: bool) -> list:
+    """`attachments` for one chat.send. The images of several messages sent
+    together (`combined`) are numbered in order, image-1, image-2, ...: each
+    message names its own by its position in it, so two can share a name."""
+    if not combined:
+        return attachments
+    out = []
+    for n, a in enumerate(attachments, 1):
+        ext = mimetypes.guess_extension(a.get("mimeType") or "") or ".png"
+        out.append({**a, "fileName": f"image-{n}{ext}"})
+    return out
+
+
 def _item_assistant_text(data: dict) -> str:
     """Return visible assistant text carried by item/preamble events."""
     kind = str(data.get("kind", "")).strip().lower()
@@ -2745,6 +2758,10 @@ class _GatewayConnection:
         # A retired connection stays up for them as it does for consumers:
         # closing it would leave the waiter with no settle push, ever (ELI-172).
         self._open_send_sections = 0
+        # Per session, the replies waiting in `send_section` for a run to
+        # settle that may send their message together with a later one,
+        # oldest first (`send_waiters`).
+        self._send_waiters: dict[str, list] = {}
 
         # Cancelled turns parked until they are claimed or released, by
         # session key (`park_cancelled_turn`). An immediate chat.abort on a
@@ -3508,6 +3525,19 @@ class _GatewayConnection:
             self._open_send_sections -= 1
             self._close_if_retired_and_idle()
 
+    def send_waiters(self, session_key: str) -> list:
+        """The replies of `session_key` waiting to send, oldest first. A
+        reply released when the run settles hands its message to the newest
+        one, so messages that queued up behind one run go out as one turn."""
+        return self._send_waiters.setdefault(session_key, [])
+
+    def drop_send_waiter(self, session_key: str, waiter) -> None:
+        waiters = self._send_waiters.get(session_key)
+        if waiters and waiter in waiters:
+            waiters.remove(waiter)
+            if not waiters:
+                del self._send_waiters[session_key]
+
     MODEL_PATCH_CACHE_TTL_S = 60.0
 
     def model_patch_lock(self, session_key: str) -> asyncio.Lock:
@@ -3850,7 +3880,8 @@ class _GatewayConnection:
                             grace_s: float, send_stop: bool,
                             run_text: dict | None = None, settle=None,
                             reply: dict | None = None,
-                            waiting: list | None = None) -> None:
+                            waiting: list | None = None,
+                            attachments: list | None = None) -> None:
         """Hand a cancelled reply's unfinished business to the next message.
 
         OWUI cancels a response the same way for Stop and for Send now /
@@ -3862,7 +3893,8 @@ class _GatewayConnection:
           the run emits (including ones queued but not yet shown) is buffered
           rather than dropped;
         * `carried` holds user messages the cancelled reply had accepted but
-          not yet sent to the Gateway, oldest first;
+          not yet sent to the Gateway, oldest first, and `attachments` their
+          images;
         * `run_text` holds the run's text dedup baselines up to the cut
           ({"received", "stream", "item"}). The run's closing events repeat
           its WHOLE text; a claimer that starts from empty baselines takes all
@@ -3907,6 +3939,7 @@ class _GatewayConnection:
                 previous["task"].cancel()
             previous["resolved"].set()
             carried = list(previous["carried"]) + list(carried)
+            attachments = list(previous["attachments"]) + list(attachments or [])
             waiting = list(previous["waiting"]) + [
                 r for r in (waiting or []) if r not in previous["waiting"]]
             if previous["queue"] is not None and previous["queue"] is not queue:
@@ -3924,6 +3957,7 @@ class _GatewayConnection:
             self.mark_delivered_live(session_key, run_id)
 
         entry = {"run_id": run_id, "queue": queue, "carried": list(carried),
+                 "attachments": list(attachments or []),
                  "send_stop": send_stop, "task": None,
                  "resolved": asyncio.Event(), "run_text": run_text, "reply": reply,
                  "waiting": list(waiting or [])}
@@ -4052,8 +4086,9 @@ class _GatewayConnection:
         (`_INTENT_QUERY_TIMEOUT_S`), and it always runs to its end in the
         background, so this needs no bound of its own (ELI-95).
 
-        Returns {"run_id", "queue", "carried", "waiting"}; the caller now
-        owns the run, its buffered queue, the carried messages and the
+        Returns {"run_id", "queue", "carried", "attachments", "waiting"}; the
+        caller now owns the run, its buffered queue, the carried messages
+        (and their images) and the
         replies waiting for them.
         """
         entry = self._pending_cancel_aborts.get(session_key)
@@ -4073,6 +4108,7 @@ class _GatewayConnection:
         self._keep_in_own_message(session_key, entry)
         return {"run_id": entry["run_id"], "queue": entry["queue"],
                 "carried": list(entry["carried"]),
+                "attachments": list(entry["attachments"]),
                 "waiting": list(entry["waiting"]),
                 "run_text": entry.get("run_text")}
 

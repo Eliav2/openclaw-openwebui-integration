@@ -1722,6 +1722,7 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.conn = _GatewayConnection(lambda: None)
         self.conn._ws = object()
         self.sent = []
+        self.sent_images = []
         self.rpc = []
         self.aborts = []
         self.active = False
@@ -1733,8 +1734,11 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         async def send_request(method, params, timeout=10):
             self.rpc.append(method)
             if method == "chat.send":
+                if getattr(self, "send_fails", None):
+                    raise self.send_fails
                 n["run"] += 1
                 self.sent.append(params.get("message"))
+                self.sent_images.append([(a["fileName"], a["content"]) for a in params.get("attachments") or []])
                 self.keys.append(params.get("idempotencyKey"))
                 return {"runId": f"run-{n['run']}"}
             if method == "chat.history":
@@ -1782,7 +1786,8 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         for p in self.patches:
             p.stop()
 
-    def _reply(self, text, msg_id, intent=None):
+    def _reply(self, text, msg_id, intent=None, image=None, chat="chat-1", thinking=None):
+        """`image`: base64 data of a PNG attached to the message."""
         self.emitted = getattr(self, "emitted", [])
 
         async def emitter(event):
@@ -1792,9 +1797,14 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
             # The page's answer to `_intent_query_js`.
             return intent
 
+        content = text if image is None else [
+            {"type": "text", "text": text},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image}"}}]
         body = {"model": "openclaw_gateway.default",
-                "messages": [{"role": "user", "content": text}]}
-        meta = {"chat_id": "chat-1", "user_id": "u1", "message_id": msg_id}
+                "messages": [{"role": "user", "content": content}]}
+        if thinking:
+            body["reasoning_effort"] = thinking
+        meta = {"chat_id": chat, "user_id": "u1", "message_id": msg_id}
         return self.pipe._pipe_impl(body, emitter, __metadata__=meta,
                                     __event_call__=event_call if intent else None)
 
@@ -2671,6 +2681,236 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self._queue("run-1").put_nowait(self._final("run-1"))
         await nxt
         await r3.aclose()
+
+    async def test_images_of_interrupted_replies_go_with_the_next_send(self):
+        """A message handed on by a reply interrupted while it waited keeps
+        its image: the next reply sends every carried message's images with
+        the texts, in order, each under its own file name."""
+        self._record_closes()
+        self._hold_parked_timers()
+        self.active = True
+        for text, mid, image in (("a", "m2", "QUFB"), ("b", "m3", None)):
+            r = self._reply(text, mid, image=image)
+            t = asyncio.ensure_future(r.__anext__())
+            await self._spin()
+            t.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await t
+        r3 = self._reply("c", "m4", image="Q0ND")
+        nxt = asyncio.ensure_future(self._read(r3, "OK"))
+        await self._spin()
+        self._settled(False)
+        await self._until_registered("run-1")
+        self.assertEqual(self.sent, ["a\n\nb\n\nc"])
+        self.assertEqual(self.sent_images, [[("image-1.png", "QUFB"), ("image-2.png", "Q0ND")]])
+        self._queue("run-1").put_nowait(self._delta("run-1", "OK"))
+        self._queue("run-1").put_nowait(self._final("run-1"))
+        await nxt
+        await r3.aclose()
+
+    async def test_images_carried_through_a_kept_run_are_sent_after_it(self):
+        """Send now twice while a run streams: the reply that continues the
+        run sends the interrupted reply's message after it, image included."""
+        self._hold_parked_timers()
+        r1 = self._reply("count", "m1")
+        first = asyncio.ensure_future(r1.__anext__())
+        await self._until_registered("run-1")
+        self.active = True
+        q = self._queue("run-1")
+        q.put_nowait(self._delta("run-1", "1\n"))
+        await first
+        await r1.aclose()
+        r2 = self._reply("test", "m2", image="QUFB")
+        q.put_nowait(self._delta("run-1", "2\n"))
+        await self._read(r2, "2")
+        await r2.aclose()
+        r3 = self._reply("another test", "m3")
+        q.put_nowait(self._delta("run-1", "3\n"))
+        q.put_nowait(self._final("run-1"))
+        await self._read(r3, "3")
+        self.active = False
+        rest = asyncio.ensure_future(self._read(r3, "ANSWER"))
+        await self._until_registered("run-2")
+        self._queue("run-2").put_nowait(self._delta("run-2", "ANSWER"))
+        self._queue("run-2").put_nowait(self._final("run-2"))
+        await rest
+        await r3.aclose()
+        self.assertEqual(self.sent, ["count", "test\n\nanother test"])
+        self.assertEqual(self.sent_images, [[], [("image-1.png", "QUFB")]])
+
+    async def _waiting_replies(self, *specs):
+        """Start a reply per (text, msg_id, image) that waits behind the
+        running run, as messages sent from another tab or device do: nobody
+        cancels them. Each is read until its reply's first text."""
+        reads = []
+        for text, mid, image in specs:
+            r = self._reply(text, mid, image=image)
+            reads.append((r, asyncio.ensure_future(self._drain(r))))
+            await self._spin()
+        return reads
+
+    @staticmethod
+    async def _drain(gen):
+        out = ""
+        async for item in gen:
+            if isinstance(item, str):
+                out += item
+        return out
+
+    async def test_messages_waiting_behind_a_run_go_out_as_one(self):
+        """Three messages sent from another tab while a run goes on wait
+        behind it, and nobody cancels them. Once the run settles they go out
+        as ONE chat.send, in order, with every image; the answer is in the
+        last one's reply, and the first two say where their message went."""
+        closed = self._record_closes()
+        self.active = True
+        reads = await self._waiting_replies(("a", "m2", "QUFB"), ("b", "m3", None), ("c", "m4", "Q0ND"))
+        self.assertEqual(self.sent, [])
+        self._settled(False)
+        await self._until_registered("run-1")
+        await self._spin()
+        self.assertEqual(self.sent, ["a\n\nb\n\nc"])
+        self.assertEqual(self.sent_images, [[("image-1.png", "QUFB"), ("image-2.png", "Q0ND")]])
+        self.assertEqual(sorted(closed), [("m2", self.ocp.REPLY_SENT_WITH_NEXT_NOTE),
+                                          ("m3", self.ocp.REPLY_SENT_WITH_NEXT_NOTE)])
+        self.assertEqual(await reads[0][1], "")
+        self.assertEqual(await reads[1][1], "")
+        self._queue("run-1").put_nowait(self._delta("run-1", "OK"))
+        self._queue("run-1").put_nowait(self._final("run-1"))
+        self.assertIn("OK", await asyncio.wait_for(reads[2][1], 30))
+        self.assertEqual(len(self.sent), 1)
+
+    async def test_a_message_that_arrives_during_the_joint_send_waits_its_turn(self):
+        """A message sent while the joined messages are being sent is not
+        added to them: it waits for their run, then goes out on its own."""
+        self.active = True
+        reads = await self._waiting_replies(("a", "m2", None), ("b", "m3", None))
+        self._settled(False)
+        await self._until_registered("run-1")
+        self.active = True
+        late = await self._waiting_replies(("c", "m4", None))
+        self.assertEqual(self.sent, ["a\n\nb"])
+        self._queue("run-1").put_nowait(self._delta("run-1", "OK"))
+        self._queue("run-1").put_nowait(self._final("run-1"))
+        await asyncio.wait_for(reads[1][1], 30)
+        self._settled(False)
+        await self._until_registered("run-2")
+        self.assertEqual(self.sent, ["a\n\nb", "c"])
+        self._queue("run-2").put_nowait(self._delta("run-2", "OK"))
+        self._queue("run-2").put_nowait(self._final("run-2"))
+        await asyncio.wait_for(late[0][1], 30)
+
+    async def test_waiting_messages_of_another_chat_are_not_joined(self):
+        """Only one session's waiting messages are joined: another chat's
+        message waiting at the same time is sent on its own."""
+        self.active = True
+        reads = await self._waiting_replies(("a", "m2", None))
+        other = self._reply("x", "o1", chat="chat-2")
+        other_read = asyncio.ensure_future(self._drain(other))
+        await self._spin()
+        reads += await self._waiting_replies(("b", "m3", None))
+        self._settled(False)
+        self.conn._on_sessions_changed({
+            "sessionKey": self.ocp._owui_session_key(self.pipe.valves.AGENT_ID, "u1", "chat-2"),
+            "hasActiveRun": False, "reason": "chat.run.settled"})
+        for _ in range(200):
+            if len(self.sent) == 2:
+                break
+            await asyncio.sleep(0.005)
+        self.assertEqual(sorted(self.sent), ["a\n\nb", "x"])
+        for task in [t for _, t in reads] + [other_read]:
+            task.cancel()
+
+    async def test_a_stop_after_a_message_was_handed_on_drops_both(self):
+        """A message handed on to a later one that then waits again (another
+        run started first) and is stopped: both messages are dropped, and
+        both replies say so."""
+        closed = self._record_closes()
+        self.active = True
+        hand_on = self.ocp._PipeTurn.hand_on
+
+        def hand_on_then_busy(turn):
+            handed = hand_on(turn)
+            self.active = True   # a run from elsewhere starts before the send
+            return handed
+        patch = mock.patch.object(self.ocp._PipeTurn, "hand_on", hand_on_then_busy)
+        patch.start()
+        self.addCleanup(patch.stop)
+        first = self._reply("a", "m2", intent="stop")
+        first_read = asyncio.ensure_future(self._drain(first))
+        await self._spin()
+        last = self._reply("b", "m3", intent="stop")
+        last_task = asyncio.ensure_future(last.__anext__())
+        await self._spin()
+        self._settled(False)
+        self.assertEqual(await asyncio.wait_for(first_read, 30), "")
+        await self._spin()
+        last_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await last_task
+        for _ in range(200):
+            if len(closed) == 2:
+                break
+            await asyncio.sleep(0.005)
+        self.assertEqual(sorted(closed), [("m2", self.ocp.REPLY_NOT_SENT_NOTE),
+                                          ("m3", self.ocp.REPLY_NOT_SENT_NOTE)])
+        self.assertEqual(self.sent, [])
+
+    async def test_waiting_messages_with_other_thinking_levels_go_apart(self):
+        """One send has one thinking level: a waiting message that asks for
+        another level is not joined, so each is answered at its own."""
+        self.active = True
+        reads = []
+        for text, mid, level in (("a", "m2", "low"), ("b", "m3", "high")):
+            r = self._reply(text, mid, thinking=level)
+            reads.append(asyncio.ensure_future(self._drain(r)))
+            await self._spin()
+        self._settled(False)
+        await self._until_registered("run-2")
+        self.assertEqual(self.sent, ["a", "b"])
+        for task in reads:
+            task.cancel()
+
+    async def test_a_failed_joint_send_tells_the_handed_on_replies(self):
+        """The send that was to carry a handed-on message fails: its reply
+        shows the error, and the reply that handed its message on says so
+        instead of staying blank."""
+        closed = self._record_closes()
+        self.active = True
+        reads = await self._waiting_replies(("a", "m2", None), ("b", "m3", None))
+        self.send_fails = RuntimeError("gateway said no")
+        self._settled(False)
+        out = await asyncio.wait_for(reads[1][1], 30)
+        self.assertIn("Error sending message", out)
+        for _ in range(200):
+            if closed:
+                break
+            await asyncio.sleep(0.005)
+        self.assertEqual(closed, [("m2", self.ocp.REPLY_SEND_FAILED_NOTE)])
+
+    async def test_a_stop_while_messages_wait_drops_them_all(self):
+        """Stop while messages wait behind a run (nothing joined yet): each
+        is dropped and says so, as before."""
+        closed = self._record_closes()
+        self.active = True
+        replies = []
+        for text, mid in (("a", "m2"), ("b", "m3")):
+            r = self._reply(text, mid, intent="stop")
+            t = asyncio.ensure_future(r.__anext__())
+            await self._spin()
+            replies.append(t)
+        for t in replies:
+            t.cancel()
+        for t in replies:
+            with self.assertRaises(asyncio.CancelledError):
+                await t
+        for _ in range(200):
+            if len(closed) == 2:
+                break
+            await asyncio.sleep(0.005)
+        self.assertEqual(sorted(closed), [("m2", self.ocp.REPLY_NOT_SENT_NOTE),
+                                          ("m3", self.ocp.REPLY_NOT_SENT_NOTE)])
+        self.assertEqual(self.sent, [])
 
     def _record_status_closes(self):
         """The replies whose open status line was closed after they ended."""
