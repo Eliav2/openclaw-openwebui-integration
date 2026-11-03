@@ -219,6 +219,8 @@ uv run --with-requirements requirements-dev.txt pytest -v e2e/test_e2e.py
 E2E_SHARD=2 uv run --with-requirements requirements-dev.txt pytest -v e2e/test_e2e.py   # one shard only
 ```
 
+`bash e2e/start_stack.sh down` stops the fake model, the Gateway and its children and the Open WebUI container it started (it reads the pid files in `E2E_LOG_DIR`, so give it the same `E2E_LOG_DIR`). A start that fails halfway does that itself; `E2E_KEEP_ON_FAIL=1` keeps the half-started stack for a look.
+
 ---
 
 ## The docs site

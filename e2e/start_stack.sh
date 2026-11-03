@@ -8,6 +8,12 @@
 # installer's own smoke test is the first end-to-end assertion: it fails the
 # script if a real chat completion does not come back through the Gateway.
 #
+# `bash e2e/start_stack.sh down` stops what a start left running (fake model,
+# Gateway and its children, the image pull, the Open WebUI container), using
+# the pid files in E2E_LOG_DIR. A start that fails halfway tears itself down
+# the same way (set E2E_KEEP_ON_FAIL=1 to keep it for a look); in GitHub Actions
+# it does not, because the next step reads `docker logs owui` after a failure.
+#
 # Inputs (env): OWUI_IMAGE, OPENCLAW_VERSION (npm spec, e.g. 2026.9.3 or latest;
 # replaced by the installed version once npm has it),
 # E2E_LOG_DIR. Writes the credentials the test suite needs to $GITHUB_ENV when
@@ -21,16 +27,86 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+LOG_DIR="${E2E_LOG_DIR:-$PWD/e2e-logs}"
+# One pid file per process the stack starts. gateway.pid is also read (and
+# rewritten after a relaunch) by the crash tests, so it holds the bare pid.
+STACK_PID_FILES=("$LOG_DIR/fake-llm.pid" "$LOG_DIR/gateway.pid" "$LOG_DIR/docker-pull.pid")
+
+tree_pids() {  # tree_pids <pid>: the pid and all its descendants
+  local k
+  echo "$1"
+  for k in $(pgrep -P "$1" 2>/dev/null || true); do tree_pids "$k"; done
+}
+
+started_at() {  # started_at <pid>: epoch second the process started, nothing if it is gone
+  local ticks
+  ticks=$(sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}')
+  [[ -n "$ticks" ]] || return 0
+  awk -v t="$ticks" -v hz="$(getconf CLK_TCK)" '/^btime/ {print int($2 + t / hz)}' /proc/stat
+}
+
+running() {  # running <pid>: alive and not a zombie waiting for its parent
+  local st
+  st=$(sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $1}')
+  [[ -n "$st" && "$st" != Z ]]
+}
+
+stack_down() {
+  local f pid started pids=() p left
+  for f in "${STACK_PID_FILES[@]}"; do
+    [[ -s "$f" ]] || continue
+    pid=$(<"$f")
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    # A pid file older than the process means the pid was reused: not ours.
+    started=$(started_at "$pid")
+    if [[ -n "$started" ]] && (( started <= $(stat -c %Y "$f") + 2 )); then
+      mapfile -t -O "${#pids[@]}" pids < <(tree_pids "$pid")
+    fi
+  done
+  if (( ${#pids[@]} )); then
+    kill -TERM "${pids[@]}" 2>/dev/null || true
+    for _ in $(seq 1 10); do
+      left=()
+      for p in "${pids[@]}"; do running "$p" && left+=("$p"); done
+      (( ${#left[@]} )) || break
+      sleep 1
+    done
+    (( ${#left[@]} )) && kill -KILL "${left[@]}" 2>/dev/null || true
+  fi
+  docker rm -f owui >/dev/null 2>&1 || true
+  rm -f "${STACK_PID_FILES[@]}"
+  echo "stack down (${#pids[@]} processes stopped)"
+}
+
+if [[ "${1:-}" == down ]]; then
+  stack_down
+  exit 0
+fi
+
 : "${OWUI_IMAGE:?set OWUI_IMAGE}"
 : "${OPENCLAW_VERSION:?set OPENCLAW_VERSION}"
-LOG_DIR="${E2E_LOG_DIR:-$PWD/e2e-logs}"
 mkdir -p "$LOG_DIR"
+
+STACK_UP=0
+on_exit() {
+  local rc=$?
+  trap - EXIT
+  if (( rc != 0 && STACK_UP == 0 )) && [[ -z "${E2E_KEEP_ON_FAIL:-}" && -z "${GITHUB_ACTIONS:-}" ]]; then
+    echo "::warning::the stack did not come up (exit $rc); stopping what it started"
+    stack_down
+  fi
+  exit "$rc"
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # The Open WebUI image is the stack's largest download. It is pulled while the
 # fake model, the npm install and the Gateway come up; `docker run` waits for it.
 PULL_START=$SECONDS
 docker pull --quiet "$OWUI_IMAGE" >"$LOG_DIR/docker-pull.log" 2>&1 &
 PULL_PID=$!
+echo "$PULL_PID" >"$LOG_DIR/docker-pull.pid"
 
 OWUI_URL="http://localhost:8080"
 OWUI_EMAIL="${STACK_ADMIN_EMAIL:-e2e-admin@example.com}"
@@ -60,6 +136,7 @@ echo "::group::Fake model server"
 FAKE_LLM_LOG="$LOG_DIR/fake-llm.jsonl"
 FAKE_LLM_LOG="$FAKE_LLM_LOG" FAKE_LLM_PORT=$FAKE_LLM_PORT \
   nohup python3 e2e/fake_llm.py >"$LOG_DIR/fake-llm.log" 2>&1 &
+echo $! >"$LOG_DIR/fake-llm.pid"
 wait_for "fake model" 30 curl -fsS "http://127.0.0.1:$FAKE_LLM_PORT/health"
 echo "::endgroup::"
 
@@ -179,4 +256,5 @@ if [[ -n "${GITHUB_ENV:-}" ]]; then
 else
   echo "export OWUI_URL=$OWUI_URL OWUI_EMAIL=$OWUI_EMAIL OWUI_PASSWORD=$OWUI_PASSWORD E2E_STACK=1 E2E_GATEWAY_PID_FILE=$GATEWAY_PID_FILE E2E_FAKE_LLM_LOG=$FAKE_LLM_LOG GATEWAY_TOKEN=$GATEWAY_TOKEN GATEWAY_URL=$GATEWAY_URL OPENCLAW_VERSION=$OPENCLAW_VERSION"
 fi
+STACK_UP=1
 echo "stack ready"
