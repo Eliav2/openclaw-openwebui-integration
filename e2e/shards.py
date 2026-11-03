@@ -120,6 +120,7 @@ SHARDS = {
     "4": [
         f"{BROWSER}::test_send_now_on_a_queued_message_keeps_the_running_reply",
         f"{BROWSER}::test_a_reply_interrupted_while_queued_says_its_message_went_with_the_next",
+        f"{BROWSER}::test_messages_sent_from_other_tabs_while_a_reply_runs_are_answered_together",
         f"{BROWSER}::test_a_queued_reply_stopped_says_its_message_was_not_sent",
         f"{BROWSER}::test_stop_after_send_now_stops_the_run",
         f"{BROWSER}::test_a_reload_mid_reply_shows_the_answer_so_far_and_keeps_going",
