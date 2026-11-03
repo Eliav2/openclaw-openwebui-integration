@@ -2180,7 +2180,7 @@ def _dialog_safe_event_call(event_call, sid, user_id):
 # reply that is streaming into the same tab.
 # ---------------------------------------------------------------------------
 
-_COMPOSER_BUTTON_VERSION = "8"
+_COMPOSER_BUTTON_VERSION = "9"
 
 # The Status Action's function id (install_action.py's FUNCTION_ID; the
 # dialog's own JS calls the same fixed id) and the Pipe's default function id.
@@ -2239,6 +2239,8 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
     // The window width at which the button last did not fit in the chip row;
     // up to that width it sits in the left group instead.
     narrowAt: 0,
+    resizeObserver: null,
+    watched: null,
     warned: {},
     dead: false,
   };
@@ -2551,8 +2553,30 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
     if (r.width === 0) return;
     if (r.left < box.left - 0.5 || r.right > box.right + 0.5) {
       state.narrowAt = window.innerWidth;
-      schedule();
+      // Now, not on the next ensure(): a clipped button must not stay on
+      // screen for a debounce.
+      const s = leftSlot(c);
+      if (s) s.parent.appendChild(btn);
+      return;
     }
+    watchChips(c.chips, btn);
+  }
+
+  // The chip row can get narrower without a childList change (the model's
+  // name fills in, a font loads): check again whenever its size changes.
+  function watchChips(chips, btn) {
+    if (typeof ResizeObserver !== 'function') return;
+    if (!state.resizeObserver) {
+      state.resizeObserver = new ResizeObserver(function () {
+        const b = document.getElementById(BTN_ID);
+        if (b) checkFits(b);
+      });
+    }
+    if (state.watched === chips) return;
+    state.resizeObserver.disconnect();
+    state.resizeObserver.observe(chips);
+    state.resizeObserver.observe(btn);
+    state.watched = chips;
   }
 
   function onResize() {
@@ -2625,6 +2649,9 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
     state.timer = null;
     window.removeEventListener('popstate', schedule);
     window.removeEventListener('resize', onResize);
+    if (state.resizeObserver) state.resizeObserver.disconnect();
+    state.resizeObserver = null;
+    state.watched = null;
     document.removeEventListener('click', onToolbarClick, true);
     try { removeAll(); } catch (e) { /* page is going away */ }
   }

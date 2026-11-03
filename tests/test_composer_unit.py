@@ -155,6 +155,18 @@ class StatusLabelWidthTests(unittest.TestCase):
         self.assertIn("window.addEventListener('resize', onResize);", code)
         self.assertIn("window.removeEventListener('resize', onResize);", code)
 
+    def test_a_cut_off_button_moves_at_once_and_a_narrower_chip_row_is_checked_again(self):
+        """The move happens in the same task as the check, not on the next
+        debounced ensure(), so a clipped button is never left on screen; and a
+        ResizeObserver on the chip row catches it narrowing without a childList
+        change (the model's name filling in)."""
+        code = _render_composer_button_js()
+        fits = code[code.index("function checkFits(btn)"):code.index("function onResize()")]
+        self.assertIn("if (s) s.parent.appendChild(btn);", fits)
+        self.assertNotIn("schedule()", fits)
+        self.assertIn("state.resizeObserver.observe(chips);", fits)
+        self.assertIn("if (state.resizeObserver) state.resizeObserver.disconnect();", code)
+
 
 class ClawNameTests(unittest.TestCase):
     """ELI-202: the composer chip, its tooltip and the dialog read "Claw", and
