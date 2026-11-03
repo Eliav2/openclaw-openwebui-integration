@@ -1407,7 +1407,8 @@ class Scenes:
         box = page.locator(".chat-control-valves")
         box.wait_for(timeout=30_000)
         if not box.locator("select").count():
-            box.get_by_role("button", name="Default").first.click()  # Default -> Custom shows the field
+            # Default -> Custom shows the field. Open WebUI 0.13's popover gives it role=menuitem.
+            box.locator("button", has_text="Default").first.click()
         sel = box.locator("select").first
         sel.wait_for(timeout=30_000)
         print("  levels: " + json.dumps(sel.evaluate("s => [...s.options].map(o => o.value)")), flush=True)
