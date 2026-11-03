@@ -79,7 +79,8 @@ stack_down() {
       (( ${#left[@]} )) || break
       sleep 1
     done
-    if (( ${#left[@]} )); then kill -KILL "${left[@]}" 2>/dev/null || true; fi
+    # Check identity again right before the KILL: the pid could have been reused since the last look.
+    for p in "${left[@]}"; do running_as "$p" "${ticks[$p]}" && kill -KILL "$p" 2>/dev/null; done || true
   fi
   # Only the container this start created (its id is recorded at `docker run`), never an `owui` that was there before.
   if [[ -s "$LOG_DIR/owui.id" ]]; then
