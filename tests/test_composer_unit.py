@@ -173,6 +173,8 @@ class StatusLabelWidthTests(unittest.TestCase):
         width does not reach LOOP_LIMIT and remove the button until reload."""
         code = _render_composer_button_js()
         on = code[code.index("function onResize()"):code.index("function removeAll()")]
+        self.assertIn("if (state.narrowAt && window.innerWidth > state.narrowAt) {", on)
+        self.assertIn("state.narrowAt = 0;", on)
         self.assertIn("state.inserts = [];", on)
         self.assertEqual(on.count("schedule();"), 1)
         self.assertLess(on.index("}\n    schedule();"), len(on))
