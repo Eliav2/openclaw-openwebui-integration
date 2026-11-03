@@ -1732,6 +1732,10 @@ class _GatewayConnection:
         # A retired connection stays up for them as it does for consumers:
         # closing it would leave the waiter with no settle push, ever (ELI-172).
         self._open_send_sections = 0
+        # Per session, the replies waiting in `send_section` for a run to
+        # settle that may send their message together with a later one,
+        # oldest first (`send_waiters`).
+        self._send_waiters: dict[str, list] = {}
 
         # Cancelled turns parked until they are claimed or released, by
         # session key (`park_cancelled_turn`). An immediate chat.abort on a
@@ -2494,6 +2498,19 @@ class _GatewayConnection:
         finally:
             self._open_send_sections -= 1
             self._close_if_retired_and_idle()
+
+    def send_waiters(self, session_key: str) -> list:
+        """The replies of `session_key` waiting to send, oldest first. A
+        reply released when the run settles hands its message to the newest
+        one, so messages that queued up behind one run go out as one turn."""
+        return self._send_waiters.setdefault(session_key, [])
+
+    def drop_send_waiter(self, session_key: str, waiter) -> None:
+        waiters = self._send_waiters.get(session_key)
+        if waiters and waiter in waiters:
+            waiters.remove(waiter)
+            if not waiters:
+                del self._send_waiters[session_key]
 
     MODEL_PATCH_CACHE_TTL_S = 60.0
 
