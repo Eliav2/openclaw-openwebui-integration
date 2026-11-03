@@ -9,6 +9,14 @@
 # (and "done"), so a `not in (done, failed, cancelled)` test would treat every
 # resting session as active and hang every message. Only these gate the queue.
 _ACTIVE_RUN_STATES = ("active", "running", "streaming", "queued")
+# A session row that names the end of a run (`endedAt`) yet still counts it as
+# active is read again after these delays (seconds, the last one repeating),
+# whether or not the Gateway pushes anything. OpenClaw 2026.10.10 clears that
+# flag a moment after the end of a cron wake's run and pushes no
+# `sessions.changed` for the clearing: a queued message waiting on the push
+# alone never left the queue. A run with no end time is still waited for on
+# its push, with no timer (ELI-88).
+ENDED_RUN_RECHECK_S = (1.0, 2.0, 4.0, 8.0)
 # The Gateway's questions (secret requests, ELI-96; the ask_user tool,
 # ELI-216) are asked in the chat (askuser.py).
 _QUESTION_HOOKS = (question_requested, question_resolved)
@@ -914,6 +922,8 @@ class _PipeTurn:
         # (model key, ladder) this turn last filed in the ladder cache: the
         # queue wait probes every 1.5 s, and filing reads and writes a file.
         self._ladder_recorded = None
+        # The last session read named the end of a run it still counts as active.
+        self._active_row_ended = False
 
         # --- Short-circuit OWUI background tasks ---
         # image_prompt_generation and function_calling are skipped too: both already have a documented, silent OWUI-side
@@ -1220,6 +1230,7 @@ class _PipeTurn:
                      f"{prior['run_id'][:20]}... (a second call from Open WebUI); "
                      "following that run instead of sending it again")
             found = None
+            rechecks = 0
             while True:
                 changed = self.conn.session_change_event(self.session_key)
                 try:
@@ -1230,7 +1241,7 @@ class _PipeTurn:
                 found = _stub_turn(hist, reply_id, "")
                 if found is None or found["closed"] or not await self._session_run_active():
                     break
-                await changed.wait()
+                rechecks = await self._wait_for_session_change(changed, rechecks)
             if found is not None:
                 for item in _history_renderer(found["messages"]).finished_output():
                     if item.get("type") == "message":
@@ -1333,6 +1344,21 @@ class _PipeTurn:
         self.turn.unsent, self.turn.attachments, self.turn.waiting = [], [], []
         return True
 
+    async def _wait_for_session_change(self, changed: asyncio.Event, rechecks: int) -> int:
+        """Wait for the push in `changed`. When the last read named the end
+        of a run it still counts as active, give up after the next delay in
+        `ENDED_RUN_RECHECK_S` too, so the caller reads again. Returns the
+        number of such timeouts in a row."""
+        if not self._active_row_ended:
+            await changed.wait()
+            return 0
+        delays = ENDED_RUN_RECHECK_S
+        try:
+            await asyncio.wait_for(changed.wait(), delays[min(rechecks, len(delays) - 1)])
+        except asyncio.TimeoutError:
+            return rechecks + 1
+        return 0
+
     async def wait_and_send(self, reply_id):
         """Wait for the session's run to settle, then send this reply's
         messages as their own run (ELI-56), or hand them on (`hand_on`)."""
@@ -1347,6 +1373,7 @@ class _PipeTurn:
             # send instead (see `enqueued_not_started`). Stop cancels this
             # wait like any other.
             ever_active = False
+            rechecks = 0
             while True:
                 changed = self.conn.session_change_event(self.session_key)
                 if not await self._session_run_active():
@@ -1360,7 +1387,7 @@ class _PipeTurn:
                         "Queued: waiting for the current run to finish…",
                         done=False,
                     )
-                await changed.wait()
+                rechecks = await self._wait_for_session_change(changed, rechecks)
             if ever_active:
                 pipe_log("  active run settled; sending queued message as its own run")
             if self in self.conn.send_waiters(self.session_key) and self.hand_on():
@@ -2358,6 +2385,7 @@ class _PipeTurn:
                 await self.save_end_snapshot()
 
     async def _session_run_active(self) -> bool:
+        self._active_row_ended = False
         # Fast path: describe exposes a persisted `status`. When it names a
         # live run state we're done. But describe.status flips to 'done'
         # during a subagent-yield gap (the run is only suspended and will
@@ -2396,6 +2424,7 @@ class _PipeTurn:
                             ladder, model_key=self.session_model_key,
                             state_dir=getattr(self.pipe.valves, "STATE_DIR", "")):
                         self._ladder_recorded = (self.session_model_key, ladder)
+            self._active_row_ended = bool(row.get("endedAt"))
             if row.get("activeRunId") or status in _ACTIVE_RUN_STATES:
                 return True
         except Exception as ex:

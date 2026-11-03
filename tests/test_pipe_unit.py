@@ -1726,6 +1726,7 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.rpc = []
         self.aborts = []
         self.active = False
+        self.run_ended_at = None
         self.runtime = None
         self.keys = []
         self.history = {}
@@ -1747,8 +1748,11 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
                 self.aborts.append(params)
                 return {"aborted": True}
             if method == "sessions.describe":
-                return {"session": {"status": "running" if self.active else "done",
-                                    "agentRuntime": {"id": self.runtime}}}
+                row = {"status": "running" if self.active else "done",
+                       "agentRuntime": {"id": self.runtime}}
+                if self.active and self.run_ended_at:
+                    row["endedAt"] = self.run_ended_at
+                return {"session": row}
             if method == "sessions.list":
                 return {"sessions": [{"key": self.SK, "hasActiveRun": self.active}]}
             return {}
@@ -1894,6 +1898,55 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         async for chunk in gen:
             out += chunk if isinstance(chunk, str) else ""
         self.assertIn("hi there", out)
+
+    async def test_a_run_the_gateway_ended_but_still_counts_is_read_again_without_a_push(self):
+        """2026.10.10, a cron wake that streamed into the chat: its row carries
+        `endedAt` and the turn writer finalized the reply, yet `sessions.describe`
+        and `sessions.list` kept saying running / hasActiveRun for as long as
+        the Gateway lived, because the clearing of that flag pushes no further
+        `sessions.changed` (the one at the end is sent while it is still set).
+        A message queued behind the wake never left the queue. A row that
+        names an end time but still counts as active is read again on a short
+        backoff, and the message goes out the moment the Gateway says idle. A
+        run with no end time is still waited for on its push alone."""
+        self.run_ended_at = 1793702659908
+        self.active = True
+        with mock.patch.object(self.ocp, "ENDED_RUN_RECHECK_S", (0.01, 0.02)):
+            gen = self._reply("hello", "m1")
+            first = asyncio.ensure_future(gen.__anext__())
+            await self._spin()
+            self.assertEqual(self.sent, [])
+            self.assertTrue(any("Queued: waiting" in str(e) for e in self.emitted))
+            reads = self.rpc.count("sessions.describe")
+            await asyncio.sleep(0.15)
+            self.assertGreater(self.rpc.count("sessions.describe"), reads + 2, "an ended run is read again")
+            self.assertEqual(self.sent, [], "sent while the Gateway still counted the run")
+
+            self.active = False         # cleared on the Gateway, nothing pushed
+            await self._until_registered("run-1")
+            self.assertEqual(self.sent, ["hello"])
+            q = self._queue("run-1")
+            q.put_nowait(self._delta("run-1", "hi there"))
+            q.put_nowait(self._final("run-1"))
+            out = await asyncio.wait_for(first, 5)
+            async for chunk in gen:
+                out += chunk if isinstance(chunk, str) else ""
+            self.assertIn("hi there", out)
+
+    async def test_a_running_run_without_an_end_time_is_not_polled(self):
+        """The counterpart: ELI-88 stays. Only a row that names an end time is
+        read again on a timer; a run still going waits for its push."""
+        self.active = True
+        with mock.patch.object(self.ocp, "ENDED_RUN_RECHECK_S", (0.01, 0.02)):
+            gen = self._reply("hello", "m1")
+            first = asyncio.ensure_future(gen.__anext__())
+            await self._spin()
+            reads = self.rpc.count("sessions.describe")
+            await asyncio.sleep(0.15)
+            self.assertEqual(self.rpc.count("sessions.describe"), reads)
+            self.assertEqual(self.sent, [])
+            first.cancel()
+            await asyncio.gather(first, return_exceptions=True)
 
     async def test_queued_message_survives_a_redeploy_retiring_its_connection(self):
         """ELI-172 (2026-10-17): a message typed at 12:03:56Z
