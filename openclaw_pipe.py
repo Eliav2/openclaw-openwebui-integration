@@ -1449,20 +1449,33 @@ def _gateway_image_blocks(message) -> list[dict]:
     ]
 
 
+def _is_run_assistant_message(message, run_id: str) -> bool:
+    """Whether `message` is one of run `run_id`'s stored assistant messages:
+    the run's own (`runId`), or the one the Gateway appends for the run's
+    media when it cannot add them to the run's own message, keyed
+    `<run id>:assistant-media[:n]` with no `runId` (2026.10.10,
+    chat-send-handler appendInjectedAssistantMessageToTranscript)."""
+    if not isinstance(message, dict) or message.get("role") != "assistant" or not run_id:
+        return False
+    meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
+    if run_id in (meta.get("runId"), message.get("runId")):
+        return True
+    media_key = f"{run_id}:assistant-media"
+    return any(isinstance(key, str) and (key == media_key or key.startswith(media_key + ":"))
+               for key in (meta.get("idempotencyKey"), message.get("idempotencyKey")))
+
+
 def _history_image_blocks_for_run(history: dict, run_id: str) -> list[dict]:
     """The Gateway image blocks of one run's assistant messages in
-    `chat.history`, in order. The Gateway attaches a run's managed images to
-    its stored message; the live `chat` final and `session.message` carry
-    only the text (measured 2026-10-25, ELI-322)."""
+    `chat.history`, in order. The Gateway stores a run's managed images after
+    its final, in the run's message or in one it appends for them; the live
+    `chat` final carries only the text (measured 2026-10-25, ELI-322)."""
     messages = (history or {}).get("messages")
-    if not isinstance(messages, list) or not run_id:
+    if not isinstance(messages, list):
         return []
     blocks = []
     for message in messages:
-        if not isinstance(message, dict) or message.get("role") != "assistant":
-            continue
-        meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
-        if run_id in (meta.get("runId"), message.get("runId")):
+        if _is_run_assistant_message(message, run_id):
             blocks += _gateway_image_blocks(message)
     return blocks
 
@@ -1473,10 +1486,7 @@ def _history_media_errors_for_run(history: dict, run_id: str) -> list[str]:
     e.g. a path that does not exist (seen live: code `file-not-found`)."""
     labels = []
     for message in (history or {}).get("messages") or []:
-        if not isinstance(message, dict) or message.get("role") != "assistant":
-            continue
-        meta = message.get("__openclaw") if isinstance(message.get("__openclaw"), dict) else {}
-        if run_id not in (meta.get("runId"), message.get("runId")):
+        if not _is_run_assistant_message(message, run_id):
             continue
         for block in message.get("content") if isinstance(message.get("content"), list) else []:
             attachment = block.get("attachment") if isinstance(block, dict) else None
@@ -6765,19 +6775,48 @@ class _GatewayConnection:
         return ev
 
     def session_message_event(self, session_key: str) -> asyncio.Event:
-        """An Event set by the next `session.message` for `session_key` (the
-        Gateway appended a transcript message), or by a socket gap. Take it
-        BEFORE reading the transcript, as with `session_change_event`."""
+        """An Event set by the next change to `session_key`'s transcript: a
+        `session.message` (the Gateway appended a message), a `sessions.changed`
+        with phase `message` (it rewrote a stored one, e.g. attached a run's
+        images to it), or a socket gap. Take it BEFORE reading the transcript,
+        as with `session_change_event`."""
         ev = self._session_message_waiters.get(session_key)
         if ev is None:
             ev = self._session_message_waiters[session_key] = asyncio.Event()
         return ev
 
-    def _on_session_message(self, payload: dict) -> None:
-        key = payload.get("sessionKey") or ""
-        ev = self._session_message_waiters.pop(key, None)
+    def _wake_message_waiter(self, session_key: str) -> None:
+        ev = self._session_message_waiters.pop(session_key, None)
         if ev is not None:
             ev.set()
+
+    async def read_until_stored(self, session_key: str, read, have, max_wait_s: float):
+        """`read(fresh)` until `have(result)`: the session's stored messages
+        hold what the caller waits for. The first read may be a cached one;
+        each later read is fresh and follows a transcript change of
+        `session_key` (`session_message_event`, taken before that read).
+        Returns (last result, whether `have` held). `max_wait_s` bounds a
+        Gateway that never stores it; the caller logs that."""
+        got = await read(False)
+        if have(got):
+            return got, True
+        deadline = asyncio.get_running_loop().time() + max_wait_s
+        while True:
+            changed = self.session_message_event(session_key)
+            got = await read(True)
+            if have(got):
+                return got, True
+            left = deadline - asyncio.get_running_loop().time()
+            if left <= 0:
+                return got, False
+            try:
+                await asyncio.wait_for(changed.wait(), left)
+            except asyncio.TimeoutError:
+                return got, False
+
+    def _on_session_message(self, payload: dict) -> None:
+        key = payload.get("sessionKey") or ""
+        self._wake_message_waiter(key)
         if _TURNS and key:
             _TURNS.session_message(self, key)
 
@@ -6799,6 +6838,10 @@ class _GatewayConnection:
         if key and "hasActiveRun" in payload:
             self._wake_session_waiters(key)
             self.row_to_consumers(key, payload)
+        if key and payload.get("phase") == "message":
+            # A stored message was rewritten, not appended: no `session.message`
+            # follows (2026.10.5+, server-session-events historyReset branch).
+            self._wake_message_waiter(key)
         parent = payload.get("spawnedBy") or payload.get("parentSessionKey")
         if parent and parent != key:
             ev = self._session_child_waiters.pop(parent, None)
@@ -10364,8 +10407,8 @@ class _TurnWriter:
         """(image blocks, names of files never stored) of the runs written
         into M, as the inline reply reads them (`finish_final_images`): the
         Gateway attaches a run's images to its stored message after the
-        run's final, so a run that made or named some is read again until
-        they are there, bounded (ELI-328)."""
+        run's final, so a run that made or named some is read again on each
+        transcript change until they are there (ELI-328)."""
         for _s, _e, fname in _media_scan(self.renderer.text)[0]:
             if _is_gateway_media_name(fname):
                 self.gateway_media.add(fname)
@@ -10379,17 +10422,23 @@ class _TurnWriter:
                 errors += [e for e in _history_media_errors_for_run(h, run)
                            if os.path.basename(e) in names]
             return blocks, errors
-        blocks, errors = stored(hist)
-        loop = asyncio.get_running_loop()
-        start = loop.time()
-        while len(blocks) + len(errors) < expected and loop.time() - start < _RUN_IMAGES_WAIT_S:
-            await asyncio.sleep(_RUN_IMAGES_POLL_S)
-            try:
-                hist = await self.conn.session_history(self.session_key, limit=RUN_HISTORY_LIMIT)
-            except Exception as ex:
-                pipe_log(f"  turn writer: chat.history for the run's images failed: {ex!r}")
-                break
-            blocks, errors = stored(hist)
+        last = [stored(hist)]
+
+        async def read(fresh):
+            if fresh:
+                last[0] = stored(await self.conn.session_history(
+                    self.session_key, limit=RUN_HISTORY_LIMIT))
+            return last[0]
+        try:
+            _got, complete = await self.conn.read_until_stored(
+                self.session_key, read, lambda got: len(got[0]) + len(got[1]) >= expected,
+                _RUN_IMAGES_MAX_WAIT_S)
+            if not complete:
+                pipe_log(f"  turn writer: WARNING: the runs' images not all stored after "
+                         f"{_RUN_IMAGES_MAX_WAIT_S:.0f} s; written without the rest")
+        except Exception as ex:
+            pipe_log(f"  turn writer: chat.history for the run's images failed: {ex!r}")
+        blocks, errors = last[0]
         if expected:
             pipe_log(f"  turn writer: runs made {self.images_made} image(s) and named "
                      f"{len(self.gateway_media)} file(s); {len(blocks)} stored")
@@ -13997,11 +14046,11 @@ _SEND_NOW_HOLD_S = 120.0
 # The agent stream a Codex-runtime run reports its items on, an image its
 # image tool made among them.
 CODEX_ITEM_STREAM = "codex_app_server.item"
-# How long, and how often, a reply whose run made images reads the
-# transcript for them once the run ended (ELI-322): measured live, they
-# land there about 0.9 s after the run's final.
-_RUN_IMAGES_WAIT_S = 10.0
-_RUN_IMAGES_POLL_S = 0.5
+# The Gateway attaches a run's images to its stored message after the run's
+# final and then pushes `sessions.changed` phase `message` (ELI-322); a reply
+# reads the transcript again on that push (`read_until_stored`). This bounds
+# only a Gateway that never stores them, and is logged when reached.
+_RUN_IMAGES_MAX_WAIT_S = 30.0
 
 
 async def _current_load(pipe, request):
@@ -16046,17 +16095,18 @@ class _PipeTurn:
             return (_history_image_blocks_for_run(hist, self.our_run_id),
                     [e for e in _history_media_errors_for_run(hist, self.our_run_id)
                      if os.path.basename(e) in names])
+        async def read(fresh):
+            return stored(await self.run_end_history(fresh=fresh))
         try:
-            blocks, errors = stored(await self.run_end_history())
-            # The Gateway attaches the run's images to its stored message
-            # about a second after the run's final, with no event that
-            # carries them: read until they are there, bounded.
-            while len(blocks) + len(errors) < expected and loop.time() - start < _RUN_IMAGES_WAIT_S:
-                await asyncio.sleep(_RUN_IMAGES_POLL_S)
-                blocks, errors = stored(await self.run_end_history(fresh=True))
+            (blocks, errors), complete = await self.conn.read_until_stored(
+                self.session_key, read, lambda got: len(got[0]) + len(got[1]) >= expected,
+                _RUN_IMAGES_MAX_WAIT_S)
         except Exception as ex:
             pipe_log(f"  run images: chat.history failed: {ex!r}")
             return
+        if not complete:
+            pipe_log(f"  run images: WARNING: {len(blocks) + len(errors)} of {expected} stored "
+                     f"after {_RUN_IMAGES_MAX_WAIT_S:.0f} s; the reply ends without the rest")
         if expected:
             pipe_log(f"  run made {self.images_made} image(s) and named {len(self.gateway_media)} "
                      f"file(s); {len(blocks)} stored after {(loop.time() - start) * 1000:.0f} ms")

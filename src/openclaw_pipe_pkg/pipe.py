@@ -87,11 +87,11 @@ _SEND_NOW_HOLD_S = 120.0
 # The agent stream a Codex-runtime run reports its items on, an image its
 # image tool made among them.
 CODEX_ITEM_STREAM = "codex_app_server.item"
-# How long, and how often, a reply whose run made images reads the
-# transcript for them once the run ended (ELI-322): measured live, they
-# land there about 0.9 s after the run's final.
-_RUN_IMAGES_WAIT_S = 10.0
-_RUN_IMAGES_POLL_S = 0.5
+# The Gateway attaches a run's images to its stored message after the run's
+# final and then pushes `sessions.changed` phase `message` (ELI-322); a reply
+# reads the transcript again on that push (`read_until_stored`). This bounds
+# only a Gateway that never stores them, and is logged when reached.
+_RUN_IMAGES_MAX_WAIT_S = 30.0
 
 
 async def _current_load(pipe, request):
@@ -2136,17 +2136,18 @@ class _PipeTurn:
             return (_history_image_blocks_for_run(hist, self.our_run_id),
                     [e for e in _history_media_errors_for_run(hist, self.our_run_id)
                      if os.path.basename(e) in names])
+        async def read(fresh):
+            return stored(await self.run_end_history(fresh=fresh))
         try:
-            blocks, errors = stored(await self.run_end_history())
-            # The Gateway attaches the run's images to its stored message
-            # about a second after the run's final, with no event that
-            # carries them: read until they are there, bounded.
-            while len(blocks) + len(errors) < expected and loop.time() - start < _RUN_IMAGES_WAIT_S:
-                await asyncio.sleep(_RUN_IMAGES_POLL_S)
-                blocks, errors = stored(await self.run_end_history(fresh=True))
+            (blocks, errors), complete = await self.conn.read_until_stored(
+                self.session_key, read, lambda got: len(got[0]) + len(got[1]) >= expected,
+                _RUN_IMAGES_MAX_WAIT_S)
         except Exception as ex:
             pipe_log(f"  run images: chat.history failed: {ex!r}")
             return
+        if not complete:
+            pipe_log(f"  run images: WARNING: {len(blocks) + len(errors)} of {expected} stored "
+                     f"after {_RUN_IMAGES_MAX_WAIT_S:.0f} s; the reply ends without the rest")
         if expected:
             pipe_log(f"  run made {self.images_made} image(s) and named {len(self.gateway_media)} "
                      f"file(s); {len(blocks)} stored after {(loop.time() - start) * 1000:.0f} ms")
