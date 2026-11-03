@@ -104,10 +104,14 @@ jobs:
         # The tool-card tests are only as true as this copy of upstream's code.
         run: |
           set -a; . e2e/versions.env; set +a
-          for ref in "$OWUI_REF" ${OWUI_NEXT_REF:+"$OWUI_NEXT_REF"}; do
-            python3 scripts/check_owui_fixture.py --ref "$ref"
-            python3 scripts/check_owui_frontend_fixture.py --ref "$ref"
-          done
+          # The copy the tests run against the pin; the next release against
+          # its own _v<tag> copy, or that same copy when it did not change.
+          python3 scripts/check_owui_fixture.py --ref "$OWUI_REF" --copy pinned
+          python3 scripts/check_owui_frontend_fixture.py --ref "$OWUI_REF" --copy pinned
+          if [ -n "${OWUI_NEXT_REF:-}" ]; then
+            python3 scripts/check_owui_fixture.py --ref "$OWUI_NEXT_REF" --copy next
+            python3 scripts/check_owui_frontend_fixture.py --ref "$OWUI_NEXT_REF" --copy next
+          fi
 
   secrets:
     name: Secret scan

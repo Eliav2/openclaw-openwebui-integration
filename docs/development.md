@@ -88,9 +88,11 @@ Every push and PR runs `.github/workflows/ci.yml`:
 |-----|----------------|
 | Lint | `ruff` with correctness rules only (`ruff.toml`), run on the **built artifacts** rather than the fragments, so an undefined name is caught where Open WebUI would hit it. Also `shellcheck`, `actionlint`, and a parse check of the Gateway plugin. |
 | Unit (py3.10 to 3.13) | Drift guard for every artifact, the unit suite (coverage reported on 3.11), and a load check that execs each artifact the way Open WebUI's plugin loader does. |
-| OWUI handler fixture is current | `scripts/check_owui_fixture.py` compares the vendored `handle_responses_streaming_event` with Open WebUI's source at the pinned version. A stale copy is how the tool cards once vanished while the suite stayed green. `scripts/check_owui_frontend_fixture.py` does the same for the chat tab's live reducer (`applyResponseStreamEvent`, run with bun by the live-order tests). |
+| OWUI handler fixture is current | `scripts/check_owui_fixture.py` compares the vendored `handle_responses_streaming_event` with Open WebUI's source: the copy the tests run against the pinned version (`--copy pinned`), and the next release's `_v<tag>` copy, or that same copy, against `OWUI_NEXT_REF` (`--copy next`). A stale copy is how the tool cards once vanished while the suite stayed green. `scripts/check_owui_frontend_fixture.py` does the same for the chat tab's live reducer (`applyResponseStreamEvent`, run with bun by the live-order tests). |
 | Secret scan | gitleaks over the full history. |
-| E2E | The whole stack, real everywhere except the model (below). |
+| E2E | The whole stack, real everywhere except the model (below), on the pinned Open WebUI and OpenClaw. |
+| E2E next | The same suite on the next OpenClaw (`OPENCLAW_NEXT_VERSION`), with the pinned Open WebUI. Blocking. |
+| E2E OWUI next | The same suite on the next Open WebUI (`OWUI_NEXT_IMAGE`), with the pinned OpenClaw. Blocking. |
 
 **E2E** (`.github/workflows/e2e.yml`, `e2e/`): starts a deterministic fake
 OpenAI-compatible model (`e2e/fake_llm.py`), a real OpenClaw Gateway pointed at
