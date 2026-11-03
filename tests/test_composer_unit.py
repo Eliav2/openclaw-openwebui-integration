@@ -144,6 +144,17 @@ class StatusLabelWidthTests(unittest.TestCase):
         self.assertIn('<span class="pr-0.5 hidden sm:inline">Claw</span>', code)
         self.assertIn("b.setAttribute('aria-label', 'OpenClaw status');", code)
 
+    def test_a_button_cut_off_by_the_chip_row_moves_to_the_left_group(self):
+        """Open WebUI 0.13's Model controls button leaves a 375 px chip row too
+        narrow for the Thinking chip and the button: the button moves after
+        Integrations (the left group, which never scrolls) up to that width,
+        and back to the chip row once the window is wider."""
+        code = _render_composer_button_js()
+        self.assertIn("if (state.narrowAt && window.innerWidth <= state.narrowAt) return leftSlot(c);", code)
+        self.assertIn("state.narrowAt = window.innerWidth;", code)
+        self.assertIn("window.addEventListener('resize', onResize);", code)
+        self.assertIn("window.removeEventListener('resize', onResize);", code)
+
 
 class ClawNameTests(unittest.TestCase):
     """ELI-202: the composer chip, its tooltip and the dialog read "Claw", and
