@@ -460,11 +460,15 @@ _COMPOSER_BUTTON_JS_TEMPLATE = r"""
     state.watched = chips;
   }
 
+  // Wider than where the button stopped fitting: try the chip row again.
+  // Narrower: ensure() checks the fit. Moves a width change causes are not
+  // the composer fighting the button, so they don't count toward LOOP_LIMIT.
   function onResize() {
     if (state.narrowAt && window.innerWidth > state.narrowAt) {
       state.narrowAt = 0;
-      schedule();
+      state.inserts = [];
     }
+    schedule();
   }
 
   function removeAll() {

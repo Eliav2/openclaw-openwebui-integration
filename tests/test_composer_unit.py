@@ -167,6 +167,16 @@ class StatusLabelWidthTests(unittest.TestCase):
         self.assertIn("state.resizeObserver.observe(chips);", fits)
         self.assertIn("if (state.resizeObserver) state.resizeObserver.disconnect();", code)
 
+    def test_a_resize_checks_the_fit_and_its_moves_do_not_count_as_a_fight(self):
+        """Narrowing a window where the button fitted checks it again; widening
+        past where it stopped fitting clears the insert count, so dragging the
+        width does not reach LOOP_LIMIT and remove the button until reload."""
+        code = _render_composer_button_js()
+        on = code[code.index("function onResize()"):code.index("function removeAll()")]
+        self.assertIn("state.inserts = [];", on)
+        self.assertEqual(on.count("schedule();"), 1)
+        self.assertLess(on.index("}\n    schedule();"), len(on))
+
 
 class ClawNameTests(unittest.TestCase):
     """ELI-202: the composer chip, its tooltip and the dialog read "Claw", and
