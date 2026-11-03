@@ -38,21 +38,27 @@ tree_pids() {  # tree_pids <pid>: the pid and all its descendants
   for k in $(pgrep -P "$1" 2>/dev/null || true); do tree_pids "$k"; done
 }
 
-started_at() {  # started_at <pid>: epoch second the process started, nothing if it is gone
-  local ticks
-  ticks=$(sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}')
-  [[ -n "$ticks" ]] || return 0
-  awk -v t="$ticks" -v hz="$(getconf CLK_TCK)" '/^btime/ {print int($2 + t / hz)}' /proc/stat
+proc_stat() {  # proc_stat <pid>: "<state> <start ticks>" of a process, nothing if it is gone
+  sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $1, $20}'
 }
 
-running() {  # running <pid>: alive and not a zombie waiting for its parent
+started_at() {  # started_at <pid>: epoch second the process started, nothing if it is gone
   local st
-  st=$(sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $1}')
-  [[ -n "$st" && "$st" != Z ]]
+  st=$(proc_stat "$1")
+  [[ -n "$st" ]] || return 0
+  awk -v t="${st#* }" -v hz="$(getconf CLK_TCK)" '/^btime/ {print int($2 + t / hz)}' /proc/stat
+}
+
+running_as() {  # running_as <pid> <start ticks>: still that process, and not a zombie waiting for its parent
+  local st
+  st=$(proc_stat "$1")
+  [[ -n "$st" && "${st%% *}" != Z && "${st#* }" == "$2" ]]
 }
 
 stack_down() {
-  local f pid started pids=() p left
+  local f pid started st pids=() p left id
+  declare -A ticks
+  command -v pgrep >/dev/null || { echo "::error::pgrep (procps) is needed to find the stack's child processes" >&2; exit 1; }
   for f in "${STACK_PID_FILES[@]}"; do
     [[ -s "$f" ]] || continue
     pid=$(<"$f")
@@ -64,17 +70,23 @@ stack_down() {
     fi
   done
   if (( ${#pids[@]} )); then
+    # Remember each process's start time: a pid the kernel reuses during the wait is not ours to kill.
+    for p in "${pids[@]}"; do st=$(proc_stat "$p"); ticks[$p]="${st#* }"; done
     kill -TERM "${pids[@]}" 2>/dev/null || true
     for _ in $(seq 1 10); do
       left=()
-      for p in "${pids[@]}"; do running "$p" && left+=("$p"); done
+      for p in "${pids[@]}"; do running_as "$p" "${ticks[$p]}" && left+=("$p"); done
       (( ${#left[@]} )) || break
       sleep 1
     done
     if (( ${#left[@]} )); then kill -KILL "${left[@]}" 2>/dev/null || true; fi
   fi
-  docker rm -f owui >/dev/null 2>&1 || true
-  rm -f "${STACK_PID_FILES[@]}"
+  # Only the container this start created (its id is recorded at `docker run`), never an `owui` that was there before.
+  if [[ -s "$LOG_DIR/owui.id" ]]; then
+    id=$(<"$LOG_DIR/owui.id")
+    docker rm -f "$id" >/dev/null 2>&1 || true
+  fi
+  rm -f "${STACK_PID_FILES[@]}" "$LOG_DIR/owui.id"
   echo "stack down (${#pids[@]} processes stopped)"
 }
 
@@ -93,6 +105,8 @@ on_exit() {
   trap - EXIT
   if (( rc != 0 && STACK_UP == 0 )) && [[ -z "${E2E_KEEP_ON_FAIL:-}" && -z "${GITHUB_ACTIONS:-}" ]]; then
     echo "::warning::the stack did not come up (exit $rc); stopping what it started"
+    # A signal can land between starting a process and writing its pid file: stop the script's own children too.
+    pkill -TERM -P $$ 2>/dev/null || true
     stack_down
   fi
   exit "$rc"
@@ -216,7 +230,7 @@ docker run -d --name owui --network host \
   -e ENABLE_OPENAI_API=false \
   -e OFFLINE_MODE=true \
   -e ENABLE_CHANNELS=true \
-  "$OWUI_IMAGE" >/dev/null
+  "$OWUI_IMAGE" >"$LOG_DIR/owui.id"
 wait_for "Open WebUI" 300 curl -fsS "$OWUI_URL/health" \
   || { docker logs --tail 100 owui; exit 1; }
 curl -fsS "$OWUI_URL/api/version"; echo

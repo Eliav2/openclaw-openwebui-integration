@@ -219,7 +219,14 @@ uv run --with-requirements requirements-dev.txt pytest -v e2e/test_e2e.py
 E2E_SHARD=2 uv run --with-requirements requirements-dev.txt pytest -v e2e/test_e2e.py   # one shard only
 ```
 
-`bash e2e/start_stack.sh down` stops the fake model, the Gateway and its children and the Open WebUI container it started (it reads the pid files in `E2E_LOG_DIR`, so give it the same `E2E_LOG_DIR`). A start that fails halfway does that itself; `E2E_KEEP_ON_FAIL=1` keeps the half-started stack for a look.
+`bash e2e/start_stack.sh down` stops the fake model, the Gateway and its children, and the Open WebUI container this start created (it removes that container by the id recorded in `owui.id`, never by name). It reads the pid files in `E2E_LOG_DIR`, so give it the same `E2E_LOG_DIR`. It prints how many processes it stopped, and can be run twice:
+
+```text
+$ bash e2e/start_stack.sh down
+stack down (5 processes stopped)
+```
+
+A start that fails halfway does that itself; `E2E_KEEP_ON_FAIL=1` keeps the half-started stack for a look.
 
 Two things to know when a script or an agent tool starts the stack for you:
 - Start it from a process that outlives the launching shell. A tool that kills its process group when a call ends also kills a `nohup` stack mid-start, silently; under systemd use `systemd-run --user --unit=<name> ...` and stop that unit when you are done.
