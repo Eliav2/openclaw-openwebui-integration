@@ -763,6 +763,7 @@ def test_no_tool_runs_after_the_run_is_aborted(token):
     assert refused, f"the call after the abort was not refused: {got}"
 
 
+@pytest.mark.skipif(not _steers_mid_run_messages(), reason="the Gateway runs a mid-run message after the run")
 def test_a_steered_message_splits_the_run_where_claude_code_took_it_in(token):
     """Eliav's chat c9dc45f0, test 2: "say tomato" was sent while a claude-cli
     turn ran, and Claude Code took it in only at its next tool boundary, after
