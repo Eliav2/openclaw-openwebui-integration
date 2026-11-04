@@ -45,7 +45,7 @@ docker run -d --name "$name" -p 127.0.0.1:18780:8080 \
 cp "$push/examples/cloudflare-worker/src/index.js" "$run/worker/src/index.js"
 mkdir -p "$run/web"; cp "$push/web/oc-sw.js" "$push/web/oc-push.js" "$run/web/"
 sed -i 's#\.\./\.\./\.\./web/#../web/#' "$run/worker/src/index.js"
-mv "$run/web" "$run/worker/web"
+rm -rf "$run/worker/web"; mv "$run/web" "$run/worker/web"   # a second `up` on the same run dir would nest it
 cat > "$run/worker/wrangler.jsonc" <<JSON
 { "name": "web-push-e2e", "main": "src/index.js", "compatibility_date": "2025-10-01",
   "rules": [{ "type": "Text", "globs": ["**/oc-sw.js", "**/oc-push.js"], "fallthrough": true }],
