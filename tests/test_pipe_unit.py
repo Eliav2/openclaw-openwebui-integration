@@ -16330,6 +16330,20 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         first_a.cancel()
         await self._spin()
 
+    def test_a_steered_message_waiting_in_a_turn_writer_is_not_a_run(self):
+        """Browser path (test_a_reply_interrupted_while_queued_...): Send now
+        cancelled the 2nd reply, whose message waits to be steered, into a turn
+        writer before the run's next boundary. The run the 3rd message goes
+        into is still the 1st message's."""
+        conn = self.conn
+        for run, started in ((self.R1, True), (self.R2, False)):
+            pump = openclaw_pipe._RunPump()
+            pump.started = started
+            conn._turn_pumps[(self.SK, run)] = pump
+        self.assertTrue(conn.user_turn_run_active(self.SK, self.CHAT))
+        conn._turn_pumps[(self.SK, self.R2)].started = True
+        self.assertFalse(conn.user_turn_run_active(self.SK, self.CHAT), "two runs: none to steer into")
+
     async def test_a_message_sent_during_a_wake_waits_for_it(self):
         """The active run is a cron wake's, which a turn writer shows: no run
         of this chat's own messages. The Gateway does not steer into it, it
