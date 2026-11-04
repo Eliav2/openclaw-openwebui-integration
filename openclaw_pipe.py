@@ -11800,10 +11800,10 @@ def _history_steered_into(history: dict, index: int) -> str | None:
     messages = (history or {}).get("messages") or []
     own = _history_user_run_id(messages[index]) if 0 <= index < len(messages) else None
     if not own or _history_ran(history, own) or _cron_turn_job(messages[index]):
-        # A cron wake's prompt is not one: on 2026.10.10 the Gateway hands it
-        # to a running claude-cli process, which records it as it arrives and
-        # runs it after the current turn, as a run of its own (live gate
-        # two-wakes, chat d51a3a0a).
+        # A cron wake's prompt is not one: on 2026.10.10 a wake fired while a
+        # claude-cli run works runs after it, as a run of its own, and its
+        # prompt carries the time it fired, so it sorts between that run's
+        # imported messages (live gate two-wakes, chat d51a3a0a).
         return None
     for k in range(index - 1, -1, -1):
         m = messages[k]
