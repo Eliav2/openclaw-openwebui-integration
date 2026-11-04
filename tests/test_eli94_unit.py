@@ -143,6 +143,20 @@ class EndedWhileDownTests(_EndedWhileDownCase):
         self.assertEqual(_cards(m.get("output")), 1, "the tool card comes from the transcript")
         self.assertEqual(set(self.chat["history"]["messages"]), {"u1", M}, "no second message")
 
+    async def test_a_completed_reply_publishes_chat_finished_with_the_valve(self):
+        """Review on #273: the reply this pass completes is saved whole, and
+        PUBLISH_CHAT_FINISHED publishes it (the request Open WebUI's stop
+        cancelled published nothing)."""
+        published = []
+
+        async def publish(chat_id, message_id, user_id, text=None):
+            published.append((chat_id, message_id, user_id))
+        self.conn._valves = lambda: types.SimpleNamespace(AGENT_ID="main", PUBLISH_CHAT_FINISHED=True)
+        with mock.patch.object(openclaw_pipe, "_publish_chat_finished", publish):
+            await self.startup()
+        self.assertEqual(self.msg()["content"], "Reading them.\n\nFound it.")
+        self.assertEqual(published, [(CHAT, M, USER)])
+
     async def test_a_run_that_closed_before_the_chat_was_last_written_is_left_alone(self):
         """The reply was written after its run closed: it already holds the end."""
         self.history = _closed_history(closed_ms=(T0 - 1) * 1000 + 900)

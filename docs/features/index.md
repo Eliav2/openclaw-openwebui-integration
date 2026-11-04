@@ -57,6 +57,7 @@ Everything here works as soon as the Pipe is installed, except entries marked:
 - [**Cron jobs and `sessions_send`**](./agent-turns.md#where-these-replies-come-from): a reply the agent starts lands in your chat as a normal reply, live, with tool cards, and no message from you
 - [**Sub-agent results**](./agent-turns.md#sub-agent-results): a finished sub-agent's result reaches the chat through its parent's reply, or as a Sub-agent card when the parent stays silent
 - [**Open tabs update live**](./agent-turns.md#what-you-see): the reply appears in an open tab without a reload, and Stop works on it
+- [**`chat.finished` for every reply**](./agent-turns.md#telling-other-functions-a-reply-finished): the Pipe can publish Open WebUI's `chat.finished` event when each OpenClaw reply is saved, agent turns included, for push notifiers, webhooks and notification targets
 
 ## Reliability
 
