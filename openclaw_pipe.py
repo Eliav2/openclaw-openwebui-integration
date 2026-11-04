@@ -9314,6 +9314,28 @@ def _retryable_refusal_retry_ms(ex: GatewayError) -> int | None:
     return int(retry) if isinstance(retry, (int, float)) and retry > 0 else 250
 
 
+# `sessions.list` returns at most 100 rows, newest first, unless told a
+# `limit` (recorded: 100 of 131 on 2026.10.10, 100 of 1312 live), and it has
+# no filter by key: `search` is a substring of it.
+_SESSIONS_PAGE = 500          # rows asked for per page of a full read
+_SESSION_READ_LIMIT = 10      # rows asked for when one session is named
+
+
+async def _list_all_sessions(conn, *, timeout: float = 30, **filters) -> dict:
+    """Every row `sessions.list` has for `filters`, read page by page
+    (`limit`, `offset`, `totalCount`). For the readers that need them all; a
+    read of one session names it (`_session_list_active`)."""
+    rows: list = []
+    while True:
+        resp = await conn.send_request(
+            "sessions.list", {**filters, "limit": _SESSIONS_PAGE, "offset": len(rows)}, timeout=timeout)
+        page = resp.get("sessions") or []
+        rows.extend(page)
+        total = resp.get("totalCount")
+        if not page or (total is not None and len(rows) >= total) or (total is None and len(page) < _SESSIONS_PAGE):
+            return {"sessions": rows, "totalCount": total if total is not None else len(rows)}
+
+
 # --- writer ----------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -12419,15 +12441,29 @@ async def _owui_chat_has_live_task(chat_id: str) -> bool:
 async def _session_list_active(conn: "_GatewayConnection", session_key: str,
                                *, missing: bool | None = False) -> bool | None:
     """`sessions.list` `hasActiveRun` for one session (counts a sub-agent
-    yield gap as active, unlike `sessions.describe`). `missing` when the
-    Gateway lists no such session, None when it can't be asked."""
+    yield gap as active, unlike `sessions.describe`). The read names the
+    session (`search`): an unfiltered list holds only the newest 100 rows, so
+    a long run's row, last touched when it started, is not in it, and the
+    session read as having no run. `missing` when the Gateway has no such
+    session (a chat's first message); None when it can't be asked, or when
+    more rows matched than came back and none is the session, so its absence
+    is not known."""
     try:
-        lst = await conn.send_request("sessions.list", {}, timeout=15)
+        lst = await conn.send_request(
+            "sessions.list", {"search": session_key, "limit": _SESSION_READ_LIMIT}, timeout=15)
     except Exception as ex:
         pipe_log(f"  sessions.list for {session_key[-36:][:8]}... failed: {ex}")
         return None
-    row = next((r for r in (lst.get("sessions") or []) if r.get("key") == session_key), None)
-    return bool(row.get("hasActiveRun")) if row else missing
+    rows = lst.get("sessions") or []
+    row = next((r for r in rows if r.get("key") == session_key), None)
+    if row:
+        return bool(row.get("hasActiveRun"))
+    total = lst.get("totalCount")
+    if len(rows) >= _SESSION_READ_LIMIT or (total is not None and total > len(rows)):
+        pipe_log(f"  sessions.list for {session_key[-36:][:8]}...: {total or len(rows)} rows match, "
+                 "none is the session; its state is unknown")
+        return None
+    return missing
 
 
 async def _wait_for_session_idle(conn: "_GatewayConnection", session_key: str, is_active,
@@ -12715,7 +12751,7 @@ async def _reconcile_ended_while_down(conn: "_GatewayConnection", agent_id: str)
     closed in a later second than the chat's last write is rebuilt from the
     transcript into its message (identity rule, rule E for recoveries)."""
     from open_webui.models.chats import Chats
-    lst = await conn.send_request("sessions.list", {}, timeout=15)
+    lst = await _list_all_sessions(conn)
     prefix = f"agent:{agent_id}:openwebui-"
     fixed = 0
     for row in lst.get("sessions") or []:
@@ -17253,7 +17289,10 @@ class _PipeTurn:
                             ladder, model_key=self.session_model_key,
                             state_dir=getattr(self.pipe.valves, "STATE_DIR", "")):
                         self._ladder_recorded = (self.session_model_key, ladder)
-            if row.get("activeRunId") or status in _ACTIVE_RUN_STATES:
+            # The row's own run facts: `hasActiveRun` (the Gateway's aggregate
+            # flag) or a non-empty `activeRunIds`, as well as the status. There
+            # is no `activeRunId`.
+            if row.get("hasActiveRun") or row.get("activeRunIds") or status in _ACTIVE_RUN_STATES:
                 return True
         except Exception as ex:
             # Describe failed: fall back to the list probe below, and if

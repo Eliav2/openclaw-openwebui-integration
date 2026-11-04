@@ -5666,6 +5666,28 @@ def _retryable_refusal_retry_ms(ex: GatewayError) -> int | None:
     return int(retry) if isinstance(retry, (int, float)) and retry > 0 else 250
 
 
+# `sessions.list` returns at most 100 rows, newest first, unless told a
+# `limit` (recorded: 100 of 131 on 2026.10.10, 100 of 1312 live), and it has
+# no filter by key: `search` is a substring of it.
+_SESSIONS_PAGE = 500          # rows asked for per page of a full read
+_SESSION_READ_LIMIT = 10      # rows asked for when one session is named
+
+
+async def _list_all_sessions(conn, *, timeout: float = 30, **filters) -> dict:
+    """Every row `sessions.list` has for `filters`, read page by page
+    (`limit`, `offset`, `totalCount`). For the readers that need them all; a
+    read of one session names it (`_session_list_active`)."""
+    rows: list = []
+    while True:
+        resp = await conn.send_request(
+            "sessions.list", {**filters, "limit": _SESSIONS_PAGE, "offset": len(rows)}, timeout=timeout)
+        page = resp.get("sessions") or []
+        rows.extend(page)
+        total = resp.get("totalCount")
+        if not page or (total is not None and len(rows) >= total) or (total is None and len(page) < _SESSIONS_PAGE):
+            return {"sessions": rows, "totalCount": total if total is not None else len(rows)}
+
+
 # --- emit ------------------------------------------------------------------
 
 
@@ -9876,7 +9898,7 @@ class Action:
         current_task = asyncio.ensure_future(conn.send_request(
             "sessions.list", dict(spawnedBy=session_key, limit=50, includeLastMessage=True), timeout=5))
         seed_task = None if _subagent_index_seeded() else asyncio.ensure_future(
-            conn.send_request("sessions.list", dict(limit=1000), timeout=30))
+            _list_all_sessions(conn))
         tasks_task = asyncio.ensure_future(_read_background_tasks(conn, session_key))
         jobs_task = asyncio.ensure_future(_read_automations(conn))
 

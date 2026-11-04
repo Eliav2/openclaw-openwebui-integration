@@ -978,7 +978,7 @@ class ChildIndexTests(unittest.IsolatedAsyncioTestCase):
         ]
         gw = _WindowGateway(rows)
         data = (await self._open(gw))[-1]
-        self.assertEqual(gw.full_reads(), [{"limit": 1000}])
+        self.assertEqual(gw.full_reads(), [{"limit": 500, "offset": 0}])
         self.assertEqual([(t["id"][-4:], t["status"]) for t in data["tasks"]],
                          [("0002", "failed"), ("0004", "ended"), ("0001", "completed")])
         self.assertEqual(data["tasks"][0]["error"], "provider 529")

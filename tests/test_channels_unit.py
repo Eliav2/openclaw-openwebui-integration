@@ -18,6 +18,7 @@ from unittest import mock
 
 import conftest  # noqa: F401  (imports real pydantic before the stubs can shadow it)
 
+from _paged_sessions import PagedSessions, crowd  # noqa: E402
 from _test_stubs import install_stubs  # noqa: E402
 
 install_stubs()
@@ -327,6 +328,7 @@ class PushConn(FakeRunConn):
         super().__init__(*args, **kwargs)
         self.real = openclaw_pipe._GatewayConnection(lambda: None)
         self.flag = True
+        self.crowded = False     # the thread's session sits past the Gateway's first 100 rows
 
     def session_change_event(self, key):
         return self.real.session_change_event(key)
@@ -337,7 +339,8 @@ class PushConn(FakeRunConn):
     async def send_request(self, method, params, timeout=10):
         if method == "sessions.list":
             self.requests.append((method, params))
-            return {"sessions": [{"key": "k", "hasActiveRun": self.flag}]}
+            rows = crowd("k", busy=self.flag) if self.crowded else [{"key": "k", "hasActiveRun": self.flag}]
+            return PagedSessions(rows).list(params)
         return await super().send_request(method, params, timeout)
 
 
@@ -436,6 +439,45 @@ class RunTests(unittest.IsolatedAsyncioTestCase):
                   session={"status": "done", "hasActiveRun": False, "activeRunIds": []})
         self.assertEqual(await asyncio.wait_for(task, 2), ("started", "Sure"))
         self.assertEqual(conn.methods(), ["chat.send"])
+
+    async def test_a_follow_up_waits_for_a_busy_thread_past_the_first_hundred_sessions(self):
+        """Recorded live: an unfiltered `sessions.list` holds the newest 100 of
+        1312 sessions. A thread whose run started long ago is not among them,
+        its row was missing, and `missing=False` sent the follow-up into the
+        running turn. The read names the session."""
+        conn = PushConn("started", [final("Sure")])
+        conn.crowded = True
+        task = asyncio.ensure_future(_channel_run(conn, "k", "m", "chanfollow-x", owner=True))
+        await _spin()
+        self.assertNotIn("chat.send", conn.methods(), "sent into a run the first page does not show")
+        conn.flag = False
+        conn.push(reason="agent.input.settled", hasActiveRun=False, status="done")
+        self.assertEqual(await asyncio.wait_for(task, 2), ("started", "Sure"))
+
+    async def test_a_follow_up_is_not_sent_when_the_answer_may_hide_the_thread(self):
+        """More rows matched than came back and none is the thread: busy or
+        idle is not known, so nothing is sent."""
+        conn = PushConn("started", [final("Sure")])
+
+        async def send_request(method, params, timeout=10):
+            if method == "sessions.list":
+                return {"sessions": [{"key": f"o{i}", "hasActiveRun": False} for i in range(10)], "totalCount": 30}
+            return {}
+        conn.send_request = send_request
+        self.assertEqual(await asyncio.wait_for(
+            _channel_run(conn, "k", "m", "chanfollow-x", owner=True), 2), ("failed", None))
+
+    async def test_a_socket_gap_wakes_a_follow_up_waiting_for_the_idle(self):
+        """The idle push may be among the events a dropped socket lost
+        (`_mark_event_gap` wakes every waiter, the channel follow-up's among
+        them): the follow-up reads the flag again and is sent."""
+        conn = PushConn("started", [final("Sure")])
+        task = asyncio.ensure_future(_channel_run(conn, "k", "m", "chanfollow-x", owner=True))
+        await _spin()
+        self.assertFalse(task.done())
+        conn.flag = False                 # went idle while the socket was down: nothing pushed
+        conn.real._mark_event_gap()
+        self.assertEqual(await asyncio.wait_for(task, 2), ("started", "Sure"))
 
     async def test_an_unreadable_transcript_at_the_end_keeps_the_streamed_reply(self):
         settle = {"type": openclaw_pipe._ROW_MARKER_TYPE, "row": {"hasActiveRun": False, "lastRunId": "chanfollow-x"}}
