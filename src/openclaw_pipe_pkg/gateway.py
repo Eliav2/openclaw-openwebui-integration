@@ -1638,6 +1638,15 @@ class _RunQueue(asyncio.Queue):
         return items
 
 
+class _DiscardQueue(_RunQueue):
+    """Where a run's events go when nothing shows them: its message's reply
+    was steered on while a turn writer had it, which reads its answer from
+    the transcript (`_GatewayConnection._steer_handed_over`)."""
+
+    def put_nowait(self, item) -> None:
+        pass
+
+
 # Open WebUI's uvicorn Server, kept while it serves (see `owui_shutting_down`).
 _UVICORN_SERVER = None
 
@@ -2974,6 +2983,11 @@ class _GatewayConnection:
             return False
         consumer.started = True
         consumer.ended = consumer.ended or terminal
+        if consumer.ended and consumer.queues and all(isinstance(q, _DiscardQueue) for q in consumer.queues):
+            # Nothing shows the rest of its run (`_steer_handed_over`): its end lets it go.
+            self._consumers.pop(f"{consumer.session_key}:{consumer.run_id}", None)
+            self._wake_session_waiters(consumer.session_key)
+            return False
         return True
 
     def _on_user_message_committed(self, session_key: str, message: dict) -> None:
@@ -2986,9 +3000,22 @@ class _GatewayConnection:
         if not (message.get("role") == "user" and idem.endswith(":user")
                 and steers_mid_run_messages(self.gateway_version)):
             return
-        consumer = self._consumers.get(f"{session_key}:{idem[:-len(':user')]}")
+        run_id = idem[:-len(":user")]
+        consumer = self._consumers.get(f"{session_key}:{run_id}") or self._steer_handed_over(session_key, run_id)
         if consumer is not None and not (consumer.started or consumer.steered):
             self._steer(consumer)
+
+    def _steer_handed_over(self, session_key: str, run_id: str) -> _Consumer | None:
+        """The steer target of a message whose reply a turn writer took over
+        while it waited to be steered (a later message's Send now cancelled
+        its request, Eliav's chat c9dc45f0): the run still ends its earlier
+        reply at the commit, and the writer reads its answer from the
+        transcript, so the run's events go nowhere until the next steer
+        (`_DiscardQueue`). None when no such writer waits."""
+        pump = getattr(self, "_turn_pumps", {}).get((session_key, run_id))
+        if pump is None or pump.started or not (pump.handover or {}).get("steer_pending"):
+            return None
+        return _Consumer(session_key=session_key, run_id=run_id, queues=[_DiscardQueue()])
 
     def _steer(self, consumer: _Consumer) -> bool:
         """Switch the session's active run to the reply of `consumer`'s
@@ -3056,14 +3083,15 @@ class _GatewayConnection:
                               max_chars: int = RECOVERY_HISTORY_MAX_CHARS,
                               timeout: float = 10) -> dict:
         """Fetch the session's recent messages unclipped, with each turn in
-        the role the transcript holds (`_transcript_roles`)."""
+        the role the transcript holds (`_transcript_roles`) and each message
+        steered into a run where the run took it in (`_transcript_commit_order`)."""
         hist = await self.send_request(
             "chat.history",
             dict(sessionKey=session_key, limit=limit, maxChars=max_chars),
             timeout=timeout
         )
         if isinstance(hist, dict) and isinstance(hist.get("messages"), list):
-            hist["messages"] = _transcript_roles(hist["messages"])
+            hist["messages"] = _transcript_commit_order(_transcript_roles(hist["messages"]))
         return hist
 
     async def abort(self, session_key: str, run_id: str):
@@ -4167,6 +4195,40 @@ def _transcript_roles(messages: list) -> list:
     claude-cli run was rebuilt from the transcript, and the run it started
     was not found (GH #24, OpenClaw 2026.10.2+). Other messages are kept."""
     return [{**m, "role": "user"} if _is_forwarded_turn(m) else m for m in messages]
+
+
+def _transcript_commit_order(messages: list) -> list:
+    """`chat.history` messages with each one steered into a running run
+    moved to where the run took it in. The Gateway stores it when sent, but
+    on claude-cli the run takes it in at a tool boundary, and the messages
+    Claude Code wrote in between carry their own, later times, so they sort
+    after it: Eliav's chat c9dc45f0, where "21-40", written during the pause
+    a message was sent in, read as that message's answer. Its commit time
+    (`recordTimestampMs`) is the boundary: it goes past the messages written
+    before it, up to the next user message. Other messages keep their order."""
+    out = list(messages)
+    for message in [m for m in messages if _steered_commit_ms(m) is not None]:
+        at = out.index(message)
+        committed = _steered_commit_ms(message)
+        end = at + 1
+        while end < len(out) and (out[end] or {}).get("role") != "user" \
+                and isinstance((out[end] or {}).get("timestamp"), (int, float)) \
+                and out[end]["timestamp"] <= committed:
+            end += 1
+        out.insert(end - 1, out.pop(at))
+    return out
+
+
+def _steered_commit_ms(message) -> float | None:
+    """When the Gateway committed a message it steered into a running run
+    (2026.10.10 `steerTargetRunId`), if after it was sent; else None."""
+    meta = (message or {}).get("__openclaw") if isinstance(message, dict) else None
+    if not isinstance(meta, dict) or not meta.get("steerTargetRunId") or message.get("role") != "user":
+        return None
+    committed, sent = meta.get("recordTimestampMs"), message.get("timestamp")
+    if not isinstance(committed, (int, float)) or not isinstance(sent, (int, float)) or committed <= sent:
+        return None
+    return committed
 
 
 def _history_user_run_id(message) -> str | None:
