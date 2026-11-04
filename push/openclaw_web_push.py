@@ -2,9 +2,9 @@
 title: Web Push notifications
 author: eliavb43
 author_url: https://github.com/Eliav2/openclaw-openwebui-integration
-version: 0.1.0
+version: 0.2.0
 requirements: pywebpush==2.0.3
-description: Event function. Sends a Web Push notification to each of the user's subscribed devices when a reply finishes. Title and link only, never the reply.
+description: Event function. Sends a Web Push notification to each of the user's subscribed devices when a reply finishes: the chat's title and link, and the start of the reply only when PREVIEW_CHARS is on. Muted chats send nothing.
 """
 # Docs: docs/install/web-push.md. The page script (push/web/oc-push.js) keeps
 # each device's subscription in this function's user valves; the service
@@ -15,6 +15,8 @@ import hashlib
 import json
 import logging
 import os
+import re
+import time
 
 from pydantic import BaseModel, Field
 
@@ -34,23 +36,88 @@ GONE_STATUSES = (404, 410)
 DEFAULT_KEY_FILE = os.path.join(os.environ.get("DATA_DIR", "/app/backend/data"), "web-push", "vapid_private.pem")
 
 
-def build_payload(event: dict) -> dict:
-    """What the device gets: the chat's title and where to open it. Never the
-    reply: `data.message` holds the whole reply text (Open WebUI 0.13.0 and
-    the Pipe), and the push service and the lock screen are not the server."""
+# What a preview leaves out of the reply, and what it unwraps.
+_BLOCKS = re.compile(r"<details\b.*?</details>", re.S | re.I)
+_FENCES = re.compile(r"```.*?(```|$)", re.S)
+_IMAGES = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+_MEDIA = re.compile(r"^\s*MEDIA:\S*\s*$", re.M)
+_LINKS = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+_TAGS = re.compile(r"<[^>]+>")
+_LINE_MARKS = re.compile(r"^\s*(#{1,6}\s+|[-*+]\s+|\d+[.)]\s+|>\s?)", re.M)
+_INLINE_MARKS = re.compile(r"(\*\*|__|~~|`)")
+
+
+def snippet(text: str, limit: int) -> str:
+    """The start of a reply as one line of plain text, at most `limit` characters
+    (cut on a word, with an ellipsis): tool and status blocks, images and media
+    lines left out, a code block as "[code]", markdown and HTML unwrapped."""
+    t = _BLOCKS.sub(" ", str(text or ""))
+    t = _FENCES.sub(" [code] ", t)
+    t = _MEDIA.sub(" ", _IMAGES.sub(" ", t))
+    t = _LINKS.sub(r"\1", t)
+    t = _TAGS.sub(" ", t)
+    t = _INLINE_MARKS.sub("", _LINE_MARKS.sub("", t)).replace("|", " ")
+    t = re.sub(r"\s+", " ", t).strip()
+    t = re.sub(r"\s+([:.,;!?])", r"\1", t)
+    if t.replace("[code]", "").strip() == "":
+        return ""
+    if len(t) <= limit:
+        return t
+    cut = t[:limit - 1]
+    return (cut.rsplit(" ", 1)[0] if " " in cut else cut).rstrip(" ,;:") + "…"
+
+
+def build_payload(event: dict, preview_chars: int = 0, fn: str = "") -> dict:
+    """What the device gets: the chat's title and where to open it, the id of
+    this function (the service worker's Mute writes its user valves), and, only
+    with `preview_chars`, the start of the reply. `data.message` holds the whole
+    reply (Open WebUI 0.13.0 and the Pipe); it is never sent whole."""
     data = event.get("data") or {}
     chat_id = str(data.get("chat_id") or "")
     title = str(data.get("title") or event.get("message") or "Reply finished")[:MAX_TITLE_CHARS]
-    return {"v": 1, "kind": event.get("event"), "source": event.get("source"), "chat_id": chat_id,
-            "message_id": data.get("message_id"), "title": title,
-            "url": f"/c/{chat_id}" if chat_id else "/"}
+    payload = {"v": 2, "kind": event.get("event"), "source": event.get("source"), "chat_id": chat_id,
+               "message_id": data.get("message_id"), "title": title,
+               "url": f"/c/{chat_id}" if chat_id else "/"}
+    if fn:
+        payload["fn"] = fn
+    if preview_chars > 0:
+        body = snippet(data.get("message") or "", preview_chars)
+        if body:
+            payload["body"] = body
+    return payload
 
 
 def encode_payload(payload: dict) -> str:
-    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    """JSON within MAX_PAYLOAD_BYTES: the preview is shortened first, then the title."""
+    def dump(p):
+        return json.dumps(p, separators=(",", ":"), ensure_ascii=False)
+    body = dump(payload)
+    while len(body.encode()) > MAX_PAYLOAD_BYTES and payload.get("body"):
+        over = len(body.encode()) - MAX_PAYLOAD_BYTES
+        # Each character is 1 to 4 bytes: drop at least what is over, in characters.
+        keep = max(0, len(payload["body"]) - 1 - over // 2 - 1)
+        payload = {**payload, "body": snippet(payload["body"].rstrip("…"), keep) if keep > 20 else ""}
+        if not payload["body"]:
+            payload.pop("body")
+        body = dump(payload)
     if len(body.encode()) > MAX_PAYLOAD_BYTES:
-        body = json.dumps({**payload, "title": payload["title"][:40]}, separators=(",", ":"), ensure_ascii=False)
+        body = dump({**payload, "title": payload["title"][:40]})
     return body
+
+
+def is_muted(raw, chat_id: str, now: float | None = None) -> bool:
+    """`mutes` user valve: {chat_id: until} in epoch seconds, 0 for always.
+    Anything unreadable mutes nothing."""
+    try:
+        mutes = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        return False
+    if not isinstance(mutes, dict) or chat_id not in mutes:
+        return False
+    until = mutes[chat_id]
+    if isinstance(until, bool) or not isinstance(until, (int, float)):
+        return False
+    return until == 0 or until > (time.time() if now is None else now)
 
 
 def topic_for(chat_id: str) -> str:
@@ -101,11 +168,20 @@ class Event:
             description="Comma list of model id prefixes whose replies come from the OpenClaw Pipe "
                         "(its function id plus a dot). For these, only the Pipe's own "
                         "'chat.finished' is sent. Turn on the Pipe's PUBLISH_CHAT_FINISHED.")
+        PREVIEW_CHARS: int = Field(
+            default=0, ge=0, le=2000,
+            description="Show the start of the reply (plain text, at most this many characters) "
+                        "in the notification. 0: off, the body says 'New reply'. The text shows on "
+                        "the lock screen and in the notification shade of every subscribed device.")
 
     class UserValves(BaseModel):
         subscriptions: str = Field(
             default="[]",
             description="Written by the page script: one Web Push subscription per device.")
+        mutes: str = Field(
+            default="{}",
+            description="Written by the page script and the service worker: chats that send no "
+                        "notification, {chat_id: until} in epoch seconds, 0 for always.")
 
     def __init__(self):
         self.valves = self.Valves()
@@ -125,12 +201,17 @@ class Event:
         subs = parse_subscriptions(valves.get("subscriptions"))
         if not subs:
             return
+        chat_id = str(data.get("chat_id") or "")
+        # Before anything is encrypted or sent: a muted chat sends nothing, to any device.
+        if is_muted(valves.get("mutes"), chat_id):
+            log.info("web push: chat %s is muted, nothing sent", chat_id[:8])
+            return
         key = self._private_key()
         if key is None:
             return
         subject = await self._subject()
-        body = encode_payload(build_payload(event))
-        gone = await asyncio.to_thread(self.send_all, subs, body, topic_for(str(data.get("chat_id") or "")),
+        body = encode_payload(build_payload(event, self.valves.PREVIEW_CHARS, fid))
+        gone = await asyncio.to_thread(self.send_all, subs, body, topic_for(chat_id),
                                        key, subject)
         if gone:
             await self._drop(Functions, fid, user_id, gone)
