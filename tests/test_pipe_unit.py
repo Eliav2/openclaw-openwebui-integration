@@ -9237,13 +9237,18 @@ class TurnWriterEndTests(_TurnWriterCase):
         self.assertIs(self.m()["done"], True)
         self.assertEqual(self.m()["content"], openclaw_pipe.REPLY_SENT_WITH_NEXT_NOTE)
 
-    def _steered_transcript(self, *after):
-        """R1's message, its first answer, the message steered in as R2, then `after`."""
+    # A Pipe reply run, as `pipe_run_id` names it.
+    STEERED = "msg-c0ffee00-0000-4000-8000-000000000001-00000000-0000-4000-8000-000000000002-1.0"
+
+    def _steered_transcript(self, *after, committed=True):
+        """R1's message, its first answer, the message steered in as STEERED
+        (once `committed`), then `after`."""
         return {"messages": [
             {"role": "user", "content": "count", "__openclaw": {"idempotencyKey": "R1:user"}},
             {"role": "assistant", "content": [{"type": "text", "text": "slow-1 slow-2"}],
              "stopReason": "stop", "__openclaw": {"runId": "R1"}},
-            {"role": "user", "content": "aside", "__openclaw": {"idempotencyKey": "R2:user"}},
+            *([{"role": "user", "content": "aside",
+                "__openclaw": {"idempotencyKey": f"{self.STEERED}:user"}}] if committed else []),
             *after]}
 
     async def test_a_steered_reply_waits_for_its_answer_in_the_transcript(self):
@@ -9257,7 +9262,7 @@ class TurnWriterEndTests(_TurnWriterCase):
                                   "content": "", "done": True,
                                   "statusHistory": copy.deepcopy(self.LEFT_BY_THE_CANCEL)}
         w = _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
-                        run_id="R2", message_id="m1", takeover=True, renderer=_TurnRenderer())
+                        run_id=self.STEERED, message_id="m1", takeover=True, renderer=_TurnRenderer())
         hist = {"now": self._steered_transcript()}
         self.conn.session_history = mock.AsyncMock(side_effect=lambda *a, **k: copy.deepcopy(hist["now"]))
         ending = asyncio.ensure_future(w.end({"status": "done", "hasActiveRun": False, "lastRunId": "R1"}))
@@ -9281,7 +9286,7 @@ class TurnWriterEndTests(_TurnWriterCase):
                                   "content": "", "done": True,
                                   "statusHistory": copy.deepcopy(self.LEFT_BY_THE_CANCEL)}
         w = _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
-                        run_id="R2", message_id="m1", takeover=True, renderer=_TurnRenderer())
+                        run_id=self.STEERED, message_id="m1", takeover=True, renderer=_TurnRenderer())
         self.conn.session_history = mock.AsyncMock(return_value=self._steered_transcript(
             {"role": "user", "content": "second", "__openclaw": {"idempotencyKey": "R3:user"}},
             {"role": "assistant", "content": [{"type": "text", "text": "both"}],
@@ -9289,6 +9294,47 @@ class TurnWriterEndTests(_TurnWriterCase):
         await w.end({"status": "done", "hasActiveRun": False, "lastRunId": "R1"})
         self.assertIs(self.m()["done"], True)
         self.assertEqual(self.m()["content"], openclaw_pipe.REPLY_SENT_WITH_NEXT_NOTE)
+
+    async def test_a_steered_reply_waits_for_its_message_to_be_committed(self):
+        """CI next 3 on fff6a65: the idle row came before the Gateway even
+        committed the steered message. The reply waits for the commit, then
+        for the answer."""
+        self.conn.gateway_version = "2026.10.10"
+        self.owui.msgs()["m1"] = {"id": "m1", "role": "assistant", "parentId": "q1",
+                                  "content": "", "done": True,
+                                  "statusHistory": copy.deepcopy(self.LEFT_BY_THE_CANCEL)}
+        w = _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
+                        run_id=self.STEERED, message_id="m1", takeover=True, renderer=_TurnRenderer())
+        hist = {"now": self._steered_transcript(committed=False)}
+        self.conn.session_history = mock.AsyncMock(side_effect=lambda *a, **k: copy.deepcopy(hist["now"]))
+        ending = asyncio.ensure_future(w.end({"status": "done", "hasActiveRun": False, "lastRunId": "R1"}))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        self.assertFalse(ending.done(), "it waits: its message is not committed yet")
+        hist["now"] = self._steered_transcript()
+        self.conn._on_session_message({"sessionKey": self.KEY})
+        for _ in range(5):
+            await asyncio.sleep(0)
+        self.assertFalse(ending.done(), "committed, its answer not stored yet")
+        hist["now"] = self._steered_transcript(
+            {"role": "assistant", "content": [{"type": "text", "text": "the aside"}],
+             "stopReason": "stop", "__openclaw": {"runId": "R1"}})
+        self.conn._on_session_message({"sessionKey": self.KEY})
+        await asyncio.wait_for(ending, 5)
+        self.assertEqual(self.m()["content"], "the aside")
+
+    async def test_a_reply_whose_steered_message_was_aborted_does_not_wait(self):
+        """Its own run's terminal event (an abort) came and the message never
+        reached the transcript: nothing to wait for."""
+        self.conn.gateway_version = "2026.10.10"
+        w = _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
+                        run_id=self.STEERED, message_id="m1", takeover=True, renderer=_TurnRenderer())
+        pump = openclaw_pipe._RunPump()
+        pump.terminal.set()
+        self.conn._turn_pumps[(self.KEY, self.STEERED)] = pump
+        self.conn.session_history = mock.AsyncMock(return_value=self._steered_transcript(committed=False))
+        await asyncio.wait_for(w.end({"status": "done", "hasActiveRun": False, "lastRunId": "R1"}), 5)
+        self.assertTrue(w.closed)
 
     def test_a_reply_cancelled_before_its_run_started_is_not_steered_into(self):
         """Its handed run never ran, so a message steered in later takes the

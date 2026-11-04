@@ -10357,20 +10357,37 @@ class _TurnWriter:
         for the next turn, before M ends from it. The session's idle push can
         come before the Gateway stores the run's last message (2026.10.10-beta.1
         CI, a socket drop while the message waited to be steered), and M,
-        which streamed nothing, would end with nothing. Each read follows a
-        transcript append (`session_message_event`, taken before the read)."""
+        which streamed nothing, would end with nothing; the idle row can also
+        come before the Gateway commits the message itself, which it does once
+        the run takes it in (CI next 3 on fff6a65). Each read follows a
+        transcript append (`session_message_event`, taken before the read) or
+        the run's own terminal event."""
+        if not (self.takeover and steers_mid_run_messages(self.conn.gateway_version)
+                and (parse_pipe_run_id(self.run_id) or {}).get("kind") == "reply"):
+            return
         while True:
             appended = self.conn.session_message_event(self.session_key)
+            pump = self.conn._turn_pumps.get((self.session_key, self.run_id))
+            # Its own run's terminal event (an abort) says the message will
+            # not be committed; a lone final says it was steered.
+            ended = pump is not None and pump.terminal.is_set()
             try:
                 hist = await self.conn.session_history(self.session_key, limit=RUN_HISTORY_LIMIT)
             except Exception as ex:
                 pipe_log(f"  turn writer: chat.history failed waiting for a steered answer: {ex!r}")
                 return
-            if not _history_steered_answer_pending(hist, self.run_id):
+            if not _history_steered_answer_pending(hist, self.run_id, uncommitted=not ended):
                 return
-            pipe_log(f"  turn writer: {self.message_id[:8]}... waits for the answer to its "
-                     f"steered message in the transcript")
-            await appended.wait()
+            pipe_log(f"  turn writer: {self.message_id[:8]}... waits for its steered message's "
+                     f"answer in the transcript")
+            waits = [asyncio.ensure_future(appended.wait())]
+            if pump is not None:
+                waits.append(asyncio.ensure_future(pump.terminal.wait()))
+            try:
+                await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for w in waits:
+                    w.cancel()
 
     async def _run_is_inter_session(self) -> bool:
         """True when this run answers another session's `sessions_send` (provenance
@@ -11264,6 +11281,10 @@ def _turn_settled(conn: "_GatewayConnection", session_key: str, row: dict) -> No
     first) and is released ahead of the row."""
     for (sess, run) in [k for k in conn._turn_unkinded if k[0] == session_key]:
         _release_unkinded(conn, sess, run)
+    pumps = [run for (sess, run) in conn._turn_pumps if sess == session_key]
+    if pumps:
+        pipe_log(f"  session settled (status {row.get('status')!r}, last run "
+                 f"{str(row.get('lastRunId'))[-24:]}): {len(pumps)} turn writer run(s)")
     for (sess, _run), pump in list(conn._turn_pumps.items()):
         if sess == session_key:
             pump.queue.put_nowait(("settled", row))
@@ -11802,14 +11823,19 @@ def _history_steered_host(history: dict, run_id: str) -> str | None:
     return _history_steered_into(history, start) if start is not None else None
 
 
-def _history_steered_answer_pending(history: dict, run_id: str) -> bool:
+def _history_steered_answer_pending(history: dict, run_id: str, uncommitted: bool = False) -> bool:
     """`run_id`'s message was steered into a run whose answer to it is not in
     the transcript yet, and no later turn began (a message steered in after
-    it, or a run of its own, ends what this one waits for)."""
+    it, or a run of its own, ends what this one waits for). `uncommitted`:
+    a message not in the transcript yet counts as pending too."""
+    messages = (history or {}).get("messages")
+    if not isinstance(messages, list):
+        return False
+    start = next((n for n, m in enumerate(messages) if _history_user_run_id(m) == run_id), None)
+    if start is None:
+        return uncommitted
     if _history_steered_host(history, run_id) is None:
         return False
-    messages = history["messages"]
-    start = next(n for n, m in enumerate(messages) if _history_user_run_id(m) == run_id)
     if any(_history_user_run_id(m) for m in messages[start + 1:]):
         return False
     return _history_steered_span(history, run_id) is None
