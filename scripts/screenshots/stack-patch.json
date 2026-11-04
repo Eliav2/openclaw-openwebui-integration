@@ -82,6 +82,7 @@
       "model": {
         "primary": "anthropic/claude-opus-5-5"
       },
+      "models": null,
       "modelPolicy": {
         "allow": [
           "anthropic/claude-opus-5-5",
