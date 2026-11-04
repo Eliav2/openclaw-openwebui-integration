@@ -1298,8 +1298,8 @@ class _TurnWriter:
         """(image blocks, names of files never stored) of the runs written
         into M, as the inline reply reads them (`finish_final_images`): the
         Gateway attaches a run's images to its stored message after the
-        run's final, so a run that made or named some is read again until
-        they are there, bounded (ELI-328)."""
+        run's final, so a run that made or named some is read again on each
+        transcript change until they are there (ELI-328)."""
         for _s, _e, fname in _media_scan(self.renderer.text)[0]:
             if _is_gateway_media_name(fname):
                 self.gateway_media.add(fname)
@@ -1313,17 +1313,23 @@ class _TurnWriter:
                 errors += [e for e in _history_media_errors_for_run(h, run)
                            if os.path.basename(e) in names]
             return blocks, errors
-        blocks, errors = stored(hist)
-        loop = asyncio.get_running_loop()
-        start = loop.time()
-        while len(blocks) + len(errors) < expected and loop.time() - start < _RUN_IMAGES_WAIT_S:
-            await asyncio.sleep(_RUN_IMAGES_POLL_S)
-            try:
-                hist = await self.conn.session_history(self.session_key, limit=RUN_HISTORY_LIMIT)
-            except Exception as ex:
-                pipe_log(f"  turn writer: chat.history for the run's images failed: {ex!r}")
-                break
-            blocks, errors = stored(hist)
+        last = [stored(hist)]
+
+        async def read(fresh):
+            if fresh:
+                last[0] = stored(await self.conn.session_history(
+                    self.session_key, limit=RUN_HISTORY_LIMIT))
+            return last[0]
+        try:
+            _got, complete = await self.conn.read_until_stored(
+                self.session_key, read, lambda got: len(got[0]) + len(got[1]) >= expected,
+                _RUN_IMAGES_MAX_WAIT_S)
+            if not complete:
+                pipe_log(f"  turn writer: WARNING: the runs' images not all stored after "
+                         f"{_RUN_IMAGES_MAX_WAIT_S:.0f} s; written without the rest")
+        except Exception as ex:
+            pipe_log(f"  turn writer: chat.history for the run's images failed: {ex!r}")
+        blocks, errors = last[0]
         if expected:
             pipe_log(f"  turn writer: runs made {self.images_made} image(s) and named "
                      f"{len(self.gateway_media)} file(s); {len(blocks)} stored")

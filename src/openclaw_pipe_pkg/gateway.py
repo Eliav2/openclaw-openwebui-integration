@@ -2100,19 +2100,70 @@ class _GatewayConnection:
         return ev
 
     def session_message_event(self, session_key: str) -> asyncio.Event:
-        """An Event set by the next `session.message` for `session_key` (the
-        Gateway appended a transcript message), or by a socket gap. Take it
-        BEFORE reading the transcript, as with `session_change_event`."""
+        """An Event set by the next change to `session_key`'s transcript: a
+        `session.message` (the Gateway appended a message), a `sessions.changed`
+        with phase `message` (it rewrote a stored one, e.g. attached a run's
+        images to it), or a socket gap. Take it BEFORE reading the transcript,
+        as with `session_change_event`."""
         ev = self._session_message_waiters.get(session_key)
         if ev is None:
             ev = self._session_message_waiters[session_key] = asyncio.Event()
         return ev
 
-    def _on_session_message(self, payload: dict) -> None:
-        key = payload.get("sessionKey") or ""
-        ev = self._session_message_waiters.pop(key, None)
+    def _wake_message_waiter(self, session_key: str) -> None:
+        ev = self._session_message_waiters.pop(session_key, None)
         if ev is not None:
             ev.set()
+
+    async def read_until_stored(self, session_key: str, read, have, max_wait_s: float, empty=None):
+        """`read(fresh)` until `have(result)`: the session's stored messages
+        hold what the caller waits for. The first read may be a cached one;
+        each later read is fresh and follows a transcript change of
+        `session_key` (`session_message_event`, taken before that read, with
+        the session's message subscription taken again first: a failed
+        subscribe drops it). Returns (last result, whether `have` held).
+        `max_wait_s` bounds a Gateway that never stores it, counted from the
+        start and across every read and subscribe: one that runs past it ends
+        the wait with the result before it (`empty` before the first). A
+        read's own error, its own timeout included, is raised. The caller
+        logs both."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max_wait_s
+        bound = object()
+
+        async def within(coro):
+            # Only the bound's expiry is the bound: `asyncio.wait` never raises
+            # for it, so a TimeoutError of the read itself still reaches the caller.
+            task = asyncio.ensure_future(coro)
+            left = deadline - loop.time()
+            if left > 0:
+                await asyncio.wait({task}, timeout=left)
+            if not task.done():
+                task.cancel()
+                return bound
+            return task.result()
+
+        got = await within(read(False))
+        if got is bound:
+            return empty, False
+        if have(got):
+            return got, True
+        while True:
+            if await within(self.ensure_message_subscription(session_key)) is bound:
+                return got, False
+            changed = self.session_message_event(session_key)
+            fresh = await within(read(True))
+            if fresh is bound:
+                return got, False
+            got = fresh
+            if have(got):
+                return got, True
+            if await within(changed.wait()) is bound:
+                return got, False
+
+    def _on_session_message(self, payload: dict) -> None:
+        key = payload.get("sessionKey") or ""
+        self._wake_message_waiter(key)
         if _TURNS and key:
             _TURNS.session_message(self, key)
 
@@ -2134,6 +2185,10 @@ class _GatewayConnection:
         if key and "hasActiveRun" in payload:
             self._wake_session_waiters(key)
             self.row_to_consumers(key, payload)
+        if key and payload.get("phase") == "message":
+            # A stored message was rewritten, not appended: no `session.message`
+            # follows (2026.10.5+, server-session-events historyReset branch).
+            self._wake_message_waiter(key)
         parent = payload.get("spawnedBy") or payload.get("parentSessionKey")
         if parent and parent != key:
             ev = self._session_child_waiters.pop(parent, None)
