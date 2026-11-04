@@ -529,6 +529,65 @@ class HistoryRunRebuildTests(unittest.TestCase):
                 r = _history_renderer(span)
                 self.assertEqual(r.text, "A heard.\n\nB heard.")
 
+    @staticmethod
+    def _tool(n):
+        return {"role": "assistant", "stopReason": "tool_use", "__openclaw": {"importedFrom": "claude-cli"},
+                "content": [{"type": "toolcall", "id": f"t{n}", "name": "exec", "arguments": {"command": f"step {n}"}},
+                            {"type": "tool_result", "tool_use_id": f"t{n}", "name": "exec",
+                             "content": [{"type": "text", "text": f"out {n}"}]}]}
+
+    @staticmethod
+    def _cron_prompt(key, job):
+        # As 2026.10.10 stores it: a cron provenance with no jobId or prompt prefix.
+        return {"role": "user", "content": f"[cron:{job} selftest] This is a test",
+                "provenance": {"kind": "internal_system", "sourceTool": "cron"},
+                "__openclaw": {"idempotencyKey": f"{key}:user", "importedFrom": "claude-cli"}}
+
+    @staticmethod
+    def _closing(run, text):
+        return {"role": "assistant", "stopReason": "stop", "content": [{"type": "text", "text": text}],
+                "__openclaw": {"runId": run, "idempotencyKey": f"cli-assistant:{run}", "importedFrom": "claude-cli"}}
+
+    def _cards(self, span):
+        return sum(1 for i in _history_renderer(span).output if i["type"] == "function_call")
+
+    def test_a_cron_prompt_recorded_mid_run_stays_out_of_the_run_it_landed_in(self):
+        """2026.10.10 stores a cron wake's prompt when the job fires, and the
+        wake runs after the run it waits for, under its own agent run id; the
+        running run's messages, imported with Claude Code's own times, sort
+        around that prompt (live gate two-wakes on 565e9cd, chat d51a3a0a):
+        the first wake's span stopped at the second wake's prompt and lost
+        its first tool card."""
+        w1, w2 = "6f367d1b-4012-4af0-a399-a19fd9957567", "9a0a91fd-fd1b-4f04-9b83-7feb4e2f1acb"
+        ready = "msg-c-1-1.0"
+        messages = [{"role": "user", "content": "Reply with exactly: READY", "idempotencyKey": f"{ready}:user"},
+                    self._closing(ready, "READY"),
+                    self._cron_prompt("46f6a533-3ebe-4822-90eb-6df00aaf33c9", "2faa013f"), self._tool(1),
+                    self._cron_prompt("ef53af68-1b7a-461e-ba17-5d69bcd82101", "4751274e"), self._tool(2),
+                    self._closing(w1, "W1-DONE"), self._tool(3), self._tool(4), self._closing(w2, "W2-DONE")]
+        for run, cards, text in ((ready, 0, "READY"), (w1, 2, "W1-DONE"), (w2, 2, "W2-DONE")):
+            with self.subTest(run=run):
+                span = _history_span_messages({"messages": messages}, run)
+                self.assertNotIn("user", [m["role"] for m in span])
+                self.assertEqual(self._cards(span), cards)
+                self.assertEqual(_history_renderer(span).text, text)
+
+    def test_a_user_run_a_cron_wake_fired_into_keeps_every_tool_card(self):
+        """A user's claude-cli run, then a cron wake fires mid-run: its prompt
+        sorts between the run's tool calls and a rebuild from the transcript
+        (reload, socket drop) showed only the calls after it."""
+        run, wake = "msg-c-1-1.0", "9a0a91fd-fd1b-4f04-9b83-7feb4e2f1acb"
+        messages = [{"role": "user", "content": "do two steps", "idempotencyKey": f"{run}:user"},
+                    {"role": "user", "content": "Conversation info (untrusted metadata): {}\n\ndo two steps"},
+                    self._tool(1), self._cron_prompt("46f6a533-3ebe-4822-90eb-6df00aaf33c9", "2faa013f"),
+                    self._tool(2), self._closing(run, "R-DONE"), self._tool(3), self._closing(wake, "W-DONE")]
+        for rid, cards, text in ((run, 2, "R-DONE"), (wake, 1, "W-DONE")):
+            with self.subTest(run=rid):
+                span = _history_span_messages({"messages": messages}, rid)
+                self.assertNotIn("user", [m["role"] for m in span])
+                self.assertEqual(self._cards(span), cards)
+                self.assertEqual(_history_renderer(span).text, text)
+
 
 def _turn_history(stub_id="stub-1", *, run="msg-c-stub-1-1.0", closed=True,
                   text="check the logs", later=False):
@@ -16465,6 +16524,9 @@ class SteeredTranscriptSpanTests(unittest.TestCase):
             tool(3), self._said("W-DONE", run="W1", key="cli-assistant:W1")]}
         span = _history_span_messages(hist, "R1")
         self.assertIn("R-DONE", _history_renderer(span).text)
+        # The walk goes past the wake's prompt (#281): the run's first call
+        # is still its own (review on #278).
+        self.assertIn(tool(1), span)
 
     PIPE_RUN = "msg-c0ffee00-0000-4000-8000-000000000001-00000000-0000-4000-8000-000000000002-1.0"
 

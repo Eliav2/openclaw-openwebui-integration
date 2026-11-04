@@ -794,13 +794,15 @@ _CRON_PROMPT_RE = re.compile(r"^\[cron:(?P<job>[^\s\]]+)[\s\]]")
 
 def _cron_turn_job(m: dict) -> str | None:
     """The cron job a wake turn names: its provenance's (10.2+), else its
-    prompt's header (9.3, no provenance). None for any other turn."""
+    prompt's header (9.3, no provenance; 10.10, whose cron provenance names
+    neither). None for any other turn."""
     prov = m.get("provenance") if isinstance(m.get("provenance"), dict) else None
     if prov:
         if (prov.get("kind"), prov.get("sourceTool")) != ("internal_system", "cron"):
             return None
         hit = _CRON_PROMPT_RE.match(str(prov.get("sourcePromptPrefix") or ""))
-        return prov.get("jobId") or (hit.group("job") if hit else None)
+        if prov.get("jobId") or hit:
+            return prov.get("jobId") or hit.group("job")
     hit = _CRON_PROMPT_RE.match(((_history_item(m) or {}).get("text") or "").lstrip())
     return hit.group("job") if hit else None
 
