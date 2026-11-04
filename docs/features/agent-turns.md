@@ -3,7 +3,7 @@
 A reply the agent starts without a message from you (a cron job, another session's `sessions_send`, a finished sub-agent's result) appears in your chat as a normal reply, live, with its tool cards. It sits at the end of the chat like any other reply, with no label on it.
 
 Applies to: Pipe
-Valves: `OWUI_API_KEY`
+Valves: `OWUI_API_KEY`, `PUBLISH_CHAT_FINISHED`
 
 ## What you see
 
@@ -63,6 +63,27 @@ To watch a sub-agent while it works, open it from the [Status dialog](./status.m
 A `MEDIA:` line in such a reply becomes an attached image or file, as in [your own replies](./chat.md#images-and-files-from-the-agent). There is no request of yours to borrow a login from, so the upload to Open WebUI's Files API uses the [`OWUI_API_KEY`](../configuration.md#owui_api_key) valve. Without it, the file falls back to the built-in file server link.
 
 A reply that ends with a question asks it as a [question card](./questions.md#questions-in-replies-the-agent-starts) on the tab viewing the chat. With no such tab, the question stays as text.
+
+## Telling other functions a reply finished
+
+Open WebUI publishes a `chat.finished` event when a chat request ends. Event functions (for example a push notifier), event webhooks and notification targets act on it. For an OpenClaw reply that event can be wrong: a reply the agent starts has no request, so it never fires, and a reply that outlives its request (after a Gateway restart or lost events) fires it before the reply is done.
+
+With [`PUBLISH_CHAT_FINISHED`](../configuration.md#publish_chat_finished) on, the Pipe publishes its own `chat.finished` once each reply is saved: a reply that ended in its request after Open WebUI's save, and every other reply after its last save. A stopped reply, or one whose save failed, publishes nothing. The event has Open WebUI's usual shape, with `source` set to `openclaw-pipe`:
+
+```json
+{"event": "chat.finished", "source": "openclaw-pipe",
+ "subject": {"type": "chat", "id": "<chat id>"},
+ "data": {"user_id": "<user id>", "chat_id": "<chat id>", "message_id": "<message id>",
+          "model_id": "openclaw_gateway.main", "title": "<chat title>",
+          "url": "https://<your Open WebUI>/c/<chat id>", "message": "<reply text>"}}
+```
+
+Open WebUI's own event still fires as well. A consumer that gets both for an OpenClaw model should keep the one with `source` `openclaw-pipe`.
+
+Two things to know before you turn it on:
+
+- **The full reply is in the event.** As in Open WebUI's own `chat.finished` (0.13.0 and later), `data.message` holds the whole reply text. Every event function, event webhook and notification target receives it. A consumer that sends the event off the server, such as a push notifier, should forward only the title and the link, never `message`.
+- **Two notifications with a notification target.** A user whose notification target in Settings > Notifications has `chat.finished` on gets Open WebUI's event and the Pipe's, so two notifications for each OpenClaw reply. Turn off `chat.finished` on that target, or leave the valve off.
 
 ## Restarts and reconnects
 

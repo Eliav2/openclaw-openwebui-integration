@@ -173,6 +173,63 @@ async def _clear_response_stream(task_id: str | None) -> None:
         pipe_log(f"  turn writer: clearing the response stream failed: {ex!r}")
 
 
+# Marks the `chat.finished` the Pipe publishes. Open WebUI's event names are a
+# closed catalog (events.py `event_name`), so a consumer tells this one from
+# the middleware's own by `source`.
+CHAT_FINISHED_SOURCE = "openclaw-pipe"
+
+
+async def _publish_chat_finished(chat_id: str, message_id: str, user_id: str,
+                                 text: str | None = None) -> None:
+    """Open WebUI's `chat.finished` for a reply saved whole, as the
+    middleware's `publish_chat_finished_event` shapes it, with `source`
+    CHAT_FINISHED_SOURCE: from the turn writer's final save, or once the
+    request of a reply that ended in it is over (Open WebUI's own save done).
+    The middleware's own fires when the chat request ends: for a reply
+    handed over to the writer that is before the reply ends, and an agent
+    turn has no request at all. Event functions, event webhooks and
+    notification targets receive it. `text`: the reply's text, else the
+    saved message's."""
+    app = getattr(sys.modules.get("open_webui.main"), "app", None)
+    if app is None or not message_id:
+        return
+    try:
+        from open_webui.events import EVENTS, publish_event
+        from open_webui.models.chats import Chats
+        from open_webui.models.users import Users
+        from open_webui.utils.chat_id import is_saved_chat_id
+        from starlette.requests import Request
+
+        if not is_saved_chat_id(chat_id):
+            return
+        row = await Chats.get_message_by_id_and_message_id(chat_id, message_id) or {}
+        if row.get("done") is not True:
+            return
+        if text is None:
+            text = row.get("content") or ""
+        title = await Chats.get_chat_title_by_id(chat_id) or ""
+        user = await Users.get_user_by_id(user_id)
+        try:
+            from open_webui.models.config import Config
+            base = (await Config.get("webui.url") or "").rstrip("/")
+        except Exception:
+            base = ""
+        # The sinks and event functions read `request.app`; an agent turn has
+        # no request of its own.
+        request = Request({"type": "http", "app": app, "method": "POST", "path": "/",
+                           "headers": [], "query_string": b""})
+        await publish_event(
+            request, EVENTS.CHAT_FINISHED,
+            actor=user or {"id": user_id}, subject_id=chat_id, subject_type="chat",
+            source=CHAT_FINISHED_SOURCE,
+            data={"user_id": user_id, "chat_id": chat_id, "message_id": message_id,
+                  "model_id": row.get("model"), "title": title,
+                  "url": f"{base}/c/{chat_id}", "message": text},
+            message=title or "Chat finished")
+    except Exception as ex:
+        pipe_log(f"  turn writer: publishing chat.finished for {message_id[:8]}... failed: {ex!r}")
+
+
 def _owui_request_task(task_id: str | None):
     """The asyncio task Open WebUI runs a chat request in (main.py
     `create_task`, keyed by the request's `task_id`): the Pipe call, then the
@@ -1374,6 +1431,8 @@ class _TurnWriter:
             if saved:
                 await _clear_response_stream(self.task_id)
                 await self._push_final(text, output)
+                if not stopped and getattr(self.conn._valves(), "PUBLISH_CHAT_FINISHED", False):
+                    await _publish_chat_finished(self.chat_id, self.message_id, self.user_id, text)
             else:
                 pipe_log(f"  turn writer: chat {self.chat_id[:8]}... message {self.message_id[:8]}...: "
                          f"FINAL SAVE FAILED; keeping the mid-turn copy, M is not sent finished")
