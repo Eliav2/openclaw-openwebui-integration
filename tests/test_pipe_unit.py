@@ -27,6 +27,7 @@ from unittest import mock
 import conftest  # noqa: F401  (imports real pydantic before the stubs can shadow it)
 
 from _test_helpers import FakeSio, RecordingEmitter, fake_owui, owui_modules  # noqa: E402
+from _paged_sessions import PagedSessions, crowd  # noqa: E402
 from _test_stubs import install_stubs  # noqa: E402
 
 install_stubs()
@@ -1845,6 +1846,8 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.active = False
         self.run_ended_at = None
         self.describe_extra = {}
+        self.list_active = None     # None: the list says what describe says
+        self.crowded = False        # the session sits past the Gateway's first 100 rows
         self.runtime = None
         self.keys = []
         self.history = {}
@@ -1873,7 +1876,9 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
                 row.update(self.describe_extra)
                 return {"session": row}
             if method == "sessions.list":
-                return {"sessions": [{"key": self.SK, "hasActiveRun": self.active}]}
+                busy = self.active if self.list_active is None else self.list_active
+                rows = crowd(self.SK, busy=busy) if self.crowded else [{"key": self.SK, "hasActiveRun": busy}]
+                return PagedSessions(rows).list(params)
             return {}
 
         async def no_abort(session_key, run_id):
@@ -2120,6 +2125,26 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         is idle."""
         self.assertTrue(await self._queued_while_describe_says(
             status="done", hasActiveRun=False, activeRunIds=[], activeRunId="r1"))
+
+    async def test_a_message_waits_behind_a_busy_session_past_the_first_hundred_rows(self):
+        """Recorded live: `sessions.list` with no filter returns 100 of 1312
+        sessions, newest first, and a long run's row is old. The busy flag was
+        read from that page, the row was missing, and the message was sent into
+        the running turn. Here describe reads idle (the starting window) and
+        the Gateway lists the session as running, 120 rows deep."""
+        self.crowded = True
+        self.active = False
+        self.list_active = True
+        gen = self._reply("hello", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._spin()
+        self.assertEqual(self.sent, [], "sent into a run the first page does not show")
+        self.list_active = False
+        self._gateway_push(reason="agent.input.settled", hasActiveRun=False, status="done")
+        await self._until_registered("run-1")
+        self.assertEqual(self.sent, ["hello"])
+        first.cancel()
+        await asyncio.gather(first, return_exceptions=True)
 
     async def test_a_push_for_another_session_does_not_read(self):
         """Waking on every push of the session is not waking on every push: the
@@ -13059,6 +13084,76 @@ class GatewayTenRecoveryRoutingTests(_RoutingCase):
         self.assertIs(self.owui.msgs().get(own, {}).get("done"), True)
         self.assertNotIn("Follow-up.", self.owui.msgs()[turn_message_id(self.key, self.RUN, self.CHAT)]
                          .get("content", ""))
+
+class SessionListCapTests(unittest.IsolatedAsyncioTestCase):
+    """`sessions.list` returns 100 rows unless told otherwise (recorded: 100
+    of 131 on 2026.10.10, 100 of 1312 live). A read of one session names it,
+    and a full read pages."""
+
+    KEY = "agent:main:openwebui-11111111-1111-1111-1111-111111111111-22222222-2222-2222-2222-222222222222"
+
+    def conn(self, rows):
+        gw = PagedSessions(rows)
+        conn = types.SimpleNamespace(gw=gw)
+
+        async def send_request(method, params, timeout=10):
+            assert method == "sessions.list", method
+            return gw.list(params)
+        conn.send_request = send_request
+        return conn
+
+    async def test_a_busy_session_past_the_default_page_reads_busy(self):
+        conn = self.conn(crowd(self.KEY, busy=True))
+        self.assertIs(await openclaw_pipe._session_list_active(conn, self.KEY, missing=False), True)
+        self.assertTrue(all("search" in c for c in conn.gw.calls), conn.gw.calls)
+
+    async def test_an_idle_session_past_the_default_page_reads_idle(self):
+        conn = self.conn(crowd(self.KEY, busy=False))
+        self.assertIs(await openclaw_pipe._session_list_active(conn, self.KEY, missing=False), False)
+
+    async def test_a_session_the_gateway_does_not_have_is_missing_by_the_callers_rule(self):
+        """Not listed at all (a chat's first message): no session, no run.
+        The caller says what that means to it."""
+        conn = self.conn(crowd(self.KEY, busy=True)[:50])
+        self.assertIs(await openclaw_pipe._session_list_active(conn, self.KEY, missing=False), False)
+        self.assertIsNone(await openclaw_pipe._session_list_active(conn, self.KEY, missing=None))
+
+    async def test_an_answer_that_may_hide_the_session_cannot_say(self):
+        """More rows matched than came back and none is the session: absent
+        is not known, so neither idle nor busy is answered."""
+        async def send_request(method, params, timeout=10):
+            return {"sessions": [{"key": f"other-{i}", "hasActiveRun": False} for i in range(10)], "totalCount": 25}
+        conn = types.SimpleNamespace(send_request=send_request)
+        self.assertIsNone(await openclaw_pipe._session_list_active(conn, self.KEY, missing=False))
+
+    async def test_a_full_read_pages_through_every_session(self):
+        rows = crowd(self.KEY, busy=True, before=400, after=700)
+        conn = self.conn(rows)
+        got = await openclaw_pipe._list_all_sessions(conn)
+        self.assertEqual([r["key"] for r in got["sessions"]], [r["key"] for r in rows])
+        self.assertGreater(len(conn.gw.calls), 1)
+
+    async def test_the_ended_while_down_pass_reaches_a_session_past_the_first_page(self):
+        """The startup pass that finishes replies whose run ended while Open
+        WebUI was down read only the newest 100 sessions."""
+        user, chat = "33333333-3333-3333-3333-333333333333", "44444444-4444-4444-4444-444444444444"
+        key = f"agent:main:openwebui-{user}-{chat}"
+        rows = crowd(key, busy=False)
+        rows[120] = {**rows[120], "updatedAt": 10_000_000, "sessionId": "s1", "lastRunId": "r1"}
+        conn = self.conn(rows)
+        chats = types.ModuleType("open_webui.models.chats")
+
+        async def get_chat_by_id(chat_id):
+            return types.SimpleNamespace(user_id=user, updated_at=0)
+        chats.Chats = types.SimpleNamespace(get_chat_by_id=get_chat_by_id)
+        reconcile = mock.AsyncMock(return_value=1)
+        with mock.patch.dict(sys.modules, {"open_webui": types.ModuleType("open_webui"),
+                                           "open_webui.models": types.ModuleType("open_webui.models"),
+                                           "open_webui.models.chats": chats}), \
+                mock.patch.object(openclaw_pipe, "_reconcile_chat_ended_runs", reconcile):
+            await openclaw_pipe._reconcile_ended_while_down(conn, "main")
+        self.assertEqual([c.args[1] for c in reconcile.await_args_list], [key])
+
 
 if __name__ == "__main__":
     unittest.main()
