@@ -16831,6 +16831,47 @@ class SteeredTranscriptSpanTests(unittest.TestCase):
         self.assertEqual(self._texts(_history_span_messages(hist, "R2")), ["tomato"])
         self.assertEqual(self._texts(_history_span_messages(hist, "R3")), ["blue"])
 
+    def _commit_ordered(self, messages):
+        conn = openclaw_pipe._GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"))
+
+        async def send_request(method, params, timeout=10):
+            return {"messages": copy.deepcopy(messages)}
+        conn.send_request = send_request
+        return asyncio.run(conn.session_history("s"))["messages"]
+
+    @staticmethod
+    def _sent(key, text, at, committed):
+        return {"role": "user", "content": text, "timestamp": at,
+                "__openclaw": {"idempotencyKey": f"{key}:user", "recordTimestampMs": committed,
+                               "steerTargetRunId": "R1"}}
+
+    def test_messages_committed_together_keep_the_order_they_were_sent_in(self):
+        """Review on #290: moved from the last one back, the earlier of two
+        messages committed at the same time went past the later one."""
+        got = self._commit_ordered([
+            self._sent("R1", "count", 1000, 1000), {**self._said("slow-1"), "timestamp": 1001},
+            self._sent("A", "first", 1002, 1010), self._sent("B", "second", 1003, 1010),
+            {**self._said("both"), "timestamp": 1011}])
+        self.assertEqual([m.get("content") if isinstance(m.get("content"), str) else "said" for m in got],
+                         ["count", "said", "first", "second", "said"])
+
+    def test_a_message_stops_at_its_own_copy_not_an_earlier_one_with_its_text(self):
+        """Review on #290: an earlier copy with the same text ("yes") stopped
+        the move, and what the run wrote before taking the message in went
+        under it."""
+        imported = lambda text, at: {"role": "user", "content": f"Conversation info ...\n\n{text}",  # noqa: E731
+                                     "timestamp": at}
+        got = self._commit_ordered([
+            self._sent("R1", "ok?", 1000, 1000), imported("ok?", 1001),
+            self._sent("A", "yes", 1002, 1004), self._sent("B", "yes", 1003, 1020),
+            imported("yes", 1004), {**self._said("A done"), "timestamp": 1005},
+            {**self._said("before B"), "timestamp": 1010},
+            imported("yes", 1019), {**self._said("B done"), "timestamp": 1021}])
+        keys = [(m.get("__openclaw") or {}).get("idempotencyKey") or (m.get("content") if isinstance(
+            m.get("content"), str) else m["content"][0]["text"]) for m in got]
+        self.assertLess(keys.index("before B"), keys.index("B:user"))
+        self.assertEqual(keys[keys.index("B:user") + 1], "Conversation info ...\n\nyes")
+
     def test_a_run_still_going_has_no_steered_answer_yet(self):
         hist = {"messages": [self._user("R1", "count"), self._said("slow-1", run="R1", stop="toolUse"),
                              self._user("R2", "banana")]}
@@ -17221,6 +17262,25 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         await conn._dispatch_run_event(self._lifecycle(self.R1, "end"))
         self.assertNotIn(f"{sk}:{self.R1}", conn._consumers)
         self.assertFalse(conn.has_reply(sk))
+
+    async def test_a_retired_connection_closes_when_such_a_run_ends(self):
+        """Review on #290: letting the run go was the connection's last
+        work, so a retired connection closes then, as on every other removal."""
+        self.conn.gateway_version = "2026.10.10"
+        conn, sk = self.conn, self.SK
+        host = openclaw_pipe._RunPump()
+        host.started = True
+        conn._turn_pumps[(sk, self.R1)] = host
+        tomato = openclaw_pipe._RunPump()
+        tomato.handover = {"message_id": "w2", "steer_pending": True,
+                           "renderer": types.SimpleNamespace(received="", output=None)}
+        conn._turn_pumps[(sk, self.R2)] = tomato
+        conn._on_session_message(self._commit(self.R2, "say tomato")["payload"])
+        conn._retired = True
+        with mock.patch.object(conn, "disconnect", mock.AsyncMock()) as disconnect:
+            await conn._dispatch_run_event(self._lifecycle(self.R1, "end"))
+            await self._spin()
+        disconnect.assert_awaited()
 
     async def test_a_steer_into_a_run_whose_writer_is_not_resolved_yet_knows_the_earlier_reply(self):
         """Review on #278: a steer that took a turn writer's run before the

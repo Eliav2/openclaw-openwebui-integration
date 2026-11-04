@@ -7665,6 +7665,7 @@ class _GatewayConnection:
             # Nothing shows the rest of its run (`_steer_handed_over`): its end lets it go.
             self._consumers.pop(f"{consumer.session_key}:{consumer.run_id}", None)
             self._wake_session_waiters(consumer.session_key)
+            self._close_if_retired_and_idle()
             return False
         return True
 
@@ -8883,17 +8884,21 @@ def _transcript_commit_order(messages: list) -> list:
     carry their own, later times and sort after it: Eliav's chat c9dc45f0,
     where "21-40", written during the pause a message was sent in, read as
     that message's answer. Its commit time (`recordTimestampMs`) is the
-    boundary: it goes past the messages stamped before then, up to the copy
-    of it Claude Code wrote, which stays right after it. From the last one
-    back, so one moved past is already in its own place."""
+    boundary: it goes past the messages stamped before then, but not past a
+    sent message committed with it, which was sent after it; the copy of it
+    Claude Code wrote (the last one with its text there) stays right after
+    it. From the last one back, so one moved past is already in its own place."""
     out = list(messages)
     for message in reversed([m for m in messages if _committed_after_sent(m) is not None]):
         at = out.index(message)
         committed = _committed_after_sent(message)
         end = at + 1
-        while end < len(out) and _commit_ms(out[end]) is not None and _commit_ms(out[end]) <= committed \
-                and not _copy_of(out[end], message):
+        while end < len(out) and _commit_ms(out[end]) is not None and (
+                _commit_ms(out[end]) < committed
+                or (_commit_ms(out[end]) == committed and not _history_user_run_id(out[end]))):
             end += 1
+        own = [i for i in range(at + 1, end) if _copy_of(out[i], message)]
+        end = own[-1] if own else end
         out.insert(end - 1, out.pop(at))
     return out
 
