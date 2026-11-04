@@ -16176,6 +16176,25 @@ class SteeredTranscriptSpanTests(unittest.TestCase):
         self.assertEqual(self._texts(_history_span_messages(hist, "R1")), ["E2E_CLI_HOLD_START"])
         self.assertEqual(self._texts(_history_span_messages(hist, "R2")), ["E2E_CLI_STEERED: aside"])
 
+    def test_a_cron_prompt_recorded_mid_run_is_not_steered_into_it(self):
+        """2026.10.10 claude-cli (live gate two-wakes, d51a3a0a): a wake that
+        fires while a run works is recorded in the transcript as it reaches
+        Claude Code and runs after it under its own id. The run keeps all of
+        its own messages, its closing text included."""
+        def tool(i):
+            return {"role": "assistant", "stopReason": "tool_use", "content": [
+                {"type": "toolcall", "id": f"t{i}", "name": "exec", "arguments": {"command": f"step {i}"}},
+                {"type": "tool_result", "tool_use_id": f"t{i}", "name": "exec",
+                 "content": [{"type": "text", "text": f"out {i}"}]}]}
+        hist = {"messages": [
+            self._user("R1", "do two steps"), tool(1),
+            {"role": "user", "content": "[cron:job1 wake] do W",
+             "__openclaw": {"idempotencyKey": "46f6a533-3ebe-4822-90eb-6df00aaf33c9:user"}},
+            tool(2), self._said("R-DONE", run="R1", key="cli-assistant:R1"),
+            tool(3), self._said("W-DONE", run="W1", key="cli-assistant:W1")]}
+        span = _history_span_messages(hist, "R1")
+        self.assertIn("R-DONE", _history_renderer(span).text)
+
     def test_two_messages_steered_at_one_boundary(self):
         hist = {"messages": [self._user("R1", "count"), self._said("slow-1", run="R1"),
                              self._user("A", "first"), self._user("B", "second"),
