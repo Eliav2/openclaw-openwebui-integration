@@ -17208,10 +17208,13 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         """Eliav's chat c9dc45f0, test 2: "say blue", sent while "say tomato"
         waited to be steered, cancelled tomato's request (Send now), so a
         turn writer had its reply when the Gateway committed it. Nothing
-        switched there: the first reply kept the tomato answer. At its commit
-        the first reply ends; tomato's writer shows its answer from the
-        transcript; the run's events wait for the next steer, which still
-        takes the run over."""
+        switched there: the first reply kept the tomato answer. From its
+        commit the run's events stop reaching the first reply, which ends
+        from the transcript when the session settles (a writer ended at the
+        commit keeps only what streamed, which misses what a socket drop's
+        event gap lost: CI browser test_a_message_queued_behind_a_run_waits_
+        out_a_socket_drop on #290); tomato's writer shows its answer from the
+        transcript; the next steer still takes the run over."""
         self.conn.gateway_version = "2026.10.10"
         conn = self.conn
         # A session key the turn writer routes (an Open WebUI user id).
@@ -17231,8 +17234,7 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         q3 = conn.register_consumer(sk, self.R3)
 
         conn._on_session_message(self._commit(self.R2, "say tomato")["payload"])
-        kind, fut = host.queue.get_nowait()
-        self.assertEqual(kind, "steered", "the first reply ends at the commit")
+        self.assertTrue(host.queue.empty(), "the first reply ends from the transcript, not here")
         with mock.patch.object(openclaw_pipe, "_turn_pump_loop", mock.AsyncMock()) as loop:
             await conn._dispatch_run_event(self._delta(self.R1, "tomato"))
         loop.assert_not_called()
@@ -17245,10 +17247,7 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(q3.get_nowait()["_steered"]["run"], self.R1, "the next steer takes the run")
         await conn._dispatch_run_event(self._delta(self.R1, "blue"))
         self.assertEqual(q3.get_nowait()["payload"]["runId"], self.R1)
-        host.queue.put_nowait((kind, fut))
-        await openclaw_pipe._turn_pump_loop(conn, sk, self.R1, ("u1", self.CHAT), host)
-        writer.finalize.assert_awaited_once_with(steered=True)
-        writer.feed.assert_not_awaited()
+        self.assertTrue(host.queue.empty(), "nothing of the run after the commit reached the first reply")
 
     async def test_a_run_whose_steered_reply_a_turn_writer_has_is_let_go_at_its_end(self):
         """The run's events after such a steer go nowhere until the next one;
@@ -17268,7 +17267,6 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         conn._turn_pumps[(sk, self.R2)] = tomato
         conn._on_session_message(self._commit(self.R2, "say tomato")["payload"])
         self.assertTrue(conn.has_reply(sk), "the run still works")
-        self.assertEqual(host.queue.get_nowait()[0], "steered")
         await conn._dispatch_run_event(self._lifecycle(self.R1, "end"))
         self.assertNotIn(f"{sk}:{self.R1}", conn._consumers)
         self.assertFalse(conn.has_reply(sk))

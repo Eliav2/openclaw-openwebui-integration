@@ -2667,6 +2667,11 @@ class _RunQueue(asyncio.Queue):
         return items
 
 
+def _discards(consumer: "_Consumer") -> bool:
+    """`consumer` shows nothing: its queues only discard (`_DiscardQueue`)."""
+    return bool(consumer.queues) and all(isinstance(q, _DiscardQueue) for q in consumer.queues)
+
+
 class _DiscardQueue(_RunQueue):
     """Where a run's events go when nothing shows them: its message's reply
     was steered on while a turn writer had it, which reads its answer from
@@ -4013,7 +4018,7 @@ class _GatewayConnection:
             return False
         consumer.started = True
         consumer.ended = consumer.ended or terminal
-        if consumer.ended and consumer.queues and all(isinstance(q, _DiscardQueue) for q in consumer.queues):
+        if consumer.ended and _discards(consumer):
             # Nothing shows the rest of its run (`_steer_handed_over`): its end lets it go,
             # and a late event of it (its `chat` final after the lifecycle end) opens nothing.
             self.mark_delivered_live(consumer.session_key, consumer.run_id)
@@ -4042,10 +4047,10 @@ class _GatewayConnection:
     def _steer_handed_over(self, session_key: str, run_id: str) -> _Consumer | None:
         """The steer target of a message whose reply a turn writer took over
         while it waited to be steered (a later message's Send now cancelled
-        its request, Eliav's chat c9dc45f0): the run still ends its earlier
-        reply at the commit, and the writer reads its answer from the
-        transcript, so the run's events go nowhere until the next steer
-        (`_DiscardQueue`). None when no such writer waits."""
+        its request, Eliav's chat c9dc45f0): the run's events stop reaching
+        its earlier reply at the commit and go nowhere until the next steer
+        (`_DiscardQueue`); both writers end from the transcript, split there.
+        None when no such writer waits."""
         pump = getattr(self, "_turn_pumps", {}).get((session_key, run_id))
         if pump is None or pump.started or not (pump.handover or {}).get("steer_pending"):
             return None
@@ -4084,7 +4089,13 @@ class _GatewayConnection:
             earlier = writer and {"chat_id": writer.chat_id, "message_id": writer.message_id,
                                   "request_task_id": None, "span_run": run_id}
             run_text = asyncio.get_running_loop().create_future()
-            pump.queue.put_nowait(("steered", run_text))
+            if not _discards(consumer):
+                pump.queue.put_nowait(("steered", run_text))
+            # Else (`_steer_handed_over`) the writer keeps M open: the run's
+            # events stop reaching it, and it ends when the session settles,
+            # from the transcript, which splits the run where it took the
+            # message in. Ended here, it would keep only what it streamed, which
+            # misses what an event gap (a socket drop) lost.
             self._consumers[f"{sess}:{run_id}"] = _Consumer(
                 session_key=sess, run_id=run_id, queues=list(consumer.queues), started=True)
         else:
