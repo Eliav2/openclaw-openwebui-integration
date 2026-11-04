@@ -49,6 +49,7 @@ SHARDS = {
         f"{E2E}::test_every_status_action_class_is_in_the_shipped_css",
         f"{E2E}::test_vendored_css_class_list_matches_the_pinned_image",
         f"{E2E}::test_two_cron_wakes_in_a_row_get_one_finished_message_each",
+        f"{E2E}::test_a_cron_wake_a_second_wake_fired_into_is_completed_whole_on_start",
         f"{E2E}::test_a_run_on_a_deleted_chats_session_writes_nothing_and_fails_nothing",
         f"{E2E}::test_a_message_queued_behind_a_wake_does_not_cut_it",
         f"{E2E}::test_messages_waiting_behind_a_run_go_to_the_agent_as_one_turn",
