@@ -779,12 +779,17 @@ def test_a_steered_message_splits_the_run_where_claude_code_took_it_in(token):
     assert first["content"].strip() == "E2E_CLI_REPLY", first["content"]
     word = f"late{uuid.uuid4().hex[:8]}"
     go = os.path.join(logs, f"go-{word}")
+    page = _Page(token)
+    page.join(chat_id)
     held = _post_turn(token, chat_id, f"E2E_CLI_LATE_STEER {word}", model=CLI_MODEL)
 
     def logged(line):
         return os.path.exists(log) and line in open(log, encoding="utf-8").read()
     try:
-        _until("the Claude Code turn holding", lambda: logged(f"holding {word}"), timeout_s=60, every_s=0.2)
+        # Sent once the reply shows the run, as Eliav did: before that, the run
+        # a Send now hands over has shown nothing, and the message queues.
+        _until("the running reply showing the run",
+               lambda: "E2E_LATE_PART_1" in _output_text(page.streamed(held)), timeout_s=60, every_s=0.2)
         # What Send now does: Open WebUI cancels the running reply, then sends.
         _request("POST", f"/api/tasks/chat/{chat_id}/stop", token=token)
         tomato = _post_turn(token, chat_id, f"say tomato-{word}", model=CLI_MODEL)
@@ -807,6 +812,7 @@ def test_a_steered_message_splits_the_run_where_claude_code_took_it_in(token):
             pass  # the asserts below say what each reply shows
     finally:
         open(go, "w").close()
+        page.close()
     msgs = _chat_messages(token, chat_id)
     shown = {r: msgs[r].get("content", "") for r in (held, tomato, blue)}
     assert shown[held].split() == ["E2E_LATE_PART_1", "E2E_LATE_PART_2"], shown

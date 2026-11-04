@@ -267,18 +267,23 @@ while True:
         token = late.group(1)
         say("E2E_LATE_PART_1", stop="tool_use")
         note(f"holding {token}")
-        first = inputs.get()  # sent during tool step 1, as "say tomato" during pause 1
-        note(f"steer waiting {token}")
+        go = os.path.join(DIR, f"go-{token}")
+        injected = []
+        while not (injected or os.path.exists(go)):  # sent during tool step 1, as "say tomato" in pause 1
+            try:
+                injected.append(inputs.get(timeout=0.2))
+            except queue.Empty:
+                continue
+        note(f"steer waiting {token}" if injected else f"released {token} with no message")
         tool_step(1, token)
         say("E2E_LATE_PART_2", stop="tool_use")
         tool_step(2, token)
         note(f"boundary {token}")
-        while not os.path.exists(os.path.join(DIR, f"go-{token}")):
+        while not os.path.exists(go):
             time.sleep(0.2)
-        injected = [first]
         while not inputs.empty():
             injected.append(inputs.get_nowait())
-        answer = ""
+        answer = "E2E_CLI_HOLD_END"
         for each in injected:
             if each.get("type") == "eof":
                 break
