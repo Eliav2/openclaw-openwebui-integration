@@ -55,6 +55,7 @@ Each row is the full end-to-end suite on one pair, on GitHub's runners. The suit
 | 2026.9.3 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/39173684021) |
 | 2026.10.3 | pass | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/38641695395) |
 | 2026.10.5 | pass | | every pull request |
+| 2026.10.10 | pass (on Open WebUI 0.13.0) | | [run](https://github.com/Eliav2/openclaw-openwebui-integration/actions/runs/41675560751) |
 
 ## Keeping this page true
 
