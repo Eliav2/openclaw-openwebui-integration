@@ -2377,7 +2377,13 @@ def _history_run_messages(history: dict, run_id: str, started_ms: float | None =
     A run the Gateway steered a message into (a second sub-agent's announce
     while the first one's run streams) answers it in the same run: each of
     its replies then looks like a closing message, and the walk back goes
-    past them to the previous run's (ELI-271)."""
+    past them to the previous run's (ELI-271).
+
+    A cron wake that fires while a claude-cli run works has its prompt
+    stored when it fires, while it waits for that run; the run's messages,
+    imported afterwards with Claude Code's own times, sort around it
+    (`_history_queued_prompt`): the walk goes past that prompt and leaves
+    it out."""
     messages = (history or {}).get("messages")
     if not isinstance(messages, list) or not run_id:
         return None
@@ -2387,13 +2393,34 @@ def _history_run_messages(history: dict, run_id: str, started_ms: float | None =
             continue
         if run_id not in _idempotency_keys(message) and _run_closed_by(message) != run_id:
             continue
-        start = end
-        while start > 0 and (messages[start - 1] or {}).get("role") != "user" \
-                and _run_closed_by(messages[start - 1]) in (None, run_id) \
+        start, queued = end, set()
+        while start > 0 and _run_closed_by(messages[start - 1]) in (None, run_id) \
                 and not _stamped_before(messages[start - 1], started_ms):
+            if (messages[start - 1] or {}).get("role") == "user":
+                if not _history_queued_prompt(messages, start - 1, run_id):
+                    break
+                queued.add(start - 1)
             start -= 1
-        return messages[start:end + 1]
+        return [m for i, m in enumerate(messages[start:end + 1], start) if i not in queued]
     return None
+
+
+def _history_queued_prompt(messages: list, index: int, run_id: str) -> bool:
+    """Whether the user message at `index` is a cron wake's prompt that
+    sorts inside another run: an earlier prompt, back to the previous run's
+    closing, started the run it landed in. 2026.10.10 stores the prompt when
+    the job fires, then the wake waits for the run; claude-cli imports that
+    run's messages stamped with Claude Code's own times, before and after
+    it (live gate two-wakes on 565e9cd, chat d51a3a0a)."""
+    own = _history_user_run_id(messages[index])
+    if not own or own == run_id or not _cron_turn_job(messages[index]):
+        return False
+    for message in reversed(messages[:index]):
+        if _run_closed_by(message) not in (None, run_id):
+            return False
+        if _history_user_run_id(message):
+            return True
+    return False
 
 
 def _stamped_before(message: dict, started_ms: float | None) -> bool:
