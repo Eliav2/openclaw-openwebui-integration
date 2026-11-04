@@ -437,6 +437,18 @@ class RunTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await asyncio.wait_for(task, 2), ("started", "Sure"))
         self.assertEqual(conn.methods(), ["chat.send"])
 
+    async def test_a_socket_gap_wakes_a_follow_up_waiting_for_the_idle(self):
+        """The idle push may be among the events a dropped socket lost
+        (`_mark_event_gap` wakes every waiter, the channel follow-up's among
+        them): the follow-up reads the flag again and is sent."""
+        conn = PushConn("started", [final("Sure")])
+        task = asyncio.ensure_future(_channel_run(conn, "k", "m", "chanfollow-x", owner=True))
+        await _spin()
+        self.assertFalse(task.done())
+        conn.flag = False                 # went idle while the socket was down: nothing pushed
+        conn.real._mark_event_gap()
+        self.assertEqual(await asyncio.wait_for(task, 2), ("started", "Sure"))
+
     async def test_an_unreadable_transcript_at_the_end_keeps_the_streamed_reply(self):
         settle = {"type": openclaw_pipe._ROW_MARKER_TYPE, "row": {"hasActiveRun": False, "lastRunId": "chanfollow-x"}}
         conn = FakeRunConn("started", [delta("Boo"), delta("ked."), settle])

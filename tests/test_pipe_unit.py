@@ -1844,6 +1844,7 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.aborts = []
         self.active = False
         self.run_ended_at = None
+        self.describe_extra = {}
         self.runtime = None
         self.keys = []
         self.history = {}
@@ -1869,6 +1870,7 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
                        "agentRuntime": {"id": self.runtime}}
                 if self.active and self.run_ended_at:
                     row["endedAt"] = self.run_ended_at
+                row.update(self.describe_extra)
                 return {"session": row}
             if method == "sessions.list":
                 return {"sessions": [{"key": self.SK, "hasActiveRun": self.active}]}
@@ -2085,6 +2087,39 @@ class NoDroppedMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sent, ["hello"])
         first.cancel()
         await asyncio.gather(first, return_exceptions=True)
+
+    async def _queued_while_describe_says(self, **row):
+        """A message sent while `sessions.describe` carries `row` and
+        `sessions.list` says idle: returns whether it was sent at once."""
+        self.active = False
+        self.describe_extra = row
+        gen = self._reply("hello", "m1")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._spin()
+        sent = list(self.sent)
+        self.describe_extra = {}
+        self._gateway_push(reason="agent.input.settled", hasActiveRun=False, status="done")
+        await self._until_registered("run-1")
+        first.cancel()
+        await asyncio.gather(first, return_exceptions=True)
+        return bool(sent)
+
+    async def test_the_describe_row_counts_a_run_by_has_active_run(self):
+        """`sessions.describe` rows carry `hasActiveRun` (the Gateway's
+        aggregate flag), as `sessions.list` rows do. Read when the status
+        says nothing (a sub-agent yield gap reads `done`)."""
+        self.assertFalse(await self._queued_while_describe_says(status="done", hasActiveRun=True))
+
+    async def test_the_describe_row_counts_a_run_by_its_active_run_ids(self):
+        """`activeRunIds` is the exact set of runs; a non-empty one is a run."""
+        self.assertFalse(await self._queued_while_describe_says(status="done", activeRunIds=["r1"]))
+
+    async def test_the_describe_row_has_no_singular_active_run_id(self):
+        """Neither 2026.10.8 nor 2026.10.10 has an `activeRunId` field on a
+        row, so one is not read: with the flag false and no ids the session
+        is idle."""
+        self.assertTrue(await self._queued_while_describe_says(
+            status="done", hasActiveRun=False, activeRunIds=[], activeRunId="r1"))
 
     async def test_a_push_for_another_session_does_not_read(self):
         """Waking on every push of the session is not waking on every push: the
