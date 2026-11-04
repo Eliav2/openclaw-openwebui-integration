@@ -15734,6 +15734,28 @@ class SteeredTranscriptSpanTests(unittest.TestCase):
         self.assertEqual(self._texts(_history_span_messages(hist, "R1")), ["ROUND 1"])
         self.assertEqual(self._texts(_history_span_messages(hist, "R2")), ["Stopped. banana"])
 
+    def test_claude_cli_with_imported_user_copies(self):
+        """claude-cli imports Claude Code's own transcript: each user message
+        has an unkeyed copy right after the keyed one (sandbox 2026.10.10)."""
+        copy = lambda text: {"role": "user", "content": f"Conversation info ...\n\n{text}"}  # noqa: E731
+        hist = {"messages": [
+            self._user("R1", "hold"), copy("hold"), self._said("E2E_CLI_HOLD_START", stop="end_turn"),
+            self._user("R2", "aside"), copy("aside"), self._said("E2E_CLI_STEERED: aside", stop="end_turn"),
+            self._said("E2E_CLI_HOLD_START\n\nE2E_CLI_STEERED: aside", run="R1", key="cli-assistant:R1")]}
+        self.assertEqual(self._texts(_history_span_messages(hist, "R1")), ["E2E_CLI_HOLD_START"])
+        self.assertEqual(self._texts(_history_span_messages(hist, "R2")), ["E2E_CLI_STEERED: aside"])
+
+    def test_claude_cli_closing_copy_in_place_of_the_answer(self):
+        """The closing copy carries only the last answer, so the Gateway's
+        import merges it with Claude Code's record of it (sandbox 2026.10.10)."""
+        copy = lambda text: {"role": "user", "content": f"Conversation info ...\n\n{text}"}  # noqa: E731
+        hist = {"messages": [
+            self._user("R1", "hold"), copy("hold"), self._said("E2E_CLI_HOLD_START", stop="end_turn"),
+            self._user("R2", "aside"), copy("aside"),
+            self._said("E2E_CLI_STEERED: aside", run="R1", key="cli-assistant:R1")]}
+        self.assertEqual(self._texts(_history_span_messages(hist, "R1")), ["E2E_CLI_HOLD_START"])
+        self.assertEqual(self._texts(_history_span_messages(hist, "R2")), ["E2E_CLI_STEERED: aside"])
+
     def test_two_messages_steered_at_one_boundary(self):
         hist = {"messages": [self._user("R1", "count"), self._said("slow-1", run="R1"),
                              self._user("A", "first"), self._user("B", "second"),
@@ -15753,6 +15775,20 @@ class SteeredTranscriptSpanTests(unittest.TestCase):
                              self._user("R2", "next"), self._said("own answer", run="R2")]}
         self.assertEqual(self._texts(_history_span_messages(hist, "R1")), ["slow-1"])
         self.assertEqual(self._texts(_history_span_messages(hist, "R2")), ["own answer"])
+
+
+class SettleSteeredRepliesTests(unittest.TestCase):
+    """`_settle_misplaced`: when the replies around a steer are rewritten from
+    the transcript. Only a moved split, never other content."""
+
+    def test_the_answer_began_in_the_earlier_reply(self):
+        self.assertTrue(openclaw_pipe._settle_misplaced(["holdSTEERED:a", "a"], ["hold", "STEERED:a"]))
+        self.assertTrue(openclaw_pipe._settle_misplaced(["holdSTEERED:a", "STEERED:a"], ["hold", "STEERED:a"]))
+
+    def test_replies_already_in_place_or_holding_more_stay(self):
+        self.assertFalse(openclaw_pipe._settle_misplaced(["hold", "STEERED:a"], ["hold", "STEERED:a"]))
+        self.assertFalse(openclaw_pipe._settle_misplaced(["holdnote", "STEERED:a"], ["hold", "STEERED:a"]))
+        self.assertFalse(openclaw_pipe._settle_misplaced(["hold", "STEERED:a(note)"], ["hold", "STEERED:a"]))
 
 
 class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):

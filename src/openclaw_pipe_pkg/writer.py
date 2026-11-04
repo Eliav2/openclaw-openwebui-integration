@@ -411,6 +411,74 @@ async def _close_unsent_reply(conn: "_GatewayConnection", ref: dict, note: str) 
         pipe_log(f"  reply {message_id[:8]}...: closing note failed: {ex!r}")
 
 
+def _settle_text(text: str) -> str:
+    return "".join((text or "").split())
+
+
+def _settle_misplaced(saved: list, parts: list) -> bool:
+    """The saved replies around a steer hold the transcript's parts with the
+    split moved: each earlier reply its own part and then the start of the
+    next one's, the last reply the rest of its own part (all of it when the
+    reply recovered it). Whitespace-blind."""
+    if saved == parts:
+        return False
+    for n, (was, part) in enumerate(zip(saved, parts)):
+        if n == len(parts) - 1:
+            return part.endswith(was)
+        if not (was.startswith(part) and parts[n + 1].startswith(was[len(part):])):
+            return False
+    return False
+
+
+async def _settle_steered_replies(conn: "_GatewayConnection", session_key: str, refs: list) -> None:
+    """Rewrite the replies around a steer from the transcript once the run
+    ended: `refs` [{chat_id, message_id, request_task_id, span_run}], the
+    reply that ended where a message went in, then that message's reply.
+
+    On claude-cli the Gateway commits a steered message once Claude Code
+    takes it in, and forwards what Claude Code says next without waiting for
+    that commit, so the switch (`_GatewayConnection._steer`) can come after
+    the answer began in the earlier reply. The transcript has the message in
+    its place: each reply gets its own part (`_history_span_messages`). Only
+    the split moves (`_settle_misplaced`), so nothing else a reply holds is
+    lost. Each request's own save comes first (`_close_unsent_reply`)."""
+    refs = [r for r in refs if r and r.get("chat_id") and r.get("message_id") and r.get("span_run")]
+    if len(refs) < 2:
+        return
+    for ref in refs:
+        request = _owui_request_task(ref.get("request_task_id"))
+        if request is not None and not request.done():
+            await asyncio.wait({request})
+    from open_webui.models.chats import Chats
+    from open_webui.socket.main import get_event_emitter
+
+    try:
+        hist = await conn.session_history(session_key, limit=RUN_HISTORY_LIMIT)
+        spans = [_history_span_messages(hist, r["span_run"]) for r in refs]
+        if any(s is None for s in spans):
+            return
+        parts = [_history_renderer(s) for s in spans]
+        saved = [await Chats.get_message_by_id_and_message_id(r["chat_id"], r["message_id"]) or {}
+                 for r in refs]
+        texts = [(m.get("content") or "") for m in saved]
+        if not _settle_misplaced([_settle_text(t) for t in texts], [_settle_text(p.text) for p in parts]):
+            return
+        user_id = (conn.parse_owui_session_key(session_key) or (None, None))[0]
+        for ref, part, was in zip(refs, parts, texts):
+            if _settle_text(was) == _settle_text(part.text):
+                continue
+            text, output = part.text.strip(), part.finished_output()
+            async with conn._chat_write_lock(ref["chat_id"]):
+                await _owui_upsert_message(ref["chat_id"], ref["message_id"],
+                                           {"content": text, "output": output, "done": True})
+            emit = await get_event_emitter({"chat_id": ref["chat_id"], "message_id": ref["message_id"],
+                                            "user_id": user_id}, update_db=False)
+            await emit({"type": "chat:completion", "data": {"done": True, "content": text, "output": output}})
+            pipe_log(f"  reply {ref['message_id'][:8]}... settled from the transcript around a steer")
+    except Exception as ex:
+        pipe_log(f"  settling the replies around a steer failed: {ex!r}")
+
+
 def _end_unsent_replies(conn: "_GatewayConnection", refs: list, *, sent: bool,
                         note: str | None = None) -> None:
     """End each reply in `refs` (see `_close_unsent_reply`) in the background:
@@ -2454,7 +2522,9 @@ def _history_run_messages(history: dict, run_id: str, started_ms: float | None =
         # Past the messages steered into it too (2026.10.10): the run goes on
         # after each, answering it.
         while start > 0 and ((messages[start - 1] or {}).get("role") != "user"
-                             or _history_steered_into(history, start - 1) == run_id) \
+                             or _history_steered_into(history, start - 1) == run_id
+                             or (_history_imported_copy(messages, start - 1)
+                                 and _history_steered_into(history, start - 2) == run_id)) \
                 and _run_closed_by(messages[start - 1]) in (None, run_id) \
                 and not _stamped_before(messages[start - 1], started_ms):
             start -= 1
@@ -2467,6 +2537,14 @@ def _history_ran(history: dict, run_id: str) -> bool:
     return any(isinstance(m, dict) and m.get("role") == "assistant"
                and (run_id in _idempotency_keys(m) or _run_closed_by(m) == run_id)
                for m in (history or {}).get("messages") or [])
+
+
+def _history_imported_copy(messages: list, index: int) -> bool:
+    """The user message at `index` is the copy a CLI runtime imports right
+    after the `chat.send`-keyed one (claude-cli): no run key of its own."""
+    m = messages[index] if 0 <= index < len(messages) else None
+    return (isinstance(m, dict) and m.get("role") == "user" and not _history_user_run_id(m)
+            and index > 0 and bool(_history_user_run_id(messages[index - 1])))
 
 
 def _history_steered_into(history: dict, index: int) -> str | None:
@@ -2486,7 +2564,7 @@ def _history_steered_into(history: dict, index: int) -> str | None:
                 closers = {_run_closed_by(x) for x in messages[k + 1:index]} - {None}
                 return rid if closers <= {rid} else None
             continue
-        if isinstance(m, dict) and m.get("role") == "user":
+        if isinstance(m, dict) and m.get("role") == "user" and not _history_imported_copy(messages, k):
             return None
     return None
 
@@ -2511,8 +2589,13 @@ def _history_steered_span(history: dict, run_id: str) -> list | None:
     end = next((n for n in range(start + 1, len(messages)) if _history_user_run_id(messages[n])),
                len(messages))
     last = max((n for n in closers if n < end), default=end - 1)
-    return [m for m in messages[start + 1:min(end, last + 1)]
-            if not any(k.startswith("cli-assistant:") for k in _idempotency_keys(m))]
+    span = messages[start + 1:min(end, last + 1)]
+    own = [m for m in span if not any(k.startswith("cli-assistant:") for k in _idempotency_keys(m))]
+    # The closing copy takes the place of Claude Code's own record of the
+    # answer when their texts match (cli-session-history mergeCliHistoryRow).
+    answered = any(m.get("role") == "assistant" and _history_renderer([m]).text.strip() for m in own
+                   if isinstance(m, dict))
+    return own if answered else span
 
 
 def _stamped_before(message: dict, started_ms: float | None) -> bool:

@@ -159,6 +159,12 @@ echo "::group::OpenClaw Gateway (openclaw@$OPENCLAW_VERSION)"
 npm install --global --no-audit --no-fund "openclaw@$OPENCLAW_VERSION" >"$LOG_DIR/npm-install.log" 2>&1 \
   || { cat "$LOG_DIR/npm-install.log"; exit 1; }
 openclaw --version
+# e2e/fake_claude.py is the `claude` CLI the claude-cli runtime runs, ahead of
+# any real one on PATH: the stack never uses a real Claude login.
+ln -sf "$PWD/e2e/fake_claude.py" "$(npm prefix --global)/bin/claude"
+export E2E_FAKE_CLAUDE_DIR="$LOG_DIR"
+[[ "$(command -v claude)" == "$(npm prefix --global)/bin/claude" ]] \
+  || { echo "::error::the fake claude is not the first claude on PATH: $(command -v claude)"; exit 1; }
 # The Gateway reports OPENCLAW_VERSION as its own version when it is set, ahead
 # of its package version, and the Pipe's version gates read that. An npm spec
 # (`latest`) there makes them all take their oldest path (ELI-225), so from
@@ -193,6 +199,7 @@ cat >"$HOME/.openclaw/openclaw.json" <<EOF
   "agents": {
     "defaults": {
       "model": {"primary": "fake/e2e-default"},
+      "models": {"anthropic/claude-opus-5-5": {"agentRuntime": {"id": "claude-cli"}}},
       "heartbeat": {"agentId": "main", "every": "0m"},
       "systemAgent": {"agentId": "main"}
     },

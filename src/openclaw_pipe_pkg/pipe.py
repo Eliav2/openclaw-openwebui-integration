@@ -1869,13 +1869,19 @@ class _PipeTurn:
         # This reply's own run stays registered, steered, until its lone final
         # (`_note_run_event`), so that final never reads as a run to write.
         await _emit_status(self.__event_emitter__, "", done=True)
+        # The reply that ended where this message went in, and this reply's
+        # own part of the transcript: both are settled from it once the run
+        # ends (`_settle_steered_replies`).
+        self.steered_earlier = steered.get("earlier")
+        self.steered_span_run = self.our_run_id
         self.our_run_id = steered["run"]
         self.turn.run_id = self.our_run_id
         # A turn writer that takes the rest over writes it into this reply's
         # message, after what the earlier reply showed.
         self.conn.register_run_target(
             self.session_key, self.our_run_id, self.owui_origin_chat_id, self.owui_message_id,
-            thinking=self.resolved_thinking, request_task_id=(self.__metadata__ or {}).get("task_id"))
+            thinking=self.resolved_thinking, request_task_id=(self.__metadata__ or {}).get("task_id"),
+            span_run=self.steered_span_run)
         self.conn.seed_run_renderer(self.session_key, self.our_run_id, self.queue, run_text)
         self.renderer.seed(run_text)
         self.assistant_stream_text = run_text.get("stream", "")
@@ -2373,6 +2379,16 @@ class _PipeTurn:
         # for a `done: false` message and with no tab open.
         if not self.aborted and self.text_yielded:
             await self.save_end_snapshot()
+
+        if getattr(self, "steered_span_run", None) and not self.aborted:
+            # The run's live events give no point where this message went in
+            # on claude-cli (its commit can trail the answer's first delta);
+            # the transcript does.
+            spawn_background(_settle_steered_replies(self.conn, self.session_key, [
+                self.steered_earlier,
+                {"chat_id": self.owui_origin_chat_id, "message_id": self.owui_message_id,
+                 "request_task_id": (self.__metadata__ or {}).get("task_id"),
+                 "span_run": self.steered_span_run}]))
 
         # Auto-title: generate title after first exchange (best-effort, non-blocking)
         if not self.aborted and self.text_yielded:

@@ -41,6 +41,8 @@ On OpenClaw 2026.10.10 and later, a text message goes to the agent at once and t
 
 The boundary is the Gateway's own event: your message is written to the transcript (`session.message`, keyed by its send) right before the agent's next step, and every event of the run after it goes to your message's reply. A message whose send reaches the Gateway only after that step is steered in at the step after it. Several messages that reach the same step go in together: the last one's reply has the answer, and the earlier ones say their message was sent together with the next. A reload, or a lost connection to the Gateway, rebuilds both replies from the transcript, split at your message the same way.
 
+On the `claude-cli` runtime the Gateway writes your message to the transcript once Claude Code takes it in, but it can forward Claude Code's first words of the answer before that. Those words then show at the end of the running reply for a moment. Once the run ends, the Pipe reads the transcript and moves them to your message's reply. It only moves the split: if either reply holds anything the transcript does not, both stay as they are.
+
 A message with images or files still waits, as on older Gateways: the Gateway would only queue it behind the run. On Gateways before 2026.10.10 the `claude-cli` runtime cannot add a message to a run that is already going (OpenClaw 2026.9.3: such a message is dropped), so the Pipe holds every message and sends it right after the run ends.
 
 A held message from another tab or device, or one sent during a run you did not start, waits in the Pipe's own queue the same way. The status line says "Queued: waiting for the current run to finish...".

@@ -614,7 +614,7 @@ def _steers_mid_run_messages() -> bool:
     return bool(m) and tuple(int(g) for g in m.groups()) >= (2026, 10, 10)
 
 
-def _post_turn(token: str, chat_id: str, prompt: str) -> str:
+def _post_turn(token: str, chat_id: str, prompt: str, model: str = DEFAULT_MODEL) -> str:
     """Send `prompt` in `chat_id` under its current leaf, as a client with no
     page does (the API, a script), and return its reply's id at once."""
     status, got = _request("GET", f"/api/v1/chats/{chat_id}", token=token)
@@ -625,16 +625,16 @@ def _post_turn(token: str, chat_id: str, prompt: str) -> str:
     now = int(time.time())
     uid, aid = str(uuid.uuid4()), str(uuid.uuid4())
     user = {"id": uid, "parentId": leaf, "childrenIds": [aid], "role": "user", "content": prompt,
-            "timestamp": now, "models": [DEFAULT_MODEL]}
+            "timestamp": now, "models": [model]}
     msgs[uid] = user
     msgs[aid] = {"id": aid, "parentId": uid, "childrenIds": [], "role": "assistant",
-                 "content": "", "model": DEFAULT_MODEL, "timestamp": now, "done": False}
+                 "content": "", "model": model, "timestamp": now, "done": False}
     msgs[leaf]["childrenIds"] = [*(msgs[leaf].get("childrenIds") or []), uid]
     chat["history"]["currentId"] = aid
     status, saved = _request("POST", f"/api/v1/chats/{chat_id}", {"chat": chat}, token)
     assert status == 200, saved
     status, ack = _request("POST", "/api/chat/completions", {
-        "model": DEFAULT_MODEL, "messages": [{"role": "user", "content": prompt}],
+        "model": model, "messages": [{"role": "user", "content": prompt}],
         "stream": True, "chat_id": chat_id, "id": aid, "session_id": f"e2e-{uuid.uuid4().hex[:8]}",
         "parent_id": uid, "user_message": user}, token)
     assert status == 200, ack
@@ -680,6 +680,49 @@ def test_a_message_sent_while_a_run_works_is_steered_into_it(token):
         asked = [json.dumps(json.loads(line)["request"]["messages"]) for line in f if line.strip()]
     carrying = [a for a in asked if word in a]
     assert carrying and "e2e-hold-released" in carrying[0], (carrying[:1] or asked[-1:])[0][-400:]
+
+
+CLI_MODEL = "openclaw_gateway.anthropic/claude-opus-5-5"  # e2e/start_stack.sh: claude-cli, e2e/fake_claude.py
+
+
+@pytest.mark.skipif(not _steers_mid_run_messages(), reason="the Gateway runs a mid-run message after the run")
+def test_a_message_sent_while_a_claude_cli_turn_works_is_steered_into_it(token):
+    """The claude-cli runtime's own steering path (OpenClaw 2026.10.10): the
+    Gateway writes the message into the running Claude Code process, which
+    takes it in (`command_lifecycle` started) and answers it in the same turn.
+    The answer shows under the message; the running reply keeps only what
+    came before it. e2e/fake_claude.py holds its turn until a message comes."""
+    log = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), "fake-claude.log")
+    chat_id, first = _chat_turn(token, "Respond with exactly: E2E_CLI_CHAT", model=CLI_MODEL)
+    assert first["content"].strip() == "E2E_CLI_REPLY", first["content"]
+    word = f"E2E_CLI_ASIDE_{uuid.uuid4().hex[:6]}"
+    hold_token = f"cli{uuid.uuid4().hex[:8]}"
+    gate = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{hold_token}")
+    held = _post_turn(token, chat_id, f"E2E_CLI_HOLD {hold_token}", model=CLI_MODEL)
+    try:
+        _until("the Claude Code turn holding", lambda: os.path.exists(log)
+               and f"holding {hold_token}" in open(log, encoding="utf-8").read(), timeout_s=60, every_s=0.2)
+        aside = _post_turn(token, chat_id, f"Stop and say {word}", model=CLI_MODEL)
+        _until("both replies done", lambda: all(
+            _chat_messages(token, chat_id)[r].get("done") for r in (held, aside)))
+        # Claude Code can stream the answer before the Gateway commits the
+        # message, so its first words may land in the running reply; the
+        # Pipe then moves the split to the transcript's (`_settle_steered_replies`).
+        _until("the held reply ending at the message", lambda: _chat_messages(token, chat_id)[held]
+               .get("content", "").strip() == "E2E_CLI_HOLD_START")
+    finally:
+        open(gate, "w").close()
+    msgs = _chat_messages(token, chat_id)
+    assert msgs[aside]["content"].strip().startswith("E2E_CLI_STEERED:") and word in msgs[aside]["content"], (
+        msgs[aside]["content"])
+    statuses = json.dumps([msgs[r].get("statusHistory") for r in (held, aside)])
+    assert "Queued: waiting" not in statuses and STEER_PENDING in statuses, statuses
+    # Taken in by the running process, not run after it as a turn of its own.
+    with open(log, encoding="utf-8") as f:
+        text = f.read()
+    turn = text[text.index(f"holding {hold_token}"):]
+    assert word in turn and "E2E_CLI_HOLD_END" not in turn, turn[-600:]
+    os.remove(gate)
 
 
 def test_messages_waiting_behind_a_run_go_to_the_agent_as_one_turn(token):

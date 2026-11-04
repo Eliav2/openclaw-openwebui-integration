@@ -2293,17 +2293,22 @@ class _GatewayConnection:
     def register_run_target(self, session_key: str, run_id: str,
                             chat_id: str | None, message_id: str | None,
                             thinking: str | None = None,
-                            request_task_id: str | None = None) -> None:
+                            request_task_id: str | None = None,
+                            span_run: str | None = None) -> None:
         """Remember that this run streams into OWUI message `message_id` in
         `chat_id`, and start a shadow `_TurnRenderer` for it. No-op without both
         ids (e.g. a chat with no stable message id yet). `thinking`: the
         turn's level, which a writer's resume keeps. `request_task_id`: Open
-        WebUI's task for the request, whose end a handover's write waits for."""
+        WebUI's task for the request, whose end a handover's write waits for.
+        `span_run`: the run whose part of the transcript the message shows,
+        when it is not `run_id`: a message steered into `run_id` shows the
+        part after its own user message (`_settle_steered_replies`)."""
         if not (chat_id and message_id and run_id):
             return
         key = f"{session_key}:{run_id}"
         self._run_targets[key] = {"chat_id": chat_id, "message_id": message_id,
-                                  "thinking": thinking, "request_task_id": request_task_id}
+                                  "thinking": thinking, "request_task_id": request_task_id,
+                                  "span_run": span_run}
         self._run_renderers[key] = _TurnRenderer()
         # Bound memory: a run that never emits a terminal would otherwise leak
         # its target/renderer forever. Far above any real concurrency.
@@ -2882,6 +2887,9 @@ class _GatewayConnection:
                  if s == sess and pump.started and not pump.wake and not pump.terminal.is_set()]
         if len(active) == 1:
             run = active[0]
+            earlier = self._run_targets.get(f"{sess}:{run.run_id}")
+            earlier = earlier and {k: earlier.get(k) for k in ("chat_id", "message_id", "request_task_id")} | {
+                "span_run": earlier.get("span_run") or run.run_id}
             shadow = self._run_renderers.get(f"{sess}:{run.run_id}")
             run_text = ({"received": shadow.received, "stream": shadow.received,
                          "item": shadow.last_item} if shadow is not None else None)
@@ -2891,6 +2899,9 @@ class _GatewayConnection:
             run_id = run.run_id
         elif not active and len(pumps) == 1:
             run_id, pump = pumps[0]
+            writer = pump.writer
+            earlier = writer and {"chat_id": writer.chat_id, "message_id": writer.message_id,
+                                  "request_task_id": None, "span_run": run_id}
             run_text = asyncio.get_running_loop().create_future()
             pump.queue.put_nowait(("steered", run_text))
             self._consumers[f"{sess}:{run_id}"] = _Consumer(
@@ -2899,7 +2910,8 @@ class _GatewayConnection:
             return False
         consumer.steered = True
         for q in consumer.queues:
-            q.put_nowait({"type": _STEERED_MARKER_TYPE, "_steered": {"run": run_id, "run_text": run_text}})
+            q.put_nowait({"type": _STEERED_MARKER_TYPE, "_steered": {
+                "run": run_id, "run_text": run_text, "earlier": earlier}})
         pipe_log(f"  run {consumer.run_id[:24]}... steered into {run_id[:24]}...; "
                  "its reply continues that run")
         return True
