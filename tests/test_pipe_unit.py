@@ -17213,7 +17213,10 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         transcript; the run's events wait for the next steer, which still
         takes the run over."""
         self.conn.gateway_version = "2026.10.10"
-        conn, sk = self.conn, self.SK
+        conn = self.conn
+        # A session key the turn writer routes (an Open WebUI user id).
+        conn._valves = lambda: types.SimpleNamespace(AGENT_ID="main")
+        self.SK = sk = f"agent:main:openwebui-00000000-0000-4000-8000-0000000000aa-{self.CHAT}"
         host = openclaw_pipe._RunPump()
         writer = mock.Mock(chat_id=self.CHAT, message_id="w1")
         writer.steered_away = lambda: {"received": "21-40", "stream": "21-40", "item": ""}
@@ -17230,7 +17233,9 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         conn._on_session_message(self._commit(self.R2, "say tomato")["payload"])
         kind, fut = host.queue.get_nowait()
         self.assertEqual(kind, "steered", "the first reply ends at the commit")
-        await conn._dispatch_run_event(self._delta(self.R1, "tomato"))
+        with mock.patch.object(openclaw_pipe, "_turn_pump_loop", mock.AsyncMock()) as loop:
+            await conn._dispatch_run_event(self._delta(self.R1, "tomato"))
+        loop.assert_not_called()
         self.assertTrue(host.queue.empty(), "the tomato answer is not the first reply's")
         self.assertTrue(tomato.queue.empty(), "tomato's writer reads its answer from the transcript")
         self.assertEqual([k for k in conn._turn_pumps if k[1] == self.R1], [(sk, self.R1)],
@@ -17249,7 +17254,11 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         """The run's events after such a steer go nowhere until the next one;
         with none, its end lets it go, so the session reads idle."""
         self.conn.gateway_version = "2026.10.10"
-        conn, sk = self.conn, self.SK
+        # A session key the turn writer routes (an Open WebUI user id).
+        conn = self.conn
+        conn._valves = lambda: types.SimpleNamespace(AGENT_ID="main")
+        self.SK = sk = f"agent:main:openwebui-00000000-0000-4000-8000-0000000000aa-{self.CHAT}"
+        self.assertIsNotNone(conn.parse_owui_session_key(sk))
         host = openclaw_pipe._RunPump()
         host.started = True
         conn._turn_pumps[(sk, self.R1)] = host
@@ -17259,9 +17268,18 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         conn._turn_pumps[(sk, self.R2)] = tomato
         conn._on_session_message(self._commit(self.R2, "say tomato")["payload"])
         self.assertTrue(conn.has_reply(sk), "the run still works")
+        self.assertEqual(host.queue.get_nowait()[0], "steered")
         await conn._dispatch_run_event(self._lifecycle(self.R1, "end"))
         self.assertNotIn(f"{sk}:{self.R1}", conn._consumers)
         self.assertFalse(conn.has_reply(sk))
+        # Review on #290: its `chat` final comes after its lifecycle end, and
+        # reached a writer that showed the whole run in the earlier reply.
+        conn._turn_pumps.pop((sk, self.R1))
+        with mock.patch.object(openclaw_pipe, "_turn_pump_loop", mock.AsyncMock()) as loop:
+            await conn._dispatch_run_event(self._final(self.R1, "21-40 tomato"))
+            await self._spin()
+        loop.assert_not_called()
+        self.assertTrue(host.queue.empty())
 
     async def test_a_retired_connection_closes_when_such_a_run_ends(self):
         """Review on #290: letting the run go was the connection's last

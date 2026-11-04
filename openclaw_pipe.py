@@ -7662,7 +7662,10 @@ class _GatewayConnection:
         consumer.started = True
         consumer.ended = consumer.ended or terminal
         if consumer.ended and consumer.queues and all(isinstance(q, _DiscardQueue) for q in consumer.queues):
-            # Nothing shows the rest of its run (`_steer_handed_over`): its end lets it go.
+            # Nothing shows the rest of its run (`_steer_handed_over`): its end lets it go,
+            # and a late event of it (its `chat` final after the lifecycle end) opens nothing.
+            self.mark_delivered_live(consumer.session_key, consumer.run_id)
+            self.unregister_run_target(consumer.session_key, consumer.run_id)
             self._consumers.pop(f"{consumer.session_key}:{consumer.run_id}", None)
             self._wake_session_waiters(consumer.session_key)
             self._close_if_retired_and_idle()
