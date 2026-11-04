@@ -28,6 +28,7 @@ import json
 import os
 import queue
 import re
+import shlex
 import signal
 import sys
 import threading
@@ -193,7 +194,7 @@ def mcp_call(server, name, arguments):
 def abort_tool(token):
     """A turn that calls the MCP `exec` before and after its run's abort."""
     server = MCP
-    before = mcp_call(server, "exec", {"command": f"touch {DIR}/before-{token}"})
+    before = mcp_call(server, "exec", {"command": f"touch {shlex.quote(os.path.join(DIR, f'before-{token}'))}"})
     note(f"mcp before {token}: {json.dumps(before)[:300]}")
     aborted = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: aborted.set())
@@ -202,8 +203,9 @@ def abort_tool(token):
     while not aborted.wait(0.2):
         if os.path.exists(os.path.join(DIR, f"hold-{token}")):
             note(f"released {token} without an abort")
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
             return
-    after = mcp_call(server, "exec", {"command": f"touch {DIR}/after-{token}"})
+    after = mcp_call(server, "exec", {"command": f"touch {shlex.quote(os.path.join(DIR, f'after-{token}'))}"})
     note(f"mcp after abort {token}: {json.dumps(after)[:300]}")
     with open(os.path.join(DIR, f"abort-mcp-{token}.json"), "w") as f:
         json.dump({"status": after[0], "reply": after[1]}, f)
