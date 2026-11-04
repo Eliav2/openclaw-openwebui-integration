@@ -77,13 +77,13 @@
     bar.id = "oc-push-offer";
     bar.setAttribute("role", "region");
     bar.setAttribute("aria-label", "Notifications");
-    bar.style.cssText = "position:fixed;left:12px;bottom:12px;z-index:9999;display:flex;gap:4px;" +
+    bar.style.cssText = "position:fixed;top:60px;left:50%;transform:translateX(-50%);z-index:9999;display:flex;gap:4px;" +
       "font:14px system-ui,sans-serif;background:#111;color:#fff;border-radius:999px;padding:4px;box-shadow:0 2px 8px #0004";
     const btn = (text, label) => {
       const b = document.createElement("button");
       b.textContent = text;
       b.setAttribute("aria-label", label);
-      b.style.cssText = "background:none;border:0;color:inherit;font:inherit;padding:6px 10px;border-radius:999px;cursor:pointer";
+      b.style.cssText = "background:none;border:0;color:inherit;font:inherit;padding:6px 10px;border-radius:999px;cursor:pointer;white-space:nowrap";
       bar.appendChild(b);
       return b;
     };

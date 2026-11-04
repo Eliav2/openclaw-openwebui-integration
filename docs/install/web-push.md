@@ -59,7 +59,7 @@ The page script has two placeholders to replace: `__VAPID_PUBLIC_KEY__` (the pub
 
 ### Serve the scripts with a Cloudflare Worker
 
-`push/examples/cloudflare-worker/` is a Worker for exactly two routes of your Open WebUI hostname: `/oc-sw.js`, which it serves itself, and `/static/loader.js`, which it fetches from Open WebUI and appends the page script to. It never runs on `/api`, `/ws` or `/_app`.
+`push/examples/cloudflare-worker/` is a Cloudflare Worker for exactly two routes of your Open WebUI hostname: `/oc-sw.js`, which it serves itself, and `/static/loader.js`, which it fetches from Open WebUI and appends the page script to. It never runs on `/api`, `/ws` or `/_app`.
 
 ```bash
 cd push/examples/cloudflare-worker
@@ -86,7 +86,7 @@ The page script replaces Open WebUI's `loader.js`, which is empty unless you put
 
 ## 5. Turn it on, on each device
 
-Open Open WebUI. While the browser has not been asked yet, an **Enable notifications** button shows at the bottom left. Click it and allow notifications. The × hides the button for good on that device. On iPhone and iPad, add Open WebUI to the Home Screen first and open it from there.
+Open Open WebUI. While the browser has not been asked yet, an **Enable notifications** button shows at the top of the page. Click it and allow notifications. The × hides the button for good on that device. On iPhone and iPad, add Open WebUI to the Home Screen first and open it from there.
 
 Each device is saved in its user's own list, so two people on one Open WebUI each get their own notifications.
 
@@ -111,12 +111,12 @@ INFO     | function_openclaw_web_push_<hash>:send_all:<line> - web push: sent to
 Each part is separate:
 
 - Turn the function off: nothing is sent.
-- Remove the Worker routes or the nginx locations: pages load the stock `loader.js`. Service workers that are already registered stay idle until Open WebUI's next update removes them.
+- Remove the Cloudflare Worker's routes or the nginx locations: pages load the stock `loader.js`. Service workers that are already registered stay idle until Open WebUI's next update removes them.
 - Turn the Pipe's `PUBLISH_CHAT_FINISHED` off: OpenClaw replies are no longer notified.
 
 ## Tests
 
-`tests/test_web_push_unit.py` covers the payload (never the reply), which events are sent, and a real encrypted send to a local push service. `push/e2e/` drives Google Chrome against the real push service (FCM), the Worker example under `wrangler dev` and a throwaway Open WebUI:
+`tests/test_web_push_unit.py` covers the payload (never the reply), which events are sent, and a real encrypted send to a local push service. `push/e2e/` drives Google Chrome against the real push service (FCM), the Cloudflare Worker example under `wrangler dev` and a throwaway Open WebUI:
 
 ```bash
 push/e2e/stack.sh up /tmp/web-push-e2e openclaw_pipe.py

@@ -19,7 +19,8 @@ VIDEOS_TOTAL_BUDGET = 8 * 1024 * 1024
 # Contributor and design pages may name issues and internals; user pages may not.
 INTERNAL_OK = {"docs/architecture.md", "docs/development.md", "docs/metadata-contract.md",
                "docs/rehydration-persistence.md"}
-JARGON = re.compile(r"\bELI-\d+|\bturn writer\b|\bproactive\b|\bpipe run id\b|\bworker\b|\bmanager\b", re.I)
+# "service worker" and "Cloudflare Worker" are product names, not ours.
+JARGON = re.compile(r"\bELI-\d+|\bturn writer\b|\bproactive\b|\bpipe run id\b|(?<!service )(?<!cloudflare )(?<!cloudflare-)\bworker\b|\bmanager\b", re.I)
 
 LINK = re.compile(r"!?\[[^\]]*\]\(([^)\s]+)\)|(?:src|srcset)=\"([^\"]+)\"")
 FENCE = re.compile(r"^(```|~~~).*?^\1", re.M | re.S)

@@ -46,6 +46,8 @@ def owui():
         token = api("/api/v1/auths/signin", cred)["token"]
     except urllib.error.HTTPError:
         token = api("/api/v1/auths/signup", {"name": "E2E", **cred})["token"]
+    # The admin's "What's New" dialog would cover the page: mark this version seen.
+    api("/api/v1/users/user/settings/update", {"ui": {"showChangelog": False}}, token)
     have = {f["id"] for f in api("/api/v1/functions/", token=token)}
     for fid, name, path in (("web_push", "Web Push", os.path.join(PUSH, "openclaw_web_push.py")),
                             ("stub", "Stub", os.path.join(HERE, "stub_pipe.py")),
@@ -123,6 +125,9 @@ def test_enable_subscribe_notify_suppress_and_resubscribe(owui, browser):
     page.goto(BASE + "/")
     assert ready(page) == "no-permission"
     page.locator("#oc-push-offer").wait_for(timeout=WAIT_MS)
+    if os.environ.get("E2E_SHOTS"):
+        page.locator("#chat-input").wait_for(timeout=WAIT_MS)   # Open WebUI drawn around it
+        page.screenshot(path=os.path.join(os.environ["E2E_SHOTS"], "web-push-offer.png"))
     # What the user's Allow in the prompt does: notifications and push for this origin.
     ctx.grant_permissions(["notifications"], origin=BASE)
     ctx.new_cdp_session(page).send("Browser.setPermission", {
