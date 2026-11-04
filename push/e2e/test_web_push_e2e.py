@@ -2,7 +2,7 @@
 Cloudflare Worker example under `wrangler dev`, a throwaway Open WebUI.
 
     push/e2e/stack.sh up <run_dir> <openclaw_pipe.py build>
-    xvfb-run -a uv run --with playwright==1.64.0 --with pytest pytest -q push/e2e/test_web_push_e2e.py
+    WEB_PUSH_E2E=1 xvfb-run -a uv run --with playwright==1.64.0 --with pytest pytest -q push/e2e/test_web_push_e2e.py
     push/e2e/stack.sh down <run_dir>
 
 Push needs Google Chrome (Chromium builds have no push service), a persistent
@@ -18,7 +18,11 @@ import urllib.request
 import uuid
 
 import pytest
-from playwright.sync_api import sync_playwright
+
+# Runs only against a stack this machine started (stack.sh up); the unit job skips it.
+if not os.environ.get("WEB_PUSH_E2E"):
+    pytest.skip("set WEB_PUSH_E2E=1 with push/e2e/stack.sh up", allow_module_level=True)
+from playwright.sync_api import sync_playwright  # noqa: E402
 
 OWUI = os.environ.get("E2E_OWUI", "http://127.0.0.1:18780")
 BASE = os.environ.get("E2E_BASE", "http://localhost:18787")   # the Worker

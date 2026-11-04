@@ -120,7 +120,7 @@ Each part is separate:
 
 ```bash
 push/e2e/stack.sh up /tmp/web-push-e2e openclaw_pipe.py
-xvfb-run -a uv run --with playwright==1.64.0 --with pytest pytest -q push/e2e/test_web_push_e2e.py
+WEB_PUSH_E2E=1 xvfb-run -a uv run --with playwright==1.64.0 --with pytest pytest -q push/e2e/test_web_push_e2e.py
 push/e2e/stack.sh down /tmp/web-push-e2e
 ```
 
