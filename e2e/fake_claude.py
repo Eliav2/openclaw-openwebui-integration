@@ -12,6 +12,9 @@ Replies:
   `$E2E_FAKE_CLAUDE_DIR/hold-TOKEN` or for a message injected into the turn. An injected
   message is taken in (its `command_lifecycle` started) and answered as `E2E_CLI_STEERED:
   <its text>`; with none, the turn ends with `E2E_CLI_HOLD_END`.
+* `E2E_CLI_TOOL_HOLD TOKEN` -> runs tool step 1, says `E2E_CLI_HOLD_START`, waits for the
+  hold file, then runs tool step 2 and ends with `E2E_CLI_HOST_DONE`. A cron wake fired
+  meanwhile runs after the turn; its prompt carries the time it fired, between the steps.
 * the installer's route smoke ("... answer with only the exact model line") -> the model's
   ref, `anthropic/<--model>`, as session_status would give it.
 * anything else -> `E2E_CLI_REPLY`.
@@ -22,6 +25,7 @@ import queue
 import re
 import sys
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -34,6 +38,7 @@ if "--version" in sys.argv:
     sys.exit(0)
 
 HOLD = re.compile(r"E2E_CLI_HOLD\s+([A-Za-z0-9_]{3,})")
+TOOL_HOLD = re.compile(r"E2E_CLI_TOOL_HOLD\s+([A-Za-z0-9_]{3,})")
 DIR = os.environ["E2E_FAKE_CLAUDE_DIR"]  # e2e/start_stack.sh: its log dir, where the hold files are
 sid = next((sys.argv[i + 1] for i, a in enumerate(sys.argv[:-1]) if a in ("--session-id", "--resume")),
            str(uuid.uuid4()))
@@ -130,6 +135,22 @@ def result(text):
           "usage": {"input_tokens": 10, "output_tokens": 2}})
 
 
+def tool_step(n, token):
+    """One Bash call and its result, as Claude Code streams and records them."""
+    call = {"type": "tool_use", "id": "toolu_" + uuid.uuid4().hex[:20], "name": "Bash",
+            "input": {"command": f"echo e2e-step-{n}-{token}"}}
+    message = {"id": "msg_" + uuid.uuid4().hex[:20], "type": "message", "role": "assistant", "model": model,
+               "content": [call], "stop_reason": "tool_use", "stop_sequence": None,
+               "usage": {"input_tokens": 10, "output_tokens": 2, "cache_creation_input_tokens": 0,
+                         "cache_read_input_tokens": 0}}
+    emit({"type": "assistant", "message": message, "session_id": sid, "parent_tool_use_id": None})
+    record("assistant", message["content"], model=model, stop_reason="tool_use", usage=message["usage"])
+    output = [{"type": "tool_result", "tool_use_id": call["id"], "content": f"e2e-step-{n}-{token}"}]
+    emit({"type": "user", "message": {"role": "user", "content": output}, "session_id": sid,
+          "parent_tool_use_id": None})
+    record("user", output)
+
+
 def take_in(msg):
     """Start a user input: its lifecycle, its replay, its prompt hook."""
     lifecycle("started", msg.get("uuid"))
@@ -148,6 +169,19 @@ while True:
     if msg.get("type") == "eof":
         break
     take_in(msg)
+    tool_hold = TOOL_HOLD.search(text_of(msg))
+    if tool_hold:
+        token = tool_hold.group(1)
+        tool_step(1, token)
+        say("E2E_CLI_HOLD_START")
+        note(f"holding {token}")
+        while not os.path.exists(os.path.join(DIR, f"hold-{token}")):
+            time.sleep(0.2)
+        tool_step(2, token)
+        say("E2E_CLI_HOST_DONE")
+        lifecycle("completed", msg.get("uuid"))
+        result("E2E_CLI_HOST_DONE")
+        continue
     hold = HOLD.search(text_of(msg))
     if not hold:
         reply = f"anthropic/{model}" if "exact model line" in text_of(msg) else "E2E_CLI_REPLY"
