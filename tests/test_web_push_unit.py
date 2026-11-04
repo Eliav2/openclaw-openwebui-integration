@@ -37,7 +37,7 @@ class PayloadTests(unittest.TestCase):
         reply in data.message; the device gets the title and link only."""
         body = web_push.encode_payload(web_push.build_payload(finished()))
         self.assertNotIn("SECRET-REPLY-TEXT", body)
-        self.assertEqual(json.loads(body), {"v": 1, "kind": "chat.finished", "source": "openclaw-pipe", "chat_id": "c1", "message_id": "m1",
+        self.assertEqual(json.loads(body), {"v": 2, "kind": "chat.finished", "source": "openclaw-pipe", "chat_id": "c1", "message_id": "m1",
                                             "title": "Trip plan", "url": "/c/c1"})
 
     def test_the_link_is_relative_whatever_the_event_says(self):
@@ -82,6 +82,50 @@ class WhichEventsTests(unittest.TestCase):
                           {"endpoint": "https://p/2"}, "junk", {"keys": {"p256dh": "k"}}])
         self.assertEqual([s["endpoint"] for s in web_push.parse_subscriptions(raw)], ["https://p/1"])
         self.assertEqual(web_push.parse_subscriptions("not json"), [])
+
+
+class PreviewTests(unittest.TestCase):
+    """PREVIEW_CHARS > 0: a plain-text start of the reply as the notification body."""
+
+    def test_off_by_default_no_body(self):
+        self.assertEqual(web_push.Event.Valves().PREVIEW_CHARS, 0)
+        self.assertNotIn("body", web_push.build_payload(finished()))
+
+    def test_on_the_start_of_the_reply_as_plain_text(self):
+        md = ("# Plan\n\nHere is **the plan** for [Kyoto](https://x.example/k):\n\n- day one\n- day two\n\n"
+              "```python\nprint('x')\n```\n\n![map](/img.png)\nMEDIA:/tmp/a.png\n"
+              "<details type=\"tool_calls\"><summary>Tool</summary>\nsecret tool output\n</details>\nDone.")
+        body = web_push.snippet(md, 600)
+        self.assertEqual(body, "Plan Here is the plan for Kyoto: day one day two [code] Done.")
+
+    def test_cut_on_a_word_with_an_ellipsis(self):
+        self.assertEqual(web_push.snippet("one two three four", 9), "one two…")
+
+    def test_hebrew_is_kept_as_is(self):
+        self.assertEqual(web_push.snippet("**שלום** עולם, מה נשמע?", 600), "שלום עולם, מה נשמע?")
+
+    def test_the_payload_with_a_preview_fits_a_push(self):
+        p = web_push.build_payload(finished(message="א" * 5000), preview_chars=4000, fn="web_push")
+        body = web_push.encode_payload(p)
+        self.assertLessEqual(len(body.encode()), web_push.MAX_PAYLOAD_BYTES)
+        self.assertTrue(json.loads(body)["body"].startswith("אאא"))
+        self.assertEqual(json.loads(body)["fn"], "web_push")
+
+    def test_an_empty_reply_has_no_body(self):
+        self.assertNotIn("body", web_push.build_payload(finished(message="```\nx\n```"), preview_chars=600))
+
+
+class MuteTests(unittest.TestCase):
+    def test_always_and_until_and_expired(self):
+        mutes = json.dumps({"c1": 0, "c2": 2000, "c3": 500})
+        self.assertTrue(web_push.is_muted(mutes, "c1", now=1000))
+        self.assertTrue(web_push.is_muted(mutes, "c2", now=1000))
+        self.assertFalse(web_push.is_muted(mutes, "c3", now=1000))
+        self.assertFalse(web_push.is_muted(mutes, "c4", now=1000))
+
+    def test_malformed_mutes_mute_nothing(self):
+        for raw in ("not json", "[1]", json.dumps({"c1": "soon"}), None, ""):
+            self.assertFalse(web_push.is_muted(raw, "c1", now=1000), raw)
 
 
 class EventTests(unittest.IsolatedAsyncioTestCase):
@@ -132,6 +176,24 @@ class EventTests(unittest.IsolatedAsyncioTestCase):
         await self.fn.event(finished(), __id__="web_push")
         self.assertEqual(self.sent, [])
 
+    async def test_a_muted_chat_sends_nothing(self):
+        self.store["mutes"] = json.dumps({"c1": 0})
+        with self.assertLogs("openclaw_web_push", "INFO") as logs:
+            await self.fn.event(finished(), __id__="web_push")
+        self.assertEqual(self.sent, [])
+        self.assertIn("muted", "\n".join(logs.output))
+
+    async def test_another_chat_muted_still_sends(self):
+        self.store["mutes"] = json.dumps({"c9": 0})
+        await self.fn.event(finished(), __id__="web_push")
+        self.assertEqual(len(self.sent), 1)
+
+    async def test_the_preview_valve_puts_the_reply_start_in_the_body(self):
+        self.fn.valves.PREVIEW_CHARS = 600
+        await self.fn.event(finished(), __id__="web_push")
+        (subs, body, key, subject), = self.sent
+        self.assertEqual(json.loads(body)["body"], REPLY)
+
     async def test_the_middlewares_event_for_an_openclaw_model_sends_nothing(self):
         await self.fn.event(finished(source="api"), __id__="web_push")
         self.assertEqual(self.sent, [])
@@ -150,8 +212,8 @@ class RoundTripTests(unittest.TestCase):
         res = self.run_scenario("ok")
         self.assertEqual([r["device"] for r in res["received"]], ["dev1", "dev2"])
         for r in res["received"]:
-            self.assertEqual(r["payload"], {"v": 1, "kind": "chat.finished", "source": "openclaw-pipe", "chat_id": "c1", "message_id": "m1",
-                                            "title": "Trip plan", "url": "/c/c1"})
+            self.assertEqual(r["payload"], {"v": 2, "kind": "chat.finished", "source": "openclaw-pipe", "chat_id": "c1", "message_id": "m1",
+                                            "title": "Trip plan", "url": "/c/c1", "fn": "web_push"})
             self.assertNotIn("SECRET-REPLY-TEXT", json.dumps(r["payload"]))
             self.assertEqual(r["headers"]["Content-Encoding"], "aes128gcm")
             self.assertEqual((r["headers"]["TTL"], r["headers"]["Urgency"]), ("3600", "normal"))
