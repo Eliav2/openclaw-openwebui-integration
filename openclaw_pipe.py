@@ -6315,6 +6315,20 @@ class _RunQueue(asyncio.Queue):
         return items
 
 
+def _discards(consumer: "_Consumer") -> bool:
+    """`consumer` shows nothing: its queues only discard (`_DiscardQueue`)."""
+    return bool(consumer.queues) and all(isinstance(q, _DiscardQueue) for q in consumer.queues)
+
+
+class _DiscardQueue(_RunQueue):
+    """Where a run's events go when nothing shows them: its message's reply
+    was steered on while a turn writer had it, which reads its answer from
+    the transcript (`_GatewayConnection._steer_handed_over`)."""
+
+    def put_nowait(self, item) -> None:
+        pass
+
+
 # Open WebUI's uvicorn Server, kept while it serves (see `owui_shutting_down`).
 _UVICORN_SERVER = None
 
@@ -6921,7 +6935,8 @@ class _GatewayConnection:
                 self.row_to_consumers(key, payload)
         if key and payload.get("phase") == "message":
             # A stored message was rewritten, not appended: no `session.message`
-            # follows (2026.10.5+, server-session-events historyReset branch).
+            # follows (server-session-events: an update with no message from
+            # 2026.9.3 on, also a projected one that needs a reset from 2026.10.5).
             self._wake_message_waiter(key)
         parent = payload.get("spawnedBy") or payload.get("parentSessionKey")
         if parent and parent != key:
@@ -7651,6 +7666,15 @@ class _GatewayConnection:
             return False
         consumer.started = True
         consumer.ended = consumer.ended or terminal
+        if consumer.ended and _discards(consumer):
+            # Nothing shows the rest of its run (`_steer_handed_over`): its end lets it go,
+            # and a late event of it (its `chat` final after the lifecycle end) opens nothing.
+            self.mark_delivered_live(consumer.session_key, consumer.run_id)
+            self.unregister_run_target(consumer.session_key, consumer.run_id)
+            self._consumers.pop(f"{consumer.session_key}:{consumer.run_id}", None)
+            self._wake_session_waiters(consumer.session_key)
+            self._close_if_retired_and_idle()
+            return False
         return True
 
     def _on_user_message_committed(self, session_key: str, message: dict) -> None:
@@ -7663,11 +7687,30 @@ class _GatewayConnection:
         if not (message.get("role") == "user" and idem.endswith(":user")
                 and steers_mid_run_messages(self.gateway_version)):
             return
-        consumer = self._consumers.get(f"{session_key}:{idem[:-len(':user')]}")
+        run_id = idem[:-len(":user")]
+        consumer = self._consumers.get(f"{session_key}:{run_id}")
         if consumer is not None and not (consumer.started or consumer.steered):
             self._steer(consumer)
+        elif consumer is None and (handed := self._steer_handed_over(session_key, run_id)) is not None:
+            # Only into the run the Gateway names: one it queued instead is
+            # committed when its own run starts, while another may work.
+            into = (message.get("__openclaw") or {}).get("steerTargetRunId")
+            if into:
+                self._steer(handed, into=into)
 
-    def _steer(self, consumer: _Consumer) -> bool:
+    def _steer_handed_over(self, session_key: str, run_id: str) -> _Consumer | None:
+        """The steer target of a message whose reply a turn writer took over
+        while it waited to be steered (a later message's Send now cancelled
+        its request, Eliav's chat c9dc45f0): the run's events stop reaching
+        its earlier reply at the commit and go nowhere until the next steer
+        (`_DiscardQueue`); both writers end from the transcript, split there.
+        None when no such writer waits."""
+        pump = getattr(self, "_turn_pumps", {}).get((session_key, run_id))
+        if pump is None or pump.started or not (pump.handover or {}).get("steer_pending"):
+            return None
+        return _Consumer(session_key=session_key, run_id=run_id, queues=[_DiscardQueue()])
+
+    def _steer(self, consumer: _Consumer, into: str | None = None) -> bool:
         """Switch the session's active run to the reply of `consumer`'s
         message, which the Gateway steered into it: from here, in dispatch
         order, its events go to that reply. What it sent before belongs to the
@@ -7675,7 +7718,8 @@ class _GatewayConnection:
         ends, a turn writer gets `("steered", future)` behind the events it
         still writes and ends there. The steered reply gets `_steered`: the run
         to continue and its dedup baselines (a dict, or that future). False
-        when the session has no single active run to take."""
+        when the session has no single active run to take, or (`into`) not
+        that one."""
         sess = consumer.session_key
         active = [c for c in self._consumers.values()
                   if c.session_key == sess and c is not consumer and c.started
@@ -7684,6 +7728,8 @@ class _GatewayConnection:
                  if s == sess and pump.started and not pump.wake and not pump.terminal.is_set()]
         if len(active) == 1:
             run = active[0]
+            if into and run.run_id != into:
+                return False
             earlier = self._run_targets.get(f"{sess}:{run.run_id}")
             earlier = earlier and {k: earlier.get(k) for k in ("chat_id", "message_id", "request_task_id")} | {
                 "span_run": earlier.get("span_run") or run.run_id, "before": earlier.get("before") or []}
@@ -7696,11 +7742,19 @@ class _GatewayConnection:
             run_id = run.run_id
         elif not active and len(pumps) == 1:
             run_id, pump = pumps[0]
+            if into and run_id != into:
+                return False
             writer = pump.writer
             earlier = writer and {"chat_id": writer.chat_id, "message_id": writer.message_id,
                                   "request_task_id": None, "span_run": run_id}
             run_text = asyncio.get_running_loop().create_future()
-            pump.queue.put_nowait(("steered", run_text))
+            if not _discards(consumer):
+                pump.queue.put_nowait(("steered", run_text))
+            # Else (`_steer_handed_over`) the writer keeps M open: the run's
+            # events stop reaching it, and it ends when the session settles,
+            # from the transcript, which splits the run where it took the
+            # message in. Ended here, it would keep only what it streamed, which
+            # misses what an event gap (a socket drop) lost.
             self._consumers[f"{sess}:{run_id}"] = _Consumer(
                 session_key=sess, run_id=run_id, queues=list(consumer.queues), started=True)
         else:
@@ -7733,14 +7787,15 @@ class _GatewayConnection:
                               max_chars: int = RECOVERY_HISTORY_MAX_CHARS,
                               timeout: float = 10) -> dict:
         """Fetch the session's recent messages unclipped, with each turn in
-        the role the transcript holds (`_transcript_roles`)."""
+        the role the transcript holds (`_transcript_roles`) and each message
+        steered into a run where the run took it in (`_transcript_commit_order`)."""
         hist = await self.send_request(
             "chat.history",
             dict(sessionKey=session_key, limit=limit, maxChars=max_chars),
             timeout=timeout
         )
         if isinstance(hist, dict) and isinstance(hist.get("messages"), list):
-            hist["messages"] = _transcript_roles(hist["messages"])
+            hist["messages"] = _transcript_commit_order(_transcript_roles(hist["messages"]))
         return hist
 
     async def abort(self, session_key: str, run_id: str):
@@ -8844,6 +8899,62 @@ def _transcript_roles(messages: list) -> list:
     claude-cli run was rebuilt from the transcript, and the run it started
     was not found (GH #24, OpenClaw 2026.10.2+). Other messages are kept."""
     return [{**m, "role": "user"} if _is_forwarded_turn(m) else m for m in messages]
+
+
+def _transcript_commit_order(messages: list) -> list:
+    """`chat.history` messages with each sent user message where its run
+    took it in. The Gateway stores a message when it is sent, but on
+    claude-cli a running run takes a steered one in at a tool boundary, and a
+    queued one runs after it, while the messages Claude Code wrote meanwhile
+    carry their own, later times and sort after it: Eliav's chat c9dc45f0,
+    where "21-40", written during the pause a message was sent in, read as
+    that message's answer. Its commit time (`recordTimestampMs`) is the
+    boundary: it goes past the messages stamped before then, but not past a
+    sent message committed with it, which was sent after it; the copy of it
+    Claude Code wrote (the last one with its text there) stays right after
+    it. From the last one back, so one moved past is already in its own place."""
+    out = list(messages)
+    for message in reversed([m for m in messages if _committed_after_sent(m) is not None]):
+        at = out.index(message)
+        committed = _committed_after_sent(message)
+        end = at + 1
+        while end < len(out) and _commit_ms(out[end]) is not None and (
+                _commit_ms(out[end]) < committed
+                or (_commit_ms(out[end]) == committed and not _history_user_run_id(out[end]))):
+            end += 1
+        own = [i for i in range(at + 1, end) if _copy_of(out[i], message)]
+        end = own[-1] if own else end
+        out.insert(end - 1, out.pop(at))
+    return out
+
+
+def _commit_ms(message) -> float | None:
+    """When `message` joined the run: a sent message's commit, else its time."""
+    if not isinstance(message, dict):
+        return None
+    committed = _committed_after_sent(message)
+    at = message.get("timestamp")
+    return committed if committed is not None else (at if isinstance(at, (int, float)) else None)
+
+
+def _committed_after_sent(message) -> float | None:
+    """When the Gateway committed a message a `chat.send` stored on its
+    arrival, if later (`recordTimestampMs`); else None."""
+    if not _history_user_run_id(message):
+        return None
+    committed, sent = (message.get("__openclaw") or {}).get("recordTimestampMs"), message.get("timestamp")
+    if not isinstance(committed, (int, float)) or not isinstance(sent, (int, float)) or committed <= sent:
+        return None
+    return committed
+
+
+def _copy_of(message, sent: dict) -> bool:
+    """`message` is the copy of `sent` a CLI runtime imports (its own text
+    after the context the Gateway adds)."""
+    if not isinstance(message, dict) or message.get("role") != "user" or _history_user_run_id(message):
+        return False
+    text = (_history_item(sent) or {}).get("text", "").strip()
+    return bool(text) and (_history_item(message) or {}).get("text", "").strip().endswith(text)
 
 
 def _history_user_run_id(message) -> str | None:

@@ -763,6 +763,71 @@ def test_no_tool_runs_after_the_run_is_aborted(token):
     assert refused, f"the call after the abort was not refused: {got}"
 
 
+@pytest.mark.skipif(not _steers_mid_run_messages(), reason="the Gateway runs a mid-run message after the run")
+def test_a_steered_message_splits_the_run_where_claude_code_took_it_in(token):
+    """Eliav's chat c9dc45f0, test 2: "say tomato" was sent while a claude-cli
+    turn ran, and Claude Code took it in only at its next tool boundary, after
+    writing more text. "say blue" followed, and its Send now cancelled
+    tomato's request, so a turn writer had tomato's reply. The first reply
+    showed the whole run, tomato's answer included, and tomato's reply the
+    text written in between. Each reply holds its own part: the run up to
+    where Claude Code took the message in, and each answer under its message.
+    e2e/fake_claude.py writes `E2E_LATE_PART_2` between the send and the
+    boundary."""
+    logs = os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"])
+    log = os.path.join(logs, "fake-claude.log")
+    chat_id, first = _chat_turn(token, "Respond with exactly: E2E_CLI_CHAT", model=CLI_MODEL)
+    assert first["content"].strip() == "E2E_CLI_REPLY", first["content"]
+    word = f"late{uuid.uuid4().hex[:8]}"
+    go = os.path.join(logs, f"go-{word}")
+    page = _Page(token)
+    page.join(chat_id)
+    held = _post_turn(token, chat_id, f"E2E_CLI_LATE_STEER {word}", model=CLI_MODEL)
+
+    def logged(line):
+        return os.path.exists(log) and line in open(log, encoding="utf-8").read()
+    try:
+        # Sent once the reply shows the run, as Eliav did: before that, the run
+        # a Send now hands over has shown nothing, and the message queues.
+        _until("the running reply showing the run",
+               lambda: "E2E_LATE_PART_1" in _output_text(page.streamed(held)), timeout_s=60, every_s=0.2)
+        # What Send now does: Open WebUI cancels the running reply, then sends.
+        _request("POST", f"/api/tasks/chat/{chat_id}/stop", token=token)
+        tomato = _post_turn(token, chat_id, f"say tomato-{word}", model=CLI_MODEL)
+        _until("Claude Code past the send, at its next boundary", lambda: logged(f"boundary {word}"),
+               timeout_s=60, every_s=0.2)
+        _request("POST", f"/api/tasks/chat/{chat_id}/stop", token=token)
+        blue = _post_turn(token, chat_id, f"say blue-{word}", model=CLI_MODEL)
+        _until("the blue message sent into the turn", lambda: STEER_PENDING in json.dumps(
+            _chat_messages(token, chat_id)[blue].get("statusHistory")), timeout_s=60, every_s=0.2)
+        open(go, "w").close()
+        _until("all three replies done", lambda: all(
+            _chat_messages(token, chat_id)[r].get("done") for r in (held, tomato, blue)))
+        def settled():
+            msgs = _chat_messages(token, chat_id)
+            return (f"tomato-{word}" in msgs[tomato].get("content", "")
+                    and "E2E_LATE_PART_2" in msgs[held].get("content", ""))
+        try:
+            _until("each reply holding its own part", settled, timeout_s=60)
+        except pytest.fail.Exception:
+            pass  # the asserts below say what each reply shows
+    finally:
+        open(go, "w").close()
+        page.close()
+    msgs = _chat_messages(token, chat_id)
+    shown = {r: msgs[r].get("content", "") for r in (held, tomato, blue)}
+    assert shown[held].split() == ["E2E_LATE_PART_1", "E2E_LATE_PART_2"], shown
+    assert "STEERED" not in shown[held], shown
+    assert shown[tomato].strip().startswith("E2E_CLI_STEERED:") and f"tomato-{word}" in shown[tomato], shown
+    assert "E2E_LATE_PART" not in shown[tomato], shown
+    # The Gateway may steer "say blue" in after the tomato answer (c9dc45f0)
+    # or run it after the run: an answer of its own, either way, never only
+    # a note that it went elsewhere (review on #290).
+    assert shown[blue].strip() == "E2E_CLI_REPLY" or (
+        shown[blue].strip().startswith("E2E_CLI_STEERED:") and f"blue-{word}" in shown[blue]), shown
+    os.remove(go)
+
+
 def test_messages_waiting_behind_a_run_go_to_the_agent_as_one_turn(token):
     """Three messages sent by a client with no page while a reply runs: no
     Send now cancels them, so they wait behind the run in the Pipe. Once it
