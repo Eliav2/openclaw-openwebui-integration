@@ -17035,11 +17035,12 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
             payload["message"] = {"role": "assistant", "content": [{"type": "text", "text": text}]}
         return {"type": "event", "event": "chat", "payload": payload}
 
-    def _commit(self, run_id, text="aside"):
-        """The `session.message` that commits a message sent as `run_id`."""
+    def _commit(self, run_id, text="aside", into=None):
+        """The `session.message` that commits a message sent as `run_id`;
+        `into`: the run the Gateway steered it into (`steerTargetRunId`)."""
+        meta = {"idempotencyKey": f"{run_id}:user"} | ({"steerTargetRunId": into} if into else {})
         return {"type": "event", "event": "session.message", "payload": {
-            "sessionKey": self.SK, "message": {"role": "user", "content": text,
-                                               "__openclaw": {"idempotencyKey": f"{run_id}:user"}}}}
+            "sessionKey": self.SK, "message": {"role": "user", "content": text, "__openclaw": meta}}}
 
     async def _dispatch(self, *msgs):
         for msg in msgs:
@@ -17233,7 +17234,7 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         conn._turn_pumps[(sk, self.R2)] = tomato
         q3 = conn.register_consumer(sk, self.R3)
 
-        conn._on_session_message(self._commit(self.R2, "say tomato")["payload"])
+        conn._on_session_message(self._commit(self.R2, "say tomato", into=self.R1)["payload"])
         self.assertTrue(host.queue.empty(), "the first reply ends from the transcript, not here")
         with mock.patch.object(openclaw_pipe, "_turn_pump_loop", mock.AsyncMock()) as loop:
             await conn._dispatch_run_event(self._delta(self.R1, "tomato"))
@@ -17265,7 +17266,7 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         tomato.handover = {"message_id": "w2", "steer_pending": True,
                            "renderer": types.SimpleNamespace(received="", output=None)}
         conn._turn_pumps[(sk, self.R2)] = tomato
-        conn._on_session_message(self._commit(self.R2, "say tomato")["payload"])
+        conn._on_session_message(self._commit(self.R2, "say tomato", into=self.R1)["payload"])
         self.assertTrue(conn.has_reply(sk), "the run still works")
         await conn._dispatch_run_event(self._lifecycle(self.R1, "end"))
         self.assertNotIn(f"{sk}:{self.R1}", conn._consumers)
@@ -17279,6 +17280,26 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         loop.assert_not_called()
         self.assertTrue(host.queue.empty())
 
+    async def test_a_handed_over_message_the_gateway_did_not_steer_takes_no_run(self):
+        """Review on #290: a handed-over message the Gateway queued instead
+        (committed when its own run starts) cut whatever run was active. The
+        Gateway names the run it steered a message into (`steerTargetRunId`);
+        only that run is taken."""
+        self.conn.gateway_version = "2026.10.10"
+        conn, sk = self.conn, self.SK
+        host = openclaw_pipe._RunPump()
+        host.started = True
+        conn._turn_pumps[(sk, self.R1)] = host
+        waiting = openclaw_pipe._RunPump()
+        waiting.handover = {"message_id": "w2", "steer_pending": True,
+                            "renderer": types.SimpleNamespace(received="", output=None)}
+        conn._turn_pumps[(sk, self.R2)] = waiting
+        for into in (None, self.R3):
+            conn._on_session_message(self._commit(self.R2, "say tomato", into=into)["payload"])
+            self.assertNotIn(f"{sk}:{self.R1}", conn._consumers, f"steered into {into}: the active run is not taken")
+        conn._on_session_message(self._commit(self.R2, "say tomato", into=self.R1)["payload"])
+        self.assertIn(f"{sk}:{self.R1}", conn._consumers)
+
     async def test_a_retired_connection_closes_when_such_a_run_ends(self):
         """Review on #290: letting the run go was the connection's last
         work, so a retired connection closes then, as on every other removal."""
@@ -17291,7 +17312,7 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         tomato.handover = {"message_id": "w2", "steer_pending": True,
                            "renderer": types.SimpleNamespace(received="", output=None)}
         conn._turn_pumps[(sk, self.R2)] = tomato
-        conn._on_session_message(self._commit(self.R2, "say tomato")["payload"])
+        conn._on_session_message(self._commit(self.R2, "say tomato", into=self.R1)["payload"])
         conn._retired = True
         with mock.patch.object(conn, "disconnect", mock.AsyncMock()) as disconnect:
             await conn._dispatch_run_event(self._lifecycle(self.R1, "end"))

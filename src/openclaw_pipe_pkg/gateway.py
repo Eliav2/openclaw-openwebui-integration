@@ -3011,9 +3011,15 @@ class _GatewayConnection:
                 and steers_mid_run_messages(self.gateway_version)):
             return
         run_id = idem[:-len(":user")]
-        consumer = self._consumers.get(f"{session_key}:{run_id}") or self._steer_handed_over(session_key, run_id)
+        consumer = self._consumers.get(f"{session_key}:{run_id}")
         if consumer is not None and not (consumer.started or consumer.steered):
             self._steer(consumer)
+        elif consumer is None and (handed := self._steer_handed_over(session_key, run_id)) is not None:
+            # Only into the run the Gateway names: one it queued instead is
+            # committed when its own run starts, while another may work.
+            into = (message.get("__openclaw") or {}).get("steerTargetRunId")
+            if into:
+                self._steer(handed, into=into)
 
     def _steer_handed_over(self, session_key: str, run_id: str) -> _Consumer | None:
         """The steer target of a message whose reply a turn writer took over
@@ -3027,7 +3033,7 @@ class _GatewayConnection:
             return None
         return _Consumer(session_key=session_key, run_id=run_id, queues=[_DiscardQueue()])
 
-    def _steer(self, consumer: _Consumer) -> bool:
+    def _steer(self, consumer: _Consumer, into: str | None = None) -> bool:
         """Switch the session's active run to the reply of `consumer`'s
         message, which the Gateway steered into it: from here, in dispatch
         order, its events go to that reply. What it sent before belongs to the
@@ -3035,7 +3041,8 @@ class _GatewayConnection:
         ends, a turn writer gets `("steered", future)` behind the events it
         still writes and ends there. The steered reply gets `_steered`: the run
         to continue and its dedup baselines (a dict, or that future). False
-        when the session has no single active run to take."""
+        when the session has no single active run to take, or (`into`) not
+        that one."""
         sess = consumer.session_key
         active = [c for c in self._consumers.values()
                   if c.session_key == sess and c is not consumer and c.started
@@ -3044,6 +3051,8 @@ class _GatewayConnection:
                  if s == sess and pump.started and not pump.wake and not pump.terminal.is_set()]
         if len(active) == 1:
             run = active[0]
+            if into and run.run_id != into:
+                return False
             earlier = self._run_targets.get(f"{sess}:{run.run_id}")
             earlier = earlier and {k: earlier.get(k) for k in ("chat_id", "message_id", "request_task_id")} | {
                 "span_run": earlier.get("span_run") or run.run_id, "before": earlier.get("before") or []}
@@ -3056,6 +3065,8 @@ class _GatewayConnection:
             run_id = run.run_id
         elif not active and len(pumps) == 1:
             run_id, pump = pumps[0]
+            if into and run_id != into:
+                return False
             writer = pump.writer
             earlier = writer and {"chat_id": writer.chat_id, "message_id": writer.message_id,
                                   "request_task_id": None, "span_run": run_id}

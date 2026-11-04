@@ -821,8 +821,10 @@ def test_a_steered_message_splits_the_run_where_claude_code_took_it_in(token):
     assert shown[tomato].strip().startswith("E2E_CLI_STEERED:") and f"tomato-{word}" in shown[tomato], shown
     assert "E2E_LATE_PART" not in shown[tomato], shown
     # The Gateway may steer "say blue" in after the tomato answer (c9dc45f0)
-    # or run it after the run: an answer of its own, either way.
-    assert "tomato" not in shown[blue] and "E2E_LATE_PART" not in shown[blue] and shown[blue].strip(), shown
+    # or run it after the run: an answer of its own, either way, never only
+    # a note that it went elsewhere (review on #290).
+    assert shown[blue].strip() == "E2E_CLI_REPLY" or (
+        shown[blue].strip().startswith("E2E_CLI_STEERED:") and f"blue-{word}" in shown[blue]), shown
     os.remove(go)
 
 
