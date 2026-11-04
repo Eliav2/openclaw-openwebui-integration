@@ -6348,8 +6348,11 @@ class _Consumer:
     started: bool = False
     ended: bool = False    # its terminal event came
     # Its message was steered into another run of the session (`_steer`):
-    # its own events (the lone final) are dropped here.
+    # its own events (the lone final) are dropped here. It is no reply of its
+    # own, and goes with the run it was steered into (`steered_into`): a
+    # socket drop can lose its lone final.
     steered: bool = False
+    steered_into: str = ""
 
 
 # The turn writer's entry points (writer.py's `_TurnHooks`), which the Pipe
@@ -7293,6 +7296,9 @@ class _GatewayConnection:
                 pass
         if not consumer.queues or queue is None:
             del self._consumers[key]
+            for other in [k for k, c in self._consumers.items()
+                          if c.session_key == session_key and c.steered and c.steered_into == run_id]:
+                del self._consumers[other]
             self._release_held(session_key)
             # Its run may never have started (`has_reply`): waiters re-read.
             self._wake_session_waiters(session_key)
@@ -7304,12 +7310,14 @@ class _GatewayConnection:
         Its consumer is registered before its chat.send, so this holds while
         the Gateway has no run for it yet (ELI-260); its end wakes the
         session's `session_change_event`."""
-        return any(c.session_key == session_key for c in self._consumers.values())
+        return any(c.session_key == session_key and not getattr(c, "steered", False)
+                   for c in self._consumers.values())
 
     def _serving(self) -> bool:
         """Work a retired connection still owes: replies streaming here, and
         messages waiting here to send (ELI-172)."""
-        return bool(self._consumers or self._open_send_sections)
+        return (any(not getattr(c, "steered", False) for c in self._consumers.values())
+                or bool(self._open_send_sections))
 
     def _close_if_retired_and_idle(self) -> None:
         if self._retired and not self._serving():
@@ -7581,7 +7589,7 @@ class _GatewayConnection:
             run_text = ({"received": shadow.received, "stream": shadow.received,
                          "item": shadow.last_item} if shadow is not None else None)
             for q in run.queues:
-                q.put_nowait({"type": _STEERED_MARKER_TYPE, "into": consumer.run_id})
+                q.put_control({"type": _STEERED_MARKER_TYPE, "into": consumer.run_id})
             run.queues = list(consumer.queues)
             run_id = run.run_id
         elif not active and len(pumps) == 1:
@@ -7595,9 +7603,9 @@ class _GatewayConnection:
                 session_key=sess, run_id=run_id, queues=list(consumer.queues), started=True)
         else:
             return False
-        consumer.steered = True
+        consumer.steered, consumer.steered_into = True, run_id
         for q in consumer.queues:
-            q.put_nowait({"type": _STEERED_MARKER_TYPE, "_steered": {
+            q.put_control({"type": _STEERED_MARKER_TYPE, "_steered": {
                 "run": run_id, "run_text": run_text, "earlier": earlier}})
         pipe_log(f"  run {consumer.run_id[:24]}... steered into {run_id[:24]}...; "
                  "its reply continues that run")
@@ -9666,9 +9674,11 @@ async def _settle_steered_replies(conn: "_GatewayConnection", session_key: str, 
         if not _settle_misplaced([_settle_text(t) for t in texts], [_settle_text(p.text) for p in parts]):
             return
         user_id = (conn.parse_owui_session_key(session_key) or (None, None))[0]
-        for ref, part, was in zip(refs, parts, texts):
+        for ref, part, was, message in zip(refs, parts, texts, saved):
             if _settle_text(was) == _settle_text(part.text):
                 continue
+            # The Pipe's own notes are in no transcript (ELI-229).
+            _keep_pipe_notes(list(message.get("output") or []), part)
             text, output = part.text.strip(), part.finished_output()
             async with conn._chat_write_lock(ref["chat_id"]):
                 await _owui_upsert_message(ref["chat_id"], ref["message_id"],
@@ -10598,7 +10608,8 @@ class _TurnWriter:
                 if rebuilt is not None:
                     self.renderer = rebuilt
                 self.renderer.flush()
-                if hist and _history_steered_host(hist, self.run_id) is not None:
+                if (hist and steers_mid_run_messages(self.conn.gateway_version)
+                        and _history_steered_host(hist, self.run_id) is not None):
                     # Also when its lone final came after the settle.
                     self.steered_message = True
                 if self.steered_message and not self._showable():
@@ -11829,11 +11840,7 @@ def _history_steered_into(history: dict, index: int) -> str | None:
     other such messages and no other run's closing message between."""
     messages = (history or {}).get("messages") or []
     own = _history_user_run_id(messages[index]) if 0 <= index < len(messages) else None
-    if not own or _history_ran(history, own) or _cron_turn_job(messages[index]):
-        # A cron wake's prompt is not one: on 2026.10.10 a wake fired while a
-        # claude-cli run works runs after it, as a run of its own, and its
-        # prompt carries the time it fired, so it sorts between that run's
-        # imported messages (live gate two-wakes, chat d51a3a0a).
+    if not own or _history_ran(history, own) or _history_wake_prompt(messages[index]):
         return None
     for k in range(index - 1, -1, -1):
         m = messages[k]
@@ -11846,6 +11853,22 @@ def _history_steered_into(history: dict, index: int) -> str | None:
         if isinstance(m, dict) and m.get("role") == "user" and not _history_imported_copy(messages, k):
             return None
     return None
+
+
+def _history_wake_prompt(message: dict) -> bool:
+    """A cron wake's prompt, which is never steered: on 2026.10.10 a wake
+    fired while a claude-cli run works runs after it, as a run of its own,
+    and its prompt carries the time it fired, so it sorts between that run's
+    imported messages (live gate two-wakes, chat d51a3a0a). A message the
+    Pipe sent is never one, whatever its text (as in `wake_turns`)."""
+    own = _history_user_run_id(message)
+    return bool(own) and not parse_pipe_run_id(own) and bool(_cron_turn_job(message))
+
+
+def _history_next_turn(message: dict) -> bool:
+    """A user message that ends a steered message's answer: a later send,
+    not a wake's prompt stored while the run works."""
+    return bool(_history_user_run_id(message)) and not _history_wake_prompt(message)
 
 
 def _history_steered_host(history: dict, run_id: str) -> str | None:
@@ -11870,7 +11893,7 @@ def _history_steered_answer_pending(history: dict, run_id: str, uncommitted: boo
         return uncommitted
     if _history_steered_host(history, run_id) is None:
         return False
-    if any(_history_user_run_id(m) for m in messages[start + 1:]):
+    if any(_history_next_turn(m) for m in messages[start + 1:]):
         return False
     return _history_steered_span(history, run_id) is None
 
@@ -11892,10 +11915,10 @@ def _history_steered_span(history: dict, run_id: str) -> list | None:
     closers = [n for n in range(start + 1, len(messages)) if _run_closed_by(messages[n]) == host]
     if not closers:
         return None
-    end = next((n for n in range(start + 1, len(messages)) if _history_user_run_id(messages[n])),
+    end = next((n for n in range(start + 1, len(messages)) if _history_next_turn(messages[n])),
                len(messages))
     last = max((n for n in closers if n < end), default=end - 1)
-    span = messages[start + 1:min(end, last + 1)]
+    span = [m for m in messages[start + 1:min(end, last + 1)] if not _history_wake_prompt(m)]
     own = [m for m in span if not any(k.startswith("cli-assistant:") for k in _idempotency_keys(m))]
     # The closing copy takes the place of Claude Code's own record of the
     # answer when their texts match (cli-session-history mergeCliHistoryRow).

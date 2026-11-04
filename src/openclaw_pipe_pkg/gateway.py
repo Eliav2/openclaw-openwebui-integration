@@ -1683,8 +1683,11 @@ class _Consumer:
     started: bool = False
     ended: bool = False    # its terminal event came
     # Its message was steered into another run of the session (`_steer`):
-    # its own events (the lone final) are dropped here.
+    # its own events (the lone final) are dropped here. It is no reply of its
+    # own, and goes with the run it was steered into (`steered_into`): a
+    # socket drop can lose its lone final.
     steered: bool = False
+    steered_into: str = ""
 
 
 # The turn writer's entry points (writer.py's `_TurnHooks`), which the Pipe
@@ -2628,6 +2631,9 @@ class _GatewayConnection:
                 pass
         if not consumer.queues or queue is None:
             del self._consumers[key]
+            for other in [k for k, c in self._consumers.items()
+                          if c.session_key == session_key and c.steered and c.steered_into == run_id]:
+                del self._consumers[other]
             self._release_held(session_key)
             # Its run may never have started (`has_reply`): waiters re-read.
             self._wake_session_waiters(session_key)
@@ -2639,12 +2645,14 @@ class _GatewayConnection:
         Its consumer is registered before its chat.send, so this holds while
         the Gateway has no run for it yet (ELI-260); its end wakes the
         session's `session_change_event`."""
-        return any(c.session_key == session_key for c in self._consumers.values())
+        return any(c.session_key == session_key and not getattr(c, "steered", False)
+                   for c in self._consumers.values())
 
     def _serving(self) -> bool:
         """Work a retired connection still owes: replies streaming here, and
         messages waiting here to send (ELI-172)."""
-        return bool(self._consumers or self._open_send_sections)
+        return (any(not getattr(c, "steered", False) for c in self._consumers.values())
+                or bool(self._open_send_sections))
 
     def _close_if_retired_and_idle(self) -> None:
         if self._retired and not self._serving():
@@ -2916,7 +2924,7 @@ class _GatewayConnection:
             run_text = ({"received": shadow.received, "stream": shadow.received,
                          "item": shadow.last_item} if shadow is not None else None)
             for q in run.queues:
-                q.put_nowait({"type": _STEERED_MARKER_TYPE, "into": consumer.run_id})
+                q.put_control({"type": _STEERED_MARKER_TYPE, "into": consumer.run_id})
             run.queues = list(consumer.queues)
             run_id = run.run_id
         elif not active and len(pumps) == 1:
@@ -2930,9 +2938,9 @@ class _GatewayConnection:
                 session_key=sess, run_id=run_id, queues=list(consumer.queues), started=True)
         else:
             return False
-        consumer.steered = True
+        consumer.steered, consumer.steered_into = True, run_id
         for q in consumer.queues:
-            q.put_nowait({"type": _STEERED_MARKER_TYPE, "_steered": {
+            q.put_control({"type": _STEERED_MARKER_TYPE, "_steered": {
                 "run": run_id, "run_text": run_text, "earlier": earlier}})
         pipe_log(f"  run {consumer.run_id[:24]}... steered into {run_id[:24]}...; "
                  "its reply continues that run")

@@ -31,9 +31,9 @@ Valves: [`GATEWAY_URL`](../configuration.md#gateway_url), [`GATEWAY_TOKEN`](../c
 
 ## Messages sent while the agent works
 
-Send a message while the agent is working, even in the middle of a long tool call, and it is in the chat at once. The tool is not interrupted and the run is not stopped: it finishes in its own reply, with its tool card running until the tool really ends, then the agent answers your message in a reply of its own. What you do not get is a blank reply, which is what the naive implementation produces.
+Send a message while the agent is working, even in the middle of a long tool call, and it is in the chat at once. The tool is not interrupted and the run is not stopped. What you do not get is a blank reply, which is what the naive implementation produces. On OpenClaw 2026.10.10 and later a text message is steered into the run (below). On older Gateways, and for a message with images or files, the run finishes in its own reply, with its tool card running until the tool really ends, then the agent answers your message in a reply of its own.
 
-<img src="../img/demos/sent-mid-run.gif" alt="A second message sent while the cache refresh runs: it is in the chat at once, the refresh finishes in its own reply, then the new message gets its own answer" width="800">
+<img src="../img/demos/sent-mid-run.gif" alt="On a Gateway before OpenClaw 2026.10.10: a second message sent while the cache refresh runs is in the chat at once, the refresh finishes in its own reply, then the new message gets its own answer" width="800">
 
 Left alone, Open WebUI would hold the message in a queue above the composer until the reply ends, and send it only when you click its Send now arrow. With [`AUTO_SEND_WHILE_RUNNING`](../configuration.md#auto_send_while_running) on (the default), the Pipe clicks it for you in OpenClaw chats as soon as the message is queued, and the click goes through [Send now](#send-now), which keeps the run. Turn the valve off to get Open WebUI's queue back. Open WebUI's own **Settings > Interface > Enable Message Queue** switch, when off, also sends at once, the same way.
 
