@@ -8,6 +8,8 @@
 pydantic==2.13.4
 cryptography==48.0.1
 websockets==16.0
+# The Web Push function's own requirement (push/openclaw_web_push.py frontmatter).
+pywebpush==2.0.3
 
 pytest==9.2.0
 pytest-cov==7.1.0

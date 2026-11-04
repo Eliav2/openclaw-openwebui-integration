@@ -1,0 +1,127 @@
+# Push notifications
+
+Web Push sends a notification to your phone or computer when a reply finishes, also when Open WebUI is closed. It shows the chat's title and opens the chat on a tap. The reply itself never leaves your server.
+
+Applies to: Web Push function, Pipe
+
+Valves: the function's own (below), and the Pipe's [`PUBLISH_CHAT_FINISHED`](../configuration.md#publish_chat_finished)
+
+It has three parts, all in [`push/`](https://github.com/Eliav2/openclaw-openwebui-integration/tree/main/push):
+
+- **The Web Push function** (`push/openclaw_web_push.py`): an Open WebUI event function. On each `chat.finished` it sends a push to each of the user's devices.
+- **The service worker** (`push/web/oc-sw.js`), served at `/oc-sw.js`: it receives the push and shows the notification.
+- **The page script** (`push/web/oc-push.js`), served as `/static/loader.js`: it registers the service worker, offers "Enable notifications", and saves each device's subscription.
+
+Open WebUI loads `/static/loader.js` on every page, but it rebuilds `/static` on every start, so both scripts are served by the proxy in front of Open WebUI: a [Cloudflare Worker](#serve-the-scripts-with-a-cloudflare-worker) or [nginx](#serve-the-scripts-with-nginx). Nothing else in Open WebUI changes.
+
+## What you need
+
+- Open WebUI on HTTPS (browsers allow service workers only there, or on `localhost`).
+- A proxy in front of it where you can serve two paths.
+- Outbound HTTPS from the Open WebUI container to the push services (`fcm.googleapis.com`, `web.push.apple.com`, `updates.push.services.mozilla.com`).
+- On iPhone and iPad, iOS 16.4 or later, with Open WebUI added to the Home Screen. Safari tabs get no Web Push.
+
+## 1. Make a VAPID key pair
+
+The push services check each push against this key pair. Make it once, where Open WebUI can read the private key, for example in its data volume:
+
+```bash
+mkdir -p <data volume>/web-push
+openssl ecparam -name prime256v1 -genkey -noout -out <data volume>/web-push/vapid_private.pem
+openssl ec -in <data volume>/web-push/vapid_private.pem -pubout -outform DER | tail -c 65 | base64 | tr '/+' '_-' | tr -d '=\n'
+```
+
+The last command prints the public key (87 characters). The public key is not a secret: the page script gets it. Keep a backup of the private key; a new one makes every device subscribe again.
+
+The private key stays in a file, not in a valve: Open WebUI stores valves unencrypted unless `ENABLE_VALVE_ENCRYPTION` is on.
+
+## 2. Install the function
+
+In **Admin Panel > Functions**, add a function with the content of `push/openclaw_web_push.py`, id `openclaw_web_push`, and turn it on. Open WebUI installs its one requirement, `pywebpush`, on the first load (unless `ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS` is off; then install it into the container yourself).
+
+Its valves:
+
+| Valve | Default | What it does |
+|---|---|---|
+| `VAPID_PRIVATE_KEY_FILE` | `$DATA_DIR/web-push/vapid_private.pem` (`/app/backend/data/web-push/vapid_private.pem` in the image) | The private key, as the container sees it. |
+| `VAPID_SUBJECT` | Open WebUI's `WEBUI_URL` | A `mailto:` or `https:` contact for the push services. Apple rejects pushes without a real one. |
+| `TTL_SECONDS` | `3600` | How long a push service keeps a notification for a device that is offline. |
+| `URGENCY` | `normal` | RFC 8030 urgency: `very-low`, `low`, `normal` or `high`. |
+| `PIPE_MODEL_PREFIXES` | `openclaw_gateway.` | Models served by the OpenClaw Pipe (its function id and a dot). For these only the Pipe's own `chat.finished` is sent; see below. |
+
+## 3. Turn on the Pipe's event
+
+Open WebUI's own `chat.finished` fires when the chat request ends. For OpenClaw that misses the replies the agent starts (cron, `sessions_send`, sub-agent results) and fires too early for a reply that outlives its request. Turn on the Pipe's [`PUBLISH_CHAT_FINISHED`](../configuration.md#publish_chat_finished): the Pipe then publishes its own `chat.finished` once each reply is saved (see [Telling other functions a reply finished](../features/agent-turns.md#telling-other-functions-a-reply-finished)), and the function sends that one for OpenClaw models. Other models need nothing: Open WebUI's own event is right for them.
+
+## 4. Serve the two scripts
+
+The page script has two placeholders to replace: `__VAPID_PUBLIC_KEY__` (the public key from step 1) and `__FUNCTION_ID__` (`openclaw_web_push`).
+
+### Serve the scripts with a Cloudflare Worker
+
+`push/examples/cloudflare-worker/` is a Worker for exactly two routes of your Open WebUI hostname: `/oc-sw.js`, which it serves itself, and `/static/loader.js`, which it fetches from Open WebUI and appends the page script to. It never runs on `/api`, `/ws` or `/_app`.
+
+```bash
+cd push/examples/cloudflare-worker
+cp wrangler.example.jsonc wrangler.jsonc   # your hostname, zone, public key and function id
+npx wrangler deploy
+```
+
+The API token needs Workers Scripts: Edit (account) and Workers Routes: Edit (zone).
+
+Behind Cloudflare Access, add a second Access application with a **Bypass** policy for `/oc-sw.js` and the icons (`/static/favicon.png`, `/static/logo.png`, `/static/apple-touch-icon.png`, `/static/web-app-manifest-*.png`). The browser checks for a new service worker without your Access session, and iOS fetches the Home Screen icon without it. These are static files with no data in them. Do not bypass all of `/static`.
+
+### Serve the scripts with nginx
+
+`push/examples/nginx.conf` serves both files from a folder next to nginx, with the placeholders replaced, for example:
+
+```bash
+mkdir -p /srv/open-webui-push
+cp push/web/oc-sw.js /srv/open-webui-push/
+sed -e "s/__VAPID_PUBLIC_KEY__/<public key>/g" -e "s/__FUNCTION_ID__/openclaw_web_push/g" \
+  push/web/oc-push.js > /srv/open-webui-push/oc-push.js
+```
+
+The page script replaces Open WebUI's `loader.js`, which is empty unless you put something in it. If you did, append it to `oc-push.js`.
+
+## 5. Turn it on, on each device
+
+Open Open WebUI. While the browser has not been asked yet, an **Enable notifications** button shows at the bottom left. Click it and allow notifications. The × hides the button for good on that device. On iPhone and iPad, add Open WebUI to the Home Screen first and open it from there.
+
+Each device is saved in its user's own list, so two people on one Open WebUI each get their own notifications.
+
+## How it behaves
+
+- **One notification per chat.** A newer reply in the same chat replaces the notification that is still showing.
+- **Not while you look at it.** When the chat is open, visible and focused on a device, that device shows nothing. Other devices still show it. iOS always shows it, because WebKit revokes a subscription whose pushes show nothing.
+- **Title only.** The push carries the chat's title, its id and the link. Open WebUI's `chat.finished` data holds the whole reply in `message` (Open WebUI 0.13.0 and the Pipe's event); the function never forwards it.
+- **Tap to open.** A tap focuses an open Open WebUI window and opens the chat, or opens a new one. Behind Cloudflare Access with an expired session, you sign in first and land in the chat.
+- **After an Open WebUI update.** Open WebUI removes every service worker when it updates. The next time you open it on a device, it registers again with a new subscription, which replaces the old one. Replies that finish before that are not notified on that device.
+- **Another user on the same device.** When someone else signs in on a device, the page script drops the old subscription and makes a new one for them. Signing out alone does not: the device keeps getting the previous user's notifications until someone signs in again, or until notifications are turned off for the site.
+- **Gone subscriptions.** A device whose push service answers 404 or 410 is removed from the user's list.
+
+What the function did is in Open WebUI's log:
+
+```
+INFO     | function_openclaw_web_push_<hash>:send_all:<line> - web push: sent to fcm.googleapis.com
+```
+
+## Turning it off
+
+Each part is separate:
+
+- Turn the function off: nothing is sent.
+- Remove the Worker routes or the nginx locations: pages load the stock `loader.js`. Service workers that are already registered stay idle until Open WebUI's next update removes them.
+- Turn the Pipe's `PUBLISH_CHAT_FINISHED` off: OpenClaw replies are no longer notified.
+
+## Tests
+
+`tests/test_web_push_unit.py` covers the payload (never the reply), which events are sent, and a real encrypted send to a local push service. `push/e2e/` drives Google Chrome against the real push service (FCM), the Worker example under `wrangler dev` and a throwaway Open WebUI:
+
+```bash
+push/e2e/stack.sh up /tmp/web-push-e2e openclaw_pipe.py
+xvfb-run -a uv run --with playwright==1.64.0 --with pytest pytest -q push/e2e/test_web_push_e2e.py
+push/e2e/stack.sh down /tmp/web-push-e2e
+```
+
+It needs Google Chrome (Chromium has no push service), Docker, `bunx` and outbound internet.
