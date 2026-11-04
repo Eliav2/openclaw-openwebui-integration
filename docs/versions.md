@@ -27,6 +27,7 @@ Below the minimums the chat itself still works, but some features break (the tab
 | Status button in the composer on chat open | Open WebUI 0.12.0 | Appears after the next reply instead |
 | A reply that finishes while a tab is loading the chat | Open WebUI 0.12.4 | 0.12.0 to 0.12.3: that tab can show the reply cut until it is reloaded. Those releases replace what reached the page during a load with what the load fetched; 0.12.4 keeps it |
 | Cron replies, and finishing a reply a Gateway restart cut off | OpenClaw 2026.9.3 | 2026.9.1 and older: a cron run in the chat's session is not recognised, so its reply is never shown; and in the restart test, a reply cut by a Gateway restart did not finish |
+| A message sent while the agent works, answered in the same run | OpenClaw 2026.10.10 | Earlier Gateways: the message waits for the run to end and gets its own reply ([Reliability](./features/reliability.md#messages-sent-while-the-agent-works)). On `claude-cli` with 2026.9.3 the Gateway would drop it, so the Pipe holds it |
 | Rate limits for a Gateway that only has a Claude CLI login | The `claude-cli-usage` Gateway plugin | OpenClaw 2026.9.1 and later report no Anthropic windows for that login; the dialog says so ([Status button](./install/status-action.md)) |
 
 ## Test runs
