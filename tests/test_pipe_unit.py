@@ -9323,6 +9323,40 @@ class TurnWriterEndTests(_TurnWriterCase):
         await asyncio.wait_for(ending, 5)
         self.assertEqual(self.m()["content"], "the aside")
 
+    async def test_a_steered_reply_whose_lone_final_came_before_the_commit_waits(self):
+        """CI next 3 on 986139a (a socket drop as the message went out to be
+        steered): the Gateway took the message in at the run's end; the
+        message's lone final, then the session's idle row, came before its
+        commit. The final is the steer's sign, not an abort: the reply waits
+        for the commit and the answer instead of ending with nothing."""
+        self.conn.gateway_version = "2026.10.10"
+        self.owui.msgs()["m1"] = {"id": "m1", "role": "assistant", "parentId": "q1",
+                                  "content": "", "done": True,
+                                  "statusHistory": copy.deepcopy(self.LEFT_BY_THE_CANCEL)}
+        w = _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
+                        run_id=self.STEERED, message_id="m1", takeover=True, renderer=_TurnRenderer())
+        pump = openclaw_pipe._RunPump()
+        pump.terminal.set()
+        self.conn._turn_pumps[(self.KEY, self.STEERED)] = pump
+        hist = {"now": self._steered_transcript(committed=False)}
+        self.conn.session_history = mock.AsyncMock(side_effect=lambda *a, **k: copy.deepcopy(hist["now"]))
+        await w.feed({"runId": self.STEERED, "sessionKey": self.KEY, "state": "final"})
+        ending = asyncio.ensure_future(w.end({"status": "done", "hasActiveRun": False, "lastRunId": "R1"}))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        self.assertFalse(ending.done(), "it waits: its message is not committed yet")
+        reads = self.conn.session_history.await_count
+        for _ in range(20):
+            await asyncio.sleep(0)
+        self.assertEqual(self.conn.session_history.await_count, reads,
+                         "no read without a transcript append: the set terminal wakes nothing")
+        hist["now"] = self._steered_transcript(
+            {"role": "assistant", "content": [{"type": "text", "text": "the aside"}],
+             "stopReason": "stop", "__openclaw": {"runId": "R1"}})
+        self.conn._on_session_message({"sessionKey": self.KEY})
+        await asyncio.wait_for(ending, 5)
+        self.assertEqual(self.m()["content"], "the aside")
+
     async def test_a_reply_whose_steered_message_was_aborted_does_not_wait(self):
         """Its own run's terminal event (an abort) came and the message never
         reached the transcript: nothing to wait for."""
@@ -10260,6 +10294,50 @@ class AgentTurnRoutingTests(_RoutingCase):
         await self.dispatch(run, _tool("result", tcid="toolu_2"))
         await self.spin()
         self.assertEqual(len(self.owui.upserts), writes + 1, "then none mid-turn")
+
+    async def test_a_reply_handed_over_while_its_message_waits_to_be_steered_stays_open(self):
+        """CI next 3 on 986139a: a message went to the Gateway to be steered
+        into the running run, and the socket dropped before the run took it
+        in. The reply's request ended there (Open WebUI saved it done and
+        empty) and a writer took it over, which opened only on a showable
+        item: for the 18 s until the answer the reply read finished and
+        empty. It stays open, not done, until its answer ends it."""
+        self.conn.gateway_version = "2026.10.10"
+        run = pipe_run_id(self.CHAT, self.STUB)
+        pending = {"description": openclaw_pipe.STEER_PENDING_STATUS, "done": False}
+        self.add_stub(self.STUB, statusHistory=[pending])
+        request = asyncio.get_running_loop().create_future()
+        self.owui.request_tasks["req-1"] = request
+        self.conn.register_run_target(self.key, run, self.CHAT, self.STUB,
+                                      request_task_id="req-1", steer_pending=True)
+        self.assertTrue(openclaw_pipe._hand_over_run(self.conn, self.key, run))
+        await self.spin()
+        patches = lambda: [d["data"]["messages"][self.STUB]  # noqa: E731
+                           for d in self.owui.events("chat:messages") if self.STUB in d["data"]["messages"]]
+        self.assertEqual(patches(), [], "not before the request's end, whose own done would win in the tab")
+        await self.owui.end_request(self.STUB, [])
+        request.set_result(None)
+        await self.spin()
+        m = self.owui.msgs()[self.STUB]
+        self.assertIs(m["done"], False, "the DB says the reply goes on")
+        shown = patches()
+        self.assertTrue(shown and shown[-1]["done"] is False, "open tabs show it going on")
+        self.assertEqual(shown[-1].get("statusHistory"), [pending], "with the line it waits under")
+        # The run takes the message in at its end; the answer ends the reply.
+        self.history = {"messages": [
+            {"role": "user", "content": "count", "__openclaw": {"idempotencyKey": "R1:user"}},
+            {"role": "assistant", "content": [{"type": "text", "text": "slow-1 slow-2"}],
+             "stopReason": "stop", "__openclaw": {"runId": "R1"}},
+            {"role": "user", "content": "aside", "__openclaw": {"idempotencyKey": f"{run}:user"}},
+            {"role": "assistant", "content": [{"type": "text", "text": "the aside"}],
+             "stopReason": "stop", "__openclaw": {"runId": "R1"}}]}
+        await self.dispatch(run, {"state": "final"})
+        self.conn._on_sessions_changed({"sessionKey": self.key, "hasActiveRun": False,
+                                        "status": "done", "lastRunId": "R1"})
+        await self.spin()
+        m = self.owui.msgs()[self.STUB]
+        self.assertIs(m["done"], True)
+        self.assertEqual(m["content"], "the aside")
 
     async def test_handover_an_inline_reply_that_ends_early_continues_in_its_own_message(self):
         run = pipe_run_id(self.CHAT, self.STUB)

@@ -6959,7 +6959,8 @@ class _GatewayConnection:
                             chat_id: str | None, message_id: str | None,
                             thinking: str | None = None,
                             request_task_id: str | None = None,
-                            span_run: str | None = None) -> None:
+                            span_run: str | None = None,
+                            steer_pending: bool = False) -> None:
         """Remember that this run streams into OWUI message `message_id` in
         `chat_id`, and start a shadow `_TurnRenderer` for it. No-op without both
         ids (e.g. a chat with no stable message id yet). `thinking`: the
@@ -6967,13 +6968,15 @@ class _GatewayConnection:
         WebUI's task for the request, whose end a handover's write waits for.
         `span_run`: the run whose part of the transcript the message shows,
         when it is not `run_id`: a message steered into `run_id` shows the
-        part after its own user message (`_settle_steered_replies`)."""
+        part after its own user message (`_settle_steered_replies`).
+        `steer_pending`: the message went to the Gateway to be steered into
+        the session's running run, so the reply waits for that run's answer."""
         if not (chat_id and message_id and run_id):
             return
         key = f"{session_key}:{run_id}"
         self._run_targets[key] = {"chat_id": chat_id, "message_id": message_id,
                                   "thinking": thinking, "request_task_id": request_task_id,
-                                  "span_run": span_run}
+                                  "span_run": span_run, "steer_pending": steer_pending}
         self._run_renderers[key] = _TurnRenderer()
         # Bound memory: a run that never emits a terminal would otherwise leak
         # its target/renderer forever. Far above any real concurrency.
@@ -6990,7 +6993,8 @@ class _GatewayConnection:
         target = self._run_targets[key]
         return {"message_id": target["message_id"], "renderer": self._run_renderers.get(key),
                 "thinking": thinking or target.get("thinking"), "shown": target.get("shown", ""),
-                "request_task_id": target.get("request_task_id")}
+                "request_task_id": target.get("request_task_id"),
+                "steer_pending": bool(target.get("steer_pending"))}
 
     def unregister_run_target(self, session_key: str, run_id: str) -> None:
         key = f"{session_key}:{run_id}"
@@ -9981,6 +9985,27 @@ class _TurnWriter:
                  f"{self.run_id[:24]}... in chat {self.chat_id[:8]}...")
         return True
 
+    async def hold_open(self) -> None:
+        """M's message went to the Gateway to be steered into the running
+        run, and M's request ended before the run took it in (a socket drop):
+        M opens now, not done, under the line it waits with, until the answer
+        ends it. Opened only on a showable item, it read finished and empty
+        until then (CI next 3 on 986139a: 18 s)."""
+        if self.opened or not await self.open(takeover=self.takeover):
+            return
+        if self.request_task is not None and not self.request_task.done():
+            # The request's end marks M done in open tabs and in the DB:
+            # M says it goes on after that, or that end wins.
+            await asyncio.wait({self.request_task}, timeout=FINAL_STATUS_REQUEST_WAIT_S)
+        message = {**self._claim["messages"][self.message_id], "content": self.sent_text,
+                   "output": copy.deepcopy(self.sent_output), "done": False}
+        await _introduce_turn_message(
+            self.chat_id, self.user_id,
+            _turn_message_patch(self.message_id, self._claim.get("parent"), message), self.message_id)
+        # The DB says so once the request's own save is in (ELI-115).
+        self.handover_owed = True
+        await self._stream()
+
     def _showable(self) -> bool:
         """Condition B: a tool call start, or text that is not a silent
         sentinel or a prefix of one. Whichever comes first."""
@@ -10347,7 +10372,7 @@ class _TurnWriter:
                 note = f"**Error:** {row['lastRunError']}"
         if note is None and await self._ask_question():
             return
-        if not self.opened and not self._showable():
+        if not self._showable():
             await self._await_steered_answer()
         await self.finalize(note)
 
@@ -10368,9 +10393,11 @@ class _TurnWriter:
         while True:
             appended = self.conn.session_message_event(self.session_key)
             pump = self.conn._turn_pumps.get((self.session_key, self.run_id))
-            # Its own run's terminal event (an abort) says the message will
-            # not be committed; a lone final says it was steered.
-            ended = pump is not None and pump.terminal.is_set()
+            # Its own run's terminal event says the message will not be
+            # committed, unless it is the lone final that says it was steered:
+            # the commit can come after that final and the session's idle row
+            # (a message taken in at the run's end, CI next 3 on 986139a).
+            ended = pump is not None and pump.terminal.is_set() and not self.steered_message
             try:
                 hist = await self.conn.session_history(self.session_key, limit=RUN_HISTORY_LIMIT)
             except Exception as ex:
@@ -10381,7 +10408,7 @@ class _TurnWriter:
             pipe_log(f"  turn writer: {self.message_id[:8]}... waits for its steered message's "
                      f"answer in the transcript")
             waits = [asyncio.ensure_future(appended.wait())]
-            if pump is not None:
+            if pump is not None and not pump.terminal.is_set():
                 waits.append(asyncio.ensure_future(pump.terminal.wait()))
             try:
                 await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
@@ -11257,7 +11284,8 @@ def _hand_over_run(conn: "_GatewayConnection", session_key: str, run_id: str, *,
         pump.handover = {"message_id": reply["message_id"], "renderer": reply["renderer"],
                          "thinking": thinking or (target or {}).get("thinking"), "shown": "",
                          "no_resume": bool(reply.get("no_resume")),
-                         "request_task_id": (target or {}).get("request_task_id")}
+                         "request_task_id": (target or {}).get("request_task_id"),
+                         "steer_pending": bool((target or {}).get("steer_pending"))}
         pump.started = _handover_started(pump.handover)
         for payload in reply["events"]:
             pump.queue.put_nowait(("event", payload))
@@ -11379,6 +11407,8 @@ async def _turn_pump_loop(conn: "_GatewayConnection", sess: str, run: str,
                 # into the same session (ELI-159), so an outside kill ends M.
                 pump.writer.resumes = MAX_TURN_RESUMES
             await pump.writer.feed(None)
+            if handed.get("steer_pending"):
+                await pump.writer.hold_open()
         elif re.fullmatch(_UUID_RE, run) and run == await conn.session_id_for(sess):
             pump.wake = True
         else:
@@ -15866,6 +15896,7 @@ class _PipeTurn:
             self.session_key, self.our_run_id, self.owui_origin_chat_id, self.owui_message_id,
             thinking=self.resolved_thinking,
             request_task_id=(self.__metadata__ or {}).get("task_id"),
+            steer_pending=bool(getattr(self, "to_be_steered", False)),
         )
         # When the Gateway had admitted this reply's run (chat.send returned;
         # an adopted run already ran). An idle row read after it means the

@@ -1544,6 +1544,7 @@ class _PipeTurn:
             self.session_key, self.our_run_id, self.owui_origin_chat_id, self.owui_message_id,
             thinking=self.resolved_thinking,
             request_task_id=(self.__metadata__ or {}).get("task_id"),
+            steer_pending=bool(getattr(self, "to_be_steered", False)),
         )
         # When the Gateway had admitted this reply's run (chat.send returned;
         # an adopted run already ran). An idle row read after it means the

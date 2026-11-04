@@ -2294,7 +2294,8 @@ class _GatewayConnection:
                             chat_id: str | None, message_id: str | None,
                             thinking: str | None = None,
                             request_task_id: str | None = None,
-                            span_run: str | None = None) -> None:
+                            span_run: str | None = None,
+                            steer_pending: bool = False) -> None:
         """Remember that this run streams into OWUI message `message_id` in
         `chat_id`, and start a shadow `_TurnRenderer` for it. No-op without both
         ids (e.g. a chat with no stable message id yet). `thinking`: the
@@ -2302,13 +2303,15 @@ class _GatewayConnection:
         WebUI's task for the request, whose end a handover's write waits for.
         `span_run`: the run whose part of the transcript the message shows,
         when it is not `run_id`: a message steered into `run_id` shows the
-        part after its own user message (`_settle_steered_replies`)."""
+        part after its own user message (`_settle_steered_replies`).
+        `steer_pending`: the message went to the Gateway to be steered into
+        the session's running run, so the reply waits for that run's answer."""
         if not (chat_id and message_id and run_id):
             return
         key = f"{session_key}:{run_id}"
         self._run_targets[key] = {"chat_id": chat_id, "message_id": message_id,
                                   "thinking": thinking, "request_task_id": request_task_id,
-                                  "span_run": span_run}
+                                  "span_run": span_run, "steer_pending": steer_pending}
         self._run_renderers[key] = _TurnRenderer()
         # Bound memory: a run that never emits a terminal would otherwise leak
         # its target/renderer forever. Far above any real concurrency.
@@ -2325,7 +2328,8 @@ class _GatewayConnection:
         target = self._run_targets[key]
         return {"message_id": target["message_id"], "renderer": self._run_renderers.get(key),
                 "thinking": thinking or target.get("thinking"), "shown": target.get("shown", ""),
-                "request_task_id": target.get("request_task_id")}
+                "request_task_id": target.get("request_task_id"),
+                "steer_pending": bool(target.get("steer_pending"))}
 
     def unregister_run_target(self, session_key: str, run_id: str) -> None:
         key = f"{session_key}:{run_id}"
