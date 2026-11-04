@@ -14,10 +14,10 @@ self.addEventListener("push", (e) => {
   try { p = e.data ? e.data.json() : {}; } catch (_) {}
   e.waitUntil((async () => {
     const wins = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
-    // The chat is in front of the user on this device: nothing to tell.
-    const onScreen = !!p.chat_id && wins.some((c) => c.focused && c.visibilityState === "visible" &&
-      new URL(c.url).pathname === "/c/" + p.chat_id);
-    const shown = MUST_SHOW || !onScreen;
+    // Open WebUI is in front of the user on this device, whatever chat is open:
+    // nothing to tell, as in a messaging app (the page has its own cues).
+    const inFront = wins.some((c) => c.focused && c.visibilityState === "visible");
+    const shown = MUST_SHOW || !inFront;
     if (shown) {
       await self.registration.showNotification(p.title || "Open WebUI", {
         body: "New reply",

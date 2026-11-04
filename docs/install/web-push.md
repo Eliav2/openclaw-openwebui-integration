@@ -95,7 +95,7 @@ Each device is saved in its user's own list, so two people on one Open WebUI eac
 ## How it behaves
 
 - **One notification per chat.** A newer reply in the same chat replaces the notification that is still showing.
-- **Not while you look at it.** When the chat is open, visible and focused on a device, that device shows nothing. Other devices still show it. iOS always shows it, because WebKit revokes a subscription whose pushes show nothing.
+- **Not while you use it.** While Open WebUI is open, visible and focused on a device, whatever chat is open, that device shows nothing, as in a messaging app; Open WebUI's own sidebar shows the new reply. In the background, closed or with the screen off, it notifies. Other devices still show it. iOS always shows it, because WebKit revokes a subscription whose pushes show nothing.
 - **Title only.** The push carries the chat's title, its id and the link. Open WebUI's `chat.finished` data holds the whole reply in `message` (Open WebUI 0.13.0 and the Pipe's event); the function never forwards it.
 - **Tap to open.** A tap focuses an open Open WebUI window and opens the chat, or opens a new one. Behind Cloudflare Access with an expired session, you sign in first and land in the chat.
 - **After an Open WebUI update.** Open WebUI removes every service worker when it updates. The next time you open it on a device, it registers again with a new subscription, which replaces the old one. Replies that finish before that are not notified on that device.

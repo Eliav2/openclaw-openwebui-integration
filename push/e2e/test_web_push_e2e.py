@@ -108,6 +108,20 @@ def seen_for(page, chat_id, n=1):
     return page.evaluate("(c) => window.ocPushSeen.filter(d => d.payload.chat_id === c)", chat_id)
 
 
+def behind(ctx, page):
+    """Another tab in front, so Open WebUI's page loses focus, as on a phone's home screen. A real
+    tab through CDP, with Playwright's focus emulation off (it keeps every page focused). Call the result again to
+    put it in front again."""
+    cdp = ctx.new_cdp_session(page)
+    tab = cdp.send("Target.createTarget", {"url": "about:blank"})["targetId"]
+    def front():
+        cdp.send("Emulation.setFocusEmulationEnabled", {"enabled": False})   # bring_to_front turns it on again
+        cdp.send("Target.activateTarget", {"targetId": tab})
+        page.wait_for_function("() => !document.hasFocus()", timeout=WAIT_MS)
+    front()
+    return front
+
+
 def ready(page):
     page.wait_for_function("() => window.ocPushState !== undefined", timeout=WAIT_MS)
     return page.evaluate("() => window.ocPushState")
@@ -180,7 +194,8 @@ def test_enable_subscribe_notify_suppress_and_resubscribe(owui, browser):
     assert sub["endpoint"].startswith("https://fcm.googleapis.com/"), sub["endpoint"][:40]
     assert sub["keys"]["p256dh"] and sub["device"]
 
-    # 2. A plain model's reply, while another page is open: Open WebUI's own chat.finished -> a notification.
+    # 2. A plain model's reply, while Open WebUI is in the background: Open WebUI's own chat.finished -> a notification.
+    other = behind(ctx, page)
     a_chat, a_msg = new_chat(token, "stub", "Chat A")
     reply(token, "stub", a_chat, a_msg)
     (d,) = seen_for(page, a_chat)
@@ -202,12 +217,20 @@ def test_enable_subscribe_notify_suppress_and_resubscribe(owui, browser):
     (d,) = seen_for(page, b_chat)
     assert d["payload"]["source"] == "openclaw-pipe" and d["shown"] is False, d
     assert not any(s in json.dumps(d) for s in SECRETS)
-    # The same chat, not on screen: shown. A later chat's decision arrives after B's two events.
+    # Another chat while Open WebUI is in front (chat B open): nothing either, as in a messaging app.
+    # A later chat's decision arrives after B's two events.
     c_chat, c_msg = new_chat(token, "openclaw_gateway.fake", "Chat C")
     reply(token, "openclaw_gateway.fake", c_chat, c_msg)
     (d,) = seen_for(page, c_chat)
-    assert d["shown"] and d["payload"]["source"] == "openclaw-pipe"
+    assert d["payload"]["source"] == "openclaw-pipe" and d["shown"] is False, d
     assert [x["payload"]["source"] for x in page.evaluate("(c) => window.ocPushSeen.filter(d => d.payload.chat_id === c)", b_chat)] == ["openclaw-pipe"]
+    assert page.evaluate(NOTES) == []
+    # The same, with Open WebUI in the background: shown.
+    other()
+    e_chat, e_msg = new_chat(token, "openclaw_gateway.fake", "Chat E")
+    reply(token, "openclaw_gateway.fake", e_chat, e_msg)
+    (d,) = seen_for(page, e_chat)
+    assert d["shown"] and d["payload"]["source"] == "openclaw-pipe"
     page.evaluate(CLEAR)
 
     # 4. Open WebUI's update path: every service worker unregistered, the page reloaded. The next
@@ -217,6 +240,7 @@ def test_enable_subscribe_notify_suppress_and_resubscribe(owui, browser):
     assert ready(page) == "saved"
     (sub2,) = subscriptions(token, page)
     assert sub2["endpoint"] != sub["endpoint"] and sub2["device"] == sub["device"]
+    other()
     d_chat, d_msg = new_chat(token, "stub", "Chat D")
     reply(token, "stub", d_chat, d_msg)
     (d,) = seen_for(page, d_chat)
