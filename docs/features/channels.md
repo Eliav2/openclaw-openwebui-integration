@@ -28,6 +28,8 @@ After answering, the agent follows the thread. When someone writes there without
 
 When unsure, the agent stays silent. A mention always gets an answer.
 
+If the agent is still busy in that thread (a long run, or a scheduled wake that is replying there), the follow-up waits for the run to end, however long that takes, and is sent then.
+
 A thread with no message for [`CHANNEL_THREAD_IDLE_HOURS`](../configuration.md#channel_thread_idle_hours) hours (24 by default) is no longer followed; a new mention there follows it again. The Pipe reads the channel only while it follows at least one thread, and only the followed threads' new messages.
 
 An Open WebUI that runs several processes still posts one answer per message: the Gateway runs the turn for a message once, and only the process that started it posts the answer.

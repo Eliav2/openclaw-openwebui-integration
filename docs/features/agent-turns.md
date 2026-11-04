@@ -53,10 +53,10 @@ To watch a sub-agent while it works, open it from the [Status dialog](./status.m
 ## Stop, Send now and new messages
 
 - **Stop** aborts the run and finishes the message with what it has.
-- **Send now** (or Enter while the reply runs, with Open WebUI's message queue off) keeps the run going to its end in the same message; your message runs right after it.
-- **A message you send while it streams** is in the chat at once ([`AUTO_SEND_WHILE_RUNNING`](../configuration.md#auto_send_while_running)). The Pipe waits for the run to finish and then sends it as its own reply. It is never mixed into the agent's run.
+- **Send now** (or Enter while the reply runs, with Open WebUI's message queue off) keeps the run going in the same message; your message is steered into it (2026.10.10+) or runs right after it.
+- **A message you send while it streams** is in the chat at once ([`AUTO_SEND_WHILE_RUNNING`](../configuration.md#auto_send_while_running)). On OpenClaw 2026.10.10 and later the agent reads it at its next step and answers it under your message ([steering](./reliability.md#messages-sent-while-the-agent-works)); on older Gateways, or with images attached, the Pipe waits for the run to finish and then sends it as its own reply.
 
-<img src="../img/demos/send-now.gif" alt="A second message sent while a reply runs waits in Open WebUI's queue; Send now posts it at once, marked queued until the first reply finishes, and then it gets its own reply" width="800">
+<img src="../img/demos/send-now.gif" alt="On a Gateway before OpenClaw 2026.10.10: a second message sent while a reply runs waits in Open WebUI's queue; Send now posts it at once, marked queued until the first reply finishes, and then it gets its own reply" width="800">
 
 ## Images, files and questions
 
@@ -91,7 +91,7 @@ These replies follow the same rules as yours, see [Reliability](./reliability.md
 
 - **Gateway restart mid-run:** the reply is continued in the same message, by the Gateway's recovery or by a resume from the Pipe, never by both. See [Gateway restarts](./reliability.md#gateway-restarts).
 - **Open WebUI restart mid-run:** when Open WebUI is back, the reply is picked up and finished.
-- **Run ended while Open WebUI was down:** its reply is written from the transcript when Open WebUI starts.
+- **Run ended while Open WebUI was down:** its reply is written from the transcript when Open WebUI starts. A reply you stopped stays as it was.
 - **Lost connection:** the Pipe reconnects and finishes the message from the transcript once the run is over.
 
 ## Messages from older versions
