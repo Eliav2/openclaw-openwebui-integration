@@ -1706,6 +1706,21 @@ _RESTART_MARKER_TYPE = "_pipe_restart"
 # `read_at` (time.monotonic) is when the row was read: a reply trusts an idle
 # row only when it was read after its run was admitted.
 _ROW_MARKER_TYPE = "_pipe_row"
+# Queue item `_GatewayConnection._steer` puts in a run's queues when a later
+# message of its session was steered into that run (2026.10.10+):
+# `{"type", "into"}`. The reply showing the run ends there; the rest of the run
+# is the steered message's answer and goes to that message's reply, whose
+# queues get `{"type", "_steered"}`.
+_STEERED_MARKER_TYPE = "_pipe_steered"
+
+
+def steers_mid_run_messages(version) -> bool:
+    """A 2026.10.10+ Gateway steers a message sent while a run works into
+    that run, claude-cli included (its stream-JSON process takes the input at
+    the next tool boundary; docs/concepts/queue-steering.md). 2026.10.5's
+    Claude runtime has no input injection. An unknown version is the old one."""
+    m = re.match(r"\s*(\d{4})\.(\d{1,2})\.(\d{1,3})", str(version or ""))
+    return bool(m) and tuple(int(g) for g in m.groups()) >= (2026, 10, 10)
 
 
 # How much of the already-received text anchors a cumulative text that does not
@@ -2690,6 +2705,13 @@ class _Consumer:
     session_key: str
     run_id: str
     queues: list[asyncio.Queue] = field(default_factory=list)
+    # The run has sent an event other than a lone message-less `chat` final:
+    # it runs, rather than having been steered into another run.
+    started: bool = False
+    ended: bool = False    # its terminal event came
+    # Its message was steered into another run of the session (`_steer`):
+    # its own events (the lone final) are dropped here.
+    steered: bool = False
 
 
 # The turn writer's entry points (writer.py's `_TurnHooks`), which the Pipe
@@ -3140,6 +3162,8 @@ class _GatewayConnection:
         ev = self._session_message_waiters.pop(key, None)
         if ev is not None:
             ev.set()
+        if key and isinstance(payload.get("message"), dict):
+            self._on_user_message_committed(key, payload["message"])
         if _TURNS and key:
             _TURNS.session_message(self, key)
 
@@ -3807,6 +3831,8 @@ class _GatewayConnection:
         if not consumers and _TURNS and _TURNS.route_now(self, payload):
             return
 
+        if consumers and not self._note_run_event(msg, consumers[0]):
+            return
         if consumers:
             if not payload.get("runId"):
                 pipe_log("  dispatched session-only event to sole consumer")
@@ -3829,6 +3855,82 @@ class _GatewayConnection:
         # If nothing matches at all, drop it.
         # This efficiently filters cross-session bleed.
 
+    def _note_run_event(self, msg: dict, consumer: _Consumer) -> bool:
+        """Track whether `consumer`'s run runs, has ended or was steered into
+        another run. False: drop the event (a steered run's own lone final).
+        A first event that is a `chat` final with no message means the
+        Gateway steered the run's message into the active run without its
+        commit having switched it here (`_steer`)."""
+        payload = msg.get("payload") or {}
+        terminal = (payload.get("state") in ("final", "error", "aborted")
+                    or (payload.get("stream") == "lifecycle"
+                        and (payload.get("data") or {}).get("phase") in ("end", "error")))
+        if consumer.steered:
+            if terminal:
+                self._consumers.pop(f"{consumer.session_key}:{consumer.run_id}", None)
+            return False
+        if (not consumer.started and msg.get("event") == "chat"
+                and payload.get("state") == "final" and not payload.get("message")
+                and steers_mid_run_messages(self.gateway_version) and self._steer(consumer)):
+            self._consumers.pop(f"{consumer.session_key}:{consumer.run_id}", None)
+            return False
+        consumer.started = True
+        consumer.ended = consumer.ended or terminal
+        return True
+
+    def _on_user_message_committed(self, session_key: str, message: dict) -> None:
+        """A user message joined the transcript. On 2026.10.10 one whose run
+        has not started while another run of the session works was steered
+        into that run: the commit comes before the answer's first event
+        (probe_steer_events.py: the steered run's own lone final can come
+        after it), so the answer goes to its reply from here."""
+        idem = str((message.get("__openclaw") or {}).get("idempotencyKey") or "")
+        if not (message.get("role") == "user" and idem.endswith(":user")
+                and steers_mid_run_messages(self.gateway_version)):
+            return
+        consumer = self._consumers.get(f"{session_key}:{idem[:-len(':user')]}")
+        if consumer is not None and not (consumer.started or consumer.steered):
+            self._steer(consumer)
+
+    def _steer(self, consumer: _Consumer) -> bool:
+        """Switch the session's active run to the reply of `consumer`'s
+        message, which the Gateway steered into it: from here, in dispatch
+        order, its events go to that reply. What it sent before belongs to the
+        reply that showed it: a live reply gets `_STEERED_MARKER_TYPE` and
+        ends, a turn writer gets `("steered", future)` behind the events it
+        still writes and ends there. The steered reply gets `_steered`: the run
+        to continue and its dedup baselines (a dict, or that future). False
+        when the session has no single active run to take."""
+        sess = consumer.session_key
+        active = [c for c in self._consumers.values()
+                  if c.session_key == sess and c is not consumer and c.started
+                  and not (c.ended or c.steered)]
+        pumps = [(run, pump) for (s, run), pump in getattr(self, "_turn_pumps", {}).items()
+                 if s == sess and pump.started and not pump.wake and not pump.terminal.is_set()]
+        if len(active) == 1:
+            run = active[0]
+            shadow = self._run_renderers.get(f"{sess}:{run.run_id}")
+            run_text = ({"received": shadow.received, "stream": shadow.received,
+                         "item": shadow.last_item} if shadow is not None else None)
+            for q in run.queues:
+                q.put_nowait({"type": _STEERED_MARKER_TYPE, "into": consumer.run_id})
+            run.queues = list(consumer.queues)
+            run_id = run.run_id
+        elif not active and len(pumps) == 1:
+            run_id, pump = pumps[0]
+            run_text = asyncio.get_running_loop().create_future()
+            pump.queue.put_nowait(("steered", run_text))
+            self._consumers[f"{sess}:{run_id}"] = _Consumer(
+                session_key=sess, run_id=run_id, queues=list(consumer.queues), started=True)
+        else:
+            return False
+        consumer.steered = True
+        for q in consumer.queues:
+            q.put_nowait({"type": _STEERED_MARKER_TYPE, "_steered": {"run": run_id, "run_text": run_text}})
+        pipe_log(f"  run {consumer.run_id[:24]}... steered into {run_id[:24]}...; "
+                 "its reply continues that run")
+        return True
+
     def consumers_for_event(self, payload: dict) -> list[_Consumer]:
         """Return consumers that should receive a Gateway event payload."""
         evt_session = payload.get("sessionKey", "")
@@ -3839,7 +3941,7 @@ class _GatewayConnection:
         if evt_session and not evt_run_id:
             matches = [
                 consumer for consumer in self._consumers.values()
-                if consumer.session_key == evt_session
+                if consumer.session_key == evt_session and not consumer.steered
             ]
             return matches if len(matches) == 1 else []
         return []
