@@ -40,8 +40,6 @@ _CHANNEL_SKIP = "[skip]"
 _CHANNEL_STATE_FILE = "channel-threads.json"
 _CHANNEL_POLL_S = 2.0
 _CHANNEL_JUDGE_TIMEOUT_S = 10.0
-_CHANNEL_IDLE_WAIT_S = 1800.0   # a follow-up waits at most this long for the thread's run to end
-_CHANNEL_RUN_TIMEOUT_S = 1800.0  # and for its own run's end
 _CHANNEL_JUDGE_TAIL = 12
 _CHANNEL_JUDGE_CONTEXT_CHARS = 15000
 _CHANNEL_WATCH_ATTR = "_openclaw_channel_watcher_v1"
@@ -347,23 +345,11 @@ async def _channel_run(conn, session_key: str, message: str, idempotency_key: st
     # sending, under the per-session send lock. A send into a running turn
     # (a mention in the same thread) is merged into it and never ends.
     async with conn.send_section(session_key):
-        waited = time.monotonic()
-        while True:
-            changed = conn.session_change_event(session_key)
-            active = await _session_list_active(conn, session_key, missing=False)
-            if active is None:
-                pipe_log("[channels] follow-up: the Gateway cannot say whether the thread is busy; not sent")
-                return "failed", None
-            if not active:
-                break
-            left = _CHANNEL_IDLE_WAIT_S - (time.monotonic() - waited)
-            if left <= 0:
-                pipe_log("[channels] follow-up: the thread stayed busy; not sent")
-                return "failed", None
-            try:
-                await asyncio.wait_for(changed.wait(), left)
-            except asyncio.TimeoutError:
-                pass
+        async def thread_active():
+            return await _session_list_active(conn, session_key, missing=False)
+        if await _wait_for_session_idle(conn, session_key, thread_active) is None:
+            pipe_log("[channels] follow-up: the Gateway cannot say whether the thread is busy; not sent")
+            return "failed", None
         if still_needed is not None and not still_needed():
             pipe_log("[channels] follow-up: a turn meanwhile already carried these messages")
             return "covered", None
@@ -388,11 +374,10 @@ async def _channel_run(conn, session_key: str, message: str, idempotency_key: st
             run_id = resp["runId"]
             queue = conn.register_consumer(session_key, run_id)
     try:
-        return await asyncio.wait_for(_channel_run_text(conn, session_key, run_id, queue),
-                                      _CHANNEL_RUN_TIMEOUT_S)
-    except asyncio.TimeoutError:
-        pipe_log(f"[channels] follow-up {run_id[:24]} sent no end in {_CHANNEL_RUN_TIMEOUT_S:.0f} s; not posted")
-        return "failed", None
+        # Until the run ends, however long that takes: its end arrives as the
+        # run's own final / error event, a restart marker, or the row after a
+        # reconnect (`_channel_run_text`).
+        return await _channel_run_text(conn, session_key, run_id, queue)
     finally:
         conn.unregister_consumer(session_key, run_id)
 
