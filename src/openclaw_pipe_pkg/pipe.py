@@ -137,9 +137,11 @@ async def _settle_cancel_intent(conn, session_key, run_id, chat_id, event_call,
         except (Exception, asyncio.CancelledError) as ex:
             pipe_log(f"  cancel intent query failed: {ex!r}")
     pipe_log(f"  cancel intent from the page: {intent or 'unknown'}")
-    conn.settle_parked_turn(session_key, run_id, intent, hold_s=_SEND_NOW_HOLD_S)
     if intent == "stop" and chat_id and message_id:
-        spawn_background(_mark_stopped(chat_id, message_id, _owui_request_task(task_id)))
+        # Before the request's own `done: true` save, which follows this
+        # cancel's handling.
+        await _mark_stopped(chat_id, message_id, _owui_request_task(task_id))
+    conn.settle_parked_turn(session_key, run_id, intent, hold_s=_SEND_NOW_HOLD_S)
 
 
 # Open WebUI 0.12.3 creates a chat as "New Chat" (main.py, not translated).

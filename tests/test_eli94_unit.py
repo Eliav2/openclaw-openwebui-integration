@@ -148,6 +148,26 @@ class EndedWhileDownTests(_EndedWhileDownCase):
         self.assertEqual(self.writes, [])
         self.assertEqual(self.msg(), held)
 
+    async def test_a_stopped_reply_left_unfinished_keeps_what_it_showed(self):
+        """Review on #282: a Stop whose final save failed leaves the marked
+        reply `done: false`; the next start's orphan pass must not rebuild
+        it from the transcript either."""
+        async def the_stub(prefixes):
+            return [(CHAT, M)]
+        original = copy.deepcopy(self.msg())
+        # A request's stub, its task dead with Open WebUI. A gone turn
+        # writer's message takes the same early way out of `_reconcile_stub`.
+        for owner in ({"task_id": "task-dead"},):
+            with self.subTest(owner=owner):
+                self.chat["history"]["messages"][M] = copy.deepcopy(original)
+                self.msg().update(done=False, meta={**owner, openclaw_pipe.STOPPED_META: True})
+                held = {k: copy.deepcopy(self.msg()[k]) for k in ("content", "output")}
+                with mock.patch("openclaw_pipe._orphan_stub_ids", the_stub), \
+                        mock.patch("openclaw_pipe._turn_writer_alive", lambda w: False):
+                    await self.startup()
+                self.assertEqual({k: self.msg()[k] for k in ("content", "output")}, held)
+                self.assertIs(self.msg()["meta"].get(openclaw_pipe.STOPPED_META), True)
+
     async def test_a_reply_open_webuis_shutdown_cancelled_is_still_completed(self):
         """An Open WebUI stop cancels the reply as a Stop does, "Stopped"
         status line and all, but no page says it was the user's Stop: the

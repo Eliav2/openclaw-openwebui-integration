@@ -9116,10 +9116,20 @@ STOPPED_META = "openclaw_stopped"
 
 
 async def _mark_stopped(chat_id: str, message_id: str, request=None) -> None:
-    """Mark the reply ended by the user's Stop (STOPPED_META), after
-    `request` (Open WebUI's task for it, whose own save comes first)."""
+    """Mark the reply ended by the user's Stop (STOPPED_META) as soon as the
+    Stop is known, before any `done: true` save of it, so no restart finds it
+    finished and unmarked. While `request` (Open WebUI's task for the reply)
+    runs, marked again in the background once it ended, after its own save.
+    A failed write is logged; the reply finishes all the same."""
+    await _write_stop_mark(chat_id, message_id)
     if request is not None and not request.done():
-        await asyncio.wait({request})
+        async def after_request():
+            await asyncio.wait({request})
+            await _write_stop_mark(chat_id, message_id)
+        spawn_background(after_request())
+
+
+async def _write_stop_mark(chat_id: str, message_id: str) -> None:
     try:
         await _set_turn_meta(chat_id, message_id, {STOPPED_META: True})
     except Exception as ex:
@@ -10641,8 +10651,8 @@ class _TurnWriter:
                 pipe_log(f"  turn writer: chat.abort failed: {ex}")
         if not aborted and wake:
             await self._cancel_wake_run()
-        await self.finalize(stopped=True)
         await _mark_stopped(self.chat_id, self.message_id, self.request_task)
+        await self.finalize(stopped=True)
 
     async def _abort_agent_run(self) -> bool:
         """Stop a run the agent started by its id: `sessions.abort` with a run id
@@ -11730,6 +11740,15 @@ async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
         stub = msgs.get(stub_id) or {}
         if stub.get("role") != "assistant" or stub.get("done") is not False:
             return "skip"  # gone or finished meanwhile
+        if _ended_by_stop(stub):
+            # The user stopped it and its final save did not land: it ends as
+            # it is, never rebuilt from the transcript or adopted.
+            async with conn._chat_write_lock(chat_id):
+                if await _owui_upsert_message(chat_id, stub_id, {"done": True}) is None:
+                    return "skip"
+            pipe_log(f"  orphan stub {stub_id[:8]}... in chat {chat_id[:8]}...: stopped by the user, "
+                     "closed as it was")
+            return "done"
         writer = (stub.get("meta") or {}).get("openclaw_writer")
         if writer:
             # A turn writer's message: its own writer finishes it, or, once
@@ -14073,9 +14092,11 @@ async def _settle_cancel_intent(conn, session_key, run_id, chat_id, event_call,
         except (Exception, asyncio.CancelledError) as ex:
             pipe_log(f"  cancel intent query failed: {ex!r}")
     pipe_log(f"  cancel intent from the page: {intent or 'unknown'}")
-    conn.settle_parked_turn(session_key, run_id, intent, hold_s=_SEND_NOW_HOLD_S)
     if intent == "stop" and chat_id and message_id:
-        spawn_background(_mark_stopped(chat_id, message_id, _owui_request_task(task_id)))
+        # Before the request's own `done: true` save, which follows this
+        # cancel's handling.
+        await _mark_stopped(chat_id, message_id, _owui_request_task(task_id))
+    conn.settle_parked_turn(session_key, run_id, intent, hold_s=_SEND_NOW_HOLD_S)
 
 
 # Open WebUI 0.12.3 creates a chat as "New Chat" (main.py, not translated).
