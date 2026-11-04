@@ -84,6 +84,8 @@ sed -e "s/__VAPID_PUBLIC_KEY__/<public key>/g" -e "s/__FUNCTION_ID__/openclaw_we
 
 The page script replaces Open WebUI's `loader.js`, which is empty unless you put something in it. If you did, append it to `oc-push.js`.
 
+Open WebUI serves `/static/loader.js` with no `Cache-Control` header, so browsers cache it for a while: on Cloudflare for the zone's Browser Cache TTL (4 hours by default), otherwise for a heuristic time. A device that loaded the page before you started serving the page script keeps the old, empty file until that runs out, and shows no button. Both examples serve the new file with `Cache-Control: no-cache`, so this happens only once, at the switch. To skip the wait on a device, clear the browser's cached files (not its cookies or site data) and open Open WebUI again.
+
 ## 5. Turn it on, on each device
 
 Open Open WebUI. While the browser has not been asked yet, an **Enable notifications** button shows at the top of the page. Click it and allow notifications. The × hides the button for good on that device. On iPhone and iPad, add Open WebUI to the Home Screen first and open it from there.
