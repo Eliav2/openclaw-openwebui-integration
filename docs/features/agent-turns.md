@@ -68,7 +68,7 @@ A reply that ends with a question asks it as a [question card](./questions.md#qu
 
 Open WebUI publishes a `chat.finished` event when a chat request ends. Event functions (for example a push notifier), event webhooks and notification targets act on it. For an OpenClaw reply that event can be wrong: a reply the agent starts has no request, so it never fires, and a reply that outlives its request (after a Gateway restart or lost events) fires it before the reply is done.
 
-With [`PUBLISH_CHAT_FINISHED`](../configuration.md#publish_chat_finished) on, the Pipe publishes its own `chat.finished` once each reply is saved: a reply that ended in its request after Open WebUI's save, and every other reply after its last save. A stopped reply, or one whose save failed, publishes nothing. The event has Open WebUI's usual shape, with `source` set to `openclaw-pipe`:
+With [`PUBLISH_CHAT_FINISHED`](../configuration.md#publish_chat_finished) on, the Pipe publishes its own `chat.finished` once each reply is saved: a reply that ended in its request after Open WebUI's save, and every other reply after its last save. A stopped reply, one whose save failed, and a reply in a temporary chat (Open WebUI doesn't save those) publish nothing. The event has Open WebUI's usual shape, with `source` set to `openclaw-pipe`:
 
 ```json
 {"event": "chat.finished", "source": "openclaw-pipe",
