@@ -1373,9 +1373,12 @@ class _PipeTurn:
         """Whether this reply's message goes to the Gateway while a run of its
         session works, which then steers it into that run (2026.10.10+). Text
         only: the Gateway keeps images for a later turn. Not for a channel
-        thread, whose turns wait for the thread's run (channels.py)."""
+        thread, whose turns wait for the thread's run (channels.py). Only
+        into a run a message of this chat started, not a cron wake's or an
+        announce's (`user_turn_run_active`)."""
         return (steers_mid_run_messages(self.conn.gateway_version)
-                and not self.turn.attachments and not self.channel_id)
+                and not self.turn.attachments and not self.channel_id
+                and self.conn.user_turn_run_active(self.session_key, self.chat_id))
 
     async def wait_and_send(self, reply_id):
         """Wait for the session's run to settle, then send this reply's

@@ -7406,6 +7406,24 @@ class _GatewayConnection:
             return matches[0]
         return None
 
+    def user_turn_run_active(self, session_key: str, chat_id: str) -> bool:
+        """The session's run, as this connection sees it, is the run of a
+        user's own message in `chat_id` (a Pipe reply run, `pipe_run_id`):
+        the one kind of run a message is sent into to be steered. The Gateway
+        steers only while the run's reply operation owns the session; into
+        any other (a cron wake, an announce, a resume, one this worker does
+        not see) it falls back to its follow-up queue (agent-runner-run
+        "steering rejected; applying follow-up policy", `reply-owner-ended`),
+        where the send is aborted and, on 2026.10.10-beta.1, never runs."""
+        # Started: a message sent to be steered has a consumer too, with no
+        # event yet.
+        runs = {c.run_id for c in self._consumers.values()
+                if c.session_key == session_key and c.started and not (c.ended or c.steered)}
+        runs |= {run for (s, run), pump in getattr(self, "_turn_pumps", {}).items()
+                 if s == session_key and not pump.terminal.is_set()}
+        parsed = parse_pipe_run_id(next(iter(runs))) if len(runs) == 1 else None
+        return bool(parsed and parsed["kind"] == "reply" and parsed["chat"] == chat_id)
+
     def parse_owui_session_key(self, session_key: str) -> tuple[str, str] | None:
         """Reverse `_owui_session_key`: extract (user_id, chat_id) from a
         session key this pipe built, e.g.
@@ -15599,9 +15617,12 @@ class _PipeTurn:
         """Whether this reply's message goes to the Gateway while a run of its
         session works, which then steers it into that run (2026.10.10+). Text
         only: the Gateway keeps images for a later turn. Not for a channel
-        thread, whose turns wait for the thread's run (channels.py)."""
+        thread, whose turns wait for the thread's run (channels.py). Only
+        into a run a message of this chat started, not a cron wake's or an
+        announce's (`user_turn_run_active`)."""
         return (steers_mid_run_messages(self.conn.gateway_version)
-                and not self.turn.attachments and not self.channel_id)
+                and not self.turn.attachments and not self.channel_id
+                and self.conn.user_turn_run_active(self.session_key, self.chat_id))
 
     async def wait_and_send(self, reply_id):
         """Wait for the session's run to settle, then send this reply's

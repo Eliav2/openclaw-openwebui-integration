@@ -15802,9 +15802,29 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
     Real reply generators; events through the connection's own dispatch."""
 
     SK = None
-    asyncSetUp = NoDroppedMessagesTests.asyncSetUp
+    CHAT = "c0ffee00-0000-4000-8000-000000000001"
     asyncTearDown = NoDroppedMessagesTests.asyncTearDown
-    _reply = NoDroppedMessagesTests._reply
+
+    @classmethod
+    def _run_id(cls, n):
+        """What `pipe_run_id` gives the reply run of message n of the chat."""
+        return f"msg-{cls.CHAT}-00000000-0000-4000-8000-{n:012d}-1.0"
+
+    async def asyncSetUp(self):
+        await NoDroppedMessagesTests.asyncSetUp(self)
+        type(self).SK = self.ocp._owui_session_key(self.pipe.valves.AGENT_ID, "u1", self.CHAT)
+        self.R1, self.R2, self.R3 = (self._run_id(n) for n in (1, 2, 3))
+        send = self.conn.send_request
+
+        async def send_request(method, params, timeout=10):
+            got = await send(method, params, timeout)
+            if method == "chat.send":
+                return {"runId": self._run_id(int(got["runId"].rsplit("-", 1)[1]))}
+            return got
+        self.conn.send_request = send_request
+
+    def _reply(self, text, msg_id, **kw):
+        return NoDroppedMessagesTests._reply(self, text, msg_id, chat=self.CHAT, **kw)
     _delta = NoDroppedMessagesTests._delta
     _until_registered = NoDroppedMessagesTests._until_registered
     _spin = staticmethod(NoDroppedMessagesTests._spin)
@@ -15837,9 +15857,9 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
     async def _running_first_reply(self):
         gen = self._reply("Do 4 rounds of sleep 12", "m1")
         first = asyncio.ensure_future(gen.__anext__())
-        await self._until_registered("run-1")
+        await self._until_registered(self.R1)
         self.active = True
-        await self._dispatch(self._lifecycle("run-1", "start"), self._delta("run-1", "ROUND 1"))
+        await self._dispatch(self._lifecycle(self.R1, "start"), self._delta(self.R1, "ROUND 1"))
         return gen, first
 
     async def test_a_mid_run_message_is_steered_and_answered_in_its_own_reply(self):
@@ -15847,18 +15867,18 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         gen_a, first_a = await self._running_first_reply()
         gen_b = self._reply("Stop and say banana", "m2")
         first_b = asyncio.ensure_future(gen_b.__anext__())
-        await self._until_registered("run-2")
+        await self._until_registered(self.R2)
         self.assertEqual(self.sent[-1], "Stop and say banana", "sent while the run works")
         self.assertFalse(any("Queued: waiting" in str(e) for e in self.emitted))
         self.assertTrue(any(self.ocp.STEER_PENDING_STATUS in str(e) for e in self.emitted),
                         "the reply says its message went to the running agent")
 
         await self._dispatch(
-            self._final("run-2"),                       # steered: no message
-            self._delta("run-1", "\n\nStopped. banana"),
-            self._lifecycle("run-1", "end"))
+            self._final(self.R2),                       # steered: no message
+            self._delta(self.R1, "\n\nStopped. banana"),
+            self._lifecycle(self.R1, "end"))
         self.active = False
-        await self._dispatch(self._final("run-1", "ROUND 1\n\nStopped. banana"))
+        await self._dispatch(self._final(self.R1, "ROUND 1\n\nStopped. banana"))
         out_a, _ = await self._collect(first_a, gen_a)
         out_b, _ = await self._collect(first_b, gen_b)
         self.assertEqual(out_a.strip(), "ROUND 1", "the first reply ends where the steer landed")
@@ -15874,20 +15894,20 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         gen_a, first_a = await self._running_first_reply()
         gen_b = self._reply("Stop and say banana", "m2")
         first_b = asyncio.ensure_future(gen_b.__anext__())
-        await self._until_registered("run-2")
+        await self._until_registered(self.R2)
         await self._dispatch(
-            self._commit("run-2", "Stop and say banana"),
-            self._delta("run-1", "\n\nStopped."),
-            self._final("run-2"),
-            self._delta("run-1", " banana"),
-            self._lifecycle("run-1", "end"))
+            self._commit(self.R2, "Stop and say banana"),
+            self._delta(self.R1, "\n\nStopped."),
+            self._final(self.R2),
+            self._delta(self.R1, " banana"),
+            self._lifecycle(self.R1, "end"))
         self.active = False
-        await self._dispatch(self._final("run-1", "ROUND 1\n\nStopped. banana"))
+        await self._dispatch(self._final(self.R1, "ROUND 1\n\nStopped. banana"))
         out_a, _ = await self._collect(first_a, gen_a)
         out_b, _ = await self._collect(first_b, gen_b)
         self.assertEqual(out_a.strip(), "ROUND 1")
         self.assertEqual(out_b.strip(), "Stopped. banana")
-        self.assertNotIn(f"{self.SK}:run-2", self.conn._consumers, "its lone final retired it")
+        self.assertNotIn(f"{self.SK}:{self.R2}", self.conn._consumers, "its lone final retired it")
 
     async def test_a_message_committed_after_the_run_ended_is_not_steered(self):
         """Queued by the Gateway (not steered): its commit comes once the
@@ -15896,12 +15916,12 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         gen_a, first_a = await self._running_first_reply()
         gen_b = self._reply("next", "m2")
         first_b = asyncio.ensure_future(gen_b.__anext__())
-        await self._until_registered("run-2")
-        await self._dispatch(self._lifecycle("run-1", "end"), self._final("run-1", "ROUND 1"))
+        await self._until_registered(self.R2)
+        await self._dispatch(self._lifecycle(self.R1, "end"), self._final(self.R1, "ROUND 1"))
         self.active = False
-        await self._dispatch(self._commit("run-2", "next"), self._lifecycle("run-2", "start"),
-                             self._delta("run-2", "own answer"), self._lifecycle("run-2", "end"),
-                             self._final("run-2", "own answer"))
+        await self._dispatch(self._commit(self.R2, "next"), self._lifecycle(self.R2, "start"),
+                             self._delta(self.R2, "own answer"), self._lifecycle(self.R2, "end"),
+                             self._final(self.R2, "own answer"))
         out_a, _ = await self._collect(first_a, gen_a)
         out_b, _ = await self._collect(first_b, gen_b)
         self.assertEqual(out_a.strip(), "ROUND 1")
@@ -15917,12 +15937,12 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         for i, text in enumerate(("first aside", "second aside"), start=2):
             gen = self._reply(text, f"m{i}")
             replies.append((gen, asyncio.ensure_future(gen.__anext__())))
-            await self._until_registered(f"run-{i}")
-        await self._dispatch(self._final("run-2"), self._final("run-3"),
-                             self._delta("run-1", "\n\nBoth asides answered."),
-                             self._lifecycle("run-1", "end"))
+            await self._until_registered(self._run_id(i))
+        await self._dispatch(self._final(self.R2), self._final(self.R3),
+                             self._delta(self.R1, "\n\nBoth asides answered."),
+                             self._lifecycle(self.R1, "end"))
         self.active = False
-        await self._dispatch(self._final("run-1", "ROUND 1\n\nBoth asides answered."))
+        await self._dispatch(self._final(self.R1, "ROUND 1\n\nBoth asides answered."))
         out_a, _ = await self._collect(first_a, gen_a)
         (gen_b, first_b), (gen_c, first_c) = replies
         out_b, _ = await self._collect(first_b, gen_b)
@@ -15945,22 +15965,22 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         writer.finalize = mock.AsyncMock()
         writer.feed = mock.AsyncMock()
         pump.writer, pump.started = writer, True
-        conn._turn_pumps[(sk, "run-1")] = pump
-        q2 = conn.register_consumer(sk, "run-2")
-        conn._on_session_message(self._commit("run-2")["payload"])
-        self.assertIn(f"{sk}:run-1", conn._consumers, "run-1 is consumed by the steered reply now")
-        self.assertIs(conn._consumers[f"{sk}:run-1"].queues[0], q2)
-        await conn._dispatch_run_event(self._delta("run-1", "\n\nStopped. banana"))
-        await conn._dispatch_run_event(self._final("run-2"))
+        conn._turn_pumps[(sk, self.R1)] = pump
+        q2 = conn.register_consumer(sk, self.R2)
+        conn._on_session_message(self._commit(self.R2)["payload"])
+        self.assertIn(f"{sk}:{self.R1}", conn._consumers, "the active run is consumed by the steered reply now")
+        self.assertIs(conn._consumers[f"{sk}:{self.R1}"].queues[0], q2)
+        await conn._dispatch_run_event(self._delta(self.R1, "\n\nStopped. banana"))
+        await conn._dispatch_run_event(self._final(self.R2))
         steered = q2.get_nowait()["_steered"]
-        self.assertEqual(steered["run"], "run-1")
-        self.assertEqual(q2.get_nowait()["payload"]["runId"], "run-1", "the next delta comes here")
+        self.assertEqual(steered["run"], self.R1)
+        self.assertEqual(q2.get_nowait()["payload"]["runId"], self.R1, "the next delta comes here")
         self.assertTrue(q2.empty(), "the steered run's own lone final is not shown")
-        self.assertNotIn((sk, "run-2"), conn._turn_pumps, "nor written as a run of its own")
+        self.assertNotIn((sk, self.R2), conn._turn_pumps, "nor written as a run of its own")
         kind, fut = pump.queue.get_nowait()
         self.assertEqual(kind, "steered")
         pump.queue.put_nowait((kind, fut))
-        await openclaw_pipe._turn_pump_loop(conn, sk, "run-1", ("u", "chat-1"), pump)
+        await openclaw_pipe._turn_pump_loop(conn, sk, self.R1, ("u1", self.CHAT), pump)
         self.assertEqual((await steered["run_text"])["stream"], "ROUND 1")
         writer.finalize.assert_awaited_once_with(steered=True)
         writer.feed.assert_not_awaited()
@@ -15989,19 +16009,34 @@ class MidRunSteeringTests(unittest.IsolatedAsyncioTestCase):
         first_a.cancel()
         await self._spin()
 
-    async def test_steered_into_a_run_no_reply_shows_is_not_taken_back(self):
-        """The active run is a wake's, which a turn writer shows: no live reply
-        to hand over from. The message reached the agent; it is not aborted
-        and sent again (the claude-cli take-back of a queued message)."""
+    async def test_a_message_sent_during_a_wake_waits_for_it(self):
+        """The active run is a cron wake's, which a turn writer shows: no run
+        of this chat's own messages. The Gateway does not steer into it, it
+        falls back to its follow-up queue and aborts the send (2026.10.10-beta.1
+        CI, `reply-owner-ended`, the follow-up never ran), so the message
+        waits for the wake and goes as its own run."""
         self.conn.gateway_version = "2026.10.10"
         self.runtime = "claude-cli"
         self.active = True
+        pump = openclaw_pipe._RunPump()
+        pump.started = pump.wake = True
+        self.conn._turn_pumps[(self.SK, "6f1c2a7e-5b9d-4c3a-9e2f-0a1b2c3d4e5f")] = pump
         gen = self._reply("Stop and say banana", "m2")
         first = asyncio.ensure_future(gen.__anext__())
-        await self._until_registered("run-1")
-        self.active = False
-        await self._dispatch(self._final("run-1"))
-        out, _ = await self._collect(first, gen)
-        self.assertEqual(self.aborts, [])
-        self.assertEqual(self.sent.count("Stop and say banana"), 1)
-        self.assertIn("answers it there", out)
+        await self._spin()
+        self.assertNotIn("Stop and say banana", self.sent, "not sent into the wake")
+        self.assertTrue(any("Queued: waiting" in str(e) for e in self.emitted))
+        first.cancel()
+        await self._spin()
+
+    async def test_a_message_sent_during_a_run_this_worker_does_not_see_waits(self):
+        """Another Open WebUI worker's run, or one started outside the Pipe:
+        nothing says it is a run of this chat's own messages."""
+        self.conn.gateway_version = "2026.10.10"
+        self.active = True
+        gen = self._reply("Stop and say banana", "m2")
+        first = asyncio.ensure_future(gen.__anext__())
+        await self._spin()
+        self.assertNotIn("Stop and say banana", self.sent)
+        first.cancel()
+        await self._spin()

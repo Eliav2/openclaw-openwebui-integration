@@ -43,6 +43,8 @@ The boundary is the Gateway's own event: your message is written to the transcri
 
 On the `claude-cli` runtime the Gateway writes your message to the transcript once Claude Code takes it in, but it can forward Claude Code's first words of the answer before that. Those words then show at the end of the running reply for a moment. Once the run ends, the Pipe reads the transcript and moves them to your message's reply. It only moves the split: if either reply holds anything the transcript does not, both stay as they are.
 
+Only a run that one of your messages in this chat started is steered into. A run the agent started by itself (a scheduled wake, a sub-agent's result) is not: the Gateway would not steer into it and would hold the message in its own queue instead, where 2026.10.10-beta.1 drops it. A message sent during such a run waits for it, as below.
+
 A message with images or files still waits, as on older Gateways: the Gateway would only queue it behind the run. On Gateways before 2026.10.10 the `claude-cli` runtime cannot add a message to a run that is already going (OpenClaw 2026.9.3: such a message is dropped), so the Pipe holds every message and sends it right after the run ends.
 
 A held message from another tab or device, or one sent during a run you did not start, waits in the Pipe's own queue the same way. The status line says "Queued: waiting for the current run to finish...".
