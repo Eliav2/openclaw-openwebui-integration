@@ -6550,6 +6550,9 @@ class _GatewayConnection:
         # The model and thinking level each session's last reply was sent at
         # (`steers_into_active_run`).
         self.sent_settings: dict[str, tuple] = {}
+        # "<session>:<run>" -> how a run ended without its answer ("aborted",
+        # "error"); its end wakes the session's `session_message_event`.
+        self.runs_failed: dict[str, str] = {}
 
         # Per-chat write locks for the read-modify-write paths that are not
         # turn writers (stub reconcile). Shared across connections.
@@ -6801,6 +6804,24 @@ class _GatewayConnection:
         if ev is None:
             ev = self._session_message_waiters[session_key] = asyncio.Event()
         return ev
+
+    def _note_run_failed(self, payload: dict) -> None:
+        """Record a run that ended aborted or failed, which stores no answer,
+        and wake its session's transcript waiters (a steered message's reply
+        waits for that run's answer, `_await_steered_answer`)."""
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        how = payload.get("state") if payload.get("state") in ("aborted", "error") else (
+            "error" if payload.get("stream") == "lifecycle" and data.get("phase") == "error" else None)
+        sess, run = payload.get("sessionKey"), payload.get("runId")
+        if not (how and sess and run):
+            return
+        self.runs_failed[f"{sess}:{run}"] = how
+        if len(self.runs_failed) > 2000:
+            for stale in list(self.runs_failed)[:1000]:
+                self.runs_failed.pop(stale, None)
+        ev = self._session_message_waiters.pop(sess, None)
+        if ev is not None:
+            ev.set()
 
     def _on_session_message(self, payload: dict) -> None:
         key = payload.get("sessionKey") or ""
@@ -7478,6 +7499,7 @@ class _GatewayConnection:
 
     async def _dispatch_run_event(self, msg: dict) -> None:
         payload = msg.get("payload", {})
+        self._note_run_failed(payload)
         spawned = self._spawn_seen(payload) if payload.get("stream") == "tool" else None
         if spawned:
             # The Status dialog's child index (state.py), off the loop.
@@ -10410,10 +10432,11 @@ class _TurnWriter:
         come before the Gateway commits the message itself, which it does once
         the run takes it in (CI next 3 on fff6a65). Each read follows a
         transcript append (`session_message_event`, taken before the read) or
-        the run's own terminal event. A live Gateway always stores the run's
-        closing message; one that restarted without the run (stop mode, a
-        crash) never will, so a restart read after the reconnect's gap, with
-        the session's run gone, ends the wait."""
+        the run's own terminal event. The run it went into ends one of three
+        ways, each an event here: it answers (its closing message is
+        stored and pushed), it is aborted or fails (its event,
+        `runs_failed`), or the Gateway restarts without it (stop mode, a
+        crash: read after the reconnect's gap, with the session's run gone)."""
         if not (self.takeover and steers_mid_run_messages(self.conn.gateway_version)
                 and (parse_pipe_run_id(self.run_id) or {}).get("kind") == "reply"):
             return
@@ -10433,6 +10456,11 @@ class _TurnWriter:
                 return
             if not _history_steered_answer_pending(hist, self.run_id, uncommitted=not ended,
                                                    steered=self.steered_message):
+                return
+            host = _history_steered_host(hist, self.run_id)
+            if host and self.conn.runs_failed.get(f"{self.session_key}:{host}"):
+                pipe_log(f"  turn writer: {self.message_id[:8]}...: the run its message went into "
+                         f"ended {self.conn.runs_failed[f'{self.session_key}:{host}']} before answering it")
                 return
             if (self.conn.gateway_restarts > restarts
                     and await _session_list_active(self.conn, self.session_key) is False):

@@ -9304,6 +9304,26 @@ class TurnWriterEndTests(_TurnWriterCase):
         await asyncio.wait_for(ending, 5)
         self.assertEqual(self.m()["content"], "the aside")
 
+    async def test_a_steered_reply_stops_waiting_when_its_run_is_aborted(self):
+        """Every way the run it went into ends reaches the wait as an event:
+        a run stopped or failed before its answer stores none, so its
+        aborted or error event ends the wait too."""
+        self.conn.gateway_version = "2026.10.10"
+        self.owui.msgs()["m1"] = {"id": "m1", "role": "assistant", "parentId": "q1",
+                                  "content": "", "done": True,
+                                  "statusHistory": copy.deepcopy(self.LEFT_BY_THE_CANCEL)}
+        w = _TurnWriter(self.conn, session_key=self.KEY, chat_id=self.CHAT, user_id=self.USER,
+                        run_id=self.STEERED, message_id="m1", takeover=True, renderer=_TurnRenderer())
+        self.conn.session_history = mock.AsyncMock(side_effect=lambda *a, **k: self._steered_transcript())
+        ending = asyncio.ensure_future(w.end({"status": "done", "hasActiveRun": False, "lastRunId": "R1"}))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        self.assertFalse(ending.done(), "it waits: the answer is not stored yet")
+        await self.conn._dispatch_run_event({"type": "event", "event": "chat", "payload": {
+            "sessionKey": self.KEY, "runId": "R1", "state": "aborted"}})
+        await asyncio.wait_for(ending, 5)
+        self.assertIs(self.m()["done"], True)
+
     async def test_a_steered_reply_stops_waiting_once_a_gateway_restart_lost_its_run(self):
         """Review on #278: the wait for the steered answer had no end if the
         run never stored one. A live Gateway always stores the run's closing

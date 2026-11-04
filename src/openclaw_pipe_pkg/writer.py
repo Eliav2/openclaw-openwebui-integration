@@ -1192,10 +1192,11 @@ class _TurnWriter:
         come before the Gateway commits the message itself, which it does once
         the run takes it in (CI next 3 on fff6a65). Each read follows a
         transcript append (`session_message_event`, taken before the read) or
-        the run's own terminal event. A live Gateway always stores the run's
-        closing message; one that restarted without the run (stop mode, a
-        crash) never will, so a restart read after the reconnect's gap, with
-        the session's run gone, ends the wait."""
+        the run's own terminal event. The run it went into ends one of three
+        ways, each an event here: it answers (its closing message is
+        stored and pushed), it is aborted or fails (its event,
+        `runs_failed`), or the Gateway restarts without it (stop mode, a
+        crash: read after the reconnect's gap, with the session's run gone)."""
         if not (self.takeover and steers_mid_run_messages(self.conn.gateway_version)
                 and (parse_pipe_run_id(self.run_id) or {}).get("kind") == "reply"):
             return
@@ -1215,6 +1216,11 @@ class _TurnWriter:
                 return
             if not _history_steered_answer_pending(hist, self.run_id, uncommitted=not ended,
                                                    steered=self.steered_message):
+                return
+            host = _history_steered_host(hist, self.run_id)
+            if host and self.conn.runs_failed.get(f"{self.session_key}:{host}"):
+                pipe_log(f"  turn writer: {self.message_id[:8]}...: the run its message went into "
+                         f"ended {self.conn.runs_failed[f'{self.session_key}:{host}']} before answering it")
                 return
             if (self.conn.gateway_restarts > restarts
                     and await _session_list_active(self.conn, self.session_key) is False):
