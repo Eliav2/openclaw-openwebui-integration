@@ -2750,12 +2750,12 @@ class _GatewayConnection:
         not see) it falls back to its follow-up queue (agent-runner-run
         "steering rejected; applying follow-up policy", `reply-owner-ended`),
         where the send is aborted and, on 2026.10.10-beta.1, never runs."""
-        # Started: a message sent to be steered has a consumer too, with no
-        # event yet.
+        # Started: a message sent to be steered has a consumer too, or a turn
+        # writer once Open WebUI cancelled its reply, with no event yet.
         runs = {c.run_id for c in self._consumers.values()
                 if c.session_key == session_key and c.started and not (c.ended or c.steered)}
         runs |= {run for (s, run), pump in getattr(self, "_turn_pumps", {}).items()
-                 if s == session_key and not pump.terminal.is_set()}
+                 if s == session_key and pump.started and not pump.terminal.is_set()}
         parsed = parse_pipe_run_id(next(iter(runs))) if len(runs) == 1 else None
         return bool(parsed and parsed["kind"] == "reply" and parsed["chat"] == chat_id)
 
