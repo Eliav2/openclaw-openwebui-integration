@@ -32,6 +32,9 @@ whole):
   model, so the judge may not be asked at all).
 * `E2E_ECHO: any text`                 -> replies with the rest of that line,
   byte for byte (Hebrew, emoji, markup), so a round trip can be exact.
+* `E2E_MEDIA_PATH /abs/file.png`       -> replies `Here it is.` and, on a line
+  of its own, `MEDIA:/abs/file.png`: a file named by path, which the Gateway
+  takes out of the text and stores as an image block of the run's message.
 * `E2E_TOOL_CALL`                      -> first answers with a call to the
   `session_status` tool (any harmless tool the agent offers, if that one is
   missing), then, once the tool result is in the transcript, replies
@@ -166,6 +169,7 @@ DEFERRED_CALL_TOOLS = ("dispatch_action", "tool_call")
 
 _EXACTLY = re.compile(r"exactly:?\s+([A-Za-z0-9_]{3,})")
 _ECHO = re.compile(r"E2E_ECHO: ([^\n]+)")
+_MEDIA_PATH = re.compile(r"E2E_MEDIA_PATH (/[^\s]+)")
 # E2E_ASK_TOOL: one question with two options, as a model calls ask_user.
 ASK_TOOL_ARGS = {"questions": [{"id": "db", "header": "Database", "question": "Which database?",
                                 "options": [{"label": "Postgres", "description": "needs a server"},
@@ -630,6 +634,9 @@ def _scripted(user_text: str, messages: list, last_assistant: int, turn: list,
         count = int(m.group(1) or SLOW_WORDS)
         words = " ".join(f"slow-{i}" for i in range(1, count + 1))
         return {"text": f"{m.group(2)} {words}", "delay": 1.0}
+    m = _MEDIA_PATH.search(user_text)
+    if m:
+        return {"text": f"Here it is.\nMEDIA:{m.group(1)}"}
     m = _ECHO.search(user_text)
     if m:
         return {"text": m.group(1)}

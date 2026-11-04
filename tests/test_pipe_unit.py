@@ -3371,17 +3371,32 @@ class GatewayImageBlockTests(unittest.IsolatedAsyncioTestCase):
             "sessionKey": self.SK, "runId": run_id, "stream": "codex_app_server.item",
             "data": {"phase": "completed", "itemId": "exec-1", "type": "imageGeneration"}}}
 
-    def _attached_late(self, reads_before):
-        """The run's stored message gets its image block only after
-        `reads_before` chat.history reads, as live: about 0.9 s after the
-        final."""
+    def _attached_late(self, reads_before, appended=False):
+        """As live: the Gateway stores the run's image block after the final,
+        here right after the `reads_before`-th chat.history read. It adds it
+        to the run's message and pushes `sessions.changed` phase `message`
+        (2026.10.5+), or (`appended`, 2026.10.10) appends a message keyed
+        `<run>:assistant-media:1` and pushes `session.message`."""
         reads = []
         send_request = self.conn.send_request
+        self._stored("run-1")
+
+        def attach():
+            if appended:
+                self._stored("run-1")
+                self.history["messages"].append({
+                    "role": "assistant", "content": [self.BLOCK], "model": "gateway-injected",
+                    "__openclaw": {"idempotencyKey": "run-1:assistant-media:1"}})
+                self.conn._on_session_message({"sessionKey": self.SK})
+                return
+            self._stored("run-1", self.BLOCK)
+            self.conn._on_sessions_changed({"sessionKey": self.SK, "phase": "message", "ts": 1})
 
         async def late(method, params, timeout=10):
             if method == "chat.history":
                 reads.append(1)
-                self._stored("run-1", *([self.BLOCK] if len(reads) > reads_before else []))
+                if len(reads) == reads_before:
+                    asyncio.get_running_loop().call_soon(attach)
             return await send_request(method, params, timeout=timeout)
         self.conn.send_request = late
         return reads
@@ -3397,8 +3412,7 @@ class GatewayImageBlockTests(unittest.IsolatedAsyncioTestCase):
         q.put_nowait(self._delta("run-1", "Here it is."))
         q.put_nowait(self._lifecycle_end("run-1"))
         q.put_nowait(self._final("run-1"))
-        with mock.patch.object(self.ocp, "_RUN_IMAGES_POLL_S", 0.01), \
-             mock.patch.object(self.ocp, "_fetch_gateway_media", return_value=b"PNG") as fetch, \
+        with mock.patch.object(self.ocp, "_fetch_gateway_media", return_value=b"PNG") as fetch, \
              mock.patch.object(self.ocp, "_upload_owui_file",
                                return_value={"id": "f1", "meta": {"content_type": "image/png"}}):
             out, _ = await self._collect(first, gen)
@@ -3415,11 +3429,10 @@ class GatewayImageBlockTests(unittest.IsolatedAsyncioTestCase):
         q.put_nowait(self._image_made("run-1"))
         q.put_nowait(self._delta("run-1", "Here it is."))
         q.put_nowait(self._lifecycle_end("run-1"))
-        with mock.patch.object(self.ocp, "_RUN_IMAGES_POLL_S", 0.01), \
-             mock.patch.object(self.ocp, "_RUN_IMAGES_WAIT_S", 0.1):
+        with mock.patch.object(self.ocp, "_RUN_IMAGES_MAX_WAIT_S", 0.1, create=True):
             out, _ = await self._collect(first, gen)
         self.assertEqual(out, "Here it is.")
-        self.assertGreater(len(reads), 2)
+        self.assertEqual(len(reads), 2, "no push, no read: the transcript is not polled")
 
     async def test_a_run_that_made_no_image_reads_the_transcript_once(self):
         reads = self._attached_late(10 ** 6)
@@ -3482,8 +3495,7 @@ class GatewayImageBlockTests(unittest.IsolatedAsyncioTestCase):
             q.put_nowait(event)
         q.put_nowait(self._lifecycle_end("run-1"))
         q.put_nowait(self._final("run-1"))
-        with mock.patch.object(self.ocp, "_RUN_IMAGES_POLL_S", 0.01), \
-             mock.patch.object(self.ocp, "_RUN_IMAGES_WAIT_S", 0.3), \
+        with mock.patch.object(self.ocp, "_RUN_IMAGES_MAX_WAIT_S", 0.3, create=True), \
              mock.patch.object(self.ocp, "_fetch_gateway_media", return_value=b"PNG") as fetch, \
              mock.patch.object(self.ocp, "_upload_owui_file",
                                return_value={"id": "f1", "meta": {"content_type": "image/png"}}):
@@ -3499,6 +3511,15 @@ class GatewayImageBlockTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(out.startswith("Here it is."))
         self.assertIn("](/api/v1/files/f1/content)", out)
         self.assertNotIn("MEDIA:", out)
+
+    async def test_a_path_stored_in_a_message_the_gateway_appends_is_shown(self):
+        self._media_dir()
+        reads = self._attached_late(2, appended=True)
+        out, fetch = await self._events(self._media_event("run-1", "Here it is.", [self.PATH]))
+        fetch.assert_called_once()
+        self.assertEqual(len(reads), 3, "read again on the append's push")
+        self.assertIn("](/api/v1/files/f1/content)", out)
+        self.assertNotIn("could not be loaded", out)
 
     async def test_a_path_directive_in_the_text_shows_the_stored_block_not_a_link(self):
         """The file server never had a path: its link was a broken image."""
@@ -8887,15 +8908,28 @@ class TurnWriterImageTests(_TurnWriterCase):
     async def asyncSetUp(self):
         await super().asyncSetUp()
         self.reads = []
+        # The read after which the block is stored (the Gateway pushes the
+        # rewrite then), or None: stored by the second read already.
+        self.attach_after = None
+        self.attached = False
+
+        def attach():
+            self.attached = True
+            self.conn._on_sessions_changed({"sessionKey": self.KEY, "phase": "message", "ts": 1})
 
         async def history(session_key, limit=None, **kw):
             self.reads.append(1)
-            blocks = [self.BLOCK] if len(self.reads) > 1 else []
+            if self.attach_after is None:
+                blocks = [self.BLOCK] if len(self.reads) > 1 else []
+            else:
+                blocks = [self.BLOCK] if self.attached else []
+                if len(self.reads) == self.attach_after:
+                    asyncio.get_running_loop().call_soon(attach)
             return {"messages": [{"role": "assistant", "__openclaw": {"runId": "agent-run-1"},
                                   "content": [{"type": "text", "text": "Done."}, *blocks]}]}
         self.conn.session_history = history
         self.shown = mock.AsyncMock(return_value="\n\n![x.png](/api/v1/files/f1/content)\n")
-        for name, value in (("_gateway_images_text", self.shown), ("_RUN_IMAGES_POLL_S", 0.01)):
+        for name, value in (("_gateway_images_text", self.shown),):
             patch = mock.patch.object(openclaw_pipe, name, value)
             patch.start()
             self.addCleanup(patch.stop)
@@ -8913,6 +8947,27 @@ class TurnWriterImageTests(_TurnWriterCase):
         m = self._final_message()
         self.assertTrue(m["done"])
         self.assertEqual(m["content"], "Done.\n\n![x.png](/api/v1/files/f1/content)")
+
+    async def test_a_block_stored_late_is_read_on_the_gateways_push(self):
+        """Stored only after the writer's second read: it reads again when the
+        Gateway pushes `sessions.changed` phase `message`, not on a timer."""
+        self.attach_after = 2
+        w = self.writer()
+        await w.feed({"stream": "assistant", "data": {"delta": "Done.", "mediaUrls": [self.PATH]}})
+        with mock.patch.object(openclaw_pipe, "_RUN_IMAGES_MAX_WAIT_S", 5.0, create=True):
+            await asyncio.wait_for(w.finalize(), 2)
+        self.assertEqual(len(self.reads), 3)
+        (blocks,), kw = self.shown.call_args
+        self.assertEqual((blocks, kw["missing"]), ([self.BLOCK], []))
+
+    async def test_a_block_never_stored_is_not_polled_for(self):
+        self.attach_after = 10 ** 6
+        w = self.writer()
+        await w.feed({"stream": "assistant", "data": {"delta": "Done.", "mediaUrls": [self.PATH]}})
+        with mock.patch.object(openclaw_pipe, "_RUN_IMAGES_MAX_WAIT_S", 0.2, create=True):
+            await w.finalize()
+        self.assertEqual(len(self.reads), 2, "no push, no read")
+        self.assertTrue(self._final_message()["done"])
 
     async def test_a_path_directive_is_taken_out_of_the_text(self):
         w = self.writer()
@@ -15697,3 +15752,54 @@ class AutoTitleTests(unittest.IsolatedAsyncioTestCase):
         self.rename("look  \nhere")
         await self.second_message()
         self.assertEqual(self.chat.title, self.GENERATED)
+
+
+class TranscriptRewritePushTests(unittest.IsolatedAsyncioTestCase):
+    """2026.10.5+: a rewrite of a stored message (a run's images attached
+    after its final) is pushed as `sessions.changed` phase `message`, with no
+    `session.message`; it wakes transcript waiters, and only that session's."""
+
+    async def test_phase_message_wakes_that_sessions_transcript_waiter(self):
+        conn = _GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"))
+        mine = conn.session_message_event("agent:main:a")
+        other = conn.session_message_event("agent:main:b")
+        conn._on_sessions_changed({"sessionKey": "agent:main:a", "phase": "start", "ts": 1})
+        self.assertFalse(mine.is_set(), "a run start is not a transcript change")
+        conn._on_sessions_changed({"sessionKey": "agent:main:a", "phase": "message", "ts": 2})
+        self.assertTrue(mine.is_set())
+        self.assertFalse(other.is_set())
+
+
+class RunMediaMessageTests(unittest.TestCase):
+    """2026.10.10: a file the reply named by path is stored in a message the
+    Gateway appends for the run (no `runId`, idempotency key
+    `<run>:assistant-media[:n]`, model `gateway-injected`), next to the run's
+    own text message. Shapes captured from a 2026.10.10-beta.1 stack."""
+
+    RUN = "msg-fc87f8b4-cd5b-4857-bc80-b97ca2b707ef-fcb1d90e-1793748028.778025"
+    BLOCK = {"type": "image", "url": "/api/chat/media/outgoing/agent%3Amain%3Ax/633ad0e2/full",
+             "alt": "e2e-gw-media.png", "mimeType": "image/png"}
+    ERROR = {"type": "attachment_error", "attachment": {"label": "gone.png", "code": "file-not-found"}}
+
+    def _history(self, key, *content):
+        return {"messages": [
+            {"role": "assistant", "content": [{"type": "text", "text": "Here it is."}],
+             "__openclaw": {"runId": self.RUN, "seq": 2}},
+            {"role": "assistant", "content": list(content), "provider": "openclaw",
+             "model": "gateway-injected", "idempotencyKey": key,
+             "__openclaw": {"idempotencyKey": key, "seq": 3}}]}
+
+    def test_the_runs_appended_media_message_counts(self):
+        for key in (f"{self.RUN}:assistant-media:1", f"{self.RUN}:assistant-media"):
+            with self.subTest(key=key):
+                h = self._history(key, self.BLOCK, self.ERROR)
+                self.assertEqual(openclaw_pipe._history_image_blocks_for_run(h, self.RUN), [self.BLOCK])
+                self.assertEqual(openclaw_pipe._history_media_errors_for_run(h, self.RUN), ["gone.png"])
+
+    def test_another_runs_media_message_does_not(self):
+        for key in ("msg-other:assistant-media:1", f"{self.RUN}0:assistant-media:1",
+                    f"{self.RUN}:assistant-mediax", self.RUN):
+            with self.subTest(key=key):
+                h = self._history(key, self.BLOCK, self.ERROR)
+                self.assertEqual(openclaw_pipe._history_image_blocks_for_run(h, self.RUN), [])
+                self.assertEqual(openclaw_pipe._history_media_errors_for_run(h, self.RUN), [])

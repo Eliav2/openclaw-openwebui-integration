@@ -2529,6 +2529,33 @@ def test_a_media_line_from_the_agent_is_uploaded_attached_and_linked(token):
     assert "MEDIA:" not in content and content.startswith("Here it is:") and content.endswith("done"), dump
 
 
+@pytest.mark.skipif(shutil.which("docker") is None, reason="needs the e2e stack's Open WebUI container")
+def test_a_file_named_by_path_shows_as_the_image_the_gateway_stored(token):
+    """A reply names a file on the Gateway's host by path (ELI-328): the
+    Gateway takes the line out of the text, stores the file as an image block
+    of the run's message after the run's final, then pushes `sessions.changed`
+    phase `message`. The Pipe reads the transcript again on that push: the
+    saved reply links the uploaded image, and the Pipe never reached its bound
+    for a Gateway that does not store it (its WARNING line)."""
+    name = f"e2e-gw-media-{uuid.uuid4().hex[:8]}.png"
+    path = os.path.join(os.path.expanduser("~/.openclaw/workspace"), name)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(PNG_1PX)
+    since = str(int(time.time()))   # docker reads a zone-less date as the host's local time
+    chat_id, msg = _chat_turn(token, f"E2E_MEDIA_PATH {path}")
+
+    saved = _db_message(chat_id, msg["id"])
+    dump = json.dumps(saved)[:2000]
+    content = saved.get("content") or ""
+    assert content.startswith("Here it is."), dump
+    assert "MEDIA:" not in content, dump
+    assert re.search(r"!\[[^\]]*\]\(/api/v1/files/[^)]+/content\)", content), f"no image: {dump}"
+    log = subprocess.run(["docker", "logs", "--since", since, "owui"],
+                         capture_output=True, text=True, timeout=60)
+    assert "run images: WARNING" not in log.stdout + log.stderr, "the Pipe waited out its bound"
+
+
 THINKING_FILTER_ID = "openclaw_thinking"   # install_filter.py
 
 
