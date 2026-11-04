@@ -682,6 +682,11 @@ def test_a_message_sent_while_a_run_works_is_steered_into_it(token):
     assert carrying and "e2e-hold-released" in carrying[0], (carrying[:1] or asked[-1:])[0][-400:]
 
 
+def _is_cli_closing(m: dict) -> bool:
+    meta = m.get("__openclaw") if isinstance(m.get("__openclaw"), dict) else {}
+    return str(m.get("idempotencyKey") or meta.get("idempotencyKey") or "").startswith("cli-assistant:")
+
+
 CLI_MODEL = "openclaw_gateway.anthropic/claude-opus-5-5"  # e2e/start_stack.sh: claude-cli, e2e/fake_claude.py
 
 
@@ -1939,6 +1944,74 @@ def test_a_reply_whose_run_ends_while_owui_is_stopped_is_completed_on_start(toke
     assert msgs[aid]["content"].strip().startswith("E2E_DOWN slow-1"), msgs[aid]["content"][:300]
     assert [k for k, m in msgs.items() if m.get("role") == "assistant"] == [aid], "a second reply"
     _assert_clean(token, chat_id, msgs)
+
+
+@pytest.mark.skipif(shutil.which("docker") is None, reason="needs the e2e stack's Open WebUI container")
+@pytest.mark.skipif(not _steers_mid_run_messages(), reason="the Gateway runs a wake after the run")
+def test_a_cron_wake_a_second_wake_fired_into_is_completed_whole_on_start(token):
+    """Two cron wakes, the second fired while the first's claude-cli run works:
+    2026.10.10 runs the second after the first's run, and its prompt carries
+    the time it fired; the first's messages, imported with Claude Code's own
+    times, sort around it (live gate two-wakes, chat d51a3a0a).
+    Rebuilt from the transcript (here: the run ends while Open WebUI is
+    stopped), the first wake's reply lost every tool card from before the
+    second's prompt."""
+    log = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), "fake-claude.log")
+    chat_id, first = _chat_turn(token, "Respond with exactly: E2E_CLI_CHAT", model=CLI_MODEL)
+    assert first["content"].strip() == "E2E_CLI_REPLY", first["content"]
+    key = _session_key(token, chat_id)
+    hold_token = f"cli{uuid.uuid4().hex[:8]}"
+    step = lambda n: f"echo e2e-step-{n}-{hold_token}"  # noqa: E731
+    gate = os.path.join(os.path.dirname(os.environ["E2E_FAKE_LLM_LOG"]), f"hold-{hold_token}")
+
+    def commands(msg):
+        return [(i.get("arguments") if isinstance(i.get("arguments"), dict)
+                 else json.loads(i.get("arguments") or "{}")).get("command")
+                for i in msg.get("output") or [] if i.get("type") == "function_call"]
+
+    def transcript():
+        return _gw("chat.history", {"sessionKey": key, "limit": 50}).get("messages") or []
+
+    def first_wake():
+        return next((k for k, m in _chat_messages(token, chat_id).items()
+                     if m.get("role") == "assistant" and step(1) in commands(m)), None)
+
+    _schedule_wake(key, f"E2E_CLI_TOOL_HOLD {hold_token}", 2)
+    try:
+        _until("the first wake's Claude Code turn holding", lambda: os.path.exists(log)
+               and f"holding {hold_token}" in open(log, encoding="utf-8").read(), every_s=0.2)
+        woke = _until("the first wake's reply showing its first tool card", first_wake)
+        subprocess.run(["docker", "stop", "-t", "30", "owui"], check=True, capture_output=True)
+        second = _schedule_wake(key, "Reply with exactly: E2E_CLI_WAKE_TWO", 2)
+        # Fired, and waiting for the first wake's run: its prompt is stamped
+        # with this time and so sorts between the first wake's tool calls.
+        _until("the second wake to fire while the first works", lambda: any(
+            j.get("id") == second and (j.get("state") or {}).get("runningAtMs")
+            for j in _gw("cron.list", {"includeDisabled": True}).get("jobs") or []))
+        open(gate, "w").close()
+        # The chat's first turn, then each wake, closes with its `cli-assistant:` message.
+        _until("both wakes to finish", lambda: not _session_row(key).get("hasActiveRun") and sum(
+            1 for m in transcript() if _is_cli_closing(m)) >= 3, timeout_s=120)
+    finally:
+        open(gate, "w").close()
+        subprocess.run(["docker", "start", "owui"], check=True, capture_output=True)
+    _until("Open WebUI to come back", _owui_up, timeout_s=300, every_s=2)
+
+    # The first model listing after a start runs the startup reconcile, which
+    # rebuilds the first wake's reply from the transcript.
+    status, _models = _request("GET", "/api/models", token=token)
+    assert status == 200
+    try:
+        _until("the first wake's reply rebuilt with both tool cards",
+               lambda: commands(_chat_messages(token, chat_id)[woke]) == [step(1), step(2)])
+    except pytest.fail.Exception as ex:
+        reply = _chat_messages(token, chat_id)[woke]
+        pytest.fail(f"{ex}: {commands(reply)}\n{json.dumps(reply)[:2000]}\n{_down_state(token, chat_id, key)}")
+    msgs = _chat_messages(token, chat_id)
+    assert msgs[woke].get("done") is True and "E2E_CLI_HOLD_START" in msgs[woke]["content"], msgs[woke]
+    assert not [k for k, m in msgs.items() if k != woke and step(1) in json.dumps(m.get("output"))], (
+        "the first wake's card in another message")
+    os.remove(gate)
 
 
 # ── A plain redeploy of the Pipe mid-reply (ELI-145) ─────────────────────────
