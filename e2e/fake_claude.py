@@ -20,11 +20,12 @@ Replies:
   run's abort: its SIGTERM is taken and the same call is made for `after-TOKEN`, as a Claude
   Code the abort has not killed yet can (gate 280c: a call 0.8 s after Stop). The Gateway's
   answer goes to `abort-mcp-TOKEN.json`; the process then exits.
-* `E2E_CLI_LATE_STEER TOKEN` -> runs tool step 1, says `E2E_LATE_PART_1` and waits for a
-  message injected into the turn. It does not take it in yet: it says `E2E_LATE_PART_2` and
-  runs tool step 2, as Claude Code goes on to its next tool boundary, then waits for the
-  file `go-TOKEN`. There it takes the message in and answers it as `E2E_CLI_STEERED: <its
-  text>`, then each one injected meanwhile the same way (Eliav's chat c9dc45f0, test 2).
+* `E2E_CLI_LATE_STEER TOKEN` -> says `E2E_LATE_PART_1` and, in its tool step 1, waits for a
+  message injected into the turn. It does not take it in yet: it ends the step, says
+  `E2E_LATE_PART_2` and runs tool step 2, as Claude Code goes on to its next tool boundary,
+  then waits for the file `go-TOKEN`. There it takes the message in and answers it as
+  `E2E_CLI_STEERED: <its text>`, then each one injected meanwhile the same way (Eliav's chat
+  c9dc45f0, test 2).
 * the installer's route smoke ("... answer with only the exact model line") -> the model's
   ref, `anthropic/<--model>`, as session_status would give it.
 * anything else -> `E2E_CLI_REPLY`.
@@ -264,11 +265,11 @@ while True:
     late = LATE_STEER.search(text_of(msg))
     if late:
         token = late.group(1)
-        tool_step(1, token)
         say("E2E_LATE_PART_1", stop="tool_use")
         note(f"holding {token}")
-        first = inputs.get()
+        first = inputs.get()  # sent during tool step 1, as "say tomato" during pause 1
         note(f"steer waiting {token}")
+        tool_step(1, token)
         say("E2E_LATE_PART_2", stop="tool_use")
         tool_step(2, token)
         note(f"boundary {token}")

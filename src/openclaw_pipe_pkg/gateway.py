@@ -2253,7 +2253,8 @@ class _GatewayConnection:
                 self.row_to_consumers(key, payload)
         if key and payload.get("phase") == "message":
             # A stored message was rewritten, not appended: no `session.message`
-            # follows (2026.10.5+, server-session-events historyReset branch).
+            # follows (server-session-events: an update with no message from
+            # 2026.9.3 on, also a projected one that needs a reset from 2026.10.5).
             self._wake_message_waiter(key)
         parent = payload.get("spawnedBy") or payload.get("parentSessionKey")
         if parent and parent != key:
