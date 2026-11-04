@@ -72,7 +72,8 @@
   }
 
   function offer() {
-    if (Notification.permission !== "default" || store.get("ocPushOffer") === "dismissed" || !store.get("token")) return;
+    if (Notification.permission !== "default" || store.get("ocPushOffer") === "dismissed" || !store.get("token") ||
+      document.getElementById("oc-push-offer")) return;
     const bar = document.createElement("div");
     bar.id = "oc-push-offer";
     bar.setAttribute("role", "region");
@@ -95,10 +96,34 @@
     document.body.appendChild(bar);
   }
 
+  // One run at a time; each run is for the token it started with.
+  let running = null, ranFor;
+  const run = () => running ||= (ranFor = store.get("token"), ensure())
+    .catch((e) => "error:" + e.message).then((state) => {
+      running = null;
+      // The token changed while this run was on its way: the result is stale.
+      const t = store.get("token");
+      if (t && t !== ranFor) return run();
+      window.ocPushState = state;
+      if (state === "no-permission") offer();
+      return state;
+    });
+
+  // Open WebUI signs in, signs up and signs out without a page load: it stores
+  // the token, then navigates on the client (SvelteKit calls history.pushState
+  // or replaceState). Each navigation checks whether the token changed since the
+  // last run, and runs again if so.
+  const navigated = () => { const t = store.get("token"); if (t && t !== ranFor) run(); };
+  for (const k of ["pushState", "replaceState"]) {
+    const orig = history[k];
+    history[k] = function (...args) {
+      const r = orig.apply(this, args);
+      navigated();
+      return r;
+    };
+  }
+  addEventListener("popstate", navigated);
+
   window.ocPushEnable = enable;
-  window.ocPushReady = ensure().catch((e) => "error:" + e.message).then((state) => {
-    window.ocPushState = state;
-    if (state === "no-permission") offer();
-    return state;
-  });
+  window.ocPushReady = run();
 })();

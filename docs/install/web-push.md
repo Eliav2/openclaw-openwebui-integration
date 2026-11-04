@@ -10,7 +10,7 @@ It has three parts, all in [`push/`](https://github.com/Eliav2/openclaw-openwebu
 
 - **The Web Push function** (`push/openclaw_web_push.py`): an Open WebUI event function. On each `chat.finished` it sends a push to each of the user's devices.
 - **The service worker** (`push/web/oc-sw.js`), served at `/oc-sw.js`: it receives the push and shows the notification.
-- **The page script** (`push/web/oc-push.js`), served as `/static/loader.js`: it registers the service worker, offers "Enable notifications", and saves each device's subscription.
+- **The page script** (`push/web/oc-push.js`), served as `/static/loader.js`: it registers the service worker, offers "Enable notifications", and saves each device's subscription. Open WebUI signs in and signs up without loading a page, so the script also runs again on Open WebUI's in-app navigation whenever the signed-in token has changed.
 
 Open WebUI loads `/static/loader.js` on every page, but it rebuilds `/static` on every start, so both scripts are served by the proxy in front of Open WebUI: a [Cloudflare Worker](#serve-the-scripts-with-a-cloudflare-worker) or [nginx](#serve-the-scripts-with-nginx). Nothing else in Open WebUI changes.
 

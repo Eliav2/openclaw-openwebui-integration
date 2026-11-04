@@ -52,6 +52,11 @@ def owui():
         token = api("/api/v1/auths/signup", {"name": "E2E", **cred})["token"]
     # The admin's "What's New" dialog would cover the page: mark this version seen.
     api("/api/v1/users/user/settings/update", {"ui": {"showChangelog": False}}, token)
+    # Open WebUI keeps sign-up in its saved config (the env var is only the first default):
+    # on, with new accounts as plain users, for the sign-up test.
+    cfg = api("/api/v1/auths/admin/config", token=token)
+    if not cfg["ENABLE_SIGNUP"] or cfg["DEFAULT_USER_ROLE"] != "user":
+        api("/api/v1/auths/admin/config", {**cfg, "ENABLE_SIGNUP": True, "DEFAULT_USER_ROLE": "user"}, token)
     have = {f["id"] for f in api("/api/v1/functions/", token=token)}
     for fid, name, path in (("web_push", "Web Push", os.path.join(PUSH, "openclaw_web_push.py")),
                             ("stub", "Stub", os.path.join(HERE, "stub_pipe.py")),
@@ -109,16 +114,48 @@ def ready(page):
 
 
 @pytest.fixture(scope="module")
-def browser(owui):
-    with sync_playwright() as pw:
-        ctx = pw.chromium.launch_persistent_context(
-            tempfile.mkdtemp(prefix="webpush-e2e-"), executable_path=CHROME, headless=False,
-            args=["--no-sandbox"], viewport={"width": 390, "height": 844},
-            ignore_default_args=["--disable-background-networking", "--disable-component-update", "--disable-sync"])
-        ctx.add_init_script(f"localStorage.setItem('token', {json.dumps(owui)})")
-        ctx.add_init_script(DECISIONS)
+def pw():
+    with sync_playwright() as p:
+        yield p
+
+
+def chrome(pw):
+    """Google Chrome with its own new profile, as a phone-sized window."""
+    return pw.chromium.launch_persistent_context(
+        tempfile.mkdtemp(prefix="webpush-e2e-"), executable_path=CHROME, headless=False,
+        args=["--no-sandbox"], viewport={"width": 390, "height": 844},
+        ignore_default_args=["--disable-background-networking", "--disable-component-update", "--disable-sync"])
+
+
+@pytest.fixture(scope="module")
+def browser(owui, pw):
+    ctx = chrome(pw)
+    ctx.add_init_script(f"localStorage.setItem('token', {json.dumps(owui)})")
+    ctx.add_init_script(DECISIONS)
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    yield ctx, page
+    ctx.close()
+
+
+def test_a_fresh_sign_up_gets_the_offer_without_a_reload(owui, pw):
+    # Open WebUI signs up (and in) on the client: it stores the token and navigates without
+    # loading a page. The page script loaded signed out must notice and offer, once.
+    ctx = chrome(pw)
+    try:
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        yield ctx, page
+        page.goto(BASE + "/auth")
+        assert ready(page) == "no-token"
+        page.evaluate("() => { window.ocSameLoad = true }")
+        page.get_by_role("button", name="Sign up", exact=True).click()
+        page.locator("#name").fill("Fresh")
+        page.locator("#email").fill(f"fresh-{uuid.uuid4().hex[:8]}@e2e.example.com")
+        page.locator("input[type=password]").first.fill("e2e-pass-2")
+        page.get_by_role("button", name="Create Account").click()
+        page.locator("#oc-push-offer").wait_for(timeout=WAIT_MS)
+        assert page.evaluate("() => window.ocSameLoad") is True, "the page was reloaded"
+        assert page.evaluate("() => window.ocPushState") == "no-permission"
+        assert page.locator("#oc-push-offer").count() == 1
+    finally:
         ctx.close()
 
 
