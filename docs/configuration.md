@@ -118,7 +118,7 @@ Auto-generate a chat title after the first exchange (like native OWUI). Uses a f
 
 Type: `bool`. Default: `False`.
 
-Publish Open WebUI's 'chat.finished' event when an OpenClaw reply is saved, for every reply the Pipe writes (also cron, sub-agent and other agent turns), with source 'openclaw-pipe'. Event functions (such as a push notifier), event webhooks and notification targets receive it. Open WebUI's own 'chat.finished' still fires when the chat request ends, which for OpenClaw can be before the reply does, so a consumer that gets both should keep this one. A user with an Open WebUI notification target (Settings > Notifications) that has 'chat.finished' on gets both, so two notifications per OpenClaw reply. The event's data holds the full reply text in 'message'.
+Publish Open WebUI's 'chat.finished' event when an OpenClaw reply is saved, for every reply the Pipe writes (also cron, sub-agent and other agent turns), with source 'openclaw-pipe'. Event functions (such as a push notifier), event webhooks and notification targets receive it. Open WebUI's own 'chat.finished' still fires when the chat request ends, which for OpenClaw can be before the reply does, so a consumer that gets both should keep this one. A user with an Open WebUI notification target (Settings > Notifications) that has 'chat.finished' on gets both for a reply to a chat message, so two notifications; a reply an agent started (cron, sub-agent, sessions_send) has no chat request and gets only this one. The event's data holds the full reply text in 'message'.
 
 ### COMPOSER_STATUS_BUTTON
 

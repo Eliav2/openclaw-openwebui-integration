@@ -83,7 +83,7 @@ Open WebUI's own event still fires as well. A consumer that gets both for an Ope
 Two things to know before you turn it on:
 
 - **The full reply is in the event.** As in Open WebUI's own `chat.finished` (0.13.0 and later), `data.message` holds the whole reply text. Every event function, event webhook and notification target receives it. A consumer that sends the event off the server, such as a push notifier, should forward only the title and the link, never `message`.
-- **Two notifications with a notification target.** A user whose notification target in Settings > Notifications has `chat.finished` on gets Open WebUI's event and the Pipe's, so two notifications for each OpenClaw reply. Turn off `chat.finished` on that target, or leave the valve off.
+- **Two notifications with a notification target.** A user whose notification target in Settings > Notifications has `chat.finished` on gets Open WebUI's event and the Pipe's for a reply to a chat message, so two notifications for it. A reply an agent started (cron, sub-agent, `sessions_send`) has no chat request, so the Pipe's event is its only one: turning off `chat.finished` on the target drops those too. A target can't tell the two apart; to get one notification per reply, turn the target's `chat.finished` off and notify from an event function or webhook that keeps only `source` `openclaw-pipe`.
 
 ## Restarts and reconnects
 

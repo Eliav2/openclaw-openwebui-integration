@@ -680,6 +680,24 @@ class OrphanStubReconcileTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self._stub()["content"], "Reading them.\n\nFound it.")
         self.assertIs(self._stub()["done"], True)
 
+    async def test_a_finished_stub_publishes_chat_finished_with_the_valve(self):
+        """Review on #273: a reply the startup recovery finishes is saved
+        whole like any other, and PUBLISH_CHAT_FINISHED publishes it."""
+        published = []
+
+        async def publish(chat_id, message_id, user_id, text=None):
+            published.append((chat_id, message_id, user_id))
+        self.history, self.active = _turn_history(), False
+        for on in (False, True):
+            self.chat["history"]["messages"][self.STUB].update(done=False, content="")
+            self.conn._claimed_runs.clear()
+            self.conn._valves = lambda: types.SimpleNamespace(AGENT_ID="main", PUBLISH_CHAT_FINISHED=on)
+            with mock.patch.object(openclaw_pipe, "_publish_chat_finished", publish):
+                await _reconcile_stub(self.conn, "main", self.CHAT, self.STUB)
+                await self._spin()
+            self.assertIs(self._stub()["done"], True)
+            self.assertEqual(published, [(self.CHAT, self.STUB, self.USER)] if on else [])
+
     async def test_a_reply_answered_in_a_model_column_is_finished_from_that_session(self):
         """ELI-329: the second model of a multi-model chat has its own session."""
         import tempfile
@@ -8723,10 +8741,13 @@ class PublishChatFinishedTests(unittest.IsolatedAsyncioTestCase):
         async def publish_event(request, event, **kw):
             test.calls.append((request, event, kw))
 
+        self.chat = types.SimpleNamespace(chat={"history": {"messages": {"m1": self.message}}})
+
         class Chats:
             @staticmethod
-            async def get_message_by_id_and_message_id(chat_id, message_id):
-                return dict(test.message)
+            @contextlib.asynccontextmanager
+            async def _chat_transaction(chat_id):
+                yield ("db", test.chat)
 
             @staticmethod
             async def get_chat_title_by_id(chat_id):
@@ -8761,9 +8782,21 @@ class PublishChatFinishedTests(unittest.IsolatedAsyncioTestCase):
             "open_webui.utils": mod("open_webui.utils"),
             "open_webui.utils.chat_id": mod("open_webui.utils.chat_id",
                                             is_saved_chat_id=lambda c: bool(c) and ":" not in c),
-            "starlette": mod("starlette"), "starlette.requests": mod("starlette.requests", Request=Request)})
+            "starlette": mod("starlette"), "starlette.requests": mod("starlette.requests", Request=Request),
+            "sqlalchemy": mod("sqlalchemy"), "sqlalchemy.orm": mod("sqlalchemy.orm"),
+            "sqlalchemy.orm.attributes": mod("sqlalchemy.orm.attributes", flag_modified=lambda o, n: None)})
         p.start()
         self.addCleanup(p.stop)
+
+    async def test_a_reply_is_published_once(self):
+        """Review on #273: Open WebUI can call the Pipe twice for one reply,
+        and each request that ended published the reply again. The first
+        publish claims the reply in its message's meta under the chat's row
+        lock, which every worker process reads."""
+        await openclaw_pipe._publish_chat_finished("c1", "m1", "u1", "the reply")
+        await openclaw_pipe._publish_chat_finished("c1", "m1", "u1", "the reply")
+        self.assertEqual(len(self.calls), 1)
+        self.assertTrue(self.message["meta"][openclaw_pipe.CHAT_FINISHED_META])
 
     async def test_the_event_as_the_middleware_shapes_it(self):
         await openclaw_pipe._publish_chat_finished("c1", "m1", "u1", "the reply")

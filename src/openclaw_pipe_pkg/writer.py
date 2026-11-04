@@ -177,6 +177,35 @@ async def _clear_response_stream(task_id: str | None) -> None:
 # closed catalog (events.py `event_name`), so a consumer tells this one from
 # the middleware's own by `source`.
 CHAT_FINISHED_SOURCE = "openclaw-pipe"
+# The message meta key that marks a reply published as finished, so it is
+# published once however many paths finish it.
+CHAT_FINISHED_META = "openclaw_chat_finished"
+
+
+async def _claim_chat_finished(chat_id: str, message_id: str) -> dict | None:
+    """The message, when it is saved whole and not published yet, marked
+    published under the chat's row lock: Open WebUI can run a reply's
+    request twice, in any worker process, and the startup recovery finishes
+    replies too. None otherwise. Never cut short by a cancel."""
+    return await _uncancellable(_claim_chat_finished_now(chat_id, message_id))
+
+
+async def _claim_chat_finished_now(chat_id: str, message_id: str) -> dict | None:
+    from open_webui.models.chats import Chats
+    from sqlalchemy.orm.attributes import flag_modified
+
+    async with Chats._chat_transaction(chat_id) as (db, chat):
+        if chat is None:
+            return None
+        data = chat.chat or {}
+        history = data.get("history") or {}
+        msg = (history.get("messages") or {}).get(message_id)
+        if msg is None or msg.get("done") is not True or (msg.get("meta") or {}).get(CHAT_FINISHED_META):
+            return None
+        msg["meta"] = {**(msg.get("meta") or {}), CHAT_FINISHED_META: True}
+        chat.chat = {**data, "history": history}
+        flag_modified(chat, "chat")
+        return dict(msg)
 
 
 async def _publish_chat_finished(chat_id: str, message_id: str, user_id: str,
@@ -189,7 +218,7 @@ async def _publish_chat_finished(chat_id: str, message_id: str, user_id: str,
     handed over to the writer that is before the reply ends, and an agent
     turn has no request at all. Event functions, event webhooks and
     notification targets receive it. `text`: the reply's text, else the
-    saved message's."""
+    saved message's. Once per reply (_claim_chat_finished)."""
     app = getattr(sys.modules.get("open_webui.main"), "app", None)
     if app is None or not message_id:
         return
@@ -202,8 +231,8 @@ async def _publish_chat_finished(chat_id: str, message_id: str, user_id: str,
 
         if not is_saved_chat_id(chat_id):
             return
-        row = await Chats.get_message_by_id_and_message_id(chat_id, message_id) or {}
-        if row.get("done") is not True:
+        row = await _claim_chat_finished(chat_id, message_id)
+        if row is None:
             return
         if text is None:
             text = row.get("content") or ""
@@ -2800,6 +2829,8 @@ async def _reconcile_stub(conn: "_GatewayConnection", agent_id: str,
                                 {"type": "chat:completion", "data": {"output": output}})
     await _relay_emit_event(chat.user_id, chat_id, stub_id,
                             {"type": "chat:active", "data": {"active": False}})
+    if getattr(conn._valves(), "PUBLISH_CHAT_FINISHED", False):
+        await _publish_chat_finished(chat_id, stub_id, chat.user_id)
     cards = sum(1 for i in output or [] if i.get("type") == "function_call")
     if output is None:
         how = "closed, content kept"
@@ -2995,6 +3026,8 @@ async def _reconcile_chat_ended_runs(conn: "_GatewayConnection", session_key: st
             conn.mark_delivered_live(session_key, run)
         await _relay_emit_event(chat.user_id, chat_id, mid,
                                 {"type": "chat:completion", "data": {"output": output}})
+        if getattr(conn._valves(), "PUBLISH_CHAT_FINISHED", False):
+            await _publish_chat_finished(chat_id, mid, chat.user_id)
         pipe_log(f"  ended-while-down {mid[:8]}... in chat {chat_id[:8]}...: completed from "
                  f"{len(runs)} run(s) ({len(text)} chars, {cards} tool card(s), "
                  f"held {held_cards}) (ELI-94)")
