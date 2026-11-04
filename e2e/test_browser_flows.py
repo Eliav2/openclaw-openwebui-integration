@@ -843,7 +843,8 @@ def test_messages_sent_from_other_tabs_while_a_reply_runs_are_answered_together(
     behind its run. Once it ends they go to the agent as one turn, in the
     order sent: three user messages in the chat, the first two replies
     saying their message went with the next, the last one answering; the
-    same after a reload."""
+    same after a reload. Where the Gateway steers them (2026.10.10+), they
+    go into the run in order, at the boundaries the Gateway picks."""
     words = [f"BROWSER_JOIN_{w}_{os.getpid()}" for w in ("A", "B", "C")]
     asked = len(_fake_llm_requests())
     hold_token = f"join{os.getpid()}_{asked}"
@@ -873,15 +874,29 @@ def test_messages_sent_from_other_tabs_while_a_reply_runs_are_answered_together(
         open(gate, "w").close()
         for other in tabs:
             other.close()
-    # The first model request that carries any of the messages carries all
-    # three, in order: sent apart, the first would carry only the first.
-    first = next((text for text in (json.dumps(r["request"]["messages"]) for r in _fake_llm_requests()[asked:])
-                  if any(w in text for w in words)), "")
-    assert all(w in first for w in words), (
-        f"the waiting messages reached the agent as separate turns: {first[-300:]}")
-    assert first.index(words[0]) < first.index(words[1]) < first.index(words[2]), first[-300:]
-    for index in (1, 2):
-        _says_where_its_message_went(page, index, "sent together with your next one")
+    requests = [json.dumps(r["request"]["messages"]) for r in _fake_llm_requests()[asked:]]
+    if _steers():
+        # Steered, each message goes in at the run's first boundary after the
+        # Gateway admits it, and admission takes the Gateway a while
+        # (chat-send stage=steer), so messages sent seconds apart can go in at
+        # different boundaries. In order either way, and each reply has its
+        # message's answer or says it went in with the next one.
+        reached = [next(n for n, text in enumerate(requests) if w in text) for w in words]
+        assert reached == sorted(reached), f"the messages reached the agent out of order: {reached}"
+        for index, word in enumerate(words, start=1):
+            _wait(page, f"() => [{json.dumps(word)}, 'sent together with your next one']"
+                        f".some(t => {_message_text_js(index)}.includes(t))",
+                  f"reply {index} answering {word} or saying where it went", 60_000)
+            assert "Queued: waiting" not in page.evaluate(f"() => {_message_text_js(index)}")
+    else:
+        # The first model request that carries any of the messages carries all
+        # three, in order: sent apart, the first would carry only the first.
+        first = next((text for text in requests if any(w in text for w in words)), "")
+        assert all(w in first for w in words), (
+            f"the waiting messages reached the agent as separate turns: {first[-300:]}")
+        assert first.index(words[0]) < first.index(words[1]) < first.index(words[2]), first[-300:]
+        for index in (1, 2):
+            _says_where_its_message_went(page, index, "sent together with your next one")
     shown = (_user_texts(page), [r["text"] for r in _replies(page)])
     _saved_whole(page, token, "E2E_HOLD_END", _ran_its_command if _steers() else None)
     _reload(page)
