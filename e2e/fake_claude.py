@@ -131,13 +131,18 @@ def prompt_hook(prompt):
 
 def say(text, stop="end_turn"):
     """One assistant message, streamed first as `--include-partial-messages`
-    does (the Gateway shows a claude-cli reply from these deltas)."""
-    for event in ({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+    does (the Gateway shows a claude-cli reply from these deltas, and starts a
+    new paragraph at each `message_start`)."""
+    mid = "msg_" + uuid.uuid4().hex[:20]
+    for event in ({"type": "message_start", "message": {"id": mid, "type": "message", "role": "assistant",
+                                                         "model": model, "content": []}},
+                  {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
                   {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}},
-                  {"type": "content_block_stop", "index": 0}):
+                  {"type": "content_block_stop", "index": 0},
+                  {"type": "message_stop"}):
         emit({"type": "stream_event", "event": event, "uuid": str(uuid.uuid4()), "session_id": sid,
               "parent_tool_use_id": None})
-    message = {"id": "msg_" + uuid.uuid4().hex[:20], "type": "message", "role": "assistant", "model": model,
+    message = {"id": mid, "type": "message", "role": "assistant", "model": model,
                "content": [{"type": "text", "text": text}], "stop_reason": stop, "stop_sequence": None,
                "usage": {"input_tokens": 10, "output_tokens": 2, "cache_creation_input_tokens": 0,
                          "cache_read_input_tokens": 0}}

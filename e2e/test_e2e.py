@@ -797,25 +797,25 @@ def test_a_steered_message_splits_the_run_where_claude_code_took_it_in(token):
         open(go, "w").close()
         _until("all three replies done", lambda: all(
             _chat_messages(token, chat_id)[r].get("done") for r in (held, tomato, blue)))
-        expected = {held: "E2E_LATE_PART_1", tomato: f"E2E_CLI_STEERED: say tomato-{word}",
-                    blue: f"E2E_CLI_STEERED: say blue-{word}"}
-
         def settled():
             msgs = _chat_messages(token, chat_id)
-            return all(expected[r] in msgs[r].get("content", "") for r in expected) and \
-                "E2E_LATE_PART_2" in msgs[held].get("content", "")
+            return (f"tomato-{word}" in msgs[tomato].get("content", "")
+                    and "E2E_LATE_PART_2" in msgs[held].get("content", ""))
         try:
             _until("each reply holding its own part", settled, timeout_s=60)
-        except AssertionError:
-            pass
+        except pytest.fail.Exception:
+            pass  # the asserts below say what each reply shows
     finally:
         open(go, "w").close()
     msgs = _chat_messages(token, chat_id)
     shown = {r: msgs[r].get("content", "") for r in (held, tomato, blue)}
-    assert "E2E_LATE_PART_1" in shown[held] and "E2E_LATE_PART_2" in shown[held], shown
+    assert shown[held].split() == ["E2E_LATE_PART_1", "E2E_LATE_PART_2"], shown
     assert "STEERED" not in shown[held], shown
-    assert shown[tomato].strip() == f"E2E_CLI_STEERED: say tomato-{word}", shown
-    assert shown[blue].strip() == f"E2E_CLI_STEERED: say blue-{word}", shown
+    assert shown[tomato].strip().startswith("E2E_CLI_STEERED:") and f"tomato-{word}" in shown[tomato], shown
+    assert "E2E_LATE_PART" not in shown[tomato], shown
+    # The Gateway may steer "say blue" in after the tomato answer (c9dc45f0)
+    # or run it after the run: an answer of its own, either way.
+    assert "tomato" not in shown[blue] and "E2E_LATE_PART" not in shown[blue] and shown[blue].strip(), shown
     os.remove(go)
 
 

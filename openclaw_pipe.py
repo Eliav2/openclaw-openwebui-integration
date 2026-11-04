@@ -8875,37 +8875,55 @@ def _transcript_roles(messages: list) -> list:
 
 
 def _transcript_commit_order(messages: list) -> list:
-    """`chat.history` messages with each one steered into a running run
-    moved to where the run took it in. The Gateway stores it when sent, but
-    on claude-cli the run takes it in at a tool boundary, and the messages
-    Claude Code wrote in between carry their own, later times, so they sort
-    after it: Eliav's chat c9dc45f0, where "21-40", written during the pause
-    a message was sent in, read as that message's answer. Its commit time
-    (`recordTimestampMs`) is the boundary: it goes past the messages written
-    before it, up to the next user message. Other messages keep their order."""
+    """`chat.history` messages with each sent user message where its run
+    took it in. The Gateway stores a message when it is sent, but on
+    claude-cli a running run takes a steered one in at a tool boundary, and a
+    queued one runs after it, while the messages Claude Code wrote meanwhile
+    carry their own, later times and sort after it: Eliav's chat c9dc45f0,
+    where "21-40", written during the pause a message was sent in, read as
+    that message's answer. Its commit time (`recordTimestampMs`) is the
+    boundary: it goes past the messages stamped before then, up to the copy
+    of it Claude Code wrote, which stays right after it. From the last one
+    back, so one moved past is already in its own place."""
     out = list(messages)
-    for message in [m for m in messages if _steered_commit_ms(m) is not None]:
+    for message in reversed([m for m in messages if _committed_after_sent(m) is not None]):
         at = out.index(message)
-        committed = _steered_commit_ms(message)
+        committed = _committed_after_sent(message)
         end = at + 1
-        while end < len(out) and (out[end] or {}).get("role") != "user" \
-                and isinstance((out[end] or {}).get("timestamp"), (int, float)) \
-                and out[end]["timestamp"] <= committed:
+        while end < len(out) and _commit_ms(out[end]) is not None and _commit_ms(out[end]) <= committed \
+                and not _copy_of(out[end], message):
             end += 1
         out.insert(end - 1, out.pop(at))
     return out
 
 
-def _steered_commit_ms(message) -> float | None:
-    """When the Gateway committed a message it steered into a running run
-    (2026.10.10 `steerTargetRunId`), if after it was sent; else None."""
-    meta = (message or {}).get("__openclaw") if isinstance(message, dict) else None
-    if not isinstance(meta, dict) or not meta.get("steerTargetRunId") or message.get("role") != "user":
+def _commit_ms(message) -> float | None:
+    """When `message` joined the run: a sent message's commit, else its time."""
+    if not isinstance(message, dict):
         return None
-    committed, sent = meta.get("recordTimestampMs"), message.get("timestamp")
+    committed = _committed_after_sent(message)
+    at = message.get("timestamp")
+    return committed if committed is not None else (at if isinstance(at, (int, float)) else None)
+
+
+def _committed_after_sent(message) -> float | None:
+    """When the Gateway committed a message a `chat.send` stored on its
+    arrival, if later (`recordTimestampMs`); else None."""
+    if not _history_user_run_id(message):
+        return None
+    committed, sent = (message.get("__openclaw") or {}).get("recordTimestampMs"), message.get("timestamp")
     if not isinstance(committed, (int, float)) or not isinstance(sent, (int, float)) or committed <= sent:
         return None
     return committed
+
+
+def _copy_of(message, sent: dict) -> bool:
+    """`message` is the copy of `sent` a CLI runtime imports (its own text
+    after the context the Gateway adds)."""
+    if not isinstance(message, dict) or message.get("role") != "user" or _history_user_run_id(message):
+        return False
+    text = (_history_item(sent) or {}).get("text", "").strip()
+    return bool(text) and (_history_item(message) or {}).get("text", "").strip().endswith(text)
 
 
 def _history_user_run_id(message) -> str | None:

@@ -16797,6 +16797,40 @@ class SteeredTranscriptSpanTests(unittest.TestCase):
         self.assertEqual(self._texts(_history_span_messages(hist, "R2")), ["tomato"])
         self.assertEqual(self._texts(_history_span_messages(hist, "R3")), ["blue"])
 
+    def test_a_message_queued_behind_the_run_is_not_its_steered_answers_end(self):
+        """The sandbox's shape of the same test (e2e
+        test_a_steered_message_splits_the_run_where_claude_code_took_it_in):
+        "say blue" was queued, not steered, so it ran after the run, but the
+        Gateway stored it when sent, before tomato's answer, which then read
+        as "sent together with your next one". Claude Code writes its copy of
+        a message just before the Gateway commits it; that copy stays after it."""
+        def user(key, text, at, committed, into=None):
+            meta = {"idempotencyKey": f"{key}:user", "recordTimestampMs": committed}
+            return {"role": "user", "content": text, "timestamp": at,
+                    "__openclaw": meta | ({"steerTargetRunId": into} if into else {})}
+
+        def said(text, at, **kw):
+            return {**self._said(text, **kw), "timestamp": at}
+
+        def imported(text, at):
+            return {"role": "user", "content": f"Conversation info ...\n\n{text}", "timestamp": at}
+        raw = {"messages": [
+            user("R1", "count", 1000, 1000), imported("count", 1001), said("PART-1", 1002, stop="toolUse"),
+            user("R2", "say tomato", 1010, 1030, into="R1"), said("PART-2", 1011, stop="toolUse"),
+            user("R3", "say blue", 1012, 1040),
+            imported("say tomato", 1029), said("tomato", 1031, run="R1", key="cli-assistant:R1"),
+            imported("say blue", 1041), said("blue", 1042, run="R3", key="cli-assistant:R3")]}
+        conn = openclaw_pipe._GatewayConnection(lambda: types.SimpleNamespace(AGENT_ID="main"))
+
+        async def send_request(method, params, timeout=10):
+            return copy.deepcopy(raw)
+        conn.send_request = send_request
+        hist = asyncio.run(conn.session_history("s"))
+        first = _history_renderer(_history_span_messages(hist, "R1")).text
+        self.assertTrue("PART-1" in first and "PART-2" in first and "tomato" not in first, first)
+        self.assertEqual(self._texts(_history_span_messages(hist, "R2")), ["tomato"])
+        self.assertEqual(self._texts(_history_span_messages(hist, "R3")), ["blue"])
+
     def test_a_run_still_going_has_no_steered_answer_yet(self):
         hist = {"messages": [self._user("R1", "count"), self._said("slow-1", run="R1", stop="toolUse"),
                              self._user("R2", "banana")]}
